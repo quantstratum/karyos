@@ -1,0 +1,47 @@
+# Local agent instructions
+AGENTS.md
+
+# Rust build output
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock is committed on purpose: the workspace ships binaries and
+# ADR-0033 requires locked, reproducible builds.
+
+# Fuzzing (cargo-fuzz)
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# Coverage and profiling
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+cobertura.xml
+perf.data
+perf.data.old
+flamegraph.svg
+
+# cargo-mutants
+mutants.out/
+mutants.out.old/
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment files
+.env
+.env.*
