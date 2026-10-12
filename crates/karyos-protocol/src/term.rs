@@ -74,6 +74,7 @@ pub struct TermAppender<'a> {
     tail: u32,
     identity: TermIdentity,
     mtu: u32,
+    max_reserved: u32,
     max_message_length: u32,
 }
 
@@ -111,6 +112,7 @@ impl<'a> TermAppender<'a> {
             tail: 0,
             identity,
             mtu,
+            max_reserved,
             max_message_length,
         })
     }
@@ -160,9 +162,19 @@ impl<'a> TermAppender<'a> {
             value: payload.len() as u64,
         })?;
         let max = if ext {
-            plan.max_message_length(self.max_reserved_budget()?, self.term_length_typed()?)?
+            plan.max_message_length(self.max_reserved, TermLength::try_new(self.term_length)?)?
         } else {
             self.max_message_length
+        };
+        // Encode the extension once, up front, so an invalid one fails before
+        // any byte of the term is written.
+        let extension = match options.extension {
+            Some(extension) => {
+                let mut bytes = [0u8; EXTENSION_LENGTH as usize];
+                extension.encode(&mut bytes)?;
+                Some(bytes)
+            }
+            None => None,
         };
         FragmentPlan::check_message(length, max)?;
         let reserved = plan.reserved(length)?;
@@ -203,8 +215,14 @@ impl<'a> TermAppender<'a> {
             let region = slice_mut(self.term, offset, frame_reserved)?;
             region.fill(0);
             header.encode(region)?;
-            if let Some(extension) = options.extension {
-                extension.encode(tail_mut(region, HEADER_LENGTH)?)?;
+            if let Some(bytes) = &extension {
+                tail_mut(region, HEADER_LENGTH)?
+                    .get_mut(..bytes.len())
+                    .ok_or(ProtocolError::BufferTooShort {
+                        required: bytes.len(),
+                        available: 0,
+                    })?
+                    .copy_from_slice(bytes);
             }
             tail_mut(region, header_length)?
                 .get_mut(..body.len())
@@ -255,14 +273,6 @@ impl<'a> TermAppender<'a> {
         }
         self.tail = self.term_length;
         Ok(())
-    }
-
-    fn max_reserved_budget(&self) -> Result<u32, ProtocolError> {
-        Ok(self.term_length_typed()?.max_reserved_limit())
-    }
-
-    fn term_length_typed(&self) -> Result<TermLength, ProtocolError> {
-        TermLength::try_new(self.term_length)
     }
 }
 
@@ -813,6 +823,44 @@ mod tests {
         let mut scan = scanner(&term);
         assert_eq!(contents(&message(scan.next_item().unwrap())), fake);
         assert_eq!(scan.next_item(), Ok(ScanItem::Pending));
+    }
+
+    #[test]
+    fn extension_messages_respect_the_configured_budget() {
+        let mut term = vec![0u8; TERM as usize];
+        let mut app =
+            TermAppender::new(&mut term, term_length(), IDENTITY, DEFAULT_MTU, 128).unwrap();
+        let traced = AppendOptions {
+            extension: Some(TraceExtension::default()),
+            ..AppendOptions::default()
+        };
+        // 96-byte header + 64 bytes reserves 160 > 128.
+        assert_eq!(
+            app.append(&payload(64, 1), traced),
+            Err(ProtocolError::MessageTooLarge {
+                length: 64,
+                max: 32
+            })
+        );
+        assert_eq!(app.append(&payload(32, 1), traced).map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn invalid_extension_fails_before_writing() {
+        let mut term = vec![0u8; TERM as usize];
+        {
+            let mut app = appender(&mut term);
+            let options = AppendOptions {
+                extension: Some(TraceExtension {
+                    extension_flags: 1,
+                    ..TraceExtension::default()
+                }),
+                ..AppendOptions::default()
+            };
+            assert!(app.append(&payload(3000, 1), options).is_err());
+            assert_eq!(app.tail(), 0);
+        }
+        assert!(term.iter().all(|b| *b == 0));
     }
 
     #[test]
