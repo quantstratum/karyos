@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# Licence and source policy for the resolved dependency graph (ADR-0033).
+# cargo-deny does not prove the absence of native build steps; build scripts
+# and linkage are reviewed separately for every new dependency.
+
+[graph]
+all-features = true
+
+[licenses]
+# Dev and build dependencies are part of the reviewed graph (ADR-0033).
+include-dev = true
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+yanked = "deny"

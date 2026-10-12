@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/karyos-sys",
+    "crates/karyos-io",
+    "crates/karyos-protocol",
+    "crates/karyos-codec",
+    "crates/karyos-client",
+    "crates/karyos-driver",
+    "crates/karyos-trace",
+    "crates/karyos-archive",
+    "crates/karyos-cluster",
+    "crates/karyos-feed",
+    "crates/karyos-sim",
+    "crates/karyos",
+    "crates/karyos-tools",
+    "crates/karyos-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/joaquinbejar/karyos"
+publish = false
+
+[workspace.dependencies]
+karyos-sys = { path = "crates/karyos-sys", version = "0.1.0" }
+karyos-io = { path = "crates/karyos-io", version = "0.1.0" }
+karyos-protocol = { path = "crates/karyos-protocol", version = "0.1.0" }
+karyos-codec = { path = "crates/karyos-codec", version = "0.1.0" }
+karyos-client = { path = "crates/karyos-client", version = "0.1.0" }
+karyos-driver = { path = "crates/karyos-driver", version = "0.1.0" }
+karyos-trace = { path = "crates/karyos-trace", version = "0.1.0" }
+karyos-archive = { path = "crates/karyos-archive", version = "0.1.0" }
+karyos-cluster = { path = "crates/karyos-cluster", version = "0.1.0" }
+karyos-feed = { path = "crates/karyos-feed", version = "0.1.0" }
+karyos-sim = { path = "crates/karyos-sim", version = "0.1.0" }
+karyos = { path = "crates/karyos", version = "0.1.0" }
+karyos-tools = { path = "crates/karyos-tools", version = "0.1.0" }
+karyos-bench = { path = "crates/karyos-bench", version = "0.1.0" }
+
+# Inherited by every crate except karyos-sys and karyos-io (SPEC.md §14).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[profile.release]
+debug = "line-tables-only"

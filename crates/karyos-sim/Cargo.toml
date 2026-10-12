@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "karyos-sim"
+description = "Deterministic simulator, including the backend ring models."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+karyos-driver.workspace = true
+karyos-archive.workspace = true
+karyos-cluster.workspace = true
+
+[lints]
+workspace = true

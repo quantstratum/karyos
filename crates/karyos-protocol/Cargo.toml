@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "karyos-protocol"
+description = "Frame layouts, flyweights and channel URI parsing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+karyos-sys.workspace = true
+
+[lints]
+workspace = true
