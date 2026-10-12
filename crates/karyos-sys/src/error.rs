@@ -91,6 +91,14 @@ pub enum SysError {
         /// Raw OS error number.
         errno: i32,
     },
+    /// A sealed backing does not carry exactly the required seals.
+    #[error("backing seals are {found:#x}, expected exactly {expected:#x}")]
+    SealMismatch {
+        /// The required seal bits.
+        expected: u32,
+        /// The seal bits found.
+        found: u32,
+    },
     /// A state transition found the descriptor in an unexpected state.
     #[error("descriptor transition expected {expected:#018x} but found {found:#018x}")]
     UnexpectedDescriptor {

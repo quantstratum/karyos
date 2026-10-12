@@ -2,17 +2,21 @@
 
 //! Shared memory backed by a sealed `memfd` (Linux only).
 //!
-//! The backing is an anonymous `memfd` whose size is sealed before it is
-//! mapped (`F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`). The seals live on the
-//! inode, so no file descriptor, including one reopened through
-//! `/proc/<pid>/fd`, can truncate or extend it: a live mapping can never lose
-//! its backing pages. There is no path-based mapping, and no attachment by
-//! another process yet; sharing the backing across processes is a later,
-//! separately reviewed capability.
+//! The backing is an anonymous `memfd`. Its size is sealed before it is mapped
+//! (`F_SEAL_SHRINK | F_SEAL_GROW`); then the single writable shared mapping is
+//! created; then `F_SEAL_FUTURE_WRITE | F_SEAL_SEAL` are added, and the exact
+//! seal set is verified. Seals live on the inode, so no file descriptor,
+//! including one reopened through `/proc/<pid>/fd`, can resize the backing,
+//! write it with `write`/`pwrite`, punch holes in it or create a new writable
+//! mapping. The mapping created here is therefore the only writer, and it is
+//! accessed only atomically. A kernel without these seals fails closed.
 //!
-//! Contents remain writable by any holder of the file descriptor, as with any
-//! shared memory. Processes that bypass the protocol are outside the isolation
-//! boundary (SPEC.md §4).
+//! This is a local, unintegrated primitive. It is not the IPC backing:
+//! `F_SEAL_FUTURE_WRITE` forbids the writable mappings other processes would
+//! need, and the accepted SPEC.md §4 location (`/dev/shm`) is unchanged. There
+//! is no path-based mapping and no attachment by another process. The trust
+//! boundary excludes hostile code in the same process (for example through
+//! `ptrace` or `/proc/self/mem`).
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -24,6 +28,12 @@ use rustix::mm::{MapFlags, ProtFlags};
 
 use crate::atomic_view::{AtomicWords, WORD_BYTES};
 use crate::error::SysError;
+
+/// The exact seal set of a [`SealedMapping`] backing.
+const REQUIRED_SEALS: SealFlags = SealFlags::SHRINK
+    .union(SealFlags::GROW)
+    .union(SealFlags::FUTURE_WRITE)
+    .union(SealFlags::SEAL);
 
 /// Whether to try `mlock` on a new mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,12 +111,13 @@ impl SealedMapping {
         let fd = rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)
             .map_err(os("memfd_create"))?;
         rustix::fs::ftruncate(&fd, file_len).map_err(os("ftruncate"))?;
-        rustix::fs::fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL)
+        rustix::fs::fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW)
             .map_err(os("fcntl_add_seals"))?;
 
         // SAFETY: a fresh mapping at an address chosen by the kernel (null
         // hint) over `len` bytes of a file sealed at exactly `len` bytes; it
-        // aliases no existing Rust object.
+        // aliases no existing Rust object, and no other mapping of the file
+        // exists (the descriptor has not been shared).
         let raw = unsafe {
             rustix::mm::mmap(
                 core::ptr::null_mut(),
@@ -130,6 +141,18 @@ impl SealedMapping {
             },
         };
         // From here `mapping` owns the region; an early return unmaps it.
+
+        // Now that the only writable mapping exists, forbid every other write
+        // path and further seal changes, then verify the exact set.
+        rustix::fs::fcntl_add_seals(&mapping.fd, SealFlags::FUTURE_WRITE | SealFlags::SEAL)
+            .map_err(os("fcntl_add_seals"))?;
+        let found = rustix::fs::fcntl_get_seals(&mapping.fd).map_err(os("fcntl_get_seals"))?;
+        if found != REQUIRED_SEALS {
+            return Err(SysError::SealMismatch {
+                expected: REQUIRED_SEALS.bits(),
+                found: found.bits(),
+            });
+        }
 
         let words = mapping.words_checked()?;
         let page_words = page / WORD_BYTES;
@@ -227,7 +250,8 @@ fn os(operation: &'static str) -> impl Fn(rustix::io::Errno) -> SysError {
 
 // Miri cannot execute mmap or memfd system calls; the heap backing covers the
 // shared `AtomicWords::from_raw` path under Miri.
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
+#[cfg(not(miri))]
 mod tests {
     use super::*;
     use rustix::fd::AsRawFd;
@@ -272,25 +296,83 @@ mod tests {
         }
     }
 
-    #[test]
-    fn backing_cannot_be_resized_even_through_a_reopened_descriptor() {
-        let mapping = SealedMapping::create("karyos-test", page(), LockRequest::No).unwrap();
+    fn reopen(mapping: &SealedMapping) -> std::fs::File {
         let path = format!("/proc/self/fd/{}", mapping.fd().as_raw_fd());
-        let reopened = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
-            .unwrap();
+            .unwrap()
+    }
+
+    fn perm() -> Option<i32> {
+        Some(rustix::io::Errno::PERM.raw_os_error())
+    }
+
+    #[test]
+    fn seal_set_is_exact() {
+        let mapping = SealedMapping::create("karyos-test", page(), LockRequest::No).unwrap();
         assert_eq!(
-            reopened.set_len(0).unwrap_err().raw_os_error(),
-            Some(rustix::io::Errno::PERM.raw_os_error())
+            rustix::fs::fcntl_get_seals(mapping.fd()).unwrap(),
+            REQUIRED_SEALS
         );
+    }
+
+    #[test]
+    fn backing_cannot_be_resized_through_a_reopened_descriptor() {
+        let mapping = SealedMapping::create("karyos-test", page(), LockRequest::No).unwrap();
+        let reopened = reopen(&mapping);
+        assert_eq!(reopened.set_len(0).unwrap_err().raw_os_error(), perm());
         let grown = u64::try_from(2 * page()).unwrap();
-        assert_eq!(
-            reopened.set_len(grown).unwrap_err().raw_os_error(),
-            Some(rustix::io::Errno::PERM.raw_os_error())
-        );
-        // The mapping is still fully usable.
+        assert_eq!(reopened.set_len(grown).unwrap_err().raw_os_error(), perm());
         mapping.words().get(0).unwrap().store(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn backing_cannot_be_written_through_a_reopened_descriptor() {
+        use std::os::unix::fs::FileExt;
+        let mapping = SealedMapping::create("karyos-test", page(), LockRequest::No).unwrap();
+        let reopened = reopen(&mapping);
+        assert_eq!(
+            reopened.write_at(&[1, 2, 3], 0).unwrap_err().raw_os_error(),
+            perm()
+        );
+        assert_eq!(mapping.words().get(0).unwrap().load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn no_second_writable_mapping_through_a_reopened_descriptor() {
+        let mapping = SealedMapping::create("karyos-test", page(), LockRequest::No).unwrap();
+        let reopened = reopen(&mapping);
+        // SAFETY: if the kernel wrongly accepted this mapping, it is unmapped
+        // immediately below and never dereferenced.
+        let second = unsafe {
+            rustix::mm::mmap(
+                core::ptr::null_mut(),
+                page(),
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED,
+                &reopened,
+                0,
+            )
+        };
+        match second {
+            Ok(ptr) => {
+                // SAFETY: unmaps the mapping just created, which nothing uses.
+                let _ = unsafe { rustix::mm::munmap(ptr, page()) };
+                panic!("a second writable shared mapping was allowed");
+            }
+            Err(errno) => assert_eq!(Some(errno.raw_os_error()), perm()),
+        }
+    }
+
+    #[test]
+    fn original_mapping_stays_writable_after_sealing() {
+        let mapping = SealedMapping::create("karyos-test", 2 * page(), LockRequest::No).unwrap();
+        let words = mapping.words();
+        let last = words.len() - 1;
+        words.get(last).unwrap().store(7, Ordering::SeqCst);
+        assert_eq!(words.get(last).unwrap().fetch_add(1, Ordering::SeqCst), 7);
+        assert_eq!(words.get(last).unwrap().load(Ordering::SeqCst), 8);
     }
 }
