@@ -154,6 +154,10 @@ impl HeapWords {
     /// whole region (cheap per access, also under Miri).
     #[inline]
     #[must_use]
+    #[cfg_attr(
+        loom,
+        allow(dead_code, reason = "used by the owned APIs, absent under loom")
+    )]
     pub(crate) fn word(&self, index: usize) -> Option<&AtomicU64> {
         if index >= self.count {
             return None;
@@ -169,6 +173,10 @@ impl HeapWords {
     /// The `len` words starting at `start`, if in bounds, without forming a
     /// view of the whole region.
     #[must_use]
+    #[cfg_attr(
+        loom,
+        allow(dead_code, reason = "used by the owned APIs, absent under loom")
+    )]
     pub(crate) fn range(&self, start: usize, len: usize) -> Option<&[AtomicU64]> {
         let end = start.checked_add(len)?;
         if end > self.count {
