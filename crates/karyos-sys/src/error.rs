@@ -74,6 +74,31 @@ pub enum SysError {
         /// The state code of the descriptor passed in.
         given: u8,
     },
+    /// A memory region failed validation (null, misaligned, empty, not a
+    /// multiple of the word or page size, or larger than `isize::MAX`).
+    #[error("invalid memory region at {address:#x} of {len} bytes")]
+    InvalidRegion {
+        /// Base address, or 0 before mapping.
+        address: usize,
+        /// Length in bytes.
+        len: usize,
+    },
+    /// A system call failed.
+    #[error("{operation} failed with OS error {errno}")]
+    Os {
+        /// The failing operation.
+        operation: &'static str,
+        /// Raw OS error number.
+        errno: i32,
+    },
+    /// A sealed backing does not carry exactly the required seals.
+    #[error("backing seals are {found:#x}, expected exactly {expected:#x}")]
+    SealMismatch {
+        /// The required seal bits.
+        expected: u32,
+        /// The seal bits found.
+        found: u32,
+    },
     /// A state transition found the descriptor in an unexpected state.
     #[error("descriptor transition expected {expected:#018x} but found {found:#018x}")]
     UnexpectedDescriptor {

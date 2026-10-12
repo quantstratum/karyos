@@ -13,6 +13,9 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [target.'cfg(loom)'.dependencies]
 loom.workspace = true
 
