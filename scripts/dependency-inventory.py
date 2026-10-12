@@ -54,7 +54,7 @@ def main(argv: list) -> int:
         return 2
     output = argv[1]
     result = subprocess.run(
-        ["cargo", "metadata", "--locked", "--format-version", "1"],
+        ["cargo", "metadata", "--locked", "--color", "never", "--format-version", "1"],
         capture_output=True,
         text=True,
     )
@@ -65,7 +65,7 @@ def main(argv: list) -> int:
     inventory["evaluated"] = {}
     for target in SUPPORTED_TARGETS:
         tree = subprocess.run(
-            ["cargo", "tree", "--locked", "--workspace", "--target", target,
+            ["cargo", "tree", "--locked", "--color", "never", "--workspace", "--target", target,
              "--edges", "normal,build", "--prefix", "none", "--format", "{p}"],
             capture_output=True,
             text=True,
