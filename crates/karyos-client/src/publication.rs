@@ -231,7 +231,9 @@ impl ClientPublication {
     /// # Errors
     ///
     /// Returns [`ClientError::EmptyMessage`], [`ClientError::MessageTooLarge`]
-    /// and lower-layer errors; nothing is published on error.
+    /// and lower-layer errors. An error makes no new reservation; a
+    /// forgotten claim resolved first may still have published its
+    /// `ABORTED` word (see [`ClientPublication::offer_with`]).
     pub fn offer(&mut self, payload: &[u8]) -> Result<OfferOutcome, ClientError> {
         self.offer_with(payload, AppendOptions::default())
     }
@@ -274,7 +276,8 @@ impl ClientPublication {
     /// Returns [`ClientError::EmptyMessage`], [`ClientError::MessageTooLarge`]
     /// (above `max_message_length`, one fragment or the reservation limit)
     /// and lower-layer errors, such as `ResourcesUnavailable` once the claim
-    /// record's serial is exhausted; nothing is reserved on error.
+    /// record's serial is exhausted. An error makes no new reservation; a
+    /// forgotten claim is still resolved first.
     pub fn try_claim(&mut self, length: u32) -> Result<ClaimOutcome<'_>, ClientError> {
         self.try_claim_with(length, AppendOptions::default())
     }
