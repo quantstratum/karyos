@@ -316,16 +316,21 @@ mod tests {
 
     /// The closed form agrees with a brute-force search over small sizes.
     #[test]
-    // Pure arithmetic with no unsafe code; too slow to interpret under Miri.
-    #[cfg_attr(miri, ignore)]
     fn max_message_length_matches_brute_force() {
         let term = TermLength::try_new(MIN_TERM_LENGTH).unwrap();
+        // Under Miri the same check runs on a bounded subset: interpreting the
+        // full sweep would take minutes and the code has no unsafe parts.
+        let (mtus, step): (&[u32], usize) = if cfg!(miri) {
+            (&[160, 1408], 1504)
+        } else {
+            (&[128, 160, 200, 1408, 4096], 96)
+        };
         for flags in [Flags::NONE, ext()] {
-            for mtu in [128, 160, 200, 1408, 4096] {
+            for &mtu in mtus {
                 let Ok(plan) = FragmentPlan::new(mtu, flags) else {
                     continue;
                 };
-                for max_reserved in (128..=term.max_reserved_limit()).step_by(96) {
+                for max_reserved in (128..=term.max_reserved_limit()).step_by(step) {
                     let closed = plan.max_message_length(max_reserved, term).unwrap();
                     assert!(plan.reserved(closed).unwrap() <= max_reserved);
                     let mut brute = 0;
@@ -364,12 +369,11 @@ mod tests {
     }
 
     #[test]
-    // Pure arithmetic with no unsafe code; too slow to interpret under Miri.
-    #[cfg_attr(miri, ignore)]
     fn reserved_is_monotonic() {
         let plan = FragmentPlan::new(DEFAULT_MTU, Flags::NONE).unwrap();
         let mut previous = 0;
-        for length in 0..20_000 {
+        let limit = if cfg!(miri) { 3_000 } else { 20_000 };
+        for length in 0..limit {
             let reserved = plan.reserved(length).unwrap();
             assert!(reserved >= previous);
             assert_eq!(reserved % FRAME_ALIGNMENT, 0);
