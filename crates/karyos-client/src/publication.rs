@@ -4,17 +4,26 @@
 
 use std::sync::Arc;
 
+use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, LogBuffer, Publication};
 
 use crate::error::ClientError;
 
-/// Result of an offer.
+/// Result of an offer. Each call performs at most one append attempt:
+/// padding, rotation and waiting for the driver are reported to the caller
+/// as [`OfferOutcome::AdminAction`] and never retried silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "back pressure and admin actions must be handled"]
 pub enum OfferOutcome {
-    /// The message was published at `position`.
+    /// The message was accepted into the local publication log at
+    /// `position` in `lane`. Positions are per lane, so the pair identifies
+    /// the message. Acceptance is local only: it does not imply backend
+    /// submission, wire transmission, receiver delivery, archive durability
+    /// or Cluster commitment (SPEC.md §10).
     Accepted {
-        /// Stream position of the message.
+        /// The lane the message was appended to.
+        lane: Lane,
+        /// Position of the message in that lane.
         position: u64,
     },
     /// The flow-control limit does not admit the message; retry later.
@@ -81,7 +90,10 @@ impl ClientPublication {
             return Ok(OfferOutcome::NotConnected);
         }
         Ok(match self.inner.append(payload, options)? {
-            AppendOutcome::Appended { position } => OfferOutcome::Accepted { position },
+            AppendOutcome::Appended { position } => OfferOutcome::Accepted {
+                lane: self.buffer.lane(),
+                position,
+            },
             AppendOutcome::BackPressured => OfferOutcome::BackPressured,
             AppendOutcome::AdminAction => OfferOutcome::AdminAction,
         })

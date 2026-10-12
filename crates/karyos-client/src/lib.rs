@@ -13,4 +13,6 @@ pub mod subscription;
 
 pub use error::ClientError;
 pub use publication::{ClientPublication, OfferOutcome};
-pub use subscription::{ClientSubscription, MessageInfo, Overrun, PollError, PollSummary};
+pub use subscription::{
+    ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,
+};

@@ -31,6 +31,27 @@ pub struct MessageInfo {
     pub extension: Option<[u8; EXTENSION_LENGTH as usize]>,
 }
 
+/// Upper bound on whole messages delivered by one poll. Counts reassembled
+/// messages, never fragments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MessageLimit(u32);
+
+impl MessageLimit {
+    /// A limit of `messages` whole messages; 0 makes a poll do nothing.
+    #[inline]
+    #[must_use]
+    pub const fn new(messages: u32) -> Self {
+        Self(messages)
+    }
+
+    /// The number of messages.
+    #[inline]
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 /// A lost range reported by an optional subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Overrun {
@@ -96,10 +117,15 @@ impl ClientSubscription {
     /// Returns [`PollError`] carrying the deliveries handled before a
     /// lower-layer failure, such as a required subscription whose data is
     /// gone.
-    pub fn poll<H>(&mut self, mut handler: H, message_limit: u32) -> Result<PollSummary, PollError>
+    pub fn poll<H>(
+        &mut self,
+        mut handler: H,
+        message_limit: MessageLimit,
+    ) -> Result<PollSummary, PollError>
     where
         H: FnMut(&[u8], MessageInfo),
     {
+        let message_limit = message_limit.get();
         let mut summary = PollSummary::default();
         if message_limit == 0 {
             return Ok(summary);

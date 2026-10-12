@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use karyos_client::{ClientError, OfferOutcome};
+use karyos_client::{ClientError, MessageLimit, OfferOutcome};
 use karyos_driver::{DriverError, EmbeddedDriver, StreamConfig};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{AppendOptions, LogBufferConfig, Role};
@@ -67,7 +67,10 @@ fn not_connected_without_subscribers_unless_allowed() {
     // starts at position 0.
     assert_eq!(
         publication.offer(b"x").unwrap(),
-        OfferOutcome::Accepted { position: 0 }
+        OfferOutcome::Accepted {
+            lane: Lane::ZERO,
+            position: 0
+        }
     );
 
     let mut open_config = config(true);
@@ -99,14 +102,20 @@ fn messages_flow_through_many_rotations_with_limits() {
         offer_retrying(&mut driver, &mut publication, &message(sequence));
         // At most 3 messages per poll.
         let summary = subscription
-            .poll(|bytes, _| received.push(bytes.to_vec()), 3)
+            .poll(
+                |bytes, _| received.push(bytes.to_vec()),
+                MessageLimit::new(3),
+            )
             .unwrap();
         assert!(summary.delivered <= 3);
     }
     while (received.len() as u32) < total {
         let _ = driver.do_work().unwrap();
         let _ = subscription
-            .poll(|bytes, _| received.push(bytes.to_vec()), 10)
+            .poll(
+                |bytes, _| received.push(bytes.to_vec()),
+                MessageLimit::new(10),
+            )
             .unwrap();
     }
     for (sequence, bytes) in received.iter().enumerate() {
@@ -129,12 +138,12 @@ fn a_panicking_required_handler_gets_the_message_again() {
         OfferOutcome::Accepted { .. }
     ));
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = subscription.poll(|_, _| panic!("handler failed"), 10);
+        let _ = subscription.poll(|_, _| panic!("handler failed"), MessageLimit::new(10));
     }));
     assert!(panicked.is_err());
     let mut seen = Vec::new();
     let summary = subscription
-        .poll(|bytes, _| seen.push(bytes.to_vec()), 10)
+        .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(10))
         .unwrap();
     assert_eq!(summary.delivered, 2);
     assert_eq!(seen, vec![b"first".to_vec(), b"second".to_vec()]);
@@ -150,7 +159,7 @@ fn optional_overruns_are_reported_and_extensions_pass_through() {
         offer_retrying(&mut driver, &mut publication, &message(sequence));
         let _ = driver.do_work().unwrap();
     }
-    let summary = lagging.poll(|_, _| {}, 10).unwrap();
+    let summary = lagging.poll(|_, _| {}, MessageLimit::new(10)).unwrap();
     // The poll stops at the overrun: nothing else was delivered with it.
     assert_eq!(summary.delivered, 0);
     let overrun = summary.overrun.expect("the lagging reader was overrun");
@@ -167,7 +176,9 @@ fn optional_overruns_are_reported_and_extensions_pass_through() {
         OfferOutcome::Accepted { .. }
     ));
     let mut info = None;
-    let _ = lagging.poll(|_, i| info = Some(i), 1).unwrap();
+    let _ = lagging
+        .poll(|_, i| info = Some(i), MessageLimit::new(1))
+        .unwrap();
     assert_eq!(info.and_then(|i| i.extension), Some(extension));
 }
 
@@ -207,7 +218,7 @@ fn publisher_and_subscribers_on_threads_with_manual_duty() {
                             assert_eq!(bytes, &message(next)[..]);
                             next += 1;
                         },
-                        16,
+                        MessageLimit::new(16),
                     )
                     .unwrap();
                 std::thread::yield_now();
@@ -234,12 +245,12 @@ fn an_optional_handler_panic_is_not_replayed() {
         OfferOutcome::Accepted { .. }
     ));
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = subscription.poll(|_, _| panic!("handler failed"), 10);
+        let _ = subscription.poll(|_, _| panic!("handler failed"), MessageLimit::new(10));
     }));
     assert!(panicked.is_err());
     let mut seen = Vec::new();
     let _ = subscription
-        .poll(|bytes, _| seen.push(bytes.to_vec()), 10)
+        .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(10))
         .unwrap();
     assert_eq!(seen, vec![b"second".to_vec()]);
 }
@@ -268,12 +279,64 @@ fn limits_handles_and_maximum_sizes() {
     ));
     // A limit of 0 does nothing.
     let summary = subscription
-        .poll(|_, _| panic!("no delivery expected"), 0)
+        .poll(|_, _| panic!("no delivery expected"), MessageLimit::new(0))
         .unwrap();
     assert_eq!(summary.delivered, 0);
     let mut seen = Vec::new();
     let _ = subscription
-        .poll(|bytes, _| seen.push(bytes.to_vec()), 1)
+        .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(1))
         .unwrap();
     assert_eq!(seen, vec![max]);
+}
+
+#[test]
+fn streams_are_isolated_and_subscriber_cells_are_bounded() {
+    let mut driver = EmbeddedDriver::new();
+    let first = driver.add_stream(config(false)).unwrap();
+    let mut second_config = config(false);
+    second_config.buffer.stream_id = 9;
+    let second = driver.add_stream(second_config).unwrap();
+    assert_ne!(first, second);
+
+    let mut first_sub = driver.subscribe(first, Role::Required).unwrap();
+    let mut second_sub = driver.subscribe(second, Role::Required).unwrap();
+    let mut first_pub = driver.publication(first).unwrap();
+    let mut second_pub = driver.publication(second).unwrap();
+    assert!(matches!(
+        first_pub.offer(b"one").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    let mut seen = Vec::new();
+    let summary = second_sub
+        .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(10))
+        .unwrap();
+    assert_eq!(summary.delivered, 0);
+    assert!(matches!(
+        second_pub.offer(b"two").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    let _ = first_sub
+        .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(10))
+        .unwrap();
+    let _ = second_sub
+        .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(10))
+        .unwrap();
+    assert_eq!(seen, vec![b"one".to_vec(), b"two".to_vec()]);
+
+    // max_subscribers = 4 registry cells; one is used above.
+    let _more: Vec<_> = (0..3)
+        .map(|_| driver.subscribe(first, Role::Required).unwrap())
+        .collect();
+    assert!(matches!(
+        driver.subscribe(first, Role::Required),
+        Err(DriverError::Sys(_))
+    ));
+    // Exhausting one stream leaves the other unaffected. Optional
+    // subscribers also need a slot credit: S - C = 2, one held by the
+    // publication, so exactly one optional subscriber fits.
+    let _optional = driver.subscribe(second, Role::Optional).unwrap();
+    assert!(matches!(
+        driver.subscribe(second, Role::Optional),
+        Err(DriverError::Sys(_))
+    ));
 }

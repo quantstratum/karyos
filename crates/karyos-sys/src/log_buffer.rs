@@ -242,6 +242,13 @@ impl LogBuffer {
         issue_conductor(Arc::clone(self))
     }
 
+    /// The lane this buffer carries; positions are local to it.
+    #[inline]
+    #[must_use]
+    pub fn lane(&self) -> Lane {
+        self.config.lane
+    }
+
     /// Largest message without the trace extension.
     #[inline]
     #[must_use]

@@ -7,8 +7,8 @@
 //! errors. The Archive and Cluster APIs do not exist yet.
 
 pub use karyos_client::{
-    ClientError, ClientPublication, ClientSubscription, MessageInfo, OfferOutcome, Overrun,
-    PollError, PollSummary,
+    ClientError, ClientPublication, ClientSubscription, MessageInfo, MessageLimit, OfferOutcome,
+    Overrun, PollError, PollSummary,
 };
 
 /// Every error of the public Karyos API.
