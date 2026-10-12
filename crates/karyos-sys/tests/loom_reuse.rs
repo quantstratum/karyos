@@ -18,7 +18,7 @@ use karyos_sys::loan::{
 };
 use karyos_sys::publication::{clear_word, observe_block, publish_block};
 use karyos_sys::slot::{Descriptor, SlotIndex, SlotState};
-use karyos_sys::sync::{AtomicU64, Ordering};
+use karyos_sys::sync::AtomicU64;
 use karyos_sys::term::{Generation, TermCount, TermId};
 use loom::cell::UnsafeCell;
 use loom::sync::Arc;
