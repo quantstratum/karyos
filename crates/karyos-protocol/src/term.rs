@@ -940,21 +940,29 @@ mod tests {
     #[test]
     fn invalid_extension_on_a_full_term_does_not_pad() {
         let mut term = vec![0u8; TERM as usize];
-        let mut app = appender(&mut term);
-        let filler = payload(8000, 3);
-        while app.tail() + 8192 <= TERM - 4096 {
-            let _ = app.append(&filler, AppendOptions::default()).unwrap();
+        {
+            let mut app = appender(&mut term);
+            let filler = payload(8000, 3);
+            for _ in 0..7 {
+                let _ = app.append(&filler, AppendOptions::default()).unwrap();
+            }
+            let _ = app
+                .append(&payload(4000, 3), AppendOptions::default())
+                .unwrap();
+            assert_eq!(app.tail(), 61_440);
+            let options = AppendOptions {
+                extension: Some(TraceExtension {
+                    extension_flags: 1,
+                    ..TraceExtension::default()
+                }),
+                ..AppendOptions::default()
+            };
+            // 7000 traced bytes reserve 7584 > 4096 free: a valid extension
+            // would pad the term; an invalid one must not.
+            assert!(app.append(&payload(7000, 3), options).is_err());
+            assert_eq!(app.tail(), 61_440);
         }
-        let tail = app.tail();
-        let options = AppendOptions {
-            extension: Some(TraceExtension {
-                extension_flags: 1,
-                ..TraceExtension::default()
-            }),
-            ..AppendOptions::default()
-        };
-        assert!(app.append(&payload(7000, 3), options).is_err());
-        assert_eq!(app.tail(), tail);
+        assert!(term[61_440..].iter().all(|b| *b == 0));
     }
 
     #[test]
