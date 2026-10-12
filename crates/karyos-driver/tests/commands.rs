@@ -416,3 +416,28 @@ fn invalid_configurations_are_rejected() {
     };
     assert!(EmbeddedDriver::with_config(ring).is_err());
 }
+
+#[test]
+fn a_panicking_callback_loses_no_unknown_notification() {
+    let (mut driver, _) = driver_with(DriverConfig::default());
+    let mut client = driver.connect().unwrap();
+    let first = client.add_publication(key(2), false).unwrap();
+    let second = client
+        .add_subscription(key(2), SubscriberRole::Optional)
+        .unwrap();
+    drop(driver);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = client.poll(usize::MAX, |_| panic!("callback failed"));
+    }));
+    assert!(panicked.is_err());
+    // Both are terminal; neither notification was lost. The one whose
+    // callback panicked is delivered again.
+    assert_eq!(client.pending(), 2);
+    let mut done = Vec::new();
+    let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    let mut sequences: Vec<_> = done.iter().map(|c| c.sequence).collect();
+    sequences.sort_unstable();
+    assert_eq!(sequences, vec![first, second]);
+    assert!(done.iter().all(|c| matches!(c.outcome, Outcome::Unknown)));
+    assert_eq!(client.pending(), 0);
+}

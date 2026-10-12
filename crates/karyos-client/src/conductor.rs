@@ -10,6 +10,7 @@
 //! [`Outcome::Unknown`], terminally: it is never retried automatically, and
 //! a late response for it is ignored.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use karyos_protocol::cnc::ErrorCode;
@@ -105,6 +106,10 @@ pub struct ClientConductor {
     link: Arc<ClientLink>,
     next_sequence: u64,
     pending: Vec<Pending>,
+    /// Requests already terminalized as `Unknown` whose notification has
+    /// not been delivered yet. A notification leaves this queue only after
+    /// its callback returns, so a panicking callback loses none.
+    unknown: VecDeque<u64>,
     max_pending: usize,
 }
 
@@ -126,6 +131,7 @@ impl ClientConductor {
             link,
             next_sequence: 1,
             pending: Vec::with_capacity(max_pending),
+            unknown: VecDeque::with_capacity(max_pending),
             max_pending,
         }
     }
@@ -136,10 +142,10 @@ impl ClientConductor {
         self.owner
     }
 
-    /// Requests that are submitted and not yet completed.
+    /// Requests that are submitted and not yet reported.
     #[must_use]
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        self.pending.len() + self.unknown.len()
     }
 
     /// Requests the stream's exclusive publication; returns the request
@@ -246,7 +252,7 @@ impl ClientConductor {
         if self.closed() {
             return Err(ConductorError::Closed);
         }
-        if self.pending.len() >= self.max_pending {
+        if self.pending() >= self.max_pending {
             return Err(ConductorError::TooManyPending);
         }
         let sequence = self.next_sequence;
@@ -271,13 +277,16 @@ impl ClientConductor {
         }
     }
 
-    /// Reads at most `limit` broadcast records and reports completed
-    /// requests to `on`. Returns early when nothing more is published.
+    /// Makes at most `limit` broadcast receive attempts and reports
+    /// completed requests to `on`. Each attempt reads one record of any
+    /// client or a lap report, plus at most one padding record before it.
+    /// Returns early when nothing more is published.
     pub fn poll<F>(&mut self, limit: usize, mut on: F) -> ConductorPoll
     where
         F: FnMut(Completion),
     {
         let mut report = ConductorPoll::default();
+        self.deliver_unknown(&mut on);
         while report.records < limit {
             // Copy what is needed out of the receiver before acting on it.
             let step = match self.receiver.receive() {
@@ -374,12 +383,22 @@ impl ClientConductor {
         }
     }
 
+    /// Terminalizes every pending request as `Unknown` before any callback
+    /// runs (a late response can no longer match it), then delivers the
+    /// notifications.
     fn fail_pending<F: FnMut(Completion)>(&mut self, on: &mut F) {
-        for pending in self.pending.drain(..) {
+        self.unknown
+            .extend(self.pending.drain(..).map(|pending| pending.sequence));
+        self.deliver_unknown(on);
+    }
+
+    fn deliver_unknown<F: FnMut(Completion)>(&mut self, on: &mut F) {
+        while let Some(&sequence) = self.unknown.front() {
             on(Completion {
-                sequence: pending.sequence,
+                sequence,
                 outcome: Outcome::Unknown,
             });
+            self.unknown.pop_front();
         }
     }
 

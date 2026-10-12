@@ -18,6 +18,11 @@
 //! and subscriptions through their command rings; the direct
 //! [`EmbeddedDriver::publication`] and [`EmbeddedDriver::subscribe`] calls
 //! remain for single-component use and hold no stream lease.
+//!
+//! Scope of this increment: streams stay configured until the driver is
+//! dropped. Lease counts are observable ([`EmbeddedDriver::live_leases`])
+//! but nothing reclaims a stream yet; stream removal, reclamation at zero
+//! leases and a stream limit come with that work.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
