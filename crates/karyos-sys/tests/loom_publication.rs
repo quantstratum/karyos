@@ -4,14 +4,18 @@
 //! `karyos_sys::publication`: a writer fills a two-fragment block (plain
 //! payload, interior word 0) and publishes its first word 0; a reader that
 //! observes the block committed must see the interior word and the payload,
-//! with Loom checking that every plain access is ordered.
+//! with Loom checking that every plain access is ordered. A second model
+//! does the same for shared terms, whose payload is moved only as `Relaxed`
+//! atomic words (`quantstratum-docs: karyos/design/shared-payload-access.md`).
 //!
 //! Run with `make loom`.
 
 #![cfg(loom)]
 
 use karyos_sys::frame::{Flags, FrameType, Lane, Word0};
-use karyos_sys::publication::{load_interior, observe_block, publish_block, store_interior};
+use karyos_sys::publication::{
+    load_body, load_interior, observe_block, publish_block, store_body, store_interior,
+};
 use karyos_sys::sync::AtomicU64;
 use loom::cell::UnsafeCell;
 use loom::sync::Arc;
@@ -72,6 +76,34 @@ fn published_block_is_fully_visible() {
                 unsafe { *payload }
             });
             assert_eq!(payload, PAYLOAD);
+        }
+        writer.join().unwrap();
+    });
+}
+
+/// Shared terms: body words are `Relaxed` atomics, so only the
+/// Release/Acquire pair on the first word 0 makes them visible.
+#[test]
+fn published_shared_block_is_fully_visible() {
+    const BODY: [[u8; 8]; 2] = [[0x11; 8], [0x22; 8]];
+    loom::model(|| {
+        let first = Arc::new(AtomicU64::new(0));
+        let body = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+        let writer = {
+            let first = Arc::clone(&first);
+            let body = Arc::clone(&body);
+            thread::spawn(move || {
+                for (word, bytes) in body.iter().zip(BODY) {
+                    store_body(word, bytes);
+                }
+                publish_block(&first, first_word());
+            })
+        };
+
+        if observe_block(&first) != 0 {
+            for (word, bytes) in body.iter().zip(BODY) {
+                assert_eq!(load_body(word), bytes);
+            }
         }
         writer.join().unwrap();
     });

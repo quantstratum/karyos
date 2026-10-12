@@ -35,10 +35,10 @@ pub mod mmap;
 pub mod publication;
 pub mod sizing;
 pub mod slot;
-#[cfg(not(loom))]
-pub(crate) mod slot_regions;
 pub mod sync;
 pub mod term;
+#[cfg(not(loom))]
+pub mod term_bytes;
 // Real memory with std atomics; the Loom model covers `publication` instead.
 #[cfg(not(loom))]
 pub mod term_memory;

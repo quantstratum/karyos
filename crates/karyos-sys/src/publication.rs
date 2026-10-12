@@ -41,6 +41,24 @@ pub fn load_interior(word: &AtomicU64) -> u64 {
     u64::from_le(word.load(Ordering::Relaxed))
 }
 
+/// Stores eight body bytes (header words 1 to 3, extension or payload) of a
+/// block on shared terms, which are written only as atomic words. Like an
+/// interior word 0 they become visible through the block's `Release`
+/// publication, so `Relaxed` suffices. Bytes keep their memory order, as a
+/// plain copy would.
+#[inline]
+pub fn store_body(word: &AtomicU64, bytes: [u8; 8]) {
+    word.store(u64::from_ne_bytes(bytes), Ordering::Relaxed);
+}
+
+/// Loads eight body bytes of a block on shared terms after
+/// [`observe_block`] saw it committed.
+#[inline]
+#[must_use]
+pub fn load_body(word: &AtomicU64) -> [u8; 8] {
+    word.load(Ordering::Relaxed).to_ne_bytes()
+}
+
 /// Clears a location that may have held a word 0, during exclusive cleaning.
 /// The `Release` publication of `FREE` afterwards orders it before any later
 /// use of the slot.
