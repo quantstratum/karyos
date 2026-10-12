@@ -1887,6 +1887,8 @@ fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
         Step::Done(PollOutcome::Pending) => {}
         _ => panic!("unexpected step"),
     }
+}
+
 // Concurrent handles, batch a2.
 
 fn offer_concurrent(

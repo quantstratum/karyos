@@ -123,7 +123,11 @@ fn reservations_model(reserve: Reserve, commit: Commit) {
             thread::spawn(move || {
                 for index in 0..BLOCKS {
                     if observe_block(&term.first[index]) == committed(index).pack() {
-                        assert_eq!(load_interior(&term.interior[index]), interior().pack());
+                        assert_eq!(
+                            load_interior(&term.interior[index]),
+                            interior().pack(),
+                            "committed block not visible"
+                        );
                         let payload = term.payload[index].with(|payload| {
                             // SAFETY: as above; ordered after the writer's
                             // write only through the commit and this Acquire.
@@ -151,13 +155,13 @@ fn concurrent_reservations_are_disjoint_and_ordered() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "block already marked")]
 fn control_reservation_by_load_and_store_fails() {
     reservations_model(Reserve::LoadStore, Commit::CompareExchange);
 }
 
 #[test]
-#[should_panic(expected = "Concurrent read and write accesses")]
+#[should_panic(expected = "committed block not visible")]
 fn control_relaxed_commit_fails() {
     reservations_model(Reserve::FetchAdd, Commit::RelaxedStore);
 }
