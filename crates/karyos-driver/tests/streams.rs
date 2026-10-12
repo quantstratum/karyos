@@ -278,3 +278,76 @@ fn max_streams_counts_retiring_streams_until_freed() {
     let _ = driver.do_work().unwrap();
     assert!(driver.add_stream(stream_config(3)).is_ok());
 }
+
+#[test]
+fn a_held_entry_taken_after_retirement_still_frees_on_drop() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver.add_stream(stream_config(2)).unwrap();
+    let mut client = driver.connect().unwrap();
+    let _ = client
+        .add_subscription(key(2), SubscriberRole::Required)
+        .unwrap();
+    let _ = driver.do_work().unwrap();
+    // Held, then the stream retires, then the client takes it.
+    driver.remove_stream(stream).unwrap();
+    let _ = driver.do_work().unwrap();
+    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    let subscription = match drain(&mut client).pop().unwrap().outcome {
+        Outcome::Subscription(subscription) => subscription,
+        other => panic!("unexpected {other:?}"),
+    };
+    let _ = driver.do_work().unwrap();
+    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    drop(subscription);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(state(&driver, stream), StreamState::Freed);
+}
+
+#[test]
+fn a_queued_remove_with_zero_leases_still_blocks_freeing() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver.add_stream(stream_config(2)).unwrap();
+    let mut client = driver.connect().unwrap();
+    let _ = client.add_publication(key(2), false).unwrap();
+    let _ = driver.do_work().unwrap();
+    let publication = match drain(&mut client).pop().unwrap().outcome {
+        Outcome::Publication(publication) => publication,
+        other => panic!("unexpected {other:?}"),
+    };
+    let _ = client.remove_publication(publication).unwrap();
+    assert_eq!(driver.live_leases(stream).unwrap(), 0);
+    driver.remove_stream(stream).unwrap();
+    // Leases are zero, but the queued Remove's registration remains until
+    // this cycle serves it, after the freeing check.
+    let _ = driver.do_work().unwrap();
+    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(state(&driver, stream), StreamState::Freed);
+}
+
+#[test]
+fn repeated_remove_and_re_add_keeps_no_history() {
+    let config = DriverConfig {
+        max_streams: 1,
+        ..DriverConfig::default()
+    };
+    let mut driver = EmbeddedDriver::with_config(config).unwrap();
+    let mut previous = Vec::new();
+    for _ in 0..100 {
+        let stream = driver.add_stream(stream_config(2)).unwrap();
+        let publication = driver.publication(stream).unwrap();
+        drop(publication);
+        driver.remove_stream(stream).unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(state(&driver, stream), StreamState::Freed);
+        previous.push(stream);
+    }
+    // Every old handle stays freed; none names the live stream.
+    let live = driver.add_stream(stream_config(2)).unwrap();
+    assert!(previous.iter().all(|&old| old != live));
+    assert!(
+        previous
+            .iter()
+            .all(|&old| driver.stream_state(old).unwrap() == StreamState::Freed)
+    );
+}
