@@ -40,3 +40,11 @@ pub fn observe_block(first: &AtomicU64) -> u64 {
 pub fn load_interior(word: &AtomicU64) -> u64 {
     u64::from_le(word.load(Ordering::Relaxed))
 }
+
+/// Clears a location that may have held a word 0, during exclusive cleaning.
+/// The `Release` publication of `FREE` afterwards orders it before any later
+/// use of the slot.
+#[inline]
+pub fn clear_word(word: &AtomicU64) {
+    word.store(0, Ordering::Relaxed);
+}
