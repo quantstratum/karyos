@@ -72,7 +72,8 @@ impl Point {
     }
 
     /// Whether the observation is taken per packet by the kernel or the
-    /// NIC, so it may carry a packet identity.
+    /// NIC, so its record must carry packet context (and only such records
+    /// may).
     #[must_use]
     pub const fn is_packet_level(self) -> bool {
         matches!(

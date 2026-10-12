@@ -33,8 +33,8 @@ pub enum TraceError {
     /// on another point.
     #[error("subscriber identity does not match the observation point")]
     Subscriber,
-    /// Packet identity is zero or present on a point that is not packet
-    /// level.
+    /// Packet context is missing on a packet-level point, has a zero token,
+    /// or is present on a point that is not packet level.
     #[error("packet identity does not match the observation point")]
     Packet,
     /// The underlying journal failed.
