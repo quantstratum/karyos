@@ -17,7 +17,7 @@ use karyos_sys::frame::EXTENSION_LENGTH;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, Subscription};
 
 use crate::error::ClientError;
-use crate::link::Origin;
+use crate::link::{Lease, Origin};
 
 /// Metadata delivered with each message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +92,9 @@ pub struct ClientSubscription {
     inner: Subscription<Arc<LogBuffer>>,
     scratch: Box<[u8]>,
     origin: Option<Origin>,
+    /// The stream lease of a handle from the direct driver API, held only
+    /// for its drop.
+    _lease: Option<Lease>,
 }
 
 impl ClientSubscription {
@@ -104,7 +107,17 @@ impl ClientSubscription {
             inner,
             scratch: vec![0u8; max_message_length as usize].into_boxed_slice(),
             origin: None,
+            _lease: None,
         }
+    }
+
+    /// Wraps a subscription from the direct driver API; the handle keeps
+    /// the stream's lease until it is dropped.
+    #[must_use]
+    pub fn with_lease(inner: Subscription<Arc<LogBuffer>>, lease: Lease) -> Self {
+        let mut subscription = Self::new(inner);
+        subscription._lease = Some(lease);
+        subscription
     }
 
     /// Wraps a subscription handed over through a client conductor; the

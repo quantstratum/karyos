@@ -48,8 +48,16 @@ enum Kind {
 pub(crate) struct Registration {
     id: u64,
     client: u64,
+    stream: u64,
     kind: Kind,
     end: Arc<LeaseEnd>,
+}
+
+impl Registration {
+    /// The stream id this registration belongs to.
+    pub(crate) fn stream(&self) -> u64 {
+        self.stream
+    }
 }
 
 impl EmbeddedDriver {
@@ -207,9 +215,11 @@ impl EmbeddedDriver {
     }
 
     fn find_stream(&self, stream: StreamKey) -> Option<usize> {
-        self.streams
-            .iter()
-            .position(|s| s.stream_id == stream.stream_id && s.session_id == stream.session_id)
+        // Commands bind by wire key at execution; retiring streams accept
+        // nothing new.
+        self.streams.iter().position(|s| {
+            !s.retiring && s.stream_id == stream.stream_id && s.session_id == stream.session_id
+        })
     }
 
     fn held_total(&self) -> usize {
@@ -282,9 +292,11 @@ impl EmbeddedDriver {
                     capability,
                     lease,
                 });
+                let stream_id = target.id;
                 self.registrations.push(Registration {
                     id: registration,
                     client,
+                    stream: stream_id,
                     kind,
                     end,
                 });

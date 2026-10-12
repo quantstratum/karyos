@@ -13,5 +13,5 @@ mod commands;
 pub mod embedded;
 pub mod error;
 
-pub use embedded::{DriverConfig, EmbeddedDriver, StreamConfig, StreamHandle};
+pub use embedded::{DriverConfig, EmbeddedDriver, StreamConfig, StreamHandle, StreamState};
 pub use error::DriverError;

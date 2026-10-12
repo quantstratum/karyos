@@ -8,7 +8,7 @@ use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, LogBuffer, Publication};
 
 use crate::error::ClientError;
-use crate::link::Origin;
+use crate::link::{Lease, Origin};
 
 /// Result of an offer. Each call performs at most one append attempt:
 /// padding, rotation and waiting for the driver are reported to the caller
@@ -42,6 +42,9 @@ pub struct ClientPublication {
     inner: Publication<Arc<LogBuffer>>,
     allow_unconnected: bool,
     origin: Option<Origin>,
+    /// The stream lease of a handle from the direct driver API, held only
+    /// for its drop.
+    _lease: Option<Lease>,
 }
 
 impl ClientPublication {
@@ -53,6 +56,21 @@ impl ClientPublication {
             inner,
             allow_unconnected,
             origin: None,
+            _lease: None,
+        }
+    }
+
+    /// Wraps a publication from the direct driver API; the handle keeps the
+    /// stream's lease until it is dropped.
+    #[must_use]
+    pub fn with_lease(
+        inner: Publication<Arc<LogBuffer>>,
+        allow_unconnected: bool,
+        lease: Lease,
+    ) -> Self {
+        Self {
+            _lease: Some(lease),
+            ..Self::new(inner, allow_unconnected)
         }
     }
 
@@ -68,6 +86,7 @@ impl ClientPublication {
             inner,
             allow_unconnected,
             origin: Some(origin),
+            _lease: None,
         }
     }
 

@@ -9,12 +9,25 @@ use thiserror::Error;
 /// Errors returned by the embedded driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DriverError {
-    /// The stream handle does not name a stream of this driver.
-    #[error("unknown stream {index}")]
+    /// The stream handle does not name a live stream of this driver.
+    #[error("unknown stream {stream}")]
     UnknownStream {
-        /// The handle's index.
-        index: usize,
+        /// The handle's stream id.
+        stream: u64,
     },
+    /// The stream is being removed: it accepts no new publication or
+    /// subscription.
+    #[error("stream {stream} is retiring")]
+    StreamRetiring {
+        /// The handle's stream id.
+        stream: u64,
+    },
+    /// `max_streams` streams are configured (active or retiring).
+    #[error("too many streams")]
+    TooManyStreams,
+    /// Stream identities are exhausted.
+    #[error("stream identities exhausted")]
+    StreamIdsExhausted,
     /// A stream with the same wire stream id and session already exists.
     #[error("stream {stream_id} session {session_id} already exists")]
     DuplicateStream {

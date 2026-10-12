@@ -189,6 +189,10 @@ impl ClientConductor {
     /// # Errors
     ///
     /// Returns the handle intact with the error, so the caller can retry.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the handle is returned intact so the caller can retry; boxing it would allocate on every Full"
+    )]
     pub fn remove_publication(
         &mut self,
         publication: ClientPublication,
@@ -220,6 +224,10 @@ impl ClientConductor {
     /// # Errors
     ///
     /// Returns the handle intact with the error, so the caller can retry.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the handle is returned intact so the caller can retry; boxing it would allocate on every Full"
+    )]
     pub fn remove_subscription(
         &mut self,
         subscription: ClientSubscription,

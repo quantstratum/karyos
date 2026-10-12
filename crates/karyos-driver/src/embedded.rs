@@ -17,17 +17,16 @@
 //! Clients admitted with [`EmbeddedDriver::connect`] request publications
 //! and subscriptions through their command rings; the direct
 //! [`EmbeddedDriver::publication`] and [`EmbeddedDriver::subscribe`] calls
-//! remain for single-component use and hold no stream lease.
+//! remain for single-component use; their handles hold stream leases too.
 //!
-//! Scope of this increment: streams stay configured until the driver is
-//! dropped. Lease counts are observable ([`EmbeddedDriver::live_leases`])
-//! but nothing reclaims a stream yet; stream removal, reclamation at zero
-//! leases and a stream limit come with that work.
+//! [`EmbeddedDriver::remove_stream`] retires a stream at once; a later duty
+//! cycle frees it when no capability lease and no registration of it
+//! remains (quantstratum-docs: karyos/design/stream-lifecycle.md).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use karyos_client::link::StreamLeases;
+use karyos_client::link::{Lease, LeaseEnd, StreamLeases};
 use karyos_client::{ClientPublication, ClientSubscription};
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
@@ -56,6 +55,8 @@ pub struct DriverConfig {
     /// Bytes of the broadcast buffer; at least `2 * B * R * m`, `R` being
     /// the largest response record.
     pub broadcast_capacity: usize,
+    /// Streams configured at once, active or retiring.
+    pub max_streams: usize,
 }
 
 impl Default for DriverConfig {
@@ -68,6 +69,7 @@ impl Default for DriverConfig {
             cycles_between_drains: 2,
             ring_capacity: 1024,
             broadcast_capacity: 16 * 1024,
+            max_streams: 64,
         }
     }
 }
@@ -85,12 +87,25 @@ pub struct StreamConfig {
 }
 
 /// Names a stream of one [`EmbeddedDriver`]. It is distinct from the wire
-/// `stream_id`: it carries the issuing driver's identity, so a handle from
-/// another driver is rejected instead of naming the wrong buffer.
+/// `stream_id`: it carries the issuing driver's identity and a stream id
+/// that is never reused, so a handle from another driver, or to a removed
+/// stream, never names another stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamHandle {
     driver: u64,
-    index: usize,
+    stream: u64,
+}
+
+/// The lifecycle state of a stream (quantstratum-docs: karyos/design/stream-lifecycle.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamState {
+    /// Accepts publications and subscriptions.
+    Active,
+    /// Removed: accepts nothing new and is freed once no capability or
+    /// registration remains.
+    Retiring,
+    /// Freed: its buffer is gone.
+    Freed,
 }
 
 /// Source of driver identities within the process.
@@ -98,6 +113,8 @@ static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub(crate) struct Stream {
+    pub(crate) id: u64,
+    pub(crate) retiring: bool,
     pub(crate) buffer: Arc<LogBuffer>,
     pub(crate) conductor: Conductor<Arc<LogBuffer>>,
     pub(crate) leases: Arc<StreamLeases>,
@@ -116,6 +133,7 @@ pub struct EmbeddedDriver {
     pub(crate) clients: Vec<ClientSlot>,
     pub(crate) registrations: Vec<crate::commands::Registration>,
     pub(crate) next_client: u64,
+    pub(crate) next_stream: u64,
     pub(crate) next_registration: u64,
     pub(crate) scan_cursor: usize,
     pub(crate) terminal: bool,
@@ -147,6 +165,7 @@ impl EmbeddedDriver {
             .and_then(|n| n.checked_mul(config.cycles_between_drains))
             .ok_or(DriverError::InvalidConfig)?;
         let valid = config.max_clients > 0
+            && config.max_streams > 0
             && config.max_pending_per_client > 0
             && config.max_hand_over > 0
             && config.command_budget > 0
@@ -173,6 +192,7 @@ impl EmbeddedDriver {
             clients: Vec::new(),
             registrations: Vec::new(),
             next_client: 1,
+            next_stream: 1,
             next_registration: 1,
             scan_cursor: 0,
             terminal: false,
@@ -189,6 +209,53 @@ impl EmbeddedDriver {
         Ok(self.stream(stream)?.leases.live())
     }
 
+    /// The stream's lifecycle state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::UnknownStream`] for a handle of another
+    /// driver.
+    pub fn stream_state(&self, stream: StreamHandle) -> Result<StreamState, DriverError> {
+        if stream.driver != self.id || stream.stream >= self.next_stream {
+            return Err(DriverError::UnknownStream {
+                stream: stream.stream,
+            });
+        }
+        // Derived: an issued id that is no longer present was freed.
+        Ok(match self.streams.iter().find(|s| s.id == stream.stream) {
+            Some(s) if s.retiring => StreamState::Retiring,
+            Some(_) => StreamState::Active,
+            None => StreamState::Freed,
+        })
+    }
+
+    /// Removes a stream: it stops accepting publications and subscriptions
+    /// at once, and is freed by a later duty cycle once no capability or
+    /// registration of it remains. Never waits and never revokes a live
+    /// capability. Removing a retiring stream again succeeds with no
+    /// effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::UnknownStream`] for a foreign or freed
+    /// stream.
+    pub fn remove_stream(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+        self.stream(stream)?.retiring = true;
+        Ok(())
+    }
+
+    /// Frees retiring streams with no live lease and no registration.
+    pub(crate) fn free_retired_streams(&mut self) {
+        let registrations = &self.registrations;
+        self.streams.retain(|stream| {
+            !(stream.retiring
+                && stream.leases.live() == 0
+                && !registrations
+                    .iter()
+                    .any(|registration| registration.stream() == stream.id))
+        });
+    }
+
     /// Whether the driver is in its terminal state: the broadcast buffer is
     /// closed and no command is served.
     #[must_use]
@@ -203,6 +270,11 @@ impl EmbeddedDriver {
     /// Returns configuration and allocation errors; no stream is added on
     /// error.
     pub fn add_stream(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
+        if self.streams.len() >= self.config.max_streams {
+            return Err(DriverError::TooManyStreams);
+        }
+        let id = self.next_stream;
+        let next = id.checked_add(1).ok_or(DriverError::StreamIdsExhausted)?;
         let key = (config.buffer.stream_id, config.buffer.session_id);
         if self
             .streams
@@ -218,7 +290,10 @@ impl EmbeddedDriver {
         let conductor = buffer
             .conductor_owned()
             .ok_or(karyos_sys::error::SysError::ResourcesUnavailable)?;
+        self.next_stream = next;
         self.streams.push(Stream {
+            id,
+            retiring: false,
             buffer,
             conductor,
             leases: Arc::new(StreamLeases::default()),
@@ -228,7 +303,7 @@ impl EmbeddedDriver {
         });
         Ok(StreamHandle {
             driver: self.id,
-            index: self.streams.len() - 1,
+            stream: id,
         })
     }
 
@@ -239,12 +314,17 @@ impl EmbeddedDriver {
     /// Returns [`DriverError::PublicationTaken`] after the first call and
     /// [`DriverError::UnknownStream`] for a foreign handle.
     pub fn publication(&mut self, stream: StreamHandle) -> Result<ClientPublication, DriverError> {
-        let stream = self.stream(stream)?;
+        let stream = self.active_stream(stream)?;
         let inner = stream
             .buffer
             .publication_owned()?
             .ok_or(DriverError::PublicationTaken)?;
-        Ok(ClientPublication::new(inner, stream.allow_unconnected))
+        let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
+        Ok(ClientPublication::with_lease(
+            inner,
+            stream.allow_unconnected,
+            lease,
+        ))
     }
 
     /// Admits a subscriber to the stream (control path: allocates its copy
@@ -259,9 +339,10 @@ impl EmbeddedDriver {
         stream: StreamHandle,
         role: Role,
     ) -> Result<ClientSubscription, DriverError> {
-        let stream = self.stream(stream)?;
+        let stream = self.active_stream(stream)?;
         let inner = stream.conductor.subscribe(role)?;
-        Ok(ClientSubscription::new(inner))
+        let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
+        Ok(ClientSubscription::with_lease(inner, lease))
     }
 
     /// Runs one duty cycle: retires closed clients, serves client commands,
@@ -275,6 +356,7 @@ impl EmbeddedDriver {
     pub fn do_work(&mut self) -> Result<u32, DriverError> {
         self.retire_closed_clients();
         self.sweep_ended_registrations();
+        self.free_retired_streams();
         let mut work = self.serve_commands();
         for stream in &mut self.streams {
             let report = stream.conductor.duty_cycle()?;
@@ -284,15 +366,23 @@ impl EmbeddedDriver {
     }
 
     fn stream(&mut self, stream: StreamHandle) -> Result<&mut Stream, DriverError> {
+        let unknown = DriverError::UnknownStream {
+            stream: stream.stream,
+        };
         if stream.driver != self.id {
-            return Err(DriverError::UnknownStream {
-                index: stream.index,
-            });
+            return Err(unknown);
         }
         self.streams
-            .get_mut(stream.index)
-            .ok_or(DriverError::UnknownStream {
-                index: stream.index,
-            })
+            .iter_mut()
+            .find(|s| s.id == stream.stream)
+            .ok_or(unknown)
+    }
+
+    fn active_stream(&mut self, stream: StreamHandle) -> Result<&mut Stream, DriverError> {
+        let found = self.stream(stream)?;
+        if found.retiring {
+            return Err(DriverError::StreamRetiring { stream: found.id });
+        }
+        Ok(found)
     }
 }
