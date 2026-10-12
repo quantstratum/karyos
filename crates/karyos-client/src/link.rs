@@ -28,12 +28,23 @@ pub struct Owner {
 /// its lease. Dropping the handle ends the lease.
 #[derive(Debug)]
 pub struct Origin {
+    pub(crate) owner: Owner,
+    pub(crate) registration: u64,
+    pub(crate) lease: Lease,
+}
+
+impl Origin {
     /// The owning client.
-    pub owner: Owner,
+    #[must_use]
+    pub fn owner(&self) -> Owner {
+        self.owner
+    }
+
     /// The registration id.
-    pub registration: u64,
-    /// The stream lease.
-    pub lease: Lease,
+    #[must_use]
+    pub fn registration(&self) -> u64 {
+        self.registration
+    }
 }
 
 /// Live capability leases of one stream.
@@ -88,7 +99,7 @@ impl LeaseEnd {
 
 /// One capability lease; dropping it ends the lease (Release): the stream's
 /// count drops and the registration's end state becomes `Dropped`, unless
-/// [`Lease::mark_removing`] set it to `Removing` first.
+/// the client conductor marked it `Removing` after writing its `Remove`.
 #[derive(Debug)]
 pub struct Lease {
     leases: Arc<StreamLeases>,
@@ -112,8 +123,10 @@ impl Lease {
 
 impl Lease {
     /// Records that a `Remove` for this registration was written, before
-    /// the handle holding this lease is dropped (Release).
-    pub fn mark_removing(&self) {
+    /// the handle holding this lease is dropped (Release). Only the client
+    /// conductor calls this, after a successful write, so no caller can
+    /// keep a registration alive without a queued `Remove`.
+    pub(crate) fn mark_removing(&self) {
         self.end.state.store(LEASE_REMOVING, Ordering::Release);
     }
 }

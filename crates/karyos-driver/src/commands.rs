@@ -508,7 +508,7 @@ mod tests {
             }
         });
         let handle = handle.unwrap();
-        let registration = handle.origin().unwrap().registration;
+        let registration = handle.origin().unwrap().registration();
         let (intruder, mut producer, _link) = raw_client(&mut driver);
         let mut observer = driver.broadcast.receiver();
         write(
