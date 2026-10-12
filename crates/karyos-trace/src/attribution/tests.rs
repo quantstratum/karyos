@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::*;
 use crate::record::{ObservedTime, Point, PublicationId, TraceIds, TraceRecord};
@@ -314,9 +314,9 @@ fn every_trace_that_lost_an_observation_is_incomplete() {
         });
         let (mut epoch, mut time) = (0u64, 0u64);
         // Open traces in the current epoch: trace id -> first time.
-        let mut open: HashMap<u64, u64> = HashMap::new();
-        let mut lost: HashSet<u64> = HashSet::new();
-        let mut seen: HashSet<u64> = HashSet::new();
+        let mut open: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut lost: BTreeSet<u64> = BTreeSet::new();
+        let mut retained: BTreeSet<u64> = BTreeSet::new();
         let mut next_trace = 1u64;
         let steps = 10 + next(40);
         for sequence in 0..steps {
@@ -338,7 +338,6 @@ fn every_trace_that_lost_an_observation_is_incomplete() {
                 let keys: Vec<u64> = open.keys().copied().collect();
                 keys[next(keys.len() as u64) as usize]
             };
-            seen.insert(trace);
             match next(40) {
                 0 => {
                     lost.insert(trace);
@@ -348,23 +347,28 @@ fn every_trace_that_lost_an_observation_is_incomplete() {
                     feed.corrupt(sequence);
                 }
                 _ => {
+                    retained.insert(trace);
                     feed.record(sequence, trace, epoch, time);
                 }
             }
         }
         let verdicts = feed.close(steps);
-        for trace in &lost {
-            if let Some(verdict) = verdicts.get(trace) {
-                assert_eq!(*verdict, Incomplete, "seed {seed}: trace {trace} lost one");
-            }
+        // Every retained trace gets exactly one verdict (the table holds
+        // them all), and every one that lost an observation is incomplete.
+        let keys: BTreeSet<u64> = verdicts.keys().copied().collect();
+        assert_eq!(keys, retained, "seed {seed}: verdict set");
+        for trace in lost.intersection(&retained) {
+            assert_eq!(
+                verdicts[trace], Incomplete,
+                "seed {seed}: trace {trace} lost one"
+            );
         }
         completes += verdicts
             .values()
             .filter(|verdict| **verdict == Complete)
             .count();
-        // Traces entirely lost here are absent: `combine` makes them
+        // Traces entirely lost here have no verdict: `combine` makes them
         // incomplete wherever they are expected.
-        assert!(seen.len() >= verdicts.len());
     }
     // The model is not trivially marking everything.
     assert!(completes > 100, "only {completes} complete verdicts");
@@ -382,4 +386,16 @@ fn an_epoch_spanning_loss_reaches_traces_first_seen_much_later() {
     feed.record(3, 3, 1, 100);
     feed.record(4, 9, 1, 200);
     assert_eq!(feed.close(5)[&9], Incomplete);
+}
+
+#[test]
+fn unallocatable_tables_are_refused() {
+    assert!(matches!(
+        Attributor::new(AttributionConfig {
+            span: 1,
+            max_traces: usize::MAX,
+            max_intervals: 1,
+        }),
+        Err(TraceError::Attribution)
+    ));
 }

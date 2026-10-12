@@ -15,6 +15,12 @@
 //! `Incomplete` is final as soon as it is reached. `Complete` is final only
 //! at the journal's terminal close: [`Attributor::close`].
 //!
+//! **Feed contract.** An attributor is fed by exactly one collector, from
+//! the journal's start: every [`Collected::Record`] and
+//! [`Collected::Corrupt`] it returns, exactly once and in order, with no
+//! filtering, replay or mixing of journals. Verdicts derived from any other
+//! feed are meaningless.
+//!
 //! All state is preallocated: up to `max_traces` trace entries and
 //! `max_intervals` loss intervals; overflow only marks more traces
 //! incomplete.
@@ -151,15 +157,24 @@ impl Attributor {
     ///
     /// # Errors
     ///
-    /// Returns [`TraceError::Attribution`] when a table size is zero.
+    /// Returns [`TraceError::Attribution`] when a table size is zero or
+    /// cannot be allocated.
     pub fn new(config: AttributionConfig) -> Result<Self, TraceError> {
         if config.max_traces == 0 || config.max_intervals == 0 {
             return Err(TraceError::Attribution);
         }
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(config.max_traces)
+            .map_err(|_| TraceError::Attribution)?;
+        let mut intervals = Vec::new();
+        intervals
+            .try_reserve_exact(config.max_intervals)
+            .map_err(|_| TraceError::Attribution)?;
         Ok(Self {
             config,
-            entries: Vec::with_capacity(config.max_traces),
-            intervals: Vec::with_capacity(config.max_intervals),
+            entries,
+            intervals,
             cohort: false,
             earliest_loss_epoch: None,
             previous: None,
@@ -387,8 +402,13 @@ impl Attributor {
 }
 
 /// Combines a trace's verdicts over the journals it is expected in: complete
-/// only if every expected journal gave a final `Complete`. `None` means the
-/// trace was absent from that journal at its terminal close: `Incomplete`.
+/// only if every expected journal gave a final `Complete`.
+///
+/// The caller passes exactly one entry per `ObserverId` of the trace's
+/// expected set, frozen before any verdict, and only once each of those
+/// journals reached its terminal close: a journal still open is pending and
+/// delays the combination. `None` means the trace was absent from that
+/// journal at its terminal close, which is `Incomplete`.
 pub fn combine(verdicts: impl IntoIterator<Item = Option<Verdict>>) -> Verdict {
     let mut any = false;
     for verdict in verdicts {
