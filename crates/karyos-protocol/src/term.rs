@@ -734,13 +734,14 @@ mod tests {
     #[test]
     fn empty_messages_are_rejected_and_header_only_data_is_a_heartbeat() {
         let mut term = vec![0u8; TERM as usize];
-        let mut app = appender(&mut term);
-        assert_eq!(
-            app.append(&[], AppendOptions::default()),
-            Err(ProtocolError::EmptyMessage)
-        );
-        assert_eq!(app.tail(), 0);
-        drop(app);
+        {
+            let mut app = appender(&mut term);
+            assert_eq!(
+                app.append(&[], AppendOptions::default()),
+                Err(ProtocolError::EmptyMessage)
+            );
+            assert_eq!(app.tail(), 0);
+        }
         assert!(term.iter().all(|b| *b == 0));
 
         let heartbeat = FrameHeader {
