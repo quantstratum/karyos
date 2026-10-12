@@ -6,6 +6,12 @@
 //! `Full`, while a consumer drains it. The consumer must receive exactly the
 //! records written, in order, with every payload byte intact.
 //!
+//! Weakening the `tail` Release or Acquire makes this model fail. Weakening
+//! the `head` Release or Acquire does not: that defect lets the producer
+//! overwrite words whose earlier loads by the consumer read the newer
+//! values (load buffering), which Loom does not model. The `head` pair is
+//! kept by the standard release/acquire argument and the Miri tests.
+//!
 //! Run with `make loom`.
 
 #![cfg(loom)]
@@ -38,9 +44,8 @@ fn payload(type_id: u32, length: usize) -> Vec<u8> {
 
 #[test]
 fn records_arrive_once_in_order_and_intact() {
-    let mut builder = loom::model::Builder::new();
-    builder.preemption_bound = Some(2);
-    builder.check(|| {
+    // Unbounded exploration; it finishes in seconds.
+    loom::model(|| {
         let ring = Arc::new(Ring {
             data: (0..8).map(|_| AtomicU64::new(0)).collect(),
             trailer: (0..TRAILER_WORDS).map(|_| AtomicU64::new(0)).collect(),
@@ -61,32 +66,39 @@ fn records_arrive_once_in_order_and_intact() {
                 }
             }
         });
+        let consumer_ring = Arc::clone(&ring);
+        let consumer = thread::spawn(move || {
+            let words = consumer_ring.words();
+            let mut out = vec![0u8; words.max_payload()];
+            let mut received = 0;
+            while received < RECORDS.len() {
+                match words.read(&mut out) {
+                    Ok(RingRead::Message {
+                        position,
+                        type_id,
+                        length,
+                    }) => {
+                        assert_eq!(
+                            (type_id, position, length),
+                            RECORDS[received],
+                            "wrong record"
+                        );
+                        assert_eq!(
+                            &out[..length],
+                            &payload(type_id, length)[..],
+                            "corrupt payload"
+                        );
+                        received += 1;
+                    }
+                    Ok(RingRead::Pending) => thread::yield_now(),
+                    Err(error) => panic!("consumer error {error}"),
+                }
+            }
+        });
+        producer.join().unwrap();
+        consumer.join().unwrap();
         let words = ring.words();
         let mut out = vec![0u8; words.max_payload()];
-        let mut received = 0;
-        while received < RECORDS.len() {
-            match words.read(&mut out).unwrap() {
-                RingRead::Message {
-                    position,
-                    type_id,
-                    length,
-                } => {
-                    let (expected_type, expected_position, expected_length) = RECORDS[received];
-                    assert_eq!(
-                        (type_id, position, length),
-                        (expected_type, expected_position, expected_length)
-                    );
-                    assert_eq!(
-                        &out[..length],
-                        &payload(type_id, length)[..],
-                        "corrupt payload"
-                    );
-                    received += 1;
-                }
-                RingRead::Pending => thread::yield_now(),
-            }
-        }
-        producer.join().unwrap();
         assert_eq!(words.read(&mut out).unwrap(), RingRead::Pending);
     });
 }
