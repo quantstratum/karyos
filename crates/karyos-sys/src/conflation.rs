@@ -438,8 +438,11 @@ mod owned {
         pub journal_drained: bool,
         /// Whether the writer closed the table.
         pub closed: bool,
-        /// Whether the table is closed and this reader has delivered the
-        /// last value of every key (a slot left unstable stays pending).
+        /// Whether this poll verified that the table is closed and this
+        /// reader has delivered the last value of every key (a slot left
+        /// unstable stays pending). It is computed per poll: a later poll
+        /// that does not read the journal, such as a zero-key poll, reports
+        /// `false` again.
         pub finished: bool,
     }
 
