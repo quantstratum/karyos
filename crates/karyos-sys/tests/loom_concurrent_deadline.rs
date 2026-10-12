@@ -20,8 +20,10 @@
 //!
 //! Negative controls must fail: the walk storing `ABORTED` before marking,
 //! a terminal store after a lost first compare-exchange, a marker equal to
-//! a valid reserved word, a walk passing a non-zero word, and a writer
-//! writing its payload after a failed mark (a data race Loom reports).
+//! a valid reserved word, a walk passing a non-zero word, a writer writing
+//! its payload after a failed mark (ordered after the walk by the failed
+//! compare-exchange, so it overwrites the walk's boundary), and a writer
+//! writing before its mark (a data race Loom reports).
 //!
 //! Exploration: default Loom bounds; the walk and two writers, or the walk
 //! and one reader.
@@ -249,7 +251,17 @@ fn control_a_reader_sees_aborted_before_the_markers() {
 
 /// The interior boundary of a two-boundary block as one plain location:
 /// the writer's payload, or the walk's marker over it.
-fn payload_model(write_after_failed_mark: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Payload {
+    Production,
+    /// Writes after a failed mark: ordered after the walk by the failed
+    /// compare-exchange's Acquire, so it overwrites the walk's boundary.
+    AfterFailedMark,
+    /// Writes before marking: unordered with the walk's write.
+    BeforeMark,
+}
+
+fn payload_model(variant: Payload) {
     const PAYLOAD: u64 = 0xA;
     const MARKER: u64 = 0xB;
     let reserved = || {
@@ -272,11 +284,17 @@ fn payload_model(write_after_failed_mark: bool) {
         let writer = {
             let (first, interior) = (Arc::clone(&first), Arc::clone(&interior));
             thread::spawn(move || {
-                let marked = mark_block(&first, reserved());
-                if marked || write_after_failed_mark {
+                let write = || {
                     // SAFETY: the pointer comes from a live `UnsafeCell`;
                     // Loom checks that no access races with this write.
                     interior.with_mut(|bytes| unsafe { *bytes = PAYLOAD });
+                };
+                if variant == Payload::BeforeMark {
+                    write();
+                }
+                let marked = mark_block(&first, reserved());
+                if marked || variant == Payload::AfterFailedMark {
+                    write();
                 }
                 if marked {
                     assert!(commit_block(&first, reserved(), committed()));
@@ -294,17 +312,27 @@ fn payload_model(write_after_failed_mark: bool) {
         assert!(owned != marked, "the block has two owners or none");
         // SAFETY: as above; both threads have finished.
         let value = interior.with(|bytes| unsafe { *bytes });
-        assert_eq!(value, if marked { PAYLOAD } else { MARKER });
+        assert_eq!(
+            value,
+            if marked { PAYLOAD } else { MARKER },
+            "a boundary written by a party that does not own it"
+        );
     });
 }
 
 #[test]
 fn a_writer_and_the_walk_never_both_write_a_boundary() {
-    payload_model(false);
+    payload_model(Payload::Production);
+}
+
+#[test]
+#[should_panic(expected = "a boundary written by a party that does not own it")]
+fn control_a_payload_write_after_a_failed_mark_overwrites_the_walk() {
+    payload_model(Payload::AfterFailedMark);
 }
 
 #[test]
 #[should_panic(expected = "Causality violation")]
-fn control_a_payload_write_after_a_failed_mark_races() {
-    payload_model(true);
+fn control_a_payload_write_before_the_mark_races_the_walk() {
+    payload_model(Payload::BeforeMark);
 }
