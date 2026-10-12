@@ -7,7 +7,8 @@
 //! errors. The Archive and Cluster APIs do not exist yet.
 
 pub use karyos_client::{
-    ClientError, ClientPublication, ClientSubscription, MessageInfo, OfferOutcome, PollSummary,
+    ClientError, ClientPublication, ClientSubscription, MessageInfo, OfferOutcome, Overrun,
+    PollError, PollSummary,
 };
 
 /// Every error of the public Karyos API.
@@ -16,4 +17,7 @@ pub enum Error {
     /// A client error.
     #[error(transparent)]
     Client(#[from] ClientError),
+    /// A poll failed after possibly delivering messages.
+    #[error(transparent)]
+    Poll(#[from] PollError),
 }

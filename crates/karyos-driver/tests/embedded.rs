@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use karyos_client::{ClientError, OfferOutcome};
-use karyos_driver::{EmbeddedDriver, StreamConfig};
+use karyos_driver::{DriverError, EmbeddedDriver, StreamConfig};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{AppendOptions, LogBufferConfig, Role};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
@@ -63,12 +63,16 @@ fn not_connected_without_subscribers_unless_allowed() {
     let mut publication = driver.publication(strict).unwrap();
     assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::NotConnected);
     let _subscription = driver.subscribe(strict, Role::Optional).unwrap();
-    assert!(matches!(
+    // The NotConnected offer reserved nothing: the first accepted message
+    // starts at position 0.
+    assert_eq!(
         publication.offer(b"x").unwrap(),
-        OfferOutcome::Accepted { .. }
-    ));
+        OfferOutcome::Accepted { position: 0 }
+    );
 
-    let open = driver.add_stream(config(true)).unwrap();
+    let mut open_config = config(true);
+    open_config.buffer.stream_id = 3;
+    let open = driver.add_stream(open_config).unwrap();
     let mut publication = driver.publication(open).unwrap();
     assert!(matches!(
         publication.offer(b"x").unwrap(),
@@ -146,10 +150,10 @@ fn optional_overruns_are_reported_and_extensions_pass_through() {
         offer_retrying(&mut driver, &mut publication, &message(sequence));
         let _ = driver.do_work().unwrap();
     }
-    let summary = lagging.poll(|_, _| {}, 1).unwrap();
-    let overrun = summary
-        .last_overrun
-        .expect("the lagging reader was overrun");
+    let summary = lagging.poll(|_, _| {}, 10).unwrap();
+    // The poll stops at the overrun: nothing else was delivered with it.
+    assert_eq!(summary.delivered, 0);
+    let overrun = summary.overrun.expect("the lagging reader was overrun");
     assert_eq!(overrun.from, 0);
     assert!(overrun.lost_to > 0 && overrun.lost_to <= overrun.resume);
 
@@ -213,4 +217,63 @@ fn publisher_and_subscribers_on_threads_with_manual_duty() {
         assert_eq!(reader.join().unwrap(), total);
         done.store(true, Ordering::Release);
     });
+}
+
+#[test]
+fn an_optional_handler_panic_is_not_replayed() {
+    let mut driver = EmbeddedDriver::new();
+    let stream = driver.add_stream(config(false)).unwrap();
+    let mut subscription = driver.subscribe(stream, Role::Optional).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    assert!(matches!(
+        publication.offer(b"first").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert!(matches!(
+        publication.offer(b"second").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = subscription.poll(|_, _| panic!("handler failed"), 10);
+    }));
+    assert!(panicked.is_err());
+    let mut seen = Vec::new();
+    let _ = subscription
+        .poll(|bytes, _| seen.push(bytes.to_vec()), 10)
+        .unwrap();
+    assert_eq!(seen, vec![b"second".to_vec()]);
+}
+
+#[test]
+fn limits_handles_and_maximum_sizes() {
+    let mut driver = EmbeddedDriver::new();
+    let stream = driver.add_stream(config(false)).unwrap();
+    // Duplicate wire identity and foreign handles are rejected.
+    assert!(matches!(
+        driver.add_stream(config(false)),
+        Err(DriverError::DuplicateStream { .. })
+    ));
+    let mut other = EmbeddedDriver::new();
+    assert!(matches!(
+        other.subscribe(stream, Role::Optional),
+        Err(DriverError::UnknownStream { .. })
+    ));
+    let mut subscription = driver.subscribe(stream, Role::Required).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    // A message of exactly the maximum size round-trips.
+    let max = vec![0xABu8; publication.max_message_length() as usize];
+    assert!(matches!(
+        publication.offer(&max).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    // A limit of 0 does nothing.
+    let summary = subscription
+        .poll(|_, _| panic!("no delivery expected"), 0)
+        .unwrap();
+    assert_eq!(summary.delivered, 0);
+    let mut seen = Vec::new();
+    let _ = subscription
+        .poll(|bytes, _| seen.push(bytes.to_vec()), 1)
+        .unwrap();
+    assert_eq!(seen, vec![max]);
 }

@@ -42,16 +42,26 @@ pub struct Overrun {
     pub resume: u64,
 }
 
-/// What one poll did.
+/// What one poll did. A poll stops at the first overrun, so no loss report
+/// is ever overwritten.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PollSummary {
-    /// Messages delivered to the handler.
+    /// Messages delivered to the handler (and acknowledged) before the poll
+    /// stopped.
     pub delivered: u32,
-    /// The last overrun observed in this poll, if any. Earlier overruns in
-    /// the same poll are counted in `overruns`.
-    pub last_overrun: Option<Overrun>,
-    /// Overruns observed in this poll.
-    pub overruns: u32,
+    /// The overrun that stopped the poll, if any.
+    pub overrun: Option<Overrun>,
+}
+
+/// A poll that failed after possibly delivering messages: `summary` reports
+/// the deliveries that were handled and acknowledged before `cause`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("poll failed after {} deliveries: {cause}", summary.delivered)]
+pub struct PollError {
+    /// Progress made before the failure.
+    pub summary: PollSummary,
+    /// The failure.
+    pub cause: ClientError,
 }
 
 /// A subscription on one stream.
@@ -74,32 +84,41 @@ impl ClientSubscription {
 
     /// Delivers up to `message_limit` messages to `handler`.
     ///
-    /// Work is bounded: at most `2 × message_limit + 2` attempts, each of
-    /// which may also step over a PAD or report an overrun. The poll stops
-    /// early when nothing is published.
+    /// The handler gets a slice of the private copy, valid only for that
+    /// call; no loan is held while it runs. A normal return means the message
+    /// was handled. Work is bounded: a limit of 0 does nothing; otherwise at
+    /// most `message_limit + 1` lower-layer polls run, each copying at most
+    /// one message after stepping over at most one PAD. The poll stops when
+    /// nothing is published or at the first overrun.
     ///
     /// # Errors
     ///
-    /// Lower-layer errors, including a required subscription that finds its
-    /// data gone. Messages delivered before the error stay delivered.
-    pub fn poll<H>(
-        &mut self,
-        mut handler: H,
-        message_limit: u32,
-    ) -> Result<PollSummary, ClientError>
+    /// Returns [`PollError`] carrying the deliveries handled before a
+    /// lower-layer failure, such as a required subscription whose data is
+    /// gone.
+    pub fn poll<H>(&mut self, mut handler: H, message_limit: u32) -> Result<PollSummary, PollError>
     where
         H: FnMut(&[u8], MessageInfo),
     {
         let mut summary = PollSummary::default();
-        let attempts = message_limit
-            .checked_mul(2)
-            .and_then(|a| a.checked_add(2))
-            .unwrap_or(u32::MAX);
+        if message_limit == 0 {
+            return Ok(summary);
+        }
+        let attempts = message_limit.checked_add(1).unwrap_or(message_limit);
         for _ in 0..attempts {
             if summary.delivered == message_limit {
                 break;
             }
-            match self.inner.poll(&mut self.scratch)? {
+            let outcome = match self.inner.poll(&mut self.scratch) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return Err(PollError {
+                        summary,
+                        cause: ClientError::from(error),
+                    });
+                }
+            };
+            match outcome {
                 PollOutcome::Message {
                     position,
                     length,
@@ -124,12 +143,12 @@ impl ClientSubscription {
                     lost_to,
                     resume,
                 } => {
-                    summary.overruns += 1;
-                    summary.last_overrun = Some(Overrun {
+                    summary.overrun = Some(Overrun {
                         from,
                         lost_to,
                         resume,
                     });
+                    break;
                 }
                 PollOutcome::Pending => break,
             }

@@ -15,6 +15,14 @@ pub enum DriverError {
         /// The handle's index.
         index: usize,
     },
+    /// A stream with the same wire stream id and session already exists.
+    #[error("stream {stream_id} session {session_id} already exists")]
+    DuplicateStream {
+        /// Wire stream id.
+        stream_id: i32,
+        /// Session alias.
+        session_id: i32,
+    },
     /// The stream's publication has already been taken.
     #[error("the stream's publication has already been taken")]
     PublicationTaken,

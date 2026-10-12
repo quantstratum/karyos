@@ -735,8 +735,12 @@ impl<O: BufferOwner> Subscription<O> {
     ///
     /// # Errors
     ///
-    /// Returns [`SysError::BufferTooShort`] (position unchanged) and
-    /// [`SysError::CorruptTerm`] for inconsistent published geometry.
+    /// Returns [`SysError::BufferTooShort`] when `out` is too small,
+    /// [`SysError::RequiredSubscriberLapped`] when a required subscriber's
+    /// data is gone, and [`SysError::CorruptTerm`] for inconsistent published
+    /// geometry. On error the acknowledged position and any pending message
+    /// are preserved; the read cursor may have been rewound to the
+    /// acknowledged position for redelivery.
     pub fn poll(&mut self, out: &mut [u8]) -> Result<PollOutcome, SysError> {
         SubscriptionContext {
             buffer: &self.buffer,
@@ -1856,7 +1860,8 @@ mod tests {
         assert!(
             matches!(first, PollOutcome::Message { position, length: 8000, .. } if position == TERM)
         );
-        // Redelivery into a short buffer fails and moves nothing.
+        // Redelivery into a short buffer fails; the pending message and the
+        // acknowledged position are preserved.
         let mut short = vec![0u8; 100];
         assert!(matches!(
             required.poll(&mut short),
