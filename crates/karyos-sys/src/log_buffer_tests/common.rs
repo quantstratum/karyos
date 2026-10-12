@@ -1278,3 +1278,26 @@ fn aborted_words_are_validated() {
         assert_eq!(buffer.cell(1).unwrap().position.load(Ordering::Acquire), 0);
     }
 }
+
+#[test]
+fn the_claim_staging_is_sized_by_the_largest_admissible_claim() {
+    // An MTU far above the reservation limit.
+    let buffer = new_buffer(LogBufferConfig {
+        mtu: 1 << 20,
+        ..config(3, 3)
+    })
+    .unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let max = buffer.max_message_length();
+    assert_eq!(max, MIN_TERM_LENGTH / 8 - 32);
+    let expected = if <Terms as crate::term_bytes::sealed::Access>::DIRECT {
+        0
+    } else {
+        max as usize
+    };
+    assert_eq!(publication.staging.len(), expected);
+    let mut claim = claimed(publication.try_claim(max, AppendOptions::default()));
+    assert_eq!(claim.payload().len(), max as usize);
+    claim.payload().fill(3);
+    assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+}

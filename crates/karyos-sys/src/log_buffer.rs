@@ -354,6 +354,24 @@ impl<T: TermBytes> LogBuffer<T> {
 
 fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>, SysError> {
     let buffer: &LogBuffer<O::Terms> = &owner;
+    // The staging buffer of claims on a backing without direct bytes, sized
+    // for the largest admissible claim and allocated fallibly before the
+    // publication is issued.
+    let staging = if <O::Terms as crate::term_bytes::sealed::Access>::DIRECT {
+        Box::default()
+    } else {
+        let plan = FragmentPlan::new(
+            buffer.config.mtu,
+            Flags::new(true, true, false, false, buffer.config.lane),
+        )?;
+        let size = plan.payload_per_fragment().min(buffer.max_message_length) as usize;
+        let mut staging = Vec::new();
+        staging
+            .try_reserve_exact(size)
+            .map_err(|_| SysError::ResourcesUnavailable)?;
+        staging.resize(size, 0u8);
+        staging.into_boxed_slice()
+    };
     if buffer
         .publication_taken
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -370,25 +388,16 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
         TermCount::ZERO,
     );
     match take_loan(&cell.loan, &cell.revoked, buffer.descriptor(0)?, target)? {
-        LoanOutcome::Granted => {
-            // The staging buffer of claims on a backing without direct
-            // bytes; one fragment never exceeds the MTU.
-            let staging = if <O::Terms as crate::term_bytes::sealed::Access>::DIRECT {
-                Box::default()
-            } else {
-                vec![0u8; buffer.config.mtu as usize].into_boxed_slice()
-            };
-            Ok(Some(Publication {
-                buffer: owner,
-                state: PublicationState::Active {
-                    count: TermCount::ZERO,
-                    slot: 0,
-                    tail: 0,
-                },
-                pending: None,
-                staging,
-            }))
-        }
+        LoanOutcome::Granted => Ok(Some(Publication {
+            buffer: owner,
+            state: PublicationState::Active {
+                count: TermCount::ZERO,
+                slot: 0,
+                tail: 0,
+            },
+            pending: None,
+            staging,
+        })),
         _ => Err(SysError::CorruptTerm {
             offset: 0,
             reason: "initial term not active",
