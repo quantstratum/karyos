@@ -996,6 +996,13 @@
         },
         {
           "features": [],
+          "from": "workspace:karyos-trace@0.1.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
           "from": "workspace:karyos@0.1.0",
           "kind": "normal",
           "target": null,
