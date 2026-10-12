@@ -97,8 +97,11 @@ impl SlotRegions {
         debug_assert!(offset.is_multiple_of(FRAME_ALIGNMENT) && offset < self.term_length);
         // SAFETY: in range per the caller's contract.
         let pointer = unsafe { self.at(slot, offset) };
-        // SAFETY: 32-aligned inside the 4096-aligned allocation, valid while
-        // `&self` lives, and only accessed atomically during the incarnation.
+        // SAFETY: 32-aligned inside the 4096-aligned allocation and valid
+        // while `&self` lives. Under the caller's contract no non-atomic
+        // access to this location races with the reference: either it is a
+        // frame start of the loaned term (atomic-only), or the caller holds
+        // exclusive CLEANING.
         unsafe { AtomicU64::from_ptr(pointer.cast::<u64>()) }
     }
 
