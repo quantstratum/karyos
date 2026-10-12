@@ -532,7 +532,11 @@ mod tests {
             panic!("not claimed");
         };
         let _ = driver.do_work().unwrap();
-        driver.stream(broken).unwrap().buffer.poison_claim_record();
+        driver
+            .stream(broken)
+            .unwrap()
+            .buffer
+            .inject_deadline_fault();
         clock.0.store(100, Ordering::Relaxed);
         // The broken stream, first in order, reports its error only after
         // the healthy one still ran its deadline and duty cycle.

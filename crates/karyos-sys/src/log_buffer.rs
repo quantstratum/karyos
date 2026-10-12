@@ -160,6 +160,9 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     /// (`quantstratum-docs: karyos/design/claim-deadline.md`).
     claim_record: AtomicU64,
     claim_serial: AtomicU64,
+    /// Test hook: an injected deadline fault (feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    deadline_fault: AtomicBool,
 }
 
 impl LogBuffer<HeapTerms> {
@@ -259,6 +262,8 @@ impl<T: TermBytes> LogBuffer<T> {
             conductor_taken: AtomicBool::new(false),
             claim_record: AtomicU64::new(0),
             claim_serial: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            deadline_fault: AtomicBool::new(false),
         })
     }
 
@@ -407,13 +412,13 @@ impl<T: TermBytes> LogBuffer<T> {
 
 #[cfg(feature = "test-hooks")]
 impl<T: TermBytes> LogBuffer<T> {
-    /// Test hook (feature `test-hooks`): overwrites the claim record with
-    /// one naming a slot that does not exist, so the next deadline call on
-    /// this buffer reports [`SysError::CorruptTerm`]. Only for tests of
-    /// error handling in dependent crates.
+    /// Test hook (feature `test-hooks`): makes every later deadline call of
+    /// this buffer's conductor return an injected error before it reads the
+    /// claim record or touches any word, without changing the protocol
+    /// state. Only for tests of error handling in dependent crates.
     #[doc(hidden)]
-    pub fn poison_claim_record(&self) {
-        self.write_record(encode_record(0x7F, 0, FRAME_ALIGNMENT));
+    pub fn inject_deadline_fault(&self) {
+        self.deadline_fault.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1861,6 +1866,10 @@ impl<O: BufferOwner> Conductor<O> {
         clock: &mut dyn FnMut() -> u64,
     ) -> Result<ClaimDeadline, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        #[cfg(feature = "test-hooks")]
+        if buffer.deadline_fault.load(Ordering::Relaxed) {
+            return Err(SysError::ResourcesUnavailable);
+        }
         let Some((serial, record)) = read_claim_record(&buffer.claim_serial, &buffer.claim_record)
         else {
             self.observed = None;
