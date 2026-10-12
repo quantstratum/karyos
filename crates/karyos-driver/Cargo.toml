@@ -13,6 +13,8 @@ publish.workspace = true
 [dependencies]
 karyos-client.workspace = true
 karyos-io.workspace = true
+karyos-sys.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

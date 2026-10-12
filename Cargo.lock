@@ -71,6 +71,7 @@ dependencies = [
  "karyos-archive",
  "karyos-client",
  "karyos-cluster",
+ "thiserror",
 ]
 
 [[package]]
@@ -106,6 +107,7 @@ version = "0.1.0"
 dependencies = [
  "karyos-protocol",
  "karyos-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -128,6 +130,8 @@ version = "0.1.0"
 dependencies = [
  "karyos-client",
  "karyos-io",
+ "karyos-sys",
+ "thiserror",
 ]
 
 [[package]]

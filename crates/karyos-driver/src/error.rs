@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Errors of the driver.
+
+use karyos_client::ClientError;
+use karyos_sys::error::SysError;
+use thiserror::Error;
+
+/// Errors returned by the embedded driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum DriverError {
+    /// The stream handle does not name a stream of this driver.
+    #[error("unknown stream {index}")]
+    UnknownStream {
+        /// The handle's index.
+        index: usize,
+    },
+    /// The stream's publication has already been taken.
+    #[error("the stream's publication has already been taken")]
+    PublicationTaken,
+    /// A client-level error.
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    /// A lower layer failed.
+    #[error(transparent)]
+    Sys(#[from] SysError),
+}

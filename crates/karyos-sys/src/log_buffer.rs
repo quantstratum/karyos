@@ -249,6 +249,19 @@ impl LogBuffer {
         self.max_message_length
     }
 
+    /// Number of attached subscribers. Advisory: it can change right after
+    /// it is read; used for connection policy, never for memory safety.
+    #[must_use]
+    pub fn attached_subscribers(&self) -> u32 {
+        let attached = self
+            .cells
+            .iter()
+            .skip(1)
+            .filter(|cell| cell.state.load(Ordering::Acquire) != CELL_FREE)
+            .count();
+        u32::try_from(attached).unwrap_or(u32::MAX)
+    }
+
     fn cell(&self, index: usize) -> Result<&Cell, SysError> {
         self.cells.get(index).ok_or(SysError::ResourcesUnavailable)
     }

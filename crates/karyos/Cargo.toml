@@ -14,6 +14,7 @@ publish.workspace = true
 karyos-client.workspace = true
 karyos-archive.workspace = true
 karyos-cluster.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
