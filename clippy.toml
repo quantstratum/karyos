@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Tests are exempt from the unwrap, expect, indexing and panic restrictions
+# (ADR-0007); library code is not.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true

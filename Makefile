@@ -2,7 +2,7 @@
 
 CARGO ?= cargo
 
-.PHONY: fmt fmt-check lint test build-release deny lint-sync pre-push
+.PHONY: fmt fmt-check lint test loom build-release deny lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -16,6 +16,9 @@ lint:
 test:
 	$(CARGO) test --workspace --locked
 
+loom:
+	RUSTFLAGS="--cfg loom" $(CARGO) test -p karyos-sys --release --locked --test 'loom_*'
+
 build-release:
 	RUSTFLAGS="-D warnings" $(CARGO) build --workspace --release --locked
 
@@ -25,4 +28,4 @@ deny:
 lint-sync:
 	scripts/check-lint-sync.sh
 
-pre-push: fmt-check lint-sync lint test build-release
+pre-push: fmt-check lint-sync lint test loom build-release

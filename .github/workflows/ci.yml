@@ -33,6 +33,13 @@ jobs:
       - run: rustup show active-toolchain
       - run: make lint test build-release
 
+  loom:
+    name: Loom models
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: make loom
+
   deny:
     name: Licences and sources
     runs-on: ubuntu-24.04
