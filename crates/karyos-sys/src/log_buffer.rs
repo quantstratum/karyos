@@ -689,6 +689,15 @@ impl<O: BufferOwner> Publication<O> {
     /// issued once: closing does not let the buffer issue another.
     pub fn close(self) {}
 
+    /// Resolves a forgotten claim: aborts its decision word unless it is
+    /// already terminal and clears its record. Every call on the
+    /// publication does this first; a wrapper that may return early
+    /// without calling into the publication calls it itself
+    /// (`quantstratum-docs: karyos/design/client-claims.md`). A no-op without a forgotten claim.
+    pub fn resolve_forgotten_claim(&mut self) {
+        self.resolve_claim();
+    }
+
     /// Aborts the outstanding claim, if any, and clears its record. Called
     /// only where no reference into the block can remain: by the next call
     /// on the publication (the claim borrowed it mutably), by `Drop` of the
