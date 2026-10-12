@@ -365,12 +365,13 @@ impl<'a> BroadcastWords<'a> {
             .trailer(TAIL_INTENT)
             .map_or(tail, |word| word.load(Ordering::Relaxed))
             .max(tail);
-        let floor = if intent >= self.capacity {
-            intent - self.capacity
-        } else {
-            0
-        };
-        let target = if (floor..tail).contains(&latest) && latest > *cursor {
+        // `latest >= intent - capacity`, written without subtraction so it
+        // needs neither saturation (ADR-0007) nor a special case below one
+        // capacity.
+        let not_overwritten = latest
+            .checked_add(self.capacity)
+            .is_some_and(|end| end >= intent);
+        let target = if not_overwritten && latest < tail && latest > *cursor {
             latest
         } else {
             tail
