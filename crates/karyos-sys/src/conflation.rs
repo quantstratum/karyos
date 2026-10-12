@@ -132,6 +132,14 @@ impl<'a> SlotWords<'a> {
             .map_or(0, |word| word.load(Ordering::Relaxed))
     }
 
+    /// Whether one more write fits the version space: a writer can check
+    /// every slot it is about to touch before mutating any of them.
+    #[must_use]
+    pub fn can_write(&self) -> bool {
+        self.word(VERSION)
+            .is_some_and(|word| word.load(Ordering::Relaxed).checked_add(2).is_some())
+    }
+
     /// Writes `value`. Only the slot's single writer calls this (see
     /// [`SlotWords`]). Returns the new version.
     ///
