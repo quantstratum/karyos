@@ -201,6 +201,11 @@ impl ClientConductor {
             registration,
         }) {
             Ok(sequence) => {
+                // The Remove is queued: the driver keeps the registration
+                // until it serves it.
+                if let Some(origin) = publication.origin() {
+                    origin.lease.mark_removing();
+                }
                 drop(publication);
                 Ok(sequence)
             }
@@ -227,6 +232,11 @@ impl ClientConductor {
             registration,
         }) {
             Ok(sequence) => {
+                // The Remove is queued: the driver keeps the registration
+                // until it serves it.
+                if let Some(origin) = subscription.origin() {
+                    origin.lease.mark_removing();
+                }
                 drop(subscription);
                 Ok(sequence)
             }

@@ -9,7 +9,7 @@
 //! never touches it. Crossing processes replaces these mechanisms under
 //! ADR-0045.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karyos_sys::log_buffer::{LogBuffer, Publication, Subscription};
@@ -51,23 +51,44 @@ impl StreamLeases {
     }
 }
 
-/// Set when a registration's capability is gone (its lease ended), so the
-/// driver can forget the registration.
+const LEASE_ALIVE: u8 = 0;
+const LEASE_DROPPED: u8 = 1;
+const LEASE_REMOVING: u8 = 2;
+
+/// How a registration's lease ended, so the driver knows whether to forget
+/// the registration now or wait for its queued `Remove`.
 #[derive(Debug, Default)]
 pub struct LeaseEnd {
-    ended: AtomicBool,
+    state: AtomicU8,
+}
+
+/// The observed state of a [`LeaseEnd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseState {
+    /// The capability is alive (held for hand-over or in a handle).
+    Alive,
+    /// The capability was dropped without `remove`: no `Remove` will come.
+    Dropped,
+    /// The handle was dropped by `remove` after its `Remove` was written:
+    /// the registration ends when that command is served.
+    Removing,
 }
 
 impl LeaseEnd {
-    /// Whether the lease ended (Acquire).
+    /// The current state (Acquire).
     #[must_use]
-    pub fn ended(&self) -> bool {
-        self.ended.load(Ordering::Acquire)
+    pub fn state(&self) -> LeaseState {
+        match self.state.load(Ordering::Acquire) {
+            LEASE_ALIVE => LeaseState::Alive,
+            LEASE_REMOVING => LeaseState::Removing,
+            _ => LeaseState::Dropped,
+        }
     }
 }
 
 /// One capability lease; dropping it ends the lease (Release): the stream's
-/// count drops and the registration's end flag is set.
+/// count drops and the registration's end state becomes `Dropped`, unless
+/// [`Lease::mark_removing`] set it to `Removing` first.
 #[derive(Debug)]
 pub struct Lease {
     leases: Arc<StreamLeases>,
@@ -89,10 +110,24 @@ impl Lease {
     }
 }
 
+impl Lease {
+    /// Records that a `Remove` for this registration was written, before
+    /// the handle holding this lease is dropped (Release).
+    pub fn mark_removing(&self) {
+        self.end.state.store(LEASE_REMOVING, Ordering::Release);
+    }
+}
+
 impl Drop for Lease {
     fn drop(&mut self) {
         self.leases.live.fetch_sub(1, Ordering::Release);
-        self.end.ended.store(true, Ordering::Release);
+        // Keep `Removing` if it was set; otherwise the lease was dropped.
+        let _ = self.end.state.compare_exchange(
+            LEASE_ALIVE,
+            LEASE_DROPPED,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
     }
 }
 

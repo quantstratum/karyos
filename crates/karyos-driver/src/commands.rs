@@ -14,9 +14,9 @@
 use std::sync::Arc;
 
 use karyos_client::ClientConductor;
-use std::collections::VecDeque;
-
-use karyos_client::link::{Capability, ClientLink, HandOverEntry, Lease, LeaseEnd, Owner};
+use karyos_client::link::{
+    Capability, ClientLink, HandOverEntry, Lease, LeaseEnd, LeaseState, Owner,
+};
 use karyos_protocol::cnc::{
     Command, ErrorCode, MAX_COMMAND_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey,
     SubscriberRole,
@@ -35,10 +35,6 @@ pub(crate) struct ClientSlot {
     /// client's producer is known to be detached (its close flag).
     consumer: Option<RingConsumer>,
     link: Arc<ClientLink>,
-    /// Registrations of this client forgotten because their capability
-    /// ended, so a `Remove` already queued for one still succeeds. Bounded:
-    /// the oldest is evicted first.
-    ended: VecDeque<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +79,6 @@ impl EmbeddedDriver {
             id,
             consumer: Some(consumer),
             link: Arc::clone(&link),
-            ended: VecDeque::new(),
         });
         Ok(ClientConductor::new(
             Owner {
@@ -138,27 +133,13 @@ impl EmbeddedDriver {
         }
     }
 
-    /// Forgets registrations whose capability ended (its handle or held
-    /// entry was dropped), so dropping handles without `remove` cannot
-    /// accumulate registration records.
+    /// Forgets registrations whose capability was dropped without
+    /// `remove`, so dropping handles cannot accumulate registration
+    /// records. A registration whose handle was dropped by `remove` stays
+    /// until its queued `Remove` is served (or its client is retired).
     pub(crate) fn sweep_ended_registrations(&mut self) {
-        let limit = self.config.max_pending_per_client;
-        let clients = &mut self.clients;
-        self.registrations.retain(|registration| {
-            if !registration.end.ended() {
-                return true;
-            }
-            if let Some(slot) = clients
-                .iter_mut()
-                .find(|slot| slot.id == registration.client)
-            {
-                if slot.ended.len() >= limit {
-                    slot.ended.pop_front();
-                }
-                slot.ended.push_back(registration.id);
-            }
-            false
-        });
+        self.registrations
+            .retain(|registration| registration.end.state() != LeaseState::Dropped);
     }
 
     pub(crate) fn enter_terminal(&mut self) {
@@ -332,20 +313,7 @@ impl EmbeddedDriver {
                     .iter()
                     .position(|r| r.id == registration && r.client == client && r.kind == kind)
                 else {
-                    // Already forgotten because its capability ended: the
-                    // client drops the handle right after writing Remove.
-                    let forgotten = self
-                        .clients
-                        .iter_mut()
-                        .find(|slot| slot.id == client)
-                        .and_then(|slot| {
-                            let index = slot.ended.iter().position(|&id| id == registration)?;
-                            slot.ended.remove(index)
-                        });
-                    return match forgotten {
-                        Some(_) => Response::OperationSucceeded { request },
-                        None => refuse(ErrorCode::UnknownRegistration, registration),
-                    };
+                    return refuse(ErrorCode::UnknownRegistration, registration);
                 };
                 self.registrations.swap_remove(index);
                 // Drops a capability still held; a taken one was dropped by
@@ -411,7 +379,6 @@ mod tests {
             id,
             consumer: Some(consumer),
             link: Arc::clone(&link),
-            ended: VecDeque::new(),
         });
         (id, producer, link)
     }
@@ -569,7 +536,47 @@ mod tests {
             let _ = driver.do_work().unwrap();
             assert!(driver.registrations.is_empty());
         }
-        assert!(driver.clients[0].ended.len() <= 1);
+    }
+
+    #[test]
+    fn a_queued_remove_survives_other_drops() {
+        let mut driver = EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+            max_pending_per_client: 1,
+            max_hand_over: 1,
+            ..crate::embedded::DriverConfig::default()
+        })
+        .unwrap();
+        let mut other = self::driver();
+        driver.streams.push(other.streams.pop().unwrap());
+        let mut client = driver.connect().unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let _ = client
+                .add_subscription(
+                    StreamKey {
+                        stream_id: 2,
+                        session_id: 1,
+                    },
+                    SubscriberRole::Required,
+                )
+                .unwrap();
+            let _ = driver.do_work().unwrap();
+            let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                Outcome::Subscription(handle) => handles.push(handle),
+                other => panic!("unexpected {other:?}"),
+            });
+        }
+        let second = handles.pop().unwrap();
+        let first = handles.pop().unwrap();
+        let remove = client.remove_subscription(first).unwrap();
+        drop(second);
+        let _ = driver.do_work().unwrap();
+        let mut done = Vec::new();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].sequence, remove);
+        assert!(matches!(done[0].outcome, Outcome::Succeeded));
+        assert!(driver.registrations.is_empty());
     }
 
     #[test]
