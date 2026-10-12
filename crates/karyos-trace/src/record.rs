@@ -2,13 +2,20 @@
 
 //! The trace observation record (SPEC.md §7.3; layout in
 //! `quantstratum-docs: karyos/design/trace-records.md`): one observation of one frame, encoded as
-//! [`RECORD_WORDS`] little-endian words. Encoding and decoding apply the same
-//! checks, so a writer cannot produce a record a collector would reject.
+//! [`OBSERVATION_WORDS`] little-endian words, followed in the journal by the
+//! writer's collection stamp ([`RECORD_WORDS`] in all). Encoding and decoding
+//! apply the same checks, so a writer cannot produce a record a collector
+//! would reject.
+
+use karyos_protocol::journal::Stamp;
 
 use crate::error::TraceError;
 
-/// Words of an encoded record.
-pub const RECORD_WORDS: usize = 22;
+/// Words of an encoded observation (words 0 to 21 of a record).
+pub const OBSERVATION_WORDS: usize = 22;
+/// Words of a journal record: the observation and the collection stamp
+/// (time, clock, epoch) in words 22 to 24.
+pub const RECORD_WORDS: usize = OBSERVATION_WORDS + 3;
 /// Layout version written in word 0.
 pub const RECORD_VERSION: u8 = 1;
 /// Highest lane (SPEC.md §7.4: four lanes).
@@ -221,7 +228,7 @@ impl TraceRecord {
     /// # Errors
     ///
     /// As [`TraceRecord::validate`].
-    pub fn encode(&self) -> Result<[u64; RECORD_WORDS], TraceError> {
+    pub fn encode(&self) -> Result<[u64; OBSERVATION_WORDS], TraceError> {
         self.validate()?;
         let subscriber = self.subscriber.map_or(([0, 0], 0, 0), |s| {
             (s.driver, s.registration, s.incarnation)
@@ -267,7 +274,7 @@ impl TraceRecord {
     /// [`TraceError::Version`], [`TraceError::UnknownPoint`],
     /// [`TraceError::ReservedBits`], and the errors of
     /// [`TraceRecord::validate`].
-    pub fn decode(words: &[u64; RECORD_WORDS]) -> Result<Self, TraceError> {
+    pub fn decode(words: &[u64; OBSERVATION_WORDS]) -> Result<Self, TraceError> {
         let [
             head,
             driver_low,
@@ -352,6 +359,45 @@ impl TraceRecord {
         record.validate()?;
         Ok(record)
     }
+}
+
+/// Encodes a journal record: the observation and, in words 22 to 24, the
+/// collection stamp the writer passes to the journal with it.
+///
+/// # Errors
+///
+/// As [`TraceRecord::validate`].
+pub fn encode_record(
+    record: &TraceRecord,
+    collected: Stamp,
+) -> Result<[u64; RECORD_WORDS], TraceError> {
+    let observation = record.encode()?;
+    let mut words = [0u64; RECORD_WORDS];
+    for (word, value) in words.iter_mut().zip(observation) {
+        *word = value;
+    }
+    let [time, clock, epoch] = [collected.time, collected.clock, collected.epoch];
+    if let Some(tail) = words.get_mut(OBSERVATION_WORDS..) {
+        for (word, value) in tail.iter_mut().zip([time, clock, epoch]) {
+            *word = value;
+        }
+    }
+    Ok(words)
+}
+
+/// Decodes a journal record into its observation and collection stamp.
+///
+/// # Errors
+///
+/// As [`TraceRecord::decode`].
+pub fn decode_record(words: &[u64; RECORD_WORDS]) -> Result<(TraceRecord, Stamp), TraceError> {
+    let mut observation = [0u64; OBSERVATION_WORDS];
+    for (word, value) in observation.iter_mut().zip(words) {
+        *word = *value;
+    }
+    let record = TraceRecord::decode(&observation)?;
+    let [.., time, clock, epoch] = *words;
+    Ok((record, Stamp { time, clock, epoch }))
 }
 
 #[cfg(test)]
@@ -511,7 +557,7 @@ mod tests {
         path[20] = 0;
         assert_eq!(TraceRecord::decode(&path), Err(TraceError::Packet));
         assert_eq!(
-            TraceRecord::decode(&[0; RECORD_WORDS]),
+            TraceRecord::decode(&[0; OBSERVATION_WORDS]),
             Err(TraceError::Version { version: 0 })
         );
         // Stray transport fields on a point that is not packet level.
@@ -559,7 +605,7 @@ mod tests {
             }),
             packet: None,
         };
-        let golden: [u64; RECORD_WORDS] = [
+        let golden: [u64; OBSERVATION_WORDS] = [
             0x0002_0401, // version 1, point 4 (SubscriberPoll), lane 2
             0x0101,
             0x0202,
@@ -587,5 +633,14 @@ mod tests {
         assert_eq!(TraceRecord::decode(&golden), Ok(record));
         let codes: Vec<u8> = POINTS.iter().map(|point| point.code()).collect();
         assert_eq!(codes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let collected = Stamp {
+            time: 0x15,
+            clock: 0x16,
+            epoch: 0x17,
+        };
+        let full = encode_record(&record, collected).unwrap();
+        assert_eq!(full[..OBSERVATION_WORDS], golden);
+        assert_eq!(full[OBSERVATION_WORDS..], [0x15, 0x16, 0x17]);
+        assert_eq!(decode_record(&full), Ok((record, collected)));
     }
 }

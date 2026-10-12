@@ -37,6 +37,18 @@ pub enum TraceError {
     /// or is present on a point that is not packet level.
     #[error("packet identity does not match the observation point")]
     Packet,
+    /// The collection stamp uses another clock than the journal's declared
+    /// collection clock, or an epoch below the last accepted one; nothing
+    /// was appended.
+    #[error("collection stamp does not follow the journal's collection clock")]
+    CollectionClock,
+    /// An attribution table size is zero.
+    #[error("invalid attribution configuration")]
+    Attribution,
+    /// Final verdicts were requested before the journal's terminal close was
+    /// observed.
+    #[error("the journal has not been observed closed")]
+    NotClosed,
     /// The underlying journal failed.
     #[error(transparent)]
     Journal(#[from] JournalError),
