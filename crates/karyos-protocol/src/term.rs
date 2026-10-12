@@ -511,14 +511,13 @@ impl<'a> TermScanner<'a> {
                 Ok(ScanItem::End)
             }
             Ok(FrameType::Data) => {
-                let flags = word0.flags();
-                if flags.begin() && flags.end() && length == flags.header_length() {
-                    self.check_header(offset, FrameType::Data)?;
-                    self.offset += align_frame(length)?;
-                    return Ok(ScanItem::Heartbeat { offset });
-                }
+                // Full validation first; a heartbeat is then a validated block
+                // with no payload.
                 let block = self.scan_block(offset)?;
                 self.offset += block.reserved();
+                if block.length() == 0 {
+                    return Ok(ScanItem::Heartbeat { offset });
+                }
                 Ok(ScanItem::Message(block))
             }
             _ => Err(invalid(offset, "frame type not allowed in a term")),
@@ -1132,6 +1131,49 @@ mod tests {
             Word0::new(TERM as i32 + 32, Flags::NONE, FrameType::Aborted),
         );
         assert!(scanner(&term).next_item().is_err());
+    }
+
+    #[test]
+    fn heartbeats_are_fully_validated() {
+        let mut term = vec![0u8; TERM as usize];
+        // A 96-byte header-only frame with EXT but an invalid (all-zero)
+        // extension is rejected, not reported as a heartbeat.
+        let at = (TERM - 64) as usize;
+        let header = FrameHeader {
+            word0: Word0::new(
+                96,
+                Flags::new(true, true, false, true, Lane::ZERO),
+                FrameType::Data,
+            ),
+            term_offset: at as i32,
+            session_id: IDENTITY.session_id,
+            stream_id: IDENTITY.stream_id,
+            term_id: IDENTITY.term_id,
+            reserved_value: 0,
+        };
+        // Reach the offset by an aborted extent covering the start.
+        term[..8].copy_from_slice(
+            &Word0::new(at as i32, Flags::NONE, FrameType::Aborted)
+                .pack()
+                .to_le_bytes(),
+        );
+        header.encode(&mut term[at..]).unwrap();
+        let mut scan = scanner(&term);
+        assert!(matches!(scan.next_item(), Ok(ScanItem::Aborted { .. })));
+        assert!(scan.next_item().is_err());
+        assert_eq!(scan.offset() as usize, at);
+
+        // A valid traced heartbeat is reported as a heartbeat.
+        let mut term = vec![0u8; TERM as usize];
+        let traced = FrameHeader {
+            term_offset: 0,
+            ..header
+        };
+        traced.encode(&mut term).unwrap();
+        TraceExtension::default().encode(&mut term[32..]).unwrap();
+        let mut scan = scanner(&term);
+        assert_eq!(scan.next_item(), Ok(ScanItem::Heartbeat { offset: 0 }));
+        assert_eq!(scan.offset(), 96);
     }
 
     #[test]
