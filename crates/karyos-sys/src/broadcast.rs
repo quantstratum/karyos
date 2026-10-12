@@ -33,8 +33,9 @@ pub const PAD_TYPE: u32 = u32::MAX;
 pub const HEADER_LENGTH: u32 = 8;
 /// Smallest capacity of an owned buffer, in bytes.
 pub const MIN_CAPACITY: usize = 1024;
-/// Words of the trailer: `tail_intent`, `tail` and `latest`, each on its own
-/// 128-byte stride.
+/// Words of the trailer: `tail_intent` (sharing its stride with the
+/// writer-only closed flag), `tail` and `latest`, each on its own 128-byte
+/// stride.
 pub const TRAILER_WORDS: usize = 3 * STRIDE;
 
 const STRIDE: usize = 16;
@@ -62,7 +63,8 @@ pub enum BroadcastError {
         max: usize,
     },
     /// Positions would exceed `u64::MAX`. The buffer is closed for good:
-    /// this and every later transmit fail without writing.
+    /// this and every later transmit write no record, padding or position
+    /// (only the first sets the persistent closed flag).
     #[error("broadcast positions exhausted; the buffer is closed")]
     PositionsExhausted,
     /// Capacity is not a power of two of at least the minimum, or the
@@ -190,8 +192,9 @@ impl<'a> BroadcastWords<'a> {
     ///
     /// Returns [`BroadcastError::ReservedType`],
     /// [`BroadcastError::MessageTooLarge`] and
-    /// [`BroadcastError::PositionsExhausted`]; nothing is written on error.
-    /// Exhaustion closes the buffer: every later transmit fails too.
+    /// [`BroadcastError::PositionsExhausted`]. On error no record, padding
+    /// or position is written; the first exhaustion only sets the
+    /// persistent closed flag, after which every transmit fails.
     pub fn transmit(&self, type_id: u32, payload: &[u8]) -> Result<u64, BroadcastError> {
         if self.is_closed() {
             return Err(BroadcastError::PositionsExhausted);
