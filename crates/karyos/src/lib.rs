@@ -3,12 +3,13 @@
 //! Public facade: re-exports the client, Archive and Cluster APIs and defines
 //! `karyos::Error`.
 //!
-//! Implemented so far: the client API and the error type aggregating client
-//! errors. The Archive and Cluster APIs do not exist yet.
+//! Implemented so far: the client API (publications, subscriptions and the
+//! client conductor) and the error type aggregating client errors. The Archive and Cluster APIs do not exist yet.
 
 pub use karyos_client::{
-    ClientError, ClientPublication, ClientSubscription, MessageInfo, MessageLimit, OfferOutcome,
-    Overrun, PollError, PollSummary,
+    ClientConductor, ClientError, ClientPublication, ClientSubscription, Completion,
+    ConductorError, ConductorPoll, MessageInfo, MessageLimit, OfferOutcome, Outcome, Overrun,
+    PollError, PollSummary,
 };
 
 /// Every error of the public Karyos API.
@@ -20,4 +21,7 @@ pub enum Error {
     /// A poll failed after possibly delivering messages.
     #[error(transparent)]
     Poll(#[from] PollError),
+    /// A client conductor request could not be submitted.
+    #[error(transparent)]
+    Conductor(#[from] ConductorError),
 }

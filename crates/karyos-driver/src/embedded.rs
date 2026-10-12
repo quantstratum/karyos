@@ -33,6 +33,7 @@ use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::log_buffer::{Conductor, LogBuffer, LogBufferConfig, Role};
 
 use crate::commands::ClientSlot;
+use crate::counters::{DriverCounters, Event};
 use crate::error::DriverError;
 
 /// Limits and sizes of the control channel.
@@ -137,6 +138,7 @@ pub struct EmbeddedDriver {
     pub(crate) next_registration: u64,
     pub(crate) scan_cursor: usize,
     pub(crate) terminal: bool,
+    pub(crate) counters: DriverCounters,
 }
 
 impl EmbeddedDriver {
@@ -181,10 +183,12 @@ impl EmbeddedDriver {
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
             return Err(DriverError::InvalidConfig);
         }
+        let counters = DriverCounters::new()?;
         let id = NEXT_DRIVER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| DriverError::DriverIdsExhausted)?;
         Ok(Self {
+            counters,
             id,
             config,
             streams: Vec::new(),
@@ -230,6 +234,33 @@ impl EmbeddedDriver {
         })
     }
 
+    /// A read-only view of the driver's counters (SPEC.md §11), for tools.
+    #[must_use]
+    pub fn counters(&self) -> karyos_sys::counters::CountersReader {
+        self.counters.reader()
+    }
+
+    /// Refreshes every gauge from the current state.
+    pub(crate) fn update_stream_gauges(&self) {
+        let gauge = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
+        let retiring = self.streams.iter().filter(|s| s.retiring).count();
+        let active = self.streams.len() - retiring;
+        self.counters.set(Event::StreamsActive, gauge(active));
+        self.counters.set(Event::StreamsRetiring, gauge(retiring));
+        self.counters
+            .set(Event::ClientsConnected, gauge(self.clients.len()));
+        self.counters
+            .set(Event::HandOverHeld, gauge(self.held_total()));
+        match self
+            .streams
+            .iter()
+            .try_fold(0u64, |sum, s| sum.checked_add(s.leases.live()))
+        {
+            Some(leases) => self.counters.set(Event::LeasesLive, leases),
+            None => self.counters.add(Event::CounterOverflows, 1),
+        }
+    }
+
     /// Removes a stream: it stops accepting publications and subscriptions
     /// at once, and is freed by a later duty cycle once no capability or
     /// registration of it remains. Never waits and never revokes a live
@@ -241,12 +272,18 @@ impl EmbeddedDriver {
     /// Returns [`DriverError::UnknownStream`] for a foreign or freed
     /// stream.
     pub fn remove_stream(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
-        self.stream(stream)?.retiring = true;
+        let target = self.stream(stream)?;
+        if !target.retiring {
+            target.retiring = true;
+            self.counters.add(Event::StreamsRemoved, 1);
+        }
+        self.update_stream_gauges();
         Ok(())
     }
 
     /// Frees retiring streams with no live lease and no registration.
     pub(crate) fn free_retired_streams(&mut self) {
+        let before = self.streams.len();
         let registrations = &self.registrations;
         self.streams.retain(|stream| {
             !(stream.retiring
@@ -255,6 +292,14 @@ impl EmbeddedDriver {
                     .iter()
                     .any(|registration| registration.stream() == stream.id))
         });
+        let freed = before - self.streams.len();
+        if freed > 0 {
+            self.counters.add(
+                Event::StreamsFreed,
+                u64::try_from(freed).unwrap_or(u64::MAX),
+            );
+            self.update_stream_gauges();
+        }
     }
 
     /// Whether the driver is in its terminal state: the broadcast buffer is
@@ -303,6 +348,7 @@ impl EmbeddedDriver {
             stream_id: key.0,
             session_id: key.1,
         });
+        self.update_stream_gauges();
         Ok(StreamHandle {
             driver: self.id,
             stream: id,
@@ -324,11 +370,9 @@ impl EmbeddedDriver {
             .publication_owned()?
             .ok_or(DriverError::PublicationTaken)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
-        Ok(ClientPublication::with_lease(
-            inner,
-            stream.allow_unconnected,
-            lease,
-        ))
+        let publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease);
+        self.update_stream_gauges();
+        Ok(publication)
     }
 
     /// Admits a subscriber to the stream (control path: allocates its copy
@@ -348,7 +392,9 @@ impl EmbeddedDriver {
         let stream = self.active_stream(stream)?;
         let inner = stream.conductor.subscribe(role)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
-        Ok(ClientSubscription::with_lease(inner, lease))
+        let subscription = ClientSubscription::with_lease(inner, lease);
+        self.update_stream_gauges();
+        Ok(subscription)
     }
 
     /// Runs one duty cycle: retires closed clients, serves client commands,
@@ -368,6 +414,7 @@ impl EmbeddedDriver {
             let report = stream.conductor.duty_cycle()?;
             work += report.cleaned + u32::from(report.prepared);
         }
+        self.update_stream_gauges();
         Ok(work)
     }
 
