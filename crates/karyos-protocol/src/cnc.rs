@@ -11,6 +11,19 @@
 //! A command carries only the client's request sequence; the driver knows
 //! the sender from the ring it read the command from and forms the
 //! [`RequestId`]. Responses carry the full [`RequestId`].
+//!
+//! Layouts (type id: words, each a little-endian `u64`):
+//!
+//! | Type | Message | Word 0 | Word 1 | Word 2 | Word 3 |
+//! | --- | --- | --- | --- | --- | --- |
+//! | `0x01` | `AddPublication` | sequence | stream id (low 32) and session id (high 32) | flags: bit 0 allow unconnected, others zero | |
+//! | `0x02` | `AddSubscription` | sequence | stream and session as above | role: 0 required, 1 optional | |
+//! | `0x03` | `RemovePublication` | sequence | registration | | |
+//! | `0x04` | `RemoveSubscription` | sequence | registration | | |
+//! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
+//! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
+//! | `0x83` | `OperationSucceeded` | client | sequence | | |
+//! | `0x84` | `Error` | client | sequence | code (1 to 5, see [`ErrorCode`]) | detail |
 
 use thiserror::Error;
 
@@ -532,6 +545,73 @@ mod tests {
             );
             assert_eq!(response.request(), request);
         }
+    }
+
+    /// Literal bytes, so a layout change cannot hide behind a matching
+    /// encoder and decoder.
+    #[test]
+    fn golden_bytes() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = Command::AddPublication {
+            sequence: 0x0102,
+            stream: StreamKey {
+                stream_id: -2,
+                session_id: 7,
+            },
+            allow_unconnected: true,
+        }
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(
+            &out[..length],
+            &[
+                0x02, 0x01, 0, 0, 0, 0, 0, 0, // sequence
+                0xfe, 0xff, 0xff, 0xff, 7, 0, 0, 0, // stream -2, session 7
+                1, 0, 0, 0, 0, 0, 0, 0, // allow unconnected
+            ]
+        );
+        let mut out = [0u8; MAX_RESPONSE_LENGTH];
+        let length = Response::Error {
+            request: RequestId {
+                client: 3,
+                sequence: 4,
+            },
+            code: ErrorCode::UnknownRegistration,
+            detail: 0x0506,
+        }
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(
+            &out[..length],
+            &[
+                3, 0, 0, 0, 0, 0, 0, 0, // client
+                4, 0, 0, 0, 0, 0, 0, 0, // sequence
+                3, 0, 0, 0, 0, 0, 0, 0, // code: unknown registration
+                0x06, 0x05, 0, 0, 0, 0, 0, 0, // detail
+            ]
+        );
+        assert_eq!(
+            Command::AddSubscription {
+                sequence: 0,
+                stream: StreamKey {
+                    stream_id: 0,
+                    session_id: 0
+                },
+                role: SubscriberRole::Optional
+            }
+            .type_id(),
+            0x02
+        );
+        assert_eq!(
+            Response::OperationSucceeded {
+                request: RequestId {
+                    client: 0,
+                    sequence: 0
+                }
+            }
+            .type_id(),
+            0x83
+        );
     }
 
     #[test]
