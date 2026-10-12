@@ -26,10 +26,13 @@ pub mod frame;
 pub mod loan;
 #[cfg(target_os = "linux")]
 pub mod mmap;
+pub mod publication;
 pub mod sizing;
 pub mod slot;
 pub mod sync;
 pub mod term;
+// Real memory with std atomics; the Loom model covers `publication` instead.
+#[cfg(not(loom))]
 pub mod term_memory;
 
 pub use error::{LayoutError, SysError};

@@ -33,6 +33,7 @@ use crate::frame::{
     EXTENSION_LENGTH, FRAME_ALIGNMENT, Flags, FrameType, HEADER_LENGTH, Lane, PROTOCOL_VERSION,
     Word0,
 };
+use crate::publication::{load_interior, observe_block, publish_block, store_interior};
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
 
 /// Alignment of a term allocation.
@@ -306,17 +307,13 @@ impl ExclusiveWriter<'_> {
             if index == 0 {
                 first = Some(word0);
             } else {
-                self.memory
-                    .word0(offset)
-                    .store(word0.pack().to_le(), Ordering::Relaxed);
+                store_interior(self.memory.word0(offset), word0);
             }
             // Alignment padding is already zero: the term is never reused.
             offset += align_frame(frame_length).unwrap_or(frame_length);
         }
         if let Some(word0) = first {
-            self.memory
-                .word0(start)
-                .store(word0.pack().to_le(), Ordering::Release);
+            publish_block(self.memory.word0(start), word0);
         }
         self.tail = start + reserved;
         Ok(WriteOutcome::Appended {
@@ -330,11 +327,9 @@ impl ExclusiveWriter<'_> {
         let offset = self.tail;
         let flags = Flags::new(false, false, false, false, self.memory.identity.lane);
         self.write_header_tail(offset, 0);
-        self.memory.word0(offset).store(
-            Word0::new(extent as i32, flags, FrameType::Pad)
-                .pack()
-                .to_le(),
-            Ordering::Release,
+        publish_block(
+            self.memory.word0(offset),
+            Word0::new(extent as i32, flags, FrameType::Pad),
         );
         self.tail = self.memory.length.get();
     }
@@ -409,7 +404,7 @@ impl CommittedReader<'_> {
             return Ok(ReadOutcome::End);
         }
         let start = self.offset;
-        let first = u64::from_le(self.memory.word0(start).load(Ordering::Acquire));
+        let first = observe_block(self.memory.word0(start));
         let signed = first as u32 as i32;
         if signed <= 0 {
             return Ok(ReadOutcome::Pending);
@@ -469,10 +464,8 @@ impl CommittedReader<'_> {
             if offset == term_length {
                 return Err(corrupt(offset, "block without END"));
             }
-            word0 = Word0::unpack(u64::from_le(
-                self.memory.word0(offset).load(Ordering::Relaxed),
-            ))
-            .map_err(|_| corrupt(offset, "reserved flags"))?;
+            word0 = Word0::unpack(load_interior(self.memory.word0(offset)))
+                .map_err(|_| corrupt(offset, "reserved flags"))?;
             if word0.frame_type_code() != FrameType::Data.code() {
                 return Err(corrupt(offset, "interior frame type"));
             }
@@ -490,10 +483,8 @@ impl CommittedReader<'_> {
         let mut offset = start;
         let mut written = 0usize;
         while offset < end {
-            let word0 = Word0::unpack(u64::from_le(
-                self.memory.word0(offset).load(Ordering::Relaxed),
-            ))
-            .map_err(|_| corrupt(offset, "reserved flags"))?;
+            let word0 = Word0::unpack(load_interior(self.memory.word0(offset)))
+                .map_err(|_| corrupt(offset, "reserved flags"))?;
             let header_length = word0.flags().header_length();
             let frame_length = word0.frame_length() as u32;
             let payload = (frame_length - header_length) as usize;
@@ -697,24 +688,33 @@ mod tests {
         assert_eq!(read(&mut reader).1, payload(300, 5));
     }
 
+    fn sequenced(sequence: u32) -> Vec<u8> {
+        let len = 40 + (sequence as usize * 37) % 2500;
+        let mut data = payload(len, sequence as u8);
+        data[..4].copy_from_slice(&sequence.to_le_bytes());
+        data
+    }
+
     /// One writer thread and two reader threads; under Miri this checks the
-    /// access rules for data races.
+    /// access rules for data races. Every reader must deliver exactly the
+    /// writer's accepted sequence, in order and intact.
     #[test]
     fn concurrent_writer_and_readers() {
         let count: u32 = if cfg!(miri) { 12 } else { 400 };
         let term = term();
-        std::thread::scope(|scope| {
+        let (accepted, delivered) = std::thread::scope(|scope| {
             let mut writer = term
                 .writer(DEFAULT_MTU, MIN_TERM_LENGTH / 8)
                 .unwrap()
                 .unwrap();
-            scope.spawn(move || {
+            let writer_thread = scope.spawn(move || {
+                let mut accepted = 0u32;
                 for sequence in 0..count {
-                    let len = 40 + (sequence as usize * 37) % 2500;
-                    let mut data = payload(len, sequence as u8);
-                    data[..4].copy_from_slice(&sequence.to_le_bytes());
-                    match writer.append(&data, WriteOptions::default()).unwrap() {
-                        WriteOutcome::Appended { .. } => {}
+                    match writer
+                        .append(&sequenced(sequence), WriteOptions::default())
+                        .unwrap()
+                    {
+                        WriteOutcome::Appended { .. } => accepted += 1,
                         WriteOutcome::TermFull => break,
                     }
                 }
@@ -724,31 +724,118 @@ mod tests {
                     .unwrap()
                     != WriteOutcome::TermFull
                 {}
+                accepted
             });
-            for _ in 0..2 {
-                scope.spawn(|| {
-                    let mut reader = term.reader();
-                    let mut expected = 0u32;
-                    let mut out = vec![0u8; 8192];
-                    loop {
-                        match reader.poll(&mut out).unwrap() {
-                            ReadOutcome::Message { length, .. } => {
-                                let sequence = u32::from_le_bytes(out[..4].try_into().unwrap());
-                                if length as usize != 2600 {
-                                    assert_eq!(sequence, expected);
-                                    let len = 40 + (sequence as usize * 37) % 2500;
-                                    let mut data = payload(len, sequence as u8);
-                                    data[..4].copy_from_slice(&sequence.to_le_bytes());
-                                    assert_eq!(&out[..length as usize], &data[..]);
-                                    expected += 1;
+            let readers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut reader = term.reader();
+                        let mut delivered = 0u32;
+                        let mut out = vec![0u8; 8192];
+                        loop {
+                            match reader.poll(&mut out).unwrap() {
+                                ReadOutcome::Message { length, .. } => {
+                                    if length as usize == 2600 {
+                                        continue;
+                                    }
+                                    assert_eq!(&out[..length as usize], &sequenced(delivered)[..]);
+                                    delivered += 1;
                                 }
+                                ReadOutcome::Pending => std::thread::yield_now(),
+                                ReadOutcome::End => break delivered,
                             }
-                            ReadOutcome::Pending => std::thread::yield_now(),
-                            ReadOutcome::End => break,
                         }
-                    }
-                });
-            }
+                    })
+                })
+                .collect();
+            let accepted = writer_thread.join().unwrap();
+            let delivered: Vec<u32> = readers.into_iter().map(|r| r.join().unwrap()).collect();
+            (accepted, delivered)
         });
+        assert!(accepted > 0);
+        assert_eq!(delivered, vec![accepted, accepted]);
+    }
+
+    #[test]
+    fn racing_writer_acquisition_issues_exactly_one() {
+        let term = term();
+        let issued: u32 = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        u32::from(
+                            term.writer(DEFAULT_MTU, MIN_TERM_LENGTH / 8)
+                                .unwrap()
+                                .is_some(),
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        assert_eq!(issued, 1);
+    }
+
+    #[test]
+    fn a_forgotten_writer_is_not_reissued() {
+        let term = term();
+        let writer = term.writer(DEFAULT_MTU, MIN_TERM_LENGTH / 8).unwrap();
+        let _forgotten = core::mem::ManuallyDrop::new(writer);
+        assert!(
+            term.writer(DEFAULT_MTU, MIN_TERM_LENGTH / 8)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hostile_looking_payload_and_extension_do_not_change_geometry() {
+        let term = term();
+        let mut writer = term
+            .writer(DEFAULT_MTU, MIN_TERM_LENGTH / 8)
+            .unwrap()
+            .unwrap();
+        // Payload and extension full of committed-looking words with END and
+        // PAD codes at every 8-byte position.
+        let fake = Word0::new(
+            32,
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Pad,
+        );
+        let mut hostile = Vec::new();
+        for _ in 0..500 {
+            hostile.extend_from_slice(&fake.pack().to_le_bytes());
+        }
+        let mut extension = [0u8; 64];
+        for chunk in extension.chunks_mut(8) {
+            chunk.copy_from_slice(&fake.pack().to_le_bytes());
+        }
+        let options = WriteOptions {
+            extension: Some(extension),
+            ..WriteOptions::default()
+        };
+        let _ = writer.append(&hostile, options).unwrap();
+        let second = payload(100, 9);
+        let _ = writer.append(&second, WriteOptions::default()).unwrap();
+        let mut reader = term.reader();
+        assert_eq!(read(&mut reader).1, hostile);
+        assert_eq!(read(&mut reader).1, second);
+        assert_eq!(read(&mut reader).0, ReadOutcome::Pending);
+    }
+
+    #[test]
+    fn short_buffer_leaves_output_untouched_and_retry_succeeds() {
+        let term = term();
+        let mut writer = term
+            .writer(DEFAULT_MTU, MIN_TERM_LENGTH / 8)
+            .unwrap()
+            .unwrap();
+        let data = payload(3000, 6);
+        let _ = writer.append(&data, WriteOptions::default()).unwrap();
+        let mut reader = term.reader();
+        let mut small = [0xEEu8; 2999];
+        assert!(reader.poll(&mut small).is_err());
+        assert!(small.iter().all(|b| *b == 0xEE));
+        assert_eq!(read(&mut reader).1, data);
     }
 }
