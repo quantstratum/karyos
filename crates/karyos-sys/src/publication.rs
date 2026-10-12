@@ -9,7 +9,7 @@
 //! layout on every target.
 
 use crate::frame::Word0;
-use crate::sync::{AtomicU64, Ordering};
+use crate::sync::{AtomicU64, Ordering, fence};
 
 /// Stores an interior fragment's word 0. It becomes visible to readers
 /// through the `Release` of the block's first word 0, so `Relaxed` suffices.
@@ -111,4 +111,74 @@ pub fn abort_block(first: &AtomicU64, reserved: Word0, aborted: Word0) -> bool {
             Ordering::Acquire,
         )
         .is_ok()
+}
+
+/// Writes the claim record (`quantstratum-docs: karyos/design/claim-deadline.md`) as a seqlock
+/// of atomic words: the serial goes odd, a Release fence orders it before
+/// the record store, and the next even serial is stored with Release. Only
+/// the publication writes it.
+#[inline]
+pub fn write_claim_record(serial: &AtomicU64, record: &AtomicU64, value: u64) {
+    let current = serial.load(Ordering::Relaxed);
+    serial.store(current.wrapping_add(1), Ordering::Relaxed);
+    fence(Ordering::Release);
+    record.store(value, Ordering::Relaxed);
+    serial.store(current.wrapping_add(2), Ordering::Release);
+}
+
+/// Reads a consistent claim record: `(serial, record)` when both serial
+/// loads are equal and even, `None` while the publication rewrites it.
+#[inline]
+#[must_use]
+pub fn read_claim_record(serial: &AtomicU64, record: &AtomicU64) -> Option<(u64, u64)> {
+    let first = serial.load(Ordering::Acquire);
+    let value = record.load(Ordering::Relaxed);
+    fence(Ordering::Acquire);
+    let second = serial.load(Ordering::Relaxed);
+    (first == second && first.is_multiple_of(2)).then_some((first, value))
+}
+
+/// Whether `raw` (as loaded, little-endian) is a valid reserved word of a
+/// claim of `extent` bytes on `lane`: protocol version, no reserved flag
+/// bits, type DATA, BEGIN and END, the lane, and a length of minus the
+/// extent. EOS and EXT are the claim's choice.
+#[must_use]
+fn is_reserved_claim(raw: u64, extent: u32, lane: crate::frame::Lane) -> bool {
+    let Ok(word) = Word0::unpack(u64::from_le(raw)) else {
+        return false;
+    };
+    let flags = word.flags();
+    word.version() == crate::frame::PROTOCOL_VERSION
+        && word.frame_type_code() == crate::frame::FrameType::Data.code()
+        && flags.begin()
+        && flags.end()
+        && flags.lane() == lane
+        && i64::from(word.frame_length()) == -i64::from(extent)
+}
+
+/// The commit-deadline abort of one claimed block
+/// (`quantstratum-docs: karyos/design/claim-deadline.md`): at most two compare-exchanges on its
+/// first word 0, and no other access. From 0 (the writer has not marked)
+/// to `aborted`; if that fails because the writer marked, or the word was
+/// already a valid reserved word of `extent` on `lane`, from exactly that
+/// observed word to `aborted`. Returns whether this call won the abort.
+#[inline]
+pub fn deadline_abort(
+    first: &AtomicU64,
+    extent: u32,
+    lane: crate::frame::Lane,
+    aborted: Word0,
+) -> bool {
+    let target = aborted.pack().to_le();
+    let mut current = first.load(Ordering::Acquire);
+    if current == 0 {
+        match first.compare_exchange(0, target, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(found) => current = found,
+        }
+    }
+    is_reserved_claim(current, extent, lane)
+        && first
+            .compare_exchange(current, target, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
 }

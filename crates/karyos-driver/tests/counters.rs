@@ -29,6 +29,7 @@ fn stream_config(stream_id: i32) -> StreamConfig {
             lane: Lane::ZERO,
             session_id: 1,
             stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
         },
         allow_unconnected: true,
     }
