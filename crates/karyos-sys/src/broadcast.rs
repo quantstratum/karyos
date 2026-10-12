@@ -365,12 +365,12 @@ impl<'a> BroadcastWords<'a> {
             .trailer(TAIL_INTENT)
             .map_or(tail, |word| word.load(Ordering::Relaxed))
             .max(tail);
-        // `latest >= intent - capacity`, written without subtraction so it
-        // needs neither saturation (ADR-0007) nor a special case below one
-        // capacity.
-        let not_overwritten = latest
-            .checked_add(self.capacity)
-            .is_some_and(|end| end >= intent);
+        // `latest >= intent - capacity` without saturation (ADR-0007) or
+        // overflow near `u64::MAX`; `intent >= tail > latest` for a valid
+        // candidate, so the subtraction only fails for an invalid one.
+        let not_overwritten = intent
+            .checked_sub(latest)
+            .is_some_and(|distance| distance <= self.capacity);
         let target = if not_overwritten && latest < tail && latest > *cursor {
             latest
         } else {
@@ -647,6 +647,22 @@ mod tests {
         // A record that would still fit is refused too: closed for good.
         assert_eq!(tx.transmit(2, &[]), Err(BroadcastError::PositionsExhausted));
         assert_eq!(rx.receive(), Received::Pending);
+    }
+
+    #[test]
+    fn a_lap_near_the_end_of_positions_rejoins_at_latest() {
+        let mut tx = broadcast(1024).unwrap();
+        // 2048 positions left: `latest + capacity` overflows below.
+        tx.seed(u64::MAX - 2047);
+        let mut rx = tx.receiver();
+        for sequence in 0..15u32 {
+            tx.transmit(sequence, &message(sequence, 100)).unwrap();
+        }
+        assert!(matches!(rx.receive(), Received::Lapped { .. }));
+        let Received::Message { type_id, .. } = rx.receive() else {
+            panic!("expected the latest message");
+        };
+        assert_eq!(type_id, 14);
     }
 
     #[test]
