@@ -436,3 +436,92 @@ fn a_forgotten_handle_pins_a_retiring_stream() {
         Err(DriverError::TooManyStreams)
     ));
 }
+
+fn lapping_config() -> DriverConfig {
+    DriverConfig {
+        command_budget: 1,
+        cycles_between_drains: 1,
+        broadcast_capacity: 1024,
+        max_pending_per_client: 32,
+        ..DriverConfig::default()
+    }
+}
+
+/// Takes one required subscription for `client`.
+fn subscribed(
+    driver: &mut EmbeddedDriver,
+    client: &mut ClientConductor,
+) -> karyos_client::ClientSubscription {
+    let _ = client
+        .add_subscription(key(2), SubscriberRole::Required)
+        .unwrap();
+    for _ in 0..4 {
+        let _ = driver.do_work().unwrap();
+        if let Some(completion) = drain(client).pop() {
+            match completion.outcome {
+                Outcome::Subscription(subscription) => return subscription,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    panic!("no subscription");
+}
+
+#[test]
+fn an_unknown_remove_that_executed_leaves_nothing() {
+    let mut driver = EmbeddedDriver::with_config(lapping_config()).unwrap();
+    let stream = driver.add_stream(stream_config(2)).unwrap();
+    let mut slow = driver.connect().unwrap();
+    let mut busy = driver.connect().unwrap();
+    let subscription = subscribed(&mut driver, &mut slow);
+    let remove = slow.remove_subscription(subscription).unwrap();
+    // Served, then its response is lapped away.
+    for _ in 0..60 {
+        let _ = busy.add_subscription(key(99), SubscriberRole::Optional);
+        let _ = driver.do_work().unwrap();
+        let _ = drain(&mut busy);
+    }
+    let done = drain(&mut slow);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].sequence, remove);
+    assert!(matches!(done[0].outcome, Outcome::Unknown));
+    driver.remove_stream(stream).unwrap();
+    let _ = driver.do_work().unwrap();
+    assert_eq!(state(&driver, stream), StreamState::Freed);
+}
+
+#[test]
+fn an_unknown_remove_still_queued_keeps_its_registration_until_served() {
+    let mut driver = EmbeddedDriver::with_config(lapping_config()).unwrap();
+    let stream = driver.add_stream(stream_config(2)).unwrap();
+    let mut slow = driver.connect().unwrap();
+    let mut busy = driver.connect().unwrap();
+    let subscription = subscribed(&mut driver, &mut slow);
+    // Twenty refused requests ahead of the Remove in the slow ring.
+    for _ in 0..20 {
+        let _ = slow
+            .add_subscription(key(99), SubscriberRole::Optional)
+            .unwrap();
+    }
+    let remove = slow.remove_subscription(subscription).unwrap();
+    driver.remove_stream(stream).unwrap();
+    // Lap the slow client before its Remove is served: with a budget of
+    // one and two rings, the Remove (21st in its ring) needs about 42
+    // cycles, while about 26 responses already lap a 1 KiB broadcast.
+    for _ in 0..30 {
+        let _ = busy.add_subscription(key(99), SubscriberRole::Optional);
+        let _ = driver.do_work().unwrap();
+        let _ = drain(&mut busy);
+    }
+    let lapped = drain(&mut slow);
+    // Every pending request, the Remove included, is Unknown...
+    assert!(lapped.iter().any(|c| c.sequence == remove));
+    assert!(lapped.iter().all(|c| matches!(c.outcome, Outcome::Unknown)));
+    // ...but the Remove is still queued: its registration keeps the stream.
+    assert_eq!(driver.live_leases(stream).unwrap(), 0);
+    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    for _ in 0..60 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(state(&driver, stream), StreamState::Freed);
+}
