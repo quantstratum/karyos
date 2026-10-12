@@ -182,8 +182,9 @@ impl<'a> RingWords<'a> {
     /// # Errors
     ///
     /// Returns [`RingError::ReservedType`], [`RingError::MessageTooLarge`],
-    /// [`RingError::Full`] and [`RingError::Closed`]. On error nothing is
-    /// written, except that position exhaustion closes the ring.
+    /// [`RingError::Full`] and [`RingError::Closed`]. On error no record or
+    /// position is written; position exhaustion or an impossible `head`
+    /// sets the persistent closed flag.
     pub fn write(&self, type_id: u32, payload: &[u8]) -> Result<u64, RingError> {
         if self.is_closed() {
             return Err(RingError::Closed);
@@ -208,12 +209,15 @@ impl<'a> RingWords<'a> {
         };
         let tail = tail_word.load(Ordering::Relaxed);
         let head = head_word.load(Ordering::Acquire);
-        // A head ahead of the tail or more than a capacity behind it is
-        // impossible with a correct consumer.
-        let used = tail
+        // A misaligned head, or one ahead of the tail or more than a capacity
+        // behind it, is impossible with a correct consumer: close for good.
+        let Some(used) = tail
             .checked_sub(head)
-            .filter(|&used| used <= self.capacity)
-            .ok_or(RingError::Closed)?;
+            .filter(|&used| used <= self.capacity && head.is_multiple_of(8))
+        else {
+            self.close();
+            return Err(RingError::Closed);
+        };
         let to_end = self.capacity - (tail & (self.capacity - 1));
         let padding = if extent > to_end { to_end } else { 0 };
         let Some((start, new_tail)) = tail
@@ -276,7 +280,12 @@ impl<'a> RingWords<'a> {
                 self.close();
                 Err(RingError::Malformed { position: head })
             };
-            let Some(available) = tail.checked_sub(head).filter(|&a| a <= self.capacity) else {
+            // Positions are record boundaries: multiples of 8, the tail at
+            // most a capacity ahead of the head. Checked before anything
+            // else, including the empty case.
+            let Some(available) = tail.checked_sub(head).filter(|&a| {
+                a <= self.capacity && head.is_multiple_of(8) && tail.is_multiple_of(8)
+            }) else {
                 return malformed();
             };
             if available == 0 {
@@ -340,6 +349,15 @@ impl RingWords<'_> {
     fn corrupt(&self, position: u64, value: u64) {
         if let Some(word) = self.word_at(position) {
             word.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// Test only: sets the tail and the head as a faulty party would.
+    fn set_positions(&self, tail: u64, head: u64) {
+        for (index, value) in [(TAIL, tail), (HEAD, head)] {
+            if let Some(word) = self.trailer(index) {
+                word.store(value, Ordering::Relaxed);
+            }
         }
     }
 
@@ -551,6 +569,28 @@ mod tests {
         assert!(producer.is_closed());
         assert_eq!(consumer.read(), Err(RingError::Closed));
         assert_eq!(producer.write(1, b"x"), Err(RingError::Closed));
+    }
+
+    #[test]
+    fn misaligned_or_impossible_positions_close_the_ring() {
+        // A misaligned tail: rejected before delivery or any head advance.
+        let (producer, mut consumer) = command_ring(1024).unwrap();
+        let words = producer.words_for_test().unwrap();
+        words.corrupt(0, (7u64 << 32) | 8);
+        words.set_positions(9, 0);
+        assert_eq!(consumer.read(), Err(RingError::Malformed { position: 0 }));
+        assert!(producer.is_closed());
+
+        // A head ahead of the tail: the producer closes the ring for good,
+        // and restoring the head does not reopen it.
+        let (mut producer, _consumer) = command_ring(1024).unwrap();
+        let words = producer.words_for_test().unwrap();
+        words.set_positions(0, 8);
+        assert_eq!(producer.write(1, b"x"), Err(RingError::Closed));
+        let words = producer.words_for_test().unwrap();
+        words.set_positions(0, 0);
+        assert_eq!(producer.write(1, b"x"), Err(RingError::Closed));
+        assert!(producer.is_closed());
     }
 
     #[test]
