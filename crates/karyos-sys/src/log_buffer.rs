@@ -160,6 +160,9 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     /// (`quantstratum-docs: karyos/design/claim-deadline.md`).
     claim_record: AtomicU64,
     claim_serial: AtomicU64,
+    /// Test hook: an injected deadline fault (feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    deadline_fault: AtomicBool,
 }
 
 impl LogBuffer<HeapTerms> {
@@ -259,6 +262,8 @@ impl<T: TermBytes> LogBuffer<T> {
             conductor_taken: AtomicBool::new(false),
             claim_record: AtomicU64::new(0),
             claim_serial: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            deadline_fault: AtomicBool::new(false),
         })
     }
 
@@ -402,6 +407,18 @@ impl<T: TermBytes> LogBuffer<T> {
     /// Rewrites the claim record; only the publication calls it.
     fn write_record(&self, value: u64) {
         write_claim_record(&self.claim_serial, &self.claim_record, value);
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl<T: TermBytes> LogBuffer<T> {
+    /// Test hook (feature `test-hooks`): makes every later deadline call of
+    /// this buffer's conductor return an injected error before it reads the
+    /// claim record or touches any word, without changing the protocol
+    /// state. Only for tests of error handling in dependent crates.
+    #[doc(hidden)]
+    pub fn inject_deadline_fault(&self) {
+        self.deadline_fault.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1833,7 +1850,26 @@ impl<O: BufferOwner> Conductor<O> {
     /// Returns [`SysError::CorruptTerm`] for a record outside the term and
     /// errors from the descriptor protocol.
     pub fn abort_expired_claims(&mut self, now: u64) -> Result<ClaimDeadline, SysError> {
+        self.abort_expired_claims_with(&mut || now)
+    }
+
+    /// [`Conductor::abort_expired_claims`] reading the time from `clock`
+    /// only after the claim record and the reserved head show an admitted
+    /// claim, so its first observation is dated at or after its admission
+    /// (`quantstratum-docs: karyos/design/client-claims.md`). The clock is not called otherwise.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::abort_expired_claims`].
+    pub fn abort_expired_claims_with(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+    ) -> Result<ClaimDeadline, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        #[cfg(feature = "test-hooks")]
+        if buffer.deadline_fault.load(Ordering::Relaxed) {
+            return Err(SysError::ResourcesUnavailable);
+        }
         let Some((serial, record)) = read_claim_record(&buffer.claim_serial, &buffer.claim_record)
         else {
             self.observed = None;
@@ -1861,6 +1897,8 @@ impl<O: BufferOwner> Conductor<O> {
             self.observed = None;
             return Ok(ClaimDeadline::Idle);
         }
+        // Admitted: only now is the time read.
+        let now = clock();
         let first_seen = match self.observed {
             Some((seen, first_seen)) if seen == serial => first_seen,
             _ => {
