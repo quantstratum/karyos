@@ -198,6 +198,7 @@ name = "karyos-trace"
 version = "0.1.0"
 dependencies = [
  "karyos-protocol",
+ "thiserror",
 ]
 
 [[package]]
