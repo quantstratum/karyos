@@ -11,11 +11,11 @@ use super::{
     HEADER_LENGTH, LayoutError, LogBuffer, Lookup, SysError, TermBytes, write_fragments,
     write_header_tail,
 };
-use crate::frame::{Flags, FrameType, Word0};
+use crate::frame::{FRAME_ALIGNMENT, Flags, FrameType, PROTOCOL_VERSION, Word0};
 use crate::loan::{LoanOutcome, release_loan, rotate_to, take_loan};
 use crate::publication::{
-    abort_block, acquire_publisher_slot, commit_block, mark_block, reissue_from,
-    release_publisher_slot,
+    ABORTING_MARKER, abort_block, acquire_publisher_slot, commit_block, mark_block, observe_block,
+    reissue_from, release_publisher_slot,
 };
 use crate::slot::{Descriptor, SlotState};
 use crate::term::TermCount;
@@ -65,6 +65,43 @@ struct Pending {
     aborted: Word0,
 }
 
+/// Result of [`ConcurrentPublication::offer`]. Unlike the exclusive
+/// [`AppendOutcome`], a concurrent offer can lose its block to the
+/// commit-deadline abort (`quantstratum-docs: karyos/design/concurrent-deadline.md`): pre-1.0,
+/// `offer` returns this type instead of `AppendOutcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "back pressure, aborts and admin actions must be handled"]
+pub enum ConcurrentOfferOutcome {
+    /// The message was published; its block starts at `position`.
+    Appended {
+        /// Stream position of the block.
+        position: u64,
+    },
+    /// The message was not published: the conductor's deadline abort won
+    /// the block reserved at `position` on the buffer's lane, before its
+    /// mark or its commit. Readers skip it; the message may be offered
+    /// again.
+    Aborted {
+        /// Stream position of the reserved block.
+        position: u64,
+    },
+    /// The flow-control limit does not admit the reservation; retry later.
+    BackPressured,
+    /// The handle waits for a later term, or its reservation crossed or
+    /// landed past the term end; retry later.
+    AdminAction,
+}
+
+impl From<AppendOutcome> for ConcurrentOfferOutcome {
+    fn from(outcome: AppendOutcome) -> Self {
+        match outcome {
+            AppendOutcome::Appended { position } => Self::Appended { position },
+            AppendOutcome::BackPressured => Self::BackPressured,
+            AppendOutcome::AdminAction => Self::AdminAction,
+        }
+    }
+}
+
 /// Result of [`ConcurrentPublication::try_claim`].
 #[derive(Debug)]
 #[must_use = "back pressure and admin actions must be handled"]
@@ -76,6 +113,13 @@ pub enum ConcurrentClaimOutcome<'a, O: BufferOwner> {
     /// The handle waits for a later term, or its reservation crossed or
     /// landed past the term end; retry later.
     AdminAction,
+    /// The block reserved at `position` was aborted by the conductor's
+    /// deadline before this call marked it: nothing was written. Pre-1.0
+    /// addition (`quantstratum-docs: karyos/design/concurrent-deadline.md`).
+    Aborted {
+        /// Stream position of the reserved block.
+        position: u64,
+    },
 }
 
 /// A claimed block of a concurrent handle: it mutably borrows the handle;
@@ -235,9 +279,10 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     }
 
     /// Offers one message with one reservation attempt (SPEC.md §4,
-    /// concurrent publication): `Appended` once committed, `BackPressured`
-    /// past the limit, `AdminAction` when the handle waits for a later term
-    /// or its reservation crossed or landed past the term end (the crossing
+    /// concurrent publication): `Appended` once committed, `Aborted` when
+    /// the conductor's deadline abort won its block, `BackPressured` past
+    /// the limit, `AdminAction` when the handle waits for a later term or
+    /// its reservation crossed or landed past the term end (the crossing
     /// owner first commits a `PAD` over the remainder it owns).
     ///
     /// # Errors
@@ -245,12 +290,23 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// Returns [`SysError::EmptyMessage`], layout errors for messages that
     /// are too large, and errors from the descriptor protocol. A validation
     /// error (empty or too large) reserves nothing; an error after the
-    /// reservation means another party marked a block this handle owns.
+    /// reservation means a word this handle owns holds something no legal
+    /// history writes.
     pub fn offer(
         &mut self,
         payload: &[u8],
         options: AppendOptions,
-    ) -> Result<AppendOutcome, SysError> {
+    ) -> Result<ConcurrentOfferOutcome, SysError> {
+        self.offer_pausing(payload, options, &mut |_| {})
+    }
+
+    /// [`ConcurrentPublication::offer`] with test pause points.
+    pub(super) fn offer_pausing(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        pause: &mut dyn FnMut(WriterPause),
+    ) -> Result<ConcurrentOfferOutcome, SysError> {
         self.resolve_claim();
         if payload.is_empty() {
             return Err(SysError::EmptyMessage);
@@ -272,27 +328,32 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         };
         FragmentPlan::check_message(length, max)?;
         let reserved = plan.reserved(length)?;
-        let (count, slot, start) = match self.reserve(reserved)? {
+        let (count, slot, start) = match self.reserve(reserved, pause)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
-            Reserved::Outcome(outcome) => return Ok(outcome),
+            Reserved::Outcome(outcome) => return Ok(outcome.into()),
         };
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        // The block `[start, start + reserved)` is this handle's alone.
+        let position = buffer.position(count, start);
+        // The block `[start, start + reserved)` is this handle's alone,
+        // unless the deadline's span walk takes its first word first.
         let fragments = plan.fragments(length);
         let first_flags = Flags::new(true, fragments == 1, false, ext, lane);
         let reserved_word = Word0::new(-(reserved as i32), first_flags, FrameType::Data);
         // SAFETY: write loan held; `start` is the block's first frame start.
         let word = unsafe { buffer.regions.word0(slot, start) };
+        pause(WriterPause::Mark);
         if !mark_block(word, reserved_word) {
-            return Err(foreign_mark(start));
+            // Nothing written.
+            span_taken(buffer, word, start)?;
+            return Ok(ConcurrentOfferOutcome::Aborted { position });
         }
         let first = write_fragments(buffer, slot, count, start, payload, &plan, options);
+        pause(WriterPause::Commit);
         if !commit_block(word, reserved_word, first) {
-            return Err(foreign_mark(start));
+            lost_commit(buffer, word, start, reserved)?;
+            return Ok(ConcurrentOfferOutcome::Aborted { position });
         }
-        Ok(AppendOutcome::Appended {
-            position: buffer.position(count, start),
-        })
+        Ok(ConcurrentOfferOutcome::Appended { position })
     }
 
     /// Claims one unfragmented block of `length` payload bytes with one
@@ -306,12 +367,23 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// `max_message_length`, one fragment or `max_reserved`, and
     /// [`SysError::MaxPositionExceeded`] at the last term. A validation
     /// error reserves nothing (a forgotten claim is still resolved first);
-    /// an error after the reservation means another party marked a block
-    /// this handle owns.
+    /// an error after the reservation means a word this handle owns holds
+    /// something no legal history writes. `Aborted` means the conductor's
+    /// deadline abort took the block before its mark: nothing was written.
     pub fn try_claim(
         &mut self,
         length: u32,
         options: AppendOptions,
+    ) -> Result<ConcurrentClaimOutcome<'_, O>, SysError> {
+        self.try_claim_pausing(length, options, &mut |_| {})
+    }
+
+    /// [`ConcurrentPublication::try_claim`] with test pause points.
+    pub(super) fn try_claim_pausing(
+        &mut self,
+        length: u32,
+        options: AppendOptions,
+        pause: &mut dyn FnMut(WriterPause),
     ) -> Result<ConcurrentClaimOutcome<'_, O>, SysError> {
         self.resolve_claim();
         if length == 0 {
@@ -333,7 +405,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         if reserved > buffer.config.max_reserved {
             return Err(LayoutError::MessageTooLarge { length, max }.into());
         }
-        let (count, slot, start) = match self.reserve(reserved)? {
+        let (count, slot, start) = match self.reserve(reserved, pause)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
             Reserved::Outcome(AppendOutcome::BackPressured) => {
                 return Ok(ConcurrentClaimOutcome::BackPressured);
@@ -345,8 +417,12 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         let reserved_word = Word0::new(-(reserved as i32), flags, FrameType::Data);
         // SAFETY: write loan held; `start` is the block's first frame start.
         let word = unsafe { buffer.regions.word0(slot, start) };
+        pause(WriterPause::Mark);
         if !mark_block(word, reserved_word) {
-            return Err(foreign_mark(start));
+            span_taken(buffer, word, start)?;
+            return Ok(ConcurrentClaimOutcome::Aborted {
+                position: buffer.position(count, start),
+            });
         }
         write_header_tail(buffer, slot, count, start, options.reserved_value);
         if let Some(extension) = &options.extension {
@@ -396,7 +472,11 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// One reservation attempt of `reserved` bytes: catch up, check the
     /// tail and the limit, one `fetch_add`. A crossing commits the `PAD`
     /// this handle owns; a reservation past the end holds nothing.
-    fn reserve(&mut self, reserved: u32) -> Result<Reserved, SysError> {
+    fn reserve(
+        &mut self,
+        reserved: u32,
+        pause: &mut dyn FnMut(WriterPause),
+    ) -> Result<Reserved, SysError> {
         // At most one rotation attempt per call (SPEC.md §4).
         let mut help = true;
         if !self.catch_up_helping(&mut help)? {
@@ -452,12 +532,17 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             // SAFETY: the handle's write loan on `count` in `slot` is held;
             // `start` is the frame start of the remainder it owns.
             let word = unsafe { buffer.regions.word0(slot, start) };
-            if !mark_block(word, reserved_pad) {
-                return Err(foreign_mark(start));
-            }
-            write_header_tail(buffer, slot, count, start, 0);
-            if !commit_block(word, reserved_pad, pad) {
-                return Err(foreign_mark(start));
+            // A remainder the deadline aborted holds no message: the
+            // crossing still ends this handle's term either way.
+            pause(WriterPause::PadMark);
+            if mark_block(word, reserved_pad) {
+                write_header_tail(buffer, slot, count, start, 0);
+                pause(WriterPause::PadCommit);
+                if !commit_block(word, reserved_pad, pad) {
+                    lost_commit(buffer, word, start, extent)?;
+                }
+            } else {
+                span_taken(buffer, word, start)?;
             }
             self.mark_crossed();
             self.help_rotation(count, &mut help)?;
@@ -654,6 +739,16 @@ impl<O: BufferOwner> Drop for ConcurrentClaim<'_, O> {
     }
 }
 
+/// Where a test pauses a concurrent writer, after its `fetch_add`: before
+/// the named compare-exchange of its block or of its crossing `PAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriterPause {
+    Mark,
+    Commit,
+    PadMark,
+    PadCommit,
+}
+
 /// Result of one reservation attempt.
 enum Reserved {
     /// `[start, start + reserved)` in `slot`'s term `count` is this
@@ -667,12 +762,54 @@ enum Reserved {
     Outcome(AppendOutcome),
 }
 
-/// A marked or terminal word where this handle's reservation starts:
-/// another party wrote a block this handle owns, which no legal history
-/// produces while nothing aborts concurrent blocks (batch a).
-fn foreign_mark(offset: u32) -> SysError {
-    SysError::CorruptTerm {
-        offset,
-        reason: "concurrent reservation already marked",
+/// A failed mark at `start`: the deadline's span walk took the word first
+/// (`quantstratum-docs: karyos/design/concurrent-deadline.md`), so it holds the exact aborting
+/// marker or, once the walk ended, a valid `ABORTED` word starting there.
+/// Anything else is a broken invariant.
+fn span_taken<T: TermBytes>(
+    buffer: &LogBuffer<T>,
+    word: &core::sync::atomic::AtomicU64,
+    start: u32,
+) -> Result<(), SysError> {
+    let found = observe_block(word);
+    let aborted = Word0::unpack(found).is_ok_and(|word0| {
+        let extent = word0.frame_length();
+        word0.version() == PROTOCOL_VERSION
+            && word0.frame_type_code() == FrameType::Aborted.code()
+            && word0.flags() == Flags::new(false, false, false, false, buffer.config.lane)
+            && extent > 0
+            && (extent as u32).is_multiple_of(FRAME_ALIGNMENT)
+            && extent as u32 <= buffer.term_length - start
+    });
+    if found == ABORTING_MARKER.pack() || aborted {
+        Ok(())
+    } else {
+        Err(SysError::CorruptTerm {
+            offset: start,
+            reason: "concurrent reservation already marked",
+        })
+    }
+}
+
+/// A lost commit of the marked block of `extent` bytes at `start`: the
+/// deadline abort won, so the word is exactly its `ABORTED` word.
+fn lost_commit<T: TermBytes>(
+    buffer: &LogBuffer<T>,
+    word: &core::sync::atomic::AtomicU64,
+    start: u32,
+    extent: u32,
+) -> Result<(), SysError> {
+    let aborted = Word0::new(
+        extent as i32,
+        Flags::new(false, false, false, false, buffer.config.lane),
+        FrameType::Aborted,
+    );
+    if observe_block(word) == aborted.pack() {
+        Ok(())
+    } else {
+        Err(SysError::CorruptTerm {
+            offset: start,
+            reason: "concurrent commit lost to a foreign word",
+        })
     }
 }

@@ -8,7 +8,7 @@
 //! Values are stored little-endian so the bytes in memory match the wire
 //! layout on every target.
 
-use crate::frame::Word0;
+use crate::frame::{Flags, FrameType, Lane, PROTOCOL_VERSION, Word0};
 use crate::sync::{AtomicU64, Ordering, fence};
 
 /// Stores an interior fragment's word 0. It becomes visible to readers
@@ -143,13 +143,13 @@ pub fn read_claim_record(serial: &AtomicU64, record: &AtomicU64) -> Option<(u64,
 /// bits, type DATA, BEGIN and END, the lane, and a length of minus the
 /// extent. EOS and EXT are the claim's choice.
 #[must_use]
-fn is_reserved_claim(raw: u64, extent: u32, lane: crate::frame::Lane) -> bool {
+fn is_reserved_claim(raw: u64, extent: u32, lane: Lane) -> bool {
     let Ok(word) = Word0::unpack(u64::from_le(raw)) else {
         return false;
     };
     let flags = word.flags();
-    word.version() == crate::frame::PROTOCOL_VERSION
-        && word.frame_type_code() == crate::frame::FrameType::Data.code()
+    word.version() == PROTOCOL_VERSION
+        && word.frame_type_code() == FrameType::Data.code()
         && flags.begin()
         && flags.end()
         && flags.lane() == lane
@@ -163,12 +163,7 @@ fn is_reserved_claim(raw: u64, extent: u32, lane: crate::frame::Lane) -> bool {
 /// already a valid reserved word of `extent` on `lane`, from exactly that
 /// observed word to `aborted`. Returns whether this call won the abort.
 #[inline]
-pub fn deadline_abort(
-    first: &AtomicU64,
-    extent: u32,
-    lane: crate::frame::Lane,
-    aborted: Word0,
-) -> bool {
+pub fn deadline_abort(first: &AtomicU64, extent: u32, lane: Lane, aborted: Word0) -> bool {
     let target = aborted.pack().to_le();
     let mut current = first.load(Ordering::Acquire);
     if current == 0 {
@@ -221,4 +216,69 @@ pub fn reissue_from(previous: Option<u32>, active: u32, crossed: impl FnOnce() -
         Some(t_close) if active <= t_close && crossed() => t_close.wrapping_add(1),
         _ => active,
     }
+}
+
+/// The aborting marker of the span walk (`quantstratum-docs: karyos/design/concurrent-deadline.md`):
+/// type `ABORTED`, length `-32`, no flags. No reserved word equals it
+/// (those are `DATA` or `PAD`), and readers wait at it as at any negative
+/// word.
+pub const ABORTING_MARKER: Word0 = Word0::new(-32, Flags::NONE, FrameType::Aborted);
+
+/// Takes one 32-byte boundary of a zero span for the span walk: compare-
+/// exchanges it from 0 to [`ABORTING_MARKER`]. Fails with the word found
+/// (decoded) when a writer marked or committed there first; the walk then
+/// stores nothing there.
+#[inline]
+pub fn take_span_word(word: &AtomicU64) -> Result<(), u64> {
+    word.compare_exchange(
+        0,
+        ABORTING_MARKER.pack().to_le(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    )
+    .map(|_| ())
+    .map_err(u64::from_le)
+}
+
+/// Ends a span walk: stores the `ABORTED` word covering the owned span over
+/// the marker at its start with `Release`, after every marker of the span.
+#[inline]
+pub fn end_span(first: &AtomicU64, aborted: Word0) {
+    publish_block(first, aborted);
+}
+
+/// The extent of a concurrent block's valid reserved word `raw` (decoded)
+/// at `offset` (`quantstratum-docs: karyos/design/concurrent-deadline.md`, aborting a marked
+/// block): protocol version, no reserved flag bits, type `DATA` with BEGIN
+/// (a message or claim) or a `PAD` without flags ending exactly at the
+/// term end, the buffer's lane, and a negative length that is a multiple of
+/// 32, at most `max_reserved` and fits in the term from `offset`. `None`
+/// for anything else, the aborting marker included.
+#[must_use]
+pub fn reserved_extent(
+    raw: u64,
+    offset: u32,
+    term_length: u32,
+    max_reserved: u32,
+    lane: Lane,
+) -> Option<u32> {
+    let word = Word0::unpack(raw).ok()?;
+    let length = word.frame_length();
+    if word.version() != PROTOCOL_VERSION || length >= 0 {
+        return None;
+    }
+    let extent = length.unsigned_abs();
+    let flags = word.flags();
+    let fits = extent.is_multiple_of(32)
+        && extent <= max_reserved
+        && offset < term_length
+        && extent <= term_length - offset;
+    let shape = match FrameType::try_from_code(word.frame_type_code()) {
+        Ok(FrameType::Data) => flags.begin() && flags.lane() == lane,
+        Ok(FrameType::Pad) => {
+            flags == Flags::new(false, false, false, false, lane) && extent == term_length - offset
+        }
+        _ => false,
+    };
+    (fits && shape).then_some(extent)
 }

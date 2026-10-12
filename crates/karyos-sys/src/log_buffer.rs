@@ -47,11 +47,14 @@ use crate::term_bytes::sealed::{Access as _, Token};
 use crate::term_bytes::{HeapTerms, SharedTerms, TermBytes};
 
 mod concurrent;
+mod deadline;
 
 #[cfg(test)]
 use crate::loan::{Rotation, rotate_to};
 
-pub use concurrent::{ConcurrentClaim, ConcurrentClaimOutcome, ConcurrentPublication};
+pub use concurrent::{
+    ConcurrentClaim, ConcurrentClaimOutcome, ConcurrentOfferOutcome, ConcurrentPublication,
+};
 
 mod sealed {
     /// Prevents implementations of [`super::BufferOwner`] outside this
@@ -665,10 +668,12 @@ fn issue_conductor<O: BufferOwner>(owner: O) -> Option<Conductor<O>> {
         .conductor_taken
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
+    let publishers = owner.first_subscriber_cell();
     Some(Conductor {
         buffer: owner,
         quarantined: Vec::new(),
         observed: None,
+        deadlines: deadline::ConcurrentDeadlines::new(publishers),
     })
 }
 
@@ -2013,6 +2018,8 @@ pub struct Conductor<O: BufferOwner> {
     quarantined: Vec<u8>,
     /// The claim being timed: `(serial, first_seen)`.
     observed: Option<(u64, u64)>,
+    /// The concurrent deadline state (`quantstratum-docs: karyos/design/concurrent-deadline.md`).
+    deadlines: deadline::ConcurrentDeadlines,
 }
 
 /// Every outcome of one [`Conductor::service_deadlines`] call
@@ -2147,10 +2154,10 @@ impl<O: BufferOwner> Conductor<O> {
     /// single claim of [`Conductor::abort_expired_claims_with`]; its
     /// `waiting` is set exactly when that result is `Waiting`.
     ///
-    /// Concurrent buffers are not served yet: until the concurrent span
-    /// walk lands (batch c2), the call returns an empty report without
-    /// reading the clock, and no concurrent block is aborted at its
-    /// deadline.
+    /// For a concurrent buffer it serves every expired marked block,
+    /// advances the span walk and scans under fixed budgets
+    /// (`quantstratum-docs: karyos/design/concurrent-deadline.md`, Work per call and bounds);
+    /// `waiting` is set while an observation or a span walk remains.
     ///
     /// # Errors
     ///
@@ -2169,8 +2176,13 @@ impl<O: BufferOwner> Conductor<O> {
             });
         }
         if self.buffer.concurrent() {
-            // Batch c2: the concurrent span walk.
-            return Ok(report);
+            let buffer: &LogBuffer<O::Terms> = &self.buffer;
+            let result = self.deadlines.service(buffer, clock, &mut report);
+            report.waiting = self.deadlines.waiting();
+            return match result {
+                Ok(()) => Ok(report),
+                Err(error) => Err(DeadlineError { report, error }),
+            };
         }
         match self.exclusive_deadline(clock) {
             Ok(ClaimDeadline::Idle) => {}
@@ -2264,6 +2276,7 @@ impl<O: BufferOwner> Conductor<O> {
         ConductorContext {
             buffer: &self.buffer,
             quarantined: &mut self.quarantined,
+            deadlines: &mut self.deadlines,
         }
     }
 }
@@ -2272,6 +2285,7 @@ impl<O: BufferOwner> Conductor<O> {
 struct ConductorContext<'a, T: TermBytes> {
     buffer: &'a LogBuffer<T>,
     quarantined: &'a mut Vec<u8>,
+    deadlines: &'a mut deadline::ConcurrentDeadlines,
 }
 
 impl<T: TermBytes> ConductorContext<'_, T> {
@@ -2416,6 +2430,8 @@ impl<T: TermBytes> ConductorContext<'_, T> {
                 continue;
             }
             self.quarantined.retain(|s| *s != slot);
+            // The deadline service keeps nothing of a term it cannot inspect.
+            self.deadlines.forget_slot(slot);
             let cleaning = begin_cleaning(word, reclaiming)?;
             // SAFETY: this conductor moved the slot to CLEANING after a
             // complete scan of every registry cell found no loan for its term.
