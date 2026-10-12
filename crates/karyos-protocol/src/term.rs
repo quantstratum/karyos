@@ -579,6 +579,14 @@ impl<'a> TermScanner<'a> {
                     Some(_) => {}
                 }
             }
+            if frame_length == header_length && !(flags.begin() && flags.end()) {
+                // Only a single-fragment frame may be header-only (a
+                // heartbeat); fragments of a message always carry payload.
+                return Err(invalid(
+                    offset,
+                    "empty fragment in a multi-fragment message",
+                ));
+            }
             length = length
                 .checked_add(frame_length - header_length)
                 .ok_or_else(|| invalid(offset, "message length overflow"))?;
@@ -1174,6 +1182,30 @@ mod tests {
         let mut scan = scanner(&term);
         assert_eq!(scan.next_item(), Ok(ScanItem::Heartbeat { offset: 0 }));
         assert_eq!(scan.offset(), 96);
+    }
+
+    #[test]
+    fn header_only_fragments_cannot_form_a_message() {
+        let mut term = vec![0u8; TERM as usize];
+        for (offset, begin, end) in [(0u32, true, false), (32, false, true)] {
+            FrameHeader {
+                word0: Word0::new(
+                    32,
+                    Flags::new(begin, end, false, false, Lane::ZERO),
+                    FrameType::Data,
+                ),
+                term_offset: offset as i32,
+                session_id: IDENTITY.session_id,
+                stream_id: IDENTITY.stream_id,
+                term_id: IDENTITY.term_id,
+                reserved_value: 0,
+            }
+            .encode(&mut term[offset as usize..])
+            .unwrap();
+        }
+        let mut scan = scanner(&term);
+        assert!(scan.next_item().is_err());
+        assert_eq!(scan.offset(), 0);
     }
 
     #[test]
