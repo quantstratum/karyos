@@ -214,7 +214,19 @@ impl<'a> TermAppender<'a> {
             let frame_reserved = align_frame(frame_length)?;
             let region = slice_mut(self.term, offset, frame_reserved)?;
             region.fill(0);
-            header.encode(region)?;
+            let mut header_bytes = [0u8; HEADER_LENGTH as usize];
+            header.encode(&mut header_bytes)?;
+            // Bytes 0..8 are word 0. Interior fragments get theirs now; the
+            // first fragment's word 0 is the decision word and is written
+            // only after the whole block (it is never published early).
+            let from = if index == 0 { 8 } else { 0 };
+            region
+                .get_mut(from..HEADER_LENGTH as usize)
+                .ok_or(ProtocolError::BufferTooShort {
+                    required: HEADER_LENGTH as usize,
+                    available: 0,
+                })?
+                .copy_from_slice(header_bytes.get(from..).unwrap_or(&[]));
             if let Some(bytes) = &extension {
                 tail_mut(region, HEADER_LENGTH)?
                     .get_mut(..bytes.len())
@@ -232,15 +244,7 @@ impl<'a> TermAppender<'a> {
                 })?
                 .copy_from_slice(body);
             if index == 0 {
-                // The decision word is written last, after every fragment.
                 first_word0 = Some(word0);
-                region
-                    .get_mut(..8)
-                    .ok_or(ProtocolError::BufferTooShort {
-                        required: 8,
-                        available: 0,
-                    })?
-                    .fill(0);
             }
             offset += frame_reserved;
         }
@@ -513,6 +517,7 @@ impl<'a> TermScanner<'a> {
         let mut offset = start;
         let mut length: u32 = 0;
         let mut first: Option<FrameHeader> = None;
+        let mut first_extension: Option<&[u8]> = None;
         let end_of_stream;
         loop {
             let header = self.check_header(offset, FrameType::Data)?;
@@ -538,6 +543,15 @@ impl<'a> TermScanner<'a> {
             if flags.ext() {
                 let ext = slice(self.term, offset + HEADER_LENGTH, EXTENSION_LENGTH)?;
                 TraceExtension::decode(ext).map_err(|_| invalid(offset, "invalid extension"))?;
+                // Every fragment of a traced message carries the same,
+                // immutable extension.
+                match first_extension {
+                    None => first_extension = Some(ext),
+                    Some(first) if first != ext => {
+                        return Err(invalid(offset, "fragments disagree on the trace extension"));
+                    }
+                    Some(_) => {}
+                }
             }
             length = length
                 .checked_add(frame_length - header_length)
@@ -861,6 +875,52 @@ mod tests {
             assert_eq!(app.tail(), 0);
         }
         assert!(term.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn traced_fragments_must_agree() {
+        let mut base = vec![0u8; TERM as usize];
+        let options = AppendOptions {
+            extension: Some(TraceExtension {
+                message_id: 99,
+                ..TraceExtension::default()
+            }),
+            ..AppendOptions::default()
+        };
+        let _ = appender(&mut base)
+            .append(&payload(3000, 2), options)
+            .unwrap();
+        assert!(matches!(
+            scanner(&base).next_item(),
+            Ok(ScanItem::Message(_))
+        ));
+        // Second fragment without EXT, or with another message id.
+        let mut cleared = base.clone();
+        cleared[1408 + 5] &= !0x08;
+        assert!(scanner(&cleared).next_item().is_err());
+        let mut changed = base.clone();
+        changed[1408 + 32 + 40] = 100;
+        assert!(scanner(&changed).next_item().is_err());
+    }
+
+    #[test]
+    fn invalid_extension_on_a_full_term_does_not_pad() {
+        let mut term = vec![0u8; TERM as usize];
+        let mut app = appender(&mut term);
+        let filler = payload(8000, 3);
+        while app.tail() + 8192 <= TERM - 4096 {
+            let _ = app.append(&filler, AppendOptions::default()).unwrap();
+        }
+        let tail = app.tail();
+        let options = AppendOptions {
+            extension: Some(TraceExtension {
+                extension_flags: 1,
+                ..TraceExtension::default()
+            }),
+            ..AppendOptions::default()
+        };
+        assert!(app.append(&payload(7000, 3), options).is_err());
+        assert_eq!(app.tail(), tail);
     }
 
     #[test]
