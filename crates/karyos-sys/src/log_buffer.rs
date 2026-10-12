@@ -930,8 +930,7 @@ impl<'a> Conductor<'a> {
     /// Floor and limit from one head snapshot; the floor is published first.
     fn publish_floor_and_limit(&self) {
         let buffer = self.buffer;
-        let term = u64::from(buffer.term_length);
-        let window = term / 2;
+        let window = u64::from(buffer.term_length / 2);
         let head = buffer.reserved_head.load(Ordering::Acquire);
         let mut bound = None::<u64>;
         for cell in buffer.cells.iter().skip(1) {
@@ -940,14 +939,20 @@ impl<'a> Conductor<'a> {
                 bound = Some(bound.map_or(position, |b| b.min(position)));
             }
         }
-        let required = bound.unwrap_or(head);
-        // One term of history behind the head, never before position 0.
-        let history = head.max(term) - term;
-        let floor = required
-            .min(history)
-            .max(buffer.floor.load(Ordering::Relaxed));
+        // SPEC.md §4 retention floor: the minimum required position, or,
+        // without required participants, `head_snapshot - window` bounded
+        // below by position 0 through an explicit comparison.
+        let (floor, base) = match bound {
+            Some(required) => (required, required),
+            // `max` bounds the subtraction at the publication start without
+            // wrapping or saturating arithmetic.
+            None => (head.max(window) - window, head),
+        };
+        // Neither the floor nor the limit ever decreases.
+        let floor = floor.max(buffer.floor.load(Ordering::Relaxed));
+        let limit = (base + window).max(buffer.limit.load(Ordering::Relaxed));
         buffer.floor.store(floor, Ordering::Release);
-        buffer.limit.store(required + window, Ordering::Release);
+        buffer.limit.store(limit, Ordering::Release);
     }
 
     /// Completes a full term's rotation the publication left half-done.
@@ -1144,7 +1149,7 @@ mod tests {
         let mut subscription = conductor.subscribe(Role::Required).unwrap();
         let mut publication = buffer.publication().unwrap().unwrap();
         let mut expected = 0u32;
-        let total = 1200u32;
+        let total: u32 = if cfg!(miri) { 160 } else { 1200 };
         for sequence in 0..total {
             let data = message(sequence);
             let _ = append_retrying(&mut publication, &mut conductor, &data, || {});
@@ -1164,7 +1169,8 @@ mod tests {
             }
         }
         // Many terms went through five slots: slots were reused.
-        assert!(buffer.active_count.load(Ordering::Acquire) > 10);
+        let minimum = if cfg!(miri) { 2 } else { 10 };
+        assert!(buffer.active_count.load(Ordering::Acquire) > minimum);
     }
 
     #[test]
@@ -1208,7 +1214,8 @@ mod tests {
         let mut conductor = buffer.conductor().unwrap();
         let mut lagging = conductor.subscribe(Role::Optional).unwrap();
         let mut publication = buffer.publication().unwrap().unwrap();
-        for sequence in 0..300 {
+        let messages = if cfg!(miri) { 140 } else { 300 };
+        for sequence in 0..messages {
             let _ = append_retrying(&mut publication, &mut conductor, &message(sequence), || {});
             let _ = conductor.duty_cycle().unwrap();
         }
@@ -1421,27 +1428,39 @@ mod tests {
         assert!(buffer.conductor().is_none());
     }
 
+    fn sized_message(sequence: u32, len: usize) -> Vec<u8> {
+        let mut data: Vec<u8> = (0..len).map(|i| (i as u8) ^ (sequence as u8)).collect();
+        data[..4].copy_from_slice(&sequence.to_le_bytes());
+        data
+    }
+
     /// Publisher, conductor, a required and an optional subscriber on four
-    /// threads; Miri checks the loan, cleaning and reuse orderings.
+    /// threads, with messages large enough to rotate through every slot and
+    /// reuse cleaned ones, also under Miri, which checks the loan, cleaning
+    /// and reuse orderings.
     #[test]
     fn concurrent_publication_reuse_and_subscribers() {
-        let total: u32 = if cfg!(miri) { 60 } else { 3000 };
+        let (total, len): (u32, usize) = if cfg!(miri) { (70, 7000) } else { (3000, 3000) };
         let buffer = LogBuffer::new(config(3, 2)).unwrap();
-        let done = AtomicBool::new(false);
+        let slots = u64::from(buffer.slots);
+        let published = AtomicBool::new(false);
+        let finished = AtomicBool::new(false);
         let mut conductor = buffer.conductor().unwrap();
         let mut required = conductor.subscribe(Role::Required).unwrap();
         let mut optional = conductor.subscribe(Role::Optional).unwrap();
         let mut publication = buffer.publication().unwrap().unwrap();
         std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while !done.load(Ordering::Acquire) {
-                    let _ = conductor.duty_cycle().unwrap();
+            let conductor_thread = scope.spawn(|| {
+                let mut cleaned = 0u32;
+                while !finished.load(Ordering::Acquire) {
+                    cleaned += conductor.duty_cycle().unwrap().cleaned;
                     std::thread::yield_now();
                 }
+                cleaned
             });
-            scope.spawn(move || {
+            scope.spawn(|| {
                 for sequence in 0..total {
-                    let data = message(sequence);
+                    let data = sized_message(sequence, len);
                     loop {
                         match publication.append(&data, AppendOptions::default()).unwrap() {
                             AppendOutcome::Appended { .. } => break,
@@ -1449,6 +1468,7 @@ mod tests {
                         }
                     }
                 }
+                published.store(true, Ordering::Release);
             });
             let required_thread = scope.spawn(move || {
                 let mut out = vec![0u8; 8192];
@@ -1456,7 +1476,7 @@ mod tests {
                 while expected < total {
                     match required.poll(&mut out).unwrap() {
                         PollOutcome::Message { length, .. } => {
-                            assert_eq!(&out[..length as usize], &message(expected)[..]);
+                            assert_eq!(&out[..length as usize], &sized_message(expected, len)[..]);
                             expected += 1;
                         }
                         PollOutcome::Pending => std::thread::yield_now(),
@@ -1465,32 +1485,48 @@ mod tests {
                 }
                 expected
             });
+            let buffer = &buffer;
+            let published = &published;
             let optional_thread = scope.spawn(move || {
                 let mut out = vec![0u8; 8192];
                 let mut last = None::<u32>;
-                let mut seen = 0u32;
+                let (mut seen, mut lost) = (0u32, 0u64);
                 loop {
                     match optional.poll(&mut out).unwrap() {
                         PollOutcome::Message { length, .. } => {
                             let sequence = u32::from_le_bytes(out[..4].try_into().unwrap());
-                            assert_eq!(&out[..length as usize], &message(sequence)[..]);
+                            assert_eq!(&out[..length as usize], &sized_message(sequence, len)[..]);
                             if let Some(previous) = last {
                                 assert!(sequence > previous);
                             }
                             last = Some(sequence);
                             seen += 1;
-                            if sequence + 1 == total {
-                                break seen;
-                            }
                         }
-                        PollOutcome::Overrun { .. } => {}
-                        PollOutcome::Pending => std::thread::yield_now(),
+                        PollOutcome::Overrun { from, to } => lost += to - from,
+                        PollOutcome::Pending => {
+                            // Done once everything is published and the
+                            // cursor reached the final head; receiving the
+                            // last message is not required (it may be lost).
+                            if published.load(Ordering::Acquire)
+                                && optional.position()
+                                    >= buffer.reserved_head.load(Ordering::Acquire)
+                            {
+                                break (seen, lost);
+                            }
+                            std::thread::yield_now();
+                        }
                     }
                 }
             });
             assert_eq!(required_thread.join().unwrap(), total);
-            assert!(optional_thread.join().unwrap() > 0);
-            done.store(true, Ordering::Release);
+            let (seen, lost) = optional_thread.join().unwrap();
+            assert!(seen > 0 || lost > 0);
+            finished.store(true, Ordering::Release);
+            let cleaned = conductor_thread.join().unwrap();
+            // Slots were cleaned and the term count passed the slot count, so
+            // cleaned slots were rewritten while subscribers were running.
+            assert!(cleaned > 0);
+            assert!(buffer.active_count.load(Ordering::Acquire) >= slots);
         });
     }
 }

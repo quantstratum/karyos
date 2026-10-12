@@ -152,3 +152,71 @@ fn reuse_after_reclaim_is_ordered_by_loans() {
         reader.join().unwrap();
     });
 }
+
+/// The conductor cleans a released slot and hands it to term C through
+/// `FREE`, `READY` and `ACTIVE`; a different writer thread and a reader
+/// thread use term C. No join or channel orders them: only the descriptor
+/// publications and the loans do.
+#[test]
+fn handoff_of_a_cleaned_slot_to_another_writer() {
+    loom::model(|| {
+        let slot = Arc::new(Slot {
+            descriptor: AtomicU64::new(descriptor(0, SlotState::Active).encode()),
+            word0: AtomicU64::new(data_word().pack()),
+            payload: UnsafeCell::new(PAYLOAD_A),
+            loans: [AtomicU64::new(0), AtomicU64::new(0)],
+            revoked: [AtomicU64::new(0), AtomicU64::new(0)],
+        });
+
+        let writer = {
+            let slot = Arc::clone(&slot);
+            thread::spawn(move || {
+                let outcome = take_loan(
+                    &slot.loans[0],
+                    &slot.revoked[0],
+                    &slot.descriptor,
+                    target(3),
+                )
+                .unwrap();
+                if outcome == LoanOutcome::Granted {
+                    slot.write_payload(PAYLOAD_C);
+                    publish_block(&slot.word0, data_word());
+                    release_loan(&slot.loans[0]);
+                }
+            })
+        };
+        let reader = {
+            let slot = Arc::clone(&slot);
+            thread::spawn(move || {
+                let outcome = take_loan(
+                    &slot.loans[1],
+                    &slot.revoked[1],
+                    &slot.descriptor,
+                    target(3),
+                )
+                .unwrap();
+                if outcome == LoanOutcome::Granted {
+                    if observe_block(&slot.word0) != 0 {
+                        assert_eq!(slot.read_payload(), PAYLOAD_C);
+                    }
+                    release_loan(&slot.loans[1]);
+                }
+            })
+        };
+
+        // Conductor: term A has no loans; reclaim, clean, free, prepare C.
+        let reclaiming = begin_reclaim(&slot.descriptor, descriptor(0, SlotState::Active)).unwrap();
+        let index = SlotIndex::try_new(0).unwrap();
+        assert!(!loan_held(&slot.loans, index, reclaiming).unwrap());
+        let cleaning = begin_cleaning(&slot.descriptor, reclaiming).unwrap();
+        clear_word(&slot.word0);
+        slot.write_payload(0);
+        publish(&slot.descriptor, cleaning.with_state(SlotState::Free));
+        let ready = descriptor(3, SlotState::Ready);
+        publish(&slot.descriptor, ready);
+        activate(&slot.descriptor, ready).unwrap();
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
