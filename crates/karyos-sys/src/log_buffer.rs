@@ -1504,6 +1504,7 @@ mod shared_tests {
         let term_words = (MIN_TERM_LENGTH / 8) as usize;
         let rounds: u32 = if cfg!(miri) { 40 } else { 20_000 };
         let stop = AtomicBool::new(false);
+        let mutations = AtomicU64::new(0);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 let words = buffer.regions.words();
@@ -1525,6 +1526,7 @@ mod shared_tests {
                     };
                     if let Some(word) = words.get(index) {
                         word.store(value, Ordering::Relaxed);
+                        mutations.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             });
@@ -1537,11 +1539,20 @@ mod shared_tests {
                 }
             }
             let _stop = StopOnDrop(&stop);
+            // The peer has really stored before polling starts, and keeps
+            // storing while it runs.
+            while mutations.load(Ordering::Relaxed) == 0 {
+                std::thread::yield_now();
+            }
+            let started = mutations.load(Ordering::Relaxed);
             let mut out = vec![0u8; 8192];
             for _ in 0..rounds {
                 if let Ok(PollOutcome::Message { length, .. }) = subscription.poll(&mut out) {
                     assert!(length as usize <= out.len());
                 }
+            }
+            while mutations.load(Ordering::Relaxed) == started {
+                std::thread::yield_now();
             }
         });
     }
