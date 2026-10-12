@@ -146,6 +146,8 @@ impl EmbeddedDriver {
             && config.max_hand_over > 0
             && config.command_budget > 0
             && config.cycles_between_drains > 0
+            && config.ring_capacity >= karyos_sys::command_ring::MIN_CAPACITY
+            && config.ring_capacity.is_power_of_two()
             && config.broadcast_capacity >= needed;
         if !valid {
             return Err(DriverError::InvalidConfig);

@@ -410,4 +410,9 @@ fn invalid_configurations_are_rejected() {
         ..DriverConfig::default()
     };
     assert!(EmbeddedDriver::with_config(zero).is_err());
+    let ring = DriverConfig {
+        ring_capacity: 1000,
+        ..DriverConfig::default()
+    };
+    assert!(EmbeddedDriver::with_config(ring).is_err());
 }
