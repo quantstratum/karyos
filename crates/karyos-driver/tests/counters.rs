@@ -64,6 +64,14 @@ fn counters_track_clients_commands_and_streams() {
 
     let stream = driver.add_stream(stream_config(2)).unwrap();
     assert_eq!(value(&driver, "streams active"), 1);
+    // Direct issuance refreshes the lease gauge at once.
+    let direct = driver
+        .subscribe(stream, karyos_sys::log_buffer::Role::Optional)
+        .unwrap();
+    assert_eq!(value(&driver, "stream leases live"), 1);
+    drop(direct);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(value(&driver, "stream leases live"), 0);
     let mut client = driver.connect().unwrap();
     let _other = driver.connect().unwrap();
     assert_eq!(value(&driver, "clients admitted"), 2);

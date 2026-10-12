@@ -55,17 +55,32 @@ const LABELS: [(u64, &str); 16] = [
 /// One of the driver's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Event {
+    /// Clients admitted by `connect`.
     ClientsAdmitted,
+    /// Admission slots released (the client's close flag was observed).
     ClientsRetired,
+    /// Clients retired for a protocol violation, counted at the first
+    /// retirement; their slot is released later and counted in
+    /// `ClientsRetired`.
     ClientsFaulty,
+    /// Commands decoded and executed or refused; malformed records are not
+    /// commands and count in `ClientsFaulty` instead.
     CommandsServed,
+    /// Served commands answered with an `Error`.
     CommandsRefused,
+    /// Responses written to the broadcast buffer.
     ResponsesSent,
+    /// 1 once the driver is in its terminal state.
     Terminal,
+    /// Streams accepting new capabilities.
     StreamsActive,
+    /// Streams removed but not yet freed.
     StreamsRetiring,
+    /// Streams freed.
     StreamsFreed,
+    /// Registrations forgotten because their capability was dropped.
     RegistrationsSwept,
+    /// Increments that would have overflowed and were not applied.
     CounterOverflows,
     /// Admission slots in use, including retired faulty clients whose
     /// producer has not detached yet.

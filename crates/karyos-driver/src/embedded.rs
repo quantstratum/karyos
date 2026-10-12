@@ -370,11 +370,9 @@ impl EmbeddedDriver {
             .publication_owned()?
             .ok_or(DriverError::PublicationTaken)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
-        Ok(ClientPublication::with_lease(
-            inner,
-            stream.allow_unconnected,
-            lease,
-        ))
+        let publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease);
+        self.update_stream_gauges();
+        Ok(publication)
     }
 
     /// Admits a subscriber to the stream (control path: allocates its copy
@@ -394,7 +392,9 @@ impl EmbeddedDriver {
         let stream = self.active_stream(stream)?;
         let inner = stream.conductor.subscribe(role)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
-        Ok(ClientSubscription::with_lease(inner, lease))
+        let subscription = ClientSubscription::with_lease(inner, lease);
+        self.update_stream_gauges();
+        Ok(subscription)
     }
 
     /// Runs one duty cycle: retires closed clients, serves client commands,
