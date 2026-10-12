@@ -83,9 +83,16 @@ impl SlotRegions {
     /// # Safety
     ///
     /// `slot < slots`, `offset` is a multiple of 32 below the term length,
-    /// the caller holds a loan for the slot's current term (or exclusive
-    /// `CLEANING`) for as long as the reference is used, and every access to
-    /// this location during the term incarnation is atomic.
+    /// and one of:
+    ///
+    /// - the caller holds a loan for the slot's current term for as long as
+    ///   the reference is used, and `offset` is a frame start of that term's
+    ///   layout, a location accessed only atomically during the term
+    ///   incarnation; or
+    /// - the caller holds exclusive `CLEANING` for the slot (no loan and no
+    ///   other access exists). The sweep may then target 32-byte boundaries
+    ///   that the old term used as payload; their earlier plain accesses all
+    ///   happen before the `CLEANING` transition through the loan handshake.
     pub(crate) unsafe fn word0(&self, slot: u8, offset: u32) -> &AtomicU64 {
         debug_assert!(offset.is_multiple_of(FRAME_ALIGNMENT) && offset < self.term_length);
         // SAFETY: in range per the caller's contract.

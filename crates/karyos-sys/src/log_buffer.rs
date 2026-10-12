@@ -585,13 +585,18 @@ pub enum PollOutcome {
     },
     /// Nothing published at the position yet.
     Pending,
-    /// The subscriber was lapped: `[from, to)` was lost and it rejoined at
-    /// the head (`rejoin_at_head`).
+    /// The subscriber was lapped. Data in `[from, lost_to)` is no longer
+    /// retained (below the retention floor). Under `rejoin_at_head` the
+    /// subscriber resumes at `resume`, the reserved head; data in
+    /// `[lost_to, resume)` may still be retained but is skipped by policy.
     Overrun {
-        /// First lost position.
+        /// First position not delivered.
         from: u64,
-        /// Position the subscriber resumes from.
-        to: u64,
+        /// End of the range known lost: the retention floor when the
+        /// overrun was detected (at least `from`).
+        lost_to: u64,
+        /// Position the subscriber resumes from (a block boundary).
+        resume: u64,
     },
 }
 
@@ -796,9 +801,14 @@ impl Subscription<'_> {
     /// reserved head, which is always a block boundary.
     fn overrun(&mut self) -> Result<Step, SysError> {
         let from = self.position;
-        let to = self.buffer.reserved_head.load(Ordering::Acquire).max(from);
-        self.advance_to(to);
-        Ok(Step::Done(PollOutcome::Overrun { from, to }))
+        let lost_to = self.buffer.floor.load(Ordering::Acquire).max(from);
+        let resume = self.buffer.reserved_head.load(Ordering::Acquire).max(from);
+        self.advance_to(resume);
+        Ok(Step::Done(PollOutcome::Overrun {
+            from,
+            lost_to,
+            resume,
+        }))
     }
 
     fn advance_to(&mut self, position: u64) {
@@ -1221,9 +1231,14 @@ mod tests {
         }
         let head = buffer.reserved_head.load(Ordering::Acquire);
         match poll(&mut lagging) {
-            PollOutcome::Overrun { from, to } => {
+            PollOutcome::Overrun {
+                from,
+                lost_to,
+                resume,
+            } => {
                 assert_eq!(from, 0);
-                assert_eq!(to, head);
+                assert!(lost_to > 0 && lost_to <= resume);
+                assert_eq!(resume, head);
             }
             other => panic!("expected Overrun, found {other:?}"),
         }
@@ -1292,37 +1307,95 @@ mod tests {
     fn a_loan_quarantines_its_slot_until_released() {
         let buffer = LogBuffer::new(config(2, 1)).unwrap();
         let mut conductor = buffer.conductor().unwrap();
-        let mut publication = buffer.publication().unwrap().unwrap();
-        for sequence in 0..120 {
-            let _ = append_retrying(&mut publication, &mut conductor, &message(sequence), || {});
-        }
-        // Pin term 0 (slot 0) with a loan in the publication's... no: in a
-        // spare registry cell standing in for a paused reader.
+        // A paused reader in a spare cell pins term 0 in slot 0, which is
+        // ACTIVE from the start.
         let pinned = buffer.cells.get(1).unwrap();
-        let slot0 = buffer.descriptor(0).unwrap();
-        let found = Descriptor::decode(slot0.load(Ordering::Acquire)).unwrap();
-        if found.state() == SlotState::Active {
-            let target = buffer
-                .target(
-                    0,
-                    found.term_id().count_from(buffer.initial_term_id).unwrap(),
-                )
-                .unwrap();
-            pinned.loan.store(target.loan().encode(), Ordering::SeqCst);
-            let mut quarantined = false;
-            for _ in 0..5 {
-                let report = conductor.duty_cycle().unwrap();
-                quarantined |= report.quarantined > 0;
-                let state = Descriptor::decode(slot0.load(Ordering::Acquire))
-                    .unwrap()
-                    .state();
-                assert_ne!(state, SlotState::Free);
-            }
-            assert!(quarantined);
-            release_loan(&pinned.loan);
+        let target = buffer.target(0, TermCount::ZERO).unwrap();
+        assert_eq!(
+            take_loan(
+                &pinned.loan,
+                &pinned.revoked,
+                buffer.descriptor(0).unwrap(),
+                target
+            ),
+            Ok(LoanOutcome::Granted)
+        );
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let data = vec![5u8; 7000];
+        let mut quarantined = false;
+        // Publish several terms; term 0 falls below the floor but stays
+        // quarantined, so slot 0 is never freed or reused.
+        for _ in 0..60 {
+            let _ = publication.append(&data, AppendOptions::default()).unwrap();
             let report = conductor.duty_cycle().unwrap();
-            assert!(report.cleaned > 0);
+            quarantined |= report.quarantined > 0;
+            let state =
+                Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
+            assert_eq!(state.term_id(), buffer.initial_term_id);
+            assert_ne!(state.state(), SlotState::Free);
         }
+        assert!(quarantined, "term 0 never reached reclamation");
+        release_loan(&pinned.loan);
+        let report = conductor.duty_cycle().unwrap();
+        assert!(report.cleaned > 0);
+        let state = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire))
+            .unwrap()
+            .state();
+        assert!(matches!(state, SlotState::Free | SlotState::Ready));
+    }
+
+    /// Codex's floor probes: without required subscribers the floor is
+    /// `head - window`; with a required subscriber it is its position. An
+    /// optional cursor below the floor is overrun, not served.
+    #[test]
+    fn optional_cursors_below_the_floor_are_overrun() {
+        let small = vec![3u8; 992];
+        // Optional only: 48 x 992 reserve 49152; floor = 49152 - 32768.
+        let buffer = LogBuffer::new(config(3, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut optional = conductor.subscribe(Role::Optional).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        buffer.limit.store(4 * TERM, Ordering::Release);
+        for _ in 0..48 {
+            let _ = publication
+                .append(&small, AppendOptions::default())
+                .unwrap();
+        }
+        let _ = conductor.duty_cycle().unwrap();
+        assert_eq!(buffer.floor.load(Ordering::Acquire), 16_384);
+        assert!(matches!(
+            poll(&mut optional),
+            PollOutcome::Overrun {
+                from: 0,
+                lost_to: 16_384,
+                resume: 49_152
+            }
+        ));
+
+        // Required consumed 8 x 992 = 8192: floor = 8192.
+        let buffer = LogBuffer::new(config(3, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut required = conductor.subscribe(Role::Required).unwrap();
+        let mut optional = conductor.subscribe(Role::Optional).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        for _ in 0..16 {
+            let _ = publication
+                .append(&small, AppendOptions::default())
+                .unwrap();
+        }
+        for _ in 0..8 {
+            assert!(poll_message(&mut required).is_some());
+        }
+        let _ = conductor.duty_cycle().unwrap();
+        assert_eq!(buffer.floor.load(Ordering::Acquire), 8192);
+        assert!(matches!(
+            poll(&mut optional),
+            PollOutcome::Overrun {
+                from: 0,
+                lost_to: 8192,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1502,7 +1575,7 @@ mod tests {
                             last = Some(sequence);
                             seen += 1;
                         }
-                        PollOutcome::Overrun { from, to } => lost += to - from,
+                        PollOutcome::Overrun { from, resume, .. } => lost += resume - from,
                         PollOutcome::Pending => {
                             // Done once everything is published and the
                             // cursor reached the final head; receiving the
