@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
-      - run: make fmt-check lint-sync
+      - run: make fmt-check lint-sync deps-check
 
   test:
     name: Clippy and test (${{ matrix.os }})

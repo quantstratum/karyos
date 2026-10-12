@@ -19,25 +19,42 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 absent from every normal and release build and from the graph shipped to
 users; it is compiled only by `make loom`.
 
-## Transitive additions
+## Resolved graph
 
-| Crate | Version | Pulled in by | Licence | Build script |
-| --- | --- | --- | --- | --- |
-| `thiserror-impl` | 2.0.21 | `thiserror` (proc macro) | MIT OR Apache-2.0 | none |
-| `proc-macro2` | 1.0.107 | `thiserror-impl` | MIT OR Apache-2.0 | rustc version probe; compiles no C |
-| `quote` | 1.0.47 | `thiserror-impl` | MIT OR Apache-2.0 | rustc version probe; compiles no C |
-| `syn` | 3.0.8 | `thiserror-impl` | MIT OR Apache-2.0 | none |
-| `unicode-ident` | 1.0.26 | `proc-macro2` | (MIT OR Apache-2.0) AND Unicode-3.0 | none |
+[`dependency-inventory.tsv`](dependency-inventory.tsv) lists every external
+package in the resolved graph with its version, source, licence, whether it
+has a build script, how the workspace reaches it and its target conditions.
+It is generated from `Cargo.lock` by `scripts/dependency-inventory.py`
+(`make deps-inventory`); CI fails when the committed file is stale. Reach
+classes:
 
-`thiserror` itself has a build script that probes the compiler version and
-compiles no C. `syn`, `quote` and `proc-macro2` run only at compile time inside
-the proc macro; ADR-0033 approves them for the codec, and here they enter
-transitively through `thiserror`'s derive.
+- `runtime`: linked into Karyos builds (`thiserror`).
+- `build`: runs only at compile time, as a proc macro or its dependency
+  (`thiserror-impl`, `syn`, `quote`, `proc-macro2`, `unicode-ident`).
+  ADR-0033 approves `syn`, `quote` and `proc-macro2` for the codec; here they
+  enter through `thiserror`'s derive.
+- `loom`: compiled only with `--cfg loom` (`make loom`), never in normal,
+  test or release builds. 30 of the 36 packages are in this class.
 
-Under `--cfg loom` only, `loom` adds `generator`, `scoped-tls`, `cfg-if`,
-`tracing`, `tracing-subscriber` and their dependencies (all MIT or
-MIT OR Apache-2.0, Unlicense OR MIT for `memchr` and `aho-corasick`).
-`generator` 0.8.10 has a build script that invokes the `cc` crate to assemble
-`asm_ppc64le_elf.S` only when the target architecture is `powerpc64`; on the
-supported targets (x86_64, aarch64) it compiles nothing. Powerpc64 is not a
-Karyos target.
+Target conditions that exclude packages from the supported targets:
+`windows-sys` and `windows-result` (`cfg(windows)`) and `valuable`
+(`cfg(tracing_unstable)`, a flag Karyos never sets). `libc` is `cfg(unix)`
+and is reached only under `--cfg loom`.
+
+## Build scripts
+
+Seven packages in the graph have build scripts. None compiles C or C++ on a
+supported target (x86_64 and aarch64 Linux, aarch64 macOS):
+
+| Package | Reach | What the build script does |
+| --- | --- | --- |
+| `thiserror` 2.0.21 | runtime | Runs `rustc --version` and a probe compile to set cfgs |
+| `proc-macro2` 1.0.107 | build | Runs `rustc --version` and a probe compile to set cfgs |
+| `quote` 1.0.47 | build | Runs `rustc --version` to set cfgs |
+| `rustversion` 1.0.23 | loom | Runs `rustc --version` to generate version constants |
+| `libc` 0.2.190 | loom | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
+| `generator` 0.8.10 | loom | Invokes `cc` to assemble `asm_ppc64le_elf.S` only when the target architecture is `powerpc64`, which Karyos does not support |
+| `valuable` 0.1.1 | loom | Emits atomic-support cfgs from the target name |
+
+`cc` 1.8.0 and its dependencies are in the graph only as `generator`'s
+build dependency and do nothing on supported targets.

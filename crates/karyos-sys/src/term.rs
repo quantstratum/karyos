@@ -16,6 +16,12 @@ pub const GENERATION_LIMIT: u32 = 1 << 24;
 /// Term ids advance modulo `2^32` from a random initial term id. This type is
 /// the single place where that rollover is modelled; positions are never
 /// computed from a raw term id, only from a [`TermCount`].
+///
+/// Its two `wrapping_*` calls are the one deliberate exception to the
+/// convention that forbids `wrapping_*` arithmetic (SPEC.md §14): term ids are
+/// defined modulo `2^32` (SPEC.md §4), so wrapping is the specified algorithm
+/// here, not an overflow being hidden. Exhaustion is checked on
+/// [`TermCount`], which never wraps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TermId(u32);
 
