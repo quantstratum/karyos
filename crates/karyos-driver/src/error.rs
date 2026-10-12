@@ -23,6 +23,18 @@ pub enum DriverError {
         /// Session alias.
         session_id: i32,
     },
+    /// A control-channel limit or size is invalid.
+    #[error("invalid driver configuration")]
+    InvalidConfig,
+    /// `max_clients` clients are admitted.
+    #[error("too many clients")]
+    TooManyClients,
+    /// Client identities are exhausted.
+    #[error("client identities exhausted")]
+    ClientIdsExhausted,
+    /// The driver is in its terminal state: its broadcast buffer is closed.
+    #[error("the driver is in its terminal state")]
+    Terminal,
     /// The process has used every driver identity.
     #[error("driver identities exhausted")]
     DriverIdsExhausted,

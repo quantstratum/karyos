@@ -62,11 +62,14 @@ pub enum BroadcastError {
         /// Largest payload accepted.
         max: usize,
     },
-    /// Positions would exceed `u64::MAX`. The buffer is closed for good:
-    /// this and every later transmit write no record, padding or position
-    /// (only the first sets the persistent closed flag).
+    /// Positions would exceed `u64::MAX`. The buffer is now closed for good;
+    /// later transmits fail with [`BroadcastError::Closed`]. Nothing but the
+    /// persistent closed flag is written.
     #[error("broadcast positions exhausted; the buffer is closed")]
     PositionsExhausted,
+    /// The buffer is closed (after exhaustion or an explicit close).
+    #[error("broadcast buffer closed")]
+    Closed,
     /// Capacity is not a power of two of at least the minimum, or the
     /// record limit does not fit it.
     #[error("invalid broadcast geometry")]
@@ -173,12 +176,39 @@ impl<'a> BroadcastWords<'a> {
         self.data.get(usize::try_from(offset / 8).ok()?)
     }
 
-    /// Whether position exhaustion has closed the buffer (Acquire). Readers
-    /// can still drain what was committed.
+    /// Whether the buffer is closed (Acquire), by position exhaustion or by
+    /// [`BroadcastWords::close`]. Readers can still drain what was
+    /// committed.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.trailer(CLOSED)
             .is_some_and(|word| word.load(Ordering::Acquire) != 0)
+    }
+
+    /// Closes the buffer for good (Release). Only the single writer calls
+    /// this; every later transmit fails.
+    pub fn close(&self) {
+        if let Some(word) = self.trailer(CLOSED) {
+            word.store(1, Ordering::Release);
+        }
+    }
+
+    /// Whether one more record of up to `payload_length` bytes, with any
+    /// padding it may need, can be transmitted: the buffer is open and its
+    /// positions cannot be exhausted by it. Only the single writer calls
+    /// this; it changes nothing.
+    #[must_use]
+    pub fn has_room(&self, payload_length: usize) -> bool {
+        let fits = u64::try_from(payload_length)
+            .ok()
+            .and_then(|length| length.checked_add(u64::from(HEADER_LENGTH)))
+            .and_then(align8)
+            .is_some_and(|extent| extent <= self.max_extent);
+        let tail = self
+            .trailer(TAIL)
+            .map_or(u64::MAX, |word| word.load(Ordering::Relaxed));
+        // Padding is shorter than the record, so two extents bound both.
+        fits && !self.is_closed() && tail.checked_add(2 * self.max_extent).is_some()
     }
 
     /// The committed tail (Acquire): where a new reader starts.
@@ -194,12 +224,12 @@ impl<'a> BroadcastWords<'a> {
     ///
     /// Returns [`BroadcastError::ReservedType`],
     /// [`BroadcastError::MessageTooLarge`] and
-    /// [`BroadcastError::PositionsExhausted`]. On error no record, padding
-    /// or position is written; the first exhaustion only sets the
-    /// persistent closed flag, after which every transmit fails.
+    /// [`BroadcastError::PositionsExhausted`] (which closes the buffer) and
+    /// [`BroadcastError::Closed`]. On error no record, padding or position is
+    /// written; the first exhaustion only sets the persistent closed flag.
     pub fn transmit(&self, type_id: u32, payload: &[u8]) -> Result<u64, BroadcastError> {
         if self.is_closed() {
-            return Err(BroadcastError::PositionsExhausted);
+            return Err(BroadcastError::Closed);
         }
         if type_id == PAD_TYPE {
             return Err(BroadcastError::ReservedType { type_id });
@@ -473,10 +503,25 @@ mod owned {
             self.region.words().map_or(0, |words| words.max_payload())
         }
 
-        /// Whether position exhaustion has closed the buffer.
+        /// Whether the buffer is closed.
         #[must_use]
         pub fn is_closed(&self) -> bool {
             self.region.words().map_or(true, |words| words.is_closed())
+        }
+
+        /// Closes the buffer for good; see [`BroadcastWords::close`].
+        pub fn close(&mut self) {
+            if let Ok(words) = self.region.words() {
+                words.close();
+            }
+        }
+
+        /// See [`BroadcastWords::has_room`].
+        #[must_use]
+        pub fn has_room(&self, payload_length: usize) -> bool {
+            self.region
+                .words()
+                .is_ok_and(|words| words.has_room(payload_length))
         }
 
         #[cfg(test)]
@@ -534,6 +579,13 @@ mod owned {
     }
 
     impl BroadcastReceiver {
+        /// Whether the writer closed the buffer. Records committed before
+        /// the close can still be received.
+        #[must_use]
+        pub fn is_closed(&self) -> bool {
+            self.region.words().map_or(true, |words| words.is_closed())
+        }
+
         /// The next position this reader reads.
         #[must_use]
         pub fn position(&self) -> u64 {
@@ -647,7 +699,7 @@ mod tests {
         );
         assert!(tx.is_closed());
         // A record that would still fit is refused too: closed for good.
-        assert_eq!(tx.transmit(2, &[]), Err(BroadcastError::PositionsExhausted));
+        assert_eq!(tx.transmit(2, &[]), Err(BroadcastError::Closed));
         assert_eq!(rx.receive(), Received::Pending);
     }
 
@@ -665,6 +717,25 @@ mod tests {
             panic!("expected the latest message");
         };
         assert_eq!(type_id, 14);
+    }
+
+    #[test]
+    fn explicit_close_and_room() {
+        let mut tx = broadcast(1024).unwrap();
+        let mut rx = tx.receiver();
+        assert!(tx.has_room(120));
+        assert!(!tx.has_room(121));
+        tx.transmit(1, b"before").unwrap();
+        tx.close();
+        assert!(tx.is_closed() && rx.is_closed());
+        assert!(!tx.has_room(0));
+        assert_eq!(tx.transmit(2, b"after"), Err(BroadcastError::Closed));
+        assert!(matches!(rx.receive(), Received::Message { type_id: 1, .. }));
+        assert_eq!(rx.receive(), Received::Pending);
+        // Near the end of positions there is no room even when open.
+        let tx = broadcast(1024).unwrap();
+        tx.seed(u64::MAX - 200);
+        assert!(!tx.has_room(0));
     }
 
     #[test]
