@@ -5,15 +5,17 @@
 //!
 //! Implemented so far: the trace observation record (`record`) and a typed
 //! trace journal over the bounded record journal (`journal`), as designed in
-//! `quantstratum-docs: karyos/design/trace-records.md`; and loss attribution to traces in one
-//! journal (`attribution`), as designed in `quantstratum-docs: karyos/design/trace-attribution.md`.
-//! Seals for long-running journals, clock calibration, sampling and
-//! histograms do not exist yet.
+//! `quantstratum-docs: karyos/design/trace-records.md`; loss attribution to traces in one journal
+//! (`attribution`), as designed in `quantstratum-docs: karyos/design/trace-attribution.md`; and
+//! the sampling policy (`sampling`), as designed in
+//! `quantstratum-docs: karyos/design/trace-sampling.md`. Seals for long-running journals, clock
+//! calibration and histograms do not exist yet.
 
 pub mod attribution;
 pub mod error;
 pub mod journal;
 pub mod record;
+pub mod sampling;
 
 pub use attribution::{AttributionConfig, Attributor, Observed, Verdict, combine};
 pub use error::TraceError;
@@ -22,3 +24,4 @@ pub use record::{
     MAX_LANE, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId, RECORD_VERSION,
     RECORD_WORDS, SubscriberId, TraceIds, TraceRecord, decode_record, encode_record,
 };
+pub use sampling::{Decision, IdSource, Sampler, Sampling};
