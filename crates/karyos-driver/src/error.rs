@@ -54,6 +54,15 @@ pub enum DriverError {
     /// The stream's publication has already been taken.
     #[error("the stream's publication has already been taken")]
     PublicationTaken,
+    /// A duty cycle's work count does not fit `u32`; the work was done
+    /// and the count keeps its previous value.
+    #[error("work count overflow: {count} + {delta}")]
+    WorkCountOverflow {
+        /// The count before the failed addition.
+        count: u32,
+        /// The work that did not fit.
+        delta: u32,
+    },
     /// A client-level error.
     #[error(transparent)]
     Client(#[from] ClientError),

@@ -30,7 +30,6 @@ use karyos_client::link::{Lease, LeaseEnd, StreamLeases};
 use karyos_client::{ClientPublication, ClientSubscription};
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
-use karyos_sys::error::SysError;
 use karyos_sys::log_buffer::{
     Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, Role,
 };
@@ -434,9 +433,11 @@ impl EmbeddedDriver {
     ///
     /// # Errors
     ///
-    /// Returns the first stream error (a corrupt claim record or a broken
-    /// conductor invariant), after every other stream has still run its
-    /// deadline and duty cycle and the gauges were refreshed.
+    /// Returns the first error, after every other stream has still run its
+    /// deadline and duty cycle and the gauges were refreshed: a stream
+    /// error (a corrupt claim record or a broken conductor invariant), or
+    /// [`DriverError::WorkCountOverflow`] when the work count does not fit
+    /// `u32`.
     pub fn do_work(&mut self) -> Result<u32, DriverError> {
         self.retire_closed_clients();
         self.sweep_ended_registrations();
@@ -446,20 +447,21 @@ impl EmbeddedDriver {
         let clock = &mut self.clock;
         let counters = &self.counters;
         for stream in &mut self.streams {
-            let deadlines = account_deadlines(
+            stream.claim_waiting = account_deadlines(
                 counters,
-                work,
+                &mut work,
+                &mut first_error,
                 stream.conductor.service_deadlines(&mut || clock.now()),
             );
-            work = deadlines.work;
-            stream.claim_waiting = deadlines.waiting;
-            if let Some(error) = deadlines.error {
-                first_error.get_or_insert(DriverError::from(error));
-            }
             match stream.conductor.duty_cycle() {
                 Ok(report) => {
-                    work = add_work(counters, work, report.cleaned);
-                    work = add_work(counters, work, u32::from(report.prepared));
+                    add_work(counters, &mut work, &mut first_error, report.cleaned);
+                    add_work(
+                        counters,
+                        &mut work,
+                        &mut first_error,
+                        u32::from(report.prepared),
+                    );
                 }
                 Err(error) => {
                     first_error.get_or_insert(DriverError::from(error));
@@ -495,21 +497,16 @@ impl EmbeddedDriver {
     }
 }
 
-/// A stream's deadline service call, accounted.
-struct Deadlines {
-    work: u32,
-    waiting: bool,
-    error: Option<SysError>,
-}
-
-/// Counts every field of a deadline report, also the one an error carries
-/// (`quantstratum-docs: karyos/design/concurrent-deadline.md`, Results), before the error is
-/// recorded; adds the aborts to `work`.
+/// Accounts a stream's deadline service call: counts every field of its
+/// report, also the one an error carries, adds the aborts to `work`, then
+/// records the error (`quantstratum-docs: karyos/design/concurrent-deadline.md`, Results).
+/// Returns whether the stream is waiting on a deadline.
 fn account_deadlines(
     counters: &DriverCounters,
-    work: u32,
+    work: &mut u32,
+    first_error: &mut Option<DriverError>,
     result: Result<DeadlineReport, DeadlineError>,
-) -> Deadlines {
+) -> bool {
     let (report, error) = match result {
         Ok(report) => (report, None),
         Err(DeadlineError { report, error }) => (report, Some(error)),
@@ -524,20 +521,34 @@ fn account_deadlines(
         Event::ClaimDeadlinesUnrepresentable,
         u64::from(report.unrepresentable),
     );
-    Deadlines {
-        work: add_work(counters, work, report.aborted),
-        waiting: report.waiting,
-        error,
+    add_work(counters, work, first_error, report.aborted);
+    if let Some(error) = error {
+        first_error.get_or_insert(DriverError::from(error));
     }
+    report.waiting
 }
 
-/// Adds `delta` to a duty cycle's work count. An overflow keeps the count
-/// at its maximum and is recorded in `counter overflows` (ADR-0007).
-fn add_work(counters: &DriverCounters, work: u32, delta: u32) -> u32 {
-    work.checked_add(delta).unwrap_or_else(|| {
-        counters.add(Event::CounterOverflows, 1);
-        u32::MAX
-    })
+/// Adds `delta` to a duty cycle's work count with a checked sum
+/// (ADR-0007). An overflow leaves the count unchanged, is recorded in
+/// `counter overflows` and becomes [`DriverError::WorkCountOverflow`]
+/// unless an earlier error is already recorded; the rest of the cycle
+/// still runs.
+fn add_work(
+    counters: &DriverCounters,
+    work: &mut u32,
+    first_error: &mut Option<DriverError>,
+    delta: u32,
+) {
+    match work.checked_add(delta) {
+        Some(sum) => *work = sum,
+        None => {
+            counters.add(Event::CounterOverflows, 1);
+            first_error.get_or_insert(DriverError::WorkCountOverflow {
+                count: *work,
+                delta,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -545,6 +556,7 @@ mod tests {
     use super::*;
     use crate::clock::MonotonicClock;
     use karyos_client::{ClaimOutcome, CommitOutcome};
+    use karyos_sys::error::SysError;
     use karyos_sys::frame::Lane;
     use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
     use karyos_sys::term::TermId;
@@ -603,14 +615,31 @@ mod tests {
     }
 
     #[test]
-    fn an_overflowing_work_count_saturates_and_is_recorded() {
+    fn an_overflowing_work_count_is_a_typed_error() {
         let counters = DriverCounters::new().unwrap();
-        assert_eq!(add_work(&counters, u32::MAX - 1, 1), u32::MAX);
-        assert_eq!(counters.value(Event::CounterOverflows), 0);
-        assert_eq!(add_work(&counters, u32::MAX, 1), u32::MAX);
+        let mut work = u32::MAX - 1;
+        let mut error = None;
+        add_work(&counters, &mut work, &mut error, 1);
+        assert_eq!((work, error.is_none()), (u32::MAX, true));
+        add_work(&counters, &mut work, &mut error, 0);
+        assert_eq!((work, error.is_none()), (u32::MAX, true));
+        add_work(&counters, &mut work, &mut error, 2);
+        assert_eq!(work, u32::MAX);
+        assert!(matches!(
+            error,
+            Some(DriverError::WorkCountOverflow {
+                count: u32::MAX,
+                delta: 2,
+            })
+        ));
         assert_eq!(counters.value(Event::CounterOverflows), 1);
-        assert_eq!(add_work(&counters, u32::MAX, 0), u32::MAX);
-        assert_eq!(counters.value(Event::CounterOverflows), 1);
+        // A later overflow is counted; the first error is kept.
+        add_work(&counters, &mut work, &mut error, 3);
+        assert!(matches!(
+            error,
+            Some(DriverError::WorkCountOverflow { delta: 2, .. })
+        ));
+        assert_eq!(counters.value(Event::CounterOverflows), 2);
     }
 
     #[test]
@@ -662,22 +691,50 @@ mod tests {
             ]
             .map(|event| counters.value(event))
         };
-        let ok = account_deadlines(&counters, 10, Ok(report));
-        assert_eq!((ok.work, ok.waiting, ok.error), (13, true, None));
-        assert_eq!(counted(&counters), [3, 2, 4, 5]);
-        let failed = account_deadlines(
+        let mut work = 10;
+        let mut error = None;
+        assert!(account_deadlines(
             &counters,
-            u32::MAX - 1,
+            &mut work,
+            &mut error,
+            Ok(report)
+        ));
+        assert_eq!((work, error.is_none()), (13, true));
+        assert_eq!(counted(&counters), [3, 2, 4, 5]);
+        let mut work = u32::MAX - 1;
+        assert!(account_deadlines(
+            &counters,
+            &mut work,
+            &mut error,
             Err(DeadlineError {
                 report,
                 error: SysError::ResourcesUnavailable,
             }),
-        );
-        assert_eq!(
-            (failed.work, failed.waiting, failed.error),
-            (u32::MAX, true, Some(SysError::ResourcesUnavailable))
-        );
+        ));
+        // The report is counted first; the work overflow is the first error.
         assert_eq!(counted(&counters), [6, 4, 8, 10]);
+        assert_eq!(work, u32::MAX - 1);
+        assert!(matches!(
+            error,
+            Some(DriverError::WorkCountOverflow { delta: 3, .. })
+        ));
+        let mut work = 0;
+        let mut error = None;
+        assert!(account_deadlines(
+            &counters,
+            &mut work,
+            &mut error,
+            Err(DeadlineError {
+                report,
+                error: SysError::ResourcesUnavailable,
+            }),
+        ));
+        assert_eq!(counted(&counters), [9, 6, 12, 15]);
+        assert_eq!(work, 3);
+        assert!(matches!(
+            error,
+            Some(DriverError::Sys(SysError::ResourcesUnavailable))
+        ));
         assert_eq!(counters.value(Event::CounterOverflows), 1);
     }
 }

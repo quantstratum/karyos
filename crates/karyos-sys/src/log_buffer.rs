@@ -2141,11 +2141,16 @@ impl<O: BufferOwner> Conductor<O> {
         self.exclusive_deadline(clock)
     }
 
-    /// The deadline service of either mode (`quantstratum-docs: karyos/design/concurrent-deadline.md`,
+    /// The deadline service (`quantstratum-docs: karyos/design/concurrent-deadline.md`,
     /// Results): every outcome of this call counted in a fixed-size
     /// report. For an exclusive buffer the report is derived from the
     /// single claim of [`Conductor::abort_expired_claims_with`]; its
     /// `waiting` is set exactly when that result is `Waiting`.
+    ///
+    /// Concurrent buffers are not served yet: until the concurrent span
+    /// walk lands (batch c2), the call returns an empty report without
+    /// reading the clock, and no concurrent block is aborted at its
+    /// deadline.
     ///
     /// # Errors
     ///
