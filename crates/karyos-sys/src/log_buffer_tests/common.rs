@@ -4,6 +4,7 @@
 // including module defines `Terms` and `new_buffer`.
 
 use crate::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH};
+use super::concurrent::WriterPause;
 
 const TERM: u64 = MIN_TERM_LENGTH as u64;
 
@@ -1968,8 +1969,9 @@ fn offer_concurrent(
 ) -> u64 {
     for _ in 0..1000 {
         match handle.offer(data, AppendOptions::default()).unwrap() {
-            AppendOutcome::Appended { position } => return position,
-            AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
+            ConcurrentOfferOutcome::Appended { position } => return position,
+            outcome @ ConcurrentOfferOutcome::Aborted { .. } => panic!("unexpected {outcome:?}"),
+            ConcurrentOfferOutcome::BackPressured | ConcurrentOfferOutcome::AdminAction => {
                 drain();
                 let _ = conductor.duty_cycle().unwrap();
             }
@@ -2064,12 +2066,13 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
         let _ = conductor.duty_cycle().unwrap();
         while poll_message(&mut subscription).is_some() {}
         match a.offer(&data, AppendOptions::default()).unwrap() {
-            AppendOutcome::Appended { .. } => {}
-            AppendOutcome::AdminAction => {
+            ConcurrentOfferOutcome::Appended { .. } => {}
+            ConcurrentOfferOutcome::AdminAction => {
                 crossed = true;
                 break;
             }
-            AppendOutcome::BackPressured => {}
+            ConcurrentOfferOutcome::BackPressured => {}
+            outcome @ ConcurrentOfferOutcome::Aborted { .. } => panic!("unexpected {outcome:?}"),
         }
     }
     assert!(crossed);
@@ -2083,7 +2086,7 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
     // B finds term 0 full: no reservation there.
     assert_eq!(
         b.offer(&data, AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
+        ConcurrentOfferOutcome::AdminAction
     );
     assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), raw);
     // Both catch up and publish in term 1, never again in term 0.
@@ -2114,11 +2117,11 @@ fn a_live_handle_catches_up_after_three_rotations() {
     let mut outcomes = Vec::new();
     for _ in 0..3 {
         outcomes.push(paused.offer(&data, AppendOptions::default()).unwrap());
-        if matches!(outcomes.last(), Some(AppendOutcome::Appended { .. })) {
+        if matches!(outcomes.last(), Some(ConcurrentOfferOutcome::Appended { .. })) {
             break;
         }
     }
-    let Some(AppendOutcome::Appended { position }) = outcomes.last().copied() else {
+    let Some(ConcurrentOfferOutcome::Appended { position }) = outcomes.last().copied() else {
         panic!("never caught up: {outcomes:?}");
     };
     assert_eq!(
@@ -2157,7 +2160,7 @@ fn a_reissued_slot_never_crosses_a_term_twice() {
     let mut holder = conductor.concurrent_publication().unwrap().unwrap();
     assert_eq!(
         holder.offer(&data, AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
+        ConcurrentOfferOutcome::AdminAction
     );
     assert_eq!(buffer.active_count.load(Ordering::Acquire), 0);
     holder.close();
@@ -2167,7 +2170,7 @@ fn a_reissued_slot_never_crosses_a_term_twice() {
     for _ in 0..3 {
         assert_eq!(
             reissued.offer(&data, AppendOptions::default()).unwrap(),
-            AppendOutcome::AdminAction
+            ConcurrentOfferOutcome::AdminAction
         );
     }
     // It made no reservation in term 0.
@@ -2215,7 +2218,7 @@ fn concurrent_offers_are_back_pressured() {
     let mut pressured = false;
     for _ in 0..1000 {
         let _ = conductor.duty_cycle().unwrap();
-        if handle.offer(&data, AppendOptions::default()).unwrap() == AppendOutcome::BackPressured {
+        if handle.offer(&data, AppendOptions::default()).unwrap() == ConcurrentOfferOutcome::BackPressured {
             pressured = true;
             break;
         }
@@ -2366,7 +2369,7 @@ fn publishers_rotate_without_the_conductor() {
     // The crossing owner pads and rotates to the prepared term 1.
     assert_eq!(
         handle.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
+        ConcurrentOfferOutcome::AdminAction
     );
     assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
     let t1 = buffer
@@ -2377,7 +2380,7 @@ fn publishers_rotate_without_the_conductor() {
     // And then publishes in term 1 without a duty cycle.
     assert!(matches!(
         handle.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
-        AppendOutcome::Appended { position } if position == TERM
+        ConcurrentOfferOutcome::Appended { position } if position == TERM
     ));
 }
 
@@ -2431,21 +2434,21 @@ fn a_full_term_is_rotated_by_the_next_publisher_call() {
     // The peer finds the term full and rotates; its next call publishes.
     assert_eq!(
         peer.offer(b"x", AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
+        ConcurrentOfferOutcome::AdminAction
     );
     assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
     assert!(matches!(
         peer.offer(b"x", AppendOptions::default()).unwrap(),
-        AppendOutcome::Appended { position } if position == TERM
+        ConcurrentOfferOutcome::Appended { position } if position == TERM
     ));
     // The owner, still in term 0, finds it full, then catches up.
     assert_eq!(
         owner.offer(b"y", AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
+        ConcurrentOfferOutcome::AdminAction
     );
     assert!(matches!(
         owner.offer(b"y", AppendOptions::default()).unwrap(),
-        AppendOutcome::Appended { position } if position == TERM + 64
+        ConcurrentOfferOutcome::Appended { position } if position == TERM + 64
     ));
     // A crossed handle whose successor was not ready helps once it is.
     let buffer = new_buffer(concurrent_config(2)).unwrap();
@@ -2465,18 +2468,657 @@ fn a_full_term_is_rotated_by_the_next_publisher_call() {
     );
     assert_eq!(
         owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
+        ConcurrentOfferOutcome::AdminAction
     );
     assert_eq!(buffer.active_count.load(Ordering::Acquire), 0);
     // The successor becomes ready (as the conductor's preparation would).
     buffer.descriptor(1).unwrap().store(ready, Ordering::Release);
     assert_eq!(
         owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
+        ConcurrentOfferOutcome::AdminAction
     );
     assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
     assert!(matches!(
         owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
-        AppendOutcome::Appended { position } if position == TERM
+        ConcurrentOfferOutcome::Appended { position } if position == TERM
     ));
+}
+
+// Concurrent deadline, batch c2 (quantstratum-docs: karyos/design/concurrent-deadline.md).
+
+fn deadline_concurrent_config(publishers: u8) -> LogBufferConfig {
+    LogBufferConfig {
+        claim_deadline: DEADLINE,
+        ..concurrent_config(publishers)
+    }
+}
+
+fn serve(conductor: &mut Conductor<&LogBuffer<Terms>>, now: u64) -> DeadlineReport {
+    conductor.service_deadlines(&mut || now).unwrap()
+}
+
+fn waiting() -> DeadlineReport {
+    DeadlineReport {
+        waiting: true,
+        ..DeadlineReport::default()
+    }
+}
+
+fn aborted(count: u32, bytes: u64) -> DeadlineReport {
+    DeadlineReport {
+        aborted: count,
+        aborted_bytes: bytes,
+        ..DeadlineReport::default()
+    }
+}
+
+#[test]
+fn a_marked_concurrent_claim_is_aborted_at_its_deadline_while_its_writer_writes() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let mut other = conductor.concurrent_publication().unwrap().unwrap();
+    let mut claim = concurrent_claimed(handle.try_claim(8, AppendOptions::default()));
+    claim.payload().fill(7);
+    let behind = offer_concurrent(&mut other, &mut conductor, &message(1), || {});
+    assert_eq!(behind, 64);
+    assert_eq!(serve(&mut conductor, 10), waiting());
+    assert_eq!(serve(&mut conductor, 10 + DEADLINE - 1), waiting());
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+    assert_eq!(serve(&mut conductor, 10 + DEADLINE), aborted(1, 64));
+    // The writer keeps writing its payload; its commit loses.
+    claim.payload().fill(9);
+    assert_eq!(claim.commit(), CommitOutcome::Aborted { position: 0 });
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: 0,
+            extent: 64,
+        }
+    );
+    assert_eq!(poll_message(&mut subscription), Some(message(1)));
+    assert_eq!(serve(&mut conductor, u64::MAX), DeadlineReport::default());
+}
+
+#[test]
+fn a_marked_fragmented_offer_is_aborted_and_its_commit_reports_the_abort() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let data = sized_message(2, 3000);
+    let reserved = reserved_of(&data);
+    let outcome = handle
+        .offer_pausing(&data, AppendOptions::default(), &mut |point| {
+            if point == WriterPause::Commit {
+                assert_eq!(serve(&mut conductor, 0), waiting());
+                assert_eq!(
+                    serve(&mut conductor, DEADLINE),
+                    aborted(1, u64::from(reserved))
+                );
+            }
+        })
+        .unwrap();
+    assert_eq!(outcome, ConcurrentOfferOutcome::Aborted { position: 0 });
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: 0,
+            extent: reserved,
+        }
+    );
+    // The handle publishes again after the abort.
+    let position = offer_concurrent(&mut handle, &mut conductor, &data, || {});
+    assert_eq!(position, u64::from(reserved));
+    assert_eq!(poll_message(&mut subscription), Some(data));
+}
+
+#[test]
+fn a_marked_crossing_pad_is_aborted_and_the_owner_still_rotates() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let data = vec![3u8; 3000];
+    let reserved = reserved_of(&data);
+    let tail = |buffer: &LogBuffer<Terms>| buffer.tail(0).unwrap().load(Ordering::Acquire) as u32;
+    while tail(&buffer) + reserved <= MIN_TERM_LENGTH {
+        let _ = offer_concurrent(&mut handle, &mut conductor, &data, || {
+            while poll_message(&mut subscription).is_some() {}
+        });
+    }
+    while poll_message(&mut subscription).is_some() {}
+    let _ = conductor.duty_cycle().unwrap();
+    let start = tail(&buffer);
+    let extent = MIN_TERM_LENGTH - start;
+    let outcome = handle
+        .offer_pausing(&data, AppendOptions::default(), &mut |point| {
+            if point == WriterPause::PadCommit {
+                // The scan reaches the PAD within a few budgeted calls.
+                let mut calls = 0;
+                while serve(&mut conductor, 0) != waiting() {
+                    calls += 1;
+                    assert!(calls < 10, "the marked PAD was never observed");
+                }
+                assert_eq!(
+                    serve(&mut conductor, DEADLINE),
+                    aborted(1, u64::from(extent))
+                );
+            }
+        })
+        .unwrap();
+    assert_eq!(outcome, ConcurrentOfferOutcome::AdminAction);
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: u64::from(start),
+            extent,
+        }
+    );
+    let position = offer_concurrent(&mut handle, &mut conductor, &data, || {});
+    assert_eq!(position, TERM);
+    assert_eq!(poll_message(&mut subscription), Some(data));
+}
+
+#[test]
+fn a_writer_paused_before_its_mark_inside_a_zero_span_writes_nothing() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut paused = conductor.concurrent_publication().unwrap().unwrap();
+    let mut other = conductor.concurrent_publication().unwrap().unwrap();
+    let mut behind = 0;
+    let outcome = paused
+        .offer_pausing(&message(1), AppendOptions::default(), &mut |point| {
+            if point == WriterPause::Mark {
+                behind = offer_concurrent(&mut other, &mut conductor, &message(2), || {});
+                assert_eq!(serve(&mut conductor, 0), waiting());
+                assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+                // The walk takes the span up to the committed block.
+                assert_eq!(serve(&mut conductor, DEADLINE), aborted(1, behind));
+            }
+        })
+        .unwrap();
+    assert_eq!(outcome, ConcurrentOfferOutcome::Aborted { position: 0 });
+    // The paused writer's mark failed: the span's word is untouched by it.
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: 0,
+            extent: behind as u32,
+        }
+    );
+    assert_eq!(poll_message(&mut subscription), Some(message(2)));
+    // A paused claim is refused the same way.
+    let mut position = None;
+    let outcome = paused
+        .try_claim_pausing(8, AppendOptions::default(), &mut |point| {
+            if point == WriterPause::Mark {
+                position = Some(buffer.conductor_head().unwrap() - 64);
+                assert_eq!(serve(&mut conductor, 0), waiting());
+                assert_eq!(serve(&mut conductor, DEADLINE), aborted(1, 64));
+            }
+        })
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        ConcurrentClaimOutcome::Aborted { position: p } if Some(p) == position
+    ));
+}
+
+#[test]
+fn a_mark_noticed_by_the_failed_first_take_is_served_in_the_same_call() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let reserved = reserved_of(&message(1));
+    let outcome = handle
+        .offer_pausing(&message(1), AppendOptions::default(), &mut |point| {
+            match point {
+                // A zero span, first observed at 0.
+                WriterPause::Mark => assert_eq!(serve(&mut conductor, 0), waiting()),
+                // Marked since: the walk's first compare-exchange fails and
+                // the mark is aborted at the span's original deadline.
+                WriterPause::Commit => assert_eq!(
+                    serve(&mut conductor, DEADLINE),
+                    aborted(1, u64::from(reserved))
+                ),
+                _ => {}
+            }
+        })
+        .unwrap();
+    assert_eq!(outcome, ConcurrentOfferOutcome::Aborted { position: 0 });
+}
+
+#[test]
+fn a_zero_span_marked_before_its_deadline_keeps_its_first_observation() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let reserved = reserved_of(&message(1));
+    let outcome = handle
+        .offer_pausing(&message(1), AppendOptions::default(), &mut |point| {
+            match point {
+                WriterPause::Mark => assert_eq!(serve(&mut conductor, 0), waiting()),
+                WriterPause::Commit => {
+                    // The scan finds the mark: same position, same timer.
+                    assert_eq!(serve(&mut conductor, DEADLINE - 1), waiting());
+                    assert_eq!(
+                        serve(&mut conductor, DEADLINE),
+                        aborted(1, u64::from(reserved))
+                    );
+                }
+                _ => {}
+            }
+        })
+        .unwrap();
+    assert_eq!(outcome, ConcurrentOfferOutcome::Aborted { position: 0 });
+}
+
+#[test]
+fn a_span_longer_than_the_walk_budget_completes_over_several_calls() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.deadlines.set_budgets(1, 2);
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut paused = conductor.concurrent_publication().unwrap().unwrap();
+    let mut other = conductor.concurrent_publication().unwrap().unwrap();
+    let data = sized_message(1, 100);
+    assert_eq!(reserved_of(&data), 160);
+    let outcome = paused
+        .offer_pausing(&data, AppendOptions::default(), &mut |point| {
+            if point == WriterPause::Mark {
+                let _ = offer_concurrent(&mut other, &mut conductor, &message(2), || {});
+                assert_eq!(serve(&mut conductor, 0), waiting());
+                // One compare-exchange per call: five boundaries taken,
+                // readers waiting meanwhile, then the failed one ends it.
+                for _ in 0..5 {
+                    assert_eq!(serve(&mut conductor, DEADLINE), waiting());
+                    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+                }
+                assert_eq!(serve(&mut conductor, DEADLINE), aborted(1, 160));
+            }
+        })
+        .unwrap();
+    assert_eq!(outcome, ConcurrentOfferOutcome::Aborted { position: 0 });
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: 0,
+            extent: 160,
+        }
+    );
+    assert_eq!(poll_message(&mut subscription), Some(message(2)));
+}
+
+#[test]
+fn several_stuck_writers_are_timed_at_once() {
+    let buffer = new_buffer(deadline_concurrent_config(3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handles: Vec<_> = (0..3)
+        .map(|_| conductor.concurrent_publication().unwrap().unwrap())
+        .collect();
+    for handle in &mut handles {
+        core::mem::forget(concurrent_claimed(handle.try_claim(8, AppendOptions::default())));
+    }
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    assert_eq!(serve(&mut conductor, DEADLINE), aborted(3, 192));
+    for position in [0, 64, 128] {
+        assert_eq!(
+            poll(&mut subscription),
+            PollOutcome::Aborted {
+                position,
+                extent: 64,
+            }
+        );
+    }
+}
+
+#[test]
+fn a_younger_reservation_is_outside_an_older_spans_frozen_bound() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut older = conductor.concurrent_publication().unwrap().unwrap();
+    let mut younger = conductor.concurrent_publication().unwrap().unwrap();
+    let reserved = reserved_of(&message(1));
+    let mut inner = None;
+    let outcome = older
+        .offer_pausing(&message(1), AppendOptions::default(), &mut |point| {
+            if point != WriterPause::Mark {
+                return;
+            }
+            assert_eq!(serve(&mut conductor, 0), waiting());
+            inner = Some(
+                younger
+                    .offer_pausing(&message(2), AppendOptions::default(), &mut |point| {
+                        if point == WriterPause::Mark {
+                            // Admitted after the older span's first
+                            // observation: the walk stops at its frozen
+                            // bound, and the younger zero is timed anew.
+                            let report = serve(&mut conductor, DEADLINE);
+                            assert_eq!(
+                                report,
+                                DeadlineReport {
+                                    waiting: true,
+                                    ..aborted(1, u64::from(reserved))
+                                }
+                            );
+                            assert_eq!(serve(&mut conductor, 2 * DEADLINE - 1), waiting());
+                        }
+                    })
+                    .unwrap(),
+            );
+        })
+        .unwrap();
+    assert_eq!(outcome, ConcurrentOfferOutcome::Aborted { position: 0 });
+    assert_eq!(
+        inner,
+        Some(ConcurrentOfferOutcome::Appended {
+            position: u64::from(reserved),
+        })
+    );
+    assert_eq!(serve(&mut conductor, 2 * DEADLINE - 1), DeadlineReport::default());
+    assert!(matches!(poll(&mut subscription), PollOutcome::Aborted { .. }));
+    assert_eq!(poll_message(&mut subscription), Some(message(2)));
+}
+
+#[test]
+fn a_call_reports_every_outcome_it_meets() {
+    let buffer = new_buffer(deadline_concurrent_config(4)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handles: Vec<_> = (0..4)
+        .map(|_| conductor.concurrent_publication().unwrap().unwrap())
+        .collect();
+    let [first, second, third, fourth] = handles.as_mut_slice() else {
+        panic!("four handles");
+    };
+    core::mem::forget(concurrent_claimed(first.try_claim(8, AppendOptions::default())));
+    let kept = concurrent_claimed(second.try_claim(8, AppendOptions::default()));
+    core::mem::forget(concurrent_claimed(third.try_claim(8, AppendOptions::default())));
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    // A fourth block, first observed by a scan whose clock reads 1000
+    // while the step 1 clock read 50.
+    core::mem::forget(concurrent_claimed(fourth.try_claim(8, AppendOptions::default())));
+    let mut reads = [50, 1000].into_iter();
+    let report = conductor
+        .service_deadlines(&mut || reads.next().unwrap())
+        .unwrap();
+    assert_eq!(report, waiting());
+    assert_eq!(kept.commit(), CommitOutcome::Committed { position: 64 });
+    // Two aborted, one already committed after its expiry, one timer
+    // re-anchored, and still waiting on it.
+    assert_eq!(
+        serve(&mut conductor, 500),
+        DeadlineReport {
+            aborted: 2,
+            aborted_bytes: 128,
+            resolved: 1,
+            clock_went_back: 1,
+            unrepresentable: 0,
+            waiting: true,
+        }
+    );
+}
+
+#[test]
+fn a_concurrent_call_failing_after_an_abort_carries_it() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    core::mem::forget(concurrent_claimed(first.try_claim(8, AppendOptions::default())));
+    core::mem::forget(concurrent_claimed(second.try_claim(8, AppendOptions::default())));
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    // A peer rewrites the second marked word.
+    let foreign = Word0::new(-96, Flags::new(true, true, false, false, Lane::ZERO), FrameType::Data);
+    word0_of_term0(&buffer, 64).store(foreign.pack().to_le(), Ordering::Release);
+    let error = conductor.service_deadlines(&mut || DEADLINE).unwrap_err();
+    assert_eq!(
+        error.report,
+        DeadlineReport {
+            waiting: true,
+            ..aborted(1, 64)
+        }
+    );
+    assert!(matches!(error.error, SysError::CorruptTerm { offset: 64, .. }));
+}
+
+#[test]
+fn an_unrepresentable_concurrent_expiry_is_counted_per_call() {
+    let buffer = new_buffer(LogBufferConfig {
+        claim_deadline: u64::MAX,
+        ..concurrent_config(2)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let _claim = concurrent_claimed(handle.try_claim(8, AppendOptions::default()));
+    assert_eq!(serve(&mut conductor, 1), waiting());
+    let unrepresentable = DeadlineReport {
+        unrepresentable: 1,
+        waiting: true,
+        ..DeadlineReport::default()
+    };
+    assert_eq!(serve(&mut conductor, 2), unrepresentable);
+    assert_eq!(serve(&mut conductor, u64::MAX), unrepresentable);
+}
+
+/// An aborted writer keeps its loan while it writes its live payload
+/// (direct on heap terms, staging on shared terms): other publishers
+/// rotate past its term and the conductor's reclaim attempts quarantine
+/// the slot until the writer's accesses end.
+#[test]
+fn an_aborted_writer_keeps_its_slot_until_its_accesses_end() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut stuck = conductor.concurrent_publication().unwrap().unwrap();
+    let mut other = conductor.concurrent_publication().unwrap().unwrap();
+    let mut claim = concurrent_claimed(stuck.try_claim(64, AppendOptions::default()));
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    assert_eq!(serve(&mut conductor, DEADLINE), aborted(1, 96));
+    let data = vec![5u8; 3000];
+    let mut quarantined = 0;
+    while buffer.active_count.load(Ordering::Acquire) < 4 {
+        claim.payload().fill(1);
+        let _ = offer_concurrent(&mut other, &mut conductor, &data, || {});
+        quarantined += conductor.duty_cycle().unwrap().quarantined;
+        let _ = serve(&mut conductor, DEADLINE);
+    }
+    assert!(quarantined > 0, "term 0's slot was never quarantined");
+    let term0 = buffer.initial_term_id;
+    let found = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
+    assert_eq!((found.term_id(), found.state()), (term0, SlotState::Reclaiming));
+    claim.payload().fill(2);
+    assert_eq!(claim.commit(), CommitOutcome::Aborted { position: 0 });
+    // The writer's next calls leave term 0; then the slot is cleaned.
+    let _ = offer_concurrent(&mut stuck, &mut conductor, &data, || {});
+    let _ = conductor.duty_cycle().unwrap();
+    let found = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
+    assert!(found.term_id() != term0 || found.state() == SlotState::Free);
+}
+
+/// A writer's block marked by hand at the active term 0's tail: its
+/// `fetch_add` and mark. Returns its start.
+fn mark_by_hand(buffer: &LogBuffer<Terms>, extent: u32) -> u32 {
+    let start = buffer.tail(0).unwrap().fetch_add(u64::from(extent), Ordering::AcqRel) as u32;
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    let reserved = Word0::new(-(extent as i32), flags, FrameType::Data);
+    assert!(mark_block(word0_of_term0(buffer, start), reserved));
+    start
+}
+
+fn commit_by_hand(buffer: &LogBuffer<Terms>, start: u32, extent: u32) {
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    let reserved = Word0::new(-(extent as i32), flags, FrameType::Data);
+    let committed = Word0::new(HEADER_LENGTH as i32 + 8, flags, FrameType::Data);
+    assert!(commit_block(word0_of_term0(buffer, start), reserved, committed));
+}
+
+/// With the minimum scan budget, a marked frontier costs no read once
+/// step 1 confirmed it, so the look-ahead gets past a fragmented block.
+#[test]
+fn the_minimum_scan_budget_discovers_past_a_fragmented_block() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.deadlines.set_budgets(1, 2);
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    let a = concurrent_claimed(first.try_claim(8, AppendOptions::default()));
+    let data = sized_message(2, 3000);
+    assert!(matches!(
+        second.offer(&data, AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { .. }
+    ));
+    let c = concurrent_claimed(second.try_claim(8, AppendOptions::default()));
+    // The first call observes the frontier; the next ones walk the three
+    // fragments and reach C.
+    for _ in 0..4 {
+        let _ = serve(&mut conductor, 0);
+    }
+    assert_eq!(serve(&mut conductor, DEADLINE), aborted(2, 128));
+    assert_eq!(a.commit(), CommitOutcome::Aborted { position: 0 });
+    assert!(matches!(c.commit(), CommitOutcome::Aborted { .. }));
+}
+
+/// Cleaning an unrelated slot keeps a fragment walk's continuation.
+#[test]
+fn cleaning_another_slot_keeps_the_fragment_walk() {
+    let buffer = new_buffer(deadline_concurrent_config(3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.deadlines.set_budgets(1, 2);
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    let mut writer = conductor.concurrent_publication().unwrap().unwrap();
+    let a = concurrent_claimed(first.try_claim(8, AppendOptions::default()));
+    let data = sized_message(2, 3000);
+    let _ = writer.offer(&data, AppendOptions::default()).unwrap();
+    let c = concurrent_claimed(second.try_claim(8, AppendOptions::default()));
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    let mut total = 0;
+    for cycle in 0..6 {
+        // Each cycle cleans at least one slot other than term 0's.
+        let mut cleaned = 0;
+        for _ in 0..1000 {
+            let _ = writer.offer(&data, AppendOptions::default()).unwrap();
+            cleaned += conductor.duty_cycle().unwrap().cleaned;
+            if cleaned > 0 {
+                break;
+            }
+        }
+        assert!(cleaned > 0);
+        total += serve(&mut conductor, DEADLINE * (cycle + 1)).aborted;
+    }
+    assert_eq!(total, 2);
+    assert_eq!(a.commit(), CommitOutcome::Aborted { position: 0 });
+    assert!(matches!(c.commit(), CommitOutcome::Aborted { .. }));
+}
+
+/// A writer that completes an observed block and marks another during
+/// one call never loses the new block's discovery to stale entries.
+#[test]
+fn a_block_discovered_beside_stale_observations_keeps_its_timer() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let a = mark_by_hand(&buffer, 64);
+    let b = mark_by_hand(&buffer, 64);
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    let mut c = None;
+    let report = conductor
+        .service_deadlines_pausing(&mut || 1, &mut || {
+            // After step 1 confirmed both: B completes, its writer marks C.
+            commit_by_hand(&buffer, b, 64);
+            c = Some(mark_by_hand(&buffer, 64));
+        })
+        .unwrap();
+    assert_eq!(report, waiting());
+    assert_eq!((a, b, c), (0, 64, Some(128)));
+    // C, discovered at 1, is aborted at 1 + DEADLINE with A; B resolved.
+    assert_eq!(
+        serve(&mut conductor, 1 + DEADLINE),
+        DeadlineReport {
+            resolved: 1,
+            ..aborted(2, 128)
+        }
+    );
+}
+
+/// The production scan budget keeps a 128-fragment walk across unrelated
+/// cleaning.
+#[test]
+fn the_default_scan_budget_keeps_a_long_fragment_walk_across_cleaning() {
+    let buffer = new_buffer(LogBufferConfig {
+        mtu: 64,
+        ..deadline_concurrent_config(3)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    let mut writer = conductor.concurrent_publication().unwrap().unwrap();
+    let a = concurrent_claimed(first.try_claim(8, AppendOptions::default()));
+    let data = sized_message(2, 4096);
+    let _ = writer.offer(&data, AppendOptions::default()).unwrap();
+    let c = concurrent_claimed(second.try_claim(8, AppendOptions::default()));
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    let mut total = 0;
+    for cycle in 0..6 {
+        let mut cleaned = 0;
+        for _ in 0..1000 {
+            let _ = writer.offer(&data, AppendOptions::default()).unwrap();
+            cleaned += conductor.duty_cycle().unwrap().cleaned;
+            if cleaned > 0 {
+                break;
+            }
+        }
+        assert!(cleaned > 0);
+        total += serve(&mut conductor, DEADLINE * (cycle + 1)).aborted;
+    }
+    assert_eq!(total, 2);
+    assert_eq!(a.commit(), CommitOutcome::Aborted { position: 0 });
+    assert!(matches!(c.commit(), CommitOutcome::Aborted { .. }));
+}
+
+/// When the frontier's marked block commits, the frontier moves past the
+/// region the look-ahead already scanned without reading it again, so a
+/// partly walked fragmented block resumes where it stopped.
+#[test]
+fn a_committed_frontier_does_not_replay_the_lookahead() {
+    let buffer = new_buffer(LogBufferConfig {
+        mtu: 64,
+        ..deadline_concurrent_config(3)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.deadlines.set_budgets(1, 2);
+    let mut a = conductor.concurrent_publication().unwrap().unwrap();
+    let mut b = conductor.concurrent_publication().unwrap().unwrap();
+    let mut c = conductor.concurrent_publication().unwrap().unwrap();
+    // Three and ten fragments of 32 payload bytes.
+    let (first, second) = (sized_message(1, 96), sized_message(2, 320));
+    let outcome = a
+        .offer_pausing(&first, AppendOptions::default(), &mut |point| {
+            if point != WriterPause::Commit {
+                return;
+            }
+            assert!(matches!(
+                b.offer(&second, AppendOptions::default()).unwrap(),
+                ConcurrentOfferOutcome::Appended { .. }
+            ));
+            core::mem::forget(concurrent_claimed(c.try_claim(8, AppendOptions::default())));
+            // A observed, then eight calls of the look-ahead into B.
+            for _ in 0..8 {
+                assert_eq!(serve(&mut conductor, 0), waiting());
+            }
+        })
+        .unwrap();
+    assert!(matches!(outcome, ConcurrentOfferOutcome::Appended { .. }));
+    // B's remaining fragments and C take three more calls: C is first
+    // observed at 3 at the latest, and expires by 3 + DEADLINE.
+    for now in 1..=3 {
+        let _ = serve(&mut conductor, now);
+    }
+    assert_eq!(serve(&mut conductor, 3 + DEADLINE), aborted(1, 64));
 }

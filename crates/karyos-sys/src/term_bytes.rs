@@ -80,6 +80,15 @@ pub(crate) mod sealed {
         ///   boundaries that the old term used as payload; their earlier
         ///   accesses all happen before the `CLEANING` transition through the
         ///   loan handshake.
+        /// - the caller is the buffer's conductor serving commit deadlines
+        ///   (`quantstratum-docs: karyos/design/concurrent-deadline.md`): it has just validated
+        ///   that the slot holds the term `ACTIVE` or `RECLAIMING`, only it
+        ///   moves the slot on to `CLEANING`, and not while it uses the
+        ///   reference; and `offset` is a location no party accesses
+        ///   non-atomically during the term incarnation: a frame start, or
+        ///   a 32-byte boundary of a zero span its span walk takes, where
+        ///   every writer whose block starts in the span fails its mark
+        ///   before any write.
         unsafe fn word0(&self, slot: u8, offset: u32) -> &AtomicU64;
 
         /// Copies `bytes` into `slot` at `offset`.
