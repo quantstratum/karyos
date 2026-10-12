@@ -12,11 +12,33 @@
 //!   itself is unaffected. Only an overflow of `counter overflows` itself
 //!   goes unrecorded.
 //! - **Gauges** ([`TYPE_GAUGE`]) are current values. The driver refreshes
-//!   them at the end of every duty cycle and after each control call that
-//!   changes them, so a handle dropped by the application shows up at the
-//!   next duty cycle.
+//!   them at the end of every successful duty cycle and after each control
+//!   call that changes them, so a handle dropped by the application shows
+//!   up at the next duty cycle. A duty cycle that returns an error may skip
+//!   the refresh.
 //! - Each counter is read on its own; there is no atomic snapshot across
 //!   counters.
+//!
+//! Counters, by label (the label is the counter's metadata):
+//!
+//! | Label | Type | Meaning |
+//! | --- | --- | --- |
+//! | `clients admitted` | event | clients admitted by `connect` |
+//! | `clients retired` | event | admission slots released (close flag observed) |
+//! | `clients faulty` | event | clients retired for a protocol violation, at the first retirement |
+//! | `commands served` | event | commands decoded and executed or refused; malformed records are not commands |
+//! | `commands refused` | event | served commands answered with an `Error` |
+//! | `responses sent` | event | responses written to the broadcast buffer |
+//! | `terminal` | gauge | 1 once the driver is in its terminal state |
+//! | `streams active` | gauge | streams accepting new capabilities |
+//! | `streams retiring` | gauge | streams removed but not yet freed |
+//! | `streams freed` | event | streams freed |
+//! | `registrations swept` | event | registrations forgotten because their capability was dropped |
+//! | `counter overflows` | event | increments that would have overflowed and were not applied |
+//! | `clients connected` | gauge | admission slots in use, including faulty clients awaiting producer detach |
+//! | `hand-over entries held` | gauge | capabilities waiting to be taken |
+//! | `stream leases live` | gauge | capability leases over all streams; forgotten handles stay counted |
+//! | `streams removed` | event | streams that went from active to retiring, once each |
 //!
 //! The cells are allocated once, when the driver is created. A reader
 //! keeps the region alive after the driver is dropped; the driver's
