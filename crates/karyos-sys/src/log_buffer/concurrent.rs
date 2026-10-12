@@ -89,7 +89,7 @@ impl<O: BufferOwner> Conductor<O> {
             if let Some(error) = crossed_error {
                 return Err(error);
             }
-            Ok(TermCount::try_new(from)?)
+            TermCount::try_new(from)
         };
         let from = match issue() {
             Ok(from) => from,
