@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint test loom miri build-release deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint doc test loom miri build-release deny deps-inventory deps-check lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -14,6 +14,9 @@ fmt-check:
 
 lint:
 	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+
+doc:
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --locked
 
 test:
 	$(CARGO) test --workspace --locked
@@ -39,4 +42,4 @@ deps-check:
 lint-sync:
 	scripts/check-lint-sync.sh
 
-pre-push: fmt-check lint-sync deps-check lint test loom build-release
+pre-push: fmt-check lint-sync deps-check lint doc test loom build-release

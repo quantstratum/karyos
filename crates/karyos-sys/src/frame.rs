@@ -155,7 +155,8 @@ impl Lane {
 /// Frame types with their stable wire codes (SPEC.md §5).
 ///
 /// Control frames share only word 0 with data frames; a type code here does
-/// not imply that its frame body is the 32-byte [`FrameHeader`] layout.
+/// not imply that its frame body is the 32-byte header layout (`FrameHeader`
+/// in `karyos-protocol`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum FrameType {

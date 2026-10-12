@@ -145,7 +145,7 @@ impl<'a> TermAppender<'a> {
     ///
     /// Returns [`ProtocolError::EmptyMessage`] for an empty payload (a
     /// header-only DATA frame is a heartbeat, not an application message),
-    /// [`ProtocolError::MessageTooLarge`] above the message limit (with the
+    /// [`ProtocolError::Layout`] with `MessageTooLarge` above the message limit (with the
     /// extension the limit is recomputed for its header) and arithmetic
     /// errors from sizing. Every error is detected before anything is
     /// written; the tail and the term are then unchanged.

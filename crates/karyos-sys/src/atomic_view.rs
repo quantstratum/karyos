@@ -109,7 +109,8 @@ impl<'a> AtomicWords<'a> {
 }
 
 /// Heap-backed atomic words, for tests and single-process use. Built through
-/// [`AtomicWords::from_raw`] like a mapping, so Miri exercises that path.
+/// the same internal constructor as a mapping (`AtomicWords::from_raw`), so
+/// Miri exercises that path.
 #[derive(Debug)]
 pub struct HeapWords {
     base: NonNull<AtomicU64>,

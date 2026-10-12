@@ -2,6 +2,7 @@
 
 //! Errors of the `karyos-protocol` crate.
 
+pub use karyos_sys::error::LayoutError;
 use thiserror::Error;
 
 /// Errors raised while validating frame layouts and sizes.
@@ -9,7 +10,7 @@ use thiserror::Error;
 pub enum ProtocolError {
     /// A frame layout or sizing rule from `karyos_sys` failed.
     #[error(transparent)]
-    Layout(#[from] karyos_sys::error::LayoutError),
+    Layout(#[from] LayoutError),
     /// A buffer is shorter than the structure being read or written.
     #[error("buffer of {available} bytes is shorter than the required {required}")]
     BufferTooShort {

@@ -66,7 +66,8 @@ impl FrameHeader {
     /// # Errors
     ///
     /// Returns [`ProtocolError::BufferTooShort`] for a short buffer and
-    /// [`ProtocolError::ReservedFlags`] for reserved flag bits. The version
+    /// [`ProtocolError::Layout`] ([`crate::error::LayoutError::ReservedFlags`]) for reserved
+    /// flag bits. The version
     /// and frame type are returned as found.
     pub fn decode(bytes: &[u8]) -> Result<Self, ProtocolError> {
         let bytes = prefix(bytes, HEADER_LENGTH as usize)?;
