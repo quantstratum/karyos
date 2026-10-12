@@ -108,8 +108,7 @@ impl SealedMapping {
         let file_len =
             u64::try_from(len).map_err(|_| SysError::InvalidRegion { address: 0, len })?;
 
-        let fd = rustix::fs::memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)
-            .map_err(os("memfd_create"))?;
+        let fd = create_memfd(name)?;
         rustix::fs::ftruncate(&fd, file_len).map_err(os("ftruncate"))?;
         rustix::fs::fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW)
             .map_err(os("fcntl_add_seals"))?;
@@ -153,7 +152,10 @@ impl SealedMapping {
         rustix::fs::fcntl_add_seals(&mapping.fd, SealFlags::FUTURE_WRITE | SealFlags::SEAL)
             .map_err(os("fcntl_add_seals"))?;
         let found = rustix::fs::fcntl_get_seals(&mapping.fd).map_err(os("fcntl_get_seals"))?;
-        if found != REQUIRED_SEALS {
+        // The kernel may add `F_SEAL_EXEC` (non-executable memfd policy); it
+        // is harmless here. Every required seal must be present and nothing
+        // else is allowed.
+        if found.difference(SealFlags::EXEC) != REQUIRED_SEALS {
             return Err(SysError::SealMismatch {
                 expected: REQUIRED_SEALS.bits(),
                 found: found.bits(),
@@ -247,6 +249,21 @@ impl Drop for SealedMapping {
     }
 }
 
+/// Creates a sealable, close-on-exec memfd, non-executable when the kernel
+/// supports `MFD_NOEXEC_SEAL` (Linux 6.3+). Older kernels reject that flag
+/// with `EINVAL`; the memfd is then created without it, which is still never
+/// mapped executable by this crate.
+fn create_memfd(name: &str) -> Result<OwnedFd, SysError> {
+    let base = MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING;
+    match rustix::fs::memfd_create(name, base | MemfdFlags::NOEXEC_SEAL) {
+        Ok(fd) => Ok(fd),
+        Err(rustix::io::Errno::INVAL) => {
+            rustix::fs::memfd_create(name, base).map_err(os("memfd_create"))
+        }
+        Err(errno) => Err(os("memfd_create")(errno)),
+    }
+}
+
 fn os(operation: &'static str) -> impl Fn(rustix::io::Errno) -> SysError {
     move |errno| SysError::Os {
         operation,
@@ -316,12 +333,11 @@ mod tests {
     }
 
     #[test]
-    fn seal_set_is_exact() {
+    fn seal_set_is_the_required_set_plus_at_most_exec() {
         let mapping = SealedMapping::create("karyos-test", page(), LockRequest::No).unwrap();
-        assert_eq!(
-            rustix::fs::fcntl_get_seals(mapping.fd()).unwrap(),
-            REQUIRED_SEALS
-        );
+        let found = rustix::fs::fcntl_get_seals(mapping.fd()).unwrap();
+        assert!(found.contains(REQUIRED_SEALS));
+        assert_eq!(found.difference(SealFlags::EXEC), REQUIRED_SEALS);
     }
 
     #[test]
