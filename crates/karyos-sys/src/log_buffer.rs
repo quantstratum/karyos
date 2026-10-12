@@ -723,10 +723,20 @@ impl<O: BufferOwner> Subscription<O> {
         .poll(out)
     }
 
-    /// Acknowledges the last copied message: publishes the position after it
-    /// to the registry. A no-op when nothing is pending.
+    /// Acknowledges the last copied message: publishes the stored end of
+    /// that block to the registry. It takes no caller position. A no-op when
+    /// nothing is pending, so repeated calls are harmless. At most one
+    /// message is pending; until it is acknowledged every poll copies that
+    /// same message again (same position, payload and extension).
+    ///
+    /// Optional subscribers acknowledge automatically on copy; this
+    /// low-level API does not replay a message to an optional subscriber
+    /// whose handler failed. `close` and `Drop` abandon a pending message.
     pub fn acknowledge(&mut self) {
         if let Some(position) = self.cursor.pending.take() {
+            // A failed redelivery may have reset the read cursor to the
+            // acknowledged position; the acknowledged block ends here.
+            self.cursor.position = position;
             SubscriptionContext {
                 buffer: &self.buffer,
                 cursor: &mut self.cursor,
@@ -763,8 +773,10 @@ struct SubscriptionContext<'a> {
 
 impl SubscriptionContext<'_> {
     fn poll(&mut self, out: &mut [u8]) -> Result<PollOutcome, SysError> {
-        // An unacknowledged copy is delivered again: never skip ahead.
-        if self.cursor.pending.take().is_some() {
+        // An unacknowledged copy is delivered again: never skip ahead. The
+        // pending end stays recorded until a redelivery succeeds, so failed,
+        // short-buffer or pending polls never invalidate it.
+        if self.cursor.pending.is_some() {
             self.cursor.position = self.cursor.acknowledged;
         }
         // At most two iterations: the end of one term and the next term.
@@ -962,8 +974,15 @@ impl SubscriptionContext<'_> {
     }
 
     /// Applies `rejoin_at_head`: report the lost range and resume at the
-    /// reserved head, which is always a block boundary.
+    /// reserved head, which is always a block boundary. A required
+    /// subscriber is never lapped while it bounds the publisher; if it ever
+    /// finds its data gone, that is an error and its cursor does not move.
     fn overrun(&mut self) -> Result<Step, SysError> {
+        if self.cursor.role == Role::Required {
+            return Err(SysError::RequiredSubscriberLapped {
+                position: self.cursor.position,
+            });
+        }
         let from = self.cursor.position;
         let lost_to = self.buffer.floor.load(Ordering::Acquire).max(from);
         let resume = self.buffer.reserved_head.load(Ordering::Acquire).max(from);
@@ -1593,11 +1612,9 @@ mod tests {
 
     #[test]
     fn the_floor_is_rechecked_after_the_loan_is_granted() {
-        let buffer = LogBuffer::new(config(2, 2)).unwrap();
+        let buffer = LogBuffer::new(config(3, 2)).unwrap();
         let mut conductor = buffer.conductor().unwrap();
-        let mut subscription = conductor
-            .subscribe(Role::Optional)
-            .unwrap_or_else(|_| conductor.subscribe(Role::Required).unwrap());
+        let mut subscription = conductor.subscribe(Role::Optional).unwrap();
         let mut publication = buffer.publication().unwrap().unwrap();
         let _ = append_retrying(&mut publication, &mut conductor, &message(1), || {});
         // The term is still ACTIVE, but the floor has passed the position, as
@@ -1775,6 +1792,79 @@ mod tests {
         required.acknowledge();
         let _ = conductor.duty_cycle().unwrap();
         assert!(buffer.floor.load(Ordering::Acquire) > 0);
+    }
+
+    /// A failed redelivery (short buffer) keeps the original pending end, so
+    /// acknowledging the original delivery still works; a crossing PAD
+    /// before the unacknowledged message is consumed on its own.
+    #[test]
+    fn failed_redelivery_keeps_the_pending_message() {
+        let buffer = LogBuffer::new(config(2, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut required = conductor.subscribe(Role::Required).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        buffer.limit.store(4 * TERM, Ordering::Release);
+        // Fill term 0 so the next message lands after a PAD in term 1.
+        let filler = vec![1u8; 992];
+        for _ in 0..60 {
+            let _ = publication
+                .append(&filler, AppendOptions::default())
+                .unwrap();
+        }
+        let big = vec![2u8; 8000];
+        assert_eq!(
+            publication.append(&big, AppendOptions::default()).unwrap(),
+            AppendOutcome::AdminAction
+        );
+        let _ = publication.append(&big, AppendOptions::default()).unwrap();
+        let mut out = vec![0u8; 8192];
+        for _ in 0..60 {
+            assert!(matches!(
+                required.poll(&mut out).unwrap(),
+                PollOutcome::Message { .. }
+            ));
+            required.acknowledge();
+        }
+        // Crosses the PAD, delivers the 8000-byte message at the term start.
+        let first = required.poll(&mut out).unwrap();
+        assert!(
+            matches!(first, PollOutcome::Message { position, length: 8000, .. } if position == TERM)
+        );
+        // Redelivery into a short buffer fails and moves nothing.
+        let mut short = vec![0u8; 100];
+        assert!(matches!(
+            required.poll(&mut short),
+            Err(SysError::BufferTooShort { .. })
+        ));
+        // The original delivery can still be acknowledged.
+        required.acknowledge();
+        let _ = conductor.duty_cycle().unwrap();
+        assert_eq!(
+            buffer.cells[1].position.load(Ordering::Acquire),
+            TERM + 8192
+        );
+        assert_eq!(required.poll(&mut out).unwrap(), PollOutcome::Pending);
+    }
+
+    /// A required subscriber whose data is gone gets an error, never a
+    /// silent rejoin: its cursor and pending message stay put.
+    #[test]
+    fn a_required_subscriber_never_skips_silently() {
+        let buffer = LogBuffer::new(config(2, 1)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut required = conductor.subscribe(Role::Required).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let _ = publication
+            .append(&message(1), AppendOptions::default())
+            .unwrap();
+        // Force an impossible floor above the required position.
+        buffer.floor.store(1, Ordering::Release);
+        let mut out = vec![0u8; 8192];
+        assert_eq!(
+            required.poll(&mut out),
+            Err(SysError::RequiredSubscriberLapped { position: 0 })
+        );
+        assert_eq!(required.position(), 0);
     }
 
     #[test]

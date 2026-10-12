@@ -105,6 +105,12 @@ pub enum SysError {
     /// A fixed capacity (slots, registry cells or loan credits) is exhausted.
     #[error("resources unavailable")]
     ResourcesUnavailable,
+    /// A required subscriber found its data gone; its cursor did not move.
+    #[error("required subscriber lapped at position {position}")]
+    RequiredSubscriberLapped {
+        /// The subscriber's position.
+        position: u64,
+    },
     /// An application message must carry at least one byte.
     #[error("empty application message")]
     EmptyMessage,
