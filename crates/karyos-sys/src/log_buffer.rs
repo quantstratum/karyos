@@ -1856,11 +1856,17 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             });
         }
         let from = self.cursor.position;
+        // The floor first: the head read after it is at or above it (the
+        // conductor publishes a floor only from an earlier head snapshot).
+        let lost_to = self.buffer.floor.load(Ordering::Acquire).max(from);
         let Some(head) = self.buffer.head()? else {
             // No consistent head now: retry later instead of rejoining.
             return Ok(Step::Done(PollOutcome::Pending));
         };
-        let lost_to = self.buffer.floor.load(Ordering::Acquire).max(from);
+        if head < lost_to {
+            // Never resume inside the range just reported lost.
+            return Ok(Step::Done(PollOutcome::Pending));
+        }
         let resume = head.max(from);
         self.advance_to(resume);
         Ok(Step::Done(PollOutcome::Overrun {
