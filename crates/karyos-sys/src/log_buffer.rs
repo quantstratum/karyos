@@ -16,9 +16,10 @@
 //!   `&mut self`.
 //!
 //! Scope: embedded mode (one process), one lane, copy delivery, `hold`
-//! required subscribers and `rejoin_at_head` optional subscribers. No
-//! concurrent publication, claims, observers, revocation policies or mapping
-//! generations. This low-level copy primitive also allows a publication with
+//! required subscribers and `rejoin_at_head` optional subscribers. Claims
+//! on the exclusive publication follow `quantstratum-docs: karyos/design/claims.md`, without the
+//! driver's commit-deadline abort. No concurrent publication, observers,
+//! revocation policies or mapping generations. This low-level copy primitive also allows a publication with
 //! no subscribers at all: the `NotConnected` / `allow_unconnected` connection
 //! rules of SPEC.md §4 are left to a later, higher layer.
 
@@ -28,17 +29,21 @@ use std::sync::Arc;
 
 use crate::error::{LayoutError, SysError};
 use crate::frame::{
-    EXTENSION_LENGTH, Flags, FrameType, HEADER_LENGTH, Lane, PROTOCOL_VERSION, Word0,
+    EXTENSION_LENGTH, FRAME_ALIGNMENT, Flags, FrameType, HEADER_LENGTH, Lane, PROTOCOL_VERSION,
+    Word0,
 };
 use crate::loan::{
     LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held, publish,
     release_loan, take_loan,
 };
-use crate::publication::{load_interior, observe_block, publish_block, store_interior};
+use crate::publication::{
+    abort_block, commit_block, load_interior, mark_block, observe_block, publish_block,
+    store_interior,
+};
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
 use crate::slot::{Descriptor, SlotIndex, SlotState};
 use crate::term::{Generation, TermCount, TermId};
-use crate::term_bytes::sealed::Token;
+use crate::term_bytes::sealed::{Access as _, Token};
 use crate::term_bytes::{HeapTerms, SharedTerms, TermBytes};
 
 mod sealed {
@@ -365,14 +370,25 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
         TermCount::ZERO,
     );
     match take_loan(&cell.loan, &cell.revoked, buffer.descriptor(0)?, target)? {
-        LoanOutcome::Granted => Ok(Some(Publication {
-            buffer: owner,
-            state: PublicationState::Active {
-                count: TermCount::ZERO,
-                slot: 0,
-                tail: 0,
-            },
-        })),
+        LoanOutcome::Granted => {
+            // The staging buffer of claims on a backing without direct
+            // bytes; one fragment never exceeds the MTU.
+            let staging = if <O::Terms as crate::term_bytes::sealed::Access>::DIRECT {
+                Box::default()
+            } else {
+                vec![0u8; buffer.config.mtu as usize].into_boxed_slice()
+            };
+            Ok(Some(Publication {
+                buffer: owner,
+                state: PublicationState::Active {
+                    count: TermCount::ZERO,
+                    slot: 0,
+                    tail: 0,
+                },
+                pending: None,
+                staging,
+            }))
+        }
         _ => Err(SysError::CorruptTerm {
             offset: 0,
             reason: "initial term not active",
@@ -448,11 +464,69 @@ enum PublicationState {
     },
 }
 
+/// The publication's record of its outstanding claim (claims.md,
+/// forgotten claims): set when the claim marks its block, cleared when it
+/// commits or aborts. A forgotten claim leaves it set.
+#[derive(Debug, Clone, Copy)]
+struct PendingClaim {
+    /// The term the claim reserved in, under the standing write loan.
+    count: TermCount,
+    slot: u8,
+    /// Term offset of the block.
+    start: u32,
+    position: u64,
+    /// Payload length.
+    length: u32,
+    header_length: u32,
+    /// The decision word's expected values.
+    reserved: Word0,
+    committed: Word0,
+    aborted: Word0,
+}
+
+/// Result of [`Publication::try_claim`].
+#[derive(Debug)]
+#[must_use = "back pressure and admin actions must be handled"]
+pub enum ClaimOutcome<'a, O: BufferOwner> {
+    /// A block was reserved and marked; write the payload, then commit.
+    Claimed(Claim<'a, O>),
+    /// The flow-control limit does not admit the reservation; retry later.
+    BackPressured,
+    /// The call only padded or rotated, or rotation waits for the
+    /// conductor; retry later.
+    AdminAction,
+    /// The block was aborted before it could be marked; nothing was
+    /// written. Not produced while no other party aborts blocks.
+    Aborted {
+        /// Stream position of the block.
+        position: u64,
+    },
+}
+
+/// Result of [`Claim::commit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a commit can lose to an abort"]
+pub enum CommitOutcome {
+    /// The message was published at `position`.
+    Committed {
+        /// Stream position of the block.
+        position: u64,
+    },
+    /// An abort won; readers skip the block.
+    Aborted {
+        /// Stream position of the block.
+        position: u64,
+    },
+}
+
 /// The buffer's only publication.
 #[derive(Debug)]
 pub struct Publication<O: BufferOwner> {
     buffer: O,
     state: PublicationState,
+    pending: Option<PendingClaim>,
+    /// Claim payload staging on backings without direct bytes.
+    staging: Box<[u8]>,
 }
 
 impl<O: BufferOwner> Publication<O> {
@@ -475,12 +549,218 @@ impl<O: BufferOwner> Publication<O> {
         payload: &[u8],
         options: AppendOptions,
     ) -> Result<AppendOutcome, SysError> {
+        self.resolve_claim();
         PublicationContext {
             buffer: &self.buffer,
             state: &mut self.state,
         }
         .append(payload, options)
     }
+
+    /// Claims one unfragmented block of `length` payload bytes (SPEC.md §4,
+    /// claims; `quantstratum-docs: karyos/design/claims.md`). The returned [`Claim`] borrows the
+    /// publication; its payload starts zeroed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::EmptyMessage`], [`LayoutError::MessageTooLarge`]
+    /// when `length` exceeds `max_message_length`, one fragment or
+    /// `max_reserved`, and [`SysError::MaxPositionExceeded`] as
+    /// [`Publication::append`]. Nothing is written on error, except the
+    /// resolution of a forgotten claim.
+    pub fn try_claim(
+        &mut self,
+        length: u32,
+        options: AppendOptions,
+    ) -> Result<ClaimOutcome<'_, O>, SysError> {
+        self.resolve_claim();
+        let step = PublicationContext {
+            buffer: &self.buffer,
+            state: &mut self.state,
+        }
+        .claim(length, options)?;
+        match step {
+            ClaimStep::Marked(pending) => {
+                if let Some(staging) = self.staging.get_mut(..pending.length as usize) {
+                    staging.fill(0);
+                }
+                self.pending = Some(pending);
+                Ok(ClaimOutcome::Claimed(Claim { publication: self }))
+            }
+            ClaimStep::Outcome(AppendOutcome::BackPressured) => Ok(ClaimOutcome::BackPressured),
+            ClaimStep::Outcome(_) => Ok(ClaimOutcome::AdminAction),
+            ClaimStep::Aborted { position } => Ok(ClaimOutcome::Aborted { position }),
+        }
+    }
+
+    /// Closes the publication, aborting a forgotten claim first. The
+    /// standing write loan is kept, as when the publication is dropped.
+    pub fn close(self) {}
+
+    /// Aborts the outstanding claim, if any, and clears its record. Called
+    /// only where no reference into the block can remain: by the next call
+    /// on the publication (the claim borrowed it mutably), by `Drop` of the
+    /// claim or of the publication.
+    fn resolve_claim(&mut self) {
+        let Some(claim) = self.pending.take() else {
+            return;
+        };
+        debug_assert!(matches!(
+            self.state,
+            PublicationState::Active { count, slot, .. }
+                if count == claim.count && slot == claim.slot
+        ));
+        // SAFETY: the standing write loan on the claim's term is still
+        // held: no call rotated while the claim was recorded. `start` is
+        // the block's first frame start.
+        let word = unsafe { self.buffer.regions.word0(claim.slot, claim.start) };
+        // Losing means the block is already terminal.
+        let _ = abort_block(word, claim.reserved, claim.aborted);
+    }
+}
+
+impl<O: BufferOwner> Drop for Publication<O> {
+    fn drop(&mut self) {
+        self.resolve_claim();
+    }
+}
+
+/// A claimed block (SPEC.md §4, claims). It mutably borrows its
+/// publication; [`Claim::commit`] publishes it, and [`Claim::abort`] or
+/// dropping it uncommitted aborts it. A claim forgotten with
+/// `mem::forget` is aborted by the publication's next call, `close` or
+/// drop.
+///
+/// The payload cannot outlive the claim:
+///
+/// ```compile_fail,E0597
+/// # use karyos_sys::log_buffer::*;
+/// fn escape<O: BufferOwner + core::fmt::Debug>(publication: &mut Publication<O>) {
+///     let payload;
+///     {
+///         let Ok(ClaimOutcome::Claimed(mut claim)) =
+///             publication.try_claim(8, AppendOptions::default())
+///         else {
+///             return;
+///         };
+///         payload = claim.payload();
+///     }
+///     payload[0] = 1;
+/// }
+/// ```
+///
+/// nor be used after `commit`:
+///
+/// ```compile_fail,E0505
+/// # use karyos_sys::log_buffer::*;
+/// fn after_commit<O: BufferOwner>(mut claim: Claim<'_, O>) {
+///     let payload = claim.payload();
+///     let _ = claim.commit();
+///     payload[0] = 1;
+/// }
+/// ```
+#[derive(Debug)]
+pub struct Claim<'a, O: BufferOwner> {
+    publication: &'a mut Publication<O>,
+}
+
+impl<O: BufferOwner> Claim<'_, O> {
+    /// Stream position of the block.
+    #[must_use]
+    pub fn position(&self) -> u64 {
+        self.publication.pending.map_or(0, |claim| claim.position)
+    }
+
+    /// The payload: exactly the claimed length, zeroed at claim time. On
+    /// [`HeapTerms`] it is the block's payload range in the term; on
+    /// [`SharedTerms`] a staging buffer copied in at commit.
+    pub fn payload(&mut self) -> &mut [u8] {
+        let publication = &mut *self.publication;
+        let Some(claim) = publication.pending else {
+            return &mut [];
+        };
+        // SAFETY: the claim marked the block under the standing write loan,
+        // which stays held while the claim exists (a borrow of `self`); the
+        // range is the frame's payload, after the header and extension and
+        // before the alignment padding, so it holds no control word; readers
+        // do not access a block whose word 0 is negative, and nothing else
+        // writes it while the publication is mutably borrowed.
+        let direct = unsafe {
+            publication.buffer.regions.direct_bytes(
+                claim.slot,
+                claim.start + claim.header_length,
+                claim.length,
+            )
+        };
+        match direct {
+            // SAFETY: as above; the slice borrows `self` mutably, so it ends
+            // before commit, abort or drop.
+            Some(pointer) => unsafe {
+                core::slice::from_raw_parts_mut(pointer.as_ptr(), claim.length as usize)
+            },
+            None => publication
+                .staging
+                .get_mut(..claim.length as usize)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Commits the block: exactly one of commit and abort wins.
+    pub fn commit(self) -> CommitOutcome {
+        let publication = &mut *self.publication;
+        let Some(claim) = publication.pending.take() else {
+            return CommitOutcome::Aborted { position: 0 };
+        };
+        let buffer = &*publication.buffer;
+        if let Some(staging) = publication.staging.get(..claim.length as usize)
+            && !<O::Terms as crate::term_bytes::sealed::Access>::DIRECT
+        {
+            // SAFETY: write loan held; the payload range of the marked,
+            // unpublished frame; the bytes up to the next word already read
+            // as zero (cleaned slot).
+            unsafe {
+                buffer
+                    .regions
+                    .write_bytes(claim.slot, claim.start + claim.header_length, staging)
+            };
+        }
+        // SAFETY: write loan held; the block's first frame start.
+        let word = unsafe { buffer.regions.word0(claim.slot, claim.start) };
+        if commit_block(word, claim.reserved, claim.committed) {
+            CommitOutcome::Committed {
+                position: claim.position,
+            }
+        } else {
+            CommitOutcome::Aborted {
+                position: claim.position,
+            }
+        }
+    }
+
+    /// Aborts the block; readers skip it.
+    pub fn abort(self) {}
+}
+
+impl<O: BufferOwner> Drop for Claim<'_, O> {
+    fn drop(&mut self) {
+        self.publication.resolve_claim();
+    }
+}
+
+enum ClaimStep {
+    Marked(PendingClaim),
+    Outcome(AppendOutcome),
+    Aborted { position: u64 },
+}
+
+enum Reservation {
+    Reserved {
+        count: TermCount,
+        slot: u8,
+        tail: u32,
+        position: u64,
+    },
+    Outcome(AppendOutcome),
 }
 
 /// The publication's state borrowed together with its buffer.
@@ -514,12 +794,96 @@ impl<T: TermBytes> PublicationContext<'_, T> {
         };
         FragmentPlan::check_message(length, max)?;
         let reserved = plan.reserved(length)?;
+        match self.reserve(reserved)? {
+            Reservation::Outcome(outcome) => Ok(outcome),
+            Reservation::Reserved {
+                count,
+                slot,
+                tail,
+                position,
+            } => {
+                self.write_block(slot, count, tail, payload, &plan, options);
+                Ok(AppendOutcome::Appended { position })
+            }
+        }
+    }
 
+    /// Checks and marks a claim (claims.md, the claim).
+    fn claim(&mut self, length: u32, options: AppendOptions) -> Result<ClaimStep, SysError> {
+        if length == 0 {
+            return Err(SysError::EmptyMessage);
+        }
+        let buffer = self.buffer;
+        let ext = options.extension.is_some();
+        let lane = buffer.config.lane;
+        let flags = Flags::new(true, true, options.end_of_stream, ext, lane);
+        let plan = FragmentPlan::new(buffer.config.mtu, flags)?;
+        let max = if ext {
+            plan.max_message_length(buffer.config.max_reserved, buffer.config.term_length)?
+        } else {
+            buffer.max_message_length
+        };
+        FragmentPlan::check_message(length, max)?;
+        FragmentPlan::check_message(length, plan.payload_per_fragment())?;
+        let reserved = plan.reserved(length)?;
+        if reserved > buffer.config.max_reserved {
+            return Err(LayoutError::MessageTooLarge { length, max }.into());
+        }
+        let (count, slot, tail, position) = match self.reserve(reserved)? {
+            Reservation::Outcome(outcome) => return Ok(ClaimStep::Outcome(outcome)),
+            Reservation::Reserved {
+                count,
+                slot,
+                tail,
+                position,
+            } => (count, slot, tail, position),
+        };
+        let header_length = flags.header_length();
+        let reserved_word = Word0::new(-(reserved as i32), flags, FrameType::Data);
+        // SAFETY: the standing write loan on `count` in `slot` is held;
+        // `tail` is the reserved block's first frame start.
+        let word = unsafe { buffer.regions.word0(slot, tail) };
+        if !mark_block(word, reserved_word) {
+            return Ok(ClaimStep::Aborted { position });
+        }
+        // Marked: only now write the rest of the header.
+        self.write_header_tail(slot, count, tail, options.reserved_value);
+        if let Some(extension) = &options.extension {
+            // SAFETY: write loan held; the extension follows the header of
+            // the marked, unpublished frame; not a word 0.
+            unsafe {
+                buffer
+                    .regions
+                    .write_bytes(slot, tail + HEADER_LENGTH, extension)
+            };
+        }
+        Ok(ClaimStep::Marked(PendingClaim {
+            count,
+            slot,
+            start: tail,
+            position,
+            length,
+            header_length,
+            reserved: reserved_word,
+            committed: Word0::new((header_length + length) as i32, flags, FrameType::Data),
+            aborted: Word0::new(
+                reserved as i32,
+                Flags::new(false, false, false, false, lane),
+                FrameType::Aborted,
+            ),
+        }))
+    }
+
+    /// Reserves `reserved` bytes at the tail, once: publishes the reserved
+    /// head and advances the cached tail past the block. Without room it
+    /// pads and rotates, and without credit it reports back pressure.
+    fn reserve(&mut self, reserved: u32) -> Result<Reservation, SysError> {
+        let buffer = self.buffer;
         if let PublicationState::Rotating { next } = *self.state {
-            return self.rotate(next);
+            return Ok(Reservation::Outcome(self.rotate(next)?));
         }
         let PublicationState::Active { count, slot, tail } = *self.state else {
-            return Ok(AppendOutcome::AdminAction);
+            return Ok(Reservation::Outcome(AppendOutcome::AdminAction));
         };
         let limit = buffer.limit.load(Ordering::Acquire);
         let remaining = buffer.term_length - tail;
@@ -527,7 +891,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
             // Reserve only the PAD up to the term boundary.
             let boundary = buffer.position(count, buffer.term_length);
             if boundary > limit {
-                return Ok(AppendOutcome::BackPressured);
+                return Ok(Reservation::Outcome(AppendOutcome::BackPressured));
             }
             let next = count.next()?;
             buffer.reserved_head.store(boundary, Ordering::Release);
@@ -539,21 +903,25 @@ impl<T: TermBytes> PublicationContext<'_, T> {
             release_loan(&buffer.cell(0)?.loan);
             *self.state = PublicationState::Rotating { next };
             let _ = self.rotate(next)?;
-            return Ok(AppendOutcome::AdminAction);
+            return Ok(Reservation::Outcome(AppendOutcome::AdminAction));
         }
         let start = buffer.position(count, tail);
         let end = start + u64::from(reserved);
         if end > limit {
-            return Ok(AppendOutcome::BackPressured);
+            return Ok(Reservation::Outcome(AppendOutcome::BackPressured));
         }
         buffer.reserved_head.store(end, Ordering::Release);
-        self.write_block(slot, count, tail, payload, &plan, options);
         *self.state = PublicationState::Active {
             count,
             slot,
             tail: tail + reserved,
         };
-        Ok(AppendOutcome::Appended { position: start })
+        Ok(Reservation::Reserved {
+            count,
+            slot,
+            tail,
+            position: start,
+        })
     }
 
     /// Rotation from the no-loan state: find, activate and advance to `next`,
@@ -714,6 +1082,14 @@ pub enum PollOutcome {
     },
     /// Nothing published at the position yet.
     Pending,
+    /// An aborted block was skipped: only its word 0 was read. Its extent
+    /// carries no message and needs no acknowledgement.
+    Aborted {
+        /// Stream position of the block.
+        position: u64,
+        /// Bytes skipped.
+        extent: u32,
+    },
     /// The subscriber was lapped. Data in `[from, lost_to)` is no longer
     /// retained (below the retention floor). Under `rejoin_at_head` the
     /// subscriber resumes at `resume`, the reserved head; data in
@@ -908,6 +1284,11 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         match result? {
             Read::Pending => Ok(Step::Done(PollOutcome::Pending)),
             Read::Pad => Ok(Step::NextTerm),
+            Read::Aborted { extent } => {
+                let position = self.cursor.position;
+                self.advance_to(position + u64::from(extent));
+                Ok(Step::Done(PollOutcome::Aborted { position, extent }))
+            }
             Read::Message {
                 length,
                 reserved,
@@ -938,6 +1319,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         match self.validate_block(slot, start)? {
             Validated::Pending => Ok(Read::Pending),
             Validated::Pad => Ok(Read::Pad),
+            Validated::Aborted { extent } => Ok(Read::Aborted { extent }),
             Validated::Block(block) => self.copy_block(slot, start, block, out),
         }
     }
@@ -964,6 +1346,17 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                     return Err(corrupt(start, "pad extent"));
                 }
                 return Ok(Validated::Pad);
+            }
+            Ok(FrameType::Aborted) => {
+                // Only word 0 of an aborted block is read.
+                let extent = signed as u32;
+                if word0.flags().lane() != buffer.config.lane {
+                    return Err(corrupt(start, "aborted lane"));
+                }
+                if !extent.is_multiple_of(FRAME_ALIGNMENT) || extent > term_length - start {
+                    return Err(corrupt(start, "aborted extent"));
+                }
+                return Ok(Validated::Aborted { extent });
             }
             Ok(FrameType::Data) => {}
             _ => return Err(corrupt(start, "frame type")),
@@ -1176,6 +1569,7 @@ enum Step {
 enum Validated {
     Pending,
     Pad,
+    Aborted { extent: u32 },
     Block(Block),
 }
 
@@ -1195,6 +1589,9 @@ struct Block {
 enum Read {
     Pending,
     Pad,
+    Aborted {
+        extent: u32,
+    },
     Message {
         length: u32,
         reserved: u32,

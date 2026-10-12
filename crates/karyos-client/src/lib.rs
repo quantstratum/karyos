@@ -18,5 +18,5 @@ pub use conductor::{ClientConductor, Completion, ConductorError, ConductorPoll, 
 pub use error::ClientError;
 pub use publication::{ClientPublication, OfferOutcome};
 pub use subscription::{
-    ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,
+    Aborted, ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,
 };

@@ -64,8 +64,19 @@ pub struct Overrun {
     pub resume: u64,
 }
 
-/// What one poll did. A poll stops at the first overrun, so no loss report
-/// is ever overwritten.
+/// An aborted block the poll skipped: the claim that reserved it never
+/// committed, so its extent carries no message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aborted {
+    /// Stream position of the block.
+    pub position: u64,
+    /// Bytes skipped.
+    pub extent: u32,
+}
+
+/// What one poll did. A poll stops at the first overrun or aborted block,
+/// so no loss or abort report is ever overwritten or hidden behind later
+/// deliveries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PollSummary {
     /// Messages delivered to the handler (and acknowledged) before the poll
@@ -73,6 +84,9 @@ pub struct PollSummary {
     pub delivered: u32,
     /// The overrun that stopped the poll, if any.
     pub overrun: Option<Overrun>,
+    /// The aborted block that stopped the poll, if any; the next poll
+    /// resumes after it.
+    pub aborted: Option<Aborted>,
 }
 
 /// A poll that failed after possibly delivering messages: `summary` reports
@@ -142,7 +156,8 @@ impl ClientSubscription {
     /// was handled. Work is bounded: a limit of 0 does nothing; otherwise at
     /// most `message_limit + 1` lower-layer polls run, each copying at most
     /// one message after stepping over at most one PAD. The poll stops when
-    /// nothing is published or at the first overrun.
+    /// nothing is published, at the first overrun, or at the first aborted
+    /// block, which it reports and which needs no acknowledgement.
     ///
     /// # Errors
     ///
@@ -210,6 +225,10 @@ impl ClientSubscription {
                     });
                     break;
                 }
+                PollOutcome::Aborted { position, extent } => {
+                    summary.aborted = Some(Aborted { position, extent });
+                    break;
+                }
                 PollOutcome::Pending => break,
             }
         }
@@ -221,5 +240,109 @@ impl ClientSubscription {
     #[must_use]
     pub fn position(&self) -> u64 {
         self.inner.acknowledged_position()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{AppendOptions, ClaimOutcome, LogBufferConfig, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    fn buffer() -> Arc<LogBuffer> {
+        Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 2,
+                max_subscribers: 2,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// DATA, ABORTED, DATA: the abort stops the poll after the first
+    /// delivery and is reported; a required subscriber needs no
+    /// acknowledgement for it and is not stalled by it.
+    #[test]
+    fn an_aborted_block_stops_the_poll_and_is_reported() {
+        let buffer = buffer();
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let mut subscription =
+            ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        let mut publication = buffer.publication_owned().unwrap().unwrap();
+        let _ = publication
+            .append(b"first", AppendOptions::default())
+            .unwrap();
+        let ClaimOutcome::Claimed(mut claim) =
+            publication.try_claim(40, AppendOptions::default()).unwrap()
+        else {
+            panic!("not claimed");
+        };
+        claim.payload().fill(0xEE);
+        let aborted_at = claim.position();
+        claim.abort();
+        let _ = publication
+            .append(b"second", AppendOptions::default())
+            .unwrap();
+
+        let mut seen = Vec::new();
+        let summary = subscription
+            .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(summary.overrun, None);
+        assert_eq!(
+            summary.aborted,
+            Some(Aborted {
+                position: aborted_at,
+                extent: 96,
+            })
+        );
+        assert_eq!(seen, vec![b"first".to_vec()]);
+        // Already past the extent: nothing to acknowledge.
+        assert_eq!(subscription.position(), aborted_at + 96);
+
+        let summary = subscription
+            .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(summary.aborted, None);
+        assert_eq!(seen, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    /// An abort first in line still stops the poll with nothing delivered,
+    /// and counts as one of the bounded lower-layer polls.
+    #[test]
+    fn an_aborted_block_alone_is_reported_with_no_delivery() {
+        let buffer = buffer();
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let mut subscription =
+            ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        let mut publication = buffer.publication_owned().unwrap().unwrap();
+        let ClaimOutcome::Claimed(claim) =
+            publication.try_claim(8, AppendOptions::default()).unwrap()
+        else {
+            panic!("not claimed");
+        };
+        drop(claim);
+        let summary = subscription
+            .poll(|_, _| panic!("nothing to deliver"), MessageLimit::new(1))
+            .unwrap();
+        assert_eq!(summary.delivered, 0);
+        assert_eq!(
+            summary.aborted,
+            Some(Aborted {
+                position: 0,
+                extent: 64,
+            })
+        );
     }
 }

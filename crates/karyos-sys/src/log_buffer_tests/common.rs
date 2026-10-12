@@ -3,7 +3,6 @@
 // Log buffer tests, included once per term backing by `log_buffer.rs`; the
 // including module defines `Terms` and `new_buffer`.
 
-use crate::term_bytes::sealed::Access as _;
 use crate::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH};
 
 const TERM: u64 = MIN_TERM_LENGTH as u64;
@@ -450,7 +449,7 @@ fn owned_capabilities_outlive_the_creating_handle() {
                         expected += 1;
                     }
                     PollOutcome::Pending => std::thread::yield_now(),
-                    PollOutcome::Overrun { .. } => panic!("required subscriber lapped"),
+                    other => panic!("unexpected {other:?}"),
                 }
             }
         });
@@ -673,7 +672,7 @@ fn concurrent_publication_reuse_and_subscribers() {
                         expected += 1;
                     }
                     PollOutcome::Pending => std::thread::yield_now(),
-                    PollOutcome::Overrun { .. } => panic!("a required subscriber was lapped"),
+                    other => panic!("unexpected {other:?}"),
                 }
             }
             expected
@@ -696,6 +695,7 @@ fn concurrent_publication_reuse_and_subscribers() {
                         seen += 1;
                     }
                     PollOutcome::Overrun { from, resume, .. } => lost += resume - from,
+                    PollOutcome::Aborted { .. } => panic!("nothing was aborted"),
                     PollOutcome::Pending => {
                         // Done once everything is published and the
                         // cursor reached the final head; receiving the
@@ -868,5 +868,367 @@ fn a_word0_changed_between_passes_is_corrupt() {
             matches!(result, Err(SysError::CorruptTerm { .. })),
             "{name}: {result:?}"
         );
+    }
+}
+
+// Claims (quantstratum-docs: karyos/design/claims.md).
+
+fn claimed<O: BufferOwner + core::fmt::Debug>(outcome: Result<ClaimOutcome<'_, O>, SysError>) -> Claim<'_, O> {
+    match outcome.unwrap() {
+        ClaimOutcome::Claimed(claim) => claim,
+        other => panic!("not claimed: {other:?}"),
+    }
+}
+
+/// The raw first word 0 at `offset` of term 0 (slot 0).
+fn word0_of_term0(buffer: &LogBuffer<Terms>, offset: u32) -> &AtomicU64 {
+    // SAFETY: test-only peer access to a frame start of the active term 0,
+    // only ever accessed atomically.
+    unsafe { buffer.regions.word0(0, offset) }
+}
+
+#[test]
+fn claim_and_commit_round_trip_alternating_with_append() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let extension = [9u8; EXTENSION_LENGTH as usize];
+    let options = AppendOptions {
+        end_of_stream: true,
+        reserved_value: -5,
+        extension: Some(extension),
+    };
+    let mut positions = Vec::new();
+    for round in 0..4u8 {
+        // Lengths with a partial last word.
+        let length = 13 + u32::from(round) * 100;
+        let mut claim = claimed(publication.try_claim(length, options));
+        let payload = claim.payload();
+        assert_eq!(payload.len(), length as usize);
+        assert!(payload.iter().all(|byte| *byte == 0), "payload starts zeroed");
+        payload.fill(round + 1);
+        let position = claim.position();
+        assert_eq!(claim.commit(), CommitOutcome::Committed { position });
+        positions.push(position);
+        let appended = publication
+            .append(&message(u32::from(round)), AppendOptions::default())
+            .unwrap();
+        assert!(matches!(appended, AppendOutcome::Appended { .. }));
+    }
+    let mut out = vec![0u8; 8192];
+    for round in 0..4u8 {
+        match subscription.poll(&mut out).unwrap() {
+            PollOutcome::Message {
+                position,
+                length,
+                end_of_stream,
+                reserved_value,
+                extension: found,
+            } => {
+                assert_eq!(position, positions[usize::from(round)]);
+                assert_eq!(length, 13 + u32::from(round) * 100);
+                assert!(out[..length as usize].iter().all(|byte| *byte == round + 1));
+                assert!(end_of_stream);
+                assert_eq!(reserved_value, -5);
+                assert_eq!(found, Some(extension));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        subscription.acknowledge();
+        assert_eq!(poll_message(&mut subscription), Some(message(u32::from(round))));
+    }
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+}
+
+#[test]
+fn aborted_claims_are_skipped_without_acknowledgement() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut required = conductor.subscribe(Role::Required).unwrap();
+    let mut optional = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication.append(&message(0), AppendOptions::default()).unwrap();
+    // Explicit abort, then an abort by drop.
+    let mut claim = claimed(publication.try_claim(100, AppendOptions::default()));
+    claim.payload().fill(0xAB);
+    let first = claim.position();
+    claim.abort();
+    let claim = claimed(publication.try_claim(40, AppendOptions::default()));
+    let second = claim.position();
+    drop(claim);
+    let _ = publication.append(&message(1), AppendOptions::default()).unwrap();
+    for subscription in [&mut required, &mut optional] {
+        assert_eq!(poll_message(subscription), Some(message(0)));
+        assert_eq!(
+            poll(subscription),
+            PollOutcome::Aborted {
+                position: first,
+                extent: 160,
+            }
+        );
+        // No acknowledgement: the position is already past the extent.
+        assert_eq!(subscription.acknowledged_position(), first + 160);
+        assert_eq!(
+            poll(subscription),
+            PollOutcome::Aborted {
+                position: second,
+                extent: 96,
+            }
+        );
+        assert_eq!(poll_message(subscription), Some(message(1)));
+    }
+}
+
+#[test]
+fn a_commit_that_loses_reports_aborted() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
+    let position = claim.position();
+    // Another party (standing in for the deadline abort) wins.
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    assert!(abort_block(
+        word0_of_term0(&buffer, 0),
+        Word0::new(-96, flags, FrameType::Data),
+        Word0::new(96, Flags::NONE, FrameType::Aborted),
+    ));
+    // The writer may keep writing after the abort won; nobody reads it.
+    claim.payload().fill(1);
+    assert_eq!(poll(&mut subscription), PollOutcome::Aborted { position, extent: 96 });
+    claim.payload().fill(2);
+    assert_eq!(claim.commit(), CommitOutcome::Aborted { position });
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+}
+
+#[test]
+fn a_panic_inside_the_claim_aborts_it() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
+        claim.payload()[0] = 1;
+        panic!("encoder failed");
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: 0,
+            extent: 96,
+        }
+    );
+    let _ = publication.append(&message(3), AppendOptions::default()).unwrap();
+    assert_eq!(poll_message(&mut subscription), Some(message(3)));
+}
+
+#[test]
+fn a_forgotten_claim_is_aborted_by_the_next_call() {
+    for next in 0..4 {
+        let buffer = new_buffer(config(3, 3)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
+        claim.payload().fill(5);
+        core::mem::forget(claim);
+        // Still pending: the block is marked, not terminal.
+        assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+        match next {
+            0 => {
+                let _ = publication.append(&message(4), AppendOptions::default()).unwrap();
+            }
+            1 => {
+                let claim = claimed(publication.try_claim(8, AppendOptions::default()));
+                assert_eq!(claim.position(), 96);
+                core::mem::forget(claim);
+            }
+            2 => publication.close(),
+            _ => drop(publication),
+        }
+        assert_eq!(
+            poll(&mut subscription),
+            PollOutcome::Aborted {
+                position: 0,
+                extent: 96,
+            }
+        );
+        if next == 0 {
+            assert_eq!(poll_message(&mut subscription), Some(message(4)));
+        }
+    }
+}
+
+#[test]
+fn claims_at_the_term_end_pad_and_rotate() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut committed = 0u32;
+    let mut admin = 0;
+    while committed < 200 {
+        let _ = conductor.duty_cycle().unwrap();
+        while poll_message(&mut subscription).is_some() {}
+        match publication.try_claim(1000, AppendOptions::default()).unwrap() {
+            ClaimOutcome::Claimed(mut claim) => {
+                claim.payload()[..4].copy_from_slice(&committed.to_le_bytes());
+                let position = claim.position();
+                // Never across a term boundary.
+                assert_eq!(position / TERM, (position + 1056 - 1) / TERM);
+                assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+                committed += 1;
+            }
+            ClaimOutcome::AdminAction => admin += 1,
+            ClaimOutcome::BackPressured => {}
+            ClaimOutcome::Aborted { .. } => panic!("nothing aborts"),
+        }
+    }
+    assert!(admin > 0, "the claims never reached a term end");
+}
+
+#[test]
+fn claim_sizes_are_checked() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let with_extension = AppendOptions {
+        extension: Some([0u8; EXTENSION_LENGTH as usize]),
+        ..AppendOptions::default()
+    };
+    assert!(matches!(
+        publication.try_claim(0, AppendOptions::default()),
+        Err(SysError::EmptyMessage)
+    ));
+    // One fragment of the MTU: 1408 - 32 without, 1408 - 96 with the
+    // extension.
+    for (options, max) in [(AppendOptions::default(), 1376), (with_extension, 1312)] {
+        assert!(matches!(
+            publication.try_claim(max + 1, options),
+            Err(SysError::Layout(LayoutError::MessageTooLarge { .. }))
+        ));
+        let mut claim = claimed(publication.try_claim(max, options));
+        assert_eq!(claim.payload().len(), max as usize);
+        claim.abort();
+    }
+    // A buffer whose reservation limit is below one fragment.
+    let small = new_buffer(LogBufferConfig {
+        max_reserved: 512,
+        ..config(3, 3)
+    })
+    .unwrap();
+    let mut publication = small.publication().unwrap().unwrap();
+    let max = small.max_message_length();
+    assert_eq!(max, 512 - 32);
+    assert!(matches!(
+        publication.try_claim(max + 1, AppendOptions::default()),
+        Err(SysError::Layout(LayoutError::MessageTooLarge { .. }))
+    ));
+    assert!(matches!(
+        publication.try_claim(max - 64 + 1, with_extension),
+        Err(SysError::Layout(LayoutError::MessageTooLarge { .. }))
+    ));
+    claimed(publication.try_claim(max, AppendOptions::default())).abort();
+}
+
+#[test]
+fn claims_are_back_pressured() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let _required = conductor.subscribe(Role::Required).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut pressured = false;
+    for _ in 0..2000 {
+        let _ = conductor.duty_cycle().unwrap();
+        match publication.try_claim(1000, AppendOptions::default()).unwrap() {
+            ClaimOutcome::Claimed(claim) => {
+                let _ = claim.commit();
+            }
+            ClaimOutcome::BackPressured => {
+                pressured = true;
+                break;
+            }
+            ClaimOutcome::AdminAction => {}
+            ClaimOutcome::Aborted { .. } => panic!("nothing aborts"),
+        }
+    }
+    assert!(pressured);
+    assert!(buffer.reserved_head.load(Ordering::Acquire) <= TERM / 2);
+}
+
+#[test]
+fn aborted_words_are_validated() {
+    let lane = Lane::try_new(2).unwrap();
+    let make = || {
+        new_buffer(LogBufferConfig {
+            lane,
+            ..config(3, 3)
+        })
+        .unwrap()
+    };
+    let raw = |length: i32, flags: u8, version: u8| {
+        u64::from(length as u32)
+            | (u64::from(version) << 32)
+            | (u64::from(flags) << 40)
+            | (u64::from(FrameType::Aborted.code()) << 48)
+    };
+    let lane_flags = Flags::new(false, false, false, false, lane).get();
+    let other_lane = Flags::new(false, false, false, false, Lane::ZERO).get();
+    let reserved_bits = lane_flags | 0x40;
+    // Valid: the claim's own flags, BEGIN/END set, and an extent larger
+    // than `max_reserved` inside the term.
+    let begin_end = Flags::new(true, true, true, true, lane).get();
+    let big = 8192 * 4;
+    assert!(big > MIN_TERM_LENGTH / 8);
+    for (word, extent) in [
+        (raw(96, lane_flags, PROTOCOL_VERSION), 96),
+        (raw(96, begin_end, PROTOCOL_VERSION), 96),
+        (raw(big as i32, lane_flags, PROTOCOL_VERSION), big),
+        (raw(TERM as i32, lane_flags, PROTOCOL_VERSION), TERM as u32),
+    ] {
+        let buffer = make();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Required).unwrap();
+        word0_of_term0(&buffer, 0).store(word.to_le(), Ordering::Release);
+        assert_eq!(
+            poll(&mut subscription),
+            PollOutcome::Aborted {
+                position: 0,
+                extent,
+            }
+        );
+        assert_eq!(subscription.acknowledged_position(), u64::from(extent));
+    }
+    // Zero or negative lengths are pending, whatever the type bits say.
+    for word in [raw(0, lane_flags, PROTOCOL_VERSION), raw(-96, 0xFF, 0)] {
+        let buffer = make();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Required).unwrap();
+        word0_of_term0(&buffer, 0).store(word.to_le(), Ordering::Release);
+        assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+    }
+    // Corrupt: nothing advances or is acknowledged.
+    for word in [
+        raw(96, lane_flags, PROTOCOL_VERSION + 1),
+        raw(96, reserved_bits, PROTOCOL_VERSION),
+        raw(96, other_lane, PROTOCOL_VERSION),
+        raw(100, lane_flags, PROTOCOL_VERSION),
+        raw(TERM as i32 + 32, lane_flags, PROTOCOL_VERSION),
+    ] {
+        let buffer = make();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Required).unwrap();
+        word0_of_term0(&buffer, 0).store(word.to_le(), Ordering::Release);
+        let mut out = vec![0u8; 64];
+        assert!(matches!(
+            subscription.poll(&mut out),
+            Err(SysError::CorruptTerm { .. })
+        ));
+        assert_eq!(subscription.position(), 0);
+        assert_eq!(subscription.acknowledged_position(), 0);
+        assert_eq!(buffer.cell(1).unwrap().position.load(Ordering::Acquire), 0);
     }
 }

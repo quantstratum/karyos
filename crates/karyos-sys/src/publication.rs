@@ -66,3 +66,49 @@ pub fn load_body(word: &AtomicU64) -> [u8; 8] {
 pub fn clear_word(word: &AtomicU64) {
     word.store(0, Ordering::Relaxed);
 }
+
+/// Marks a claimed block: compare-exchanges its first word 0 from 0 to the
+/// `reserved` value, a negative length (SPEC.md §4, claims). It is the
+/// claim's first write to the block; it fails only if the block was already
+/// aborted, and then nothing else may be written.
+#[inline]
+pub fn mark_block(first: &AtomicU64, reserved: Word0) -> bool {
+    first
+        .compare_exchange(
+            0,
+            reserved.pack().to_le(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Commits a marked block: compare-exchanges its first word 0 from
+/// `reserved` to the final `committed` word 0. Its `Release` publishes the
+/// block like [`publish_block`]. Fails if an abort won.
+#[inline]
+pub fn commit_block(first: &AtomicU64, reserved: Word0, committed: Word0) -> bool {
+    first
+        .compare_exchange(
+            reserved.pack().to_le(),
+            committed.pack().to_le(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Aborts a marked block: compare-exchanges its first word 0 from
+/// `reserved` to the `aborted` word 0 stating the reserved extent. Fails if
+/// a commit won (or another abort did).
+#[inline]
+pub fn abort_block(first: &AtomicU64, reserved: Word0, aborted: Word0) -> bool {
+    first
+        .compare_exchange(
+            reserved.pack().to_le(),
+            aborted.pack().to_le(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
