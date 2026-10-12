@@ -240,18 +240,25 @@ impl EmbeddedDriver {
         self.counters.reader()
     }
 
-    /// Sets the stream gauges from the current streams.
+    /// Refreshes every gauge from the current state.
     pub(crate) fn update_stream_gauges(&self) {
+        let gauge = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
         let retiring = self.streams.iter().filter(|s| s.retiring).count();
         let active = self.streams.len() - retiring;
-        self.counters.set(
-            Event::StreamsActive,
-            u64::try_from(active).unwrap_or(u64::MAX),
-        );
-        self.counters.set(
-            Event::StreamsRetiring,
-            u64::try_from(retiring).unwrap_or(u64::MAX),
-        );
+        self.counters.set(Event::StreamsActive, gauge(active));
+        self.counters.set(Event::StreamsRetiring, gauge(retiring));
+        self.counters
+            .set(Event::ClientsConnected, gauge(self.clients.len()));
+        self.counters
+            .set(Event::HandOverHeld, gauge(self.held_total()));
+        match self
+            .streams
+            .iter()
+            .try_fold(0u64, |sum, s| sum.checked_add(s.leases.live()))
+        {
+            Some(leases) => self.counters.set(Event::LeasesLive, leases),
+            None => self.counters.add(Event::CounterOverflows, 1),
+        }
     }
 
     /// Removes a stream: it stops accepting publications and subscriptions
@@ -265,7 +272,11 @@ impl EmbeddedDriver {
     /// Returns [`DriverError::UnknownStream`] for a foreign or freed
     /// stream.
     pub fn remove_stream(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
-        self.stream(stream)?.retiring = true;
+        let target = self.stream(stream)?;
+        if !target.retiring {
+            target.retiring = true;
+            self.counters.add(Event::StreamsRemoved, 1);
+        }
         self.update_stream_gauges();
         Ok(())
     }
@@ -403,6 +414,7 @@ impl EmbeddedDriver {
             let report = stream.conductor.duty_cycle()?;
             work += report.cleaned + u32::from(report.prepared);
         }
+        self.update_stream_gauges();
         Ok(work)
     }
 

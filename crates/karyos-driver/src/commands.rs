@@ -90,6 +90,7 @@ impl EmbeddedDriver {
             consumer: Some(consumer),
             link: Arc::clone(&link),
         });
+        self.update_stream_gauges();
         Ok(ClientConductor::new(
             Owner {
                 driver: self.id,
@@ -243,7 +244,7 @@ impl EmbeddedDriver {
         })
     }
 
-    fn held_total(&self) -> usize {
+    pub(crate) fn held_total(&self) -> usize {
         self.clients.iter().map(|slot| slot.link.held()).sum()
     }
 

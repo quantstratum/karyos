@@ -88,15 +88,43 @@ fn counters_track_clients_commands_and_streams() {
     assert_eq!(value(&driver, "commands refused"), 1);
     assert_eq!(value(&driver, "responses sent"), 2);
 
+    assert_eq!(value(&driver, "clients connected"), 2);
+    assert_eq!(value(&driver, "hand-over entries held"), 1);
+    assert_eq!(value(&driver, "stream leases live"), 1);
     driver.remove_stream(stream).unwrap();
+    // Counted once however often it is repeated.
+    driver.remove_stream(stream).unwrap();
+    assert_eq!(value(&driver, "streams removed"), 1);
     assert_eq!(value(&driver, "streams active"), 0);
     assert_eq!(value(&driver, "streams retiring"), 1);
     // The held publication keeps the stream until the client closes.
     client.close();
     let _ = driver.do_work().unwrap();
     assert_eq!(value(&driver, "clients retired"), 1);
+    assert_eq!(value(&driver, "clients connected"), 1);
+    assert_eq!(value(&driver, "hand-over entries held"), 0);
+    assert_eq!(value(&driver, "stream leases live"), 0);
     assert_eq!(value(&driver, "streams retiring"), 0);
     assert_eq!(value(&driver, "streams freed"), 1);
     assert_eq!(value(&driver, "terminal"), 0);
     assert_eq!(value(&driver, "counter overflows"), 0);
+}
+
+#[test]
+fn a_reader_outlives_the_driver_with_the_last_values() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let _ = driver.connect().unwrap();
+    let reader = driver.counters();
+    drop(driver);
+    let admitted = (0..reader.capacity())
+        .find_map(|index| match reader.read(index) {
+            CellRead::Allocated {
+                metadata,
+                value,
+                release_pending,
+            } if metadata.label() == b"clients admitted" => Some((value, release_pending)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(admitted, (1, true));
 }

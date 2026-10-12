@@ -1,12 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The embedded driver's system counters (SPEC.md §11): client admission,
-//! command service, the terminal state and stream lifecycle, in a counters
-//! region that tools read through a [`CountersReader`].
+//! Instrumentation of the embedded driver (a first part of SPEC.md §11, not
+//! the full CnC observability or error log): client admission, command
+//! service, the terminal state and stream lifecycle, in a counters region
+//! that tools read through a [`CountersReader`].
 //!
-//! Event counters only grow. An increment that would overflow leaves the
-//! counter unchanged (ADR-0007, no silent wrap or saturation) and is
-//! recorded by the `counter overflows` counter instead.
+//! - **Event counters** ([`TYPE_EVENTS`]) are lifetime totals and only
+//!   grow. An increment that would overflow leaves the counter unchanged
+//!   (ADR-0007, no silent wrap or saturation) and adds one to `counter
+//!   overflows`, which is how an overflow is reported; the command or event
+//!   itself is unaffected. Only an overflow of `counter overflows` itself
+//!   goes unrecorded.
+//! - **Gauges** ([`TYPE_GAUGE`]) are current values. The driver refreshes
+//!   them at the end of every duty cycle and after each control call that
+//!   changes them, so a handle dropped by the application shows up at the
+//!   next duty cycle.
+//! - Each counter is read on its own; there is no atomic snapshot across
+//!   counters.
+//!
+//! The cells are allocated once, when the driver is created. A reader
+//! keeps the region alive after the driver is dropped; the driver's
+//! counters then read as pending release with their last values, and
+//! nothing reallocates them.
 
 use karyos_sys::counters::{Counter, CountersManager, CountersReader, counters};
 
@@ -18,7 +33,7 @@ pub const TYPE_EVENTS: u64 = 1;
 pub const TYPE_GAUGE: u64 = 2;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 12] = [
+const LABELS: [(u64, &str); 16] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -31,6 +46,10 @@ const LABELS: [(u64, &str); 12] = [
     (TYPE_EVENTS, "streams freed"),
     (TYPE_EVENTS, "registrations swept"),
     (TYPE_EVENTS, "counter overflows"),
+    (TYPE_GAUGE, "clients connected"),
+    (TYPE_GAUGE, "hand-over entries held"),
+    (TYPE_GAUGE, "stream leases live"),
+    (TYPE_EVENTS, "streams removed"),
 ];
 
 /// One of the driver's counters.
@@ -48,6 +67,15 @@ pub(crate) enum Event {
     StreamsFreed,
     RegistrationsSwept,
     CounterOverflows,
+    /// Admission slots in use, including retired faulty clients whose
+    /// producer has not detached yet.
+    ClientsConnected,
+    HandOverHeld,
+    /// Leases over all streams; a forgotten handle stays counted.
+    LeasesLive,
+    /// Streams that went from active to retiring; a repeated
+    /// `remove_stream` is not counted again.
+    StreamsRemoved,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -130,6 +158,10 @@ mod tests {
             (Event::StreamsFreed, "streams freed"),
             (Event::RegistrationsSwept, "registrations swept"),
             (Event::CounterOverflows, "counter overflows"),
+            (Event::ClientsConnected, "clients connected"),
+            (Event::HandOverHeld, "hand-over entries held"),
+            (Event::LeasesLive, "stream leases live"),
+            (Event::StreamsRemoved, "streams removed"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();
