@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::atomic_view::HeapWords;
 
 fn stamp(time: u64) -> Stamp {
     Stamp {
@@ -338,4 +339,35 @@ fn the_terminal_gap_is_derived_after_the_horizon() {
     let losses = consumer.losses();
     assert_eq!(received, losses.stored);
     assert_eq!(losses.attempted - losses.stored, 2);
+}
+
+/// A buffer shorter than the drop-range ring is refused before reading,
+/// rather than silently hiding ranges.
+#[test]
+fn a_short_loss_buffer_is_refused() {
+    let records = HeapWords::zeroed(2).unwrap();
+    let control = HeapWords::zeroed(CONTROL_WORDS).unwrap();
+    let ranges = HeapWords::zeroed(RANGE_WORDS).unwrap();
+    let words = JournalWords::new(
+        records.range(0, 2).unwrap(),
+        control.range(0, CONTROL_WORDS).unwrap(),
+        ranges.range(0, RANGE_WORDS).unwrap(),
+        1,
+    )
+    .unwrap();
+    words.append(&[0], stamp(0)).unwrap();
+    words.append(&[1], stamp(1)).unwrap();
+    assert_eq!(
+        words.losses(&mut []),
+        Err(JournalError::OutputTooSmall {
+            length: 0,
+            required: 1
+        })
+    );
+    let mut out = [DropRange::default(); 1];
+    let snapshot = words.losses(&mut out).unwrap();
+    assert_eq!(
+        (snapshot.attempted, snapshot.stored, snapshot.ranges),
+        (2, 1, 1)
+    );
 }

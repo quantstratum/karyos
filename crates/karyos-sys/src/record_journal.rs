@@ -89,6 +89,14 @@ pub enum JournalError {
     /// The journal is closed.
     #[error("record journal closed")]
     Closed,
+    /// The caller's buffer cannot hold every drop range; nothing was read.
+    #[error("buffer of {length} drop ranges, at least {required} required")]
+    OutputTooSmall {
+        /// Entries given.
+        length: usize,
+        /// Drop-range entries of the journal.
+        required: usize,
+    },
 }
 
 /// The writer's own time of an append, with its clock domain and
@@ -519,7 +527,19 @@ impl<'a> JournalWords<'a> {
     /// the attempted count `A` (Acquire), the stored count (Acquire, so it
     /// covers every record stored below `A`), the drop ranges into `out`
     /// (stable ones, clipped to sequences below `A`), then the watermark.
-    pub fn losses(&self, out: &mut [DropRange]) -> LossSnapshot {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::OutputTooSmall`], before reading anything,
+    /// when `out` has fewer entries than the journal has drop ranges: a
+    /// shorter buffer would silently hide ranges.
+    pub fn losses(&self, out: &mut [DropRange]) -> Result<LossSnapshot, JournalError> {
+        if out.len() < self.range_count() {
+            return Err(JournalError::OutputTooSmall {
+                length: out.len(),
+                required: self.range_count(),
+            });
+        }
         let attempted = self.load(ATTEMPTED, Ordering::Acquire);
         let stored = self.load(HEAD, Ordering::Acquire);
         let mut snapshot = LossSnapshot {
@@ -581,7 +601,7 @@ impl<'a> JournalWords<'a> {
                 snapshot.unstable += 1;
             }
         }
-        snapshot
+        Ok(snapshot)
     }
 }
 
@@ -825,7 +845,16 @@ mod owned {
                     lost_before: None,
                 };
             };
-            let snapshot = words.losses(&mut self.ranges);
+            // The buffer holds every drop range by construction.
+            let Ok(snapshot) = words.losses(&mut self.ranges) else {
+                return Losses {
+                    attempted: 0,
+                    stored: 0,
+                    ranges: &[],
+                    unstable: 1,
+                    lost_before: None,
+                };
+            };
             Losses {
                 attempted: snapshot.attempted,
                 stored: snapshot.stored,

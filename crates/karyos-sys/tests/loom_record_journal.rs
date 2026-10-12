@@ -131,7 +131,7 @@ fn evicted_ranges_stay_covered() {
             thread::spawn(move || {
                 let words = journal.words(1);
                 let mut ranges = [DropRange::default(); 1];
-                let snapshot = words.losses(&mut ranges);
+                let snapshot = words.losses(&mut ranges).unwrap();
                 if snapshot.unstable == 0 {
                     for sequence in 1..snapshot.attempted {
                         let in_range = ranges[..snapshot.ranges]
