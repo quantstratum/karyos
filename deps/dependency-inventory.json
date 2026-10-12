@@ -1,0 +1,1093 @@
+{
+  "generated_by": "scripts/dependency-inventory.py",
+  "packages": [
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#regex-automata@0.4.18",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#aho-corasick@1.1.5",
+      "license": "Unlicense OR MIT",
+      "name": "aho-corasick",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.1.5"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
+          "kind": "build",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#cc@1.8.0",
+      "license": "MIT OR Apache-2.0",
+      "name": "cc",
+      "paths": {
+        "loom-build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.8.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#loom@0.7.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#thread_local@1.1.10",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#cfg-if@1.0.5",
+      "license": "MIT OR Apache-2.0",
+      "name": "cfg-if",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.5"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cc@1.8.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#find-msvc-tools@0.1.14",
+      "license": "MIT OR Apache-2.0",
+      "name": "find-msvc-tools",
+      "paths": {
+        "loom-build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.14"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#loom@0.7.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
+      "license": "MIT/Apache-2.0",
+      "name": "generator",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.10"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#sharded-slab@0.1.7",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#lazy_static@1.5.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "lazy_static",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.5.1"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
+          "kind": "normal",
+          "target": "cfg(unix)",
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.190",
+      "license": "MIT OR Apache-2.0",
+      "name": "libc",
+      "paths": {
+        "loom-runtime": [
+          [
+            "cfg(unix)"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.190"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-log@0.2.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#log@0.4.34",
+      "license": "MIT OR Apache-2.0",
+      "name": "log",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.34"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "workspace:karyos-sys@0.1.0",
+          "kind": "normal",
+          "target": "cfg(loom)",
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#loom@0.7.2",
+      "license": "MIT",
+      "name": "loom",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.7.2"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#matchers@0.2.0",
+      "license": "MIT",
+      "name": "matchers",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#aho-corasick@1.1.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#regex-automata@0.4.18",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3",
+      "license": "Unlicense OR MIT",
+      "name": "memchr",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.8.3"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#nu-ansi-term@0.50.3",
+      "license": "MIT",
+      "name": "nu-ansi-term",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.50.3"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-core@0.1.36",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-log@0.2.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "alloc",
+        "default",
+        "race",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#once_cell@1.21.4",
+      "license": "MIT OR Apache-2.0",
+      "name": "once_cell",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.21.4"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing@0.1.44",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#pin-project-lite@0.2.17",
+      "license": "Apache-2.0 OR MIT",
+      "name": "pin-project-lite",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.17"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.21",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "proc-macro"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107",
+      "license": "MIT OR Apache-2.0",
+      "name": "proc-macro2",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.107"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.21",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "proc-macro"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47",
+      "license": "MIT OR Apache-2.0",
+      "name": "quote",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.47"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "dfa-build",
+            "dfa-search",
+            "syntax"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#matchers@0.2.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "std"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "dfa-build",
+        "dfa-search",
+        "nfa-thompson",
+        "std",
+        "syntax"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#regex-automata@0.4.18",
+      "license": "MIT OR Apache-2.0",
+      "name": "regex-automata",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.18"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#regex-automata@0.4.18",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#regex-syntax@0.8.11",
+      "license": "MIT OR Apache-2.0",
+      "name": "regex-syntax",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.11"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
+          "kind": "build",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#rustversion@1.0.23",
+      "license": "MIT OR Apache-2.0",
+      "name": "rustversion",
+      "paths": {
+        "loom-build": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.23"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#loom@0.7.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#scoped-tls@1.0.1",
+      "license": "MIT/Apache-2.0",
+      "name": "scoped-tls",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#sharded-slab@0.1.7",
+      "license": "MIT",
+      "name": "sharded-slab",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.7"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cc@1.8.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#shlex@2.0.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "shlex",
+      "paths": {
+        "loom-build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.0.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#smallvec@1.16.3",
+      "license": "MIT OR Apache-2.0",
+      "name": "smallvec",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.16.3"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.21",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "clone-impls",
+        "default",
+        "derive",
+        "parsing",
+        "printing",
+        "proc-macro"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.8",
+      "license": "MIT OR Apache-2.0",
+      "name": "syn",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "3.0.8"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "workspace:karyos-sys@0.1.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#thiserror@2.0.21",
+      "license": "MIT OR Apache-2.0",
+      "name": "thiserror",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.0.21"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#thiserror@2.0.21",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.21",
+      "license": "MIT OR Apache-2.0",
+      "name": "thiserror-impl",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.0.21"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#thread_local@1.1.10",
+      "license": "MIT OR Apache-2.0",
+      "name": "thread_local",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.1.10"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "std"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#loom@0.7.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#tracing@0.1.44",
+      "license": "MIT",
+      "name": "tracing",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.44"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-log@0.2.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing@0.1.44",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "default",
+        "once_cell",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#tracing-core@0.1.36",
+      "license": "MIT",
+      "name": "tracing-core",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.36"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "log-tracer",
+            "std"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "log-tracer",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#tracing-log@0.2.0",
+      "license": "MIT",
+      "name": "tracing-log",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "env-filter"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#loom@0.7.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "alloc",
+        "ansi",
+        "default",
+        "env-filter",
+        "fmt",
+        "matchers",
+        "nu-ansi-term",
+        "once_cell",
+        "registry",
+        "sharded-slab",
+        "smallvec",
+        "std",
+        "thread_local",
+        "tracing",
+        "tracing-log"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
+      "license": "MIT",
+      "name": "tracing-subscriber",
+      "paths": {
+        "loom-runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.23"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#unicode-ident@1.0.26",
+      "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
+      "name": "unicode-ident",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.26"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-core@0.1.36",
+          "kind": "normal",
+          "target": "cfg(tracing_unstable)",
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#valuable@0.1.1",
+      "license": "MIT",
+      "name": "valuable",
+      "paths": {
+        "loom-runtime": [
+          [
+            "cfg(tracing_unstable)"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
+          "kind": "normal",
+          "target": "cfg(windows)",
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#windows-result@0.4.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#windows-sys@0.61.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#windows-link@0.2.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "windows-link",
+      "paths": {
+        "loom-runtime": [
+          [
+            "cfg(windows)"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
+          "kind": "normal",
+          "target": "cfg(windows)",
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#windows-result@0.4.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "windows-result",
+      "paths": {
+        "loom-runtime": [
+          [
+            "cfg(windows)"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "Win32_Foundation",
+            "Win32_Security",
+            "Win32_Storage_FileSystem",
+            "Win32_System_Console"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#nu-ansi-term@0.50.3",
+          "kind": "normal",
+          "target": "cfg(windows)",
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "Win32",
+        "Win32_Foundation",
+        "Win32_Security",
+        "Win32_Storage",
+        "Win32_Storage_FileSystem",
+        "Win32_System",
+        "Win32_System_Console",
+        "default"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#windows-sys@0.61.2",
+      "license": "MIT OR Apache-2.0",
+      "name": "windows-sys",
+      "paths": {
+        "loom-runtime": [
+          [
+            "cfg(windows)"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.61.2"
+    }
+  ]
+}

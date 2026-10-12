@@ -43,6 +43,10 @@ karyos = { path = "crates/karyos", version = "0.1.0" }
 karyos-tools = { path = "crates/karyos-tools", version = "0.1.0" }
 karyos-bench = { path = "crates/karyos-bench", version = "0.1.0" }
 
+# External dependencies; each admission is recorded in deps/dependencies.md.
+loom = { version = "0.7.2", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
+
 # Inherited by every crate except karyos-sys and karyos-io (SPEC.md §14).
 [workspace.lints.rust]
 unsafe_code = "forbid"
