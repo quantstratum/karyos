@@ -1656,3 +1656,33 @@ fn the_clock_is_read_only_after_an_admitted_claim_is_observed() {
     );
     drop(outcome);
 }
+
+/// The test hook fails the deadline call before it touches anything, also
+/// with 128 slots and a real claim present.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_injected_deadline_fault_leaves_the_protocol_state_intact() {
+    let buffer = new_buffer(LogBufferConfig {
+        spare_slots: 125,
+        ..deadline_config(DEADLINE)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    let serial = buffer.claim_serial.load(Ordering::Relaxed);
+    let record = buffer.claim_record.load(Ordering::Relaxed);
+    let loan = buffer.cell(0).unwrap().loan.load(Ordering::SeqCst);
+    let word = word0_of_term0(&buffer, 0).load(Ordering::Acquire);
+    buffer.inject_deadline_fault();
+    assert!(matches!(
+        conductor.abort_expired_claims_with(&mut || panic!("clock read")),
+        Err(SysError::ResourcesUnavailable)
+    ));
+    assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), serial);
+    assert_eq!(buffer.claim_record.load(Ordering::Relaxed), record);
+    assert_eq!(buffer.cell(0).unwrap().loan.load(Ordering::SeqCst), loan);
+    assert_eq!(word0_of_term0(&buffer, 0).load(Ordering::Acquire), word);
+    claim.payload().fill(1);
+    assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+}
