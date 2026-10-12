@@ -21,9 +21,12 @@
 //! Negative controls must fail: the walk storing `ABORTED` before marking,
 //! a terminal store after a lost first compare-exchange, a marker equal to
 //! a valid reserved word, a walk passing a non-zero word, a writer writing
-//! its payload after a failed mark (ordered after the walk by the failed
-//! compare-exchange, so it overwrites the walk's boundary), and a writer
-//! writing before its mark (a data race Loom reports).
+//! its payload after a failed mark (Loom's first failing schedule has the
+//! failed compare-exchange observe the walk's final Release store, which
+//! orders the write after the walk's, so it overwrites the walk's
+//! boundary; observing only the marker would not order it after the
+//! walk's later write), and a writer writing before its mark (a data race
+//! Loom reports).
 //!
 //! Exploration: default Loom bounds; the walk and two writers, or the walk
 //! and one reader.
@@ -254,8 +257,11 @@ fn control_a_reader_sees_aborted_before_the_markers() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Payload {
     Production,
-    /// Writes after a failed mark: ordered after the walk by the failed
-    /// compare-exchange's Acquire, so it overwrites the walk's boundary.
+    /// Writes after a failed mark. When the failed compare-exchange
+    /// observes the walk's final Release store, its Acquire orders the
+    /// write after the walk's and it overwrites the walk's boundary (the
+    /// schedule Loom fails first); observing only the marker leaves the
+    /// write unordered with the walk's later one.
     AfterFailedMark,
     /// Writes before marking: unordered with the walk's write.
     BeforeMark,
