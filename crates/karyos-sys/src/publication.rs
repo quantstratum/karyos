@@ -182,3 +182,43 @@ pub fn deadline_abort(
             .compare_exchange(current, target, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
 }
+
+/// A publisher slot in use (`quantstratum-docs: karyos/design/concurrent-publication.md`). A
+/// free slot holds 0 (never used) or `t_close + 1`.
+pub const PUBLISHER_HELD: u64 = 1 << 63;
+
+/// Frees a publisher slot after its holder's last access, recording the
+/// active term count at close (`t_close`). The Release orders every access
+/// of the holder before the conductor's Acquire in
+/// [`acquire_publisher_slot`].
+#[inline]
+pub fn release_publisher_slot(word: &AtomicU64, t_close: u32) {
+    word.store(u64::from(t_close) + 1, Ordering::Release);
+}
+
+/// Takes a free publisher slot for a new holder: `None` when it is held,
+/// otherwise `Some` of the previous holder's `t_close` (`None` for a
+/// never-used slot). Only the conductor issues slots, so the store needs
+/// no compare-exchange.
+#[inline]
+pub fn acquire_publisher_slot(word: &AtomicU64) -> Option<Option<u32>> {
+    let value = word.load(Ordering::Acquire);
+    if value & PUBLISHER_HELD != 0 {
+        return None;
+    }
+    word.store(PUBLISHER_HELD | value, Ordering::Relaxed);
+    Some(value.checked_sub(1).map(|t_close| t_close as u32))
+}
+
+/// The first term count a reissued publisher slot may reserve in: the
+/// active count `active`, unless the previous holder closed in the still
+/// active term `t_close` after a crossing in it (`crossed`, evaluated only
+/// then), in which case `t_close + 1`.
+#[inline]
+#[must_use]
+pub fn reissue_from(previous: Option<u32>, active: u32, crossed: impl FnOnce() -> bool) -> u32 {
+    match previous {
+        Some(t_close) if active <= t_close && crossed() => t_close.wrapping_add(1),
+        _ => active,
+    }
+}

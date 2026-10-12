@@ -12,20 +12,13 @@ use super::{
 };
 use crate::frame::{Flags, FrameType, Word0};
 use crate::loan::{LoanOutcome, release_loan, take_loan};
-use crate::publication::{commit_block, mark_block};
+use crate::publication::{
+    acquire_publisher_slot, commit_block, mark_block, reissue_from, release_publisher_slot,
+};
 use crate::slot::{Descriptor, SlotState};
 use crate::term::TermCount;
 use crate::term_bytes::sealed::Access as _;
 use core::sync::atomic::Ordering;
-
-/// A publisher slot in use.
-const HELD: u64 = 1 << 63;
-
-/// The value of a publisher slot freed by a handle that closed while
-/// `t_close` was the active term; 0 is a never-used slot.
-fn freed_at(t_close: TermCount) -> u64 {
-    u64::from(t_close.get()) + 1
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandleState {
@@ -72,31 +65,45 @@ impl<O: BufferOwner> Conductor<O> {
         }
         // The Acquire load observes a closing holder's Release of FREE,
         // made after its last access.
-        let Some((index, previous)) = buffer
-            .publishers
-            .iter()
-            .map(|word| word.load(Ordering::Acquire))
-            .enumerate()
-            .find(|(_, value)| value & HELD == 0)
+        let Some((index, previous)) =
+            buffer
+                .publishers
+                .iter()
+                .enumerate()
+                .find_map(|(index, word)| {
+                    acquire_publisher_slot(word).map(|previous| (index, previous))
+                })
         else {
             return Ok(None);
         };
-        let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
-        let from = if previous == 0 {
-            active
-        } else {
-            let t_close = TermCount::try_new((previous - 1) as u32)?;
-            if active.get() > t_close.get() || !crossed(buffer, t_close)? {
-                active
-            } else {
-                t_close.next()?
+        let issue = || -> Result<TermCount, SysError> {
+            let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
+            let mut crossed_error = None;
+            let from = reissue_from(previous, active.get(), || {
+                // `t_close` is still active here.
+                crossed(buffer, active).unwrap_or_else(|error| {
+                    crossed_error = Some(error);
+                    true
+                })
+            });
+            if let Some(error) = crossed_error {
+                return Err(error);
+            }
+            Ok(TermCount::try_new(from)?)
+        };
+        let from = match issue() {
+            Ok(from) => from,
+            Err(error) => {
+                // Not issued: give the slot back as it was.
+                if let Some(word) = buffer.publishers.get(index) {
+                    word.store(
+                        previous.map_or(0, |t_close| u64::from(t_close) + 1),
+                        Ordering::Release,
+                    );
+                }
+                return Err(error);
             }
         };
-        let word = buffer
-            .publishers
-            .get(index)
-            .ok_or(SysError::ResourcesUnavailable)?;
-        word.store(HELD | previous, Ordering::Relaxed);
         let mut handle = ConcurrentPublication {
             buffer: self.buffer.clone(),
             index,
@@ -139,8 +146,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// # Errors
     ///
     /// Returns [`SysError::EmptyMessage`], layout errors for messages that
-    /// are too large, and errors from the descriptor protocol. Nothing is
-    /// reserved on error.
+    /// are too large, and errors from the descriptor protocol. A validation
+    /// error (empty or too large) reserves nothing; an error after the
+    /// reservation means another party marked a block this handle owns.
     pub fn offer(
         &mut self,
         payload: &[u8],
@@ -303,13 +311,9 @@ impl<O: BufferOwner> Drop for ConcurrentPublication<O> {
             release_loan(&cell.loan);
         }
         let active = buffer.active_count.load(Ordering::Acquire) as u32;
-        if let (Ok(t_close), Some(word)) = (
-            TermCount::try_new(active),
-            buffer.publishers.get(self.index),
-        ) {
-            // After the handle's last access: the conductor's Acquire load
-            // of this value orders every access before a reissue.
-            word.store(freed_at(t_close), Ordering::Release);
+        if let Some(word) = buffer.publishers.get(self.index) {
+            // After the handle's last access.
+            release_publisher_slot(word, active);
         }
     }
 }

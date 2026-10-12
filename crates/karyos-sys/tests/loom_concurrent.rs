@@ -8,9 +8,11 @@
 //!   writes a plain payload witness and an interior word 0, and commits
 //!   with the commit compare-exchange; a reader that sees a committed
 //!   block sees its witness and its interior word;
-//! - the publisher-slot handoff: a holder that made its end-crossing
-//!   reservation in the still active term closes; the reissued slot never
-//!   makes a second end-crossing reservation in that term.
+//! - the publisher-slot handoff over the production helpers
+//!   (`acquire_publisher_slot`, `release_publisher_slot`, `reissue_from`):
+//!   a holder that made its end-crossing reservation in the still active
+//!   term closes; the slot is reissued twice, and no holder makes a second
+//!   end-crossing reservation in that term.
 //!
 //! Negative controls must fail: a reservation by load and store instead of
 //! `fetch_add` (overlapping blocks), a commit by Relaxed store (payload
@@ -25,7 +27,8 @@
 
 use karyos_sys::frame::{Flags, FrameType, Lane, Word0};
 use karyos_sys::publication::{
-    commit_block, load_interior, mark_block, observe_block, store_interior,
+    acquire_publisher_slot, commit_block, load_interior, mark_block, observe_block, reissue_from,
+    release_publisher_slot, store_interior,
 };
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::cell::UnsafeCell;
@@ -166,19 +169,21 @@ fn control_relaxed_commit_fails() {
     reservations_model(Reserve::FetchAdd, Commit::RelaxedStore);
 }
 
-/// Term length in reservation units; the holder's reservation of 2 from
-/// offset 2 ends past it.
+/// Term length in reservation units; a reservation of 2 from offset 2
+/// ends past it.
 const TERM: u64 = 3;
 const SIZE: u64 = 2;
-const FREE_NEVER_USED: u64 = 0;
-const HELD: u64 = 1 << 63;
 
-fn handoff_model(respect_t_close: bool) {
+/// The handoff over the production helpers: a holder crosses term 0 and
+/// closes; the conductor reissues the slot twice (FREE to HELD, then the
+/// second holder closes and the slot is reissued again) while term 0 stays
+/// active (rotation delayed). Every holder reserves only from the term
+/// `eligible` returns.
+fn handoff_model(eligible: fn(Option<u32>, u32, &AtomicU64) -> u32) {
     loom::model(move || {
-        // Term 0 is active and stays active (rotation delayed).
         let active = Arc::new(AtomicU64::new(0));
         let tail = Arc::new(AtomicU64::new(2));
-        let slot = Arc::new(AtomicU64::new(HELD));
+        let slot = Arc::new(AtomicU64::new(0));
         let crossings = Arc::new(AtomicU64::new(0));
         let reserve = {
             let tail = Arc::clone(&tail);
@@ -190,16 +195,15 @@ fn handoff_model(respect_t_close: bool) {
                 }
             }
         };
+        // The first holder: issued, crosses term 0, closes.
+        assert_eq!(acquire_publisher_slot(&slot), Some(None));
         let holder = {
             let active = Arc::clone(&active);
             let slot = Arc::clone(&slot);
             let reserve = reserve.clone();
             thread::spawn(move || {
-                // Its one end-crossing reservation in term 0, then close:
-                // record the active term and free the slot with Release.
                 reserve();
-                let t_close = active.load(Ordering::Acquire);
-                slot.store(t_close + 1, Ordering::Release);
+                release_publisher_slot(&slot, active.load(Ordering::Acquire) as u32);
             })
         };
         let conductor = {
@@ -207,20 +211,17 @@ fn handoff_model(respect_t_close: bool) {
             let slot = Arc::clone(&slot);
             let tail = Arc::clone(&tail);
             thread::spawn(move || {
-                let value = slot.load(Ordering::Acquire);
-                if value & HELD != 0 {
-                    return;
-                }
-                let n = active.load(Ordering::Acquire);
-                let eligible = if !respect_t_close || value == FREE_NEVER_USED {
-                    true
-                } else {
-                    let t_close = value - 1;
-                    n > t_close || tail.load(Ordering::Acquire) < TERM
-                };
-                slot.store(HELD | value, Ordering::Relaxed);
-                if eligible {
-                    reserve();
+                for _ in 0..2 {
+                    let Some(previous) = acquire_publisher_slot(&slot) else {
+                        return;
+                    };
+                    let n = active.load(Ordering::Acquire) as u32;
+                    // A reissued holder reserves only when its first term is
+                    // the active one, then closes in turn.
+                    if eligible(previous, n, &tail) == n {
+                        reserve();
+                    }
+                    release_publisher_slot(&slot, n);
                 }
             })
         };
@@ -233,13 +234,21 @@ fn handoff_model(respect_t_close: bool) {
     });
 }
 
+fn production(previous: Option<u32>, active: u32, tail: &AtomicU64) -> u32 {
+    reissue_from(previous, active, || tail.load(Ordering::Acquire) >= TERM)
+}
+
+fn ignoring_t_close(_: Option<u32>, active: u32, _: &AtomicU64) -> u32 {
+    active
+}
+
 #[test]
 fn a_reissued_slot_crosses_a_term_at_most_once() {
-    handoff_model(true);
+    handoff_model(production);
 }
 
 #[test]
 #[should_panic(expected = "a slot crossed one term twice")]
 fn control_reissue_ignoring_t_close_fails() {
-    handoff_model(false);
+    handoff_model(ignoring_t_close);
 }
