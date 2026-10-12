@@ -150,6 +150,22 @@ impl HeapWords {
         })
     }
 
+    /// The word at `index`, if in bounds, without forming a view of the
+    /// whole region (cheap per access, also under Miri).
+    #[inline]
+    #[must_use]
+    pub(crate) fn word(&self, index: usize) -> Option<&AtomicU64> {
+        if index >= self.count {
+            return None;
+        }
+        // SAFETY: `index < count`, so the pointer stays inside the live
+        // allocation of `count` `AtomicU64`s owned by `self`.
+        let pointer = unsafe { self.base.as_ptr().add(index) };
+        // SAFETY: the word is initialized and lives as long as `self`, which
+        // the reference borrows; `AtomicU64` permits shared mutation.
+        Some(unsafe { &*pointer })
+    }
+
     /// Views the words.
     #[must_use]
     pub fn words(&self) -> AtomicWords<'_> {

@@ -29,7 +29,9 @@ use core::fmt::Debug;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU64;
 
-use crate::atomic_view::{AtomicWords, HeapWords, WORD_BYTES};
+#[cfg(test)]
+use crate::atomic_view::AtomicWords;
+use crate::atomic_view::{HeapWords, WORD_BYTES};
 use crate::error::SysError;
 use crate::frame::FRAME_ALIGNMENT;
 use crate::publication::{clear_word, load_body, store_body};
@@ -239,14 +241,14 @@ pub struct SharedTerms {
 }
 
 impl SharedTerms {
-    fn view(&self) -> AtomicWords<'_> {
-        self.words.words()
+    fn word(&self, index: usize) -> Option<&AtomicU64> {
+        self.words.word(index)
     }
 
     /// Every word, for tests that act as a peer keeping the access ABI.
     #[cfg(test)]
     pub(crate) fn words(&self) -> AtomicWords<'_> {
-        self.view()
+        self.words.words()
     }
 
     /// Index of the word at byte `offset` of `slot`.
@@ -273,7 +275,7 @@ impl sealed::Access for SharedTerms {
 
     unsafe fn word0(&self, slot: u8, offset: u32) -> &AtomicU64 {
         debug_assert!(offset.is_multiple_of(FRAME_ALIGNMENT) && offset < self.term_length);
-        match self.view().get(self.index(slot, offset)) {
+        match self.word(self.index(slot, offset)) {
             Some(word) => word,
             // In range per the caller's contract; an out-of-range request is
             // a bug, answered without touching the region.
@@ -282,11 +284,10 @@ impl sealed::Access for SharedTerms {
     }
 
     unsafe fn write_bytes(&self, slot: u8, offset: u32, bytes: &[u8]) {
-        let view = self.view();
         let first = self.index(slot, offset);
         let (words, rest) = bytes.as_chunks::<WORD_BYTES>();
         for (index, word) in (first..).zip(words) {
-            if let Some(target) = view.get(index) {
+            if let Some(target) = self.word(index) {
                 store_body(target, *word);
             }
         }
@@ -297,24 +298,23 @@ impl sealed::Access for SharedTerms {
             if let Some(prefix) = word.get_mut(..rest.len()) {
                 prefix.copy_from_slice(rest);
             }
-            if let Some(target) = view.get(first + words.len()) {
+            if let Some(target) = self.word(first + words.len()) {
                 store_body(target, word);
             }
         }
     }
 
     unsafe fn read_bytes(&self, slot: u8, offset: u32, out: &mut [u8]) {
-        let view = self.view();
         let first = self.index(slot, offset);
         let (words, rest) = out.as_chunks_mut::<WORD_BYTES>();
         let full = words.len();
         for (index, word) in (first..).zip(words) {
-            if let Some(source) = view.get(index) {
+            if let Some(source) = self.word(index) {
                 *word = load_body(source);
             }
         }
         if !rest.is_empty()
-            && let Some(source) = view.get(first + full)
+            && let Some(source) = self.word(first + full)
         {
             let word = load_body(source);
             if let Some(prefix) = word.get(..rest.len()) {
@@ -324,11 +324,12 @@ impl sealed::Access for SharedTerms {
     }
 
     unsafe fn clean(&self, slot: u8) {
-        let view = self.view();
         let start = self.index(slot, 0);
         let count = self.term_length as usize / WORD_BYTES;
-        for word in view.as_slice().iter().skip(start).take(count) {
-            clear_word(word);
+        for index in start..start + count {
+            if let Some(word) = self.word(index) {
+                clear_word(word);
+            }
         }
     }
 }
