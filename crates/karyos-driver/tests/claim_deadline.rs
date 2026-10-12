@@ -191,3 +191,123 @@ fn a_retiring_stream_still_runs_its_deadline() {
     assert_eq!(driver.do_work().unwrap(), 1);
     assert!(matches!(claim.commit(), CommitOutcome::Aborted { .. }));
 }
+
+const EVENTS: [&str; 4] = [
+    "claims aborted at deadline",
+    "claim deadlines resolved",
+    "claim clock steps back",
+    "claim deadlines unrepresentable",
+];
+
+/// The claim counters by label.
+fn claim_counters(driver: &EmbeddedDriver) -> std::collections::HashMap<String, u64> {
+    use karyos_sys::counters::CellRead;
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .filter_map(|index| match reader.read(index) {
+            CellRead::Allocated {
+                metadata, value, ..
+            } => {
+                let label = String::from_utf8(metadata.label().to_vec()).unwrap();
+                (EVENTS.contains(&label.as_str()) || label == "claims waiting")
+                    .then_some((label, value))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Checks that after `step` exactly the `moved` event changed (by one),
+/// and the `claims waiting` gauge reads `waiting`.
+fn expect(
+    driver: &mut EmbeddedDriver,
+    step: impl FnOnce(&mut EmbeddedDriver) -> u32,
+    moved: Option<&str>,
+    waiting: u64,
+    work: u32,
+) {
+    let before = claim_counters(driver);
+    assert_eq!(step(driver), work);
+    let after = claim_counters(driver);
+    for label in EVENTS {
+        let delta = after[label] - before[label];
+        assert_eq!(delta, u64::from(Some(label) == moved), "{label}");
+    }
+    assert_eq!(after["claims waiting"], waiting);
+}
+
+#[test]
+fn every_deadline_result_has_its_own_counter() {
+    let (mut driver, clock) = driver();
+    let stream = driver.add_stream(config(2, 100)).unwrap();
+    let _subscription = driver.subscribe(stream, Role::Optional).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    let work = |driver: &mut EmbeddedDriver| driver.do_work().unwrap();
+    // Idle: nothing.
+    expect(&mut driver, work, None, 0, 0);
+    let claim = claimed(publication.try_claim(8).unwrap());
+    clock.set(1000);
+    // Waiting: the gauge only.
+    expect(&mut driver, work, None, 1, 0);
+    // ClockWentBack, twice: counted per call; the stream leaves the gauge.
+    clock.set(500);
+    expect(&mut driver, work, Some("claim clock steps back"), 0, 0);
+    clock.set(400);
+    expect(&mut driver, work, Some("claim clock steps back"), 0, 0);
+    // Aborted: one event and one unit of work.
+    clock.set(500);
+    expect(&mut driver, work, Some("claims aborted at deadline"), 0, 1);
+    // Resolved, repeated per call while the record stays.
+    expect(&mut driver, work, Some("claim deadlines resolved"), 0, 0);
+    expect(&mut driver, work, Some("claim deadlines resolved"), 0, 0);
+    drop(claim);
+    // Waiting, then Idle once the claim is committed: the gauge clears.
+    let claim = claimed(publication.try_claim(8).unwrap());
+    expect(&mut driver, work, None, 1, 0);
+    assert!(matches!(claim.commit(), CommitOutcome::Accepted { .. }));
+    expect(&mut driver, work, None, 0, 0);
+}
+
+#[test]
+fn an_unrepresentable_expiry_is_counted_per_call() {
+    let (mut driver, clock) = driver();
+    let stream = driver.add_stream(config(2, u64::MAX)).unwrap();
+    let _subscription = driver.subscribe(stream, Role::Optional).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    let _claim = claimed(publication.try_claim(8).unwrap());
+    clock.set(1);
+    let work = |driver: &mut EmbeddedDriver| driver.do_work().unwrap();
+    expect(
+        &mut driver,
+        work,
+        Some("claim deadlines unrepresentable"),
+        0,
+        0,
+    );
+    expect(
+        &mut driver,
+        work,
+        Some("claim deadlines unrepresentable"),
+        0,
+        0,
+    );
+}
+
+#[test]
+fn a_freed_stream_leaves_the_waiting_gauge() {
+    let (mut driver, _clock) = driver();
+    let stream = driver.add_stream(config(2, 100)).unwrap();
+    let subscription = driver.subscribe(stream, Role::Optional).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    core::mem::forget(claimed(publication.try_claim(8).unwrap()));
+    let work = |driver: &mut EmbeddedDriver| driver.do_work().unwrap();
+    expect(&mut driver, work, None, 1, 0);
+    driver.remove_stream(stream).unwrap();
+    // Retiring, still waiting.
+    expect(&mut driver, work, None, 1, 0);
+    drop(publication);
+    drop(subscription);
+    // Freed: the gauge no longer counts it.
+    let _ = driver.do_work().unwrap();
+    expect(&mut driver, work, None, 0, 0);
+}

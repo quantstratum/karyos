@@ -12,10 +12,10 @@
 //!   itself is unaffected. Only an overflow of `counter overflows` itself
 //!   goes unrecorded.
 //! - **Gauges** ([`TYPE_GAUGE`]) are current values. The driver refreshes
-//!   them at the end of every successful duty cycle and after each control
-//!   call that changes them, so a handle dropped by the application shows
-//!   up at the next duty cycle. A duty cycle that returns an error may skip
-//!   the refresh.
+//!   them at the end of every duty cycle, also one that returns a stream's
+//!   error (every stream still runs first), and after each control call
+//!   that changes them, so a handle dropped by the application shows up at
+//!   the next duty cycle.
 //! - Each counter is read on its own; there is no atomic snapshot across
 //!   counters.
 //!
@@ -39,6 +39,11 @@
 //! | `hand-over entries held` | gauge | capabilities waiting to be taken |
 //! | `stream leases live` | gauge | capability leases over all streams; forgotten handles stay counted |
 //! | `streams removed` | event | streams that went from active to retiring, once each |
+//! | `claims aborted at deadline` | event | deadline calls that won an abort (`ClaimDeadline::Aborted`) |
+//! | `claim deadlines resolved` | event | deadline calls that found an expired claim already terminal (`Resolved`); repeats per call |
+//! | `claim clock steps back` | event | deadline calls that re-anchored a timer (`ClockWentBack`); repeats per call |
+//! | `claim deadlines unrepresentable` | event | deadline calls whose expiry instant does not fit `u64` (`Unrepresentable`); repeats per call |
+//! | `claims waiting` | gauge | streams whose latest deadline call returned `Waiting` |
 //!
 //! The cells are allocated once, when the driver is created. A reader
 //! keeps the region alive after the driver is dropped; the driver's
@@ -55,7 +60,7 @@ pub const TYPE_EVENTS: u64 = 1;
 pub const TYPE_GAUGE: u64 = 2;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 16] = [
+const LABELS: [(u64, &str); 21] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -72,6 +77,11 @@ const LABELS: [(u64, &str); 16] = [
     (TYPE_GAUGE, "hand-over entries held"),
     (TYPE_GAUGE, "stream leases live"),
     (TYPE_EVENTS, "streams removed"),
+    (TYPE_EVENTS, "claims aborted at deadline"),
+    (TYPE_EVENTS, "claim deadlines resolved"),
+    (TYPE_EVENTS, "claim clock steps back"),
+    (TYPE_EVENTS, "claim deadlines unrepresentable"),
+    (TYPE_GAUGE, "claims waiting"),
 ];
 
 /// One of the driver's counters.
@@ -113,6 +123,16 @@ pub(crate) enum Event {
     /// Streams that went from active to retiring; a repeated
     /// `remove_stream` is not counted again.
     StreamsRemoved,
+    /// Deadline calls that won an abort.
+    ClaimsAborted,
+    /// Deadline calls that found an expired claim already terminal.
+    ClaimDeadlinesResolved,
+    /// Deadline calls that re-anchored a timer after the clock went back.
+    ClaimClockStepsBack,
+    /// Deadline calls whose expiry instant does not fit `u64`.
+    ClaimDeadlinesUnrepresentable,
+    /// Streams whose latest deadline call returned `Waiting`.
+    ClaimsWaiting,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -199,6 +219,14 @@ mod tests {
             (Event::HandOverHeld, "hand-over entries held"),
             (Event::LeasesLive, "stream leases live"),
             (Event::StreamsRemoved, "streams removed"),
+            (Event::ClaimsAborted, "claims aborted at deadline"),
+            (Event::ClaimDeadlinesResolved, "claim deadlines resolved"),
+            (Event::ClaimClockStepsBack, "claim clock steps back"),
+            (
+                Event::ClaimDeadlinesUnrepresentable,
+                "claim deadlines unrepresentable",
+            ),
+            (Event::ClaimsWaiting, "claims waiting"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();
