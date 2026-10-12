@@ -1206,6 +1206,28 @@ mod tests {
         let mut scan = scanner(&term);
         assert!(scan.next_item().is_err());
         assert_eq!(scan.offset(), 0);
+
+        // Mixed: a header-only BEGIN followed by a non-empty END.
+        let mut term = vec![0u8; TERM as usize];
+        for (offset, begin, end, length) in [(0u32, true, false, 32), (32, false, true, 40)] {
+            FrameHeader {
+                word0: Word0::new(
+                    length,
+                    Flags::new(begin, end, false, false, Lane::ZERO),
+                    FrameType::Data,
+                ),
+                term_offset: offset as i32,
+                session_id: IDENTITY.session_id,
+                stream_id: IDENTITY.stream_id,
+                term_id: IDENTITY.term_id,
+                reserved_value: 0,
+            }
+            .encode(&mut term[offset as usize..])
+            .unwrap();
+        }
+        let mut scan = scanner(&term);
+        assert!(scan.next_item().is_err());
+        assert_eq!(scan.offset(), 0);
     }
 
     #[test]
