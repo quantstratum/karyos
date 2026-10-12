@@ -2176,4 +2176,17 @@ fn a_concurrent_handle_stops_at_the_last_term() {
         ));
     }
     assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), tail);
+    // A crossed last term: the handle crosses it, closes, and a reissue
+    // reports the exhaustion and leaves the slot free.
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((u64::from(term_id.get()) << 32) | TERM, Ordering::Release);
+    handle.close();
+    let free = buffer.publishers[0].load(Ordering::Acquire);
+    assert!(matches!(
+        conductor.concurrent_publication(),
+        Err(SysError::MaxPositionExceeded { .. })
+    ));
+    assert_eq!(buffer.publishers[0].load(Ordering::Acquire), free);
 }

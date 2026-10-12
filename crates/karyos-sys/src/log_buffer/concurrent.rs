@@ -89,7 +89,13 @@ impl<O: BufferOwner> Conductor<O> {
             if let Some(error) = crossed_error {
                 return Err(error);
             }
-            TermCount::try_new(from)
+            // `from` is the active count, or the successor of the still
+            // active closing term: its exhaustion is MaxPositionExceeded.
+            if from == active.get() {
+                Ok(active)
+            } else {
+                active.next()
+            }
         };
         let from = match issue() {
             Ok(from) => from,
