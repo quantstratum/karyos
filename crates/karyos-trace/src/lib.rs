@@ -12,12 +12,16 @@
 //! calibration and histograms do not exist yet.
 
 pub mod attribution;
+pub mod clocks;
 pub mod error;
 pub mod journal;
 pub mod record;
 pub mod sampling;
 
 pub use attribution::{AttributionConfig, Attributor, Observed, Verdict, combine};
+pub use clocks::{
+    Calibration, CalibrationError, ClockKey, Latency, Observation, Unavailable, latency,
+};
 pub use error::TraceError;
 pub use journal::{Collected, ObserverId, TraceCollector, TraceWriter, trace_journal};
 pub use record::{
