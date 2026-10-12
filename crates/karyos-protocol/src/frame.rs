@@ -128,6 +128,8 @@ pub struct Lane(u8);
 impl Lane {
     /// Number of lanes.
     pub const COUNT: u8 = 4;
+    /// Lane 0, the most urgent.
+    pub const ZERO: Self = Self(0);
 
     /// Validates a lane.
     ///

@@ -60,6 +60,17 @@ pub enum ProtocolError {
         /// The effective header length.
         header_length: u32,
     },
+    /// An application message must carry at least one byte.
+    #[error("empty application message; header-only DATA is a heartbeat")]
+    EmptyMessage,
+    /// A frame in a term violates the frame rules.
+    #[error("invalid frame at term offset {offset}: {reason}")]
+    InvalidFrame {
+        /// Term offset of the offending frame.
+        offset: u32,
+        /// Which rule failed.
+        reason: &'static str,
+    },
     /// A length computation overflowed.
     #[error("length arithmetic overflowed for {value}")]
     LengthOverflow {
