@@ -310,10 +310,12 @@ impl Word0 {
 
 /// The 32-byte base frame header.
 ///
-/// In a term, only word 0 of a PAD or ABORTED block is meaningful: the rest
-/// of its extent may be uninitialised or still being written, so a reader
-/// must not decode a full header there (SPEC.md §4). On the wire both travel
-/// as canonical 32-byte records whose extent is `reserved_value`.
+/// In a term, a committed DATA or PAD frame is fully visible once its word 0
+/// is loaded with Acquire. An ABORTED block is not: only its word 0 is
+/// meaningful and the rest of its extent may be uninitialised or still being
+/// written, so a reader must not decode a full header there (SPEC.md §4). On
+/// the wire, PAD and ABORTED both travel as canonical 32-byte records whose
+/// extent is `reserved_value`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameHeader {
     /// Word 0.

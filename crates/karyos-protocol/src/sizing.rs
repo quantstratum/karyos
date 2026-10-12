@@ -337,6 +337,31 @@ mod tests {
     }
 
     #[test]
+    fn arithmetic_bounds() {
+        let largest_aligned = u32::MAX - u32::MAX % FRAME_ALIGNMENT;
+        assert_eq!(align_frame(largest_aligned), Ok(largest_aligned));
+        assert!(align_frame(largest_aligned + 1).is_err());
+        let max_payload = i32::MAX as u32 - 32;
+        assert_eq!(frame_length(Flags::NONE, max_payload), Ok(i32::MAX as u32));
+        assert!(frame_length(Flags::NONE, max_payload + 1).is_err());
+        assert_eq!(reserved_length(Flags::NONE, max_payload), Ok(1 << 31));
+        let plan = FragmentPlan::new(DEFAULT_MTU, Flags::NONE).unwrap();
+        assert!(plan.reserved(u32::MAX).is_err());
+        let max_term = TermLength::try_new(MAX_TERM_LENGTH).unwrap();
+        let max = plan
+            .max_message_length(max_term.max_reserved_limit(), max_term)
+            .unwrap();
+        assert!(plan.reserved(max).unwrap() <= max_term.max_reserved_limit());
+        assert!(plan.reserved(max + 1).unwrap() > max_term.max_reserved_limit());
+        // A budget that is not a multiple of 32 rounds down to whole frames.
+        let term = TermLength::try_new(MIN_TERM_LENGTH).unwrap();
+        assert_eq!(
+            plan.max_message_length(1500, term),
+            plan.max_message_length(1472, term)
+        );
+    }
+
+    #[test]
     fn reserved_is_monotonic() {
         let plan = FragmentPlan::new(DEFAULT_MTU, Flags::NONE).unwrap();
         let mut previous = 0;
