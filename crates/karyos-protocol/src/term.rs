@@ -1,0 +1,934 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Sequential flyweights over one term held in a byte slice: an appender
+//! that writes whole message blocks at its tail and a scanner that walks
+//! committed blocks from the term start (SPEC.md §4, publish and read).
+//!
+//! This is foundational storage logic, not the concurrent appender nor the
+//! IPC mode. It works on `&mut [u8]` and `&[u8]`, so Rust's borrow rules
+//! provide the exclusion that the shared-memory version will provide with
+//! loans and atomics. Header locations come only from the appender's tail or
+//! the scanner's walk, never from caller-chosen offsets. The scanner follows
+//! the publisher-log rule: the first fragment's word 0 is the decision word of
+//! the whole block, so interior fragments are read only once that word is
+//! committed.
+
+use crate::error::ProtocolError;
+use crate::frame::{
+    EXTENSION_LENGTH, FRAME_ALIGNMENT, Flags, FrameHeader, FrameType, HEADER_LENGTH, Lane,
+    PROTOCOL_VERSION, TraceExtension, Word0,
+};
+use crate::sizing::{FragmentPlan, TermLength, align_frame};
+
+/// The header fields every frame of one term carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TermIdentity {
+    /// Compact wire alias of the publication incarnation.
+    pub session_id: i32,
+    /// Application-chosen stream.
+    pub stream_id: i32,
+    /// The term's id.
+    pub term_id: i32,
+}
+
+/// Per-message options for [`TermAppender::append`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendOptions {
+    /// Lane written in every fragment's flags.
+    pub lane: Lane,
+    /// Set EOS on the last fragment.
+    pub end_of_stream: bool,
+    /// Trace extension written after every fragment's header.
+    pub extension: Option<TraceExtension>,
+    /// Application value in every fragment's header.
+    pub reserved_value: i64,
+}
+
+/// Result of an append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a full term must be rotated"]
+pub enum AppendOutcome {
+    /// The message was written as one block.
+    Appended {
+        /// Term offset of the block's first fragment.
+        offset: u32,
+        /// Bytes the block occupies.
+        reserved: u32,
+    },
+    /// The block did not fit: the rest of the term was padded (if any space
+    /// remained) and nothing else can be appended to this term.
+    TermFull,
+}
+
+/// Writes whole message blocks at the tail of a term it borrows exclusively.
+#[derive(Debug)]
+pub struct TermAppender<'a> {
+    term: &'a mut [u8],
+    term_length: u32,
+    tail: u32,
+    identity: TermIdentity,
+    mtu: u32,
+    max_message_length: u32,
+}
+
+impl<'a> TermAppender<'a> {
+    /// Starts appending at offset 0 of `term`.
+    ///
+    /// `max_reserved` bounds the bytes one message may reserve (at most
+    /// `term_length / 8`); the message limit is derived from it for messages
+    /// without the trace extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::BufferTooShort`] when `term` is not exactly
+    /// `term_length` bytes, and the errors of [`FragmentPlan::new`] and
+    /// [`FragmentPlan::max_message_length`].
+    pub fn new(
+        term: &'a mut [u8],
+        term_length: TermLength,
+        identity: TermIdentity,
+        mtu: u32,
+        max_reserved: u32,
+    ) -> Result<Self, ProtocolError> {
+        let length = term_length.get();
+        if term.len() != length as usize {
+            return Err(ProtocolError::BufferTooShort {
+                required: length as usize,
+                available: term.len(),
+            });
+        }
+        let plan = FragmentPlan::new(mtu, Flags::NONE)?;
+        let max_message_length = plan.max_message_length(max_reserved, term_length)?;
+        Ok(Self {
+            term,
+            term_length: length,
+            tail: 0,
+            identity,
+            mtu,
+            max_message_length,
+        })
+    }
+
+    /// Current tail offset.
+    #[inline]
+    #[must_use]
+    pub fn tail(&self) -> u32 {
+        self.tail
+    }
+
+    /// Largest message without the trace extension.
+    #[inline]
+    #[must_use]
+    pub fn max_message_length(&self) -> u32 {
+        self.max_message_length
+    }
+
+    /// Appends `payload` as one message block.
+    ///
+    /// The block is never split across terms: if it does not fit, the rest
+    /// of the term is filled with one PAD frame and [`AppendOutcome::TermFull`]
+    /// is returned. As in the publisher's log, every interior fragment is
+    /// complete before the first fragment's word 0 is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::MessageTooLarge`] above the message limit
+    /// (with the extension the limit is recomputed for its header) and
+    /// arithmetic errors from sizing.
+    pub fn append(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+    ) -> Result<AppendOutcome, ProtocolError> {
+        let ext = options.extension.is_some();
+        let fragment_flags = Flags::new(false, false, false, ext, options.lane);
+        let plan = FragmentPlan::new(self.mtu, fragment_flags)?;
+        let length = u32::try_from(payload.len()).map_err(|_| ProtocolError::LengthOverflow {
+            value: payload.len() as u64,
+        })?;
+        let max = if ext {
+            plan.max_message_length(self.max_reserved_budget()?, self.term_length_typed()?)?
+        } else {
+            self.max_message_length
+        };
+        FragmentPlan::check_message(length, max)?;
+        let reserved = plan.reserved(length)?;
+        let end = self
+            .tail
+            .checked_add(reserved)
+            .ok_or(ProtocolError::LengthOverflow {
+                value: u64::from(reserved),
+            })?;
+        if end > self.term_length {
+            self.pad_to_end()?;
+            return Ok(AppendOutcome::TermFull);
+        }
+
+        let start = self.tail;
+        let fragments = plan.fragments(length);
+        let chunk = plan.payload_per_fragment() as usize;
+        let mut offset = start;
+        let mut first_word0 = None;
+        let mut rest = payload;
+        for index in 0..fragments {
+            let (body, next) = rest.split_at(chunk.min(rest.len()));
+            rest = next;
+            let last = index + 1 == fragments;
+            let flags = Flags::new(
+                index == 0,
+                last,
+                last && options.end_of_stream,
+                ext,
+                options.lane,
+            );
+            let header_length = flags.header_length();
+            let frame_length = header_length + body.len() as u32;
+            let word0 = Word0::new(frame_length as i32, flags, FrameType::Data);
+            let header = FrameHeader {
+                word0,
+                term_offset: offset as i32,
+                session_id: self.identity.session_id,
+                stream_id: self.identity.stream_id,
+                term_id: self.identity.term_id,
+                reserved_value: options.reserved_value,
+            };
+            let frame_reserved = align_frame(frame_length)?;
+            let region = slice_mut(self.term, offset, frame_reserved)?;
+            region.fill(0);
+            header.encode(region)?;
+            if let Some(extension) = options.extension {
+                extension.encode(tail_mut(region, HEADER_LENGTH)?)?;
+            }
+            tail_mut(region, header_length)?
+                .get_mut(..body.len())
+                .ok_or(ProtocolError::BufferTooShort {
+                    required: body.len(),
+                    available: 0,
+                })?
+                .copy_from_slice(body);
+            if index == 0 {
+                // The decision word is written last, after every fragment.
+                first_word0 = Some(word0);
+                region
+                    .get_mut(..8)
+                    .ok_or(ProtocolError::BufferTooShort {
+                        required: 8,
+                        available: 0,
+                    })?
+                    .fill(0);
+            }
+            offset += frame_reserved;
+        }
+        if let Some(word0) = first_word0 {
+            slice_mut(self.term, start, 8)?.copy_from_slice(&word0.pack().to_le_bytes());
+        }
+        self.tail = end;
+        Ok(AppendOutcome::Appended {
+            offset: start,
+            reserved,
+        })
+    }
+
+    /// Fills `[tail, term_length)` with one PAD frame whose length states the
+    /// extent, then closes the term.
+    fn pad_to_end(&mut self) -> Result<(), ProtocolError> {
+        let extent = self.term_length - self.tail;
+        if extent > 0 {
+            let header = FrameHeader {
+                word0: Word0::new(extent as i32, Flags::NONE, FrameType::Pad),
+                term_offset: self.tail as i32,
+                session_id: self.identity.session_id,
+                stream_id: self.identity.stream_id,
+                term_id: self.identity.term_id,
+                reserved_value: 0,
+            };
+            let region = slice_mut(self.term, self.tail, HEADER_LENGTH)?;
+            header.encode(region)?;
+        }
+        self.tail = self.term_length;
+        Ok(())
+    }
+
+    fn max_reserved_budget(&self) -> Result<u32, ProtocolError> {
+        Ok(self.term_length_typed()?.max_reserved_limit())
+    }
+
+    fn term_length_typed(&self) -> Result<TermLength, ProtocolError> {
+        TermLength::try_new(self.term_length)
+    }
+}
+
+/// One committed message block found by the scanner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageBlock<'a> {
+    block: &'a [u8],
+    offset: u32,
+    length: u32,
+    lane: Lane,
+    end_of_stream: bool,
+    reserved_value: i64,
+}
+
+impl<'a> MessageBlock<'a> {
+    /// Term offset of the first fragment.
+    #[inline]
+    #[must_use]
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Bytes the block occupies.
+    #[inline]
+    #[must_use]
+    pub fn reserved(&self) -> u32 {
+        self.block.len() as u32
+    }
+
+    /// Logical message length (sum of fragment payloads).
+    #[inline]
+    #[must_use]
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+
+    /// Lane of the message.
+    #[inline]
+    #[must_use]
+    pub fn lane(&self) -> Lane {
+        self.lane
+    }
+
+    /// Whether the last fragment carries EOS.
+    #[inline]
+    #[must_use]
+    pub fn end_of_stream(&self) -> bool {
+        self.end_of_stream
+    }
+
+    /// Application value of the first fragment.
+    #[inline]
+    #[must_use]
+    pub fn reserved_value(&self) -> i64 {
+        self.reserved_value
+    }
+
+    /// The payload of each fragment, in order. The block was validated when
+    /// it was scanned.
+    #[must_use]
+    pub fn fragments(&self) -> Fragments<'a> {
+        Fragments { rest: self.block }
+    }
+
+    /// Copies the whole message into `out`, returning the bytes written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::BufferTooShort`] when `out` is too small.
+    pub fn copy_to(&self, out: &mut [u8]) -> Result<usize, ProtocolError> {
+        let mut written = 0usize;
+        let available = out.len();
+        for fragment in self.fragments() {
+            let end = written + fragment.len();
+            out.get_mut(written..end)
+                .ok_or(ProtocolError::BufferTooShort {
+                    required: self.length as usize,
+                    available,
+                })?
+                .copy_from_slice(fragment);
+            written = end;
+        }
+        Ok(written)
+    }
+}
+
+/// Iterator over the fragment payloads of a validated block.
+#[derive(Debug, Clone)]
+pub struct Fragments<'a> {
+    rest: &'a [u8],
+}
+
+impl<'a> Iterator for Fragments<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        let header = FrameHeader::decode(self.rest).ok()?;
+        let frame_length = u32::try_from(header.word0.frame_length()).ok()?;
+        let header_length = header.word0.flags().header_length();
+        let reserved = align_frame(frame_length).ok()? as usize;
+        let payload = self
+            .rest
+            .get(header_length as usize..frame_length as usize)?;
+        self.rest = self.rest.get(reserved..).unwrap_or(&[]);
+        Some(payload)
+    }
+}
+
+/// What the scanner found at its position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanItem<'a> {
+    /// A committed message block.
+    Message(MessageBlock<'a>),
+    /// An aborted extent, skipped without reading past its word 0.
+    Aborted {
+        /// Term offset of the extent.
+        offset: u32,
+        /// Bytes skipped.
+        extent: u32,
+    },
+    /// Nothing committed yet at the position (word 0 is zero or a negative
+    /// marker); scan again later from the same position.
+    Pending,
+    /// The term ended (a PAD frame, or the term length was reached).
+    End,
+}
+
+/// Walks committed blocks of one term from its start.
+#[derive(Debug, Clone)]
+pub struct TermScanner<'a> {
+    term: &'a [u8],
+    term_length: u32,
+    offset: u32,
+    identity: TermIdentity,
+}
+
+impl<'a> TermScanner<'a> {
+    /// Scans `term` from offset 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::BufferTooShort`] when `term` is not exactly
+    /// `term_length` bytes.
+    pub fn new(
+        term: &'a [u8],
+        term_length: TermLength,
+        identity: TermIdentity,
+    ) -> Result<Self, ProtocolError> {
+        let length = term_length.get();
+        if term.len() != length as usize {
+            return Err(ProtocolError::BufferTooShort {
+                required: length as usize,
+                available: term.len(),
+            });
+        }
+        Ok(Self {
+            term,
+            term_length: length,
+            offset: 0,
+            identity,
+        })
+    }
+
+    /// The position the next call reads from.
+    #[inline]
+    #[must_use]
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Reads the item at the current position and advances past it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::InvalidFrame`] when the bytes at the position
+    /// violate the frame rules; the position does not advance.
+    pub fn next_item(&mut self) -> Result<ScanItem<'a>, ProtocolError> {
+        if self.offset == self.term_length {
+            return Ok(ScanItem::End);
+        }
+        let offset = self.offset;
+        let word0 = Word0::unpack(u64::from_le_bytes(read8(self.term, offset)?))
+            .map_err(|_| invalid(offset, "reserved flag bits set"))?;
+        let length = word0.frame_length();
+        if length <= 0 {
+            return Ok(ScanItem::Pending);
+        }
+        let length = length as u32;
+        let remaining = self.term_length - offset;
+        match FrameType::try_from_code(word0.frame_type_code()) {
+            Ok(FrameType::Aborted) => {
+                if !length.is_multiple_of(FRAME_ALIGNMENT) || length > remaining {
+                    return Err(invalid(offset, "aborted extent out of bounds"));
+                }
+                self.offset += length;
+                Ok(ScanItem::Aborted {
+                    offset,
+                    extent: length,
+                })
+            }
+            Ok(FrameType::Pad) => {
+                if length != remaining {
+                    return Err(invalid(offset, "pad does not end at the term end"));
+                }
+                self.check_header(offset, FrameType::Pad)?;
+                self.offset = self.term_length;
+                Ok(ScanItem::End)
+            }
+            Ok(FrameType::Data) => {
+                let block = self.scan_block(offset)?;
+                self.offset += block.reserved();
+                Ok(ScanItem::Message(block))
+            }
+            _ => Err(invalid(offset, "frame type not allowed in a term")),
+        }
+    }
+
+    /// Validates every fragment of the block whose decision word at `start`
+    /// is committed.
+    fn scan_block(&self, start: u32) -> Result<MessageBlock<'a>, ProtocolError> {
+        let mut offset = start;
+        let mut length: u32 = 0;
+        let mut first: Option<FrameHeader> = None;
+        let end_of_stream;
+        loop {
+            let header = self.check_header(offset, FrameType::Data)?;
+            let flags = header.word0.flags();
+            if flags.begin() != first.is_none() {
+                return Err(invalid(offset, "BEGIN flag out of place"));
+            }
+            if let Some(first) = first
+                && flags.lane() != first.word0.flags().lane()
+            {
+                return Err(invalid(offset, "fragment lane differs"));
+            }
+            let frame_length = u32::try_from(header.word0.frame_length())
+                .map_err(|_| invalid(offset, "interior fragment not complete"))?;
+            let header_length = flags.header_length();
+            if frame_length < header_length {
+                return Err(invalid(offset, "frame shorter than its header"));
+            }
+            let reserved = align_frame(frame_length)?;
+            if reserved > self.term_length - offset {
+                return Err(invalid(offset, "frame extends past the term"));
+            }
+            if flags.ext() {
+                let ext = slice(self.term, offset + HEADER_LENGTH, EXTENSION_LENGTH)?;
+                TraceExtension::decode(ext).map_err(|_| invalid(offset, "invalid extension"))?;
+            }
+            length = length
+                .checked_add(frame_length - header_length)
+                .ok_or_else(|| invalid(offset, "message length overflow"))?;
+            if first.is_none() {
+                first = Some(header);
+            }
+            offset += reserved;
+            if flags.end() {
+                end_of_stream = flags.eos();
+                break;
+            }
+            if offset == self.term_length {
+                return Err(invalid(offset, "block ends without END"));
+            }
+        }
+        let Some(first) = first else {
+            return Err(invalid(start, "empty block"));
+        };
+        let block = slice(self.term, start, offset - start)?;
+        Ok(MessageBlock {
+            block,
+            offset: start,
+            length,
+            lane: first.word0.flags().lane(),
+            end_of_stream,
+            reserved_value: first.reserved_value,
+        })
+    }
+
+    fn check_header(&self, offset: u32, expected: FrameType) -> Result<FrameHeader, ProtocolError> {
+        let header = FrameHeader::decode(slice(self.term, offset, HEADER_LENGTH)?)
+            .map_err(|_| invalid(offset, "reserved flag bits set"))?;
+        if header.word0.version() != PROTOCOL_VERSION {
+            return Err(ProtocolError::UnsupportedVersion {
+                version: header.word0.version(),
+            });
+        }
+        if header.word0.frame_type_code() != expected.code() {
+            return Err(invalid(offset, "unexpected frame type inside a block"));
+        }
+        if header.term_offset != offset as i32
+            || header.term_id != self.identity.term_id
+            || header.session_id != self.identity.session_id
+            || header.stream_id != self.identity.stream_id
+        {
+            return Err(invalid(offset, "header identity does not match the term"));
+        }
+        Ok(header)
+    }
+}
+
+fn invalid(offset: u32, reason: &'static str) -> ProtocolError {
+    ProtocolError::InvalidFrame { offset, reason }
+}
+
+fn read8(bytes: &[u8], offset: u32) -> Result<[u8; 8], ProtocolError> {
+    let mut out = [0u8; 8];
+    out.copy_from_slice(slice(bytes, offset, 8)?);
+    Ok(out)
+}
+
+fn slice(bytes: &[u8], offset: u32, length: u32) -> Result<&[u8], ProtocolError> {
+    let start = offset as usize;
+    let end = start
+        .checked_add(length as usize)
+        .ok_or(ProtocolError::LengthOverflow {
+            value: u64::from(length),
+        })?;
+    bytes.get(start..end).ok_or(ProtocolError::BufferTooShort {
+        required: end,
+        available: bytes.len(),
+    })
+}
+
+fn slice_mut(bytes: &mut [u8], offset: u32, length: u32) -> Result<&mut [u8], ProtocolError> {
+    let available = bytes.len();
+    let start = offset as usize;
+    let end = start
+        .checked_add(length as usize)
+        .ok_or(ProtocolError::LengthOverflow {
+            value: u64::from(length),
+        })?;
+    bytes
+        .get_mut(start..end)
+        .ok_or(ProtocolError::BufferTooShort {
+            required: end,
+            available,
+        })
+}
+
+fn tail_mut(bytes: &mut [u8], from: u32) -> Result<&mut [u8], ProtocolError> {
+    let available = bytes.len();
+    bytes
+        .get_mut(from as usize..)
+        .ok_or(ProtocolError::BufferTooShort {
+            required: from as usize,
+            available,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sizing::DEFAULT_MTU;
+
+    const TERM: u32 = 64 * 1024;
+    const IDENTITY: TermIdentity = TermIdentity {
+        session_id: -7,
+        stream_id: 1001,
+        term_id: 0x1234_5678,
+    };
+
+    fn term_length() -> TermLength {
+        TermLength::try_new(TERM).unwrap()
+    }
+
+    fn appender(term: &mut [u8]) -> TermAppender<'_> {
+        TermAppender::new(term, term_length(), IDENTITY, DEFAULT_MTU, TERM / 8).unwrap()
+    }
+
+    fn scanner(term: &[u8]) -> TermScanner<'_> {
+        TermScanner::new(term, term_length(), IDENTITY).unwrap()
+    }
+
+    fn payload(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    fn message(item: ScanItem<'_>) -> MessageBlock<'_> {
+        match item {
+            ScanItem::Message(block) => block,
+            other => panic!("expected a message, found {other:?}"),
+        }
+    }
+
+    fn contents(block: &MessageBlock<'_>) -> Vec<u8> {
+        let mut out = vec![0; block.length() as usize];
+        assert_eq!(block.copy_to(&mut out).unwrap(), out.len());
+        out
+    }
+
+    fn put_word0(term: &mut [u8], offset: u32, word: Word0) {
+        let at = offset as usize;
+        term[at..at + 8].copy_from_slice(&word.pack().to_le_bytes());
+    }
+
+    #[test]
+    fn single_message_round_trip_then_pending() {
+        let mut term = vec![0u8; TERM as usize];
+        let data = payload(100, 1);
+        let outcome = appender(&mut term)
+            .append(&data, AppendOptions::default())
+            .unwrap();
+        assert_eq!(
+            outcome,
+            AppendOutcome::Appended {
+                offset: 0,
+                reserved: 160
+            }
+        );
+        let mut scan = scanner(&term);
+        let block = message(scan.next_item().unwrap());
+        assert_eq!(
+            (block.offset(), block.reserved(), block.length()),
+            (0, 160, 100)
+        );
+        assert_eq!(contents(&block), data);
+        assert_eq!(scan.next_item(), Ok(ScanItem::Pending));
+        assert_eq!(scan.offset(), 160);
+    }
+
+    #[test]
+    fn spec_sized_message_fragments_and_reassembles() {
+        let mut term = vec![0u8; TERM as usize];
+        let data = payload(8000, 2);
+        let mut app = appender(&mut term);
+        assert_eq!(app.max_message_length(), 8000);
+        assert_eq!(
+            app.append(&data, AppendOptions::default()),
+            Ok(AppendOutcome::Appended {
+                offset: 0,
+                reserved: 8192
+            })
+        );
+        assert_eq!(
+            app.append(&payload(8001, 2), AppendOptions::default()),
+            Err(ProtocolError::MessageTooLarge {
+                length: 8001,
+                max: 8000
+            })
+        );
+        let block = message(scanner(&term).next_item().unwrap());
+        assert_eq!(block.fragments().count(), 6);
+        assert_eq!(contents(&block), data);
+    }
+
+    #[test]
+    fn empty_message_and_end_of_stream() {
+        let mut term = vec![0u8; TERM as usize];
+        let options = AppendOptions {
+            lane: Lane::try_new(2).unwrap(),
+            end_of_stream: true,
+            extension: None,
+            reserved_value: -1,
+        };
+        let _ = appender(&mut term).append(&[], options).unwrap();
+        let block = message(scanner(&term).next_item().unwrap());
+        assert_eq!((block.length(), block.reserved()), (0, 32));
+        assert!(block.end_of_stream());
+        assert_eq!(block.lane().get(), 2);
+        assert_eq!(block.reserved_value(), -1);
+    }
+
+    #[test]
+    fn extension_messages_round_trip() {
+        let mut term = vec![0u8; TERM as usize];
+        let extension = TraceExtension {
+            message_id: 99,
+            ..TraceExtension::default()
+        };
+        let data = payload(3000, 3);
+        let options = AppendOptions {
+            extension: Some(extension),
+            ..AppendOptions::default()
+        };
+        let _ = appender(&mut term).append(&data, options).unwrap();
+        let block = message(scanner(&term).next_item().unwrap());
+        assert_eq!(block.fragments().count(), 3);
+        assert_eq!(contents(&block), data);
+    }
+
+    #[test]
+    fn full_term_is_padded_and_ends_the_scan() {
+        let mut term = vec![0u8; TERM as usize];
+        let data = payload(5000, 4);
+        let mut app = appender(&mut term);
+        let mut appended = 0;
+        while let AppendOutcome::Appended { .. } =
+            app.append(&data, AppendOptions::default()).unwrap()
+        {
+            appended += 1;
+        }
+        assert_eq!(app.tail(), TERM);
+        assert_eq!(
+            app.append(&data, AppendOptions::default()),
+            Ok(AppendOutcome::TermFull)
+        );
+        let mut scan = scanner(&term);
+        for _ in 0..appended {
+            assert_eq!(contents(&message(scan.next_item().unwrap())), data);
+        }
+        assert_eq!(scan.next_item(), Ok(ScanItem::End));
+        assert_eq!(scan.next_item(), Ok(ScanItem::End));
+    }
+
+    #[test]
+    fn uncommitted_decision_word_hides_committed_looking_interior_fragments() {
+        let mut term = vec![0u8; TERM as usize];
+        let _ = appender(&mut term)
+            .append(&payload(4000, 5), AppendOptions::default())
+            .unwrap();
+        // Interior fragment word 0 is positive, but the block's decision word
+        // is not committed yet.
+        term[..8].fill(0);
+        assert_eq!(scanner(&term).next_item(), Ok(ScanItem::Pending));
+        put_word0(
+            &mut term,
+            0,
+            Word0::new(-4096, Flags::NONE, FrameType::Data),
+        );
+        assert_eq!(scanner(&term).next_item(), Ok(ScanItem::Pending));
+    }
+
+    #[test]
+    fn aborted_block_is_skipped_reading_only_word0() {
+        let mut term = vec![0u8; TERM as usize];
+        let mut app = appender(&mut term);
+        let first = app
+            .append(&payload(3000, 6), AppendOptions::default())
+            .unwrap();
+        let second = payload(200, 7);
+        let _ = app.append(&second, AppendOptions::default()).unwrap();
+        let AppendOutcome::Appended { reserved, .. } = first else {
+            panic!("first append failed");
+        };
+        // Garbage after word 0 must not be read.
+        term[8..reserved as usize].fill(0xFF);
+        put_word0(
+            &mut term,
+            0,
+            Word0::new(reserved as i32, Flags::NONE, FrameType::Aborted),
+        );
+        let mut scan = scanner(&term);
+        assert_eq!(
+            scan.next_item(),
+            Ok(ScanItem::Aborted {
+                offset: 0,
+                extent: reserved
+            })
+        );
+        assert_eq!(contents(&message(scan.next_item().unwrap())), second);
+    }
+
+    #[test]
+    fn malformed_frames_are_rejected_without_advancing() {
+        let base = {
+            let mut term = vec![0u8; TERM as usize];
+            let _ = appender(&mut term)
+                .append(&payload(3000, 8), AppendOptions::default())
+                .unwrap();
+            term
+        };
+        type Corruption = Box<dyn Fn(&mut Vec<u8>)>;
+        let corruptions: Vec<(&str, Corruption)> = vec![
+            ("version", Box::new(|t| t[4] = 9)),
+            ("reserved flags", Box::new(|t| t[5] |= 0x40)),
+            (
+                "type in term",
+                Box::new(|t| t[6] = FrameType::Nak.code() as u8),
+            ),
+            ("term offset", Box::new(|t| t[8] = 32)),
+            ("session", Box::new(|t| t[12] ^= 1)),
+            ("stream", Box::new(|t| t[16] ^= 1)),
+            ("term id", Box::new(|t| t[20] ^= 1)),
+            ("short frame", Box::new(|t| t[0] = 8)),
+            ("missing BEGIN", Box::new(|t| t[5] &= !0x01)),
+            ("interior BEGIN", Box::new(|t| t[1408 + 5] |= 0x01)),
+            ("interior lane", Box::new(|t| t[1408 + 5] |= 0x10)),
+            (
+                "interior incomplete",
+                Box::new(|t| t[1408..1408 + 4].copy_from_slice(&(-1i32).to_le_bytes())),
+            ),
+            (
+                "missing END",
+                Box::new(|t| {
+                    t[2816 + 5] &= !0x02;
+                    t[2816..2820].copy_from_slice(&1376i32.to_le_bytes());
+                }),
+            ),
+            (
+                "past term end",
+                Box::new(|t| t[0..4].copy_from_slice(&(TERM as i32 + 32).to_le_bytes())),
+            ),
+        ];
+        for (name, corrupt) in corruptions {
+            let mut term = base.clone();
+            corrupt(&mut term);
+            let mut scan = scanner(&term);
+            assert!(scan.next_item().is_err(), "{name} was accepted");
+            assert_eq!(scan.offset(), 0, "{name} advanced");
+        }
+    }
+
+    #[test]
+    fn bad_pad_and_aborted_extents_are_rejected() {
+        let mut term = vec![0u8; TERM as usize];
+        put_word0(&mut term, 0, Word0::new(64, Flags::NONE, FrameType::Pad));
+        assert!(scanner(&term).next_item().is_err());
+        put_word0(
+            &mut term,
+            0,
+            Word0::new(48, Flags::NONE, FrameType::Aborted),
+        );
+        assert!(scanner(&term).next_item().is_err());
+        put_word0(
+            &mut term,
+            0,
+            Word0::new(TERM as i32 + 32, Flags::NONE, FrameType::Aborted),
+        );
+        assert!(scanner(&term).next_item().is_err());
+    }
+
+    #[test]
+    fn wrong_buffer_lengths_are_rejected() {
+        let mut short = vec![0u8; TERM as usize - 1];
+        assert!(
+            TermAppender::new(&mut short, term_length(), IDENTITY, DEFAULT_MTU, TERM / 8).is_err()
+        );
+        assert!(TermScanner::new(&short, term_length(), IDENTITY).is_err());
+        let mut term = vec![0u8; TERM as usize];
+        assert!(
+            TermAppender::new(&mut term, term_length(), IDENTITY, DEFAULT_MTU, TERM / 4).is_err()
+        );
+    }
+
+    /// Randomized append and scan with a fixed-seed generator: the scanner
+    /// returns exactly the appended sequence, then the term end.
+    #[test]
+    fn randomized_sequences_round_trip() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..20 {
+            let mut term = vec![0u8; TERM as usize];
+            let mut appended = Vec::new();
+            {
+                let mut app = appender(&mut term);
+                loop {
+                    let len = (next() % 8001) as usize;
+                    let data = payload(len, round as u8);
+                    let ext = next() % 4 == 0;
+                    let options = AppendOptions {
+                        extension: ext.then_some(TraceExtension::default()),
+                        lane: Lane::try_new((next() % 4) as u8).unwrap(),
+                        ..AppendOptions::default()
+                    };
+                    match app.append(&data, options) {
+                        Ok(AppendOutcome::Appended { .. }) => appended.push(data),
+                        Ok(AppendOutcome::TermFull) => break,
+                        Err(ProtocolError::MessageTooLarge { .. }) => {}
+                        Err(err) => panic!("append failed: {err}"),
+                    }
+                }
+            }
+            let mut scan = scanner(&term);
+            for expected in &appended {
+                assert_eq!(&contents(&message(scan.next_item().unwrap())), expected);
+            }
+            assert_eq!(scan.next_item(), Ok(ScanItem::End));
+        }
+    }
+}
