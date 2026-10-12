@@ -41,6 +41,8 @@ const STRIDE: usize = 16;
 const TAIL_INTENT: usize = 0;
 const TAIL: usize = STRIDE;
 const LATEST: usize = 2 * STRIDE;
+/// Written only by the writer, so it shares the intent's stride.
+const CLOSED: usize = TAIL_INTENT + 1;
 
 /// Errors of the broadcast buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -59,8 +61,9 @@ pub enum BroadcastError {
         /// Largest payload accepted.
         max: usize,
     },
-    /// Positions would exceed `u64::MAX`; the buffer is closed.
-    #[error("broadcast positions exhausted")]
+    /// Positions would exceed `u64::MAX`. The buffer is closed for good:
+    /// this and every later transmit fail without writing.
+    #[error("broadcast positions exhausted; the buffer is closed")]
     PositionsExhausted,
     /// Capacity is not a power of two of at least the minimum, or the
     /// record limit does not fit it.
@@ -166,6 +169,14 @@ impl<'a> BroadcastWords<'a> {
         self.data.get(usize::try_from(offset / 8).ok()?)
     }
 
+    /// Whether position exhaustion has closed the buffer (Acquire). Readers
+    /// can still drain what was committed.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.trailer(CLOSED)
+            .is_some_and(|word| word.load(Ordering::Acquire) != 0)
+    }
+
     /// The committed tail (Acquire): where a new reader starts.
     #[must_use]
     pub fn tail(&self) -> u64 {
@@ -180,7 +191,11 @@ impl<'a> BroadcastWords<'a> {
     /// Returns [`BroadcastError::ReservedType`],
     /// [`BroadcastError::MessageTooLarge`] and
     /// [`BroadcastError::PositionsExhausted`]; nothing is written on error.
+    /// Exhaustion closes the buffer: every later transmit fails too.
     pub fn transmit(&self, type_id: u32, payload: &[u8]) -> Result<u64, BroadcastError> {
+        if self.is_closed() {
+            return Err(BroadcastError::PositionsExhausted);
+        }
         if type_id == PAD_TYPE {
             return Err(BroadcastError::ReservedType { type_id });
         }
@@ -206,12 +221,15 @@ impl<'a> BroadcastWords<'a> {
         let tail = tail_word.load(Ordering::Relaxed);
         let to_end = self.capacity - (tail & (self.capacity - 1));
         let padding = if extent > to_end { to_end } else { 0 };
-        let start = tail
+        let Some((start, new_tail)) = tail
             .checked_add(padding)
-            .ok_or(BroadcastError::PositionsExhausted)?;
-        let new_tail = start
-            .checked_add(extent)
-            .ok_or(BroadcastError::PositionsExhausted)?;
+            .and_then(|start| Some((start, start.checked_add(extent)?)))
+        else {
+            if let Some(closed) = self.trailer(CLOSED) {
+                closed.store(1, Ordering::Release);
+            }
+            return Err(BroadcastError::PositionsExhausted);
+        };
 
         intent.store(new_tail, Ordering::Relaxed);
         fence(Ordering::Release);
@@ -359,6 +377,19 @@ impl<'a> BroadcastWords<'a> {
     }
 }
 
+#[cfg(all(test, not(loom)))]
+impl BroadcastWords<'_> {
+    /// Test only: moves an empty buffer's positions to `position`, a
+    /// multiple of 8.
+    fn seed(&self, position: u64) {
+        for index in [TAIL_INTENT, TAIL, LATEST] {
+            if let Some(word) = self.trailer(index) {
+                word.store(position, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 #[cfg(not(loom))]
 pub use owned::{BroadcastReceiver, BroadcastTransmitter, broadcast};
 
@@ -431,6 +462,19 @@ mod owned {
         #[must_use]
         pub fn max_payload(&self) -> usize {
             self.region.words().map_or(0, |words| words.max_payload())
+        }
+
+        /// Whether position exhaustion has closed the buffer.
+        #[must_use]
+        pub fn is_closed(&self) -> bool {
+            self.region.words().map_or(true, |words| words.is_closed())
+        }
+
+        #[cfg(test)]
+        pub(super) fn seed(&self, position: u64) {
+            if let Ok(words) = self.region.words() {
+                words.seed(position);
+            }
         }
 
         /// A new reader starting at the committed tail (control path:
@@ -580,6 +624,22 @@ mod tests {
             assert_eq!(type_id, sequence);
             assert_eq!(payload, &message(sequence, 100)[..]);
         }
+    }
+
+    #[test]
+    fn position_exhaustion_closes_the_buffer() {
+        let mut tx = broadcast(1024).unwrap();
+        tx.seed(u64::MAX - 15);
+        let mut rx = tx.receiver();
+        // A 17-byte payload needs PAD 16 + extent 32: exhausted.
+        assert_eq!(
+            tx.transmit(1, &[0; 17]),
+            Err(BroadcastError::PositionsExhausted)
+        );
+        assert!(tx.is_closed());
+        // A record that would still fit is refused too: closed for good.
+        assert_eq!(tx.transmit(2, &[]), Err(BroadcastError::PositionsExhausted));
+        assert_eq!(rx.receive(), Received::Pending);
     }
 
     #[test]
