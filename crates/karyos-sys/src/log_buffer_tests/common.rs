@@ -2190,3 +2190,76 @@ fn a_concurrent_handle_stops_at_the_last_term() {
     ));
     assert_eq!(buffer.publishers[0].load(Ordering::Acquire), free);
 }
+
+// Claims on concurrent handles, batch a3.
+
+fn concurrent_claimed<'a, O: BufferOwner + core::fmt::Debug>(
+    outcome: Result<ConcurrentClaimOutcome<'a, O>, SysError>,
+) -> ConcurrentClaim<'a, O> {
+    match outcome.unwrap() {
+        ConcurrentClaimOutcome::Claimed(claim) => claim,
+        other => panic!("not claimed: {other:?}"),
+    }
+}
+
+#[test]
+fn concurrent_claims_commit_between_other_handles_offers() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut claimer = conductor.concurrent_publication().unwrap().unwrap();
+    let mut offerer = conductor.concurrent_publication().unwrap().unwrap();
+    let mut claim = concurrent_claimed(claimer.try_claim(5, AppendOptions::default()));
+    // Another handle publishes while the claim is open.
+    let offered = offer_concurrent(&mut offerer, &mut conductor, &message(9), || {});
+    assert!(offered > claim.position());
+    // Readers wait at the open claim (head of line).
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+    assert!(claim.payload().iter().all(|byte| *byte == 0));
+    claim.payload().copy_from_slice(b"hello");
+    let position = claim.position();
+    assert_eq!(claim.commit(), CommitOutcome::Committed { position });
+    assert_eq!(poll_message(&mut subscription), Some(b"hello".to_vec()));
+    assert_eq!(poll_message(&mut subscription), Some(message(9)));
+}
+
+#[test]
+fn concurrent_claims_abort_by_abort_drop_and_forget() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    concurrent_claimed(handle.try_claim(8, AppendOptions::default())).abort();
+    drop(concurrent_claimed(handle.try_claim(40, AppendOptions::default())));
+    core::mem::forget(concurrent_claimed(handle.try_claim(8, AppendOptions::default())));
+    // The next mutable operation resolves the forgotten claim.
+    let _ = offer_concurrent(&mut handle, &mut conductor, &message(1), || {});
+    for (position, extent) in [(0, 64), (64, 96), (160, 64)] {
+        assert_eq!(poll(&mut subscription), PollOutcome::Aborted { position, extent });
+    }
+    assert_eq!(poll_message(&mut subscription), Some(message(1)));
+    // Dropping the handle resolves a forgotten claim before its loan goes.
+    core::mem::forget(concurrent_claimed(handle.try_claim(8, AppendOptions::default())));
+    drop(handle);
+    assert!(matches!(poll(&mut subscription), PollOutcome::Aborted { extent: 64, .. }));
+    let held = buffer.cell(0).unwrap().loan.load(Ordering::SeqCst);
+    assert_eq!(held, 0);
+}
+
+#[test]
+fn concurrent_claim_sizes_are_checked() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    assert!(matches!(
+        handle.try_claim(0, AppendOptions::default()),
+        Err(SysError::EmptyMessage)
+    ));
+    assert!(matches!(
+        handle.try_claim(1377, AppendOptions::default()),
+        Err(SysError::Layout(LayoutError::MessageTooLarge { .. }))
+    ));
+    let mut claim = concurrent_claimed(handle.try_claim(1376, AppendOptions::default()));
+    assert_eq!(claim.payload().len(), 1376);
+    claim.abort();
+}
