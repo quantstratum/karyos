@@ -2015,6 +2015,37 @@ pub struct Conductor<O: BufferOwner> {
     observed: Option<(u64, u64)>,
 }
 
+/// Every outcome of one [`Conductor::service_deadlines`] call
+/// (`quantstratum-docs: karyos/design/concurrent-deadline.md`, Results). Each count is at most
+/// `P + 1` (at most 256), so it fits `u32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeadlineReport {
+    /// Blocks and spans this call aborted.
+    pub aborted: u32,
+    /// Their total extent in bytes.
+    pub aborted_bytes: u64,
+    /// Expired points found already terminal.
+    pub resolved: u32,
+    /// Timers re-anchored because the clock went back.
+    pub clock_went_back: u32,
+    /// Points whose expiry instant does not fit `u64`.
+    pub unrepresentable: u32,
+    /// Concurrent: an observation or span walk remains after the call.
+    /// Exclusive: the claim's result was `Waiting`.
+    pub waiting: bool,
+}
+
+/// A deadline service call that failed, with the effects it completed
+/// before the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("deadline service failed after {} aborts: {error}", report.aborted)]
+pub struct DeadlineError {
+    /// What the call completed before the error.
+    pub report: DeadlineReport,
+    /// The error.
+    pub error: SysError,
+}
+
 /// What [`Conductor::abort_expired_claims`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -2074,8 +2105,10 @@ impl<O: BufferOwner> Conductor<O> {
     ///
     /// # Errors
     ///
-    /// Returns [`SysError::CorruptTerm`] for a record outside the term and
-    /// errors from the descriptor protocol.
+    /// Returns [`SysError::CorruptTerm`] for a record outside the term,
+    /// errors from the descriptor protocol, and
+    /// [`SysError::InvalidPublicationMode`] for a concurrent buffer, whose
+    /// deadlines are served by [`Conductor::service_deadlines`].
     pub fn abort_expired_claims(&mut self, now: u64) -> Result<ClaimDeadline, SysError> {
         self.abort_expired_claims_with(&mut || now)
     }
@@ -2098,12 +2131,68 @@ impl<O: BufferOwner> Conductor<O> {
             return Err(SysError::ResourcesUnavailable);
         }
         // The claim record has a single writer, the exclusive publication;
-        // concurrent buffers have no deadline abort yet
-        // (`quantstratum-docs: karyos/design/concurrent-publication.md`, batch c).
+        // concurrent buffers are served by `service_deadlines`
+        // (`quantstratum-docs: karyos/design/concurrent-deadline.md`).
         if buffer.concurrent() {
-            self.observed = None;
-            return Ok(ClaimDeadline::Idle);
+            return Err(SysError::InvalidPublicationMode {
+                reason: "a concurrent buffer's deadlines are served by service_deadlines",
+            });
         }
+        self.exclusive_deadline(clock)
+    }
+
+    /// The deadline service (`quantstratum-docs: karyos/design/concurrent-deadline.md`,
+    /// Results): every outcome of this call counted in a fixed-size
+    /// report. For an exclusive buffer the report is derived from the
+    /// single claim of [`Conductor::abort_expired_claims_with`]; its
+    /// `waiting` is set exactly when that result is `Waiting`.
+    ///
+    /// Concurrent buffers are not served yet: until the concurrent span
+    /// walk lands (batch c2), the call returns an empty report without
+    /// reading the clock, and no concurrent block is aborted at its
+    /// deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeadlineError`] carrying the effects completed before the
+    /// error (a corrupt record or a broken descriptor invariant).
+    pub fn service_deadlines(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+    ) -> Result<DeadlineReport, DeadlineError> {
+        let mut report = DeadlineReport::default();
+        #[cfg(feature = "test-hooks")]
+        if self.buffer.deadline_fault.load(Ordering::Relaxed) {
+            return Err(DeadlineError {
+                report,
+                error: SysError::ResourcesUnavailable,
+            });
+        }
+        if self.buffer.concurrent() {
+            // Batch c2: the concurrent span walk.
+            return Ok(report);
+        }
+        match self.exclusive_deadline(clock) {
+            Ok(ClaimDeadline::Idle) => {}
+            Ok(ClaimDeadline::Waiting) => report.waiting = true,
+            Ok(ClaimDeadline::ClockWentBack) => report.clock_went_back = 1,
+            Ok(ClaimDeadline::Unrepresentable) => report.unrepresentable = 1,
+            Ok(ClaimDeadline::Resolved) => report.resolved = 1,
+            Ok(ClaimDeadline::Aborted { extent, .. }) => {
+                report.aborted = 1;
+                report.aborted_bytes = u64::from(extent);
+            }
+            Err(error) => return Err(DeadlineError { report, error }),
+        }
+        Ok(report)
+    }
+
+    /// The exclusive claim's deadline (`quantstratum-docs: karyos/design/claim-deadline.md`).
+    fn exclusive_deadline(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+    ) -> Result<ClaimDeadline, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
         let Some((serial, record)) = read_claim_record(&buffer.claim_serial, &buffer.claim_record)
         else {
             self.observed = None;

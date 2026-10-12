@@ -1503,6 +1503,64 @@ fn the_claim_timer_follows_the_clock() {
     assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
 }
 
+/// `service_deadlines` on an exclusive buffer reports each legacy
+/// outcome as one count; only `Waiting` sets `waiting`.
+#[test]
+fn the_exclusive_deadline_report_matches_the_legacy_outcome() {
+    let at = |now: u64| move || now;
+    let report = |conductor: &mut Conductor<_>, now: u64| {
+        conductor.service_deadlines(&mut at(now)).unwrap()
+    };
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    assert_eq!(report(&mut conductor, 0), DeadlineReport::default());
+    let claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    assert_eq!(
+        report(&mut conductor, 1000),
+        DeadlineReport {
+            waiting: true,
+            ..DeadlineReport::default()
+        }
+    );
+    assert_eq!(
+        report(&mut conductor, 500),
+        DeadlineReport {
+            clock_went_back: 1,
+            ..DeadlineReport::default()
+        }
+    );
+    assert_eq!(
+        report(&mut conductor, 1000 + DEADLINE),
+        DeadlineReport {
+            aborted: 1,
+            aborted_bytes: 64,
+            ..DeadlineReport::default()
+        }
+    );
+    assert_eq!(
+        report(&mut conductor, 2000 + DEADLINE),
+        DeadlineReport {
+            resolved: 1,
+            ..DeadlineReport::default()
+        }
+    );
+    drop(claim);
+    assert_eq!(report(&mut conductor, u64::MAX), DeadlineReport::default());
+
+    let buffer = new_buffer(deadline_config(u64::MAX)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    assert_eq!(
+        report(&mut conductor, 1),
+        DeadlineReport {
+            unrepresentable: 1,
+            ..DeadlineReport::default()
+        }
+    );
+}
+
 #[test]
 fn an_unrepresentable_expiry_is_reported() {
     let buffer = new_buffer(deadline_config(u64::MAX)).unwrap();
@@ -1680,6 +1738,13 @@ fn an_injected_deadline_fault_leaves_the_protocol_state_intact() {
         conductor.abort_expired_claims_with(&mut || panic!("clock read")),
         Err(SysError::ResourcesUnavailable)
     ));
+    assert_eq!(
+        conductor.service_deadlines(&mut || panic!("clock read")),
+        Err(DeadlineError {
+            report: DeadlineReport::default(),
+            error: SysError::ResourcesUnavailable,
+        })
+    );
     assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), serial);
     assert_eq!(buffer.claim_record.load(Ordering::Relaxed), record);
     assert_eq!(buffer.cell(0).unwrap().loan.load(Ordering::SeqCst), loan);
@@ -1839,11 +1904,15 @@ fn the_conductor_rotates_a_full_concurrent_term_and_prepares_tails() {
 fn the_deadline_service_is_idle_for_concurrent_buffers() {
     let buffer = new_buffer(concurrent_config(2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
+    assert!(matches!(
+        conductor.abort_expired_claims_with(&mut || panic!("clock read")),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
     assert_eq!(
         conductor
-            .abort_expired_claims_with(&mut || panic!("clock read"))
+            .service_deadlines(&mut || panic!("clock read"))
             .unwrap(),
-        ClaimDeadline::Idle
+        DeadlineReport::default()
     );
 }
 
