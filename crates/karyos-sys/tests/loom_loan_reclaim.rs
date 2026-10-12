@@ -12,8 +12,8 @@
 #![cfg(loom)]
 
 use karyos_sys::loan::{
-    LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held, publish,
-    release_loan, take_loan,
+    LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held,
+    participant_quiescent, publish, release_loan, revoke, take_loan,
 };
 use karyos_sys::slot::{Descriptor, SlotIndex, SlotState};
 use karyos_sys::sync::{AtomicU64, Ordering};
@@ -31,6 +31,7 @@ const REASSIGNED_BYTES: u64 = 9;
 struct Slot {
     descriptor: AtomicU64,
     loan_words: [AtomicU64; 1],
+    revoked: AtomicU64,
     bytes: AtomicU64,
 }
 
@@ -44,6 +45,7 @@ fn fixture() -> (Arc<Slot>, LoanTarget, Descriptor) {
     let shared = Arc::new(Slot {
         descriptor: AtomicU64::new(active.encode()),
         loan_words: [AtomicU64::new(0)],
+        revoked: AtomicU64::new(0),
         bytes: AtomicU64::new(TERM_BYTES),
     });
     (shared, target, active)
@@ -53,13 +55,13 @@ fn fixture() -> (Arc<Slot>, LoanTarget, Descriptor) {
 /// unchanged until it releases the loan.
 fn participant(shared: &Slot, target: LoanTarget) {
     let [word] = &shared.loan_words;
-    match take_loan(word, &shared.descriptor, target).unwrap() {
+    match take_loan(word, &shared.revoked, &shared.descriptor, target).unwrap() {
         LoanOutcome::Granted => {
             assert_eq!(shared.bytes.load(Ordering::Relaxed), TERM_BYTES);
             assert_eq!(shared.bytes.load(Ordering::Relaxed), TERM_BYTES);
             release_loan(word);
         }
-        LoanOutcome::Overrun | LoanOutcome::Retry => {
+        LoanOutcome::Overrun | LoanOutcome::Retry | LoanOutcome::Revoked => {
             assert_eq!(word.load(Ordering::SeqCst), 0);
         }
     }
@@ -130,5 +132,32 @@ fn quarantined_slot_is_cleaned_after_release() {
         let cleaning = begin_cleaning(&shared.descriptor, reclaiming).unwrap();
         shared.bytes.store(CLEANED_BYTES, Ordering::Relaxed);
         publish(&shared.descriptor, cleaning.with_state(SlotState::Free));
+    });
+}
+
+/// Contract "Required participant revocation" (SPEC.md §13): the reader may
+/// pause just before storing its loan word while the driver revokes it. Once
+/// the driver sees the participant quiescent it withdraws the participant's
+/// bound, after which the publisher may overwrite the term; the reader's
+/// acquisition must then fail.
+#[test]
+fn revocation_versus_paused_acquisition() {
+    loom::model(|| {
+        let (shared, target, _active) = fixture();
+        let reader = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || participant(&shared, target))
+        };
+
+        if revoke(&shared.revoked, &shared.loan_words).unwrap() {
+            // Bound withdrawn: the publisher laps the reader.
+            shared.bytes.store(CLEANED_BYTES, Ordering::Relaxed);
+        }
+
+        reader.join().unwrap();
+        // The registration is kept: after the reader is done, a rescan must
+        // find it quiescent and its flag still set.
+        assert!(participant_quiescent(&shared.loan_words).unwrap());
+        assert_ne!(shared.revoked.load(Ordering::SeqCst), 0);
     });
 }

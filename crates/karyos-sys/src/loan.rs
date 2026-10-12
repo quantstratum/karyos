@@ -167,13 +167,20 @@ pub enum LoanOutcome {
     Retry,
     /// The term is gone (reclaimed, cleaned or reassigned).
     Overrun,
+    /// The participant has been revoked and can take no new loan.
+    Revoked,
 }
 
+/// Value of a participant's revoked flag once the driver has revoked it.
+pub const REVOKED: u64 = 1;
+
 /// Takes a loan on `target` through `word`, validating it against
-/// `descriptor`.
+/// `descriptor` and the participant's `revoked` flag.
 ///
-/// The loan word must belong to the caller and be empty. On any outcome other
-/// than [`LoanOutcome::Granted`] the word is cleared before returning.
+/// The loan word must belong to the caller, be empty and belong to the bank of
+/// the lane that `target.slot()` indexes. On any outcome other than
+/// [`LoanOutcome::Granted`] the word is cleared before returning. A revoked
+/// participant never gets a loan, whatever the descriptor says.
 ///
 /// # Errors
 ///
@@ -182,13 +189,18 @@ pub enum LoanOutcome {
 /// is cleared in that case too.
 pub fn take_loan(
     word: &AtomicU64,
+    revoked: &AtomicU64,
     descriptor: &AtomicU64,
     target: LoanTarget,
 ) -> Result<LoanOutcome, SysError> {
     word.store(target.loan().encode(), Ordering::SeqCst);
     fence(Ordering::SeqCst);
     let observed = descriptor.load(Ordering::SeqCst);
-    let outcome = classify(observed, target);
+    let outcome = if revoked.load(Ordering::SeqCst) == 0 {
+        classify(observed, target)
+    } else {
+        Ok(LoanOutcome::Revoked)
+    };
     if !matches!(outcome, Ok(LoanOutcome::Granted)) {
         word.store(0, Ordering::SeqCst);
     }
@@ -220,6 +232,44 @@ fn classify(raw: u64, target: LoanTarget) -> Result<LoanOutcome, SysError> {
 #[inline]
 pub fn release_loan(word: &AtomicU64) {
     word.store(0, Ordering::Release);
+}
+
+/// Driver: revokes a participant and reports whether it is quiescent.
+///
+/// Stores the participant's revoked flag, then scans all its loan words (in
+/// every lane bank). Returns `true` only when every word is empty: from then
+/// on no acquisition by this participant can succeed, because an acquisition
+/// stores its word before loading the flag. Returns `false` while a loan is
+/// still held; call [`participant_quiescent`] again until it returns `true`.
+///
+/// Quiescence does not free the registration. The loan words and the flag
+/// stay allocated, flag set, until the participant proves detach or its
+/// process verifiably exits (SPEC.md §4, IPC flow control).
+///
+/// # Errors
+///
+/// Returns [`SysError::InvalidLoanWord`] when a loan word is malformed.
+pub fn revoke(revoked: &AtomicU64, loan_words: &[AtomicU64]) -> Result<bool, SysError> {
+    revoked.store(REVOKED, Ordering::SeqCst);
+    // Pairs with the fence in `take_loan`, as in `begin_reclaim`.
+    fence(Ordering::SeqCst);
+    participant_quiescent(loan_words)
+}
+
+/// Driver: whether every loan word of a revoked participant is empty. Only
+/// meaningful after [`revoke`]; reading empty words without revocation never
+/// proves quiescence.
+///
+/// # Errors
+///
+/// Returns [`SysError::InvalidLoanWord`] when a loan word is malformed.
+pub fn participant_quiescent(loan_words: &[AtomicU64]) -> Result<bool, SysError> {
+    for word in loan_words {
+        if Loan::decode(word.load(Ordering::SeqCst))?.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Driver: moves `active` to `RECLAIMING`, after which no new loan is granted.
@@ -347,6 +397,8 @@ fn transition(
 mod tests {
     use super::*;
 
+    static NOT_REVOKED: AtomicU64 = AtomicU64::new(0);
+
     fn ids() -> (SlotIndex, Generation, TermId) {
         (
             SlotIndex::try_new(5).unwrap(),
@@ -403,7 +455,7 @@ mod tests {
             let word = AtomicU64::new(0);
             let desc = AtomicU64::new(found.encode());
             assert_eq!(
-                take_loan(&word, &desc, target(3)),
+                take_loan(&word, &NOT_REVOKED, &desc, target(3)),
                 Ok(expected),
                 "{found:?}"
             );
@@ -423,7 +475,7 @@ mod tests {
         let word = AtomicU64::new(0);
         let desc = AtomicU64::new(other.encode());
         assert_eq!(
-            take_loan(&word, &desc, target(0)),
+            take_loan(&word, &NOT_REVOKED, &desc, target(0)),
             Err(SysError::GenerationMismatch {
                 expected: 7,
                 found: 8
@@ -439,13 +491,13 @@ mod tests {
         let desc = AtomicU64::new(active.encode());
         let words = [AtomicU64::new(0), AtomicU64::new(0)];
         assert_eq!(
-            take_loan(&words[1], &desc, target(3)),
+            take_loan(&words[1], &NOT_REVOKED, &desc, target(3)),
             Ok(LoanOutcome::Granted)
         );
 
         let reclaiming = begin_reclaim(&desc, active).unwrap();
         assert_eq!(
-            take_loan(&words[0], &desc, target(3)),
+            take_loan(&words[0], &NOT_REVOKED, &desc, target(3)),
             Ok(LoanOutcome::Overrun)
         );
         assert_eq!(loan_held(&words, slot, reclaiming), Ok(true));
@@ -456,7 +508,7 @@ mod tests {
         assert_eq!(cleaning.state(), SlotState::Cleaning);
         publish(&desc, cleaning.with_state(SlotState::Free));
         assert_eq!(
-            take_loan(&words[0], &desc, target(3)),
+            take_loan(&words[0], &NOT_REVOKED, &desc, target(3)),
             Ok(LoanOutcome::Overrun)
         );
     }
@@ -496,5 +548,34 @@ mod tests {
         assert_eq!(activate(&desc, ready), Ok(active));
         publish(&desc, descriptor(4, SlotState::Reclaiming));
         assert!(activate(&desc, ready).is_err());
+    }
+
+    #[test]
+    fn revoked_participant_gets_no_loan() {
+        let active = descriptor(3, SlotState::Active);
+        let desc = AtomicU64::new(active.encode());
+        let revoked = AtomicU64::new(0);
+        let words = [AtomicU64::new(0)];
+        assert_eq!(revoke(&revoked, &words), Ok(true));
+        assert_eq!(
+            take_loan(&words[0], &revoked, &desc, target(3)),
+            Ok(LoanOutcome::Revoked)
+        );
+        assert_eq!(words[0].load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn revocation_waits_for_held_loans() {
+        let active = descriptor(3, SlotState::Active);
+        let desc = AtomicU64::new(active.encode());
+        let revoked = AtomicU64::new(0);
+        let words = [AtomicU64::new(0), AtomicU64::new(0)];
+        assert_eq!(
+            take_loan(&words[1], &revoked, &desc, target(3)),
+            Ok(LoanOutcome::Granted)
+        );
+        assert_eq!(revoke(&revoked, &words), Ok(false));
+        release_loan(&words[1]);
+        assert_eq!(participant_quiescent(&words), Ok(true));
     }
 }
