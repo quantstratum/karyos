@@ -13,7 +13,7 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | Crate | Version | Source | Features | Scope | Targets | Licence | Family approval |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `thiserror` | 2.0.21 | crates.io | default features off | runtime, `karyos-sys` | all | MIT OR Apache-2.0 | ADR-0033 (`thiserror`, all crates) |
-| `rustix` | 1.1.5 | crates.io | default features off; `fs`, `mm`, `param` | runtime, `karyos-sys` | Linux only (`cfg(target_os = "linux")`) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | ADR-0033 (`rustix`, sys and io) |
+| `rustix` | 1.1.5 | crates.io | default features off; `std`, `fs`, `mm`, `param` | runtime, `karyos-sys` | Linux only (`cfg(target_os = "linux")`) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | ADR-0033 (`rustix`, sys and io) |
 | `loom` | 0.7.2 | crates.io | default features off | model checking, only under `--cfg loom` | all | MIT | ADR-0033 (`loom`, dev only) |
 
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
@@ -76,7 +76,7 @@ supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 | `rustix` 1.1.5 | runtime (Linux) | Runs `rustc` probes to select the backend and set cfgs; no build dependencies |
 | `quote` 1.0.47 | build | Runs `rustc --version` to set cfgs |
 | `rustversion` 1.0.23 | loom | Runs `rustc --version` to generate version constants |
-| `libc` 0.2.190 | loom | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
+| `libc` 0.2.190 | loom; also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in normal builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
 | `generator` 0.8.10 | loom | Invokes `cc` to assemble `asm_ppc64le_elf.S` only when the target architecture is `powerpc64`, which Karyos does not support |
 | `valuable` 0.1.1 | loom | Emits atomic-support cfgs from the target name |
 
