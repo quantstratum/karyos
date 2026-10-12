@@ -375,7 +375,8 @@ fn a_late_reader_after_overflow_delivers_everything() {
 fn journal_exhaustion_is_refused_before_the_slot_changes() {
     let mut writer = conflation(2, 8, 1024).unwrap();
     let mut reader = writer.reader();
-    writer.seed_journal(u64::MAX - 64);
+    // Aligned to 8, as every journal position is; 2^64 - 64.
+    writer.seed_journal(u64::MAX - 63);
     assert_eq!(
         writer.write(0, b"x"),
         Err(ConflationError::VersionsExhausted)
