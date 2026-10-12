@@ -1888,3 +1888,305 @@ fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
         _ => panic!("unexpected step"),
     }
 }
+
+// Concurrent handles, batch a2.
+
+fn offer_concurrent(
+    handle: &mut ConcurrentPublication<&LogBuffer<Terms>>,
+    conductor: &mut Conductor<&LogBuffer<Terms>>,
+    data: &[u8],
+    mut drain: impl FnMut(),
+) -> u64 {
+    for _ in 0..1000 {
+        match handle.offer(data, AppendOptions::default()).unwrap() {
+            AppendOutcome::Appended { position } => return position,
+            AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
+                drain();
+                let _ = conductor.duty_cycle().unwrap();
+            }
+        }
+    }
+    panic!("concurrent offer never succeeded");
+}
+
+#[test]
+fn concurrent_handles_are_issued_up_to_their_slots() {
+    let exclusive = new_buffer(config(3, 3)).unwrap();
+    assert!(matches!(
+        exclusive.conductor().unwrap().concurrent_publication(),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let first = conductor.concurrent_publication().unwrap().unwrap();
+    let _second = conductor.concurrent_publication().unwrap().unwrap();
+    assert!(conductor.concurrent_publication().unwrap().is_none());
+    drop(first);
+    assert!(conductor.concurrent_publication().unwrap().is_some());
+}
+
+#[test]
+fn concurrent_offers_are_disjoint_contiguous_and_delivered() {
+    let buffer = new_buffer(concurrent_config(3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut handles: Vec<_> = (0..3)
+        .map(|_| conductor.concurrent_publication().unwrap().unwrap())
+        .collect();
+    let mut expected = Vec::new();
+    let mut received = Vec::new();
+    let total: u32 = if cfg!(miri) { 60 } else { 600 };
+    let mut previous_end = None::<u64>;
+    for sequence in 0..total {
+        let data = message(sequence);
+        let handle = &mut handles[(sequence % 3) as usize];
+        let position = offer_concurrent(handle, &mut conductor, &data, || {
+            while let Some(message) = poll_message(&mut subscription) {
+                received.push(message);
+            }
+        });
+        // Sequential calls: each block starts where the previous ended,
+        // except across a term end.
+        if let Some(end) = previous_end
+            && position / TERM == end / TERM
+        {
+            assert_eq!(position, end);
+        }
+        previous_end = Some(position + u64::from(reserved_of(&data)));
+        expected.push(data);
+    }
+    for _ in 0..1000 {
+        while let Some(message) = poll_message(&mut subscription) {
+            received.push(message);
+        }
+        if received.len() == expected.len() {
+            break;
+        }
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    assert_eq!(received, expected);
+    // Under Miri fewer messages pass one term end; natively several.
+    let rotations = if cfg!(miri) { 0 } else { 2 };
+    assert!(
+        buffer.active_count.load(Ordering::Acquire) > rotations,
+        "no rotation"
+    );
+}
+
+fn reserved_of(data: &[u8]) -> u32 {
+    FragmentPlan::new(DEFAULT_MTU, Flags::NONE)
+        .unwrap()
+        .reserved(data.len() as u32)
+        .unwrap()
+}
+
+#[test]
+fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut a = conductor.concurrent_publication().unwrap().unwrap();
+    let mut b = conductor.concurrent_publication().unwrap().unwrap();
+    // 3104 reserved bytes: never an exact fill of a 64 KiB term.
+    let data = vec![3u8; 3000];
+    // Fill term 0 until a reservation crosses.
+    let mut crossed = false;
+    for _ in 0..100 {
+        let _ = conductor.duty_cycle().unwrap();
+        while poll_message(&mut subscription).is_some() {}
+        match a.offer(&data, AppendOptions::default()).unwrap() {
+            AppendOutcome::Appended { .. } => {}
+            AppendOutcome::AdminAction => {
+                crossed = true;
+                break;
+            }
+            AppendOutcome::BackPressured => {}
+        }
+    }
+    assert!(crossed);
+    // The remainder is a committed PAD up to the term end.
+    let t0 = u64::from(buffer.initial_term_id.get());
+    let raw = buffer.tail(0).unwrap().load(Ordering::Acquire);
+    assert_eq!(raw >> 32, t0);
+    assert!(raw as u32 >= MIN_TERM_LENGTH);
+    // B's reservation lands past the end and holds nothing.
+    assert_eq!(
+        b.offer(&data, AppendOptions::default()).unwrap(),
+        AppendOutcome::AdminAction
+    );
+    // A makes no second reservation in term 0.
+    assert_eq!(
+        a.offer(&data, AppendOptions::default()).unwrap(),
+        AppendOutcome::AdminAction
+    );
+    // The conductor rotates; both catch up and publish in term 1.
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    while poll_message(&mut subscription).is_some() {}
+    let pa = offer_concurrent(&mut a, &mut conductor, &data, || {});
+    let pb = offer_concurrent(&mut b, &mut conductor, &data, || {});
+    assert_eq!(pa / TERM, 1);
+    assert_eq!(pb / TERM, 1);
+}
+
+#[test]
+fn a_live_handle_catches_up_after_three_rotations() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut paused = conductor.concurrent_publication().unwrap().unwrap();
+    let mut writer = conductor.concurrent_publication().unwrap().unwrap();
+    // The paused handle holds its loan on term 0 while three rotations
+    // pass; its slot cannot be reclaimed meanwhile.
+    let data = vec![1u8; 6000];
+    while buffer.active_count.load(Ordering::Acquire) < 3 {
+        let _ = offer_concurrent(&mut writer, &mut conductor, &data, || {
+            while poll_message(&mut subscription).is_some() {}
+        });
+    }
+    // Its next call finds term 0 full (one crossing at most), then it
+    // catches up to the active term, never waiting for term 1.
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        outcomes.push(paused.offer(&data, AppendOptions::default()).unwrap());
+        if matches!(outcomes.last(), Some(AppendOutcome::Appended { .. })) {
+            break;
+        }
+    }
+    let Some(AppendOutcome::Appended { position }) = outcomes.last().copied() else {
+        panic!("never caught up: {outcomes:?}");
+    };
+    assert_eq!(
+        position / TERM,
+        buffer.active_count.load(Ordering::Acquire)
+    );
+}
+
+#[test]
+fn a_reissued_slot_never_crosses_a_term_twice() {
+    let buffer = new_buffer(concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let data = vec![2u8; 5000];
+    // A holder fills term 0 until it crosses, then closes before rotation.
+    let mut holder = conductor.concurrent_publication().unwrap().unwrap();
+    loop {
+        let _ = conductor.duty_cycle().unwrap();
+        while poll_message(&mut subscription).is_some() {}
+        match holder.offer(&data, AppendOptions::default()).unwrap() {
+            AppendOutcome::AdminAction => break,
+            AppendOutcome::Appended { .. } | AppendOutcome::BackPressured => {}
+        }
+    }
+    holder.close();
+    // Reissued while term 0 is still active and crossed: it waits.
+    let mut reissued = conductor.concurrent_publication().unwrap().unwrap();
+    let tail = buffer.tail(0).unwrap().load(Ordering::Acquire);
+    assert_eq!(
+        reissued.offer(&data, AppendOptions::default()).unwrap(),
+        AppendOutcome::AdminAction
+    );
+    // It made no reservation in term 0.
+    assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), tail);
+    let _ = conductor.duty_cycle().unwrap();
+    while poll_message(&mut subscription).is_some() {}
+    let position = offer_concurrent(&mut reissued, &mut conductor, &data, || {});
+    assert_eq!(position / TERM, 1);
+}
+
+#[test]
+fn a_reissue_after_cleaning_and_reassignment_starts_at_the_active_term() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let data = vec![4u8; 6000];
+    let mut writer = conductor.concurrent_publication().unwrap().unwrap();
+    let mut closing = conductor.concurrent_publication().unwrap().unwrap();
+    let _ = offer_concurrent(&mut closing, &mut conductor, &data, || {});
+    closing.close();
+    // Rotations pass and term 0's slot is cleaned and reassigned.
+    while buffer.active_count.load(Ordering::Acquire) < 4 {
+        let _ = offer_concurrent(&mut writer, &mut conductor, &data, || {
+            while poll_message(&mut subscription).is_some() {}
+        });
+    }
+    let found = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
+    assert_ne!(found.term_id(), buffer.initial_term_id, "slot 0 was not reused");
+    let mut reissued = conductor.concurrent_publication().unwrap().unwrap();
+    let position = offer_concurrent(&mut reissued, &mut conductor, &data, || {
+        while poll_message(&mut subscription).is_some() {}
+    });
+    assert!(position / TERM >= 4);
+}
+
+#[test]
+fn concurrent_offers_are_back_pressured() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let _required = conductor.subscribe(Role::Required).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let data = vec![5u8; 3000];
+    let mut pressured = false;
+    for _ in 0..1000 {
+        let _ = conductor.duty_cycle().unwrap();
+        if handle.offer(&data, AppendOptions::default()).unwrap() == AppendOutcome::BackPressured {
+            pressured = true;
+            break;
+        }
+    }
+    assert!(pressured);
+    // Never past the window plus one message above the bounding position.
+    let head = buffer.head().unwrap().unwrap();
+    assert!(head <= TERM / 2);
+}
+
+/// The last representable term: a handle reports `MaxPositionExceeded`
+/// every time instead of waiting for a term that cannot exist, and makes
+/// no reservation.
+#[test]
+fn a_concurrent_handle_stops_at_the_last_term() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    // Seed a coherent identity: slot 0 holds the last term, 32 bytes from
+    // its end; no loan exists yet.
+    let last = TermCount::try_new((1 << 31) - 1).unwrap();
+    assert!(last.next().is_err());
+    let term_id = buffer.initial_term_id.advanced_by(last);
+    buffer.descriptor(0).unwrap().store(
+        Descriptor::new(term_id, buffer.generation, SlotState::Active).encode(),
+        Ordering::Release,
+    );
+    buffer
+        .table_slot(last)
+        .unwrap()
+        .store(table_entry(last.get(), 0), Ordering::Release);
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((u64::from(term_id.get()) << 32) | (TERM - 32), Ordering::Release);
+    buffer
+        .active_count
+        .store(u64::from(last.get()), Ordering::Release);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let tail = buffer.tail(0).unwrap().load(Ordering::Acquire);
+    for _ in 0..4 {
+        assert!(matches!(
+            handle.offer(b"x", AppendOptions::default()),
+            Err(SysError::MaxPositionExceeded { .. })
+        ));
+    }
+    assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), tail);
+    // A crossed last term: the handle crosses it, closes, and a reissue
+    // reports the exhaustion and leaves the slot free.
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((u64::from(term_id.get()) << 32) | TERM, Ordering::Release);
+    handle.close();
+    let free = buffer.publishers[0].load(Ordering::Acquire);
+    assert!(matches!(
+        conductor.concurrent_publication(),
+        Err(SysError::MaxPositionExceeded { .. })
+    ));
+    assert_eq!(buffer.publishers[0].load(Ordering::Acquire), free);
+}

@@ -46,6 +46,10 @@ use crate::term::{Generation, TermCount, TermId};
 use crate::term_bytes::sealed::{Access as _, Token};
 use crate::term_bytes::{HeapTerms, SharedTerms, TermBytes};
 
+mod concurrent;
+
+pub use concurrent::ConcurrentPublication;
+
 mod sealed {
     /// Prevents implementations of [`super::BufferOwner`] outside this
     /// module.
@@ -183,6 +187,9 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     /// Raw tail of each physical slot: `term_id << 32 | offset`
     /// (concurrent mode; initialised for every prepared term).
     tails: Box<[AtomicU64]>,
+    /// Publisher slots of concurrent handles
+    /// (`quantstratum-docs: karyos/design/concurrent-publication.md`).
+    publishers: Box<[AtomicU64]>,
     /// Test hook: an injected deadline fault (feature `test-hooks`).
     #[cfg(feature = "test-hooks")]
     deadline_fault: AtomicBool,
@@ -297,6 +304,7 @@ impl<T: TermBytes> LogBuffer<T> {
             claim_record: AtomicU64::new(0),
             claim_serial: AtomicU64::new(0),
             tails,
+            publishers: (0..publisher_cells).map(|_| AtomicU64::new(0)).collect(),
             #[cfg(feature = "test-hooks")]
             deadline_fault: AtomicBool::new(false),
         })
@@ -1324,77 +1332,107 @@ impl<T: TermBytes> PublicationContext<'_, T> {
         options: AppendOptions,
     ) {
         let buffer = self.buffer;
-        let ext = options.extension.is_some();
-        let lane = buffer.config.lane;
-        let fragments = plan.fragments(payload.len() as u32);
-        let chunk = plan.payload_per_fragment() as usize;
-        let mut offset = start;
-        let mut rest = payload;
-        let mut first = None;
-        for index in 0..fragments {
-            let (body, next) = rest.split_at(chunk.min(rest.len()));
-            rest = next;
-            let last = index + 1 == fragments;
-            let flags = Flags::new(index == 0, last, last && options.end_of_stream, ext, lane);
-            let header_length = flags.header_length();
-            let frame_length = header_length + body.len() as u32;
-            let word0 = Word0::new(frame_length as i32, flags, FrameType::Data);
-            self.write_header_tail(slot, count, offset, options.reserved_value);
-            if let Some(extension) = &options.extension {
-                // SAFETY: write loan held; bytes after the header of a frame
-                // in the unpublished range; not a word 0.
-                unsafe {
-                    buffer
-                        .regions
-                        .write_bytes(slot, offset + HEADER_LENGTH, extension)
-                };
-            }
-            // SAFETY: as above, for the payload bytes.
-            unsafe {
-                buffer
-                    .regions
-                    .write_bytes(slot, offset + header_length, body)
-            };
-            let frame_reserved = align_frame(frame_length).unwrap_or(frame_length);
-            // The slot was cleaned before reuse, so alignment padding and the
-            // rest of the reserved range already read as zero.
-            if index == 0 {
-                first = Some(word0);
-            } else {
-                // SAFETY: write loan held; 32-aligned frame start in range.
-                store_interior(unsafe { buffer.regions.word0(slot, offset) }, word0);
-            }
-            offset += frame_reserved;
-        }
-        if let Some(word0) = first {
-            // SAFETY: write loan held; the block's first frame start.
-            publish_block(unsafe { buffer.regions.word0(slot, start) }, word0);
-        }
+        let first = write_fragments(buffer, slot, count, start, payload, plan, options);
+        // SAFETY: write loan held; the block's first frame start.
+        publish_block(unsafe { buffer.regions.word0(slot, start) }, first);
     }
 
     /// Writes header bytes 8..32 of the frame at `offset`.
     fn write_header_tail(&self, slot: u8, count: TermCount, offset: u32, reserved_value: i64) {
-        let buffer = self.buffer;
-        let term_id = buffer.initial_term_id.advanced_by(count).get() as i32;
-        let mut bytes = [0u8; 24];
-        let fields: [&[u8]; 5] = [
-            &(offset as i32).to_le_bytes(),
-            &buffer.config.session_id.to_le_bytes(),
-            &buffer.config.stream_id.to_le_bytes(),
-            &term_id.to_le_bytes(),
-            &reserved_value.to_le_bytes(),
-        ];
-        let mut at = 0;
-        for field in fields {
-            if let Some(destination) = bytes.get_mut(at..at + field.len()) {
-                destination.copy_from_slice(field);
-            }
-            at += field.len();
-        }
-        // SAFETY: write loan held; header bytes 8..32 of a frame in the
-        // unpublished range, never a word 0.
-        unsafe { buffer.regions.write_bytes(slot, offset + 8, &bytes) };
+        write_header_tail(self.buffer, slot, count, offset, reserved_value);
     }
+}
+
+/// Writes every byte of a block except its first word 0, which it
+/// returns: headers 8..32, extensions, payloads and interior words 0. The
+/// caller publishes the first word 0 (a Release store, or the commit
+/// compare-exchange of a marked block).
+///
+/// The caller holds the slot's write loan for `count` and owns
+/// `[start, start + reserved)`: no reader reaches it before that
+/// publication.
+fn write_fragments<T: TermBytes>(
+    buffer: &LogBuffer<T>,
+    slot: u8,
+    count: TermCount,
+    start: u32,
+    payload: &[u8],
+    plan: &FragmentPlan,
+    options: AppendOptions,
+) -> Word0 {
+    let ext = options.extension.is_some();
+    let lane = buffer.config.lane;
+    let fragments = plan.fragments(payload.len() as u32);
+    let chunk = plan.payload_per_fragment() as usize;
+    let mut offset = start;
+    let mut rest = payload;
+    let mut first = None;
+    for index in 0..fragments {
+        let (body, next) = rest.split_at(chunk.min(rest.len()));
+        rest = next;
+        let last = index + 1 == fragments;
+        let flags = Flags::new(index == 0, last, last && options.end_of_stream, ext, lane);
+        let header_length = flags.header_length();
+        let frame_length = header_length + body.len() as u32;
+        let word0 = Word0::new(frame_length as i32, flags, FrameType::Data);
+        write_header_tail(buffer, slot, count, offset, options.reserved_value);
+        if let Some(extension) = &options.extension {
+            // SAFETY: write loan held; bytes after the header of a frame
+            // in the unpublished range; not a word 0.
+            unsafe {
+                buffer
+                    .regions
+                    .write_bytes(slot, offset + HEADER_LENGTH, extension)
+            };
+        }
+        // SAFETY: as above, for the payload bytes.
+        unsafe {
+            buffer
+                .regions
+                .write_bytes(slot, offset + header_length, body)
+        };
+        let frame_reserved = align_frame(frame_length).unwrap_or(frame_length);
+        // The slot was cleaned before reuse, so alignment padding and the
+        // rest of the reserved range already read as zero.
+        if index == 0 {
+            first = Some(word0);
+        } else {
+            // SAFETY: write loan held; 32-aligned frame start in range.
+            store_interior(unsafe { buffer.regions.word0(slot, offset) }, word0);
+        }
+        offset += frame_reserved;
+    }
+    first.unwrap_or(Word0::new(0, Flags::NONE, FrameType::Data))
+}
+
+/// Writes header bytes 8..32 of the frame at `offset` under the caller's
+/// write loan, in a range it owns and no reader reaches yet.
+fn write_header_tail<T: TermBytes>(
+    buffer: &LogBuffer<T>,
+    slot: u8,
+    count: TermCount,
+    offset: u32,
+    reserved_value: i64,
+) {
+    let term_id = buffer.initial_term_id.advanced_by(count).get() as i32;
+    let mut bytes = [0u8; 24];
+    let fields: [&[u8]; 5] = [
+        &(offset as i32).to_le_bytes(),
+        &buffer.config.session_id.to_le_bytes(),
+        &buffer.config.stream_id.to_le_bytes(),
+        &term_id.to_le_bytes(),
+        &reserved_value.to_le_bytes(),
+    ];
+    let mut at = 0;
+    for field in fields {
+        if let Some(destination) = bytes.get_mut(at..at + field.len()) {
+            destination.copy_from_slice(field);
+        }
+        at += field.len();
+    }
+    // SAFETY: write loan held; header bytes 8..32 of a frame in the
+    // unpublished range, never a word 0.
+    unsafe { buffer.regions.write_bytes(slot, offset + 8, &bytes) };
 }
 
 /// Result of a poll.
