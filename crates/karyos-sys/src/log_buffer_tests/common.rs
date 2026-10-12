@@ -2011,12 +2011,11 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
     assert!(raw as u32 >= MIN_TERM_LENGTH);
     // The crossing owner rotated (term 1 was prepared).
     assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
-    // B finds term 0 full: no reservation there; it catches up and makes
-    // its one reservation in term 1 within the same call.
-    assert!(matches!(
+    // B finds term 0 full: no reservation there.
+    assert_eq!(
         b.offer(&data, AppendOptions::default()).unwrap(),
-        AppendOutcome::Appended { position } if position / TERM == 1
-    ));
+        AppendOutcome::AdminAction
+    );
     assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), raw);
     // Both catch up and publish in term 1, never again in term 0.
     while poll_message(&mut subscription).is_some() {}
@@ -2360,12 +2359,21 @@ fn a_full_term_is_rotated_by_the_next_publisher_call() {
     // Exactly full: no crossing reservation will ever happen in term 0.
     buffer.tail(0).unwrap().store((t0 << 32) | TERM, Ordering::Release);
     buffer.limit.store(2 * TERM, Ordering::Release);
-    // The peer finds the term full, rotates, and reserves in term 1.
+    // The peer finds the term full and rotates; its next call publishes.
+    assert_eq!(
+        peer.offer(b"x", AppendOptions::default()).unwrap(),
+        AppendOutcome::AdminAction
+    );
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
     assert!(matches!(
         peer.offer(b"x", AppendOptions::default()).unwrap(),
         AppendOutcome::Appended { position } if position == TERM
     ));
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    // The owner, still in term 0, finds it full, then catches up.
+    assert_eq!(
+        owner.offer(b"y", AppendOptions::default()).unwrap(),
+        AppendOutcome::AdminAction
+    );
     assert!(matches!(
         owner.offer(b"y", AppendOptions::default()).unwrap(),
         AppendOutcome::Appended { position } if position == TERM + 64
