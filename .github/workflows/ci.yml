@@ -9,11 +9,12 @@ on:
 permissions:
   contents: read
 
-# A new push to a pull request cancels that pull request's older run; runs on
-# main are never cancelled, so every merge keeps its own result. Merges do not
-# wait for CI either way (ADR-0046).
+# A new push to a pull request cancels that pull request's older run. Every
+# other run (pushes to main) gets its own group from its run id, so a later
+# merge neither cancels nor replaces a pending one and every merge keeps its
+# own result. Merges do not wait for CI either way (ADR-0046).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
