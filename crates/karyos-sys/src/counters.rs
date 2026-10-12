@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Counters (SPEC.md §12) with checked increments (SPEC.md §4, counter row).
+//! Counters (SPEC.md §11) with checked increments (SPEC.md §4, counter row).
 //!
 //! A counters region has a fixed number of cells. Each cell has a value word
 //! on its own 128-byte stride and a metadata record (version, state,
 //! registration id, type id and a label of up to 64 bytes) published with a
 //! seqlock: the allocator makes the version odd, issues a Release fence,
-//! writes the metadata and resets the value with Relaxed stores, and makes
-//! the version even with a Release store. A reader loads the version
+//! writes the metadata with Relaxed stores, resets the value with a Relaxed
+//! swap (a read-modify-write), and makes the version even with a Release
+//! store. A reader loads the version
 //! (Acquire), copies the metadata and the value (Relaxed), issues an Acquire
 //! fence and reloads the version (Relaxed); it accepts the copy only if the
 //! version is even and unchanged.
