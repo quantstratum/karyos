@@ -79,7 +79,9 @@ pub struct TermAppender<'a> {
 }
 
 impl<'a> TermAppender<'a> {
-    /// Starts appending at offset 0 of `term`.
+    /// Starts appending at offset 0 of `term`, which it first zero-fills:
+    /// constructing an appender resets the term, so stale frames from earlier
+    /// use can never be scanned after a shorter new append.
     ///
     /// `max_reserved` bounds the bytes one message may reserve (at most
     /// `term_length / 8`); the message limit is derived from it for messages
@@ -106,6 +108,7 @@ impl<'a> TermAppender<'a> {
         }
         let plan = FragmentPlan::new(mtu, Flags::NONE)?;
         let max_message_length = plan.max_message_length(max_reserved, term_length)?;
+        term.fill(0);
         Ok(Self {
             term,
             term_length: length,
@@ -455,10 +458,15 @@ impl<'a> TermScanner<'a> {
 
     /// Reads the item at the current position and advances past it.
     ///
+    /// An error is terminal for this scanner: the position does not advance
+    /// and no resynchronization is attempted. Resynchronizing after an
+    /// interruption (a new BEGIN, PAD or ABORTED inside a block) belongs to
+    /// the receiver and assembler layers.
+    ///
     /// # Errors
     ///
     /// Returns [`ProtocolError::InvalidFrame`] when the bytes at the position
-    /// violate the frame rules; the position does not advance.
+    /// violate the frame rules.
     pub fn next_item(&mut self) -> Result<ScanItem<'a>, ProtocolError> {
         if self.offset == self.term_length {
             return Ok(ScanItem::End);
@@ -479,6 +487,12 @@ impl<'a> TermScanner<'a> {
         let remaining = self.term_length - offset;
         match FrameType::try_from_code(word0.frame_type_code()) {
             Ok(FrameType::Aborted) => {
+                // Only word 0 of an aborted block may be read.
+                if word0.version() != PROTOCOL_VERSION {
+                    return Err(ProtocolError::UnsupportedVersion {
+                        version: word0.version(),
+                    });
+                }
                 if !length.is_multiple_of(FRAME_ALIGNMENT) || length > remaining {
                     return Err(invalid(offset, "aborted extent out of bounds"));
                 }
@@ -520,10 +534,23 @@ impl<'a> TermScanner<'a> {
         let mut first_extension: Option<&[u8]> = None;
         let end_of_stream;
         loop {
+            if first.is_some() {
+                // An interior fragment: classify its word 0 before reading the
+                // rest of its header, so an interruption (an ABORTED or PAD
+                // record, or an uncommitted word) never reads further.
+                let word0 = Word0::unpack(u64::from_le_bytes(read8(self.term, offset)?))
+                    .map_err(|_| invalid(offset, "reserved flag bits set"))?;
+                if word0.frame_length() <= 0 || word0.frame_type_code() != FrameType::Data.code() {
+                    return Err(invalid(offset, "block interrupted before END"));
+                }
+            }
             let header = self.check_header(offset, FrameType::Data)?;
             let flags = header.word0.flags();
             if flags.begin() != first.is_none() {
                 return Err(invalid(offset, "BEGIN flag out of place"));
+            }
+            if flags.eos() && !flags.end() {
+                return Err(invalid(offset, "EOS on a fragment that is not the last"));
             }
             if let Some(first) = first
                 && flags.ext() != first.word0.flags().ext()
@@ -1040,6 +1067,29 @@ mod tests {
             ("interior lane", Box::new(|t| t[1408 + 5] |= 0x10)),
             ("first lane", Box::new(|t| t[5] |= 0x10)),
             ("interior extension", Box::new(|t| t[1408 + 5] |= 0x08)),
+            ("early EOS", Box::new(|t| t[1408 + 5] |= 0x04)),
+            (
+                "aborted interruption",
+                Box::new(|t| {
+                    t[1408..1408 + 8].copy_from_slice(
+                        &Word0::new(1408, Flags::NONE, FrameType::Aborted)
+                            .pack()
+                            .to_le_bytes(),
+                    );
+                    t[1408 + 8..2816].fill(0xFF);
+                }),
+            ),
+            (
+                "aborted version",
+                Box::new(|t| {
+                    t[..8].copy_from_slice(
+                        &Word0::new(4192, Flags::NONE, FrameType::Aborted)
+                            .pack()
+                            .to_le_bytes(),
+                    );
+                    t[4] = 2;
+                }),
+            ),
             (
                 "interior incomplete",
                 Box::new(|t| t[1408..1408 + 4].copy_from_slice(&(-1i32).to_le_bytes())),
@@ -1082,6 +1132,21 @@ mod tests {
             Word0::new(TERM as i32 + 32, Flags::NONE, FrameType::Aborted),
         );
         assert!(scanner(&term).next_item().is_err());
+    }
+
+    #[test]
+    fn a_new_appender_resets_the_term() {
+        let mut term = vec![0u8; TERM as usize];
+        let _ = appender(&mut term)
+            .append(&payload(5000, 1), AppendOptions::default())
+            .unwrap();
+        let short = payload(10, 2);
+        let _ = appender(&mut term)
+            .append(&short, AppendOptions::default())
+            .unwrap();
+        let mut scan = scanner(&term);
+        assert_eq!(contents(&message(scan.next_item().unwrap())), short);
+        assert_eq!(scan.next_item(), Ok(ScanItem::Pending));
     }
 
     #[test]
