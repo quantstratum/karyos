@@ -30,7 +30,10 @@ use karyos_client::link::{Lease, LeaseEnd, StreamLeases};
 use karyos_client::{ClientPublication, ClientSubscription};
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
-use karyos_sys::log_buffer::{Conductor, DeadlineError, LogBuffer, LogBufferConfig, Role};
+use karyos_sys::error::SysError;
+use karyos_sys::log_buffer::{
+    Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, Role,
+};
 
 use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
@@ -443,23 +446,14 @@ impl EmbeddedDriver {
         let clock = &mut self.clock;
         let counters = &self.counters;
         for stream in &mut self.streams {
-            let (report, error) = match stream.conductor.service_deadlines(&mut || clock.now()) {
-                Ok(report) => (report, None),
-                Err(DeadlineError { report, error }) => (report, Some(error)),
-            };
-            stream.claim_waiting = report.waiting;
-            counters.add(Event::ClaimsAborted, u64::from(report.aborted));
-            counters.add(Event::ClaimDeadlinesResolved, u64::from(report.resolved));
-            counters.add(
-                Event::ClaimClockStepsBack,
-                u64::from(report.clock_went_back),
+            let deadlines = account_deadlines(
+                counters,
+                work,
+                stream.conductor.service_deadlines(&mut || clock.now()),
             );
-            counters.add(
-                Event::ClaimDeadlinesUnrepresentable,
-                u64::from(report.unrepresentable),
-            );
-            work = add_work(counters, work, report.aborted);
-            if let Some(error) = error {
+            work = deadlines.work;
+            stream.claim_waiting = deadlines.waiting;
+            if let Some(error) = deadlines.error {
                 first_error.get_or_insert(DriverError::from(error));
             }
             match stream.conductor.duty_cycle() {
@@ -498,6 +492,42 @@ impl EmbeddedDriver {
             return Err(DriverError::StreamRetiring { stream: found.id });
         }
         Ok(found)
+    }
+}
+
+/// A stream's deadline service call, accounted.
+struct Deadlines {
+    work: u32,
+    waiting: bool,
+    error: Option<SysError>,
+}
+
+/// Counts every field of a deadline report, also the one an error carries
+/// (`quantstratum-docs: karyos/design/concurrent-deadline.md`, Results), before the error is
+/// recorded; adds the aborts to `work`.
+fn account_deadlines(
+    counters: &DriverCounters,
+    work: u32,
+    result: Result<DeadlineReport, DeadlineError>,
+) -> Deadlines {
+    let (report, error) = match result {
+        Ok(report) => (report, None),
+        Err(DeadlineError { report, error }) => (report, Some(error)),
+    };
+    counters.add(Event::ClaimsAborted, u64::from(report.aborted));
+    counters.add(Event::ClaimDeadlinesResolved, u64::from(report.resolved));
+    counters.add(
+        Event::ClaimClockStepsBack,
+        u64::from(report.clock_went_back),
+    );
+    counters.add(
+        Event::ClaimDeadlinesUnrepresentable,
+        u64::from(report.unrepresentable),
+    );
+    Deadlines {
+        work: add_work(counters, work, report.aborted),
+        waiting: report.waiting,
+        error,
     }
 }
 
@@ -604,13 +634,50 @@ mod tests {
         clock.0.store(100, Ordering::Relaxed);
         assert!(matches!(
             driver.do_work(),
-            Err(DriverError::Sys(
-                karyos_sys::error::SysError::ResourcesUnavailable
-            ))
+            Err(DriverError::Sys(SysError::ResourcesUnavailable))
         ));
         // The error carries an empty report: nothing counted, not waiting.
         assert_eq!(driver.counters.value(Event::ClaimsWaiting), 0);
         assert_eq!(driver.counters.value(Event::ClaimsAborted), 0);
         assert!(matches!(claim.commit(), CommitOutcome::Accepted { .. }));
+    }
+
+    #[test]
+    fn every_report_field_is_counted_also_from_an_error() {
+        let counters = DriverCounters::new().unwrap();
+        let report = DeadlineReport {
+            aborted: 3,
+            aborted_bytes: 96,
+            resolved: 2,
+            clock_went_back: 4,
+            unrepresentable: 5,
+            waiting: true,
+        };
+        let counted = |counters: &DriverCounters| {
+            [
+                Event::ClaimsAborted,
+                Event::ClaimDeadlinesResolved,
+                Event::ClaimClockStepsBack,
+                Event::ClaimDeadlinesUnrepresentable,
+            ]
+            .map(|event| counters.value(event))
+        };
+        let ok = account_deadlines(&counters, 10, Ok(report));
+        assert_eq!((ok.work, ok.waiting, ok.error), (13, true, None));
+        assert_eq!(counted(&counters), [3, 2, 4, 5]);
+        let failed = account_deadlines(
+            &counters,
+            u32::MAX - 1,
+            Err(DeadlineError {
+                report,
+                error: SysError::ResourcesUnavailable,
+            }),
+        );
+        assert_eq!(
+            (failed.work, failed.waiting, failed.error),
+            (u32::MAX, true, Some(SysError::ResourcesUnavailable))
+        );
+        assert_eq!(counted(&counters), [6, 4, 8, 10]);
+        assert_eq!(counters.value(Event::CounterOverflows), 1);
     }
 }
