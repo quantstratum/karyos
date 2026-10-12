@@ -14,4 +14,4 @@ pub mod frame;
 pub mod sizing;
 pub mod term;
 
-pub use error::ProtocolError;
+pub use error::{LayoutError, ProtocolError};
