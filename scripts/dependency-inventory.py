@@ -18,8 +18,10 @@ resolved graph:
   that class. An empty set means an unconditional path.
 
 The `evaluated` section lists, per supported target, the external packages
-that `cargo tree --target T --edges normal,build` resolves for the workspace:
-the graph actually compiled there in normal builds (no `--cfg loom`, no Miri).
+in the target-filtered dependency graph that `cargo tree --target T --edges
+normal,build` reports for the workspace's default features. It approximates
+what a normal build there compiles (no `--cfg loom`, no Miri); it is not a
+record of an actual build.
 
 Reach classes: `runtime` is linked into normal builds; `build` runs only at
 compile time (build dependency or proc macro); `dev` is reached through a
@@ -39,8 +41,8 @@ import tempfile
 
 LOOM_CFG = "cfg(loom)"
 
-# Targets whose normal and build graphs are evaluated with `cargo tree`; this
-# is the graph actually compiled there without --cfg loom or Miri.
+# Targets whose target-filtered normal and build graphs are listed with
+# `cargo tree`, an approximation of what a normal build compiles there.
 SUPPORTED_TARGETS = [
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-gnu",

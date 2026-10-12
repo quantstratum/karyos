@@ -31,9 +31,9 @@ minimal target conditions along the paths that reach it. Only an edge whose
 condition is exactly `cfg(loom)` makes a path `loom-*`; any other condition is
 kept verbatim. Generation writes a temporary file and replaces the committed
 one only on success. Its `evaluated` section lists, for x86_64 and aarch64
-Linux and aarch64 macOS, the packages `cargo tree --target` resolves for
-normal and build edges: the graph actually compiled there without
-`--cfg loom` or Miri. It is generated from `Cargo.lock` by
+Linux and aarch64 macOS, the target-filtered dependency graph that
+`cargo tree --target --edges normal,build` reports for default features: an
+approximation of what a normal build compiles there, not a build record. It is generated from `Cargo.lock` by
 `scripts/dependency-inventory.py` (`make deps-inventory`); `make deps-check`
 runs in CI and fails when the committed file is stale, so a lockfile, feature
 or build-script change cannot reuse old admission evidence. Reach classes:
