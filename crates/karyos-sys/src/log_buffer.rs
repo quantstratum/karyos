@@ -2024,7 +2024,7 @@ pub struct Conductor<O: BufferOwner> {
 
 /// Every outcome of one [`Conductor::service_deadlines`] call
 /// (`quantstratum-docs: karyos/design/concurrent-deadline.md`, Results). Each count is at most
-/// `P + 1` (at most 256), so it fits `u32`.
+/// `P + S + 1` (`P ≤ 255`, `S` the scan budget), so it fits `u32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeadlineReport {
     /// Blocks and spans this call aborted.
@@ -2167,6 +2167,16 @@ impl<O: BufferOwner> Conductor<O> {
         &mut self,
         clock: &mut dyn FnMut() -> u64,
     ) -> Result<DeadlineReport, DeadlineError> {
+        self.service_deadlines_pausing(clock, &mut || {})
+    }
+
+    /// [`Conductor::service_deadlines`] with a test pause point after the
+    /// marked blocks are served (concurrent buffers).
+    fn service_deadlines_pausing(
+        &mut self,
+        clock: &mut dyn FnMut() -> u64,
+        after_marked: &mut dyn FnMut(),
+    ) -> Result<DeadlineReport, DeadlineError> {
         let mut report = DeadlineReport::default();
         #[cfg(feature = "test-hooks")]
         if self.buffer.deadline_fault.load(Ordering::Relaxed) {
@@ -2177,7 +2187,9 @@ impl<O: BufferOwner> Conductor<O> {
         }
         if self.buffer.concurrent() {
             let buffer: &LogBuffer<O::Terms> = &self.buffer;
-            let result = self.deadlines.service(buffer, clock, &mut report);
+            let result = self
+                .deadlines
+                .service(buffer, clock, &mut report, after_marked);
             report.waiting = self.deadlines.waiting();
             return match result {
                 Ok(()) => Ok(report),

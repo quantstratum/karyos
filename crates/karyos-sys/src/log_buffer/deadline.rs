@@ -64,6 +64,7 @@ struct Span {
 #[derive(Debug, Clone, Copy)]
 struct Fragments {
     count: TermCount,
+    slot: u8,
     start: u32,
     /// Its first word 0, re-loaded and compared on resumption.
     first: u64,
@@ -99,7 +100,10 @@ pub(super) struct ConcurrentDeadlines {
     frontier: Point,
     lookahead: Point,
     fragments: Option<Fragments>,
-    /// At most `P` marked blocks, reserved at issue.
+    /// Marked blocks, `P + S` entries reserved at issue: step 1 leaves at
+    /// most `P` (each confirmed reserved at its read, at most one per
+    /// writer, whose later block is reserved only after its earlier one
+    /// completed) and one scan adds at most `S`, one per read.
     marked: Vec<Marked>,
     limit: usize,
     span: Option<Span>,
@@ -131,8 +135,8 @@ impl ConcurrentDeadlines {
                 offset: 0,
             },
             fragments: None,
-            marked: Vec::with_capacity(publishers),
-            limit: publishers,
+            marked: Vec::with_capacity(publishers + SCAN_BUDGET as usize),
+            limit: publishers + SCAN_BUDGET as usize,
             span: None,
             walk_budget: WALK_BUDGET,
             scan_budget: SCAN_BUDGET,
@@ -142,7 +146,7 @@ impl ConcurrentDeadlines {
     /// Test hook: smaller budgets.
     #[cfg(test)]
     pub(super) fn set_budgets(&mut self, walk: u32, scan: u32) {
-        assert!(walk >= 1 && scan >= 2);
+        assert!(walk >= 1 && (2..=SCAN_BUDGET).contains(&scan));
         self.walk_budget = walk;
         self.scan_budget = scan;
     }
@@ -154,7 +158,9 @@ impl ConcurrentDeadlines {
         if self.span.is_some_and(|span| span.slot == slot) {
             self.span = None;
         }
-        self.fragments = None;
+        if self.fragments.is_some_and(|walk| walk.slot == slot) {
+            self.fragments = None;
+        }
     }
 
     /// One service call: serve expired marked blocks, advance the span
@@ -165,10 +171,12 @@ impl ConcurrentDeadlines {
         buffer: &LogBuffer<T>,
         clock: &mut dyn FnMut() -> u64,
         report: &mut DeadlineReport,
+        after_marked: &mut dyn FnMut(),
     ) -> Result<(), SysError> {
         // The clock of points already observed below the admitted head.
         let mut now = Now { clock, value: None };
         self.serve_marked(buffer, &mut now, report)?;
+        after_marked();
         self.walk(buffer, &mut now, report)?;
         // New observations are dated by a clock read after the head
         // snapshot of the scan.
@@ -379,6 +387,21 @@ impl ConcurrentDeadlines {
             let bound = bound(buffer, head, point.count);
             if point.offset >= bound || *reads >= self.scan_budget {
                 return Ok(Stop::Done);
+            }
+            // A marked block step 1 of this call just found still reserved:
+            // its observation is the evidence, so the scan spends no read
+            // on it and the look-ahead keeps the whole budget.
+            if let Some(marked) = self
+                .marked
+                .iter()
+                .find(|marked| (marked.count, marked.offset) == (point.count, point.offset))
+            {
+                return Ok(Stop::Marked {
+                    after: Point {
+                        count: point.count,
+                        offset: point.offset + marked.extent,
+                    },
+                });
             }
             let at_span = self
                 .span
@@ -610,6 +633,7 @@ impl ConcurrentDeadlines {
             if *reads >= self.scan_budget {
                 self.fragments = Some(Fragments {
                     count: point.count,
+                    slot,
                     start,
                     first: raw,
                     next: offset,

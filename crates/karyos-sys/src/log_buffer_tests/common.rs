@@ -2939,3 +2939,108 @@ fn an_aborted_writer_keeps_its_slot_until_its_accesses_end() {
     let found = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
     assert!(found.term_id() != term0 || found.state() == SlotState::Free);
 }
+
+/// A writer's block marked by hand at the active term 0's tail: its
+/// `fetch_add` and mark. Returns its start.
+fn mark_by_hand(buffer: &LogBuffer<Terms>, extent: u32) -> u32 {
+    let start = buffer.tail(0).unwrap().fetch_add(u64::from(extent), Ordering::AcqRel) as u32;
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    let reserved = Word0::new(-(extent as i32), flags, FrameType::Data);
+    assert!(mark_block(word0_of_term0(buffer, start), reserved));
+    start
+}
+
+fn commit_by_hand(buffer: &LogBuffer<Terms>, start: u32, extent: u32) {
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    let reserved = Word0::new(-(extent as i32), flags, FrameType::Data);
+    let committed = Word0::new(HEADER_LENGTH as i32 + 8, flags, FrameType::Data);
+    assert!(commit_block(word0_of_term0(buffer, start), reserved, committed));
+}
+
+/// With the minimum scan budget, a marked frontier costs no read once
+/// step 1 confirmed it, so the look-ahead gets past a fragmented block.
+#[test]
+fn the_minimum_scan_budget_discovers_past_a_fragmented_block() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.deadlines.set_budgets(1, 2);
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    let a = concurrent_claimed(first.try_claim(8, AppendOptions::default()));
+    let data = sized_message(2, 3000);
+    assert!(matches!(
+        second.offer(&data, AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { .. }
+    ));
+    let c = concurrent_claimed(second.try_claim(8, AppendOptions::default()));
+    // The first call observes the frontier; the next ones walk the three
+    // fragments and reach C.
+    for _ in 0..4 {
+        let _ = serve(&mut conductor, 0);
+    }
+    assert_eq!(serve(&mut conductor, DEADLINE), aborted(2, 128));
+    assert_eq!(a.commit(), CommitOutcome::Aborted { position: 0 });
+    assert!(matches!(c.commit(), CommitOutcome::Aborted { .. }));
+}
+
+/// Cleaning an unrelated slot keeps a fragment walk's continuation.
+#[test]
+fn cleaning_another_slot_keeps_the_fragment_walk() {
+    let buffer = new_buffer(deadline_concurrent_config(3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.deadlines.set_budgets(1, 2);
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    let mut writer = conductor.concurrent_publication().unwrap().unwrap();
+    let a = concurrent_claimed(first.try_claim(8, AppendOptions::default()));
+    let data = sized_message(2, 3000);
+    let _ = writer.offer(&data, AppendOptions::default()).unwrap();
+    let c = concurrent_claimed(second.try_claim(8, AppendOptions::default()));
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    let mut total = 0;
+    for cycle in 0..6 {
+        // Each cycle cleans at least one slot other than term 0's.
+        let mut cleaned = 0;
+        for _ in 0..1000 {
+            let _ = writer.offer(&data, AppendOptions::default()).unwrap();
+            cleaned += conductor.duty_cycle().unwrap().cleaned;
+            if cleaned > 0 {
+                break;
+            }
+        }
+        assert!(cleaned > 0);
+        total += serve(&mut conductor, DEADLINE * (cycle + 1)).aborted;
+    }
+    assert_eq!(total, 2);
+    assert_eq!(a.commit(), CommitOutcome::Aborted { position: 0 });
+    assert!(matches!(c.commit(), CommitOutcome::Aborted { .. }));
+}
+
+/// A writer that completes an observed block and marks another during
+/// one call never loses the new block's discovery to stale entries.
+#[test]
+fn a_block_discovered_beside_stale_observations_keeps_its_timer() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let a = mark_by_hand(&buffer, 64);
+    let b = mark_by_hand(&buffer, 64);
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    let mut c = None;
+    let report = conductor
+        .service_deadlines_pausing(&mut || 1, &mut || {
+            // After step 1 confirmed both: B completes, its writer marks C.
+            commit_by_hand(&buffer, b, 64);
+            c = Some(mark_by_hand(&buffer, 64));
+        })
+        .unwrap();
+    assert_eq!(report, waiting());
+    assert_eq!((a, b, c), (0, 64, Some(128)));
+    // C, discovered at 1, is aborted at 1 + DEADLINE with A; B resolved.
+    assert_eq!(
+        serve(&mut conductor, 1 + DEADLINE),
+        DeadlineReport {
+            resolved: 1,
+            ..aborted(2, 128)
+        }
+    );
+}
