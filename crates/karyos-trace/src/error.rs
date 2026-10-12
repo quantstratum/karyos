@@ -42,7 +42,7 @@ pub enum TraceError {
     /// was appended.
     #[error("collection stamp does not follow the journal's collection clock")]
     CollectionClock,
-    /// An attribution table size is zero.
+    /// An attribution table size is zero or cannot be allocated.
     #[error("invalid attribution configuration")]
     Attribution,
     /// Final verdicts were requested before the journal's terminal close was
