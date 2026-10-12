@@ -65,6 +65,15 @@ pub enum SysError {
         /// The generation found in the descriptor.
         found: u32,
     },
+    /// A transition was called with a descriptor in the wrong state; the
+    /// atomic descriptor was not read or changed.
+    #[error("transition requires a descriptor in state {required} but was given state {given}")]
+    WrongSourceState {
+        /// The state code the transition requires.
+        required: u8,
+        /// The state code of the descriptor passed in.
+        given: u8,
+    },
     /// A state transition found the descriptor in an unexpected state.
     #[error("descriptor transition expected {expected:#018x} but found {found:#018x}")]
     UnexpectedDescriptor {

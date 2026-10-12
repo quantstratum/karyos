@@ -375,9 +375,9 @@ fn transition(
     ordering: Ordering,
 ) -> Result<Descriptor, SysError> {
     if from.state() != required {
-        return Err(SysError::UnexpectedDescriptor {
-            expected: from.with_state(required).encode(),
-            found: from.encode(),
+        return Err(SysError::WrongSourceState {
+            required: required as u8,
+            given: from.state() as u8,
         });
     }
     let failure = match ordering {
@@ -552,6 +552,22 @@ mod tests {
         assert!(begin_reclaim(&desc, active.with_state(SlotState::Ready)).is_err());
         let stale = descriptor(2, SlotState::Active);
         assert!(begin_reclaim(&desc, stale).is_err());
+    }
+
+    #[test]
+    fn activation_rejects_a_non_ready_argument_without_reading_the_slot() {
+        let active = descriptor(4, SlotState::Active);
+        for actual in [SlotState::Reclaiming, SlotState::Free] {
+            let desc = AtomicU64::new(descriptor(4, actual).encode());
+            assert_eq!(
+                activate(&desc, active),
+                Err(SysError::WrongSourceState {
+                    required: SlotState::Ready as u8,
+                    given: SlotState::Active as u8,
+                })
+            );
+            assert_eq!(desc.load(Ordering::SeqCst), descriptor(4, actual).encode());
+        }
     }
 
     #[test]
