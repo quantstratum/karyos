@@ -77,10 +77,12 @@ pub enum JournalError {
         /// Words per record.
         expected: usize,
     },
-    /// The stamp's time is earlier than the last accepted stamp of the same
-    /// clock and epoch; nothing was stored or counted. A new clock or epoch
-    /// is accepted.
-    #[error("stamp earlier than the last one of its clock and epoch")]
+    /// The stamp has the same clock and epoch as the immediately preceding
+    /// accepted stamp and an earlier time; nothing was stored or counted.
+    /// Only that adjacent stamp is checked: a writer that alternates clocks
+    /// keeps each clock and epoch monotonic itself, and starts a new epoch
+    /// rather than reuse a clock and epoch whose time restarted.
+    #[error("stamp earlier than the preceding one of the same clock and epoch")]
     StampRegression,
     /// The next sequence, or a drop-range or watermark version, would
     /// overflow. The journal is now closed; nothing was stored or counted.

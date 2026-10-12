@@ -371,3 +371,24 @@ fn a_short_loss_buffer_is_refused() {
         (2, 1, 1)
     );
 }
+
+/// Only the immediately preceding stamp is checked: alternating clocks is
+/// the caller's responsibility to keep monotonic.
+#[test]
+fn the_regression_check_is_against_the_preceding_stamp() {
+    let (mut writer, _consumer) = record_journal(8, 3, 2).unwrap();
+    let at = |clock, time| Stamp {
+        time,
+        clock,
+        epoch: 0,
+    };
+    writer.append(&payload(0), at(1, 100)).unwrap();
+    writer.append(&payload(1), at(2, 200)).unwrap();
+    // Clock 1 went back relative to its own 100, but the preceding stamp
+    // was clock 2: accepted, as documented.
+    writer.append(&payload(2), at(1, 50)).unwrap();
+    assert_eq!(
+        writer.append(&payload(3), at(1, 49)),
+        Err(JournalError::StampRegression)
+    );
+}
