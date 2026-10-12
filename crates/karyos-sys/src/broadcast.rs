@@ -287,8 +287,7 @@ impl<'a> BroadcastWords<'a> {
             let to_end = self.capacity - (position & (self.capacity - 1));
             // Checked before any copy: a lapped header can hold arbitrary
             // bits. A PAD's length and extent equal the rest of the area; a
-            // record fits
-            // both the record limit and the rest of the area.
+            // record fits both the record limit and the rest of the area.
             let fits = |extent: u64| {
                 if type_id == PAD_TYPE {
                     // The writer only generates exact, aligned padding.
@@ -300,9 +299,11 @@ impl<'a> BroadcastWords<'a> {
             let extent = align8(length)
                 .filter(|&e| length >= u64::from(HEADER_LENGTH) && fits(e))
                 .filter(|&e| position.checked_add(e).is_some_and(|end| end <= tail));
-            let payload_length = length.saturating_sub(u64::from(HEADER_LENGTH));
-            let copied = match (extent, usize::try_from(payload_length)) {
-                (Some(_), Ok(n)) if type_id != PAD_TYPE => {
+            let payload_length = length
+                .checked_sub(u64::from(HEADER_LENGTH))
+                .and_then(|n| usize::try_from(n).ok());
+            let copied = match (extent, payload_length) {
+                (Some(_), Some(n)) if type_id != PAD_TYPE => {
                     self.copy_payload(position, out.get_mut(..n).unwrap_or(&mut []));
                     n
                 }
@@ -347,11 +348,10 @@ impl<'a> BroadcastWords<'a> {
     /// recently written non-PAD record) is only a candidate: it is used if
     /// it lies in `[intent - capacity, tail)` for a fresh Acquire load of
     /// `tail` and a later load of `tail_intent`, so it is committed and not
-    /// yet overwritten. Otherwise the reader moves to that `tail`, or to the
-    /// intent if the fresh `tail` is still at or behind the cursor (a
-    /// Relaxed observation of an overwrite does not make the newer `tail`
-    /// visible). Every position used is a record boundary, and the cursor
-    /// never moves backward.
+    /// yet overwritten. Otherwise, or if the candidate is at or behind the
+    /// cursor (a stale `latest`), the reader moves to that `tail`. This runs
+    /// only after an Acquire load saw `tail > cursor`, and `tail` never
+    /// decreases, so the cursor always moves forward to a record boundary.
     fn rejoin(&self, cursor: &mut u64) -> Receive {
         let lost_from = *cursor;
         let tail = self.tail();
@@ -362,15 +362,16 @@ impl<'a> BroadcastWords<'a> {
             .trailer(TAIL_INTENT)
             .map_or(tail, |word| word.load(Ordering::Relaxed))
             .max(tail);
-        let floor = intent.saturating_sub(self.capacity);
-        let mut target = if (floor..tail).contains(&latest) {
+        let floor = if intent >= self.capacity {
+            intent - self.capacity
+        } else {
+            0
+        };
+        let target = if (floor..tail).contains(&latest) && latest > *cursor {
             latest
         } else {
             tail
         };
-        if target <= *cursor {
-            target = intent;
-        }
         *cursor = target.max(*cursor);
         Receive::Lapped {
             lost_from,
