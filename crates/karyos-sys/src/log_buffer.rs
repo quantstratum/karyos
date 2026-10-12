@@ -37,8 +37,8 @@ use crate::loan::{
     release_loan, take_loan,
 };
 use crate::publication::{
-    abort_block, commit_block, load_interior, mark_block, observe_block, publish_block,
-    store_interior,
+    abort_block, commit_block, deadline_abort, load_interior, mark_block, observe_block,
+    publish_block, read_claim_record, store_interior, write_claim_record,
 };
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
 use crate::slot::{Descriptor, SlotIndex, SlotState};
@@ -106,7 +106,14 @@ pub struct LogBufferConfig {
     pub session_id: i32,
     /// Stream id written in every header.
     pub stream_id: i32,
+    /// Commit deadline of claims, in ticks of the clock passed to
+    /// [`Conductor::abort_expired_claims`] (nanoseconds by convention); at
+    /// least 1 (`quantstratum-docs: karyos/design/claim-deadline.md`).
+    pub claim_deadline: u64,
 }
+
+/// A default commit deadline of claims: one second in nanoseconds.
+pub const DEFAULT_CLAIM_DEADLINE: u64 = 1_000_000_000;
 
 #[derive(Debug)]
 struct Cell {
@@ -149,6 +156,10 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     cells: Box<[Cell]>,
     publication_taken: AtomicBool,
     conductor_taken: AtomicBool,
+    /// The claim record and its seqlock serial
+    /// (`quantstratum-docs: karyos/design/claim-deadline.md`).
+    claim_record: AtomicU64,
+    claim_serial: AtomicU64,
 }
 
 impl LogBuffer<HeapTerms> {
@@ -187,6 +198,11 @@ impl<T: TermBytes> LogBuffer<T> {
             .ok_or(SysError::ResourcesUnavailable)?;
         if config.spare_slots < CLEANING_HEADROOM + 1 {
             return Err(SysError::ResourcesUnavailable);
+        }
+        if config.claim_deadline == 0 {
+            return Err(SysError::InvalidClaimDeadline {
+                value: config.claim_deadline,
+            });
         }
         let plan = FragmentPlan::new(config.mtu, Flags::NONE)?;
         let max_message_length =
@@ -241,6 +257,8 @@ impl<T: TermBytes> LogBuffer<T> {
             cells,
             publication_taken: AtomicBool::new(false),
             conductor_taken: AtomicBool::new(false),
+            claim_record: AtomicU64::new(0),
+            claim_serial: AtomicU64::new(0),
         })
     }
 
@@ -352,6 +370,41 @@ impl<T: TermBytes> LogBuffer<T> {
     }
 }
 
+/// Claim record layout (`quantstratum-docs: karyos/design/claim-deadline.md`): valid bit, slot,
+/// term offset and extent in units of 32.
+const RECORD_VALID: u64 = 1 << 55;
+const RECORD_SLOT_SHIFT: u32 = 48;
+const RECORD_OFFSET_SHIFT: u32 = 23;
+const RECORD_FIELD_MASK_23: u64 = (1 << 23) - 1;
+const RECORD_FIELD_MASK_25: u64 = (1 << 25) - 1;
+/// Serial increments of one claim: set and clear, two each.
+const CLAIM_SERIAL_COST: u64 = 4;
+
+fn encode_record(slot: u8, offset: u32, extent: u32) -> u64 {
+    RECORD_VALID
+        | (u64::from(slot) << RECORD_SLOT_SHIFT)
+        | (u64::from(offset / FRAME_ALIGNMENT) << RECORD_OFFSET_SHIFT)
+        | u64::from(extent / FRAME_ALIGNMENT)
+}
+
+/// `(slot, offset, extent)` of a valid record.
+fn decode_record(record: u64) -> Option<(u8, u32, u32)> {
+    if record & RECORD_VALID == 0 {
+        return None;
+    }
+    let slot = ((record >> RECORD_SLOT_SHIFT) & 0x7F) as u8;
+    let offset = ((record >> RECORD_OFFSET_SHIFT) & RECORD_FIELD_MASK_25) as u32 * FRAME_ALIGNMENT;
+    let extent = (record & RECORD_FIELD_MASK_23) as u32 * FRAME_ALIGNMENT;
+    Some((slot, offset, extent))
+}
+
+impl<T: TermBytes> LogBuffer<T> {
+    /// Rewrites the claim record; only the publication calls it.
+    fn write_record(&self, value: u64) {
+        write_claim_record(&self.claim_serial, &self.claim_record, value);
+    }
+}
+
 fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>, SysError> {
     let buffer: &LogBuffer<O::Terms> = &owner;
     // Already issued: no allocation. The compare-exchange below still
@@ -418,6 +471,7 @@ fn issue_conductor<O: BufferOwner>(owner: O) -> Option<Conductor<O>> {
     Some(Conductor {
         buffer: owner,
         quarantined: Vec::new(),
+        observed: None,
     })
 }
 
@@ -592,7 +646,30 @@ impl<O: BufferOwner> Publication<O> {
             buffer: &self.buffer,
             state: &mut self.state,
         }
-        .claim(length, options)?;
+        .claim(length, options, &mut |_| {})?;
+        self.finish_claim(step)
+    }
+
+    /// [`Publication::try_claim`] with `pause` called at the pause points
+    /// of `quantstratum-docs: karyos/design/claim-deadline.md`: before the reserved head is
+    /// published (not admitted) and before the mark (admitted).
+    #[cfg(test)]
+    fn try_claim_pausing(
+        &mut self,
+        length: u32,
+        options: AppendOptions,
+        pause: &mut dyn FnMut(ClaimPause),
+    ) -> Result<ClaimOutcome<'_, O>, SysError> {
+        self.resolve_claim();
+        let step = PublicationContext {
+            buffer: &self.buffer,
+            state: &mut self.state,
+        }
+        .claim(length, options, pause)?;
+        self.finish_claim(step)
+    }
+
+    fn finish_claim(&mut self, step: ClaimStep) -> Result<ClaimOutcome<'_, O>, SysError> {
         match step {
             ClaimStep::Marked(pending) => {
                 if let Some(staging) = self.staging.get_mut(..pending.length as usize) {
@@ -631,6 +708,8 @@ impl<O: BufferOwner> Publication<O> {
         let word = unsafe { self.buffer.regions.word0(claim.slot, claim.start) };
         // Losing means the block is already terminal.
         let _ = abort_block(word, claim.reserved, claim.aborted);
+        // Terminal: the record may go, before any loan release.
+        self.buffer.write_record(0);
     }
 }
 
@@ -749,7 +828,10 @@ impl<O: BufferOwner> Claim<'_, O> {
         }
         // SAFETY: write loan held; the block's first frame start.
         let word = unsafe { buffer.regions.word0(claim.slot, claim.start) };
-        if commit_block(word, claim.reserved, claim.committed) {
+        let committed = commit_block(word, claim.reserved, claim.committed);
+        // Terminal: the record stayed eligible through the staging copy.
+        buffer.write_record(0);
+        if committed {
             CommitOutcome::Committed {
                 position: claim.position,
             }
@@ -768,6 +850,15 @@ impl<O: BufferOwner> Drop for Claim<'_, O> {
     fn drop(&mut self) {
         self.publication.resolve_claim();
     }
+}
+
+/// Pause points of a claim, for tests of the deadline abort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimPause {
+    /// The record is set; the head store has not admitted the claim.
+    BeforeHead,
+    /// Admitted; the mark has not been attempted.
+    BeforeMark,
 }
 
 enum ClaimStep {
@@ -817,7 +908,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
         };
         FragmentPlan::check_message(length, max)?;
         let reserved = plan.reserved(length)?;
-        match self.reserve(reserved)? {
+        match self.reserve(reserved, None)? {
             Reservation::Outcome(outcome) => Ok(outcome),
             Reservation::Reserved {
                 count,
@@ -832,7 +923,12 @@ impl<T: TermBytes> PublicationContext<'_, T> {
     }
 
     /// Checks and marks a claim (claims.md, the claim).
-    fn claim(&mut self, length: u32, options: AppendOptions) -> Result<ClaimStep, SysError> {
+    fn claim(
+        &mut self,
+        length: u32,
+        options: AppendOptions,
+        pause: &mut dyn FnMut(ClaimPause),
+    ) -> Result<ClaimStep, SysError> {
         if length == 0 {
             return Err(SysError::EmptyMessage);
         }
@@ -852,7 +948,11 @@ impl<T: TermBytes> PublicationContext<'_, T> {
         if reserved > buffer.config.max_reserved {
             return Err(LayoutError::MessageTooLarge { length, max }.into());
         }
-        let (count, slot, tail, position) = match self.reserve(reserved)? {
+        // Both record rewrites of this claim must fit the serial.
+        if buffer.claim_serial.load(Ordering::Relaxed) > u64::MAX - CLAIM_SERIAL_COST {
+            return Err(SysError::ResourcesUnavailable);
+        }
+        let (count, slot, tail, position) = match self.reserve(reserved, Some(pause))? {
             Reservation::Outcome(outcome) => return Ok(ClaimStep::Outcome(outcome)),
             Reservation::Reserved {
                 count,
@@ -866,7 +966,10 @@ impl<T: TermBytes> PublicationContext<'_, T> {
         // SAFETY: the standing write loan on `count` in `slot` is held;
         // `tail` is the reserved block's first frame start.
         let word = unsafe { buffer.regions.word0(slot, tail) };
+        pause(ClaimPause::BeforeMark);
         if !mark_block(word, reserved_word) {
+            // The deadline abort won before the mark: nothing was written.
+            buffer.write_record(0);
             return Ok(ClaimStep::Aborted { position });
         }
         // Marked: only now write the rest of the header.
@@ -900,7 +1003,13 @@ impl<T: TermBytes> PublicationContext<'_, T> {
     /// Reserves `reserved` bytes at the tail, once: publishes the reserved
     /// head and advances the cached tail past the block. Without room it
     /// pads and rotates, and without credit it reports back pressure.
-    fn reserve(&mut self, reserved: u32) -> Result<Reservation, SysError> {
+    /// A claim passes `announce`: its record is set once the reservation is
+    /// decided and before the head store that admits it.
+    fn reserve(
+        &mut self,
+        reserved: u32,
+        announce: Option<&mut dyn FnMut(ClaimPause)>,
+    ) -> Result<Reservation, SysError> {
         let buffer = self.buffer;
         if let PublicationState::Rotating { next } = *self.state {
             return Ok(Reservation::Outcome(self.rotate(next)?));
@@ -932,6 +1041,11 @@ impl<T: TermBytes> PublicationContext<'_, T> {
         let end = start + u64::from(reserved);
         if end > limit {
             return Ok(Reservation::Outcome(AppendOutcome::BackPressured));
+        }
+        if let Some(pause) = announce {
+            // The claim's intent; the head store below admits it.
+            buffer.write_record(encode_record(slot, tail, reserved));
+            pause(ClaimPause::BeforeHead);
         }
         buffer.reserved_head.store(end, Ordering::Release);
         *self.state = PublicationState::Active {
@@ -1642,6 +1756,33 @@ pub struct DutyReport {
 pub struct Conductor<O: BufferOwner> {
     buffer: O,
     quarantined: Vec<u8>,
+    /// The claim being timed: `(serial, first_seen)`.
+    observed: Option<(u64, u64)>,
+}
+
+/// What [`Conductor::abort_expired_claims`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ClaimDeadline {
+    /// No admitted claim.
+    Idle,
+    /// An admitted claim whose deadline has not passed.
+    Waiting,
+    /// The clock went back below the claim's first observation; its timer
+    /// was re-anchored.
+    ClockWentBack,
+    /// The expiry instant `first_seen + claim_deadline` does not fit `u64`:
+    /// no representable `now` reaches it.
+    Unrepresentable,
+    /// This call aborted the claim.
+    Aborted {
+        /// Stream position of the block.
+        position: u64,
+        /// Bytes aborted.
+        extent: u32,
+    },
+    /// The expired claim was already terminal.
+    Resolved,
 }
 
 impl<O: BufferOwner> Conductor<O> {
@@ -1668,6 +1809,83 @@ impl<O: BufferOwner> Conductor<O> {
     /// invariant.
     pub fn duty_cycle(&mut self) -> Result<DutyReport, SysError> {
         self.context().duty_cycle()
+    }
+
+    /// The commit-deadline abort of claims (`quantstratum-docs: karyos/design/claim-deadline.md`):
+    /// times the admitted claim named by the claim record from its first
+    /// observation, with `now` from a monotonic clock in the unit of
+    /// `claim_deadline`, and aborts it once expired, touching only its first
+    /// word 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::CorruptTerm`] for a record outside the term and
+    /// errors from the descriptor protocol.
+    pub fn abort_expired_claims(&mut self, now: u64) -> Result<ClaimDeadline, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let Some((serial, record)) = read_claim_record(&buffer.claim_serial, &buffer.claim_record)
+        else {
+            self.observed = None;
+            return Ok(ClaimDeadline::Idle);
+        };
+        let Some((slot, offset, extent)) = decode_record(record) else {
+            self.observed = None;
+            return Ok(ClaimDeadline::Idle);
+        };
+        if slot >= buffer.slots
+            || extent == 0
+            || u64::from(offset) + u64::from(extent) > u64::from(buffer.term_length)
+        {
+            return Err(corrupt(offset, "claim record"));
+        }
+        let found = Descriptor::decode(buffer.descriptor(slot)?.load(Ordering::Acquire))?;
+        if !matches!(found.state(), SlotState::Active | SlotState::Reclaiming) {
+            self.observed = None;
+            return Ok(ClaimDeadline::Idle);
+        }
+        let count = found.term_id().count_from(buffer.initial_term_id)?;
+        let position = buffer.position(count, offset);
+        // Admission: the reserved head covers the block.
+        if buffer.reserved_head.load(Ordering::Acquire) < position + u64::from(extent) {
+            self.observed = None;
+            return Ok(ClaimDeadline::Idle);
+        }
+        let first_seen = match self.observed {
+            Some((seen, first_seen)) if seen == serial => first_seen,
+            _ => {
+                self.observed = Some((serial, now));
+                now
+            }
+        };
+        if now < first_seen {
+            self.observed = Some((serial, now));
+            return Ok(ClaimDeadline::ClockWentBack);
+        }
+        let Some(expiry) = first_seen.checked_add(buffer.config.claim_deadline) else {
+            return Ok(ClaimDeadline::Unrepresentable);
+        };
+        if now < expiry {
+            return Ok(ClaimDeadline::Waiting);
+        }
+        let lane = buffer.config.lane;
+        let aborted = Word0::new(
+            extent as i32,
+            Flags::new(false, false, false, false, lane),
+            FrameType::Aborted,
+        );
+        // SAFETY: the location is the first word 0 of the admitted claim's
+        // block in `slot`, a frame start accessed only atomically during
+        // this term incarnation. Only this conductor cleans or reassigns
+        // slots, never during this call, and the record names this term:
+        // the publication clears it before releasing its write loan, and
+        // the reclaim scan that precedes any cleaning observed that release
+        // (quantstratum-docs: karyos/design/claim-deadline.md).
+        let word = unsafe { buffer.regions.word0(slot, offset) };
+        if deadline_abort(word, extent, lane, aborted) {
+            Ok(ClaimDeadline::Aborted { position, extent })
+        } else {
+            Ok(ClaimDeadline::Resolved)
+        }
     }
 
     fn context(&mut self) -> ConductorContext<'_, O::Terms> {

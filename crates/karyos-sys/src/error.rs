@@ -111,6 +111,12 @@ pub enum SysError {
         /// The subscriber's position.
         position: u64,
     },
+    /// The commit deadline of claims must be at least one tick.
+    #[error("invalid claim deadline {value}")]
+    InvalidClaimDeadline {
+        /// The configured deadline.
+        value: u64,
+    },
     /// An application message must carry at least one byte.
     #[error("empty application message")]
     EmptyMessage,

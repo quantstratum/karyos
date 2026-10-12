@@ -18,6 +18,7 @@ fn config(spare_slots: u8, max_subscribers: u8) -> LogBufferConfig {
         lane: Lane::ZERO,
         session_id: 3,
         stream_id: 4,
+        claim_deadline: DEFAULT_CLAIM_DEADLINE,
     }
 }
 
@@ -1300,4 +1301,317 @@ fn the_claim_staging_is_sized_by_the_largest_admissible_claim() {
     assert_eq!(claim.payload().len(), max as usize);
     claim.payload().fill(3);
     assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+}
+
+// Commit-deadline abort (quantstratum-docs: karyos/design/claim-deadline.md).
+
+const DEADLINE: u64 = 100;
+
+fn deadline_config(claim_deadline: u64) -> LogBufferConfig {
+    LogBufferConfig {
+        claim_deadline,
+        ..config(3, 3)
+    }
+}
+
+#[test]
+fn a_zero_claim_deadline_is_refused() {
+    assert!(matches!(
+        new_buffer(deadline_config(0)),
+        Err(SysError::InvalidClaimDeadline { value: 0 })
+    ));
+}
+
+#[test]
+fn the_deadline_aborts_a_marked_claim_at_exactly_the_deadline() {
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Idle);
+    let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
+    let position = claim.position();
+    assert_eq!(conductor.abort_expired_claims(10).unwrap(), ClaimDeadline::Waiting);
+    assert_eq!(
+        conductor.abort_expired_claims(10 + DEADLINE - 1).unwrap(),
+        ClaimDeadline::Waiting
+    );
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+    assert_eq!(
+        conductor.abort_expired_claims(10 + DEADLINE).unwrap(),
+        ClaimDeadline::Aborted {
+            position,
+            extent: 96,
+        }
+    );
+    // The writer keeps writing; nobody reads it; its commit loses.
+    claim.payload().fill(7);
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position,
+            extent: 96,
+        }
+    );
+    claim.payload().fill(8);
+    assert_eq!(claim.commit(), CommitOutcome::Aborted { position });
+    // The record was cleared after the terminal compare-exchange.
+    assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
+}
+
+#[test]
+fn the_deadline_aborts_claims_with_end_of_stream_and_extension() {
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let options = AppendOptions {
+        end_of_stream: true,
+        reserved_value: 3,
+        extension: Some([1u8; EXTENSION_LENGTH as usize]),
+    };
+    let claim = claimed(publication.try_claim(8, options));
+    assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
+    assert!(matches!(
+        conductor.abort_expired_claims(DEADLINE).unwrap(),
+        ClaimDeadline::Aborted { extent: 128, .. }
+    ));
+    assert!(matches!(claim.commit(), CommitOutcome::Aborted { .. }));
+}
+
+#[test]
+fn an_admitted_claim_paused_before_its_mark_is_aborted_and_writes_nothing() {
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut seen = Vec::new();
+    let outcome = publication
+        .try_claim_pausing(64, AppendOptions::default(), &mut |point| {
+            if point == ClaimPause::BeforeMark {
+                seen.push(conductor.abort_expired_claims(0).unwrap());
+                seen.push(conductor.abort_expired_claims(DEADLINE).unwrap());
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        seen,
+        [
+            ClaimDeadline::Waiting,
+            ClaimDeadline::Aborted {
+                position: 0,
+                extent: 96,
+            }
+        ]
+    );
+    assert!(matches!(outcome, ClaimOutcome::Aborted { position: 0 }));
+    drop(outcome);
+    // Nothing but the aborted word was written: the header stays clean.
+    let mut header = [0u8; 24];
+    // SAFETY: test-only read of bytes 8..32 of the aborted block of the
+    // active term; nothing writes them.
+    unsafe { buffer.regions.read_bytes(0, 8, &mut header) };
+    assert_eq!(header, [0u8; 24]);
+    assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
+    // The reservation stays consumed; the required reader skips it.
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: 0,
+            extent: 96,
+        }
+    );
+    let _ = publication.append(&message(1), AppendOptions::default()).unwrap();
+    assert_eq!(poll_message(&mut subscription), Some(message(1)));
+    publication.close();
+}
+
+#[test]
+fn a_claim_before_its_head_store_is_not_admitted() {
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut seen = Vec::new();
+    let mut required = None;
+    let mut limit = 0;
+    let outcome = publication
+        .try_claim_pausing(64, AppendOptions::default(), &mut |point| {
+            if point == ClaimPause::BeforeHead {
+                seen.push(conductor.abort_expired_claims(0).unwrap());
+                seen.push(conductor.abort_expired_claims(u64::MAX).unwrap());
+                let _ = conductor.duty_cycle().unwrap();
+                limit = buffer.limit.load(Ordering::Acquire);
+                // A required subscriber admitted at the unmoved head.
+                required = Some(conductor.subscribe(Role::Required).unwrap());
+            }
+        })
+        .unwrap();
+    assert_eq!(seen, [ClaimDeadline::Idle, ClaimDeadline::Idle]);
+    let ClaimOutcome::Claimed(claim) = outcome else {
+        panic!("not claimed");
+    };
+    // Admitted now: timed from its first observation and aborted.
+    assert_eq!(conductor.abort_expired_claims(5).unwrap(), ClaimDeadline::Waiting);
+    assert!(matches!(
+        conductor.abort_expired_claims(5 + DEADLINE).unwrap(),
+        ClaimDeadline::Aborted { position: 0, .. }
+    ));
+    drop(claim);
+    let mut required = required.unwrap();
+    assert!(matches!(poll(&mut required), PollOutcome::Aborted { position: 0, extent: 96 }));
+    let _ = conductor.duty_cycle().unwrap();
+    // The limit never goes below one already granted.
+    assert!(buffer.limit.load(Ordering::Acquire) >= limit);
+    let _late = conductor.subscribe(Role::Required).unwrap();
+    let _ = conductor.duty_cycle().unwrap();
+    assert!(buffer.limit.load(Ordering::Acquire) >= limit);
+}
+
+#[test]
+fn the_claim_timer_follows_the_clock() {
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    assert_eq!(conductor.abort_expired_claims(1000).unwrap(), ClaimDeadline::Waiting);
+    // Back: re-anchored, never earlier.
+    assert_eq!(
+        conductor.abort_expired_claims(500).unwrap(),
+        ClaimDeadline::ClockWentBack
+    );
+    assert_eq!(
+        conductor.abort_expired_claims(1000 + DEADLINE).unwrap(),
+        ClaimDeadline::Aborted {
+            position: 0,
+            extent: 64,
+        }
+    );
+    // Already aborted: an expired, terminal claim is resolved.
+    assert_eq!(
+        conductor.abort_expired_claims(2000).unwrap(),
+        ClaimDeadline::Resolved
+    );
+    drop(claim);
+    // A new claim of equal size restarts the timer.
+    let claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    assert_eq!(conductor.abort_expired_claims(5000).unwrap(), ClaimDeadline::Waiting);
+    assert_eq!(
+        conductor.abort_expired_claims(5000 + DEADLINE - 1).unwrap(),
+        ClaimDeadline::Waiting
+    );
+    assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+    assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
+}
+
+#[test]
+fn an_unrepresentable_expiry_is_reported() {
+    let buffer = new_buffer(deadline_config(u64::MAX)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    assert_eq!(
+        conductor.abort_expired_claims(1).unwrap(),
+        ClaimDeadline::Unrepresentable
+    );
+    assert_eq!(
+        conductor.abort_expired_claims(u64::MAX).unwrap(),
+        ClaimDeadline::Unrepresentable
+    );
+    drop(claim);
+    // Exactly `first_seen + deadline = u64::MAX`: expires at `u64::MAX`.
+    let claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
+    assert_eq!(
+        conductor.abort_expired_claims(u64::MAX - 1).unwrap(),
+        ClaimDeadline::Waiting
+    );
+    assert!(matches!(
+        conductor.abort_expired_claims(u64::MAX).unwrap(),
+        ClaimDeadline::Aborted { .. }
+    ));
+    assert!(matches!(claim.commit(), CommitOutcome::Aborted { .. }));
+}
+
+#[test]
+fn a_forgotten_claim_aborted_at_the_deadline_is_resolved_by_the_next_call() {
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    core::mem::forget(claimed(publication.try_claim(64, AppendOptions::default())));
+    assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
+    assert!(matches!(
+        conductor.abort_expired_claims(DEADLINE).unwrap(),
+        ClaimDeadline::Aborted { .. }
+    ));
+    // The loan is still held until the next call resolves the claim.
+    assert_ne!(buffer.cell(0).unwrap().loan.load(Ordering::SeqCst), 0);
+    let _ = publication.append(&message(2), AppendOptions::default()).unwrap();
+    assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
+    assert!(matches!(poll(&mut subscription), PollOutcome::Aborted { .. }));
+    assert_eq!(poll_message(&mut subscription), Some(message(2)));
+}
+
+#[test]
+fn claims_stop_when_the_record_serial_would_run_out() {
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // A resting serial is a multiple of four; this one leaves room for
+    // exactly one more claim.
+    buffer.claim_serial.store(u64::MAX - 7, Ordering::Relaxed);
+    let claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    // The last claim is observable and abortable.
+    assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
+    assert!(matches!(
+        conductor.abort_expired_claims(DEADLINE).unwrap(),
+        ClaimDeadline::Aborted { .. }
+    ));
+    claim.abort();
+    assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), u64::MAX - 3);
+    let head = buffer.reserved_head.load(Ordering::Acquire);
+    assert!(matches!(
+        publication.try_claim(8, AppendOptions::default()),
+        Err(SysError::ResourcesUnavailable)
+    ));
+    assert_eq!(buffer.reserved_head.load(Ordering::Acquire), head);
+    // Offers are unaffected.
+    assert!(matches!(
+        publication.append(&message(0), AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+}
+
+#[test]
+fn the_last_claim_the_serial_admits_can_be_forgotten() {
+    for close in [false, true] {
+        let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        buffer.claim_serial.store(u64::MAX - 7, Ordering::Relaxed);
+        core::mem::forget(claimed(publication.try_claim(8, AppendOptions::default())));
+        // The last admitted claim is observable before it is resolved.
+        assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
+        if close {
+            publication.close();
+        } else {
+            let head = buffer.reserved_head.load(Ordering::Acquire);
+            // The next call resolves the forgotten claim (its clear fits),
+            // then refuses the new claim without moving the head.
+            assert!(matches!(
+                publication.try_claim(8, AppendOptions::default()),
+                Err(SysError::ResourcesUnavailable)
+            ));
+            assert_eq!(buffer.reserved_head.load(Ordering::Acquire), head);
+        }
+        assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), u64::MAX - 3);
+        assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
+        assert_eq!(
+            poll(&mut subscription),
+            PollOutcome::Aborted {
+                position: 0,
+                extent: 64,
+            }
+        );
+    }
 }
