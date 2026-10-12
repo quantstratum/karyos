@@ -99,6 +99,28 @@ pub enum SysError {
         /// The seal bits found.
         found: u32,
     },
+    /// A frame layout or sizing rule failed.
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
+    /// An application message must carry at least one byte.
+    #[error("empty application message")]
+    EmptyMessage,
+    /// A caller buffer is too small.
+    #[error("buffer of {available} bytes is shorter than the required {required}")]
+    BufferTooShort {
+        /// Bytes required.
+        required: usize,
+        /// Bytes available.
+        available: usize,
+    },
+    /// Published term geometry is inconsistent.
+    #[error("corrupt term at offset {offset}: {reason}")]
+    CorruptTerm {
+        /// Term offset of the inconsistency.
+        offset: u32,
+        /// Which check failed.
+        reason: &'static str,
+    },
     /// A state transition found the descriptor in an unexpected state.
     #[error("descriptor transition expected {expected:#018x} but found {found:#018x}")]
     UnexpectedDescriptor {
