@@ -517,7 +517,9 @@ mod owned {
         /// version, value)`, within `budget`. The value borrows this
         /// reader's private copy.
         ///
-        /// If the handler panics, its key is served again by the next poll.
+        /// If the handler panics, its key is not marked delivered: the next
+        /// poll queues it again (at the back, behind keys already pending) and
+        /// it is served within that or later budgets.
         pub fn poll_changed(
             &mut self,
             budget: Budget,
