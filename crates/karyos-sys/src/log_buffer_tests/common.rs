@@ -2139,3 +2139,41 @@ fn concurrent_offers_are_back_pressured() {
     let head = buffer.head().unwrap().unwrap();
     assert!(head <= TERM / 2);
 }
+
+/// The last representable term: a handle reports `MaxPositionExceeded`
+/// every time instead of waiting for a term that cannot exist, and makes
+/// no reservation.
+#[test]
+fn a_concurrent_handle_stops_at_the_last_term() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    // Seed a coherent identity: slot 0 holds the last term, 32 bytes from
+    // its end; no loan exists yet.
+    let last = TermCount::try_new((1 << 31) - 1).unwrap();
+    assert!(last.next().is_err());
+    let term_id = buffer.initial_term_id.advanced_by(last);
+    buffer.descriptor(0).unwrap().store(
+        Descriptor::new(term_id, buffer.generation, SlotState::Active).encode(),
+        Ordering::Release,
+    );
+    buffer
+        .table_slot(last)
+        .unwrap()
+        .store(table_entry(last.get(), 0), Ordering::Release);
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((u64::from(term_id.get()) << 32) | (TERM - 32), Ordering::Release);
+    buffer
+        .active_count
+        .store(u64::from(last.get()), Ordering::Release);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let tail = buffer.tail(0).unwrap().load(Ordering::Acquire);
+    for _ in 0..4 {
+        assert!(matches!(
+            handle.offer(b"x", AppendOptions::default()),
+            Err(SysError::MaxPositionExceeded { .. })
+        ));
+    }
+    assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), tail);
+}

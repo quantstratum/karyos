@@ -185,6 +185,13 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         let term_length = buffer.term_length;
         // Under the handle's loan on `count`, the slot holds `count`.
         let offset = tail.load(Ordering::Acquire) as u32;
+        // The last representable term has no successor: a reservation
+        // that would reach its end is refused before any `fetch_add`, every
+        // time (SPEC.md §4: positions stop at `2^31` terms).
+        if count.next().is_err() && u64::from(offset) + u64::from(reserved) > u64::from(term_length)
+        {
+            count.next()?;
+        }
         if offset >= term_length {
             self.mark_crossed();
             return Ok(AppendOutcome::AdminAction);
@@ -267,6 +274,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
                 crossed: true,
                 ..
             } => {
+                // A crossing in the last term (another handle's reservation
+                // pushed this one past the end) has no successor to wait for.
+                count.next()?;
                 if active.get() <= count.get() {
                     return Ok(false);
                 }
