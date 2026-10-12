@@ -21,6 +21,7 @@
 //! enforce those properties; these helpers alone are not that capability.
 
 pub mod atomic_view;
+pub mod broadcast;
 pub mod counters;
 pub mod error;
 pub mod frame;
