@@ -1554,13 +1554,20 @@ fn a_forgotten_claim_aborted_at_the_deadline_is_resolved_by_the_next_call() {
 #[test]
 fn claims_stop_when_the_record_serial_would_run_out() {
     let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
-    buffer
-        .claim_serial
-        .store(u64::MAX - CLAIM_SERIAL_COST, Ordering::Relaxed);
-    // Exactly enough for one more claim.
-    claimed(publication.try_claim(8, AppendOptions::default())).abort();
-    assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), u64::MAX);
+    // A resting serial is a multiple of four; this one leaves room for
+    // exactly one more claim.
+    buffer.claim_serial.store(u64::MAX - 7, Ordering::Relaxed);
+    let claim = claimed(publication.try_claim(8, AppendOptions::default()));
+    // The last claim is observable and abortable.
+    assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
+    assert!(matches!(
+        conductor.abort_expired_claims(DEADLINE).unwrap(),
+        ClaimDeadline::Aborted { .. }
+    ));
+    claim.abort();
+    assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), u64::MAX - 3);
     let head = buffer.reserved_head.load(Ordering::Acquire);
     assert!(matches!(
         publication.try_claim(8, AppendOptions::default()),
@@ -1581,10 +1588,10 @@ fn the_last_claim_the_serial_admits_can_be_forgotten() {
         let mut conductor = buffer.conductor().unwrap();
         let mut subscription = conductor.subscribe(Role::Optional).unwrap();
         let mut publication = buffer.publication().unwrap().unwrap();
-        buffer
-            .claim_serial
-            .store(u64::MAX - CLAIM_SERIAL_COST, Ordering::Relaxed);
+        buffer.claim_serial.store(u64::MAX - 7, Ordering::Relaxed);
         core::mem::forget(claimed(publication.try_claim(8, AppendOptions::default())));
+        // The last admitted claim is observable before it is resolved.
+        assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
         if close {
             publication.close();
         } else {
@@ -1597,7 +1604,7 @@ fn the_last_claim_the_serial_admits_can_be_forgotten() {
             ));
             assert_eq!(buffer.reserved_head.load(Ordering::Acquire), head);
         }
-        assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), u64::MAX - 3);
         assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
         assert_eq!(
             poll(&mut subscription),
