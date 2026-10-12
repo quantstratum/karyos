@@ -10,6 +10,8 @@
 //! write it with `write`/`pwrite`, punch holes in it or create a new writable
 //! mapping. The mapping created here is therefore the only writer, and it is
 //! accessed only atomically. A kernel without these seals fails closed.
+//! Reopening through `/proc` is already outside Rust's safety guarantees
+//! (see `std::os::unix::io`); the write seals are defense in depth.
 //!
 //! This is a local, unintegrated primitive. It is not the IPC backing:
 //! `F_SEAL_FUTURE_WRITE` forbids the writable mappings other processes would
