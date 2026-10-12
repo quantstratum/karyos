@@ -12,6 +12,11 @@
 //! the publisher-log rule: the first fragment's word 0 is the decision word of
 //! the whole block, so interior fragments are read only once that word is
 //! committed.
+//!
+//! These helpers read and write plain bytes. They must never be placed over a
+//! live term that other threads or processes access concurrently: that needs
+//! atomic decision-word reads and capability-scoped plain ranges, which are a
+//! separate, later layer.
 
 use crate::error::ProtocolError;
 use crate::frame::{
@@ -20,9 +25,12 @@ use crate::frame::{
 };
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
 
-/// The header fields every frame of one term carries.
+/// The header fields every frame of one term carries. A term belongs to one
+/// lane's bank, so its lane is part of the identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TermIdentity {
+    /// The lane whose bank holds the term.
+    pub lane: Lane,
     /// Compact wire alias of the publication incarnation.
     pub session_id: i32,
     /// Application-chosen stream.
@@ -34,8 +42,6 @@ pub struct TermIdentity {
 /// Per-message options for [`TermAppender::append`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppendOptions {
-    /// Lane written in every fragment's flags.
-    pub lane: Lane,
     /// Set EOS on the last fragment.
     pub end_of_stream: bool,
     /// Trace extension written after every fragment's header.
@@ -132,16 +138,23 @@ impl<'a> TermAppender<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ProtocolError::MessageTooLarge`] above the message limit
-    /// (with the extension the limit is recomputed for its header) and
-    /// arithmetic errors from sizing.
+    /// Returns [`ProtocolError::EmptyMessage`] for an empty payload (a
+    /// header-only DATA frame is a heartbeat, not an application message),
+    /// [`ProtocolError::MessageTooLarge`] above the message limit (with the
+    /// extension the limit is recomputed for its header) and arithmetic
+    /// errors from sizing. Every error is detected before anything is
+    /// written; the tail and the term are then unchanged.
     pub fn append(
         &mut self,
         payload: &[u8],
         options: AppendOptions,
     ) -> Result<AppendOutcome, ProtocolError> {
+        if payload.is_empty() {
+            return Err(ProtocolError::EmptyMessage);
+        }
         let ext = options.extension.is_some();
-        let fragment_flags = Flags::new(false, false, false, ext, options.lane);
+        let lane = self.identity.lane;
+        let fragment_flags = Flags::new(false, false, false, ext, lane);
         let plan = FragmentPlan::new(self.mtu, fragment_flags)?;
         let length = u32::try_from(payload.len()).map_err(|_| ProtocolError::LengthOverflow {
             value: payload.len() as u64,
@@ -174,13 +187,7 @@ impl<'a> TermAppender<'a> {
             let (body, next) = rest.split_at(chunk.min(rest.len()));
             rest = next;
             let last = index + 1 == fragments;
-            let flags = Flags::new(
-                index == 0,
-                last,
-                last && options.end_of_stream,
-                ext,
-                options.lane,
-            );
+            let flags = Flags::new(index == 0, last, last && options.end_of_stream, ext, lane);
             let header_length = flags.header_length();
             let frame_length = header_length + body.len() as u32;
             let word0 = Word0::new(frame_length as i32, flags, FrameType::Data);
@@ -234,8 +241,9 @@ impl<'a> TermAppender<'a> {
     fn pad_to_end(&mut self) -> Result<(), ProtocolError> {
         let extent = self.term_length - self.tail;
         if extent > 0 {
+            let pad_flags = Flags::new(false, false, false, false, self.identity.lane);
             let header = FrameHeader {
-                word0: Word0::new(extent as i32, Flags::NONE, FrameType::Pad),
+                word0: Word0::new(extent as i32, pad_flags, FrameType::Pad),
                 term_offset: self.tail as i32,
                 session_id: self.identity.session_id,
                 stream_id: self.identity.stream_id,
@@ -368,6 +376,12 @@ impl<'a> Iterator for Fragments<'a> {
 pub enum ScanItem<'a> {
     /// A committed message block.
     Message(MessageBlock<'a>),
+    /// A committed header-only DATA frame: a heartbeat observation, not an
+    /// application message.
+    Heartbeat {
+        /// Term offset of the frame.
+        offset: u32,
+    },
     /// An aborted extent, skipped without reading past its word 0.
     Aborted {
         /// Term offset of the extent.
@@ -436,13 +450,18 @@ impl<'a> TermScanner<'a> {
             return Ok(ScanItem::End);
         }
         let offset = self.offset;
-        let word0 = Word0::unpack(u64::from_le_bytes(read8(self.term, offset)?))
-            .map_err(|_| invalid(offset, "reserved flag bits set"))?;
-        let length = word0.frame_length();
-        if length <= 0 {
+        let raw = u64::from_le_bytes(read8(self.term, offset)?);
+        // Classify the signed length before looking at anything else: zero is
+        // unwritten and negative values (down to i32::MIN) are in-progress
+        // markers whose other bits carry no meaning.
+        let signed = raw as u32 as i32;
+        let Ok(length) = u32::try_from(signed) else {
+            return Ok(ScanItem::Pending);
+        };
+        if length == 0 {
             return Ok(ScanItem::Pending);
         }
-        let length = length as u32;
+        let word0 = Word0::unpack(raw).map_err(|_| invalid(offset, "reserved flag bits set"))?;
         let remaining = self.term_length - offset;
         match FrameType::try_from_code(word0.frame_type_code()) {
             Ok(FrameType::Aborted) => {
@@ -464,6 +483,12 @@ impl<'a> TermScanner<'a> {
                 Ok(ScanItem::End)
             }
             Ok(FrameType::Data) => {
+                let flags = word0.flags();
+                if flags.begin() && flags.end() && length == flags.header_length() {
+                    self.check_header(offset, FrameType::Data)?;
+                    self.offset += align_frame(length)?;
+                    return Ok(ScanItem::Heartbeat { offset });
+                }
                 let block = self.scan_block(offset)?;
                 self.offset += block.reserved();
                 Ok(ScanItem::Message(block))
@@ -486,9 +511,9 @@ impl<'a> TermScanner<'a> {
                 return Err(invalid(offset, "BEGIN flag out of place"));
             }
             if let Some(first) = first
-                && flags.lane() != first.word0.flags().lane()
+                && flags.ext() != first.word0.flags().ext()
             {
-                return Err(invalid(offset, "fragment lane differs"));
+                return Err(invalid(offset, "fragments disagree on the extension"));
             }
             let frame_length = u32::try_from(header.word0.frame_length())
                 .map_err(|_| invalid(offset, "interior fragment not complete"))?;
@@ -543,6 +568,9 @@ impl<'a> TermScanner<'a> {
         }
         if header.word0.frame_type_code() != expected.code() {
             return Err(invalid(offset, "unexpected frame type inside a block"));
+        }
+        if header.word0.flags().lane() != self.identity.lane {
+            return Err(invalid(offset, "frame lane does not match the term's lane"));
         }
         if header.term_offset != offset as i32
             || header.term_id != self.identity.term_id
@@ -611,6 +639,7 @@ mod tests {
 
     const TERM: u32 = 64 * 1024;
     const IDENTITY: TermIdentity = TermIdentity {
+        lane: Lane::ZERO,
         session_id: -7,
         stream_id: 1001,
         term_id: 0x1234_5678,
@@ -703,20 +732,86 @@ mod tests {
     }
 
     #[test]
-    fn empty_message_and_end_of_stream() {
+    fn empty_messages_are_rejected_and_header_only_data_is_a_heartbeat() {
+        let mut term = vec![0u8; TERM as usize];
+        let mut app = appender(&mut term);
+        assert_eq!(
+            app.append(&[], AppendOptions::default()),
+            Err(ProtocolError::EmptyMessage)
+        );
+        assert_eq!(app.tail(), 0);
+        drop(app);
+        assert!(term.iter().all(|b| *b == 0));
+
+        let heartbeat = FrameHeader {
+            word0: Word0::new(
+                32,
+                Flags::new(true, true, false, false, Lane::ZERO),
+                FrameType::Data,
+            ),
+            term_offset: 0,
+            session_id: IDENTITY.session_id,
+            stream_id: IDENTITY.stream_id,
+            term_id: IDENTITY.term_id,
+            reserved_value: 0,
+        };
+        heartbeat.encode(&mut term).unwrap();
+        let mut scan = scanner(&term);
+        assert_eq!(scan.next_item(), Ok(ScanItem::Heartbeat { offset: 0 }));
+        assert_eq!(scan.offset(), 32);
+    }
+
+    #[test]
+    fn end_of_stream_and_reserved_value() {
         let mut term = vec![0u8; TERM as usize];
         let options = AppendOptions {
-            lane: Lane::try_new(2).unwrap(),
             end_of_stream: true,
             extension: None,
             reserved_value: -1,
         };
-        let _ = appender(&mut term).append(&[], options).unwrap();
+        let _ = appender(&mut term)
+            .append(&payload(3000, 9), options)
+            .unwrap();
         let block = message(scanner(&term).next_item().unwrap());
-        assert_eq!((block.length(), block.reserved()), (0, 32));
         assert!(block.end_of_stream());
-        assert_eq!(block.lane().get(), 2);
         assert_eq!(block.reserved_value(), -1);
+        let flags: Vec<u8> = [0usize, 1408, 2816].iter().map(|at| term[at + 5]).collect();
+        assert_eq!(flags, vec![0x01, 0x00, 0x02 | 0x04]);
+    }
+
+    #[test]
+    fn markers_with_junk_are_pending_and_payload_headers_are_never_read() {
+        let mut term = vec![0u8; TERM as usize];
+        // A negative marker whose other bits are junk, including reserved
+        // flag bits, and i32::MIN.
+        term[..8].copy_from_slice(&0xFFFF_FFFF_8000_0000u64.to_le_bytes());
+        assert_eq!(scanner(&term).next_item(), Ok(ScanItem::Pending));
+        term[..8].copy_from_slice(&0xC0C0_C0C0_FFFF_FFE0u64.to_le_bytes());
+        assert_eq!(scanner(&term).next_item(), Ok(ScanItem::Pending));
+
+        // A payload that contains a valid-looking aligned header is data.
+        let mut term = vec![0u8; TERM as usize];
+        let mut fake = vec![0u8; 96];
+        FrameHeader {
+            word0: Word0::new(
+                64,
+                Flags::new(true, true, false, false, Lane::ZERO),
+                FrameType::Pad,
+            ),
+            term_offset: 64,
+            session_id: IDENTITY.session_id,
+            stream_id: IDENTITY.stream_id,
+            term_id: IDENTITY.term_id,
+            reserved_value: 0,
+        }
+        .encode(&mut fake[32..])
+        .unwrap();
+        let _ = appender(&mut term)
+            .append(&fake, AppendOptions::default())
+            .unwrap();
+        let mut scan = scanner(&term);
+        assert_eq!(contents(&message(scan.next_item().unwrap())), fake);
+        assert_eq!(scan.next_item(), Ok(ScanItem::Pending));
     }
 
     #[test]
@@ -834,6 +929,8 @@ mod tests {
             ("missing BEGIN", Box::new(|t| t[5] &= !0x01)),
             ("interior BEGIN", Box::new(|t| t[1408 + 5] |= 0x01)),
             ("interior lane", Box::new(|t| t[1408 + 5] |= 0x10)),
+            ("first lane", Box::new(|t| t[5] |= 0x10)),
+            ("interior extension", Box::new(|t| t[1408 + 5] |= 0x08)),
             (
                 "interior incomplete",
                 Box::new(|t| t[1408..1408 + 4].copy_from_slice(&(-1i32).to_le_bytes())),
@@ -908,12 +1005,11 @@ mod tests {
             {
                 let mut app = appender(&mut term);
                 loop {
-                    let len = (next() % 8001) as usize;
+                    let len = (next() % 8000) as usize + 1;
                     let data = payload(len, round as u8);
                     let ext = next() % 4 == 0;
                     let options = AppendOptions {
                         extension: ext.then_some(TraceExtension::default()),
-                        lane: Lane::try_new((next() % 4) as u8).unwrap(),
                         ..AppendOptions::default()
                     };
                     match app.append(&data, options) {
