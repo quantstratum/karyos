@@ -1980,7 +1980,8 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
     let mut subscription = conductor.subscribe(Role::Optional).unwrap();
     let mut a = conductor.concurrent_publication().unwrap().unwrap();
     let mut b = conductor.concurrent_publication().unwrap().unwrap();
-    let data = vec![3u8; 4000];
+    // 3104 reserved bytes: never an exact fill of a 64 KiB term.
+    let data = vec![3u8; 3000];
     // Fill term 0 until a reservation crosses.
     let mut crossed = false;
     for _ in 0..100 {
@@ -2063,6 +2064,7 @@ fn a_reissued_slot_never_crosses_a_term_twice() {
     // A holder fills term 0 until it crosses, then closes before rotation.
     let mut holder = conductor.concurrent_publication().unwrap().unwrap();
     loop {
+        let _ = conductor.duty_cycle().unwrap();
         while poll_message(&mut subscription).is_some() {}
         match holder.offer(&data, AppendOptions::default()).unwrap() {
             AppendOutcome::AdminAction => break,
