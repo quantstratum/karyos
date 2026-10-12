@@ -102,6 +102,9 @@ pub enum SysError {
     /// A frame layout or sizing rule failed.
     #[error(transparent)]
     Layout(#[from] LayoutError),
+    /// A fixed capacity (slots, registry cells or loan credits) is exhausted.
+    #[error("resources unavailable")]
+    ResourcesUnavailable,
     /// An application message must carry at least one byte.
     #[error("empty application message")]
     EmptyMessage,
