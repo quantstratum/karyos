@@ -284,6 +284,12 @@ fn bounded(min: i128, max: i128) -> Latency {
 /// clocks: exactly one direct calibration from `a`'s clock to `b`'s, valid
 /// over `a`'s whole interval, converts `a` first. Anything else is
 /// unavailable with its reason.
+///
+/// Precondition: `calibrations` is the complete, authoritative set for the
+/// queried times. This function cannot detect a record missing from the
+/// slice: an integrator that cannot establish the set (a competing or
+/// replacing calibration may be lost) must report the latency unavailable
+/// itself, and replay passes the exact historical set it used.
 #[must_use]
 pub fn latency(a: &Observation, b: &Observation, calibrations: &[Calibration]) -> Latency {
     let (b_low, b_high) = b.interval();
