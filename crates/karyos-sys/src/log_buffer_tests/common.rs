@@ -2011,11 +2011,12 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
     assert!(raw as u32 >= MIN_TERM_LENGTH);
     // The crossing owner rotated (term 1 was prepared).
     assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
-    // B finds term 0 full: no reservation there.
-    assert_eq!(
+    // B finds term 0 full: no reservation there; it catches up and makes
+    // its one reservation in term 1 within the same call.
+    assert!(matches!(
         b.offer(&data, AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
-    );
+        AppendOutcome::Appended { position } if position / TERM == 1
+    ));
     assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), raw);
     // Both catch up and publish in term 1, never again in term 0.
     while poll_message(&mut subscription).is_some() {}
@@ -2344,4 +2345,61 @@ fn a_rotation_attempt_is_idempotent_and_detects_supersession() {
     let five = TermCount::try_new(5).unwrap();
     let t5 = buffer.initial_term_id.advanced_by(five);
     assert_eq!(rotate(five, t5), Rotation::NotReady);
+}
+
+/// An exactly full term, or a crossing owner that could not rotate, is
+/// rotated by the next publisher call once the successor is ready, with no
+/// conductor duty.
+#[test]
+fn a_full_term_is_rotated_by_the_next_publisher_call() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = conductor.concurrent_publication().unwrap().unwrap();
+    let mut peer = conductor.concurrent_publication().unwrap().unwrap();
+    let t0 = u64::from(buffer.initial_term_id.get());
+    // Exactly full: no crossing reservation will ever happen in term 0.
+    buffer.tail(0).unwrap().store((t0 << 32) | TERM, Ordering::Release);
+    buffer.limit.store(2 * TERM, Ordering::Release);
+    // The peer finds the term full, rotates, and reserves in term 1.
+    assert!(matches!(
+        peer.offer(b"x", AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { position } if position == TERM
+    ));
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        owner.offer(b"y", AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { position } if position == TERM + 64
+    ));
+    // A crossed handle whose successor was not ready helps once it is.
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = conductor.concurrent_publication().unwrap().unwrap();
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((t0 << 32) | (TERM - 32), Ordering::Release);
+    buffer.limit.store(2 * TERM, Ordering::Release);
+    let one = TermCount::try_new(1).unwrap();
+    let t1 = buffer.initial_term_id.advanced_by(one);
+    let ready = Descriptor::new(t1, buffer.generation, SlotState::Ready).encode();
+    buffer.descriptor(1).unwrap().store(
+        Descriptor::new(t1, buffer.generation, SlotState::Free).encode(),
+        Ordering::Release,
+    );
+    assert_eq!(
+        owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
+        AppendOutcome::AdminAction
+    );
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 0);
+    // The successor becomes ready (as the conductor's preparation would).
+    buffer.descriptor(1).unwrap().store(ready, Ordering::Release);
+    assert_eq!(
+        owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
+        AppendOutcome::AdminAction
+    );
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { position } if position == TERM
+    ));
 }

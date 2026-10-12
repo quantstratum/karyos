@@ -275,6 +275,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         let (count, slot, start) = match self.reserve(reserved)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
             Reserved::Outcome(outcome) => return Ok(outcome),
+            Reserved::Full => return Ok(AppendOutcome::AdminAction),
         };
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         // The block `[start, start + reserved)` is this handle's alone.
@@ -338,7 +339,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             Reserved::Outcome(AppendOutcome::BackPressured) => {
                 return Ok(ConcurrentClaimOutcome::BackPressured);
             }
-            Reserved::Outcome(_) => return Ok(ConcurrentClaimOutcome::AdminAction),
+            Reserved::Outcome(_) | Reserved::Full => {
+                return Ok(ConcurrentClaimOutcome::AdminAction);
+            }
         };
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         let header_length = flags.header_length();
@@ -397,6 +400,19 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// tail and the limit, one `fetch_add`. A crossing commits the `PAD`
     /// this handle owns; a reservation past the end holds nothing.
     fn reserve(&mut self, reserved: u32) -> Result<Reserved, SysError> {
+        // A full term holds no reservation of this handle: after helping
+        // the rotation it may catch up and make its one reservation in the
+        // next term within the same call.
+        match self.reserve_once(reserved)? {
+            Reserved::Full => match self.reserve_once(reserved)? {
+                Reserved::Full => Ok(Reserved::Outcome(AppendOutcome::AdminAction)),
+                other => Ok(other),
+            },
+            other => Ok(other),
+        }
+    }
+
+    fn reserve_once(&mut self, reserved: u32) -> Result<Reserved, SysError> {
         if !self.catch_up()? {
             return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
@@ -417,8 +433,10 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             count.next()?;
         }
         if offset >= term_length {
+            // Full: no reservation here; help the rotation once.
             self.mark_crossed();
-            return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
+            self.help_rotation(count)?;
+            return Ok(Reserved::Full);
         }
         // The head of the handle's own term, never above the true head.
         let head = buffer.position(count, offset);
@@ -508,6 +526,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
                 // pushed this one past the end) has no successor to wait for.
                 count.next()?;
                 if active.get() <= count.get() {
+                    // The successor may have become ready since: help the
+                    // rotation once, then wait for a later call.
+                    self.help_rotation(count)?;
                     return Ok(false);
                 }
                 // Every access to `count` has ended.
@@ -648,6 +669,8 @@ enum Reserved {
     },
     /// No block: the outcome to report.
     Outcome(AppendOutcome),
+    /// The term was found full before any `fetch_add`.
+    Full,
 }
 
 /// A marked or terminal word where this handle's reservation starts:
