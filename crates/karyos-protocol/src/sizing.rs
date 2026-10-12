@@ -94,6 +94,11 @@ pub const fn reserved_length(flags: Flags, payload_length: u32) -> Result<u32, P
 }
 
 /// Fragmentation of messages for one MTU and header length.
+///
+/// This is arithmetic only. It does not enforce the channel's MTU limits
+/// (default 1408, jumbo frames up to 8 KiB) or that every result fits a
+/// positive `i32` wire length; channel and publication validation gate those
+/// before a plan is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FragmentPlan {
     header_length: u32,

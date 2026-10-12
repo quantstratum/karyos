@@ -349,6 +349,11 @@ impl FrameHeader {
 
     /// Reads a header from the first 32 bytes of `bytes`.
     ///
+    /// This is a raw decode: it checks only the buffer length and the
+    /// reserved flag bits. Admitting a committed or received frame also needs
+    /// version, type, `EXT`, length and canonical PAD/ABORTED validation,
+    /// which belong to the readers and receivers that use this decoder.
+    ///
     /// # Errors
     ///
     /// Returns [`ProtocolError::BufferTooShort`] for a short buffer and
@@ -627,6 +632,30 @@ mod tests {
                 available: 31
             })
         );
+    }
+
+    /// Binary vector: a full extension with distinct multi-byte identifiers,
+    /// so swapped fields cannot round-trip unnoticed.
+    #[test]
+    fn extension_binary_vector() {
+        let ext = TraceExtension {
+            extension_flags: 0,
+            trace_id: [0x1112_1314_1516_1718, 0x2122_2324_2526_2728],
+            span_id: 0x3132_3334_3536_3738,
+            parent_span_id: 0x4142_4344_4546_4748,
+            message_id: 0x5152_5354_5556_5758,
+        };
+        let mut expected = [0u8; 64];
+        expected[..8].copy_from_slice(&[1, 0, 0, 0, 64, 0, 0, 0]);
+        expected[8..16].copy_from_slice(&[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11]);
+        expected[16..24].copy_from_slice(&[0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21]);
+        expected[24..32].copy_from_slice(&[0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31]);
+        expected[32..40].copy_from_slice(&[0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41]);
+        expected[40..48].copy_from_slice(&[0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51]);
+        let mut out = [0xAAu8; 64];
+        ext.encode(&mut out).unwrap();
+        assert_eq!(out, expected);
+        assert_eq!(TraceExtension::decode(&expected), Ok(ext));
     }
 
     #[test]
