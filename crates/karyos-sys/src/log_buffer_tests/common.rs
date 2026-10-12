@@ -1060,7 +1060,53 @@ fn a_forgotten_claim_is_aborted_by_the_next_call() {
         if next == 0 {
             assert_eq!(poll_message(&mut subscription), Some(message(4)));
         }
+        // Close and drop end the publication's accesses: its write loan is
+        // released, after the claim was resolved.
+        let held = buffer.cell(0).unwrap().loan.load(Ordering::SeqCst) != 0;
+        assert_eq!(held, next < 2);
     }
+}
+
+#[test]
+fn closing_the_publication_resolves_its_claim_then_releases_its_loan() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // Fill term 0 and move the publication's loan to term 1.
+    let mut sequence = 0;
+    while buffer.active_count.load(Ordering::Acquire) == 0 {
+        let _ = append_retrying(&mut publication, &mut conductor, &message(sequence), || {});
+        while poll_message(&mut subscription).is_some() {}
+        sequence += 1;
+    }
+    let active = buffer.active_count.load(Ordering::Acquire) as u32;
+    let Lookup::Slot(slot) = buffer.lookup(TermCount::try_new(active).unwrap()).unwrap() else {
+        panic!("active term without a slot");
+    };
+    let claim = claimed(publication.try_claim(64, AppendOptions::default()));
+    core::mem::forget(claim);
+    let index = SlotIndex::try_new(slot).unwrap();
+    let descriptor = Descriptor::decode(
+        buffer
+            .descriptor(slot)
+            .unwrap()
+            .load(Ordering::Acquire),
+    )
+    .unwrap();
+    let held = |buffer: &LogBuffer<Terms>| {
+        loan_held(
+            core::slice::from_ref(&buffer.cell(0).unwrap().loan),
+            index,
+            descriptor.with_state(SlotState::Reclaiming),
+        )
+        .unwrap()
+    };
+    assert!(held(&buffer));
+    publication.close();
+    assert!(!held(&buffer), "the write loan survived close");
+    // The forgotten claim was aborted before the loan was released.
+    assert!(matches!(poll(&mut subscription), PollOutcome::Aborted { extent: 96, .. }));
 }
 
 #[test]

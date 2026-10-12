@@ -593,8 +593,9 @@ impl<O: BufferOwner> Publication<O> {
         }
     }
 
-    /// Closes the publication, aborting a forgotten claim first. The
-    /// standing write loan is kept, as when the publication is dropped.
+    /// Closes the publication: aborts a forgotten claim first, then releases
+    /// the standing write loan, as dropping it does. The publication is
+    /// issued once: closing does not let the buffer issue another.
     pub fn close(self) {}
 
     /// Aborts the outstanding claim, if any, and clears its record. Called
@@ -621,7 +622,15 @@ impl<O: BufferOwner> Publication<O> {
 
 impl<O: BufferOwner> Drop for Publication<O> {
     fn drop(&mut self) {
+        // A claim's accesses have ended: it borrowed the publication, which
+        // is being dropped. Resolve it, then release the loan.
         self.resolve_claim();
+        if let PublicationState::Active { .. } = self.state
+            && let Ok(cell) = self.buffer.cell(0)
+        {
+            // The last access of the publication to its term.
+            release_loan(&cell.loan);
+        }
     }
 }
 
