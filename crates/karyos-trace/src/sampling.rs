@@ -31,9 +31,10 @@ pub enum Sampling {
 
 /// Bounded source of random identifiers, owned by the sampler's owner.
 ///
-/// Both methods run on the publication path: they must not allocate, block,
-/// make system calls or reseed (for example, read from a buffer refilled off
-/// the path). Outputs must be independent and uniform across every source,
+/// Identifiers come from a cryptographically strong random generator, for
+/// example as precomputed output. Both methods run on the publication path:
+/// they must not allocate, block, make system calls or reseed (for example,
+/// read from a buffer refilled off the path). Outputs must be independent and uniform across every source,
 /// publication and driver restart; copying, resetting or replaying a
 /// generator's state voids the collision bounds of the design.
 pub trait IdSource {
@@ -89,7 +90,10 @@ impl Sampler {
     }
 
     /// A sampler that continues an incarnation from its message-id
-    /// high-water mark (the next message id it may assign, at least 1).
+    /// high-water mark (the next message id it may assign, at least 1). It
+    /// restores only the message ids: the cadence restarts at its first
+    /// root, as after [`Sampler::set_policy`], and the previous sampling
+    /// phase is not restored.
     /// Owner precondition: one sampler owns an incarnation's counter at a
     /// time.
     #[must_use]
