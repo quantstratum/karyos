@@ -7,13 +7,15 @@
 //! is completed by the conductor; publisher-side rotation comes in batch b.
 
 use super::{
-    AppendOptions, AppendOutcome, BufferOwner, Conductor, FragmentPlan, LayoutError, LogBuffer,
-    Lookup, SysError, TermBytes, write_fragments, write_header_tail,
+    AppendOptions, AppendOutcome, BufferOwner, CommitOutcome, Conductor, FragmentPlan,
+    HEADER_LENGTH, LayoutError, LogBuffer, Lookup, SysError, TermBytes, write_fragments,
+    write_header_tail,
 };
 use crate::frame::{Flags, FrameType, Word0};
 use crate::loan::{LoanOutcome, release_loan, take_loan};
 use crate::publication::{
-    acquire_publisher_slot, commit_block, mark_block, reissue_from, release_publisher_slot,
+    abort_block, acquire_publisher_slot, commit_block, mark_block, reissue_from,
+    release_publisher_slot,
 };
 use crate::slot::{Descriptor, SlotState};
 use crate::term::TermCount;
@@ -43,6 +45,75 @@ pub struct ConcurrentPublication<O: BufferOwner> {
     /// Publisher slot, also the registry cell of the handle's loan.
     index: usize,
     state: HandleState,
+    /// The outstanding claim, private to the handle (claims.md); never in
+    /// the buffer's claim record.
+    pending: Option<Pending>,
+    /// Claim payload staging on backings without direct bytes.
+    staging: Box<[u8]>,
+}
+
+/// A marked claim block of a concurrent handle.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    slot: u8,
+    start: u32,
+    position: u64,
+    length: u32,
+    header_length: u32,
+    reserved: Word0,
+    committed: Word0,
+    aborted: Word0,
+}
+
+/// Result of [`ConcurrentPublication::try_claim`].
+#[derive(Debug)]
+#[must_use = "back pressure and admin actions must be handled"]
+pub enum ConcurrentClaimOutcome<'a, O: BufferOwner> {
+    /// A block was reserved and marked; write the payload, then commit.
+    Claimed(ConcurrentClaim<'a, O>),
+    /// The flow-control limit does not admit the reservation; retry later.
+    BackPressured,
+    /// The handle waits for a later term, or its reservation crossed or
+    /// landed past the term end; retry later.
+    AdminAction,
+}
+
+/// A claimed block of a concurrent handle: it mutably borrows the handle;
+/// [`ConcurrentClaim::commit`] publishes it, and [`ConcurrentClaim::abort`]
+/// or dropping it uncommitted aborts it. A forgotten claim is aborted by
+/// the handle's next mutable operation or its drop.
+///
+/// The payload cannot outlive the claim:
+///
+/// ```compile_fail,E0597
+/// # use karyos_sys::log_buffer::*;
+/// fn escape<O: BufferOwner + core::fmt::Debug>(handle: &mut ConcurrentPublication<O>) {
+///     let payload;
+///     {
+///         let Ok(ConcurrentClaimOutcome::Claimed(mut claim)) =
+///             handle.try_claim(8, AppendOptions::default())
+///         else {
+///             return;
+///         };
+///         payload = claim.payload();
+///     }
+///     payload[0] = 1;
+/// }
+/// ```
+///
+/// nor be used after `commit`:
+///
+/// ```compile_fail,E0505
+/// # use karyos_sys::log_buffer::*;
+/// fn after_commit<O: BufferOwner>(mut claim: ConcurrentClaim<'_, O>) {
+///     let payload = claim.payload();
+///     let _ = claim.commit();
+///     payload[0] = 1;
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ConcurrentClaim<'a, O: BufferOwner> {
+    handle: &'a mut ConcurrentPublication<O>,
 }
 
 impl<O: BufferOwner> Conductor<O> {
@@ -63,6 +134,22 @@ impl<O: BufferOwner> Conductor<O> {
                 reason: "a concurrent handle of an exclusive buffer",
             });
         }
+        // Allocated before a slot is taken, so a failure leaves no slot held.
+        let staging = if <O::Terms as crate::term_bytes::sealed::Access>::DIRECT {
+            Box::default()
+        } else {
+            let plan = FragmentPlan::new(
+                buffer.config.mtu,
+                Flags::new(true, true, false, false, buffer.config.lane),
+            )?;
+            let size = plan.payload_per_fragment().min(buffer.max_message_length) as usize;
+            let mut staging = Vec::new();
+            staging
+                .try_reserve_exact(size)
+                .map_err(|_| SysError::ResourcesUnavailable)?;
+            staging.resize(size, 0u8);
+            staging.into_boxed_slice()
+        };
         // The Acquire load observes a closing holder's Release of FREE,
         // made after its last access.
         let Some((index, previous)) =
@@ -114,6 +201,8 @@ impl<O: BufferOwner> Conductor<O> {
             buffer: self.buffer.clone(),
             index,
             state: HandleState::Waiting { from },
+            pending: None,
+            staging,
         };
         let _ = handle.catch_up()?;
         Ok(Some(handle))
@@ -160,6 +249,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         payload: &[u8],
         options: AppendOptions,
     ) -> Result<AppendOutcome, SysError> {
+        self.resolve_claim();
         if payload.is_empty() {
             return Err(SysError::EmptyMessage);
         }
@@ -180,13 +270,136 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         };
         FragmentPlan::check_message(length, max)?;
         let reserved = plan.reserved(length)?;
-        if !self.catch_up()? {
-            return Ok(AppendOutcome::AdminAction);
-        }
-        let HandleState::Active { count, slot, .. } = self.state else {
-            return Ok(AppendOutcome::AdminAction);
+        let (count, slot, start) = match self.reserve(reserved)? {
+            Reserved::Own { count, slot, start } => (count, slot, start),
+            Reserved::Outcome(outcome) => return Ok(outcome),
         };
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        // The block `[start, start + reserved)` is this handle's alone.
+        let fragments = plan.fragments(length);
+        let first_flags = Flags::new(true, fragments == 1, false, ext, lane);
+        let reserved_word = Word0::new(-(reserved as i32), first_flags, FrameType::Data);
+        // SAFETY: write loan held; `start` is the block's first frame start.
+        let word = unsafe { buffer.regions.word0(slot, start) };
+        if !mark_block(word, reserved_word) {
+            return Err(foreign_mark(start));
+        }
+        let first = write_fragments(buffer, slot, count, start, payload, &plan, options);
+        if !commit_block(word, reserved_word, first) {
+            return Err(foreign_mark(start));
+        }
+        Ok(AppendOutcome::Appended {
+            position: buffer.position(count, start),
+        })
+    }
+
+    /// Claims one unfragmented block of `length` payload bytes with one
+    /// reservation attempt (SPEC.md §4 claims). The claim's payload starts
+    /// zeroed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::EmptyMessage`] and
+    /// [`LayoutError::MessageTooLarge`] when `length` exceeds
+    /// `max_message_length`, one fragment or `max_reserved`. An error makes
+    /// no new reservation; a forgotten claim is still resolved first.
+    pub fn try_claim(
+        &mut self,
+        length: u32,
+        options: AppendOptions,
+    ) -> Result<ConcurrentClaimOutcome<'_, O>, SysError> {
+        self.resolve_claim();
+        if length == 0 {
+            return Err(SysError::EmptyMessage);
+        }
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let ext = options.extension.is_some();
+        let lane = buffer.config.lane;
+        let flags = Flags::new(true, true, options.end_of_stream, ext, lane);
+        let plan = FragmentPlan::new(buffer.config.mtu, flags)?;
+        let max = if ext {
+            plan.max_message_length(buffer.config.max_reserved, buffer.config.term_length)?
+        } else {
+            buffer.max_message_length
+        };
+        FragmentPlan::check_message(length, max)?;
+        FragmentPlan::check_message(length, plan.payload_per_fragment())?;
+        let reserved = plan.reserved(length)?;
+        if reserved > buffer.config.max_reserved {
+            return Err(LayoutError::MessageTooLarge { length, max }.into());
+        }
+        let (count, slot, start) = match self.reserve(reserved)? {
+            Reserved::Own { count, slot, start } => (count, slot, start),
+            Reserved::Outcome(AppendOutcome::BackPressured) => {
+                return Ok(ConcurrentClaimOutcome::BackPressured);
+            }
+            Reserved::Outcome(_) => return Ok(ConcurrentClaimOutcome::AdminAction),
+        };
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let header_length = flags.header_length();
+        let reserved_word = Word0::new(-(reserved as i32), flags, FrameType::Data);
+        // SAFETY: write loan held; `start` is the block's first frame start.
+        let word = unsafe { buffer.regions.word0(slot, start) };
+        if !mark_block(word, reserved_word) {
+            return Err(foreign_mark(start));
+        }
+        write_header_tail(buffer, slot, count, start, options.reserved_value);
+        if let Some(extension) = &options.extension {
+            // SAFETY: write loan held; the extension follows the header of
+            // the marked, unpublished frame; not a word 0.
+            unsafe {
+                buffer
+                    .regions
+                    .write_bytes(slot, start + HEADER_LENGTH, extension)
+            };
+        }
+        if let Some(staging) = self.staging.get_mut(..length as usize) {
+            staging.fill(0);
+        }
+        self.pending = Some(Pending {
+            slot,
+            start,
+            position: buffer.position(count, start),
+            length,
+            header_length,
+            reserved: reserved_word,
+            committed: Word0::new((header_length + length) as i32, flags, FrameType::Data),
+            aborted: Word0::new(
+                reserved as i32,
+                Flags::new(false, false, false, false, lane),
+                FrameType::Aborted,
+            ),
+        });
+        Ok(ConcurrentClaimOutcome::Claimed(ConcurrentClaim {
+            handle: self,
+        }))
+    }
+
+    /// Aborts the outstanding claim, if any: no reference into it remains
+    /// (the claim borrowed the handle mutably).
+    fn resolve_claim(&mut self) {
+        let Some(claim) = self.pending.take() else {
+            return;
+        };
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        // SAFETY: the handle's loan on the claim's term is still held: no
+        // catch-up ran while the claim was outstanding.
+        let word = unsafe { buffer.regions.word0(claim.slot, claim.start) };
+        let _ = abort_block(word, claim.reserved, claim.aborted);
+    }
+
+    /// One reservation attempt of `reserved` bytes: catch up, check the
+    /// tail and the limit, one `fetch_add`. A crossing commits the `PAD`
+    /// this handle owns; a reservation past the end holds nothing.
+    fn reserve(&mut self, reserved: u32) -> Result<Reserved, SysError> {
+        if !self.catch_up()? {
+            return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
+        }
+        let HandleState::Active { count, slot, .. } = self.state else {
+            return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
+        };
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let lane = buffer.config.lane;
         let tail = buffer.tail(slot)?;
         let term_length = buffer.term_length;
         // Under the handle's loan on `count`, the slot holds `count`.
@@ -200,12 +413,12 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }
         if offset >= term_length {
             self.mark_crossed();
-            return Ok(AppendOutcome::AdminAction);
+            return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
         // The head of the handle's own term, never above the true head.
         let head = buffer.position(count, offset);
         if head + u64::from(reserved) > buffer.limit.load(Ordering::Acquire) {
-            return Ok(AppendOutcome::BackPressured);
+            return Ok(Reserved::Outcome(AppendOutcome::BackPressured));
         }
         let old = tail.fetch_add(u64::from(reserved), Ordering::AcqRel);
         debug_assert_eq!(
@@ -216,7 +429,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         if start >= term_length {
             // Landed past the end: holds nothing.
             self.mark_crossed();
-            return Ok(AppendOutcome::AdminAction);
+            return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
         // `start < 2^31` and `reserved ≤ term_length / 8`: no overflow.
         if start + reserved > term_length {
@@ -236,24 +449,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
                 return Err(foreign_mark(start));
             }
             self.mark_crossed();
-            return Ok(AppendOutcome::AdminAction);
+            return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
-        // The block `[start, start + reserved)` is this handle's alone.
-        let fragments = plan.fragments(length);
-        let first_flags = Flags::new(true, fragments == 1, false, ext, lane);
-        let reserved_word = Word0::new(-(reserved as i32), first_flags, FrameType::Data);
-        // SAFETY: write loan held; `start` is the block's first frame start.
-        let word = unsafe { buffer.regions.word0(slot, start) };
-        if !mark_block(word, reserved_word) {
-            return Err(foreign_mark(start));
-        }
-        let first = write_fragments(buffer, slot, count, start, payload, &plan, options);
-        if !commit_block(word, reserved_word, first) {
-            return Err(foreign_mark(start));
-        }
-        Ok(AppendOutcome::Appended {
-            position: buffer.position(count, start),
-        })
+        Ok(Reserved::Own { count, slot, start })
     }
 
     /// Closes the handle: releases its loan and its publisher slot, as
@@ -320,6 +518,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
 
 impl<O: BufferOwner> Drop for ConcurrentPublication<O> {
     fn drop(&mut self) {
+        self.resolve_claim();
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         if let HandleState::Active { .. } = self.state
             && let Ok(cell) = buffer.cell(self.index)
@@ -332,6 +531,97 @@ impl<O: BufferOwner> Drop for ConcurrentPublication<O> {
             release_publisher_slot(word, active);
         }
     }
+}
+
+impl<O: BufferOwner> ConcurrentClaim<'_, O> {
+    /// Stream position of the block.
+    #[must_use]
+    pub fn position(&self) -> u64 {
+        self.handle.pending.map_or(0, |claim| claim.position)
+    }
+
+    /// The payload: exactly the claimed length, zeroed at claim time.
+    pub fn payload(&mut self) -> &mut [u8] {
+        let handle = &mut *self.handle;
+        let Some(claim) = handle.pending else {
+            return &mut [];
+        };
+        // SAFETY: the claim marked its block under the handle's write
+        // loan, held while the claim exists (a borrow of `self`); the range
+        // is the frame's payload, holding no control word; readers do not
+        // access a block whose word 0 is negative, and no other party
+        // writes a block this handle reserved.
+        let direct = unsafe {
+            handle.buffer.regions.direct_bytes(
+                claim.slot,
+                claim.start + claim.header_length,
+                claim.length,
+            )
+        };
+        match direct {
+            // SAFETY: as above; the slice borrows `self` mutably.
+            Some(pointer) => unsafe {
+                core::slice::from_raw_parts_mut(pointer.as_ptr(), claim.length as usize)
+            },
+            None => handle
+                .staging
+                .get_mut(..claim.length as usize)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Commits the block: exactly one of commit and abort wins.
+    pub fn commit(self) -> CommitOutcome {
+        let handle = &mut *self.handle;
+        let Some(claim) = handle.pending.take() else {
+            return CommitOutcome::Aborted { position: 0 };
+        };
+        let buffer: &LogBuffer<O::Terms> = &handle.buffer;
+        if let Some(staging) = handle.staging.get(..claim.length as usize)
+            && !<O::Terms as crate::term_bytes::sealed::Access>::DIRECT
+        {
+            // SAFETY: write loan held; the payload range of the marked,
+            // unpublished frame; the bytes up to the next word read as zero.
+            unsafe {
+                buffer
+                    .regions
+                    .write_bytes(claim.slot, claim.start + claim.header_length, staging)
+            };
+        }
+        // SAFETY: write loan held; the block's first frame start.
+        let word = unsafe { buffer.regions.word0(claim.slot, claim.start) };
+        if commit_block(word, claim.reserved, claim.committed) {
+            CommitOutcome::Committed {
+                position: claim.position,
+            }
+        } else {
+            CommitOutcome::Aborted {
+                position: claim.position,
+            }
+        }
+    }
+
+    /// Aborts the block; readers skip it.
+    pub fn abort(self) {}
+}
+
+impl<O: BufferOwner> Drop for ConcurrentClaim<'_, O> {
+    fn drop(&mut self) {
+        self.handle.resolve_claim();
+    }
+}
+
+/// Result of one reservation attempt.
+enum Reserved {
+    /// `[start, start + reserved)` in `slot`'s term `count` is this
+    /// handle's alone.
+    Own {
+        count: TermCount,
+        slot: u8,
+        start: u32,
+    },
+    /// No block: the outcome to report.
+    Outcome(AppendOutcome),
 }
 
 /// A marked or terminal word where this handle's reservation starts:

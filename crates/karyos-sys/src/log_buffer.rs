@@ -48,7 +48,7 @@ use crate::term_bytes::{HeapTerms, SharedTerms, TermBytes};
 
 mod concurrent;
 
-pub use concurrent::ConcurrentPublication;
+pub use concurrent::{ConcurrentClaim, ConcurrentClaimOutcome, ConcurrentPublication};
 
 mod sealed {
     /// Prevents implementations of [`super::BufferOwner`] outside this
