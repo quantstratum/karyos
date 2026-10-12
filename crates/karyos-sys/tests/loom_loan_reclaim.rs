@@ -6,6 +6,11 @@
 //! `RECLAIMING`, `CLEANING`, `FREE` or reassigned, and cleaning never starts
 //! while a loan for the term remains.
 //!
+//! Term bytes are modelled as a plain value in a Loom `UnsafeCell`, accessed
+//! non-atomically like real payload bytes. Loom reports any read and write of
+//! it that are not ordered by happens-before, so the models check the
+//! synchronization the protocol provides, not only the values observed.
+//!
 //! Run with `RUSTFLAGS="--cfg loom" cargo test -p karyos-sys --test
 //! loom_loan_reclaim --release`.
 
@@ -18,6 +23,7 @@ use karyos_sys::loan::{
 use karyos_sys::slot::{Descriptor, SlotIndex, SlotState};
 use karyos_sys::sync::{AtomicU64, Ordering};
 use karyos_sys::term::{Generation, TermCount, TermId};
+use loom::cell::UnsafeCell;
 use loom::sync::Arc;
 use loom::thread;
 
@@ -32,7 +38,27 @@ struct Slot {
     descriptor: AtomicU64,
     loan_words: [AtomicU64; 1],
     revoked: AtomicU64,
-    bytes: AtomicU64,
+    bytes: UnsafeCell<u64>,
+}
+
+impl Slot {
+    /// A plain read of the term bytes.
+    fn read_bytes(&self) -> u64 {
+        self.bytes.with(|bytes| {
+            // SAFETY: the pointer comes from a live `UnsafeCell` owned by
+            // `self`; Loom checks that no write races with this read.
+            unsafe { *bytes }
+        })
+    }
+
+    /// A plain write of the term bytes, as cleaning or a new term does.
+    fn write_bytes(&self, value: u64) {
+        self.bytes.with_mut(|bytes| {
+            // SAFETY: the pointer comes from a live `UnsafeCell` owned by
+            // `self`; Loom checks that no other access races with this write.
+            unsafe { *bytes = value }
+        });
+    }
 }
 
 fn fixture() -> (Arc<Slot>, LoanTarget, Descriptor) {
@@ -46,7 +72,7 @@ fn fixture() -> (Arc<Slot>, LoanTarget, Descriptor) {
         descriptor: AtomicU64::new(active.encode()),
         loan_words: [AtomicU64::new(0)],
         revoked: AtomicU64::new(0),
-        bytes: AtomicU64::new(TERM_BYTES),
+        bytes: UnsafeCell::new(TERM_BYTES),
     });
     (shared, target, active)
 }
@@ -57,8 +83,8 @@ fn participant(shared: &Slot, target: LoanTarget) {
     let [word] = &shared.loan_words;
     match take_loan(word, &shared.revoked, &shared.descriptor, target).unwrap() {
         LoanOutcome::Granted => {
-            assert_eq!(shared.bytes.load(Ordering::Relaxed), TERM_BYTES);
-            assert_eq!(shared.bytes.load(Ordering::Relaxed), TERM_BYTES);
+            assert_eq!(shared.read_bytes(), TERM_BYTES);
+            assert_eq!(shared.read_bytes(), TERM_BYTES);
             release_loan(word);
         }
         LoanOutcome::Overrun | LoanOutcome::Retry | LoanOutcome::Revoked => {
@@ -79,7 +105,7 @@ fn loan_versus_reclaim_and_cleaning() {
         let reclaiming = begin_reclaim(&shared.descriptor, active).unwrap();
         if !loan_held(&shared.loan_words, target.slot(), reclaiming).unwrap() {
             let cleaning = begin_cleaning(&shared.descriptor, reclaiming).unwrap();
-            shared.bytes.store(CLEANED_BYTES, Ordering::Relaxed);
+            shared.write_bytes(CLEANED_BYTES);
             publish(&shared.descriptor, cleaning.with_state(SlotState::Free));
         }
 
@@ -101,7 +127,7 @@ fn loan_versus_reassignment() {
         let reclaiming = begin_reclaim(&shared.descriptor, active).unwrap();
         if !loan_held(&shared.loan_words, target.slot(), reclaiming).unwrap() {
             let cleaning = begin_cleaning(&shared.descriptor, reclaiming).unwrap();
-            shared.bytes.store(CLEANED_BYTES, Ordering::Relaxed);
+            shared.write_bytes(CLEANED_BYTES);
             publish(&shared.descriptor, cleaning.with_state(SlotState::Free));
 
             let later =
@@ -109,7 +135,7 @@ fn loan_versus_reassignment() {
             let ready = Descriptor::new(later, active.generation(), SlotState::Ready);
             publish(&shared.descriptor, ready);
             activate(&shared.descriptor, ready).unwrap();
-            shared.bytes.store(REASSIGNED_BYTES, Ordering::Relaxed);
+            shared.write_bytes(REASSIGNED_BYTES);
         }
 
         reader.join().unwrap();
@@ -130,7 +156,7 @@ fn quarantined_slot_is_cleaned_after_release() {
         reader.join().unwrap();
         assert!(!loan_held(&shared.loan_words, target.slot(), reclaiming).unwrap());
         let cleaning = begin_cleaning(&shared.descriptor, reclaiming).unwrap();
-        shared.bytes.store(CLEANED_BYTES, Ordering::Relaxed);
+        shared.write_bytes(CLEANED_BYTES);
         publish(&shared.descriptor, cleaning.with_state(SlotState::Free));
     });
 }
@@ -151,7 +177,7 @@ fn revocation_versus_paused_acquisition() {
 
         if revoke(&shared.revoked, &shared.loan_words).unwrap() {
             // Bound withdrawn: the publisher laps the reader.
-            shared.bytes.store(CLEANED_BYTES, Ordering::Relaxed);
+            shared.write_bytes(CLEANED_BYTES);
         }
 
         reader.join().unwrap();

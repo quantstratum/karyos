@@ -308,8 +308,8 @@ pub fn loan_held(
     for word in words {
         // `SeqCst` (at least `Acquire`) is required: a scan that reads a
         // released word must synchronize with the holder's `Release` so its
-        // accesses happen before cleaning. Loom does not model load buffering,
-        // so this ordering is argued here rather than checked by the model.
+        // accesses happen before cleaning. The Loom models check this: with a
+        // `Relaxed` load they report a race on the term bytes.
         if let Some(loan) = Loan::decode(word.load(Ordering::SeqCst))?
             && loan.pins(slot, reclaiming)
         {
