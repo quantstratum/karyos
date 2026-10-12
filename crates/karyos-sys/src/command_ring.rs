@@ -213,12 +213,12 @@ impl<'a> RingWords<'a> {
         };
         let tail = tail_word.load(Ordering::Relaxed);
         let head = head_word.load(Ordering::Acquire);
-        // A misaligned head, or one ahead of the tail or more than a capacity
-        // behind it, is impossible with a correct consumer: close for good.
-        let Some(used) = tail
-            .checked_sub(head)
-            .filter(|&used| used <= self.capacity && head.is_multiple_of(8))
-        else {
+        // Misaligned positions, or a head ahead of the tail or more than a
+        // capacity behind it, are impossible in a correct ring: close for
+        // good before any store.
+        let Some(used) = tail.checked_sub(head).filter(|&used| {
+            used <= self.capacity && head.is_multiple_of(8) && tail.is_multiple_of(8)
+        }) else {
             self.close();
             return Err(RingError::Closed);
         };
@@ -593,6 +593,12 @@ mod tests {
         assert_eq!(producer.write(1, b"x"), Err(RingError::Closed));
         let words = producer.words_for_test().unwrap();
         words.set_positions(0, 0);
+        assert_eq!(producer.write(1, b"x"), Err(RingError::Closed));
+        assert!(producer.is_closed());
+
+        // A misaligned tail: the producer writes nothing and closes.
+        let (mut producer, _consumer) = command_ring(1024).unwrap();
+        producer.words_for_test().unwrap().set_positions(9, 0);
         assert_eq!(producer.write(1, b"x"), Err(RingError::Closed));
         assert!(producer.is_closed());
     }
