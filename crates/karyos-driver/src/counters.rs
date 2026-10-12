@@ -12,10 +12,10 @@
 //!   itself is unaffected. Only an overflow of `counter overflows` itself
 //!   goes unrecorded.
 //! - **Gauges** ([`TYPE_GAUGE`]) are current values. The driver refreshes
-//!   them at the end of every successful duty cycle and after each control
-//!   call that changes them, so a handle dropped by the application shows
-//!   up at the next duty cycle. A duty cycle that returns an error may skip
-//!   the refresh.
+//!   them at the end of every duty cycle, also one that returns a stream's
+//!   error (every stream still runs first), and after each control call
+//!   that changes them, so a handle dropped by the application shows up at
+//!   the next duty cycle.
 //! - Each counter is read on its own; there is no atomic snapshot across
 //!   counters.
 //!
