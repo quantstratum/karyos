@@ -124,7 +124,10 @@ impl TraceCollector {
         self.observer
     }
 
-    /// Takes and decodes the oldest record.
+    /// Takes and decodes the oldest record. [`Collected`] does not carry the
+    /// [`ObserverId`]: whoever exports it keeps [`TraceCollector::observer`]
+    /// alongside, since the record's clocks and packet context are scoped by
+    /// it.
     #[must_use]
     pub fn take(&mut self) -> Collected {
         match self.consumer.take() {
@@ -153,7 +156,9 @@ impl TraceCollector {
 
     /// The journal's loss snapshot, unchanged: horizon, stored count, drop
     /// ranges, watermark and unstable entries. It reports storage loss only;
-    /// which traces a loss affects is decided elsewhere.
+    /// which traces a loss affects is decided elsewhere. Like
+    /// [`TraceCollector::take`], the snapshot omits the [`ObserverId`] that
+    /// scopes its clocks: exporters keep it alongside.
     #[must_use]
     pub fn losses(&mut self) -> Losses<'_> {
         self.consumer.losses()
