@@ -30,8 +30,9 @@ use karyos_client::link::{Lease, LeaseEnd, StreamLeases};
 use karyos_client::{ClientPublication, ClientSubscription};
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
-use karyos_sys::log_buffer::{Conductor, LogBuffer, LogBufferConfig, Role};
+use karyos_sys::log_buffer::{ClaimDeadline, Conductor, LogBuffer, LogBufferConfig, Role};
 
+use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
 use crate::counters::{DriverCounters, Event};
 use crate::error::DriverError;
@@ -139,6 +140,8 @@ pub struct EmbeddedDriver {
     pub(crate) scan_cursor: usize,
     pub(crate) terminal: bool,
     pub(crate) counters: DriverCounters,
+    /// The clock of claim deadlines.
+    clock: Box<dyn MonotonicClock>,
 }
 
 impl EmbeddedDriver {
@@ -161,6 +164,20 @@ impl EmbeddedDriver {
     /// broadcast size the primitives reject, or a broadcast smaller than
     /// `2 * B * R * m`; and [`DriverError::DriverIdsExhausted`].
     pub fn with_config(config: DriverConfig) -> Result<Self, DriverError> {
+        Self::with_clock(config, Box::new(SystemClock::new()))
+    }
+
+    /// An empty driver with explicit limits and the clock of claim
+    /// deadlines (`quantstratum-docs: karyos/design/client-claims.md`), in the unit of each
+    /// stream's `claim_deadline`.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::with_config`].
+    pub fn with_clock(
+        config: DriverConfig,
+        clock: Box<dyn MonotonicClock>,
+    ) -> Result<Self, DriverError> {
         let needed = RESPONSE_EXTENT
             .checked_mul(2)
             .and_then(|n| n.checked_mul(config.command_budget))
@@ -200,6 +217,7 @@ impl EmbeddedDriver {
             next_registration: 1,
             scan_cursor: 0,
             terminal: false,
+            clock,
         })
     }
 
@@ -398,24 +416,49 @@ impl EmbeddedDriver {
     }
 
     /// Runs one duty cycle: retires closed clients, serves client commands,
-    /// then runs one conductor duty cycle on every stream. Returns commands
-    /// served plus slots cleaned plus terms prepared, a rough measure of
-    /// work done.
+    /// then, on every stream, active or retiring, the commit deadline of its
+    /// claim and one conductor duty cycle. Returns commands served plus
+    /// claims aborted at their deadline plus slots cleaned plus terms
+    /// prepared, a rough measure of work done.
+    ///
+    /// The clock is read for a stream only once its claim is observed
+    /// admitted (`quantstratum-docs: karyos/design/client-claims.md`).
     ///
     /// # Errors
     ///
-    /// Returns the first conductor error, which indicates a broken invariant.
+    /// Returns the first stream error (a corrupt claim record or a broken
+    /// conductor invariant), after every other stream has still run its
+    /// deadline and duty cycle and the gauges were refreshed.
     pub fn do_work(&mut self) -> Result<u32, DriverError> {
         self.retire_closed_clients();
         self.sweep_ended_registrations();
         self.free_retired_streams();
         let mut work = self.serve_commands();
+        let mut first_error = None;
+        let clock = &mut self.clock;
         for stream in &mut self.streams {
-            let report = stream.conductor.duty_cycle()?;
-            work += report.cleaned + u32::from(report.prepared);
+            match stream
+                .conductor
+                .abort_expired_claims_with(&mut || clock.now())
+            {
+                Ok(ClaimDeadline::Aborted { .. }) => work += 1,
+                Ok(_) => {}
+                Err(error) => {
+                    first_error.get_or_insert(DriverError::from(error));
+                }
+            }
+            match stream.conductor.duty_cycle() {
+                Ok(report) => work += report.cleaned + u32::from(report.prepared),
+                Err(error) => {
+                    first_error.get_or_insert(DriverError::from(error));
+                }
+            }
         }
         self.update_stream_gauges();
-        Ok(work)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(work),
+        }
     }
 
     fn stream(&mut self, stream: StreamHandle) -> Result<&mut Stream, DriverError> {
@@ -437,5 +480,63 @@ impl EmbeddedDriver {
             return Err(DriverError::StreamRetiring { stream: found.id });
         }
         Ok(found)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::MonotonicClock;
+    use karyos_client::{ClaimOutcome, CommitOutcome};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    #[derive(Debug, Clone, Default)]
+    struct ManualClock(Arc<AtomicU64>);
+
+    impl MonotonicClock for ManualClock {
+        fn now(&mut self) -> u64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    fn config(stream_id: i32) -> StreamConfig {
+        StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id,
+                claim_deadline: 100,
+            },
+            allow_unconnected: false,
+        }
+    }
+
+    #[test]
+    fn a_failing_stream_does_not_stop_the_next_one() {
+        let clock = ManualClock::default();
+        let mut driver =
+            EmbeddedDriver::with_clock(DriverConfig::default(), Box::new(clock.clone())).unwrap();
+        let broken = driver.add_stream(config(2)).unwrap();
+        let healthy = driver.add_stream(config(3)).unwrap();
+        let _subscription = driver.subscribe(healthy, Role::Optional).unwrap();
+        let mut publication = driver.publication(healthy).unwrap();
+        let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
+            panic!("not claimed");
+        };
+        let _ = driver.do_work().unwrap();
+        driver.stream(broken).unwrap().buffer.poison_claim_record();
+        clock.0.store(100, Ordering::Relaxed);
+        // The broken stream, first in order, reports its error only after
+        // the healthy one still ran its deadline and duty cycle.
+        assert!(matches!(driver.do_work(), Err(DriverError::Sys(_))));
+        assert!(matches!(claim.commit(), CommitOutcome::Aborted { .. }));
     }
 }

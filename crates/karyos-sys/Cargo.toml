@@ -10,6 +10,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Hooks for tests of dependent crates that need a broken invariant; never
+# enabled outside dev-dependencies.
+test-hooks = []
+
 [dependencies]
 thiserror.workspace = true
 

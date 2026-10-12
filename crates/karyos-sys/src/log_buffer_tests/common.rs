@@ -1615,3 +1615,44 @@ fn the_last_claim_the_serial_admits_can_be_forgotten() {
         );
     }
 }
+
+#[test]
+fn the_clock_is_read_only_after_an_admitted_claim_is_observed() {
+    let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut reads = 0;
+    let mut clock = || {
+        reads += 1;
+        7
+    };
+    assert_eq!(
+        conductor.abort_expired_claims_with(&mut clock).unwrap(),
+        ClaimDeadline::Idle
+    );
+    let mut seen = Vec::new();
+    let outcome = publication
+        .try_claim_pausing(8, AppendOptions::default(), &mut |point| {
+            if point == ClaimPause::BeforeHead {
+                // Not admitted: the clock is not read.
+                seen.push(conductor.abort_expired_claims_with(&mut || panic!("read")).unwrap());
+            }
+        })
+        .unwrap();
+    assert_eq!(seen, [ClaimDeadline::Idle]);
+    assert_eq!(
+        conductor.abort_expired_claims_with(&mut clock).unwrap(),
+        ClaimDeadline::Waiting
+    );
+    assert_eq!(reads, 1);
+    assert_eq!(
+        conductor
+            .abort_expired_claims_with(&mut || 7 + DEADLINE)
+            .unwrap(),
+        ClaimDeadline::Aborted {
+            position: 0,
+            extent: 64,
+        }
+    );
+    drop(outcome);
+}

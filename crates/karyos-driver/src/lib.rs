@@ -9,10 +9,12 @@
 //! [`EmbeddedDriver::do_work`]. The media driver process, the network
 //! sender and receiver, and agent threads do not exist yet.
 
+pub mod clock;
 mod commands;
 pub mod counters;
 pub mod embedded;
 pub mod error;
 
+pub use clock::{MonotonicClock, SystemClock};
 pub use embedded::{DriverConfig, EmbeddedDriver, StreamConfig, StreamHandle, StreamState};
 pub use error::DriverError;
