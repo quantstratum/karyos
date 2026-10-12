@@ -274,6 +274,11 @@ fn max_streams_counts_retiring_streams_until_freed() {
         driver.add_stream(stream_config(3)),
         Err(DriverError::TooManyStreams)
     ));
+    // The retiring key is reported as a duplicate before the quota.
+    assert!(matches!(
+        driver.add_stream(stream_config(2)),
+        Err(DriverError::DuplicateStream { .. })
+    ));
     drop(kept);
     let _ = driver.do_work().unwrap();
     assert!(driver.add_stream(stream_config(3)).is_ok());
@@ -350,4 +355,56 @@ fn repeated_remove_and_re_add_keeps_no_history() {
             .iter()
             .all(|&old| driver.stream_state(old).unwrap() == StreamState::Freed)
     );
+}
+
+#[test]
+fn a_retiring_stream_keeps_conductor_duty_through_rotations() {
+    use karyos_client::MessageLimit;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver.add_stream(stream_config(2)).unwrap();
+    let mut subscription = driver.subscribe(stream, Role::Required).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    driver.remove_stream(stream).unwrap();
+    // Far more than three terms of data: rotation, reclamation and cleaning
+    // must keep running while the stream retires.
+    let payload = vec![7u8; 1500];
+    let mut received = 0usize;
+    for _ in 0..400 {
+        // Bounded: without conductor duty the offer would never be
+        // accepted again after the prepared terms are used up.
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(attempts < 10_000, "no progress: conductor duty stopped");
+            match publication.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => break,
+                _ => {
+                    let _ = driver.do_work().unwrap();
+                    let _ = subscription
+                        .poll(|_, _| received += 1, MessageLimit::new(16))
+                        .unwrap();
+                }
+            }
+        }
+        let _ = driver.do_work().unwrap();
+        let _ = subscription
+            .poll(|_, _| received += 1, MessageLimit::new(16))
+            .unwrap();
+    }
+    for _ in 0..10_000 {
+        if received == 400 {
+            break;
+        }
+        let _ = driver.do_work().unwrap();
+        let _ = subscription
+            .poll(|_, _| received += 1, MessageLimit::new(16))
+            .unwrap();
+    }
+    assert_eq!(received, 400);
+    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    drop(publication);
+    drop(subscription);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(state(&driver, stream), StreamState::Freed);
 }

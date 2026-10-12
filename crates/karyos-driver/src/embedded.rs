@@ -270,11 +270,7 @@ impl EmbeddedDriver {
     /// Returns configuration and allocation errors; no stream is added on
     /// error.
     pub fn add_stream(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
-        if self.streams.len() >= self.config.max_streams {
-            return Err(DriverError::TooManyStreams);
-        }
-        let id = self.next_stream;
-        let next = id.checked_add(1).ok_or(DriverError::StreamIdsExhausted)?;
+        // A key in use (active or retiring) is reported before the quota.
         let key = (config.buffer.stream_id, config.buffer.session_id);
         if self
             .streams
@@ -286,6 +282,11 @@ impl EmbeddedDriver {
                 session_id: key.1,
             });
         }
+        if self.streams.len() >= self.config.max_streams {
+            return Err(DriverError::TooManyStreams);
+        }
+        let id = self.next_stream;
+        let next = id.checked_add(1).ok_or(DriverError::StreamIdsExhausted)?;
         let buffer = Arc::new(LogBuffer::new(config.buffer)?);
         let conductor = buffer
             .conductor_owned()
