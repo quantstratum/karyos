@@ -1965,7 +1965,12 @@ fn concurrent_offers_are_disjoint_contiguous_and_delivered() {
         let _ = conductor.duty_cycle().unwrap();
     }
     assert_eq!(received, expected);
-    assert!(buffer.active_count.load(Ordering::Acquire) > 2, "no rotation");
+    // Under Miri fewer messages pass one term end; natively several.
+    let rotations = if cfg!(miri) { 0 } else { 2 };
+    assert!(
+        buffer.active_count.load(Ordering::Acquire) > rotations,
+        "no rotation"
+    );
 }
 
 fn reserved_of(data: &[u8]) -> u32 {
