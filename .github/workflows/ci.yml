@@ -40,6 +40,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: make loom
 
+  miri:
+    name: Miri (karyos-sys)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - run: make miri
+
   deny:
     name: Licences and sources
     runs-on: ubuntu-24.04

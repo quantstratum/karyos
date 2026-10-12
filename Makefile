@@ -2,7 +2,7 @@
 
 CARGO ?= cargo
 
-.PHONY: fmt fmt-check lint test loom build-release deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint test loom miri build-release deny deps-inventory deps-check lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -18,6 +18,9 @@ test:
 
 loom:
 	RUSTFLAGS="--cfg loom" $(CARGO) test -p karyos-sys --release --locked --test 'loom_*'
+
+miri:
+	$(CARGO) +nightly miri test -p karyos-sys --lib --locked
 
 build-release:
 	RUSTFLAGS="-D warnings" $(CARGO) build --workspace --release --locked

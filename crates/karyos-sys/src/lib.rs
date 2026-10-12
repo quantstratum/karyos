@@ -5,8 +5,11 @@
 //!
 //! That is the planned scope from `quantstratum-docs: karyos/SPEC.md` §14. Implemented so far: the
 //! term identity types, the slot descriptor and loan word encodings, and the
-//! loan, revocation and reclaim handshakes of SPEC.md §4. Mappings and payload
-//! access do not exist yet; nothing here grants access to term bytes.
+//! loan, revocation and reclaim handshakes of SPEC.md §4; atomic-only views
+//! of memory (`atomic_view`), with a heap backing; and, on Linux, a
+//! size-sealed `memfd` mapping viewed only as atomic words (`mmap`). Payload
+//! (term byte) access and attaching to another process's mapping do not exist
+//! yet; nothing here grants access to term bytes.
 //!
 //! The `loan` functions are raw protocol helpers over atomics. They do not
 //! enforce who owns a loan word, which lane bank a slot belongs to, that a
@@ -14,8 +17,11 @@
 //! steps. The future capability types that hand out payload references must
 //! enforce those properties; these helpers alone are not that capability.
 
+pub mod atomic_view;
 pub mod error;
 pub mod loan;
+#[cfg(target_os = "linux")]
+pub mod mmap;
 pub mod slot;
 pub mod sync;
 pub mod term;
