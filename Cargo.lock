@@ -149,6 +149,7 @@ name = "karyos-protocol"
 version = "0.1.0"
 dependencies = [
  "karyos-sys",
+ "thiserror",
 ]
 
 [[package]]
