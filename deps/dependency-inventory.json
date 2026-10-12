@@ -1,4 +1,36 @@
 {
+  "evaluated": {
+    "aarch64-apple-darwin": [
+      "proc-macro2 v1.0.107",
+      "quote v1.0.47",
+      "syn v3.0.8",
+      "thiserror v2.0.21",
+      "thiserror-impl v2.0.21",
+      "unicode-ident v1.0.26"
+    ],
+    "aarch64-unknown-linux-gnu": [
+      "bitflags v2.13.2",
+      "linux-raw-sys v0.12.1",
+      "proc-macro2 v1.0.107",
+      "quote v1.0.47",
+      "rustix v1.1.5",
+      "syn v3.0.8",
+      "thiserror v2.0.21",
+      "thiserror-impl v2.0.21",
+      "unicode-ident v1.0.26"
+    ],
+    "x86_64-unknown-linux-gnu": [
+      "bitflags v2.13.2",
+      "linux-raw-sys v0.12.1",
+      "proc-macro2 v1.0.107",
+      "quote v1.0.47",
+      "rustix v1.1.5",
+      "syn v3.0.8",
+      "thiserror v2.0.21",
+      "thiserror-impl v2.0.21",
+      "unicode-ident v1.0.26"
+    ]
+  },
   "generated_by": "scripts/dependency-inventory.py",
   "packages": [
     {

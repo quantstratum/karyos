@@ -17,6 +17,10 @@ resolved graph:
   accumulated along the paths from the workspace that reach the package in
   that class. An empty set means an unconditional path.
 
+The `evaluated` section lists, per supported target, the external packages
+that `cargo tree --target T --edges normal,build` resolves for the workspace:
+the graph actually compiled there in normal builds (no `--cfg loom`, no Miri).
+
 Reach classes: `runtime` is linked into normal builds; `build` runs only at
 compile time (build dependency or proc macro); `dev` is reached through a
 dev-dependency; `loom-runtime` and `loom-build` are reached only through an
@@ -35,6 +39,14 @@ import tempfile
 
 LOOM_CFG = "cfg(loom)"
 
+# Targets whose normal and build graphs are evaluated with `cargo tree`; this
+# is the graph actually compiled there without --cfg loom or Miri.
+SUPPORTED_TARGETS = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
+
 
 def main(argv: list) -> int:
     if len(argv) != 2:
@@ -50,6 +62,23 @@ def main(argv: list) -> int:
         sys.stderr.write(result.stderr)
         return result.returncode
     inventory = build(json.loads(result.stdout))
+    inventory["evaluated"] = {}
+    for target in SUPPORTED_TARGETS:
+        tree = subprocess.run(
+            ["cargo", "tree", "--locked", "--workspace", "--target", target,
+             "--edges", "normal,build", "--prefix", "none", "--format", "{p}"],
+            capture_output=True,
+            text=True,
+        )
+        if tree.returncode != 0:
+            sys.stderr.write(tree.stderr)
+            return tree.returncode
+        names = set()
+        for line in tree.stdout.splitlines():
+            line = line.replace(" (*)", "").replace(" (proc-macro)", "").strip()
+            if line and "(/" not in line:
+                names.add(line)
+        inventory["evaluated"][target] = sorted(names)
     directory = os.path.dirname(os.path.abspath(output))
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".inventory-", suffix=".json")
     try:

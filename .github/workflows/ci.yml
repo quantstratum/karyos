@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal --component miri,rust-src
+      - run: rustup toolchain install nightly-2026-10-11 --profile minimal --component miri,rust-src
       - run: make miri
 
   deny:

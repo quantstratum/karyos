@@ -30,20 +30,30 @@ and requested features of the declaration), and for each reach class the
 minimal target conditions along the paths that reach it. Only an edge whose
 condition is exactly `cfg(loom)` makes a path `loom-*`; any other condition is
 kept verbatim. Generation writes a temporary file and replaces the committed
-one only on success. It is generated from `Cargo.lock` by
+one only on success. Its `evaluated` section lists, for x86_64 and aarch64
+Linux and aarch64 macOS, the packages `cargo tree --target` resolves for
+normal and build edges: the graph actually compiled there without
+`--cfg loom` or Miri. It is generated from `Cargo.lock` by
 `scripts/dependency-inventory.py` (`make deps-inventory`); `make deps-check`
 runs in CI and fails when the committed file is stale, so a lockfile, feature
 or build-script change cannot reuse old admission evidence. Reach classes:
 
-- `runtime`: linked into Karyos builds (`thiserror`; on Linux `rustix`,
-  `bitflags` and `linux-raw-sys`).
+- `runtime`: may be linked into Karyos builds. On the supported targets the
+  evaluated runtime graph is `thiserror`, plus `rustix`, `bitflags` and
+  `linux-raw-sys` on Linux. The raw edges also list `libc` and `errno` under
+  `rustix`, either as optional dependencies of the `linux_raw` backend that
+  only the unused `use-libc` feature enables, or behind `rustix_use_libc` or
+  `miri`; neither applies to normal builds.
 - `build`: runs only at compile time, as a proc macro or its dependency
   (`thiserror-impl`, `syn`, `quote`, `proc-macro2`, `unicode-ident`).
   ADR-0033 approves `syn`, `quote` and `proc-macro2` for the codec; here they
   enter through `thiserror`'s derive.
 - `loom-runtime` and `loom-build`: the same classes reached only through the
   `cfg(loom)` dependency, compiled only by `make loom`, never in normal, test
-  or release builds. 30 of the 36 packages are in these classes.
+  or release builds.
+
+The inventory currently holds 40 packages; counts per class change with the
+lockfile and are read from the JSON rather than repeated here.
 
 On x86_64 and aarch64 Linux `rustix` uses its `linux_raw` backend: system
 calls through Rust inline assembly and the pure-Rust `linux-raw-sys`
@@ -52,8 +62,7 @@ only by `--cfg rustix_use_libc`, which Karyos never sets, or under Miri.
 
 Effective target conditions that exclude packages from the supported
 targets: `windows-sys`, `windows-result` and `windows-link` (`cfg(windows)`)
-and `valuable` (`cfg(tracing_unstable)`, a flag Karyos never sets). `libc` is
-`cfg(unix)` and reached only under `--cfg loom`.
+and `valuable` (`cfg(tracing_unstable)`, a flag Karyos never sets).
 
 ## Build scripts
 

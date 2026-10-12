@@ -30,9 +30,19 @@ impl<'a> AtomicWords<'a> {
     ///
     /// # Safety
     ///
-    /// For the whole lifetime `'a`, the `len_bytes` bytes at `base` must stay
-    /// allocated (mapped), readable and writable, and this process must access
-    /// them only through atomic operations on naturally aligned 64-bit words.
+    /// For the whole lifetime `'a`:
+    ///
+    /// - `base..base + len_bytes` must be one allocation (one heap block or one
+    ///   mapping) that `base` has provenance over, and the range must not wrap
+    ///   around the address space;
+    /// - every byte must be initialized, readable and writable, and stay
+    ///   allocated (mapped) and the same size;
+    /// - this process must access those bytes only through atomic operations
+    ///   on naturally aligned 64-bit words, never through ordinary or
+    ///   mixed-size accesses.
+    ///
+    /// The function checks the address and length properties it can check;
+    /// the caller guarantees the rest.
     ///
     /// # Errors
     ///

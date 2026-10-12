@@ -129,8 +129,14 @@ impl SealedMapping {
             )
         }
         .map_err(os("mmap"))?;
-        let base =
-            NonNull::new(raw.cast::<u8>()).ok_or(SysError::InvalidRegion { address: 0, len })?;
+        let Some(base) = NonNull::new(raw.cast::<u8>()) else {
+            // Without MAP_FIXED the kernel never returns address 0 for a
+            // successful mapping; if it ever did, release it before failing.
+            // SAFETY: unmaps exactly the range just mapped, which nothing
+            // references.
+            let _ = unsafe { rustix::mm::munmap(raw, len) };
+            return Err(SysError::InvalidRegion { address: 0, len });
+        };
         let mut mapping = Self {
             base,
             len,
