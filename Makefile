@@ -26,10 +26,10 @@ deny:
 	$(CARGO) deny check
 
 deps-inventory:
-	python3 scripts/dependency-inventory.py > deps/dependency-inventory.json
+	python3 scripts/dependency-inventory.py deps/dependency-inventory.json
 
 deps-check:
-	python3 scripts/dependency-inventory.py | diff -u deps/dependency-inventory.json -
+	@tmp=$$(mktemp) && python3 scripts/dependency-inventory.py $$tmp && diff -u deps/dependency-inventory.json $$tmp; status=$$?; rm -f $$tmp; exit $$status
 
 lint-sync:
 	scripts/check-lint-sync.sh

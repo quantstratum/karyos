@@ -2,43 +2,68 @@
 # SPDX-License-Identifier: Apache-2.0
 """Write the resolved external dependency inventory (ADR-0033) as JSON.
 
+Usage: dependency-inventory.py OUTPUT
+
 Reads `cargo metadata --locked` and writes, for every external package in the
 resolved graph:
 
-- `id`, `name`, `version`, `source`, `license`;
+- `id`, `name`, `version`, raw `source`, `license`;
 - `build_script` and `proc_macro` flags;
-- `features`: the features resolved for the package;
-- `edges`: every incoming dependency edge, with the dependent package, the
-  edge kind (normal, build, dev) and its raw target condition;
-- `reach`: how the workspace reaches it. `runtime` is linked into normal
-  builds; `build` runs only at compile time (build dependency or proc macro);
-  `loom-runtime` and `loom-build` are the same classes reached only through the
-  `cfg(loom)` dependency, compiled only by `make loom`;
-- `effective_conditions`: the target conditions accumulated along each path
-  from the workspace (cfg(loom) excluded, it is part of `reach`). An empty
-  list inside means at least one unconditional path.
+- `features`: the features resolved for the package (aggregated by Cargo);
+- `edges`: every incoming dependency edge with the dependent package id, the
+  edge kind (normal, build, dev), its exact raw target condition, and the
+  `uses_default_features` and requested `features` of that declaration;
+- `paths`: for each reach class, the minimal sets of target conditions
+  accumulated along the paths from the workspace that reach the package in
+  that class. An empty set means an unconditional path.
 
-`make deps-inventory` regenerates deps/dependency-inventory.json and
-`make deps-check` (run in CI) fails when the committed file is stale, so a
-changed lockfile, feature set or new build script cannot silently reuse old
-admission evidence.
+Reach classes: `runtime` is linked into normal builds; `build` runs only at
+compile time (build dependency or proc macro); `dev` is reached through a
+dev-dependency; `loom-runtime` and `loom-build` are reached only through an
+edge whose condition is exactly `cfg(loom)`. Any other condition, including
+ones that merely mention `loom`, is kept verbatim as a target condition.
+
+The output is written to a temporary file and moved into place only when
+generation succeeds, so a failure never truncates the committed inventory.
 """
 
 import json
+import os
 import subprocess
 import sys
+import tempfile
 
-LOOM_MARK = "loom"
+LOOM_CFG = "cfg(loom)"
 
 
-def main() -> int:
-    raw = subprocess.run(
+def main(argv: list) -> int:
+    if len(argv) != 2:
+        sys.stderr.write("usage: dependency-inventory.py OUTPUT\n")
+        return 2
+    output = argv[1]
+    result = subprocess.run(
         ["cargo", "metadata", "--locked", "--format-version", "1"],
-        check=True,
         capture_output=True,
         text=True,
-    ).stdout
-    meta = json.loads(raw)
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        return result.returncode
+    inventory = build(json.loads(result.stdout))
+    directory = os.path.dirname(os.path.abspath(output))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".inventory-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(inventory, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, output)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    return 0
+
+
+def build(meta: dict) -> dict:
     packages = {p["id"]: p for p in meta["packages"]}
     workspace = set(meta["workspace_members"])
     nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
@@ -46,18 +71,51 @@ def main() -> int:
     def is_proc_macro(pkg_id: str) -> bool:
         return any("proc-macro" in t["kind"] for t in packages[pkg_id]["targets"])
 
-    # Walk every path from the workspace, carrying (class, conditions).
-    reach: dict = {}
-    conditions: dict = {}
+    def declaration(dependent: str, dep_name: str, kind: dict) -> dict:
+        """The manifest declaration behind one resolved edge."""
+        for d in packages[dependent]["dependencies"]:
+            if (
+                (d.get("rename") or d["name"]).replace("-", "_") == dep_name
+                and (d.get("kind") or "normal") == kind["kind"]
+                and d.get("target") == kind.get("target")
+            ):
+                return d
+        return {}
+
     edges: dict = {}
+    paths: dict = {}
     queue = []
+
+    def visit_edges(dependent: str, cls, conds):
+        for dep in nodes[dependent]["deps"]:
+            for raw_kind in dep["dep_kinds"]:
+                kind = {"kind": raw_kind.get("kind") or "normal", "target": raw_kind.get("target")}
+                if dependent not in workspace and kind["kind"] == "dev":
+                    continue
+                decl = declaration(dependent, dep["name"], kind)
+                record(edges, dep["pkg"], {
+                    "from": stable_id(dependent, packages),
+                    "kind": kind["kind"],
+                    "target": kind.get("target"),
+                    "uses_default_features": decl.get("uses_default_features"),
+                    "features": sorted(decl.get("features", [])),
+                })
+                target = kind.get("target")
+                if cls is None:
+                    child_cls = {"dev": "dev", "build": "build"}.get(kind["kind"], "runtime")
+                else:
+                    child_cls = cls
+                    if kind["kind"] == "build" or is_proc_macro(dependent):
+                        child_cls = to_build(cls)
+                child_conds = set(conds)
+                if target == LOOM_CFG:
+                    child_cls = to_loom(child_cls)
+                elif target:
+                    child_conds.add(target)
+                queue.append((dep["pkg"], child_cls, frozenset(child_conds)))
+
     for member in sorted(workspace):
-        for dep in nodes[member]["deps"]:
-            for kind in dep["dep_kinds"]:
-                record_edge(edges, dep["pkg"], packages[member]["name"], kind)
-                state = start_state(kind)
-                if state is not None:
-                    queue.append((dep["pkg"],) + state)
+        visit_edges(member, None, frozenset())
     seen = set()
     while queue:
         pkg, cls, conds = queue.pop()
@@ -69,84 +127,55 @@ def main() -> int:
         if key in seen:
             continue
         seen.add(key)
-        reach.setdefault(pkg, set()).add(cls)
-        conditions.setdefault(pkg, set()).add(conds)
-        for dep in nodes[pkg]["deps"]:
-            for kind in dep["dep_kinds"]:
-                if kind["kind"] == "dev":
-                    continue
-                record_edge(edges, dep["pkg"], packages[pkg]["name"], kind)
-                child_cls = to_build(cls) if kind["kind"] == "build" or is_proc_macro(pkg) else cls
-                target = kind.get("target")
-                child_conds = conds
-                if target and LOOM_MARK not in target:
-                    child_conds = tuple(sorted(set(conds) | {target}))
-                queue.append((dep["pkg"], child_cls, child_conds))
+        paths.setdefault(pkg, {}).setdefault(cls, set()).add(conds)
+        visit_edges(pkg, cls, conds)
 
-    inventory = []
-    for pkg_id in sorted(reach, key=lambda i: (packages[i]["name"], packages[i]["version"])):
+    out = []
+    for pkg_id in sorted(paths, key=lambda i: (packages[i]["name"], packages[i]["version"], i)):
         p = packages[pkg_id]
-        inventory.append(
-            {
-                "name": p["name"],
-                "version": p["version"],
-                "id": pkg_id,
-                "source": p.get("source"),
-                "license": p.get("license"),
-                "build_script": any("custom-build" in t["kind"] for t in p["targets"]),
-                "proc_macro": is_proc_macro(pkg_id),
-                "features": sorted(nodes[pkg_id].get("features", [])),
-                "reach": sorted(reach[pkg_id]),
-                "effective_conditions": minimal(conditions[pkg_id]),
-                "edges": sorted(edges.get(pkg_id, []), key=lambda e: json.dumps(e, sort_keys=True)),
-            }
-        )
-    json.dump(
-        {"generated_by": "scripts/dependency-inventory.py", "packages": inventory},
-        sys.stdout,
-        indent=2,
-        sort_keys=True,
-    )
-    sys.stdout.write("\n")
-    return 0
+        out.append({
+            "name": p["name"],
+            "version": p["version"],
+            "id": pkg_id,
+            "source": p.get("source"),
+            "license": p.get("license"),
+            "build_script": any("custom-build" in t["kind"] for t in p["targets"]),
+            "proc_macro": is_proc_macro(pkg_id),
+            "features": sorted(nodes[pkg_id].get("features", [])),
+            "paths": {cls: minimal(sets) for cls, sets in sorted(paths[pkg_id].items())},
+            "edges": sorted(edges.get(pkg_id, []), key=lambda e: json.dumps(e, sort_keys=True)),
+        })
+    return {"generated_by": "scripts/dependency-inventory.py", "packages": out}
 
 
-def start_state(kind: dict):
-    target = kind.get("target") or ""
-    loom = LOOM_MARK in target
-    if kind["kind"] == "dev":
-        return ("dev", ())
-    cls = "build" if kind["kind"] == "build" else "runtime"
-    if loom:
-        cls = "loom-" + cls
-    conds = () if (not target or loom) else (target,)
-    return (cls, conds)
+def stable_id(pkg_id: str, packages: dict) -> str:
+    """External ids are kept verbatim; workspace ids embed the checkout path,
+    so they become `workspace:<name>@<version>`."""
+    if pkg_id.startswith("path+file://"):
+        p = packages[pkg_id]
+        return "workspace:" + p["name"] + "@" + p["version"]
+    return pkg_id
 
 
 def to_build(cls: str) -> str:
-    if cls == "runtime":
-        return "build"
-    if cls == "loom-runtime":
-        return "loom-build"
-    return cls
+    return {"runtime": "build", "loom-runtime": "loom-build"}.get(cls, cls)
 
 
-def record_edge(edges: dict, pkg: str, dependent: str, kind: dict) -> None:
-    entry = {"from": dependent, "kind": kind["kind"], "target": kind.get("target")}
+def to_loom(cls: str) -> str:
+    return {"runtime": "loom-runtime", "build": "loom-build"}.get(cls, cls)
+
+
+def record(edges: dict, pkg: str, entry: dict) -> None:
     bucket = edges.setdefault(pkg, [])
     if entry not in bucket:
         bucket.append(entry)
 
 
-def minimal(paths: set) -> list:
+def minimal(sets: set) -> list:
     """Drop condition sets that are supersets of another path's set."""
-    sets = [set(p) for p in paths]
-    keep = []
-    for s in sets:
-        if not any(o < s for o in sets) and s not in keep:
-            keep.append(s)
-    return sorted(sorted(s) for s in keep)
+    keep = [s for s in sets if not any(o < s for o in sets)]
+    return sorted(sorted(s) for s in set(keep))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv))

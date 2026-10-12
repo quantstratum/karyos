@@ -22,10 +22,14 @@ users; it is compiled only by `make loom`.
 ## Resolved graph
 
 [`dependency-inventory.json`](dependency-inventory.json) lists every external
-package in the resolved graph: package id, version, source, licence, build
-script and proc macro flags, resolved features, every incoming edge (kind and
-raw target condition), reach class and effective target conditions along
-each path. It is generated from `Cargo.lock` by
+package in the resolved graph: package id, version, raw source, licence,
+build script and proc macro flags, resolved features, every incoming edge
+(dependent package id, kind, exact target condition, `uses_default_features`
+and requested features of the declaration), and for each reach class the
+minimal target conditions along the paths that reach it. Only an edge whose
+condition is exactly `cfg(loom)` makes a path `loom-*`; any other condition is
+kept verbatim. Generation writes a temporary file and replaces the committed
+one only on success. It is generated from `Cargo.lock` by
 `scripts/dependency-inventory.py` (`make deps-inventory`); `make deps-check`
 runs in CI and fails when the committed file is stale, so a lockfile, feature
 or build-script change cannot reuse old admission evidence. Reach classes:
