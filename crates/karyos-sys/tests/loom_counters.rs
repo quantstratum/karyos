@@ -4,9 +4,10 @@
 //! production `CellWords`. A concurrent reader must never pair one
 //! allocation's metadata with a value written for another allocation.
 //!
-//! Two focused models keep the search small: one where the allocator's own
-//! thread increments A and then reallocates the cell as B, and one where
-//! B's capability is handed to a separate updater thread that sets a gauge.
+//! Two focused models, explored with one preemption (see `builder`): one
+//! where the allocator's own thread increments A and then reallocates the
+//! cell as B, and one where B's capability is handed to a separate updater
+//! thread that sets a gauge.
 //! In both, the reader asserts before any join, and a quiescent read after
 //! the joins must succeed.
 //!
@@ -85,9 +86,14 @@ fn quiescent_b(cell: &Cell, value: u64) {
     );
 }
 
+/// Scope: one preemption. With the production reader (four seqlock
+/// attempts over 64-byte metadata) bounds 2 and 3 did not finish in review
+/// runs of 90 s to over 20 minutes, which are not counted as passes. Bound 1
+/// finishes and still fails for each known defect (gauge `set` as a plain
+/// store, either seqlock fence removed); bound 0 misses the gauge defect.
 fn builder() -> loom::model::Builder {
     let mut builder = loom::model::Builder::new();
-    builder.preemption_bound = Some(3);
+    builder.preemption_bound = Some(1);
     builder
 }
 
