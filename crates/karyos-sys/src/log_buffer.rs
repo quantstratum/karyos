@@ -702,11 +702,20 @@ pub struct Subscription<O: BufferOwner> {
 }
 
 impl<O: BufferOwner> Subscription<O> {
-    /// The position of the next block to copy.
+    /// The read cursor: where the next copy starts. With a pending
+    /// (unacknowledged) message the next poll rewinds to the acknowledged
+    /// position instead; see [`Subscription::acknowledged_position`].
     #[inline]
     #[must_use]
     pub fn position(&self) -> u64 {
         self.cursor.position
+    }
+
+    /// The acknowledged position published in the registry.
+    #[inline]
+    #[must_use]
+    pub fn acknowledged_position(&self) -> u64 {
+        self.cursor.acknowledged
     }
 
     /// Copies the next message into `out`.
@@ -1817,6 +1826,10 @@ mod tests {
             AppendOutcome::AdminAction
         );
         let _ = publication.append(&big, AppendOptions::default()).unwrap();
+        let after = vec![3u8; 100];
+        let _ = publication
+            .append(&after, AppendOptions::default())
+            .unwrap();
         let mut out = vec![0u8; 8192];
         for _ in 0..60 {
             assert!(matches!(
@@ -1843,7 +1856,12 @@ mod tests {
             buffer.cells[1].position.load(Ordering::Acquire),
             TERM + 8192
         );
-        assert_eq!(required.poll(&mut out).unwrap(), PollOutcome::Pending);
+        // The next poll delivers the following message, not the
+        // acknowledged one again.
+        assert!(matches!(
+            required.poll(&mut out).unwrap(),
+            PollOutcome::Message { position, length: 100, .. } if position == TERM + 8192
+        ));
     }
 
     /// A required subscriber whose data is gone gets an error, never a
