@@ -2009,19 +2009,15 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
     let raw = buffer.tail(0).unwrap().load(Ordering::Acquire);
     assert_eq!(raw >> 32, t0);
     assert!(raw as u32 >= MIN_TERM_LENGTH);
-    // B's reservation lands past the end and holds nothing.
+    // The crossing owner rotated (term 1 was prepared).
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    // B finds term 0 full: no reservation there.
     assert_eq!(
         b.offer(&data, AppendOptions::default()).unwrap(),
         AppendOutcome::AdminAction
     );
-    // A makes no second reservation in term 0.
-    assert_eq!(
-        a.offer(&data, AppendOptions::default()).unwrap(),
-        AppendOutcome::AdminAction
-    );
-    // The conductor rotates; both catch up and publish in term 1.
-    let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), raw);
+    // Both catch up and publish in term 1, never again in term 0.
     while poll_message(&mut subscription).is_some() {}
     let pa = offer_concurrent(&mut a, &mut conductor, &data, || {});
     let pb = offer_concurrent(&mut b, &mut conductor, &data, || {});
@@ -2067,29 +2063,50 @@ fn a_reissued_slot_never_crosses_a_term_twice() {
     let buffer = new_buffer(concurrent_config(1)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     let mut subscription = conductor.subscribe(Role::Optional).unwrap();
-    let data = vec![2u8; 5000];
-    // A holder fills term 0 until it crosses, then closes before rotation.
+    // Term 0 32 bytes from its end, term 1 not prepared yet (the driver is
+    // behind), and a limit that admits the reservation.
+    let t0 = u64::from(buffer.initial_term_id.get());
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((t0 << 32) | (TERM - 32), Ordering::Release);
+    let t1 = buffer
+        .initial_term_id
+        .advanced_by(TermCount::try_new(1).unwrap());
+    buffer.descriptor(1).unwrap().store(
+        Descriptor::new(t1, buffer.generation, SlotState::Free).encode(),
+        Ordering::Release,
+    );
+    buffer
+        .table_slot(TermCount::try_new(1).unwrap())
+        .unwrap()
+        .store(0, Ordering::Release);
+    buffer.limit.store(2 * TERM, Ordering::Release);
+    let data = vec![2u8; 100];
+    // The holder crosses term 0, owns the remainder, cannot rotate, and
+    // closes while term 0 is still active.
     let mut holder = conductor.concurrent_publication().unwrap().unwrap();
-    loop {
-        let _ = conductor.duty_cycle().unwrap();
-        while poll_message(&mut subscription).is_some() {}
-        match holder.offer(&data, AppendOptions::default()).unwrap() {
-            AppendOutcome::AdminAction => break,
-            AppendOutcome::Appended { .. } | AppendOutcome::BackPressured => {}
-        }
-    }
-    holder.close();
-    // Reissued while term 0 is still active and crossed: it waits.
-    let mut reissued = conductor.concurrent_publication().unwrap().unwrap();
-    let tail = buffer.tail(0).unwrap().load(Ordering::Acquire);
     assert_eq!(
-        reissued.offer(&data, AppendOptions::default()).unwrap(),
+        holder.offer(&data, AppendOptions::default()).unwrap(),
         AppendOutcome::AdminAction
     );
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 0);
+    holder.close();
+    // Reissued in the still active, crossed term: it waits.
+    let mut reissued = conductor.concurrent_publication().unwrap().unwrap();
+    let tail = buffer.tail(0).unwrap().load(Ordering::Acquire);
+    for _ in 0..3 {
+        assert_eq!(
+            reissued.offer(&data, AppendOptions::default()).unwrap(),
+            AppendOutcome::AdminAction
+        );
+    }
     // It made no reservation in term 0.
     assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire), tail);
+    // The conductor prepares and rotates; the handle publishes in term 1.
     let _ = conductor.duty_cycle().unwrap();
-    while poll_message(&mut subscription).is_some() {}
+    let _ = conductor.duty_cycle().unwrap();
+    while poll(&mut subscription) != PollOutcome::Pending {}
     let position = offer_concurrent(&mut reissued, &mut conductor, &data, || {});
     assert_eq!(position / TERM, 1);
 }
@@ -2262,4 +2279,69 @@ fn concurrent_claim_sizes_are_checked() {
     let mut claim = concurrent_claimed(handle.try_claim(1376, AppendOptions::default()));
     assert_eq!(claim.payload().len(), 1376);
     claim.abort();
+}
+
+// Rotation by publishers, batch b.
+
+#[test]
+fn publishers_rotate_without_the_conductor() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let t0 = u64::from(buffer.initial_term_id.get());
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((t0 << 32) | (TERM - 32), Ordering::Release);
+    buffer.limit.store(2 * TERM, Ordering::Release);
+    // The crossing owner pads and rotates to the prepared term 1.
+    assert_eq!(
+        handle.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
+        AppendOutcome::AdminAction
+    );
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    let t1 = buffer
+        .initial_term_id
+        .advanced_by(TermCount::try_new(1).unwrap());
+    let found = Descriptor::decode(buffer.descriptor(1).unwrap().load(Ordering::Acquire)).unwrap();
+    assert_eq!(found, Descriptor::new(t1, buffer.generation, SlotState::Active));
+    // And then publishes in term 1 without a duty cycle.
+    assert!(matches!(
+        handle.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { position } if position == TERM
+    ));
+}
+
+#[test]
+fn a_rotation_attempt_is_idempotent_and_detects_supersession() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let one = TermCount::try_new(1).unwrap();
+    let t1 = buffer.initial_term_id.advanced_by(one);
+    let rotate = |next: TermCount, term: TermId| {
+        rotate_to(
+            buffer.descriptor(1).unwrap(),
+            &buffer.active_count,
+            term,
+            buffer.generation,
+            next,
+        )
+        .unwrap()
+    };
+    assert_eq!(rotate(one, t1), Rotation::Completed);
+    // Repeating it, as a second helper would, changes nothing.
+    assert_eq!(rotate(one, t1), Rotation::Completed);
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    // A helper paused across later rotations finds the count beyond and
+    // the slot reassigned to a later term: it writes nothing.
+    buffer.active_count.store(3, Ordering::Release);
+    let t4 = buffer.initial_term_id.advanced_by(TermCount::try_new(4).unwrap());
+    let ready4 = Descriptor::new(t4, buffer.generation, SlotState::Ready).encode();
+    buffer.descriptor(1).unwrap().store(ready4, Ordering::Release);
+    assert_eq!(rotate(one, t1), Rotation::Superseded);
+    assert_eq!(buffer.descriptor(1).unwrap().load(Ordering::Acquire), ready4);
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 3);
+    // A term not prepared yet: the driver is behind.
+    let five = TermCount::try_new(5).unwrap();
+    let t5 = buffer.initial_term_id.advanced_by(five);
+    assert_eq!(rotate(five, t5), Rotation::NotReady);
 }

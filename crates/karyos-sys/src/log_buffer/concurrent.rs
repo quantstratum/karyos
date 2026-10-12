@@ -12,7 +12,7 @@ use super::{
     write_header_tail,
 };
 use crate::frame::{Flags, FrameType, Word0};
-use crate::loan::{LoanOutcome, release_loan, take_loan};
+use crate::loan::{LoanOutcome, release_loan, rotate_to, take_loan};
 use crate::publication::{
     abort_block, acquire_publisher_slot, commit_block, mark_block, reissue_from,
     release_publisher_slot,
@@ -432,8 +432,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         );
         let start = old as u32;
         if start >= term_length {
-            // Landed past the end: holds nothing.
+            // Landed past the end: holds nothing; helps rotate once.
             self.mark_crossed();
+            self.help_rotation(count)?;
             return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
         // `start < 2^31` and `reserved ≤ term_length / 8`: no overflow.
@@ -454,6 +455,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
                 return Err(foreign_mark(start));
             }
             self.mark_crossed();
+            self.help_rotation(count)?;
             return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
         Ok(Reserved::Own { count, slot, start })
@@ -462,6 +464,25 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// Closes the handle: releases its loan and its publisher slot, as
     /// dropping it does.
     pub fn close(self) {}
+
+    /// One rotation attempt from `count` to the next term (SPEC.md §4
+    /// rotation), by the crossing owner or a producer that landed past the
+    /// end. Its result does not change the call's outcome (`AdminAction`).
+    fn help_rotation(&self, count: TermCount) -> Result<(), SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let next = count.next()?;
+        let Lookup::Slot(slot) = buffer.lookup(next)? else {
+            return Ok(());
+        };
+        let _ = rotate_to(
+            buffer.descriptor(slot)?,
+            &buffer.active_count,
+            buffer.initial_term_id.advanced_by(next),
+            buffer.generation,
+            next,
+        )?;
+        Ok(())
+    }
 
     fn mark_crossed(&mut self) {
         if let HandleState::Active { crossed, .. } = &mut self.state {
