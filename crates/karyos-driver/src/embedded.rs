@@ -30,7 +30,7 @@ use karyos_client::link::{Lease, LeaseEnd, StreamLeases};
 use karyos_client::{ClientPublication, ClientSubscription};
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
-use karyos_sys::log_buffer::{ClaimDeadline, Conductor, LogBuffer, LogBufferConfig, Role};
+use karyos_sys::log_buffer::{Conductor, DeadlineError, LogBuffer, LogBufferConfig, Role};
 
 use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
@@ -443,27 +443,30 @@ impl EmbeddedDriver {
         let clock = &mut self.clock;
         let counters = &self.counters;
         for stream in &mut self.streams {
-            let result = stream
-                .conductor
-                .abort_expired_claims_with(&mut || clock.now());
-            stream.claim_waiting = matches!(result, Ok(ClaimDeadline::Waiting));
-            match result {
-                Ok(ClaimDeadline::Aborted { .. }) => {
-                    work += 1;
-                    counters.add(Event::ClaimsAborted, 1);
-                }
-                Ok(ClaimDeadline::Resolved) => counters.add(Event::ClaimDeadlinesResolved, 1),
-                Ok(ClaimDeadline::ClockWentBack) => counters.add(Event::ClaimClockStepsBack, 1),
-                Ok(ClaimDeadline::Unrepresentable) => {
-                    counters.add(Event::ClaimDeadlinesUnrepresentable, 1);
-                }
-                Ok(ClaimDeadline::Idle | ClaimDeadline::Waiting) => {}
-                Err(error) => {
-                    first_error.get_or_insert(DriverError::from(error));
-                }
+            let (report, error) = match stream.conductor.service_deadlines(&mut || clock.now()) {
+                Ok(report) => (report, None),
+                Err(DeadlineError { report, error }) => (report, Some(error)),
+            };
+            stream.claim_waiting = report.waiting;
+            counters.add(Event::ClaimsAborted, u64::from(report.aborted));
+            counters.add(Event::ClaimDeadlinesResolved, u64::from(report.resolved));
+            counters.add(
+                Event::ClaimClockStepsBack,
+                u64::from(report.clock_went_back),
+            );
+            counters.add(
+                Event::ClaimDeadlinesUnrepresentable,
+                u64::from(report.unrepresentable),
+            );
+            work = add_work(counters, work, report.aborted);
+            if let Some(error) = error {
+                first_error.get_or_insert(DriverError::from(error));
             }
             match stream.conductor.duty_cycle() {
-                Ok(report) => work += report.cleaned + u32::from(report.prepared),
+                Ok(report) => {
+                    work = add_work(counters, work, report.cleaned);
+                    work = add_work(counters, work, u32::from(report.prepared));
+                }
                 Err(error) => {
                     first_error.get_or_insert(DriverError::from(error));
                 }
@@ -496,6 +499,15 @@ impl EmbeddedDriver {
         }
         Ok(found)
     }
+}
+
+/// Adds `delta` to a duty cycle's work count. An overflow keeps the count
+/// at its maximum and is recorded in `counter overflows` (ADR-0007).
+fn add_work(counters: &DriverCounters, work: u32, delta: u32) -> u32 {
+    work.checked_add(delta).unwrap_or_else(|| {
+        counters.add(Event::CounterOverflows, 1);
+        u32::MAX
+    })
 }
 
 #[cfg(test)]
@@ -558,5 +570,47 @@ mod tests {
         // the healthy one still ran its deadline and duty cycle.
         assert!(matches!(driver.do_work(), Err(DriverError::Sys(_))));
         assert!(matches!(claim.commit(), CommitOutcome::Aborted { .. }));
+    }
+
+    #[test]
+    fn an_overflowing_work_count_saturates_and_is_recorded() {
+        let counters = DriverCounters::new().unwrap();
+        assert_eq!(add_work(&counters, u32::MAX - 1, 1), u32::MAX);
+        assert_eq!(counters.value(Event::CounterOverflows), 0);
+        assert_eq!(add_work(&counters, u32::MAX, 1), u32::MAX);
+        assert_eq!(counters.value(Event::CounterOverflows), 1);
+        assert_eq!(add_work(&counters, u32::MAX, 0), u32::MAX);
+        assert_eq!(counters.value(Event::CounterOverflows), 1);
+    }
+
+    #[test]
+    fn a_deadline_error_counts_its_report_and_leaves_the_gauge() {
+        let clock = ManualClock::default();
+        let mut driver =
+            EmbeddedDriver::with_clock(DriverConfig::default(), Box::new(clock.clone())).unwrap();
+        let stream = driver.add_stream(config(2)).unwrap();
+        let _subscription = driver.subscribe(stream, Role::Optional).unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
+            panic!("not claimed");
+        };
+        assert_eq!(driver.do_work().unwrap(), 0);
+        assert_eq!(driver.counters.value(Event::ClaimsWaiting), 1);
+        driver
+            .stream(stream)
+            .unwrap()
+            .buffer
+            .inject_deadline_fault();
+        clock.0.store(100, Ordering::Relaxed);
+        assert!(matches!(
+            driver.do_work(),
+            Err(DriverError::Sys(
+                karyos_sys::error::SysError::ResourcesUnavailable
+            ))
+        ));
+        // The error carries an empty report: nothing counted, not waiting.
+        assert_eq!(driver.counters.value(Event::ClaimsWaiting), 0);
+        assert_eq!(driver.counters.value(Event::ClaimsAborted), 0);
+        assert!(matches!(claim.commit(), CommitOutcome::Accepted { .. }));
     }
 }

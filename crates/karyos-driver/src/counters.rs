@@ -39,11 +39,11 @@
 //! | `hand-over entries held` | gauge | capabilities waiting to be taken |
 //! | `stream leases live` | gauge | capability leases over all streams; forgotten handles stay counted |
 //! | `streams removed` | event | streams that went from active to retiring, once each |
-//! | `claims aborted at deadline` | event | deadline calls that won an abort (`ClaimDeadline::Aborted`) |
-//! | `claim deadlines resolved` | event | deadline calls that found an expired claim already terminal (`Resolved`); repeats per call |
-//! | `claim clock steps back` | event | deadline calls that re-anchored a timer (`ClockWentBack`); repeats per call |
-//! | `claim deadlines unrepresentable` | event | deadline calls whose expiry instant does not fit `u64` (`Unrepresentable`); repeats per call |
-//! | `claims waiting` | gauge | streams whose latest deadline call returned `Waiting` |
+//! | `claims aborted at deadline` | event | claims and blocks a deadline call aborted (`DeadlineReport::aborted`) |
+//! | `claim deadlines resolved` | event | expired points a deadline call found already terminal (`resolved`); repeats per call |
+//! | `claim clock steps back` | event | timers a deadline call re-anchored (`clock_went_back`); repeats per call |
+//! | `claim deadlines unrepresentable` | event | points whose expiry instant does not fit `u64` (`unrepresentable`); repeats per call |
+//! | `claims waiting` | gauge | streams whose latest deadline call reported `waiting` |
 //!
 //! The cells are allocated once, when the driver is created. A reader
 //! keeps the region alive after the driver is dropped; the driver's
@@ -188,6 +188,16 @@ impl DriverCounters {
     /// A read-only view for tools.
     pub(crate) fn reader(&self) -> CountersReader {
         self.reader.clone()
+    }
+
+    /// An event's current value.
+    #[cfg(test)]
+    pub(crate) fn value(&self, event: Event) -> u64 {
+        use karyos_sys::counters::CellRead;
+        match self.reader.read(self.counter(event).unwrap().index()) {
+            CellRead::Allocated { value, .. } => value,
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
 
