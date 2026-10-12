@@ -28,5 +28,6 @@ pub mod sizing;
 pub mod slot;
 pub mod sync;
 pub mod term;
+pub mod term_memory;
 
 pub use error::{LayoutError, SysError};
