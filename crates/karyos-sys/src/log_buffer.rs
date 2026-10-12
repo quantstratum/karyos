@@ -48,6 +48,9 @@ use crate::term_bytes::{HeapTerms, SharedTerms, TermBytes};
 
 mod concurrent;
 
+#[cfg(test)]
+use crate::loan::{Rotation, rotate_to};
+
 pub use concurrent::{ConcurrentClaim, ConcurrentClaimOutcome, ConcurrentPublication};
 
 mod sealed {

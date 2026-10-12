@@ -613,3 +613,79 @@ mod tests {
         assert_eq!(participant_quiescent(&words), Ok(true));
     }
 }
+
+/// What one rotation attempt did (SPEC.md §4 rotation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rotation {
+    /// The next term is active and the active count reached it (by this
+    /// attempt or an earlier one).
+    Completed,
+    /// A later term was observed: the rotation finished long ago; nothing
+    /// was written.
+    Superseded,
+    /// The next term is not prepared yet (the driver is behind).
+    NotReady,
+}
+
+/// One idempotent rotation attempt from term count `next - 1` to `next`,
+/// whose slot descriptor is `descriptor` and should name `term_id` READY
+/// or ACTIVE: activate it, then advance the active count. Safe to repeat,
+/// and by any number of helpers; a helper paused across later rotations
+/// finds a later term and stops without writing.
+///
+/// # Errors
+///
+/// Returns descriptor decoding errors, which indicate a broken invariant.
+pub fn rotate_to(
+    descriptor: &AtomicU64,
+    active_count: &AtomicU64,
+    term_id: TermId,
+    generation: Generation,
+    next: TermCount,
+) -> Result<Rotation, SysError> {
+    let found = Descriptor::decode(descriptor.load(Ordering::Acquire))?;
+    if found.term_id() != term_id {
+        // Reassigned to a later term, or not prepared yet.
+        return Ok(if superseded(active_count, next) {
+            Rotation::Superseded
+        } else {
+            Rotation::NotReady
+        });
+    }
+    match found.state() {
+        SlotState::Ready => {
+            match activate(
+                descriptor,
+                Descriptor::new(term_id, generation, SlotState::Ready),
+            ) {
+                Ok(_) => {}
+                // Changed since the load to something other than
+                // `ACTIVE(term)` (which `activate` accepts): the slot moved
+                // on to a later term while this helper paused.
+                Err(SysError::UnexpectedDescriptor { .. }) => return Ok(Rotation::Superseded),
+                Err(error) => return Err(error),
+            }
+        }
+        SlotState::Active => {}
+        SlotState::Reclaiming | SlotState::Cleaning | SlotState::Free => {
+            return Ok(Rotation::Superseded);
+        }
+    }
+    let previous = u64::from(next.get()).wrapping_sub(1);
+    match active_count.compare_exchange(
+        previous,
+        u64::from(next.get()),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => Ok(Rotation::Completed),
+        Err(found) if found == u64::from(next.get()) => Ok(Rotation::Completed),
+        Err(found) if found > u64::from(next.get()) => Ok(Rotation::Superseded),
+        Err(_) => Ok(Rotation::NotReady),
+    }
+}
+
+/// Whether the active count already passed `next`.
+fn superseded(active_count: &AtomicU64, next: TermCount) -> bool {
+    active_count.load(Ordering::Acquire) > u64::from(next.get())
+}
