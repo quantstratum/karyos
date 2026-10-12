@@ -16,7 +16,7 @@ pub mod subscription;
 
 pub use conductor::{ClientConductor, Completion, ConductorError, ConductorPoll, Outcome};
 pub use error::ClientError;
-pub use publication::{ClientPublication, OfferOutcome};
+pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
     Aborted, ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,
 };

@@ -611,7 +611,8 @@ impl<O: BufferOwner> Publication<O> {
     ///
     /// Returns [`SysError::EmptyMessage`], layout errors for messages that
     /// are too large, and [`SysError::MaxPositionExceeded`] when the next
-    /// term would reach `2^31`. Nothing is written on error.
+    /// term would reach `2^31`. Nothing new is reserved or written on
+    /// error; a forgotten claim is still resolved first.
     pub fn append(
         &mut self,
         payload: &[u8],
@@ -688,6 +689,16 @@ impl<O: BufferOwner> Publication<O> {
     /// the standing write loan, as dropping it does. The publication is
     /// issued once: closing does not let the buffer issue another.
     pub fn close(self) {}
+
+    /// Resolves a forgotten claim: aborts its decision word unless it is
+    /// already terminal and clears its record. Every mutable operation of
+    /// the publication (`append`, `try_claim`, `close`) and its drop do
+    /// this first; a wrapper whose mutable operation may return early
+    /// without calling into the publication calls it itself
+    /// (`quantstratum-docs: karyos/design/client-claims.md`). A no-op without a forgotten claim.
+    pub fn resolve_forgotten_claim(&mut self) {
+        self.resolve_claim();
+    }
 
     /// Aborts the outstanding claim, if any, and clears its record. Called
     /// only where no reference into the block can remain: by the next call

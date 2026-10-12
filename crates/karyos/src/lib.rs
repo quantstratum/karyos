@@ -7,9 +7,9 @@
 //! client conductor) and the error type aggregating client errors. The Archive and Cluster APIs do not exist yet.
 
 pub use karyos_client::{
-    ClientConductor, ClientError, ClientPublication, ClientSubscription, Completion,
-    ConductorError, ConductorPoll, MessageInfo, MessageLimit, OfferOutcome, Outcome, Overrun,
-    PollError, PollSummary,
+    Aborted, ClaimOutcome, ClientClaim, ClientConductor, ClientError, ClientPublication,
+    ClientSubscription, CommitOutcome, Completion, ConductorError, ConductorPoll, MessageInfo,
+    MessageLimit, OfferOutcome, Outcome, Overrun, PollError, PollSummary,
 };
 
 /// Every error of the public Karyos API.
