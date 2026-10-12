@@ -166,6 +166,23 @@ impl HeapWords {
         Some(unsafe { &*pointer })
     }
 
+    /// The `len` words starting at `start`, if in bounds, without forming a
+    /// view of the whole region.
+    #[must_use]
+    pub(crate) fn range(&self, start: usize, len: usize) -> Option<&[AtomicU64]> {
+        let end = start.checked_add(len)?;
+        if end > self.count {
+            return None;
+        }
+        // SAFETY: `start <= end <= count`, so the pointer stays inside (or
+        // one past) the live allocation owned by `self`.
+        let pointer = unsafe { self.base.as_ptr().add(start) };
+        // SAFETY: the `len` words from `pointer` are initialized `AtomicU64`s
+        // of the allocation and live as long as `self`, which the slice
+        // borrows; `AtomicU64` permits shared mutation.
+        Some(unsafe { core::slice::from_raw_parts(pointer, len) })
+    }
+
     /// Views the words.
     #[must_use]
     pub fn words(&self) -> AtomicWords<'_> {

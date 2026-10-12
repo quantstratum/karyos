@@ -525,7 +525,7 @@ mod owned {
         }
 
         #[cfg(test)]
-        pub(super) fn seed(&self, position: u64) {
+        pub(crate) fn seed(&self, position: u64) {
             if let Ok(words) = self.region.words() {
                 words.seed(position);
             }
