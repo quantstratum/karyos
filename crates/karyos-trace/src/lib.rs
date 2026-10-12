@@ -14,6 +14,7 @@
 pub mod attribution;
 pub mod clocks;
 pub mod error;
+pub mod histogram;
 pub mod journal;
 pub mod record;
 pub mod sampling;
@@ -23,6 +24,7 @@ pub use clocks::{
     Calibration, CalibrationError, ClockKey, Latency, Observation, Unavailable, latency,
 };
 pub use error::TraceError;
+pub use histogram::{Histogram, HistogramError, Quantile};
 pub use journal::{Collected, ObserverId, TraceCollector, TraceWriter, trace_journal};
 pub use record::{
     MAX_LANE, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId, RECORD_VERSION,
