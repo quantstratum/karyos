@@ -1528,13 +1528,21 @@ mod shared_tests {
                     }
                 }
             });
+            // Stops the writer however the reader ends, so a reader panic
+            // fails the test instead of hanging it in the scope's join.
+            struct StopOnDrop<'a>(&'a AtomicBool);
+            impl Drop for StopOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let _stop = StopOnDrop(&stop);
             let mut out = vec![0u8; 8192];
             for _ in 0..rounds {
                 if let Ok(PollOutcome::Message { length, .. }) = subscription.poll(&mut out) {
                     assert!(length as usize <= out.len());
                 }
             }
-            stop.store(true, Ordering::Relaxed);
         });
     }
 }
