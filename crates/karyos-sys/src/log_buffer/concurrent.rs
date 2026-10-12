@@ -126,7 +126,9 @@ impl<O: BufferOwner> Conductor<O> {
     /// # Errors
     ///
     /// Returns [`SysError::InvalidPublicationMode`] for an exclusive
-    /// buffer, and errors from the descriptor protocol.
+    /// buffer, [`SysError::ResourcesUnavailable`] when the claim staging of
+    /// a shared buffer cannot be allocated (no slot is taken then), and
+    /// errors from the descriptor protocol (the slot is given back).
     pub fn concurrent_publication(&mut self) -> Result<Option<ConcurrentPublication<O>>, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         if !buffer.concurrent() {
@@ -301,8 +303,11 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     ///
     /// Returns [`SysError::EmptyMessage`] and
     /// [`LayoutError::MessageTooLarge`] when `length` exceeds
-    /// `max_message_length`, one fragment or `max_reserved`. An error makes
-    /// no new reservation; a forgotten claim is still resolved first.
+    /// `max_message_length`, one fragment or `max_reserved`, and
+    /// [`SysError::MaxPositionExceeded`] at the last term. A validation
+    /// error reserves nothing (a forgotten claim is still resolved first);
+    /// an error after the reservation means another party marked a block
+    /// this handle owns.
     pub fn try_claim(
         &mut self,
         length: u32,
