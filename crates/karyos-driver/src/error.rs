@@ -23,6 +23,9 @@ pub enum DriverError {
         /// Session alias.
         session_id: i32,
     },
+    /// The process has used every driver identity.
+    #[error("driver identities exhausted")]
+    DriverIdsExhausted,
     /// The stream's publication has already been taken.
     #[error("the stream's publication has already been taken")]
     PublicationTaken,

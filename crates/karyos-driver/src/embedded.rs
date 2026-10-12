@@ -55,20 +55,22 @@ pub struct EmbeddedDriver {
     streams: Vec<Stream>,
 }
 
-impl Default for EmbeddedDriver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl EmbeddedDriver {
     /// An empty driver.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            id: NEXT_DRIVER.fetch_add(1, Ordering::Relaxed),
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::DriverIdsExhausted`] once the process has
+    /// created `u64::MAX - 1` drivers; identities are never reused, so a
+    /// stale handle can never name another driver's stream.
+    pub fn new() -> Result<Self, DriverError> {
+        let id = NEXT_DRIVER
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| DriverError::DriverIdsExhausted)?;
+        Ok(Self {
+            id,
             streams: Vec::new(),
-        }
+        })
     }
 
     /// Creates a stream (control path: allocates its log buffer).
@@ -118,11 +120,7 @@ impl EmbeddedDriver {
             .buffer
             .publication_owned()?
             .ok_or(DriverError::PublicationTaken)?;
-        Ok(ClientPublication::new(
-            inner,
-            Arc::clone(&stream.buffer),
-            stream.allow_unconnected,
-        ))
+        Ok(ClientPublication::new(inner, stream.allow_unconnected))
     }
 
     /// Admits a subscriber to the stream (control path: allocates its copy
@@ -139,10 +137,7 @@ impl EmbeddedDriver {
     ) -> Result<ClientSubscription, DriverError> {
         let stream = self.stream(stream)?;
         let inner = stream.conductor.subscribe(role)?;
-        Ok(ClientSubscription::new(
-            inner,
-            stream.buffer.max_message_length(),
-        ))
+        Ok(ClientSubscription::new(inner))
     }
 
     /// Runs one conductor duty cycle on every stream. Returns the number of

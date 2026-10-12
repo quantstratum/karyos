@@ -39,21 +39,16 @@ pub enum OfferOutcome {
 #[derive(Debug)]
 pub struct ClientPublication {
     inner: Publication<Arc<LogBuffer>>,
-    buffer: Arc<LogBuffer>,
     allow_unconnected: bool,
 }
 
 impl ClientPublication {
-    /// Wraps the buffer's publication.
+    /// Wraps the buffer's publication. Connectivity, limits and the lane
+    /// are read from the buffer the publication itself appends to.
     #[must_use]
-    pub fn new(
-        inner: Publication<Arc<LogBuffer>>,
-        buffer: Arc<LogBuffer>,
-        allow_unconnected: bool,
-    ) -> Self {
+    pub fn new(inner: Publication<Arc<LogBuffer>>, allow_unconnected: bool) -> Self {
         Self {
             inner,
-            buffer,
             allow_unconnected,
         }
     }
@@ -62,7 +57,7 @@ impl ClientPublication {
     #[inline]
     #[must_use]
     pub fn max_message_length(&self) -> u32 {
-        self.buffer.max_message_length()
+        self.inner.buffer().max_message_length()
     }
 
     /// Offers one message.
@@ -86,12 +81,12 @@ impl ClientPublication {
         payload: &[u8],
         options: AppendOptions,
     ) -> Result<OfferOutcome, ClientError> {
-        if !self.allow_unconnected && self.buffer.attached_subscribers() == 0 {
+        if !self.allow_unconnected && self.inner.buffer().attached_subscribers() == 0 {
             return Ok(OfferOutcome::NotConnected);
         }
         Ok(match self.inner.append(payload, options)? {
             AppendOutcome::Appended { position } => OfferOutcome::Accepted {
-                lane: self.buffer.lane(),
+                lane: self.inner.buffer().lane(),
                 position,
             },
             AppendOutcome::BackPressured => OfferOutcome::BackPressured,

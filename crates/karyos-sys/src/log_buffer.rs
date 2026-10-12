@@ -427,6 +427,13 @@ pub struct Publication<O: BufferOwner> {
 }
 
 impl<O: BufferOwner> Publication<O> {
+    /// The buffer this publication appends to.
+    #[inline]
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer {
+        &self.buffer
+    }
+
     /// Appends one message (SPEC.md §4, exclusive offer).
     ///
     /// # Errors
@@ -722,6 +729,13 @@ pub struct Subscription<O: BufferOwner> {
 }
 
 impl<O: BufferOwner> Subscription<O> {
+    /// The buffer this subscription reads.
+    #[inline]
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer {
+        &self.buffer
+    }
+
     /// The read cursor: where the next copy starts. With a pending
     /// (unacknowledged) message the next poll rewinds to the acknowledged
     /// position instead; see [`Subscription::acknowledged_position`].
@@ -745,9 +759,11 @@ impl<O: BufferOwner> Subscription<O> {
     /// Returns [`SysError::BufferTooShort`] when `out` is too small,
     /// [`SysError::RequiredSubscriberLapped`] when a required subscriber's
     /// data is gone, and [`SysError::CorruptTerm`] for inconsistent published
-    /// geometry. On error the acknowledged position and any pending message
-    /// are preserved; the read cursor may have been rewound to the
-    /// acknowledged position for redelivery.
+    /// geometry. On error a pending message and its acknowledgement are
+    /// preserved, and the read cursor may have been rewound to the
+    /// acknowledged position for redelivery. A PAD stepped over before the
+    /// failing read is still acknowledged: the acknowledged position can
+    /// advance past it.
     pub fn poll(&mut self, out: &mut [u8]) -> Result<PollOutcome, SysError> {
         SubscriptionContext {
             buffer: &self.buffer,

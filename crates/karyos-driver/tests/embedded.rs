@@ -58,7 +58,7 @@ fn offer_retrying(
 
 #[test]
 fn not_connected_without_subscribers_unless_allowed() {
-    let mut driver = EmbeddedDriver::new();
+    let mut driver = EmbeddedDriver::new().unwrap();
     let strict = driver.add_stream(config(false)).unwrap();
     let mut publication = driver.publication(strict).unwrap();
     assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::NotConnected);
@@ -92,7 +92,7 @@ fn not_connected_without_subscribers_unless_allowed() {
 
 #[test]
 fn messages_flow_through_many_rotations_with_limits() {
-    let mut driver = EmbeddedDriver::new();
+    let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(config(false)).unwrap();
     let mut subscription = driver.subscribe(stream, Role::Required).unwrap();
     let mut publication = driver.publication(stream).unwrap();
@@ -125,7 +125,7 @@ fn messages_flow_through_many_rotations_with_limits() {
 
 #[test]
 fn a_panicking_required_handler_gets_the_message_again() {
-    let mut driver = EmbeddedDriver::new();
+    let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(config(false)).unwrap();
     let mut subscription = driver.subscribe(stream, Role::Required).unwrap();
     let mut publication = driver.publication(stream).unwrap();
@@ -151,7 +151,7 @@ fn a_panicking_required_handler_gets_the_message_again() {
 
 #[test]
 fn optional_overruns_are_reported_and_extensions_pass_through() {
-    let mut driver = EmbeddedDriver::new();
+    let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(config(false)).unwrap();
     let mut lagging = driver.subscribe(stream, Role::Optional).unwrap();
     let mut publication = driver.publication(stream).unwrap();
@@ -185,7 +185,7 @@ fn optional_overruns_are_reported_and_extensions_pass_through() {
 #[test]
 fn publisher_and_subscribers_on_threads_with_manual_duty() {
     let total: u32 = 2000;
-    let mut driver = EmbeddedDriver::new();
+    let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(config(false)).unwrap();
     let mut required = driver.subscribe(stream, Role::Required).unwrap();
     let mut publication = driver.publication(stream).unwrap();
@@ -232,7 +232,7 @@ fn publisher_and_subscribers_on_threads_with_manual_duty() {
 
 #[test]
 fn an_optional_handler_panic_is_not_replayed() {
-    let mut driver = EmbeddedDriver::new();
+    let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(config(false)).unwrap();
     let mut subscription = driver.subscribe(stream, Role::Optional).unwrap();
     let mut publication = driver.publication(stream).unwrap();
@@ -257,14 +257,14 @@ fn an_optional_handler_panic_is_not_replayed() {
 
 #[test]
 fn limits_handles_and_maximum_sizes() {
-    let mut driver = EmbeddedDriver::new();
+    let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(config(false)).unwrap();
     // Duplicate wire identity and foreign handles are rejected.
     assert!(matches!(
         driver.add_stream(config(false)),
         Err(DriverError::DuplicateStream { .. })
     ));
-    let mut other = EmbeddedDriver::new();
+    let mut other = EmbeddedDriver::new().unwrap();
     assert!(matches!(
         other.subscribe(stream, Role::Optional),
         Err(DriverError::UnknownStream { .. })
@@ -291,7 +291,7 @@ fn limits_handles_and_maximum_sizes() {
 
 #[test]
 fn streams_are_isolated_and_subscriber_cells_are_bounded() {
-    let mut driver = EmbeddedDriver::new();
+    let mut driver = EmbeddedDriver::new().unwrap();
     let first = driver.add_stream(config(false)).unwrap();
     let mut second_config = config(false);
     second_config.buffer.stream_id = 9;
@@ -339,4 +339,30 @@ fn streams_are_isolated_and_subscriber_cells_are_bounded() {
         driver.subscribe(second, Role::Optional),
         Err(DriverError::Sys(_))
     ));
+}
+
+#[test]
+fn a_poll_delivers_exactly_its_limit_from_a_longer_queue() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver.add_stream(config(false)).unwrap();
+    let mut subscription = driver.subscribe(stream, Role::Required).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    for sequence in 0..5 {
+        assert!(matches!(
+            publication.offer(&message(sequence)).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    let mut seen = Vec::new();
+    for (limit, expected) in [(2, 2), (2, 2), (10, 1), (10, 0)] {
+        let summary = subscription
+            .poll(
+                |bytes, _| seen.push(bytes.to_vec()),
+                MessageLimit::new(limit),
+            )
+            .unwrap();
+        assert_eq!(summary.delivered, expected);
+    }
+    let expected: Vec<_> = (0..5).map(message).collect();
+    assert_eq!(seen, expected);
 }

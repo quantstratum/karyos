@@ -94,9 +94,10 @@ pub struct ClientSubscription {
 
 impl ClientSubscription {
     /// Wraps a log buffer subscription, allocating its private copy buffer
-    /// (control path) for the buffer's largest message.
+    /// (control path) for the largest message of the buffer it reads.
     #[must_use]
-    pub fn new(inner: Subscription<Arc<LogBuffer>>, max_message_length: u32) -> Self {
+    pub fn new(inner: Subscription<Arc<LogBuffer>>) -> Self {
+        let max_message_length = inner.buffer().max_message_length();
         Self {
             inner,
             scratch: vec![0u8; max_message_length as usize].into_boxed_slice(),
@@ -116,7 +117,9 @@ impl ClientSubscription {
     ///
     /// Returns [`PollError`] carrying the deliveries handled before a
     /// lower-layer failure, such as a required subscription whose data is
-    /// gone.
+    /// gone. A message handed to the handler and not yet acknowledged stays
+    /// pending for redelivery; a PAD stepped over before the failure may
+    /// still have been acknowledged.
     pub fn poll<H>(
         &mut self,
         mut handler: H,
