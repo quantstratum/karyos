@@ -412,7 +412,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         // Under the handle's loan on `count`, the slot holds `count`.
         let offset = tail.load(Ordering::Acquire) as u32;
         // The last representable term has no successor: a reservation
-        // that would reach its end is refused before any `fetch_add`, every
+        // that would exceed its end is refused before any `fetch_add`, every
         // time (SPEC.md §4: positions stop at `2^31` terms).
         if count.next().is_err() && u64::from(offset) + u64::from(reserved) > u64::from(term_length)
         {
