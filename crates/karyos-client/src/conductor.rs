@@ -303,7 +303,13 @@ impl ClientConductor {
         F: FnMut(Completion),
     {
         let mut report = ConductorPoll::default();
-        self.deliver_unknown(&mut on);
+        // A closed client resolves its pending requests now, however small
+        // the budget and however busy the broadcast buffer.
+        if self.closed() {
+            self.fail_pending(&mut on);
+        } else {
+            self.deliver_unknown(&mut on);
+        }
         while report.records < limit {
             // Copy what is needed out of the receiver before acting on it.
             let step = match self.receiver.receive() {

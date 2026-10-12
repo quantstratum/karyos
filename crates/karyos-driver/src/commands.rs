@@ -450,6 +450,44 @@ mod tests {
     }
 
     #[test]
+    fn a_retired_client_resolves_pending_under_a_tiny_poll_budget() {
+        let mut driver = driver();
+        let mut retired = driver.connect().unwrap();
+        let mut busy = driver.connect().unwrap();
+        let request = retired
+            .add_subscription(
+                StreamKey {
+                    stream_id: 9,
+                    session_id: 1,
+                },
+                SubscriberRole::Optional,
+            )
+            .unwrap();
+        driver.retire_faulty(0);
+        // The busy client keeps one response per cycle in the broadcast; the
+        // retired client polls one record per cycle and never sees Pending.
+        let mut done = Vec::new();
+        for _ in 0..3 {
+            let _ = busy
+                .add_subscription(
+                    StreamKey {
+                        stream_id: 9,
+                        session_id: 1,
+                    },
+                    SubscriberRole::Optional,
+                )
+                .unwrap();
+            let _ = driver.do_work().unwrap();
+            let report = retired.poll(1, |completion| done.push(completion));
+            assert!(!report.drained);
+            let _ = busy.poll(usize::MAX, |_| {});
+        }
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].sequence, request);
+        assert!(matches!(done[0].outcome, Outcome::Unknown));
+    }
+
+    #[test]
     fn another_clients_registration_cannot_be_removed() {
         let mut driver = driver();
         let mut owner = driver.connect().unwrap();
