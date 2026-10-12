@@ -90,8 +90,9 @@ pub enum CommitOutcome {
 /// A claimed block of a [`ClientPublication`] (SPEC.md §4 claims). It
 /// mutably borrows the publication; [`ClientClaim::commit`] publishes it,
 /// and [`ClientClaim::abort`] or dropping it uncommitted aborts it. A claim
-/// forgotten with `mem::forget` is aborted by the publication's next call,
-/// or when it is dropped.
+/// forgotten with `mem::forget` is aborted by the publication's next mutable
+/// operation (`offer`, `offer_with`, `try_claim`, `try_claim_with`), or when
+/// the publication is dropped.
 ///
 /// The payload cannot outlive the claim:
 ///
@@ -237,6 +238,10 @@ impl ClientPublication {
 
     /// Offers one message with header options (EOS, reserved value, an
     /// opaque trace extension).
+    ///
+    /// A forgotten claim is aborted first, even when the offer then returns
+    /// `NotConnected` or an error: that may publish the earlier claim's
+    /// `ABORTED` word, but such a return never makes a new reservation.
     ///
     /// # Errors
     ///
