@@ -21,25 +21,28 @@ users; it is compiled only by `make loom`.
 
 ## Resolved graph
 
-[`dependency-inventory.tsv`](dependency-inventory.tsv) lists every external
-package in the resolved graph with its version, source, licence, whether it
-has a build script, how the workspace reaches it and its target conditions.
-It is generated from `Cargo.lock` by `scripts/dependency-inventory.py`
-(`make deps-inventory`); CI fails when the committed file is stale. Reach
-classes:
+[`dependency-inventory.json`](dependency-inventory.json) lists every external
+package in the resolved graph: package id, version, source, licence, build
+script and proc macro flags, resolved features, every incoming edge (kind and
+raw target condition), reach class and effective target conditions along
+each path. It is generated from `Cargo.lock` by
+`scripts/dependency-inventory.py` (`make deps-inventory`); `make deps-check`
+runs in CI and fails when the committed file is stale, so a lockfile, feature
+or build-script change cannot reuse old admission evidence. Reach classes:
 
 - `runtime`: linked into Karyos builds (`thiserror`).
 - `build`: runs only at compile time, as a proc macro or its dependency
   (`thiserror-impl`, `syn`, `quote`, `proc-macro2`, `unicode-ident`).
   ADR-0033 approves `syn`, `quote` and `proc-macro2` for the codec; here they
   enter through `thiserror`'s derive.
-- `loom`: compiled only with `--cfg loom` (`make loom`), never in normal,
-  test or release builds. 30 of the 36 packages are in this class.
+- `loom-runtime` and `loom-build`: the same classes reached only through the
+  `cfg(loom)` dependency, compiled only by `make loom`, never in normal, test
+  or release builds. 30 of the 36 packages are in these classes.
 
-Target conditions that exclude packages from the supported targets:
-`windows-sys` and `windows-result` (`cfg(windows)`) and `valuable`
-(`cfg(tracing_unstable)`, a flag Karyos never sets). `libc` is `cfg(unix)`
-and is reached only under `--cfg loom`.
+Effective target conditions that exclude packages from the supported
+targets: `windows-sys`, `windows-result` and `windows-link` (`cfg(windows)`)
+and `valuable` (`cfg(tracing_unstable)`, a flag Karyos never sets). `libc` is
+`cfg(unix)` and reached only under `--cfg loom`.
 
 ## Build scripts
 

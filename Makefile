@@ -26,10 +26,10 @@ deny:
 	$(CARGO) deny check
 
 deps-inventory:
-	python3 scripts/dependency-inventory.py > quantstratum-docs: karyos/dependency-inventory.tsv
+	python3 scripts/dependency-inventory.py > deps/dependency-inventory.json
 
 deps-check:
-	python3 scripts/dependency-inventory.py | diff -u quantstratum-docs: karyos/dependency-inventory.tsv -
+	python3 scripts/dependency-inventory.py | diff -u deps/dependency-inventory.json -
 
 lint-sync:
 	scripts/check-lint-sync.sh
