@@ -51,21 +51,40 @@ impl StreamLeases {
     }
 }
 
-/// One capability lease; dropping it ends the lease (Release).
+/// Set when a registration's capability is gone (its lease ended), so the
+/// driver can forget the registration.
+#[derive(Debug, Default)]
+pub struct LeaseEnd {
+    ended: AtomicBool,
+}
+
+impl LeaseEnd {
+    /// Whether the lease ended (Acquire).
+    #[must_use]
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::Acquire)
+    }
+}
+
+/// One capability lease; dropping it ends the lease (Release): the stream's
+/// count drops and the registration's end flag is set.
 #[derive(Debug)]
 pub struct Lease {
     leases: Arc<StreamLeases>,
+    end: Arc<LeaseEnd>,
 }
 
 impl Lease {
-    /// Starts a lease on `leases`. Called by the driver when it creates a
+    /// Starts a lease on `leases` for one registration, whose end is
+    /// reported through `end`. Called by the driver when it creates a
     /// capability.
     #[must_use]
-    pub fn acquire(leases: &Arc<StreamLeases>) -> Self {
+    pub fn acquire(leases: &Arc<StreamLeases>, end: &Arc<LeaseEnd>) -> Self {
         // A lease count cannot reach u64::MAX: each lease is a live object.
         leases.live.fetch_add(1, Ordering::Relaxed);
         Self {
             leases: Arc::clone(leases),
+            end: Arc::clone(end),
         }
     }
 }
@@ -73,6 +92,7 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         self.leases.live.fetch_sub(1, Ordering::Release);
+        self.end.ended.store(true, Ordering::Release);
     }
 }
 

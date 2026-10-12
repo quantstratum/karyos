@@ -269,6 +269,7 @@ impl EmbeddedDriver {
     /// Returns the first conductor error, which indicates a broken invariant.
     pub fn do_work(&mut self) -> Result<u32, DriverError> {
         self.retire_closed_clients();
+        self.sweep_ended_registrations();
         let mut work = self.serve_commands();
         for stream in &mut self.streams {
             let report = stream.conductor.duty_cycle()?;
