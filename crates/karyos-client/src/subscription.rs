@@ -17,6 +17,7 @@ use karyos_sys::frame::EXTENSION_LENGTH;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, Subscription};
 
 use crate::error::ClientError;
+use crate::link::Origin;
 
 /// Metadata delivered with each message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +91,7 @@ pub struct PollError {
 pub struct ClientSubscription {
     inner: Subscription<Arc<LogBuffer>>,
     scratch: Box<[u8]>,
+    origin: Option<Origin>,
 }
 
 impl ClientSubscription {
@@ -101,7 +103,23 @@ impl ClientSubscription {
         Self {
             inner,
             scratch: vec![0u8; max_message_length as usize].into_boxed_slice(),
+            origin: None,
         }
+    }
+
+    /// Wraps a subscription handed over through a client conductor; the
+    /// handle keeps the stream's lease until it is dropped.
+    #[must_use]
+    pub fn from_hand_over(inner: Subscription<Arc<LogBuffer>>, origin: Origin) -> Self {
+        let mut subscription = Self::new(inner);
+        subscription.origin = Some(origin);
+        subscription
+    }
+
+    /// The owner and registration, for a handle from a client conductor.
+    #[must_use]
+    pub fn origin(&self) -> Option<&Origin> {
+        self.origin.as_ref()
     }
 
     /// Delivers up to `message_limit` messages to `handler`.

@@ -8,6 +8,7 @@ use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, LogBuffer, Publication};
 
 use crate::error::ClientError;
+use crate::link::Origin;
 
 /// Result of an offer. Each call performs at most one append attempt:
 /// padding, rotation and waiting for the driver are reported to the caller
@@ -40,6 +41,7 @@ pub enum OfferOutcome {
 pub struct ClientPublication {
     inner: Publication<Arc<LogBuffer>>,
     allow_unconnected: bool,
+    origin: Option<Origin>,
 }
 
 impl ClientPublication {
@@ -50,7 +52,29 @@ impl ClientPublication {
         Self {
             inner,
             allow_unconnected,
+            origin: None,
         }
+    }
+
+    /// Wraps a publication handed over through a client conductor; the
+    /// handle keeps the stream's lease until it is dropped.
+    #[must_use]
+    pub fn from_hand_over(
+        inner: Publication<Arc<LogBuffer>>,
+        allow_unconnected: bool,
+        origin: Origin,
+    ) -> Self {
+        Self {
+            inner,
+            allow_unconnected,
+            origin: Some(origin),
+        }
+    }
+
+    /// The owner and registration, for a handle from a client conductor.
+    #[must_use]
+    pub fn origin(&self) -> Option<&Origin> {
+        self.origin.as_ref()
     }
 
     /// Largest message accepted without a trace extension.
