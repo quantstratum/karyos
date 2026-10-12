@@ -77,9 +77,11 @@ pub enum ConflationError {
 ///
 /// This is the protocol layer, exposed for models and for backings built on
 /// it; it does not enforce its own preconditions. Values are coherent only
-/// if at most one thread ever calls [`SlotWords::write`] on a slot (the view
-/// is `Copy`, so nothing stops a second writer) and the words start zeroed
-/// or as left by earlier writes through this protocol. Memory safety never
+/// if a slot has a single logical writer: its [`SlotWords::write`] calls
+/// never overlap, and when they move to another thread the handoff is
+/// synchronized (the view is `Copy`, so nothing here stops a second writer);
+/// and if the words start zeroed or as left by earlier writes through this
+/// protocol. Memory safety never
 /// depends on this: every access is atomic and bounds-checked. The owned
 /// [`conflation`] API enforces both conditions with its single
 /// [`ConflationWriter`].
