@@ -108,9 +108,16 @@ fn floor_billionths(numerator: i128) -> i128 {
     numerator.div_euclid(BILLION)
 }
 
-/// Ceiling of `numerator / BILLION`.
+/// Ceiling of `numerator / BILLION`, from the floor and the remainder, so it
+/// never negates `i128::MIN` (the quotient is far from the type's bounds, so
+/// adding one cannot overflow).
 fn ceil_billionths(numerator: i128) -> i128 {
-    -(-numerator).div_euclid(BILLION)
+    let floor = numerator.div_euclid(BILLION);
+    if numerator.rem_euclid(BILLION) == 0 {
+        floor
+    } else {
+        floor + 1
+    }
 }
 
 impl Calibration {

@@ -278,3 +278,28 @@ fn review_acceptance_vectors() {
         available(3, 3)
     );
 }
+
+/// Review regression: a drift product equal to `i128::MIN` is computed
+/// without negating it, and the latency is unavailable or bounded, never a
+/// panic.
+#[test]
+fn a_product_equal_to_i128_min_does_not_panic() {
+    let extreme = Calibration {
+        drift: i64::MIN,
+        drift_uncertainty: 1 << 63,
+        ..calibration(0, 0)
+    };
+    let a = at(clock(OBSERVER_A, 0), 1 << 63, 0);
+    let b = at(clock(OBSERVER_B, 0), 0, 0);
+    assert_eq!(
+        latency(&a, &b, &[extreme]),
+        Latency::Unavailable(Unavailable::Overflow)
+    );
+    assert_eq!(
+        ceil_billionths(i128::MIN),
+        i128::MIN.div_euclid(BILLION) + 1
+    );
+    assert_eq!(ceil_billionths(-1), 0);
+    assert_eq!(ceil_billionths(1), 1);
+    assert_eq!(ceil_billionths(-BILLION), -1);
+}
