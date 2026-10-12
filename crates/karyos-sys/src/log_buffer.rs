@@ -1850,6 +1850,12 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     /// subscriber is never lapped while it bounds the publisher; if it ever
     /// finds its data gone, that is an error and its cursor does not move.
     fn overrun(&mut self) -> Result<Step, SysError> {
+        self.overrun_with(&mut || {})
+    }
+
+    /// [`SubscriptionContext::overrun`] with `between` run between the
+    /// floor and head reads (tests reproduce a pause there).
+    fn overrun_with(&mut self, between: &mut dyn FnMut()) -> Result<Step, SysError> {
         if self.cursor.role == Role::Required {
             return Err(SysError::RequiredSubscriberLapped {
                 position: self.cursor.position,
@@ -1859,6 +1865,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         // The floor first: the head read after it is at or above it (the
         // conductor publishes a floor only from an earlier head snapshot).
         let lost_to = self.buffer.floor.load(Ordering::Acquire).max(from);
+        between();
         let Some(head) = self.buffer.head()? else {
             // No consistent head now: retry later instead of rejoining.
             return Ok(Step::Done(PollOutcome::Pending));

@@ -1690,11 +1690,13 @@ fn an_injected_deadline_fault_leaves_the_protocol_state_intact() {
 
 // Concurrent mode, batch a1 (quantstratum-docs: karyos/design/concurrent-publication.md).
 
+/// Infrastructure fixture: allows targets without LSE, so the tests run
+/// everywhere; the LSE refusal is tested explicitly.
 fn concurrent_config(publishers: u8) -> LogBufferConfig {
     LogBufferConfig {
         publication: PublicationMode::Concurrent {
             publishers,
-            allow_non_lse: false,
+            allow_non_lse: true,
         },
         // 3 publishers + 2 optional subscribers fit S - C = 5.
         ..config(6, 4)
@@ -1723,7 +1725,14 @@ fn concurrent_mode_creation_checks() {
     };
     assert!(matches!(new_buffer(tight), Err(SysError::ResourcesUnavailable)));
     // Without a single-instruction fetch_add only with explicit allowance.
-    let config = concurrent_config(2);
+    let config = LogBufferConfig {
+        publication: PublicationMode::Concurrent {
+            publishers: 2,
+            allow_non_lse: false,
+        },
+        ..concurrent_config(2)
+    };
+    assert!(check_publication_mode_on(&config, true).is_ok());
     assert!(matches!(
         check_publication_mode_on(&config, false),
         Err(SysError::InvalidPublicationMode { .. })
@@ -1836,4 +1845,46 @@ fn the_deadline_service_is_idle_for_concurrent_buffers() {
             .unwrap(),
         ClaimDeadline::Idle
     );
+}
+
+/// A rejoin never resumes inside the range it reports lost, even when the
+/// floor and the head advance between its two reads.
+#[test]
+fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // Lap the subscriber: its position falls below the floor.
+    while buffer.floor.load(Ordering::Acquire) < TERM {
+        let _ = append_retrying(&mut publication, &mut conductor, &message(1), || {});
+    }
+    let before = buffer.reserved_head.load(Ordering::Acquire);
+    let mut context = SubscriptionContext {
+        buffer: &buffer,
+        cursor: &mut subscription.cursor,
+    };
+    // Between the reads, the head moves more than a window ahead and the
+    // conductor publishes a floor above the old head.
+    let step = context
+        .overrun_with(&mut || {
+            while buffer.reserved_head.load(Ordering::Acquire) <= before + TERM / 2 {
+                let _ = append_retrying(&mut publication, &mut conductor, &message(2), || {});
+            }
+            let _ = conductor.duty_cycle().unwrap();
+            assert!(buffer.floor.load(Ordering::Acquire) > before);
+        })
+        .unwrap();
+    match step {
+        Step::Done(PollOutcome::Overrun {
+            from,
+            lost_to,
+            resume,
+        }) => {
+            assert!(from < lost_to);
+            assert!(lost_to <= resume, "resumed inside the lost range");
+        }
+        Step::Done(PollOutcome::Pending) => {}
+        _ => panic!("unexpected step"),
+    }
 }
