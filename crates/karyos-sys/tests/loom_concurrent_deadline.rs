@@ -12,11 +12,16 @@
 //!   writer whose mark fails finds the exact marker or the span's
 //!   `ABORTED`, never a word that reads as a reserved one;
 //! - the walk against a reader: the marker is never read as terminal, and
-//!   a reader that sees the span's `ABORTED` sees every marker of it.
+//!   a reader that sees the span's `ABORTED` sees every marker of it;
+//! - payload exclusion: a writer of a two-boundary block writes its
+//!   payload over its interior boundary only after its mark succeeded, and
+//!   the walk writes that boundary only after taking the block's first
+//!   word; the two plain writes never race.
 //!
 //! Negative controls must fail: the walk storing `ABORTED` before marking,
 //! a terminal store after a lost first compare-exchange, a marker equal to
-//! a valid reserved word, and a walk passing a non-zero word.
+//! a valid reserved word, a walk passing a non-zero word, and a writer
+//! writing its payload after a failed mark (a data race Loom reports).
 //!
 //! Exploration: default Loom bounds; the walk and two writers, or the walk
 //! and one reader.
@@ -31,6 +36,7 @@ use karyos_sys::publication::{
     take_span_word,
 };
 use karyos_sys::sync::{AtomicU64, Ordering};
+use loom::cell::UnsafeCell;
 use loom::sync::Arc;
 use loom::thread;
 
@@ -239,4 +245,66 @@ fn the_marker_is_never_terminal_to_a_reader() {
 #[should_panic(expected = "aborted span published before its markers")]
 fn control_a_reader_sees_aborted_before_the_markers() {
     reader_model(Walk::StoreFirst);
+}
+
+/// The interior boundary of a two-boundary block as one plain location:
+/// the writer's payload, or the walk's marker over it.
+fn payload_model(write_after_failed_mark: bool) {
+    const PAYLOAD: u64 = 0xA;
+    const MARKER: u64 = 0xB;
+    let reserved = || {
+        Word0::new(
+            -64,
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Data,
+        )
+    };
+    let committed = || {
+        Word0::new(
+            40,
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Data,
+        )
+    };
+    loom::model(move || {
+        let first = Arc::new(AtomicU64::new(0));
+        let interior = Arc::new(UnsafeCell::new(0u64));
+        let writer = {
+            let (first, interior) = (Arc::clone(&first), Arc::clone(&interior));
+            thread::spawn(move || {
+                let marked = mark_block(&first, reserved());
+                if marked || write_after_failed_mark {
+                    // SAFETY: the pointer comes from a live `UnsafeCell`;
+                    // Loom checks that no access races with this write.
+                    interior.with_mut(|bytes| unsafe { *bytes = PAYLOAD });
+                }
+                if marked {
+                    assert!(commit_block(&first, reserved(), committed()));
+                }
+                marked
+            })
+        };
+        let owned = take_span_word(&first).is_ok();
+        if owned {
+            // SAFETY: as above; the walk owns the block's first word.
+            interior.with_mut(|bytes| unsafe { *bytes = MARKER });
+            end_span(&first, aborted(64));
+        }
+        let marked = writer.join().unwrap();
+        assert!(owned != marked, "the block has two owners or none");
+        // SAFETY: as above; both threads have finished.
+        let value = interior.with(|bytes| unsafe { *bytes });
+        assert_eq!(value, if marked { PAYLOAD } else { MARKER });
+    });
+}
+
+#[test]
+fn a_writer_and_the_walk_never_both_write_a_boundary() {
+    payload_model(false);
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn control_a_payload_write_after_a_failed_mark_races() {
+    payload_model(true);
 }

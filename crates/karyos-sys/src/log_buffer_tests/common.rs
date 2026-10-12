@@ -3044,3 +3044,39 @@ fn a_block_discovered_beside_stale_observations_keeps_its_timer() {
         }
     );
 }
+
+/// The production scan budget keeps a 128-fragment walk across unrelated
+/// cleaning.
+#[test]
+fn the_default_scan_budget_keeps_a_long_fragment_walk_across_cleaning() {
+    let buffer = new_buffer(LogBufferConfig {
+        mtu: 64,
+        ..deadline_concurrent_config(3)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    let mut writer = conductor.concurrent_publication().unwrap().unwrap();
+    let a = concurrent_claimed(first.try_claim(8, AppendOptions::default()));
+    let data = sized_message(2, 4096);
+    let _ = writer.offer(&data, AppendOptions::default()).unwrap();
+    let c = concurrent_claimed(second.try_claim(8, AppendOptions::default()));
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    let mut total = 0;
+    for cycle in 0..6 {
+        let mut cleaned = 0;
+        for _ in 0..1000 {
+            let _ = writer.offer(&data, AppendOptions::default()).unwrap();
+            cleaned += conductor.duty_cycle().unwrap().cleaned;
+            if cleaned > 0 {
+                break;
+            }
+        }
+        assert!(cleaned > 0);
+        total += serve(&mut conductor, DEADLINE * (cycle + 1)).aborted;
+    }
+    assert_eq!(total, 2);
+    assert_eq!(a.commit(), CommitOutcome::Aborted { position: 0 });
+    assert!(matches!(c.commit(), CommitOutcome::Aborted { .. }));
+}
