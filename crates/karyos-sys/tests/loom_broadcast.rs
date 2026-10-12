@@ -55,8 +55,16 @@ fn accepted_messages_are_never_mixed() {
             for _ in 0..3 {
                 match words.receive(&mut cursor, &mut out).unwrap() {
                     Receive::Message {
-                        type_id, length, ..
+                        position,
+                        type_id,
+                        length,
                     } => {
+                        // Logical identity: record n starts at (n - 1) * 16,
+                        // so a coherent newer record read at an older
+                        // position is caught.
+                        assert!((1..=3).contains(&type_id));
+                        assert_eq!(position, u64::from(type_id - 1) * 16);
+                        assert_eq!(cursor, position + 16);
                         assert_eq!(length, 8);
                         assert_eq!(out, payload(type_id), "mixed copy for {type_id}");
                         assert!(type_id > last, "out of order: {type_id} after {last}");

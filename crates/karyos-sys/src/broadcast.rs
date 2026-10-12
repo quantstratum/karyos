@@ -286,11 +286,13 @@ impl<'a> BroadcastWords<'a> {
             let type_id = u32::try_from(header >> 32).unwrap_or(PAD_TYPE);
             let to_end = self.capacity - (position & (self.capacity - 1));
             // Checked before any copy: a lapped header can hold arbitrary
-            // bits. A PAD fills exactly the rest of the area; a record fits
+            // bits. A PAD's length and extent equal the rest of the area; a
+            // record fits
             // both the record limit and the rest of the area.
             let fits = |extent: u64| {
                 if type_id == PAD_TYPE {
-                    extent == to_end
+                    // The writer only generates exact, aligned padding.
+                    extent == to_end && length == to_end
                 } else {
                     extent <= self.max_extent.min(to_end)
                 }
