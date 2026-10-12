@@ -18,7 +18,9 @@
 //! Scope: embedded mode (one process), one lane, copy delivery, `hold`
 //! required subscribers and `rejoin_at_head` optional subscribers. No
 //! concurrent publication, claims, observers, revocation policies or mapping
-//! generations.
+//! generations. This low-level copy primitive also allows a publication with
+//! no subscribers at all: the `NotConnected` / `allow_unconnected` connection
+//! rules of SPEC.md §4 are left to a later, higher layer.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
