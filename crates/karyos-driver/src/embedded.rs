@@ -33,6 +33,7 @@ use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::log_buffer::{Conductor, LogBuffer, LogBufferConfig, Role};
 
 use crate::commands::ClientSlot;
+use crate::counters::{DriverCounters, Event};
 use crate::error::DriverError;
 
 /// Limits and sizes of the control channel.
@@ -137,6 +138,7 @@ pub struct EmbeddedDriver {
     pub(crate) next_registration: u64,
     pub(crate) scan_cursor: usize,
     pub(crate) terminal: bool,
+    pub(crate) counters: DriverCounters,
 }
 
 impl EmbeddedDriver {
@@ -181,10 +183,12 @@ impl EmbeddedDriver {
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
             return Err(DriverError::InvalidConfig);
         }
+        let counters = DriverCounters::new()?;
         let id = NEXT_DRIVER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| DriverError::DriverIdsExhausted)?;
         Ok(Self {
+            counters,
             id,
             config,
             streams: Vec::new(),
@@ -230,6 +234,26 @@ impl EmbeddedDriver {
         })
     }
 
+    /// A read-only view of the driver's counters (SPEC.md §11), for tools.
+    #[must_use]
+    pub fn counters(&self) -> karyos_sys::counters::CountersReader {
+        self.counters.reader()
+    }
+
+    /// Sets the stream gauges from the current streams.
+    pub(crate) fn update_stream_gauges(&self) {
+        let retiring = self.streams.iter().filter(|s| s.retiring).count();
+        let active = self.streams.len() - retiring;
+        self.counters.set(
+            Event::StreamsActive,
+            u64::try_from(active).unwrap_or(u64::MAX),
+        );
+        self.counters.set(
+            Event::StreamsRetiring,
+            u64::try_from(retiring).unwrap_or(u64::MAX),
+        );
+    }
+
     /// Removes a stream: it stops accepting publications and subscriptions
     /// at once, and is freed by a later duty cycle once no capability or
     /// registration of it remains. Never waits and never revokes a live
@@ -242,11 +266,13 @@ impl EmbeddedDriver {
     /// stream.
     pub fn remove_stream(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
         self.stream(stream)?.retiring = true;
+        self.update_stream_gauges();
         Ok(())
     }
 
     /// Frees retiring streams with no live lease and no registration.
     pub(crate) fn free_retired_streams(&mut self) {
+        let before = self.streams.len();
         let registrations = &self.registrations;
         self.streams.retain(|stream| {
             !(stream.retiring
@@ -255,6 +281,14 @@ impl EmbeddedDriver {
                     .iter()
                     .any(|registration| registration.stream() == stream.id))
         });
+        let freed = before - self.streams.len();
+        if freed > 0 {
+            self.counters.add(
+                Event::StreamsFreed,
+                u64::try_from(freed).unwrap_or(u64::MAX),
+            );
+            self.update_stream_gauges();
+        }
     }
 
     /// Whether the driver is in its terminal state: the broadcast buffer is
@@ -303,6 +337,7 @@ impl EmbeddedDriver {
             stream_id: key.0,
             session_id: key.1,
         });
+        self.update_stream_gauges();
         Ok(StreamHandle {
             driver: self.id,
             stream: id,

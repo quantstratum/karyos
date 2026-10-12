@@ -24,6 +24,7 @@ use karyos_protocol::cnc::{
 use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::log_buffer::Role;
 
+use crate::counters::Event;
 use crate::embedded::EmbeddedDriver;
 use crate::error::DriverError;
 
@@ -83,6 +84,7 @@ impl EmbeddedDriver {
         let link = Arc::new(ClientLink::new());
         let receiver = self.broadcast.receiver();
         self.next_client = next;
+        self.counters.add(Event::ClientsAdmitted, 1);
         self.clients.push(ClientSlot {
             id,
             consumer: Some(consumer),
@@ -115,6 +117,7 @@ impl EmbeddedDriver {
         while let Some(slot) = self.clients.get(index) {
             if slot.link.is_closed() {
                 let slot = self.clients.swap_remove(index);
+                self.counters.add(Event::ClientsRetired, 1);
                 slot.link.drop_all(false);
                 self.registrations
                     .retain(|registration| registration.client != slot.id);
@@ -129,6 +132,9 @@ impl EmbeddedDriver {
     /// until its producer is known to be detached.
     fn retire_faulty(&mut self, index: usize) {
         if let Some(slot) = self.clients.get_mut(index) {
+            if slot.consumer.is_some() {
+                self.counters.add(Event::ClientsFaulty, 1);
+            }
             // Publish the closure to the producer before discarding the
             // consumer.
             if let Some(mut consumer) = slot.consumer.take() {
@@ -146,12 +152,21 @@ impl EmbeddedDriver {
     /// records. A registration whose handle was dropped by `remove` stays
     /// until its queued `Remove` is served (or its client is retired).
     pub(crate) fn sweep_ended_registrations(&mut self) {
+        let before = self.registrations.len();
         self.registrations
             .retain(|registration| registration.end.state() != LeaseState::Dropped);
+        let swept = before - self.registrations.len();
+        if swept > 0 {
+            self.counters.add(
+                Event::RegistrationsSwept,
+                u64::try_from(swept).unwrap_or(u64::MAX),
+            );
+        }
     }
 
     pub(crate) fn enter_terminal(&mut self) {
         self.terminal = true;
+        self.counters.set(Event::Terminal, 1);
         self.broadcast.close();
     }
 
@@ -199,14 +214,20 @@ impl EmbeddedDriver {
                 self.retire_faulty(index);
                 continue;
             };
+            self.counters.add(Event::CommandsServed, 1);
             let response = self.execute(client, &link, command);
+            if matches!(response, Response::Error { .. }) {
+                self.counters.add(Event::CommandsRefused, 1);
+            }
             let mut out = [0u8; MAX_RESPONSE_LENGTH];
             let sent = response
                 .encode(&mut out)
                 .ok()
                 .and_then(|length| out.get(..length))
                 .map(|payload| self.broadcast.transmit(response.type_id(), payload));
-            if !matches!(sent, Some(Ok(_))) {
+            if matches!(sent, Some(Ok(_))) {
+                self.counters.add(Event::ResponsesSent, 1);
+            } else {
                 // A broken invariant after the room check.
                 self.enter_terminal();
             }

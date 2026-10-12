@@ -10,6 +10,7 @@
 //! sender and receiver, and agent threads do not exist yet.
 
 mod commands;
+pub mod counters;
 pub mod embedded;
 pub mod error;
 
