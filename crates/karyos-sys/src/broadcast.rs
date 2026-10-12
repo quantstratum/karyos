@@ -130,7 +130,9 @@ impl<'a> BroadcastWords<'a> {
     /// Returns [`BroadcastError::InvalidGeometry`] unless the data area is a
     /// power of two of at least 2 words, the trailer has
     /// [`TRAILER_WORDS`] words, and `max_extent` is a multiple of 8 between
-    /// 16 and the capacity.
+    /// 16 and half the capacity. Padding is always shorter than the record
+    /// that needs it, so a padding record plus a record of at most half the
+    /// capacity fit in the area and a record never overlaps its own padding.
     pub fn new(
         data: &'a [AtomicU64],
         trailer: &'a [AtomicU64],
@@ -144,7 +146,7 @@ impl<'a> BroadcastWords<'a> {
             && capacity.is_power_of_two()
             && trailer.len() >= TRAILER_WORDS
             && max_extent.is_multiple_of(8)
-            && (16..=capacity).contains(&max_extent);
+            && (16..=capacity / 2).contains(&max_extent);
         if !valid {
             return Err(BroadcastError::InvalidGeometry);
         }
