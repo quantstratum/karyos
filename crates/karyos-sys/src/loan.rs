@@ -440,6 +440,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_identity_loan_is_distinct_from_empty() {
+        let loan = LoanTarget::new(
+            SlotIndex::try_new(0).unwrap(),
+            Generation::try_new(0).unwrap(),
+            TermId::new(0),
+            TermCount::ZERO,
+        )
+        .loan();
+        assert_eq!(loan.encode(), VALID_FLAG);
+        assert_eq!(Loan::decode(loan.encode()), Ok(Some(loan)));
+        assert_eq!(Loan::decode(0), Ok(None));
+    }
+
+    #[test]
     fn outcomes_follow_state_and_term_order() {
         let cases = [
             (descriptor(3, SlotState::Active), LoanOutcome::Granted),
