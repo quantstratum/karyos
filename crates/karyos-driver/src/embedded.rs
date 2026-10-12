@@ -123,6 +123,8 @@ pub(crate) struct Stream {
     allow_unconnected: bool,
     pub(crate) stream_id: i32,
     pub(crate) session_id: i32,
+    /// Whether the latest deadline call returned `Waiting`.
+    claim_waiting: bool,
 }
 
 /// Owns streams and clients and runs conductor duty on demand.
@@ -265,6 +267,8 @@ impl EmbeddedDriver {
         let active = self.streams.len() - retiring;
         self.counters.set(Event::StreamsActive, gauge(active));
         self.counters.set(Event::StreamsRetiring, gauge(retiring));
+        let waiting = self.streams.iter().filter(|s| s.claim_waiting).count();
+        self.counters.set(Event::ClaimsWaiting, gauge(waiting));
         self.counters
             .set(Event::ClientsConnected, gauge(self.clients.len()));
         self.counters
@@ -365,6 +369,7 @@ impl EmbeddedDriver {
             allow_unconnected: config.allow_unconnected,
             stream_id: key.0,
             session_id: key.1,
+            claim_waiting: false,
         });
         self.update_stream_gauges();
         Ok(StreamHandle {
@@ -436,13 +441,23 @@ impl EmbeddedDriver {
         let mut work = self.serve_commands();
         let mut first_error = None;
         let clock = &mut self.clock;
+        let counters = &self.counters;
         for stream in &mut self.streams {
-            match stream
+            let result = stream
                 .conductor
-                .abort_expired_claims_with(&mut || clock.now())
-            {
-                Ok(ClaimDeadline::Aborted { .. }) => work += 1,
-                Ok(_) => {}
+                .abort_expired_claims_with(&mut || clock.now());
+            stream.claim_waiting = matches!(result, Ok(ClaimDeadline::Waiting));
+            match result {
+                Ok(ClaimDeadline::Aborted { .. }) => {
+                    work += 1;
+                    counters.add(Event::ClaimsAborted, 1);
+                }
+                Ok(ClaimDeadline::Resolved) => counters.add(Event::ClaimDeadlinesResolved, 1),
+                Ok(ClaimDeadline::ClockWentBack) => counters.add(Event::ClaimClockStepsBack, 1),
+                Ok(ClaimDeadline::Unrepresentable) => {
+                    counters.add(Event::ClaimDeadlinesUnrepresentable, 1);
+                }
+                Ok(ClaimDeadline::Idle | ClaimDeadline::Waiting) => {}
                 Err(error) => {
                     first_error.get_or_insert(DriverError::from(error));
                 }
