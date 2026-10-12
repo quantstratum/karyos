@@ -240,8 +240,15 @@ impl ClientConductor {
             .map(|origin| origin.registration)
     }
 
+    /// Whether this client can no longer be served: its ring was closed (by
+    /// itself or by the driver, which retires a faulty client), the
+    /// broadcast buffer closed, or the driver was dropped.
     fn closed(&self) -> bool {
-        self.producer.is_none() || self.receiver.is_closed() || self.link.driver_gone()
+        self.producer
+            .as_ref()
+            .is_none_or(karyos_sys::command_ring::RingProducer::is_closed)
+            || self.receiver.is_closed()
+            || self.link.driver_gone()
     }
 
     fn submit(
@@ -299,7 +306,7 @@ impl ClientConductor {
             let response = match step {
                 None => {
                     report.drained = true;
-                    if self.receiver.is_closed() || self.link.driver_gone() {
+                    if self.closed() {
                         self.fail_pending(&mut on);
                     }
                     break;

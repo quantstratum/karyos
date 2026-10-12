@@ -175,7 +175,10 @@ impl<'a> RingWords<'a> {
             .is_none_or(|word| word.load(Ordering::Acquire) != 0)
     }
 
-    fn close(&self) {
+    /// Closes the ring for good (Release). The consumer calls this when it
+    /// stops serving the producer; later writes fail with
+    /// [`RingError::Closed`].
+    pub fn close(&self) {
         if let Some(word) = self.trailer(CLOSED) {
             word.store(1, Ordering::Release);
         }
@@ -486,6 +489,14 @@ mod owned {
     }
 
     impl RingConsumer {
+        /// Closes the ring for good, so the producer sees it; see
+        /// [`RingWords::close`].
+        pub fn close(&mut self) {
+            if let Ok(words) = self.region.words() {
+                words.close();
+            }
+        }
+
         /// Reads at most one record; `Ok(None)` when nothing is pending.
         ///
         /// # Errors

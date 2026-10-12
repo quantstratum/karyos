@@ -126,7 +126,11 @@ impl EmbeddedDriver {
     /// until its producer is known to be detached.
     fn retire_faulty(&mut self, index: usize) {
         if let Some(slot) = self.clients.get_mut(index) {
-            slot.consumer = None;
+            // Publish the closure to the producer before discarding the
+            // consumer.
+            if let Some(mut consumer) = slot.consumer.take() {
+                consumer.close();
+            }
             slot.link.drop_all(false);
             let client = slot.id;
             self.registrations
@@ -425,13 +429,55 @@ mod tests {
         let mut observer = driver.broadcast.receiver();
         producer.write(0x99, &[0; 8]).unwrap();
         let _ = driver.do_work().unwrap();
-        // No response, client retired, slot still charged.
+        // No response, client retired and told so, slot still charged.
         assert_eq!(observer.receive(), Received::Pending);
         assert_eq!(driver.clients(), 1);
         assert!(driver.clients[0].consumer.is_none());
+        assert!(producer.is_closed());
+        assert!(producer.write(1, &[0; 8]).is_err());
         // The producer detaches, then the close flag is set.
         drop(producer);
         link.mark_closed();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.clients(), 0);
+    }
+
+    #[test]
+    fn a_retired_client_sees_its_ring_closed() {
+        let mut driver = driver();
+        let mut client = driver.connect().unwrap();
+        let request = client
+            .add_publication(
+                StreamKey {
+                    stream_id: 2,
+                    session_id: 1,
+                },
+                false,
+            )
+            .unwrap();
+        // The driver retires this client as faulty while the broadcast and
+        // the driver stay open.
+        driver.retire_faulty(0);
+        let mut done = Vec::new();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].sequence, request);
+        assert!(matches!(done[0].outcome, Outcome::Unknown));
+        assert!(matches!(
+            client.add_publication(
+                StreamKey {
+                    stream_id: 2,
+                    session_id: 1
+                },
+                false
+            ),
+            Err(karyos_client::ConductorError::Closed)
+        ));
+        assert!(!driver.is_terminal());
+        // The slot stays until the client drops its conductor.
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.clients(), 1);
+        drop(client);
         let _ = driver.do_work().unwrap();
         assert_eq!(driver.clients(), 0);
     }
