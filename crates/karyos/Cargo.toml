@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "karyos"
+description = "Public facade: re-exports the client, Archive and Cluster APIs and defines karyos::Error."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+karyos-client.workspace = true
+karyos-archive.workspace = true
+karyos-cluster.workspace = true
+
+[lints]
+workspace = true

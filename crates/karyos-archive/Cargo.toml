@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "karyos-archive"
+description = "Recording, catalog, replay and recording groups."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+karyos-client.workspace = true
+karyos-codec.workspace = true
+karyos-io.workspace = true
+
+[lints]
+workspace = true

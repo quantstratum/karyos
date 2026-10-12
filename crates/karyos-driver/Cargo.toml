@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "karyos-driver"
+description = "Driver conductor, sender, receiver, flow control and path arbitration."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+karyos-client.workspace = true
+karyos-io.workspace = true
+
+[lints]
+workspace = true
