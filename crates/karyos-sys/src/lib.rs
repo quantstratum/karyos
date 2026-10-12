@@ -23,6 +23,7 @@
 pub mod atomic_view;
 pub mod broadcast;
 pub mod command_ring;
+pub mod conflation;
 pub mod counters;
 pub mod error;
 pub mod frame;
