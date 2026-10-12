@@ -242,11 +242,31 @@ impl LogBuffer {
         issue_conductor(Arc::clone(self))
     }
 
+    /// The lane this buffer carries; positions are local to it.
+    #[inline]
+    #[must_use]
+    pub fn lane(&self) -> Lane {
+        self.config.lane
+    }
+
     /// Largest message without the trace extension.
     #[inline]
     #[must_use]
     pub fn max_message_length(&self) -> u32 {
         self.max_message_length
+    }
+
+    /// Number of attached subscribers. Advisory: it can change right after
+    /// it is read; used for connection policy, never for memory safety.
+    #[must_use]
+    pub fn attached_subscribers(&self) -> u32 {
+        let attached = self
+            .cells
+            .iter()
+            .skip(1)
+            .filter(|cell| cell.state.load(Ordering::Acquire) != CELL_FREE)
+            .count();
+        u32::try_from(attached).unwrap_or(u32::MAX)
     }
 
     fn cell(&self, index: usize) -> Result<&Cell, SysError> {
@@ -407,6 +427,13 @@ pub struct Publication<O: BufferOwner> {
 }
 
 impl<O: BufferOwner> Publication<O> {
+    /// The buffer this publication appends to.
+    #[inline]
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer {
+        &self.buffer
+    }
+
     /// Appends one message (SPEC.md §4, exclusive offer).
     ///
     /// # Errors
@@ -702,6 +729,13 @@ pub struct Subscription<O: BufferOwner> {
 }
 
 impl<O: BufferOwner> Subscription<O> {
+    /// The buffer this subscription reads.
+    #[inline]
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer {
+        &self.buffer
+    }
+
     /// The read cursor: where the next copy starts. With a pending
     /// (unacknowledged) message the next poll rewinds to the acknowledged
     /// position instead; see [`Subscription::acknowledged_position`].
@@ -722,8 +756,14 @@ impl<O: BufferOwner> Subscription<O> {
     ///
     /// # Errors
     ///
-    /// Returns [`SysError::BufferTooShort`] (position unchanged) and
-    /// [`SysError::CorruptTerm`] for inconsistent published geometry.
+    /// Returns [`SysError::BufferTooShort`] when `out` is too small,
+    /// [`SysError::RequiredSubscriberLapped`] when a required subscriber's
+    /// data is gone, and [`SysError::CorruptTerm`] for inconsistent published
+    /// geometry. On error a pending message and its acknowledgement are
+    /// preserved, and the read cursor may have been rewound to the
+    /// acknowledged position for redelivery. A PAD stepped over before the
+    /// failing read is still acknowledged: the acknowledged position can
+    /// advance past it.
     pub fn poll(&mut self, out: &mut [u8]) -> Result<PollOutcome, SysError> {
         SubscriptionContext {
             buffer: &self.buffer,
@@ -1843,7 +1883,8 @@ mod tests {
         assert!(
             matches!(first, PollOutcome::Message { position, length: 8000, .. } if position == TERM)
         );
-        // Redelivery into a short buffer fails and moves nothing.
+        // Redelivery into a short buffer fails; the pending message and the
+        // acknowledged position are preserved.
         let mut short = vec![0u8; 100];
         assert!(matches!(
             required.poll(&mut short),

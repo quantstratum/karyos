@@ -12,7 +12,7 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 
 | Crate | Version | Source | Features | Scope | Targets | Licence | Family approval |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `thiserror` | 2.0.21 | crates.io | default features off | runtime, `karyos-sys` | all | MIT OR Apache-2.0 | ADR-0033 (`thiserror`, all crates) |
+| `thiserror` | 2.0.21 | crates.io | default features off | runtime, `karyos-sys`, `karyos-protocol`, `karyos-client`, `karyos-driver`, `karyos` | all | MIT OR Apache-2.0 | ADR-0033 (`thiserror`, all crates) |
 | `rustix` | 1.1.5 | crates.io | default features off; `std`, `fs`, `mm`, `param` | runtime, `karyos-sys` | Linux only (`cfg(target_os = "linux")`) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | ADR-0033 (`rustix`, sys and io) |
 | `loom` | 0.7.2 | crates.io | default features off | model checking, only under `--cfg loom` | all | MIT | ADR-0033 (`loom`, dev only) |
 
