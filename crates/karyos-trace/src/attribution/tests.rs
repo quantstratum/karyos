@@ -398,4 +398,12 @@ fn unallocatable_tables_are_refused() {
         }),
         Err(TraceError::Attribution)
     ));
+    assert!(matches!(
+        Attributor::new(AttributionConfig {
+            span: 1,
+            max_traces: 1,
+            max_intervals: usize::MAX,
+        }),
+        Err(TraceError::Attribution)
+    ));
 }
