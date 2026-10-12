@@ -22,7 +22,9 @@
 //! no subscribers at all: the `NotConnected` / `allow_unconnected` connection
 //! rules of SPEC.md §4 are left to a later, higher layer.
 
+use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::error::{LayoutError, SysError};
 use crate::frame::{
@@ -37,6 +39,21 @@ use crate::sizing::{FragmentPlan, TermLength, align_frame};
 use crate::slot::{Descriptor, SlotIndex, SlotState};
 use crate::slot_regions::SlotRegions;
 use crate::term::{Generation, TermCount, TermId};
+
+mod sealed {
+    /// Prevents implementations of [`super::BufferOwner`] outside this
+    /// module.
+    pub trait Sealed {}
+}
+
+/// A stable owner of a [`LogBuffer`]: every dereference returns the same
+/// buffer. Implemented only for `&LogBuffer` and `Arc<LogBuffer>`.
+pub trait BufferOwner: Deref<Target = LogBuffer> + Clone + sealed::Sealed {}
+
+impl sealed::Sealed for &LogBuffer {}
+impl BufferOwner for &LogBuffer {}
+impl sealed::Sealed for Arc<LogBuffer> {}
+impl BufferOwner for Arc<LogBuffer> {}
 
 /// Slots reserved as headroom for slots awaiting cleaning (`C`).
 pub const CLEANING_HEADROOM: u8 = 1;
@@ -193,49 +210,36 @@ impl LogBuffer {
         })
     }
 
-    /// Takes the only publication, with its standing write loan on `t0`.
-    /// Returns `None` once taken; it is never reissued.
+    /// Takes the only publication, borrowing the buffer. Returns `None` once
+    /// a publication has been issued in either form; it is never reissued.
     ///
     /// # Errors
     ///
     /// Returns an error when the initial write loan cannot be taken.
-    pub fn publication(&self) -> Result<Option<Publication<'_>>, SysError> {
-        if self
-            .publication_taken
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(None);
-        }
-        let cell = self.cell(0)?;
-        let slot = SlotIndex::try_new(0)?;
-        let target = LoanTarget::new(slot, self.generation, self.initial_term_id, TermCount::ZERO);
-        match take_loan(&cell.loan, &cell.revoked, self.descriptor(0)?, target)? {
-            LoanOutcome::Granted => Ok(Some(Publication {
-                buffer: self,
-                state: PublicationState::Active {
-                    count: TermCount::ZERO,
-                    slot: 0,
-                    tail: 0,
-                },
-            })),
-            _ => Err(SysError::CorruptTerm {
-                offset: 0,
-                reason: "initial term not active",
-            }),
-        }
+    pub fn publication(&self) -> Result<Option<Publication<&Self>>, SysError> {
+        issue_publication(self)
     }
 
-    /// Takes the only conductor. Returns `None` once taken.
+    /// Takes the only publication, owning a share of the buffer.
+    ///
+    /// # Errors
+    ///
+    /// As [`LogBuffer::publication`].
+    pub fn publication_owned(self: &Arc<Self>) -> Result<Option<Publication<Arc<Self>>>, SysError> {
+        issue_publication(Arc::clone(self))
+    }
+
+    /// Takes the only conductor, borrowing the buffer. Returns `None` once a
+    /// conductor has been issued in either form.
     #[must_use]
-    pub fn conductor(&self) -> Option<Conductor<'_>> {
-        self.conductor_taken
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Conductor {
-                buffer: self,
-                quarantined: Vec::new(),
-            })
+    pub fn conductor(&self) -> Option<Conductor<&Self>> {
+        issue_conductor(self)
+    }
+
+    /// Takes the only conductor, owning a share of the buffer.
+    #[must_use]
+    pub fn conductor_owned(self: &Arc<Self>) -> Option<Conductor<Arc<Self>>> {
+        issue_conductor(Arc::clone(self))
     }
 
     /// Largest message without the trace extension.
@@ -292,6 +296,50 @@ impl LogBuffer {
             Some(_) => Lookup::Missing,
         })
     }
+}
+
+fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>, SysError> {
+    let buffer: &LogBuffer = &owner;
+    if buffer
+        .publication_taken
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let cell = buffer.cell(0)?;
+    let slot = SlotIndex::try_new(0)?;
+    let target = LoanTarget::new(
+        slot,
+        buffer.generation,
+        buffer.initial_term_id,
+        TermCount::ZERO,
+    );
+    match take_loan(&cell.loan, &cell.revoked, buffer.descriptor(0)?, target)? {
+        LoanOutcome::Granted => Ok(Some(Publication {
+            buffer: owner,
+            state: PublicationState::Active {
+                count: TermCount::ZERO,
+                slot: 0,
+                tail: 0,
+            },
+        })),
+        _ => Err(SysError::CorruptTerm {
+            offset: 0,
+            reason: "initial term not active",
+        }),
+    }
+}
+
+fn issue_conductor<O: BufferOwner>(owner: O) -> Option<Conductor<O>> {
+    owner
+        .conductor_taken
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some(Conductor {
+        buffer: owner,
+        quarantined: Vec::new(),
+    })
 }
 
 enum Lookup {
@@ -353,12 +401,12 @@ enum PublicationState {
 
 /// The buffer's only publication.
 #[derive(Debug)]
-pub struct Publication<'a> {
-    buffer: &'a LogBuffer,
+pub struct Publication<O: BufferOwner> {
+    buffer: O,
     state: PublicationState,
 }
 
-impl Publication<'_> {
+impl<O: BufferOwner> Publication<O> {
     /// Appends one message (SPEC.md §4, exclusive offer).
     ///
     /// # Errors
@@ -367,6 +415,26 @@ impl Publication<'_> {
     /// are too large, and [`SysError::MaxPositionExceeded`] when the next
     /// term would reach `2^31`. Nothing is written on error.
     pub fn append(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+    ) -> Result<AppendOutcome, SysError> {
+        PublicationContext {
+            buffer: &self.buffer,
+            state: &mut self.state,
+        }
+        .append(payload, options)
+    }
+}
+
+/// The publication's state borrowed together with its buffer.
+struct PublicationContext<'a> {
+    buffer: &'a LogBuffer,
+    state: &'a mut PublicationState,
+}
+
+impl PublicationContext<'_> {
+    fn append(
         &mut self,
         payload: &[u8],
         options: AppendOptions,
@@ -391,10 +459,10 @@ impl Publication<'_> {
         FragmentPlan::check_message(length, max)?;
         let reserved = plan.reserved(length)?;
 
-        if let PublicationState::Rotating { next } = self.state {
+        if let PublicationState::Rotating { next } = *self.state {
             return self.rotate(next);
         }
-        let PublicationState::Active { count, slot, tail } = self.state else {
+        let PublicationState::Active { count, slot, tail } = *self.state else {
             return Ok(AppendOutcome::AdminAction);
         };
         let limit = buffer.limit.load(Ordering::Acquire);
@@ -413,7 +481,7 @@ impl Publication<'_> {
             // Every access to the old term has ended: release its loan before
             // touching anything else.
             release_loan(&buffer.cell(0)?.loan);
-            self.state = PublicationState::Rotating { next };
+            *self.state = PublicationState::Rotating { next };
             let _ = self.rotate(next)?;
             return Ok(AppendOutcome::AdminAction);
         }
@@ -424,7 +492,7 @@ impl Publication<'_> {
         }
         buffer.reserved_head.store(end, Ordering::Release);
         self.write_block(slot, count, tail, payload, &plan, options);
-        self.state = PublicationState::Active {
+        *self.state = PublicationState::Active {
             count,
             slot,
             tail: tail + reserved,
@@ -467,7 +535,7 @@ impl Publication<'_> {
             buffer.target(slot, next)?,
         )? {
             LoanOutcome::Granted => {
-                self.state = PublicationState::Active {
+                *self.state = PublicationState::Active {
                     count: next,
                     slot,
                     tail: 0,
@@ -584,6 +652,9 @@ pub enum PollOutcome {
         end_of_stream: bool,
         /// Reserved value of the first fragment.
         reserved_value: i64,
+        /// The first fragment's trace extension, copied under the loan
+        /// (opaque; validated by protocol-level callers).
+        extension: Option<[u8; EXTENSION_LENGTH as usize]>,
     },
     /// Nothing published at the position yet.
     Pending,
@@ -602,21 +673,40 @@ pub enum PollOutcome {
     },
 }
 
-/// A registered subscriber.
+/// A registered subscriber's private cursor.
 #[derive(Debug)]
-pub struct Subscription<'a> {
-    buffer: &'a LogBuffer,
+struct Cursor {
     cell: usize,
+    role: Role,
+    /// Next block to copy.
     position: u64,
+    /// Position published in the registry (acknowledged).
+    acknowledged: u64,
+    /// For a required subscriber, the position after a copied but not yet
+    /// acknowledged message.
+    pending: Option<u64>,
     detached: bool,
 }
 
-impl Subscription<'_> {
-    /// The subscriber's position.
+/// A registered subscriber.
+///
+/// Optional subscribers acknowledge every copy automatically. A required
+/// subscriber must call [`Subscription::acknowledge`] after it has handled a
+/// copied message; until then its registry position, which bounds the
+/// publisher and the retention floor, stays at the message, and the next
+/// poll copies the same message again (redelivery after a failed handler).
+#[derive(Debug)]
+pub struct Subscription<O: BufferOwner> {
+    buffer: O,
+    cursor: Cursor,
+}
+
+impl<O: BufferOwner> Subscription<O> {
+    /// The position of the next block to copy.
     #[inline]
     #[must_use]
     pub fn position(&self) -> u64 {
-        self.position
+        self.cursor.position
     }
 
     /// Copies the next message into `out`.
@@ -626,9 +716,60 @@ impl Subscription<'_> {
     /// Returns [`SysError::BufferTooShort`] (position unchanged) and
     /// [`SysError::CorruptTerm`] for inconsistent published geometry.
     pub fn poll(&mut self, out: &mut [u8]) -> Result<PollOutcome, SysError> {
+        SubscriptionContext {
+            buffer: &self.buffer,
+            cursor: &mut self.cursor,
+        }
+        .poll(out)
+    }
+
+    /// Acknowledges the last copied message: publishes the position after it
+    /// to the registry. A no-op when nothing is pending.
+    pub fn acknowledge(&mut self) {
+        if let Some(position) = self.cursor.pending.take() {
+            SubscriptionContext {
+                buffer: &self.buffer,
+                cursor: &mut self.cursor,
+            }
+            .publish(position);
+        }
+    }
+
+    /// Detaches, freeing the registry cell for a later subscriber.
+    pub fn close(mut self) {
+        self.detach();
+    }
+
+    fn detach(&mut self) {
+        SubscriptionContext {
+            buffer: &self.buffer,
+            cursor: &mut self.cursor,
+        }
+        .detach();
+    }
+}
+
+impl<O: BufferOwner> Drop for Subscription<O> {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
+/// A subscriber's cursor borrowed together with its buffer.
+struct SubscriptionContext<'a> {
+    buffer: &'a LogBuffer,
+    cursor: &'a mut Cursor,
+}
+
+impl SubscriptionContext<'_> {
+    fn poll(&mut self, out: &mut [u8]) -> Result<PollOutcome, SysError> {
+        // An unacknowledged copy is delivered again: never skip ahead.
+        if self.cursor.pending.take().is_some() {
+            self.cursor.position = self.cursor.acknowledged;
+        }
         // At most two iterations: the end of one term and the next term.
         for _ in 0..2 {
-            let (count, offset) = self.buffer.split(self.position)?;
+            let (count, offset) = self.buffer.split(self.cursor.position)?;
             if offset == self.buffer.term_length {
                 self.advance_to(self.buffer.position(count.next()?, 0));
                 continue;
@@ -655,7 +796,7 @@ impl Subscription<'_> {
             Lookup::Missing => return Ok(Step::Done(PollOutcome::Pending)),
             Lookup::Gone => return self.overrun(),
         };
-        let cell = buffer.cell(self.cell)?;
+        let cell = buffer.cell(self.cursor.cell)?;
         match take_loan(
             &cell.loan,
             &cell.revoked,
@@ -668,7 +809,7 @@ impl Subscription<'_> {
         }
         // Retention admission point: the floor is checked after the loan is
         // granted and before any plain read.
-        if self.position < buffer.floor.load(Ordering::Acquire) {
+        if self.cursor.position < buffer.floor.load(Ordering::Acquire) {
             release_loan(&cell.loan);
             return self.overrun();
         }
@@ -682,14 +823,21 @@ impl Subscription<'_> {
                 reserved,
                 end_of_stream,
                 reserved_value,
+                extension,
             } => {
-                let position = self.position;
-                self.advance_to(position + u64::from(reserved));
+                let position = self.cursor.position;
+                let next = position + u64::from(reserved);
+                self.cursor.position = next;
+                match self.cursor.role {
+                    Role::Optional => self.publish(next),
+                    Role::Required => self.cursor.pending = Some(next),
+                }
                 Ok(Step::Done(PollOutcome::Message {
                     position,
                     length,
                     end_of_stream,
                     reserved_value,
+                    extension,
                 }))
             }
         }
@@ -771,6 +919,19 @@ impl Subscription<'_> {
                 .regions
                 .read_plain(slot, start + 24, &mut reserved_value)
         };
+        let extension = if word0.flags().ext() {
+            let mut bytes = [0u8; EXTENSION_LENGTH as usize];
+            // SAFETY: read loan held; the extension follows the first header
+            // inside the published frame (frame_length >= 96 was checked).
+            unsafe {
+                buffer
+                    .regions
+                    .read_plain(slot, start + HEADER_LENGTH, &mut bytes)
+            };
+            Some(bytes)
+        } else {
+            None
+        };
         let mut offset = start;
         let mut written = 0usize;
         while offset < end {
@@ -796,13 +957,14 @@ impl Subscription<'_> {
             reserved: end - start,
             end_of_stream,
             reserved_value: i64::from_le_bytes(reserved_value),
+            extension,
         })
     }
 
     /// Applies `rejoin_at_head`: report the lost range and resume at the
     /// reserved head, which is always a block boundary.
     fn overrun(&mut self) -> Result<Step, SysError> {
-        let from = self.position;
+        let from = self.cursor.position;
         let lost_to = self.buffer.floor.load(Ordering::Acquire).max(from);
         let resume = self.buffer.reserved_head.load(Ordering::Acquire).max(from);
         self.advance_to(resume);
@@ -813,34 +975,31 @@ impl Subscription<'_> {
         }))
     }
 
+    /// Moves past bytes that deliver nothing (PAD, term ends, overrun),
+    /// publishing the position: there is no message to acknowledge.
     fn advance_to(&mut self, position: u64) {
-        self.position = position;
-        if let Ok(cell) = self.buffer.cell(self.cell) {
+        self.cursor.position = position;
+        self.publish(position);
+    }
+
+    /// Publishes `position` as the acknowledged registry position.
+    fn publish(&mut self, position: u64) {
+        self.cursor.acknowledged = position;
+        if let Ok(cell) = self.buffer.cell(self.cursor.cell) {
             cell.position.store(position, Ordering::Release);
         }
     }
 
-    /// Detaches, freeing the registry cell for a later subscriber.
-    pub fn close(mut self) {
-        self.detach();
-    }
-
     fn detach(&mut self) {
-        if self.detached {
+        if self.cursor.detached {
             return;
         }
-        self.detached = true;
-        if let Ok(cell) = self.buffer.cell(self.cell) {
+        self.cursor.detached = true;
+        if let Ok(cell) = self.buffer.cell(self.cursor.cell) {
             // No loan is held outside `poll`; publishing FREE is the last
             // access of this holder to its cell.
             cell.state.store(CELL_FREE, Ordering::Release);
         }
-    }
-}
-
-impl Drop for Subscription<'_> {
-    fn drop(&mut self) {
-        self.detach();
     }
 }
 
@@ -857,6 +1016,7 @@ enum Read {
         reserved: u32,
         end_of_stream: bool,
         reserved_value: i64,
+        extension: Option<[u8; EXTENSION_LENGTH as usize]>,
     },
 }
 
@@ -875,19 +1035,53 @@ pub struct DutyReport {
 
 /// The buffer's only conductor; every operation takes `&mut self`.
 #[derive(Debug)]
-pub struct Conductor<'a> {
-    buffer: &'a LogBuffer,
+pub struct Conductor<O: BufferOwner> {
+    buffer: O,
     quarantined: Vec<u8>,
 }
 
-impl<'a> Conductor<'a> {
+impl<O: BufferOwner> Conductor<O> {
     /// Admits a subscriber at the reserved head.
     ///
     /// # Errors
     ///
     /// Returns [`SysError::ResourcesUnavailable`] when no registry cell is
     /// free or an optional subscriber's slot credit does not fit `S - C`.
-    pub fn subscribe(&mut self, role: Role) -> Result<Subscription<'a>, SysError> {
+    pub fn subscribe(&mut self, role: Role) -> Result<Subscription<O>, SysError> {
+        let cursor = self.context().subscribe(role)?;
+        Ok(Subscription {
+            buffer: self.buffer.clone(),
+            cursor,
+        })
+    }
+
+    /// One duty cycle: flow control and retention, rotation help,
+    /// reclamation and cleaning, and preparation of the next term.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from the descriptor protocol, which indicate a broken
+    /// invariant.
+    pub fn duty_cycle(&mut self) -> Result<DutyReport, SysError> {
+        self.context().duty_cycle()
+    }
+
+    fn context(&mut self) -> ConductorContext<'_> {
+        ConductorContext {
+            buffer: &self.buffer,
+            quarantined: &mut self.quarantined,
+        }
+    }
+}
+
+/// The conductor's state borrowed together with its buffer.
+struct ConductorContext<'a> {
+    buffer: &'a LogBuffer,
+    quarantined: &'a mut Vec<u8>,
+}
+
+impl ConductorContext<'_> {
+    fn subscribe(&mut self, role: Role) -> Result<Cursor, SysError> {
         let buffer = self.buffer;
         let mut optional = 0u32;
         let mut free = None;
@@ -915,22 +1109,17 @@ impl<'a> Conductor<'a> {
             Role::Optional => CELL_OPTIONAL,
         };
         cell.state.store(state, Ordering::Release);
-        Ok(Subscription {
-            buffer,
+        Ok(Cursor {
             cell: index,
+            role,
             position: start,
+            acknowledged: start,
+            pending: None,
             detached: false,
         })
     }
 
-    /// One duty cycle: flow control and retention, rotation help,
-    /// reclamation and cleaning, and preparation of the next term.
-    ///
-    /// # Errors
-    ///
-    /// Returns errors from the descriptor protocol, which indicate a broken
-    /// invariant.
-    pub fn duty_cycle(&mut self) -> Result<DutyReport, SysError> {
+    fn duty_cycle(&mut self) -> Result<DutyReport, SysError> {
         let mut report = DutyReport::default();
         self.publish_floor_and_limit();
         self.help_rotation()?;
@@ -1120,8 +1309,8 @@ mod tests {
     /// Appends until the message is accepted, running duty cycles on
     /// back pressure and admin actions. Returns how many cycles it needed.
     fn append_retrying(
-        publication: &mut Publication<'_>,
-        conductor: &mut Conductor<'_>,
+        publication: &mut Publication<&LogBuffer>,
+        conductor: &mut Conductor<&LogBuffer>,
         data: &[u8],
         mut drain: impl FnMut(),
     ) -> u32 {
@@ -1137,15 +1326,17 @@ mod tests {
         panic!("append never succeeded");
     }
 
-    fn poll(subscription: &mut Subscription<'_>) -> PollOutcome {
+    fn poll(subscription: &mut Subscription<&LogBuffer>) -> PollOutcome {
         let mut out = vec![0u8; 8192];
         subscription.poll(&mut out).unwrap()
     }
 
-    fn poll_message(subscription: &mut Subscription<'_>) -> Option<Vec<u8>> {
+    fn poll_message(subscription: &mut Subscription<&LogBuffer>) -> Option<Vec<u8>> {
         let mut out = vec![0u8; 8192];
         match subscription.poll(&mut out).unwrap() {
             PollOutcome::Message { length, .. } => {
+                // Handled: acknowledge (a no-op for optional subscribers).
+                subscription.acknowledge();
                 out.truncate(length as usize);
                 Some(out)
             }
@@ -1495,6 +1686,128 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_are_issued_once_across_borrowed_and_owned_forms() {
+        let buffer = Arc::new(LogBuffer::new(config(2, 1)).unwrap());
+        assert!(buffer.publication_owned().unwrap().is_some());
+        assert!(buffer.publication().unwrap().is_none());
+        assert!(buffer.publication_owned().unwrap().is_none());
+        assert!(buffer.conductor().is_some());
+        assert!(buffer.conductor_owned().is_none());
+    }
+
+    /// Owned capabilities keep the buffer alive after the creator's handle is
+    /// dropped, and work across threads.
+    #[test]
+    fn owned_capabilities_outlive_the_creating_handle() {
+        let buffer = Arc::new(LogBuffer::new(config(2, 1)).unwrap());
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let mut subscription = conductor.subscribe(Role::Required).unwrap();
+        let mut publication = buffer.publication_owned().unwrap().unwrap();
+        drop(buffer);
+        let count: u32 = if cfg!(miri) { 20 } else { 200 };
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for sequence in 0..count {
+                    let data = message(sequence);
+                    loop {
+                        match publication.append(&data, AppendOptions::default()).unwrap() {
+                            AppendOutcome::Appended { .. } => break,
+                            _ => std::thread::yield_now(),
+                        }
+                    }
+                }
+            });
+            scope.spawn(move || {
+                let mut out = vec![0u8; 8192];
+                let mut expected = 0;
+                while expected < count {
+                    let _ = conductor.duty_cycle().unwrap();
+                    match subscription.poll(&mut out).unwrap() {
+                        PollOutcome::Message { length, .. } => {
+                            assert_eq!(&out[..length as usize], &message(expected)[..]);
+                            subscription.acknowledge();
+                            expected += 1;
+                        }
+                        PollOutcome::Pending => std::thread::yield_now(),
+                        PollOutcome::Overrun { .. } => panic!("required subscriber lapped"),
+                    }
+                }
+            });
+        });
+    }
+
+    /// A required subscriber that does not acknowledge gets the same message
+    /// again and keeps bounding the publisher at the unacknowledged position;
+    /// acknowledging releases it.
+    #[test]
+    fn unacknowledged_messages_are_redelivered_and_keep_bounding() {
+        let buffer = LogBuffer::new(config(2, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut required = conductor.subscribe(Role::Required).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let data = vec![4u8; 3000];
+        let _ = publication.append(&data, AppendOptions::default()).unwrap();
+        let mut out = vec![0u8; 8192];
+        let first = required.poll(&mut out).unwrap();
+        assert!(matches!(first, PollOutcome::Message { position: 0, .. }));
+        // The handler failed: no acknowledgement. Redelivery, same position.
+        assert_eq!(required.poll(&mut out).unwrap(), first);
+        // The publisher stays bounded by the unacknowledged position.
+        let mut pressured = false;
+        for _ in 0..100 {
+            let _ = conductor.duty_cycle().unwrap();
+            if publication.append(&data, AppendOptions::default()).unwrap()
+                == AppendOutcome::BackPressured
+            {
+                pressured = true;
+                break;
+            }
+        }
+        assert!(pressured);
+        assert!(buffer.reserved_head.load(Ordering::Acquire) <= TERM / 2);
+        assert_eq!(buffer.floor.load(Ordering::Acquire), 0);
+        // Acknowledge, then the next poll moves on and the bound advances.
+        required.acknowledge();
+        assert!(matches!(
+            required.poll(&mut out).unwrap(),
+            PollOutcome::Message { position, .. } if position > 0
+        ));
+        required.acknowledge();
+        let _ = conductor.duty_cycle().unwrap();
+        assert!(buffer.floor.load(Ordering::Acquire) > 0);
+    }
+
+    #[test]
+    fn traced_messages_return_their_extension() {
+        let buffer = LogBuffer::new(config(2, 1)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Required).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let extension = [0x5Au8; 64];
+        let options = AppendOptions {
+            extension: Some(extension),
+            ..AppendOptions::default()
+        };
+        let _ = publication.append(&message(1), options).unwrap();
+        let _ = publication
+            .append(&message(2), AppendOptions::default())
+            .unwrap();
+        let mut out = vec![0u8; 8192];
+        assert!(matches!(
+            subscription.poll(&mut out).unwrap(),
+            PollOutcome::Message { extension: Some(bytes), .. } if bytes == extension
+        ));
+        subscription.acknowledge();
+        assert!(matches!(
+            subscription.poll(&mut out).unwrap(),
+            PollOutcome::Message {
+                extension: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn capabilities_are_issued_once() {
         let buffer = LogBuffer::new(config(2, 1)).unwrap();
         assert!(buffer.publication().unwrap().is_some());
@@ -1552,6 +1865,7 @@ mod tests {
                     match required.poll(&mut out).unwrap() {
                         PollOutcome::Message { length, .. } => {
                             assert_eq!(&out[..length as usize], &sized_message(expected, len)[..]);
+                            required.acknowledge();
                             expected += 1;
                         }
                         PollOutcome::Pending => std::thread::yield_now(),
