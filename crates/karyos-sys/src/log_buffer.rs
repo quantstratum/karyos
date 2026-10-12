@@ -354,6 +354,11 @@ impl<T: TermBytes> LogBuffer<T> {
 
 fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>, SysError> {
     let buffer: &LogBuffer<O::Terms> = &owner;
+    // Already issued: no allocation. The compare-exchange below still
+    // decides a race.
+    if buffer.publication_taken.load(Ordering::Acquire) {
+        return Ok(None);
+    }
     // The staging buffer of claims on a backing without direct bytes, sized
     // for the largest admissible claim and allocated fallibly before the
     // publication is issued.
