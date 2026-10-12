@@ -44,7 +44,7 @@ const REGION_ALIGNMENT: usize = 4096;
 const WORD0_BYTES: usize = 8;
 
 pub(crate) mod sealed {
-    use super::{AtomicU64, SysError, TermLength};
+    use super::{AtomicU64, NonNull, SysError, TermLength};
 
     /// Proof that the caller is this crate: only it can build one.
     #[derive(Debug, Clone, Copy)]
@@ -58,6 +58,9 @@ pub(crate) mod sealed {
 
     /// The byte movement of a backing. Not nameable outside the crate.
     pub trait Access: Sized {
+        /// Whether [`Access::direct_bytes`] exposes term bytes.
+        const DIRECT: bool;
+
         /// Allocates `slots` zeroed terms.
         fn allocate(token: Token, term_length: TermLength, slots: u8) -> Result<Self, SysError>;
 
@@ -91,6 +94,20 @@ pub(crate) mod sealed {
         /// store zeros in the bytes between the end of `bytes` and the next
         /// multiple of 8; they must already read as zero.
         unsafe fn write_bytes(&self, slot: u8, offset: u32, bytes: &[u8]);
+
+        /// The term bytes at `offset` of `slot` for direct plain writes by
+        /// a claim, or `None` when the backing moves bytes only as atomic
+        /// words (the claim then writes through a staging buffer and
+        /// [`Access::write_bytes`]).
+        ///
+        /// # Safety
+        ///
+        /// As [`Access::write_bytes`], for a range of `len` bytes, for as
+        /// long as the pointer is used: the range is inside one frame being
+        /// written, contains no word 0 and no other control word, and the
+        /// caller keeps the slot's write loan until its last access through
+        /// the pointer.
+        unsafe fn direct_bytes(&self, slot: u8, offset: u32, len: u32) -> Option<NonNull<u8>>;
 
         /// Copies from `slot` at `offset` into `out`.
         ///
@@ -157,6 +174,8 @@ impl HeapTerms {
 }
 
 impl sealed::Access for HeapTerms {
+    const DIRECT: bool = true;
+
     fn allocate(
         _token: sealed::Token,
         term_length: TermLength,
@@ -195,6 +214,12 @@ impl sealed::Access for HeapTerms {
         // SAFETY: the caller owns the destination range exclusively; the
         // source is caller memory outside the allocation, so no overlap.
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len()) };
+    }
+
+    unsafe fn direct_bytes(&self, slot: u8, offset: u32, len: u32) -> Option<NonNull<u8>> {
+        debug_assert!(offset as usize + len as usize <= self.term_length as usize);
+        // SAFETY: in range per the caller's contract.
+        NonNull::new(unsafe { self.at(slot, offset) })
     }
 
     unsafe fn read_bytes(&self, slot: u8, offset: u32, out: &mut [u8]) {
@@ -260,6 +285,8 @@ impl SharedTerms {
 }
 
 impl sealed::Access for SharedTerms {
+    const DIRECT: bool = false;
+
     fn allocate(
         _token: sealed::Token,
         term_length: TermLength,
@@ -302,6 +329,10 @@ impl sealed::Access for SharedTerms {
                 store_body(target, word);
             }
         }
+    }
+
+    unsafe fn direct_bytes(&self, _slot: u8, _offset: u32, _len: u32) -> Option<NonNull<u8>> {
+        None
     }
 
     unsafe fn read_bytes(&self, slot: u8, offset: u32, out: &mut [u8]) {
