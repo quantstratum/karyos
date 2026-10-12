@@ -30,6 +30,7 @@ fn stream_config(stream_id: i32) -> StreamConfig {
             session_id: 1,
             stream_id,
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
         },
         allow_unconnected: true,
     }

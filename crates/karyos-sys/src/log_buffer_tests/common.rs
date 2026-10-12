@@ -19,6 +19,7 @@ fn config(spare_slots: u8, max_subscribers: u8) -> LogBufferConfig {
         session_id: 3,
         stream_id: 4,
         claim_deadline: DEFAULT_CLAIM_DEADLINE,
+        publication: PublicationMode::Exclusive,
     }
 }
 
@@ -1685,4 +1686,154 @@ fn an_injected_deadline_fault_leaves_the_protocol_state_intact() {
     assert_eq!(word0_of_term0(&buffer, 0).load(Ordering::Acquire), word);
     claim.payload().fill(1);
     assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+}
+
+// Concurrent mode, batch a1 (quantstratum-docs: karyos/design/concurrent-publication.md).
+
+fn concurrent_config(publishers: u8) -> LogBufferConfig {
+    LogBufferConfig {
+        publication: PublicationMode::Concurrent {
+            publishers,
+            allow_non_lse: false,
+        },
+        // 3 publishers + 2 optional subscribers fit S - C = 5.
+        ..config(6, 4)
+    }
+}
+
+#[test]
+fn concurrent_mode_creation_checks() {
+    assert!(new_buffer(concurrent_config(3)).is_ok());
+    assert!(matches!(
+        new_buffer(concurrent_config(0)),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+    // 5 × 8192 > 65536 / 2.
+    assert!(matches!(
+        new_buffer(concurrent_config(5)),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+    // More publishers than spare credits.
+    let tight = LogBufferConfig {
+        publication: PublicationMode::Concurrent {
+            publishers: 3,
+            allow_non_lse: false,
+        },
+        ..config(3, 4)
+    };
+    assert!(matches!(new_buffer(tight), Err(SysError::ResourcesUnavailable)));
+    // Without a single-instruction fetch_add only with explicit allowance.
+    let config = concurrent_config(2);
+    assert!(matches!(
+        check_publication_mode_on(&config, false),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+    let allowed = LogBufferConfig {
+        publication: PublicationMode::Concurrent {
+            publishers: 2,
+            allow_non_lse: true,
+        },
+        ..config
+    };
+    assert!(check_publication_mode_on(&allowed, false).is_ok());
+}
+
+#[test]
+fn a_concurrent_buffer_has_no_exclusive_publication() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    assert!(matches!(
+        buffer.publication(),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+}
+
+#[test]
+fn publisher_credits_are_reserved_for_the_buffer_life() {
+    let buffer = new_buffer(concurrent_config(3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    // S - C = 5: 3 publishers + 2 optional subscribers exactly.
+    let first = conductor.subscribe(Role::Optional).unwrap();
+    let _second = conductor.subscribe(Role::Optional).unwrap();
+    let before = buffer.attached_subscribers();
+    assert!(matches!(
+        conductor.subscribe(Role::Optional),
+        Err(SysError::ResourcesUnavailable)
+    ));
+    assert_eq!(buffer.attached_subscribers(), before);
+    // A required subscriber takes no credit.
+    let _required = conductor.subscribe(Role::Required).unwrap();
+    drop(first);
+    let _third = conductor.subscribe(Role::Optional).unwrap();
+}
+
+#[test]
+fn the_concurrent_head_is_derived_from_the_active_tail() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let t0 = u64::from(buffer.initial_term_id.get());
+    assert_eq!(buffer.head().unwrap(), Some(0));
+    // A reservation of 96 bytes in term 0.
+    buffer.tail(0).unwrap().store((t0 << 32) | 96, Ordering::Release);
+    assert_eq!(buffer.head().unwrap(), Some(96));
+    // The limit derives from that head and the concurrent window.
+    let _ = conductor.duty_cycle().unwrap();
+    let window = TERM / 2 - 8192;
+    assert_eq!(buffer.limit.load(Ordering::Acquire), 96 + window);
+    // Past the end: clamped to the term end.
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((t0 << 32) | (TERM + 500), Ordering::Release);
+    assert_eq!(buffer.head().unwrap(), Some(TERM));
+    // A tail of another term identity yields no head.
+    buffer
+        .tail(0)
+        .unwrap()
+        .store(((t0 + 5) << 32) | 64, Ordering::Release);
+    assert_eq!(buffer.head().unwrap(), None);
+    assert!(matches!(
+        conductor.duty_cycle(),
+        Err(SysError::CorruptTerm { .. })
+    ));
+}
+
+#[test]
+fn the_conductor_rotates_a_full_concurrent_term_and_prepares_tails() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let t0 = u64::from(buffer.initial_term_id.get());
+    let limit = buffer.limit.load(Ordering::Acquire);
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((t0 << 32) | TERM, Ordering::Release);
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    // Term 1 (slot 1) starts empty; the next term's tail is prepared with
+    // its own identity.
+    assert_eq!(buffer.head().unwrap(), Some(TERM));
+    let _ = conductor.duty_cycle().unwrap();
+    let Lookup::Slot(slot) = buffer.lookup(TermCount::try_new(2).unwrap()).unwrap() else {
+        panic!("term 2 not prepared");
+    };
+    let t2 = buffer
+        .initial_term_id
+        .advanced_by(TermCount::try_new(2).unwrap());
+    assert_eq!(
+        buffer.tail(slot).unwrap().load(Ordering::Acquire),
+        u64::from(t2.get()) << 32
+    );
+    assert!(buffer.limit.load(Ordering::Acquire) >= limit);
+}
+
+#[test]
+fn the_deadline_service_is_idle_for_concurrent_buffers() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert_eq!(
+        conductor
+            .abort_expired_claims_with(&mut || panic!("clock read"))
+            .unwrap(),
+        ClaimDeadline::Idle
+    );
 }

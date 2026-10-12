@@ -106,10 +106,30 @@ pub struct LogBufferConfig {
     pub session_id: i32,
     /// Stream id written in every header.
     pub stream_id: i32,
+    /// Exclusive or concurrent publication, fixed for the buffer's life
+    /// (`quantstratum-docs: karyos/design/concurrent-publication.md`).
+    pub publication: PublicationMode,
     /// Commit deadline of claims, in ticks of the clock passed to
     /// [`Conductor::abort_expired_claims`] (nanoseconds by convention); at
     /// least 1 (`quantstratum-docs: karyos/design/claim-deadline.md`).
     pub claim_deadline: u64,
+}
+
+/// How a buffer is published to (`quantstratum-docs: karyos/design/concurrent-publication.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PublicationMode {
+    /// One publication with a private cached tail (the latency path).
+    #[default]
+    Exclusive,
+    /// Up to `publishers` concurrent handles reserving with one
+    /// `fetch_add` on the active slot's raw tail.
+    Concurrent {
+        /// Concurrent handles at once (`P`), at least 1.
+        publishers: u8,
+        /// Allow concurrent mode on aarch64 without LSE, where `fetch_add`
+        /// is not a single instruction (SPEC.md §4, ADR-0012).
+        allow_non_lse: bool,
+    },
 }
 
 /// A default commit deadline of claims: one second in nanoseconds.
@@ -160,6 +180,9 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     /// (`quantstratum-docs: karyos/design/claim-deadline.md`).
     claim_record: AtomicU64,
     claim_serial: AtomicU64,
+    /// Raw tail of each physical slot: `term_id << 32 | offset`
+    /// (concurrent mode; initialised for every prepared term).
+    tails: Box<[AtomicU64]>,
     /// Test hook: an injected deadline fault (feature `test-hooks`).
     #[cfg(feature = "test-hooks")]
     deadline_fault: AtomicBool,
@@ -207,6 +230,7 @@ impl<T: TermBytes> LogBuffer<T> {
                 value: config.claim_deadline,
             });
         }
+        check_publication_mode(&config)?;
         let plan = FragmentPlan::new(config.mtu, Flags::NONE)?;
         let max_message_length =
             plan.max_message_length(config.max_reserved, config.term_length)?;
@@ -232,16 +256,26 @@ impl<T: TermBytes> LogBuffer<T> {
         if let Some(entry) = table.get((1 % table_len) as usize) {
             entry.store(table_entry(1, 1), Ordering::Relaxed);
         }
-        let cells: Box<[Cell]> = (0..=config.max_subscribers)
+        let publisher_cells = publisher_cells(config.publication);
+        let cells: Box<[Cell]> = (0..usize::from(config.max_subscribers) + publisher_cells)
             .map(|index| {
-                Cell::new(if index == 0 {
+                Cell::new(if index < publisher_cells {
                     CELL_PUBLICATION
                 } else {
                     CELL_FREE
                 })
             })
             .collect();
-        let window = u64::from(config.term_length.get() / 2);
+        let tails: Box<[AtomicU64]> = (0..slots)
+            .map(|slot| {
+                let term = match slot {
+                    0 => t0,
+                    _ => t0.advanced_by(one),
+                };
+                AtomicU64::new(u64::from(term.get()) << 32)
+            })
+            .collect();
+        let window = window(&config);
         Ok(Self {
             regions,
             slots,
@@ -262,6 +296,7 @@ impl<T: TermBytes> LogBuffer<T> {
             conductor_taken: AtomicBool::new(false),
             claim_record: AtomicU64::new(0),
             claim_serial: AtomicU64::new(0),
+            tails,
             #[cfg(feature = "test-hooks")]
             deadline_fault: AtomicBool::new(false),
         })
@@ -320,7 +355,7 @@ impl<T: TermBytes> LogBuffer<T> {
         let attached = self
             .cells
             .iter()
-            .skip(1)
+            .skip(self.first_subscriber_cell())
             .filter(|cell| cell.state.load(Ordering::Acquire) != CELL_FREE)
             .count();
         u32::try_from(attached).unwrap_or(u32::MAX)
@@ -345,6 +380,58 @@ impl<T: TermBytes> LogBuffer<T> {
 
     fn position(&self, count: TermCount, offset: u32) -> u64 {
         u64::from(count.get()) * u64::from(self.term_length) + u64::from(offset)
+    }
+
+    /// Whether the buffer is published to concurrently.
+    fn concurrent(&self) -> bool {
+        matches!(self.config.publication, PublicationMode::Concurrent { .. })
+    }
+
+    /// The first registry cell of subscribers.
+    fn first_subscriber_cell(&self) -> usize {
+        publisher_cells(self.config.publication)
+    }
+
+    fn tail(&self, slot: u8) -> Result<&AtomicU64, SysError> {
+        self.tails
+            .get(usize::from(slot))
+            .ok_or(SysError::ResourcesUnavailable)
+    }
+
+    /// The head (`quantstratum-docs: karyos/design/concurrent-publication.md`): the reserved
+    /// head in exclusive mode; in concurrent mode one snapshot of the
+    /// active count, its slot-table entry, its `ACTIVE` descriptor and the
+    /// slot's raw tail, whose term id must match, clamped to the term end.
+    /// `None` when the parts disagree (a slot reassigned while the caller
+    /// paused): no head is fabricated.
+    fn head(&self) -> Result<Option<u64>, SysError> {
+        if !self.concurrent() {
+            return Ok(Some(self.reserved_head.load(Ordering::Acquire)));
+        }
+        let count = TermCount::try_new(self.active_count.load(Ordering::Acquire) as u32)?;
+        let Lookup::Slot(slot) = self.lookup(count)? else {
+            return Ok(None);
+        };
+        let term_id = self.initial_term_id.advanced_by(count);
+        let found = Descriptor::decode(self.descriptor(slot)?.load(Ordering::Acquire))?;
+        if found.state() != SlotState::Active || found.term_id() != term_id {
+            return Ok(None);
+        }
+        let raw = self.tail(slot)?.load(Ordering::Acquire);
+        if (raw >> 32) as u32 != term_id.get() {
+            return Ok(None);
+        }
+        let offset = (raw as u32).min(self.term_length);
+        Ok(Some(self.position(count, offset)))
+    }
+
+    /// The head as the conductor sees it: it is the only party that
+    /// reassigns slots, so a disagreeing snapshot is a protocol error.
+    fn conductor_head(&self) -> Result<u64, SysError> {
+        self.head()?.ok_or(SysError::CorruptTerm {
+            offset: 0,
+            reason: "head snapshot of mismatched identity",
+        })
     }
 
     fn split(&self, position: u64) -> Result<(TermCount, u32), SysError> {
@@ -372,6 +459,83 @@ impl<T: TermBytes> LogBuffer<T> {
             Some((entry_count, _)) if entry_count > count.get() => Lookup::Gone,
             Some(_) => Lookup::Missing,
         })
+    }
+}
+
+/// Registry cells reserved for publishers: 1 exclusive, `P` concurrent.
+fn publisher_cells(mode: PublicationMode) -> usize {
+    match mode {
+        PublicationMode::Exclusive => 1,
+        PublicationMode::Concurrent { publishers, .. } => usize::from(publishers),
+    }
+}
+
+/// The publication window: `term_length / 2`, less the concurrent
+/// overshoot `(P - 1) × max_reserved` (SPEC.md §4 IPC flow control).
+fn window(config: &LogBufferConfig) -> u64 {
+    let half = u64::from(config.term_length.get() / 2);
+    match config.publication {
+        PublicationMode::Exclusive => half,
+        PublicationMode::Concurrent { publishers, .. } => {
+            let overshoot =
+                u64::from(publishers.saturating_sub(1)) * u64::from(config.max_reserved);
+            // Creation checked `P × max_reserved ≤ term_length / 2`.
+            half.max(overshoot) - overshoot
+        }
+    }
+}
+
+/// Creation checks of the publication mode
+/// (`quantstratum-docs: karyos/design/concurrent-publication.md`).
+fn check_publication_mode(config: &LogBufferConfig) -> Result<(), SysError> {
+    check_publication_mode_on(config, single_instruction_fetch_add())
+}
+
+/// [`check_publication_mode`] for a target whose `fetch_add` is (`lse`) or
+/// is not a single instruction.
+fn check_publication_mode_on(config: &LogBufferConfig, lse: bool) -> Result<(), SysError> {
+    let PublicationMode::Concurrent {
+        publishers,
+        allow_non_lse,
+    } = config.publication
+    else {
+        return Ok(());
+    };
+    let invalid = |reason| Err(SysError::InvalidPublicationMode { reason });
+    if publishers == 0 {
+        return invalid("no concurrent publishers");
+    }
+    let term = u64::from(config.term_length.get());
+    let spread = u64::from(publishers) * u64::from(config.max_reserved);
+    if spread > term / 2 {
+        return invalid("publishers × max_reserved exceeds term_length / 2");
+    }
+    if term + spread >= 1 << 31 {
+        return invalid("term_length + publishers × max_reserved reaches 2^31");
+    }
+    if publishers > config.spare_slots.saturating_sub(CLEANING_HEADROOM) {
+        return Err(SysError::ResourcesUnavailable);
+    }
+    if !allow_non_lse && !lse {
+        return invalid("fetch_add is not a single instruction on this target (no LSE)");
+    }
+    Ok(())
+}
+
+/// Whether `fetch_add` on `AtomicU64` is one instruction: `LOCK XADD` on
+/// x86_64, LSE `LDADDAL` on aarch64 (checked at run time).
+fn single_instruction_fetch_add() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        true
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("lse")
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
     }
 }
 
@@ -424,6 +588,11 @@ impl<T: TermBytes> LogBuffer<T> {
 
 fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>, SysError> {
     let buffer: &LogBuffer<O::Terms> = &owner;
+    if buffer.concurrent() {
+        return Err(SysError::InvalidPublicationMode {
+            reason: "the exclusive publication of a concurrent buffer",
+        });
+    }
     // Already issued: no allocation. The compare-exchange below still
     // decides a race.
     if buffer.publication_taken.load(Ordering::Acquire) {
@@ -1687,8 +1856,12 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             });
         }
         let from = self.cursor.position;
+        let Some(head) = self.buffer.head()? else {
+            // No consistent head now: retry later instead of rejoining.
+            return Ok(Step::Done(PollOutcome::Pending));
+        };
         let lost_to = self.buffer.floor.load(Ordering::Acquire).max(from);
-        let resume = self.buffer.reserved_head.load(Ordering::Acquire).max(from);
+        let resume = head.max(from);
         self.advance_to(resume);
         Ok(Step::Done(PollOutcome::Overrun {
             from,
@@ -1870,6 +2043,13 @@ impl<O: BufferOwner> Conductor<O> {
         if buffer.deadline_fault.load(Ordering::Relaxed) {
             return Err(SysError::ResourcesUnavailable);
         }
+        // The claim record has a single writer, the exclusive publication;
+        // concurrent buffers have no deadline abort yet
+        // (`quantstratum-docs: karyos/design/concurrent-publication.md`, batch c).
+        if buffer.concurrent() {
+            self.observed = None;
+            return Ok(ClaimDeadline::Idle);
+        }
         let Some((serial, record)) = read_claim_record(&buffer.claim_serial, &buffer.claim_record)
         else {
             self.observed = None;
@@ -1893,7 +2073,7 @@ impl<O: BufferOwner> Conductor<O> {
         let count = found.term_id().count_from(buffer.initial_term_id)?;
         let position = buffer.position(count, offset);
         // Admission: the reserved head covers the block.
-        if buffer.reserved_head.load(Ordering::Acquire) < position + u64::from(extent) {
+        if buffer.conductor_head()? < position + u64::from(extent) {
             self.observed = None;
             return Ok(ClaimDeadline::Idle);
         }
@@ -1956,14 +2136,22 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let buffer = self.buffer;
         let mut optional = 0u32;
         let mut free = None;
-        for (index, cell) in buffer.cells.iter().enumerate().skip(1) {
+        for (index, cell) in buffer
+            .cells
+            .iter()
+            .enumerate()
+            .skip(buffer.first_subscriber_cell())
+        {
             match cell.state.load(Ordering::Acquire) {
                 CELL_OPTIONAL => optional += 1,
                 CELL_FREE if free.is_none() => free = Some(index),
                 _ => {}
             }
         }
-        let credits = optional + 1 + u32::from(role == Role::Optional);
+        // Publisher credits are reserved for the buffer's life: 1 for the
+        // exclusive publication, `P` for concurrent ones.
+        let publishers = buffer.first_subscriber_cell() as u32;
+        let credits = optional + publishers + u32::from(role == Role::Optional);
         if credits > u32::from(buffer.spare_slots - CLEANING_HEADROOM) {
             return Err(SysError::ResourcesUnavailable);
         }
@@ -1973,7 +2161,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // loan release happens before this reuse; its loan word is zero.
         debug_assert_eq!(cell.loan.load(Ordering::Relaxed), 0);
         cell.revoked.store(0, Ordering::Relaxed);
-        let start = buffer.reserved_head.load(Ordering::Acquire);
+        let start = buffer.conductor_head()?;
         cell.position.store(start, Ordering::Relaxed);
         let state = match role {
             Role::Required => CELL_REQUIRED,
@@ -1992,7 +2180,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
 
     fn duty_cycle(&mut self) -> Result<DutyReport, SysError> {
         let mut report = DutyReport::default();
-        self.publish_floor_and_limit();
+        self.publish_floor_and_limit()?;
         self.help_rotation()?;
         self.reclaim(&mut report)?;
         self.prepare_next(&mut report)?;
@@ -2000,12 +2188,12 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     }
 
     /// Floor and limit from one head snapshot; the floor is published first.
-    fn publish_floor_and_limit(&self) {
+    fn publish_floor_and_limit(&self) -> Result<(), SysError> {
         let buffer = self.buffer;
-        let window = u64::from(buffer.term_length / 2);
-        let head = buffer.reserved_head.load(Ordering::Acquire);
+        let window = window(&buffer.config);
+        let head = buffer.conductor_head()?;
         let mut bound = None::<u64>;
-        for cell in buffer.cells.iter().skip(1) {
+        for cell in buffer.cells.iter().skip(buffer.first_subscriber_cell()) {
             if cell.state.load(Ordering::Acquire) == CELL_REQUIRED {
                 let position = cell.position.load(Ordering::Acquire);
                 bound = Some(bound.map_or(position, |b| b.min(position)));
@@ -2025,6 +2213,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let limit = (base + window).max(buffer.limit.load(Ordering::Relaxed));
         buffer.floor.store(floor, Ordering::Release);
         buffer.limit.store(limit, Ordering::Release);
+        Ok(())
     }
 
     /// Completes a full term's rotation the publication left half-done.
@@ -2032,7 +2221,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let buffer = self.buffer;
         let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
         let boundary = buffer.position(active, buffer.term_length);
-        if buffer.reserved_head.load(Ordering::Acquire) < boundary {
+        if buffer.conductor_head()? < boundary {
             return Ok(());
         }
         let next = active.next()?;
@@ -2128,6 +2317,11 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             return Ok(());
         };
         let term_id = buffer.initial_term_id.advanced_by(next);
+        // The slot is FREE: no loan, no producer. Its tail is ready before
+        // the READY publication below (Release) makes the term reachable.
+        buffer
+            .tail(slot)?
+            .store(u64::from(term_id.get()) << 32, Ordering::Relaxed);
         publish(
             buffer.descriptor(slot)?,
             Descriptor::new(term_id, buffer.generation, SlotState::Ready),

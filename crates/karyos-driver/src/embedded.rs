@@ -529,6 +529,7 @@ mod tests {
                 session_id: 1,
                 stream_id,
                 claim_deadline: 100,
+                publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
             },
             allow_unconnected: false,
         }

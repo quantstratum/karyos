@@ -111,6 +111,13 @@ pub enum SysError {
         /// The subscriber's position.
         position: u64,
     },
+    /// The publication mode does not fit the configuration, the target or
+    /// the requested operation (`quantstratum-docs: karyos/design/concurrent-publication.md`).
+    #[error("invalid publication mode: {reason}")]
+    InvalidPublicationMode {
+        /// What is wrong.
+        reason: &'static str,
+    },
     /// The commit deadline of claims must be at least one tick.
     #[error("invalid claim deadline {value}")]
     InvalidClaimDeadline {
