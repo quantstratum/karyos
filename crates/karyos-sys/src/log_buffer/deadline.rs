@@ -358,8 +358,34 @@ impl ConcurrentDeadlines {
         now: &mut Now<'_>,
     ) -> Result<(), SysError> {
         let head = buffer.conductor_head()?;
+        // The look-ahead passed only terminal blocks, which stay terminal,
+        // and marked ones, each observed and still reserved at step 1 of
+        // this call unless dropped there as terminal: the first block
+        // between the frontier and the look-ahead that may be
+        // non-terminal is the lowest remaining observation. The frontier
+        // moves there without reading the region again.
+        if self.frontier < self.lookahead {
+            let (frontier, lookahead) = (self.frontier, self.lookahead);
+            let next = self
+                .marked
+                .iter()
+                .map(|marked| Point {
+                    count: marked.count,
+                    offset: marked.offset,
+                })
+                .filter(|point| frontier <= *point && *point < lookahead)
+                .min()
+                .unwrap_or(lookahead);
+            self.frontier = next;
+            if next.count != frontier.count {
+                self.drop_before(next);
+            }
+        }
         let mut reads = 0;
         let stop = self.scan_frontier(buffer, head, now, &mut reads)?;
+        if self.lookahead < self.frontier {
+            self.lookahead = self.frontier;
+        }
         if let Stop::Marked { after } = stop {
             if self.lookahead < after {
                 self.lookahead = after;

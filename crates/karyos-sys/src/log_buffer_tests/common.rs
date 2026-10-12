@@ -3080,3 +3080,45 @@ fn the_default_scan_budget_keeps_a_long_fragment_walk_across_cleaning() {
     assert_eq!(a.commit(), CommitOutcome::Aborted { position: 0 });
     assert!(matches!(c.commit(), CommitOutcome::Aborted { .. }));
 }
+
+/// When the frontier's marked block commits, the frontier moves past the
+/// region the look-ahead already scanned without reading it again, so a
+/// partly walked fragmented block resumes where it stopped.
+#[test]
+fn a_committed_frontier_does_not_replay_the_lookahead() {
+    let buffer = new_buffer(LogBufferConfig {
+        mtu: 64,
+        ..deadline_concurrent_config(3)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.deadlines.set_budgets(1, 2);
+    let mut a = conductor.concurrent_publication().unwrap().unwrap();
+    let mut b = conductor.concurrent_publication().unwrap().unwrap();
+    let mut c = conductor.concurrent_publication().unwrap().unwrap();
+    // Three and ten fragments of 32 payload bytes.
+    let (first, second) = (sized_message(1, 96), sized_message(2, 320));
+    let outcome = a
+        .offer_pausing(&first, AppendOptions::default(), &mut |point| {
+            if point != WriterPause::Commit {
+                return;
+            }
+            assert!(matches!(
+                b.offer(&second, AppendOptions::default()).unwrap(),
+                ConcurrentOfferOutcome::Appended { .. }
+            ));
+            core::mem::forget(concurrent_claimed(c.try_claim(8, AppendOptions::default())));
+            // A observed, then eight calls of the look-ahead into B.
+            for _ in 0..8 {
+                assert_eq!(serve(&mut conductor, 0), waiting());
+            }
+        })
+        .unwrap();
+    assert!(matches!(outcome, ConcurrentOfferOutcome::Appended { .. }));
+    // B's remaining fragments and C take three more calls: C is first
+    // observed at 3 at the latest, and expires by 3 + DEADLINE.
+    for now in 1..=3 {
+        let _ = serve(&mut conductor, now);
+    }
+    assert_eq!(serve(&mut conductor, 3 + DEADLINE), aborted(1, 64));
+}
