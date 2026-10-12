@@ -204,6 +204,18 @@ fn merge_is_all_or_nothing_and_propagates_incompleteness() {
     let before = a.clone();
     assert_eq!(a.merge(&full), Err(HistogramError::Overflow));
     assert_eq!(a, before);
+    // A bin that would overflow refuses the whole merge, even when the
+    // totals fit.
+    let mut crowded = a.clone();
+    let mut single = Histogram::new(2, 1_000, 1).unwrap();
+    single.record(interval(1, 2)).unwrap();
+    crowded.available = 0;
+    if let Slot::NonNegative(index) = crowded.slot(1) {
+        crowded.min.non_negative[index] = u64::MAX;
+    }
+    let before = crowded.clone();
+    assert_eq!(crowded.merge(&single), Err(HistogramError::Overflow));
+    assert_eq!(crowded, before);
     let mut broken = Histogram::new(2, 1_000, 1).unwrap();
     broken.incomplete = true;
     a.merge(&broken).unwrap();

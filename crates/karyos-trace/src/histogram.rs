@@ -32,7 +32,9 @@ pub enum HistogramError {
     /// A quantile with a zero denominator or above 1.
     #[error("invalid quantile")]
     InvalidQuantile,
-    /// A count would overflow; nothing was changed.
+    /// A count would overflow. No count was changed; `record` also marks
+    /// the histogram incomplete, `merge` leaves the destination entirely
+    /// unchanged.
     #[error("histogram count overflow")]
     Overflow,
     /// Merging histograms of different layouts or units.
@@ -262,7 +264,8 @@ impl Histogram {
         }
     }
 
-    /// Records one latency. Transactional: on refusal nothing changes.
+    /// Records one latency. Transactional: on refusal no count changes (an
+    /// overflow still marks the histogram incomplete).
     ///
     /// # Errors
     ///
@@ -332,9 +335,11 @@ impl Histogram {
         self.incomplete
     }
 
-    /// The quantile `numerator / denominator` as an interval. `Incomplete`
-    /// takes precedence over `Empty`. It describes only the available
-    /// latencies recorded, not trace completeness or unsampled traffic.
+    /// The quantile `numerator / denominator` as an interval, by nearest
+    /// rank: `k = max(1, ceil(q * N))`, so `q = 0` is the minimum and
+    /// `q = 1` the maximum. `Incomplete` takes precedence over `Empty`. It
+    /// describes only the available latencies recorded, not trace
+    /// completeness or unsampled traffic.
     ///
     /// # Errors
     ///
@@ -383,8 +388,11 @@ impl Histogram {
         }
     }
 
-    /// Adds `other` into `self`. All or nothing: on refusal `self` is
-    /// unchanged. An incomplete source makes `self` incomplete.
+    /// Adds `other` into `self`. All or nothing: every sum is checked before
+    /// any is applied, so on refusal `self` is unchanged; nothing is
+    /// allocated. An incomplete source makes `self` incomplete. That both
+    /// histograms measure the same quantity over a compatible selection is
+    /// the caller's contract; only the layout and the unit tag are checked.
     ///
     /// # Errors
     ///
@@ -394,34 +402,47 @@ impl Histogram {
         if self.layout != other.layout || self.unit != other.unit {
             return Err(HistogramError::Mismatch);
         }
-        let mut merged = self.clone();
-        merged.available = merged
-            .available
-            .checked_add(other.available)
-            .ok_or(HistogramError::Overflow)?;
-        for (into, from) in merged.unavailable.iter_mut().zip(other.unavailable) {
-            *into = into.checked_add(from).ok_or(HistogramError::Overflow)?;
+        let fits = self.available.checked_add(other.available).is_some()
+            && self
+                .unavailable
+                .iter()
+                .zip(other.unavailable)
+                .all(|(a, b)| a.checked_add(b).is_some())
+            && side_fits(&self.min, &other.min)
+            && side_fits(&self.max, &other.max);
+        if !fits {
+            return Err(HistogramError::Overflow);
         }
-        for (into, from) in [(&mut merged.min, &other.min), (&mut merged.max, &other.max)] {
-            add_side(into, from).ok_or(HistogramError::Overflow)?;
+        self.available += other.available;
+        for (into, from) in self.unavailable.iter_mut().zip(other.unavailable) {
+            *into += from;
         }
-        merged.incomplete = self.incomplete || other.incomplete;
-        *self = merged;
+        add_side(&mut self.min, &other.min);
+        add_side(&mut self.max, &other.max);
+        self.incomplete |= other.incomplete;
         Ok(())
     }
 }
 
-/// Merge helper: element-wise checked sums.
-fn add_side(into: &mut Side, from: &Side) -> Option<()> {
+/// Whether every element-wise sum of two sides fits.
+fn side_fits(into: &Side, from: &Side) -> bool {
+    let fits = |a: &[u64], b: &[u64]| a.iter().zip(b).all(|(x, y)| x.checked_add(*y).is_some());
+    fits(&into.non_negative, &from.non_negative)
+        && fits(&into.negative, &from.negative)
+        && into.above.checked_add(from.above).is_some()
+        && into.below.checked_add(from.below).is_some()
+}
+
+/// Adds `from` into `into`; [`side_fits`] has checked every sum.
+fn add_side(into: &mut Side, from: &Side) {
     for (a, b) in into.non_negative.iter_mut().zip(from.non_negative.iter()) {
-        *a = a.checked_add(*b)?;
+        *a += *b;
     }
     for (a, b) in into.negative.iter_mut().zip(from.negative.iter()) {
-        *a = a.checked_add(*b)?;
+        *a += *b;
     }
-    into.above = into.above.checked_add(from.above)?;
-    into.below = into.below.checked_add(from.below)?;
-    Some(())
+    into.above += from.above;
+    into.below += from.below;
 }
 
 /// `-magnitude` as `i64`. Recorded values are `i64`, so a magnitude beyond
