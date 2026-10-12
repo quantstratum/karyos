@@ -61,7 +61,14 @@ pub enum Decision {
 
 /// Per-publication sampler: the policy, the cadence residue and the message
 /// id counter.
-#[derive(Debug, Clone)]
+///
+/// Owner obligations: one sampler owns the message counter of a publication
+/// incarnation, and the counter never rewinds. A sampler that replaces
+/// another for the same incarnation is created with [`Sampler::resume`] from
+/// the previous high-water mark; otherwise the publication takes a new
+/// incarnation. The sampler is deliberately not `Clone`: a copy would repeat
+/// message ids.
+#[derive(Debug)]
 pub struct Sampler {
     policy: Sampling,
     /// Root decisions since the policy was set, modulo `n`.
@@ -95,6 +102,7 @@ impl Sampler {
     }
 
     /// The next message id this sampler may assign (its high-water mark).
+    /// `u64::MAX` is never assigned: it marks the counter as exhausted.
     #[must_use]
     pub fn next_message_id(&self) -> u64 {
         self.next_message
