@@ -54,6 +54,7 @@ fn config(stream_id: i32, claim_deadline: u64) -> StreamConfig {
             session_id: 1,
             stream_id,
             claim_deadline,
+            publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
         },
         allow_unconnected: false,
     }

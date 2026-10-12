@@ -345,6 +345,7 @@ mod tests {
                 session_id: 1,
                 stream_id: 2,
                 claim_deadline: DEFAULT_CLAIM_DEADLINE,
+                publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
             })
             .unwrap(),
         );
