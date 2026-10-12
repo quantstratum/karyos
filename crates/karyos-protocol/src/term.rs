@@ -694,6 +694,7 @@ fn tail_mut(bytes: &mut [u8], from: u32) -> Result<&mut [u8], ProtocolError> {
 mod tests {
     use super::*;
     use crate::sizing::DEFAULT_MTU;
+    use karyos_sys::error::LayoutError;
 
     const TERM: u32 = 64 * 1024;
     const IDENTITY: TermIdentity = TermIdentity {
@@ -779,10 +780,10 @@ mod tests {
         );
         assert_eq!(
             app.append(&payload(8001, 2), AppendOptions::default()),
-            Err(ProtocolError::MessageTooLarge {
+            Err(ProtocolError::Layout(LayoutError::MessageTooLarge {
                 length: 8001,
                 max: 8000
-            })
+            }))
         );
         let block = message(scanner(&term).next_item().unwrap());
         assert_eq!(block.fragments().count(), 6);
@@ -885,10 +886,10 @@ mod tests {
         // 96-byte header + 64 bytes reserves 160 > 128.
         assert_eq!(
             app.append(&payload(64, 1), traced),
-            Err(ProtocolError::MessageTooLarge {
+            Err(ProtocolError::Layout(LayoutError::MessageTooLarge {
                 length: 64,
                 max: 32
-            })
+            }))
         );
         assert_eq!(app.append(&payload(32, 1), traced).map(|_| ()), Ok(()));
     }
@@ -1293,7 +1294,7 @@ mod tests {
                     match app.append(&data, options) {
                         Ok(AppendOutcome::Appended { .. }) => appended.push(data),
                         Ok(AppendOutcome::TermFull) => break,
-                        Err(ProtocolError::MessageTooLarge { .. }) => {}
+                        Err(ProtocolError::Layout(LayoutError::MessageTooLarge { .. })) => {}
                         Err(err) => panic!("append failed: {err}"),
                     }
                 }

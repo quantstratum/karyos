@@ -5,7 +5,8 @@
 //!
 //! That is the planned scope from `quantstratum-docs: karyos/SPEC.md` §14. Implemented so far: the
 //! term identity types, the slot descriptor and loan word encodings, and the
-//! loan, revocation and reclaim handshakes of SPEC.md §4; atomic-only views
+//! loan, revocation and reclaim handshakes of SPEC.md §4; the decision word,
+//! frame types and fragment geometry (`frame`, `sizing`); atomic-only views
 //! of memory (`atomic_view`), with a heap backing; and, on Linux, a
 //! size-sealed `memfd` mapping viewed only as atomic words (`mmap`). Payload
 //! (term byte) access and attaching to another process's mapping do not exist
@@ -19,11 +20,13 @@
 
 pub mod atomic_view;
 pub mod error;
+pub mod frame;
 pub mod loan;
 #[cfg(target_os = "linux")]
 pub mod mmap;
+pub mod sizing;
 pub mod slot;
 pub mod sync;
 pub mod term;
 
-pub use error::SysError;
+pub use error::{LayoutError, SysError};
