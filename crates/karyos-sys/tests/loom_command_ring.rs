@@ -9,8 +9,9 @@
 //! Weakening the `tail` Release or Acquire makes this model fail. Weakening
 //! the `head` Release or Acquire does not: that defect lets the producer
 //! overwrite words whose earlier loads by the consumer read the newer
-//! values (load buffering), which Loom does not model. The `head` pair is
-//! kept by the standard release/acquire argument and the Miri tests.
+//! values (load buffering), which Loom does not model. The `head` pair rests
+//! on the standard release/acquire argument; no model or test here detects
+//! its removal.
 //!
 //! Run with `make loom`.
 
