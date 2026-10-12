@@ -200,11 +200,12 @@ impl EmbeddedDriver {
     }
 
     /// Live capability leases of a stream: capabilities held for hand-over
-    /// or owned by handles obtained through a client conductor.
+    /// and handles of either API (client conductor or direct calls).
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError::UnknownStream`] for a foreign handle.
+    /// Returns [`DriverError::UnknownStream`] for a foreign handle or a
+    /// freed stream.
     pub fn live_leases(&mut self, stream: StreamHandle) -> Result<u64, DriverError> {
         Ok(self.stream(stream)?.leases.live())
     }
@@ -308,12 +309,14 @@ impl EmbeddedDriver {
         })
     }
 
-    /// Takes the stream's only publication.
+    /// Takes the stream's only publication. The handle holds a stream lease
+    /// until dropped.
     ///
     /// # Errors
     ///
-    /// Returns [`DriverError::PublicationTaken`] after the first call and
-    /// [`DriverError::UnknownStream`] for a foreign handle.
+    /// Returns [`DriverError::PublicationTaken`] after the first call,
+    /// [`DriverError::StreamRetiring`] for a removed stream, and
+    /// [`DriverError::UnknownStream`] for a foreign handle or a freed stream.
     pub fn publication(&mut self, stream: StreamHandle) -> Result<ClientPublication, DriverError> {
         let stream = self.active_stream(stream)?;
         let inner = stream
@@ -329,12 +332,14 @@ impl EmbeddedDriver {
     }
 
     /// Admits a subscriber to the stream (control path: allocates its copy
-    /// buffer).
+    /// buffer). The handle holds a stream lease until dropped.
     ///
     /// # Errors
     ///
     /// Returns `ResourcesUnavailable` when the stream's registry or loan
-    /// credits are exhausted.
+    /// credits are exhausted, [`DriverError::StreamRetiring`] for a removed
+    /// stream, and [`DriverError::UnknownStream`] for a foreign handle or a
+    /// freed stream.
     pub fn subscribe(
         &mut self,
         stream: StreamHandle,

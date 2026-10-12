@@ -408,3 +408,26 @@ fn a_retiring_stream_keeps_conductor_duty_through_rotations() {
     let _ = driver.do_work().unwrap();
     assert_eq!(state(&driver, stream), StreamState::Freed);
 }
+
+#[test]
+fn a_forgotten_handle_pins_a_retiring_stream() {
+    let config = DriverConfig {
+        max_streams: 1,
+        ..DriverConfig::default()
+    };
+    let mut driver = EmbeddedDriver::with_config(config).unwrap();
+    let stream = driver.add_stream(stream_config(2)).unwrap();
+    let forgotten = driver.subscribe(stream, Role::Optional).unwrap();
+    std::mem::forget(forgotten);
+    driver.remove_stream(stream).unwrap();
+    for _ in 0..10 {
+        let _ = driver.do_work().unwrap();
+    }
+    // Its lease never ends: the stream is never freed and keeps its slot.
+    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    assert_eq!(driver.live_leases(stream).unwrap(), 1);
+    assert!(matches!(
+        driver.add_stream(stream_config(3)),
+        Err(DriverError::TooManyStreams)
+    ));
+}
