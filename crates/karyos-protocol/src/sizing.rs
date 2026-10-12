@@ -135,8 +135,10 @@ impl FragmentPlan {
         self.payload_per_fragment
     }
 
-    /// Number of fragments for a message of `length` bytes; an empty message
-    /// is one header-only fragment.
+    /// Number of fragments for a message of `length` bytes. A length of 0 is
+    /// one header-only fragment, the size of a header-only DATA heartbeat;
+    /// whether `offer` accepts an empty application message is decided by the
+    /// publication API, not here.
     #[inline]
     #[must_use]
     pub const fn fragments(self, length: u32) -> u32 {
@@ -278,6 +280,20 @@ mod tests {
                 max: 8000
             })
         );
+    }
+
+    #[test]
+    fn spec_example_with_trace_extension() {
+        let term = TermLength::try_new(64 * 1024).unwrap();
+        let plan = FragmentPlan::new(DEFAULT_MTU, ext()).unwrap();
+        assert_eq!(plan.payload_per_fragment(), 1408 - 96);
+        let max = plan
+            .max_message_length(term.max_reserved_limit(), term)
+            .unwrap();
+        assert_eq!(max, 7616);
+        assert!(plan.reserved(7616).unwrap() <= 8192);
+        assert!(plan.reserved(7617).unwrap() > 8192);
+        assert_eq!(plan.reserved(0), Ok(96));
     }
 
     #[test]

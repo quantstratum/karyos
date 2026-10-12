@@ -152,6 +152,9 @@ impl Lane {
 }
 
 /// Frame types with their stable wire codes (SPEC.md §5).
+///
+/// Control frames share only word 0 with data frames; a type code here does
+/// not imply that its frame body is the 32-byte [`FrameHeader`] layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum FrameType {
@@ -306,6 +309,11 @@ impl Word0 {
 }
 
 /// The 32-byte base frame header.
+///
+/// In a term, only word 0 of a PAD or ABORTED block is meaningful: the rest
+/// of its extent may be uninitialised or still being written, so a reader
+/// must not decode a full header there (SPEC.md §4). On the wire both travel
+/// as canonical 32-byte records whose extent is `reserved_value`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameHeader {
     /// Word 0.
@@ -510,6 +518,36 @@ mod tests {
             Err(ProtocolError::ReservedFlags { flags: 0x40 })
         );
         assert!(Lane::try_new(4).is_err());
+    }
+
+    #[test]
+    fn every_lane_round_trips_through_flags() {
+        for lane in 0..Lane::COUNT {
+            let flags = Flags::new(false, false, false, false, Lane::try_new(lane).unwrap());
+            assert_eq!(flags.get(), lane << 4);
+            assert_eq!(Flags::try_new(flags.get()).unwrap().lane().get(), lane);
+        }
+    }
+
+    #[test]
+    fn encoding_leaves_the_rest_of_the_buffer_untouched() {
+        let header = FrameHeader {
+            word0: Word0::new(0, Flags::NONE, FrameType::Pad),
+            term_offset: 0,
+            session_id: 0,
+            stream_id: 0,
+            term_id: 0,
+            reserved_value: 0,
+        };
+        let mut out = [0xEEu8; 40];
+        header.encode(&mut out).unwrap();
+        assert!(out[..32].iter().all(|b| *b == 0 || *b == 1));
+        assert_eq!(&out[32..], &[0xEE; 8]);
+
+        let mut ext_out = [0xEEu8; 70];
+        TraceExtension::default().encode(&mut ext_out).unwrap();
+        assert_eq!(&ext_out[64..], &[0xEE; 6]);
+        assert!(TraceExtension::default().encode(&mut [0u8; 63]).is_err());
     }
 
     #[test]
