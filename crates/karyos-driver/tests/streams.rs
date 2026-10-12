@@ -358,6 +358,10 @@ fn repeated_remove_and_re_add_keeps_no_history() {
 }
 
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "hundreds of kilobytes through several rotations is too slow under Miri"
+)]
 fn a_retiring_stream_keeps_conductor_duty_through_rotations() {
     use karyos_client::MessageLimit;
 
@@ -410,6 +414,7 @@ fn a_retiring_stream_keeps_conductor_duty_through_rotations() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "forgets a handle on purpose; Miri reports the leak")]
 fn a_forgotten_handle_pins_a_retiring_stream() {
     let config = DriverConfig {
         max_streams: 1,
