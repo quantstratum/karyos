@@ -123,7 +123,11 @@ impl<'a> RingWords<'a> {
     ///
     /// Returns [`RingError::InvalidGeometry`] unless the data area is a power
     /// of two of at least 2 words, the trailer has [`TRAILER_WORDS`] words,
-    /// and `max_extent` is a multiple of 8 between 16 and the capacity.
+    /// and `max_extent` is a multiple of 8 between 16 and half the
+    /// capacity. Padding is always shorter than the record that needs it, so
+    /// a padding record plus a record of at most half the capacity always fit
+    /// in the area: a record can neither overlap its own padding nor wait
+    /// forever for room.
     pub fn new(
         data: &'a [AtomicU64],
         trailer: &'a [AtomicU64],
@@ -137,7 +141,7 @@ impl<'a> RingWords<'a> {
             && capacity.is_power_of_two()
             && trailer.len() >= TRAILER_WORDS
             && max_extent.is_multiple_of(8)
-            && (16..=capacity).contains(&max_extent);
+            && (16..=capacity / 2).contains(&max_extent);
         if !valid {
             return Err(RingError::InvalidGeometry);
         }
@@ -591,6 +595,38 @@ mod tests {
         words.set_positions(0, 0);
         assert_eq!(producer.write(1, b"x"), Err(RingError::Closed));
         assert!(producer.is_closed());
+    }
+
+    #[test]
+    fn a_record_larger_than_half_the_ring_is_rejected_at_creation() {
+        let data: Vec<AtomicU64> = (0..8).map(|_| AtomicU64::new(0)).collect();
+        let trailer: Vec<AtomicU64> = (0..TRAILER_WORDS).map(|_| AtomicU64::new(0)).collect();
+        // 64-byte ring: a 64-byte record could need 48 bytes of padding and
+        // then never fit.
+        assert_eq!(
+            RingWords::new(&data, &trailer, 64).err(),
+            Some(RingError::InvalidGeometry)
+        );
+        let words = RingWords::new(&data, &trailer, 32).unwrap();
+        let mut out = [0u8; 24];
+        // Extents 24 and 16 leave the tail at offset 40, 24 bytes before
+        // the end; drain both.
+        words.write(1, &[1; 16]).unwrap();
+        words.write(2, &[2; 8]).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(words.read(&mut out), Ok(RingRead::Message { .. })));
+        }
+        // The largest record (extent 32) needs 24 bytes of padding, and the
+        // two still fit in the empty ring.
+        assert_eq!(words.write(3, &[3; 24]), Ok(64));
+        assert_eq!(
+            words.read(&mut out),
+            Ok(RingRead::Message {
+                position: 64,
+                type_id: 3,
+                length: 24
+            })
+        );
     }
 
     #[test]
