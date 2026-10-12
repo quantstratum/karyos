@@ -152,12 +152,16 @@ fn quarantined_slot_is_cleaned_after_release() {
         };
 
         let reclaiming = begin_reclaim(&shared.descriptor, active).unwrap();
-        // Rescan after the participant finished: the quarantine must end.
-        reader.join().unwrap();
-        assert!(!loan_held(&shared.loan_words, target.slot(), reclaiming).unwrap());
+        // Rescan concurrently until the quarantine ends; cleaning must then be
+        // ordered after the participant's accesses by the protocol alone,
+        // not by joining its thread.
+        while loan_held(&shared.loan_words, target.slot(), reclaiming).unwrap() {
+            thread::yield_now();
+        }
         let cleaning = begin_cleaning(&shared.descriptor, reclaiming).unwrap();
         shared.write_bytes(CLEANED_BYTES);
         publish(&shared.descriptor, cleaning.with_state(SlotState::Free));
+        reader.join().unwrap();
     });
 }
 

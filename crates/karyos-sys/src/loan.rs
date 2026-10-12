@@ -276,8 +276,9 @@ pub fn participant_quiescent(loan_words: &[AtomicU64]) -> Result<bool, SysError>
 ///
 /// # Errors
 ///
-/// Returns [`SysError::UnexpectedDescriptor`] when `active` is not an `Active`
-/// descriptor or the slot no longer holds it.
+/// Returns [`SysError::WrongSourceState`] when `active` is not an `Active`
+/// descriptor, without reading the slot, and
+/// [`SysError::UnexpectedDescriptor`] when the slot no longer holds it.
 pub fn begin_reclaim(descriptor: &AtomicU64, active: Descriptor) -> Result<Descriptor, SysError> {
     let reclaiming = active.with_state(SlotState::Reclaiming);
     let result = transition(
@@ -324,8 +325,9 @@ pub fn loan_held(
 ///
 /// # Errors
 ///
-/// Returns [`SysError::UnexpectedDescriptor`] when the slot does not hold
-/// `reclaiming`.
+/// Returns [`SysError::WrongSourceState`] when `reclaiming` is not a
+/// `Reclaiming` descriptor, without reading the slot, and
+/// [`SysError::UnexpectedDescriptor`] when the slot does not hold it.
 pub fn begin_cleaning(
     descriptor: &AtomicU64,
     reclaiming: Descriptor,
@@ -351,8 +353,10 @@ pub fn publish(descriptor: &AtomicU64, value: Descriptor) {
 ///
 /// # Errors
 ///
-/// Returns [`SysError::UnexpectedDescriptor`] when the slot holds anything
-/// else.
+/// Returns [`SysError::WrongSourceState`] when `ready` is not a `Ready`
+/// descriptor, without reading the slot, and
+/// [`SysError::UnexpectedDescriptor`] when the slot holds anything other than
+/// `ready` or its `Active` successor.
 pub fn activate(descriptor: &AtomicU64, ready: Descriptor) -> Result<Descriptor, SysError> {
     let active = ready.with_state(SlotState::Active);
     match transition(
