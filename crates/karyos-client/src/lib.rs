@@ -8,12 +8,17 @@
 //! driver through the command ring and the broadcast buffer. Conflation,
 //! lanes beyond one and IPC attachment do not exist yet.
 
+pub mod concurrent;
 pub mod conductor;
 pub mod error;
 pub mod link;
 pub mod publication;
 pub mod subscription;
 
+pub use concurrent::{
+    ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,
+    ConcurrentOfferOutcome,
+};
 pub use conductor::{ClientConductor, Completion, ConductorError, ConductorPoll, Outcome};
 pub use error::ClientError;
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};

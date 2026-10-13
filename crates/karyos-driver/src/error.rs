@@ -51,9 +51,15 @@ pub enum DriverError {
     /// The process has used every driver identity.
     #[error("driver identities exhausted")]
     DriverIdsExhausted,
-    /// The stream's publication has already been taken.
+    /// Every publication the stream can issue is out: its exclusive
+    /// publication, or all `P` publisher slots of a concurrent stream.
     #[error("the stream's publication has already been taken")]
     PublicationTaken,
+    /// The requested publication kind does not match the stream's mode: an
+    /// exclusive publication of a concurrent stream, or a concurrent
+    /// handle of an exclusive one.
+    #[error("the publication kind does not match the stream's mode")]
+    InvalidPublicationMode,
     /// A duty cycle's work count does not fit `u32`; the work was done
     /// and the count keeps its previous value.
     #[error("work count overflow: {count} + {delta}")]

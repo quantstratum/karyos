@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_client::link::{Lease, LeaseEnd, StreamLeases};
-use karyos_client::{ClientPublication, ClientSubscription};
+use karyos_client::{ClientConcurrentPublication, ClientPublication, ClientSubscription};
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::log_buffer::{
@@ -386,16 +386,48 @@ impl EmbeddedDriver {
     /// # Errors
     ///
     /// Returns [`DriverError::PublicationTaken`] after the first call,
+    /// [`DriverError::InvalidPublicationMode`] for a concurrent stream,
     /// [`DriverError::StreamRetiring`] for a removed stream, and
     /// [`DriverError::UnknownStream`] for a foreign handle or a freed stream.
     pub fn publication(&mut self, stream: StreamHandle) -> Result<ClientPublication, DriverError> {
         let stream = self.active_stream(stream)?;
         let inner = stream
             .buffer
-            .publication_owned()?
+            .publication_owned()
+            .map_err(mode_error)?
             .ok_or(DriverError::PublicationTaken)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
         let publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease);
+        self.update_stream_gauges();
+        Ok(publication)
+    }
+
+    /// Issues a concurrent publication handle on one of the stream's `P`
+    /// publisher slots (`quantstratum-docs: karyos/design/client-concurrent-publication.md`).
+    /// The handle holds a stream lease until dropped; dropping it frees its
+    /// slot for a later handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::InvalidPublicationMode`] for an exclusive
+    /// stream, [`DriverError::PublicationTaken`] while all `P` slots are
+    /// held, `ResourcesUnavailable` when the claim staging of a shared
+    /// buffer cannot be allocated, [`DriverError::StreamRetiring`] for a
+    /// removed stream, and [`DriverError::UnknownStream`] for a foreign
+    /// handle or a freed stream. Nothing is held after an error.
+    pub fn concurrent_publication(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<ClientConcurrentPublication, DriverError> {
+        let stream = self.active_stream(stream)?;
+        let inner = stream
+            .conductor
+            .concurrent_publication()
+            .map_err(mode_error)?
+            .ok_or(DriverError::PublicationTaken)?;
+        let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
+        let publication =
+            ClientConcurrentPublication::with_lease(inner, stream.allow_unconnected, lease);
         self.update_stream_gauges();
         Ok(publication)
     }
@@ -501,6 +533,17 @@ impl EmbeddedDriver {
 /// report, also the one an error carries, adds the aborts to `work`, then
 /// records the error (`quantstratum-docs: karyos/design/concurrent-deadline.md`, Results).
 /// Returns whether the stream is waiting on a deadline.
+/// A publication kind that does not match the stream's mode is the
+/// driver's typed refusal; other errors pass through.
+fn mode_error(error: karyos_sys::error::SysError) -> DriverError {
+    match error {
+        karyos_sys::error::SysError::InvalidPublicationMode { .. } => {
+            DriverError::InvalidPublicationMode
+        }
+        other => DriverError::Sys(other),
+    }
+}
+
 fn account_deadlines(
     counters: &DriverCounters,
     work: &mut u32,

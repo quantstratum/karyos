@@ -456,6 +456,15 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }))
     }
 
+    /// Aborts a forgotten claim, if any, from its observed reserved word; a
+    /// no-op without one, or once its block is terminal. `offer` and
+    /// `try_claim` call this first; a wrapper whose mutable operation may
+    /// return early without calling into the handle calls it itself
+    /// (`quantstratum-docs: karyos/design/client-concurrent-publication.md`).
+    pub fn resolve_forgotten_claim(&mut self) {
+        self.resolve_claim();
+    }
+
     /// Aborts the outstanding claim, if any: no reference into it remains
     /// (the claim borrowed the handle mutably).
     fn resolve_claim(&mut self) {
