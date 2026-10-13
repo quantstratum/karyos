@@ -47,6 +47,9 @@ pub enum ConcurrentOfferOutcome {
         /// Its position in that lane.
         position: u64,
     },
+    /// The stream is sealed: the handle accepts nothing again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 /// Result of [`ClientConcurrentPublication::try_claim`]. Embedded API,
@@ -72,6 +75,9 @@ pub enum ConcurrentClaimOutcome<'a> {
         /// Its position in that lane.
         position: u64,
     },
+    /// The stream is sealed: the handle reserves nothing again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 /// A claimed block of a [`ClientConcurrentPublication`]. It mutably
@@ -242,6 +248,10 @@ impl ClientConcurrentPublication {
         // A forgotten claim is resolved before any early return.
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
+            // A sealed handle still releases (publication-seal.md).
+            if self.inner.close_if_sealed() {
+                return Ok(ConcurrentOfferOutcome::Closed);
+            }
             return Ok(ConcurrentOfferOutcome::NotConnected);
         }
         let lane = self.inner.buffer().lane();
@@ -275,6 +285,9 @@ impl ClientConcurrentPublication {
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
+            if self.inner.close_if_sealed() {
+                return Ok(ConcurrentClaimOutcome::Closed);
+            }
             return Ok(ConcurrentClaimOutcome::NotConnected);
         }
         let lane = self.inner.buffer().lane();
@@ -298,6 +311,7 @@ fn offer_outcome(outcome: SysOfferOutcome, lane: Lane) -> ConcurrentOfferOutcome
         SysOfferOutcome::Aborted { position } => ConcurrentOfferOutcome::Aborted { lane, position },
         SysOfferOutcome::BackPressured => ConcurrentOfferOutcome::BackPressured,
         SysOfferOutcome::AdminAction => ConcurrentOfferOutcome::AdminAction,
+        SysOfferOutcome::Closed => ConcurrentOfferOutcome::Closed,
     }
 }
 
@@ -313,6 +327,7 @@ fn claim_outcome(
         SysClaimOutcome::BackPressured => ConcurrentClaimOutcome::BackPressured,
         SysClaimOutcome::AdminAction => ConcurrentClaimOutcome::AdminAction,
         SysClaimOutcome::Aborted { position } => ConcurrentClaimOutcome::Aborted { lane, position },
+        SysClaimOutcome::Closed => ConcurrentClaimOutcome::Closed,
     }
 }
 
@@ -354,6 +369,14 @@ mod tests {
         assert!(matches!(
             claim_outcome(SysClaimOutcome::AdminAction, lane),
             ConcurrentClaimOutcome::AdminAction
+        ));
+        assert_eq!(
+            offer_outcome(SysOfferOutcome::Closed, lane),
+            ConcurrentOfferOutcome::Closed
+        );
+        assert!(matches!(
+            claim_outcome(SysClaimOutcome::Closed, lane),
+            ConcurrentClaimOutcome::Closed
         ));
     }
 

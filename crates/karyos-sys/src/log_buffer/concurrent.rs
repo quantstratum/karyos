@@ -15,7 +15,7 @@ use crate::frame::{FRAME_ALIGNMENT, Flags, FrameType, PROTOCOL_VERSION, Word0};
 use crate::loan::{LoanOutcome, release_loan, rotate_to, take_loan};
 use crate::publication::{
     ABORTING_MARKER, abort_block, acquire_publisher_slot, commit_block, mark_block, observe_block,
-    reissue_from, release_publisher_slot,
+    observe_seal, reissue_from, release_publisher_slot,
 };
 use crate::slot::{Descriptor, SlotState};
 use crate::term::TermCount;
@@ -34,6 +34,9 @@ enum HandleState {
     },
     /// No loan: eligible once the active count reaches `from`.
     Waiting { from: TermCount },
+    /// The handle observed the seal and released its loan and publisher
+    /// slot (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 /// A concurrent publication handle. Issued by
@@ -90,6 +93,9 @@ pub enum ConcurrentOfferOutcome {
     /// The handle waits for a later term, or its reservation crossed or
     /// landed past the term end; retry later.
     AdminAction,
+    /// The buffer is sealed: this handle reserves nothing again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 impl From<AppendOutcome> for ConcurrentOfferOutcome {
@@ -98,6 +104,7 @@ impl From<AppendOutcome> for ConcurrentOfferOutcome {
             AppendOutcome::Appended { position } => Self::Appended { position },
             AppendOutcome::BackPressured => Self::BackPressured,
             AppendOutcome::AdminAction => Self::AdminAction,
+            AppendOutcome::Closed => Self::Closed,
         }
     }
 }
@@ -120,6 +127,9 @@ pub enum ConcurrentClaimOutcome<'a, O: BufferOwner> {
         /// Stream position of the reserved block.
         position: u64,
     },
+    /// The buffer is sealed: this handle reserves nothing again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 /// A claimed block of a concurrent handle: it mutably borrows the handle;
@@ -179,6 +189,11 @@ impl<O: BufferOwner> Conductor<O> {
             return Err(SysError::InvalidPublicationMode {
                 reason: "a concurrent handle of an exclusive buffer",
             });
+        }
+        // The conductor alone seals and issues, so a seal load here sees
+        // every earlier seal (`quantstratum-docs: karyos/design/publication-seal.md`).
+        if buffer.seal.load(Ordering::Relaxed) != 0 {
+            return Err(SysError::Sealed);
         }
         // Allocated before a slot is taken, so a failure leaves no slot held.
         let staging = if <O::Terms as crate::term_bytes::sealed::Access>::DIRECT {
@@ -308,6 +323,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         pause: &mut dyn FnMut(WriterPause),
     ) -> Result<ConcurrentOfferOutcome, SysError> {
         self.resolve_claim();
+        if self.state == HandleState::Closed {
+            return Ok(ConcurrentOfferOutcome::Closed);
+        }
         if payload.is_empty() {
             return Err(SysError::EmptyMessage);
         }
@@ -330,6 +348,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         let reserved = plan.reserved(length)?;
         let (count, slot, start) = match self.reserve(reserved, pause)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
+            Reserved::Outcome(_) if self.observe_seal() => {
+                return Ok(ConcurrentOfferOutcome::Closed);
+            }
             Reserved::Outcome(outcome) => return Ok(outcome.into()),
         };
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
@@ -386,6 +407,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         pause: &mut dyn FnMut(WriterPause),
     ) -> Result<ConcurrentClaimOutcome<'_, O>, SysError> {
         self.resolve_claim();
+        if self.state == HandleState::Closed {
+            return Ok(ConcurrentClaimOutcome::Closed);
+        }
         if length == 0 {
             return Err(SysError::EmptyMessage);
         }
@@ -407,6 +431,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }
         let (count, slot, start) = match self.reserve(reserved, pause)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
+            Reserved::Outcome(_) if self.observe_seal() => {
+                return Ok(ConcurrentClaimOutcome::Closed);
+            }
             Reserved::Outcome(AppendOutcome::BackPressured) => {
                 return Ok(ConcurrentClaimOutcome::BackPressured);
             }
@@ -564,6 +591,45 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// dropping it does.
     pub fn close(self) {}
 
+    /// Whether the publication is closed by the seal, releasing it now if
+    /// the buffer is sealed and it has not released yet
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`). Resolves a forgotten claim
+    /// first. For wrappers that return before an attempt (the connection
+    /// rule), so that a sealed publication is still released.
+    pub fn close_if_sealed(&mut self) -> bool {
+        self.resolve_claim();
+        self.state == HandleState::Closed || self.observe_seal()
+    }
+
+    /// After an attempt that was not granted: if the buffer is sealed,
+    /// releases the handle and returns `true`; every later call returns
+    /// `Closed` at once (`quantstratum-docs: karyos/design/publication-seal.md`). The caller
+    /// resolved any forgotten claim first.
+    fn observe_seal(&mut self) -> bool {
+        if !observe_seal(&self.buffer.seal) {
+            return false;
+        }
+        self.release();
+        self.state = HandleState::Closed;
+        true
+    }
+
+    /// Releases the loan, if any, then the publisher slot: the handle's
+    /// last access to the buffer.
+    fn release(&mut self) {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if let HandleState::Active { .. } = self.state
+            && let Ok(cell) = buffer.cell(self.index)
+        {
+            release_loan(&cell.loan);
+        }
+        let active = buffer.active_count.load(Ordering::Acquire) as u32;
+        if let Some(word) = buffer.publishers.get(self.index) {
+            // After the handle's last access.
+            release_publisher_slot(word, active);
+        }
+    }
+
     /// One rotation attempt from `count` to the next term (SPEC.md §4
     /// rotation), by the crossing owner or a producer that landed past the
     /// end. Its result does not change the call's outcome (`AdminAction`).
@@ -630,6 +696,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
                     return Ok(false);
                 }
             }
+            HandleState::Closed => return Ok(false),
         }
         let Lookup::Slot(slot) = buffer.lookup(active)? else {
             return Ok(false);
@@ -656,16 +723,8 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
 impl<O: BufferOwner> Drop for ConcurrentPublication<O> {
     fn drop(&mut self) {
         self.resolve_claim();
-        let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        if let HandleState::Active { .. } = self.state
-            && let Ok(cell) = buffer.cell(self.index)
-        {
-            release_loan(&cell.loan);
-        }
-        let active = buffer.active_count.load(Ordering::Acquire) as u32;
-        if let Some(word) = buffer.publishers.get(self.index) {
-            // After the handle's last access.
-            release_publisher_slot(word, active);
+        if self.state != HandleState::Closed {
+            self.release();
         }
     }
 }

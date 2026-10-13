@@ -17,7 +17,8 @@ fn claim_through_the_facade(publication: &mut ClientPublication) -> Option<Commi
             ClaimOutcome::BackPressured
             | ClaimOutcome::AdminAction
             | ClaimOutcome::NotConnected
-            | ClaimOutcome::Aborted { .. },
+            | ClaimOutcome::Aborted { .. }
+            | ClaimOutcome::Closed,
         )
         | Err(_) => None,
     }

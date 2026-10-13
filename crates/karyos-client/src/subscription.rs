@@ -87,6 +87,10 @@ pub struct PollSummary {
     /// The aborted block that stopped the poll, if any; the next poll
     /// resumes after it.
     pub aborted: Option<Aborted>,
+    /// The seal position, when the poll reached it: the stream is sealed
+    /// and no message can follow (`quantstratum-docs: karyos/design/publication-seal.md`).
+    /// Every later poll reports it again.
+    pub closed: Option<u64>,
 }
 
 /// A poll that failed after possibly delivering messages: `summary` reports
@@ -227,6 +231,10 @@ impl ClientSubscription {
                 }
                 PollOutcome::Aborted { position, extent } => {
                     summary.aborted = Some(Aborted { position, extent });
+                    break;
+                }
+                PollOutcome::Closed { position } => {
+                    summary.closed = Some(position);
                     break;
                 }
                 PollOutcome::Pending => break,

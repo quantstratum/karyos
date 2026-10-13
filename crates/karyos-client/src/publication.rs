@@ -37,6 +37,9 @@ pub enum OfferOutcome {
     /// No subscriber is attached and the publication does not allow
     /// unconnected offers (SPEC.md §4 connection rule).
     NotConnected,
+    /// The stream is sealed: the publication accepts nothing again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 /// Result of [`ClientPublication::try_claim`]. Each call makes at most
@@ -63,6 +66,9 @@ pub enum ClaimOutcome<'a> {
         /// Its position in that lane.
         position: u64,
     },
+    /// The stream is sealed: the publication reserves nothing again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 /// Result of [`ClientClaim::commit`]. Embedded API, provisional, as
@@ -256,6 +262,10 @@ impl ClientPublication {
         // A forgotten claim is resolved before any early return.
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
+            // A sealed publication still releases (publication-seal.md).
+            if self.inner.close_if_sealed() {
+                return Ok(OfferOutcome::Closed);
+            }
             return Ok(OfferOutcome::NotConnected);
         }
         Ok(match self.inner.append(payload, options)? {
@@ -265,6 +275,7 @@ impl ClientPublication {
             },
             AppendOutcome::BackPressured => OfferOutcome::BackPressured,
             AppendOutcome::AdminAction => OfferOutcome::AdminAction,
+            AppendOutcome::Closed => OfferOutcome::Closed,
         })
     }
 
@@ -297,6 +308,9 @@ impl ClientPublication {
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
+            if self.inner.close_if_sealed() {
+                return Ok(ClaimOutcome::Closed);
+            }
             return Ok(ClaimOutcome::NotConnected);
         }
         let lane = self.inner.buffer().lane();
@@ -305,6 +319,7 @@ impl ClientPublication {
             SysClaimOutcome::BackPressured => ClaimOutcome::BackPressured,
             SysClaimOutcome::AdminAction => ClaimOutcome::AdminAction,
             SysClaimOutcome::Aborted { position } => ClaimOutcome::Aborted { lane, position },
+            SysClaimOutcome::Closed => ClaimOutcome::Closed,
         })
     }
 
@@ -366,6 +381,59 @@ mod tests {
 
     fn no_delivery(_: &[u8], _: crate::subscription::MessageInfo) {
         panic!("nothing to deliver");
+    }
+
+    #[test]
+    fn a_sealed_publication_reports_closed_and_readers_reach_the_end() {
+        let (buffer, mut conductor, mut publication) = setup(false);
+        let mut subscription =
+            ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        assert!(matches!(
+            publication.offer(b"last").unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+        conductor.seal();
+        assert_eq!(publication.offer(b"late").unwrap(), OfferOutcome::Closed);
+        assert!(matches!(
+            publication.try_claim(4).unwrap(),
+            ClaimOutcome::Closed
+        ));
+        let _ = conductor.duty_cycle().unwrap();
+        let mut seen = Vec::new();
+        let summary = subscription
+            .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(seen, vec![b"last".to_vec()]);
+        assert_eq!(summary.delivered, 1);
+        let end = summary.closed.unwrap();
+        // Repeated: the end is terminal.
+        let again = subscription
+            .poll(no_delivery, MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(again.closed, Some(end));
+        drop(buffer);
+    }
+
+    #[test]
+    fn a_sealed_publication_without_subscribers_still_releases() {
+        let (_buffer, mut conductor, mut publication) = setup(false);
+        conductor.seal();
+        let _ = conductor.duty_cycle().unwrap();
+        assert_eq!(
+            conductor.seal_state(),
+            karyos_sys::log_buffer::SealState::Sealed
+        );
+        // Not connected, but sealed: Closed, and the publication released.
+        assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::Closed);
+        let _ = conductor.duty_cycle().unwrap();
+        assert_eq!(
+            conductor.seal_state(),
+            karyos_sys::log_buffer::SealState::Retired { position: 0 }
+        );
+        assert!(matches!(
+            publication.try_claim(4).unwrap(),
+            ClaimOutcome::Closed
+        ));
     }
 
     #[test]

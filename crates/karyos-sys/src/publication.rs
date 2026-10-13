@@ -282,3 +282,89 @@ pub fn reserved_extent(
     };
     (fits && shape).then_some(extent)
 }
+
+/// The seal word once sealed (`quantstratum-docs: karyos/design/publication-seal.md`).
+pub const SEAL_SEALED: u64 = 1 << 63;
+/// The seal word's mark of a known seal position, held in the bits below.
+pub const SEAL_POSITIONED: u64 = 1 << 62;
+
+/// Seals (conductor): writes `SEAL_SEALED`, then a zero `limit`. A
+/// publisher whose Acquire load of the limit reads that zero then observes
+/// the seal.
+///
+/// The issuer takes the publication, then reads the seal; the conductor
+/// writes the seal, then reads whether it was taken. Every one of these
+/// four accesses is a read-modify-write, so each reads the latest value of
+/// its word: if the issuer's read misses the seal, the seal write reads
+/// from it and synchronizes with it, and the conductor then sees the take
+/// (`quantstratum-docs: karyos/design/publication-seal.md`, issuance).
+#[inline]
+pub fn seal(seal: &AtomicU64, limit: &AtomicU64) {
+    let _ = seal.swap(SEAL_SEALED, Ordering::AcqRel);
+    limit.store(0, Ordering::Release);
+}
+
+/// A publisher's check after an attempt that was not granted: whether the
+/// buffer is sealed.
+#[inline]
+pub fn observe_seal(seal: &AtomicU64) -> bool {
+    seal.load(Ordering::Acquire) != 0
+}
+
+/// Takes the exclusive publication once (issuer), then the issuer reads
+/// the seal with [`issuer_sees_seal`].
+#[inline]
+pub fn take_publication(taken: &AtomicU64) -> bool {
+    taken
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// The issuer's read of the seal after [`take_publication`], a
+/// read-modify-write that changes nothing (see [`seal`]).
+#[inline]
+pub fn issuer_sees_seal(seal: &AtomicU64) -> bool {
+    seal.fetch_or(0, Ordering::AcqRel) != 0
+}
+
+/// The conductor's read, after [`seal`], of whether the exclusive
+/// publication was ever taken: a read-modify-write that changes nothing
+/// (see [`seal`]).
+#[inline]
+pub fn publication_taken(taken: &AtomicU64) -> bool {
+    taken.fetch_or(0, Ordering::AcqRel) != 0
+}
+
+/// Announces the exclusive publication's release after its last
+/// reservation (its last `reserved_head` store).
+#[inline]
+pub fn release_publication(released: &AtomicU64) {
+    released.store(1, Ordering::Release);
+}
+
+/// Whether the exclusive publication released: the Acquire orders every
+/// reservation it was granted before the conductor's head read.
+#[inline]
+pub fn publication_released(released: &AtomicU64) -> bool {
+    released.load(Ordering::Acquire) != 0
+}
+
+/// Whether a publisher slot is free (conductor): the Acquire orders every
+/// reservation of its last holder before the conductor's head read.
+/// Concurrent handles are issued by the conductor itself, so no issuance
+/// races this load.
+#[inline]
+pub fn publisher_slot_free(word: &AtomicU64) -> bool {
+    word.load(Ordering::Acquire) & PUBLISHER_HELD == 0
+}
+
+/// Writes the seal position (conductor), once every publisher released.
+/// A swap, like every write to the seal word, so that the issuer's
+/// read-modify-write in [`issuer_sees_seal`] is ordered with all of them.
+#[inline]
+pub fn position_seal(seal: &AtomicU64, position: u64) {
+    let _ = seal.swap(
+        SEAL_SEALED | SEAL_POSITIONED | (position & (SEAL_POSITIONED - 1)),
+        Ordering::AcqRel,
+    );
+}

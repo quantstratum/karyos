@@ -118,6 +118,10 @@ pub enum SysError {
         /// What is wrong.
         reason: &'static str,
     },
+    /// The buffer is sealed: no publication is issued
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    #[error("the publication is sealed")]
+    Sealed,
     /// The commit deadline of claims must be at least one tick.
     #[error("invalid claim deadline {value}")]
     InvalidClaimDeadline {

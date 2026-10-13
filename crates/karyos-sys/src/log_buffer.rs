@@ -37,8 +37,10 @@ use crate::loan::{
     release_loan, take_loan,
 };
 use crate::publication::{
-    abort_block, commit_block, deadline_abort, load_interior, mark_block, observe_block,
-    publish_block, read_claim_record, store_interior, write_claim_record,
+    SEAL_POSITIONED, SEAL_SEALED, abort_block, commit_block, deadline_abort, issuer_sees_seal,
+    load_interior, mark_block, observe_block, observe_seal, position_seal, publication_released,
+    publication_taken, publish_block, publisher_slot_free, read_claim_record, release_publication,
+    seal, store_interior, take_publication, write_claim_record,
 };
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
 use crate::slot::{Descriptor, SlotIndex, SlotState};
@@ -85,6 +87,11 @@ const CELL_FREE: u64 = 0;
 const CELL_REQUIRED: u64 = 1;
 const CELL_OPTIONAL: u64 = 2;
 const CELL_PUBLICATION: u64 = 3;
+
+/// The seal position bits of the seal word (`quantstratum-docs: karyos/design/publication-seal.md`):
+/// `0` while active, `SEAL_SEALED` once sealed, and `SEAL_SEALED |
+/// SEAL_POSITIONED | position` once the seal position is known.
+const SEAL_POSITION: u64 = SEAL_POSITIONED - 1;
 
 /// A subscriber's role (SPEC.md §4 reader roles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -184,8 +191,14 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     limit: AtomicU64,
     floor: AtomicU64,
     cells: Box<[Cell]>,
-    publication_taken: AtomicBool,
+    /// `1` once the exclusive publication was issued (never reissued).
+    publication_taken: AtomicU64,
     conductor_taken: AtomicBool,
+    /// The seal word, written only by the conductor.
+    seal: AtomicU64,
+    /// The exclusive publication's release after its last reservation
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    exclusive_released: AtomicU64,
     /// The claim record and its seqlock serial
     /// (`quantstratum-docs: karyos/design/claim-deadline.md`).
     claim_record: AtomicU64,
@@ -305,8 +318,10 @@ impl<T: TermBytes> LogBuffer<T> {
             limit: AtomicU64::new(window),
             floor: AtomicU64::new(0),
             cells,
-            publication_taken: AtomicBool::new(false),
+            publication_taken: AtomicU64::new(0),
             conductor_taken: AtomicBool::new(false),
+            seal: AtomicU64::new(0),
+            exclusive_released: AtomicU64::new(0),
             claim_record: AtomicU64::new(0),
             claim_serial: AtomicU64::new(0),
             tails,
@@ -609,7 +624,7 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
     }
     // Already issued: no allocation. The compare-exchange below still
     // decides a race.
-    if buffer.publication_taken.load(Ordering::Acquire) {
+    if buffer.publication_taken.load(Ordering::Acquire) != 0 {
         return Ok(None);
     }
     // The staging buffer of claims on a backing without direct bytes, sized
@@ -630,12 +645,16 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
         staging.resize(size, 0u8);
         staging.into_boxed_slice()
     };
-    if buffer
-        .publication_taken
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    // `SeqCst` with the seal load below and the conductor's seal store and
+    // positioning load: at least one side observes the other
+    // (`quantstratum-docs: karyos/design/publication-seal.md`, issuance).
+    if !take_publication(&buffer.publication_taken) {
         return Ok(None);
+    }
+    if issuer_sees_seal(&buffer.seal) {
+        // Taken but never used: released at once, and never reissued.
+        release_publication(&buffer.exclusive_released);
+        return Err(SysError::Sealed);
     }
     let cell = buffer.cell(0)?;
     let slot = SlotIndex::try_new(0)?;
@@ -720,6 +739,9 @@ pub enum AppendOutcome {
     /// The append only padded or rotated, or rotation waits for the
     /// conductor; retry later.
     AdminAction,
+    /// The buffer is sealed: this publication reserves nothing again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -732,6 +754,8 @@ enum PublicationState {
     Rotating {
         next: TermCount,
     },
+    /// The publication observed the seal and released.
+    Closed,
 }
 
 /// The publication's record of its outstanding claim (claims.md,
@@ -771,6 +795,9 @@ pub enum ClaimOutcome<'a, O: BufferOwner> {
         /// Stream position of the block.
         position: u64,
     },
+    /// The buffer is sealed: this publication reserves nothing again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed,
 }
 
 /// Result of [`Claim::commit`].
@@ -821,11 +848,19 @@ impl<O: BufferOwner> Publication<O> {
         options: AppendOptions,
     ) -> Result<AppendOutcome, SysError> {
         self.resolve_claim();
-        PublicationContext {
+        if self.state == PublicationState::Closed {
+            return Ok(AppendOutcome::Closed);
+        }
+        let outcome = PublicationContext {
             buffer: &self.buffer,
             state: &mut self.state,
         }
-        .append(payload, options)
+        .append(payload, options)?;
+        match outcome {
+            AppendOutcome::Appended { .. } => Ok(outcome),
+            _ if self.observe_seal() => Ok(AppendOutcome::Closed),
+            _ => Ok(outcome),
+        }
     }
 
     /// Claims one unfragmented block of `length` payload bytes (SPEC.md §4,
@@ -844,13 +879,7 @@ impl<O: BufferOwner> Publication<O> {
         length: u32,
         options: AppendOptions,
     ) -> Result<ClaimOutcome<'_, O>, SysError> {
-        self.resolve_claim();
-        let step = PublicationContext {
-            buffer: &self.buffer,
-            state: &mut self.state,
-        }
-        .claim(length, options, &mut |_| {})?;
-        self.finish_claim(step)
+        self.try_claim_with(length, options, &mut |_| {})
     }
 
     /// [`Publication::try_claim`] with `pause` called at the pause points
@@ -863,13 +892,63 @@ impl<O: BufferOwner> Publication<O> {
         options: AppendOptions,
         pause: &mut dyn FnMut(ClaimPause),
     ) -> Result<ClaimOutcome<'_, O>, SysError> {
+        self.try_claim_with(length, options, pause)
+    }
+
+    fn try_claim_with(
+        &mut self,
+        length: u32,
+        options: AppendOptions,
+        pause: &mut dyn FnMut(ClaimPause),
+    ) -> Result<ClaimOutcome<'_, O>, SysError> {
         self.resolve_claim();
+        if self.state == PublicationState::Closed {
+            return Ok(ClaimOutcome::Closed);
+        }
         let step = PublicationContext {
             buffer: &self.buffer,
             state: &mut self.state,
         }
         .claim(length, options, pause)?;
+        if matches!(step, ClaimStep::Outcome(_)) && self.observe_seal() {
+            return Ok(ClaimOutcome::Closed);
+        }
         self.finish_claim(step)
+    }
+
+    /// Whether the publication is closed by the seal, releasing it now if
+    /// the buffer is sealed and it has not released yet
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`). Resolves a forgotten claim
+    /// first. For wrappers that return before an attempt (the connection
+    /// rule), so that a sealed publication is still released.
+    pub fn close_if_sealed(&mut self) -> bool {
+        self.resolve_claim();
+        self.state == PublicationState::Closed || self.observe_seal()
+    }
+
+    /// After an attempt that was not granted: if the buffer is sealed,
+    /// releases the publication (its loan, then `exclusive_released` after
+    /// its last `reserved_head` store) and returns `true`; every later call
+    /// returns `Closed` at once (`quantstratum-docs: karyos/design/publication-seal.md`). The
+    /// caller resolved any forgotten claim first.
+    fn observe_seal(&mut self) -> bool {
+        if !observe_seal(&self.buffer.seal) {
+            return false;
+        }
+        self.release();
+        self.state = PublicationState::Closed;
+        true
+    }
+
+    /// Releases the standing write loan, if any, then announces the
+    /// release. The last access of the publication to the buffer.
+    fn release(&mut self) {
+        if let PublicationState::Active { .. } = self.state
+            && let Ok(cell) = self.buffer.cell(0)
+        {
+            release_loan(&cell.loan);
+        }
+        release_publication(&self.buffer.exclusive_released);
     }
 
     fn finish_claim(&mut self, step: ClaimStep) -> Result<ClaimOutcome<'_, O>, SysError> {
@@ -931,11 +1010,9 @@ impl<O: BufferOwner> Drop for Publication<O> {
         // A claim's accesses have ended: it borrowed the publication, which
         // is being dropped. Resolve it, then release the loan.
         self.resolve_claim();
-        if let PublicationState::Active { .. } = self.state
-            && let Ok(cell) = self.buffer.cell(0)
-        {
+        if self.state != PublicationState::Closed {
             // The last access of the publication to its term.
-            release_loan(&cell.loan);
+            self.release();
         }
     }
 }
@@ -1443,6 +1520,43 @@ fn write_header_tail<T: TermBytes>(
     unsafe { buffer.regions.write_bytes(slot, offset + 8, &bytes) };
 }
 
+/// The seal state of a buffer (`quantstratum-docs: karyos/design/publication-seal.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealState {
+    /// Not sealed.
+    Active,
+    /// Sealed; some issued publisher has not released yet.
+    Sealed,
+    /// Every publisher released: no block at or above `position` exists,
+    /// and every block below it is terminal.
+    Positioned {
+        /// The seal position.
+        position: u64,
+    },
+    /// Positioned, and every attached subscriber has reached `position`.
+    Retired {
+        /// The seal position.
+        position: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealWord {
+    Active,
+    Sealed,
+    Positioned(u64),
+}
+
+fn decode_seal(raw: u64) -> SealWord {
+    if raw & SEAL_POSITIONED != 0 {
+        SealWord::Positioned(raw & SEAL_POSITION)
+    } else if raw & SEAL_SEALED != 0 {
+        SealWord::Sealed
+    } else {
+        SealWord::Active
+    }
+}
+
 /// Result of a poll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollOutcome {
@@ -1462,6 +1576,13 @@ pub enum PollOutcome {
     },
     /// Nothing published at the position yet.
     Pending,
+    /// The buffer is sealed and the subscriber reached the seal position:
+    /// no message can follow. Every later poll returns it again
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
+    Closed {
+        /// The seal position.
+        position: u64,
+    },
     /// An aborted block was skipped: only its word 0 was read. Its extent
     /// carries no message and needs no acknowledgement.
     Aborted {
@@ -1550,11 +1671,23 @@ impl<O: BufferOwner> Subscription<O> {
     /// failing read is still acknowledged: the acknowledged position can
     /// advance past it.
     pub fn poll(&mut self, out: &mut [u8]) -> Result<PollOutcome, SysError> {
-        SubscriptionContext {
+        let outcome = SubscriptionContext {
             buffer: &self.buffer,
             cursor: &mut self.cursor,
         }
-        .poll(out)
+        .poll(out)?;
+        if outcome != PollOutcome::Pending || self.cursor.pending.is_some() {
+            return Ok(outcome);
+        }
+        // Only where the poll found nothing: the seal is positioned once
+        // every block below it is terminal, so a cursor at the position has
+        // read everything (`quantstratum-docs: karyos/design/publication-seal.md`).
+        match decode_seal(self.buffer.seal.load(Ordering::Acquire)) {
+            SealWord::Positioned(position) if self.cursor.position >= position => {
+                Ok(PollOutcome::Closed { position })
+            }
+            _ => Ok(outcome),
+        }
     }
 
     /// Acknowledges the last copied message: publishes the stored end of
@@ -2104,6 +2237,49 @@ impl<O: BufferOwner> Conductor<O> {
         self.context().duty_cycle()
     }
 
+    /// Seals the buffer (`quantstratum-docs: karyos/design/publication-seal.md`): no reservation
+    /// is granted from now on, publishers return `Closed` on their next
+    /// attempt that is not granted and release, and a later duty cycle
+    /// positions the seal once every issued publisher has released. A
+    /// second call has no effect.
+    pub fn seal(&mut self) {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if buffer.seal.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        // Every reservation ends above the zero limit this stores.
+        seal(&buffer.seal, &buffer.limit);
+    }
+
+    /// The buffer's seal state; retirement is computed from the attached
+    /// subscribers' positions.
+    #[must_use]
+    pub fn seal_state(&self) -> SealState {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        match decode_seal(buffer.seal.load(Ordering::Acquire)) {
+            SealWord::Active => SealState::Active,
+            SealWord::Sealed => SealState::Sealed,
+            SealWord::Positioned(position) => {
+                let passed = buffer
+                    .cells
+                    .iter()
+                    .skip(buffer.first_subscriber_cell())
+                    .filter(|cell| {
+                        matches!(
+                            cell.state.load(Ordering::Acquire),
+                            CELL_REQUIRED | CELL_OPTIONAL
+                        )
+                    })
+                    .all(|cell| cell.position.load(Ordering::Acquire) >= position);
+                if passed {
+                    SealState::Retired { position }
+                } else {
+                    SealState::Positioned { position }
+                }
+            }
+        }
+    }
+
     /// The commit-deadline abort of claims (`quantstratum-docs: karyos/design/claim-deadline.md`):
     /// times the admitted claim named by the claim record from its first
     /// observation, with `now` from a monotonic clock in the unit of
@@ -2350,6 +2526,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     fn duty_cycle(&mut self) -> Result<DutyReport, SysError> {
         let mut report = DutyReport::default();
         self.publish_floor_and_limit()?;
+        self.position_seal()?;
         self.help_rotation()?;
         self.reclaim(&mut report)?;
         self.prepare_next(&mut report)?;
@@ -2381,7 +2558,32 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let floor = floor.max(buffer.floor.load(Ordering::Relaxed));
         let limit = (base + window).max(buffer.limit.load(Ordering::Relaxed));
         buffer.floor.store(floor, Ordering::Release);
-        buffer.limit.store(limit, Ordering::Release);
+        // A sealed buffer's limit stays zero (only the conductor seals).
+        if buffer.seal.load(Ordering::Relaxed) == 0 {
+            buffer.limit.store(limit, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// Stores the seal position once every issued publisher has released
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`): each released only after
+    /// observing the seal, so its Release orders every reservation it was
+    /// granted before this head read, and nothing is granted after it.
+    fn position_seal(&self) -> Result<(), SysError> {
+        let buffer = self.buffer;
+        if decode_seal(buffer.seal.load(Ordering::Relaxed)) != SealWord::Sealed {
+            return Ok(());
+        }
+        let released = if buffer.concurrent() {
+            buffer.publishers.iter().all(publisher_slot_free)
+        } else {
+            !publication_taken(&buffer.publication_taken)
+                || publication_released(&buffer.exclusive_released)
+        };
+        if !released {
+            return Ok(());
+        }
+        position_seal(&buffer.seal, buffer.conductor_head()?);
         Ok(())
     }
 
@@ -2526,6 +2728,7 @@ mod heap_tests {
     }
 
     include!("log_buffer_tests/common.rs");
+    include!("log_buffer_tests/seal.rs");
 }
 
 #[cfg(test)]
@@ -2539,6 +2742,7 @@ mod shared_tests {
     }
 
     include!("log_buffer_tests/common.rs");
+    include!("log_buffer_tests/seal.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber

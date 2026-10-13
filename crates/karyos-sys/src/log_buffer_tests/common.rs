@@ -46,6 +46,7 @@ fn append_retrying(
                 drain();
                 let _ = conductor.duty_cycle().unwrap();
             }
+            AppendOutcome::Closed => panic!("not sealed"),
         }
     }
     panic!("append never succeeded");
@@ -118,6 +119,7 @@ fn required_subscriber_back_pressures_the_publication() {
                 break;
             }
             AppendOutcome::AdminAction => {}
+            AppendOutcome::Closed => panic!("not sealed"),
         }
         let _ = conductor.duty_cycle().unwrap();
     }
@@ -179,6 +181,7 @@ fn rotation_waits_for_the_conductor() {
             AppendOutcome::Appended { .. } => appended += 1,
             AppendOutcome::AdminAction => admin += 1,
             AppendOutcome::BackPressured => panic!("unexpected back pressure"),
+            AppendOutcome::Closed => panic!("not sealed"),
         }
     }
     // Term 0 and the prepared term 1 filled up; term 2 needs the
@@ -699,6 +702,7 @@ fn concurrent_publication_reuse_and_subscribers() {
                     }
                     PollOutcome::Overrun { from, resume, .. } => lost += resume - from,
                     PollOutcome::Aborted { .. } => panic!("nothing was aborted"),
+                    PollOutcome::Closed { .. } => panic!("not sealed"),
                     PollOutcome::Pending => {
                         // Done once everything is published and the
                         // cursor reached the final head; receiving the
@@ -1135,6 +1139,7 @@ fn claims_at_the_term_end_pad_and_rotate() {
             ClaimOutcome::AdminAction => admin += 1,
             ClaimOutcome::BackPressured => {}
             ClaimOutcome::Aborted { .. } => panic!("nothing aborts"),
+            ClaimOutcome::Closed => panic!("not sealed"),
         }
     }
     assert!(admin > 0, "the claims never reached a term end");
@@ -1202,6 +1207,7 @@ fn claims_are_back_pressured() {
             }
             ClaimOutcome::AdminAction => {}
             ClaimOutcome::Aborted { .. } => panic!("nothing aborts"),
+            ClaimOutcome::Closed => panic!("not sealed"),
         }
     }
     assert!(pressured);
@@ -1970,7 +1976,9 @@ fn offer_concurrent(
     for _ in 0..1000 {
         match handle.offer(data, AppendOptions::default()).unwrap() {
             ConcurrentOfferOutcome::Appended { position } => return position,
-            outcome @ ConcurrentOfferOutcome::Aborted { .. } => panic!("unexpected {outcome:?}"),
+            outcome @ (ConcurrentOfferOutcome::Aborted { .. } | ConcurrentOfferOutcome::Closed) => {
+                panic!("unexpected {outcome:?}")
+            }
             ConcurrentOfferOutcome::BackPressured | ConcurrentOfferOutcome::AdminAction => {
                 drain();
                 let _ = conductor.duty_cycle().unwrap();
@@ -2072,7 +2080,9 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
                 break;
             }
             ConcurrentOfferOutcome::BackPressured => {}
-            outcome @ ConcurrentOfferOutcome::Aborted { .. } => panic!("unexpected {outcome:?}"),
+            outcome @ (ConcurrentOfferOutcome::Aborted { .. } | ConcurrentOfferOutcome::Closed) => {
+                panic!("unexpected {outcome:?}")
+            }
         }
     }
     assert!(crossed);
