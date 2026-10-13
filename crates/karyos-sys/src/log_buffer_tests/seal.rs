@@ -87,6 +87,49 @@ fn a_claim_in_hand_at_the_seal_commits_and_delays_the_position() {
 }
 
 #[test]
+fn a_claim_in_hand_at_the_seal_loses_to_the_deadline_below_the_position() {
+    // The other side of the commit-time boundary: in the Sealed state the
+    // commit is decided by the claim's own compare-exchange alone, and a
+    // claim cannot outlive positioning.
+    let buffer = new_buffer(LogBufferConfig {
+        claim_deadline: 100,
+        ..config(3, 2)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
+    let position = claim.position();
+    assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
+    conductor.seal();
+    assert_eq!(
+        conductor.abort_expired_claims(100).unwrap(),
+        ClaimDeadline::Aborted {
+            position,
+            extent: 96,
+        }
+    );
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(conductor.seal_state(), SealState::Sealed, "the claim is outstanding");
+    claim.payload().fill(7);
+    assert_eq!(claim.commit(), CommitOutcome::Aborted { position });
+    assert_eq!(
+        publication.append(&message(1), AppendOptions::default()).unwrap(),
+        AppendOutcome::Closed
+    );
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position,
+            extent: 96,
+        }
+    );
+    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96 });
+}
+
+#[test]
 fn a_forgotten_claim_is_aborted_before_closed() {
     for claim_next in [false, true] {
         let buffer = new_buffer(config(3, 2)).unwrap();
