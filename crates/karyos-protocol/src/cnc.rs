@@ -20,10 +20,11 @@
 //! | `0x02` | `AddSubscription` | sequence | stream and session as above | role: 0 required, 1 optional | |
 //! | `0x03` | `RemovePublication` | sequence | registration | | |
 //! | `0x04` | `RemoveSubscription` | sequence | registration | | |
+//! | `0x05` | `AddConcurrentPublication` | sequence | stream and session as above | flags as `AddPublication` | |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
-//! | `0x84` | `Error` | client | sequence | code (1 to 5, see [`ErrorCode`]) | detail |
+//! | `0x84` | `Error` | client | sequence | code (1 to 6, see [`ErrorCode`]) | detail |
 
 use thiserror::Error;
 
@@ -36,6 +37,7 @@ const ADD_PUBLICATION: u32 = 0x01;
 const ADD_SUBSCRIPTION: u32 = 0x02;
 const REMOVE_PUBLICATION: u32 = 0x03;
 const REMOVE_SUBSCRIPTION: u32 = 0x04;
+const ADD_CONCURRENT_PUBLICATION: u32 = 0x05;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -127,7 +129,17 @@ pub enum Command {
         /// The subscriber's role.
         role: SubscriberRole,
     },
-    /// Remove a publication the client owns.
+    /// Issue a concurrent publication handle on one of the stream's
+    /// publisher slots.
+    AddConcurrentPublication {
+        /// Request sequence.
+        sequence: u64,
+        /// The stream.
+        stream: StreamKey,
+        /// Accept offers with no subscriber attached.
+        allow_unconnected: bool,
+    },
+    /// Remove a publication of either kind the client owns.
     RemovePublication {
         /// Request sequence.
         sequence: u64,
@@ -146,7 +158,8 @@ pub enum Command {
 /// Why the driver refused a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
-    /// The stream already has its publication.
+    /// Every publication the stream can issue is out: its exclusive
+    /// publication, or all publisher slots of a concurrent stream.
     PublicationTaken,
     /// No such stream.
     UnknownStream,
@@ -156,6 +169,8 @@ pub enum ErrorCode {
     ResourcesUnavailable,
     /// An identity counter is exhausted.
     IdentitiesExhausted,
+    /// The requested publication kind does not match the stream's mode.
+    InvalidPublicationMode,
 }
 
 impl ErrorCode {
@@ -166,6 +181,7 @@ impl ErrorCode {
             Self::UnknownRegistration => 3,
             Self::ResourcesUnavailable => 4,
             Self::IdentitiesExhausted => 5,
+            Self::InvalidPublicationMode => 6,
         }
     }
 
@@ -176,6 +192,7 @@ impl ErrorCode {
             3 => Self::UnknownRegistration,
             4 => Self::ResourcesUnavailable,
             5 => Self::IdentitiesExhausted,
+            6 => Self::InvalidPublicationMode,
             _ => return None,
         })
     }
@@ -265,6 +282,7 @@ impl Command {
     pub const fn type_id(&self) -> u32 {
         match self {
             Self::AddPublication { .. } => ADD_PUBLICATION,
+            Self::AddConcurrentPublication { .. } => ADD_CONCURRENT_PUBLICATION,
             Self::AddSubscription { .. } => ADD_SUBSCRIPTION,
             Self::RemovePublication { .. } => REMOVE_PUBLICATION,
             Self::RemoveSubscription { .. } => REMOVE_SUBSCRIPTION,
@@ -276,6 +294,7 @@ impl Command {
     pub const fn sequence(&self) -> u64 {
         match *self {
             Self::AddPublication { sequence, .. }
+            | Self::AddConcurrentPublication { sequence, .. }
             | Self::AddSubscription { sequence, .. }
             | Self::RemovePublication { sequence, .. }
             | Self::RemoveSubscription { sequence, .. } => sequence,
@@ -290,6 +309,11 @@ impl Command {
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CncError> {
         match *self {
             Self::AddPublication {
+                sequence,
+                stream,
+                allow_unconnected,
+            }
+            | Self::AddConcurrentPublication {
                 sequence,
                 stream,
                 allow_unconnected,
@@ -327,15 +351,25 @@ impl Command {
     /// [`CncError::Reserved`].
     pub fn decode(type_id: u32, bytes: &[u8]) -> Result<Self, CncError> {
         match type_id {
-            ADD_PUBLICATION => {
+            ADD_PUBLICATION | ADD_CONCURRENT_PUBLICATION => {
                 let [sequence, stream, flags] = read_words::<3>(type_id, bytes)?;
                 if flags & !ALLOW_UNCONNECTED != 0 {
                     return Err(CncError::Reserved { type_id });
                 }
-                Ok(Self::AddPublication {
-                    sequence,
-                    stream: stream_from(stream),
-                    allow_unconnected: flags == ALLOW_UNCONNECTED,
+                let stream = stream_from(stream);
+                let allow_unconnected = flags == ALLOW_UNCONNECTED;
+                Ok(if type_id == ADD_PUBLICATION {
+                    Self::AddPublication {
+                        sequence,
+                        stream,
+                        allow_unconnected,
+                    }
+                } else {
+                    Self::AddConcurrentPublication {
+                        sequence,
+                        stream,
+                        allow_unconnected,
+                    }
                 })
             }
             ADD_SUBSCRIPTION => {
@@ -493,6 +527,11 @@ mod tests {
                 stream: stream(),
                 role: SubscriberRole::Optional,
             },
+            Command::AddConcurrentPublication {
+                sequence: 2,
+                stream: stream(),
+                allow_unconnected: false,
+            },
             Command::RemovePublication {
                 sequence: 3,
                 registration: 9,
@@ -534,6 +573,11 @@ mod tests {
                 request,
                 code: ErrorCode::ResourcesUnavailable,
                 detail: 5,
+            },
+            Response::Error {
+                request,
+                code: ErrorCode::InvalidPublicationMode,
+                detail: 6,
             },
         ];
         for response in responses {
@@ -612,6 +656,35 @@ mod tests {
             .type_id(),
             0x83
         );
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = Command::AddConcurrentPublication {
+            sequence: 0x0102,
+            stream: StreamKey {
+                stream_id: -2,
+                session_id: 7,
+            },
+            allow_unconnected: false,
+        }
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(
+            &out[..length],
+            &[
+                0x02, 0x01, 0, 0, 0, 0, 0, 0, // sequence
+                0xfe, 0xff, 0xff, 0xff, 7, 0, 0, 0, // stream -2, session 7
+                0, 0, 0, 0, 0, 0, 0, 0, // flags
+            ]
+        );
+        assert_eq!(ErrorCode::InvalidPublicationMode.code(), 6);
+        let mut response = [0u8; MAX_RESPONSE_LENGTH];
+        response[16] = 6;
+        assert!(matches!(
+            Response::decode(0x84, &response),
+            Ok(Response::Error {
+                code: ErrorCode::InvalidPublicationMode,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -641,6 +714,14 @@ mod tests {
         assert!(matches!(
             Command::decode(0x01, &out[..length]),
             Err(CncError::Reserved { .. })
+        ));
+        assert!(matches!(
+            Command::decode(0x05, &out[..length]),
+            Err(CncError::Reserved { .. })
+        ));
+        assert!(matches!(
+            Command::decode(0x06, &out[..length]),
+            Err(CncError::UnknownType { .. })
         ));
         let mut response = [0u8; MAX_RESPONSE_LENGTH];
         response[16] = 99;

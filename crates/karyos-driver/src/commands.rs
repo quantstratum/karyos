@@ -260,7 +260,9 @@ impl EmbeddedDriver {
             detail,
         };
         match command {
-            Command::AddPublication { stream, .. } | Command::AddSubscription { stream, .. } => {
+            Command::AddPublication { stream, .. }
+            | Command::AddConcurrentPublication { stream, .. }
+            | Command::AddSubscription { stream, .. } => {
                 let detail = u64::from(stream.stream_id.cast_unsigned());
                 let Some(index) = self.find_stream(stream) else {
                     return refuse(ErrorCode::UnknownStream, detail);
@@ -289,7 +291,20 @@ impl EmbeddedDriver {
                             Kind::Publication,
                         ),
                         Ok(None) => return refuse(ErrorCode::PublicationTaken, detail),
-                        Err(_) => return refuse(ErrorCode::ResourcesUnavailable, detail),
+                        Err(error) => return refuse(issue_refusal(&error), detail),
+                    },
+                    Command::AddConcurrentPublication {
+                        allow_unconnected, ..
+                    } => match target.conductor.concurrent_publication() {
+                        Ok(Some(inner)) => (
+                            Capability::ConcurrentPublication {
+                                inner,
+                                allow_unconnected,
+                            },
+                            Kind::Publication,
+                        ),
+                        Ok(None) => return refuse(ErrorCode::PublicationTaken, detail),
+                        Err(error) => return refuse(issue_refusal(&error), detail),
                     },
                     _ => {
                         let role = match command {
@@ -356,6 +371,17 @@ impl EmbeddedDriver {
                 Response::OperationSucceeded { request }
             }
         }
+    }
+}
+
+/// The refusal code of a failed publication issuance: a kind that does not
+/// match the stream's mode, or a resource (staging, loan) not available.
+fn issue_refusal(error: &karyos_sys::error::SysError) -> ErrorCode {
+    match error {
+        karyos_sys::error::SysError::InvalidPublicationMode { .. } => {
+            ErrorCode::InvalidPublicationMode
+        }
+        _ => ErrorCode::ResourcesUnavailable,
     }
 }
 

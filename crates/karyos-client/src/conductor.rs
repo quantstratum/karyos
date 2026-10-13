@@ -19,6 +19,7 @@ use karyos_sys::broadcast::{BroadcastReceiver, Received};
 use karyos_sys::command_ring::{RingError, RingProducer};
 use thiserror::Error;
 
+use crate::concurrent::ClientConcurrentPublication;
 use crate::link::{Capability, ClientLink, Origin, Owner};
 use crate::publication::ClientPublication;
 use crate::subscription::ClientSubscription;
@@ -48,6 +49,8 @@ pub enum ConductorError {
 pub enum Outcome {
     /// The publication, ready to offer.
     Publication(ClientPublication),
+    /// A concurrent publication handle, ready to offer.
+    ConcurrentPublication(ClientConcurrentPublication),
     /// The subscription, ready to poll.
     Subscription(ClientSubscription),
     /// The command succeeded.
@@ -86,6 +89,7 @@ pub struct ConductorPoll {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     AddPublication,
+    AddConcurrentPublication,
     AddSubscription,
     Remove,
 }
@@ -166,6 +170,28 @@ impl ClientConductor {
         })
     }
 
+    /// Requests a concurrent publication handle on the stream; returns the
+    /// request sequence. The driver refuses it with
+    /// `InvalidPublicationMode` for an exclusive stream and with
+    /// `PublicationTaken` while all its publisher slots are held.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    pub fn add_concurrent_publication(
+        &mut self,
+        stream: StreamKey,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        self.submit(Kind::AddConcurrentPublication, |sequence| {
+            Command::AddConcurrentPublication {
+                sequence,
+                stream,
+                allow_unconnected,
+            }
+        })
+    }
+
     /// Requests a subscription to the stream; returns the request sequence.
     ///
     /// # Errors
@@ -197,6 +223,41 @@ impl ClientConductor {
         &mut self,
         publication: ClientPublication,
     ) -> Result<u64, (ClientPublication, ConductorError)> {
+        let Some(registration) = self.owned(publication.origin()) else {
+            return Err((publication, ConductorError::ForeignHandle));
+        };
+        match self.submit(Kind::Remove, |sequence| Command::RemovePublication {
+            sequence,
+            registration,
+        }) {
+            Ok(sequence) => {
+                // The Remove is queued: the driver keeps the registration
+                // until it serves it.
+                if let Some(origin) = publication.origin() {
+                    origin.lease.mark_removing();
+                }
+                drop(publication);
+                Ok(sequence)
+            }
+            Err(error) => Err((publication, error)),
+        }
+    }
+
+    /// Removes a concurrent publication handle this conductor handed out,
+    /// as [`ClientConductor::remove_publication`]; dropping the handle frees
+    /// its publisher slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handle intact with the error, so the caller can retry.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the handle is returned intact so the caller can retry; boxing it would allocate on every Full"
+    )]
+    pub fn remove_concurrent_publication(
+        &mut self,
+        publication: ClientConcurrentPublication,
+    ) -> Result<u64, (ClientConcurrentPublication, ConductorError)> {
         let Some(registration) = self.owned(publication.origin()) else {
             return Err((publication, ConductorError::ForeignHandle));
         };
@@ -379,6 +440,12 @@ impl ClientConductor {
                 },
             )
             | (
+                Kind::AddConcurrentPublication,
+                Response::PublicationReady {
+                    registration, key, ..
+                },
+            )
+            | (
                 Kind::AddSubscription,
                 Response::SubscriptionReady {
                     registration, key, ..
@@ -390,18 +457,38 @@ impl ClientConductor {
                         registration,
                         lease: entry.lease,
                     };
-                    match entry.capability {
-                        Capability::Publication {
-                            inner,
-                            allow_unconnected,
-                        } => Outcome::Publication(ClientPublication::from_hand_over(
+                    match (kind, entry.capability) {
+                        (
+                            Kind::AddPublication,
+                            Capability::Publication {
+                                inner,
+                                allow_unconnected,
+                            },
+                        ) => Outcome::Publication(ClientPublication::from_hand_over(
                             inner,
                             allow_unconnected,
                             origin,
                         )),
-                        Capability::Subscription(inner) => {
+                        (
+                            Kind::AddConcurrentPublication,
+                            Capability::ConcurrentPublication {
+                                inner,
+                                allow_unconnected,
+                            },
+                        ) => Outcome::ConcurrentPublication(
+                            ClientConcurrentPublication::from_hand_over(
+                                inner,
+                                allow_unconnected,
+                                origin,
+                            ),
+                        ),
+                        (Kind::AddSubscription, Capability::Subscription(inner)) => {
                             Outcome::Subscription(ClientSubscription::from_hand_over(inner, origin))
                         }
+                        // A capability of another kind than requested would
+                        // be a driver defect: it is dropped (ending its
+                        // lease and freeing what it holds), never converted.
+                        _ => Outcome::Unknown,
                     }
                 }
                 Err(_) => Outcome::Unknown,
@@ -444,5 +531,90 @@ impl Drop for ClientConductor {
     fn drop(&mut self) {
         drop(self.producer.take());
         self.link.mark_closed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::{HandOverEntry, Lease, LeaseEnd, StreamLeases};
+    use karyos_protocol::cnc::RequestId;
+    use karyos_sys::broadcast::broadcast;
+    use karyos_sys::command_ring::command_ring;
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    // A capability of another kind than the request is never converted: a
+    // driver defect the real driver cannot produce, injected by hand.
+    #[test]
+    fn a_capability_of_another_kind_is_dropped_as_unknown() {
+        let mut transmitter = broadcast(4096).unwrap();
+        let (producer, _consumer) = command_ring(1024).unwrap();
+        let link = Arc::new(ClientLink::new());
+        let owner = Owner {
+            driver: 1,
+            client: 1,
+        };
+        let mut client = ClientConductor::new(
+            owner,
+            producer,
+            transmitter.receiver(),
+            Arc::clone(&link),
+            4,
+        );
+        let sequence = client.add_concurrent_publication(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            true,
+        );
+        let sequence = sequence.unwrap();
+        let buffer = Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 2,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+            })
+            .unwrap(),
+        );
+        let leases = Arc::new(StreamLeases::default());
+        link.hold(HandOverEntry {
+            key: 9,
+            capability: Capability::Publication {
+                inner: buffer.publication_owned().unwrap().unwrap(),
+                allow_unconnected: true,
+            },
+            lease: Lease::acquire(&leases, &Arc::new(LeaseEnd::default())),
+        });
+        let response = Response::PublicationReady {
+            request: RequestId {
+                client: 1,
+                sequence,
+            },
+            registration: 9,
+            key: 9,
+        };
+        let mut payload = [0u8; karyos_protocol::cnc::MAX_RESPONSE_LENGTH];
+        let length = response.encode(&mut payload).unwrap();
+        let _ = transmitter
+            .transmit(response.type_id(), &payload[..length])
+            .unwrap();
+        let mut done = Vec::new();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        assert_eq!(done.len(), 1);
+        assert!(matches!(done[0].outcome, Outcome::Unknown));
+        // Taken and dropped: its lease ended.
+        assert_eq!(leases.live(), 0);
     }
 }

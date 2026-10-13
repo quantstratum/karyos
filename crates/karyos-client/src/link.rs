@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use karyos_sys::log_buffer::{LogBuffer, Publication, Subscription};
+use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
 
 /// Who issued a capability: the driver instance and the client id. A handle
 /// can be removed only through the conductor with the same owner.
@@ -151,6 +151,14 @@ pub enum Capability {
     Publication {
         /// The log buffer capability.
         inner: Publication<Arc<LogBuffer>>,
+        /// Accept offers with no subscriber attached.
+        allow_unconnected: bool,
+    },
+    /// A concurrent publication handle: one of the stream's publisher
+    /// slots, held until the handle or the entry is dropped.
+    ConcurrentPublication {
+        /// The log buffer capability.
+        inner: ConcurrentPublication<Arc<LogBuffer>>,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
     },
