@@ -31,7 +31,7 @@ use karyos_client::{ClientConcurrentPublication, ClientPublication, ClientSubscr
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::log_buffer::{
-    Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, Role,
+    Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, Role, SealState,
 };
 
 use crate::clock::{MonotonicClock, SystemClock};
@@ -256,6 +256,26 @@ impl EmbeddedDriver {
         })
     }
 
+    /// The seal state of a stream's buffer (`quantstratum-docs: karyos/design/publication-seal.md`):
+    /// `Active` until it is removed, then `Sealed` until every issued
+    /// publication has released, `Positioned` at the end of its last
+    /// granted reservation, and `Retired` once every attached subscriber
+    /// has read up to that position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::UnknownStream`] for a foreign handle or a
+    /// freed stream.
+    pub fn seal_state(&self, stream: StreamHandle) -> Result<SealState, DriverError> {
+        self.streams
+            .iter()
+            .find(|s| stream.driver == self.id && s.id == stream.stream)
+            .map(|s| s.conductor.seal_state())
+            .ok_or(DriverError::UnknownStream {
+                stream: stream.stream,
+            })
+    }
+
     /// A read-only view of the driver's counters (SPEC.md §11), for tools.
     #[must_use]
     pub fn counters(&self) -> karyos_sys::counters::CountersReader {
@@ -286,10 +306,13 @@ impl EmbeddedDriver {
     }
 
     /// Removes a stream: it stops accepting publications and subscriptions
-    /// at once, and is freed by a later duty cycle once no capability or
+    /// at once, its buffer is sealed (`quantstratum-docs: karyos/design/publication-seal.md`),
+    /// and it is freed by a later duty cycle once no capability or
     /// registration of it remains. Never waits and never revokes a live
-    /// capability. Removing a retiring stream again succeeds with no
-    /// effect.
+    /// capability: a live publication returns `Closed` on its next attempt
+    /// and releases, and subscribers read the backlog up to the seal
+    /// position, then report it. Removing a retiring stream again succeeds
+    /// with no effect.
     ///
     /// # Errors
     ///
@@ -299,6 +322,7 @@ impl EmbeddedDriver {
         let target = self.stream(stream)?;
         if !target.retiring {
             target.retiring = true;
+            target.conductor.seal();
             self.counters.add(Event::StreamsRemoved, 1);
         }
         self.update_stream_gauges();

@@ -75,11 +75,9 @@ fn a_stream_is_freed_only_after_every_capability_is_gone() {
 
     driver.remove_stream(stream).unwrap();
     assert_eq!(state(&driver, stream), StreamState::Retiring);
-    // Live capabilities keep working while retiring.
-    assert!(matches!(
-        direct.offer(b"x").unwrap(),
-        OfferOutcome::Accepted { .. }
-    ));
+    // Live capabilities are not revoked; the seal closes a publication on
+    // its next attempt (`quantstratum-docs: karyos/design/publication-seal.md`).
+    assert_eq!(direct.offer(b"x").unwrap(), OfferOutcome::Closed);
     let _ = driver.do_work().unwrap();
     assert_eq!(state(&driver, stream), StreamState::Retiring);
     drop(direct);
@@ -364,21 +362,19 @@ fn repeated_remove_and_re_add_keeps_no_history() {
     miri,
     ignore = "hundreds of kilobytes through several rotations is too slow under Miri"
 )]
-fn a_retiring_stream_keeps_conductor_duty_through_rotations() {
+fn a_retiring_stream_keeps_conductor_duty_until_its_seal_is_positioned() {
     use karyos_client::MessageLimit;
+    use karyos_driver::SealState;
 
     let mut driver = EmbeddedDriver::new().unwrap();
     let stream = driver.add_stream(stream_config(2)).unwrap();
     let mut subscription = driver.subscribe(stream, Role::Required).unwrap();
     let mut publication = driver.publication(stream).unwrap();
-    driver.remove_stream(stream).unwrap();
-    // Far more than three terms of data: rotation, reclamation and cleaning
-    // must keep running while the stream retires.
+    // Far more than three terms of data before the removal: rotation,
+    // reclamation and cleaning run, and a backlog is left unread.
     let payload = vec![7u8; 1500];
     let mut received = 0usize;
-    for _ in 0..400 {
-        // Bounded: without conductor duty the offer would never be
-        // accepted again after the prepared terms are used up.
+    for sent in 0..400 {
         let mut attempts = 0;
         loop {
             attempts += 1;
@@ -394,21 +390,35 @@ fn a_retiring_stream_keeps_conductor_duty_through_rotations() {
             }
         }
         let _ = driver.do_work().unwrap();
-        let _ = subscription
+        if sent < 390 {
+            let _ = subscription
+                .poll(|_, _| received += 1, MessageLimit::new(16))
+                .unwrap();
+        }
+    }
+    driver.remove_stream(stream).unwrap();
+    assert_eq!(publication.offer(&payload).unwrap(), OfferOutcome::Closed);
+    // Positioning needs the retiring stream's conductor duty.
+    let _ = driver.do_work().unwrap();
+    let SealState::Positioned { position } = driver.seal_state(stream).unwrap() else {
+        panic!("the seal was not positioned");
+    };
+    let mut closed = None;
+    for _ in 0..10_000 {
+        let summary = subscription
             .poll(|_, _| received += 1, MessageLimit::new(16))
             .unwrap();
-    }
-    for _ in 0..10_000 {
-        if received == 400 {
+        if summary.closed.is_some() {
+            closed = summary.closed;
             break;
         }
-        let _ = driver.do_work().unwrap();
-        let _ = subscription
-            .poll(|_, _| received += 1, MessageLimit::new(16))
-            .unwrap();
     }
     assert_eq!(received, 400);
-    assert_eq!(state(&driver, stream), StreamState::Retiring);
+    assert_eq!(closed, Some(position));
+    assert_eq!(
+        driver.seal_state(stream).unwrap(),
+        SealState::Retired { position }
+    );
     drop(publication);
     drop(subscription);
     let _ = driver.do_work().unwrap();

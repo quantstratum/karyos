@@ -432,11 +432,12 @@ fn a_retiring_stream_issues_nothing_and_is_freed_after_its_last_handle() {
     ));
     let _ = driver.do_work().unwrap();
     assert_eq!(driver.stream_state(stream).unwrap(), StreamState::Retiring);
-    // A live handle keeps working.
-    assert!(matches!(
+    // A live handle is not revoked; the seal closes it on its next
+    // attempt (`quantstratum-docs: karyos/design/publication-seal.md`).
+    assert_eq!(
         publication.offer(b"x").unwrap(),
-        ConcurrentOfferOutcome::Accepted { .. }
-    ));
+        ConcurrentOfferOutcome::Closed
+    );
     drop(publication);
     let _ = driver.do_work().unwrap();
     assert!(matches!(
