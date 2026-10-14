@@ -4,8 +4,8 @@
 //! (`quantstratum-docs: karyos/design/simulator-and-bench.md`, s2).
 
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
 
@@ -403,62 +403,82 @@ fn throughput(config: Config) -> Result<Measurement, BenchError> {
     }
     let stop = Arc::new(AtomicBool::new(false));
     let duty = duty_thread(driver, Arc::clone(&stop));
-    let per_publisher = config.warmup + config.iterations;
-    let expected = per_publisher * u64::from(publishers);
-    let started = Instant::now();
+    let warmup = config.warmup;
+    let iterations = config.iterations;
+    // Publishers send their warm-up, then wait until the subscriber has
+    // drained all of it; the measured phase starts for everyone at once.
+    let barrier = Arc::new(Barrier::new(usize::from(publishers) + 1));
+    // Set by a publisher that fails, so the subscriber stops waiting for
+    // messages that will never come.
+    let failed = Arc::new(AtomicBool::new(false));
     let threads: Vec<_> = handles
         .into_iter()
         .map(|mut publication| {
             let payload = vec![7u8; config.message];
+            let barrier = Arc::clone(&barrier);
+            let failed = Arc::clone(&failed);
             thread::spawn(move || -> Result<(), BenchError> {
-                for _ in 0..per_publisher {
-                    while !matches!(
-                        publication
-                            .offer(&payload)
-                            .map_err(|cause| error("offer", cause))?,
-                        ConcurrentOfferOutcome::Accepted { .. }
-                    ) {
-                        thread::yield_now();
+                let mut send = |count: u64| -> Result<(), BenchError> {
+                    for _ in 0..count {
+                        while !matches!(
+                            publication
+                                .offer(&payload)
+                                .map_err(|cause| error("offer", cause))?,
+                            ConcurrentOfferOutcome::Accepted { .. }
+                        ) {
+                            thread::yield_now();
+                        }
                     }
+                    Ok(())
+                };
+                let warmed = send(warmup);
+                if warmed.is_err() {
+                    failed.store(true, Ordering::Release);
                 }
-                Ok(())
+                // Reached even after an error, so no thread waits forever.
+                let _ = barrier.wait();
+                warmed?;
+                let measured = send(iterations);
+                if measured.is_err() {
+                    failed.store(true, Ordering::Release);
+                }
+                measured
             })
         })
         .collect();
-    let warmup = config.warmup * u64::from(publishers);
-    let mut received = 0u64;
-    let mut measured_from = None;
-    let mut outcome = Ok(());
-    while received < expected {
-        match subscription.poll(|_, _| {}, MessageLimit::new(64)) {
-            Ok(summary) => {
-                received += u64::from(summary.delivered);
-                if received >= warmup && measured_from.is_none() {
-                    measured_from = Some((Instant::now(), received));
-                }
-                if summary.delivered == 0 {
-                    thread::yield_now();
-                }
+    let mut receive_count = |count: u64| -> Result<(), BenchError> {
+        let mut received = 0u64;
+        while received < count {
+            if failed.load(Ordering::Acquire) {
+                return Err(BenchError("a publisher failed".into()));
             }
-            Err(cause) => {
-                outcome = Err(error("poll", cause));
-                break;
+            let summary = subscription
+                .poll(|_, _| {}, MessageLimit::new(64))
+                .map_err(|cause| error("poll", cause))?;
+            received += u64::from(summary.delivered);
+            if summary.delivered == 0 {
+                thread::yield_now();
             }
         }
-    }
-    let (from, at) = measured_from.unwrap_or((started, 0));
-    let seconds = from.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+        Ok(())
+    };
+    let warmed = receive_count(warmup * u64::from(publishers));
+    let _ = barrier.wait();
+    let started = Instant::now();
+    let measured = warmed.and_then(|()| receive_count(iterations * u64::from(publishers)));
+    let seconds = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
     stop.store(true, Ordering::Release);
     join(duty)?;
-    outcome?;
+    measured?;
     for thread in threads {
         join(thread)?;
     }
     Ok(Measurement {
         config,
         latency: None,
-        // Messages received after the warm-up, over the time since then.
-        rate: (expected - at) as f64 / seconds,
+        // Only the measured phase: every warm-up message was received before
+        // the clock started.
+        rate: (iterations * u64::from(publishers)) as f64 / seconds,
         resolution: 0,
     })
 }
