@@ -155,21 +155,20 @@ fn a_backlog_of_claims_drains_by_commit_or_deadline_before_the_end() {
     let _ = driver.do_work().unwrap();
     expired.payload().copy_from_slice(b"lost");
     assert!(matches!(expired.commit(), CommitOutcome::Aborted { .. }));
-    // Every holder must release before the position is known.
+    // The fence positioned the seal at removal: the idle holder does not
+    // delay it (quantstratum-docs: karyos/design/mapping-generations.md).
+    let SealState::Positioned { position } = driver.seal_state(stream).unwrap() else {
+        panic!("not positioned");
+    };
+    assert_eq!(position, expired_at + 64);
     for handle in [&mut on_time, &mut late] {
         assert_eq!(handle.offer(b"x").unwrap(), ConcurrentOfferOutcome::Closed);
     }
-    let _ = driver.do_work().unwrap();
-    assert_eq!(driver.seal_state(stream).unwrap(), SealState::Sealed);
     assert!(matches!(
         idle.try_claim(4).unwrap(),
         ConcurrentClaimOutcome::Closed
     ));
     let _ = driver.do_work().unwrap();
-    let SealState::Positioned { position } = driver.seal_state(stream).unwrap() else {
-        panic!("not positioned");
-    };
-    assert_eq!(position, expired_at + 64);
     let first = subscription
         .poll(|bytes, _| assert_eq!(bytes, b"kept"), MessageLimit::new(8))
         .unwrap();

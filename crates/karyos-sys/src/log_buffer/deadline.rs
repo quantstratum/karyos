@@ -15,8 +15,8 @@
 use super::{DeadlineReport, LayoutError, LogBuffer, Lookup, SysError, TermBytes, corrupt};
 use crate::frame::{FRAME_ALIGNMENT, Flags, FrameType, PROTOCOL_VERSION, Word0};
 use crate::publication::{
-    ABORTING_MARKER, abort_block, end_span, load_interior, observe_block, reserved_extent,
-    take_span_word,
+    ABORTING_MARKER, abort_block, active_term_count, end_span, load_interior, observe_block,
+    reserved_extent, take_span_word,
 };
 use crate::sizing::align_frame;
 use crate::slot::{Descriptor, SlotState};
@@ -781,9 +781,9 @@ fn settle<T: TermBytes>(
     buffer: &LogBuffer<T>,
     mut point: Point,
 ) -> Result<Option<(Point, u8)>, SysError> {
-    let active = buffer.active_count.load(Ordering::Acquire);
+    let active = active_term_count(buffer.active_count.load(Ordering::Acquire));
     loop {
-        if point.offset >= buffer.term_length && u64::from(point.count.get()) < active {
+        if point.offset >= buffer.term_length && point.count.get() < active {
             point = Point {
                 count: point.count.next()?,
                 offset: 0,

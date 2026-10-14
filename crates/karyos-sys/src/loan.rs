@@ -17,6 +17,7 @@
 //! models `SeqCst` fences exactly.
 
 use crate::error::SysError;
+use crate::publication::{ROTATION_FENCE, active_term_count};
 use crate::slot::{Descriptor, SlotIndex, SlotState};
 use crate::sync::{AtomicU64, Ordering, fence};
 use crate::term::{Generation, TermCount, TermId};
@@ -643,6 +644,10 @@ pub fn rotate_to(
     generation: Generation,
     next: TermCount,
 ) -> Result<Rotation, SysError> {
+    if active_count.load(Ordering::Acquire) & ROTATION_FENCE != 0 {
+        // Fenced (`quantstratum-docs: karyos/design/mapping-generations.md`): no later term.
+        return Ok(Rotation::NotReady);
+    }
     let found = Descriptor::decode(descriptor.load(Ordering::Acquire))?;
     if found.term_id() != term_id {
         // Reassigned to a later term, or not prepared yet.
@@ -679,6 +684,8 @@ pub fn rotate_to(
         Ordering::Acquire,
     ) {
         Ok(_) => Ok(Rotation::Completed),
+        // Fenced after the check above: this rotation did not happen.
+        Err(found) if found & ROTATION_FENCE != 0 => Ok(Rotation::NotReady),
         Err(found) if found == u64::from(next.get()) => Ok(Rotation::Completed),
         Err(found) if found > u64::from(next.get()) => Ok(Rotation::Superseded),
         Err(_) => Ok(Rotation::NotReady),
@@ -687,5 +694,5 @@ pub fn rotate_to(
 
 /// Whether the active count already passed `next`.
 fn superseded(active_count: &AtomicU64, next: TermCount) -> bool {
-    active_count.load(Ordering::Acquire) > u64::from(next.get())
+    active_term_count(active_count.load(Ordering::Acquire)) > next.get()
 }

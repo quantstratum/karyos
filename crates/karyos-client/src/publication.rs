@@ -392,7 +392,7 @@ mod tests {
             publication.offer(b"last").unwrap(),
             OfferOutcome::Accepted { .. }
         ));
-        conductor.seal();
+        conductor.seal().unwrap();
         assert_eq!(publication.offer(b"late").unwrap(), OfferOutcome::Closed);
         assert!(matches!(
             publication.try_claim(4).unwrap(),
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn a_sealed_publication_without_subscribers_still_releases() {
         let (_buffer, mut conductor, mut publication) = setup(false);
-        conductor.seal();
+        conductor.seal().unwrap();
         let _ = conductor.duty_cycle().unwrap();
         assert_eq!(
             conductor.seal_state(),
