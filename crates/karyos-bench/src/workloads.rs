@@ -463,8 +463,11 @@ fn throughput(config: Config) -> Result<Measurement, BenchError> {
         Ok(())
     };
     let warmed = receive_count(warmup * u64::from(publishers));
-    let _ = barrier.wait();
+    // The clock starts before the barrier releases any measured send, so
+    // the interval covers every counted message (at the cost of including
+    // the release itself).
     let started = Instant::now();
+    let _ = barrier.wait();
     let measured = warmed.and_then(|()| receive_count(iterations * u64::from(publishers)));
     let seconds = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
     stop.store(true, Ordering::Release);
