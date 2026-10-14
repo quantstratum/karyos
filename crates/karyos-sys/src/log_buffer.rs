@@ -1712,6 +1712,14 @@ impl<O: BufferOwner> Subscription<O> {
         self.cursor.acknowledged
     }
 
+    /// The registry cell of this subscriber, for its conductor's
+    /// [`Conductor::cell_position`].
+    #[inline]
+    #[must_use]
+    pub fn cell(&self) -> usize {
+        self.cursor.cell
+    }
+
     /// Copies the next message into `out`.
     ///
     /// # Errors
@@ -2313,6 +2321,33 @@ impl<O: BufferOwner> Conductor<O> {
             self.context().fence()?;
         }
         Ok(())
+    }
+
+    /// The registry position of subscriber cell `cell` (Acquire), while it
+    /// is attached; `None` for a detached or unknown cell. The driver's
+    /// cutover lease samples it (`quantstratum-docs: karyos/design/mapping-generations.md`).
+    #[must_use]
+    pub fn cell_position(&self, cell: usize) -> Option<u64> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if cell < buffer.first_subscriber_cell() {
+            return None;
+        }
+        let cell = buffer.cells.get(cell)?;
+        match cell.state.load(Ordering::Acquire) {
+            CELL_REQUIRED | CELL_OPTIONAL => Some(cell.position.load(Ordering::Acquire)),
+            _ => None,
+        }
+    }
+
+    /// The head: the end of what was reserved, capped at a positioned seal.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from the descriptor protocol, which indicate a broken
+    /// invariant.
+    pub fn head(&self) -> Result<u64, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer.conductor_head()
     }
 
     /// The buffer's seal state; retirement is computed from the attached

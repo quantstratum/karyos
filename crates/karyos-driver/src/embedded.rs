@@ -27,17 +27,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_client::link::{Lease, LeaseEnd, StreamLeases};
-use karyos_client::{ClientConcurrentPublication, ClientPublication, ClientSubscription};
+use karyos_client::{
+    ClientConcurrentPublication, ClientPublication, ClientSubscription, GenerationLink,
+};
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::log_buffer::{
-    Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, Role, SealState,
+    Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, Publication, Role,
+    SealState,
 };
+use karyos_sys::term::Generation;
 
 use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
 use crate::counters::{DriverCounters, Event};
 use crate::error::DriverError;
+use crate::generations::{Cutover, Member, MemberKind, Retained};
 
 /// Limits and sizes of the control channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +66,14 @@ pub struct DriverConfig {
     pub broadcast_capacity: usize,
     /// Streams configured at once, active or retiring.
     pub max_streams: usize,
+    /// Predecessor mappings each stream retains at once after cutovers
+    /// (SPEC.md §4 `max_retained_generations`).
+    pub max_retained_generations: usize,
+    /// How long a handle has to move to a successor mapping, in the unit of
+    /// the driver's clock: from the cutover's opening for publishers, from
+    /// the last observed progress for subscribers
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`).
+    pub cutover_deadline: u64,
 }
 
 impl Default for DriverConfig {
@@ -74,6 +87,8 @@ impl Default for DriverConfig {
             ring_capacity: 1024,
             broadcast_capacity: 16 * 1024,
             max_streams: 64,
+            max_retained_generations: 2,
+            cutover_deadline: 1_000_000_000,
         }
     }
 }
@@ -127,6 +142,42 @@ pub(crate) struct Stream {
     pub(crate) session_id: i32,
     /// Whether the latest deadline call returned `Waiting`.
     claim_waiting: bool,
+    /// The current mapping's configuration and generation, and the stream
+    /// position where it starts (`quantstratum-docs: karyos/design/mapping-generations.md`).
+    pub(crate) config: LogBufferConfig,
+    pub(crate) generation: Generation,
+    pub(crate) base: u64,
+    /// The generation links of the handles on the current mapping.
+    pub(crate) members: Vec<Member>,
+    /// The cutover in progress, if any.
+    pub(crate) cutover: Option<Cutover>,
+    /// Predecessor mappings still referenced, oldest first.
+    pub(crate) retained: Vec<Retained>,
+    /// The current mapping's exclusive publication, returned by a fence,
+    /// for the next issuance.
+    pub(crate) spare: Option<Publication<Arc<LogBuffer>>>,
+}
+
+impl Stream {
+    /// A new generation link for a handle on the current mapping.
+    pub(crate) fn join(&mut self, kind: MemberKind) -> (Arc<GenerationLink>, u64) {
+        let link = GenerationLink::new();
+        self.members.push(Member {
+            link: Arc::downgrade(&link),
+            kind,
+        });
+        (link, self.base)
+    }
+
+    /// Refuses issuance while a cutover is pending.
+    pub(crate) fn issuing(&self) -> Result<(), DriverError> {
+        match &self.cutover {
+            Some(cutover) if cutover.is_pending() => {
+                Err(DriverError::CutoverPending { stream: self.id })
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Owns streams and clients and runs conductor duty on demand.
@@ -189,6 +240,8 @@ impl EmbeddedDriver {
             .ok_or(DriverError::InvalidConfig)?;
         let valid = config.max_clients > 0
             && config.max_streams > 0
+            && config.max_retained_generations > 0
+            && config.cutover_deadline > 0
             && config.max_pending_per_client > 0
             && config.max_hand_over > 0
             && config.command_budget > 0
@@ -323,6 +376,11 @@ impl EmbeddedDriver {
         let target = self.stream(stream)?;
         if !target.retiring {
             target.conductor.seal()?;
+            // A cutover ends with the stream: its handles are fenced and its
+            // successor, if not current yet, is dropped.
+            if let Some(cutover) = target.cutover.take() {
+                cutover.abandon();
+            }
             target.retiring = true;
             self.counters.add(Event::StreamsRemoved, 1);
         }
@@ -397,6 +455,13 @@ impl EmbeddedDriver {
             stream_id: key.0,
             session_id: key.1,
             claim_waiting: false,
+            config: config.buffer,
+            generation: Generation::default(),
+            base: 0,
+            members: Vec::new(),
+            cutover: None,
+            retained: Vec::new(),
+            spare: None,
         });
         self.update_stream_gauges();
         Ok(StreamHandle {
@@ -416,13 +481,19 @@ impl EmbeddedDriver {
     /// [`DriverError::UnknownStream`] for a foreign handle or a freed stream.
     pub fn publication(&mut self, stream: StreamHandle) -> Result<ClientPublication, DriverError> {
         let stream = self.active_stream(stream)?;
-        let inner = stream
-            .buffer
-            .publication_owned()
-            .map_err(mode_error)?
-            .ok_or(DriverError::PublicationTaken)?;
+        stream.issuing()?;
+        let inner = match stream.spare.take() {
+            Some(inner) => inner,
+            None => stream
+                .buffer
+                .publication_owned()
+                .map_err(mode_error)?
+                .ok_or(DriverError::PublicationTaken)?,
+        };
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
-        let publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease);
+        let (link, base) = stream.join(MemberKind::Exclusive);
+        let publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease)
+            .with_generation(link, base)?;
         self.update_stream_gauges();
         Ok(publication)
     }
@@ -445,14 +516,17 @@ impl EmbeddedDriver {
         stream: StreamHandle,
     ) -> Result<ClientConcurrentPublication, DriverError> {
         let stream = self.active_stream(stream)?;
+        stream.issuing()?;
         let inner = stream
             .conductor
             .concurrent_publication()
             .map_err(mode_error)?
             .ok_or(DriverError::PublicationTaken)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
+        let (link, base) = stream.join(MemberKind::Concurrent);
         let publication =
-            ClientConcurrentPublication::with_lease(inner, stream.allow_unconnected, lease);
+            ClientConcurrentPublication::with_lease(inner, stream.allow_unconnected, lease)
+                .with_generation(link, base)?;
         self.update_stream_gauges();
         Ok(publication)
     }
@@ -472,9 +546,15 @@ impl EmbeddedDriver {
         role: Role,
     ) -> Result<ClientSubscription, DriverError> {
         let stream = self.active_stream(stream)?;
+        stream.issuing()?;
         let inner = stream.conductor.subscribe(role)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
-        let subscription = ClientSubscription::with_lease(inner, lease);
+        let (link, base) = stream.join(MemberKind::Subscriber {
+            role,
+            cell: inner.cell(),
+        });
+        let subscription =
+            ClientSubscription::with_lease(inner, lease).with_generation(link, base)?;
         self.update_stream_gauges();
         Ok(subscription)
     }
@@ -503,6 +583,7 @@ impl EmbeddedDriver {
         let mut first_error = None;
         let clock = &mut self.clock;
         let counters = &self.counters;
+        let deadline = self.config.cutover_deadline;
         for stream in &mut self.streams {
             stream.claim_waiting = account_deadlines(
                 counters,
@@ -510,20 +591,30 @@ impl EmbeddedDriver {
                 &mut first_error,
                 stream.conductor.service_deadlines(&mut || clock.now()),
             );
-            match stream.conductor.duty_cycle() {
-                Ok(report) => {
-                    add_work(counters, &mut work, &mut first_error, report.cleaned);
-                    add_work(
-                        counters,
-                        &mut work,
-                        &mut first_error,
-                        u32::from(report.prepared),
-                    );
-                }
-                Err(error) => {
-                    first_error.get_or_insert(DriverError::from(error));
-                }
+            duty(counters, &mut work, &mut first_error, &mut stream.conductor);
+            // Predecessors keep their duty until freed: deadlines and
+            // retirement while readers drain them.
+            for retained in &mut stream.retained {
+                let _ = account_deadlines(
+                    counters,
+                    &mut work,
+                    &mut first_error,
+                    retained.conductor.service_deadlines(&mut || clock.now()),
+                );
+                duty(
+                    counters,
+                    &mut work,
+                    &mut first_error,
+                    &mut retained.conductor,
+                );
             }
+            // The clock is read only while a cutover is in progress.
+            if stream.cutover.is_some()
+                && let Err(error) = stream.advance_cutover(clock.now(), deadline)
+            {
+                first_error.get_or_insert(error);
+            }
+            stream.forget_unused();
         }
         self.update_stream_gauges();
         match first_error {
@@ -551,6 +642,48 @@ impl EmbeddedDriver {
             return Err(DriverError::StreamRetiring { stream: found.id });
         }
         Ok(found)
+    }
+
+    pub(crate) fn active_stream_mut(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<&mut Stream, DriverError> {
+        self.active_stream(stream)
+    }
+
+    pub(crate) fn stream_ref(&self, stream: StreamHandle) -> Result<&Stream, DriverError> {
+        let unknown = DriverError::UnknownStream {
+            stream: stream.stream,
+        };
+        if stream.driver != self.id {
+            return Err(unknown);
+        }
+        self.streams
+            .iter()
+            .find(|s| s.id == stream.stream)
+            .ok_or(unknown)
+    }
+
+    pub(crate) fn clock_now(&mut self) -> u64 {
+        self.clock.now()
+    }
+}
+
+/// One conductor duty cycle, its work added.
+fn duty(
+    counters: &DriverCounters,
+    work: &mut u32,
+    first_error: &mut Option<DriverError>,
+    conductor: &mut Conductor<Arc<LogBuffer>>,
+) {
+    match conductor.duty_cycle() {
+        Ok(report) => {
+            add_work(counters, work, first_error, report.cleaned);
+            add_work(counters, work, first_error, u32::from(report.prepared));
+        }
+        Err(error) => {
+            first_error.get_or_insert(DriverError::from(error));
+        }
     }
 }
 

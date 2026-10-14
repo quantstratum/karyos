@@ -20,6 +20,7 @@ use karyos_sys::command_ring::{RingError, RingProducer};
 use thiserror::Error;
 
 use crate::concurrent::ClientConcurrentPublication;
+use crate::generation::GenerationLink;
 use crate::link::{Capability, ClientLink, Origin, Owner};
 use crate::publication::ClientPublication;
 use crate::subscription::ClientSubscription;
@@ -65,6 +66,25 @@ pub enum Outcome {
     /// The response may have been lost; the command may or may not have
     /// taken effect. Terminal.
     Unknown,
+}
+
+impl Outcome {
+    /// Attaches a generation link to a delivered handle. A base the handle
+    /// refuses would be a driver defect: the handle is dropped and the
+    /// outcome is not known.
+    fn with_generation(self, link: Arc<GenerationLink>, base: u64) -> Self {
+        let attached = match self {
+            Self::Publication(handle) => handle.with_generation(link, base).map(Self::Publication),
+            Self::ConcurrentPublication(handle) => handle
+                .with_generation(link, base)
+                .map(Self::ConcurrentPublication),
+            Self::Subscription(handle) => {
+                handle.with_generation(link, base).map(Self::Subscription)
+            }
+            other => Ok(other),
+        };
+        attached.unwrap_or(Self::Unknown)
+    }
 }
 
 /// A completed request.
@@ -457,7 +477,8 @@ impl ClientConductor {
                         registration,
                         lease: entry.lease,
                     };
-                    match (kind, entry.capability) {
+                    let generation = entry.generation;
+                    let outcome = match (kind, entry.capability) {
                         (
                             Kind::AddPublication,
                             Capability::Publication {
@@ -489,6 +510,10 @@ impl ClientConductor {
                         // be a driver defect: it is dropped (ending its
                         // lease and freeing what it holds), never converted.
                         _ => Outcome::Unknown,
+                    };
+                    match generation {
+                        Some((link, base)) => outcome.with_generation(link, base),
+                        None => outcome,
                     }
                 }
                 Err(_) => Outcome::Unknown,
@@ -596,6 +621,7 @@ mod tests {
                 allow_unconnected: true,
             },
             lease: Lease::acquire(&leases, &Arc::new(LeaseEnd::default())),
+            generation: None,
         });
         let response = Response::PublicationReady {
             request: RequestId {

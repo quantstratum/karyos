@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
 
+use crate::generation::GenerationLink;
+
 /// Who issued a capability: the driver instance and the client id. A handle
 /// can be removed only through the conductor with the same owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -175,6 +177,9 @@ pub struct HandOverEntry {
     pub capability: Capability,
     /// Its lease.
     pub lease: Lease,
+    /// The generation link and base the delivered handle starts with
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`), when the driver keeps one.
+    pub generation: Option<(Arc<GenerationLink>, u64)>,
 }
 
 #[derive(Debug, Default)]
