@@ -2339,6 +2339,15 @@ impl<O: BufferOwner> Conductor<O> {
         }
     }
 
+    /// The publication limit (Acquire): no reservation granted from now on
+    /// ends above it plus the concurrent spread, until a later duty cycle of
+    /// this conductor raises it.
+    #[must_use]
+    pub fn limit(&self) -> u64 {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer.limit.load(Ordering::Acquire)
+    }
+
     /// The head: the end of what was reserved, capped at a positioned seal.
     ///
     /// # Errors

@@ -378,17 +378,22 @@ impl EmbeddedDriver {
             spare_slots: reconfiguration.spare_slots,
             ..target.config
         };
-        // The successor's maximum end: its base is at most the head plus one
-        // term (the fence closes the active term), and one mapping spans at
-        // most 2^31 terms.
+        // The successor's maximum end. Publishers keep reserving until the
+        // seal below, but only up to the limit read here: this conductor is
+        // the only writer of the limit, and no duty cycle runs before the
+        // seal stores zero. A granted reservation ends at most the
+        // concurrent spread (below half a term) past the limit, and a
+        // crossing is clamped at its term's end, at most one term further;
+        // so the seal position is below `limit + 2 × term_length`. One
+        // mapping spans at most 2^31 terms.
         let old_term = u64::from(target.config.term_length.get());
         let new_span = u64::from(config.term_length.get())
             .checked_mul(1 << 31)
             .ok_or(DriverError::PositionsExhausted)?;
         let maximum = target
             .conductor
-            .head()?
-            .checked_add(old_term)
+            .limit()
+            .checked_add(2 * old_term)
             .and_then(|end| end.checked_add(target.base))
             .and_then(|base| base.checked_add(new_span))
             .ok_or(DriverError::PositionsExhausted)?;
@@ -521,18 +526,19 @@ mod tests {
     fn a_successor_that_could_reach_2_pow_63_is_refused() {
         let mut driver = EmbeddedDriver::new().unwrap();
         let handle = stream(&mut driver);
-        // One mapping of this term length spans 2^31 × 2^16 = 2^47 bytes.
+        // One mapping of this term length spans 2^31 × 2^16 = 2^47 bytes;
+        // the seal is below the limit plus two terms.
         let span = (1u64 << 31) * u64::from(MIN_TERM_LENGTH);
-        let term = u64::from(MIN_TERM_LENGTH);
         let target = driver.active_stream_mut(handle).unwrap();
-        target.base = (1 << 63) - span - term;
+        let reach = target.conductor.limit() + 2 * u64::from(MIN_TERM_LENGTH);
+        target.base = (1 << 63) - span - reach;
         assert!(matches!(
             driver.reconfigure_stream(handle, reconfiguration()),
             Err(DriverError::PositionsExhausted)
         ));
         assert_eq!(driver.seal_state(handle).unwrap(), SealState::Active);
         let target = driver.active_stream_mut(handle).unwrap();
-        target.base = (1 << 63) - span - term - 1;
+        target.base = (1 << 63) - span - reach - 1;
         assert!(driver.reconfigure_stream(handle, reconfiguration()).is_ok());
     }
 }
