@@ -358,6 +358,38 @@ pub fn publisher_slot_free(word: &AtomicU64) -> bool {
     word.load(Ordering::Acquire) & PUBLISHER_HELD == 0
 }
 
+/// The bit of `active_count` that stops rotation once a concurrent buffer
+/// is fenced (`quantstratum-docs: karyos/design/mapping-generations.md`). Every reader of the
+/// count truncates it to 32 bits, and every rotation advances it with a
+/// compare-exchange from an exact count, which fails once the bit is set.
+pub const ROTATION_FENCE: u64 = 1 << 63;
+
+/// Stops rotation (conductor): sets [`ROTATION_FENCE`] and returns the
+/// active term count. A read-modify-write, so a rotation's
+/// compare-exchange either precedes it (and the count returned is the
+/// rotated one) or fails.
+#[inline]
+pub fn fence_rotation(active_count: &AtomicU64) -> u32 {
+    active_count.fetch_or(ROTATION_FENCE, Ordering::AcqRel) as u32
+}
+
+/// The term count of an `active_count` value, without the fence bit.
+#[inline]
+pub fn active_term_count(raw: u64) -> u32 {
+    raw as u32
+}
+
+/// Closes the active term's tail (conductor): adds `term_length`, so every
+/// later `fetch_add` lands past the end, and returns the old tail. Its
+/// offset is the end of every reservation granted in that term, since each
+/// is a `fetch_add` earlier in the tail's modification order. A
+/// publisher's `fetch_add` that reads from this one synchronizes with the
+/// conductor and sees the seal and the zero limit stored before it.
+#[inline]
+pub fn fence_tail(tail: &AtomicU64, term_length: u32) -> u64 {
+    tail.fetch_add(u64::from(term_length), Ordering::AcqRel)
+}
+
 /// Writes the seal position (conductor), once every publisher released.
 /// A swap, like every write to the seal word, so that the issuer's
 /// read-modify-write in [`issuer_sees_seal`] is ordered with all of them.

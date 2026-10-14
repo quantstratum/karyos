@@ -37,10 +37,11 @@ use crate::loan::{
     release_loan, take_loan,
 };
 use crate::publication::{
-    SEAL_POSITIONED, SEAL_SEALED, abort_block, commit_block, deadline_abort, issuer_sees_seal,
-    load_interior, mark_block, observe_block, observe_seal, position_seal, publication_released,
-    publication_taken, publish_block, publisher_slot_free, read_claim_record, release_publication,
-    seal, store_interior, take_publication, write_claim_record,
+    SEAL_POSITIONED, SEAL_SEALED, abort_block, active_term_count, commit_block, deadline_abort,
+    fence_rotation, fence_tail, issuer_sees_seal, load_interior, mark_block, observe_block,
+    observe_seal, position_seal, publication_released, publication_taken, publish_block,
+    read_claim_record, release_publication, seal, store_interior, take_publication,
+    write_claim_record,
 };
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
 use crate::slot::{Descriptor, SlotIndex, SlotState};
@@ -224,7 +225,21 @@ impl LogBuffer<HeapTerms> {
     /// leaves no credit for the publication, and layout errors for the MTU
     /// and budget.
     pub fn new(config: LogBufferConfig) -> Result<Self, SysError> {
-        Self::build(config)
+        Self::build(config, Generation::default())
+    }
+
+    /// As [`LogBuffer::new`], for mapping generation `generation`
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`): its descriptors and loans
+    /// carry it, so they never validate against another generation's.
+    ///
+    /// # Errors
+    ///
+    /// As [`LogBuffer::new`].
+    pub fn new_with_generation(
+        config: LogBufferConfig,
+        generation: Generation,
+    ) -> Result<Self, SysError> {
+        Self::build(config, generation)
     }
 }
 
@@ -237,12 +252,24 @@ impl LogBuffer<SharedTerms> {
     ///
     /// As [`LogBuffer::new`].
     pub fn new_shared(config: LogBufferConfig) -> Result<Self, SysError> {
-        Self::build(config)
+        Self::build(config, Generation::default())
+    }
+
+    /// As [`LogBuffer::new_shared`], for mapping generation `generation`.
+    ///
+    /// # Errors
+    ///
+    /// As [`LogBuffer::new`].
+    pub fn new_shared_with_generation(
+        config: LogBufferConfig,
+        generation: Generation,
+    ) -> Result<Self, SysError> {
+        Self::build(config, generation)
     }
 }
 
 impl<T: TermBytes> LogBuffer<T> {
-    fn build(config: LogBufferConfig) -> Result<Self, SysError> {
+    fn build(config: LogBufferConfig, generation: Generation) -> Result<Self, SysError> {
         let slots = config
             .spare_slots
             .checked_add(3)
@@ -261,7 +288,6 @@ impl<T: TermBytes> LogBuffer<T> {
         let max_message_length =
             plan.max_message_length(config.max_reserved, config.term_length)?;
         let regions = T::allocate(Token::new(), config.term_length, slots)?;
-        let generation = Generation::default();
         let t0 = config.initial_term_id;
         let one = TermCount::ZERO.next()?;
         let descriptors: Box<[AtomicU64]> = (0..slots)
@@ -370,6 +396,13 @@ impl<T: TermBytes> LogBuffer<T> {
         self.config.lane
     }
 
+    /// The mapping generation (`quantstratum-docs: karyos/design/mapping-generations.md`).
+    #[inline]
+    #[must_use]
+    pub fn generation(&self) -> Generation {
+        self.generation
+    }
+
     /// Largest message without the trace extension.
     #[inline]
     #[must_use]
@@ -451,7 +484,13 @@ impl<T: TermBytes> LogBuffer<T> {
             return Ok(None);
         }
         let offset = (raw as u32).min(self.term_length);
-        Ok(Some(self.position(count, offset)))
+        let head = self.position(count, offset);
+        // A fenced term's tail is past its end; the seal position is the end
+        // of what was granted (`quantstratum-docs: karyos/design/mapping-generations.md`).
+        Ok(Some(match decode_seal(self.seal.load(Ordering::Acquire)) {
+            SealWord::Positioned(position) => head.min(position),
+            _ => head,
+        }))
     }
 
     /// The head as the conductor sees it: it is the only party that
@@ -2238,17 +2277,27 @@ impl<O: BufferOwner> Conductor<O> {
     }
 
     /// Seals the buffer (`quantstratum-docs: karyos/design/publication-seal.md`): no reservation
-    /// is granted from now on, publishers return `Closed` on their next
-    /// attempt that is not granted and release, and a later duty cycle
-    /// positions the seal once every issued publisher has released. A
-    /// second call has no effect.
-    pub fn seal(&mut self) {
+    /// is granted from now on, and publishers return `Closed` on their next
+    /// attempt that is not granted and release. An exclusive buffer's seal
+    /// is positioned by a later duty cycle once its publication has
+    /// released; a concurrent buffer's is fenced and positioned here
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`). A second call has no effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from the descriptor protocol, which indicate a broken
+    /// invariant.
+    pub fn seal(&mut self) -> Result<(), SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         if buffer.seal.load(Ordering::Relaxed) != 0 {
-            return;
+            return Ok(());
         }
         // Every reservation ends above the zero limit this stores.
         seal(&buffer.seal, &buffer.limit);
+        if buffer.concurrent() {
+            self.context().fence()?;
+        }
+        Ok(())
     }
 
     /// The buffer's seal state; retirement is computed from the attached
@@ -2527,7 +2576,10 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let mut report = DutyReport::default();
         self.publish_floor_and_limit()?;
         self.position_seal()?;
-        self.help_rotation()?;
+        // A sealed buffer starts no later term.
+        if self.buffer.seal.load(Ordering::Relaxed) == 0 {
+            self.help_rotation()?;
+        }
         self.reclaim(&mut report)?;
         self.prepare_next(&mut report)?;
         Ok(report)
@@ -2565,25 +2617,52 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         Ok(())
     }
 
-    /// Stores the seal position once every issued publisher has released
-    /// (`quantstratum-docs: karyos/design/publication-seal.md`): each released only after
+    /// Stores an exclusive buffer's seal position once its publication has
+    /// released (`quantstratum-docs: karyos/design/publication-seal.md`): it released only after
     /// observing the seal, so its Release orders every reservation it was
-    /// granted before this head read, and nothing is granted after it.
+    /// granted before this head read, and nothing is granted after it. A
+    /// concurrent buffer's seal is positioned by [`Self::fence`].
     fn position_seal(&self) -> Result<(), SysError> {
         let buffer = self.buffer;
-        if decode_seal(buffer.seal.load(Ordering::Relaxed)) != SealWord::Sealed {
+        if buffer.concurrent()
+            || decode_seal(buffer.seal.load(Ordering::Relaxed)) != SealWord::Sealed
+        {
             return Ok(());
         }
-        let released = if buffer.concurrent() {
-            buffer.publishers.iter().all(publisher_slot_free)
-        } else {
-            !publication_taken(&buffer.publication_taken)
-                || publication_released(&buffer.exclusive_released)
-        };
-        if !released {
+        if publication_taken(&buffer.publication_taken)
+            && !publication_released(&buffer.exclusive_released)
+        {
             return Ok(());
         }
         position_seal(&buffer.seal, buffer.conductor_head()?);
+        Ok(())
+    }
+
+    /// Fences a sealed concurrent buffer and positions its seal
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`): stops rotation, closes the
+    /// active term's tail and stores the end of what was granted in it as
+    /// the seal position. The head is capped there from then on.
+    fn fence(&self) -> Result<(), SysError> {
+        let buffer = self.buffer;
+        let count = TermCount::try_new(fence_rotation(&buffer.active_count))?;
+        let Lookup::Slot(slot) = buffer.lookup(count)? else {
+            return Err(corrupt(0, "active term without a slot"));
+        };
+        let term_id = buffer.initial_term_id.advanced_by(count);
+        let found = Descriptor::decode(buffer.descriptor(slot)?.load(Ordering::Acquire))?;
+        if found.state() != SlotState::Active || found.term_id() != term_id {
+            return Err(corrupt(0, "active term not active"));
+        }
+        let term_length = buffer.term_length;
+        let old = fence_tail(buffer.tail(slot)?, term_length);
+        if (old >> 32) as u32 != term_id.get() {
+            return Err(corrupt(0, "fenced tail of another term"));
+        }
+        // Every grant in term `count` ends at or below this offset; a
+        // crossing's end is clamped at the term end, where its owner pads.
+        let offset = (old as u32).min(term_length);
+        let position = buffer.position(count, offset);
+        position_seal(&buffer.seal, position);
         Ok(())
     }
 
@@ -2620,7 +2699,9 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     fn reclaim(&mut self, report: &mut DutyReport) -> Result<(), SysError> {
         let buffer = self.buffer;
         let floor = buffer.floor.load(Ordering::Acquire);
-        let active = buffer.active_count.load(Ordering::Acquire);
+        let active = u64::from(active_term_count(
+            buffer.active_count.load(Ordering::Acquire),
+        ));
         for slot in 0..buffer.slots {
             let word = buffer.descriptor(slot)?;
             let found = Descriptor::decode(word.load(Ordering::Acquire))?;
@@ -2727,6 +2808,13 @@ mod heap_tests {
         LogBuffer::new(config)
     }
 
+    fn new_buffer_with_generation(
+        config: LogBufferConfig,
+        generation: Generation,
+    ) -> Result<LogBuffer<Terms>, SysError> {
+        LogBuffer::new_with_generation(config, generation)
+    }
+
     include!("log_buffer_tests/common.rs");
     include!("log_buffer_tests/seal.rs");
 }
@@ -2739,6 +2827,13 @@ mod shared_tests {
 
     fn new_buffer(config: LogBufferConfig) -> Result<LogBuffer<Terms>, SysError> {
         LogBuffer::new_shared(config)
+    }
+
+    fn new_buffer_with_generation(
+        config: LogBufferConfig,
+        generation: Generation,
+    ) -> Result<LogBuffer<Terms>, SysError> {
+        LogBuffer::new_shared_with_generation(config, generation)
     }
 
     include!("log_buffer_tests/common.rs");

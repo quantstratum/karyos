@@ -317,12 +317,13 @@ impl EmbeddedDriver {
     /// # Errors
     ///
     /// Returns [`DriverError::UnknownStream`] for a foreign or freed
-    /// stream.
+    /// stream, and [`DriverError::Sys`] from the descriptor protocol, which
+    /// indicates a broken invariant.
     pub fn remove_stream(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
         let target = self.stream(stream)?;
         if !target.retiring {
+            target.conductor.seal()?;
             target.retiring = true;
-            target.conductor.seal();
             self.counters.add(Event::StreamsRemoved, 1);
         }
         self.update_stream_gauges();

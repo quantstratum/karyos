@@ -33,7 +33,7 @@ fn an_exclusive_seal_closes_the_next_attempt_and_positions_at_the_last_block() {
     }
     let end = buffer.reserved_head.load(Ordering::Acquire);
     assert_eq!(conductor.seal_state(), SealState::Active);
-    conductor.seal();
+    conductor.seal().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Sealed);
     // The publisher has not released: no position yet, and the reader
     // still reads the backlog and then waits.
@@ -70,7 +70,7 @@ fn a_claim_in_hand_at_the_seal_commits_and_delays_the_position() {
     let mut publication = buffer.publication().unwrap().unwrap();
     let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
     claim.payload().fill(7);
-    conductor.seal();
+    conductor.seal().unwrap();
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(poll(&mut subscription), PollOutcome::Pending);
     assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
@@ -102,7 +102,7 @@ fn a_claim_in_hand_at_the_seal_loses_to_the_deadline_below_the_position() {
     let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
     let position = claim.position();
     assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
-    conductor.seal();
+    conductor.seal().unwrap();
     assert_eq!(
         conductor.abort_expired_claims(100).unwrap(),
         ClaimDeadline::Aborted {
@@ -137,7 +137,7 @@ fn a_forgotten_claim_is_aborted_before_closed() {
         let mut subscription = conductor.subscribe(Role::Optional).unwrap();
         let mut publication = buffer.publication().unwrap().unwrap();
         core::mem::forget(claimed(publication.try_claim(64, AppendOptions::default())));
-        conductor.seal();
+        conductor.seal().unwrap();
         if claim_next {
             assert!(matches!(
                 publication.try_claim(8, AppendOptions::default()).unwrap(),
@@ -163,7 +163,7 @@ fn an_unissued_or_dropped_publication_does_not_delay_the_position() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     let mut subscription = conductor.subscribe(Role::Optional).unwrap();
-    conductor.seal();
+    conductor.seal().unwrap();
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Retired { position: 0 });
     assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 0 });
@@ -176,7 +176,7 @@ fn an_unissued_or_dropped_publication_does_not_delay_the_position() {
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication.append(&message(2), AppendOptions::default()).unwrap();
     let end = buffer.reserved_head.load(Ordering::Acquire);
-    conductor.seal();
+    conductor.seal().unwrap();
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Sealed);
     drop(publication);
@@ -190,12 +190,12 @@ fn a_second_seal_has_no_effect() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     let _subscription = conductor.subscribe(Role::Optional).unwrap();
-    conductor.seal();
-    conductor.seal();
+    conductor.seal().unwrap();
+    conductor.seal().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Sealed);
     let _ = conductor.duty_cycle().unwrap();
     let positioned = buffer.seal.load(Ordering::Acquire);
-    conductor.seal();
+    conductor.seal().unwrap();
     assert_eq!(buffer.seal.load(Ordering::Acquire), positioned);
 }
 
@@ -218,7 +218,7 @@ fn the_position_after_a_term_crossing_is_the_next_term_start() {
     }
     // The crossing padded the term: the head is the next term's start.
     assert_eq!(buffer.reserved_head.load(Ordering::Acquire), TERM);
-    conductor.seal();
+    conductor.seal().unwrap();
     assert_eq!(
         publication.append(&data, AppendOptions::default()).unwrap(),
         AppendOutcome::Closed
@@ -239,7 +239,7 @@ fn retirement_waits_for_attached_subscribers_only() {
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication.append(&message(3), AppendOptions::default()).unwrap();
     let end = buffer.reserved_head.load(Ordering::Acquire);
-    conductor.seal();
+    conductor.seal().unwrap();
     assert!(publication.close_if_sealed());
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Positioned { position: end });
@@ -250,7 +250,7 @@ fn retirement_waits_for_attached_subscribers_only() {
 }
 
 #[test]
-fn concurrent_handles_close_and_the_seal_waits_for_every_holder() {
+fn a_concurrent_seal_is_positioned_at_once_and_handles_close() {
     let buffer = new_buffer(concurrent_config(3)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     let mut subscription = conductor.subscribe(Role::Optional).unwrap();
@@ -263,7 +263,10 @@ fn concurrent_handles_close_and_the_seal_waits_for_every_holder() {
         ));
     }
     let end = buffer.head().unwrap().unwrap();
-    conductor.seal();
+    conductor.seal().unwrap();
+    // The fence positions the seal with both handles still holding.
+    assert_eq!(conductor.seal_state(), SealState::Positioned { position: end });
+    assert!(!buffer.publishers.iter().all(crate::publication::publisher_slot_free));
     assert!(matches!(
         conductor.concurrent_publication(),
         Err(SysError::Sealed)
@@ -277,13 +280,13 @@ fn concurrent_handles_close_and_the_seal_waits_for_every_holder() {
         ConcurrentClaimOutcome::Closed
     ));
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(conductor.seal_state(), SealState::Sealed, "b still holds");
-    assert!(b.close_if_sealed());
-    let _ = conductor.duty_cycle().unwrap();
     assert_eq!(drain_to_end(&mut subscription), (2, PollOutcome::Closed { position: end }));
     assert_eq!(conductor.seal_state(), SealState::Retired { position: end });
+    // The head stays at the seal position across duty cycles.
+    assert_eq!(buffer.head().unwrap(), Some(end));
+    assert!(b.close_if_sealed());
     // Released slots and loans; a closed handle's drop does nothing more.
-    assert!(buffer.publishers.iter().all(publisher_slot_free));
+    assert!(buffer.publishers.iter().all(crate::publication::publisher_slot_free));
     drop(a);
     drop(b);
 }
@@ -300,7 +303,7 @@ fn a_concurrent_forgotten_claim_is_aborted_before_closed() {
         panic!("not claimed");
     };
     core::mem::forget(claim);
-    conductor.seal();
+    conductor.seal().unwrap();
     assert_eq!(
         handle.offer(&message(1), AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::Closed
@@ -332,7 +335,7 @@ fn a_concurrent_seal_after_a_crossing_positions_at_the_next_term() {
         let _ = drain_to_end(&mut subscription);
         let _ = conductor.duty_cycle().unwrap();
     }
-    conductor.seal();
+    conductor.seal().unwrap();
     assert_eq!(
         handle.offer(&data, AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::Closed
@@ -358,4 +361,162 @@ fn close_if_sealed_does_nothing_on_an_active_buffer() {
         handle.offer(&message(1), AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::Appended { .. }
     ));
+}
+
+// The concurrent fence (`quantstratum-docs: karyos/design/mapping-generations.md`).
+
+#[test]
+fn a_reservation_admitted_before_the_fence_lands_past_the_end_and_closes() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    assert!(matches!(
+        handle.offer(&message(1), AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { .. }
+    ));
+    let end = buffer.head().unwrap().unwrap();
+    // The limit admitted the next offer; the fence comes before its
+    // `fetch_add`, which then lands past the end and holds nothing.
+    let outcome = handle
+        .offer_pausing(&message(2), AppendOptions::default(), &mut |point| {
+            if point == WriterPause::Reserve {
+                conductor.seal().unwrap();
+            }
+        })
+        .unwrap();
+    assert_eq!(outcome, ConcurrentOfferOutcome::Closed);
+    assert_eq!(conductor.seal_state(), SealState::Positioned { position: end });
+    assert_eq!(buffer.head().unwrap(), Some(end));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(drain_to_end(&mut subscription), (1, PollOutcome::Closed { position: end }));
+}
+
+#[test]
+fn a_reservation_granted_before_the_fence_commits_below_the_position() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let reserved = u64::from(reserved_of(&message(1)));
+    // Granted, then the seal is positioned before the writer marks.
+    let outcome = handle
+        .offer_pausing(&message(1), AppendOptions::default(), &mut |point| {
+            if point == WriterPause::Mark {
+                conductor.seal().unwrap();
+                assert_eq!(
+                    conductor.seal_state(),
+                    SealState::Positioned { position: reserved }
+                );
+            }
+        })
+        .unwrap();
+    assert!(matches!(outcome, ConcurrentOfferOutcome::Appended { .. }));
+    assert_eq!(
+        handle.offer(&message(2), AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Closed
+    );
+    assert_eq!(
+        drain_to_end(&mut subscription),
+        (1, PollOutcome::Closed { position: reserved })
+    );
+}
+
+#[test]
+fn a_paused_zero_span_below_the_position_is_aborted_by_the_deadline() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let reserved = u64::from(reserved_of(&message(1)));
+    let outcome = handle
+        .offer_pausing(&message(1), AppendOptions::default(), &mut |point| {
+            if point == WriterPause::Mark {
+                conductor.seal().unwrap();
+                // Readers wait at the paused writer's zero span.
+                assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+                assert_eq!(serve(&mut conductor, 0), waiting());
+                assert_eq!(serve(&mut conductor, DEADLINE), aborted(1, reserved));
+                assert_eq!(
+                    poll(&mut subscription),
+                    PollOutcome::Aborted {
+                        position: 0,
+                        extent: reserved as u32,
+                    }
+                );
+                assert_eq!(
+                    poll(&mut subscription),
+                    PollOutcome::Closed { position: reserved }
+                );
+            }
+        })
+        .unwrap();
+    assert!(matches!(outcome, ConcurrentOfferOutcome::Aborted { .. }));
+}
+
+#[test]
+fn a_fenced_buffer_never_rotates() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut a = conductor.concurrent_publication().unwrap().unwrap();
+    let mut b = conductor.concurrent_publication().unwrap().unwrap();
+    let data = sized_message(1, 3000);
+    // Fill term 0 until `a` crosses (it pads its remainder) without
+    // rotating: the seal comes before any rotation help completes.
+    let mut sealed = false;
+    while !sealed {
+        let outcome = a
+            .offer_pausing(&data, AppendOptions::default(), &mut |point| {
+                if point == WriterPause::PadCommit {
+                    conductor.seal().unwrap();
+                    sealed = true;
+                }
+            })
+            .unwrap();
+        match outcome {
+            ConcurrentOfferOutcome::Appended { .. } | ConcurrentOfferOutcome::BackPressured => {
+                let _ = drain_to_end(&mut subscription);
+                let _ = conductor.duty_cycle().unwrap();
+            }
+            // The crossing's own call observes the seal after its `PAD`.
+            ConcurrentOfferOutcome::AdminAction | ConcurrentOfferOutcome::Closed => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(conductor.seal_state(), SealState::Positioned { position: TERM });
+    for _ in 0..3 {
+        let _ = conductor.duty_cycle().unwrap();
+        for handle in [&mut a, &mut b] {
+            assert_eq!(
+                handle.offer(&data, AppendOptions::default()).unwrap(),
+                ConcurrentOfferOutcome::Closed
+            );
+        }
+    }
+    assert_eq!(
+        crate::publication::active_term_count(buffer.active_count.load(Ordering::Acquire)),
+        0
+    );
+    let (_, end) = drain_to_end(&mut subscription);
+    assert_eq!(end, PollOutcome::Closed { position: TERM });
+}
+
+#[test]
+fn a_buffer_carries_its_generation() {
+    let generation = Generation::try_new(5).unwrap();
+    let config = concurrent_config(2);
+    let buffer = new_buffer_with_generation(config, generation).unwrap();
+    assert_eq!(buffer.generation(), generation);
+    let word = buffer.descriptor(0).unwrap().load(Ordering::Acquire);
+    assert_eq!(Descriptor::decode(word).unwrap().generation(), generation);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    assert!(matches!(
+        handle.offer(&message(1), AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { .. }
+    ));
+    assert!(matches!(poll(&mut subscription), PollOutcome::Message { .. }));
+    assert!(Generation::try_new(1 << 24).is_err());
 }

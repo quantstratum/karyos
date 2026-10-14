@@ -546,6 +546,8 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         if head + u64::from(reserved) > buffer.limit.load(Ordering::Acquire) {
             return Ok(Reserved::Outcome(AppendOutcome::BackPressured));
         }
+        // Admitted by the limit it read; a fence may still come first.
+        pause(WriterPause::Reserve);
         let old = tail.fetch_add(u64::from(reserved), Ordering::AcqRel);
         debug_assert_eq!(
             (old >> 32) as u32,
@@ -807,10 +809,13 @@ impl<O: BufferOwner> Drop for ConcurrentClaim<'_, O> {
     }
 }
 
-/// Where a test pauses a concurrent writer, after its `fetch_add`: before
-/// the named compare-exchange of its block or of its crossing `PAD`.
+/// Where a test pauses a concurrent writer: `Reserve` after the limit
+/// admitted it and before its `fetch_add`; the others after its
+/// `fetch_add`, before the named compare-exchange of its block or of its
+/// crossing `PAD`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WriterPause {
+    Reserve,
     Mark,
     Commit,
     PadMark,
