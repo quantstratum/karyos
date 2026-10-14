@@ -11,6 +11,7 @@ use karyos_sys::log_buffer::{
 };
 
 use crate::error::ClientError;
+use crate::generation::{End, GenerationLink, Next, Successor};
 use crate::link::{Lease, Origin};
 
 /// Result of an offer. Each call performs at most one append attempt:
@@ -130,6 +131,8 @@ pub enum CommitOutcome {
 pub struct ClientClaim<'a> {
     inner: Claim<'a, Arc<LogBuffer>>,
     lane: Lane,
+    /// The base of the claim's mapping generation.
+    base: u64,
 }
 
 impl ClientClaim<'_> {
@@ -142,7 +145,7 @@ impl ClientClaim<'_> {
     /// The block's position in its lane.
     #[must_use]
     pub fn position(&self) -> u64 {
-        self.inner.position()
+        self.base + self.inner.position()
     }
 
     /// The payload: exactly the claimed length, zeroed at claim time.
@@ -152,10 +155,16 @@ impl ClientClaim<'_> {
 
     /// Commits the block: exactly one of commit and abort wins.
     pub fn commit(self) -> CommitOutcome {
-        let lane = self.lane;
+        let (lane, base) = (self.lane, self.base);
         match self.inner.commit() {
-            SysCommitOutcome::Committed { position } => CommitOutcome::Accepted { lane, position },
-            SysCommitOutcome::Aborted { position } => CommitOutcome::Aborted { lane, position },
+            SysCommitOutcome::Committed { position } => CommitOutcome::Accepted {
+                lane,
+                position: base + position,
+            },
+            SysCommitOutcome::Aborted { position } => CommitOutcome::Aborted {
+                lane,
+                position: base + position,
+            },
         }
     }
 
@@ -171,6 +180,11 @@ pub struct ClientPublication {
     inner: Publication<Arc<LogBuffer>>,
     allow_unconnected: bool,
     origin: Option<Origin>,
+    /// The link to the stream's successor mappings, if the driver gave one
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`).
+    link: Option<Arc<GenerationLink>>,
+    /// The stream position where this handle's mapping starts.
+    base: u64,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -185,8 +199,25 @@ impl ClientPublication {
             inner,
             allow_unconnected,
             origin: None,
+            link: None,
+            base: 0,
             _lease: None,
         }
+    }
+
+    /// Attaches the generation link the driver keeps for this handle, and
+    /// the base of the mapping it uses.
+    #[must_use]
+    pub fn with_generation(mut self, link: Arc<GenerationLink>, base: u64) -> Self {
+        self.link = Some(link);
+        self.base = base;
+        self
+    }
+
+    /// The handle's generation link, if any.
+    #[must_use]
+    pub fn generation_link(&self) -> Option<&Arc<GenerationLink>> {
+        self.link.as_ref()
     }
 
     /// Wraps a publication from the direct driver API; the handle keeps the
@@ -212,10 +243,8 @@ impl ClientPublication {
         origin: Origin,
     ) -> Self {
         Self {
-            inner,
-            allow_unconnected,
             origin: Some(origin),
-            _lease: None,
+            ..Self::new(inner, allow_unconnected)
         }
     }
 
@@ -264,18 +293,18 @@ impl ClientPublication {
         if !self.connected() {
             // A sealed publication still releases (publication-seal.md).
             if self.inner.close_if_sealed() {
-                return Ok(OfferOutcome::Closed);
+                return Ok(self.after_end().offer());
             }
             return Ok(OfferOutcome::NotConnected);
         }
         Ok(match self.inner.append(payload, options)? {
             AppendOutcome::Appended { position } => OfferOutcome::Accepted {
                 lane: self.inner.buffer().lane(),
-                position,
+                position: self.base + position,
             },
             AppendOutcome::BackPressured => OfferOutcome::BackPressured,
             AppendOutcome::AdminAction => OfferOutcome::AdminAction,
-            AppendOutcome::Closed => OfferOutcome::Closed,
+            AppendOutcome::Closed => self.after_end().offer(),
         })
     }
 
@@ -309,18 +338,54 @@ impl ClientPublication {
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
             if self.inner.close_if_sealed() {
-                return Ok(ClaimOutcome::Closed);
+                return Ok(self.after_end().claim());
             }
             return Ok(ClaimOutcome::NotConnected);
         }
+        // A handle closed by an earlier call moves (or reports the end)
+        // here, before the attempt borrows it.
+        if self.inner.is_closed() {
+            return Ok(self.after_end().claim());
+        }
         let lane = self.inner.buffer().lane();
+        let base = self.base;
+        let link = self.link.as_deref();
         Ok(match self.inner.try_claim(length, options)? {
-            SysClaimOutcome::Claimed(inner) => ClaimOutcome::Claimed(ClientClaim { inner, lane }),
+            SysClaimOutcome::Claimed(inner) => {
+                ClaimOutcome::Claimed(ClientClaim { inner, lane, base })
+            }
             SysClaimOutcome::BackPressured => ClaimOutcome::BackPressured,
             SysClaimOutcome::AdminAction => ClaimOutcome::AdminAction,
-            SysClaimOutcome::Aborted { position } => ClaimOutcome::Aborted { lane, position },
-            SysClaimOutcome::Closed => ClaimOutcome::Closed,
+            SysClaimOutcome::Aborted { position } => ClaimOutcome::Aborted {
+                lane,
+                position: base + position,
+            },
+            // Just closed: the next call moves, if a successor is coming.
+            SysClaimOutcome::Closed => End::peek(link).claim(),
         })
+    }
+
+    /// The handle's mapping ended (its sys handle is closed). With a link,
+    /// moves to an offered successor, or waits for a pending one; both
+    /// report `AdminAction` (SPEC.md §4), and the next attempt publishes on
+    /// the successor. Otherwise the publication is closed.
+    fn after_end(&mut self) -> End {
+        let Some(link) = &self.link else {
+            return End::Closed;
+        };
+        match link.next() {
+            Next::Wait => End::Retry,
+            Next::Moved {
+                base,
+                successor: Successor::Publication(inner),
+            } => {
+                self.inner = inner;
+                self.base = base;
+                End::Retry
+            }
+            // A successor of another kind is a driver bug: never used.
+            Next::Moved { .. } | Next::End => End::Closed,
+        }
     }
 
     /// The connection rule (SPEC.md §4): one advisory load of the attached
@@ -328,6 +393,22 @@ impl ClientPublication {
     /// allowed.
     fn connected(&self) -> bool {
         self.allow_unconnected || self.inner.buffer().attached_subscribers() > 0
+    }
+}
+
+impl End {
+    fn offer(self) -> OfferOutcome {
+        match self {
+            End::Retry => OfferOutcome::AdminAction,
+            End::Closed => OfferOutcome::Closed,
+        }
+    }
+
+    fn claim<'a>(self) -> ClaimOutcome<'a> {
+        match self {
+            End::Retry => ClaimOutcome::AdminAction,
+            End::Closed => ClaimOutcome::Closed,
+        }
     }
 }
 

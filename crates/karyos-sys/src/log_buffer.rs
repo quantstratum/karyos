@@ -965,6 +965,14 @@ impl<O: BufferOwner> Publication<O> {
         self.state == PublicationState::Closed || self.observe_seal()
     }
 
+    /// Whether the handle is closed: it observed the seal and released. A
+    /// field read; touches no shared state.
+    #[inline]
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.state == PublicationState::Closed
+    }
+
     /// After an attempt that was not granted: if the buffer is sealed,
     /// releases the publication (its loan, then `exclusive_released` after
     /// its last `reserved_head` store) and returns `true`; every later call

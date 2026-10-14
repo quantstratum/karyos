@@ -11,6 +11,7 @@
 pub mod concurrent;
 pub mod conductor;
 pub mod error;
+pub mod generation;
 pub mod link;
 pub mod publication;
 pub mod subscription;
@@ -21,6 +22,7 @@ pub use concurrent::{
 };
 pub use conductor::{ClientConductor, Completion, ConductorError, ConductorPoll, Outcome};
 pub use error::ClientError;
+pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
     Aborted, ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,

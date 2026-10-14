@@ -17,6 +17,7 @@ use karyos_sys::frame::EXTENSION_LENGTH;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, Subscription};
 
 use crate::error::ClientError;
+use crate::generation::{GenerationLink, Next, Successor};
 use crate::link::{Lease, Origin};
 
 /// Metadata delivered with each message.
@@ -110,6 +111,11 @@ pub struct ClientSubscription {
     inner: Subscription<Arc<LogBuffer>>,
     scratch: Box<[u8]>,
     origin: Option<Origin>,
+    /// The link to the stream's successor mappings, if the driver gave one
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`).
+    link: Option<Arc<GenerationLink>>,
+    /// The stream position where this handle's mapping starts.
+    base: u64,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -125,8 +131,25 @@ impl ClientSubscription {
             inner,
             scratch: vec![0u8; max_message_length as usize].into_boxed_slice(),
             origin: None,
+            link: None,
+            base: 0,
             _lease: None,
         }
+    }
+
+    /// Attaches the generation link the driver keeps for this handle, and
+    /// the base of the mapping it reads.
+    #[must_use]
+    pub fn with_generation(mut self, link: Arc<GenerationLink>, base: u64) -> Self {
+        self.link = Some(link);
+        self.base = base;
+        self
+    }
+
+    /// The handle's generation link, if any.
+    #[must_use]
+    pub fn generation_link(&self) -> Option<&Arc<GenerationLink>> {
+        self.link.as_ref()
     }
 
     /// Wraps a subscription from the direct driver API; the handle keeps
@@ -206,7 +229,7 @@ impl ClientSubscription {
                     extension,
                 } => {
                     let info = MessageInfo {
-                        position,
+                        position: self.base + position,
                         reserved_value,
                         end_of_stream,
                         extension,
@@ -223,20 +246,30 @@ impl ClientSubscription {
                     resume,
                 } => {
                     summary.overrun = Some(Overrun {
-                        from,
-                        lost_to,
-                        resume,
+                        from: self.base + from,
+                        lost_to: self.base + lost_to,
+                        resume: self.base + resume,
                     });
                     break;
                 }
                 PollOutcome::Aborted { position, extent } => {
-                    summary.aborted = Some(Aborted { position, extent });
+                    summary.aborted = Some(Aborted {
+                        position: self.base + position,
+                        extent,
+                    });
                     break;
                 }
-                PollOutcome::Closed { position } => {
-                    summary.closed = Some(position);
-                    break;
-                }
+                PollOutcome::Closed { position } => match self.after_end() {
+                    // Moved: the successor's first message is next, in the
+                    // same poll and budget.
+                    Some(true) => {}
+                    // A cutover is pending: nothing to deliver yet.
+                    Some(false) => break,
+                    None => {
+                        summary.closed = Some(self.base + position);
+                        break;
+                    }
+                },
                 PollOutcome::Pending => break,
             }
         }
@@ -247,7 +280,29 @@ impl ClientSubscription {
     #[inline]
     #[must_use]
     pub fn position(&self) -> u64 {
-        self.inner.acknowledged_position()
+        self.base + self.inner.acknowledged_position()
+    }
+
+    /// The poll reached the seal of the handle's mapping. With a link,
+    /// moves to an offered successor (`Some(true)`) or finds a pending
+    /// cutover (`Some(false)`); `None` when no successor will come.
+    fn after_end(&mut self) -> Option<bool> {
+        let link = self.link.as_ref()?;
+        match link.next() {
+            Next::Wait => Some(false),
+            Next::Moved {
+                base,
+                successor: Successor::Subscription { inner, scratch },
+            } => {
+                // The predecessor's cell is detached by this drop.
+                self.inner = inner;
+                self.scratch = scratch;
+                self.base = base;
+                Some(true)
+            }
+            // A successor of another kind is a driver bug: never used.
+            Next::Moved { .. } | Next::End => None,
+        }
     }
 }
 

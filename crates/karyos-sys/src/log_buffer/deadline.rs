@@ -781,6 +781,11 @@ fn settle<T: TermBytes>(
     buffer: &LogBuffer<T>,
     mut point: Point,
 ) -> Result<Option<(Point, u8)>, SysError> {
+    // Without the fence bit (`quantstratum-docs: karyos/design/mapping-generations.md`). Unmasked,
+    // a fenced buffer's count would compare above every term, but no frontier
+    // ever needs to move past the fenced term: the head is capped at the seal
+    // position inside it, and positions at or past the head are never walked.
+    // The mask keeps the comparison exact rather than relying on that.
     let active = active_term_count(buffer.active_count.load(Ordering::Acquire));
     loop {
         if point.offset >= buffer.term_length && point.count.get() < active {
