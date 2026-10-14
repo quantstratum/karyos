@@ -17,6 +17,21 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
 
+/// Stream positions stay below `2^63` (SPEC.md §4).
+pub const POSITION_LIMIT: u64 = 1 << 63;
+
+/// Whether a mapping of `buffer` starting at stream position `base` keeps
+/// every position it can report below [`POSITION_LIMIT`]: a mapping spans
+/// fewer than `2^31` terms, so its local positions stay below
+/// `2^31 × term_length`. Handles accept only such bases, so their
+/// `base + local` additions never overflow.
+#[must_use]
+pub fn representable(base: u64, buffer: &LogBuffer) -> bool {
+    let span = (1u64 << 31) * u64::from(buffer.term_length());
+    base.checked_add(span)
+        .is_some_and(|end| end <= POSITION_LIMIT)
+}
+
 /// A successor capability reserved for one handle.
 #[derive(Debug)]
 pub enum Successor {
@@ -32,6 +47,18 @@ pub enum Successor {
         /// The copy buffer.
         scratch: Box<[u8]>,
     },
+}
+
+impl Successor {
+    /// The successor mapping's buffer.
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer {
+        match self {
+            Self::Publication(inner) => inner.buffer(),
+            Self::Concurrent(inner) => inner.buffer(),
+            Self::Subscription { inner, .. } => inner.buffer(),
+        }
+    }
 }
 
 /// The link's state, as the driver sees it.
@@ -135,8 +162,12 @@ impl GenerationLink {
     ///
     /// # Errors
     ///
-    /// Returns the successor when the link is not pending.
+    /// Returns the successor when the link is not pending, or when its
+    /// mapping starting at `base` is not [`representable`].
     pub fn offer(&self, base: u64, successor: Successor) -> Result<(), Successor> {
+        if !representable(base, successor.buffer()) {
+            return Err(successor);
+        }
         let mut state = self.lock();
         if matches!(*state, State::Pending) {
             *state = State::Offered { base, successor };

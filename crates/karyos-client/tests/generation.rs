@@ -84,9 +84,11 @@ fn an_exclusive_writer_and_its_reader_continue_on_the_successor() {
     let writer_link = GenerationLink::new();
     let reader_link = GenerationLink::new();
     let mut writer = ClientPublication::new(a.publication_owned().unwrap().unwrap(), false)
-        .with_generation(Arc::clone(&writer_link), 0);
+        .with_generation(Arc::clone(&writer_link), 0)
+        .unwrap();
     let mut reader = ClientSubscription::new(a_conductor.subscribe(Role::Required).unwrap())
-        .with_generation(Arc::clone(&reader_link), 0);
+        .with_generation(Arc::clone(&reader_link), 0)
+        .unwrap();
     let OfferOutcome::Accepted {
         position: first, ..
     } = writer.offer(b"one").unwrap()
@@ -159,9 +161,11 @@ fn a_fenced_handle_reports_closed_and_its_reader_the_seal() {
         a_conductor.concurrent_publication().unwrap().unwrap(),
         false,
     )
-    .with_generation(Arc::clone(&writer_link), 0);
+    .with_generation(Arc::clone(&writer_link), 0)
+    .unwrap();
     let mut reader = ClientSubscription::new(a_conductor.subscribe(Role::Optional).unwrap())
-        .with_generation(Arc::clone(&reader_link), 0);
+        .with_generation(Arc::clone(&reader_link), 0)
+        .unwrap();
     assert!(matches!(
         writer.offer(b"one").unwrap(),
         ConcurrentOfferOutcome::Accepted { .. }
@@ -219,9 +223,11 @@ fn positions_carry_the_base_and_a_link_without_cutover_ends() {
         a_conductor.concurrent_publication().unwrap().unwrap(),
         true,
     )
-    .with_generation(Arc::clone(&link), base);
+    .with_generation(Arc::clone(&link), base)
+    .unwrap();
     let mut reader = ClientSubscription::new(a_conductor.subscribe(Role::Optional).unwrap())
-        .with_generation(GenerationLink::new(), base);
+        .with_generation(GenerationLink::new(), base)
+        .unwrap();
     for payload in [&b"a"[..], b"b"] {
         let ConcurrentOfferOutcome::Accepted { position, .. } = writer.offer(payload).unwrap()
         else {
@@ -243,4 +249,49 @@ fn positions_carry_the_base_and_a_link_without_cutover_ends() {
     assert_eq!(closed, Some(base + position));
     assert_eq!(writer.offer(b"c").unwrap(), ConcurrentOfferOutcome::Closed);
     let _ = a;
+}
+
+#[test]
+fn a_base_must_keep_every_position_of_its_mapping_below_2_pow_63() {
+    use karyos_client::ClientError;
+    use karyos_client::generation::{POSITION_LIMIT, representable};
+
+    let (a, mut a_conductor) = buffer(0, concurrent());
+    let span = (1u64 << 31) * u64::from(a.term_length());
+    let highest = POSITION_LIMIT - span;
+    assert!(representable(highest, &a));
+    assert!(!representable(highest + 1, &a));
+    assert!(!representable(u64::MAX - 1, &a));
+    // The highest base is accepted, and its positions stay exact.
+    let mut writer = ClientConcurrentPublication::new(
+        a_conductor.concurrent_publication().unwrap().unwrap(),
+        true,
+    )
+    .with_generation(GenerationLink::new(), highest)
+    .unwrap();
+    for _ in 0..2 {
+        let ConcurrentOfferOutcome::Accepted { position, .. } = writer.offer(b"x").unwrap() else {
+            panic!("not accepted");
+        };
+        assert!(position >= highest && position < POSITION_LIMIT);
+    }
+    // One more, or the probe's u64::MAX - 1, is refused before any use.
+    for base in [highest + 1, u64::MAX - 1] {
+        let handle = a_conductor.concurrent_publication().unwrap().unwrap();
+        assert!(matches!(
+            ClientConcurrentPublication::new(handle, true).with_generation(GenerationLink::new(), base),
+            Err(ClientError::PositionsExhausted { base: refused }) if refused == base
+        ));
+    }
+    // A driver offer past the range gives the successor back, and the link
+    // stays pending.
+    let link = GenerationLink::new();
+    assert!(link.set_pending());
+    let (_b, mut b_conductor) = buffer(1, concurrent());
+    let successor = Successor::Concurrent(b_conductor.concurrent_publication().unwrap().unwrap());
+    assert!(matches!(
+        link.offer(highest + 1, successor),
+        Err(Successor::Concurrent(_))
+    ));
+    assert_eq!(link.status(), LinkStatus::Pending);
 }

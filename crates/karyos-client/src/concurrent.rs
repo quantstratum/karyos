@@ -13,7 +13,7 @@ use karyos_sys::log_buffer::{
 };
 
 use crate::error::ClientError;
-use crate::generation::{End, GenerationLink, Next, Successor};
+use crate::generation::{End, GenerationLink, Next, Successor, representable};
 use crate::link::{Lease, Origin};
 use crate::publication::CommitOutcome;
 
@@ -196,11 +196,23 @@ impl ClientConcurrentPublication {
 
     /// Attaches the generation link the driver keeps for this handle, and
     /// the base of the mapping it uses.
-    #[must_use]
-    pub fn with_generation(mut self, link: Arc<GenerationLink>, base: u64) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::PositionsExhausted`] when the mapping starting
+    /// at `base` could report a position at or above `2^63`; the handle is
+    /// then dropped, releasing what it holds.
+    pub fn with_generation(
+        mut self,
+        link: Arc<GenerationLink>,
+        base: u64,
+    ) -> Result<Self, ClientError> {
+        if !representable(base, self.inner.buffer()) {
+            return Err(ClientError::PositionsExhausted { base });
+        }
         self.link = Some(link);
         self.base = base;
-        self
+        Ok(self)
     }
 
     /// The handle's generation link, if any.

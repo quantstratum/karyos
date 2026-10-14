@@ -396,6 +396,13 @@ impl<T: TermBytes> LogBuffer<T> {
         self.config.lane
     }
 
+    /// The term length in bytes.
+    #[inline]
+    #[must_use]
+    pub fn term_length(&self) -> u32 {
+        self.term_length
+    }
+
     /// The mapping generation (`quantstratum-docs: karyos/design/mapping-generations.md`).
     #[inline]
     #[must_use]
