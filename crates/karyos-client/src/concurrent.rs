@@ -13,6 +13,7 @@ use karyos_sys::log_buffer::{
 };
 
 use crate::error::ClientError;
+use crate::generation::{End, GenerationLink, Next, Successor, representable};
 use crate::link::{Lease, Origin};
 use crate::publication::CommitOutcome;
 
@@ -116,6 +117,8 @@ pub enum ConcurrentClaimOutcome<'a> {
 pub struct ClientConcurrentClaim<'a> {
     inner: ConcurrentClaim<'a, Arc<LogBuffer>>,
     lane: Lane,
+    /// The base of the claim's mapping generation.
+    base: u64,
 }
 
 impl ClientConcurrentClaim<'_> {
@@ -128,7 +131,7 @@ impl ClientConcurrentClaim<'_> {
     /// The block's position in its lane.
     #[must_use]
     pub fn position(&self) -> u64 {
-        self.inner.position()
+        self.base + self.inner.position()
     }
 
     /// The payload: exactly the claimed length, zeroed at claim time.
@@ -138,10 +141,16 @@ impl ClientConcurrentClaim<'_> {
 
     /// Commits the block: exactly one of commit and abort wins.
     pub fn commit(self) -> CommitOutcome {
-        let lane = self.lane;
+        let (lane, base) = (self.lane, self.base);
         match self.inner.commit() {
-            SysCommitOutcome::Committed { position } => CommitOutcome::Accepted { lane, position },
-            SysCommitOutcome::Aborted { position } => CommitOutcome::Aborted { lane, position },
+            SysCommitOutcome::Committed { position } => CommitOutcome::Accepted {
+                lane,
+                position: base + position,
+            },
+            SysCommitOutcome::Aborted { position } => CommitOutcome::Aborted {
+                lane,
+                position: base + position,
+            },
         }
     }
 
@@ -160,6 +169,11 @@ pub struct ClientConcurrentPublication {
     inner: ConcurrentPublication<Arc<LogBuffer>>,
     allow_unconnected: bool,
     origin: Option<Origin>,
+    /// The link to the stream's successor mappings, if the driver gave one
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`).
+    link: Option<Arc<GenerationLink>>,
+    /// The stream position where this handle's mapping starts.
+    base: u64,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -174,8 +188,37 @@ impl ClientConcurrentPublication {
             inner,
             allow_unconnected,
             origin: None,
+            link: None,
+            base: 0,
             _lease: None,
         }
+    }
+
+    /// Attaches the generation link the driver keeps for this handle, and
+    /// the base of the mapping it uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::PositionsExhausted`] when the mapping starting
+    /// at `base` could report a position at or above `2^63`; the handle is
+    /// then dropped, releasing what it holds.
+    pub fn with_generation(
+        mut self,
+        link: Arc<GenerationLink>,
+        base: u64,
+    ) -> Result<Self, ClientError> {
+        if !representable(base, self.inner.buffer()) {
+            return Err(ClientError::PositionsExhausted { base });
+        }
+        self.link = Some(link);
+        self.base = base;
+        Ok(self)
+    }
+
+    /// The handle's generation link, if any.
+    #[must_use]
+    pub fn generation_link(&self) -> Option<&Arc<GenerationLink>> {
+        self.link.as_ref()
     }
 
     /// Wraps a handle from the direct driver API; it keeps the stream's
@@ -201,10 +244,8 @@ impl ClientConcurrentPublication {
         origin: Origin,
     ) -> Self {
         Self {
-            inner,
-            allow_unconnected,
             origin: Some(origin),
-            _lease: None,
+            ..Self::new(inner, allow_unconnected)
         }
     }
 
@@ -250,12 +291,15 @@ impl ClientConcurrentPublication {
         if !self.connected() {
             // A sealed handle still releases (publication-seal.md).
             if self.inner.close_if_sealed() {
-                return Ok(ConcurrentOfferOutcome::Closed);
+                return Ok(self.after_end().concurrent_offer());
             }
             return Ok(ConcurrentOfferOutcome::NotConnected);
         }
         let lane = self.inner.buffer().lane();
-        Ok(offer_outcome(self.inner.offer(payload, options)?, lane))
+        match offer_outcome(self.inner.offer(payload, options)?, lane, self.base) {
+            ConcurrentOfferOutcome::Closed => Ok(self.after_end().concurrent_offer()),
+            outcome => Ok(outcome),
+        }
     }
 
     /// Claims one unfragmented block of `length` payload bytes.
@@ -286,12 +330,46 @@ impl ClientConcurrentPublication {
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
             if self.inner.close_if_sealed() {
-                return Ok(ConcurrentClaimOutcome::Closed);
+                return Ok(self.after_end().concurrent_claim());
             }
             return Ok(ConcurrentClaimOutcome::NotConnected);
         }
+        // A handle closed by an earlier call moves (or reports the end)
+        // here, before the attempt borrows it.
+        if self.inner.is_closed() {
+            return Ok(self.after_end().concurrent_claim());
+        }
         let lane = self.inner.buffer().lane();
-        Ok(claim_outcome(self.inner.try_claim(length, options)?, lane))
+        let base = self.base;
+        let end = End::peek(self.link.as_deref());
+        Ok(claim_outcome(
+            self.inner.try_claim(length, options)?,
+            lane,
+            base,
+            end,
+        ))
+    }
+
+    /// The handle's mapping ended (its sys handle is closed). With a link,
+    /// moves to an offered successor, or waits for a pending one; both
+    /// report `AdminAction` (SPEC.md §4). Otherwise the handle is closed.
+    fn after_end(&mut self) -> End {
+        let Some(link) = &self.link else {
+            return End::Closed;
+        };
+        match link.next() {
+            Next::Wait => End::Retry,
+            Next::Moved {
+                base,
+                successor: Successor::Concurrent(inner),
+            } => {
+                self.inner = inner;
+                self.base = base;
+                End::Retry
+            }
+            // A successor of another kind is a driver bug: never used.
+            Next::Moved { .. } | Next::End => End::Closed,
+        }
     }
 
     /// The connection rule (SPEC.md §4): one advisory load of the attached
@@ -302,13 +380,33 @@ impl ClientConcurrentPublication {
     }
 }
 
-/// The sys offer outcome on the buffer's lane.
-fn offer_outcome(outcome: SysOfferOutcome, lane: Lane) -> ConcurrentOfferOutcome {
-    match outcome {
-        SysOfferOutcome::Appended { position } => {
-            ConcurrentOfferOutcome::Accepted { lane, position }
+impl End {
+    fn concurrent_offer(self) -> ConcurrentOfferOutcome {
+        match self {
+            End::Retry => ConcurrentOfferOutcome::AdminAction,
+            End::Closed => ConcurrentOfferOutcome::Closed,
         }
-        SysOfferOutcome::Aborted { position } => ConcurrentOfferOutcome::Aborted { lane, position },
+    }
+
+    fn concurrent_claim<'a>(self) -> ConcurrentClaimOutcome<'a> {
+        match self {
+            End::Retry => ConcurrentClaimOutcome::AdminAction,
+            End::Closed => ConcurrentClaimOutcome::Closed,
+        }
+    }
+}
+
+/// The sys offer outcome on the buffer's lane.
+fn offer_outcome(outcome: SysOfferOutcome, lane: Lane, base: u64) -> ConcurrentOfferOutcome {
+    match outcome {
+        SysOfferOutcome::Appended { position } => ConcurrentOfferOutcome::Accepted {
+            lane,
+            position: base + position,
+        },
+        SysOfferOutcome::Aborted { position } => ConcurrentOfferOutcome::Aborted {
+            lane,
+            position: base + position,
+        },
         SysOfferOutcome::BackPressured => ConcurrentOfferOutcome::BackPressured,
         SysOfferOutcome::AdminAction => ConcurrentOfferOutcome::AdminAction,
         SysOfferOutcome::Closed => ConcurrentOfferOutcome::Closed,
@@ -316,18 +414,24 @@ fn offer_outcome(outcome: SysOfferOutcome, lane: Lane) -> ConcurrentOfferOutcome
 }
 
 /// The sys claim outcome on the buffer's lane.
+/// `end` is what a just-closed handle reports: the next call moves.
 fn claim_outcome(
     outcome: SysClaimOutcome<'_, Arc<LogBuffer>>,
     lane: Lane,
+    base: u64,
+    end: End,
 ) -> ConcurrentClaimOutcome<'_> {
     match outcome {
         SysClaimOutcome::Claimed(inner) => {
-            ConcurrentClaimOutcome::Claimed(ClientConcurrentClaim { inner, lane })
+            ConcurrentClaimOutcome::Claimed(ClientConcurrentClaim { inner, lane, base })
         }
         SysClaimOutcome::BackPressured => ConcurrentClaimOutcome::BackPressured,
         SysClaimOutcome::AdminAction => ConcurrentClaimOutcome::AdminAction,
-        SysClaimOutcome::Aborted { position } => ConcurrentClaimOutcome::Aborted { lane, position },
-        SysClaimOutcome::Closed => ConcurrentClaimOutcome::Closed,
+        SysClaimOutcome::Aborted { position } => ConcurrentClaimOutcome::Aborted {
+            lane,
+            position: base + position,
+        },
+        SysClaimOutcome::Closed => end.concurrent_claim(),
     }
 }
 
@@ -340,43 +444,54 @@ mod tests {
     // which the sys tests drive with pause points; the mapping is checked
     // here, the race in karyos-sys.
     #[test]
-    fn every_sys_outcome_keeps_its_position_and_gains_the_lane() {
+    fn every_sys_outcome_gains_the_base_and_the_lane() {
         let lane = Lane::try_new(3).unwrap();
         assert_eq!(
-            offer_outcome(SysOfferOutcome::Appended { position: 64 }, lane),
-            ConcurrentOfferOutcome::Accepted { lane, position: 64 }
+            offer_outcome(SysOfferOutcome::Appended { position: 64 }, lane, 1000),
+            ConcurrentOfferOutcome::Accepted {
+                lane,
+                position: 1064
+            }
         );
         assert_eq!(
-            offer_outcome(SysOfferOutcome::Aborted { position: 96 }, lane),
-            ConcurrentOfferOutcome::Aborted { lane, position: 96 }
+            offer_outcome(SysOfferOutcome::Aborted { position: 96 }, lane, 1000),
+            ConcurrentOfferOutcome::Aborted {
+                lane,
+                position: 1096
+            }
         );
         assert_eq!(
-            offer_outcome(SysOfferOutcome::BackPressured, lane),
+            offer_outcome(SysOfferOutcome::BackPressured, lane, 1000),
             ConcurrentOfferOutcome::BackPressured
         );
         assert_eq!(
-            offer_outcome(SysOfferOutcome::AdminAction, lane),
+            offer_outcome(SysOfferOutcome::AdminAction, lane, 1000),
             ConcurrentOfferOutcome::AdminAction
         );
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::Aborted { position: 128 }, lane),
-            ConcurrentClaimOutcome::Aborted { lane: l, position: 128 } if l == lane
+            claim_outcome(SysClaimOutcome::Aborted { position: 128 }, lane, 1000, End::Closed),
+            ConcurrentClaimOutcome::Aborted { lane: l, position: 1128 } if l == lane
         ));
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::BackPressured, lane),
+            claim_outcome(SysClaimOutcome::BackPressured, lane, 1000, End::Closed),
             ConcurrentClaimOutcome::BackPressured
         ));
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::AdminAction, lane),
+            claim_outcome(SysClaimOutcome::AdminAction, lane, 1000, End::Closed),
             ConcurrentClaimOutcome::AdminAction
         ));
         assert_eq!(
-            offer_outcome(SysOfferOutcome::Closed, lane),
+            offer_outcome(SysOfferOutcome::Closed, lane, 1000),
             ConcurrentOfferOutcome::Closed
         );
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::Closed, lane),
+            claim_outcome(SysClaimOutcome::Closed, lane, 1000, End::Closed),
             ConcurrentClaimOutcome::Closed
+        ));
+        // A cutover is coming: the just-closed handle retries.
+        assert!(matches!(
+            claim_outcome(SysClaimOutcome::Closed, lane, 1000, End::Retry),
+            ConcurrentClaimOutcome::AdminAction
         ));
     }
 

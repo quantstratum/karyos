@@ -603,6 +603,14 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         self.state == HandleState::Closed || self.observe_seal()
     }
 
+    /// Whether the handle is closed: it observed the seal and released. A
+    /// field read; touches no shared state.
+    #[inline]
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.state == HandleState::Closed
+    }
+
     /// After an attempt that was not granted: if the buffer is sealed,
     /// releases the handle and returns `true`; every later call returns
     /// `Closed` at once (`quantstratum-docs: karyos/design/publication-seal.md`). The caller

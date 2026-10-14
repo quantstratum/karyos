@@ -19,6 +19,13 @@ pub enum ClientError {
     /// An application message must carry at least one byte.
     #[error("empty application message")]
     EmptyMessage,
+    /// A mapping starting at `base` could report a stream position at or
+    /// above `2^63` (`quantstratum-docs: karyos/design/mapping-generations.md`).
+    #[error("a mapping starting at {base} exceeds the stream position range")]
+    PositionsExhausted {
+        /// The rejected base.
+        base: u64,
+    },
     /// A lower layer failed.
     #[error(transparent)]
     Sys(SysError),

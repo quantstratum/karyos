@@ -396,6 +396,13 @@ impl<T: TermBytes> LogBuffer<T> {
         self.config.lane
     }
 
+    /// The term length in bytes.
+    #[inline]
+    #[must_use]
+    pub fn term_length(&self) -> u32 {
+        self.term_length
+    }
+
     /// The mapping generation (`quantstratum-docs: karyos/design/mapping-generations.md`).
     #[inline]
     #[must_use]
@@ -963,6 +970,14 @@ impl<O: BufferOwner> Publication<O> {
     pub fn close_if_sealed(&mut self) -> bool {
         self.resolve_claim();
         self.state == PublicationState::Closed || self.observe_seal()
+    }
+
+    /// Whether the handle is closed: it observed the seal and released. A
+    /// field read; touches no shared state.
+    #[inline]
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.state == PublicationState::Closed
     }
 
     /// After an attempt that was not granted: if the buffer is sealed,
