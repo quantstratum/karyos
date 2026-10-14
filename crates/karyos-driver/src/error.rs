@@ -39,6 +39,24 @@ pub enum DriverError {
     /// A control-channel limit or size is invalid.
     #[error("invalid driver configuration")]
     InvalidConfig,
+
+    /// A cutover of the stream is in progress
+    /// (`quantstratum-docs: karyos/design/mapping-generations.md`): new handles wait for the
+    /// successor, and a further reconfiguration waits for the cutover to
+    /// end.
+    #[error("stream {stream} has a cutover in progress")]
+    CutoverPending {
+        /// The stream id.
+        stream: u64,
+    },
+
+    /// The successor would need generation `2^24`.
+    #[error("mapping generations exhausted")]
+    GenerationsExhausted,
+
+    /// The successor could reach a stream position at or above `2^63`.
+    #[error("stream positions exhausted")]
+    PositionsExhausted,
     /// `max_clients` clients are admitted.
     #[error("too many clients")]
     TooManyClients,

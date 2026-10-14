@@ -27,6 +27,7 @@ use karyos_sys::log_buffer::Role;
 use crate::counters::Event;
 use crate::embedded::EmbeddedDriver;
 use crate::error::DriverError;
+use crate::generations::MemberKind;
 
 /// A client's registration in the driver.
 #[derive(Debug)]
@@ -279,19 +280,33 @@ impl EmbeddedDriver {
                 let Some(target) = self.streams.get_mut(index) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
+                // New handles wait for a pending cutover's successor
+                // (quantstratum-docs: karyos/design/mapping-generations.md).
+                if target.issuing().is_err() {
+                    return refuse(ErrorCode::ResourcesUnavailable, detail);
+                }
                 let (capability, kind) = match command {
                     Command::AddPublication {
                         allow_unconnected, ..
-                    } => match target.buffer.publication_owned() {
-                        Ok(Some(inner)) => (
+                    } => match target.spare.take() {
+                        Some(inner) => (
                             Capability::Publication {
                                 inner,
                                 allow_unconnected,
                             },
                             Kind::Publication,
                         ),
-                        Ok(None) => return refuse(ErrorCode::PublicationTaken, detail),
-                        Err(error) => return refuse(issue_refusal(&error), detail),
+                        None => match target.buffer.publication_owned() {
+                            Ok(Some(inner)) => (
+                                Capability::Publication {
+                                    inner,
+                                    allow_unconnected,
+                                },
+                                Kind::Publication,
+                            ),
+                            Ok(None) => return refuse(ErrorCode::PublicationTaken, detail),
+                            Err(error) => return refuse(issue_refusal(&error), detail),
+                        },
                     },
                     Command::AddConcurrentPublication {
                         allow_unconnected, ..
@@ -321,6 +336,21 @@ impl EmbeddedDriver {
                     }
                 };
                 // Effect: everything below cannot fail.
+                let member = match &capability {
+                    Capability::Publication { .. } => MemberKind::Exclusive,
+                    Capability::ConcurrentPublication { .. } => MemberKind::Concurrent,
+                    Capability::Subscription(inner) => MemberKind::Subscriber {
+                        role: match command {
+                            Command::AddSubscription {
+                                role: SubscriberRole::Optional,
+                                ..
+                            } => Role::Optional,
+                            _ => Role::Required,
+                        },
+                        cell: inner.cell(),
+                    },
+                };
+                let generation = Some(target.join(member));
                 let end = Arc::new(LeaseEnd::default());
                 let lease = Lease::acquire(&target.leases, &end);
                 self.next_registration = next;
@@ -328,6 +358,7 @@ impl EmbeddedDriver {
                     key: registration,
                     capability,
                     lease,
+                    generation,
                 });
                 let stream_id = target.id;
                 self.registrations.push(Registration {
