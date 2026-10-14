@@ -162,8 +162,10 @@ name = "karyos-sim"
 version = "0.1.0"
 dependencies = [
  "karyos-archive",
+ "karyos-client",
  "karyos-cluster",
  "karyos-driver",
+ "karyos-sys",
 ]
 
 [[package]]
