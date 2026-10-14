@@ -520,3 +520,40 @@ fn a_buffer_carries_its_generation() {
     assert!(matches!(poll(&mut subscription), PollOutcome::Message { .. }));
     assert!(Generation::try_new(1 << 24).is_err());
 }
+
+#[test]
+fn the_fenced_term_is_never_reclaimed_while_it_is_the_active_count() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let data = sized_message(1, 3000);
+    let mut sealed = false;
+    while !sealed {
+        let outcome = handle
+            .offer_pausing(&data, AppendOptions::default(), &mut |point| {
+                if point == WriterPause::PadCommit {
+                    conductor.seal().unwrap();
+                    sealed = true;
+                }
+            })
+            .unwrap();
+        if !sealed {
+            assert!(!matches!(outcome, ConcurrentOfferOutcome::Closed));
+        }
+        let _ = drain_to_end(&mut subscription);
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    // The required reader reaches the seal at the term end, so the floor
+    // is that end; the fenced term is still the active count.
+    let (_, end) = drain_to_end(&mut subscription);
+    assert_eq!(end, PollOutcome::Closed { position: TERM });
+    for _ in 0..3 {
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    let Lookup::Slot(slot) = buffer.lookup(TermCount::ZERO).unwrap() else {
+        panic!("term 0 has no slot");
+    };
+    let found = Descriptor::decode(buffer.descriptor(slot).unwrap().load(Ordering::Acquire)).unwrap();
+    assert_eq!(found.state(), SlotState::Active);
+}
