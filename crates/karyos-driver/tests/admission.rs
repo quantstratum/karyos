@@ -11,7 +11,7 @@
 // test exemptions (ADR-0007 exempts tests from these lints).
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +65,9 @@ fn ipc_config(dir: &Path, timeout: u64) -> IpcConfig {
         max_outbound_per_client: 8,
         fetch_deadline: timeout,
         max_exports_per_client: 16,
+        max_fetches_per_client: 4,
+        max_regions_per_fetch: 4,
+        max_fetch_bytes: 1 << 30,
     }
 }
 
@@ -431,4 +434,161 @@ fn an_ipc_stream_moves_to_a_successor_in_a_new_shared_region() {
             .unwrap();
     }
     assert_eq!(received, vec![b"one".to_vec(), b"two".to_vec()]);
+}
+
+fn counter(driver: &IpcDriver, label: &str) -> u64 {
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .find_map(|index| match reader.read(index) {
+            karyos_sys::counters::CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == label.as_bytes() => Some(value),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// The next message on `socket`, serving the driver while none is there.
+fn next_message(driver: &mut IpcDriver, socket: BorrowedFd<'_>) -> (Message, Option<OwnedFd>) {
+    let start = Instant::now();
+    loop {
+        let _ = driver.do_work().unwrap();
+        let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
+        match ipc::recv(socket, &mut buffer).unwrap() {
+            Recv::Message(received) => {
+                return (
+                    Message::decode(&buffer[..received.len]).unwrap(),
+                    received.fd,
+                );
+            }
+            Recv::WouldBlock => assert!(start.elapsed() < Duration::from_secs(5), "no message"),
+            Recv::PeerClosed => panic!("the driver closed the socket"),
+        }
+    }
+}
+
+/// A remote client's `Fetch` exports its subscription grant: one
+/// `Manifest` and one `Region` with the log buffer's descriptor, which the
+/// client attaches and adopts under the record's export id, and then reads
+/// what an in-process publisher writes (`quantstratum-docs:
+/// karyos/design/ipc-data-path.md`, Grants and the export ledger).
+#[test]
+fn a_fetched_subscription_reads_what_an_in_process_publisher_writes() {
+    let dir = dir("fetch");
+    let mut driver = system_driver(&dir);
+    let stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let _ = client
+        .add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    let mut done: Vec<Completion> = Vec::new();
+    let start = Instant::now();
+    while done.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    // A remote client gets no in-process capability; the first
+    // registration of a fresh driver has key 1.
+    let socket = client.admission_socket().unwrap();
+    let fetch = encode(&Message::Fetch { fetch: 1, key: 1 });
+    assert_eq!(ipc::send(socket, &fetch, None).unwrap(), Sent::Sent);
+    let (manifest, none) = next_message(&mut driver, socket);
+    assert!(none.is_none());
+    let Message::Manifest {
+        fetch: 1,
+        key: 1,
+        registration: 1,
+        records,
+    } = manifest
+    else {
+        panic!("expected the manifest of fetch 1, got {manifest:?}");
+    };
+    let [record] = records[..] else {
+        panic!("one record");
+    };
+    assert_eq!(
+        record.kind,
+        karyos_protocol::admission::RegionKind::LogBuffer
+    );
+    assert_eq!((record.stream_id, record.session_id), (2, 1));
+    let karyos_protocol::admission::Capability::RequiredSubscriber { cell } = record.capability
+    else {
+        panic!("a required subscriber record");
+    };
+    let (region, fd) = next_message(&mut driver, socket);
+    assert_eq!(region, Message::Region { fetch: 1, index: 0 });
+    assert_eq!(counter(&driver, "grants exported"), 1);
+    let region = karyos_sys::ipc::Region::attach(
+        fd.unwrap(),
+        karyos_sys::ipc::RegionRecord {
+            instance: driver.instance().unwrap(),
+            region: record.region,
+            kind: karyos_sys::ipc::RegionKind::LogBuffer,
+            generation: record.generation,
+            layout: u64::from(record.layout),
+            structure_length: usize::try_from(record.structure_length).unwrap(),
+        },
+    )
+    .unwrap();
+    let buffer = karyos_sys::log_buffer::LogBuffer::attach(region).unwrap();
+    let mut adopted = karyos_sys::log_buffer::Subscription::adopt(
+        &buffer,
+        usize::try_from(cell).unwrap(),
+        Role::Required,
+        record.export,
+    )
+    .unwrap();
+    let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
+    let start = Instant::now();
+    while !matches!(
+        publication.offer(b"across").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ) {
+        assert!(start.elapsed() < Duration::from_secs(5), "never accepted");
+        let _ = driver.do_work().unwrap();
+    }
+    let mut out = [0u8; 64];
+    let karyos_sys::log_buffer::PollOutcome::Message { length, .. } =
+        adopted.poll(&mut out).unwrap()
+    else {
+        panic!("no message");
+    };
+    assert_eq!(&out[..length as usize], b"across");
+    adopted.acknowledge();
+    // The key is spent: a second fetch of it is refused, and so is a
+    // fetch id that does not grow.
+    let again = encode(&Message::Fetch { fetch: 2, key: 1 });
+    assert_eq!(ipc::send(socket, &again, None).unwrap(), Sent::Sent);
+    assert_eq!(
+        next_message(&mut driver, socket).0,
+        Message::Refused {
+            fetch: 2,
+            code: refusal::UNKNOWN_KEY
+        }
+    );
+    let reused = encode(&Message::Fetch { fetch: 2, key: 1 });
+    assert_eq!(ipc::send(socket, &reused, None).unwrap(), Sent::Sent);
+    assert_eq!(
+        next_message(&mut driver, socket).0,
+        Message::Refused {
+            fetch: 2,
+            code: refusal::LIMIT
+        }
+    );
+    let unknown = encode(&Message::Fetch { fetch: 3, key: 77 });
+    assert_eq!(ipc::send(socket, &unknown, None).unwrap(), Sent::Sent);
+    assert_eq!(
+        next_message(&mut driver, socket).0,
+        Message::Refused {
+            fetch: 3,
+            code: refusal::UNKNOWN_KEY
+        }
+    );
 }

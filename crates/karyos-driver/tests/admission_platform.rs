@@ -63,6 +63,9 @@ fn config(dir: &Path, pending: usize) -> IpcConfig {
         max_outbound_per_client: 8,
         fetch_deadline: 100,
         max_exports_per_client: 16,
+        max_fetches_per_client: 4,
+        max_regions_per_fetch: 4,
+        max_fetch_bytes: 1 << 30,
     }
 }
 

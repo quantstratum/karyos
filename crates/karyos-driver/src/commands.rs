@@ -486,12 +486,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let Some(index) = self.find_stream(stream) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
-                let remote = self
-                    .clients
-                    .iter()
-                    .find(|slot| slot.id == client)
-                    .and_then(|slot| slot.ledger.as_ref())
-                    .map(Ledger::full);
+                let remote = self.ledger(client).map(Ledger::full);
                 match remote {
                     // The export bound refuses before anything is reserved.
                     Some(true) => return refuse(ErrorCode::ResourcesUnavailable, detail),
@@ -731,12 +726,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let stream = target.id;
         self.next_registration = next;
         self.next_export = export + 1;
-        if let Some(ledger) = self
-            .clients
-            .iter_mut()
-            .find(|slot| slot.id == client)
-            .and_then(|slot| slot.ledger.as_mut())
-        {
+        if let Some(ledger) = self.ledger_mut(client) {
             ledger.push(Grant {
                 export,
                 registration,
@@ -778,16 +768,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// The export ledger of remote client `client`.
+    pub(crate) fn ledger(&self, client: u64) -> Option<&Ledger> {
+        self.clients
+            .iter()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_ref())
+    }
+
+    /// The export ledger of remote client `client`, to change.
+    pub(crate) fn ledger_mut(&mut self, client: u64) -> Option<&mut Ledger> {
+        self.clients
+            .iter_mut()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_mut())
+    }
+
     /// A remote client's `Remove*` of `registration`: a grant never sent is
     /// ended at once, its participant released in the buffer; a sent one
     /// stays charged until its `Detach` or the client's exit proof.
     fn remove_remote(&mut self, client: u64, registration: u64) {
-        let Some(ledger) = self
-            .clients
-            .iter_mut()
-            .find(|slot| slot.id == client)
-            .and_then(|slot| slot.ledger.as_mut())
-        else {
+        let Some(ledger) = self.ledger_mut(client) else {
             return;
         };
         if ledger

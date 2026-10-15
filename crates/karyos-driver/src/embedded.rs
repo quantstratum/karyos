@@ -75,6 +75,13 @@ pub(crate) mod sealed {
         ) -> Result<LogBuffer<Self>, DriverError>
         where
             Self: StreamTerms;
+
+        /// The shared region of `buffer`, which a fetch exports; `None` on
+        /// the heap.
+        #[cfg(target_os = "linux")]
+        fn region(buffer: &LogBuffer<Self>) -> Option<&karyos_sys::ipc::Region>
+        where
+            Self: StreamTerms;
     }
 
     impl Create for karyos_sys::term_bytes::HeapTerms {
@@ -84,6 +91,11 @@ pub(crate) mod sealed {
             generation: Generation,
         ) -> Result<LogBuffer<Self>, DriverError> {
             Ok(LogBuffer::new_with_generation(config, generation)?)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn region(_buffer: &LogBuffer<Self>) -> Option<&karyos_sys::ipc::Region> {
+            None
         }
     }
 
@@ -100,6 +112,10 @@ pub(crate) mod sealed {
                 .ok_or(DriverError::InvalidConfig)?;
             let (instance, region) = admission.next_region()?;
             Ok(LogBuffer::create_in(instance, region, config, generation)?)
+        }
+
+        fn region(buffer: &LogBuffer<Self>) -> Option<&karyos_sys::ipc::Region> {
+            buffer.region()
         }
     }
 }

@@ -258,6 +258,14 @@ pub fn attach(
 }
 
 impl RemoteClient {
+    /// The admission socket while it is open: the transport of fetches.
+    /// Test hook until the client fetches its own grants (issue #2, d3).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn admission_socket(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        self.socket.as_ref().map(AsFd::as_fd)
+    }
+
     /// The driver instance id.
     #[must_use]
     pub fn instance(&self) -> u128 {
