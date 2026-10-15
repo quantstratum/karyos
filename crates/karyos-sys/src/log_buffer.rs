@@ -4439,6 +4439,86 @@ mod region_tests {
         assert!(creator.active_count().load(Ordering::Acquire) >= 2);
     }
 
+    /// An image in a shared region (receive-publication.md, batch r5):
+    /// the receive owner writes through the creator's mapping, one
+    /// fragment at a time, while a reader adopted on a second mapping of
+    /// the same region reads concurrently; every message arrives complete.
+    #[test]
+    fn an_image_in_a_region_is_read_through_another_mapping() {
+        use crate::frame::{FrameType, Word0};
+        use crate::receive::{ImageParams, Item, ValidatedDatagram};
+
+        let mut image_config = config(PublicationMode::Image { join: 0 });
+        image_config.spare_slots = 5;
+        let creator = Arc::new(LogBuffer::create_in(1, 6, image_config, generation()).unwrap());
+        let mut conductor = creator.conductor_owned().unwrap();
+        let cell = conductor.register_subscriber(Role::Required, 41).unwrap();
+        let participant = Arc::new(attach(&creator).unwrap());
+        let mut reader =
+            Subscription::adopt(Arc::clone(&participant), cell, Role::Required, 41).unwrap();
+        let params = ImageParams::new(
+            1,
+            2,
+            1,
+            TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            DEFAULT_MTU,
+        )
+        .unwrap();
+        let mut owner = ReceiveOwner::new(params, vec![Arc::clone(&creator)]).unwrap();
+        let messages = 150u32;
+        // Three 64-byte fragments per message: 192 bytes, all in term 0.
+        let fragment = |m: u32, f: u32| -> Vec<u8> {
+            let count = TermCount::try_new(m * 192 / MIN_TERM_LENGTH).unwrap();
+            let offset = m * 192 % MIN_TERM_LENGTH + f * 64;
+            let flags = Flags::new(f == 0, f == 2, false, false, Lane::ZERO);
+            let mut out = Vec::new();
+            out.extend_from_slice(&Word0::new(57, flags, FrameType::Data).pack().to_le_bytes());
+            out.extend_from_slice(&offset.cast_signed().to_le_bytes());
+            out.extend_from_slice(&1i32.to_le_bytes());
+            out.extend_from_slice(&2i32.to_le_bytes());
+            out.extend_from_slice(&TermId::new(7).advanced_by(count).get().to_le_bytes());
+            out.extend_from_slice(&0i64.to_le_bytes());
+            out.extend((0..25).map(|i| (m * 3 + f) as u8 ^ i));
+            out
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for m in 0..messages {
+                    for f in 0..3 {
+                        let bytes = fragment(m, f);
+                        let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+                        let Some(Item::Frame(frame)) = datagram.items().next() else {
+                            panic!("no frame");
+                        };
+                        assert!(matches!(
+                            owner.receive(&frame),
+                            Ok(Received::Committed { .. })
+                        ));
+                    }
+                }
+            });
+            let mut out = vec![0u8; 256];
+            let mut seen = 0u32;
+            while seen < messages {
+                match reader.poll(&mut out).unwrap() {
+                    PollOutcome::Message { length, .. } => {
+                        let expected: Vec<u8> = (0..3)
+                            .flat_map(|f| fragment(seen, f)[32..].to_vec())
+                            .collect();
+                        assert_eq!(&out[..length as usize], expected.as_slice());
+                        reader.acknowledge();
+                        seen += 1;
+                    }
+                    PollOutcome::Pending => {
+                        let _ = conductor.duty_cycle().unwrap();
+                        std::thread::yield_now();
+                    }
+                    other => panic!("message {seen}: {other:?}"),
+                }
+            }
+        });
+    }
+
     #[test]
     fn concurrent_handles_adopted_on_both_sides_share_one_buffer() {
         let mode = PublicationMode::Concurrent {
