@@ -12,10 +12,13 @@ use proptest::prelude::*;
 use super::*;
 use crate::frame::{Flags, FrameType, Word0};
 use crate::log_buffer::IMAGE_OWNER_CELLS;
+use crate::log_buffer::Lookup;
 use crate::log_buffer::{DEFAULT_CLAIM_DEADLINE, LogBufferConfig, PollOutcome, Role, SkipReason};
+use crate::publication::observe_block;
 use crate::receive::{Item, ValidatedDatagram};
 use crate::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
-use crate::term::{TERM_COUNT_LIMIT, TermId};
+use crate::term::{TERM_COUNT_LIMIT, TermCount, TermId};
+use crate::term_bytes::sealed::Access as _;
 
 const SESSION: i32 = 3;
 const STREAM: i32 = 4;
@@ -361,6 +364,28 @@ fn copies_half_a_term_behind_are_compared_even_with_a_caught_up_reader() {
     conductor.duty_cycle().unwrap();
     conductor.duty_cycle().unwrap();
     assert_eq!(recv(&mut owner, &last), Ok(Received::Late));
+    // A copy that would conflict is late too once its term is gone.
+    assert_eq!(recv(&mut owner, &data(0, 32, 64, 9)), Ok(Received::Late));
+}
+
+#[test]
+fn a_counter_overflow_is_reported_and_the_outcome_stands() {
+    let buffer = image(0);
+    let mut owner = owner(&buffer);
+    owner.counters.frames_committed = u64::MAX;
+    owner.counters.frames_duplicate = u64::MAX - 1;
+    let frame = data(0, 0, 64, 1);
+    assert_eq!(recv(&mut owner, &frame), committed(0, 64));
+    let counters = owner.counters();
+    assert_eq!(counters.frames_committed, u64::MAX);
+    assert_eq!(counters.bytes_committed, 64);
+    assert_eq!(counters.overflowed, Some(ReceiveCounter::FramesCommitted));
+    assert_eq!(recv(&mut owner, &frame), Ok(Received::Duplicate));
+    assert_eq!(recv(&mut owner, &frame), Ok(Received::Duplicate));
+    let counters = owner.counters();
+    assert_eq!(counters.frames_duplicate, u64::MAX);
+    // The first overflow stays reported.
+    assert_eq!(counters.overflowed, Some(ReceiveCounter::FramesCommitted));
 }
 
 #[test]
@@ -489,32 +514,130 @@ fn bitmap_helpers_work_across_words() {
     assert_eq!(first_zero(&bits, 3, 100), 100);
 }
 
-/// A frame of the generated tiling: offset, extent, and its fill.
+/// What a piece of the generated tiling is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A DATA fragment with its BEGIN and END flags and payload fill.
+    Data {
+        begin: bool,
+        end: bool,
+        fill: u8,
+    },
+    Aborted,
+    Pad,
+}
+
+/// One frame of a generated term: offset, extent and kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Piece {
     offset: u32,
     extent: u32,
-    fill: u8,
+    kind: Kind,
 }
 
-fn tiling() -> impl Strategy<Value = Vec<Piece>> {
-    prop::collection::vec(1u32..20, 1..24).prop_map(|units| {
-        let mut offset = 0;
-        let mut pieces = Vec::new();
-        for (i, u) in units.into_iter().enumerate() {
-            let extent = (u + 1) * 32;
-            if offset + extent > TERM {
-                break;
+impl Piece {
+    /// The frame on the wire.
+    fn bytes(&self) -> Vec<u8> {
+        match self.kind {
+            Kind::Data { begin, end, fill } => {
+                fragment(0, self.offset, self.extent as usize - 39, begin, end, fill)
             }
+            Kind::Aborted => record(FrameType::Aborted, 0, self.offset, self.extent),
+            Kind::Pad => record(FrameType::Pad, 0, self.offset, self.extent),
+        }
+    }
+
+    /// The image word 0 and the bytes after it, as the image must hold them.
+    fn image(&self) -> (u64, Vec<u8>) {
+        let wire = self.bytes();
+        let word0 = Word0::unpack(u64::from_le_bytes(wire[..8].try_into().unwrap())).unwrap();
+        let stored = match self.kind {
+            Kind::Data { .. } => word0,
+            Kind::Aborted => Word0::new(self.extent as i32, Flags::NONE, FrameType::Aborted),
+            Kind::Pad => Word0::new(self.extent as i32, Flags::NONE, FrameType::Pad),
+        };
+        (stored.pack(), wire[8..].to_vec())
+    }
+}
+
+/// A whole term: messages of one to three DATA fragments and ABORTED
+/// records, then a final PAD to the term end.
+fn tiling() -> impl Strategy<Value = Vec<Piece>> {
+    let message = prop_oneof![
+        3 => prop::collection::vec(2u32..=44, 1..=3).prop_map(Some),
+        1 => Just(None),
+    ];
+    prop::collection::vec((message, 1u32..400), 1..60).prop_map(|items| {
+        let mut pieces = Vec::new();
+        let mut offset = 0u32;
+        for (i, (message, aborted_units)) in items.into_iter().enumerate() {
+            match message {
+                Some(fragments) => {
+                    let total: u32 = fragments.iter().map(|u| u * 32).sum();
+                    if offset + total > TERM {
+                        break;
+                    }
+                    let last = fragments.len() - 1;
+                    for (f, units) in fragments.into_iter().enumerate() {
+                        pieces.push(Piece {
+                            offset,
+                            extent: units * 32,
+                            kind: Kind::Data {
+                                begin: f == 0,
+                                end: f == last,
+                                fill: (i * 3 + f) as u8,
+                            },
+                        });
+                        offset += units * 32;
+                    }
+                }
+                None => {
+                    let extent = aborted_units * 32;
+                    if offset + extent > TERM {
+                        break;
+                    }
+                    pieces.push(Piece {
+                        offset,
+                        extent,
+                        kind: Kind::Aborted,
+                    });
+                    offset += extent;
+                }
+            }
+        }
+        if offset < TERM {
             pieces.push(Piece {
                 offset,
-                extent,
-                fill: i as u8,
+                extent: TERM - offset,
+                kind: Kind::Pad,
             });
-            offset += extent;
         }
         pieces
     })
+}
+
+/// A valid frame that differs from `piece` in content, extent or offset.
+fn tampered(piece: Piece, how: u32) -> Option<Piece> {
+    let mut out = piece;
+    match (how, piece.kind) {
+        (0, Kind::Data { begin, end, fill }) => {
+            out.kind = Kind::Data {
+                begin,
+                end,
+                fill: fill.wrapping_add(1),
+            }
+        }
+        (0, Kind::Aborted) if piece.extent > 32 => out.extent -= 32,
+        (1, Kind::Data { .. }) if piece.extent > 64 => out.extent -= 32,
+        (1, Kind::Aborted) => out.extent += 32,
+        (_, Kind::Pad) if piece.extent > 32 => {
+            out.offset += 32;
+            out.extent -= 32;
+        }
+        (_, Kind::Data { .. } | Kind::Aborted) => out.offset += 32,
+        _ => return None,
+    }
+    (out.offset + out.extent <= TERM).then_some(out)
 }
 
 /// The sequential reference model of the classification rules.
@@ -526,12 +649,12 @@ struct Model {
 impl Model {
     fn apply(&mut self, piece: Piece) -> Result<Received, ReceiveError> {
         let (start, end) = (piece.offset, piece.offset + piece.extent);
-        let outcome_conflict = conflict(u64::from(start), piece.extent);
+        let refused = conflict(u64::from(start), piece.extent);
         if let Some(found) = self.committed.iter().find(|c| c.offset == start) {
             return if *found == piece {
                 Ok(Received::Duplicate)
             } else {
-                outcome_conflict
+                refused
             };
         }
         if self
@@ -539,7 +662,7 @@ impl Model {
             .iter()
             .any(|c| c.offset < end && start < c.offset + c.extent)
         {
-            return outcome_conflict;
+            return refused;
         }
         self.committed.push(piece);
         committed(u64::from(start), piece.extent)
@@ -554,39 +677,64 @@ impl Model {
     }
 }
 
+/// Reads the image independently of the owner: every committed piece's
+/// word 0 and bytes, and a zero word 0 at every piece not committed.
+fn check_image(buffer: &LogBuffer<HeapTerms>, pieces: &[Piece], model: &Model) {
+    let Lookup::Slot(slot) = buffer.lookup(TermCount::ZERO).unwrap() else {
+        panic!("term 0 is not in the table")
+    };
+    for piece in pieces {
+        let covered = model
+            .committed
+            .iter()
+            .any(|c| c.offset <= piece.offset && piece.offset < c.offset + c.extent);
+        if covered {
+            continue;
+        }
+        // SAFETY: single-threaded test without a conductor, so term 0 stays
+        // in its slot; nothing committed covers `offset`, a 32-byte frame
+        // start of the generated layout that the owner never wrote.
+        let word0 = observe_block(unsafe { buffer.regions.word0(slot, piece.offset) });
+        assert_eq!(word0, 0, "uncommitted piece at {}", piece.offset);
+    }
+    for piece in &model.committed {
+        let (expected_word0, expected) = piece.image();
+        // SAFETY: as above; a committed frame starts at `offset`.
+        let word0 = observe_block(unsafe { buffer.regions.word0(slot, piece.offset) });
+        assert_eq!(word0, expected_word0, "word 0 at {}", piece.offset);
+        let mut body = vec![0u8; expected.len()];
+        // SAFETY: as above; the range follows the committed word 0 inside
+        // the frame, at a multiple of 8, and holds no other word 0.
+        unsafe { buffer.regions.read_bytes(slot, piece.offset + 8, &mut body) };
+        assert_eq!(body, expected, "bytes at {}", piece.offset);
+    }
+}
+
 proptest! {
     #![proptest_config(crate::receive::tests_config())]
 
     #[test]
     fn arbitrary_arrival_orders_match_the_model(
         pieces in tiling(),
-        order in prop::collection::vec(any::<prop::sample::Index>(), 1..64),
-        tamper in prop::collection::vec((any::<prop::sample::Index>(), 0u32..3), 0..8),
+        order in prop::collection::vec(any::<prop::sample::Index>(), 1..96),
+        tamper in prop::collection::vec((any::<prop::sample::Index>(), 0u32..3), 0..12),
     ) {
         let buffer = image(0);
         let mut owner = owner(&buffer);
         let mut model = Model::default();
         let mut arrivals: Vec<Piece> = order.iter().map(|i| *i.get(&pieces)).collect();
-        for (i, kind) in tamper {
-            let mut piece = *i.get(&pieces);
-            match kind {
-                0 => piece.fill = piece.fill.wrapping_add(1),
-                1 if piece.extent > 64 => piece.extent -= 32,
-                _ => piece.offset += 32,
-            }
-            if piece.offset + piece.extent <= TERM {
+        for (i, how) in tamper {
+            if let Some(piece) = tampered(*i.get(&pieces), how) {
                 arrivals.push(piece);
             }
         }
+        // Every piece arrives at least once, after the shuffled ones.
+        arrivals.extend(pieces.iter().copied());
         for piece in arrivals {
             let expected = model.apply(piece);
-            let got = recv(&mut owner, &data(0, piece.offset, piece.extent, piece.fill));
-            prop_assert_eq!(got, expected);
+            prop_assert_eq!(recv(&mut owner, &piece.bytes()), expected);
             prop_assert_eq!(owner.rebuild_position(Lane::ZERO), Some(model.prefix()));
-        }
-        for piece in &model.committed {
-            let again = recv(&mut owner, &data(0, piece.offset, piece.extent, piece.fill));
-            prop_assert_eq!(again, Ok(Received::Duplicate));
+            check_image(&buffer, &pieces, &model);
         }
     }
 }

@@ -73,7 +73,7 @@ mod deadline;
 mod image_read;
 mod receive_owner;
 
-pub use receive_owner::{ReceiveCounters, ReceiveError, ReceiveOwner, Received};
+pub use receive_owner::{ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received};
 pub(crate) mod storage;
 
 #[cfg(test)]

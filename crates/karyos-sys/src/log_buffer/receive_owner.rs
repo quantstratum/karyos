@@ -91,8 +91,32 @@ pub enum ReceiveError {
     Sys(#[from] SysError),
 }
 
-/// Lifetime counters of a receive owner, over all lanes. A counter that
-/// would overflow keeps its value and increments `overflows` instead.
+/// A receive owner counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReceiveCounter {
+    /// [`ReceiveCounters::frames_committed`].
+    FramesCommitted,
+    /// [`ReceiveCounters::bytes_committed`].
+    BytesCommitted,
+    /// [`ReceiveCounters::frames_duplicate`].
+    FramesDuplicate,
+    /// [`ReceiveCounters::frames_late`].
+    FramesLate,
+    /// [`ReceiveCounters::frames_ahead`].
+    FramesAhead,
+    /// [`ReceiveCounters::frames_not_ready`].
+    FramesNotReady,
+    /// [`ReceiveCounters::frames_conflicting`].
+    FramesConflicting,
+    /// [`ReceiveCounters::cleaner_lag`].
+    CleanerLag,
+}
+
+/// Lifetime counters of a receive owner, over all lanes. Increments are
+/// checked: a counter that would overflow keeps its value, never wraps or
+/// saturates, and the first such counter is reported in `overflowed`
+/// (SPEC.md §14, ADR-0007). An overflow never changes what `receive`
+/// returns: the frame's outcome stands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReceiveCounters {
     /// Frames committed.
@@ -111,15 +135,28 @@ pub struct ReceiveCounters {
     pub frames_conflicting: u64,
     /// Times the next term was not prepared by the conductor.
     pub cleaner_lag: u64,
-    /// Increments not applied because a counter would overflow.
-    pub overflows: u64,
+    /// The first counter whose increment was not applied because it would
+    /// have overflowed; it stays set.
+    pub overflowed: Option<ReceiveCounter>,
 }
 
 impl ReceiveCounters {
-    fn bump(counter: &mut u64, overflows: &mut u64, by: u64) {
-        match counter.checked_add(by) {
-            Some(value) => *counter = value,
-            None => *overflows = overflows.saturating_add(1),
+    fn bump(&mut self, counter: ReceiveCounter, by: u64) {
+        let value = match counter {
+            ReceiveCounter::FramesCommitted => &mut self.frames_committed,
+            ReceiveCounter::BytesCommitted => &mut self.bytes_committed,
+            ReceiveCounter::FramesDuplicate => &mut self.frames_duplicate,
+            ReceiveCounter::FramesLate => &mut self.frames_late,
+            ReceiveCounter::FramesAhead => &mut self.frames_ahead,
+            ReceiveCounter::FramesNotReady => &mut self.frames_not_ready,
+            ReceiveCounter::FramesConflicting => &mut self.frames_conflicting,
+            ReceiveCounter::CleanerLag => &mut self.cleaner_lag,
+        };
+        match value.checked_add(by) {
+            Some(next) => *value = next,
+            None => {
+                self.overflowed.get_or_insert(counter);
+            }
         }
     }
 }
@@ -200,28 +237,23 @@ impl<T: TermBytes> ReceiveOwner<T> {
             .ok_or(ReceiveError::Foreign)?;
         let result = lane.receive(frame);
         let counters = &mut self.counters;
-        let overflows = &mut counters.overflows;
         match result {
             Ok(Received::Committed { extent, .. }) => {
-                ReceiveCounters::bump(&mut counters.frames_committed, overflows, 1);
-                ReceiveCounters::bump(&mut counters.bytes_committed, overflows, u64::from(extent));
+                counters.bump(ReceiveCounter::FramesCommitted, 1);
+                counters.bump(ReceiveCounter::BytesCommitted, u64::from(extent));
             }
-            Ok(Received::Duplicate) => {
-                ReceiveCounters::bump(&mut counters.frames_duplicate, overflows, 1);
-            }
-            Ok(Received::Late) => ReceiveCounters::bump(&mut counters.frames_late, overflows, 1),
-            Ok(Received::Ahead) => ReceiveCounters::bump(&mut counters.frames_ahead, overflows, 1),
-            Ok(Received::NotReady) => {
-                ReceiveCounters::bump(&mut counters.frames_not_ready, overflows, 1);
-            }
+            Ok(Received::Duplicate) => counters.bump(ReceiveCounter::FramesDuplicate, 1),
+            Ok(Received::Late) => counters.bump(ReceiveCounter::FramesLate, 1),
+            Ok(Received::Ahead) => counters.bump(ReceiveCounter::FramesAhead, 1),
+            Ok(Received::NotReady) => counters.bump(ReceiveCounter::FramesNotReady, 1),
             Err(ReceiveError::Conflict { .. }) => {
-                ReceiveCounters::bump(&mut counters.frames_conflicting, overflows, 1);
+                counters.bump(ReceiveCounter::FramesConflicting, 1);
             }
             Err(_) => {}
         }
         if lane.lagged {
             lane.lagged = false;
-            ReceiveCounters::bump(&mut counters.cleaner_lag, overflows, 1);
+            counters.bump(ReceiveCounter::CleanerLag, 1);
         }
         result
     }
@@ -347,11 +379,10 @@ impl<T: TermBytes> LaneOwner<T> {
             let Some(index) = self.set_of(count) else {
                 return Ok(Received::Late);
             };
-            let set = self.set(index)?;
-            if !bit(&set.starts, unit) {
-                return Err(conflict());
-            }
-            return match self.compare_trailing(count, frame)? {
+            let starts = bit(&self.set(index)?.starts, unit);
+            // Whether the term is still held decides first: a copy of a
+            // reclaimed term is late whatever it would have been.
+            return match self.compare_trailing(count, frame, starts)? {
                 Some(true) => Ok(Received::Duplicate),
                 Some(false) => Err(conflict()),
                 None => Ok(Received::Late),
@@ -516,12 +547,14 @@ impl<T: TermBytes> LaneOwner<T> {
         Ok(false)
     }
 
-    /// Compares a copy for the trailing term under a transient read loan.
-    /// `None` when the term is no longer held.
+    /// Compares a copy for the trailing term under a transient read loan:
+    /// equal only if a committed frame starts where it does (`starts`) and
+    /// matches it. `None` when the term is no longer held.
     fn compare_trailing(
         &self,
         count: TermCount,
         frame: &ValidatedFrame<'_>,
+        starts: bool,
     ) -> Result<Option<bool>, SysError> {
         let buffer = &*self.buffer;
         let Lookup::Slot(slot) = buffer.lookup(count)? else {
@@ -537,7 +570,7 @@ impl<T: TermBytes> LaneOwner<T> {
             LoanOutcome::Granted => {}
             _ => return Ok(None),
         }
-        let same = equal(buffer, slot, frame);
+        let same = starts && equal(buffer, slot, frame);
         release_loan(&cell.loan);
         Ok(Some(same))
     }
