@@ -580,11 +580,19 @@ fn a_fetched_subscription_reads_what_an_in_process_publisher_writes() {
         fetch: 1,
         key: 1,
         registration: 1,
+        stream_registration,
+        incarnation,
         records,
     } = manifest
     else {
         panic!("expected the manifest of fetch 1, got {manifest:?}");
     };
+    // The grant names its stream's publication identity.
+    let identity = driver.trace_identity(stream).unwrap();
+    assert_eq!(
+        (stream_registration, incarnation),
+        (identity.registration, identity.incarnation)
+    );
     let [record] = records[..] else {
         panic!("one record");
     };
@@ -1121,6 +1129,17 @@ fn remote_subscriber(
     driver: &mut IpcDriver,
     dir: &Path,
 ) -> (RemoteClient, ClientSubscription<SharedTerms>) {
+    let (client, subscription, _) = remote_subscriber_as(driver, dir, SubscriberRole::Required);
+    (client, subscription)
+}
+
+/// A remote client takes a subscription with `role`; returns it with the
+/// subscription handle and its registration.
+fn remote_subscriber_as(
+    driver: &mut IpcDriver,
+    dir: &Path,
+    role: SubscriberRole,
+) -> (RemoteClient, ClientSubscription<SharedTerms>, u64) {
     let mut client = attach_serving(driver, dir).unwrap();
     serve_while(driver, move || {
         let _ = client
@@ -1129,7 +1148,7 @@ fn remote_subscriber(
                     stream_id: 2,
                     session_id: 1,
                 },
-                SubscriberRole::Required,
+                role,
             )
             .unwrap();
         let mut fetchable = None;
@@ -1142,9 +1161,135 @@ fn remote_subscriber(
                 }
             });
         }
-        let subscription = client.take_subscription(&fetchable.unwrap()).unwrap();
-        (client, subscription)
+        let fetchable = fetchable.unwrap();
+        let subscription = client.take_subscription(&fetchable).unwrap();
+        (client, subscription, fetchable.registration)
     })
+}
+
+/// The driver's `driver_id` as one 128-bit value: `[high, low]` packed
+/// `high << 64 | low`, as a loss record's instance.
+fn driver_instance(driver: &IpcDriver) -> u128 {
+    let [high, low] = driver.driver_id();
+    u128::from(high) << 64 | u128::from(low)
+}
+
+/// The driver_id is the single per-instance id (ACS 13555): the instance of
+/// `Admitted`, which every CnC region header the client attached carries
+/// (attach compares each header with it), equals the driver's `driver_id`.
+#[test]
+fn the_admitted_instance_is_the_driver_id() {
+    let dir = dir("instance");
+    let mut driver = system_driver(&dir);
+    let instance = driver_instance(&driver);
+    assert_ne!(instance, 0);
+    assert_eq!(driver.instance(), Some(instance));
+    let client = attach_serving(&mut driver, &dir).unwrap();
+    assert_eq!(client.instance(), instance);
+    // A raw Admitted carries it too, low word first.
+    let socket = ipc::connect(&dir, Duration::from_millis(200)).unwrap();
+    let pidfd = own_pidfd();
+    let hello = encode(&Message::Hello { version: VERSION });
+    assert_eq!(
+        ipc::send(socket.as_fd(), &hello, Some(pidfd.as_fd())).unwrap(),
+        Sent::Sent
+    );
+    let (admitted, none) = next_message(&mut driver, socket.as_fd());
+    assert!(none.is_none());
+    let Message::Admitted { instance: got, .. } = admitted else {
+        panic!("expected Admitted, got {admitted:?}");
+    };
+    assert_eq!(got, instance);
+    drop(client);
+}
+
+/// A remote optional subscriber that is overrun reports its loss as an
+/// in-process one does: the driver records one verified overrun whose
+/// instance is its `driver_id`, with the stream registration and
+/// incarnation the grant's manifest carried, the subscription's
+/// registration and the remote client.
+#[test]
+fn an_overrun_remote_subscriber_records_one_verified_loss() {
+    let dir = dir("loss");
+    let mut driver = system_driver(&dir);
+    let stream = driver
+        .add_stream(StreamConfig {
+            allow_unconnected: true,
+            ..shared_stream_config()
+        })
+        .unwrap();
+    let (mut client, subscription, registration) =
+        remote_subscriber_as(&mut driver, &dir, SubscriberRole::Optional);
+    let mut subscription = subscription.with_rejoin(karyos_client::RejoinPolicy::RejoinAtHead);
+    let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
+    // Lap the subscriber that never reads.
+    for _ in 0..300 {
+        let start = Instant::now();
+        while !matches!(
+            publication.offer(&[7u8; 512]).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ) {
+            assert!(start.elapsed() < Duration::from_secs(5), "never accepted");
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    let summary = subscription.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    let lost = summary.overrun.unwrap();
+    assert_eq!(
+        summary.rejoin,
+        Some(karyos_client::RejoinOutcome::ResumedAtHead)
+    );
+    assert!(lost.from < lost.lost_to);
+    assert_eq!(client.loss_reports_queued(), 1);
+    // The remote client's poll sends the ReportLoss through its ring.
+    let mut records = Vec::new();
+    let start = Instant::now();
+    while records.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no loss record");
+        let _ = client.poll(usize::MAX, |completion| {
+            panic!("unexpected completion {completion:?}");
+        });
+        let _ = driver.do_work().unwrap();
+        let _ = driver
+            .loss_report()
+            .scan(&mut 0, |_, record| records.push(record));
+    }
+    let [record] = records[..] else {
+        panic!("expected exactly one loss record");
+    };
+    let identity = driver.trace_identity(stream).unwrap();
+    assert_eq!(
+        karyos_sys::diag::LossRecord { time: 0, ..record },
+        karyos_sys::diag::LossRecord {
+            time: 0,
+            kind: 1,
+            reason: 0,
+            lane: 0,
+            configured_policy: 1,
+            applied_policy: 1,
+            flags: 0,
+            instance: driver_instance(&driver),
+            stream_registration: identity.registration,
+            incarnation: karyos_driver::FIRST_INCARNATION,
+            stream_id: 2,
+            from: lost.from,
+            to: lost.lost_to,
+            participant: registration,
+            client: client.client(),
+        }
+    );
+    assert_eq!(counter(&driver, "overruns rejoin at head"), 1);
+    assert_eq!(counter(&driver, "loss reports unverified"), 0);
+    assert_eq!(counter(&driver, "clients faulty"), 0);
+    assert_eq!(client.loss_reports_queued(), 0);
+    assert_eq!(client.loss_reports_dropped(), 0);
+    drop(publication);
+    serve_while(&mut driver, move || {
+        drop(subscription);
+        drop(client);
+    });
+    serve_until(&mut driver, |driver| driver.clients() == 0);
 }
 
 /// Polls `client` until it receives `SuccessorReady` or `Fenced` for any

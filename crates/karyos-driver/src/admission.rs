@@ -42,7 +42,6 @@ use karyos_protocol::admission::{
     hello_version, refusal,
 };
 use karyos_sys::command_ring::RingConsumer;
-use karyos_sys::error::SysError;
 use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, Sent};
 
 use crate::counters::Event;
@@ -166,19 +165,15 @@ pub(crate) struct Admission<T: StreamTerms> {
     next_region: u64,
 }
 
-/// A random 128-bit driver instance id (SPEC.md §5).
-fn random_instance() -> Result<u128, DriverError> {
-    use std::io::Read;
-    let mut bytes = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|error| {
-            DriverError::Sys(SysError::Os {
-                operation: "read(/dev/urandom)",
-                errno: error.raw_os_error().unwrap_or(0),
-            })
-        })?;
-    Ok(u128::from_le_bytes(bytes))
+/// The admission instance id of a driver: its `driver_id` (SPEC.md §4)
+/// as one 128-bit value. The `driver_id` is the single per-instance id;
+/// IPC mode uses it for admission (coordinator decision, ACS 13555), so
+/// region headers, `Admitted` and loss records name the same instance. Its
+/// two words `[high, low]` pack as `u128::from(high) << 64 |
+/// u128::from(low)`, as a loss record's instance does.
+pub(crate) fn instance_of(driver_id: [u64; 2]) -> u128 {
+    let [high, low] = driver_id;
+    u128::from(high) << 64 | u128::from(low)
 }
 
 fn encode(message: &Message) -> Option<Vec<u8>> {
@@ -233,9 +228,10 @@ fn record(region: &Region, export: u64) -> Option<Record> {
 }
 
 impl<T: StreamTerms> Admission<T> {
-    /// Draws the instance id and opens the socket; returns the instance id
-    /// too, for the driver's regions.
-    pub(crate) fn new(config: IpcConfig) -> Result<(Self, u128), DriverError> {
+    /// Opens the socket of the driver whose instance id is `instance`
+    /// ([`instance_of`] its `driver_id`), which every region it creates
+    /// and `Admitted` carry.
+    pub(crate) fn new(config: IpcConfig, instance: u128) -> Result<Self, DriverError> {
         if config.max_pending_hellos == 0
             || config.hello_timeout == 0
             || config.fetch_deadline == 0
@@ -247,24 +243,20 @@ impl<T: StreamTerms> Admission<T> {
         {
             return Err(DriverError::InvalidConfig);
         }
-        let instance = random_instance()?;
         let backlog = i32::try_from(config.max_pending_hellos).unwrap_or(i32::MAX);
         let listener = ipc::listen(&config.dir, backlog)?;
-        Ok((
-            Self {
-                instance,
-                config,
-                listener,
-                pending: Vec::new(),
-                remotes: Vec::new(),
-                retiring: Vec::new(),
-                next_region: FIRST_RING_REGION,
-            },
+        Ok(Self {
             instance,
-        ))
+            config,
+            listener,
+            pending: Vec::new(),
+            remotes: Vec::new(),
+            retiring: Vec::new(),
+            next_region: FIRST_RING_REGION,
+        })
     }
 
-    /// The driver instance id.
+    /// The driver instance id: the driver's `driver_id` as one value.
     pub(crate) fn instance(&self) -> u128 {
         self.instance
     }
@@ -624,6 +616,12 @@ impl<T: StreamTerms> Admission<T> {
                 fetch,
                 key,
                 registration: grant.registration,
+                // The publication identity of the grant, whose driver part
+                // is the instance of `Admitted` (ACS 13555). One
+                // incarnation per stream registration, kept across
+                // mapping generations.
+                stream_registration: grant.stream,
+                incarnation: crate::embedded::FIRST_INCARNATION,
                 records: vec![record],
             }),
             encode(&Message::Region { fetch, index: 0 }),
@@ -810,7 +808,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         work
     }
 
-    /// The driver instance id, in IPC mode.
+    /// The driver instance id, in IPC mode: the `driver_id` as one value,
+    /// `u128::from(high) << 64 | u128::from(low)` of
+    /// [`EmbeddedDriver::driver_id`]'s `[high, low]`.
     #[must_use]
     pub fn instance(&self) -> Option<u128> {
         self.admission.as_ref().map(Admission::instance)

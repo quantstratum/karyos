@@ -488,10 +488,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !valid {
             return Err(DriverError::InvalidConfig);
         }
+        // The one per-instance id: trace and loss identities carry it, and
+        // in IPC mode it is the admission instance id too (ACS 13555).
+        let mut driver_id = [0u64; 2];
+        karyos_sys::random::fill_u64s(&mut driver_id)?;
         #[cfg(target_os = "linux")]
         let (broadcast, counters, client_counters, admission, diagnostics) = match ipc {
             Some(ipc) => {
-                let (mut admission, instance) = crate::admission::Admission::new(ipc)?;
+                let instance = crate::admission::instance_of(driver_id);
+                let mut admission = crate::admission::Admission::new(ipc, instance)?;
                 let broadcast = BroadcastTransmitter::create_in(
                     instance,
                     crate::admission::BROADCAST_REGION,
@@ -549,8 +554,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let id = NEXT_DRIVER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| DriverError::DriverIdsExhausted)?;
-        let mut driver_id = [0u64; 2];
-        karyos_sys::random::fill_u64s(&mut driver_id)?;
         Ok(Self {
             counters,
             client_counters,
@@ -1198,7 +1201,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// The driver instance's random 128-bit `driver_id` (SPEC.md §4), as
-    /// two words. Trace records and observers carry it.
+    /// two words `[high, low]`. Trace records, observers and loss records
+    /// carry it, and in IPC mode it is the admission instance id too
+    /// (`instance()`, `u128::from(high) << 64 | u128::from(low)`; ACS
+    /// 13555).
     #[must_use]
     pub fn driver_id(&self) -> [u64; 2] {
         self.driver_id
