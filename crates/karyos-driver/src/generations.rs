@@ -570,6 +570,123 @@ mod tests {
         );
     }
 
+    /// SPEC.md §13 "First start and identity limits", generation part: a
+    /// stream driven by a real cutover to generation `2^24 - 1` runs on it
+    /// (several rotations), and a further cutover request returns the typed
+    /// `GenerationsExhausted` without any effect, never a wrapped generation
+    /// or a panic. Per mapping-generations.md (owner approved deviation from
+    /// SPEC.md §4) the stream keeps running and the caller closes it
+    /// explicitly with `remove_stream`, which every handle observes.
+    #[test]
+    fn a_stream_cut_over_to_the_last_generation_refuses_the_next_and_closes_on_removal() {
+        use karyos_client::{ConcurrentOfferOutcome, MessageLimit};
+
+        let last = Generation::try_new((1 << 24) - 1).unwrap();
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let handle = stream(&mut driver);
+        let mut reader = driver.subscribe(handle, Role::Optional).unwrap();
+        let mut writer = driver.concurrent_publication(handle).unwrap();
+        let mut seen: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut drain = |reader: &mut karyos_client::ClientSubscription| loop {
+            let summary = reader
+                .poll(
+                    |bytes, info| seen.push((info.position, bytes.to_vec())),
+                    MessageLimit::new(8),
+                )
+                .unwrap();
+            assert_eq!(summary.overrun, None);
+            if summary.delivered == 0 {
+                return (seen.clone(), summary.closed);
+            }
+        };
+        assert!(matches!(
+            writer.offer(b"g0").unwrap(),
+            ConcurrentOfferOutcome::Accepted { position: 0, .. }
+        ));
+        // Seed the bookkeeping one below the limit (the test hook of the
+        // test above), then reach the last generation by a real cutover:
+        // the successor buffer is created for it.
+        driver.active_stream_mut(handle).unwrap().generation =
+            Generation::try_new((1 << 24) - 2).unwrap();
+        assert_eq!(
+            driver
+                .reconfigure_stream(handle, reconfiguration())
+                .unwrap(),
+            last
+        );
+        let end = driver.generations(handle).unwrap()[0].seal.unwrap();
+        assert_eq!(
+            writer.offer(b"moved").unwrap(),
+            ConcurrentOfferOutcome::AdminAction
+        );
+        assert!(matches!(
+            writer.offer(b"moved").unwrap(),
+            ConcurrentOfferOutcome::Accepted { position, .. } if position == end
+        ));
+        let (messages, closed) = drain(&mut reader);
+        assert_eq!(
+            messages,
+            vec![(0, b"g0".to_vec()), (end, b"moved".to_vec())]
+        );
+        assert_eq!(closed, None);
+        let _ = driver.do_work().unwrap();
+        let target = driver.active_stream_mut(handle).unwrap();
+        assert_eq!(target.buffer.generation(), last);
+        assert!(target.retained.is_empty(), "the predecessor was not freed");
+        // Several rotations on the last generation: its descriptors and
+        // loans carry the 24-bit value.
+        let data = vec![3u8; 6000];
+        let mut published = 0usize;
+        let mut cycles = 0u32;
+        while published < 3 * MIN_TERM_LENGTH as usize {
+            match writer.offer(&data).unwrap() {
+                ConcurrentOfferOutcome::Accepted { .. } => published += data.len(),
+                ConcurrentOfferOutcome::AdminAction | ConcurrentOfferOutcome::BackPressured => {}
+                other => panic!("unexpected {other:?}"),
+            }
+            let _ = driver.do_work().unwrap();
+            let _ = drain(&mut reader);
+            cycles += 1;
+            assert!(cycles < 10_000, "no progress on the last generation");
+        }
+        let (messages, _) = drain(&mut reader);
+        assert_eq!(messages.len(), 2 + published / data.len());
+        // The next cutover would need generation 2^24: refused, typed, and
+        // nothing changes.
+        assert!(matches!(
+            driver.reconfigure_stream(handle, reconfiguration()),
+            Err(DriverError::GenerationsExhausted)
+        ));
+        assert_eq!(driver.seal_state(handle).unwrap(), SealState::Active);
+        let table = driver.generations(handle).unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            (table[0].generation, table[0].base, table[0].seal),
+            (last, end, None)
+        );
+        let target = driver.active_stream_mut(handle).unwrap();
+        assert!(target.cutover.is_none());
+        assert_eq!(target.generation, last);
+        // The stream keeps running on its last generation.
+        let ConcurrentOfferOutcome::Accepted {
+            position: after, ..
+        } = writer.offer(b"still").unwrap()
+        else {
+            panic!("the stream stopped after the refusal");
+        };
+        let (messages, closed) = drain(&mut reader);
+        assert_eq!(messages.last().unwrap(), &(after, b"still".to_vec()));
+        assert_eq!(closed, None);
+        // The explicit close: every handle observes it.
+        driver.remove_stream(handle).unwrap();
+        assert_eq!(writer.offer(b"x").unwrap(), ConcurrentOfferOutcome::Closed);
+        let _ = driver.do_work().unwrap();
+        let seal = driver.generations(handle).unwrap()[0].seal.unwrap();
+        assert!(seal > after);
+        let (_, closed) = drain(&mut reader);
+        assert_eq!(closed, Some(seal));
+    }
+
     #[test]
     fn a_successor_that_could_reach_2_pow_63_is_refused() {
         let mut driver = EmbeddedDriver::new().unwrap();

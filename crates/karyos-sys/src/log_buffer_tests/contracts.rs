@@ -295,7 +295,12 @@ impl Drop for StopOnDrop<'_> {
 /// §13 "Cleaner lag": the driver conductor is paused for longer than one
 /// term. Rotation returns `AdminAction` and no slot is reused before it is
 /// cleaned (every byte read later is intact); normal rotation resumes when
-/// the conductor does.
+/// the conductor does. While the conductor is paused the descriptors and
+/// the slot table are inspected after every append: no slot leaves its
+/// term or becomes `FREE`, `READY` or `RECLAIMING`, and the only transition
+/// is the publication's own activation of the prepared `READY` slot. After
+/// the conductor resumes, a slot takes a new term only once its old term
+/// lies wholly below the published floor (it was reclaimed and cleaned).
 #[test]
 fn test_log_buffer_cleaner_lag_rotation_waits_and_resumes_intact() {
     let buffer = new_buffer(config(2, 1)).unwrap();
@@ -313,9 +318,38 @@ fn test_log_buffer_cleaner_lag_rotation_waits_and_resumes_intact() {
     // would advance the limit is the one paused), so only rotation can stop
     // the publisher: publish and drain until only AdminAction is left.
     buffer.limit().store(4 * TERM, Ordering::Release);
+    let descriptors = |buffer: &LogBuffer<Terms>| -> Vec<Descriptor> {
+        (0..buffer.slots)
+            .map(|slot| {
+                Descriptor::decode(buffer.descriptor(slot).unwrap().load(Ordering::Acquire))
+                    .unwrap()
+            })
+            .collect()
+    };
+    let table = |buffer: &LogBuffer<Terms>| -> Vec<u64> {
+        buffer
+            .table()
+            .iter()
+            .map(|entry| entry.load(Ordering::Acquire))
+            .collect()
+    };
+    let paused_descriptors = descriptors(&buffer);
+    let paused_table = table(&buffer);
+    let check_paused = |buffer: &LogBuffer<Terms>| {
+        for (before, now) in paused_descriptors.iter().zip(descriptors(buffer)) {
+            let activated = before.state() == SlotState::Ready
+                && now == before.with_state(SlotState::Active);
+            assert!(
+                now == *before || activated,
+                "a slot changed while the conductor was paused: {before:?} to {now:?}"
+            );
+        }
+        assert_eq!(table(buffer), paused_table, "the slot table changed");
+    };
     let mut admin_in_a_row = 0;
     let mut data = next(&mut sequence);
     for _ in 0..10_000 {
+        check_paused(&buffer);
         if admin_in_a_row == 50 {
             break;
         }
@@ -343,16 +377,56 @@ fn test_log_buffer_cleaner_lag_rotation_waits_and_resumes_intact() {
         ));
     }
     assert_eq!(buffer.active_count().load(Ordering::Acquire), stalled);
+    check_paused(&buffer);
+    // At the stall no slot holds the next term: nothing was prepared, and
+    // no slot was taken for it before being cleaned.
+    let next_term = buffer
+        .initial_term_id
+        .advanced_by(TermCount::try_new(stalled as u32 + 1).unwrap());
+    let stalled_descriptors = descriptors(&buffer);
+    assert!(
+        stalled_descriptors
+            .iter()
+            .all(|descriptor| descriptor.term_id() != next_term
+                || descriptor.state() == SlotState::Free),
+        "the next term was prepared without the conductor: {stalled_descriptors:?}"
+    );
+    assert_eq!(
+        stalled_descriptors
+            .iter()
+            .filter(|descriptor| descriptor.state() == SlotState::Active)
+            .count(),
+        2,
+        "the written terms stay ACTIVE until the conductor reclaims them"
+    );
     // The conductor resumes: rotation continues through several terms.
     let target = expected.len() * 4;
+    let mut reused = 0u32;
     while expected.len() < target {
+        let before = descriptors(&buffer);
         let _ = append_retrying(&mut publication, &mut conductor, &data, || {
             while let Some(message) = poll_message(&mut subscription) {
                 received.push(message);
             }
         });
+        let floor = buffer.floor().load(Ordering::Acquire);
+        for (old, now) in before.iter().zip(descriptors(&buffer)) {
+            // A FREE slot was cleaned already; any other slot that takes a
+            // new term is reused within this call.
+            if old.state() != SlotState::Free && now.term_id() != old.term_id() {
+                // Its old term was wholly below the floor, so it was
+                // reclaimed and cleaned before the slot was prepared again.
+                let count = old.term_id().count_from(buffer.initial_term_id).unwrap();
+                assert!(
+                    buffer.position(count, buffer.term_length) <= floor,
+                    "slot reused for {now:?} while {old:?} was above the floor {floor}"
+                );
+                reused += 1;
+            }
+        }
         expected.push(core::mem::replace(&mut data, next(&mut sequence)));
     }
+    assert!(reused > 0, "no slot was reused after the conductor resumed");
     for _ in 0..100 {
         let _ = conductor.duty_cycle().unwrap();
         while let Some(message) = poll_message(&mut subscription) {

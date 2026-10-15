@@ -299,6 +299,110 @@ fn claims_drain_by_commit_or_deadline_and_a_paused_handle_never_delays_the_cutov
     assert_eq!(seen.last().unwrap(), &(end, b"new".to_vec()));
 }
 
+/// SPEC.md §13 "Cutover with backlog", the optional reader's bound: at the
+/// seal an optional reader lags by its whole window (`term_length / 2`, the
+/// most it can lag without being lapped, since with no required
+/// participant the floor is `head - window`) and holds a read loan, inside
+/// its in-place delivery of the oldest message. mapping-generations.md:
+/// the head stays capped at the seal position across duty cycles, so an
+/// optional reader within its window of that end is never overrun; it
+/// drains every message to the seal position and continues on the
+/// successor at the seal's stream position.
+#[test]
+fn an_optional_reader_lagging_its_whole_window_at_the_seal_drains_without_overrun() {
+    let (mut driver, _) = driver(2);
+    let stream = stream(&mut driver, 8, PublicationMode::Exclusive);
+    let mut lagging = driver.subscribe(stream, Role::Optional).unwrap();
+    let mut writer = driver.publication(stream).unwrap();
+    // 1024-byte frames (32-byte header plus 992 bytes) up to exactly one
+    // window ahead of the reader, which reads nothing meanwhile.
+    let window = u64::from(MIN_TERM_LENGTH / 2);
+    let frame = 1024u64;
+    let messages = window / frame;
+    for index in 0..messages {
+        let payload = vec![u8::try_from(index).unwrap(); 992];
+        let position = loop {
+            match writer.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { position, .. } => break position,
+                OfferOutcome::BackPressured | OfferOutcome::AdminAction => {
+                    let _ = driver.do_work().unwrap();
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(position, index * frame);
+        let _ = driver.do_work().unwrap();
+    }
+    // Inside the reader's delivery of position 0 (its loan held, its lag
+    // exactly the window), the mapping is sealed and the cutover opens.
+    let mut seen = Vec::new();
+    let mut end = None;
+    let first = lagging
+        .poll(
+            |bytes, info| {
+                seen.push((info.position, bytes.to_vec()));
+                let _ = driver.reconfigure_stream(stream, larger()).unwrap();
+                assert_eq!(writer.offer(b"next").unwrap(), OfferOutcome::AdminAction);
+                let _ = driver.do_work().unwrap();
+                let seal = driver.generations(stream).unwrap()[0].seal.unwrap();
+                assert_eq!(seal - info.position, window, "the reader lags its window");
+                end = Some(seal);
+            },
+            MessageLimit::new(1),
+        )
+        .unwrap();
+    assert_eq!(first.delivered, 1);
+    let end = end.unwrap();
+    assert_eq!(end, window);
+    // More duty cycles while the reader still lags: the capped head never
+    // raises the floor past it.
+    for _ in 0..8 {
+        let _ = driver.do_work().unwrap();
+    }
+    // The writer moves and publishes on the successor at the seal position.
+    assert_eq!(writer.offer(b"next").unwrap(), OfferOutcome::AdminAction);
+    assert_eq!(accepted(writer.offer(b"next").unwrap()), end);
+    let mut overrun = None;
+    loop {
+        let summary = lagging
+            .poll(
+                |bytes, info| seen.push((info.position, bytes.to_vec())),
+                MessageLimit::new(8),
+            )
+            .unwrap();
+        overrun = overrun.or(summary.overrun);
+        assert_eq!(summary.closed, None);
+        if summary.delivered == 0 {
+            break;
+        }
+    }
+    assert_eq!(overrun, None, "the lagging reader was overrun by the seal");
+    let mut expected: Vec<(u64, Vec<u8>)> = (0..messages)
+        .map(|index| (index * frame, vec![u8::try_from(index).unwrap(); 992]))
+        .collect();
+    expected.push((end, b"next".to_vec()));
+    assert_eq!(seen, expected);
+    // Drained to the seal and moved: the predecessor is released.
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.generations(stream).unwrap().len(), 1);
+    // Control: the window is the bound. Without a seal, one frame more
+    // laps a reader that has read nothing.
+    let control = self::stream(&mut driver, 9, PublicationMode::Exclusive);
+    let mut lapped = driver.subscribe(control, Role::Optional).unwrap();
+    let mut writer = driver.publication(control).unwrap();
+    for _ in 0..=messages {
+        while !matches!(
+            writer.offer(&[1u8; 992]).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ) {
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    let summary = lapped.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    assert_eq!(summary.overrun.map(|overrun| overrun.from), Some(0));
+}
+
 #[test]
 fn a_paused_required_subscriber_is_fenced_and_a_draining_one_is_admitted() {
     let (mut driver, clock) = driver(2);
