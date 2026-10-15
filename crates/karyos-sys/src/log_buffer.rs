@@ -123,6 +123,9 @@ const CELL_LOST_HOLDING: u64 = 5;
 const CELL_LOST: u64 = 6;
 /// A revoked reader that keeps its credit until it is freed.
 const CELL_LOST_RESERVED: u64 = 7;
+/// An observer: copies only, never bounds, holds a spare-slot credit
+/// (`quantstratum-docs: karyos/design/observer-role.md`).
+const CELL_OBSERVER: u64 = 8;
 
 /// Whether a subscriber cell in `state` bounds the publication limit.
 const fn bounds(state: u64) -> bool {
@@ -136,7 +139,7 @@ const fn bounds(state: u64) -> bool {
 const fn connected(state: u64) -> bool {
     matches!(
         state,
-        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL
+        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER
     )
 }
 
@@ -144,7 +147,7 @@ const fn connected(state: u64) -> bool {
 const fn holds_credit(state: u64) -> bool {
     matches!(
         state,
-        CELL_OPTIONAL | CELL_REQUIRED_RESERVED | CELL_LOST_RESERVED
+        CELL_OPTIONAL | CELL_OBSERVER | CELL_REQUIRED_RESERVED | CELL_LOST_RESERVED
     )
 }
 
@@ -160,6 +163,11 @@ pub enum Role {
     Required,
     /// Does not bound the publisher; lapped readers rejoin at the head.
     Optional,
+    /// Does not bound the publisher, is lapped like an optional reader, and
+    /// only ever copies: its loan covers exactly one copy inside one poll,
+    /// and its handle will never get an in-place delivery API
+    /// (`quantstratum-docs: karyos/design/observer-role.md`).
+    Observer,
 }
 
 /// What the conductor does with a required participant whose client was
@@ -1351,6 +1359,7 @@ impl<O: BufferOwner> PreparedSubscription<O> {
         let expected = match self.role {
             Role::Required => CELL_REQUIRED,
             Role::Optional => CELL_OPTIONAL,
+            Role::Observer => CELL_OBSERVER,
         };
         let state = found.state.load(Ordering::Acquire);
         let admitted =
@@ -2610,7 +2619,8 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                 let next = position + u64::from(reserved);
                 self.cursor.position = next;
                 match self.cursor.role {
-                    Role::Optional => self.publish(next),
+                    // The copy is the acknowledgement.
+                    Role::Optional | Role::Observer => self.publish(next),
                     Role::Required => self.cursor.pending = Some(next),
                 }
                 Ok(Step::Done(PollOutcome::Message {
@@ -3414,7 +3424,7 @@ impl<O: BufferOwner> Conductor<O> {
         }
         let state = found.state.load(Ordering::Acquire);
         let target = match (state, policy) {
-            (CELL_OPTIONAL, _) | (CELL_REQUIRED_RESERVED, LossPolicy::Continue) => {
+            (CELL_OPTIONAL | CELL_OBSERVER, _) | (CELL_REQUIRED_RESERVED, LossPolicy::Continue) => {
                 CELL_LOST_RESERVED
             }
             (CELL_REQUIRED, LossPolicy::Hold) => CELL_LOST_HOLDING,
@@ -3543,7 +3553,7 @@ impl<O: BufferOwner> Conductor<O> {
         }
         let cell = buffer.cells().get(cell)?;
         match cell.state.load(Ordering::Acquire) {
-            CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL => {
+            CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER => {
                 Some(cell.position.load(Ordering::Acquire))
             }
             _ => None,
@@ -3585,7 +3595,7 @@ impl<O: BufferOwner> Conductor<O> {
                     .skip(buffer.first_subscriber_cell())
                     .filter(|cell| {
                         let state = cell.state.load(Ordering::Acquire);
-                        bounds(state) || state == CELL_OPTIONAL
+                        bounds(state) || state == CELL_OPTIONAL || state == CELL_OBSERVER
                     })
                     .all(|cell| cell.position.load(Ordering::Acquire) >= position);
                 if passed {
@@ -3830,7 +3840,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // Publisher credits are reserved for the buffer's life: 1 for the
         // exclusive publication, `P` for concurrent ones.
         let publishers = buffer.first_subscriber_cell() as u32;
-        let takes_credit = role == Role::Optional || reserve;
+        let takes_credit = matches!(role, Role::Optional | Role::Observer) || reserve;
         let credits = credited + publishers + u32::from(takes_credit);
         if credits > u32::from(buffer.spare_slots - CLEANING_HEADROOM) {
             return Err(SysError::ResourcesUnavailable);
@@ -3848,6 +3858,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             (Role::Required, false) => CELL_REQUIRED,
             (Role::Required, true) => CELL_REQUIRED_RESERVED,
             (Role::Optional, _) => CELL_OPTIONAL,
+            (Role::Observer, _) => CELL_OBSERVER,
         };
         cell.state.store(state, Ordering::Release);
         Ok(Cursor {
@@ -4253,6 +4264,7 @@ mod heap_tests {
     include!("log_buffer_tests/adoption.rs");
     include!("log_buffer_tests/contracts.rs");
     include!("log_buffer_tests/loss.rs");
+    include!("log_buffer_tests/observer.rs");
 }
 
 #[cfg(test)]
@@ -4277,6 +4289,7 @@ mod shared_tests {
     include!("log_buffer_tests/adoption.rs");
     include!("log_buffer_tests/contracts.rs");
     include!("log_buffer_tests/loss.rs");
+    include!("log_buffer_tests/observer.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber

@@ -135,6 +135,58 @@ fn requests_round_trip_and_data_flows() {
 }
 
 #[test]
+fn an_observer_subscription_delivers_and_never_bounds_the_publisher() {
+    let (mut driver, stream) = driver_with(DriverConfig::default());
+    let mut client = driver.connect().unwrap();
+    let sub_request = client
+        .add_subscription(key(2), SubscriberRole::Observer)
+        .unwrap();
+    let pub_request = client.add_publication(key(2), false).unwrap();
+    let mut publication_handle = None;
+    let mut observer = None;
+    for completion in cycles(&mut driver, &mut client, 2) {
+        if completion.sequence == pub_request {
+            publication_handle = Some(publication(completion.outcome));
+        } else {
+            assert_eq!(completion.sequence, sub_request);
+            observer = Some(subscription(completion.outcome));
+        }
+    }
+    let mut publication_handle = publication_handle.unwrap();
+    let mut observer = observer.unwrap();
+    // The observer keeps the publication connected and receives.
+    assert!(matches!(
+        publication_handle.offer(b"seen").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    let mut seen = Vec::new();
+    let _ = observer
+        .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(4))
+        .unwrap();
+    assert_eq!(seen, vec![b"seen".to_vec()]);
+    // Stalled, it never back-pressures the publisher: many terms go by.
+    let data = vec![5u8; 7000];
+    for _ in 0..60 {
+        let mut accepted = false;
+        for _ in 0..100 {
+            if matches!(
+                publication_handle.offer(&data).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                accepted = true;
+                break;
+            }
+            let _ = driver.do_work().unwrap();
+        }
+        assert!(accepted, "an observer bounded the publisher");
+        let _ = driver.do_work().unwrap();
+    }
+    let summary = observer.poll(|_, _| {}, MessageLimit::new(4)).unwrap();
+    assert!(summary.overrun.is_some(), "the stalled observer was lapped");
+    assert_eq!(driver.live_leases(stream).unwrap(), 2);
+}
+
+#[test]
 fn refusals_have_no_effect() {
     let (mut driver, stream) = driver_with(DriverConfig::default());
     let mut client = driver.connect().unwrap();

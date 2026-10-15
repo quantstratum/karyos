@@ -19,7 +19,7 @@ use karyos_client::link::{
 };
 use karyos_protocol::cnc::{
     CloseReason, Command, ErrorCode, Event as DriverEvent, LossPolicyCode, MAX_COMMAND_LENGTH,
-    MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey, SubscriberRole,
+    MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::log_buffer::{LossPolicy, PublicationEnd, Revocation, Role, SealState};
@@ -567,13 +567,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         Err(error) => return refuse(issue_refusal(&error), detail),
                     },
                     _ => {
-                        let role = match command {
-                            Command::AddSubscription {
-                                role: SubscriberRole::Optional,
-                                ..
-                            } => Role::Optional,
-                            _ => Role::Required,
-                        };
+                        let role = subscription_role(command);
                         // A required reader of a `continue` stream reserves
                         // its slots like an optional one.
                         let reserve =
@@ -596,13 +590,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     Capability::Publication { .. } => MemberKind::Exclusive,
                     Capability::ConcurrentPublication { .. } => MemberKind::Concurrent,
                     Capability::Subscription(inner) => MemberKind::Subscriber {
-                        role: match command {
-                            Command::AddSubscription {
-                                role: SubscriberRole::Optional,
-                                ..
-                            } => Role::Optional,
-                            _ => Role::Required,
-                        },
+                        role: subscription_role(command),
                         cell: inner.cell(),
                     },
                 };
@@ -737,13 +725,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
             _ => {
-                let role = match command {
-                    Command::AddSubscription {
-                        role: SubscriberRole::Optional,
-                        ..
-                    } => Role::Optional,
-                    _ => Role::Required,
-                };
+                let role = subscription_role(command);
                 let reserve = role == Role::Required && target.policy == LossPolicy::Continue;
                 match target
                     .conductor
@@ -884,6 +866,15 @@ fn fetch_bytes<T: StreamTerms>(buffer: &karyos_sys::log_buffer::LogBuffer<T>) ->
 
 /// The refusal code of a failed publication issuance: a kind that does not
 /// match the stream's mode, or a resource (staging, loan) not available.
+/// The reader role an `AddSubscription` asks for; `Required` for any
+/// other command (the callers only reach it for subscriptions).
+fn subscription_role(command: Command) -> Role {
+    match command {
+        Command::AddSubscription { role, .. } => Role::from(role),
+        _ => Role::Required,
+    }
+}
+
 fn issue_refusal(error: &karyos_sys::error::SysError) -> ErrorCode {
     match error {
         karyos_sys::error::SysError::InvalidPublicationMode { .. } => {
@@ -905,7 +896,7 @@ impl<T: StreamTerms> Drop for EmbeddedDriver<T> {
 #[cfg(test)]
 mod tests {
     use karyos_client::Outcome;
-    use karyos_protocol::cnc::Response;
+    use karyos_protocol::cnc::{Response, SubscriberRole};
     use karyos_sys::broadcast::Received;
     use karyos_sys::command_ring::RingProducer;
     use karyos_sys::frame::Lane;
