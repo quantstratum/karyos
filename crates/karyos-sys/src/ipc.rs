@@ -35,7 +35,7 @@ use rustix::net::{
     SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
 };
 
-use crate::atomic_view::{AtomicWords, WORD_BYTES};
+use crate::atomic_view::{AtomicWords, ReadOnlyWords, WORD_BYTES};
 use crate::error::SysError;
 
 /// Bytes before a region's structure: the 64-byte header, padded to the
@@ -51,6 +51,31 @@ pub const REGION_MAGIC: u64 = u64::from_le_bytes(*b"KARYOSr1");
 const SIZE_SEALS: SealFlags = SealFlags::SHRINK
     .union(SealFlags::GROW)
     .union(SealFlags::SEAL);
+
+/// The seals of a region only the driver writes (owner decision Q7, A2;
+/// `quantstratum-docs: karyos/design/observability-and-tools.md`, "Read-only
+/// views"): the size seals plus `F_SEAL_FUTURE_WRITE`, added after the
+/// driver's single writable mapping, so every later mapping is read-only.
+const DRIVER_ONLY_SEALS: SealFlags = SIZE_SEALS.union(SealFlags::FUTURE_WRITE);
+
+/// The seal set a read-only attach accepts for a region kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealProfile {
+    /// The size seals: a region participants also write.
+    Shared,
+    /// The size seals and `F_SEAL_FUTURE_WRITE`: a region only the driver
+    /// writes (A2).
+    DriverOnly,
+}
+
+impl SealProfile {
+    const fn seals(self) -> SealFlags {
+        match self {
+            Self::Shared => SIZE_SEALS,
+            Self::DriverOnly => DRIVER_ONLY_SEALS,
+        }
+    }
+}
 
 /// What a region holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +193,41 @@ impl Region {
             return Err(SysError::InvalidRegion { address: 0, len });
         };
         rustix::fs::fcntl_add_seals(fd, SIZE_SEALS).map_err(os("fcntl_add_seals"))?;
-        check_seals(fd)?;
+        check_seals(fd, SIZE_SEALS)?;
+        Ok(region)
+    }
+
+    /// Creates a region only the driver writes, in the A2 order of owner
+    /// decision Q7: a fresh sealable `memfd` sized for `record`, sealed
+    /// against resizing, mapped shared read-write once (the driver's only
+    /// writable mapping), zero-filled and stamped with the header, then
+    /// sealed with `F_SEAL_FUTURE_WRITE | F_SEAL_SEAL`. Every later mapping
+    /// of its descriptor, by clients or tools, can only be read-only.
+    ///
+    /// # Errors
+    ///
+    /// As [`Region::create`].
+    pub fn create_driver_only(record: RegionRecord) -> Result<Self, SysError> {
+        let len = record.size()?;
+        let file_len =
+            u64::try_from(len).map_err(|_| SysError::InvalidRegion { address: 0, len })?;
+        let fd = create_memfd()?;
+        rustix::fs::ftruncate(&fd, file_len).map_err(os("ftruncate"))?;
+        rustix::fs::fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW)
+            .map_err(os("fcntl_add_seals"))?;
+        let region = Self::map(fd, len, record)?;
+        let words = region.words_checked()?;
+        for (index, value) in record.header_words().into_iter().enumerate() {
+            if let Some(word) = words.get(index) {
+                word.store(value, Ordering::Release);
+            }
+        }
+        let Some(fd) = region.fd.as_ref() else {
+            return Err(SysError::InvalidRegion { address: 0, len });
+        };
+        rustix::fs::fcntl_add_seals(fd, SealFlags::FUTURE_WRITE | SealFlags::SEAL)
+            .map_err(os("fcntl_add_seals"))?;
+        check_seals(fd, DRIVER_ONLY_SEALS)?;
         Ok(region)
     }
 
@@ -185,7 +244,7 @@ impl Region {
     /// descriptor is closed and any mapping undone on every error.
     pub fn attach(fd: OwnedFd, expected: RegionRecord) -> Result<Self, SysError> {
         let len = expected.size()?;
-        check_seals(&fd)?;
+        check_seals(&fd, SIZE_SEALS)?;
         let stat = rustix::fs::fstat(&fd).map_err(os("fstat"))?;
         if u64::try_from(stat.st_size).ok() != u64::try_from(len).ok() {
             return Err(SysError::InvalidRegion {
@@ -290,14 +349,131 @@ impl Drop for Region {
     }
 }
 
-/// Exactly the size seals, ignoring `F_SEAL_EXEC`.
-fn check_seals(fd: &OwnedFd) -> Result<(), SysError> {
+/// A region mapped read-only (`PROT_READ`), viewed only through
+/// [`ReadOnlyWords`]: nothing in it can store.
+#[derive(Debug)]
+pub struct ReadOnlyRegion {
+    base: NonNull<u8>,
+    len: usize,
+    record: RegionRecord,
+}
+
+// SAFETY: as for `Region`: the mapping is process-wide memory, valid from
+// any thread until `drop`, exposed only through load-only atomic views.
+unsafe impl Send for ReadOnlyRegion {}
+// SAFETY: see the `Send` impl.
+unsafe impl Sync for ReadOnlyRegion {}
+
+impl ReadOnlyRegion {
+    /// Attaches a received descriptor read-only, in the order of
+    /// [`Region::attach`]: exactly the seals of `profile` (plus
+    /// `F_SEAL_EXEC`), the exact size for `expected`, one whole `PROT_READ`
+    /// shared mapping followed at once by `MADV_DONTFORK`, the descriptor
+    /// closed, then the header compared with `expected` by atomic loads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::SealMismatch`], [`SysError::InvalidRegion`] or
+    /// [`SysError::Os`]. The descriptor is closed and any mapping undone on
+    /// every error.
+    pub fn attach(
+        fd: OwnedFd,
+        expected: RegionRecord,
+        profile: SealProfile,
+    ) -> Result<Self, SysError> {
+        let len = expected.size()?;
+        check_seals(&fd, profile.seals())?;
+        let stat = rustix::fs::fstat(&fd).map_err(os("fstat"))?;
+        if u64::try_from(stat.st_size).ok() != u64::try_from(len).ok() {
+            return Err(SysError::InvalidRegion {
+                address: 0,
+                len: usize::try_from(stat.st_size).unwrap_or(usize::MAX),
+            });
+        }
+        // SAFETY: a fresh read-only mapping at an address chosen by the
+        // kernel over `len` bytes of a size-sealed file of exactly `len`
+        // bytes (checked). It aliases no existing Rust object.
+        let raw = unsafe {
+            rustix::mm::mmap(
+                core::ptr::null_mut(),
+                len,
+                ProtFlags::READ,
+                MapFlags::SHARED,
+                &fd,
+                0,
+            )
+        }
+        .map_err(os("mmap"))?;
+        let Some(base) = NonNull::new(raw.cast::<u8>()) else {
+            // SAFETY: unmaps exactly the range just mapped, which nothing
+            // references.
+            let _ = unsafe { rustix::mm::munmap(raw, len) };
+            return Err(SysError::InvalidRegion { address: 0, len });
+        };
+        // From here `region` owns the mapping; an early return unmaps it.
+        let region = Self {
+            base,
+            len,
+            record: expected,
+        };
+        // SAFETY: advises exactly the range this object maps.
+        unsafe { rustix::mm::madvise(raw, len, Advice::LinuxDontFork) }.map_err(os("madvise"))?;
+        // Closed once mapped: the mapping keeps the memory alive.
+        drop(fd);
+        let words = region.words_checked()?;
+        let matches = expected
+            .header_words()
+            .into_iter()
+            .enumerate()
+            .all(|(index, value)| words.load(index, Ordering::Acquire) == Some(value));
+        if !matches {
+            return Err(SysError::InvalidRegion { address: 0, len });
+        }
+        Ok(region)
+    }
+
+    /// The record the region was attached for.
+    #[inline]
+    #[must_use]
+    pub fn record(&self) -> RegionRecord {
+        self.record
+    }
+
+    /// The region's structure: the words after the header stride.
+    #[must_use]
+    pub fn structure(&self) -> ReadOnlyWords<'_> {
+        match self.words_checked() {
+            Ok(words) => words.slice_from(HEADER_STRIDE / WORD_BYTES),
+            // `attach` validated the same region.
+            Err(_) => ReadOnlyWords::empty(),
+        }
+    }
+
+    fn words_checked(&self) -> Result<ReadOnlyWords<'_>, SysError> {
+        // SAFETY: `base..base + len` is mapped readable for as long as
+        // `self` lives (unmapped only in `drop`), the backing is
+        // size-sealed, the view borrows `self`, and this process accesses
+        // the region only through atomic loads.
+        unsafe { ReadOnlyWords::from_raw(self.base.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for ReadOnlyRegion {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly the range mapped in `attach`, once. No view
+        // outlives `self`, because every view borrows it.
+        let _ = unsafe { rustix::mm::munmap(self.base.as_ptr().cast::<c_void>(), self.len) };
+    }
+}
+
+/// Exactly the `expected` seals, ignoring `F_SEAL_EXEC`.
+fn check_seals(fd: &OwnedFd, expected: SealFlags) -> Result<(), SysError> {
     let found = rustix::fs::fcntl_get_seals(fd).map_err(os("fcntl_get_seals"))?;
-    if found.difference(SealFlags::EXEC) == SIZE_SEALS {
+    if found.difference(SealFlags::EXEC) == expected {
         Ok(())
     } else {
         Err(SysError::SealMismatch {
-            expected: SIZE_SEALS.bits(),
+            expected: expected.bits(),
             found: found.bits(),
         })
     }

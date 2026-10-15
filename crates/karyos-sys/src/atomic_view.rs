@@ -117,6 +117,127 @@ impl<'a> AtomicWords<'a> {
     }
 }
 
+/// A borrowed, load-only view of a region as 64-bit words: it exposes atomic
+/// loads and nothing that could store, so it can view memory mapped without
+/// write access (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+/// "Read-only views"). Plain atomic loads of naturally aligned, lock-free
+/// 64-bit words are allowed on read-only memory; no read-modify-write or
+/// store is ever issued through it.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadOnlyWords<'a> {
+    words: &'a [AtomicU64],
+}
+
+impl<'a> ReadOnlyWords<'a> {
+    /// Validates a raw region and views it as load-only words.
+    ///
+    /// Checks the same address and length properties as
+    /// [`AtomicWords::from_raw`].
+    ///
+    /// # Safety
+    ///
+    /// For the whole lifetime `'a`: `base..base + len_bytes` must be one
+    /// allocation or mapping that `base` has provenance over, not wrapping
+    /// the address space; every byte must be initialized and readable (it
+    /// need not be writable) and stay mapped and the same size; and this
+    /// process must access those bytes only through atomic operations on
+    /// naturally aligned 64-bit words. The view itself only loads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidRegion`] when a check fails.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read-only mappings exist only on Linux")
+    )]
+    pub(crate) unsafe fn from_raw(base: *const u8, len_bytes: usize) -> Result<Self, SysError> {
+        let address = base.addr();
+        let valid = !base.is_null()
+            && address.is_multiple_of(align_of::<AtomicU64>())
+            && len_bytes > 0
+            && len_bytes.is_multiple_of(WORD_BYTES)
+            && isize::try_from(len_bytes).is_ok();
+        if !valid {
+            return Err(SysError::InvalidRegion {
+                address,
+                len: len_bytes,
+            });
+        }
+        let count = len_bytes / WORD_BYTES;
+        // SAFETY: `base` is non-null and aligned (checked); the caller
+        // guarantees `count * 8` readable, initialized bytes that stay
+        // mapped for `'a`, accessed only atomically, and `len_bytes <=
+        // isize::MAX` (checked). The shared references are never used to
+        // store: this type exposes only loads.
+        let words = unsafe { core::slice::from_raw_parts(base.cast::<AtomicU64>(), count) };
+        Ok(Self { words })
+    }
+
+    /// An empty view, used only as an unreachable fallback for regions that
+    /// were already validated.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read-only mappings exist only on Linux")
+    )]
+    #[inline]
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self { words: &[] }
+    }
+
+    /// A load-only view of words this process may also write: for readers
+    /// that must work over either mapping.
+    #[inline]
+    #[must_use]
+    pub fn of(words: AtomicWords<'a>) -> Self {
+        Self {
+            words: words.as_slice(),
+        }
+    }
+
+    /// Number of words.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Whether the view has no words.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// Loads the word at `index` with `order` (`Relaxed`, `Acquire` or
+    /// `SeqCst`), if in bounds.
+    #[inline]
+    #[must_use]
+    pub fn load(&self, index: usize, order: core::sync::atomic::Ordering) -> Option<u64> {
+        self.words.get(index).map(|word| word.load(order))
+    }
+
+    /// The words from `index` on; empty when `index` is past the end.
+    #[inline]
+    #[must_use]
+    pub fn slice_from(&self, index: usize) -> Self {
+        Self {
+            words: self.words.get(index..).unwrap_or(&[]),
+        }
+    }
+
+    /// The words `index..index + count`; empty when out of bounds.
+    #[inline]
+    #[must_use]
+    pub fn range(&self, index: usize, count: usize) -> Self {
+        let words = index
+            .checked_add(count)
+            .and_then(|end| self.words.get(index..end))
+            .unwrap_or(&[]);
+        Self { words }
+    }
+}
+
 /// Heap-backed atomic words, for tests and single-process use. Built through
 /// the same internal constructor as a mapping (`AtomicWords::from_raw`), so
 /// Miri exercises that path.

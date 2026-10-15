@@ -358,63 +358,74 @@ impl<'a> CellWords<'a> {
     /// bounded number of attempts. Never waits.
     #[must_use]
     pub fn read(&self) -> CellRead {
-        let Some(version) = self.word(META_VERSION) else {
-            return CellRead::Free;
-        };
-        for _ in 0..READ_ATTEMPTS {
-            let before = version.load(Ordering::Acquire);
-            if before % 2 == 1 {
-                continue;
-            }
-            let load = |index: usize| {
-                self.word(index)
-                    .map_or(0, |word| word.load(Ordering::Relaxed))
-            };
-            let state = load(META_STATE);
-            let registration_id = load(META_REGISTRATION);
-            let type_id = load(META_TYPE);
-            let length = load(META_LABEL_LENGTH);
-            let mut label = [0u8; MAX_LABEL_LENGTH];
-            for (index, chunk) in label.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                *chunk = load(META_LABEL + index).to_le_bytes();
-            }
-            let mut keys = [0u64; KEY_WORDS];
-            for (index, key) in keys.iter_mut().enumerate() {
-                *key = load(META_KEYS + index);
-            }
-            let value = self.value.load(Ordering::Relaxed);
-            fence(Ordering::Acquire);
-            if version.load(Ordering::Relaxed) != before {
-                continue;
-            }
-            return match state {
-                STATE_ALLOCATED | STATE_RELEASE_PENDING => {
-                    let Some(label_length) = u8::try_from(length)
-                        .ok()
-                        .filter(|&l| usize::from(l) <= MAX_LABEL_LENGTH)
-                    else {
-                        return CellRead::Changing;
-                    };
-                    let Some(keys) = CounterKeys::from_words(keys) else {
-                        return CellRead::Changing;
-                    };
-                    CellRead::Allocated {
-                        metadata: CounterMetadata {
-                            registration_id,
-                            type_id,
-                            keys,
-                            label,
-                            label_length,
-                        },
-                        value,
-                        release_pending: state == STATE_RELEASE_PENDING,
-                    }
-                }
-                _ => CellRead::Free,
-            };
-        }
-        CellRead::Changing
+        read_cell(
+            |index, order| self.word(index).map(|word| word.load(order)),
+            |order| self.value.load(order),
+        )
     }
+}
+
+/// The seqlock read of one cell over load functions: `meta` loads metadata
+/// word `index` (`None` out of range) and `value` the value word. Only
+/// loads are issued, so the same read works over a writable view or a
+/// read-only mapping.
+pub(crate) fn read_cell(
+    meta: impl Fn(usize, Ordering) -> Option<u64>,
+    value: impl Fn(Ordering) -> u64,
+) -> CellRead {
+    if meta(META_VERSION, Ordering::Relaxed).is_none() {
+        return CellRead::Free;
+    }
+    for _ in 0..READ_ATTEMPTS {
+        let before = meta(META_VERSION, Ordering::Acquire).unwrap_or(0);
+        if before % 2 == 1 {
+            continue;
+        }
+        let load = |index: usize| meta(index, Ordering::Relaxed).unwrap_or(0);
+        let state = load(META_STATE);
+        let registration_id = load(META_REGISTRATION);
+        let type_id = load(META_TYPE);
+        let length = load(META_LABEL_LENGTH);
+        let mut label = [0u8; MAX_LABEL_LENGTH];
+        for (index, chunk) in label.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            *chunk = load(META_LABEL + index).to_le_bytes();
+        }
+        let mut keys = [0u64; KEY_WORDS];
+        for (index, key) in keys.iter_mut().enumerate() {
+            *key = load(META_KEYS + index);
+        }
+        let value = value(Ordering::Relaxed);
+        fence(Ordering::Acquire);
+        if meta(META_VERSION, Ordering::Relaxed) != Some(before) {
+            continue;
+        }
+        return match state {
+            STATE_ALLOCATED | STATE_RELEASE_PENDING => {
+                let Some(label_length) = u8::try_from(length)
+                    .ok()
+                    .filter(|&l| usize::from(l) <= MAX_LABEL_LENGTH)
+                else {
+                    return CellRead::Changing;
+                };
+                let Some(keys) = CounterKeys::from_words(keys) else {
+                    return CellRead::Changing;
+                };
+                CellRead::Allocated {
+                    metadata: CounterMetadata {
+                        registration_id,
+                        type_id,
+                        keys,
+                        label,
+                        label_length,
+                    },
+                    value,
+                    release_pending: state == STATE_RELEASE_PENDING,
+                }
+            }
+            _ => CellRead::Free,
+        };
+    }
+    CellRead::Changing
 }
 
 #[cfg(not(loom))]
@@ -448,6 +459,9 @@ mod owned {
         /// then the metadata (`quantstratum-docs: karyos/design/ipc-cnc-regions.md`).
         #[cfg(target_os = "linux")]
         Mapped(crate::ipc::Region),
+        /// The same layout mapped read-only (Linux): readers only.
+        #[cfg(target_os = "linux")]
+        ReadOnly(crate::ipc::ReadOnlyRegion),
     }
 
     #[derive(Debug)]
@@ -477,7 +491,35 @@ mod owned {
                         .unwrap_or(&[]);
                     (values, metadata)
                 }
+                // Only readers hold a read-only store; they read through
+                // `read_only_cell`.
+                #[cfg(target_os = "linux")]
+                Store::ReadOnly(_) => (&[], &[]),
             }
+        }
+
+        /// Reads cell `index` of a read-only store with loads only.
+        #[cfg(target_os = "linux")]
+        fn read_only_cell(
+            region: &crate::ipc::ReadOnlyRegion,
+            capacity: usize,
+            index: usize,
+        ) -> CellRead {
+            let words = region.structure();
+            let section = capacity.saturating_mul(STRIDE_WORDS);
+            let Some(start) = index.checked_mul(STRIDE_WORDS).filter(|_| index < capacity) else {
+                return CellRead::Free;
+            };
+            let values = words.range(STRIDE_WORDS, section);
+            let metadata = words.range(STRIDE_WORDS.saturating_add(section), section);
+            let meta = metadata.range(start, META_WORDS);
+            if meta.len() < META_WORDS {
+                return CellRead::Free;
+            }
+            super::read_cell(
+                |word, order| meta.load(word, order),
+                |order| values.load(start, order).unwrap_or(0),
+            )
         }
 
         fn cell(&self, index: usize) -> Option<CellWords<'_>> {
@@ -553,7 +595,9 @@ mod owned {
             .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES))
             .filter(|_| capacity > 0)
             .ok_or(invalid)?;
-        let mapped = crate::ipc::Region::create(crate::ipc::RegionRecord {
+        // Only the driver writes this region: A2 seal order (owner decision
+        // Q7), so clients and tools can map it only read-only.
+        let mapped = crate::ipc::Region::create_driver_only(crate::ipc::RegionRecord {
             instance,
             region,
             kind: crate::ipc::RegionKind::Counters,
@@ -707,17 +751,20 @@ mod owned {
     }
 
     impl CountersReader {
-        /// A reader of a counters region in an attached region (client
-        /// side). The configuration line is read once: the capacity must be
-        /// nonzero, the unused words zero, and the layout must fill the
-        /// region exactly. Every cell read is validated as on the heap.
+        /// A reader of a counters region mapped read-only (client and tool
+        /// side; owner decision Q7, A2: the driver creates it with
+        /// `F_SEAL_FUTURE_WRITE`, so no other mapping can write). The
+        /// configuration line is read once: the capacity must be nonzero,
+        /// the unused words zero, and the layout must fill the region
+        /// exactly. Every cell read is validated as on the heap, with loads
+        /// only.
         ///
         /// # Errors
         ///
         /// Returns [`SysError::InvalidRegion`] unless the region is a
         /// counters region of this layout that matches its configuration.
         #[cfg(target_os = "linux")]
-        pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
+        pub fn attach_read_only(region: crate::ipc::ReadOnlyRegion) -> Result<Self, SysError> {
             let record = region.record();
             let invalid = SysError::InvalidRegion {
                 address: 0,
@@ -732,7 +779,7 @@ mod owned {
             let structure = region.structure();
             let mut config = [0u64; STRIDE_WORDS];
             for (index, word) in config.iter_mut().enumerate() {
-                *word = structure.get(index).ok_or(invalid)?.load(Ordering::Acquire);
+                *word = structure.load(index, Ordering::Acquire).ok_or(invalid)?;
             }
             let [capacity, rest @ ..] = config;
             let capacity = usize::try_from(capacity).map_err(|_| invalid)?;
@@ -746,7 +793,7 @@ mod owned {
             }
             Ok(Self {
                 region: Arc::new(Region {
-                    store: Store::Mapped(region),
+                    store: Store::ReadOnly(region),
                     capacity,
                 }),
             })
@@ -758,7 +805,7 @@ mod owned {
         pub fn region(&self) -> Option<&crate::ipc::Region> {
             match &self.region.store {
                 Store::Mapped(region) => Some(region),
-                Store::Heap { .. } => None,
+                Store::Heap { .. } | Store::ReadOnly(_) => None,
             }
         }
 
@@ -771,6 +818,10 @@ mod owned {
         /// Reads cell `index`; `Free` when out of range.
         #[must_use]
         pub fn read(&self, index: usize) -> CellRead {
+            #[cfg(target_os = "linux")]
+            if let Store::ReadOnly(region) = &self.region.store {
+                return Region::read_only_cell(region, self.region.capacity, index);
+            }
             self.region
                 .cell(index)
                 .map_or(CellRead::Free, |cell| cell.read())
