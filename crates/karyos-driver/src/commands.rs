@@ -902,6 +902,9 @@ fn issue_refusal(error: &karyos_sys::error::SysError) -> ErrorCode {
 
 impl<T: StreamTerms> Drop for EmbeddedDriver<T> {
     fn drop(&mut self) {
+        // Position cells are released in a final pass, not left to their
+        // owners' drops outside any pass.
+        self.positions.close(&mut self.counters);
         self.broadcast.close();
         for slot in &self.clients {
             slot.link.drop_all(true);

@@ -16,6 +16,11 @@
 //! During a mapping cutover a subscriber that has not moved yet reads the
 //! predecessor: its predecessor cell is sampled (at the predecessor's base)
 //! and the successor cell reserved for it is not, until it moves.
+//!
+//! A pass releases every departed cell, of every stream, before it
+//! allocates any, and stops scanning the region after its first refused
+//! allocation. Dropping the driver releases the remaining cells in a final
+//! pass, so a reader that outlives it sees that change at an odd epoch.
 
 use karyos_client::LinkStatus;
 use karyos_sys::counters::{Counter, CounterKeys, KIND_NONE, KIND_SUBSCRIBER};
@@ -69,8 +74,40 @@ pub(crate) struct Positions {
     /// The host `CLOCK_MONOTONIC` reading of the last pass.
     last: Option<u64>,
     streams: Vec<StreamCells>,
-    /// Reused buffer of the attached subscribers of one stream.
-    attached: Vec<Attached>,
+    /// Reused buffers of the attached subscribers, one per stream in the
+    /// order of the driver's streams.
+    attached: Vec<Vec<Attached>>,
+}
+
+/// The allocator of one pass: after the first refused allocation it stops
+/// scanning the region, since nothing frees a cell later in the pass
+/// (releases all come first).
+struct PassAllocator<'a> {
+    counters: &'a mut DriverCounters,
+    exhausted: bool,
+}
+
+impl PassAllocator<'_> {
+    /// A cell for a new member; a refusal counts in `counters unavailable`.
+    fn new_cell(&mut self, label: &str, keys: CounterKeys) -> Option<Counter> {
+        if self.exhausted {
+            self.counters.count_unavailable();
+            return None;
+        }
+        let counter = self.counters.allocate_keyed(TYPE_POSITION, label, keys);
+        self.exhausted = counter.is_none();
+        counter
+    }
+
+    /// A cell for a member refused in an earlier pass, not counted again.
+    fn retry(&mut self, label: &str, keys: CounterKeys) -> Option<Counter> {
+        if self.exhausted {
+            return None;
+        }
+        let counter = self.counters.retry_keyed(TYPE_POSITION, label, keys);
+        self.exhausted = counter.is_none();
+        counter
+    }
 }
 
 impl Positions {
@@ -95,6 +132,10 @@ impl Positions {
 
     /// Runs one sampling pass at host time `now`, which it stores as
     /// `positions sampled at`.
+    ///
+    /// Every departed cell, of any stream, is released before any cell is
+    /// allocated, so a member that leaves one stream frees its cell for a
+    /// member that joins another in the same pass.
     pub(crate) fn sample<T: StreamTerms>(
         &mut self,
         now: u64,
@@ -104,6 +145,9 @@ impl Positions {
         self.last = Some(now);
         let (odd, even) = next_epochs(self.epoch);
         counters.begin_pass(odd);
+        // Releases: removed streams, then departed subscribers. Positions
+        // are loaded here, before each stream's floor, head and limit below:
+        // each only grows, so within a pass no position exceeds the head.
         self.streams.retain_mut(|cells| {
             let live = streams.iter().any(|stream| stream.id == cells.stream);
             if !live {
@@ -111,7 +155,23 @@ impl Positions {
             }
             live
         });
-        for stream in streams {
+        self.attached.resize_with(streams.len(), Vec::new);
+        for (stream, attached) in streams.iter().zip(self.attached.iter_mut()) {
+            collect_attached(stream, attached);
+            if let Some(cells) = self
+                .streams
+                .iter_mut()
+                .find(|cells| cells.stream == stream.id)
+            {
+                cells.release_departed(counters, attached);
+            }
+        }
+        // Allocations and values.
+        let mut allocator = PassAllocator {
+            counters,
+            exhausted: false,
+        };
+        for (stream, attached) in streams.iter().zip(&self.attached) {
             let index = match self
                 .streams
                 .iter()
@@ -121,18 +181,15 @@ impl Positions {
                 None => {
                     let lane = stream.config.lane.get();
                     self.streams
-                        .push(StreamCells::allocate(counters, stream.id, lane));
+                        .push(StreamCells::allocate(&mut allocator, stream.id, lane));
                     self.streams.len() - 1
                 }
             };
             let Some(cells) = self.streams.get_mut(index) else {
                 continue;
             };
-            // Positions, then floor, then head, then limit: each only grows,
-            // so within a pass no position or floor exceeds the head.
-            collect_attached(stream, &mut self.attached);
-            cells.sync_subscribers(counters, &self.attached);
-            for (subscriber, attached) in cells.subscribers.iter().zip(&self.attached) {
+            cells.admit(&mut allocator, attached);
+            for (subscriber, attached) in cells.subscribers.iter().zip(attached) {
                 set(subscriber.position.as_ref(), attached.position);
             }
             let at = |value: u64| stream.base.saturating_add(value);
@@ -142,7 +199,25 @@ impl Positions {
             }
             set(cells.limit.as_ref(), at(stream.conductor.limit()));
         }
+        let counters = allocator.counters;
         counters.set(Event::PositionsSampledAt, now);
+        self.epoch = even;
+        counters.end_pass(even);
+    }
+
+    /// Releases every cell in a final pass, so that a reader that outlives
+    /// the driver sees the membership change at an odd epoch, as it would
+    /// in any pass.
+    pub(crate) fn close(&mut self, counters: &mut DriverCounters) {
+        if self.streams.is_empty() {
+            return;
+        }
+        let (odd, even) = next_epochs(self.epoch);
+        counters.begin_pass(odd);
+        for cells in &mut self.streams {
+            cells.release(counters);
+        }
+        self.streams.clear();
         self.epoch = even;
         counters.end_pass(even);
     }
@@ -207,24 +282,34 @@ impl StreamCells {
         }
     }
 
-    fn allocate(counters: &mut DriverCounters, stream: u64, lane: u8) -> Self {
+    fn allocate(allocator: &mut PassAllocator<'_>, stream: u64, lane: u8) -> Self {
         let keys = Self::keys(stream, lane);
         Self {
             stream,
             lane,
-            limit: counters.allocate_keyed(TYPE_POSITION, "stream limit", keys),
-            head: counters.allocate_keyed(TYPE_POSITION, "stream head", keys),
-            floor: counters.allocate_keyed(TYPE_POSITION, "stream floor", keys),
+            limit: allocator.new_cell("stream limit", keys),
+            head: allocator.new_cell("stream head", keys),
+            floor: allocator.new_cell("stream floor", keys),
             subscribers: Vec::new(),
         }
     }
 
-    /// Makes the held subscriber cells match `attached`, in its order: keeps
-    /// the cells of subscribers still attached, releases the others first,
-    /// so their cells serve the new ones, then allocates for new ones and
-    /// retries the cells that found none before (counted once, when first
-    /// refused).
-    fn sync_subscribers(&mut self, counters: &mut DriverCounters, attached: &[Attached]) {
+    /// Releases the cells of subscribers no longer in `attached`.
+    fn release_departed(&mut self, counters: &mut DriverCounters, attached: &[Attached]) {
+        self.subscribers.retain_mut(|cells| {
+            let present = attached.iter().any(|now| cells.matches(now));
+            if !present && let Some(counter) = cells.position.take() {
+                counters.free(counter);
+            }
+            present
+        });
+    }
+
+    /// Makes the held subscriber cells match `attached`, in its order,
+    /// after [`release_departed`](Self::release_departed): keeps the cells
+    /// of subscribers still attached, allocates for new ones, and retries
+    /// cells refused in an earlier pass (counted once, when first refused).
+    fn admit(&mut self, allocator: &mut PassAllocator<'_>, attached: &[Attached]) {
         let stream = self.stream;
         let lane = self.lane;
         let keys = Self::keys(stream, lane);
@@ -234,26 +319,21 @@ impl StreamCells {
             (&mut self.floor, "stream floor"),
         ] {
             if counter.is_none() {
-                *counter = counters.retry_keyed(TYPE_POSITION, label, keys);
+                *counter = allocator.retry(label, keys);
             }
         }
         let mut held = core::mem::take(&mut self.subscribers);
-        held.retain_mut(|cells| {
-            let attached = attached.iter().any(|now| cells.matches(now));
-            if !attached && let Some(counter) = cells.position.take() {
-                counters.free(counter);
-            }
-            attached
-        });
         for now in attached {
-            let mut cells = match held.iter().position(|cells| cells.matches(now)) {
-                Some(index) => held.swap_remove(index),
-                None => SubscriberCells::allocate(counters, stream, lane, now),
+            let cells = match held.iter().position(|cells| cells.matches(now)) {
+                Some(index) => {
+                    let mut cells = held.swap_remove(index);
+                    if cells.position.is_none() {
+                        cells.position = allocator.retry(&cells.label(), cells.keys(stream, lane));
+                    }
+                    cells
+                }
+                None => SubscriberCells::allocate(allocator, stream, lane, now),
             };
-            if cells.position.is_none() {
-                cells.position =
-                    counters.retry_keyed(TYPE_POSITION, &cells.label(), cells.keys(stream, lane));
-            }
             self.subscribers.push(cells);
         }
     }
@@ -274,15 +354,19 @@ impl StreamCells {
 }
 
 impl SubscriberCells {
-    fn allocate(counters: &mut DriverCounters, stream: u64, lane: u8, attached: &Attached) -> Self {
+    fn allocate(
+        allocator: &mut PassAllocator<'_>,
+        stream: u64,
+        lane: u8,
+        attached: &Attached,
+    ) -> Self {
         let mut cells = Self {
             generation: attached.generation,
             cell: attached.cell,
             registration: attached.registration,
             position: None,
         };
-        cells.position =
-            counters.allocate_keyed(TYPE_POSITION, &cells.label(), cells.keys(stream, lane));
+        cells.position = allocator.new_cell(&cells.label(), cells.keys(stream, lane));
         cells
     }
 
@@ -567,6 +651,79 @@ mod tests {
         driver.positions.force_due();
         let _ = driver.do_work().unwrap();
         assert!(subscribers(&driver).is_empty());
+    }
+
+    #[test]
+    fn a_cell_released_in_one_stream_serves_a_join_in_an_earlier_one() {
+        // Room for both streams' cells and one subscriber cell (REVIEWER-02's
+        // repro, #108): streams are sampled in order, the earlier one gains a
+        // subscriber while the later one loses its own in the same pass.
+        let mut driver = driver(FIXED_COUNTERS + 7);
+        let earlier = driver.add_stream(stream_config(2)).unwrap();
+        let later = driver.add_stream(stream_config(3)).unwrap();
+        let leaving = driver.subscribe(later, Role::Optional).unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(subscribers(&driver).len(), 1);
+        drop(leaving);
+        let _joining = driver.subscribe(earlier, Role::Optional).unwrap();
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        let held = positions(&driver);
+        let joined = held
+            .iter()
+            .filter(|(metadata, _)| {
+                metadata.keys.kind == KIND_SUBSCRIBER
+                    && metadata.keys.stream == driver.streams[0].id
+            })
+            .count();
+        assert_eq!(joined, 1, "joining subscriber has no cell");
+        assert_eq!(fixed(&driver, "counters unavailable"), 0);
+    }
+
+    #[test]
+    fn refusals_after_exhaustion_are_counted_without_rescanning() {
+        // Room for the stream's cells only: every subscriber is refused,
+        // each counted once, and later passes add no count.
+        let mut driver = driver(FIXED_COUNTERS + 3);
+        let handle = driver.add_stream(stream_config(2)).unwrap();
+        let _first = driver.subscribe(handle, Role::Required).unwrap();
+        let _second = driver.subscribe(handle, Role::Optional).unwrap();
+        let _ = driver.do_work().unwrap();
+        assert!(subscribers(&driver).is_empty());
+        assert_eq!(fixed(&driver, "counters unavailable"), 2);
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(fixed(&driver, "counters unavailable"), 2);
+    }
+
+    #[test]
+    fn dropping_the_driver_releases_cells_in_a_final_pass() {
+        let mut driver = driver(64);
+        let handle = driver.add_stream(stream_config(2)).unwrap();
+        let _reader = driver.subscribe(handle, Role::Optional).unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(positions(&driver).len(), 4);
+        let before = fixed(&driver, "positions epoch");
+        let region = driver.counters();
+        drop(_reader);
+        drop(driver);
+        let mut epoch = None;
+        for index in 0..region.capacity() {
+            if let CellRead::Allocated {
+                metadata,
+                value,
+                release_pending,
+            } = region.read(index)
+            {
+                if metadata.label() == b"positions epoch" {
+                    epoch = Some(value);
+                }
+                if metadata.type_id == TYPE_POSITION {
+                    assert!(release_pending, "a position cell outlived the final pass");
+                }
+            }
+        }
+        assert_eq!(epoch, Some(before + 2));
     }
 
     #[test]
