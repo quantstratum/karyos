@@ -92,6 +92,10 @@ pub struct PollSummary {
     /// and no message can follow (`quantstratum-docs: karyos/design/publication-seal.md`).
     /// Every later poll reports it again.
     pub closed: Option<u64>,
+    /// The read position, when the subscription was revoked because its
+    /// client was lost (quantstratum-docs: `karyos/design/required-participant-loss.md`): the subscription is over, and every later
+    /// poll reports it again.
+    pub revoked: Option<u64>,
 }
 
 /// A poll that failed after possibly delivering messages: `summary` reports
@@ -282,6 +286,10 @@ impl ClientSubscription {
                         break;
                     }
                 },
+                PollOutcome::Revoked { position } => {
+                    summary.revoked = Some(self.base + position);
+                    break;
+                }
                 PollOutcome::Pending => break,
             }
         }

@@ -703,6 +703,7 @@ fn concurrent_publication_reuse_and_subscribers() {
                     PollOutcome::Overrun { from, resume, .. } => lost += resume - from,
                     PollOutcome::Aborted { .. } => panic!("nothing was aborted"),
                     PollOutcome::Closed { .. } => panic!("not sealed"),
+                    PollOutcome::Revoked { .. } => panic!("not revoked"),
                     PollOutcome::Pending => {
                         // Done once everything is published and the
                         // cursor reached the final head; receiving the

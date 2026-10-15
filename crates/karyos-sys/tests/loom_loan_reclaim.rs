@@ -191,3 +191,82 @@ fn revocation_versus_paused_acquisition() {
         assert_ne!(shared.revoked.load(Ordering::SeqCst), 0);
     });
 }
+
+/// The `hold` policy (roadmap P4, quantstratum-docs:
+/// `karyos/design/required-participant-loss.md`): the driver revokes the
+/// reader, then rescans concurrently, not by joining its thread, and
+/// withdraws the bound (here: lets the publisher overwrite the term) only
+/// once a scan after the revocation finds the loan word empty. A reader
+/// whose acquisition was granted keeps reading unchanged bytes; one that
+/// resumes after the revocation is refused.
+#[test]
+fn hold_withdraws_the_bound_only_after_an_empty_scan() {
+    loom::model(|| {
+        let (shared, target, _active) = fixture();
+        let reader = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || participant(&shared, target))
+        };
+
+        let mut quiescent = revoke(&shared.revoked, &shared.loan_words).unwrap();
+        while !quiescent {
+            thread::yield_now();
+            quiescent = participant_quiescent(&shared.loan_words).unwrap();
+        }
+        shared.write_bytes(CLEANED_BYTES);
+
+        reader.join().unwrap();
+        assert_ne!(shared.revoked.load(Ordering::SeqCst), 0);
+    });
+}
+
+/// Negative control of the model above: withdrawing the bound after an
+/// empty scan without the revocation proves nothing (SPEC.md §4). A reader
+/// that stores its loan word after the scan reads bytes the publisher is
+/// overwriting, which Loom reports.
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn hold_without_the_revocation_lets_a_reader_see_an_overwrite() {
+    loom::model(|| {
+        let (shared, target, _active) = fixture();
+        let reader = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || participant(&shared, target))
+        };
+
+        while !participant_quiescent(&shared.loan_words).unwrap() {
+            thread::yield_now();
+        }
+        shared.write_bytes(CLEANED_BYTES);
+
+        reader.join().unwrap();
+    });
+}
+
+/// The `continue` policy: the driver revokes the reader and withdraws its
+/// bound at once, without waiting for its loan; reclamation still waits for
+/// the held loan, so the bytes under it never change, and a reader that
+/// resumes after the revocation is refused.
+#[test]
+fn continue_withdraws_at_once_and_a_held_loan_still_blocks_cleaning() {
+    loom::model(|| {
+        let (shared, target, active) = fixture();
+        let reader = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || participant(&shared, target))
+        };
+
+        let _ = revoke(&shared.revoked, &shared.loan_words).unwrap();
+        // Bound withdrawn: the term falls below the floor and is reclaimed
+        // as soon as no loan holds it.
+        let reclaiming = begin_reclaim(&shared.descriptor, active).unwrap();
+        while loan_held(&shared.loan_words, target.slot(), reclaiming).unwrap() {
+            thread::yield_now();
+        }
+        let cleaning = begin_cleaning(&shared.descriptor, reclaiming).unwrap();
+        shared.write_bytes(CLEANED_BYTES);
+        publish(&shared.descriptor, cleaning.with_state(SlotState::Free));
+
+        reader.join().unwrap();
+    });
+}
