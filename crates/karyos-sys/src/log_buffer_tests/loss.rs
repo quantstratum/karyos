@@ -233,3 +233,134 @@ fn test_log_buffer_loss_a_revoked_reader_whose_data_is_gone_is_revoked() {
         Ok(PollOutcome::Revoked { .. })
     ));
 }
+
+/// Credits in use, as admission counts them: the publishers' plus every
+/// subscriber cell that holds a spare-slot credit.
+fn credits_in_use(buffer: &LogBuffer<Terms>) -> u32 {
+    let subscribers = buffer
+        .cells()
+        .iter()
+        .skip(buffer.first_subscriber_cell())
+        .filter(|cell| holds_credit(cell.state.load(Ordering::Acquire)))
+        .count() as u32;
+    buffer.first_subscriber_cell() as u32 + subscribers
+}
+
+/// SPEC.md §13 "No re-admission bypass": an evicted optional reader that
+/// still holds a loan asks to rejoin, as its own occupant. It is refused
+/// with `ResourcesUnavailable` while its loan lasts and while its cell is
+/// not freed, under every policy; only after its loan ends and its cell is
+/// freed is the same occupant admitted again. At every step the credits in
+/// use never exceed `S - C`.
+#[test]
+fn test_log_buffer_loss_an_evicted_reader_holding_a_loan_cannot_rejoin_until_its_loans_end() {
+    for policy in [LossPolicy::Hold, LossPolicy::Continue, LossPolicy::Abort] {
+        // S = 3, C = 1: two credits, one taken by the exclusive publication.
+        let buffer = new_buffer(config(3, 3)).unwrap();
+        let limit = u32::from(buffer.spare_slots - CLEANING_HEADROOM);
+        let mut conductor = buffer.conductor().unwrap();
+        let evicted = conductor.subscribe_as(Role::Optional, false, 11).unwrap();
+        let cell = evicted.cell();
+        assert_eq!(credits_in_use(&buffer), limit);
+        hold_loan(&buffer, cell);
+        assert_eq!(
+            conductor.revoke_participant(cell, 11, policy),
+            Ok(Revocation::Withdrawn)
+        );
+        assert_eq!(cell_state(&buffer, cell), CELL_LOST_RESERVED);
+        // The evicted reader asks to rejoin while it holds its loan: refused,
+        // as an optional reader or an observer, and nothing is admitted.
+        for role in [Role::Optional, Role::Observer] {
+            assert_eq!(
+                conductor.subscribe_as(role, false, 11).err(),
+                Some(SysError::ResourcesUnavailable),
+                "{policy:?} {role:?}: rejoined under a live loan"
+            );
+            assert_eq!(credits_in_use(&buffer), limit);
+        }
+        // The loan ends, but the cell is not freed until the holder leaves:
+        // still refused.
+        release_loan(&buffer.cells()[cell].loan);
+        let _ = conductor.duty_cycle().unwrap();
+        assert_eq!(
+            conductor.subscribe_as(Role::Optional, false, 11).err(),
+            Some(SysError::ResourcesUnavailable),
+            "{policy:?}: rejoined before its cell was freed"
+        );
+        assert_eq!(credits_in_use(&buffer), limit);
+        // Its loans ended and its cell is freed: the same occupant rejoins,
+        // within the credits.
+        drop(evicted);
+        assert_eq!(cell_state(&buffer, cell), CELL_FREE);
+        let rejoined = conductor.subscribe_as(Role::Optional, false, 11).unwrap();
+        assert_eq!(credits_in_use(&buffer), limit);
+        assert_eq!(
+            conductor.subscribe(Role::Optional).err(),
+            Some(SysError::ResourcesUnavailable)
+        );
+        drop(rejoined);
+    }
+}
+
+/// SPEC.md §13 "Required participant revocation": while a revoked reader
+/// may still touch its cell (its loan word, its flag), no participant is
+/// admitted into that cell. With one subscriber cell, a required reader
+/// revoked under `hold` while holding a loan leaves its cell
+/// `LOST_HOLDING`, then `LOST` once a rescan finds the loan ended; under
+/// `continue` it is `LOST_RESERVED`. In every case an admission is refused
+/// and the cell keeps the revoked reader's flag, registration and state;
+/// only the reader's own detach frees it, and the next participant starts
+/// with a clear flag and an empty loan word.
+#[test]
+fn test_log_buffer_loss_no_admission_into_a_lost_cell_while_its_reader_may_touch_it() {
+    for (policy, reserve, held, lost) in [
+        (LossPolicy::Hold, false, CELL_LOST_HOLDING, CELL_LOST),
+        (
+            LossPolicy::Continue,
+            true,
+            CELL_LOST_RESERVED,
+            CELL_LOST_RESERVED,
+        ),
+    ] {
+        let buffer = new_buffer(config(3, 1)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut revoked = conductor.subscribe_as(Role::Required, reserve, 7).unwrap();
+        let cell = revoked.cell();
+        let refused = |conductor: &mut Conductor<&LogBuffer<Terms>>| {
+            for (role, reserve) in [
+                (Role::Required, false),
+                (Role::Required, true),
+                (Role::Optional, false),
+            ] {
+                assert_eq!(
+                    conductor.subscribe_as(role, reserve, 8).err(),
+                    Some(SysError::ResourcesUnavailable),
+                    "{policy:?}: {role:?} admitted into the lost cell"
+                );
+            }
+        };
+        hold_loan(&buffer, cell);
+        let _ = conductor.revoke_participant(cell, 7, policy).unwrap();
+        assert_eq!(cell_state(&buffer, cell), held);
+        refused(&mut conductor);
+        let found = &buffer.cells()[cell];
+        assert_ne!(found.loan.load(Ordering::Acquire), 0, "the loan word was reused");
+        assert_ne!(found.revoked.load(Ordering::Acquire), 0, "the flag was cleared");
+        // The loan ends; a rescan withdraws a holding bound. The reader may
+        // still touch its cell until it detaches: still refused.
+        release_loan(&found.loan);
+        let _ = conductor.duty_cycle().unwrap();
+        assert_eq!(cell_state(&buffer, cell), lost);
+        refused(&mut conductor);
+        assert_ne!(found.revoked.load(Ordering::Acquire), 0);
+        // The reader learns it was revoked, then detaches: the cell is free
+        // and the next participant starts clean.
+        assert!(matches!(poll(&mut revoked), PollOutcome::Revoked { .. }));
+        drop(revoked);
+        assert_eq!(cell_state(&buffer, cell), CELL_FREE);
+        let next = conductor.subscribe_as(Role::Required, false, 8).unwrap();
+        assert_eq!(next.cell(), cell);
+        assert_eq!(found.revoked.load(Ordering::Acquire), 0);
+        assert_eq!(found.loan.load(Ordering::Acquire), 0);
+    }
+}

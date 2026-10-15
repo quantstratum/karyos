@@ -192,6 +192,63 @@ fn revocation_versus_paused_acquisition() {
     });
 }
 
+/// Contract "Required participant revocation" (SPEC.md §13): the resumed
+/// reader's acquisition fails, checked under Loom rather than only
+/// sequentially. The reader first acquires concurrently with the
+/// revocation (any outcome, a pause just before its loan word store
+/// included); it then resumes once it has seen the driver finish the
+/// revocation and acquires again. That acquisition is refused with
+/// `Revoked` and leaves its loan word empty, in every interleaving.
+fn resumed_acquisition_model(set_flag: bool) {
+    loom::model(move || {
+        let (shared, target, _active) = fixture();
+        let revoked = Arc::new(AtomicU64::new(0));
+        let reader = {
+            let shared = Arc::clone(&shared);
+            let revoked = Arc::clone(&revoked);
+            thread::spawn(move || {
+                participant(&shared, target);
+                // Paused until the revocation completed, then resumed.
+                while revoked.load(Ordering::Acquire) == 0 {
+                    thread::yield_now();
+                }
+                let [word] = &shared.loan_words;
+                let outcome = take_loan(word, &shared.revoked, &shared.descriptor, target).unwrap();
+                assert_eq!(
+                    outcome,
+                    LoanOutcome::Revoked,
+                    "the resumed acquisition was granted"
+                );
+                assert_eq!(word.load(Ordering::SeqCst), 0);
+            })
+        };
+        if set_flag {
+            if revoke(&shared.revoked, &shared.loan_words).unwrap() {
+                // Bound withdrawn: the publisher laps the reader.
+                shared.write_bytes(CLEANED_BYTES);
+            }
+        } else {
+            // The driver only scans, without the revocation flag.
+            let _ = participant_quiescent(&shared.loan_words).unwrap();
+        }
+        revoked.store(1, Ordering::Release);
+        reader.join().unwrap();
+    });
+}
+
+#[test]
+fn a_resumed_acquisition_after_the_revocation_is_refused() {
+    resumed_acquisition_model(true);
+}
+
+/// Negative control: without the revocation flag the resumed reader is
+/// granted a loan.
+#[test]
+#[should_panic(expected = "the resumed acquisition was granted")]
+fn control_revocation_without_the_flag_fails() {
+    resumed_acquisition_model(false);
+}
+
 /// The `hold` policy (roadmap P4, quantstratum-docs:
 /// `karyos/design/required-participant-loss.md`): the driver revokes the
 /// reader, then rescans concurrently, not by joining its thread, and
