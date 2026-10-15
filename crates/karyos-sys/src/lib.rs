@@ -20,6 +20,8 @@
 //! steps. The future capability types that hand out payload references must
 //! enforce those properties; these helpers alone are not that capability.
 
+#[cfg(feature = "test-hooks")]
+pub mod alloc_count;
 pub mod atomic_view;
 pub mod broadcast;
 #[cfg(not(loom))]

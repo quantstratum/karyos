@@ -15,5 +15,8 @@ karyos-sys.workspace = true
 karyos-protocol.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+karyos-sys = { workspace = true, features = ["test-hooks"] }
+
 [lints]
 workspace = true

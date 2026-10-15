@@ -375,6 +375,12 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
 }
 
 impl<O: BufferOwner> PreparedConcurrentPublication<O> {
+    /// The buffer this handle will be adopted in.
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer<O::Terms> {
+        &self.owner
+    }
+
     /// Adopts the prepared handle: the registration compare-exchange, the
     /// term count it starts from and its first catch-up (at most one loan
     /// and one rotation attempt), with no allocation.

@@ -1253,6 +1253,12 @@ impl<O: BufferOwner> Publication<O> {
 }
 
 impl<O: BufferOwner> PreparedPublication<O> {
+    /// The buffer this publication will be adopted in.
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer<O::Terms> {
+        &self.owner
+    }
+
     /// Adopts the prepared publication: the registration compare-exchange
     /// and the initial write loan, a bounded number of atomic operations
     /// and no allocation.
@@ -1341,6 +1347,12 @@ impl<O: BufferOwner> Subscription<O> {
 }
 
 impl<O: BufferOwner> PreparedSubscription<O> {
+    /// The buffer this subscription will be adopted in.
+    #[must_use]
+    pub fn buffer(&self) -> &LogBuffer<O::Terms> {
+        &self.owner
+    }
+
     /// Adopts the prepared subscription: the cell's state check, the
     /// registration compare-exchange and its position, with no allocation.
     ///
