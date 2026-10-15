@@ -21,7 +21,7 @@ use karyos_client::{
 use karyos_driver::{
     DriverConfig, EmbeddedDriver, LossPolicy, MonotonicClock, SealState, StreamConfig,
 };
-use karyos_protocol::cnc::{StreamKey, SubscriberRole};
+use karyos_protocol::cnc::{CloseReason, Event, LossPolicyCode, StreamKey, SubscriberRole};
 use karyos_sys::counters::CellRead;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
@@ -307,4 +307,128 @@ fn test_driver_loss_abort_seals_the_stream() {
     let (_client, _subscription) = lost_required_subscriber(&mut driver, &clock);
     assert_eq!(counter(&driver, "required participants lost"), 1);
     assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
+}
+
+// ---- p4b-2b: the driver reports losses as events ----
+
+const LOST_STREAM: StreamKey = StreamKey {
+    stream_id: 2,
+    session_id: 1,
+};
+
+/// A driver cycle that the observing client survives: it beats first and
+/// takes what the driver broadcast after.
+fn observed_work(driver: &mut EmbeddedDriver, observer: &mut ClientConductor) -> Vec<Event> {
+    let _ = observer.poll(usize::MAX, |_| {});
+    let _ = driver.do_work().unwrap();
+    let _ = observer.poll(usize::MAX, |_| {});
+    observer.take_events().collect()
+}
+
+/// Admits a required subscriber of stream 2 for a second client that the
+/// test later times out, while `observer` keeps beating.
+fn required_subscriber(
+    driver: &mut EmbeddedDriver,
+    observer: &mut ClientConductor,
+) -> (ClientConductor, ClientSubscription) {
+    let mut client = beating(driver);
+    let _ = client
+        .add_subscription(LOST_STREAM, SubscriberRole::Required)
+        .unwrap();
+    let mut done = Vec::new();
+    while done.is_empty() {
+        assert!(observed_work(driver, observer).is_empty());
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    let Outcome::Subscription(subscription) = done.remove(0).outcome else {
+        panic!("expected a subscription");
+    };
+    // The driver samples the client's last beat at this time.
+    assert!(observed_work(driver, observer).is_empty());
+    (client, subscription)
+}
+
+fn time_out(clock: &ManualClock) {
+    clock.set(clock.now.load(Ordering::Relaxed) + TIMEOUT);
+}
+
+fn assert_lost(event: &Event, expected: LossPolicyCode) {
+    let Event::ParticipantLost { stream, policy, .. } = event else {
+        panic!("expected ParticipantLost, got {event:?}");
+    };
+    assert_eq!(*stream, LOST_STREAM);
+    assert_eq!(*policy, expected);
+}
+
+#[test]
+fn test_driver_events_hold_without_a_loan_reports_the_loss_and_the_withdrawal_at_once() {
+    let (mut driver, clock) = driver();
+    let _stream = driver.add_stream(stream_config(LossPolicy::Hold)).unwrap();
+    let mut observer = beating(&mut driver);
+    let (_client, _subscription) = required_subscriber(&mut driver, &mut observer);
+    time_out(&clock);
+    let events = observed_work(&mut driver, &mut observer);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_lost(&events[0], LossPolicyCode::Hold);
+    assert!(matches!(
+        events[1],
+        Event::RequiredBoundWithdrawn {
+            stream: LOST_STREAM,
+            ..
+        }
+    ));
+    assert_eq!(counter(&driver, "events not sent"), 0);
+}
+
+#[test]
+fn test_driver_events_continue_reports_only_the_loss() {
+    let (mut driver, clock) = driver();
+    let _stream = driver
+        .add_stream(stream_config(LossPolicy::Continue))
+        .unwrap();
+    let mut observer = beating(&mut driver);
+    let (_client, _subscription) = required_subscriber(&mut driver, &mut observer);
+    time_out(&clock);
+    let events = observed_work(&mut driver, &mut observer);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_lost(&events[0], LossPolicyCode::Continue);
+}
+
+#[test]
+fn test_driver_events_abort_reports_the_loss_and_the_closed_publication() {
+    let (mut driver, clock) = driver();
+    let _stream = driver.add_stream(stream_config(LossPolicy::Abort)).unwrap();
+    let mut observer = beating(&mut driver);
+    let (_client, _subscription) = required_subscriber(&mut driver, &mut observer);
+    time_out(&clock);
+    let events = observed_work(&mut driver, &mut observer);
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_lost(&events[0], LossPolicyCode::Abort);
+    assert_eq!(
+        events[1],
+        Event::PublicationClosed {
+            stream: LOST_STREAM,
+            reason: CloseReason::RequiredParticipantLost,
+        }
+    );
+}
+
+#[test]
+fn test_driver_events_an_optional_subscriber_loss_reports_nothing() {
+    let (mut driver, clock) = driver();
+    let _stream = driver.add_stream(stream_config(LossPolicy::Abort)).unwrap();
+    let mut observer = beating(&mut driver);
+    let mut client = beating(&mut driver);
+    let _ = client
+        .add_subscription(LOST_STREAM, SubscriberRole::Optional)
+        .unwrap();
+    let mut done = Vec::new();
+    while done.is_empty() {
+        let _ = observed_work(&mut driver, &mut observer);
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    let _ = observed_work(&mut driver, &mut observer);
+    time_out(&clock);
+    assert!(observed_work(&mut driver, &mut observer).is_empty());
+    assert_eq!(counter(&driver, "participants revoked"), 1);
 }
