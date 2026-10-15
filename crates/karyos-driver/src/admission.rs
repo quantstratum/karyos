@@ -118,7 +118,6 @@ pub(crate) struct Admission {
     remotes: Vec<Remote>,
     retiring: Vec<Retiring>,
     next_region: u64,
-    next_export: u64,
 }
 
 /// A random 128-bit driver instance id (SPEC.md §5).
@@ -195,7 +194,6 @@ impl Admission {
                 remotes: Vec::new(),
                 retiring: Vec::new(),
                 next_region: FIRST_RING_REGION,
-                next_export: 1,
             },
             instance,
         ))
@@ -370,7 +368,7 @@ impl Admission {
         driver: &mut EmbeddedDriver,
     ) -> Option<(u64, Arc<ClientLink>, VecDeque<Outgoing>)> {
         let mut next_region = self.next_region;
-        let mut next_export = self.next_export;
+        let mut next_export = driver.next_export;
         let region = Self::take_ids(&mut next_region, 1)?;
         let first_export = Self::take_ids(&mut next_export, 3)?;
         let consumer =
@@ -389,7 +387,7 @@ impl Admission {
         let link = Arc::new(ClientLink::new());
         let client = driver.admit(consumer, Arc::clone(&link)).ok()?;
         self.next_region = next_region;
-        self.next_export = next_export;
+        driver.next_export = next_export;
         let mut outbound = VecDeque::with_capacity(BOOTSTRAP_MESSAGES);
         outbound.push_back(Outgoing {
             bytes: encode(&Message::Admitted {

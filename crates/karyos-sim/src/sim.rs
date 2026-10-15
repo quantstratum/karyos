@@ -226,6 +226,7 @@ impl<'s> Sim<'s> {
                         publication: plan.publication,
                     },
                     allow_unconnected: true,
+                    on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
                 })
                 .map_err(|error| fail(format!("stream: {error}")))?;
             let mut add = |kind: Kind| {

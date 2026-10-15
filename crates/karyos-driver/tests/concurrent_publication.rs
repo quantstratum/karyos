@@ -57,6 +57,7 @@ fn config(stream_id: i32, publication: PublicationMode, allow_unconnected: bool)
             publication,
         },
         allow_unconnected,
+        on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
     }
 }
 

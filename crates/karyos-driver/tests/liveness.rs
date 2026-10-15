@@ -14,10 +14,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use karyos_client::{ClientConductor, ConductorError};
-use karyos_driver::{DriverConfig, EmbeddedDriver, MonotonicClock};
+use karyos_client::{
+    ClientConductor, ClientSubscription, ConductorError, MessageLimit, OfferOutcome, Outcome,
+    PollSummary,
+};
+use karyos_driver::{
+    DriverConfig, EmbeddedDriver, LossPolicy, MonotonicClock, SealState, StreamConfig,
+};
 use karyos_protocol::cnc::{StreamKey, SubscriberRole};
 use karyos_sys::counters::CellRead;
+use karyos_sys::frame::Lane;
+use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
+use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+use karyos_sys::term::TermId;
 
 #[derive(Debug, Clone, Default)]
 struct ManualClock {
@@ -193,4 +202,109 @@ fn test_client_liveness_a_beating_driver_is_never_lost() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(!client.driver_lost());
+}
+
+// ---- p4b-2a: a lost client's subscribers under the stream's policy ----
+
+fn stream_config(policy: LossPolicy) -> StreamConfig {
+    StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 3,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 2,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Exclusive,
+        },
+        allow_unconnected: true,
+        on_required_loss: policy,
+    }
+}
+
+/// A client takes a required subscription to stream 2 and then goes
+/// silent; the driver times it out. Returns the subscription the client
+/// still holds.
+fn lost_required_subscriber(
+    driver: &mut EmbeddedDriver,
+    clock: &ManualClock,
+) -> (ClientConductor, ClientSubscription) {
+    let mut client = beating(driver);
+    let sequence = client
+        .add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    let mut done = Vec::new();
+    while done.is_empty() {
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    let completion = done.remove(0);
+    assert_eq!(completion.sequence, sequence);
+    let Outcome::Subscription(subscription) = completion.outcome else {
+        panic!("expected a subscription, got {:?}", completion.outcome);
+    };
+    // The client stops beating; the driver times it out.
+    let _ = driver.do_work().unwrap();
+    clock.set(clock.now.load(Ordering::Relaxed) + TIMEOUT);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(counter(driver, "clients timed out"), 1);
+    (client, subscription)
+}
+
+fn poll_once(subscription: &mut ClientSubscription) -> PollSummary {
+    subscription.poll(|_, _| {}, MessageLimit::new(16)).unwrap()
+}
+
+#[test]
+fn test_driver_loss_hold_revokes_a_lost_clients_required_subscriber() {
+    let (mut driver, clock) = driver();
+    let stream = driver.add_stream(stream_config(LossPolicy::Hold)).unwrap();
+    let (_client, mut subscription) = lost_required_subscriber(&mut driver, &clock);
+    assert_eq!(counter(&driver, "participants revoked"), 1);
+    assert_eq!(counter(&driver, "required participants lost"), 1);
+    // No loan was held: the bound is withdrawn at once and the reader is
+    // told it was revoked.
+    assert!(poll_once(&mut subscription).revoked.is_some());
+    assert_eq!(driver.seal_state(stream).unwrap(), SealState::Active);
+    // The publisher is not bounded by the lost reader any more.
+    let mut publication = driver.publication(stream).unwrap();
+    let data = vec![3u8; 1000];
+    for _ in 0..200 {
+        let _ = driver.do_work().unwrap();
+        assert!(!matches!(
+            publication.offer(&data).unwrap(),
+            OfferOutcome::BackPressured
+        ));
+    }
+}
+
+#[test]
+fn test_driver_loss_continue_admits_with_a_reservation_and_revokes() {
+    let (mut driver, clock) = driver();
+    let stream = driver
+        .add_stream(stream_config(LossPolicy::Continue))
+        .unwrap();
+    let (_client, mut subscription) = lost_required_subscriber(&mut driver, &clock);
+    assert_eq!(counter(&driver, "required participants lost"), 1);
+    assert!(poll_once(&mut subscription).revoked.is_some());
+    assert_eq!(driver.seal_state(stream).unwrap(), SealState::Active);
+}
+
+#[test]
+fn test_driver_loss_abort_seals_the_stream() {
+    let (mut driver, clock) = driver();
+    let stream = driver.add_stream(stream_config(LossPolicy::Abort)).unwrap();
+    let (_client, _subscription) = lost_required_subscriber(&mut driver, &clock);
+    assert_eq!(counter(&driver, "required participants lost"), 1);
+    assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
 }
