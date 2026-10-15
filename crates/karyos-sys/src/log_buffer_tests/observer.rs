@@ -171,6 +171,8 @@ fn test_stall_isolation_optional_observer_claim() {
     for reader in &readers {
         hold_loan(&buffer, reader.cell());
     }
+    let committed = word0_of_term0(&buffer, 0).load(Ordering::Acquire);
+    assert!(committed as u32 as i32 > 0, "term 0 holds no committed frame");
     // Publisher A pauses inside a claim, holding its write credit.
     let claim = concurrent_claimed(paused.try_claim(64, AppendOptions::default()));
     // Publisher B runs ten terms at full rate.
@@ -205,9 +207,19 @@ fn test_stall_isolation_optional_observer_claim() {
     let state = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
     assert_eq!(state.term_id(), buffer.initial_term_id);
     assert_ne!(state.state(), SlotState::Free);
-    // The readers resume: their copies of term 0 end, then each is lapped.
+    // Each paused reader, still under its loan, finds the committed frame
+    // intact; then its copy ends and it is lapped.
     for reader in &readers {
-        release_loan(&buffer.cells().get(reader.cell()).unwrap().loan);
+        let loan = &buffer.cells().get(reader.cell()).unwrap().loan;
+        assert_ne!(loan.load(Ordering::Acquire), 0, "the reader's loan was lost");
+        assert_eq!(word0_of_term0(&buffer, 0).load(Ordering::Acquire), committed);
+        let mut bytes = vec![0u8; first.len()];
+        // SAFETY: the reader's read loan on term 0 is held; the frame's
+        // word 0 was loaded with Acquire above; the payload starts after its
+        // 32-byte header, a multiple of 8, and lies inside the slot.
+        unsafe { buffer.regions.read_bytes(0, HEADER_LENGTH, &mut bytes) };
+        assert_eq!(bytes, first, "a held term's bytes changed");
+        release_loan(loan);
     }
     drop(claim);
     for mut reader in readers {
