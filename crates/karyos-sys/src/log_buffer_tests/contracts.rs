@@ -29,8 +29,11 @@ fn test_log_buffer_message_sizes_8000_fits_8001_refused_writers_never_interleave
 
     // 8000 bytes: one block of six fragments, contiguous from offset 0.
     let data = tagged_message(1, 0, 8000);
-    let position = offer_concurrent(&mut first, &mut conductor, &data, || {});
-    assert_eq!(position, 0);
+    assert_eq!(
+        first.offer(&data, AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { position: 0 }
+    );
+    assert_eq!(first.offer_attempt_counts(), (1, 0));
     let fragments = frames(&buffer);
     assert_eq!(fragments.len(), 6);
     assert!(fragments[0].1.flags().begin());
@@ -286,6 +289,7 @@ fn test_log_buffer_registration_churn_one_crossing_per_slot_per_term() {
     let data = vec![5u8; 7000];
     let reservation = u64::from(reserved_of(&data));
     let rounds = if cfg!(miri) { 5 } else { 200 };
+    let mut reservation_seen = false;
     for _ in 0..rounds {
         let mut handles: Vec<_> = (0..publishers)
             .map(|_| conductor.concurrent_publication().unwrap().unwrap())
@@ -296,6 +300,14 @@ fn test_log_buffer_registration_churn_one_crossing_per_slot_per_term() {
                     handle.offer(&data, AppendOptions::default()).unwrap(),
                     ConcurrentOfferOutcome::AdminAction
                 );
+                let (reservations, rotations) = handle.offer_attempt_counts();
+                assert!(reservations <= 1, "one reservation per offer");
+                assert!(rotations <= 1, "one rotation attempt per offer");
+                if reservations == 1 {
+                    assert!(!reservation_seen, "the stalled term has one crossing reservation");
+                    reservation_seen = true;
+                    assert_eq!((reservations, rotations), (1, 1));
+                }
             }
         }
         for handle in handles {
@@ -306,8 +318,48 @@ fn test_log_buffer_registration_churn_one_crossing_per_slot_per_term() {
         assert!(offset <= TERM - 32 + u64::from(publishers) * reservation);
         assert!(offset < 1 << 31);
     }
+    assert!(reservation_seen);
     // Term 0 was never rotated while the churn lasted.
     assert_eq!(buffer.active_count().load(Ordering::Acquire), 0);
+}
+
+/// §13 "Delayed rotation": the crossing offer reserves once and tries to
+/// rotate once; a later offer retries rotation without another reservation.
+#[test]
+fn test_log_buffer_delayed_rotation_retries_without_reserving_again() {
+    let buffer = new_buffer(concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let _subscription = conductor.subscribe(Role::Optional).unwrap();
+    let t0 = u64::from(buffer.initial_term_id.get());
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((t0 << 32) | (TERM - 32), Ordering::Release);
+    let t1 = buffer
+        .initial_term_id
+        .advanced_by(TermCount::try_new(1).unwrap());
+    buffer.descriptor(1).unwrap().store(
+        Descriptor::new(t1, buffer.generation, SlotState::Free).encode(),
+        Ordering::Release,
+    );
+    buffer
+        .table_slot(TermCount::try_new(1).unwrap())
+        .unwrap()
+        .store(0, Ordering::Release);
+    buffer.limit().store(2 * TERM, Ordering::Release);
+    let mut publication = conductor.concurrent_publication().unwrap().unwrap();
+    let data = vec![5u8; 7000];
+
+    assert_eq!(
+        publication.offer(&data, AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::AdminAction
+    );
+    assert_eq!(publication.offer_attempt_counts(), (1, 1));
+    assert_eq!(
+        publication.offer(&data, AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::AdminAction
+    );
+    assert_eq!(publication.offer_attempt_counts(), (0, 1));
 }
 
 /// §13 "Rotator pause": concurrent publishers at the registration bound;
@@ -347,15 +399,22 @@ fn test_log_buffer_rotator_pause_others_continue_and_remainder_aborts() {
             // before its PAD. The other publisher reaches the next term
             // through a helper (here the conductor) and publishes there.
             for attempt in 0..10 {
-                match other.offer(&message(attempt), AppendOptions::default()).unwrap() {
+                let outcome = other.offer(&message(attempt), AppendOptions::default()).unwrap();
+                match outcome {
                     ConcurrentOfferOutcome::Appended { position } => {
+                        assert_eq!(other.offer_attempt_counts(), (1, 0));
                         assert!(position >= TERM, "published below the paused owner");
                         others.push(message(attempt));
                         if others.len() == 3 {
                             break;
                         }
                     }
-                    ConcurrentOfferOutcome::AdminAction | ConcurrentOfferOutcome::BackPressured => {
+                    ConcurrentOfferOutcome::AdminAction => {
+                        assert_eq!(other.offer_attempt_counts(), (0, 1));
+                        let _ = conductor.duty_cycle().unwrap();
+                    }
+                    ConcurrentOfferOutcome::BackPressured => {
+                        assert_eq!(other.offer_attempt_counts(), (0, 0));
                         let _ = conductor.duty_cycle().unwrap();
                     }
                     outcome => panic!("unexpected {outcome:?}"),
@@ -377,6 +436,7 @@ fn test_log_buffer_rotator_pause_others_continue_and_remainder_aborts() {
         .unwrap();
     // The owner's offer made one reservation, the crossing, and reports it.
     assert_eq!(outcome, ConcurrentOfferOutcome::AdminAction);
+    assert_eq!(owner.offer_attempt_counts(), (1, 1));
     assert_eq!(
         poll(&mut subscription),
         PollOutcome::Aborted {
@@ -387,6 +447,52 @@ fn test_log_buffer_rotator_pause_others_continue_and_remainder_aborts() {
     for expected in others {
         assert_eq!(poll_message(&mut subscription), Some(expected));
     }
+}
+
+/// §13 "Offer that only pads": an exact-fill offer reserves once without
+/// rotating; the following offer only requests rotation and reserves nothing.
+#[test]
+fn test_log_buffer_exact_fill_then_pad_only_offer_has_exact_attempt_counts() {
+    let buffer = new_buffer(concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    buffer.limit().store(2 * TERM, Ordering::Release);
+    let mut publication = conductor.concurrent_publication().unwrap().unwrap();
+    let data = vec![7u8; 8000];
+
+    for index in 0u64..8 {
+        assert_eq!(
+            publication.offer(&data, AppendOptions::default()).unwrap(),
+            ConcurrentOfferOutcome::Appended {
+                position: index * 8192,
+            }
+        );
+        assert_eq!(publication.offer_attempt_counts(), (1, 0));
+    }
+    assert_eq!(buffer.tail(0).unwrap().load(Ordering::Acquire) as u32, TERM as u32);
+
+    assert_eq!(
+        publication.offer(&data, AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::AdminAction
+    );
+    assert_eq!(publication.offer_attempt_counts(), (0, 1));
+}
+
+/// §13 "Immediate offer": one successful append has one reservation and no
+/// rotation attempt.
+#[test]
+fn test_log_buffer_immediate_offer_has_one_reservation_and_no_rotation() {
+    let buffer = new_buffer(concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let _subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = conductor.concurrent_publication().unwrap().unwrap();
+
+    assert_eq!(
+        publication
+            .offer(&[9; 32], AppendOptions::default())
+            .unwrap(),
+        ConcurrentOfferOutcome::Appended { position: 0 }
+    );
+    assert_eq!(publication.offer_attempt_counts(), (1, 0));
 }
 
 /// Drains an optional reader, which may be overrun: it never bounds.

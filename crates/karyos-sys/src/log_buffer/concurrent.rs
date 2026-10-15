@@ -54,6 +54,9 @@ pub struct ConcurrentPublication<O: BufferOwner> {
     pending: Option<Pending>,
     /// Claim payload staging on backings without direct bytes.
     staging: Box<[u8]>,
+    /// Per-offer observation, enabled only in tests and `test-hooks` builds.
+    #[cfg(any(test, feature = "test-hooks"))]
+    offer_attempt_counts: (u32, u32),
 }
 
 /// A marked claim block of a concurrent handle.
@@ -202,6 +205,8 @@ impl<O: BufferOwner> Conductor<O> {
             state: HandleState::Waiting { from },
             pending: None,
             staging,
+            #[cfg(any(test, feature = "test-hooks"))]
+            offer_attempt_counts: (0, 0),
         };
         let _ = handle.catch_up()?;
         Ok(Some(handle))
@@ -408,6 +413,8 @@ impl<O: BufferOwner> PreparedConcurrentPublication<O> {
             state: HandleState::Waiting { from },
             pending: None,
             staging: self.staging,
+            #[cfg(any(test, feature = "test-hooks"))]
+            offer_attempt_counts: (0, 0),
         };
         // A corrupt buffer: the handle drops and releases its slot.
         if let Err(error) = handle.catch_up() {
@@ -473,6 +480,10 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         options: AppendOptions,
         pause: &mut dyn FnMut(WriterPause),
     ) -> Result<ConcurrentOfferOutcome, SysError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            self.offer_attempt_counts = (0, 0);
+        }
         self.resolve_claim();
         if self.state == HandleState::Closed {
             return Ok(ConcurrentOfferOutcome::Closed);
@@ -526,6 +537,13 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             return Ok(ConcurrentOfferOutcome::Aborted { position });
         }
         Ok(ConcurrentOfferOutcome::Appended { position })
+    }
+
+    /// Returns `(tail_reservations, rotation_attempts)` for the most recent
+    /// offer. Test-only observation, with no shared-memory cost.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn offer_attempt_counts(&self) -> (u32, u32) {
+        self.offer_attempt_counts
     }
 
     /// Claims one unfragmented block of `length` payload bytes with one
@@ -699,6 +717,10 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }
         // Admitted by the limit it read; a fence may still come first.
         pause(WriterPause::Reserve);
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            self.offer_attempt_counts.0 = self.offer_attempt_counts.0.saturating_add(1);
+        }
         let old = tail.fetch_add(u64::from(reserved), Ordering::AcqRel);
         debug_assert_eq!(
             (old >> 32) as u32,
@@ -797,9 +819,13 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// One rotation attempt from `count` to the next term (SPEC.md §4
     /// rotation), by the crossing owner or a producer that landed past the
     /// end. Its result does not change the call's outcome (`AdminAction`).
-    fn help_rotation(&self, count: TermCount, help: &mut bool) -> Result<(), SysError> {
+    fn help_rotation(&mut self, count: TermCount, help: &mut bool) -> Result<(), SysError> {
         if !core::mem::replace(help, false) {
             return Ok(());
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            self.offer_attempt_counts.1 = self.offer_attempt_counts.1.saturating_add(1);
         }
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         let next = count.next()?;
