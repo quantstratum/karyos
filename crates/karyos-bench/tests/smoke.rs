@@ -27,7 +27,10 @@ fn every_workload_runs_and_reports() {
             report::field(&line, "workload"),
             Some(config.workload.name())
         );
-        if config.workload == Workload::Throughput {
+        if matches!(
+            config.workload,
+            Workload::Throughput | Workload::CleanerThroughput
+        ) {
             assert!(measurement.latency.is_none());
         } else {
             assert!(report::field(&line, "p50_ns").is_some(), "{line}");
@@ -53,6 +56,14 @@ fn every_workload_runs_and_reports() {
             assert!(measurement.producer_lateness.is_some());
             assert!(report::field(&line, "producer_lateness_p50_ns").is_some());
             assert!(text.contains("producer lateness (scheduled time to accepted offer,"));
+        }
+        if config.workload == Workload::CleanerThroughput {
+            assert!(measurement.cleaned_slots_per_second.is_some());
+            assert!(measurement.term_rotations_per_second.is_some());
+            assert!(text.contains("term production"), "{text}");
+            assert!(text.contains("cleaner"), "{text}");
+            assert!(report::field(&line, "cleaned_slots_per_second").is_some());
+            assert!(report::field(&line, "term_rotations_per_second").is_some());
         }
     }
 }
@@ -103,4 +114,19 @@ fn existing_workload_configuration_key_keeps_its_original_shape() {
         report::key(&measurement, &labels)
     );
     assert!(report::compare(&previous, &line).is_some());
+}
+
+#[test]
+fn cleaner_workload_observes_term_rotation_and_reclamation() {
+    let config = Config {
+        workload: Workload::CleanerThroughput,
+        message: 32,
+        publishers: 2,
+        iterations: 6_000,
+        warmup: 1_000,
+        term_length: 64 * 1024,
+    };
+    let measurement = run(config).unwrap_or_else(|cause| panic!("{config}: {cause}"));
+    assert!(measurement.term_rotations_per_second.unwrap_or_default() > 0.0);
+    assert!(measurement.cleaned_slots_per_second.unwrap_or_default() > 0.0);
 }
