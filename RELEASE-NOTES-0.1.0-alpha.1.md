@@ -89,7 +89,9 @@ Functional evidence only. Docker and virtual machines say nothing about
 latency on physical hosts.
 
 Rows with a commit are historical evidence for that commit, recorded
-during development; the release-gates row is the run on the release commit.
+during development; the release-gates rows are the final run on `3c9de47`,
+the release content: the tagged commit adds only these notes and the
+changelog date on top of it.
 
 | Check | Commit | Environment | Result |
 | --- | --- | --- | --- |
@@ -100,7 +102,10 @@ during development; the release-gates row is the run on the release commit.
 | `scripts/linux-test.sh` (`cargo test --workspace`) | `553f873` | Docker `rust:1.99` (rustc 1.99.0), kernel 6.8.0-117-generic aarch64 (colima VM) | 591 passed, 0 failed, 0 ignored, including the `karyos-sys` library tests (340), admission (6), platform (11) and process (4) tests |
 | Process tests (`karyos-driver/tests/processes.rs`: a killed client released by its exit proof, a stopped client kept charged then resumed, a driver restart that keeps the old mappings readable) | `4dbb003`, merged as `553f873` | Docker, kernel 6.8.0 aarch64 | 4 of 4 pass, five consecutive runs |
 | Platform tests (`karyos-driver/tests/admission_platform.rs`: modes, owners, stale and foreign files, backlog, size seals, descriptor counts) | `1f7d080` on `ad8c1e9` | Docker as root, kernel 6.8.0-117-generic aarch64 | 11 of 11 pass, three consecutive runs |
-| Release gates (`make pre-push`, `make miri`, `make sim`, `scripts/linux-test.sh`) | TODO(final gate-run SHA) | TODO(final gate-run SHA) | TODO(final gate-run SHA) |
+| Release gate `make pre-push` (fmt, lint sync, dependency checks, clippy, rustdoc, workspace tests, Loom, release build) | `3c9de47` | macOS arm64 (Darwin 27.0.0), Apple M5 Max, rustc 1.99.0 | pass: 613 tests passed, 0 failed, 0 ignored |
+| Release gate `make miri` (`karyos-sys` library tests, nightly-2026-10-11) | `3c9de47` | macOS arm64 (Darwin 27.0.0), Apple M5 Max | 318 of 318 pass, no undefined behaviour reported; the Linux-only `ipc` module is not compiled on macOS and is not covered by Miri |
+| Release gate `make sim` (2000 seeds per scenario) | `3c9de47` | macOS arm64 (Darwin 27.0.0), Apple M5 Max, rustc 1.99.0 | 7 of 7 scenarios pass |
+| Release gate `scripts/linux-test.sh --workspace --locked` | `3c9de47` | Docker `rust:1.99` (rustc 1.99.0), kernel 6.8.0-117-generic aarch64 (colima VM) | 601 passed, 0 failed, 0 ignored |
 | Linux x86_64, kernels 6.9 and later | none | Not run for this alpha | Not claimed |
 
 ## Upgrading
