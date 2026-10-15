@@ -34,6 +34,8 @@
 //! | `0xC1` | `ParticipantLost` | stream and session | registration | client | policy: 1 hold, 2 continue, 3 abort | position |
 //! | `0xC2` | `RequiredBoundWithdrawn` | stream and session | registration | position | | |
 //! | `0xC3` | `PublicationClosed` | stream and session | reason: 1 required participant lost | | | |
+//! | `0xC4` | `SuccessorReady` | stream and session | registration | hand-over key of the successor grant | base position | generation |
+//! | `0xC5` | `Fenced` | stream and session | registration | | | |
 
 use thiserror::Error;
 
@@ -56,6 +58,8 @@ const ERROR: u32 = 0x84;
 const PARTICIPANT_LOST: u32 = 0xC1;
 const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
 const PUBLICATION_CLOSED: u32 = 0xC3;
+const SUCCESSOR_READY: u32 = 0xC4;
+const FENCED: u32 = 0xC5;
 
 const ALLOW_UNCONNECTED: u64 = 1;
 
@@ -623,6 +627,31 @@ pub enum Event {
         /// Why.
         reason: CloseReason,
     },
+    /// A cutover opened on a stream where a remote client holds
+    /// `registration` (`quantstratum-docs: karyos/design/ipc-data-path.md`,
+    /// Generations across processes): its successor participant is reserved
+    /// under a new grant, which the client fetches with `key` and adopts
+    /// when its handle reaches the predecessor's seal.
+    SuccessorReady {
+        /// The stream.
+        stream: StreamKey,
+        /// The registration whose handle moves.
+        registration: u64,
+        /// The hand-over key of the successor grant.
+        key: u64,
+        /// The stream position where the successor starts.
+        base: u64,
+        /// The successor's mapping generation.
+        generation: u64,
+    },
+    /// The driver fenced `registration`'s successor at the cutover
+    /// deadline: its adoption fails and its handle reports `Closed`.
+    Fenced {
+        /// The stream.
+        stream: StreamKey,
+        /// The registration fenced.
+        registration: u64,
+    },
 }
 
 impl Event {
@@ -633,6 +662,8 @@ impl Event {
             Self::ParticipantLost { .. } => PARTICIPANT_LOST,
             Self::RequiredBoundWithdrawn { .. } => REQUIRED_BOUND_WITHDRAWN,
             Self::PublicationClosed { .. } => PUBLICATION_CLOSED,
+            Self::SuccessorReady { .. } => SUCCESSOR_READY,
+            Self::Fenced { .. } => FENCED,
         }
     }
 
@@ -674,6 +705,20 @@ impl Event {
             Self::PublicationClosed { stream, reason } => {
                 write_words(&[stream_word(stream), reason.code()], out)
             }
+            Self::SuccessorReady {
+                stream,
+                registration,
+                key,
+                base,
+                generation,
+            } => write_words(
+                &[stream_word(stream), registration, key, base, generation],
+                out,
+            ),
+            Self::Fenced {
+                stream,
+                registration,
+            } => write_words(&[stream_word(stream), registration], out),
         }
     }
 
@@ -710,6 +755,24 @@ impl Event {
                 Ok(Self::PublicationClosed {
                     stream: stream_from(stream),
                     reason: CloseReason::from_code(reason).ok_or(CncError::Reserved { type_id })?,
+                })
+            }
+            SUCCESSOR_READY => {
+                let [stream, registration, key, base, generation] =
+                    read_words::<5>(type_id, bytes)?;
+                Ok(Self::SuccessorReady {
+                    stream: stream_from(stream),
+                    registration,
+                    key,
+                    base,
+                    generation,
+                })
+            }
+            FENCED => {
+                let [stream, registration] = read_words::<2>(type_id, bytes)?;
+                Ok(Self::Fenced {
+                    stream: stream_from(stream),
+                    registration,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -979,6 +1042,17 @@ mod tests {
             Event::PublicationClosed {
                 stream: stream(),
                 reason: CloseReason::RequiredParticipantLost,
+            },
+            Event::SuccessorReady {
+                stream: stream(),
+                registration: 7,
+                key: 9,
+                base: 1 << 40,
+                generation: 3,
+            },
+            Event::Fenced {
+                stream: stream(),
+                registration: 7,
             },
         ];
         for event in events {

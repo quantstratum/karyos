@@ -10,7 +10,7 @@
 
 #![cfg(loom)]
 
-use karyos_sys::registration::{ADOPTED, claim, end};
+use karyos_sys::registration::{ADOPTED, FENCED, claim, end, fence};
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::sync::Arc;
 use loom::thread;
@@ -78,5 +78,27 @@ fn an_end_racing_an_adoption_always_ends() {
         // A later adoption fails whichever came first.
         assert!(!claim(&word, OLD));
         let _ = adopted;
+    });
+}
+
+/// The adoption of a successor grant races its fence at the cutover
+/// deadline (`quantstratum-docs: karyos/design/ipc-data-path.md`,
+/// Generations across processes): exactly one wins, and the word records
+/// which.
+#[test]
+fn an_adoption_and_a_fence_have_exactly_one_winner() {
+    loom::model(|| {
+        let word = Arc::new(AtomicU64::new(OLD));
+        let driver = {
+            let word = Arc::clone(&word);
+            thread::spawn(move || fence(&word, OLD))
+        };
+        let adopted = claim(&word, OLD);
+        let fenced = driver.join().unwrap();
+        assert!(adopted != fenced, "adopted {adopted}, fenced {fenced}");
+        let expected = if adopted { OLD | ADOPTED } else { OLD | FENCED };
+        assert_eq!(word.load(Ordering::Acquire), expected);
+        // Either way the grant still ends.
+        assert!(end(&word, OLD));
     });
 }

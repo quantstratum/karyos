@@ -55,6 +55,17 @@ pub fn claim(word: &AtomicU64, export: u64) -> bool {
             .is_ok()
 }
 
+/// Fences the grant of `export` at a cutover deadline: marks the word
+/// fenced if it still holds exactly the bare export, and returns whether it
+/// did. Exactly one of a concurrent [`claim`] and this call wins: once the
+/// participant adopted, the fence fails; once fenced, the adoption fails.
+pub fn fence(word: &AtomicU64, export: u64) -> bool {
+    valid_export(export)
+        && word
+            .compare_exchange(export, export | FENCED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
 /// Ends the registration of `export`: clears the word if it still names
 /// `export`, adopted, fenced or neither, and returns whether it did. A word
 /// that holds another export or none is left untouched. Linearized with a
@@ -102,6 +113,22 @@ mod tests {
         assert_eq!(word.load(Ordering::Relaxed), 7 | ADOPTED);
         let fenced = AtomicU64::new(7 | FENCED);
         assert!(!claim(&fenced, 7));
+    }
+
+    #[test]
+    fn a_fence_and_a_claim_exclude_each_other() {
+        let word = AtomicU64::new(7);
+        assert!(!fence(&word, 8));
+        assert!(fence(&word, 7));
+        assert!(!fence(&word, 7));
+        assert!(!claim(&word, 7));
+        assert_eq!(word.load(Ordering::Relaxed), 7 | FENCED);
+        // A fenced grant still ends.
+        assert!(end(&word, 7));
+        let adopted = AtomicU64::new(7);
+        assert!(claim(&adopted, 7));
+        assert!(!fence(&adopted, 7));
+        assert!(!fence(&AtomicU64::new(0), 0));
     }
 
     #[test]
