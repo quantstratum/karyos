@@ -92,6 +92,19 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
             ));
         }
     }
+    if let Some(histogram) = &measurement.producer_lateness {
+        out.push_str(&format!(
+            "  producer lateness (scheduled time to accepted offer, interval width {} ns):",
+            measurement.resolution
+        ));
+        for (name, numerator, denominator) in QUANTILES {
+            out.push_str(&format!(
+                " {name} {}",
+                interval(histogram, numerator, denominator)
+            ));
+        }
+        out.push('\n');
+    }
     out.push_str(&format!("  rate {:.0} messages/s\n", measurement.rate));
     out
 }
@@ -130,6 +143,13 @@ pub fn history_line(measurement: &Measurement, labels: &Labels) -> String {
             }
         }
     }
+    if let Some(histogram) = &measurement.producer_lateness {
+        for (name, numerator, denominator) in QUANTILES {
+            if let Some(value) = upper(histogram, numerator, denominator) {
+                fields.push(format!("\"producer_lateness_{name}_ns\":{value}"));
+            }
+        }
+    }
     format!("{{{}}}", fields.join(","))
 }
 
@@ -163,6 +183,11 @@ pub fn compare(history: &str, line: &str) -> Option<String> {
         .iter()
         .map(|(name, ..)| format!("{name}_ns"))
         .chain(["rate".to_string()])
+        .chain(
+            QUANTILES
+                .iter()
+                .map(|(name, ..)| format!("producer_lateness_{name}_ns")),
+        )
     {
         let (Some(before), Some(after)) = (
             field(previous, &name).and_then(|v| v.parse::<f64>().ok()),

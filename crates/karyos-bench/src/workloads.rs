@@ -106,16 +106,18 @@ impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} message={} publishers={} iterations={} warmup={} term={} target_rate={}",
+            "{} message={} publishers={} iterations={} warmup={} term={}",
             self.workload.name(),
             self.message,
             self.publishers,
             self.iterations,
             self.warmup,
-            self.term_length,
-            self.target_rate
-                .map_or_else(|| "none".into(), |rate| rate.to_string())
-        )
+            self.term_length
+        )?;
+        if let Some(rate) = self.target_rate {
+            write!(f, " target_rate={rate}")?;
+        }
+        Ok(())
     }
 }
 
@@ -127,6 +129,8 @@ pub struct Measurement {
     /// Per-iteration latencies in nanoseconds (round trips for ping-pong);
     /// `None` for throughput.
     pub latency: Option<Histogram>,
+    /// Open-loop producer lateness from scheduled time to accepted offer.
+    pub producer_lateness: Option<Histogram>,
     /// Messages per second over the measured phase.
     pub rate: f64,
     /// The width of a latency interval: the clock's observed resolution.
@@ -361,6 +365,7 @@ fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchE
     Ok(Measurement {
         config,
         latency: Some(latencies),
+        producer_lateness: None,
         rate: config.iterations as f64 / seconds,
         resolution,
     })
@@ -436,6 +441,7 @@ fn single_thread(config: Config) -> Result<Measurement, BenchError> {
     Ok(Measurement {
         config,
         latency: Some(latencies),
+        producer_lateness: None,
         rate: config.iterations as f64 / seconds,
         resolution,
     })
@@ -539,6 +545,7 @@ fn ping_pong(config: Config) -> Result<Measurement, BenchError> {
     Ok(Measurement {
         config,
         latency: Some(latencies),
+        producer_lateness: None,
         rate: config.iterations as f64 / seconds,
         resolution,
     })
@@ -645,6 +652,7 @@ fn throughput(config: Config) -> Result<Measurement, BenchError> {
     Ok(Measurement {
         config,
         latency: None,
+        producer_lateness: None,
         // Only the measured phase: every warm-up message was received before
         // the clock started.
         rate: (iterations * u64::from(publishers)) as f64 / seconds,
@@ -675,6 +683,7 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
     let measured_start = scheduled_instant(schedule_start, config.warmup, target_rate)?;
     let _ = scheduled_instant(schedule_start, total - 1, target_rate)?;
     let mut latencies = histogram()?;
+    let producer_lateness = histogram()?;
     let resolution = resolution();
     let mut driver = EmbeddedDriver::new().map_err(|cause| error("driver", cause))?;
     let handle = stream(&mut driver, 1, &config, PublicationMode::Exclusive)?;
@@ -689,7 +698,8 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
     let failed = Arc::new(AtomicBool::new(false));
     let producer_failed = Arc::clone(&failed);
     let payload = vec![7u8; config.message];
-    let producer = thread::spawn(move || -> Result<(), BenchError> {
+    let producer = thread::spawn(move || -> Result<Histogram, BenchError> {
+        let mut producer_lateness = producer_lateness;
         for index in 0..total {
             if producer_failed.load(Ordering::Acquire) {
                 return Err(BenchError(
@@ -702,9 +712,11 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
                     "receiver stopped before the schedule finished".into(),
                 ));
             }
-            loop {
+            let accepted_at = loop {
                 match publication.offer(&payload) {
-                    Ok(OfferOutcome::Accepted { .. }) => break,
+                    Ok(OfferOutcome::Accepted { .. }) => {
+                        break Instant::now();
+                    }
                     Ok(_) => thread::yield_now(),
                     Err(cause) => {
                         producer_failed.store(true, Ordering::Release);
@@ -716,9 +728,19 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
                         "receiver stopped before the offer completed".into(),
                     ));
                 }
+            };
+            if index >= config.warmup
+                && let Err(cause) = record(
+                    &mut producer_lateness,
+                    scheduled_latency_ns(scheduled, accepted_at),
+                    resolution,
+                )
+            {
+                producer_failed.store(true, Ordering::Release);
+                return Err(cause);
             }
         }
-        Ok(())
+        Ok(producer_lateness)
     });
 
     let mut received = 0u64;
@@ -780,7 +802,7 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
     let producer_result = join(producer);
     join(duty)?;
     receive_result?;
-    producer_result?;
+    let producer_lateness = producer_result?;
     let seconds = finished
         .saturating_duration_since(measured_start)
         .as_secs_f64()
@@ -788,6 +810,7 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
     Ok(Measurement {
         config,
         latency: Some(latencies),
+        producer_lateness: Some(producer_lateness),
         rate: config.iterations as f64 / seconds,
         resolution,
     })
@@ -815,7 +838,7 @@ fn wait_until(scheduled: Instant, stop: &AtomicBool) -> bool {
         if remaining.is_zero() {
             return true;
         }
-        let spin_window = Duration::from_micros(20);
+        let spin_window = Duration::from_micros(200);
         if remaining > spin_window {
             thread::sleep(
                 remaining
