@@ -14,7 +14,10 @@
 //! does not fork while it holds the socket, a received descriptor or a
 //! mapping. Closing a [`RemoteClient`] closes the conductor, unmaps every
 //! region and then sends `Leave`; a failed attach does the same with what
-//! it had received. In this step hand-over keys cannot be taken yet: log
+//! it had received. The client never hands out an owner of a mapping (the
+//! conductor, its ring producer and broadcast receiver, or the counters
+//! reader), only calls that borrow them, so no mapping outlives the client
+//! and `Leave` is a true release proof. In this step hand-over keys cannot be taken yet: log
 //! buffers in regions come with i2.
 
 use std::os::fd::{AsFd, OwnedFd};
@@ -25,13 +28,14 @@ use std::time::Duration;
 use karyos_protocol::admission::{
     MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION, refusal,
 };
+use karyos_protocol::cnc::{StreamKey, SubscriberRole};
 use karyos_sys::broadcast::BroadcastReceiver;
 use karyos_sys::command_ring::RingProducer;
-use karyos_sys::counters::CountersReader;
+use karyos_sys::counters::{CellRead, CountersReader};
 use karyos_sys::error::SysError;
 use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, RegionRecord, Sent};
 
-use crate::conductor::ClientConductor;
+use crate::conductor::{ClientConductor, Completion, ConductorError, ConductorPoll};
 use crate::link::{ClientLink, Owner};
 
 /// Why an attach failed.
@@ -266,16 +270,82 @@ impl RemoteClient {
         self.client
     }
 
-    /// The client conductor, over the shared command ring and broadcast
-    /// buffer.
-    pub fn conductor(&mut self) -> Option<&mut ClientConductor> {
-        self.conductor.as_mut()
+    /// Requests a publication on `stream` (the client conductor's
+    /// `add_publication`); returns the request sequence.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_publication`].
+    pub fn add_publication(
+        &mut self,
+        stream: StreamKey,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_publication(stream, allow_unconnected)
     }
 
-    /// The driver's counters, read only.
+    /// Requests a concurrent publication handle on `stream`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_concurrent_publication`].
+    pub fn add_concurrent_publication(
+        &mut self,
+        stream: StreamKey,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_concurrent_publication(stream, allow_unconnected)
+    }
+
+    /// Requests a subscription to `stream` with `role`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_subscription`].
+    pub fn add_subscription(
+        &mut self,
+        stream: StreamKey,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?.add_subscription(stream, role)
+    }
+
+    /// Reports completed requests to `on`, as [`ClientConductor::poll`].
+    pub fn poll<F>(&mut self, limit: usize, on: F) -> ConductorPoll
+    where
+        F: FnMut(Completion),
+    {
+        self.conductor
+            .as_mut()
+            .map_or_else(ConductorPoll::default, |conductor| {
+                conductor.poll(limit, on)
+            })
+    }
+
+    /// Requests submitted and not yet reported.
     #[must_use]
-    pub fn counters(&self) -> Option<&CountersReader> {
-        self.counters.as_ref()
+    pub fn pending(&self) -> usize {
+        self.conductor.as_ref().map_or(0, ClientConductor::pending)
+    }
+
+    /// Cells of the driver's counters region.
+    #[must_use]
+    pub fn counter_capacity(&self) -> usize {
+        self.counters.as_ref().map_or(0, CountersReader::capacity)
+    }
+
+    /// Reads counter cell `index` of the driver's counters region.
+    #[must_use]
+    pub fn read_counter(&self, index: usize) -> CellRead {
+        self.counters
+            .as_ref()
+            .map_or(CellRead::Free, |counters| counters.read(index))
+    }
+
+    fn conductor_mut(&mut self) -> Result<&mut ClientConductor, ConductorError> {
+        self.conductor.as_mut().ok_or(ConductorError::Closed)
     }
 
     /// Closes the conductor, unmaps every region and sends `Leave`. Same as

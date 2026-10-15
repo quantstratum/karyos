@@ -504,6 +504,14 @@ fn check_private_dir(path: &std::path::Path) -> Result<(), SysError> {
     Ok(())
 }
 
+/// Whether `metadata` is a socket of this uid with mode `0600`.
+fn owned_socket(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    metadata.file_type().is_socket()
+        && metadata.uid() == own_uid()
+        && metadata.mode() & 0o777 == 0o600
+}
+
 fn io_error(operation: &'static str) -> impl Fn(std::io::Error) -> SysError {
     move |error| SysError::Os {
         operation,
@@ -541,18 +549,31 @@ pub fn listen(dir: &std::path::Path, backlog: i32) -> Result<OwnedFd, SysError> 
     check_private_dir(dir)?;
     let path = dir.join(SOCKET_NAME);
     let address = unix_address(&path)?;
-    if std::fs::symlink_metadata(&path).is_ok() {
-        let probe = seqpacket(SocketFlags::CLOEXEC)?;
-        match rustix::net::connect(&probe, &address) {
-            Ok(()) => {
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("stat(socket)")(error)),
+        Ok(metadata) => {
+            // Only a socket of this uid with the driver's mode is ever
+            // replaced; anything else at the path is left alone.
+            if !owned_socket(&metadata) {
                 return Err(SysError::Protocol {
-                    reason: "a live driver holds the socket",
+                    reason: "the socket path holds something other than a driver socket",
                 });
             }
-            Err(rustix::io::Errno::CONNREFUSED) => {
-                std::fs::remove_file(&path).map_err(io_error("unlink(socket)"))?;
+            // A non-blocking probe: a live driver with a full backlog
+            // answers `EAGAIN` at once instead of blocking the start.
+            let probe = seqpacket(SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)?;
+            match rustix::net::connect(&probe, &address) {
+                Ok(()) | Err(rustix::io::Errno::AGAIN) => {
+                    return Err(SysError::Protocol {
+                        reason: "a live driver holds the socket",
+                    });
+                }
+                Err(rustix::io::Errno::CONNREFUSED) => {
+                    std::fs::remove_file(&path).map_err(io_error("unlink(socket)"))?;
+                }
+                Err(errno) => return Err(os("connect(probe)")(errno)),
             }
-            Err(errno) => return Err(os("connect(probe)")(errno)),
         }
     }
     let listener = seqpacket(SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)?;
@@ -580,39 +601,57 @@ pub fn accept(listener: BorrowedFd<'_>) -> Result<Option<OwnedFd>, SysError> {
 /// Connects to the driver's admission socket in `dir` (client side,
 /// `quantstratum-docs: karyos/design/ipc-admission.md`): the directory must be a private
 /// directory of this uid, the socket a socket of this uid with mode
-/// `0600`, and the connected peer (`SO_PEERCRED`) this uid. Blocking, with
-/// `timeout` on every receive; close-on-exec.
+/// `0600`, and the connected peer (`SO_PEERCRED`) this uid. The connection
+/// attempt is bounded by `timeout` (a full backlog is retried, never waited
+/// on without bound); the socket is then blocking with `timeout` on every
+/// receive and send; close-on-exec.
 ///
 /// # Errors
 ///
 /// Returns [`SysError::Protocol`] when a check fails, and [`SysError::Os`]
 /// when a call fails.
 pub fn connect(dir: &std::path::Path, timeout: core::time::Duration) -> Result<OwnedFd, SysError> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     check_private_dir(dir)?;
     let path = dir.join(SOCKET_NAME);
     let metadata = std::fs::symlink_metadata(&path).map_err(io_error("stat(socket)"))?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != own_uid()
-        || metadata.mode() & 0o777 != 0o600
-    {
+    if !owned_socket(&metadata) {
         return Err(SysError::Protocol {
             reason: "the admission socket is not a socket of this uid with mode 0600",
         });
     }
-    let socket = seqpacket(SocketFlags::CLOEXEC)?;
-    rustix::net::connect(&socket, &unix_address(&path)?).map_err(os("connect"))?;
+    // Non-blocking, so a full listen backlog (`EAGAIN`) is retried until
+    // `timeout` instead of blocking without bound.
+    let socket = seqpacket(SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)?;
+    let address = unix_address(&path)?;
+    let start = std::time::Instant::now();
+    loop {
+        match rustix::net::connect(&socket, &address) {
+            Ok(()) => break,
+            Err(rustix::io::Errno::AGAIN) if start.elapsed() < timeout => {
+                std::thread::sleep(core::time::Duration::from_millis(1));
+            }
+            Err(errno) => return Err(os("connect")(errno)),
+        }
+    }
+    rustix::io::ioctl_fionbio(&socket, false).map_err(os("ioctl(FIONBIO)"))?;
     if peer_credentials(socket.as_fd())?.uid.as_raw() != own_uid() {
         return Err(SysError::Protocol {
             reason: "the driver runs as another uid",
         });
     }
-    rustix::net::sockopt::set_socket_timeout(
-        &socket,
-        rustix::net::sockopt::Timeout::Recv,
-        Some(timeout),
-    )
-    .map_err(os("setsockopt(SO_RCVTIMEO)"))?;
+    for (kind, operation) in [
+        (
+            rustix::net::sockopt::Timeout::Recv,
+            "setsockopt(SO_RCVTIMEO)",
+        ),
+        (
+            rustix::net::sockopt::Timeout::Send,
+            "setsockopt(SO_SNDTIMEO)",
+        ),
+    ] {
+        rustix::net::sockopt::set_socket_timeout(&socket, kind, Some(timeout))
+            .map_err(os(operation))?;
+    }
     Ok(socket)
 }
 
@@ -1130,5 +1169,37 @@ mod tests {
         ));
         drop(listener);
         assert!(matches!(listen(&dir, 8), Err(SysError::Protocol { .. })));
+    }
+
+    #[test]
+    fn listen_never_replaces_what_is_not_a_driver_socket() {
+        let dir = private_dir();
+        let path = dir.join(SOCKET_NAME);
+        std::fs::write(&path, b"not a socket").unwrap();
+        assert!(matches!(listen(&dir, 8), Err(SysError::Protocol { .. })));
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a socket");
+    }
+
+    #[test]
+    fn a_full_backlog_bounds_connect_and_the_start_probe() {
+        let dir = private_dir();
+        let listener = listen(&dir, 0).unwrap();
+        let timeout = core::time::Duration::from_millis(100);
+        // Never accepted: the backlog fills, then connect gives up in time.
+        let mut held = Vec::new();
+        let start = std::time::Instant::now();
+        loop {
+            match connect(&dir, timeout) {
+                Ok(socket) => held.push(socket),
+                Err(_) => break,
+            }
+            assert!(held.len() < 64, "the backlog never filled");
+        }
+        assert!(start.elapsed() < core::time::Duration::from_secs(5));
+        // A second driver's start probe answers at once.
+        let probe = std::time::Instant::now();
+        assert!(matches!(listen(&dir, 8), Err(SysError::Protocol { .. })));
+        assert!(probe.elapsed() < core::time::Duration::from_secs(1));
+        drop(listener);
     }
 }

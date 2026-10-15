@@ -133,8 +133,7 @@ fn a_remote_client_is_admitted_served_and_leaves() {
     assert_eq!(Some(client.instance()), driver.instance());
     assert_eq!(driver.clients(), 1);
     // A command round trip through the shared ring and broadcast buffer.
-    let conductor = client.conductor().unwrap();
-    let sequence = conductor
+    let sequence = client
         .add_subscription(
             StreamKey {
                 stream_id: 99,
@@ -148,10 +147,7 @@ fn a_remote_client_is_admitted_served_and_leaves() {
     while done.is_empty() {
         assert!(start.elapsed() < Duration::from_secs(5), "timed out");
         let _ = driver.do_work().unwrap();
-        let _ = client
-            .conductor()
-            .unwrap()
-            .poll(usize::MAX, |completion| done.push(completion));
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
     }
     assert_eq!(done[0].sequence, sequence);
     assert!(matches!(
@@ -162,7 +158,7 @@ fn a_remote_client_is_admitted_served_and_leaves() {
         }
     ));
     // The counters are readable through the attached region.
-    assert!(client.counters().unwrap().capacity() > 0);
+    assert!(client.counter_capacity() > 0);
     // Leave releases the slot.
     drop(client);
     serve_until(&mut driver, |driver| driver.clients() == 0);
