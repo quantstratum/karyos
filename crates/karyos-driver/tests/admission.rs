@@ -64,6 +64,7 @@ fn ipc_config(dir: &Path, timeout: u64) -> IpcConfig {
         hello_timeout: timeout,
         max_outbound_per_client: 8,
         fetch_deadline: timeout,
+        max_exports_per_client: 16,
     }
 }
 

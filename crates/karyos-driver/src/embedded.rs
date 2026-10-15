@@ -547,12 +547,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     pub(crate) fn free_retired_streams(&mut self) {
         let before = self.streams.len();
         let registrations = &self.registrations;
+        let clients = &self.clients;
+        // A remote grant keeps its stream until it ends, even after its
+        // registration was removed.
         self.streams.retain(|stream| {
             !(stream.retiring
                 && stream.leases.live() == 0
                 && !registrations
                     .iter()
-                    .any(|registration| registration.stream() == stream.id))
+                    .any(|registration| registration.stream() == stream.id)
+                && !clients.iter().any(|client| {
+                    client
+                        .ledger
+                        .as_ref()
+                        .is_some_and(|ledger| ledger.names_stream(stream.id))
+                }))
         });
         let freed = before - self.streams.len();
         if freed > 0 {

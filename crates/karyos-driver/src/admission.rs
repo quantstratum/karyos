@@ -14,7 +14,8 @@
 //! retired.
 //!
 //! A client ends with `Leave` or with the exit proof (its pidfd becomes
-//! readable). `Leave` is accepted at any time, also while the bootstrap is
+//! readable). `Leave` is accepted while no grant of its export ledger was
+//! sent (otherwise it is a protocol error), also while the bootstrap is
 //! still queued: the client sends it only after unmapping every region it
 //! attached and closing every descriptor it received, which is also how it
 //! rolls back a failed attach. Messages still queued for it are dropped
@@ -39,6 +40,7 @@ use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, Sent};
 
 use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
+use crate::ledger::Ledger;
 
 /// Region id of the broadcast buffer.
 pub(crate) const BROADCAST_REGION: u64 = 1;
@@ -66,6 +68,10 @@ pub struct IpcConfig {
     /// `Region` messages), in the driver clock's unit; a client that has
     /// not drained it by then is retired.
     pub fetch_deadline: u64,
+    /// Grants one client holds at once, in any state but ended
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Bounds); a
+    /// command beyond it is refused and reserves nothing.
+    pub max_exports_per_client: usize,
 }
 
 /// A connection waiting for its `Hello`.
@@ -178,6 +184,7 @@ impl<T: StreamTerms> Admission<T> {
         if config.max_pending_hellos == 0
             || config.hello_timeout == 0
             || config.fetch_deadline == 0
+            || config.max_exports_per_client == 0
             || config.max_outbound_per_client < BOOTSTRAP_MESSAGES
         {
             return Err(DriverError::InvalidConfig);
@@ -265,7 +272,7 @@ impl<T: StreamTerms> Admission<T> {
         // One datagram per client, then its outbound queue.
         let mut index = 0;
         while let Some(remote) = self.remotes.get_mut(index) {
-            let step = match Self::receive(remote, self.config.max_outbound_per_client) {
+            let step = match Self::receive(remote, driver, self.config.max_outbound_per_client) {
                 Step::Keep => Self::drain(remote),
                 other => other,
             };
@@ -394,7 +401,10 @@ impl<T: StreamTerms> Admission<T> {
             fds.push(region.descriptor()?.try_clone_to_owned().ok()?);
         }
         let link = Arc::new(ClientLink::new());
-        let client = driver.admit(consumer, Arc::clone(&link)).ok()?;
+        let ledger = Ledger::new(self.config.max_exports_per_client);
+        let client = driver
+            .admit(consumer, Arc::clone(&link), Some(ledger))
+            .ok()?;
         self.next_region = next_region;
         driver.next_export = next_export;
         let mut outbound = VecDeque::with_capacity(BOOTSTRAP_MESSAGES);
@@ -417,14 +427,22 @@ impl<T: StreamTerms> Admission<T> {
     }
 
     /// Reads at most one datagram of an admitted client.
-    fn receive(remote: &mut Remote<T>, bound: usize) -> Step {
+    fn receive(remote: &mut Remote<T>, driver: &EmbeddedDriver<T>, bound: usize) -> Step {
         let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
         match ipc::recv(remote.socket.as_fd(), &mut buffer) {
             Ok(Recv::WouldBlock) => Step::Keep,
             Ok(Recv::Message(received)) if received.fd.is_none() => {
                 let bytes = buffer.get(..received.len).unwrap_or(&[]);
                 match Message::decode(bytes) {
-                    Ok(Message::Leave) => Step::Leave,
+                    // Leave releases the client like its exit proof, so it
+                    // is accepted only while nothing was exported; otherwise
+                    // it is a protocol error and everything sent stays
+                    // charged until the exit proof.
+                    Ok(Message::Leave)
+                        if driver.ledger(remote.client).is_none_or(Ledger::only_held) =>
+                    {
+                        Step::Leave
+                    }
                     // Log buffers in regions come with i2: no key is held
                     // for a remote client yet.
                     Ok(Message::Fetch { fetch, .. }) => Self::queue(

@@ -17,6 +17,7 @@ pub mod counters;
 pub mod embedded;
 pub mod error;
 mod generations;
+mod ledger;
 
 #[cfg(target_os = "linux")]
 pub use admission::IpcConfig;
