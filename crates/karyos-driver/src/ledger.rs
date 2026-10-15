@@ -51,6 +51,12 @@ pub(crate) struct Grant {
     /// Whether a descriptor of it has left the outbound queue: from then on
     /// it stays charged until its `Detach` or the client's exit proof.
     pub(crate) sent: bool,
+    /// The mapping generation of its participant.
+    pub(crate) generation: u32,
+    /// For a successor grant reserved at a cutover: when the driver fences
+    /// it if its participant has not adopted it (`quantstratum-docs:
+    /// karyos/design/ipc-data-path.md`, Generations across processes).
+    pub(crate) fence_at: Option<u64>,
 }
 
 /// The grants of one remote client.
@@ -96,20 +102,27 @@ impl Ledger {
         self.grants.push(grant);
     }
 
-    /// The grant answering `registration`.
-    pub(crate) fn by_registration(&self, registration: u64) -> Option<&Grant> {
-        self.grants
-            .iter()
-            .find(|grant| grant.registration == registration)
+    /// Removes and returns every grant of `registration`, of any
+    /// generation, whose descriptor never left.
+    pub(crate) fn take_unsent_of(&mut self, registration: u64) -> Vec<Grant> {
+        let (unsent, kept) = core::mem::take(&mut self.grants)
+            .into_iter()
+            .partition(|grant| grant.registration == registration && !grant.sent);
+        self.grants = kept;
+        unsent
     }
 
-    /// Removes and returns the grant answering `registration`.
-    pub(crate) fn remove_registration(&mut self, registration: u64) -> Option<Grant> {
-        let index = self
-            .grants
+    /// Every grant, to change.
+    pub(crate) fn grants_mut(&mut self) -> &mut Vec<Grant> {
+        &mut self.grants
+    }
+
+    /// Whether a successor grant of stream `stream` is still waiting for
+    /// its adoption or its fence.
+    pub(crate) fn unsettled_successor(&self, stream: u64) -> bool {
+        self.grants
             .iter()
-            .position(|grant| grant.registration == registration)?;
-        Some(self.grants.swap_remove(index))
+            .any(|grant| grant.stream == stream && grant.fence_at.is_some())
     }
 
     /// Removes and returns the grant of `export` if its fetch is over
@@ -168,39 +181,30 @@ impl Ledger {
             .find(|grant| grant.key == key && grant.state == GrantState::Held)
     }
 
-    /// Moves the grant answering `registration` to `state`.
+    /// Moves the grant of `export` to `state`.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "remote clients are admitted only on Linux")
     )]
-    pub(crate) fn set_state(&mut self, registration: u64, state: GrantState) {
-        if let Some(grant) = self
-            .grants
-            .iter_mut()
-            .find(|grant| grant.registration == registration)
-        {
+    pub(crate) fn set_state(&mut self, export: u64, state: GrantState) {
+        if let Some(grant) = self.grants.iter_mut().find(|grant| grant.export == export) {
             grant.state = state;
         }
     }
 
-    /// Records that a descriptor of the grant answering `registration` has
-    /// left the outbound queue.
+    /// Records that a descriptor of the grant of `export` has left the
+    /// outbound queue.
     #[cfg_attr(
         all(not(target_os = "linux"), not(test)),
         allow(dead_code, reason = "remote clients are admitted only on Linux")
     )]
-    pub(crate) fn mark_sent(&mut self, registration: u64) {
-        if let Some(grant) = self
-            .grants
-            .iter_mut()
-            .find(|grant| grant.registration == registration)
-        {
+    pub(crate) fn mark_sent(&mut self, export: u64) {
+        if let Some(grant) = self.grants.iter_mut().find(|grant| grant.export == export) {
             grant.sent = true;
         }
     }
 
-    /// The grants, for inspection.
-    #[cfg(test)]
+    /// The grants.
     pub(crate) fn grants(&self) -> &[Grant] {
         &self.grants
     }
@@ -219,6 +223,8 @@ mod tests {
             participant: Participant::Exclusive,
             state: GrantState::Held,
             sent: false,
+            generation: 0,
+            fence_at: None,
         }
     }
 
@@ -229,7 +235,7 @@ mod tests {
         ledger.push(grant(1));
         ledger.push(grant(2));
         assert!(ledger.only_held());
-        ledger.mark_sent(2);
+        ledger.mark_sent(102);
         assert!(!ledger.only_held());
         // A retirement ends the unsent one and keeps the sent one.
         let unsent = ledger.take_unsent();

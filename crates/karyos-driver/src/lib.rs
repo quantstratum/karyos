@@ -18,6 +18,7 @@ pub mod embedded;
 pub mod error;
 mod generations;
 mod ledger;
+mod remote_generations;
 
 #[cfg(target_os = "linux")]
 pub use admission::IpcConfig;

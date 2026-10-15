@@ -76,6 +76,13 @@ pub(crate) struct Registration {
     pub(crate) subscriber: Option<(usize, u64, Role)>,
 }
 
+impl<T: StreamTerms> ClientSlot<T> {
+    /// The client's id.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl Registration {
     /// The stream id this registration belongs to.
     pub(crate) fn stream(&self) -> u64 {
@@ -738,6 +745,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         // Effect: everything below cannot fail.
         let stream = target.id;
+        let generation = target.generation.get();
         self.next_registration = next;
         self.next_export = export + 1;
         if let Some(ledger) = self.ledger_mut(client) {
@@ -749,6 +757,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 participant,
                 state: GrantState::Held,
                 sent: false,
+                generation,
+                fence_at: None,
             });
         }
         let (kind, subscriber) = match participant {
@@ -805,16 +815,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(ledger) = self.ledger_mut(client) else {
             return;
         };
-        if ledger
-            .by_registration(registration)
-            .is_none_or(|grant| grant.sent)
-        {
-            return;
+        for grant in ledger.take_unsent_of(registration) {
+            self.end_grant(&grant);
         }
-        let Some(grant) = ledger.remove_registration(registration) else {
-            return;
-        };
-        self.end_grant(&grant);
     }
 
     /// Ends `grant`'s registration in its stream's buffer. The caller holds
@@ -824,7 +827,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
             return;
         };
-        let conductor = &mut stream.conductor;
+        // The grant's own generation: the current mapping or a retained
+        // predecessor.
+        let conductor = if stream.generation.get() == grant.generation {
+            &mut stream.conductor
+        } else if let Some(retained) = stream
+            .retained
+            .iter_mut()
+            .find(|retained| retained.generation.get() == grant.generation)
+        {
+            &mut retained.conductor
+        } else {
+            return;
+        };
         let ended = match grant.participant {
             Participant::Subscriber { cell, .. } => conductor.end_subscriber(cell, grant.export),
             Participant::Exclusive => conductor
@@ -1190,9 +1205,33 @@ mod tests {
     }
 
     #[test]
-    fn reconfiguring_a_stream_with_a_remote_grant_is_refused() {
-        let (mut driver, stream) = driver_with_stream();
-        let (_client, mut producer) = remote_client(&mut driver, 4);
+    fn an_unadopted_successor_is_fenced_and_the_predecessor_freed_after_its_grant_ends() {
+        let mut driver = EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+            cutover_deadline: 1,
+            ..crate::embedded::DriverConfig::default()
+        })
+        .unwrap();
+        let stream = driver
+            .add_stream(StreamConfig {
+                buffer: LogBufferConfig {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 3,
+                    max_subscribers: 4,
+                    mtu: DEFAULT_MTU,
+                    max_reserved: MIN_TERM_LENGTH / 8,
+                    initial_term_id: TermId::new(7),
+                    lane: Lane::ZERO,
+                    session_id: 1,
+                    stream_id: 2,
+                    claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                    publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                },
+                allow_unconnected: false,
+                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+            })
+            .unwrap();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
         write(
             &mut producer,
             Command::AddSubscription {
@@ -1202,17 +1241,139 @@ mod tests {
             },
         );
         let _ = driver.do_work().unwrap();
-        assert!(matches!(
-            driver.reconfigure_stream(
+        let old = ledger(&driver, client)[0];
+        remote_ledger(&mut driver, client).mark_sent(old.export);
+        let _ = driver
+            .reconfigure_stream(
                 stream,
                 crate::generations::Reconfiguration {
                     term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
                     spare_slots: 5,
+                },
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        while counter(&driver, "grants fenced") == 0 {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "never fenced"
+            );
+            let _ = driver.do_work().unwrap();
+        }
+        // The successor was never sent: it ends at once; the old grant stays.
+        let left = ledger(&driver, client);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert_eq!(left[0].export, old.export);
+        assert_eq!(driver.streams[0].buffer.attached_subscribers(), 0);
+        let mut fenced = false;
+        while let Received::Message {
+            type_id, payload, ..
+        } = observer.receive()
+        {
+            fenced |= matches!(
+                karyos_protocol::cnc::Event::decode(type_id, payload),
+                Ok(karyos_protocol::cnc::Event::Fenced { registration, .. })
+                    if registration == old.registration
+            );
+        }
+        assert!(fenced);
+        // The predecessor is retained while the old grant is charged, and
+        // freed once the client's exit proof ends it.
+        assert_eq!(driver.generations(stream).unwrap().len(), 2);
+        driver.clients[0].link.mark_closed();
+        let _ = driver.do_work().unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.generations(stream).unwrap().len(), 1);
+    }
+
+    fn counter(driver: &EmbeddedDriver, label: &str) -> u64 {
+        let reader = driver.counters();
+        (0..reader.capacity())
+            .find_map(|index| match reader.read(index) {
+                karyos_sys::counters::CellRead::Allocated {
+                    metadata, value, ..
+                } if metadata.label() == label.as_bytes() => Some(value),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_cutover_reserves_the_successor_of_a_sent_remote_grant() {
+        let (mut driver, stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        // Its descriptor left: the participant is mapped in its process.
+        let old = ledger(&driver, client)[0];
+        remote_ledger(&mut driver, client).mark_sent(old.export);
+        let _ = responses(&mut observer);
+        let generation = driver
+            .reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 5,
+                },
+            )
+            .unwrap();
+        // A cutover opens on the writer's next call; without one, a duty
+        // cycle positions the seal.
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+        }
+        let grants = ledger(&driver, client);
+        assert_eq!(grants.len(), 2, "{grants:?}");
+        let successor = grants
+            .iter()
+            .find(|grant| grant.generation == generation.get())
+            .copied()
+            .unwrap();
+        assert_eq!(successor.registration, old.registration);
+        assert_ne!(successor.export, old.export);
+        assert_eq!(successor.state, GrantState::Held);
+        assert!(successor.fence_at.is_some());
+        // Told with SuccessorReady, carrying the new key.
+        let mut events = Vec::new();
+        while let Received::Message {
+            type_id, payload, ..
+        } = observer.receive()
+        {
+            if let Ok(event) = karyos_protocol::cnc::Event::decode(type_id, payload) {
+                events.push(event);
+            }
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                karyos_protocol::cnc::Event::SuccessorReady { registration, key, generation: g, .. }
+                    if *registration == old.registration
+                        && *key == successor.key
+                        && *g == u64::from(generation.get())
+            )),
+            "{events:?}"
+        );
+        // The predecessor stays while the old grant is charged.
+        assert_eq!(driver.generations(stream).unwrap().len(), 2);
+        // A second reconfiguration waits for the successor to settle.
+        assert!(matches!(
+            driver.reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 5,
                 }
             ),
-            Err(DriverError::RemoteParticipants { .. })
+            Err(DriverError::CutoverPending { .. })
         ));
-        assert_eq!(driver.streams[0].generation.get(), 0);
     }
 
     #[test]
