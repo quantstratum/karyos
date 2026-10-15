@@ -16,6 +16,20 @@
 //! [`Outcome::Counter`]. A released or dropped counter queues its release,
 //! which the next [`ClientConductor::poll`] sends as `ReleaseCounter`; that
 //! request is the conductor's own and never reported.
+//!
+//! Loss reports (`quantstratum-docs:
+//! karyos/design/observability-and-tools.md`, "Loss reports from clients"):
+//! each poll sends the reports its subscriptions queued ([`crate::loss`]) as
+//! `ReportLoss`, in order, while the ring and the pending bound take them;
+//! the rest wait for a later poll. These requests are the conductor's own
+//! and never reported. Reports dropped because the queue was full are
+//! counted locally ([`ClientConductor::loss_reports_dropped`]) and mirrored
+//! into the client counter `loss reports dropped` (kind client), which the
+//! conductor allocates for itself with one `AllocateCounter` at the first
+//! drop, so a client that never drops a report holds no cell of its
+//! `max_counters_per_client`. If that allocation is refused or its outcome
+//! is unknown, the conductor keeps counting locally and does not ask again;
+//! nothing ever waits for it.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -35,6 +49,7 @@ use crate::concurrent::ClientConcurrentPublication;
 use crate::counter::{ClientCounterHandle, Release};
 use crate::generation::GenerationLink;
 use crate::link::{Capability, ClientLink, Origin, Owner};
+use crate::loss::LossReporter;
 use crate::publication::ClientPublication;
 use crate::subscription::ClientSubscription;
 
@@ -188,6 +203,38 @@ enum Kind {
     AllocateCounter,
     /// The conductor's own `ReleaseCounter`: never reported.
     ReleaseCounter,
+    /// The conductor's own `ReportLoss`: never reported.
+    ReportLoss,
+    /// The conductor's own `AllocateCounter` of `loss reports dropped`:
+    /// never reported.
+    DroppedCounter,
+}
+
+impl Kind {
+    /// Whether the request is the conductor's own, never reported.
+    fn internal(self) -> bool {
+        matches!(
+            self,
+            Self::ReleaseCounter | Self::ReportLoss | Self::DroppedCounter
+        )
+    }
+}
+
+/// Label of the client counter of loss reports dropped.
+pub const LOSS_REPORTS_DROPPED: &str = "loss reports dropped";
+
+/// The client counter `loss reports dropped`, allocated at the first drop.
+#[derive(Debug)]
+enum DroppedCounter {
+    /// No report was dropped yet, or the request is still to be sent.
+    NotRequested,
+    /// `AllocateCounter` was sent.
+    Requested,
+    /// The cell, and the drops already added to it.
+    Allocated(ClientCounterHandle, u64),
+    /// The allocation was refused or its outcome is unknown: the count
+    /// stays local.
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -238,6 +285,8 @@ pub struct ClientConductor<T: TermBytes = HeapTerms> {
     /// when the driver gave none, and allocated counters then complete as
     /// `Unknown`.
     cells: Option<ClientCells>,
+    /// The client counter `loss reports dropped`.
+    dropped_counter: DroppedCounter,
     /// A remote client's admission session, which each counter handle
     /// keeps; dropped after `cells`.
     session: Option<Arc<dyn core::any::Any + Send + Sync>>,
@@ -281,6 +330,7 @@ impl<T: TermBytes> ClientConductor<T> {
             remote: false,
             cutover_events: Vec::new(),
             cells: None,
+            dropped_counter: DroppedCounter::NotRequested,
             session: None,
         }
     }
@@ -592,6 +642,107 @@ impl<T: TermBytes> ClientConductor<T> {
         })
     }
 
+    /// Loss reports of this client's subscriptions dropped because the
+    /// queue was full: the local count, complete whether or not the client
+    /// counter `loss reports dropped` could be allocated.
+    #[must_use]
+    pub fn loss_reports_dropped(&self) -> u64 {
+        self.link.loss_reports().dropped()
+    }
+
+    /// Loss reports queued and not yet sent.
+    #[must_use]
+    pub fn loss_reports_queued(&self) -> usize {
+        self.link.loss_reports().queued()
+    }
+
+    /// The client counter `loss reports dropped`, once allocated; `None`
+    /// before the first drop and when the allocation was refused.
+    #[must_use]
+    pub fn loss_reports_dropped_counter(&self) -> Option<&ClientCounterHandle> {
+        match &self.dropped_counter {
+            DroppedCounter::Allocated(handle, _) => Some(handle),
+            _ => None,
+        }
+    }
+
+    /// Sends the loss reports the client's subscriptions queued, in order,
+    /// while the ring and the pending bound take them; the rest wait for a
+    /// later poll.
+    fn send_loss_reports(&mut self) {
+        let reports = Arc::clone(self.link.loss_reports());
+        while let Some(loss) = reports.pop() {
+            let sent = self.submit(Kind::ReportLoss, None, |sequence| Command::ReportLoss {
+                sequence,
+                loss,
+            });
+            if sent.is_err() {
+                reports.unpop(loss);
+                break;
+            }
+        }
+    }
+
+    /// Brings the client counter `loss reports dropped` up to the local
+    /// count, requesting the cell at the first drop.
+    fn sync_dropped_counter(&mut self) {
+        let dropped = self.link.loss_reports().dropped();
+        match &mut self.dropped_counter {
+            DroppedCounter::NotRequested if dropped > 0 => {
+                let Some(label) = CounterLabel::new(LOSS_REPORTS_DROPPED) else {
+                    return;
+                };
+                // An event counter, of the driver's event type id; a full
+                // ring or pending bound retries on the next poll.
+                let sent = self.submit(Kind::DroppedCounter, None, |sequence| {
+                    Command::AllocateCounter {
+                        sequence,
+                        type_id: 1,
+                        label,
+                        stream: 0,
+                        participant: 0,
+                    }
+                });
+                if sent.is_ok() {
+                    self.dropped_counter = DroppedCounter::Requested;
+                }
+            }
+            // An overflow leaves the cell unchanged; the local count stays
+            // exact.
+            DroppedCounter::Allocated(handle, counted)
+                if dropped > *counted && handle.increment(dropped - *counted).is_ok() =>
+            {
+                *counted = dropped;
+            }
+            _ => {}
+        }
+    }
+
+    /// Completes the request for `loss reports dropped`.
+    fn dropped_counter_answered(&mut self, response: Option<Response>) {
+        let counter = match response {
+            Some(Response::CounterAllocated {
+                cell, registration, ..
+            }) => usize::try_from(cell).ok().and_then(|cell| {
+                self.cells
+                    .as_ref()
+                    .and_then(|cells| cells.counter(cell, registration))
+            }),
+            _ => None,
+        };
+        self.dropped_counter = match counter {
+            Some(counter) => DroppedCounter::Allocated(
+                ClientCounterHandle::new(
+                    counter,
+                    Arc::clone(self.link.counter_releases()),
+                    self.session.clone(),
+                ),
+                0,
+            ),
+            None => DroppedCounter::Unavailable,
+        };
+    }
+
     /// Sends the releases the client's counter handles queued, in order,
     /// while the ring and the pending bound take them; the rest wait for a
     /// later poll.
@@ -686,6 +837,8 @@ impl<T: TermBytes> ClientConductor<T> {
         } else {
             self.deliver_unknown(&mut on);
             self.send_releases();
+            self.send_loss_reports();
+            self.sync_dropped_counter();
         }
         while report.records < limit {
             // Copy what is needed out of the receiver before acting on it.
@@ -754,8 +907,13 @@ impl<T: TermBytes> ClientConductor<T> {
                 continue;
             };
             let pending = self.pending.swap_remove(index);
-            // The conductor's own release: nothing to report.
-            if pending.kind == Kind::ReleaseCounter {
+            // The conductor's own requests: nothing to report.
+            if pending.kind == Kind::DroppedCounter {
+                self.dropped_counter_answered(Some(response));
+                self.sync_dropped_counter();
+                continue;
+            }
+            if pending.kind.internal() {
                 continue;
             }
             let outcome = self.outcome(pending, response);
@@ -850,7 +1008,15 @@ impl<T: TermBytes> ClientConductor<T> {
                             ),
                         ),
                         (Kind::AddSubscription, Capability::Subscription(inner)) => {
-                            Outcome::Subscription(ClientSubscription::from_hand_over(inner, origin))
+                            let subscription = ClientSubscription::from_hand_over(inner, origin);
+                            Outcome::Subscription(match entry.publication {
+                                Some(publication) => subscription.with_loss_reports(LossReporter {
+                                    publication,
+                                    registration,
+                                    reports: Arc::clone(self.link.loss_reports()),
+                                }),
+                                None => subscription,
+                            })
                         }
                         // A capability of another kind than requested would
                         // be a driver defect: it is dropped (ending its
@@ -899,11 +1065,18 @@ impl<T: TermBytes> ClientConductor<T> {
     /// runs (a late response can no longer match it), then delivers the
     /// notifications.
     fn fail_pending<F: FnMut(Completion<T>)>(&mut self, on: &mut F) {
-        // The conductor's own releases are not reported.
+        // The conductor's own requests are not reported.
+        if self
+            .pending
+            .iter()
+            .any(|pending| pending.kind == Kind::DroppedCounter)
+        {
+            self.dropped_counter_answered(None);
+        }
         self.unknown.extend(
             self.pending
                 .drain(..)
-                .filter(|pending| pending.kind != Kind::ReleaseCounter)
+                .filter(|pending| !pending.kind.internal())
                 .map(|pending| pending.sequence),
         );
         self.deliver_unknown(on);
@@ -928,6 +1101,8 @@ impl<T: TermBytes> ClientConductor<T> {
 
 impl<T: TermBytes> Drop for ClientConductor<T> {
     fn drop(&mut self) {
+        // The conductor's own counter makes its last access first.
+        self.dropped_counter = DroppedCounter::Unavailable;
         drop(self.producer.take());
         self.link.mark_closed();
     }
@@ -996,6 +1171,7 @@ mod tests {
             },
             lease: Lease::acquire(&leases, &Arc::new(LeaseEnd::default())),
             generation: None,
+            publication: None,
         });
         let response = Response::PublicationReady {
             request: RequestId {

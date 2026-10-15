@@ -52,6 +52,14 @@
 //! | `spare reservations in use` | gauge | spare-slot credits in use as admission counts them (publisher credits plus subscriber credits), over all streams and retained mappings |
 //! | `loans outstanding` | gauge | non-zero loan words, over all streams and retained mappings |
 //! | `retirement pool exhausted` | event | reconfigurations refused because `max_retained_generations` predecessors are retained |
+//! | `error events dropped` | event | error events lost before reaching the error log |
+//! | `error records overwritten` | event | error log records overwritten |
+//! | `loss records overwritten` | event | loss report records overwritten |
+//! | `loss reports unverified` | event | `ReportLoss` records of a subscription that had already ended |
+//! | `overruns rejoin at head` | event | reported overruns whose applied policy was `rejoin at head` |
+//! | `overruns snapshot` | event | reported overruns whose applied policy was `snapshot`, whether it rebuilt or failed |
+//! | `overruns close` | event | reported overruns whose applied policy was `close` |
+//! | `replay fallbacks` | event | reported overruns whose `replay` policy fell back; each is also counted under its secondary |
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! "Per-stream positions") are allocated, set and released only inside a
@@ -85,7 +93,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 42] = [
+const LABELS: [(u64, &str); 47] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -128,6 +136,11 @@ const LABELS: [(u64, &str); 42] = [
     (TYPE_EVENTS, "error events dropped"),
     (TYPE_EVENTS, "error records overwritten"),
     (TYPE_EVENTS, "loss records overwritten"),
+    (TYPE_EVENTS, "loss reports unverified"),
+    (TYPE_EVENTS, "overruns rejoin at head"),
+    (TYPE_EVENTS, "overruns snapshot"),
+    (TYPE_EVENTS, "overruns close"),
+    (TYPE_EVENTS, "replay fallbacks"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -235,6 +248,19 @@ pub(crate) enum Event {
     ErrorRecordsOverwritten,
     /// Loss report records overwritten.
     LossRecordsOverwritten,
+    /// Loss reports recorded unverified: their subscription had already
+    /// ended.
+    LossReportsUnverified,
+    /// Reported overruns whose applied policy was `rejoin at head`.
+    OverrunsRejoinAtHead,
+    /// Reported overruns whose applied policy was `snapshot`, rebuilt or
+    /// failed.
+    OverrunsSnapshot,
+    /// Reported overruns whose applied policy was `close`.
+    OverrunsClose,
+    /// Reported overruns whose `replay` policy fell back to its secondary,
+    /// which is also counted under its own policy.
+    ReplayFallbacks,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -459,6 +485,11 @@ mod tests {
             (Event::ErrorEventsDropped, "error events dropped"),
             (Event::ErrorRecordsOverwritten, "error records overwritten"),
             (Event::LossRecordsOverwritten, "loss records overwritten"),
+            (Event::LossReportsUnverified, "loss reports unverified"),
+            (Event::OverrunsRejoinAtHead, "overruns rejoin at head"),
+            (Event::OverrunsSnapshot, "overruns snapshot"),
+            (Event::OverrunsClose, "overruns close"),
+            (Event::ReplayFallbacks, "replay fallbacks"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

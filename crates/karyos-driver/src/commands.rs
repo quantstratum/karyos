@@ -20,6 +20,20 @@
 //! `ReleaseCounter` is a protocol violation, which frees nothing and
 //! retires the client as faulty, without a response. A client's remaining
 //! cells are freed only when its slot is removed after its close flag.
+//!
+//! Loss reports (`quantstratum-docs:
+//! karyos/design/observability-and-tools.md`, "Loss reports from clients"):
+//! `ReportLoss` is attributed to the client whose ring carried it. A report
+//! naming another driver instance, a stream registration, incarnation or
+//! subscription registration this driver never issued, or a live
+//! registration that is not a subscription of the sending client on the
+//! named stream, is a protocol violation: nothing is recorded and the
+//! client is retired as faulty. A live subscription of the sender gives a
+//! verified record; one that has already ended gives a record flagged
+//! unverified, counted in `loss reports unverified`. Every record counts
+//! once under the policy actually applied (`overruns rejoin at head`,
+//! `overruns snapshot` whether the source rebuilt or failed, `overruns
+//! close`), and a `replay` fallback also in `replay fallbacks`.
 
 use std::sync::Arc;
 
@@ -29,7 +43,8 @@ use karyos_client::link::{
 };
 use karyos_protocol::cnc::{
     CloseReason, Command, CounterLabel, ErrorCode, Event as DriverEvent, LossPolicyCode,
-    MAX_COMMAND_LENGTH, MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey,
+    MAX_COMMAND_LENGTH, MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RejoinOutcomeCode, RejoinPolicyCode,
+    ReportedLoss, RequestId, Response, StreamKey,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::counters::{CounterKeys, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER};
@@ -509,16 +524,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 continue;
             };
             self.counters.add(Event::CommandsServed, 1);
-            let Some(response) = self.serve(client, &link, command) else {
-                // A protocol violation: no response, the client is faulty.
-                self.diagnostics.error(
-                    &mut self.counters,
-                    crate::diagnostics::ErrorCode::ClientProtocolViolation,
-                    [client, copied.map_or(0, |(type_id, _)| u64::from(type_id))],
-                    "release of a counter the client does not own; the client is retired",
-                );
-                self.retire_faulty(index);
-                continue;
+            let response = match self.serve(client, &link, command) {
+                Ok(response) => response,
+                Err(violation) => {
+                    // A protocol violation: no response, the client is
+                    // faulty.
+                    self.diagnostics.error(
+                        &mut self.counters,
+                        crate::diagnostics::ErrorCode::ClientProtocolViolation,
+                        [client, u64::from(command.type_id())],
+                        violation,
+                    );
+                    self.retire_faulty(index);
+                    continue;
+                }
             };
             if matches!(response, Response::Error { .. }) {
                 self.counters.add(Event::CommandsRefused, 1);
@@ -551,30 +570,121 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.clients.iter().map(|slot| slot.link.held()).sum()
     }
 
-    /// Serves one decoded command: its single response, or `None` for a
-    /// protocol violation, which has no effect.
+    /// Serves one decoded command: its single response, or, for a
+    /// protocol violation, which has no effect, the error log's message.
     fn serve(
         &mut self,
         client: u64,
         link: &Arc<ClientLink<T>>,
         command: Command,
-    ) -> Option<Response> {
-        if let Command::ReleaseCounter {
-            sequence,
-            cell,
-            registration,
-        } = command
-        {
-            // Only the owner's release of its exact allocation: anything
-            // else frees nothing and is a protocol violation.
-            return self
-                .client_counters
-                .release(client, cell, registration)
-                .then_some(Response::OperationSucceeded {
+    ) -> Result<Response, &'static str> {
+        match command {
+            Command::ReleaseCounter {
+                sequence,
+                cell,
+                registration,
+            } => {
+                // Only the owner's release of its exact allocation: anything
+                // else frees nothing and is a protocol violation.
+                if self.client_counters.release(client, cell, registration) {
+                    Ok(Response::OperationSucceeded {
+                        request: RequestId { client, sequence },
+                    })
+                } else {
+                    Err("release of a counter the client does not own; the client is retired")
+                }
+            }
+            Command::ReportLoss { sequence, loss } => {
+                self.report_loss(client, &loss)?;
+                Ok(Response::OperationSucceeded {
                     request: RequestId { client, sequence },
-                });
+                })
+            }
+            _ => Ok(self.execute(client, link, command)),
         }
-        Some(self.execute(client, link, command))
+    }
+
+    /// Serves `ReportLoss` from `client` (see the module documentation):
+    /// appends the loss record and counts the overrun, or returns the
+    /// violation's message and records nothing.
+    fn report_loss(&mut self, client: u64, loss: &ReportedLoss) -> Result<(), &'static str> {
+        if loss.driver != self.driver_id {
+            return Err("loss report of another driver instance; the client is retired");
+        }
+        let issued = |id: u64, next: u64| id != 0 && id < next;
+        if !issued(loss.stream_registration, self.next_stream)
+            || loss.incarnation != crate::embedded::FIRST_INCARNATION
+            || !issued(loss.subscription, self.next_registration)
+        {
+            return Err("loss report of an identity never issued; the client is retired");
+        }
+        let verified = match self
+            .registrations
+            .iter()
+            .find(|r| r.id == loss.subscription)
+        {
+            Some(live)
+                if live.client == client
+                    && live.kind == Kind::Subscription
+                    && live.stream == loss.stream_registration =>
+            {
+                true
+            }
+            Some(_) => {
+                return Err(
+                    "loss report of a registration that is not the client's subscription on that stream; the client is retired",
+                );
+            }
+            // Ended: its owner can no longer be checked.
+            None => false,
+        };
+        let stream_id = self
+            .streams
+            .iter()
+            .find(|s| s.id == loss.stream_registration)
+            .map_or(0, |s| u64::from(s.stream_id.cast_unsigned()));
+        let [high, low] = loss.driver;
+        self.diagnostics.loss(
+            &mut self.counters,
+            karyos_sys::diag::LossRecord {
+                kind: crate::diagnostics::LossKind::Overrun as u16,
+                reason: loss.fallback.map_or(0, |reason| u16::from(reason as u8)),
+                lane: loss.lane,
+                configured_policy: loss.configured as u8,
+                applied_policy: loss.applied as u8,
+                flags: if verified {
+                    0
+                } else {
+                    crate::diagnostics::LOSS_UNVERIFIED
+                },
+                instance: u128::from(high) << 64 | u128::from(low),
+                stream_registration: loss.stream_registration,
+                incarnation: loss.incarnation,
+                stream_id,
+                from: loss.from,
+                to: loss.to,
+                participant: loss.subscription,
+                client,
+                ..karyos_sys::diag::LossRecord::default()
+            },
+        );
+        if !verified {
+            self.counters.add(Event::LossReportsUnverified, 1);
+        }
+        self.counters.add(
+            match loss.applied {
+                RejoinOutcomeCode::ResumedAtHead => Event::OverrunsRejoinAtHead,
+                RejoinOutcomeCode::SnapshotRebuilt | RejoinOutcomeCode::SnapshotFailed => {
+                    Event::OverrunsSnapshot
+                }
+                RejoinOutcomeCode::Closed => Event::OverrunsClose,
+            },
+            1,
+        );
+        if loss.configured == RejoinPolicyCode::Replay {
+            self.counters.add(Event::ReplayFallbacks, 1);
+        }
+        Ok(())
     }
 
     /// Preflight, then effect. Returns the single response.
@@ -688,6 +798,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     },
                 };
                 let generation = Some(target.join(member));
+                let publication = karyos_protocol::trace_hook::PublicationIdentity {
+                    driver: self.driver_id,
+                    registration: target.id,
+                    stream_id: target.stream_id,
+                    session_id: target.session_id,
+                    incarnation: crate::embedded::FIRST_INCARNATION,
+                };
                 let end = Arc::new(LeaseEnd::default());
                 let lease = Lease::acquire(&target.leases, &end);
                 self.next_registration = next;
@@ -696,6 +813,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     capability,
                     lease,
                     generation,
+                    publication: Some(publication),
                 });
                 let stream_id = target.id;
                 if let Some(next) = occupant_used {
@@ -750,9 +868,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 participant,
                 ..
             } => self.allocate_counter(client, request, type_id, label, stream, participant),
-            // Served by `serve`, which never passes it here.
+            // Served by `serve`, which never passes them here.
             Command::ReleaseCounter { registration, .. } => {
                 refuse(ErrorCode::UnknownRegistration, registration)
+            }
+            Command::ReportLoss { loss, .. } => {
+                refuse(ErrorCode::UnknownRegistration, loss.subscription)
             }
         }
     }
@@ -2581,5 +2702,296 @@ mod tests {
         assert_eq!(done[0].sequence, request);
         assert!(matches!(done[0].outcome, Outcome::Unknown));
         assert!(matches!(driver.connect(), Err(DriverError::Terminal)));
+    }
+
+    /// A driver with a stream, a raw client and one subscription of it;
+    /// returns the client, its producer and the subscription's
+    /// registration.
+    fn reporting_client(driver: &mut EmbeddedDriver) -> (u64, RingProducer, u64) {
+        let (client, mut producer, _link) = raw_client(driver);
+        let mut observer = driver.broadcast.receiver();
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                // Required: the stream's slot credit admits one optional
+                // reader only, and the driver does not check the role.
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let answered = responses(&mut observer);
+        let [Response::SubscriptionReady { registration, .. }] = answered[..] else {
+            panic!("expected the subscription, got {answered:?}");
+        };
+        (client, producer, registration)
+    }
+
+    /// A report of `subscription` on the driver's first stream.
+    fn reported(driver: &EmbeddedDriver, subscription: u64) -> ReportedLoss {
+        ReportedLoss {
+            driver: driver.driver_id,
+            stream_registration: driver.streams[0].id,
+            incarnation: crate::embedded::FIRST_INCARNATION,
+            subscription,
+            lane: 0,
+            from: 4096,
+            to: 12_288,
+            configured: RejoinPolicyCode::RejoinAtHead,
+            applied: RejoinOutcomeCode::ResumedAtHead,
+            fallback: None,
+        }
+    }
+
+    fn losses(driver: &EmbeddedDriver) -> Vec<karyos_sys::diag::LossRecord> {
+        let mut records = Vec::new();
+        let _ = driver
+            .loss_report()
+            .scan(&mut 0, |_, record| records.push(record));
+        records
+    }
+
+    #[test]
+    fn a_loss_report_of_a_live_subscription_is_recorded_verified() {
+        let mut driver = driver();
+        let (client, mut producer, subscription) = reporting_client(&mut driver);
+        let mut observer = driver.broadcast.receiver();
+        let loss = ReportedLoss {
+            lane: 0,
+            configured: RejoinPolicyCode::Snapshot,
+            applied: RejoinOutcomeCode::SnapshotRebuilt,
+            ..reported(&driver, subscription)
+        };
+        write(&mut producer, Command::ReportLoss { sequence: 2, loss });
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            responses(&mut observer),
+            vec![Response::OperationSucceeded {
+                request: RequestId {
+                    client,
+                    sequence: 2
+                }
+            }]
+        );
+        let [record] = losses(&driver)[..] else {
+            panic!("expected one loss record");
+        };
+        let [high, low] = driver.driver_id;
+        assert_eq!(
+            karyos_sys::diag::LossRecord { time: 0, ..record },
+            karyos_sys::diag::LossRecord {
+                time: 0,
+                kind: crate::diagnostics::LossKind::Overrun as u16,
+                reason: 0,
+                lane: 0,
+                configured_policy: 2,
+                applied_policy: 2,
+                flags: 0,
+                instance: u128::from(high) << 64 | u128::from(low),
+                stream_registration: driver.streams[0].id,
+                incarnation: 1,
+                stream_id: 2,
+                from: 4096,
+                to: 12_288,
+                participant: subscription,
+                client,
+            }
+        );
+        assert!(record.time > 0);
+        assert_eq!(counter(&driver, "overruns snapshot"), 1);
+        assert_eq!(counter(&driver, "loss reports unverified"), 0);
+        assert_eq!(counter(&driver, "clients faulty"), 0);
+    }
+
+    #[test]
+    fn a_loss_report_of_an_ended_subscription_is_recorded_unverified() {
+        let mut driver = driver();
+        let (_, mut producer, subscription) = reporting_client(&mut driver);
+        let mut observer = driver.broadcast.receiver();
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 2,
+                registration: subscription,
+            },
+        );
+        let loss = reported(&driver, subscription);
+        write(&mut producer, Command::ReportLoss { sequence: 3, loss });
+        let _ = driver.do_work().unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(responses(&mut observer).len(), 2);
+        let [record] = losses(&driver)[..] else {
+            panic!("expected one loss record");
+        };
+        assert_eq!(record.flags, crate::diagnostics::LOSS_UNVERIFIED);
+        assert_eq!(record.participant, subscription);
+        assert_eq!(counter(&driver, "loss reports unverified"), 1);
+        assert_eq!(counter(&driver, "overruns rejoin at head"), 1);
+        assert_eq!(counter(&driver, "clients faulty"), 0);
+    }
+
+    #[test]
+    fn a_loss_report_of_a_foreign_or_never_issued_identity_is_a_violation() {
+        type Case = fn(&mut ReportedLoss, u64);
+        let cases: [(&str, Case); 9] = [
+            ("another driver instance", |loss, _| loss.driver[1] ^= 1),
+            ("subscription 0", |loss, _| loss.subscription = 0),
+            ("subscription never issued", |loss, next| {
+                loss.subscription = next;
+            }),
+            ("stream 0", |loss, _| loss.stream_registration = 0),
+            ("stream never issued", |loss, _| {
+                loss.stream_registration += 1;
+            }),
+            ("another incarnation", |loss, _| loss.incarnation = 2),
+            ("another stream", |loss, _| loss.stream_registration = 1),
+            // Patched below: another client's live subscription, and this
+            // client's publication.
+            ("another client's subscription", |_, _| {}),
+            ("a publication", |_, _| {}),
+        ];
+        for (name, case) in cases {
+            let mut driver = driver();
+            // A second stream, issued and live, before the reported one.
+            let mut other = self::driver();
+            let mut moved = other.streams.pop().unwrap();
+            moved.id = driver.next_stream;
+            moved.stream_id = 3;
+            driver.next_stream += 1;
+            driver.streams.insert(0, moved);
+            let stream = driver.streams[1].id;
+            let (owner, _owner_producer, foreign) = reporting_client(&mut driver);
+            let (sender, mut producer, subscription) = reporting_client(&mut driver);
+            let mut loss = ReportedLoss {
+                stream_registration: stream,
+                ..reported(&driver, subscription)
+            };
+            case(&mut loss, driver.next_registration);
+            if name == "another stream" {
+                loss.stream_registration = driver.streams[0].id;
+            }
+            if name == "another client's subscription" {
+                loss.subscription = foreign;
+                assert_ne!(owner, sender);
+            }
+            if name == "a publication" {
+                let mut observer = driver.broadcast.receiver();
+                write(
+                    &mut producer,
+                    Command::AddPublication {
+                        sequence: 5,
+                        stream: KEY,
+                        allow_unconnected: true,
+                    },
+                );
+                let _ = driver.do_work().unwrap();
+                let [Response::PublicationReady { registration, .. }] =
+                    responses(&mut observer)[..]
+                else {
+                    panic!("expected the publication");
+                };
+                loss.subscription = registration;
+            }
+            let mut observer = driver.broadcast.receiver();
+            let faulty = counter(&driver, "clients faulty");
+            write(&mut producer, Command::ReportLoss { sequence: 9, loss });
+            let _ = driver.do_work().unwrap();
+            // No response, the sender retired as faulty, nothing recorded.
+            assert_eq!(responses(&mut observer), Vec::new(), "{name}");
+            assert_eq!(counter(&driver, "clients faulty"), faulty + 1, "{name}");
+            let slot = driver
+                .clients
+                .iter()
+                .find(|slot| slot.id == sender)
+                .unwrap();
+            assert!(slot.consumer.is_none(), "{name}");
+            assert_eq!(losses(&driver), Vec::new(), "{name}");
+            for label in [
+                "overruns rejoin at head",
+                "loss reports unverified",
+                "replay fallbacks",
+            ] {
+                assert_eq!(counter(&driver, label), 0, "{name}: {label}");
+            }
+            // The violation is in the error log under the sender and the
+            // command type.
+            let mut violations = Vec::new();
+            let _ = driver.error_log().scan(&mut 0, |record| {
+                if record.code == crate::diagnostics::ErrorCode::ClientProtocolViolation as u32 {
+                    violations.push(record.key);
+                }
+            });
+            assert_eq!(violations, vec![[sender, 0x08]], "{name}");
+        }
+    }
+
+    #[test]
+    fn overruns_are_counted_by_the_policy_applied() {
+        let mut driver = driver();
+        let (_, mut producer, subscription) = reporting_client(&mut driver);
+        let replay = Some(karyos_protocol::cnc::FallbackReasonCode::NoArchive);
+        let reports = [
+            (
+                RejoinPolicyCode::RejoinAtHead,
+                RejoinOutcomeCode::ResumedAtHead,
+                None,
+            ),
+            (
+                RejoinPolicyCode::Snapshot,
+                RejoinOutcomeCode::SnapshotRebuilt,
+                None,
+            ),
+            (
+                RejoinPolicyCode::Snapshot,
+                RejoinOutcomeCode::SnapshotFailed,
+                None,
+            ),
+            (RejoinPolicyCode::Close, RejoinOutcomeCode::Closed, None),
+            (
+                RejoinPolicyCode::Replay,
+                RejoinOutcomeCode::ResumedAtHead,
+                replay,
+            ),
+            (
+                RejoinPolicyCode::Replay,
+                RejoinOutcomeCode::SnapshotFailed,
+                replay,
+            ),
+            (RejoinPolicyCode::Replay, RejoinOutcomeCode::Closed, replay),
+        ];
+        for (sequence, (configured, applied, fallback)) in (2..).zip(reports) {
+            let loss = ReportedLoss {
+                configured,
+                applied,
+                fallback,
+                ..reported(&driver, subscription)
+            };
+            write(&mut producer, Command::ReportLoss { sequence, loss });
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(counter(&driver, "overruns rejoin at head"), 2);
+        assert_eq!(counter(&driver, "overruns snapshot"), 3);
+        assert_eq!(counter(&driver, "overruns close"), 2);
+        assert_eq!(counter(&driver, "replay fallbacks"), 3);
+        assert_eq!(counter(&driver, "loss reports unverified"), 0);
+        let records = losses(&driver);
+        assert_eq!(records.len(), 7);
+        // A fallback keeps its reason and its secondary's outcome.
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.configured_policy, r.applied_policy, r.reason))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 1, 0),
+                (2, 2, 0),
+                (2, 3, 0),
+                (3, 4, 0),
+                (4, 1, 1),
+                (4, 3, 1),
+                (4, 4, 1)
+            ]
+        );
     }
 }

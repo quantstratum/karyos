@@ -25,6 +25,7 @@ pub mod generation;
 #[cfg(target_os = "linux")]
 pub mod ipc;
 pub mod link;
+pub mod loss;
 pub mod publication;
 pub mod subscription;
 pub mod trace;
@@ -41,6 +42,7 @@ pub use conflated_subscription::ConflatedSubscription;
 pub use counter::{ClientCounterHandle, CounterReleases};
 pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};
+pub use loss::{LOSS_REPORT_QUEUE, LossReports};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
     Aborted, ClientSubscription, InvalidExtensions, MessageInfo, MessageLimit, Overrun, PollError,

@@ -3,7 +3,8 @@
 //! State shared by a client conductor and its driver registration in
 //! embedded mode (quantstratum-docs: karyos/design/client-commands.md): the close flag, the
 //! hand-over table, the capability leases that keep a stream charged
-//! while any of its capabilities lives, and the client's counter releases.
+//! while any of its capabilities lives, the client's counter releases and
+//! its subscriptions' loss reports.
 //!
 //! The hand-over table is control-path state behind a mutex; the data path
 //! never touches it. Crossing processes replaces these mechanisms under
@@ -15,8 +16,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
+use karyos_protocol::trace_hook::PublicationIdentity;
+
 use crate::counter::CounterReleases;
 use crate::generation::GenerationLink;
+use crate::loss::LossReports;
 
 /// Who issued a capability: the driver instance and the client id. A handle
 /// can be removed only through the conductor with the same owner.
@@ -205,6 +209,11 @@ pub struct HandOverEntry<T: TermBytes = HeapTerms> {
     /// The generation link and base the delivered handle starts with
     /// (`quantstratum-docs: karyos/design/mapping-generations.md`), when the driver keeps one.
     pub generation: Option<(Arc<GenerationLink<T>>, u64)>,
+    /// The stream's full publication identity, with which a subscription
+    /// reports its overruns (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Loss reports from
+    /// clients"); `None` reports nothing.
+    pub publication: Option<PublicationIdentity>,
 }
 
 #[derive(Debug)]
@@ -222,6 +231,8 @@ pub struct ClientLink<T: TermBytes = HeapTerms> {
     /// The client's counter handles: their queued releases and how many
     /// are alive.
     counters: Arc<CounterReleases>,
+    /// The loss reports of the client's subscriptions.
+    losses: Arc<LossReports>,
 }
 
 /// Why a hand-over put or take failed.
@@ -240,6 +251,7 @@ impl<T: TermBytes> Default for ClientLink<T> {
                 driver_gone: false,
             }),
             counters: Arc::new(CounterReleases::default()),
+            losses: Arc::new(LossReports::default()),
         }
     }
 }
@@ -277,6 +289,15 @@ impl<T: TermBytes> ClientLink<T> {
     #[must_use]
     pub fn counter_releases(&self) -> &Arc<CounterReleases> {
         &self.counters
+    }
+
+    /// The loss reports the client's subscriptions queued for its
+    /// conductor (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Loss reports from
+    /// clients").
+    #[must_use]
+    pub fn loss_reports(&self) -> &Arc<LossReports> {
+        &self.losses
     }
 
     /// Driver side: holds `entry` for the client (`Held`).
