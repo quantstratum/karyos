@@ -1369,6 +1369,131 @@ fn the_deadline_aborts_a_marked_claim_at_exactly_the_deadline() {
     assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
 }
 
+/// SPEC.md §13 "Commit versus abort" under concurrency (issue #69): a
+/// writer, the deadline aborter with the reclaimer (the conductor's duty
+/// cycle) and a required reader on three threads, also under Miri's data
+/// race detector. The writer pauses after marking, while writing and just
+/// before commit; every eleventh claim waits for the deadline abort and its
+/// commit must lose; every seventh is forgotten in the live process and
+/// aborted by the next call. The reader sees exactly the writer's decisions:
+/// a committed claim's bytes, or an aborted block it never reads.
+#[test]
+fn concurrent_claims_race_the_deadline_the_reader_and_the_reclaimer() {
+    let (total, len): (u32, u32) = if cfg!(miri) { (150, 1024) } else { (3000, 1024) };
+    let buffer = new_buffer(deadline_config(50)).unwrap();
+    let written = AtomicBool::new(false);
+    let finished = AtomicBool::new(false);
+    let aborts = AtomicU64::new(0);
+    // The position of the deadline's last abort, plus one.
+    let last_abort = AtomicU64::new(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    std::thread::scope(|scope| {
+        let duty = scope.spawn(|| {
+            let mut now = 0u64;
+            let mut cleaned = 0;
+            while !finished.load(Ordering::Acquire) {
+                now += 1;
+                if let ClaimDeadline::Aborted { position, .. } =
+                    conductor.abort_expired_claims(now).unwrap()
+                {
+                    aborts.fetch_add(1, Ordering::AcqRel);
+                    last_abort.store(position + 1, Ordering::Release);
+                }
+                cleaned += conductor.duty_cycle().unwrap().cleaned;
+                std::thread::yield_now();
+            }
+            cleaned
+        });
+        let writer = scope.spawn(|| {
+            // Per block: its position, and the sequence it committed.
+            let mut decided = Vec::new();
+            let mut sequence = 0;
+            while sequence < total {
+                match publication.try_claim(len, AppendOptions::default()).unwrap() {
+                    ClaimOutcome::Claimed(mut claim) => {
+                        let position = claim.position();
+                        let data = sized_message(sequence, len as usize);
+                        let half = data.len() / 2;
+                        std::thread::yield_now();
+                        claim.payload()[..half].copy_from_slice(&data[..half]);
+                        std::thread::yield_now();
+                        claim.payload()[half..].copy_from_slice(&data[half..]);
+                        if sequence % 7 == 6 {
+                            // Forgotten: the next call aborts it.
+                            core::mem::forget(claim);
+                            decided.push((position, None));
+                        } else {
+                            if sequence % 11 == 10 {
+                                // The deadline aborts this claim first.
+                                while last_abort.load(Ordering::Acquire) != position + 1 {
+                                    std::thread::yield_now();
+                                }
+                            }
+                            std::thread::yield_now();
+                            match claim.commit() {
+                                CommitOutcome::Committed { position: at } => {
+                                    assert_ne!(sequence % 11, 10, "a commit after the abort won");
+                                    assert_eq!(at, position);
+                                    decided.push((position, Some(sequence)));
+                                }
+                                CommitOutcome::Aborted { position: at } => {
+                                    assert_eq!(at, position);
+                                    decided.push((position, None));
+                                }
+                            }
+                        }
+                        sequence += 1;
+                    }
+                    // Aborted before it was marked: nothing was written.
+                    ClaimOutcome::Aborted { position } => decided.push((position, None)),
+                    _ => std::thread::yield_now(),
+                }
+            }
+            publication.close();
+            written.store(true, Ordering::Release);
+            decided
+        });
+        let mut seen = Vec::new();
+        let mut out = vec![0u8; len as usize];
+        loop {
+            match subscription.poll(&mut out).unwrap() {
+                PollOutcome::Message {
+                    position, length, ..
+                } => {
+                    let sequence = u32::from_le_bytes(out[..4].try_into().unwrap());
+                    assert_eq!(&out[..length as usize], &sized_message(sequence, len as usize)[..]);
+                    subscription.acknowledge();
+                    seen.push((position, Some(sequence)));
+                }
+                PollOutcome::Aborted { position, .. } => seen.push((position, None)),
+                PollOutcome::Pending => {
+                    // A failed writer ends the run; its join reports why.
+                    if writer.is_finished() && !written.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if written.load(Ordering::Acquire)
+                        && subscription.position() >= buffer.reserved_head().load(Ordering::Acquire)
+                    {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        finished.store(true, Ordering::Release);
+        let decided = writer.join().unwrap();
+        let cleaned = duty.join().unwrap();
+        assert_eq!(seen, decided);
+        assert!(cleaned > 0, "nothing was reclaimed");
+        // At least every claim that waited for the deadline was aborted by it.
+        let waited = (0..total).filter(|s| s % 11 == 10 && s % 7 != 6).count();
+        assert!(aborts.load(Ordering::Acquire) >= waited as u64);
+    });
+}
+
 #[test]
 fn the_deadline_aborts_claims_with_end_of_stream_and_extension() {
     let buffer = new_buffer(deadline_config(DEADLINE)).unwrap();
