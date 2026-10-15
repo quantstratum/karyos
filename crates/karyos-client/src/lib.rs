@@ -42,6 +42,7 @@ pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
     Aborted, ClientSubscription, InvalidExtensions, MessageInfo, MessageLimit, Overrun, PollError,
-    PollSummary, Skipped,
+    PollSummary, RejoinOutcome, RejoinPolicy, ReplayFallbackReason, Secondary, SecondaryOutcome,
+    Skipped, SnapshotFailed, SnapshotSource,
 };
 pub use trace::TraceDecision;

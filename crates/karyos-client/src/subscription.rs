@@ -10,6 +10,12 @@
 //! if the handler panics, the panic unwinds before the acknowledgement and
 //! the next poll delivers the same message again. An optional subscription's
 //! copy is its acknowledgement, so a failed handler is not replayed.
+//!
+//! An overrun optional or observer reader follows its rejoin policy
+//! (`quantstratum-docs: karyos/design/rejoin-policies.md`, SPEC.md §4,
+//! Recovery of an overrun reader): it rejoins at the head, rebuilds through
+//! a snapshot source, or closes; `replay` falls back to a secondary policy
+//! in phase 1, which has no Archive.
 
 use std::sync::Arc;
 
@@ -103,6 +109,154 @@ pub struct Overrun {
     pub resume: u64,
 }
 
+/// The application's rebuild of its state after an overrun
+/// (`quantstratum-docs: karyos/design/rejoin-policies.md`, `snapshot`).
+pub trait SnapshotSource: Send {
+    /// Brings the application's state to where it would be after consuming
+    /// every message before `overrun.resume`. Runs once per overrun, on the
+    /// polling thread, outside any loan, before any message at or after
+    /// `resume` is delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotFailed`] when the state could not be rebuilt; the
+    /// subscription then closes rather than resume on top of it.
+    fn rebuild(&mut self, overrun: &Overrun) -> Result<(), SnapshotFailed>;
+}
+
+/// A snapshot source could not rebuild the application's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, thiserror::Error)]
+#[error("the snapshot source could not rebuild the state")]
+pub struct SnapshotFailed;
+
+/// What follows an overrun of an optional or observer reader, declared at
+/// creation (SPEC.md §4 and §10). A required reader is never lapped, so for
+/// it the policy is accepted and never used.
+#[derive(Default)]
+pub enum RejoinPolicy {
+    /// Delivery continues at the head (the default).
+    #[default]
+    RejoinAtHead,
+    /// The source rebuilds the state before delivery continues at the head.
+    Snapshot(Box<dyn SnapshotSource>),
+    /// The subscription disposes of its live state and stays closed.
+    Close,
+    /// Replay from a recording; in phase 1 there is no Archive, so the
+    /// secondary policy applies and the outcome reports why.
+    Replay {
+        /// The policy applied instead.
+        secondary: Secondary,
+    },
+}
+
+/// The policy `replay` falls back to.
+pub enum Secondary {
+    /// As [`RejoinPolicy::RejoinAtHead`].
+    RejoinAtHead,
+    /// As [`RejoinPolicy::Snapshot`].
+    Snapshot(Box<dyn SnapshotSource>),
+    /// As [`RejoinPolicy::Close`].
+    Close,
+}
+
+impl core::fmt::Debug for RejoinPolicy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RejoinAtHead => f.write_str("RejoinAtHead"),
+            Self::Snapshot(_) => f.write_str("Snapshot(..)"),
+            Self::Close => f.write_str("Close"),
+            Self::Replay { secondary } => f
+                .debug_struct("Replay")
+                .field("secondary", secondary)
+                .finish(),
+        }
+    }
+}
+
+impl core::fmt::Debug for Secondary {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::RejoinAtHead => f.write_str("RejoinAtHead"),
+            Self::Snapshot(_) => f.write_str("Snapshot(..)"),
+            Self::Close => f.write_str("Close"),
+        }
+    }
+}
+
+/// What a non-replay policy did after an overrun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryOutcome {
+    /// Delivery continues at `resume`.
+    ResumedAtHead,
+    /// The snapshot source rebuilt the state; delivery continues at
+    /// `resume`.
+    SnapshotRebuilt,
+    /// The snapshot source failed or panicked: the subscription is closed.
+    SnapshotFailed,
+    /// The subscription is closed.
+    Closed,
+}
+
+/// Why `replay` was not used. The values are fixed now, so they never
+/// change meaning when phase 3 adds Archive replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayFallbackReason {
+    /// No Archive exists (phase 1).
+    NoArchive,
+    /// No recording covers the gap (phase 3).
+    NoRecording,
+    /// The recording's retention does not reach the gap (phase 3).
+    RetentionShort,
+}
+
+/// What the rejoin policy did after an overrun, reported with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejoinOutcome {
+    /// Delivery continues at `resume`.
+    ResumedAtHead,
+    /// The snapshot source rebuilt the state; delivery continues at
+    /// `resume`.
+    SnapshotRebuilt,
+    /// The snapshot source failed or panicked: the subscription is closed.
+    SnapshotFailed,
+    /// The subscription is closed.
+    Closed,
+    /// `replay` fell back to its secondary policy.
+    ReplayFallback {
+        /// Why replay was not used.
+        reason: ReplayFallbackReason,
+        /// What the secondary policy did.
+        secondary: SecondaryOutcome,
+    },
+}
+
+impl RejoinOutcome {
+    /// Whether the outcome closed the subscription.
+    #[must_use]
+    pub fn closed(self) -> bool {
+        matches!(
+            self,
+            Self::SnapshotFailed
+                | Self::Closed
+                | Self::ReplayFallback {
+                    secondary: SecondaryOutcome::SnapshotFailed | SecondaryOutcome::Closed,
+                    ..
+                }
+        )
+    }
+}
+
+impl From<SecondaryOutcome> for RejoinOutcome {
+    fn from(outcome: SecondaryOutcome) -> Self {
+        match outcome {
+            SecondaryOutcome::ResumedAtHead => Self::ResumedAtHead,
+            SecondaryOutcome::SnapshotRebuilt => Self::SnapshotRebuilt,
+            SecondaryOutcome::SnapshotFailed => Self::SnapshotFailed,
+            SecondaryOutcome::Closed => Self::Closed,
+        }
+    }
+}
+
 /// An aborted block the poll skipped: the claim that reserved it never
 /// committed, so its extent carries no message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +303,12 @@ pub struct PollSummary {
     /// client was lost (quantstratum-docs: `karyos/design/required-participant-loss.md`): the subscription is over, and every later
     /// poll reports it again.
     pub revoked: Option<u64>,
+    /// What the rejoin policy did, set together with `overrun`, and again
+    /// on every later poll of a subscription it closed.
+    pub rejoin: Option<RejoinOutcome>,
+    /// The lost range, when the rejoin policy closed the subscription:
+    /// every later poll reports the same, touching no buffer or link.
+    pub closed_by_overrun: Option<Overrun>,
 }
 
 /// A poll that failed after possibly delivering messages: `summary` reports
@@ -165,7 +325,14 @@ pub struct PollError {
 /// A subscription on one stream.
 #[derive(Debug)]
 pub struct ClientSubscription<T: TermBytes = HeapTerms> {
-    inner: Subscription<Arc<LogBuffer<T>>>,
+    /// The live cell; `None` once the rejoin policy closed the
+    /// subscription.
+    inner: Option<Subscription<Arc<LogBuffer<T>>>>,
+    /// What follows an overrun.
+    rejoin: RejoinPolicy,
+    /// A closure by the rejoin policy: the lost range, the outcome and the
+    /// acknowledged position, reported by every later poll.
+    closed: Option<(Overrun, RejoinOutcome, u64)>,
     scratch: Box<[u8]>,
     origin: Option<Origin>,
     /// The link to the stream's successor mappings, if the driver gave one
@@ -204,7 +371,9 @@ impl<T: TermBytes> ClientSubscription<T> {
     pub fn new(inner: Subscription<Arc<LogBuffer<T>>>) -> Self {
         let max_message_length = inner.buffer().max_message_length();
         Self {
-            inner,
+            inner: Some(inner),
+            rejoin: RejoinPolicy::RejoinAtHead,
+            closed: None,
             scratch: vec![0u8; max_message_length as usize].into_boxed_slice(),
             origin: None,
             link: None,
@@ -214,6 +383,14 @@ impl<T: TermBytes> ClientSubscription<T> {
             _lease: None,
             _export: None,
         }
+    }
+
+    /// Sets what follows an overrun (control path; the default is
+    /// [`RejoinPolicy::RejoinAtHead`]).
+    #[must_use]
+    pub fn with_rejoin(mut self, policy: RejoinPolicy) -> Self {
+        self.rejoin = policy;
+        self
     }
 
     /// Records the `SubscriberPoll` observation of every traced message
@@ -269,14 +446,19 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// # Errors
     ///
     /// Returns [`ClientError::PositionsExhausted`] when the mapping starting
-    /// at `base` could report a position at or above `2^63`; the handle is
-    /// then dropped, releasing what it holds.
+    /// at `base` could report a position at or above `2^63`, and
+    /// [`ClientError::ClosedByOverrun`] for a subscription its rejoin policy
+    /// closed, which no cutover may reach; the handle is then dropped,
+    /// releasing what it holds.
     pub fn with_generation(
         mut self,
         link: Arc<GenerationLink<T>>,
         base: u64,
     ) -> Result<Self, ClientError> {
-        if !representable(base, self.inner.buffer()) {
+        let Some(inner) = &self.inner else {
+            return Err(ClientError::ClosedByOverrun);
+        };
+        if !representable(base, inner.buffer()) {
             return Err(ClientError::PositionsExhausted { base });
         }
         self.link = Some(link);
@@ -345,6 +527,11 @@ impl<T: TermBytes> ClientSubscription<T> {
     {
         let message_limit = message_limit.get();
         let mut summary = PollSummary::default();
+        if let Some((overrun, outcome, _)) = self.closed {
+            summary.rejoin = Some(outcome);
+            summary.closed_by_overrun = Some(overrun);
+            return Ok(summary);
+        }
         if message_limit == 0 {
             return Ok(summary);
         }
@@ -353,7 +540,10 @@ impl<T: TermBytes> ClientSubscription<T> {
             if summary.delivered == message_limit {
                 break;
             }
-            let outcome = match self.inner.poll(&mut self.scratch) {
+            let Some(inner) = self.inner.as_mut() else {
+                break;
+            };
+            let outcome = match inner.poll(&mut self.scratch) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     return Err(PollError {
@@ -381,9 +571,9 @@ impl<T: TermBytes> ClientSubscription<T> {
                         if decoded.is_none() && extension.is_some() {
                             self.invalid_extensions.count_one();
                         }
-                        let lane = self.inner.buffer().lane();
+                        let lane = inner.buffer().lane();
                         // The read cursor is already past the message.
-                        let end = self.base + self.inner.position();
+                        let end = self.base + inner.position();
                         trace.attempt(decoded.as_ref(), lane, info.position, end);
                     } else if extension.is_some_and(|bytes| TraceExtension::decode(&bytes).is_err())
                     {
@@ -392,7 +582,7 @@ impl<T: TermBytes> ClientSubscription<T> {
                     let message = self.scratch.get(..length as usize).unwrap_or(&[]);
                     handler(message, info);
                     // Reached only if the handler returned.
-                    self.inner.acknowledge();
+                    inner.acknowledge();
                     summary.delivered += 1;
                 }
                 PollOutcome::Overrun {
@@ -400,11 +590,17 @@ impl<T: TermBytes> ClientSubscription<T> {
                     lost_to,
                     resume,
                 } => {
-                    summary.overrun = Some(Overrun {
+                    let overrun = Overrun {
                         from: self.base + from,
                         lost_to: self.base + lost_to,
                         resume: self.base + resume,
-                    });
+                    };
+                    summary.overrun = Some(overrun);
+                    let outcome = self.rejoin(&overrun);
+                    summary.rejoin = Some(outcome);
+                    if outcome.closed() {
+                        summary.closed_by_overrun = Some(overrun);
+                    }
                     break;
                 }
                 PollOutcome::Aborted { position, extent } => {
@@ -451,7 +647,57 @@ impl<T: TermBytes> ClientSubscription<T> {
     #[inline]
     #[must_use]
     pub fn position(&self) -> u64 {
-        self.base + self.inner.acknowledged_position()
+        match (&self.inner, self.closed) {
+            (Some(inner), _) => self.base + inner.acknowledged_position(),
+            (None, Some((_, _, position))) => position,
+            (None, None) => self.base,
+        }
+    }
+
+    /// Whether the rejoin policy closed the subscription.
+    #[must_use]
+    pub fn is_closed_by_overrun(&self) -> bool {
+        self.closed.is_some()
+    }
+
+    /// Applies the rejoin policy after `overrun` was reported (the poll
+    /// that observed it, outside any loan).
+    fn rejoin(&mut self, overrun: &Overrun) -> RejoinOutcome {
+        let outcome = match &mut self.rejoin {
+            RejoinPolicy::RejoinAtHead => RejoinOutcome::ResumedAtHead,
+            RejoinPolicy::Snapshot(source) => rebuild(source.as_mut(), overrun).into(),
+            RejoinPolicy::Close => RejoinOutcome::Closed,
+            RejoinPolicy::Replay { secondary } => RejoinOutcome::ReplayFallback {
+                reason: ReplayFallbackReason::NoArchive,
+                secondary: match secondary {
+                    Secondary::RejoinAtHead => SecondaryOutcome::ResumedAtHead,
+                    Secondary::Snapshot(source) => rebuild(source.as_mut(), overrun),
+                    Secondary::Close => SecondaryOutcome::Closed,
+                },
+            },
+        };
+        if outcome.closed() {
+            self.close_by_overrun(*overrun, outcome);
+        }
+        outcome
+    }
+
+    /// The `close` policy: disposes of the whole live state at once. The
+    /// cell detaches (its last access, outside any loan), the generation
+    /// link closes for good and its offered successor is dropped, which
+    /// detaches its cell, then the link, the stream lease and a remote
+    /// grant's export are released; only the closure result stays.
+    fn close_by_overrun(&mut self, overrun: Overrun, outcome: RejoinOutcome) {
+        let position = self.position();
+        drop(self.inner.take());
+        if let Some(link) = self.link.take() {
+            drop(link.close());
+            // A remote handle's predecessor or failed successor, if any.
+            drop(link.take_retired());
+        }
+        self._lease = None;
+        self._export = None;
+        self.closed = Some((overrun, outcome, position));
     }
 
     /// The poll reached the seal of the handle's mapping. With a link,
@@ -459,14 +705,15 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// cutover (`Some(false)`); `None` when no successor will come.
     fn after_end(&mut self) -> Option<bool> {
         let link = self.link.as_ref()?;
-        match link.next(self.inner.buffer().sealed_with_successor()) {
+        let inner = self.inner.as_ref()?;
+        match link.next(inner.buffer().sealed_with_successor()) {
             Next::Wait => Some(false),
             Next::Moved {
                 base,
                 successor: Successor::Subscription { inner, scratch },
             } => {
                 // The predecessor's cell is detached by this drop.
-                self.inner = inner;
+                self.inner = Some(inner);
                 self.scratch = scratch;
                 self.base = base;
                 Some(true)
@@ -483,7 +730,9 @@ impl<T: TermBytes> ClientSubscription<T> {
                     },
             } => match prepared.activate() {
                 Ok(inner) => {
-                    let predecessor = core::mem::replace(&mut self.inner, inner);
+                    let Some(predecessor) = self.inner.replace(inner) else {
+                        unreachable!("a handle at its seal holds its cell")
+                    };
                     let predecessor_scratch = core::mem::replace(&mut self.scratch, scratch);
                     let predecessor_export = self._export.replace(export);
                     self.base = base;
@@ -520,6 +769,14 @@ impl<T: TermBytes> ClientSubscription<T> {
             // A successor of another kind is a driver bug: never used.
             Next::Moved { .. } | Next::End => None,
         }
+    }
+}
+
+/// Runs `source` once for `overrun`; a panic counts as a failure.
+fn rebuild(source: &mut dyn SnapshotSource, overrun: &Overrun) -> SecondaryOutcome {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.rebuild(overrun))) {
+        Ok(Ok(())) => SecondaryOutcome::SnapshotRebuilt,
+        Ok(Err(SnapshotFailed)) | Err(_) => SecondaryOutcome::SnapshotFailed,
     }
 }
 

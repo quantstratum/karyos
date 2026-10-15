@@ -27,6 +27,11 @@ pub enum ClientError {
         /// The rejected base.
         base: u64,
     },
+    /// The subscription was closed by its rejoin policy after an overrun
+    /// (`quantstratum-docs: karyos/design/rejoin-policies.md`): it takes no
+    /// generation link.
+    #[error("the subscription was closed by its rejoin policy")]
+    ClosedByOverrun,
     /// A conflated publication rejected its key or value size.
     #[error(transparent)]
     Conflation(#[from] ConflationError),
