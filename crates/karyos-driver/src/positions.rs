@@ -246,6 +246,7 @@ mod tests {
             },
             allow_unconnected: true,
             on_required_loss: LossPolicy::Hold,
+            conflation: None,
         }
     }
 
