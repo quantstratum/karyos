@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 use karyos_client::ipc::{RemoteClient, attach};
 use karyos_client::{Completion, Fetchable, MessageLimit, OfferOutcome, Outcome};
 use karyos_driver::{
-    DriverConfig, EmbeddedDriver, IpcConfig, LossPolicy, StreamConfig, StreamHandle, SystemClock,
+    DriverConfig, EmbeddedDriver, IpcConfig, LossPolicy, SealState, StreamConfig, StreamHandle,
+    SystemClock,
 };
 use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
 use karyos_sys::counters::CellRead;
@@ -54,10 +55,15 @@ fn dir(name: &str) -> PathBuf {
 /// only there), so a restart retries briefly while the old socket still
 /// answers.
 fn driver(dir: &Path) -> IpcDriver {
+    driver_with(dir, DriverConfig::default())
+}
+
+/// As [`driver`], with `config`.
+fn driver_with(dir: &Path, config: DriverConfig) -> IpcDriver {
     let start = Instant::now();
     loop {
         let created = EmbeddedDriver::with_ipc(
-            DriverConfig::default(),
+            config,
             IpcConfig {
                 dir: dir.to_path_buf(),
                 max_pending_hellos: 4,
@@ -634,6 +640,122 @@ fn test_ipc_data_a_stopped_required_subscriber_back_pressures_the_publisher() {
     assert!(child.0.wait().unwrap().success());
 }
 
+/// How a stopped required subscriber's test ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// SIGCONT: the resumed client finds itself revoked and disconnected.
+    Resumed,
+    /// SIGKILL: the exit proof frees its cell.
+    Killed,
+}
+
+/// p4c (`quantstratum-docs: karyos/design/required-participant-loss.md`,
+/// Cross-process): a required subscriber process stopped with SIGSTOP
+/// until the driver times its client out, under `policy`, then resumed or
+/// killed.
+fn stopped_required_subscriber(policy: LossPolicy, ending: Ending) {
+    let name = format!("stopped-{policy:?}-{ending:?}").to_lowercase();
+    let dir = dir(&name);
+    // A short liveness timeout of the system clock: ten driver heartbeat
+    // intervals of 50 ms, beyond the client's 100 ms beat.
+    let mut driver = driver_with(
+        &dir,
+        DriverConfig {
+            heartbeat_interval: 50_000_000,
+            client_liveness_timeout: 500_000_000,
+            ..DriverConfig::default()
+        },
+    );
+    let stream = add_stream_with_policy(&mut driver, policy);
+    let (mut child, reports) = spawn("subscribe-until-revoked", &dir);
+    serve_until_report(&mut driver, &reports, "subscribed");
+    signal(&child.0, "STOP");
+    serve_until(&mut driver, |driver| {
+        counter(driver, "clients timed out") == 1
+    });
+    assert_eq!(counter(&driver, "required participants lost"), 1);
+    match policy {
+        // The bound may wait for a loan the stopped reader holds; the loss
+        // itself is enough here.
+        LossPolicy::Hold => {}
+        // The bound is withdrawn at once: the writer is never held back.
+        LossPolicy::Continue => {
+            let mut publication = driver.publication(stream).unwrap();
+            let payload = [9u8; 1000];
+            let mut accepted = 0u32;
+            let start = Instant::now();
+            while accepted < 500 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "held at {accepted}"
+                );
+                let _ = driver.do_work().unwrap();
+                if let OfferOutcome::Accepted { .. } = publication.offer(&payload).unwrap() {
+                    accepted += 1;
+                }
+            }
+        }
+        LossPolicy::Abort => {
+            assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
+        }
+    }
+    match ending {
+        Ending::Resumed => {
+            signal(&child.0, "CONT");
+            serve_until_report(&mut driver, &reports, "revoked and disconnected");
+            assert!(child.0.wait().unwrap().success());
+        }
+        Ending::Killed => {
+            child.0.kill().unwrap();
+            let _ = child.0.wait();
+            serve_until(&mut driver, |driver| driver.clients() == 0);
+            // The exit proof ended its grant and freed its cell.
+            assert_eq!(counter(&driver, "grants ended"), 1);
+        }
+    }
+}
+
+#[test]
+fn test_ipc_loss_a_stopped_required_subscriber_under_hold() {
+    stopped_required_subscriber(LossPolicy::Hold, Ending::Resumed);
+    stopped_required_subscriber(LossPolicy::Hold, Ending::Killed);
+}
+
+#[test]
+fn test_ipc_loss_a_stopped_required_subscriber_under_continue() {
+    stopped_required_subscriber(LossPolicy::Continue, Ending::Resumed);
+    stopped_required_subscriber(LossPolicy::Continue, Ending::Killed);
+}
+
+#[test]
+fn test_ipc_loss_a_stopped_required_subscriber_under_abort() {
+    stopped_required_subscriber(LossPolicy::Abort, Ending::Resumed);
+    stopped_required_subscriber(LossPolicy::Abort, Ending::Killed);
+}
+
+fn add_stream_with_policy(driver: &mut IpcDriver, policy: LossPolicy) -> StreamHandle {
+    driver
+        .add_stream(StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: KEY.session_id,
+                stream_id: KEY.stream_id,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+            },
+            allow_unconnected: true,
+            on_required_loss: policy,
+            conflation: None,
+        })
+        .unwrap()
+}
+
 /// The driver is dropped while a remote subscription is mapped: the
 /// client's mapping stays readable and its handle drops without blocking
 /// past the timeout; it then attaches to the new driver instance.
@@ -1044,6 +1166,44 @@ fn child() {
             std::mem::forget(client);
             std::thread::sleep(Duration::from_secs(30));
             std::process::exit(1);
+        }
+        "subscribe-until-revoked" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, true);
+            let mut subscription = client.take_subscription(&fetchable).unwrap();
+            report("subscribed");
+            // Beat and poll until the driver's verdict reaches this
+            // process; the parent stops it in between.
+            let start = Instant::now();
+            loop {
+                assert!(start.elapsed() < Duration::from_secs(20), "never revoked");
+                let _ = client.poll(usize::MAX, |_| {});
+                let summary = match subscription.poll(|_, _| {}, MessageLimit::new(8)) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        report(&format!("poll failed: {:?}", error.cause));
+                        std::process::exit(2);
+                    }
+                };
+                let ended = if summary.revoked.is_some() {
+                    Some("revoked")
+                } else {
+                    summary.closed.map(|_| "ended")
+                };
+                if let Some(ended) = ended {
+                    // Its ring is closed: no new request gets through.
+                    let refused = client.add_subscription(KEY, SubscriberRole::Optional);
+                    assert!(
+                        matches!(refused, Err(karyos_client::ConductorError::Closed)),
+                        "{refused:?}"
+                    );
+                    report(&format!("{ended} and disconnected"));
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            drop(subscription);
+            drop(client);
         }
         "subscribe-stop-read" => {
             let mut client = attach(&dir, timeout, 16).unwrap();
