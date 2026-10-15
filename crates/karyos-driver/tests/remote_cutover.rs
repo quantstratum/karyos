@@ -635,11 +635,13 @@ fn stage(
     })
 }
 
-/// A required remote subscriber whose process stops while mapped, after
-/// staging its successor (`quantstratum-docs: karyos/design/ipc-data-path.md`,
-/// Tests, d5): at the deadline the driver fences it, its successor cell
-/// stops bounding the writers, and an in-process publisher advances on the
-/// successor far past a window the stopped reader could have held.
+/// A required remote subscriber that stops while mapped, after staging its
+/// successor (`quantstratum-docs: karyos/design/ipc-data-path.md`, Tests,
+/// d5): at the deadline the driver fences it, its successor cell stops
+/// bounding the writers, and an in-process publisher advances on the
+/// successor far past a window the stopped reader could have held. The
+/// in-process analogue of the design's stopped process: the client stops
+/// polling; no SIGSTOP is sent.
 #[test]
 fn a_required_subscriber_fenced_while_stopped_does_not_hold_the_successor_back() {
     let dir = dir("fenced-stopped");
@@ -696,8 +698,7 @@ fn a_delayed_detach_of_the_old_generation_ends_only_that_generation() {
     let mut client = stage(&mut driver, client, &link, &mut publication);
     // The handle moves at the seal; its predecessor waits in the link.
     let mut seen = Vec::new();
-    serve_until(&mut driver, |driver| {
-        let _ = driver;
+    serve_until(&mut driver, |_| {
         if let Ok(OfferOutcome::Accepted { position, .. }) = publication.offer(b"first") {
             seen.push(position);
         }
