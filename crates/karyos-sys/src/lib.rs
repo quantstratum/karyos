@@ -29,6 +29,10 @@ mod cnc_store;
 pub mod command_ring;
 pub mod conflation;
 pub mod counters;
+// The typed rings over `diag_ring`; loom models `diag_ring` itself.
+#[cfg(not(loom))]
+pub mod diag;
+pub mod diag_ring;
 pub mod error;
 pub mod frame;
 pub mod host_clock;
