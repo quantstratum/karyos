@@ -30,6 +30,9 @@ pub mod frame;
 pub mod loan;
 // Real memory with std atomics, like `term_memory`.
 #[cfg(not(loom))]
+#[cfg(target_os = "linux")]
+pub mod ipc;
+#[cfg(not(loom))]
 pub mod log_buffer;
 #[cfg(target_os = "linux")]
 pub mod mmap;

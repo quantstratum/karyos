@@ -100,6 +100,15 @@ impl<'a> AtomicWords<'a> {
         self.words.get(index)
     }
 
+    /// The words from `index` on; empty when `index` is past the end.
+    #[inline]
+    #[must_use]
+    pub fn slice_from(&self, index: usize) -> Self {
+        Self {
+            words: self.words.get(index..).unwrap_or(&[]),
+        }
+    }
+
     /// All words as a slice, for scans such as `loan_held`.
     #[inline]
     #[must_use]
