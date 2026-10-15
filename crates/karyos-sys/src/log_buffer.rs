@@ -59,6 +59,7 @@ use crate::publication::{
     read_claim_record, release_publication, seal, store_interior, take_publication,
     write_claim_record,
 };
+use crate::registration::{self, claim, valid_export};
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
 use crate::slot::{Descriptor, SlotIndex, SlotState};
 use crate::term::{Generation, TermCount, TermId};
@@ -1078,32 +1079,6 @@ const NOT_GRANTED: SysError = SysError::Protocol {
     reason: "the registration does not match the grant",
 };
 
-/// Bit of a registration word set by the one adoption of its grant. Export
-/// ids are below it, so an adopted registration never equals an export.
-const ADOPTED: u64 = 1 << 63;
-
-/// Whether `export` can name a registration: nonzero, below [`ADOPTED`].
-fn valid_export(export: u64) -> bool {
-    export != 0 && export & ADOPTED == 0
-}
-
-/// Claims the registration word for its one adoption: it must hold exactly
-/// `export`, and is marked adopted in the same step, so a second adoption
-/// of the same grant, concurrent or later, is refused. A claim is never
-/// returned: an adoption that fails after it leaves the grant spent, and
-/// the registration ends with the driver's.
-fn claim(word: &AtomicU64, export: u64) -> bool {
-    valid_export(export)
-        && word
-            .compare_exchange(
-                export,
-                export | ADOPTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-}
-
 impl<O: BufferOwner> Publication<O> {
     /// Adopts the exclusive publication that the creator registered for
     /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): taken, not
@@ -1447,6 +1422,7 @@ impl<O: BufferOwner> Publication<O> {
         {
             release_loan(&cell.loan);
         }
+        registration::clear(&self.buffer.control().publication_registration.word);
         release_publication(self.buffer.exclusive_released());
     }
 
@@ -2603,8 +2579,11 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         }
         self.cursor.detached = true;
         if let Ok(cell) = self.buffer.cell(self.cursor.cell) {
+            // The registration is cleared before the cell is freed, so a
+            // delayed end of this export never touches the next occupant.
             // No loan is held outside `poll`; publishing FREE is the last
             // access of this holder to its cell.
+            registration::clear(&cell.registration);
             cell.state.store(CELL_FREE, Ordering::Release);
         }
     }
@@ -2757,7 +2736,7 @@ impl<O: BufferOwner> Conductor<O> {
     /// # Errors
     ///
     /// As [`Conductor::subscribe`]; [`SysError::Protocol`] for export 0 or
-    /// an export with bit 63 set.
+    /// an export above [`registration::MAX_EXPORT`].
     pub fn register_subscriber(&mut self, role: Role, export: u64) -> Result<usize, SysError> {
         self.register_subscriber_with(role, false, export)
     }
@@ -2806,6 +2785,41 @@ impl<O: BufferOwner> Conductor<O> {
         })
     }
 
+    /// Ends the registration of the subscriber registered in `cell` for
+    /// `export`, adopted or not, and frees its cell
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Ending a
+    /// registration). Returns whether it did: a cell that holds another
+    /// export, an in-process occupant or nothing is left untouched, so a
+    /// delayed end never touches a later occupant.
+    ///
+    /// The caller must hold a proof that the participant makes no further
+    /// access to the cell: a `Detach` of `export` after its client unmapped
+    /// the buffer, the client's exit proof, or the knowledge that the grant
+    /// was never sent. In that order, the loan word is cleared, the
+    /// registration word is cleared, and only then is the cell freed.
+    pub fn end_subscriber(&mut self, cell: usize, export: u64) -> bool {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if cell < buffer.first_subscriber_cell() {
+            return false;
+        }
+        let Some(found) = buffer.cells().get(cell) else {
+            return false;
+        };
+        if !registration::names(found.registration.load(Ordering::Acquire), export) {
+            return false;
+        }
+        // The proof: no access under this loan can follow.
+        release_loan(&found.loan);
+        // Only the conductor reuses the cell, and an adoption or a fence
+        // keeps the export, so the end does not miss; if it did, the cell
+        // is not freed.
+        if !registration::end(&found.registration, export) {
+            return false;
+        }
+        found.state.store(CELL_FREE, Ordering::Release);
+        true
+    }
+
     /// Whether `cell` is still held by `occupant` in the `hold` state: it
     /// was revoked and still bounds the publisher because its loan word was
     /// held at the last scan.
@@ -2814,7 +2828,7 @@ impl<O: BufferOwner> Conductor<O> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         buffer.cells().get(cell).is_some_and(|found| {
             found.state.load(Ordering::Acquire) == CELL_LOST_HOLDING
-                && found.registration.load(Ordering::Acquire) & !ADOPTED == occupant
+                && registration::names(found.registration.load(Ordering::Acquire), occupant)
         })
     }
 
@@ -2854,7 +2868,7 @@ impl<O: BufferOwner> Conductor<O> {
         let Some(found) = buffer.cells().get(cell) else {
             return Ok(Revocation::Stale);
         };
-        if found.registration.load(Ordering::Acquire) & !ADOPTED != occupant || occupant == 0 {
+        if !registration::names(found.registration.load(Ordering::Acquire), occupant) {
             return Ok(Revocation::Stale);
         }
         let state = found.state.load(Ordering::Acquire);
@@ -2911,7 +2925,7 @@ impl<O: BufferOwner> Conductor<O> {
     ///
     /// [`SysError::InvalidPublicationMode`] for a concurrent buffer,
     /// [`SysError::Sealed`] for a sealed one, [`SysError::Protocol`] for
-    /// export 0 or an export with bit 63 set.
+    /// export 0 or an export above [`registration::MAX_EXPORT`].
     pub fn register_publication(&mut self, export: u64) -> Result<bool, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         if !valid_export(export) {

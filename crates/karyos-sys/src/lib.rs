@@ -40,6 +40,7 @@ pub mod log_buffer;
 pub mod mmap;
 pub mod publication;
 pub mod record_journal;
+pub mod registration;
 pub mod sizing;
 pub mod slot;
 pub mod sync;
