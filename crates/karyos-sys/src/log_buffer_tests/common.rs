@@ -2291,6 +2291,120 @@ fn a_concurrent_handle_stops_at_the_last_term() {
     assert_eq!(buffer.publisher(0).unwrap().load(Ordering::Acquire), free);
 }
 
+/// SPEC.md §13 "First start and identity limits" (issue #68): the exclusive
+/// publication in the last representable term count fills it to the end,
+/// then refuses with `MaxPositionExceeded`, every time, reserving and
+/// writing nothing.
+#[test]
+fn an_exclusive_publication_stops_at_the_last_term() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let _conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let last = TermCount::try_new((1 << 31) - 1).unwrap();
+    assert!(last.next().is_err());
+    let term_id = buffer.initial_term_id.advanced_by(last);
+    // Seed a coherent identity, as `a_concurrent_handle_stops_at_the_last_term`
+    // does: slot 0 holds the last term, one message from its end, and the
+    // publication holds its write loan there.
+    let flags = Flags::new(true, true, false, false, buffer.config.lane);
+    let reserved = crate::sizing::reserved_length(flags, 1).unwrap();
+    let tail = MIN_TERM_LENGTH - reserved;
+    let cell = buffer.cell(0).unwrap();
+    release_loan(&cell.loan);
+    buffer.descriptor(0).unwrap().store(
+        Descriptor::new(term_id, buffer.generation, SlotState::Active).encode(),
+        Ordering::Release,
+    );
+    buffer
+        .table_slot(last)
+        .unwrap()
+        .store(table_entry(last.get(), 0), Ordering::Release);
+    buffer
+        .active_count()
+        .store(u64::from(last.get()), Ordering::Release);
+    buffer
+        .reserved_head()
+        .store(buffer.position(last, tail), Ordering::Release);
+    buffer.limit().store(u64::MAX, Ordering::Release);
+    assert_eq!(
+        take_loan(
+            &cell.loan,
+            &cell.revoked,
+            buffer.descriptor(0).unwrap(),
+            buffer.target(0, last).unwrap(),
+        )
+        .unwrap(),
+        LoanOutcome::Granted
+    );
+    publication.state = PublicationState::Active {
+        count: last,
+        slot: 0,
+        tail,
+    };
+    // The last message fits exactly.
+    assert!(matches!(
+        publication.append(b"x", AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+    let head = buffer.reserved_head().load(Ordering::Acquire);
+    assert_eq!(head, buffer.position(last, MIN_TERM_LENGTH));
+    // Nothing more: no successor term exists.
+    for _ in 0..4 {
+        assert!(matches!(
+            publication.append(b"y", AppendOptions::default()),
+            Err(SysError::MaxPositionExceeded { .. })
+        ));
+        assert!(matches!(
+            publication.try_claim(1, AppendOptions::default()),
+            Err(SysError::MaxPositionExceeded { .. })
+        ));
+    }
+    assert_eq!(buffer.reserved_head().load(Ordering::Acquire), head);
+    assert_eq!(
+        publication.state,
+        PublicationState::Active {
+            count: last,
+            slot: 0,
+            tail: MIN_TERM_LENGTH,
+        }
+    );
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), u64::from(last.get()));
+}
+
+/// Issue #68: a buffer of the last mapping generation, which has no
+/// successor, runs normally: its descriptors and loans carry the 24-bit
+/// value across rotations and reclamation.
+#[test]
+fn a_buffer_of_the_last_generation_rotates_and_delivers() {
+    let last = Generation::try_new((1 << 24) - 1).unwrap();
+    assert!(matches!(
+        last.next(),
+        Err(SysError::GenerationExhausted { .. })
+    ));
+    let buffer = new_buffer_with_generation(config(3, 2), last).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = vec![6u8; 7000];
+    let mut cleaned = 0;
+    for _ in 0..60 {
+        loop {
+            let outcome = publication.append(&data, AppendOptions::default()).unwrap();
+            cleaned += conductor.duty_cycle().unwrap().cleaned;
+            if matches!(outcome, AppendOutcome::Appended { .. }) {
+                break;
+            }
+        }
+        assert_eq!(poll_message(&mut subscription), Some(data.clone()));
+    }
+    assert!(cleaned > 0, "no slot was reclaimed");
+    assert!(buffer.reserved_head().load(Ordering::Acquire) > 4 * TERM);
+    for slot in 0..buffer.slots {
+        let word = buffer.descriptor(slot).unwrap().load(Ordering::Acquire);
+        assert_eq!(Descriptor::decode(word).unwrap().generation(), last);
+    }
+}
+
 // Claims on concurrent handles, batch a3.
 
 fn concurrent_claimed<'a, O: BufferOwner + core::fmt::Debug>(
