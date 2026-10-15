@@ -222,8 +222,8 @@ impl<T: TermBytes> GenerationLink<T> {
     /// reads as pending, and its control path offers prepared successors
     /// without a `Pending` step.
     #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the remote control path uses it next (d5c2)")
+        not(any(test, target_os = "linux")),
+        allow(dead_code, reason = "remote clients exist only on Linux")
     )]
     #[must_use]
     pub(crate) fn new_remote() -> Arc<Self> {
@@ -372,8 +372,8 @@ impl<T: TermBytes> GenerationLink<T> {
 
     /// Control path: takes what the handle left behind, to drop it.
     #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the remote control path uses it next (d5c2)")
+        not(any(test, target_os = "linux")),
+        allow(dead_code, reason = "remote clients exist only on Linux")
     )]
     pub(crate) fn take_retired(&self) -> Option<Retired<T>> {
         self.lock().retired.take()

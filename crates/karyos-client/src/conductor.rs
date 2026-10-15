@@ -213,6 +213,10 @@ pub struct ClientConductor<T: TermBytes = HeapTerms> {
     /// A client of a driver in another process: its grants complete as
     /// [`Outcome::Fetchable`], never through the in-process hand-over.
     remote: bool,
+    /// A remote client's cutover events (`SuccessorReady`, `Fenced`,
+    /// `PublicationClosed`), kept for its control path whatever the
+    /// application does with its own queue.
+    cutover_events: Vec<Event>,
 }
 
 /// Driver events a client keeps until the application takes them.
@@ -251,6 +255,7 @@ impl<T: TermBytes> ClientConductor<T> {
             events: VecDeque::with_capacity(EVENT_QUEUE),
             events_dropped: 0,
             remote: false,
+            cutover_events: Vec::new(),
         }
     }
 
@@ -261,6 +266,16 @@ impl<T: TermBytes> ClientConductor<T> {
     )]
     pub(crate) fn set_remote(&mut self) {
         self.remote = true;
+    }
+
+    /// A remote client's cutover events received since the last call,
+    /// oldest first (control path).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn take_cutover_events(&mut self) -> Vec<Event> {
+        core::mem::take(&mut self.cutover_events)
     }
 
     /// Sets the heartbeat interval and the driver timeout, both on this
@@ -586,6 +601,16 @@ impl<T: TermBytes> ClientConductor<T> {
                     // Driver events answer no request: queue them for the
                     // application, dropping the oldest when full.
                     if let Ok(event) = Event::decode(type_id, payload) {
+                        if self.remote
+                            && matches!(
+                                event,
+                                Event::SuccessorReady { .. }
+                                    | Event::Fenced { .. }
+                                    | Event::PublicationClosed { .. }
+                            )
+                        {
+                            self.cutover_events.push(event);
+                        }
                         if self.events.len() == EVENT_QUEUE {
                             self.events.pop_front();
                             self.events_dropped = self.events_dropped.saturating_add(1);
