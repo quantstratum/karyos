@@ -650,6 +650,13 @@ impl<T: TermBytes> ClientConductor<T> {
         self.link.loss_reports().dropped()
     }
 
+    /// The loss report queue of this client's subscriptions, for the
+    /// subscriptions a remote client takes by fetch.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn loss_report_queue(&self) -> Arc<crate::loss::LossReports> {
+        Arc::clone(self.link.loss_reports())
+    }
+
     /// Loss reports queued and not yet sent.
     #[must_use]
     pub fn loss_reports_queued(&self) -> usize {

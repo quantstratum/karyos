@@ -21,7 +21,7 @@
 //! | `0x03` | `Detach` | export id (nonzero) |
 //! | `0x04` | `Leave` | none |
 //! | `0x81` | `Admitted` | instance (low, high); protocol version; client id; record count; records |
-//! | `0x82` | `Manifest` | fetch id; hand-over key; registration; record count; records |
+//! | `0x82` | `Manifest` | fetch id; hand-over key; registration; stream registration (nonzero); incarnation (nonzero); record count; records |
 //! | `0x83` | `Region` | fetch id; record index |
 //! | `0x84` | `Refused` | fetch id or 0; code (nonzero) |
 //!
@@ -32,6 +32,21 @@
 //! layout are fixed for every version, so a driver can read the version of
 //! any `Hello` with [`hello_version`] and refuse it in a form every client
 //! can decode.
+//!
+//! **Layout changes within a version.** Before the first release, a layout
+//! change keeps [`VERSION`] and changes encoder and decoder together, as the
+//! client counters record of the bootstrap and the observer capability did;
+//! strict decoding makes a peer of another build fail at its first changed
+//! message. The stream registration and incarnation words of `Manifest`
+//! follow that rule (coordinator decision, ACS 13555: they carry the
+//! publication identity of the grant, whose driver part is the instance of
+//! `Admitted`).
+//!
+//! **Instance.** The instance of `Admitted` is the driver's 128-bit
+//! `driver_id` (SPEC.md §4), the one id per driver instance (ACS 13555).
+//! The `driver_id` is held as two words `[high, low]`; the instance is
+//! `u128::from(high) << 64 | u128::from(low)`, the packing of a loss
+//! record's instance, and travels low word first.
 //!
 //! A record is eight words: region id; export id; kind (bits 0..8) and
 //! layout version (bits 8..40); structure length; generation; stream id
@@ -48,8 +63,9 @@ pub const VERSION: u64 = 1;
 pub const MAX_RECORDS: usize = 16;
 /// Words of one record.
 pub const RECORD_WORDS: usize = 8;
-/// Largest encoded message, in bytes: `Admitted` with [`MAX_RECORDS`].
-pub const MAX_MESSAGE_LENGTH: usize = (6 + MAX_RECORDS * RECORD_WORDS) * 8;
+/// Largest encoded message, in bytes: `Manifest` with [`MAX_RECORDS`]
+/// (seven words before its records; `Admitted` has six).
+pub const MAX_MESSAGE_LENGTH: usize = (7 + MAX_RECORDS * RECORD_WORDS) * 8;
 
 /// Refusal codes of `Refused` (nonzero). A client treats a code it does not
 /// know as a refusal without a reason.
@@ -334,6 +350,12 @@ pub enum Message {
         key: u64,
         /// The registration the regions belong to.
         registration: u64,
+        /// The registration of the grant's stream: with the driver instance
+        /// of `Admitted` and `incarnation`, the publication identity a loss
+        /// report of the grant names (nonzero).
+        stream_registration: u64,
+        /// The publication incarnation of the grant's stream (nonzero).
+        incarnation: u64,
         /// The regions.
         records: Vec<Record>,
     },
@@ -421,9 +443,18 @@ impl Message {
                 fetch,
                 key,
                 registration,
+                stream_registration,
+                incarnation,
                 records,
             } => {
-                words.extend([MANIFEST, *fetch, *key, *registration]);
+                words.extend([
+                    MANIFEST,
+                    *fetch,
+                    *key,
+                    *registration,
+                    *stream_registration,
+                    *incarnation,
+                ]);
                 records_words(records, &mut words)?;
             }
             Self::Region { fetch, index } => words.extend([REGION, *fetch, *index]),
@@ -439,6 +470,11 @@ impl Message {
             Self::Fetch { fetch: 0, .. }
             | Self::Detach { export: 0 }
             | Self::Manifest { fetch: 0, .. }
+            | Self::Manifest {
+                stream_registration: 0,
+                ..
+            }
+            | Self::Manifest { incarnation: 0, .. }
             | Self::Refused { code: 0, .. } => return Err(AdmissionError::Reserved),
             Self::Admitted { records, .. } | Self::Manifest { records, .. } => records.as_slice(),
             _ => &[],
@@ -454,7 +490,8 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`AdmissionError::Reserved`] for a message that could not be
-    /// decoded (a zero fetch id, export id or refusal code),
+    /// decoded (a zero fetch id, export id, refusal code, or stream
+    /// registration or incarnation of a manifest),
     /// [`AdmissionError::TooManyRecords`] and
     /// [`AdmissionError::BufferTooShort`].
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, AdmissionError> {
@@ -540,14 +577,16 @@ impl Message {
                 records: records_from(5, &words)?,
             }),
             MANIFEST => {
-                if word(1) == 0 {
+                if word(1) == 0 || word(4) == 0 || word(5) == 0 {
                     return Err(AdmissionError::Reserved);
                 }
                 Ok(Self::Manifest {
                     fetch: word(1),
                     key: word(2),
                     registration: word(3),
-                    records: records_from(4, &words)?,
+                    stream_registration: word(4),
+                    incarnation: word(5),
+                    records: records_from(6, &words)?,
                 })
             }
             REGION => {
@@ -639,12 +678,16 @@ mod tests {
             fetch: 5,
             key: 6,
             registration: 7,
+            stream_registration: 8,
+            incarnation: 1,
             records,
         });
         round_trip(&Message::Manifest {
             fetch: 5,
             key: 6,
             registration: 7,
+            stream_registration: 8,
+            incarnation: 1,
             records: vec![record(1, Capability::None); MAX_RECORDS],
         });
     }
@@ -668,7 +711,10 @@ mod tests {
             vec![FETCH, 0, 1],
             vec![DETACH, 0],
             vec![REFUSED, 1, 0],
-            vec![MANIFEST, 0, 1, 2, 0],
+            vec![MANIFEST, 0, 1, 2, 3, 1, 0],
+            // A zero stream registration or incarnation.
+            vec![MANIFEST, 1, 1, 2, 0, 1, 0],
+            vec![MANIFEST, 1, 1, 2, 3, 0, 0],
         ] {
             assert_eq!(
                 Message::decode(&raw(&words)),
@@ -693,25 +739,29 @@ mod tests {
             fetch: 1,
             key: 2,
             registration: 3,
+            stream_registration: 8,
+            incarnation: 1,
             records: vec![record(1, Capability::None); 2],
         });
-        manifest[32] = 3;
+        manifest[48] = 3;
         assert!(matches!(
             Message::decode(&manifest),
             Err(AdmissionError::WrongLength { .. })
         ));
-        manifest[32] = 200;
+        manifest[48] = 200;
         assert!(matches!(
             Message::decode(&manifest),
             Err(AdmissionError::TooManyRecords { .. })
         ));
         // A record with export 0, an unknown kind, an unknown capability or
         // an index on a capability without one.
-        for (offset, value) in [(48, 0u8), (56, 9), (89, 7), (96, 1)] {
+        for (offset, value) in [(64, 0u8), (72, 9), (105, 7), (112, 1)] {
             let mut bad = encode(&Message::Manifest {
                 fetch: 1,
                 key: 2,
                 registration: 3,
+                stream_registration: 8,
+                incarnation: 1,
                 records: vec![record(1, Capability::None)],
             });
             bad[offset] = value;
@@ -728,6 +778,8 @@ mod tests {
                 fetch: 1,
                 key: 2,
                 registration: 3,
+                stream_registration: 8,
+                incarnation: 1,
                 records: vec![record(1, Capability::None); MAX_RECORDS + 1],
             }
             .encode(&mut out),
@@ -750,12 +802,16 @@ mod tests {
                 fetch: 0,
                 key: 1,
                 registration: 2,
+                stream_registration: 8,
+                incarnation: 1,
                 records: Vec::new(),
             },
             Message::Manifest {
                 fetch: 1,
                 key: 1,
                 registration: 2,
+                stream_registration: 8,
+                incarnation: 1,
                 records: vec![record(0, Capability::None)],
             },
             Message::Admitted {
@@ -763,6 +819,22 @@ mod tests {
                 version: VERSION,
                 client: 1,
                 records: vec![record(0, Capability::None)],
+            },
+            Message::Manifest {
+                fetch: 1,
+                key: 1,
+                registration: 2,
+                stream_registration: 0,
+                incarnation: 1,
+                records: Vec::new(),
+            },
+            Message::Manifest {
+                fetch: 1,
+                key: 1,
+                registration: 2,
+                stream_registration: 3,
+                incarnation: 0,
+                records: Vec::new(),
             },
         ] {
             assert_eq!(
@@ -791,14 +863,66 @@ mod tests {
             fetch: 0,
             code: refusal::INCOMPATIBLE_VERSION,
         });
-        // The largest message is an Admitted with every record.
+        // The largest message is a Manifest with every record; an Admitted
+        // with every record fits too.
         let records = vec![record(1, Capability::None); MAX_RECORDS];
+        let manifest = Message::Manifest {
+            fetch: 1,
+            key: 2,
+            registration: 3,
+            stream_registration: 4,
+            incarnation: 1,
+            records: records.clone(),
+        };
+        assert_eq!(manifest.encode(&mut out), Ok(MAX_MESSAGE_LENGTH));
         let admitted = Message::Admitted {
             instance: 1,
             version: VERSION,
             client: 2,
             records,
         };
-        assert_eq!(admitted.encode(&mut out), Ok(MAX_MESSAGE_LENGTH));
+        assert_eq!(admitted.encode(&mut out), Ok(MAX_MESSAGE_LENGTH - 8));
+    }
+
+    /// The manifest's words, literally: the stream registration and the
+    /// incarnation follow the registration, before the record count.
+    #[test]
+    fn a_manifest_carries_the_publication_identity_of_its_grant() {
+        let message = Message::Manifest {
+            fetch: 5,
+            key: 6,
+            registration: 7,
+            stream_registration: 0x0102_0304,
+            incarnation: 9,
+            records: vec![record(1, Capability::OptionalSubscriber { cell: 2 })],
+        };
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let length = message.encode(&mut out).unwrap();
+        assert_eq!(length, (7 + RECORD_WORDS) * 8);
+        let words: Vec<u64> = out[..length]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
+            .collect();
+        assert_eq!(words[..7], [MANIFEST, 5, 6, 7, 0x0102_0304, 9, 1]);
+        assert_eq!(Message::decode(&out[..length]).unwrap(), message);
+        // The layout without these words (the record count after the
+        // registration) is refused: its record words are read as the count
+        // and come out two words short.
+        let mut short = words.clone();
+        short.drain(4..6);
+        let bytes: Vec<u8> = short.iter().flat_map(|word| word.to_le_bytes()).collect();
+        assert!(matches!(
+            Message::decode(&bytes),
+            Err(AdmissionError::WrongLength { .. })
+        ));
+        // A manifest of the largest size plus one word is refused.
+        let mut long = vec![0u8; MAX_MESSAGE_LENGTH + 8];
+        long[0] = MANIFEST as u8;
+        assert!(matches!(
+            Message::decode(&long),
+            Err(AdmissionError::WrongLength { .. })
+        ));
     }
 }

@@ -38,6 +38,14 @@
 //! on `Fenced`, on a `PublicationClosed` of the handle's stream and when the
 //! driver is lost it closes the link. It also drops what a handle left in its
 //! link when it moved, unmapping the predecessor and sending its `Detach`.
+//!
+//! A taken subscription reports its overruns as an in-process one does
+//! ([`crate::loss`]): through the client conductor's loss report queue,
+//! sent as `ReportLoss` by [`RemoteClient::poll`]. Its publication identity
+//! is the instance of `Admitted`, which is the driver's `driver_id`
+//! (`[high, low]` is `instance >> 64` and the low 64 bits), with the stream
+//! registration and incarnation of the grant's `Manifest` (coordinator
+//! decision, ACS 13555).
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
@@ -48,6 +56,7 @@ use karyos_protocol::admission::{
     Capability, MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION, refusal,
 };
 use karyos_protocol::cnc::{Event, StreamKey, SubscriberRole};
+use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::BroadcastReceiver;
 use karyos_sys::command_ring::RingProducer;
 use karyos_sys::counters::{CellRead, ClientCells, CountersReader};
@@ -68,6 +77,7 @@ use crate::conductor::{
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Successor};
 use crate::link::{ClientLink, Export, Owner};
+use crate::loss::{LossReporter, LossReports};
 use crate::publication::ClientPublication;
 use crate::subscription::ClientSubscription;
 
@@ -107,6 +117,8 @@ pub struct RemoteClient {
     client: u64,
     conductor: Option<ClientConductor>,
     counters: Option<CountersReader>,
+    /// The conductor's loss report queue, given to the subscriptions taken.
+    losses: Arc<LossReports>,
     /// Shared with every handle taken; dropped last, after the CnC
     /// mappings above.
     session: Option<Arc<Session>>,
@@ -136,6 +148,9 @@ struct Session {
 struct RemoteLink {
     /// The registration its grants answer, the same across generations.
     registration: u64,
+    /// The stream registration and incarnation of its first grant; a
+    /// successor grant must carry the same.
+    publication: (u64, u64),
     request: Request,
     /// The generation of the latest mapping offered or taken.
     generation: u64,
@@ -225,8 +240,13 @@ impl Session {
             .links()
             .iter()
             .find(|entry| entry.registration == registration && entry.generation < generation)
-            .and_then(|entry| entry.link.upgrade().map(|link| (entry.request, link)));
-        let Some((request, link)) = target else {
+            .and_then(|entry| {
+                entry
+                    .link
+                    .upgrade()
+                    .map(|link| (entry.request, entry.publication, link))
+            });
+        let Some((request, publication, link)) = target else {
             return;
         };
         let fetchable = Fetchable {
@@ -240,7 +260,8 @@ impl Session {
         let export = fetched.record.export;
         let prepared = check(&fetched, &request)
             .and_then(|()| {
-                (fetched.record.generation == generation)
+                (fetched.record.generation == generation
+                    && (fetched.stream_registration, fetched.incarnation) == publication)
                     .then_some(())
                     .ok_or(AttachError::Protocol)
             })
@@ -302,10 +323,13 @@ impl Drop for Detach {
     }
 }
 
-/// A fetched log buffer: its record and the attached buffer.
+/// A fetched log buffer: its record, the attached buffer, and the stream
+/// registration and incarnation its manifest named.
 struct Fetched {
     record: Record,
     buffer: Arc<LogBuffer<SharedTerms>>,
+    stream_registration: u64,
+    incarnation: u64,
 }
 
 /// One received message, with its descriptor.
@@ -497,6 +521,7 @@ pub fn attach(
     });
     match built {
         Ok((instance, client, mut conductor, counters)) => {
+            let losses = conductor.loss_report_queue();
             conductor.set_remote();
             let session = Arc::new(Session {
                 instance,
@@ -515,6 +540,7 @@ pub fn attach(
                 client,
                 conductor: Some(conductor),
                 counters: Some(counters),
+                losses,
                 session: Some(session),
             })
         }
@@ -546,6 +572,20 @@ impl RemoteClient {
     #[must_use]
     pub fn client(&self) -> u64 {
         self.client
+    }
+
+    /// Loss reports of the taken subscriptions queued and not yet sent, as
+    /// [`ClientConductor::loss_reports_queued`].
+    #[must_use]
+    pub fn loss_reports_queued(&self) -> usize {
+        self.losses.queued()
+    }
+
+    /// Loss reports dropped because the queue was full, as
+    /// [`ClientConductor::loss_reports_dropped`].
+    #[must_use]
+    pub fn loss_reports_dropped(&self) -> u64 {
+        self.losses.dropped()
     }
 
     /// Requests a publication on `stream` (the client conductor's
@@ -732,7 +772,22 @@ impl RemoteClient {
             let inner = prepare_subscription(fetched, role, export)?
                 .activate()
                 .map_err(|refused| AttachError::Sys(refused.error))?;
-            Ok(ClientSubscription::new(inner))
+            // Its overruns are reported as an in-process subscription's:
+            // the identity of the grant, the subscription's registration
+            // and the conductor's queue.
+            Ok(
+                ClientSubscription::new(inner).with_loss_reports(LossReporter {
+                    publication: PublicationIdentity {
+                        driver: [(self.instance >> 64) as u64, self.instance as u64],
+                        registration: fetched.stream_registration,
+                        stream_id: fetched.record.stream_id,
+                        session_id: fetched.record.session_id,
+                        incarnation: fetched.incarnation,
+                    },
+                    registration: fetchable.registration,
+                    reports: Arc::clone(&self.losses),
+                }),
+            )
         })
     }
 
@@ -753,6 +808,7 @@ impl RemoteClient {
         let fetched = fetch(session, fetchable)?;
         let export = fetched.record.export;
         let generation = fetched.record.generation;
+        let publication = (fetched.stream_registration, fetched.incarnation);
         let built = check(&fetched, &fetchable.request).and_then(|()| adopt(&fetched, export));
         match built {
             Ok(handle) => {
@@ -769,6 +825,7 @@ impl RemoteClient {
                     .map_err(|_| AttachError::Protocol)?;
                 session.links().push(RemoteLink {
                     registration: fetchable.registration,
+                    publication,
                     request: fetchable.request,
                     generation,
                     link: Arc::downgrade(&link),
@@ -961,7 +1018,7 @@ fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachErro
         },
         None,
     )?;
-    let record = match receive(&session.socket)? {
+    let (record, stream_registration, incarnation) = match receive(&session.socket)? {
         (Message::Refused { fetch: got, code }, None) if got == fetch => {
             return Err(AttachError::Refused { code });
         }
@@ -970,13 +1027,17 @@ fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachErro
                 fetch: got,
                 key,
                 registration,
+                stream_registration,
+                incarnation,
                 records,
             },
             None,
         ) if got == fetch => {
             let expected = key == fetchable.key && registration == fetchable.registration;
             match records[..] {
-                [record] if expected && record.kind == WireKind::LogBuffer => record,
+                [record] if expected && record.kind == WireKind::LogBuffer => {
+                    (record, stream_registration, incarnation)
+                }
                 // Not the grant requested: the fetch is aborted, but its
                 // regions still follow; each descriptor is closed and its
                 // export detached, so nothing stays charged.
@@ -1018,6 +1079,8 @@ fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachErro
         Ok(buffer) => Ok(Fetched {
             record,
             buffer: Arc::new(buffer),
+            stream_registration,
+            incarnation,
         }),
         Err(error) => {
             session.detach(record.export);
@@ -1114,6 +1177,7 @@ mod tests {
         let link = GenerationLink::new_remote();
         session.links().push(RemoteLink {
             registration,
+            publication: (1, 1),
             request,
             generation: 0,
             link: Arc::downgrade(&link),
