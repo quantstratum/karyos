@@ -39,6 +39,16 @@
 //! driver is lost it closes the link. It also drops what a handle left in its
 //! link when it moved, unmapping the predecessor and sending its `Detach`.
 //!
+//! Its trace journals (`quantstratum-docs:
+//! karyos/design/trace-journal-region.md`, J2) complete as
+//! [`Outcome::FetchableJournal`](crate::Outcome::FetchableJournal);
+//! [`RemoteClient::take_journal`] fetches the journal region as a log
+//! buffer grant is fetched (one `Manifest` with one `Journal` record naming
+//! the journal number, zero stream registration and incarnation), attaches
+//! it writable after the same checks, checks its geometry against the sizes
+//! requested and returns its writer. Dropping the writer closes the
+//! journal, unmaps the region and then sends the grant's `Detach`.
+//!
 //! A taken subscription reports its overruns as an in-process one does
 //! ([`crate::loss`]): through the client conductor's loss report queue,
 //! sent as `ReportLoss` by [`RemoteClient::poll`]. Its publication identity
@@ -76,6 +86,7 @@ use crate::conductor::{
 };
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Successor};
+use crate::journal::{ClientJournal, FetchableJournal};
 use crate::link::{ClientLink, Export, Owner};
 use crate::loss::{LossReporter, LossReports};
 use crate::publication::ClientPublication;
@@ -369,9 +380,13 @@ fn expected(instance: u128, record: &Record) -> Result<RegionRecord, AttachError
         WireKind::Broadcast => RegionKind::Broadcast,
         WireKind::Counters => RegionKind::Counters,
         WireKind::ClientCounters => RegionKind::ClientCounters,
-        // Log buffers come with a fetch; the error log and the loss report
-        // are granted to tools only.
-        WireKind::LogBuffer | WireKind::ErrorLog | WireKind::LossReport => {
+        // Log buffers and journals come with a fetch; the error log, the
+        // loss report and the trace mirror are granted to tools only.
+        WireKind::LogBuffer
+        | WireKind::Journal
+        | WireKind::ErrorLog
+        | WireKind::LossReport
+        | WireKind::TraceMirror => {
             return Err(AttachError::Protocol);
         }
     };
@@ -462,7 +477,11 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
                 .client_counters
                 .replace(Region::attach(fd, expected)?)
                 .is_some(),
-            WireKind::LogBuffer | WireKind::ErrorLog | WireKind::LossReport => {
+            WireKind::LogBuffer
+            | WireKind::Journal
+            | WireKind::ErrorLog
+            | WireKind::LossReport
+            | WireKind::TraceMirror => {
                 return Err(AttachError::Protocol);
             }
         };
@@ -656,6 +675,64 @@ impl RemoteClient {
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?
             .allocate_counter(type_id, label, stream, participant)
+    }
+
+    /// Requests a trace journal of `layout`, as
+    /// [`ClientConductor::trace_journal`]; it completes as
+    /// [`Outcome::FetchableJournal`](crate::Outcome::FetchableJournal).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::trace_journal`].
+    pub fn trace_journal(
+        &mut self,
+        layout: karyos_sys::record_journal::JournalLayout,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?.trace_journal(layout)
+    }
+
+    /// Gives the final delivery boundary of `journal`, as
+    /// [`ClientConductor::close_journal`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::close_journal`].
+    pub fn close_journal(&mut self, journal: u64, boundary: u64) -> Result<u64, ConductorError> {
+        self.conductor_mut()?.close_journal(journal, boundary)
+    }
+
+    /// Takes the trace journal of a [`FetchableJournal`]: fetches its
+    /// region, attaches it writable after the region checks, checks its
+    /// geometry against the sizes requested and returns its writer, whose
+    /// drop unmaps the region and sends the grant's `Detach`. Blocks at most
+    /// the attach timeout per message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttachError::Refused`] when the driver refuses the fetch,
+    /// [`AttachError::Protocol`] for a manifest or region that does not
+    /// match the journal, [`AttachError::Timeout`], and
+    /// [`AttachError::Sys`]. A region whose descriptor arrived is unmapped
+    /// and detached.
+    pub fn take_journal(&self, fetchable: &FetchableJournal) -> Result<ClientJournal, AttachError> {
+        let session = self.session.as_ref().ok_or(AttachError::Protocol)?;
+        let fetched = fetch_region(session, fetchable.key, fetchable.journal, WireKind::Journal)?;
+        let export = fetched.record.export;
+        match karyos_sys::record_journal::attach_journal(fetched.region, fetchable.layout) {
+            Ok(writer) => Ok(ClientJournal::new(
+                fetchable.journal,
+                writer.with_guard(Detach {
+                    session: Arc::clone(session),
+                    export,
+                }),
+            )),
+            Err(error) => {
+                // The region was unmapped by the failed attach: the Detach
+                // is the proof.
+                session.detach(export);
+                Err(AttachError::Sys(error))
+            }
+        }
     }
 
     /// Reports completed requests to `on`, as [`ClientConductor::poll`],
@@ -1007,6 +1084,47 @@ fn prepare_successor(
 /// the region is attached against that record and the session's full
 /// instance.
 fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachError> {
+    let fetched = fetch_region(
+        session,
+        fetchable.key,
+        fetchable.registration,
+        WireKind::LogBuffer,
+    )?;
+    let export = fetched.record.export;
+    match LogBuffer::attach(fetched.region) {
+        Ok(buffer) => Ok(Fetched {
+            record: fetched.record,
+            buffer: Arc::new(buffer),
+            stream_registration: fetched.stream_registration,
+            incarnation: fetched.incarnation,
+        }),
+        Err(error) => {
+            session.detach(export);
+            Err(AttachError::from(error))
+        }
+    }
+}
+
+/// A fetched region of one record, mapped writable and checked against the
+/// record and the session's full instance.
+struct FetchedRegion {
+    record: Record,
+    region: Region,
+    stream_registration: u64,
+    incarnation: u64,
+}
+
+/// Sends `Fetch { key }` and receives its `Manifest` and its one `Region`:
+/// the manifest must answer this fetch, with `key` and `registration`, and
+/// carry one record of `kind`; the region is attached against that record
+/// and the session's full instance. From the arrival of the descriptor the
+/// export is live; on a later failure it is detached.
+fn fetch_region(
+    session: &Session,
+    key: u64,
+    registration: u64,
+    kind: WireKind,
+) -> Result<FetchedRegion, AttachError> {
     let _exchange = session
         .fetching
         .lock()
@@ -1020,14 +1138,7 @@ fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachErro
         state.next_fetch = fetch.checked_add(1).ok_or(AttachError::Protocol)?;
         fetch
     };
-    send(
-        &session.socket,
-        &Message::Fetch {
-            fetch,
-            key: fetchable.key,
-        },
-        None,
-    )?;
+    send(&session.socket, &Message::Fetch { fetch, key }, None)?;
     let (record, stream_registration, incarnation) = match receive(&session.socket)? {
         (Message::Refused { fetch: got, code }, None) if got == fetch => {
             return Err(AttachError::Refused { code });
@@ -1035,17 +1146,17 @@ fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachErro
         (
             Message::Manifest {
                 fetch: got,
-                key,
-                registration,
+                key: got_key,
+                registration: got_registration,
                 stream_registration,
                 incarnation,
                 records,
             },
             None,
         ) if got == fetch => {
-            let expected = key == fetchable.key && registration == fetchable.registration;
+            let expected = got_key == key && got_registration == registration;
             match records[..] {
-                [record] if expected && record.kind == WireKind::LogBuffer => {
+                [record] if expected && record.kind == kind => {
                     (record, stream_registration, incarnation)
                 }
                 // Not the grant requested: the fetch is aborted, but its
@@ -1082,13 +1193,12 @@ fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachErro
     // The descriptor arrived: from here the export is charged and must be
     // detached.
     session.state().live.push(record.export);
-    let attached = log_buffer_region(session.instance, &record)
-        .and_then(|expected| Region::attach(fd, expected).map_err(AttachError::from))
-        .and_then(|region| LogBuffer::attach(region).map_err(AttachError::from));
+    let attached = fetched_region(session.instance, &record)
+        .and_then(|expected| Region::attach(fd, expected).map_err(AttachError::from));
     match attached {
-        Ok(buffer) => Ok(Fetched {
+        Ok(region) => Ok(FetchedRegion {
             record,
-            buffer: Arc::new(buffer),
+            region,
             stream_registration,
             incarnation,
         }),
@@ -1123,12 +1233,18 @@ fn abort(session: &Session, fetch: u64, records: &[Record]) {
     }
 }
 
-/// The region header a log buffer record describes.
-fn log_buffer_region(instance: u128, record: &Record) -> Result<RegionRecord, AttachError> {
+/// The region header a fetched record describes: a log buffer or a
+/// journal.
+fn fetched_region(instance: u128, record: &Record) -> Result<RegionRecord, AttachError> {
+    let kind = match record.kind {
+        WireKind::LogBuffer => RegionKind::LogBuffer,
+        WireKind::Journal => RegionKind::Journal,
+        _ => return Err(AttachError::Protocol),
+    };
     Ok(RegionRecord {
         instance,
         region: record.region,
-        kind: RegionKind::LogBuffer,
+        kind,
         generation: record.generation,
         layout: u64::from(record.layout),
         structure_length: usize::try_from(record.structure_length)

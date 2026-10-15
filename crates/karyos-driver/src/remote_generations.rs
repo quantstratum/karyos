@@ -143,6 +143,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     .ok()?;
                 Participant::Subscriber { cell, role }
             }
+            // A journal grant names no stream, so no cutover moves it.
+            Participant::Journal { .. } => return None,
         };
         self.next_export = next_export;
         self.next_registration = next_handover;
@@ -235,6 +237,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Concurrent { slot } => {
                 conductor.fence_concurrent_publication(slot, grant.export)
             }
+            Participant::Journal { .. } => false,
         }
     }
 

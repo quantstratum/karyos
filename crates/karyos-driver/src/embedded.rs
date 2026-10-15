@@ -197,6 +197,21 @@ pub struct DriverConfig {
     /// Client counter cells one client holds at once; an allocation beyond
     /// it is refused with `ResourcesUnavailable`.
     pub max_counters_per_client: usize,
+    /// Entries of the trace mirror's journal table (`quantstratum-docs:
+    /// karyos/design/trace-journal-region.md`): the open client trace
+    /// journals plus the ended ones whose records the mirror's ring still
+    /// retains. A `TraceJournal` that finds no free entry is refused with
+    /// `TraceJournalsExhausted`.
+    pub max_trace_journals: usize,
+    /// Bytes of every client trace journal the driver holds at once, each
+    /// counted as its whole region (header included); a `TraceJournal`
+    /// beyond it is refused with `ResourcesUnavailable`.
+    pub max_trace_journal_bytes: u64,
+    /// Journal records the driver copies into the trace mirror per duty
+    /// cycle, over all journals.
+    pub trace_drain_budget: usize,
+    /// Records of the trace mirror's ring.
+    pub trace_mirror_records: usize,
 }
 
 impl Default for DriverConfig {
@@ -229,6 +244,11 @@ impl Default for DriverConfig {
             error_dedup_window: 1_000_000_000,
             client_counters_capacity: 1024,
             max_counters_per_client: 64,
+            max_trace_journals: 64,
+            // Provisional until the trace overhead numbers of P11.
+            max_trace_journal_bytes: 64 * 1024 * 1024,
+            trace_drain_budget: 1024,
+            trace_mirror_records: 4096,
         }
     }
 }
@@ -383,6 +403,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) admission: Option<crate::admission::Admission<T>>,
     /// The error log and the loss report.
     pub(crate) diagnostics: crate::diagnostics::Diagnostics,
+    /// The client trace journals and the trace mirror.
+    pub(crate) trace_journals: crate::trace_journals::TraceJournals,
 }
 
 /// The incarnation of a stream's publication in the embedded driver: one per
@@ -472,6 +494,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             && config.loss_report_records > 0
             && config.client_counters_capacity > 0
             && config.max_counters_per_client > 0
+            && config.max_trace_journals > 0
+            && config.max_trace_journal_bytes > 0
+            && config.trace_drain_budget > 0
+            && config.trace_mirror_records > 0
             && config.cutover_deadline > 0
             && config.heartbeat_interval > 0
             && config
@@ -493,7 +519,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut driver_id = [0u64; 2];
         karyos_sys::random::fill_u64s(&mut driver_id)?;
         #[cfg(target_os = "linux")]
-        let (broadcast, counters, client_counters, admission, diagnostics) = match ipc {
+        let (broadcast, counters, client_counters, admission, diagnostics, mirror) = match ipc {
             Some(ipc) => {
                 let instance = crate::admission::instance_of(driver_id);
                 let mut admission = crate::admission::Admission::new(ipc, instance)?;
@@ -516,12 +542,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     config.client_counters_capacity,
                     config.max_counters_per_client,
                 )?;
+                let (_, region) = admission.next_region()?;
+                let mirror = karyos_sys::trace_mirror::trace_mirror_in(
+                    instance,
+                    region,
+                    config.max_trace_journals,
+                    config.trace_mirror_records,
+                )
+                .map_err(|_| DriverError::InvalidConfig)?;
                 (
                     broadcast,
                     counters,
                     client_counters,
                     Some(admission),
                     diagnostics,
+                    mirror,
                 )
             }
             None => (
@@ -533,10 +568,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 )?,
                 None,
                 crate::diagnostics::Diagnostics::new(&config)?,
+                heap_mirror(&config)?,
             ),
         };
         #[cfg(not(target_os = "linux"))]
-        let (broadcast, counters, client_counters, diagnostics) = {
+        let (broadcast, counters, client_counters, diagnostics, mirror) = {
             let _ = ipc;
             (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
@@ -546,6 +582,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     config.max_counters_per_client,
                 )?,
                 crate::diagnostics::Diagnostics::new(&config)?,
+                heap_mirror(&config)?,
             )
         };
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
@@ -578,6 +615,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             #[cfg(target_os = "linux")]
             admission,
             diagnostics,
+            trace_journals: crate::trace_journals::TraceJournals::new(
+                mirror,
+                config.max_trace_journal_bytes,
+                config.trace_drain_budget,
+            ),
         })
     }
 
@@ -687,6 +729,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.counters
             .set(Event::SpareReservationsInUse, gauge(credits));
         self.counters.set(Event::LoansOutstanding, gauge(loans));
+        self.counters
+            .set(Event::TraceJournalsOpen, gauge(self.trace_journals.open()));
     }
 
     /// Runs a positions sampling pass when `position_sample_interval` has
@@ -1086,6 +1130,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 first_error.get_or_insert(error);
             }
         }
+        let mirrored = self
+            .trace_journals
+            .drain(&mut self.diagnostics, &mut self.counters);
+        work = work.saturating_add(mirrored);
         self.update_stream_gauges();
         self.sample_positions();
         match first_error {
@@ -1200,6 +1248,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.diagnostics.loss_reader()
     }
 
+    /// A reader of the driver's trace mirror (`quantstratum-docs:
+    /// karyos/design/trace-journal-region.md`): the journal table and the
+    /// records drained from the client trace journals.
+    #[must_use]
+    pub fn trace_mirror(&self) -> karyos_sys::trace_mirror::TraceMirrorReader {
+        self.trace_journals.reader()
+    }
+
     /// The driver instance's random 128-bit `driver_id` (SPEC.md §4), as
     /// two words `[high, low]`. Trace records, observers and loss records
     /// carry it, and in IPC mode it is the admission instance id too
@@ -1286,6 +1342,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     pub(crate) fn clock_now(&mut self) -> u64 {
         self.clock.now()
     }
+}
+
+/// The trace mirror of a driver without IPC, on the heap.
+fn heap_mirror(
+    config: &DriverConfig,
+) -> Result<karyos_sys::trace_mirror::TraceMirror, DriverError> {
+    karyos_sys::trace_mirror::trace_mirror(config.max_trace_journals, config.trace_mirror_records)
+        .map_err(|_| DriverError::InvalidConfig)
 }
 
 fn seal_conflation_terminal<E>(

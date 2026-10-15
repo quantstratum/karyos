@@ -5,6 +5,6 @@
 //! `karyos-protocol` only, such as `karyos-trace`.
 
 pub use karyos_sys::record_journal::{
-    Append, DropRange, JournalConsumer, JournalError, JournalWriter, Losses, Record, Stamp, Taken,
-    record_journal,
+    Append, DropRange, JournalConsumer, JournalError, JournalLayout, JournalWriter, Losses, Record,
+    Stamp, Taken, record_journal,
 };

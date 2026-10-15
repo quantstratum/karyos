@@ -33,6 +33,9 @@ pub(crate) enum Participant {
     Concurrent { slot: usize },
     /// A subscriber cell.
     Subscriber { cell: usize, role: Role },
+    /// No stream participant: a client trace journal (`quantstratum-docs:
+    /// karyos/design/trace-journal-region.md`), whose grant has stream 0.
+    Journal { journal: u64 },
 }
 
 /// One grant.
@@ -44,7 +47,7 @@ pub(crate) struct Grant {
     pub(crate) registration: u64,
     /// The hand-over key of its response, which a fetch names.
     pub(crate) key: u64,
-    /// The driver's id of its stream.
+    /// The driver's id of its stream; 0 (no stream) for a journal grant.
     pub(crate) stream: u64,
     pub(crate) participant: Participant,
     pub(crate) state: GrantState,

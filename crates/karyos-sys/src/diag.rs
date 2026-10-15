@@ -35,7 +35,7 @@ const MESSAGE_WORDS: usize = MESSAGE_BYTES / WORD_BYTES;
 
 /// Where a ring lives.
 #[derive(Debug)]
-enum Store {
+pub(crate) enum Store {
     /// A heap allocation of this process.
     Heap(HeapWords),
     /// A shared region the driver writes (Linux).
@@ -48,7 +48,7 @@ enum Store {
 
 impl Store {
     /// The writable words; empty for a read-only store.
-    fn words(&self) -> &[AtomicU64] {
+    pub(crate) fn words(&self) -> &[AtomicU64] {
         match self {
             Self::Heap(heap) => heap.words().as_slice(),
             #[cfg(target_os = "linux")]
@@ -59,7 +59,7 @@ impl Store {
     }
 
     /// Word `index` with a `Relaxed` load, valid over every store.
-    fn load(&self, index: usize) -> Option<u64> {
+    pub(crate) fn load(&self, index: usize) -> Option<u64> {
         match self {
             #[cfg(target_os = "linux")]
             Self::ReadOnly(region) => region.structure().load(index),

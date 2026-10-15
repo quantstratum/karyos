@@ -17,7 +17,13 @@
 //! A client's log buffer grants (`quantstratum-docs:
 //! karyos/design/ipc-data-path.md`) live in its export ledger: a `Fetch` of
 //! a `Held` grant queues its `Manifest` and `Region` messages, and a
-//! `Detach` of an exported (or failed) grant ends its registration.
+//! `Detach` of an exported (or failed) grant ends its registration. A trace
+//! journal grant (`quantstratum-docs:
+//! karyos/design/trace-journal-region.md`) is fetched the same way: one
+//! `Manifest` with the journal number as registration, zero stream
+//! registration and incarnation, and one `Journal` record, then its
+//! `Region` with the journal region's descriptor (size seals only: the
+//! client writes it); its `Detach` tells the driver its writer is gone.
 //!
 //! A client ends with `Leave` or with the exit proof (its pidfd becomes
 //! readable). `Leave` is accepted only while no grant was exported and no
@@ -37,9 +43,10 @@
 //! `max_tools` tool connections, also while the driver is terminal, so
 //! that its diagnostics stay readable. A tool gets no client slot, command
 //! ring or capability: it is answered `ToolAdmitted` with the records of the
-//! four diagnostic regions (driver counters, client counters, error log,
-//! loss report), then one `Region` per record, in record order, each with
-//! the region's descriptor reopened read-only (owner decision Q7, A1). The
+//! five diagnostic regions (driver counters, client counters, error log,
+//! loss report, trace mirror), then one `Region` per record, in record
+//! order, each with the region's descriptor reopened read-only (owner
+//! decision Q7, A1). The
 //! connection stays open after this bootstrap, so the tool notices the
 //! driver's exit when it closes. A tool holds nothing the driver must
 //! reclaim (diagnostic regions are never reused while the driver lives), so
@@ -77,8 +84,8 @@ const BOOTSTRAP_REGIONS: u64 = 4;
 /// Messages of the bootstrap: `Admitted` and one `Region` per CnC record.
 const BOOTSTRAP_MESSAGES: usize = 1 + BOOTSTRAP_REGIONS as usize;
 /// Diagnostic regions granted to a tool: the driver counters, the client
-/// counters, the error log and the loss report.
-const TOOL_REGIONS: u64 = 4;
+/// counters, the error log, the loss report and the trace mirror.
+const TOOL_REGIONS: u64 = 5;
 /// A small default for [`IpcConfig::max_tools`].
 pub const DEFAULT_MAX_TOOLS: usize = 4;
 
@@ -245,9 +252,11 @@ fn record(region: &Region, export: u64) -> Option<Record> {
         RegionKind::Counters => WireKind::Counters,
         RegionKind::LogBuffer => WireKind::LogBuffer,
         RegionKind::ClientCounters => WireKind::ClientCounters,
-        // Granted to tools only (P7 o4).
+        // Granted to tools only (P7 o4, P6c).
         RegionKind::ErrorLog => WireKind::ErrorLog,
         RegionKind::LossReport => WireKind::LossReport,
+        RegionKind::TraceMirror => WireKind::TraceMirror,
+        RegionKind::Journal => WireKind::Journal,
     };
     Some(Record {
         region: header.region,
@@ -591,7 +600,7 @@ impl<T: StreamTerms> Admission<T> {
         }
     }
 
-    /// Builds a tool's bootstrap: `ToolAdmitted` with the four diagnostic
+    /// Builds a tool's bootstrap: `ToolAdmitted` with the five diagnostic
     /// records, then one `Region` per record with a read-only descriptor
     /// (A1). Export ids come from the driver's checked counter, so no id is
     /// ever given twice, although no ledger charges a tool's grants.
@@ -601,6 +610,7 @@ impl<T: StreamTerms> Admission<T> {
             driver.client_counters.region()?,
             driver.diagnostics.error_region()?,
             driver.diagnostics.loss_region()?,
+            driver.trace_journals.region()?,
         ];
         let mut next_export = driver.next_export;
         let first_export = Self::take_ids(&mut next_export, TOOL_REGIONS)?;
@@ -751,6 +761,16 @@ impl<T: StreamTerms> Admission<T> {
         else {
             return refuse(remote, refusal::UNKNOWN_KEY);
         };
+        if let Participant::Journal { journal } = grant.participant {
+            let found = driver
+                .trace_journals
+                .journal_region(journal)
+                .and_then(|region| Some((record(region, grant.export)?, descriptor(region))));
+            let Some((record, fd)) = found else {
+                return refuse(remote, refusal::RESOURCES);
+            };
+            return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, fd);
+        }
         let Some(stream) = driver.streams.iter().find(|s| s.id == grant.stream) else {
             return refuse(remote, refusal::RESOURCES);
         };
@@ -779,8 +799,32 @@ impl<T: StreamTerms> Admission<T> {
         ) else {
             return refuse(remote, refusal::RESOURCES);
         };
-        // One log buffer region per grant: one lane. The byte bound counts
-        // whole regions, header included.
+        let fd = descriptor(region);
+        Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, fd)
+    }
+
+    /// Queues the `Manifest` and the one `Region` of a grant's fetch, after
+    /// the fetch bounds; the grant is spent before anything is queued.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one fetch's whole context; a struct would only rename it"
+    )]
+    fn queue_fetch(
+        remote: &mut Remote<T>,
+        driver: &mut EmbeddedDriver<T>,
+        config: &IpcConfig,
+        fetch: u64,
+        key: u64,
+        grant: &Grant,
+        record: Record,
+        fd: Option<OwnedFd>,
+    ) -> Step {
+        let bound = config.max_outbound_per_client;
+        let refuse = |remote: &mut Remote<T>, code: u64| {
+            Self::queue(remote, &Message::Refused { fetch, code }, bound)
+        };
+        // One region per grant: one lane, or one journal. The byte bound
+        // counts whole regions, header included.
         let bytes = u64::try_from(karyos_sys::ipc::HEADER_STRIDE)
             .ok()
             .and_then(|header| record.structure_length.checked_add(header));
@@ -789,23 +833,24 @@ impl<T: StreamTerms> Admission<T> {
         {
             return refuse(remote, refusal::LIMIT);
         }
-        let Some(fd) = region
-            .descriptor()
-            .and_then(|fd| fd.try_clone_to_owned().ok())
-        else {
+        let Some(fd) = fd else {
             return refuse(remote, refusal::RESOURCES);
+        };
+        // The publication identity of the grant, whose driver part is the
+        // instance of `Admitted` (ACS 13555). One incarnation per stream
+        // registration, kept across mapping generations. A journal grant
+        // names no stream: both are zero.
+        let (stream_registration, incarnation) = match grant.participant {
+            Participant::Journal { .. } => (0, 0),
+            _ => (grant.stream, crate::embedded::FIRST_INCARNATION),
         };
         let (Some(manifest), Some(region_message)) = (
             encode(&Message::Manifest {
                 fetch,
                 key,
                 registration: grant.registration,
-                // The publication identity of the grant, whose driver part
-                // is the instance of `Admitted` (ACS 13555). One
-                // incarnation per stream registration, kept across
-                // mapping generations.
-                stream_registration: grant.stream,
-                incarnation: crate::embedded::FIRST_INCARNATION,
+                stream_registration,
+                incarnation,
                 records: vec![record],
             }),
             encode(&Message::Region { fetch, index: 0 }),
@@ -935,6 +980,13 @@ impl<T: StreamTerms> Admission<T> {
     }
 }
 
+/// A copy of the descriptor of a region the driver created.
+fn descriptor(region: &Region) -> Option<OwnedFd> {
+    region
+        .descriptor()
+        .and_then(|fd| fd.try_clone_to_owned().ok())
+}
+
 /// The manifest record of a grant's log buffer region.
 fn grant_record(
     region: &Region,
@@ -977,6 +1029,8 @@ fn grant_record(
             } => Capability::ObserverSubscriber {
                 cell: u64::try_from(cell).ok()?,
             },
+            // A journal grant has no log buffer record.
+            Participant::Journal { .. } => return None,
         },
     })
 }

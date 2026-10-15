@@ -22,6 +22,7 @@ mod generations;
 mod ledger;
 mod positions;
 mod remote_generations;
+mod trace_journals;
 
 #[cfg(target_os = "linux")]
 pub use admission::{DEFAULT_MAX_TOOLS, IpcConfig};

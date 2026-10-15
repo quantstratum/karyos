@@ -60,6 +60,10 @@
 //! | `overruns snapshot` | event | reported overruns whose applied policy was `snapshot`, whether it rebuilt or failed |
 //! | `overruns close` | event | reported overruns whose applied policy was `close` |
 //! | `replay fallbacks` | event | reported overruns whose `replay` policy fell back; each is also counted under its secondary |
+//! | `trace records mirrored` | event | client trace journal records the driver copied into the trace mirror |
+//! | `trace mirror overwritten` | event | trace mirror ring records overwritten (mirror loss, never journal loss) |
+//! | `trace journals open` | gauge | client trace journals whose writer may still append |
+//! | `trace journal faults` | event | client trace journals the driver stopped draining for a protocol violation |
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! "Per-stream positions") are allocated, set and released only inside a
@@ -93,7 +97,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 47] = [
+const LABELS: [(u64, &str); 51] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -141,6 +145,10 @@ const LABELS: [(u64, &str); 47] = [
     (TYPE_EVENTS, "overruns snapshot"),
     (TYPE_EVENTS, "overruns close"),
     (TYPE_EVENTS, "replay fallbacks"),
+    (TYPE_EVENTS, "trace records mirrored"),
+    (TYPE_EVENTS, "trace mirror overwritten"),
+    (TYPE_GAUGE, "trace journals open"),
+    (TYPE_EVENTS, "trace journal faults"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -261,6 +269,15 @@ pub(crate) enum Event {
     /// Reported overruns whose `replay` policy fell back to its secondary,
     /// which is also counted under its own policy.
     ReplayFallbacks,
+    /// Client trace journal records copied into the trace mirror.
+    TraceRecordsMirrored,
+    /// Trace mirror ring records overwritten: mirror loss, never journal
+    /// loss.
+    TraceMirrorOverwritten,
+    /// Client trace journals whose writer may still append.
+    TraceJournalsOpen,
+    /// Client trace journals no longer drained after a protocol violation.
+    TraceJournalFaults,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -490,6 +507,10 @@ mod tests {
             (Event::OverrunsSnapshot, "overruns snapshot"),
             (Event::OverrunsClose, "overruns close"),
             (Event::ReplayFallbacks, "replay fallbacks"),
+            (Event::TraceRecordsMirrored, "trace records mirrored"),
+            (Event::TraceMirrorOverwritten, "trace mirror overwritten"),
+            (Event::TraceJournalsOpen, "trace journals open"),
+            (Event::TraceJournalFaults, "trace journal faults"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

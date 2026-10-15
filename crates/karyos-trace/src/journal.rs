@@ -54,6 +54,38 @@ pub fn trace_journal(
     ))
 }
 
+/// A trace writer over a journal created elsewhere: a journal the driver
+/// created and drains into its trace mirror (`quantstratum-docs:
+/// karyos/design/trace-journal-region.md`), whose writer the client took
+/// from the driver, in process or from a journal region. Nothing changes on
+/// the data path: `record` appends with the same protocol over other
+/// memory.
+///
+/// # Errors
+///
+/// Returns [`TraceError::Journal`] with `PayloadLength` when the journal's
+/// records are not [`RECORD_WORDS`] words.
+pub fn trace_writer(
+    writer: JournalWriter,
+    observer: ObserverId,
+    collection_clock: u64,
+) -> Result<TraceWriter, TraceError> {
+    if writer.payload_words() != RECORD_WORDS {
+        return Err(TraceError::Journal(
+            karyos_protocol::journal::JournalError::PayloadLength {
+                length: writer.payload_words(),
+                expected: RECORD_WORDS,
+            },
+        ));
+    }
+    Ok(TraceWriter {
+        writer,
+        observer,
+        collection_clock,
+        last_epoch: None,
+    })
+}
+
 /// The journal's only writer: one observation point.
 #[derive(Debug)]
 pub struct TraceWriter {
@@ -314,6 +346,31 @@ mod tests {
         assert!(matches!(
             collector.take(),
             Collected::Record { collected, .. } if collected == epoch(3, 50)
+        ));
+    }
+
+    /// A trace writer over a journal created elsewhere (a driver's) appends
+    /// as one from `trace_journal`; a journal of another record length is
+    /// refused.
+    #[test]
+    fn a_trace_writer_runs_over_a_journal_created_elsewhere() {
+        let (raw, consumer) = record_journal(4, RECORD_WORDS, 2).unwrap();
+        let mut writer = trace_writer(raw, OBSERVER, 1).unwrap();
+        let mut collector = TraceCollector {
+            consumer,
+            observer: OBSERVER,
+        };
+        writer.record(&record(0, 5), stamp(5)).unwrap();
+        assert!(matches!(
+            collector.take(),
+            Collected::Record { sequence: 0, record: got, .. } if got == record(0, 5)
+        ));
+        let (short, _) = record_journal(4, RECORD_WORDS - 1, 2).unwrap();
+        assert!(matches!(
+            trace_writer(short, OBSERVER, 1),
+            Err(TraceError::Journal(
+                karyos_protocol::journal::JournalError::PayloadLength { .. }
+            ))
         ));
     }
 

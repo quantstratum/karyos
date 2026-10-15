@@ -24,11 +24,14 @@
 //! | `0x06` | `AllocateCounter` | sequence | type id | stream registration or 0 | participant registration or 0 |
 //! | `0x07` | `ReleaseCounter` | sequence | cell | registration | |
 //! | `0x08` | `ReportLoss` | sequence | driver instance id, high word | driver instance id, low word | stream registration |
+//! | `0x09` | `TraceJournal` | sequence | capacity in records (a power of two) | payload words (nonzero) | drop ranges (nonzero) |
+//! | `0x0A` | `CloseJournal` | sequence | journal number (nonzero) | final delivery boundary | |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
-//! | `0x84` | `Error` | client | sequence | code (1 to 6, see [`ErrorCode`]) | detail |
+//! | `0x84` | `Error` | client | sequence | code (1 to 7, see [`ErrorCode`]) | detail |
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
+//! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -48,6 +51,17 @@
 //! `replay`); the other bits are zero. The outcome must be one the
 //! configured policy can produce. The driver answers `OperationSucceeded`
 //! when it recorded the report, and nothing for a protocol violation.
+//!
+//! `TraceJournal` and `CloseJournal` (`quantstratum-docs:
+//! karyos/design/trace-journal-region.md`, J2 and J3): a client asks the
+//! driver for a trace journal of its sizes, which the driver creates and
+//! drains; the answer `JournalReady` carries the journal number the driver
+//! assigned and the hand-over key under which the client takes it, or
+//! `Error` with `TraceJournalsExhausted` when the driver's journal table has
+//! no free entry. `CloseJournal` gives the journal's final delivery
+//! boundary before the client closes it; the driver answers
+//! `OperationSucceeded`, or `Error` with `UnknownRegistration` for a
+//! journal that is not an open journal of the client without a boundary.
 //!
 //! Driver events (record types `0xC0` to `0xFF`, [`Event`]) answer no
 //! request and are broadcast to every client:
@@ -86,11 +100,14 @@ const ADD_CONCURRENT_PUBLICATION: u32 = 0x05;
 const ALLOCATE_COUNTER: u32 = 0x06;
 const RELEASE_COUNTER: u32 = 0x07;
 const REPORT_LOSS: u32 = 0x08;
+const TRACE_JOURNAL: u32 = 0x09;
+const CLOSE_JOURNAL: u32 = 0x0A;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
 const ERROR: u32 = 0x84;
 const COUNTER_ALLOCATED: u32 = 0x85;
+const JOURNAL_READY: u32 = 0x86;
 const PARTICIPANT_LOST: u32 = 0xC1;
 const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
 const PUBLICATION_CLOSED: u32 = 0xC3;
@@ -472,6 +489,29 @@ pub enum Command {
         /// The loss as captured.
         loss: ReportedLoss,
     },
+    /// Ask the driver for a trace journal of these sizes, which it creates
+    /// and drains into its trace mirror (`quantstratum-docs:
+    /// karyos/design/trace-journal-region.md`).
+    TraceJournal {
+        /// Request sequence.
+        sequence: u64,
+        /// Records, a nonzero power of two.
+        capacity: u64,
+        /// Payload words per record, nonzero.
+        payload_words: u64,
+        /// Drop-range entries, nonzero.
+        drop_ranges: u64,
+    },
+    /// The final delivery boundary of one of the client's journals, sent
+    /// before the client closes it.
+    CloseJournal {
+        /// Request sequence.
+        sequence: u64,
+        /// The journal number (nonzero).
+        journal: u64,
+        /// The final delivery boundary.
+        boundary: u64,
+    },
 }
 
 /// Why the driver refused a command.
@@ -490,6 +530,10 @@ pub enum ErrorCode {
     IdentitiesExhausted,
     /// The requested publication kind does not match the stream's mode.
     InvalidPublicationMode,
+    /// Every entry of the driver's journal table is held: by an open
+    /// journal, or by an ended one whose records the trace mirror still
+    /// retains. Nothing was created.
+    TraceJournalsExhausted,
 }
 
 impl ErrorCode {
@@ -501,6 +545,7 @@ impl ErrorCode {
             Self::ResourcesUnavailable => 4,
             Self::IdentitiesExhausted => 5,
             Self::InvalidPublicationMode => 6,
+            Self::TraceJournalsExhausted => 7,
         }
     }
 
@@ -512,6 +557,7 @@ impl ErrorCode {
             4 => Self::ResourcesUnavailable,
             5 => Self::IdentitiesExhausted,
             6 => Self::InvalidPublicationMode,
+            7 => Self::TraceJournalsExhausted,
             _ => return None,
         })
     }
@@ -560,6 +606,15 @@ pub enum Response {
         cell: u64,
         /// The allocation's fresh registration.
         registration: u64,
+    },
+    /// The trace journal is ready for hand-over.
+    JournalReady {
+        /// The request.
+        request: RequestId,
+        /// The journal number, never reused within the driver instance.
+        journal: u64,
+        /// The hand-over key.
+        key: u64,
     },
 }
 
@@ -617,6 +672,8 @@ impl Command {
             Self::AllocateCounter { .. } => ALLOCATE_COUNTER,
             Self::ReleaseCounter { .. } => RELEASE_COUNTER,
             Self::ReportLoss { .. } => REPORT_LOSS,
+            Self::TraceJournal { .. } => TRACE_JOURNAL,
+            Self::CloseJournal { .. } => CLOSE_JOURNAL,
         }
     }
 
@@ -631,7 +688,9 @@ impl Command {
             | Self::RemoveSubscription { sequence, .. }
             | Self::AllocateCounter { sequence, .. }
             | Self::ReleaseCounter { sequence, .. }
-            | Self::ReportLoss { sequence, .. } => sequence,
+            | Self::ReportLoss { sequence, .. }
+            | Self::TraceJournal { sequence, .. }
+            | Self::CloseJournal { sequence, .. } => sequence,
         }
     }
 
@@ -715,6 +774,17 @@ impl Command {
                 ],
                 out,
             ),
+            Self::TraceJournal {
+                sequence,
+                capacity,
+                payload_words,
+                drop_ranges,
+            } => write_words(&[sequence, capacity, payload_words, drop_ranges], out),
+            Self::CloseJournal {
+                sequence,
+                journal,
+                boundary,
+            } => write_words(&[sequence, journal, boundary], out),
         }
     }
 
@@ -828,6 +898,30 @@ impl Command {
                     loss,
                 })
             }
+            TRACE_JOURNAL => {
+                let [sequence, capacity, payload_words, drop_ranges] =
+                    read_words::<4>(type_id, bytes)?;
+                if !capacity.is_power_of_two() || payload_words == 0 || drop_ranges == 0 {
+                    return Err(CncError::Reserved { type_id });
+                }
+                Ok(Self::TraceJournal {
+                    sequence,
+                    capacity,
+                    payload_words,
+                    drop_ranges,
+                })
+            }
+            CLOSE_JOURNAL => {
+                let [sequence, journal, boundary] = read_words::<3>(type_id, bytes)?;
+                if journal == 0 {
+                    return Err(CncError::Reserved { type_id });
+                }
+                Ok(Self::CloseJournal {
+                    sequence,
+                    journal,
+                    boundary,
+                })
+            }
             _ => Err(CncError::UnknownType { type_id }),
         }
     }
@@ -843,6 +937,7 @@ impl Response {
             Self::OperationSucceeded { .. } => OPERATION_SUCCEEDED,
             Self::Error { .. } => ERROR,
             Self::CounterAllocated { .. } => COUNTER_ALLOCATED,
+            Self::JournalReady { .. } => JOURNAL_READY,
         }
     }
 
@@ -854,7 +949,8 @@ impl Response {
             | Self::SubscriptionReady { request, .. }
             | Self::OperationSucceeded { request }
             | Self::Error { request, .. }
-            | Self::CounterAllocated { request, .. } => request,
+            | Self::CounterAllocated { request, .. }
+            | Self::JournalReady { request, .. } => request,
         }
     }
 
@@ -891,6 +987,11 @@ impl Response {
                 cell,
                 registration,
             } => write_words(&[request.client, request.sequence, cell, registration], out),
+            Self::JournalReady {
+                request,
+                journal,
+                key,
+            } => write_words(&[request.client, request.sequence, journal, key], out),
         }
     }
 
@@ -940,6 +1041,14 @@ impl Response {
                     request: RequestId { client, sequence },
                     cell,
                     registration,
+                })
+            }
+            JOURNAL_READY => {
+                let [client, sequence, journal, key] = read_words::<4>(type_id, bytes)?;
+                Ok(Self::JournalReady {
+                    request: RequestId { client, sequence },
+                    journal,
+                    key,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -1476,7 +1585,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x09, &out[..length]),
+            Command::decode(0x0B, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         let mut response = [0u8; MAX_RESPONSE_LENGTH];
@@ -1836,6 +1945,111 @@ mod tests {
 /// bytes); and a flipped byte, a changed length or another record type of
 /// the direction is refused unless the result re-encodes to exactly the
 /// bytes and type decoded.
+/// The trace journal messages (`quantstratum-docs:
+/// karyos/design/trace-journal-region.md`): literal bytes and strict
+/// decoding.
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+
+    fn words_of(bytes: &[u8]) -> Vec<u64> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
+            .collect()
+    }
+
+    fn bytes_of(words: &[u64]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn journal_messages_have_their_layouts() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let open = Command::TraceJournal {
+            sequence: 3,
+            capacity: 64,
+            payload_words: 25,
+            drop_ranges: 8,
+        };
+        let length = open.encode(&mut out).unwrap();
+        assert_eq!(open.type_id(), 0x09);
+        assert_eq!(words_of(&out[..length]), [3, 64, 25, 8]);
+        assert_eq!(Command::decode(0x09, &out[..length]), Ok(open));
+        let close = Command::CloseJournal {
+            sequence: 4,
+            journal: 9,
+            boundary: 4096,
+        };
+        let length = close.encode(&mut out).unwrap();
+        assert_eq!(close.type_id(), 0x0A);
+        assert_eq!(words_of(&out[..length]), [4, 9, 4096]);
+        assert_eq!(Command::decode(0x0A, &out[..length]), Ok(close));
+        let request = RequestId {
+            client: 2,
+            sequence: 3,
+        };
+        let ready = Response::JournalReady {
+            request,
+            journal: 9,
+            key: 17,
+        };
+        let length = ready.encode(&mut out).unwrap();
+        assert_eq!(ready.type_id(), 0x86);
+        assert_eq!(words_of(&out[..length]), [2, 3, 9, 17]);
+        assert_eq!(Response::decode(0x86, &out[..length]), Ok(ready));
+        assert_eq!(ready.request(), request);
+        let refused = Response::Error {
+            request,
+            code: ErrorCode::TraceJournalsExhausted,
+            detail: 0,
+        };
+        let length = refused.encode(&mut out).unwrap();
+        assert_eq!(words_of(&out[..length]), [2, 3, 7, 0]);
+        assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
+    }
+
+    #[test]
+    fn journal_commands_are_decoded_strictly() {
+        // A capacity that is zero or not a power of two, no payload or no
+        // drop range, and journal 0.
+        for words in [[1u64, 0, 25, 8], [1, 3, 25, 8], [1, 4, 0, 8], [1, 4, 25, 0]] {
+            assert_eq!(
+                Command::decode(TRACE_JOURNAL, &bytes_of(&words)),
+                Err(CncError::Reserved {
+                    type_id: TRACE_JOURNAL
+                }),
+                "{words:?}"
+            );
+        }
+        assert_eq!(
+            Command::decode(CLOSE_JOURNAL, &bytes_of(&[1, 0, 5])),
+            Err(CncError::Reserved {
+                type_id: CLOSE_JOURNAL
+            })
+        );
+        assert!(matches!(
+            Command::decode(CLOSE_JOURNAL, &bytes_of(&[1, 2, 3, 4])),
+            Err(CncError::WrongLength { .. })
+        ));
+        assert!(matches!(
+            Command::decode(TRACE_JOURNAL, &bytes_of(&[1, 2, 3])),
+            Err(CncError::WrongLength { .. })
+        ));
+        assert!(matches!(
+            Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
+            Err(CncError::WrongLength { .. })
+        ));
+        // Error code 8 is not defined.
+        assert_eq!(
+            Response::decode(ERROR, &bytes_of(&[1, 2, 8, 0])),
+            Err(CncError::Reserved { type_id: ERROR })
+        );
+    }
+}
+
 #[cfg(test)]
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
@@ -1870,6 +2084,8 @@ mod properties {
             ALLOCATE_COUNTER,
             RELEASE_COUNTER,
             REPORT_LOSS,
+            TRACE_JOURNAL,
+            CLOSE_JOURNAL,
         ],
     };
 
@@ -1884,6 +2100,7 @@ mod properties {
             OPERATION_SUCCEEDED,
             ERROR,
             COUNTER_ALLOCATED,
+            JOURNAL_READY,
         ],
     };
 
@@ -2162,6 +2379,21 @@ mod properties {
             }),
             (any::<u64>(), loss())
                 .prop_map(|(sequence, loss)| Command::ReportLoss { sequence, loss }),
+            (any::<u64>(), 0u32..64, 1..=u64::MAX, 1..=u64::MAX).prop_map(
+                |(sequence, shift, payload_words, drop_ranges)| Command::TraceJournal {
+                    sequence,
+                    capacity: 1 << shift,
+                    payload_words,
+                    drop_ranges,
+                }
+            ),
+            (any::<u64>(), 1..=u64::MAX, any::<u64>()).prop_map(|(sequence, journal, boundary)| {
+                Command::CloseJournal {
+                    sequence,
+                    journal,
+                    boundary,
+                }
+            }),
         ]
     }
 
@@ -2174,6 +2406,7 @@ mod properties {
                 ErrorCode::ResourcesUnavailable,
                 ErrorCode::IdentitiesExhausted,
                 ErrorCode::InvalidPublicationMode,
+                ErrorCode::TraceJournalsExhausted,
             ][..],
         );
         prop_oneof![
@@ -2204,6 +2437,13 @@ mod properties {
                     request,
                     cell,
                     registration,
+                }
+            }),
+            (request(), any::<(u64, u64)>()).prop_map(|(request, (journal, key))| {
+                Response::JournalReady {
+                    request,
+                    journal,
+                    key,
                 }
             }),
         ]
@@ -2269,6 +2509,8 @@ mod properties {
                     (ALLOCATE_COUNTER, ALLOCATE_COUNTER_WORDS),
                     (RELEASE_COUNTER, 3),
                     (REPORT_LOSS, REPORT_LOSS_WORDS),
+                    (TRACE_JOURNAL, 4),
+                    (CLOSE_JOURNAL, 3),
                 ],
             ),
         ) {
@@ -2286,6 +2528,7 @@ mod properties {
                     (OPERATION_SUCCEEDED, 2),
                     (ERROR, 4),
                     (COUNTER_ALLOCATED, 4),
+                    (JOURNAL_READY, 4),
                 ],
             ),
         ) {

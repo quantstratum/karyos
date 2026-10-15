@@ -7,21 +7,21 @@
 //! [`attach_tool`] connects to the driver's admission socket after the same
 //! directory, socket and peer uid checks as a client, and sends `ToolHello`
 //! without a descriptor. The driver answers `ToolAdmitted` with its
-//! instance and the records of its four diagnostic regions, then one
+//! instance and the records of its five diagnostic regions, then one
 //! `Region` per record with a descriptor it reopened read-only (owner
 //! decision Q7, A1). The tool validates as a client does:
 //!
 //! - the version of `ToolAdmitted` is its own;
-//! - the records name each of the four diagnostic kinds (driver counters,
-//!   client counters, error log, loss report) exactly once and no other
-//!   kind;
+//! - the records name each of the five diagnostic kinds (driver counters,
+//!   client counters, error log, loss report, trace mirror) exactly once
+//!   and no other kind;
 //! - each `Region` arrives for the next record in order, with fetch id 0
 //!   and exactly one descriptor;
 //! - each descriptor passes [`ReadOnlyRegion::attach`] against the header
 //!   built from the full `ToolAdmitted` instance and its record, under the
 //!   seal profile of its kind: driver-only (A2) for the driver counters,
-//!   the error log and the loss report, shared for the client counters,
-//!   which clients write.
+//!   the error log, the loss report and the trace mirror, shared for the
+//!   client counters, which clients write.
 //!
 //! Any failure rolls the attach back: every staged mapping is unmapped,
 //! every received descriptor closed, the socket closed, and the error
@@ -42,18 +42,20 @@ use karyos_protocol::admission::{Message, Record, RegionKind as WireKind, VERSIO
 use karyos_sys::counters::CountersReader;
 use karyos_sys::diag::{ErrorLogReader, LossReportReader};
 use karyos_sys::ipc::{self, ReadOnlyRegion, Recv, RegionKind, RegionRecord, SealProfile};
+use karyos_sys::trace_mirror::TraceMirrorReader;
 
 use crate::ipc::{AttachError, receive, send};
 
 /// The diagnostic kinds a tool receives, each exactly once.
-const TOOL_KINDS: [WireKind; 4] = [
+const TOOL_KINDS: [WireKind; 5] = [
     WireKind::Counters,
     WireKind::ClientCounters,
     WireKind::ErrorLog,
     WireKind::LossReport,
+    WireKind::TraceMirror,
 ];
 
-/// A tool attached to a driver: read-only views of its four diagnostic
+/// A tool attached to a driver: read-only views of its five diagnostic
 /// regions, and the admission socket, whose close tells the driver's exit.
 #[derive(Debug)]
 pub struct RemoteTool {
@@ -62,6 +64,7 @@ pub struct RemoteTool {
     client_counters: CountersReader,
     errors: ErrorLogReader,
     losses: LossReportReader,
+    mirror: TraceMirrorReader,
     socket: Option<OwnedFd>,
 }
 
@@ -73,6 +76,7 @@ struct Staged {
     client_counters: Option<ReadOnlyRegion>,
     errors: Option<ReadOnlyRegion>,
     losses: Option<ReadOnlyRegion>,
+    mirror: Option<ReadOnlyRegion>,
 }
 
 impl Staged {
@@ -83,7 +87,11 @@ impl Staged {
             WireKind::ClientCounters => Some((&mut self.client_counters, SealProfile::Shared)),
             WireKind::ErrorLog => Some((&mut self.errors, SealProfile::DriverOnly)),
             WireKind::LossReport => Some((&mut self.losses, SealProfile::DriverOnly)),
-            WireKind::CommandRing | WireKind::Broadcast | WireKind::LogBuffer => None,
+            WireKind::TraceMirror => Some((&mut self.mirror, SealProfile::DriverOnly)),
+            WireKind::CommandRing
+            | WireKind::Broadcast
+            | WireKind::LogBuffer
+            | WireKind::Journal => None,
         }
     }
 }
@@ -96,7 +104,8 @@ fn expected(instance: u128, record: &Record) -> Result<RegionRecord, AttachError
         WireKind::ClientCounters => RegionKind::ClientCounters,
         WireKind::ErrorLog => RegionKind::ErrorLog,
         WireKind::LossReport => RegionKind::LossReport,
-        WireKind::CommandRing | WireKind::Broadcast | WireKind::LogBuffer => {
+        WireKind::TraceMirror => RegionKind::TraceMirror,
+        WireKind::CommandRing | WireKind::Broadcast | WireKind::LogBuffer | WireKind::Journal => {
             return Err(AttachError::Protocol);
         }
     };
@@ -197,11 +206,12 @@ pub fn attach_tool(dir: &Path, timeout: Duration) -> Result<RemoteTool, AttachEr
     // On any error, `staged` (and with it every mapping) and the socket are
     // dropped here; each descriptor was closed by its attach.
     let (instance, staged) = bootstrap(&socket)?;
-    let (Some(counters), Some(client_counters), Some(errors), Some(losses)) = (
+    let (Some(counters), Some(client_counters), Some(errors), Some(losses), Some(mirror)) = (
         staged.counters,
         staged.client_counters,
         staged.errors,
         staged.losses,
+        staged.mirror,
     ) else {
         return Err(AttachError::Protocol);
     };
@@ -211,6 +221,7 @@ pub fn attach_tool(dir: &Path, timeout: Duration) -> Result<RemoteTool, AttachEr
         client_counters: CountersReader::attach_read_only(client_counters)?,
         errors: ErrorLogReader::attach_read_only(errors)?,
         losses: LossReportReader::attach_read_only(losses)?,
+        mirror: TraceMirrorReader::attach_read_only(mirror)?,
         socket: Some(socket),
     })
 }
@@ -244,6 +255,13 @@ impl RemoteTool {
     #[must_use]
     pub fn loss_report(&self) -> &LossReportReader {
         &self.losses
+    }
+
+    /// The trace mirror, read-only: the journal table and the records the
+    /// driver drained from the client trace journals.
+    #[must_use]
+    pub fn trace_mirror(&self) -> &TraceMirrorReader {
+        &self.mirror
     }
 
     /// Whether the driver closed the connection, checked without blocking.

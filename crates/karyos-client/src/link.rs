@@ -4,7 +4,9 @@
 //! embedded mode (quantstratum-docs: karyos/design/client-commands.md): the close flag, the
 //! hand-over table, the capability leases that keep a stream charged
 //! while any of its capabilities lives, the client's counter releases and
-//! its subscriptions' loss reports.
+//! its subscriptions' loss reports. The table also holds the writers of the
+//! trace journals the driver created for the client (`quantstratum-docs:
+//! karyos/design/trace-journal-region.md`) until the client takes them.
 //!
 //! The hand-over table is control-path state behind a mutex; the data path
 //! never touches it. Crossing processes replaces these mechanisms under
@@ -14,6 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
+use karyos_sys::record_journal::JournalWriter;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use karyos_protocol::trace_hook::PublicationIdentity;
@@ -219,6 +222,9 @@ pub struct HandOverEntry<T: TermBytes = HeapTerms> {
 #[derive(Debug)]
 struct HandOver<T: TermBytes = HeapTerms> {
     entries: Vec<HandOverEntry<T>>,
+    /// Trace journal writers by hand-over key. Dropping one closes its
+    /// journal, which the driver then drains to its end.
+    journals: Vec<(u64, JournalWriter)>,
     /// Set when the driver is dropped: takes fail from then on.
     driver_gone: bool,
 }
@@ -248,6 +254,7 @@ impl<T: TermBytes> Default for ClientLink<T> {
             closed: AtomicBool::new(false),
             hand_over: Mutex::new(HandOver {
                 entries: Vec::new(),
+                journals: Vec::new(),
                 driver_gone: false,
             }),
             counters: Arc::new(CounterReleases::default()),
@@ -322,15 +329,44 @@ impl<T: TermBytes> ClientLink<T> {
         entry.is_some()
     }
 
-    /// Driver side: drops every `Held` entry; with `driver_gone`, later takes
-    /// fail with [`HandOverError::Closed`].
+    /// Driver side: drops every `Held` entry and journal writer; with
+    /// `driver_gone`, later takes fail with [`HandOverError::Closed`].
     pub fn drop_all(&self, driver_gone: bool) {
-        let entries = {
+        let (entries, journals) = {
             let mut table = self.table();
             table.driver_gone |= driver_gone;
-            core::mem::take(&mut table.entries)
+            (
+                core::mem::take(&mut table.entries),
+                core::mem::take(&mut table.journals),
+            )
         };
         drop(entries);
+        drop(journals);
+    }
+
+    /// Driver side: holds the writer of a trace journal under `key`.
+    pub fn hold_journal(&self, key: u64, writer: JournalWriter) {
+        self.table().journals.push((key, writer));
+    }
+
+    /// Client side: takes the trace journal writer held under `key`,
+    /// exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandOverError::Closed`] if the driver is gone or no writer
+    /// is held under `key`.
+    pub fn take_journal(&self, key: u64) -> Result<JournalWriter, HandOverError> {
+        let mut table = self.table();
+        if table.driver_gone {
+            return Err(HandOverError::Closed);
+        }
+        let index = table
+            .journals
+            .iter()
+            .position(|(held, _)| *held == key)
+            .ok_or(HandOverError::Closed)?;
+        Ok(table.journals.swap_remove(index).1)
     }
 
     /// Whether the driver was dropped.
