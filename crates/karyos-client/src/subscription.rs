@@ -21,7 +21,7 @@ use karyos_protocol::frame::TraceExtension;
 use karyos_protocol::trace_hook::{PublicationIdentity, SubscriberIdentity, TraceHook};
 
 use crate::error::ClientError;
-use crate::generation::{GenerationLink, Next, Successor, representable};
+use crate::generation::{GenerationLink, Next, Retired, RetiredHandle, Successor, representable};
 use crate::link::{Export, Lease, Origin};
 use crate::trace::DeliveryTrace;
 
@@ -471,6 +471,52 @@ impl<T: TermBytes> ClientSubscription<T> {
                 self.base = base;
                 Some(true)
             }
+            // A remote successor is activated here, without allocating; the
+            // predecessor waits in the link for the control path.
+            Next::Moved {
+                base,
+                successor:
+                    Successor::PreparedSubscription {
+                        prepared,
+                        scratch,
+                        export,
+                    },
+            } => match prepared.activate() {
+                Ok(inner) => {
+                    let predecessor = core::mem::replace(&mut self.inner, inner);
+                    let predecessor_scratch = core::mem::replace(&mut self.scratch, scratch);
+                    let predecessor_export = self._export.replace(export);
+                    self.base = base;
+                    link.retire(Retired {
+                        _handle: Some(RetiredHandle::Subscription {
+                            inner: predecessor,
+                            scratch: predecessor_scratch,
+                        }),
+                        _export: predecessor_export,
+                    });
+                    Some(true)
+                }
+                // The driver's fence won: this mapping is the last.
+                Err(refused) => {
+                    link.fail_activation(match refused.prepared {
+                        Some(prepared) => Retired {
+                            _handle: Some(RetiredHandle::Successor(
+                                Successor::PreparedSubscription {
+                                    prepared,
+                                    scratch,
+                                    export,
+                                },
+                            )),
+                            _export: None,
+                        },
+                        None => Retired {
+                            _handle: None,
+                            _export: Some(export),
+                        },
+                    });
+                    None
+                }
+            },
             // A successor of another kind is a driver bug: never used.
             Next::Moved { .. } | Next::End => None,
         }
@@ -627,5 +673,154 @@ mod tests {
                 extent: 64,
             })
         );
+    }
+
+    /// Counts the drops of the exports it marks.
+    struct DropMark(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropMark {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// A remote subscription on a predecessor sealed after `before`, and a
+    /// successor with cell `cell` registered for export 7 and its publisher.
+    struct RemoteCutover {
+        link: Arc<GenerationLink>,
+        subscription: ClientSubscription,
+        successor: Arc<LogBuffer>,
+        publication: karyos_sys::log_buffer::Publication<Arc<LogBuffer>>,
+        conductor: karyos_sys::log_buffer::Conductor<Arc<LogBuffer>>,
+        cell: usize,
+        detached: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn remote_cutover() -> RemoteCutover {
+        let predecessor = buffer();
+        let mut conductor = predecessor.conductor_owned().unwrap();
+        let link = GenerationLink::new_remote();
+        let detached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut subscription =
+            ClientSubscription::new(conductor.subscribe(Role::Required).unwrap())
+                .with_generation(Arc::clone(&link), 0)
+                .unwrap()
+                .with_export(Export::new(DropMark(Arc::clone(&detached))));
+        let mut publication = predecessor.publication_owned().unwrap().unwrap();
+        let _ = publication
+            .append(b"before", AppendOptions::default())
+            .unwrap();
+        conductor.seal().unwrap();
+        assert_eq!(
+            publication
+                .append(b"late", AppendOptions::default())
+                .unwrap(),
+            karyos_sys::log_buffer::AppendOutcome::Closed
+        );
+        let _ = conductor.duty_cycle().unwrap();
+        let mut seen = Vec::new();
+        let summary = subscription
+            .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+            .unwrap();
+        assert_eq!(seen, vec![b"before".to_vec()]);
+        // The seal is unresolved: not the end.
+        assert_eq!(summary.closed, None);
+        let successor = buffer();
+        let mut successor_conductor = successor.conductor_owned().unwrap();
+        let cell = successor_conductor
+            .register_subscriber_with(Role::Required, false, 7)
+            .unwrap();
+        let successor_publication = successor.publication_owned().unwrap().unwrap();
+        RemoteCutover {
+            link,
+            subscription,
+            successor,
+            publication: successor_publication,
+            conductor: successor_conductor,
+            cell,
+            detached,
+        }
+    }
+
+    #[test]
+    fn a_remote_subscription_activates_its_prepared_successor_at_the_seal() {
+        let RemoteCutover {
+            link,
+            mut subscription,
+            successor,
+            mut publication,
+            cell,
+            detached,
+            ..
+        } = remote_cutover();
+        let prepared =
+            Subscription::prepare_adopt(Arc::clone(&successor), cell, Role::Required, 7).unwrap();
+        let scratch = vec![0u8; successor.max_message_length() as usize].into_boxed_slice();
+        link.offer(
+            1 << 20,
+            Successor::PreparedSubscription {
+                prepared,
+                scratch,
+                export: Export::new(DropMark(Arc::clone(&detached))),
+            },
+        )
+        .unwrap();
+        let _ = publication
+            .append(b"after", AppendOptions::default())
+            .unwrap();
+        // The poll that crosses the seal neither allocates nor frees.
+        let mut seen = None;
+        let (summary, operations) = karyos_sys::alloc_count::count(|| {
+            subscription
+                .poll(
+                    |bytes, info| {
+                        if bytes == b"after" {
+                            seen = Some(info.position);
+                        }
+                    },
+                    MessageLimit::new(8),
+                )
+                .ok()
+        });
+        let summary = summary.unwrap();
+        assert_eq!(operations, 0, "the move allocated or freed");
+        assert_eq!(summary.closed, None);
+        assert_eq!(summary.delivered, 1);
+        assert_eq!(seen, Some(1 << 20));
+        assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(link.take_retired());
+        assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_remote_subscription_whose_successor_was_fenced_ends() {
+        let RemoteCutover {
+            link,
+            mut subscription,
+            successor,
+            mut conductor,
+            cell,
+            detached,
+            ..
+        } = remote_cutover();
+        let prepared =
+            Subscription::prepare_adopt(Arc::clone(&successor), cell, Role::Required, 7).unwrap();
+        assert!(conductor.fence_subscriber(cell, 7));
+        let scratch = vec![0u8; successor.max_message_length() as usize].into_boxed_slice();
+        link.offer(
+            1 << 20,
+            Successor::PreparedSubscription {
+                prepared,
+                scratch,
+                export: Export::new(DropMark(Arc::clone(&detached))),
+            },
+        )
+        .unwrap();
+        let summary = subscription.poll(|_, _| {}, MessageLimit::new(8)).unwrap();
+        assert!(summary.closed.is_some());
+        assert_eq!(link.status(), crate::LinkStatus::Closed);
+        assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(link.take_retired());
+        assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

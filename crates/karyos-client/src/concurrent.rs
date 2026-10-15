@@ -18,7 +18,9 @@ use karyos_protocol::frame::TraceExtension;
 use karyos_protocol::trace_hook::{PublicationIdentity, TraceHook};
 
 use crate::error::ClientError;
-use crate::generation::{End, GenerationLink, Next, Successor, representable};
+use crate::generation::{
+    End, GenerationLink, Next, Retired, RetiredHandle, Successor, representable,
+};
 use crate::link::{Export, Lease, Origin};
 use crate::publication::CommitOutcome;
 use crate::trace::{PublishTrace, TraceDecision};
@@ -511,6 +513,39 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
                 self.base = base;
                 End::Retry
             }
+            // A remote successor is activated here, without allocating; the
+            // predecessor waits in the link for the control path.
+            Next::Moved {
+                base,
+                successor: Successor::PreparedConcurrent { prepared, export },
+            } => match prepared.activate() {
+                Ok(inner) => {
+                    let predecessor = core::mem::replace(&mut self.inner, inner);
+                    let predecessor_export = self._export.replace(export);
+                    self.base = base;
+                    link.retire(Retired {
+                        _handle: Some(RetiredHandle::Concurrent(predecessor)),
+                        _export: predecessor_export,
+                    });
+                    End::Retry
+                }
+                // The driver's fence won: this mapping is the last.
+                Err(refused) => {
+                    link.fail_activation(match refused.prepared {
+                        Some(prepared) => Retired {
+                            _handle: Some(RetiredHandle::Successor(
+                                Successor::PreparedConcurrent { prepared, export },
+                            )),
+                            _export: None,
+                        },
+                        None => Retired {
+                            _handle: None,
+                            _export: Some(export),
+                        },
+                    });
+                    End::Closed
+                }
+            },
             // A successor of another kind is a driver bug: never used.
             Next::Moved { .. } | Next::End => End::Closed,
         }
@@ -729,5 +764,103 @@ mod tests {
                 .unwrap(),
             ConcurrentOfferOutcome::Accepted { position: 0, .. }
         ));
+    }
+
+    fn concurrent_buffer() -> Arc<LogBuffer> {
+        Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 3,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+                claim_deadline: DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Concurrent {
+                    publishers: 2,
+                    allow_non_lse: true,
+                },
+            })
+            .unwrap(),
+        )
+    }
+
+    /// Counts the drops of the exports it marks.
+    struct DropMark(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropMark {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_remote_concurrent_publication_activates_or_closes_at_the_seal() {
+        for fenced in [false, true] {
+            let predecessor = concurrent_buffer();
+            let mut conductor: Conductor<Arc<LogBuffer>> = predecessor.conductor_owned().unwrap();
+            let link = GenerationLink::new_remote();
+            let detached = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut publication = ClientConcurrentPublication::new(
+                conductor.concurrent_publication().unwrap().unwrap(),
+                true,
+            )
+            .with_generation(Arc::clone(&link), 0)
+            .unwrap()
+            .with_export(crate::link::Export::new(DropMark(Arc::clone(&detached))));
+            conductor.seal().unwrap();
+            assert_eq!(
+                publication.offer(b"late").unwrap(),
+                ConcurrentOfferOutcome::AdminAction,
+                "an unresolved seal is pending"
+            );
+            let successor = concurrent_buffer();
+            let mut successor_conductor: Conductor<Arc<LogBuffer>> =
+                successor.conductor_owned().unwrap();
+            let slot = successor_conductor
+                .register_concurrent_publication(7)
+                .unwrap()
+                .unwrap();
+            let prepared =
+                ConcurrentPublication::prepare_adopt(Arc::clone(&successor), slot, 7).unwrap();
+            if fenced {
+                assert!(successor_conductor.fence_concurrent_publication(slot, 7));
+            }
+            link.offer(
+                1 << 20,
+                Successor::PreparedConcurrent {
+                    prepared,
+                    export: crate::link::Export::new(DropMark(Arc::clone(&detached))),
+                },
+            )
+            .unwrap();
+            if fenced {
+                assert_eq!(
+                    publication.offer(b"late").unwrap(),
+                    ConcurrentOfferOutcome::Closed
+                );
+                assert_eq!(link.status(), crate::LinkStatus::Closed);
+            } else {
+                // Neither the move nor the first offer on the successor
+                // allocates or frees.
+                let (moved, operations) =
+                    karyos_sys::alloc_count::count(|| publication.offer(b"late"));
+                assert_eq!(moved.unwrap(), ConcurrentOfferOutcome::AdminAction);
+                assert_eq!(operations, 0, "the move allocated or freed");
+                let (accepted, operations) =
+                    karyos_sys::alloc_count::count(|| publication.offer(b"late"));
+                assert!(matches!(
+                    accepted.unwrap(),
+                    ConcurrentOfferOutcome::Accepted { position, .. } if position == 1 << 20
+                ));
+                assert_eq!(operations, 0);
+            }
+            assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 0);
+            drop(link.take_retired());
+            assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 1);
+        }
     }
 }

@@ -12,11 +12,27 @@
 //! touches it. The state sits behind a mutex: the driver's fence and the
 //! handle's move are both transitions under it, so exactly one of them wins
 //! for an offered successor.
+//!
+//! A remote handle's link is fed by its client's control path instead
+//! (`quantstratum-docs: karyos/design/ipc-data-path.md`, Generations across
+//! processes). Its successor arrives prepared, not adopted: the handle
+//! activates it when it reaches the seal, a bounded and allocation-free
+//! step, and leaves its predecessor in the link's retired slot, which the
+//! control path drops later (unmapping it and sending its `Detach`). A
+//! remote handle learns of a cutover only from the driver's broadcast, which
+//! can come after its data path sees the seal, so its link reports an
+//! unresolved seal as pending until the control path offers a successor or
+//! closes the link.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
+use karyos_sys::log_buffer::{
+    ConcurrentPublication, LogBuffer, PreparedConcurrentPublication, PreparedPublication,
+    PreparedSubscription, Publication, Subscription,
+};
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
+
+use crate::link::Export;
 
 /// Stream positions stay below `2^63` (SPEC.md §4).
 pub const POSITION_LIMIT: u64 = 1 << 63;
@@ -48,6 +64,32 @@ pub enum Successor<T: TermBytes = HeapTerms> {
         /// The copy buffer.
         scratch: Box<[u8]>,
     },
+    /// A remote grant's exclusive publication, prepared on the control path
+    /// and activated by the handle at the seal.
+    PreparedPublication {
+        /// The prepared adoption.
+        prepared: PreparedPublication<Arc<LogBuffer<T>>>,
+        /// The successor grant's export, sent `Detach` when dropped.
+        export: Export,
+    },
+    /// A remote grant's publisher slot, prepared as
+    /// [`Successor::PreparedPublication`].
+    PreparedConcurrent {
+        /// The prepared adoption.
+        prepared: PreparedConcurrentPublication<Arc<LogBuffer<T>>>,
+        /// The successor grant's export.
+        export: Export,
+    },
+    /// A remote grant's subscriber cell, prepared as
+    /// [`Successor::PreparedPublication`], with its copy buffer.
+    PreparedSubscription {
+        /// The prepared adoption.
+        prepared: PreparedSubscription<Arc<LogBuffer<T>>>,
+        /// The copy buffer.
+        scratch: Box<[u8]>,
+        /// The successor grant's export.
+        export: Export,
+    },
 }
 
 impl<T: TermBytes> Successor<T> {
@@ -58,8 +100,39 @@ impl<T: TermBytes> Successor<T> {
             Self::Publication(inner) => inner.buffer(),
             Self::Concurrent(inner) => inner.buffer(),
             Self::Subscription { inner, .. } => inner.buffer(),
+            Self::PreparedPublication { prepared, .. } => prepared.buffer(),
+            Self::PreparedConcurrent { prepared, .. } => prepared.buffer(),
+            Self::PreparedSubscription { prepared, .. } => prepared.buffer(),
         }
     }
+}
+
+/// What a remote handle leaves behind when it moves or fails to: dropped
+/// by the control path, never by a data call. The handle goes first, so
+/// the mapping is gone before the export's drop sends `Detach`.
+#[derive(Debug)]
+pub(crate) struct Retired<T: TermBytes = HeapTerms> {
+    /// Held only for its drop.
+    pub(crate) _handle: Option<RetiredHandle<T>>,
+    /// Held only for its drop, after the handle's.
+    pub(crate) _export: Option<Export>,
+}
+
+/// The sys handle of a [`Retired`] entry, held only for its drop.
+#[derive(Debug)]
+#[allow(dead_code, reason = "held only for its drop")]
+pub(crate) enum RetiredHandle<T: TermBytes = HeapTerms> {
+    /// A predecessor's exclusive publication.
+    Publication(Publication<Arc<LogBuffer<T>>>),
+    /// A predecessor's publisher slot.
+    Concurrent(ConcurrentPublication<Arc<LogBuffer<T>>>),
+    /// A predecessor's subscriber cell and copy buffer.
+    Subscription {
+        inner: Subscription<Arc<LogBuffer<T>>>,
+        scratch: Box<[u8]>,
+    },
+    /// A successor whose activation failed.
+    Successor(Successor<T>),
 }
 
 /// The link's state, as the driver sees it.
@@ -74,6 +147,8 @@ pub enum LinkStatus {
     Offered,
     /// Fenced: the handle will not move; its mapping is its last.
     Fenced,
+    /// Closed: its mapping is its last and no successor can be offered.
+    Closed,
 }
 
 #[derive(Debug)]
@@ -82,6 +157,14 @@ enum State<T: TermBytes = HeapTerms> {
     Pending,
     Offered { base: u64, successor: Successor<T> },
     Fenced,
+    Closed,
+}
+
+#[derive(Debug)]
+struct Inner<T: TermBytes = HeapTerms> {
+    state: State<T>,
+    /// A remote handle's predecessor, until the control path drops it.
+    retired: Option<Retired<T>>,
 }
 
 /// What a handle finds when its mapping ended.
@@ -107,8 +190,14 @@ pub(crate) enum End {
 impl End {
     /// The outcome the link announces, without moving.
     pub(crate) fn peek<T: TermBytes>(link: Option<&GenerationLink<T>>) -> Self {
-        match link.map(GenerationLink::status) {
-            Some(LinkStatus::Pending | LinkStatus::Offered) => Self::Retry,
+        let Some(link) = link else {
+            return Self::Closed;
+        };
+        match link.status() {
+            LinkStatus::Pending | LinkStatus::Offered => Self::Retry,
+            // A remote handle's seal is unresolved until its control path
+            // offers a successor or closes the link.
+            LinkStatus::Current if link.remote => Self::Retry,
             _ => Self::Closed,
         }
     }
@@ -117,61 +206,90 @@ impl End {
 /// The link shared by one handle and its driver.
 #[derive(Debug)]
 pub struct GenerationLink<T: TermBytes = HeapTerms> {
-    state: Mutex<State<T>>,
+    inner: Mutex<Inner<T>>,
+    /// Fed by a remote client's control path rather than by the driver.
+    remote: bool,
 }
 
 impl<T: TermBytes> GenerationLink<T> {
     /// A link in the `Current` state.
     #[must_use]
     pub fn new() -> Arc<Self> {
+        Self::with_remote(false)
+    }
+
+    /// A remote handle's link, in the `Current` state: an unresolved seal
+    /// reads as pending, and its control path offers prepared successors
+    /// without a `Pending` step.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the remote control path uses it next (d5c2)")
+    )]
+    #[must_use]
+    pub(crate) fn new_remote() -> Arc<Self> {
+        Self::with_remote(true)
+    }
+
+    fn with_remote(remote: bool) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(State::Current),
+            inner: Mutex::new(Inner {
+                state: State::Current,
+                retired: None,
+            }),
+            remote,
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, State<T>> {
+    fn lock(&self) -> MutexGuard<'_, Inner<T>> {
         // Every transition below is a single assignment, so a panic in
         // another holder never leaves a partial state.
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The link's state.
     #[must_use]
     pub fn status(&self) -> LinkStatus {
-        match *self.lock() {
+        match self.lock().state {
             State::Current => LinkStatus::Current,
             State::Pending => LinkStatus::Pending,
             State::Offered { .. } => LinkStatus::Offered,
             State::Fenced => LinkStatus::Fenced,
+            State::Closed => LinkStatus::Closed,
         }
     }
 
     /// Driver: a cutover started. Only a `Current` link becomes `Pending`;
     /// returns whether it did.
     pub fn set_pending(&self) -> bool {
-        let mut state = self.lock();
-        if matches!(*state, State::Current) {
-            *state = State::Pending;
+        let mut inner = self.lock();
+        if matches!(inner.state, State::Current) {
+            inner.state = State::Pending;
             true
         } else {
             false
         }
     }
 
-    /// Driver: the cutover opened at `base`. A `Pending` link is offered
-    /// `successor`; any other state gives it back.
+    /// Driver: the cutover opened at `base`. A `Pending` link, or a remote
+    /// one still `Current`, is offered `successor`; any other state gives
+    /// it back.
     ///
     /// # Errors
     ///
-    /// Returns the successor when the link is not pending, or when its
+    /// Returns the successor when the link cannot take it, or when its
     /// mapping starting at `base` is not [`representable`].
     pub fn offer(&self, base: u64, successor: Successor<T>) -> Result<(), Successor<T>> {
         if !representable(base, successor.buffer()) {
             return Err(successor);
         }
-        let mut state = self.lock();
-        if matches!(*state, State::Pending) {
-            *state = State::Offered { base, successor };
+        let mut inner = self.lock();
+        let takes = match inner.state {
+            State::Pending => true,
+            State::Current => self.remote,
+            _ => false,
+        };
+        if takes {
+            inner.state = State::Offered { base, successor };
             Ok(())
         } else {
             Err(successor)
@@ -181,36 +299,84 @@ impl<T: TermBytes> GenerationLink<T> {
     /// Driver: fences a `Pending` or `Offered` link and returns the
     /// successor it reserved, if any, for the driver to drop or reissue. A
     /// `Current` link (the handle already moved) or a `Fenced` one is left
-    /// as it is, and `None` is returned.
+    /// as it is, and `None` is returned. A `Closed` link stays closed.
     pub fn fence(&self) -> Option<Successor<T>> {
-        let mut state = self.lock();
-        match core::mem::replace(&mut *state, State::Fenced) {
+        let mut inner = self.lock();
+        match core::mem::replace(&mut inner.state, State::Fenced) {
             State::Offered { successor, .. } => Some(successor),
             State::Pending | State::Fenced => None,
-            current @ State::Current => {
-                *state = current;
+            kept @ (State::Current | State::Closed) => {
+                inner.state = kept;
                 None
             }
         }
     }
 
+    /// Closes the link for good, whatever its state: the handle's mapping
+    /// is its last. Returns the offered successor, if any, for the caller
+    /// to drop outside the link.
+    pub fn close(&self) -> Option<Successor<T>> {
+        match core::mem::replace(&mut self.lock().state, State::Closed) {
+            State::Offered { successor, .. } => Some(successor),
+            _ => None,
+        }
+    }
+
     /// Handle: its mapping ended. Takes an offered successor (the link is
     /// `Current` again, for a later cutover), or reports a pending cutover
-    /// or the end. A `Current` link means no cutover was started: the end.
+    /// or the end. A `Current` link means no cutover was started: the end,
+    /// except for a remote link, whose control path may not have heard of
+    /// the cutover yet. A remote handle whose retired slot is still full
+    /// waits until its control path empties it.
     pub(crate) fn next(&self) -> Next<T> {
-        let mut state = self.lock();
-        match core::mem::replace(&mut *state, State::Current) {
+        let mut inner = self.lock();
+        if self.remote && inner.retired.is_some() && matches!(inner.state, State::Offered { .. }) {
+            return Next::Wait;
+        }
+        match core::mem::replace(&mut inner.state, State::Current) {
             State::Offered { base, successor } => Next::Moved { base, successor },
             State::Pending => {
-                *state = State::Pending;
+                inner.state = State::Pending;
                 Next::Wait
             }
-            State::Fenced => {
-                *state = State::Fenced;
+            State::Current if self.remote => Next::Wait,
+            ended @ (State::Fenced | State::Closed) => {
+                inner.state = ended;
                 Next::End
             }
             State::Current => Next::End,
         }
+    }
+
+    /// Remote handle: keeps what it left behind for the control path. The
+    /// slot is empty when the handle moves ([`GenerationLink::next`] waits
+    /// otherwise), so nothing is dropped here.
+    pub(crate) fn retire(&self, retired: Retired<T>) {
+        let mut inner = self.lock();
+        debug_assert!(inner.retired.is_none(), "one retired entry at a time");
+        if inner.retired.is_none() {
+            inner.retired = Some(retired);
+        }
+    }
+
+    /// Remote handle: its successor's activation failed (the driver's
+    /// fence won): the link closes, keeping the successor for the control
+    /// path.
+    pub(crate) fn fail_activation(&self, retired: Retired<T>) {
+        let mut inner = self.lock();
+        inner.state = State::Closed;
+        if inner.retired.is_none() {
+            inner.retired = Some(retired);
+        }
+    }
+
+    /// Control path: takes what the handle left behind, to drop it.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "the remote control path uses it next (d5c2)")
+    )]
+    pub(crate) fn take_retired(&self) -> Option<Retired<T>> {
+        self.lock().retired.take()
     }
 }
 
@@ -271,6 +437,76 @@ mod tests {
         assert!(matches!(link.next(), Next::End));
         assert!(!link.set_pending());
         assert!(link.offer(9, successor()).is_err());
+    }
+
+    #[test]
+    fn a_remote_link_waits_at_an_unresolved_seal_and_takes_an_offer_without_pending() {
+        let link = GenerationLink::<HeapTerms>::new_remote();
+        assert!(matches!(link.next(), Next::Wait));
+        assert_eq!(End::peek(Some(&link)), End::Retry);
+        assert!(link.offer(5, successor()).is_ok());
+        assert!(matches!(link.next(), Next::Moved { base: 5, .. }));
+        assert_eq!(link.status(), LinkStatus::Current);
+        // The next mapping's seal is unresolved again.
+        assert!(matches!(link.next(), Next::Wait));
+    }
+
+    #[test]
+    fn a_remote_link_does_not_move_while_its_retired_slot_is_full() {
+        let link = GenerationLink::<HeapTerms>::new_remote();
+        link.retire(Retired {
+            _handle: None,
+            _export: None,
+        });
+        assert!(link.offer(5, successor()).is_ok());
+        assert!(matches!(link.next(), Next::Wait));
+        assert_eq!(link.status(), LinkStatus::Offered);
+        assert!(link.take_retired().is_some());
+        assert!(link.take_retired().is_none());
+        assert!(matches!(link.next(), Next::Moved { base: 5, .. }));
+    }
+
+    #[test]
+    fn close_ends_a_link_in_any_state_and_returns_its_offer() {
+        for remote in [false, true] {
+            let link = GenerationLink::<HeapTerms>::with_remote(remote);
+            assert!(link.set_pending());
+            assert!(link.offer(5, successor()).is_ok());
+            assert!(matches!(link.close(), Some(Successor::Publication(_))));
+            assert_eq!(link.status(), LinkStatus::Closed);
+            assert!(matches!(link.next(), Next::End));
+            assert_eq!(End::peek(Some(&link)), End::Closed);
+            assert!(link.offer(9, successor()).is_err());
+            assert!(!link.set_pending());
+            // A fence keeps it closed.
+            assert!(link.fence().is_none());
+            assert_eq!(link.status(), LinkStatus::Closed);
+        }
+        let link = GenerationLink::<HeapTerms>::new_remote();
+        assert!(link.close().is_none());
+        assert!(matches!(link.next(), Next::End));
+    }
+
+    /// The allocation counts of the handle tests are meaningful: the
+    /// counter sees an allocation and its free.
+    #[test]
+    fn the_counting_allocator_sees_an_allocation_and_its_free() {
+        let ((), operations) = karyos_sys::alloc_count::count(|| {
+            drop(std::hint::black_box(vec![0u8; 64]));
+        });
+        assert_eq!(operations, 2);
+    }
+
+    #[test]
+    fn a_failed_activation_closes_the_link_and_keeps_what_it_held() {
+        let link = GenerationLink::<HeapTerms>::new_remote();
+        link.fail_activation(Retired {
+            _handle: None,
+            _export: None,
+        });
+        assert_eq!(link.status(), LinkStatus::Closed);
+        assert!(matches!(link.next(), Next::End));
+        assert!(link.take_retired().is_some());
     }
 
     #[test]

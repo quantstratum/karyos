@@ -9,6 +9,13 @@
 //! The driver feeder and lanes beyond one do not yet exist. Linux IPC
 //! attachment is implemented.
 
+/// Counts this test binary's allocations, for the data calls that must not
+/// allocate (`karyos_sys::alloc_count`).
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
+    karyos_sys::alloc_count::CountingAllocator;
+
 pub mod concurrent;
 pub mod conductor;
 pub mod conflated_subscription;
