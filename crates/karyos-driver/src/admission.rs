@@ -37,7 +37,7 @@ use karyos_sys::command_ring::RingConsumer;
 use karyos_sys::error::SysError;
 use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, Sent};
 
-use crate::embedded::EmbeddedDriver;
+use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 
 /// Region id of the broadcast buffer.
@@ -84,11 +84,11 @@ struct Outgoing {
 
 /// An admitted client with an open socket.
 #[derive(Debug)]
-struct Remote {
+struct Remote<T: StreamTerms> {
     client: u64,
     socket: OwnedFd,
     pidfd: PidFd,
-    link: Arc<ClientLink>,
+    link: Arc<ClientLink<T>>,
     outbound: VecDeque<Outgoing>,
     /// When its bootstrap was queued, until the bootstrap is sent.
     bootstrap_since: Option<u64>,
@@ -96,9 +96,9 @@ struct Remote {
 
 /// A client whose socket is gone, charged until its exit proof.
 #[derive(Debug)]
-struct Retiring {
+struct Retiring<T: StreamTerms> {
     pidfd: PidFd,
-    link: Arc<ClientLink>,
+    link: Arc<ClientLink<T>>,
 }
 
 /// What happened to a remote client in one step.
@@ -110,13 +110,13 @@ enum Step {
 
 /// The admission socket and its connections.
 #[derive(Debug)]
-pub(crate) struct Admission {
+pub(crate) struct Admission<T: StreamTerms> {
     instance: u128,
     config: IpcConfig,
     listener: OwnedFd,
     pending: Vec<Pending>,
-    remotes: Vec<Remote>,
-    retiring: Vec<Retiring>,
+    remotes: Vec<Remote<T>>,
+    retiring: Vec<Retiring<T>>,
     next_region: u64,
 }
 
@@ -171,7 +171,7 @@ fn record(region: &Region, export: u64) -> Option<Record> {
     })
 }
 
-impl Admission {
+impl<T: StreamTerms> Admission<T> {
     /// Draws the instance id and opens the socket; returns the instance id
     /// too, for the driver's regions.
     pub(crate) fn new(config: IpcConfig) -> Result<(Self, u128), DriverError> {
@@ -205,6 +205,15 @@ impl Admission {
     }
 
     /// Takes `count` consecutive ids from a checked counter.
+    /// The driver instance and a fresh region id for a stream's log buffer
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Terms in the
+    /// types). Region ids are never reused.
+    pub(crate) fn next_region(&mut self) -> Result<(u128, u64), DriverError> {
+        let region =
+            Self::take_ids(&mut self.next_region, 1).ok_or(DriverError::RegionIdsExhausted)?;
+        Ok((self.instance, region))
+    }
+
     fn take_ids(next: &mut u64, count: u64) -> Option<u64> {
         let first = *next;
         *next = first.checked_add(count)?;
@@ -214,7 +223,7 @@ impl Admission {
     /// One admission step: accepts, reads `Hello`s and client messages,
     /// drains the outbound queues and checks exit proofs. Returns work
     /// done.
-    fn serve(&mut self, driver: &mut EmbeddedDriver) -> u32 {
+    fn serve(&mut self, driver: &mut EmbeddedDriver<T>) -> u32 {
         let mut work = 0u32;
         // Accept up to the pending bound.
         let mut now = None;
@@ -319,7 +328,7 @@ impl Admission {
     /// refuses it and closes the connection.
     fn hello(
         &mut self,
-        driver: &mut EmbeddedDriver,
+        driver: &mut EmbeddedDriver<T>,
         socket: OwnedFd,
         bytes: &[u8],
         fd: Option<OwnedFd>,
@@ -365,8 +374,8 @@ impl Admission {
     /// bootstrap messages.
     fn bootstrap(
         &mut self,
-        driver: &mut EmbeddedDriver,
-    ) -> Option<(u64, Arc<ClientLink>, VecDeque<Outgoing>)> {
+        driver: &mut EmbeddedDriver<T>,
+    ) -> Option<(u64, Arc<ClientLink<T>>, VecDeque<Outgoing>)> {
         let mut next_region = self.next_region;
         let mut next_export = driver.next_export;
         let region = Self::take_ids(&mut next_region, 1)?;
@@ -408,7 +417,7 @@ impl Admission {
     }
 
     /// Reads at most one datagram of an admitted client.
-    fn receive(remote: &mut Remote, bound: usize) -> Step {
+    fn receive(remote: &mut Remote<T>, bound: usize) -> Step {
         let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
         match ipc::recv(remote.socket.as_fd(), &mut buffer) {
             Ok(Recv::WouldBlock) => Step::Keep,
@@ -437,7 +446,7 @@ impl Admission {
 
     /// Queues one message without a descriptor; retires the client when
     /// its queue is full.
-    fn queue(remote: &mut Remote, message: &Message, bound: usize) -> Step {
+    fn queue(remote: &mut Remote<T>, message: &Message, bound: usize) -> Step {
         let Some(bytes) = encode(message) else {
             return Step::Retire;
         };
@@ -449,7 +458,7 @@ impl Admission {
     }
 
     /// Sends queued messages while the socket takes them.
-    fn drain(remote: &mut Remote) -> Step {
+    fn drain(remote: &mut Remote<T>) -> Step {
         while let Some(next) = remote.outbound.front() {
             match ipc::send(
                 remote.socket.as_fd(),
@@ -467,7 +476,7 @@ impl Admission {
     }
 }
 
-impl EmbeddedDriver {
+impl<T: StreamTerms> EmbeddedDriver<T> {
     /// The admission step of a duty cycle; 0 without IPC.
     pub(crate) fn serve_admission(&mut self) -> u32 {
         let Some(mut admission) = self.admission.take() else {

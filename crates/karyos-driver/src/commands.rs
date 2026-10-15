@@ -25,7 +25,7 @@ use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::log_buffer::{LossPolicy, Revocation, Role, SealState};
 
 use crate::counters::Event;
-use crate::embedded::EmbeddedDriver;
+use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::generations::MemberKind;
 
@@ -42,12 +42,12 @@ pub(crate) struct Holding {
 }
 
 #[derive(Debug)]
-pub(crate) struct ClientSlot {
+pub(crate) struct ClientSlot<T: StreamTerms> {
     id: u64,
     /// `None` once the client is retired; the slot itself stays until the
     /// client's producer is known to be detached (its close flag).
     consumer: Option<RingConsumer>,
-    link: Arc<ClientLink>,
+    link: Arc<ClientLink<T>>,
     /// The client heartbeat last seen and the driver time it was first
     /// seen at; `None` until the first sample.
     seen: Option<(u64, u64)>,
@@ -78,7 +78,7 @@ impl Registration {
     }
 }
 
-impl EmbeddedDriver {
+impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Admits a client (control path: allocates its command ring and
     /// broadcast receiver) and returns its conductor.
     ///
@@ -87,7 +87,7 @@ impl EmbeddedDriver {
     /// Returns [`DriverError::TooManyClients`] at `max_clients`,
     /// [`DriverError::ClientIdsExhausted`], and [`DriverError::Terminal`]
     /// after the driver entered its terminal state.
-    pub fn connect(&mut self) -> Result<ClientConductor, DriverError> {
+    pub fn connect(&mut self) -> Result<ClientConductor<T>, DriverError> {
         if self.terminal {
             return Err(DriverError::Terminal);
         }
@@ -117,7 +117,7 @@ impl EmbeddedDriver {
     pub(crate) fn admit(
         &mut self,
         consumer: RingConsumer,
-        link: Arc<ClientLink>,
+        link: Arc<ClientLink<T>>,
     ) -> Result<u64, DriverError> {
         let id = self.next_client;
         let next = id.checked_add(1).ok_or(DriverError::ClientIdsExhausted)?;
@@ -461,7 +461,7 @@ impl EmbeddedDriver {
     }
 
     /// Preflight, then effect. Returns the single response.
-    fn execute(&mut self, client: u64, link: &Arc<ClientLink>, command: Command) -> Response {
+    fn execute(&mut self, client: u64, link: &Arc<ClientLink<T>>, command: Command) -> Response {
         let request = RequestId {
             client,
             sequence: command.sequence(),
@@ -645,7 +645,7 @@ fn issue_refusal(error: &karyos_sys::error::SysError) -> ErrorCode {
     }
 }
 
-impl Drop for EmbeddedDriver {
+impl<T: StreamTerms> Drop for EmbeddedDriver<T> {
     fn drop(&mut self) {
         self.broadcast.close();
         for slot in &self.clients {

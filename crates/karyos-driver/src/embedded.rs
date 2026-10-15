@@ -37,12 +37,72 @@ use karyos_sys::log_buffer::{
     Role, SealState,
 };
 use karyos_sys::term::Generation;
+#[cfg(target_os = "linux")]
+use karyos_sys::term_bytes::SharedTerms;
+use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
 use crate::counters::{DriverCounters, Event};
 use crate::error::DriverError;
 use crate::generations::{Cutover, Member, MemberKind, Retained};
+
+/// The term backing of a driver's streams (`quantstratum-docs:
+/// karyos/design/ipc-data-path.md`, Terms in the types): heap words for an
+/// embedded driver, shared regions for a driver in IPC mode, whose
+/// in-process clients use the same shared terms, so one stream never has
+/// two backings. Sealed: only the driver creates streams.
+pub trait StreamTerms: TermBytes + sealed::Create {}
+
+impl StreamTerms for HeapTerms {}
+#[cfg(target_os = "linux")]
+impl StreamTerms for SharedTerms {}
+
+pub(crate) mod sealed {
+    use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig};
+    use karyos_sys::term::Generation;
+
+    use crate::embedded::{EmbeddedDriver, StreamTerms};
+    use crate::error::DriverError;
+
+    /// Creates a stream's log buffer on the driver's backing.
+    pub trait Create: Sized {
+        /// A log buffer of `generation` for `config`.
+        fn create(
+            driver: &mut EmbeddedDriver<Self>,
+            config: LogBufferConfig,
+            generation: Generation,
+        ) -> Result<LogBuffer<Self>, DriverError>
+        where
+            Self: StreamTerms;
+    }
+
+    impl Create for karyos_sys::term_bytes::HeapTerms {
+        fn create(
+            _driver: &mut EmbeddedDriver<Self>,
+            config: LogBufferConfig,
+            generation: Generation,
+        ) -> Result<LogBuffer<Self>, DriverError> {
+            Ok(LogBuffer::new_with_generation(config, generation)?)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Create for karyos_sys::term_bytes::SharedTerms {
+        fn create(
+            driver: &mut EmbeddedDriver<Self>,
+            config: LogBufferConfig,
+            generation: Generation,
+        ) -> Result<LogBuffer<Self>, DriverError> {
+            let admission = driver
+                .admission
+                .as_mut()
+                .ok_or(DriverError::InvalidConfig)?;
+            let (instance, region) = admission.next_region()?;
+            Ok(LogBuffer::create_in(instance, region, config, generation)?)
+        }
+    }
+}
 
 /// Limits and sizes of the control channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,11 +205,11 @@ pub enum StreamState {
 static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
-pub(crate) struct Stream {
+pub(crate) struct Stream<T: StreamTerms> {
     pub(crate) id: u64,
     pub(crate) retiring: bool,
-    pub(crate) buffer: Arc<LogBuffer>,
-    pub(crate) conductor: Conductor<Arc<LogBuffer>>,
+    pub(crate) buffer: Arc<LogBuffer<T>>,
+    pub(crate) conductor: Conductor<Arc<LogBuffer<T>>>,
     pub(crate) leases: Arc<StreamLeases>,
     allow_unconnected: bool,
     /// The stream's `on_required_loss` policy.
@@ -164,19 +224,19 @@ pub(crate) struct Stream {
     pub(crate) generation: Generation,
     pub(crate) base: u64,
     /// The generation links of the handles on the current mapping.
-    pub(crate) members: Vec<Member>,
+    pub(crate) members: Vec<Member<T>>,
     /// The cutover in progress, if any.
-    pub(crate) cutover: Option<Cutover>,
+    pub(crate) cutover: Option<Cutover<T>>,
     /// Predecessor mappings still referenced, oldest first.
-    pub(crate) retained: Vec<Retained>,
+    pub(crate) retained: Vec<Retained<T>>,
     /// The current mapping's exclusive publication, returned by a fence,
     /// for the next issuance.
-    pub(crate) spare: Option<Publication<Arc<LogBuffer>>>,
+    pub(crate) spare: Option<Publication<Arc<LogBuffer<T>>>>,
 }
 
-impl Stream {
+impl<T: StreamTerms> Stream<T> {
     /// A new generation link for a handle on the current mapping.
-    pub(crate) fn join(&mut self, kind: MemberKind) -> (Arc<GenerationLink>, u64) {
+    pub(crate) fn join(&mut self, kind: MemberKind) -> (Arc<GenerationLink<T>>, u64) {
         let link = GenerationLink::new();
         self.members.push(Member {
             link: Arc::downgrade(&link),
@@ -198,12 +258,12 @@ impl Stream {
 
 /// Owns streams and clients and runs conductor duty on demand.
 #[derive(Debug)]
-pub struct EmbeddedDriver {
+pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) id: u64,
     pub(crate) config: DriverConfig,
-    pub(crate) streams: Vec<Stream>,
+    pub(crate) streams: Vec<Stream<T>>,
     pub(crate) broadcast: BroadcastTransmitter,
-    pub(crate) clients: Vec<ClientSlot>,
+    pub(crate) clients: Vec<ClientSlot<T>>,
     pub(crate) registrations: Vec<crate::commands::Registration>,
     pub(crate) next_client: u64,
     pub(crate) next_stream: u64,
@@ -224,10 +284,10 @@ pub struct EmbeddedDriver {
     pub(crate) last_beat: Option<u64>,
     /// The admission socket and its connections (IPC mode).
     #[cfg(target_os = "linux")]
-    pub(crate) admission: Option<crate::admission::Admission>,
+    pub(crate) admission: Option<crate::admission::Admission<T>>,
 }
 
-impl EmbeddedDriver {
+impl EmbeddedDriver<HeapTerms> {
     /// An empty driver.
     ///
     /// # Errors
@@ -263,10 +323,14 @@ impl EmbeddedDriver {
     ) -> Result<Self, DriverError> {
         Self::build(config, clock, None)
     }
+}
 
+#[cfg(target_os = "linux")]
+impl EmbeddedDriver<SharedTerms> {
     /// A driver that also admits clients of other processes through its
     /// admission socket (`quantstratum-docs: karyos/design/ipc-admission-server.md`, Linux).
-    /// Its broadcast buffer and counters live in shared regions.
+    /// Its broadcast buffer, counters and every stream live in shared
+    /// regions; its in-process clients use the same shared terms.
     ///
     /// # Errors
     ///
@@ -281,7 +345,9 @@ impl EmbeddedDriver {
     ) -> Result<Self, DriverError> {
         Self::build(config, clock, Some(ipc))
     }
+}
 
+impl<T: StreamTerms> EmbeddedDriver<T> {
     fn build(
         config: DriverConfig,
         clock: Box<dyn MonotonicClock>,
@@ -529,7 +595,11 @@ impl EmbeddedDriver {
         }
         let id = self.next_stream;
         let next = id.checked_add(1).ok_or(DriverError::StreamIdsExhausted)?;
-        let buffer = Arc::new(LogBuffer::new(config.buffer)?);
+        let buffer = Arc::new(<T as sealed::Create>::create(
+            self,
+            config.buffer,
+            Generation::default(),
+        )?);
         let conductor = buffer
             .conductor_owned()
             .ok_or(karyos_sys::error::SysError::ResourcesUnavailable)?;
@@ -569,7 +639,10 @@ impl EmbeddedDriver {
     /// [`DriverError::InvalidPublicationMode`] for a concurrent stream,
     /// [`DriverError::StreamRetiring`] for a removed stream, and
     /// [`DriverError::UnknownStream`] for a foreign handle or a freed stream.
-    pub fn publication(&mut self, stream: StreamHandle) -> Result<ClientPublication, DriverError> {
+    pub fn publication(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<ClientPublication<T>, DriverError> {
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = match stream.spare.take() {
@@ -604,7 +677,7 @@ impl EmbeddedDriver {
     pub fn concurrent_publication(
         &mut self,
         stream: StreamHandle,
-    ) -> Result<ClientConcurrentPublication, DriverError> {
+    ) -> Result<ClientConcurrentPublication<T>, DriverError> {
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = stream
@@ -634,7 +707,7 @@ impl EmbeddedDriver {
         &mut self,
         stream: StreamHandle,
         role: Role,
-    ) -> Result<ClientSubscription, DriverError> {
+    ) -> Result<ClientSubscription<T>, DriverError> {
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = stream.conductor.subscribe(role)?;
@@ -726,7 +799,7 @@ impl EmbeddedDriver {
         }
     }
 
-    fn stream(&mut self, stream: StreamHandle) -> Result<&mut Stream, DriverError> {
+    fn stream(&mut self, stream: StreamHandle) -> Result<&mut Stream<T>, DriverError> {
         let unknown = DriverError::UnknownStream {
             stream: stream.stream,
         };
@@ -739,7 +812,7 @@ impl EmbeddedDriver {
             .ok_or(unknown)
     }
 
-    fn active_stream(&mut self, stream: StreamHandle) -> Result<&mut Stream, DriverError> {
+    fn active_stream(&mut self, stream: StreamHandle) -> Result<&mut Stream<T>, DriverError> {
         let found = self.stream(stream)?;
         if found.retiring {
             return Err(DriverError::StreamRetiring { stream: found.id });
@@ -750,11 +823,11 @@ impl EmbeddedDriver {
     pub(crate) fn active_stream_mut(
         &mut self,
         stream: StreamHandle,
-    ) -> Result<&mut Stream, DriverError> {
+    ) -> Result<&mut Stream<T>, DriverError> {
         self.active_stream(stream)
     }
 
-    pub(crate) fn stream_ref(&self, stream: StreamHandle) -> Result<&Stream, DriverError> {
+    pub(crate) fn stream_ref(&self, stream: StreamHandle) -> Result<&Stream<T>, DriverError> {
         let unknown = DriverError::UnknownStream {
             stream: stream.stream,
         };
@@ -773,11 +846,11 @@ impl EmbeddedDriver {
 }
 
 /// One conductor duty cycle, its work added.
-fn duty(
+fn duty<T: TermBytes>(
     counters: &DriverCounters,
     work: &mut u32,
     first_error: &mut Option<DriverError>,
-    conductor: &mut Conductor<Arc<LogBuffer>>,
+    conductor: &mut Conductor<Arc<LogBuffer<T>>>,
 ) {
     match conductor.duty_cycle() {
         Ok(report) => {

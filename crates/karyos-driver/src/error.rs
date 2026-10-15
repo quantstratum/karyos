@@ -69,6 +69,9 @@ pub enum DriverError {
     /// The process has used every driver identity.
     #[error("driver identities exhausted")]
     DriverIdsExhausted,
+    /// The driver has used every shared region identity.
+    #[error("region identities exhausted")]
+    RegionIdsExhausted,
     /// Every publication the stream can issue is out: its exclusive
     /// publication, or all `P` publisher slots of a concurrent stream.
     #[error("the stream's publication has already been taken")]

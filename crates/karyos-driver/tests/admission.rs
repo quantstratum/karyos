@@ -18,11 +18,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use karyos_client::ipc::{AttachError, RemoteClient, attach};
-use karyos_client::{Completion, Outcome};
-use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, MonotonicClock, SystemClock};
+use karyos_client::{
+    ClientPublication, ClientSubscription, Completion, MessageLimit, OfferOutcome, Outcome,
+};
+use karyos_driver::{
+    DriverConfig, EmbeddedDriver, IpcConfig, LossPolicy, MonotonicClock, StreamConfig, SystemClock,
+};
 use karyos_protocol::admission::{MAX_MESSAGE_LENGTH, Message, VERSION, refusal};
 use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
+use karyos_sys::frame::Lane;
 use karyos_sys::ipc::{self, PidFd, Recv, Sent};
+use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+use karyos_sys::term::TermId;
+use karyos_sys::term_bytes::SharedTerms;
 
 const CHILD: &str = "KARYOS_ADMISSION_CHILD";
 
@@ -36,6 +45,9 @@ impl MonotonicClock for ManualClock {
         self.now.load(Ordering::Relaxed)
     }
 }
+
+/// The driver of these tests: IPC mode, every stream in a shared region.
+type IpcDriver = EmbeddedDriver<SharedTerms>;
 
 fn dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("karyos-adm-{}-{name}", std::process::id()));
@@ -54,12 +66,12 @@ fn ipc_config(dir: &Path, timeout: u64) -> IpcConfig {
     }
 }
 
-fn driver(dir: &Path, clock: Box<dyn MonotonicClock>) -> EmbeddedDriver {
+fn driver(dir: &Path, clock: Box<dyn MonotonicClock>) -> IpcDriver {
     EmbeddedDriver::with_ipc(DriverConfig::default(), ipc_config(dir, 100), clock).unwrap()
 }
 
 /// A driver on the system clock (nanoseconds) with timeouts of 5 s.
-fn system_driver(dir: &Path) -> EmbeddedDriver {
+fn system_driver(dir: &Path) -> IpcDriver {
     EmbeddedDriver::with_ipc(
         DriverConfig::default(),
         ipc_config(dir, 5_000_000_000),
@@ -69,7 +81,7 @@ fn system_driver(dir: &Path) -> EmbeddedDriver {
 }
 
 /// Attaches on another thread while this one runs duty cycles.
-fn attach_serving(driver: &mut EmbeddedDriver, dir: &Path) -> Result<RemoteClient, AttachError> {
+fn attach_serving(driver: &mut IpcDriver, dir: &Path) -> Result<RemoteClient, AttachError> {
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| attach(dir, Duration::from_secs(5), 16));
         while !handle.is_finished() {
@@ -81,7 +93,7 @@ fn attach_serving(driver: &mut EmbeddedDriver, dir: &Path) -> Result<RemoteClien
 }
 
 /// Duty cycles until `done` or a few seconds pass.
-fn serve_until(driver: &mut EmbeddedDriver, mut done: impl FnMut(&EmbeddedDriver) -> bool) {
+fn serve_until(driver: &mut IpcDriver, mut done: impl FnMut(&IpcDriver) -> bool) {
     let start = Instant::now();
     while !done(driver) {
         assert!(start.elapsed() < Duration::from_secs(5), "timed out");
@@ -99,7 +111,7 @@ fn encode(message: &Message) -> Vec<u8> {
 /// Sends a raw first datagram and returns the driver's answer, if any,
 /// before the connection closes.
 fn raw_hello(
-    driver: &mut EmbeddedDriver,
+    driver: &mut IpcDriver,
     dir: &Path,
     bytes: &[u8],
     fd: Option<&OwnedFd>,
@@ -316,4 +328,53 @@ fn own_pidfd() -> OwnedFd {
 fn other_pidfd(pid: u32) -> OwnedFd {
     let pidfd = PidFd::open(i32::try_from(pid).unwrap()).unwrap();
     pidfd.as_fd().try_clone_to_owned().unwrap()
+}
+
+/// In IPC mode every stream lives in a shared region, and the driver's
+/// in-process handles use the same shared terms (`quantstratum-docs:
+/// karyos/design/ipc-data-path.md`, Terms in the types).
+#[test]
+fn an_ipc_driver_keeps_its_streams_in_shared_regions() {
+    let dir = dir("streams");
+    let mut driver = system_driver(&dir);
+    let stream = driver
+        .add_stream(StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+            },
+            allow_unconnected: false,
+            on_required_loss: LossPolicy::Hold,
+        })
+        .unwrap();
+    let mut subscription: ClientSubscription<SharedTerms> =
+        driver.subscribe(stream, Role::Required).unwrap();
+    let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
+    let mut sent = 0;
+    while sent < 3 {
+        let _ = driver.do_work().unwrap();
+        if matches!(
+            publication.offer(&[sent; 40]).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ) {
+            sent += 1;
+        }
+    }
+    let mut received = Vec::new();
+    let _ = subscription
+        .poll(
+            |payload, _| received.push(payload.to_vec()),
+            MessageLimit::new(8),
+        )
+        .unwrap();
+    assert_eq!(received, vec![vec![0u8; 40], vec![1u8; 40], vec![2u8; 40]]);
 }
