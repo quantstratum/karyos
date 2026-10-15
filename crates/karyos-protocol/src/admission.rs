@@ -37,7 +37,11 @@
 //! change keeps [`VERSION`] and changes encoder and decoder together, as the
 //! client counters record of the bootstrap and the observer capability did;
 //! strict decoding makes a peer of another build fail at its first changed
-//! message. The stream registration and incarnation words of `Manifest`
+//! message. That holds only because every decoder demands an exact length
+//! and the old and new layouts of the changed message can never have the
+//! same length for any record count; a change that keeps some length equal
+//! (for example one that adds exactly one record's words) must bump
+//! [`VERSION`] instead (review of #124). The stream registration and incarnation words of `Manifest`
 //! follow that rule (coordinator decision, ACS 13555: they carry the
 //! publication identity of the grant, whose driver part is the instance of
 //! `Admitted`).

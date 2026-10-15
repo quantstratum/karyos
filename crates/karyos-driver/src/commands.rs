@@ -43,8 +43,8 @@ use karyos_client::link::{
 };
 use karyos_protocol::cnc::{
     CloseReason, Command, CounterLabel, ErrorCode, Event as DriverEvent, LossPolicyCode,
-    MAX_COMMAND_LENGTH, MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RejoinOutcomeCode, RejoinPolicyCode,
-    ReportedLoss, RequestId, Response, StreamKey,
+    MAX_COMMAND_LENGTH, MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RejoinOutcomeCode, ReportedLoss,
+    RequestId, Response, StreamKey,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::counters::{CounterKeys, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER};
@@ -681,7 +681,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             },
             1,
         );
-        if loss.configured == RejoinPolicyCode::Replay {
+        // Only a replay that fell back: once replay can succeed (phase 3)
+        // it reports no fallback reason and is not counted here.
+        if loss.fallback.is_some() {
             self.counters.add(Event::ReplayFallbacks, 1);
         }
         Ok(())
@@ -1233,6 +1235,7 @@ mod tests {
 
     use super::*;
     use crate::embedded::{StreamConfig, StreamHandle};
+    use karyos_protocol::cnc::RejoinPolicyCode;
 
     fn driver() -> EmbeddedDriver {
         driver_with_stream().0
