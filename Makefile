@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test loom sim bench miri build-release deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint doc test loom loom-full sim bench miri build-release deny deps-inventory deps-check lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -23,6 +23,14 @@ test:
 
 loom:
 	RUSTFLAGS="--cfg loom" $(CARGO) test -p karyos-sys --release --locked --test 'loom_*'
+
+# loom plus the slow models marked #[ignore] (about 11 minutes more). Hosted
+# CI is off, so this is a merge gate: a PR that touches the counters seqlock
+# or its layout (crates/*/src/counters*, crates/karyos-sys/tests/loom_counters.rs)
+# cites a green `make loom-full` run on its exact head as review evidence
+# (coordinator decision, ACS 12607).
+loom-full:
+	RUSTFLAGS="--cfg loom" $(CARGO) test -p karyos-sys --release --locked --test 'loom_*' -- --include-ignored
 
 sim:
 	KARYOS_SIM_SEEDS=$${KARYOS_SIM_SEEDS:-2000} $(CARGO) test -p karyos-sim --release --locked --test scenarios

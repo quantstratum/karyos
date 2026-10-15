@@ -11,7 +11,9 @@
 //! In both, the reader asserts before any join, and a quiescent read after
 //! the joins must succeed.
 //!
-//! Run with `make loom`.
+//! Run with `make loom`; the three-thread gauge model is `#[ignore]` and
+//! runs with `make loom-full`, which counters changes must pass before
+//! merge (ACS 12607).
 
 #![cfg(loom)]
 
@@ -134,6 +136,7 @@ fn increments_and_reallocation_are_never_mixed() {
 /// The allocator reallocates A as B and hands B's capability to a separate
 /// updater thread, which sets a gauge value.
 #[test]
+#[ignore = "slow (about 11 minutes): run by `make loom-full`, a merge gate for counters changes"]
 fn a_transferred_gauge_is_never_mixed() {
     builder().check(|| {
         let cell = Cell::with_a();
