@@ -11,11 +11,13 @@
 //! In both, the reader asserts before any join, and a quiescent read after
 //! the joins must succeed.
 //!
-//! Run with `make loom`.
+//! Run with `make loom`; the three-thread gauge model is `#[ignore]` and
+//! runs with `make loom-full`, which counters changes must pass before
+//! merge (ACS 12607).
 
 #![cfg(loom)]
 
-use karyos_sys::counters::{CellRead, CellWords, CounterMetadata, META_WORDS};
+use karyos_sys::counters::{CellRead, CellWords, CounterKeys, CounterMetadata, META_WORDS};
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::sync::Arc;
 use loom::thread;
@@ -45,12 +47,28 @@ impl Cell {
     }
 }
 
+// A and B differ in every key word too, so a read mixing their keys is
+// caught like one mixing their labels (layout version 2).
 fn metadata_a() -> CounterMetadata {
-    CounterMetadata::new(1, 10, &"a".repeat(64)).unwrap()
+    CounterMetadata::new(1, 10, &"a".repeat(64))
+        .unwrap()
+        .with_keys(CounterKeys {
+            stream: 1,
+            lane: 1,
+            kind: 1,
+            participant: 1,
+        })
 }
 
 fn metadata_b() -> CounterMetadata {
-    CounterMetadata::new(2, 20, &"b".repeat(64)).unwrap()
+    CounterMetadata::new(2, 20, &"b".repeat(64))
+        .unwrap()
+        .with_keys(CounterKeys {
+            stream: 2,
+            lane: 2,
+            kind: 2,
+            participant: 2,
+        })
 }
 
 /// Checks a concurrent read: A's metadata only with A's values, B's only
@@ -118,6 +136,7 @@ fn increments_and_reallocation_are_never_mixed() {
 /// The allocator reallocates A as B and hands B's capability to a separate
 /// updater thread, which sets a gauge value.
 #[test]
+#[ignore = "slow (about 11 minutes): run by `make loom-full`, a merge gate for counters changes"]
 fn a_transferred_gauge_is_never_mixed() {
     builder().check(|| {
         let cell = Cell::with_a();

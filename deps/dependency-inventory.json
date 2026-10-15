@@ -1244,7 +1244,8 @@
             "net",
             "param",
             "process",
-            "std"
+            "std",
+            "time"
           ],
           "from": "workspace:karyos-sys@0.1.0-alpha.1",
           "kind": "normal",
@@ -1260,7 +1261,8 @@
         "net",
         "param",
         "process",
-        "std"
+        "std",
+        "time"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",

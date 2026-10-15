@@ -355,6 +355,45 @@ mod tests {
         }
         assert!(CountersReader::attach(pass(region, RegionKind::Counters).unwrap()).is_ok());
         assert!(crate::counters::counters_in(7, 3, 0).is_err());
+
+        // Layout version 2 carries the key words across the region.
+        let keys = crate::counters::CounterKeys {
+            stream: 12,
+            lane: 3,
+            kind: crate::counters::KIND_SUBSCRIBER,
+            participant: 40,
+        };
+        let keyed = manager
+            .allocate_keyed(crate::counters::TYPE_POSITION, "subscriber position", keys)
+            .unwrap();
+        let CellRead::Allocated { metadata, .. } = reader.read(keyed.index()) else {
+            panic!("expected an allocated cell");
+        };
+        assert_eq!(metadata.keys, keys);
+        assert_eq!(metadata.type_id, crate::counters::TYPE_POSITION);
+    }
+
+    #[test]
+    fn a_counters_reader_rejects_a_version_1_region() {
+        let capacity = 4usize;
+        let structure_length = (capacity * 2 * crate::counters::STRIDE_WORDS
+            + crate::counters::STRIDE_WORDS)
+            * crate::atomic_view::WORD_BYTES;
+        let v1 = crate::ipc::Region::create(crate::ipc::RegionRecord {
+            instance: 7,
+            region: 3,
+            kind: RegionKind::Counters,
+            generation: 0,
+            layout: 1,
+            structure_length,
+        })
+        .unwrap();
+        v1.structure()
+            .get(0)
+            .unwrap()
+            .store(capacity as u64, Ordering::Release);
+        assert_eq!(crate::counters::LAYOUT_VERSION, 2);
+        assert!(CountersReader::attach(pass(&v1, RegionKind::Counters).unwrap()).is_err());
     }
 
     #[test]
