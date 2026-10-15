@@ -442,10 +442,7 @@ mod tests {
         }
         let view = pass_read_only(&shared, RegionKind::Broadcast, SealProfile::Shared).unwrap();
         for index in 0..8 {
-            assert_eq!(
-                view.structure().load(index, Ordering::Acquire),
-                Some(index as u64 * 3)
-            );
+            assert_eq!(view.structure().load_acquire(index), Some(index as u64 * 3));
         }
         // A later store is seen through the read-only mapping too.
         shared
@@ -453,7 +450,7 @@ mod tests {
             .get(0)
             .unwrap()
             .store(99, Ordering::Release);
-        assert_eq!(view.structure().load(0, Ordering::Acquire), Some(99));
+        assert_eq!(view.structure().load_acquire(0), Some(99));
         assert!(matches!(
             pass_read_only(&shared, RegionKind::Broadcast, SealProfile::DriverOnly),
             Err(SysError::SealMismatch { .. })

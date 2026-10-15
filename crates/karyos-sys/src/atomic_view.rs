@@ -209,12 +209,31 @@ impl<'a> ReadOnlyWords<'a> {
         self.words.is_empty()
     }
 
-    /// Loads the word at `index` with `order` (`Relaxed`, `Acquire` or
-    /// `SeqCst`), if in bounds.
+    /// Loads the word at `index` with a `Relaxed` load, if in bounds.
+    ///
+    /// The view may cover `PROT_READ` memory, where Rust guarantees only
+    /// `Relaxed` loads of at most word size
+    /// (<https://doc.rust-lang.org/std/sync/atomic/index.html#atomic-accesses-to-read-only-memory>);
+    /// stronger orderings are therefore not offered. Order later reads with
+    /// [`load_acquire`](Self::load_acquire) or an explicit `Acquire` fence.
     #[inline]
     #[must_use]
-    pub fn load(&self, index: usize, order: core::sync::atomic::Ordering) -> Option<u64> {
-        self.words.get(index).map(|word| word.load(order))
+    pub fn load(&self, index: usize) -> Option<u64> {
+        self.words
+            .get(index)
+            .map(|word| word.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Loads the word at `index` with acquire semantics, if in bounds: a
+    /// `Relaxed` load followed by an `Acquire` fence, which synchronizes
+    /// with a `Release` store of the value read (or a `Release` fence before
+    /// it) without an acquire load on read-only memory.
+    #[inline]
+    #[must_use]
+    pub fn load_acquire(&self, index: usize) -> Option<u64> {
+        let value = self.load(index);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        value
     }
 
     /// The words from `index` on; empty when `index` is past the end.

@@ -425,7 +425,7 @@ impl ReadOnlyRegion {
             .header_words()
             .into_iter()
             .enumerate()
-            .all(|(index, value)| words.load(index, Ordering::Acquire) == Some(value));
+            .all(|(index, value)| words.load_acquire(index) == Some(value));
         if !matches {
             return Err(SysError::InvalidRegion { address: 0, len });
         }

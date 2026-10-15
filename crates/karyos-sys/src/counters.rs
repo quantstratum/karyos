@@ -359,29 +359,30 @@ impl<'a> CellWords<'a> {
     #[must_use]
     pub fn read(&self) -> CellRead {
         read_cell(
-            |index, order| self.word(index).map(|word| word.load(order)),
-            |order| self.value.load(order),
+            |index| self.word(index).map(|word| word.load(Ordering::Relaxed)),
+            || self.value.load(Ordering::Relaxed),
         )
     }
 }
 
-/// The seqlock read of one cell over load functions: `meta` loads metadata
-/// word `index` (`None` out of range) and `value` the value word. Only
-/// loads are issued, so the same read works over a writable view or a
-/// read-only mapping.
-pub(crate) fn read_cell(
-    meta: impl Fn(usize, Ordering) -> Option<u64>,
-    value: impl Fn(Ordering) -> u64,
-) -> CellRead {
-    if meta(META_VERSION, Ordering::Relaxed).is_none() {
+/// The seqlock read of one cell over `Relaxed` load functions: `meta`
+/// loads metadata word `index` (`None` out of range) and `value` the value
+/// word. Only `Relaxed` loads and `Acquire` fences are issued, so the same
+/// read works over a writable view or a read-only mapping, where Rust
+/// guarantees only `Relaxed` loads.
+pub(crate) fn read_cell(meta: impl Fn(usize) -> Option<u64>, value: impl Fn() -> u64) -> CellRead {
+    if meta(META_VERSION).is_none() {
         return CellRead::Free;
     }
     for _ in 0..READ_ATTEMPTS {
-        let before = meta(META_VERSION, Ordering::Acquire).unwrap_or(0);
+        let before = meta(META_VERSION).unwrap_or(0);
+        // Pairs with the writer's Release on the version: the reads below
+        // see at least what that version published.
+        fence(Ordering::Acquire);
         if before % 2 == 1 {
             continue;
         }
-        let load = |index: usize| meta(index, Ordering::Relaxed).unwrap_or(0);
+        let load = |index: usize| meta(index).unwrap_or(0);
         let state = load(META_STATE);
         let registration_id = load(META_REGISTRATION);
         let type_id = load(META_TYPE);
@@ -394,9 +395,9 @@ pub(crate) fn read_cell(
         for (index, key) in keys.iter_mut().enumerate() {
             *key = load(META_KEYS + index);
         }
-        let value = value(Ordering::Relaxed);
+        let value = value();
         fence(Ordering::Acquire);
-        if meta(META_VERSION, Ordering::Relaxed) != Some(before) {
+        if meta(META_VERSION) != Some(before) {
             continue;
         }
         return match state {
@@ -516,10 +517,7 @@ mod owned {
             if meta.len() < META_WORDS {
                 return CellRead::Free;
             }
-            super::read_cell(
-                |word, order| meta.load(word, order),
-                |order| values.load(start, order).unwrap_or(0),
-            )
+            super::read_cell(|word| meta.load(word), || values.load(start).unwrap_or(0))
         }
 
         fn cell(&self, index: usize) -> Option<CellWords<'_>> {
@@ -779,7 +777,7 @@ mod owned {
             let structure = region.structure();
             let mut config = [0u64; STRIDE_WORDS];
             for (index, word) in config.iter_mut().enumerate() {
-                *word = structure.load(index, Ordering::Acquire).ok_or(invalid)?;
+                *word = structure.load_acquire(index).ok_or(invalid)?;
             }
             let [capacity, rest @ ..] = config;
             let capacity = usize::try_from(capacity).map_err(|_| invalid)?;
