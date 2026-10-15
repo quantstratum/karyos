@@ -438,6 +438,15 @@ impl RemoteClient {
             })
     }
 
+    /// Takes the driver events received by earlier polls, as
+    /// [`ClientConductor::take_events`].
+    pub fn take_events(&mut self) -> Vec<karyos_protocol::cnc::Event> {
+        self.conductor
+            .as_mut()
+            .map(|conductor| conductor.take_events().collect())
+            .unwrap_or_default()
+    }
+
     /// Requests submitted and not yet reported.
     #[must_use]
     pub fn pending(&self) -> usize {

@@ -111,7 +111,7 @@ struct Outgoing {
 #[derive(Debug, Clone, Copy)]
 struct Mark {
     fetch: u64,
-    registration: u64,
+    export: u64,
     /// It carries a descriptor of the grant: once sent, the grant is
     /// charged until its `Detach` or the exit proof.
     descriptor: bool,
@@ -547,7 +547,20 @@ impl<T: StreamTerms> Admission<T> {
         let Some(stream) = driver.streams.iter().find(|s| s.id == grant.stream) else {
             return refuse(remote, refusal::RESOURCES);
         };
-        let Some(region) = <T as crate::embedded::sealed::Create>::region(&stream.buffer) else {
+        // The mapping of the grant's own generation: the current one or a
+        // retained predecessor.
+        let buffer = if stream.generation.get() == grant.generation {
+            Some(&stream.buffer)
+        } else {
+            stream
+                .retained
+                .iter()
+                .find(|retained| retained.generation.get() == grant.generation)
+                .map(|retained| &retained.buffer)
+        };
+        let Some(region) =
+            buffer.and_then(|buffer| <T as crate::embedded::sealed::Create>::region(buffer))
+        else {
             return refuse(remote, refusal::RESOURCES);
         };
         let Some(record) = grant_record(
@@ -591,12 +604,12 @@ impl<T: StreamTerms> Admission<T> {
         }
         // Effect: the grant is spent before anything is queued.
         if let Some(ledger) = driver.ledger_mut(remote.client) {
-            ledger.set_state(grant.registration, GrantState::Exporting);
+            ledger.set_state(grant.export, GrantState::Exporting);
         }
         let mark = |descriptor: bool, last: bool| {
             Some(Mark {
                 fetch,
-                registration: grant.registration,
+                export: grant.export,
                 descriptor,
                 last,
             })
@@ -645,10 +658,10 @@ impl<T: StreamTerms> Admission<T> {
         let mut exported = 0u64;
         for mark in sent {
             if mark.descriptor {
-                ledger.mark_sent(mark.registration);
+                ledger.mark_sent(mark.export);
             }
             if mark.last {
-                ledger.set_state(mark.registration, GrantState::Exported);
+                ledger.set_state(mark.export, GrantState::Exported);
                 exported += 1;
             }
         }
@@ -662,7 +675,7 @@ impl<T: StreamTerms> Admission<T> {
             return;
         };
         for mark in remote.outbound.iter().filter_map(|outgoing| outgoing.mark) {
-            ledger.set_state(mark.registration, GrantState::Failed);
+            ledger.set_state(mark.export, GrantState::Failed);
         }
     }
 

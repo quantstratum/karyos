@@ -779,6 +779,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .saturating_add(admitted)
             .saturating_add(alive);
         let mut first_error = None;
+        let charged = self.charged_generations();
+        let mut opened = Vec::new();
         let clock = &mut self.clock;
         let counters = &self.counters;
         let deadline = self.config.cutover_deadline;
@@ -807,12 +809,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 );
             }
             // The clock is read only while a cutover is in progress.
-            if stream.cutover.is_some()
-                && let Err(error) = stream.advance_cutover(clock.now(), deadline)
-            {
-                first_error.get_or_insert(error);
+            if stream.cutover.is_some() {
+                let before = stream.generation.get();
+                let now = clock.now();
+                if let Err(error) = stream.advance_cutover(now, deadline) {
+                    first_error.get_or_insert(error);
+                }
+                if stream.generation.get() != before {
+                    opened.push((stream.id, before, now));
+                }
             }
-            stream.forget_unused();
+            stream.forget_unused(&charged);
+        }
+        // Remote participants of the cutovers that opened, then the fences
+        // whose deadline passed; the clock is read only while one waits.
+        for (stream, before, now) in opened {
+            self.open_remote_successors(stream, before, now);
+        }
+        if self.fences_pending() {
+            let now = self.clock.now();
+            self.fence_late_successors(now);
         }
         if !self.holding.is_empty() {
             self.report_withdrawn_bounds();

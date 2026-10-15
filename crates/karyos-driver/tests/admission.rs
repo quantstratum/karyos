@@ -1037,3 +1037,239 @@ fn concurrent_takes_share_one_session() {
     assert_eq!(counter(&driver, "grants exported"), 2);
     assert_eq!(counter(&driver, "grants detached"), 2);
 }
+
+/// A driver on the system clock with a short cutover deadline.
+fn cutover_driver(dir: &Path, deadline_ns: u64) -> IpcDriver {
+    EmbeddedDriver::with_ipc(
+        DriverConfig {
+            cutover_deadline: deadline_ns,
+            ..DriverConfig::default()
+        },
+        ipc_config(dir, 5_000_000_000),
+        Box::new(SystemClock::new()),
+    )
+    .unwrap()
+}
+
+/// A remote client takes a required subscription; returns it with the
+/// subscription handle.
+fn remote_subscriber(
+    driver: &mut IpcDriver,
+    dir: &Path,
+) -> (RemoteClient, ClientSubscription<SharedTerms>) {
+    let mut client = attach_serving(driver, dir).unwrap();
+    serve_while(driver, move || {
+        let _ = client
+            .add_subscription(
+                StreamKey {
+                    stream_id: 2,
+                    session_id: 1,
+                },
+                SubscriberRole::Required,
+            )
+            .unwrap();
+        let mut fetchable = None;
+        let start = Instant::now();
+        while fetchable.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "no grant");
+            let _ = client.poll(usize::MAX, |completion| {
+                if let Outcome::Fetchable(grant) = completion.outcome {
+                    fetchable = Some(grant);
+                }
+            });
+        }
+        let subscription = client.take_subscription(&fetchable.unwrap()).unwrap();
+        (client, subscription)
+    })
+}
+
+/// Polls `client` until it receives `SuccessorReady` or `Fenced` for any
+/// registration.
+fn cutover_event(client: &mut RemoteClient) -> karyos_protocol::cnc::Event {
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(5), "no cutover event");
+        let _ = client.poll(usize::MAX, |_| {});
+        if let Some(event) = client.take_events().into_iter().find(|event| {
+            matches!(
+                event,
+                karyos_protocol::cnc::Event::SuccessorReady { .. }
+                    | karyos_protocol::cnc::Event::Fenced { .. }
+            )
+        }) {
+            return event;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// A cutover with a remote subscriber (`quantstratum-docs:
+/// karyos/design/ipc-data-path.md`, Generations across processes): the
+/// client is told `SuccessorReady`, fetches the successor grant with its
+/// key and adopts it in the successor's region, so the deadline does not
+/// fence it.
+#[test]
+fn a_remote_subscriber_fetches_and_adopts_its_successor() {
+    let dir = dir("successor");
+    let mut driver = cutover_driver(&dir, 50_000_000);
+    let stream = driver.add_stream(shared_stream_config()).unwrap();
+    let (mut client, subscription) = remote_subscriber(&mut driver, &dir);
+    let _ = driver
+        .reconfigure_stream(
+            stream,
+            karyos_driver::Reconfiguration {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                spare_slots: 5,
+            },
+        )
+        .unwrap();
+    let instance = driver.instance().unwrap();
+    let adopted = serve_while(&mut driver, move || {
+        let karyos_protocol::cnc::Event::SuccessorReady {
+            key, generation, ..
+        } = cutover_event(&mut client)
+        else {
+            panic!("fenced before adopting");
+        };
+        assert_eq!(generation, 1);
+        let socket = client.admission_socket().unwrap();
+        let fetch = encode(&Message::Fetch { fetch: 100, key });
+        assert_eq!(ipc::send(socket, &fetch, None).unwrap(), Sent::Sent);
+        let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
+        let Recv::Message(received) = ipc::recv(socket, &mut buffer).unwrap() else {
+            panic!("no manifest");
+        };
+        let Message::Manifest { records, .. } = Message::decode(&buffer[..received.len]).unwrap()
+        else {
+            panic!("expected the successor's manifest");
+        };
+        let record = records[0];
+        assert_eq!(record.generation, 1);
+        let Recv::Message(received) = ipc::recv(socket, &mut buffer).unwrap() else {
+            panic!("no region");
+        };
+        let region = karyos_sys::ipc::Region::attach(
+            received.fd.unwrap(),
+            karyos_sys::ipc::RegionRecord {
+                instance,
+                region: record.region,
+                kind: karyos_sys::ipc::RegionKind::LogBuffer,
+                generation: record.generation,
+                layout: u64::from(record.layout),
+                structure_length: usize::try_from(record.structure_length).unwrap(),
+            },
+        )
+        .unwrap();
+        let successor = karyos_sys::log_buffer::LogBuffer::attach(region).unwrap();
+        let karyos_protocol::admission::Capability::RequiredSubscriber { cell } = record.capability
+        else {
+            panic!("a required subscriber record");
+        };
+        let adopted = karyos_sys::log_buffer::Subscription::adopt(
+            &successor,
+            usize::try_from(cell).unwrap(),
+            Role::Required,
+            record.export,
+        )
+        .is_ok();
+        // Leaked on purpose: the mapping and the client stay alive past
+        // the deadline, as a moved handle would.
+        std::mem::forget(successor);
+        std::mem::forget(subscription);
+        std::mem::forget(client);
+        adopted
+    });
+    assert!(adopted);
+    // Past the deadline: an adopted successor is not fenced.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(150) {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(counter(&driver, "grants fenced"), 0);
+    assert_eq!(counter(&driver, "grants exported"), 2);
+}
+
+/// A remote subscriber that does not take its successor is fenced at the
+/// cutover deadline and told so; the never-sent successor grant ends.
+#[test]
+fn a_remote_subscriber_that_does_not_move_is_fenced() {
+    let dir = dir("fence");
+    let mut driver = cutover_driver(&dir, 50_000_000);
+    let stream = driver.add_stream(shared_stream_config()).unwrap();
+    let (mut client, subscription) = remote_subscriber(&mut driver, &dir);
+    let _ = driver
+        .reconfigure_stream(
+            stream,
+            karyos_driver::Reconfiguration {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                spare_slots: 5,
+            },
+        )
+        .unwrap();
+    let events = serve_while(&mut driver, move || {
+        let first = cutover_event(&mut client);
+        let second = cutover_event(&mut client);
+        std::mem::forget(subscription);
+        std::mem::forget(client);
+        (first, second)
+    });
+    assert!(matches!(
+        events.0,
+        karyos_protocol::cnc::Event::SuccessorReady { .. }
+    ));
+    assert!(matches!(
+        events.1,
+        karyos_protocol::cnc::Event::Fenced { .. }
+    ));
+    assert_eq!(counter(&driver, "grants fenced"), 1);
+}
+
+/// A successor whose region exceeds the client's `max_fetch_bytes` could
+/// never be fetched: it is not reserved, and the client is told `Fenced`
+/// at once, as a command would be refused.
+#[test]
+fn a_successor_no_fetch_could_carry_is_fenced_at_once() {
+    // The region size of this stream's log buffer.
+    let probe_dir = dir("successor-bytes-probe");
+    let mut probe = system_driver(&probe_dir);
+    let _stream = probe.add_stream(shared_stream_config()).unwrap();
+    let (_client, _export, fd) = fetched_subscription(&mut probe, &probe_dir);
+    let size = std::fs::File::from(fd).metadata().unwrap().len();
+    let dir = dir("successor-bytes");
+    let mut driver = EmbeddedDriver::with_ipc(
+        DriverConfig {
+            cutover_deadline: 5_000_000_000,
+            ..DriverConfig::default()
+        },
+        IpcConfig {
+            max_fetch_bytes: size,
+            ..ipc_config(&dir, 5_000_000_000)
+        },
+        Box::new(SystemClock::new()),
+    )
+    .unwrap();
+    let stream = driver.add_stream(shared_stream_config()).unwrap();
+    let (mut client, subscription) = remote_subscriber(&mut driver, &dir);
+    let _ = driver
+        .reconfigure_stream(
+            stream,
+            karyos_driver::Reconfiguration {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                spare_slots: 5,
+            },
+        )
+        .unwrap();
+    let event = serve_while(&mut driver, move || {
+        let event = cutover_event(&mut client);
+        std::mem::forget(subscription);
+        std::mem::forget(client);
+        event
+    });
+    // Told long before the 5 s deadline, and nothing was reserved.
+    assert!(
+        matches!(event, karyos_protocol::cnc::Event::Fenced { .. }),
+        "{event:?}"
+    );
+    assert_eq!(counter(&driver, "grants reserved"), 1);
+    assert_eq!(counter(&driver, "grants fenced"), 0);
+}

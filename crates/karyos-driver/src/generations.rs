@@ -325,15 +325,20 @@ impl<T: StreamTerms> Stream<T> {
     /// Forgets dropped or fenced members and predecessors nothing references
     /// any more (the driver holds two references: the buffer and its
     /// conductor).
-    pub(crate) fn forget_unused(&mut self) {
+    pub(crate) fn forget_unused(&mut self, charged: &[(u64, u32)]) {
         self.members.retain(|member| {
             member
                 .link
                 .upgrade()
                 .is_some_and(|link| link.status() != LinkStatus::Fenced)
         });
-        self.retained
-            .retain(|retained| Arc::strong_count(&retained.buffer) > 2);
+        // A remote grant of a predecessor's generation keeps it too, until
+        // its Detach or its client's exit proof.
+        let id = self.id;
+        self.retained.retain(|retained| {
+            Arc::strong_count(&retained.buffer) > 2
+                || charged.contains(&(id, retained.generation.get()))
+        });
     }
 }
 
@@ -364,15 +369,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let max_retained = self.config.max_retained_generations;
         let deadline = self.config.cutover_deadline;
         let id = self.active_stream_mut(stream)?.id;
-        // A remote participant cannot follow a cutover until generations
-        // across processes land: refused, never silently.
+        // A remote successor of the last cutover still waiting for its
+        // adoption or its fence keeps that cutover in progress.
         if self.clients.iter().any(|client| {
             client
                 .ledger
                 .as_ref()
-                .is_some_and(|ledger| ledger.names_stream(id))
+                .is_some_and(|ledger| ledger.unsettled_successor(id))
         }) {
-            return Err(DriverError::RemoteParticipants { stream: id });
+            return Err(DriverError::CutoverPending { stream: id });
         }
         let target = self.active_stream_mut(stream)?;
         if target.cutover.is_some() {
@@ -438,7 +443,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         })));
         let now = self.clock_now();
         let target = self.active_stream_mut(stream)?;
+        let before = target.generation.get();
         target.advance_cutover(now, deadline)?;
+        // A concurrent stream's cutover opens at once.
+        if self.active_stream_mut(stream)?.generation.get() != before {
+            self.open_remote_successors(id, before, now);
+        }
         Ok(generation)
     }
 
