@@ -6,7 +6,8 @@
 //! embedded-mode publication and subscription API over one lane's log buffer
 //! (copy delivery), a bounded client view over the keyed conflation table,
 //! and the client conductor that requests capabilities from the driver.
-//! The driver feeder, lanes beyond one and IPC attachment do not exist yet.
+//! The driver feeder and lanes beyond one do not yet exist. Linux IPC
+//! attachment is implemented.
 
 pub mod concurrent;
 pub mod conductor;

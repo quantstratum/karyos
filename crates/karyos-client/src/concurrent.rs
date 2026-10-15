@@ -228,10 +228,13 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         }
     }
 
-    /// Sets the limits used to validate offers on a conflated stream.
-    #[cfg_attr(not(test), allow(dead_code, reason = "wired by the P5b driver batch"))]
-    pub(crate) fn set_conflation_config(&mut self, config: ConflationConfig) {
+    /// Binds the stream's keyed conflation limits to this publication.
+    /// The driver calls this while issuing a publication for a conflated
+    /// stream; callers should normally obtain handles from the driver.
+    #[must_use]
+    pub fn with_conflation(mut self, config: ConflationConfig) -> Self {
         self.conflation = Some(config);
+        self
     }
 
     /// Attaches the generation link the driver keeps for this handle, and
@@ -680,12 +683,12 @@ mod tests {
         );
         let mut conductor: Conductor<Arc<LogBuffer>> = buffer.conductor_owned().unwrap();
         let inner = conductor.concurrent_publication().unwrap().unwrap();
-        let mut publication = ClientConcurrentPublication::new(inner, true);
-        publication.set_conflation_config(ConflationConfig {
-            keys: 2,
-            value_capacity: 4,
-            journal_capacity: 1024,
-        });
+        let mut publication =
+            ClientConcurrentPublication::new(inner, true).with_conflation(ConflationConfig {
+                keys: 2,
+                value_capacity: 4,
+                journal_capacity: 1024,
+            });
         let subscription = conductor.subscribe(Role::Required).unwrap();
         let client_subscription = crate::ClientSubscription::new(subscription);
 
@@ -724,7 +727,7 @@ mod tests {
                     }
                 )
                 .unwrap(),
-            ConcurrentOfferOutcome::Accepted { .. }
+            ConcurrentOfferOutcome::Accepted { position: 0, .. }
         ));
     }
 }

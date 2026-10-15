@@ -239,10 +239,13 @@ impl<T: TermBytes> ClientPublication<T> {
         }
     }
 
-    /// Sets the limits used to validate offers on a conflated stream.
-    #[cfg_attr(not(test), allow(dead_code, reason = "wired by the P5b driver batch"))]
-    pub(crate) fn set_conflation_config(&mut self, config: ConflationConfig) {
+    /// Binds the stream's keyed conflation limits to this publication.
+    /// The driver calls this while issuing a publication for a conflated
+    /// stream; callers should normally obtain handles from the driver.
+    #[must_use]
+    pub fn with_conflation(mut self, config: ConflationConfig) -> Self {
         self.conflation = Some(config);
+        self
     }
 
     /// Traces this handle's messages through `hook`, which records them for
@@ -800,8 +803,8 @@ mod tests {
 
     #[test]
     fn conflated_offers_and_claims_validate_before_reserving() {
-        let (buffer, mut conductor, mut publication) = setup(true);
-        publication.set_conflation_config(ConflationConfig {
+        let (buffer, mut conductor, publication) = setup(true);
+        let mut publication = publication.with_conflation(ConflationConfig {
             keys: 2,
             value_capacity: 4,
             journal_capacity: 1024,
@@ -844,7 +847,7 @@ mod tests {
                     }
                 )
                 .unwrap(),
-            OfferOutcome::Accepted { .. }
+            OfferOutcome::Accepted { position: 0, .. }
         ));
         drop(buffer);
     }
