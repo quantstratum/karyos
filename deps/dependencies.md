@@ -52,16 +52,17 @@ or build-script change cannot reuse old admission evidence. Reach classes:
 - `dev`: reached only through a dev-dependency, compiled for tests and
   never linked into a library or binary build: `proptest` 1.11.0 and its
   graph (`rand`, `rand_core`, `rand_chacha`, `rand_xorshift`, `getrandom`,
-  `zerocopy`, `ppv-lite86`, `num-traits`, `unarray`, `regex-syntax`, and on
-  macOS `libc` under `getrandom`). `zerocopy-derive` and `syn` 2 appear only
+  `zerocopy`, `ppv-lite86`, `num-traits`, `unarray`, `regex-syntax`, and
+  `libc` under `getrandom` on macOS and on Linux with the `gnu` or `musl`
+  environment). `zerocopy-derive` and `syn` 2 appear only
   behind `cfg(any())`, which is never true, and `r-efi`, `wasip2` and
   `wit-bindgen` only for UEFI or `wasm32-wasip2` targets.
 - `loom-runtime` and `loom-build`: the same classes reached only through the
   `cfg(loom)` dependency, compiled only by `make loom`, never in normal, test
   or release builds.
 
-The inventory currently holds 40 packages; counts per class change with the
-lockfile and are read from the JSON rather than repeated here.
+Counts per class change with the lockfile and are read from the JSON
+rather than repeated here.
 
 On x86_64 and aarch64 Linux `rustix` uses its `linux_raw` backend: system
 calls through Rust inline assembly and the pure-Rust `linux-raw-sys`
@@ -84,7 +85,7 @@ supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 | `rustix` 1.1.5 | runtime (Linux) | Runs `rustc` probes to select the backend and set cfgs; no build dependencies |
 | `quote` 1.0.47 | build | Runs `rustc --version` to set cfgs |
 | `rustversion` 1.0.23 | loom | Runs `rustc --version` to generate version constants |
-| `libc` 0.2.190 | loom; also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in normal builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
+| `libc` 0.2.190 | loom; dev, under `getrandom` on macOS and Linux `gnu`/`musl` (tests only); also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in normal builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
 | `generator` 0.8.10 | loom | Invokes `cc` to assemble `asm_ppc64le_elf.S` only when the target architecture is `powerpc64`, which Karyos does not support |
 | `valuable` 0.1.1 | loom | Emits atomic-support cfgs from the target name |
 | `getrandom` 0.3.4 | dev | Runs `rustc --version` to choose cfgs (sanitizer and old Windows backends); compiles nothing |
