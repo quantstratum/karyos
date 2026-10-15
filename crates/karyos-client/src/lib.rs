@@ -12,6 +12,8 @@ pub mod concurrent;
 pub mod conductor;
 pub mod error;
 pub mod generation;
+#[cfg(target_os = "linux")]
+pub mod ipc;
 pub mod link;
 pub mod publication;
 pub mod subscription;

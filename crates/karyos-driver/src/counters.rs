@@ -146,8 +146,18 @@ pub(crate) struct DriverCounters {
 impl DriverCounters {
     /// Allocates the region and every counter (control path).
     pub(crate) fn new() -> Result<Self, DriverError> {
-        let (mut manager, reader) =
-            counters(LABELS.len()).map_err(|_| DriverError::InvalidConfig)?;
+        let (manager, reader) = counters(LABELS.len()).map_err(|_| DriverError::InvalidConfig)?;
+        Self::allocate(manager, reader)
+    }
+
+    /// Allocates the region in a shared region (IPC mode).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new_in(instance: u128, region: u64) -> Result<Self, DriverError> {
+        let (manager, reader) = karyos_sys::counters::counters_in(instance, region, LABELS.len())?;
+        Self::allocate(manager, reader)
+    }
+
+    fn allocate(mut manager: CountersManager, reader: CountersReader) -> Result<Self, DriverError> {
         let counters = LABELS
             .iter()
             .map(|&(type_id, label)| manager.allocate(type_id, label))
@@ -183,6 +193,12 @@ impl DriverCounters {
         if let Some(counter) = self.counter(event) {
             counter.set(value);
         }
+    }
+
+    /// The shared region of the counters, in IPC mode.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn region(&self) -> Option<&karyos_sys::ipc::Region> {
+        self.reader.region()
     }
 
     /// A read-only view for tools.

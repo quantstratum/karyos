@@ -78,20 +78,11 @@ impl EmbeddedDriver {
         if self.clients.len() >= self.config.max_clients {
             return Err(DriverError::TooManyClients);
         }
-        let id = self.next_client;
-        let next = id.checked_add(1).ok_or(DriverError::ClientIdsExhausted)?;
         let (producer, consumer) =
             command_ring(self.config.ring_capacity).map_err(|_| DriverError::InvalidConfig)?;
         let link = Arc::new(ClientLink::new());
         let receiver = self.broadcast.receiver();
-        self.next_client = next;
-        self.counters.add(Event::ClientsAdmitted, 1);
-        self.clients.push(ClientSlot {
-            id,
-            consumer: Some(consumer),
-            link: Arc::clone(&link),
-        });
-        self.update_stream_gauges();
+        let id = self.admit(consumer, Arc::clone(&link))?;
         Ok(ClientConductor::new(
             Owner {
                 driver: self.id,
@@ -102,6 +93,36 @@ impl EmbeddedDriver {
             link,
             self.config.max_pending_per_client,
         ))
+    }
+
+    /// Registers an admitted client with its ring's consumer and link;
+    /// returns its id. The caller checked the terminal state and
+    /// `max_clients`.
+    pub(crate) fn admit(
+        &mut self,
+        consumer: RingConsumer,
+        link: Arc<ClientLink>,
+    ) -> Result<u64, DriverError> {
+        let id = self.next_client;
+        let next = id.checked_add(1).ok_or(DriverError::ClientIdsExhausted)?;
+        self.next_client = next;
+        self.counters.add(Event::ClientsAdmitted, 1);
+        self.clients.push(ClientSlot {
+            id,
+            consumer: Some(consumer),
+            link,
+        });
+        self.update_stream_gauges();
+        Ok(id)
+    }
+
+    /// Stops serving client `client` (see `retire_faulty`), keeping its
+    /// slot until its link is closed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn retire_faulty_client(&mut self, client: u64) {
+        if let Some(index) = self.clients.iter().position(|slot| slot.id == client) {
+            self.retire_faulty(index);
+        }
     }
 
     /// Clients currently admitted, including retired ones whose producer has
