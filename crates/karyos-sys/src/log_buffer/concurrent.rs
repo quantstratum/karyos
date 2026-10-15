@@ -54,6 +54,9 @@ pub struct ConcurrentPublication<O: BufferOwner> {
     pending: Option<Pending>,
     /// Claim payload staging on backings without direct bytes.
     staging: Box<[u8]>,
+    /// Per-offer observation, enabled only in tests and `test-hooks` builds.
+    #[cfg(any(test, feature = "test-hooks"))]
+    offer_attempt_counts: (u32, u32),
 }
 
 /// A marked claim block of a concurrent handle.
@@ -202,6 +205,8 @@ impl<O: BufferOwner> Conductor<O> {
             state: HandleState::Waiting { from },
             pending: None,
             staging,
+            #[cfg(any(test, feature = "test-hooks"))]
+            offer_attempt_counts: (0, 0),
         };
         let _ = handle.catch_up()?;
         Ok(Some(handle))
@@ -408,6 +413,8 @@ impl<O: BufferOwner> PreparedConcurrentPublication<O> {
             state: HandleState::Waiting { from },
             pending: None,
             staging: self.staging,
+            #[cfg(any(test, feature = "test-hooks"))]
+            offer_attempt_counts: (0, 0),
         };
         // A corrupt buffer: the handle drops and releases its slot.
         if let Err(error) = handle.catch_up() {
@@ -473,6 +480,10 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         options: AppendOptions,
         pause: &mut dyn FnMut(WriterPause),
     ) -> Result<ConcurrentOfferOutcome, SysError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            self.offer_attempt_counts = (0, 0);
+        }
         self.resolve_claim();
         if self.state == HandleState::Closed {
             return Ok(ConcurrentOfferOutcome::Closed);
@@ -497,7 +508,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         };
         FragmentPlan::check_message(length, max)?;
         let reserved = plan.reserved(length)?;
-        let (count, slot, start) = match self.reserve(reserved, pause)? {
+        let (count, slot, start) = match self.reserve(reserved, pause, true)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
             Reserved::Outcome(_) if self.observe_seal() => {
                 return Ok(ConcurrentOfferOutcome::Closed);
@@ -526,6 +537,13 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             return Ok(ConcurrentOfferOutcome::Aborted { position });
         }
         Ok(ConcurrentOfferOutcome::Appended { position })
+    }
+
+    /// Returns `(tail_reservations, rotation_attempts)` for the most recent
+    /// offer. Test-only observation, with no shared-memory cost.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn offer_attempt_counts(&self) -> (u32, u32) {
+        self.offer_attempt_counts
     }
 
     /// Claims one unfragmented block of `length` payload bytes with one
@@ -580,7 +598,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         if reserved > buffer.config.max_reserved {
             return Err(LayoutError::MessageTooLarge { length, max }.into());
         }
-        let (count, slot, start) = match self.reserve(reserved, pause)? {
+        let (count, slot, start) = match self.reserve(reserved, pause, false)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
             Reserved::Outcome(_) if self.observe_seal() => {
                 return Ok(ConcurrentClaimOutcome::Closed);
@@ -663,10 +681,11 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         &mut self,
         reserved: u32,
         pause: &mut dyn FnMut(WriterPause),
+        count_offer_attempts: bool,
     ) -> Result<Reserved, SysError> {
         // At most one rotation attempt per call (SPEC.md §4).
         let mut help = true;
-        if !self.catch_up_helping(&mut help)? {
+        if !self.catch_up_helping(&mut help, count_offer_attempts)? {
             return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
         let HandleState::Active { count, slot, .. } = self.state else {
@@ -689,7 +708,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             // Full: no reservation here; help the rotation once and let the
             // next call catch up.
             self.mark_crossed();
-            self.help_rotation(count, &mut help)?;
+            self.help_rotation(count, &mut help, count_offer_attempts)?;
             return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
         // The head of the handle's own term, never above the true head.
@@ -699,6 +718,10 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }
         // Admitted by the limit it read; a fence may still come first.
         pause(WriterPause::Reserve);
+        #[cfg(any(test, feature = "test-hooks"))]
+        if count_offer_attempts {
+            self.offer_attempt_counts.0 = self.offer_attempt_counts.0.saturating_add(1);
+        }
         let old = tail.fetch_add(u64::from(reserved), Ordering::AcqRel);
         debug_assert_eq!(
             (old >> 32) as u32,
@@ -708,7 +731,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         if start >= term_length {
             // Landed past the end: holds nothing; helps rotate once.
             self.mark_crossed();
-            self.help_rotation(count, &mut help)?;
+            self.help_rotation(count, &mut help, count_offer_attempts)?;
             return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
         // `start < 2^31` and `reserved ≤ term_length / 8`: no overflow.
@@ -734,7 +757,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
                 span_taken(buffer, word, start)?;
             }
             self.mark_crossed();
-            self.help_rotation(count, &mut help)?;
+            self.help_rotation(count, &mut help, count_offer_attempts)?;
             return Ok(Reserved::Outcome(AppendOutcome::AdminAction));
         }
         Ok(Reserved::Own { count, slot, start })
@@ -797,9 +820,20 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// One rotation attempt from `count` to the next term (SPEC.md §4
     /// rotation), by the crossing owner or a producer that landed past the
     /// end. Its result does not change the call's outcome (`AdminAction`).
-    fn help_rotation(&self, count: TermCount, help: &mut bool) -> Result<(), SysError> {
+    fn help_rotation(
+        &mut self,
+        count: TermCount,
+        help: &mut bool,
+        count_offer_attempts: bool,
+    ) -> Result<(), SysError> {
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = count_offer_attempts;
         if !core::mem::replace(help, false) {
             return Ok(());
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if count_offer_attempts {
+            self.offer_attempt_counts.1 = self.offer_attempt_counts.1.saturating_add(1);
         }
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         let next = count.next()?;
@@ -826,12 +860,18 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// in an earlier term, or once a waiting handle is eligible. Returns
     /// whether the handle holds a loan on a term it may reserve in.
     fn catch_up(&mut self) -> Result<bool, SysError> {
-        self.catch_up_helping(&mut false)
+        self.catch_up_helping(&mut false, false)
     }
 
     /// [`ConcurrentPublication::catch_up`], spending the call's rotation
     /// attempt (`help`) when a crossed handle finds no later active term.
-    fn catch_up_helping(&mut self, help: &mut bool) -> Result<bool, SysError> {
+    fn catch_up_helping(
+        &mut self,
+        help: &mut bool,
+        count_offer_attempts: bool,
+    ) -> Result<bool, SysError> {
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = count_offer_attempts;
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         let active = TermCount::try_new(buffer.active_count().load(Ordering::Acquire) as u32)?;
         let cell = buffer.cell(self.index)?;
@@ -848,7 +888,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
                 if active.get() <= count.get() {
                     // The successor may have become ready since: help the
                     // rotation once, then wait for a later call.
-                    self.help_rotation(count, help)?;
+                    self.help_rotation(count, help, count_offer_attempts)?;
                     return Ok(false);
                 }
                 // Every access to `count` has ended.
