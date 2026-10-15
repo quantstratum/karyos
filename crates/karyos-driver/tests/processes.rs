@@ -581,12 +581,25 @@ fn child() {
         "descriptor-driver" => descriptor_driver(&dir),
         "subscribe-many" => {
             let mut client = attach(&dir, timeout, 16).unwrap();
-            for _ in 0..ROUNDS {
+            // Warm up: the first take maps what the client keeps.
+            let fetchable = grant(&mut client, true);
+            drop(client.take_subscription(&fetchable).unwrap());
+            let before = open_descriptors();
+            for _ in 1..ROUNDS {
                 let fetchable = grant(&mut client, true);
                 let subscription = client.take_subscription(&fetchable).unwrap();
                 drop(subscription);
             }
-            report("rounds done");
+            // Every received descriptor was closed: the client's count is
+            // where it started too.
+            let after = open_descriptors();
+            if after == before {
+                report("rounds done");
+            } else {
+                report(&format!(
+                    "client descriptors before {before}, after {after}"
+                ));
+            }
             drop(client);
             // Alive until the driver released this client through its
             // Leave, not through the exit proof.
