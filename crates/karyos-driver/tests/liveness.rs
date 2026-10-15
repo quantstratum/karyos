@@ -112,6 +112,19 @@ fn test_driver_liveness_a_silent_client_times_out_at_exactly_the_timeout() {
 }
 
 #[test]
+fn test_driver_liveness_a_close_at_the_deadline_is_a_retirement_not_a_time_out() {
+    let (mut driver, clock) = driver();
+    let client = driver.connect().unwrap();
+    let _ = driver.do_work().unwrap();
+    clock.set(TIMEOUT);
+    client.close();
+    let _ = driver.do_work().unwrap();
+    assert_eq!(counter(&driver, "clients timed out"), 0);
+    assert_eq!(counter(&driver, "clients retired"), 1);
+    assert_eq!(driver.clients(), 0);
+}
+
+#[test]
 fn test_driver_liveness_a_beating_client_never_times_out() {
     let (mut driver, clock) = driver();
     let mut client = beating(&mut driver);
