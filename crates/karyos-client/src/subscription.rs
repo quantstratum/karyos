@@ -17,9 +17,13 @@ use karyos_sys::frame::EXTENSION_LENGTH;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SkipReason, Subscription};
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
+use karyos_protocol::frame::TraceExtension;
+use karyos_protocol::trace_hook::{PublicationIdentity, SubscriberIdentity, TraceHook};
+
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Next, Successor, representable};
 use crate::link::{Export, Lease, Origin};
+use crate::trace::DeliveryTrace;
 
 /// Metadata delivered with each message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +36,39 @@ pub struct MessageInfo {
     pub end_of_stream: bool,
     /// The opaque trace extension, if the message carries one.
     pub extension: Option<[u8; EXTENSION_LENGTH as usize]>,
+}
+
+impl MessageInfo {
+    /// The decoded trace context (SPEC.md §10, `Fragment::trace()`): `None`
+    /// for an untraced message and for an extension that does not decode,
+    /// which the subscription counts. Pass it as the parent of the messages
+    /// this one causes.
+    #[must_use]
+    pub fn trace(&self) -> Option<TraceExtension> {
+        self.extension
+            .and_then(|bytes| TraceExtension::decode(&bytes).ok())
+    }
+}
+
+/// Messages delivered whose trace extension did not decode. The count is
+/// checked: it never wraps or saturates silently; once it would overflow it
+/// keeps its value and `overflowed` stays set (SPEC.md §14, ADR-0007).
+/// Delivery is never affected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InvalidExtensions {
+    /// Messages counted.
+    pub count: u64,
+    /// The count would have overflowed.
+    pub overflowed: bool,
+}
+
+impl InvalidExtensions {
+    fn count_one(&mut self) {
+        match self.count.checked_add(1) {
+            Some(count) => self.count = count,
+            None => self.overflowed = true,
+        }
+    }
 }
 
 /// Upper bound on whole messages delivered by one poll. Counts reassembled
@@ -136,6 +173,11 @@ pub struct ClientSubscription<T: TermBytes = HeapTerms> {
     link: Option<Arc<GenerationLink<T>>>,
     /// The stream position where this handle's mapping starts.
     base: u64,
+    /// The trace hook, identities and delivery boundary, for a traced
+    /// subscription.
+    trace: Option<DeliveryTrace>,
+    /// Messages whose extension did not decode; delivered untraced.
+    invalid_extensions: InvalidExtensions,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -167,9 +209,58 @@ impl<T: TermBytes> ClientSubscription<T> {
             origin: None,
             link: None,
             base: 0,
+            trace: None,
+            invalid_extensions: InvalidExtensions::default(),
             _lease: None,
             _export: None,
         }
+    }
+
+    /// Records the `SubscriberPoll` observation of every traced message
+    /// through `hook`, for messages of `publication` received by
+    /// `subscriber` (control path). Each position is recorded at its first
+    /// delivery attempt only. Binding a new hook to a traced subscription
+    /// keeps its delivery boundary, so a message attempted before the
+    /// rebinding is not recorded again by the new hook.
+    #[must_use]
+    pub fn with_trace(
+        mut self,
+        hook: Box<dyn TraceHook>,
+        publication: PublicationIdentity,
+        subscriber: SubscriberIdentity,
+    ) -> Self {
+        let boundary = self.trace.as_ref().map_or(0, DeliveryTrace::boundary);
+        self.trace = Some(DeliveryTrace::new(hook, publication, subscriber, boundary));
+        self
+    }
+
+    /// Whether the subscription has a trace hook.
+    #[must_use]
+    pub fn is_traced(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// Control path: lets the hook refill what it consumes.
+    pub fn trace_maintenance(&mut self) {
+        if let Some(trace) = &mut self.trace {
+            trace.maintain();
+        }
+    }
+
+    /// The delivery boundary of a traced subscription: the end of the
+    /// highest message it attempted to deliver (its position plus its
+    /// reserved extent), advanced before the handler runs and independently
+    /// of acknowledgement; 0 before the first attempt or without a hook. A
+    /// message at `p` was attempted when the boundary is above `p`.
+    #[must_use]
+    pub fn delivery_boundary(&self) -> u64 {
+        self.trace.as_ref().map_or(0, DeliveryTrace::boundary)
+    }
+
+    /// Messages delivered whose extension did not decode.
+    #[must_use]
+    pub fn invalid_extensions(&self) -> InvalidExtensions {
+        self.invalid_extensions
     }
 
     /// Attaches the generation link the driver keeps for this handle, and
@@ -285,6 +376,19 @@ impl<T: TermBytes> ClientSubscription<T> {
                         end_of_stream,
                         extension,
                     };
+                    if let Some(trace) = &mut self.trace {
+                        let decoded = info.trace();
+                        if decoded.is_none() && extension.is_some() {
+                            self.invalid_extensions.count_one();
+                        }
+                        let lane = self.inner.buffer().lane();
+                        // The read cursor is already past the message.
+                        let end = self.base + self.inner.position();
+                        trace.attempt(decoded.as_ref(), lane, info.position, end);
+                    } else if extension.is_some_and(|bytes| TraceExtension::decode(&bytes).is_err())
+                    {
+                        self.invalid_extensions.count_one();
+                    }
                     let message = self.scratch.get(..length as usize).unwrap_or(&[]);
                     handler(message, info);
                     // Reached only if the handler returned.
@@ -448,6 +552,53 @@ mod tests {
         assert_eq!(summary.delivered, 1);
         assert_eq!(summary.aborted, None);
         assert_eq!(seen, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    /// The invalid-extension count is checked, with and without a hook: at
+    /// its limit it keeps its value, reports the overflow, and the message
+    /// is still delivered.
+    #[test]
+    fn the_invalid_extension_count_is_checked() {
+        for traced in [false, true] {
+            let buffer = buffer();
+            let mut conductor = buffer.conductor_owned().unwrap();
+            let mut subscription =
+                ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+            if traced {
+                let (hook, _seen) = crate::trace::test_hook::recording(false);
+                subscription = subscription.with_trace(
+                    hook,
+                    karyos_protocol::trace_hook::PublicationIdentity::default(),
+                    karyos_protocol::trace_hook::SubscriberIdentity {
+                        driver: [1, 2],
+                        registration: 1,
+                        incarnation: 1,
+                    },
+                );
+            }
+            subscription.invalid_extensions.count = u64::MAX;
+            let mut publication = buffer.publication_owned().unwrap().unwrap();
+            let mut bytes = [0u8; 64];
+            bytes[0] = 9;
+            let options = AppendOptions {
+                extension: Some(bytes),
+                ..AppendOptions::default()
+            };
+            let _ = publication.append(b"odd", options).unwrap();
+            let mut seen = Vec::new();
+            let summary = subscription
+                .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(1))
+                .unwrap();
+            assert_eq!(summary.delivered, 1);
+            assert_eq!(seen, vec![b"odd".to_vec()]);
+            assert_eq!(
+                subscription.invalid_extensions(),
+                InvalidExtensions {
+                    count: u64::MAX,
+                    overflowed: true,
+                }
+            );
+        }
     }
 
     /// An abort first in line still stops the poll with nothing delivered,

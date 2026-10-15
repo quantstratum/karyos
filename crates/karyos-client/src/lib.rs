@@ -17,6 +17,7 @@ pub mod ipc;
 pub mod link;
 pub mod publication;
 pub mod subscription;
+pub mod trace;
 
 pub use concurrent::{
     ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,
@@ -30,6 +31,7 @@ pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
-    Aborted, ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,
-    Skipped,
+    Aborted, ClientSubscription, InvalidExtensions, MessageInfo, MessageLimit, Overrun, PollError,
+    PollSummary, Skipped,
 };
+pub use trace::TraceDecision;
