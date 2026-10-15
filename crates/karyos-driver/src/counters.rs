@@ -54,11 +54,13 @@
 //! sampling pass, between its odd and its even `positions epoch`, with the
 //! layout version 2 key words: per stream lane `stream limit`, `stream
 //! head` and `stream floor` (key0 the stream, key1 its lane), and per
-//! subscriber `subscriber position cell N` (key1 also kind subscriber, key2
-//! its registration, 0 for an in-process subscription without one). The
-//! region holds `counters_capacity` cells; when none is free a cell is not
-//! allocated, `counters unavailable` counts it and tools show that position
-//! as unavailable.
+//! attached subscriber cell `subscriber position generation G cell N` (key1
+//! also kind subscriber, key2 its registration, 0 for an in-process
+//! subscription without one); during a cutover a subscriber that has not
+//! moved yet is sampled in its predecessor mapping. The region holds
+//! `counters_capacity` cells; when none is free a cell is not allocated,
+//! `counters unavailable` counts it once, tools show that position as
+//! unavailable, and later passes retry.
 //!
 //! The cells are allocated once, when the driver is created. A reader
 //! keeps the region alive after the driver is dropped; the driver's
@@ -282,6 +284,18 @@ impl DriverCounters {
                 None
             }
         }
+    }
+
+    /// Allocates a keyed counter again after an earlier refusal that
+    /// [`allocate_keyed`](Self::allocate_keyed) already counted; `None`,
+    /// not counted again, when still no cell is free.
+    pub(crate) fn retry_keyed(
+        &mut self,
+        type_id: u64,
+        label: &str,
+        keys: karyos_sys::counters::CounterKeys,
+    ) -> Option<Counter> {
+        self.manager.allocate_keyed(type_id, label, keys).ok()
     }
 
     /// Frees a keyed counter at once (inside a sampling pass).
