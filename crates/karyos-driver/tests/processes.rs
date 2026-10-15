@@ -386,6 +386,85 @@ fn test_ipc_data_an_exclusive_publisher_killed_mid_claim_is_resolved_at_its_exit
     assert!(driver.publication(stream).is_err());
 }
 
+/// SPEC.md §13 "Commit versus abort", forgotten claim in a live process:
+/// a publisher process forgets a claim (never commits, aborts or drops it)
+/// and stays alive. Its next call aborts the forgotten claim first and only
+/// then reserves: readers get the message before the claim, the aborted
+/// block and the message after it, in order, and the client is neither
+/// faulted nor released until it leaves.
+#[test]
+fn test_ipc_data_a_live_publisher_that_forgets_a_claim_aborts_it_at_its_next_call() {
+    let dir = dir("forgotten-live");
+    let mut driver = driver(&dir);
+    let stream = add_stream(&mut driver);
+    let mut subscription = driver
+        .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+        .unwrap();
+    let (mut child, reports) = spawn("forget-claim-then-offer", &dir);
+    serve_until_report(&mut driver, &reports, "after accepted");
+    // The process is alive and still attached: nothing ended its grant.
+    assert_eq!(driver.clients(), 1);
+    assert_eq!(counter(&driver, "grants ended"), 0);
+    let (received, aborted) = read_local(&mut driver, &mut subscription, 2);
+    assert_eq!(received, vec![b"before".to_vec(), b"after".to_vec()]);
+    assert!(aborted, "the forgotten claim was not aborted");
+    release(&mut child.0);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert!(child.0.wait().unwrap().success());
+    assert_eq!(counter(&driver, "clients faulty"), 0);
+}
+
+/// SPEC.md §15 phase 1 gate, process crash and restart with a claim open:
+/// the only publisher slot of a concurrent stream belongs to a process
+/// that is killed with a claim open. A restarted publisher process
+/// attaches as a new client and gets that slot back once the dead block is
+/// resolved; readers get the dead writer's message, its aborted block and
+/// then the restarted writer's message, in order.
+#[test]
+fn test_ipc_data_a_publisher_restarted_after_a_crash_with_a_claim_open_takes_over() {
+    let dir = dir("restart-claim");
+    let mut driver = driver(&dir);
+    let stream = add_stream_with(
+        &mut driver,
+        PublicationMode::Concurrent {
+            publishers: 1,
+            allow_non_lse: true,
+        },
+        // 100 ms of the system clock.
+        100_000_000,
+    );
+    let mut subscription = driver
+        .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+        .unwrap();
+    let (mut crashed, reports) = spawn("concurrent-offer-then-claim", &dir);
+    serve_until_report(&mut driver, &reports, "claimed");
+    crashed.0.kill().unwrap();
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = crashed.0.wait();
+    let (mut restarted, reports) = spawn("concurrent-restart", &dir);
+    // The restarted client may be refused while the dead block is still
+    // unresolved; it retries until the slot is released to it.
+    let start = Instant::now();
+    let granted = loop {
+        assert!(start.elapsed() < Duration::from_secs(10), "never granted");
+        let _ = driver.do_work().unwrap();
+        if let Ok(report) = reports.try_recv() {
+            break report;
+        }
+    };
+    assert!(granted.starts_with("granted after "), "{granted}");
+    serve_until_report(&mut driver, &reports, "restarted accepted");
+    let (received, aborted) = read_local(&mut driver, &mut subscription, 2);
+    assert_eq!(
+        received,
+        vec![b"before the crash".to_vec(), b"after the restart".to_vec()]
+    );
+    assert!(aborted, "the dead block was not aborted");
+    release(&mut restarted.0);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert!(restarted.0.wait().unwrap().success());
+}
+
 /// An exclusive writer process stopped (SIGSTOP) with a claim open
 /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Tests): readers are
 /// not blocked beyond the commit deadline, which aborts the claim, and
@@ -1139,6 +1218,99 @@ fn child() {
             }
             drop(publication);
             drop(client);
+        }
+        "forget-claim-then-offer" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, false);
+            let mut publication = client.take_publication(&fetchable).unwrap();
+            let start = Instant::now();
+            while !matches!(
+                publication.offer(b"before").unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                assert!(start.elapsed() < Duration::from_secs(10), "offer");
+            }
+            let karyos_client::ClaimOutcome::Claimed(mut claim) =
+                publication.try_claim(64).unwrap()
+            else {
+                panic!("not claimed");
+            };
+            claim.payload().fill(0xAB);
+            // Forgotten: never committed, aborted or dropped.
+            std::mem::forget(claim);
+            // The next call resolves it, then offers.
+            let start = Instant::now();
+            while !matches!(
+                publication.offer(b"after").unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                assert!(start.elapsed() < Duration::from_secs(10), "offer after");
+            }
+            report("after accepted");
+            wait_for_go();
+            drop(publication);
+            drop(client);
+        }
+        "concurrent-offer-then-claim" | "concurrent-restart" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let _ = client.add_concurrent_publication(KEY, true).unwrap();
+            let mut fetchable = None;
+            let mut refusals = 0u32;
+            let start = Instant::now();
+            while fetchable.is_none() {
+                // The restarted client asks again while the dead writer's
+                // slot is not yet resolved, as a restarting process would.
+                assert!(start.elapsed() < Duration::from_secs(10), "no grant");
+                let mut refused = false;
+                let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                    Outcome::Fetchable(grant) => fetchable = Some(grant),
+                    Outcome::Refused { .. } if scenario == "concurrent-restart" => refused = true,
+                    other => panic!("expected a grant, got {other:?}"),
+                });
+                if refused {
+                    refusals += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                    let _ = client.add_concurrent_publication(KEY, true).unwrap();
+                }
+                std::thread::yield_now();
+            }
+            if scenario == "concurrent-restart" {
+                report(&format!("granted after {refusals} refusals"));
+            }
+            let mut publication = client
+                .take_concurrent_publication(&fetchable.unwrap())
+                .unwrap();
+            let payload: &[u8] = if scenario == "concurrent-restart" {
+                b"after the restart"
+            } else {
+                b"before the crash"
+            };
+            let start = Instant::now();
+            while !matches!(
+                publication.offer(payload).unwrap(),
+                karyos_client::ConcurrentOfferOutcome::Accepted { .. }
+            ) {
+                assert!(start.elapsed() < Duration::from_secs(10), "offer");
+            }
+            if scenario == "concurrent-restart" {
+                report("restarted accepted");
+                wait_for_go();
+                drop(publication);
+                drop(client);
+            } else {
+                let karyos_client::ConcurrentClaimOutcome::Claimed(claim) =
+                    publication.try_claim(64).unwrap()
+                else {
+                    panic!("not claimed");
+                };
+                // Killed with the block claimed and never committed.
+                std::mem::forget(claim);
+                report("claimed");
+                std::mem::forget(publication);
+                std::mem::forget(client);
+                std::thread::sleep(Duration::from_secs(30));
+                std::process::exit(1);
+            }
         }
         "concurrent-claim" => {
             let mut client = attach(&dir, timeout, 16).unwrap();
