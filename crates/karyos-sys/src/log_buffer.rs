@@ -2856,6 +2856,8 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         }
         let resume = head.max(from);
         self.advance_to(resume);
+        // A rejoin is a new join: an image reader may land inside a message.
+        self.cursor.joining = self.buffer.image();
         Ok(Step::Done(PollOutcome::Overrun {
             from,
             lost_to,

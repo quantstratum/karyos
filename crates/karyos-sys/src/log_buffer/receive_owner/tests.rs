@@ -710,8 +710,19 @@ fn check_image(buffer: &LogBuffer<HeapTerms>, pieces: &[Piece], model: &Model) {
     }
 }
 
+/// Under Miri the full-term model, which reads the image after every
+/// arrival, runs two cases; elsewhere the shared settings apply.
+fn model_config() -> ProptestConfig {
+    let config = crate::receive::tests_config();
+    if cfg!(miri) {
+        ProptestConfig { cases: 2, ..config }
+    } else {
+        config
+    }
+}
+
 proptest! {
-    #![proptest_config(crate::receive::tests_config())]
+    #![proptest_config(model_config())]
 
     #[test]
     fn arbitrary_arrival_orders_match_the_model(
@@ -1044,4 +1055,34 @@ fn a_concurrent_reader_sees_only_complete_fragmented_messages() {
         }
     }
     writer.join().unwrap();
+}
+
+#[test]
+fn a_reader_that_rejoins_after_an_overrun_is_joining_again() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &data(0, 0, 64, 1)).unwrap();
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Message { position: 0, .. }
+    ));
+    // The rebuild position moves more than half a term past the reader,
+    // into the middle of a message.
+    recv(&mut owner, &record(FrameType::Aborted, 0, 64, TERM / 2)).unwrap();
+    let begin = 64 + TERM / 2;
+    recv(&mut owner, &fragment(0, begin, 32, true, false, 2)).unwrap();
+    recv(&mut owner, &fragment(0, begin + 64, 32, false, false, 3)).unwrap();
+    conductor.duty_cycle().unwrap();
+    let resume = u64::from(begin + 128);
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Overrun { resume: at, .. } if at == resume
+    ));
+    recv(&mut owner, &fragment(0, begin + 128, 32, false, true, 4)).unwrap();
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(resume, 64, SkipReason::JoinedMidMessage)
+    );
 }
