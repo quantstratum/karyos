@@ -100,6 +100,20 @@ impl Ledger {
         Some(self.grants.swap_remove(index))
     }
 
+    /// Removes and returns every grant whose descriptor never left.
+    pub(crate) fn take_unsent(&mut self) -> Vec<Grant> {
+        let (unsent, sent) = core::mem::take(&mut self.grants)
+            .into_iter()
+            .partition(|grant| !grant.sent);
+        self.grants = sent;
+        unsent
+    }
+
+    /// Every grant, ending the ledger.
+    pub(crate) fn into_grants(self) -> Vec<Grant> {
+        self.grants
+    }
+
     /// Whether any grant names the stream `stream`.
     pub(crate) fn names_stream(&self, stream: u64) -> bool {
         self.grants.iter().any(|grant| grant.stream == stream)

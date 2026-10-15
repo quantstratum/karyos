@@ -329,11 +329,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut index = 0;
         while let Some(slot) = self.clients.get(index) {
             if slot.link.is_closed() {
-                let slot = self.clients.swap_remove(index);
+                let mut slot = self.clients.swap_remove(index);
                 self.counters.add(Event::ClientsRetired, 1);
                 slot.link.drop_all(false);
                 self.registrations
                     .retain(|registration| registration.client != slot.id);
+                // The close flag of a remote client is its exit proof (or
+                // its Leave): every grant it holds ends, sent or not.
+                if let Some(ledger) = slot.ledger.take() {
+                    for grant in ledger.into_grants() {
+                        self.end_grant(&grant);
+                    }
+                }
             } else {
                 index += 1;
             }
@@ -362,8 +369,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             slot.link.drop_all(false);
             let client = slot.id;
+            // A grant never sent reached no one: it ends at once. Sent ones
+            // stay charged until the exit proof.
+            let unsent = slot
+                .ledger
+                .as_mut()
+                .map(Ledger::take_unsent)
+                .unwrap_or_default();
             self.registrations
                 .retain(|registration| registration.client != client);
+            for grant in unsent {
+                self.end_grant(&grant);
+            }
         }
     }
 
@@ -938,6 +955,15 @@ mod tests {
             .grants()
     }
 
+    fn remote_ledger(driver: &mut EmbeddedDriver, client: u64) -> &mut Ledger {
+        driver
+            .clients
+            .iter_mut()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_mut())
+            .unwrap()
+    }
+
     const KEY: StreamKey = StreamKey {
         stream_id: 2,
         session_id: 1,
@@ -1092,6 +1118,48 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_remote_client_ends_every_grant_and_a_retired_one_its_unsent() {
+        for closed in [true, false] {
+            let mut driver = driver();
+            let (client, mut producer) = remote_client(&mut driver, 4);
+            for sequence in 1..=2 {
+                write(
+                    &mut producer,
+                    Command::AddSubscription {
+                        sequence,
+                        stream: KEY,
+                        role: SubscriberRole::Required,
+                    },
+                );
+                let _ = driver.do_work().unwrap();
+            }
+            assert_eq!(driver.streams[0].buffer.attached_subscribers(), 2);
+            // One grant's descriptor left: only the exit proof ends it.
+            let sent = ledger(&driver, client)[0].registration;
+            remote_ledger(&mut driver, client).mark_sent(sent);
+            let index = driver
+                .clients
+                .iter()
+                .position(|slot| slot.id == client)
+                .unwrap();
+            if closed {
+                // The close flag (exit proof or Leave) ends both.
+                driver.clients[index].link.mark_closed();
+                let _ = driver.do_work().unwrap();
+                assert_eq!(driver.clients(), 0);
+                assert_eq!(driver.streams[0].buffer.attached_subscribers(), 0);
+            } else {
+                // Retired: the unsent grant ends, the sent one stays.
+                driver.retire_faulty(index);
+                let _ = driver.do_work().unwrap();
+                assert_eq!(driver.streams[0].buffer.attached_subscribers(), 1);
+                assert_eq!(ledger(&driver, client).len(), 1);
+                assert_eq!(ledger(&driver, client)[0].registration, sent);
+            }
+        }
+    }
+
+    #[test]
     fn a_sent_grant_outlives_its_remove_and_keeps_its_stream() {
         let (mut driver, stream) = driver_with_stream();
         let (client, mut producer) = remote_client(&mut driver, 4);
@@ -1106,9 +1174,7 @@ mod tests {
         let _ = driver.do_work().unwrap();
         let registration = ledger(&driver, client)[0].registration;
         // A descriptor of it left: it is charged until Detach or exit.
-        if let Some(slot) = driver.clients.iter_mut().find(|slot| slot.id == client) {
-            slot.ledger.as_mut().unwrap().mark_sent(registration);
-        }
+        remote_ledger(&mut driver, client).mark_sent(registration);
         write(
             &mut producer,
             Command::RemoveSubscription {
