@@ -633,3 +633,80 @@ fn a_prepared_concurrent_handle_activates_once() {
         Err(SysError::InvalidPublicationMode { .. })
     ));
 }
+
+#[test]
+fn a_fenced_subscriber_grant_cannot_be_adopted_and_stops_bounding() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let cell = conductor.register_subscriber(Role::Required, 7).unwrap();
+    assert_eq!(buffer.attached_subscribers(), 1);
+    assert!(!conductor.fence_subscriber(cell, 8));
+    assert!(conductor.fence_subscriber(cell, 7));
+    assert!(!conductor.fence_subscriber(cell, 7));
+    assert!(matches!(
+        Subscription::adopt(&buffer, cell, Role::Required, 7),
+        Err(SysError::Protocol { .. })
+    ));
+    // Out of flow control: the publisher is never held back by it.
+    assert_eq!(buffer.attached_subscribers(), 0);
+    // It writes several terms past where a bounding reader at 0 would have
+    // stopped it.
+    let data = vec![1u8; 1000];
+    let mut appended = 0u64;
+    for _ in 0..5000 {
+        match publication.append(&data, AppendOptions::default()).unwrap() {
+            AppendOutcome::Appended { .. } => appended += 1024,
+            AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
+                let _ = conductor.duty_cycle().unwrap();
+            }
+            AppendOutcome::Closed => panic!("not sealed"),
+        }
+        if appended > 4 * u64::from(buffer.term_length()) {
+            break;
+        }
+    }
+    assert!(
+        appended > 4 * u64::from(buffer.term_length()),
+        "a fenced cell bounds the publisher at {appended}"
+    );
+    // Not reused until its grant ends; then the cell is free.
+    assert!(conductor.end_subscriber(cell, 7));
+    assert_eq!(conductor.register_subscriber(Role::Required, 9).unwrap(), cell);
+}
+
+#[test]
+fn an_adopted_grant_cannot_be_fenced() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let cell = conductor.register_subscriber(Role::Optional, 7).unwrap();
+    let _adopted = Subscription::adopt(&buffer, cell, Role::Optional, 7).unwrap();
+    assert!(!conductor.fence_subscriber(cell, 7));
+    assert_eq!(buffer.attached_subscribers(), 1);
+    assert!(conductor.register_publication(11).unwrap());
+    let _publication = Publication::adopt(&buffer, 11).unwrap();
+    assert!(!conductor.fence_publication(11));
+}
+
+#[test]
+fn fenced_publication_grants_cannot_be_adopted() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert!(conductor.register_publication(11).unwrap());
+    assert!(conductor.fence_publication(11));
+    assert!(matches!(
+        Publication::adopt(&buffer, 11),
+        Err(SysError::Protocol { .. })
+    ));
+    assert_eq!(conductor.end_publication(11), Ok(PublicationEnd::Ended));
+    let concurrent = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = concurrent.conductor().unwrap();
+    let slot = conductor.register_concurrent_publication(21).unwrap().unwrap();
+    assert!(!conductor.fence_publication(21));
+    assert!(conductor.fence_concurrent_publication(slot, 21));
+    assert!(matches!(
+        ConcurrentPublication::adopt(&concurrent, slot, 21),
+        Err(SysError::Protocol { .. })
+    ));
+    assert_eq!(conductor.end_concurrent_publication(slot, 21), Ok(true));
+}
