@@ -106,6 +106,12 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
         out.push('\n');
     }
     out.push_str(&format!("  rate {:.0} messages/s\n", measurement.rate));
+    if let Some(rotations) = measurement.term_rotations_per_second {
+        out.push_str(&format!("  term production {rotations:.0} rotations/s\n"));
+    }
+    if let Some(cleaned) = measurement.cleaned_slots_per_second {
+        out.push_str(&format!("  cleaner {cleaned:.0} slots/s\n"));
+    }
     out
 }
 
@@ -150,6 +156,12 @@ pub fn history_line(measurement: &Measurement, labels: &Labels) -> String {
             }
         }
     }
+    if let Some(value) = measurement.term_rotations_per_second {
+        fields.push(format!("\"term_rotations_per_second\":{value:.6}"));
+    }
+    if let Some(value) = measurement.cleaned_slots_per_second {
+        fields.push(format!("\"cleaned_slots_per_second\":{value:.6}"));
+    }
     format!("{{{}}}", fields.join(","))
 }
 
@@ -188,6 +200,10 @@ pub fn compare(history: &str, line: &str) -> Option<String> {
                 .iter()
                 .map(|(name, ..)| format!("producer_lateness_{name}_ns")),
         )
+        .chain([
+            "term_rotations_per_second".to_string(),
+            "cleaned_slots_per_second".to_string(),
+        ])
     {
         let (Some(before), Some(after)) = (
             field(previous, &name).and_then(|v| v.parse::<f64>().ok()),

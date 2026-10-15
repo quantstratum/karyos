@@ -4,7 +4,7 @@
 //! (`quantstratum-docs: karyos/design/simulator-and-bench.md`, s2).
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,7 +17,8 @@ use karyos_driver::{EmbeddedDriver, StreamConfig, StreamHandle};
 use karyos_protocol::frame::FrameHeader;
 use karyos_sys::frame::{Flags, FrameType, Lane, Word0};
 use karyos_sys::log_buffer::{
-    LogBuffer, LogBufferConfig, PublicationMode, ReceiveOwner, Received, Role,
+    AppendOptions, ConcurrentOfferOutcome as SysConcurrentOfferOutcome, LogBuffer, LogBufferConfig,
+    PublicationMode, ReceiveOwner, Received, Role,
 };
 use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
 use karyos_sys::sizing::{DEFAULT_MTU, TermLength};
@@ -39,6 +40,9 @@ pub enum Workload {
     /// One publisher follows a fixed send schedule; latency starts at the
     /// scheduled instant, so late sends retain their full delay.
     OpenLoop,
+    /// Concurrent term production against the log buffer cleaner, with no
+    /// subscriber so the run measures publication and reclamation only.
+    CleanerThroughput,
     /// A receive owner commits each validated frame into an image
     /// (`quantstratum-docs: karyos/design/receive-publication.md`).
     Receive,
@@ -49,12 +53,13 @@ pub enum Workload {
 
 impl Workload {
     /// Every workload.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::OfferPoll,
         Self::Claim,
         Self::PingPong,
         Self::Throughput,
         Self::OpenLoop,
+        Self::CleanerThroughput,
         Self::Receive,
         Self::ReceiveDuplicate,
     ];
@@ -68,6 +73,7 @@ impl Workload {
             Self::PingPong => "ping-pong",
             Self::Throughput => "throughput",
             Self::OpenLoop => "open-loop",
+            Self::CleanerThroughput => "cleaner-throughput",
             Self::Receive => "receive",
             Self::ReceiveDuplicate => "receive-duplicate",
         }
@@ -135,6 +141,10 @@ pub struct Measurement {
     pub rate: f64,
     /// The width of a latency interval: the clock's observed resolution.
     pub resolution: u64,
+    /// Slots cleaned per second, for the cleaner workload.
+    pub cleaned_slots_per_second: Option<f64>,
+    /// Term boundaries crossed per second, for the cleaner workload.
+    pub term_rotations_per_second: Option<f64>,
 }
 
 /// A failed run.
@@ -238,6 +248,7 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
         Workload::PingPong => ping_pong(config),
         Workload::Throughput => throughput(config),
         Workload::OpenLoop => open_loop(config),
+        Workload::CleanerThroughput => cleaner_throughput(config),
         Workload::Receive => receive_frames(config, false),
         Workload::ReceiveDuplicate => receive_frames(config, true),
     }
@@ -368,6 +379,8 @@ fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchE
         producer_lateness: None,
         rate: config.iterations as f64 / seconds,
         resolution,
+        cleaned_slots_per_second: None,
+        term_rotations_per_second: None,
     })
 }
 
@@ -444,6 +457,8 @@ fn single_thread(config: Config) -> Result<Measurement, BenchError> {
         producer_lateness: None,
         rate: config.iterations as f64 / seconds,
         resolution,
+        cleaned_slots_per_second: None,
+        term_rotations_per_second: None,
     })
 }
 
@@ -548,6 +563,8 @@ fn ping_pong(config: Config) -> Result<Measurement, BenchError> {
         producer_lateness: None,
         rate: config.iterations as f64 / seconds,
         resolution,
+        cleaned_slots_per_second: None,
+        term_rotations_per_second: None,
     })
 }
 
@@ -657,6 +674,145 @@ fn throughput(config: Config) -> Result<Measurement, BenchError> {
         // the clock started.
         rate: (iterations * u64::from(publishers)) as f64 / seconds,
         resolution: 0,
+        cleaned_slots_per_second: None,
+        term_rotations_per_second: None,
+    })
+}
+
+fn cleaner_throughput(config: Config) -> Result<Measurement, BenchError> {
+    let term_length =
+        TermLength::try_new(config.term_length).map_err(|cause| error("term length", cause))?;
+    let publishers = config.publishers.max(1);
+    let buffer = Arc::new(
+        LogBuffer::new(LogBufferConfig {
+            term_length,
+            spare_slots: 6,
+            max_subscribers: 2,
+            mtu: DEFAULT_MTU,
+            max_reserved: config.term_length / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 1,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Concurrent {
+                publishers,
+                allow_non_lse: true,
+            },
+        })
+        .map_err(|cause| error("log buffer", cause))?,
+    );
+    let mut conductor = buffer
+        .conductor_owned()
+        .ok_or_else(|| BenchError("the log buffer's conductor was taken".into()))?;
+    let mut publications = Vec::with_capacity(usize::from(publishers));
+    for _ in 0..publishers {
+        publications.push(
+            conductor
+                .concurrent_publication()
+                .map_err(|cause| error("publication", cause))?
+                .ok_or_else(|| BenchError("the log buffer has no publication slot".into()))?,
+        );
+    }
+    let cleaned = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let cleaner = {
+        let cleaned = Arc::clone(&cleaned);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || -> Result<(), BenchError> {
+            while !stop.load(Ordering::Acquire) {
+                let report = conductor
+                    .duty_cycle()
+                    .map_err(|cause| error("cleaner duty", cause))?;
+                cleaned.fetch_add(u64::from(report.cleaned), Ordering::Relaxed);
+                if report.cleaned == 0 {
+                    thread::yield_now();
+                }
+            }
+            Ok(())
+        })
+    };
+
+    let payload = vec![7u8; config.message];
+    let term_bytes = u64::from(config.term_length);
+    let max_term = Arc::new(AtomicU64::new(0));
+    let ready = Arc::new(Barrier::new(usize::from(publishers) + 1));
+    let start = Arc::new(Barrier::new(usize::from(publishers) + 1));
+    let producers: Vec<_> = publications
+        .into_iter()
+        .map(|mut publication| {
+            let payload = payload.clone();
+            let max_term = Arc::clone(&max_term);
+            let ready = Arc::clone(&ready);
+            let start = Arc::clone(&start);
+            thread::spawn(move || -> Result<(), BenchError> {
+                let mut send = |count: u64| -> Result<(), BenchError> {
+                    for _ in 0..count {
+                        let term = loop {
+                            match publication
+                                .offer(&payload, AppendOptions::default())
+                                .map_err(|cause| error("offer", cause))?
+                            {
+                                SysConcurrentOfferOutcome::Appended { position } => {
+                                    break position / term_bytes;
+                                }
+                                SysConcurrentOfferOutcome::Aborted { .. }
+                                | SysConcurrentOfferOutcome::BackPressured
+                                | SysConcurrentOfferOutcome::AdminAction => thread::yield_now(),
+                                SysConcurrentOfferOutcome::Closed => {
+                                    return Err(BenchError("the publication closed".into()));
+                                }
+                            }
+                        };
+                        max_term.fetch_max(term, Ordering::Relaxed);
+                    }
+                    Ok(())
+                };
+                let warmed = send(config.warmup);
+                let _ = ready.wait();
+                let _ = start.wait();
+                warmed?;
+                send(config.iterations)
+            })
+        })
+        .collect();
+
+    let _ = ready.wait();
+    let measured_cleaned_start = cleaned.load(Ordering::Relaxed);
+    let measured_term_start = max_term.load(Ordering::Relaxed);
+    let measured_from = Instant::now();
+    let _ = start.wait();
+    let mut outcome = Ok(());
+    for producer in producers {
+        if let Err(cause) = join(producer)
+            && outcome.is_ok()
+        {
+            outcome = Err(cause);
+        }
+    }
+    // Snapshot the cleaner while the producers are done and before stopping
+    // its thread, so the rates exclude cleaner work after term production.
+    let measured_cleaned_end = cleaned.load(Ordering::Relaxed);
+    let measured_term_end = max_term.load(Ordering::Relaxed);
+    let measured_end = Instant::now();
+    stop.store(true, Ordering::Release);
+    let joined = join(cleaner);
+    outcome?;
+    joined?;
+    let seconds = measured_end
+        .saturating_duration_since(measured_from)
+        .as_secs_f64()
+        .max(f64::MIN_POSITIVE);
+    let cleaned_slots = measured_cleaned_end.saturating_sub(measured_cleaned_start);
+    let measured_rotations = measured_term_end.saturating_sub(measured_term_start);
+    Ok(Measurement {
+        config,
+        latency: None,
+        producer_lateness: None,
+        rate: (config.iterations * u64::from(publishers)) as f64 / seconds,
+        resolution: 0,
+        cleaned_slots_per_second: Some(cleaned_slots as f64 / seconds),
+        term_rotations_per_second: Some(measured_rotations as f64 / seconds),
     })
 }
 
@@ -813,6 +969,8 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
         producer_lateness: Some(producer_lateness),
         rate: config.iterations as f64 / seconds,
         resolution,
+        cleaned_slots_per_second: None,
+        term_rotations_per_second: None,
     })
 }
 
