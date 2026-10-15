@@ -1430,6 +1430,25 @@ mod properties {
                         );
                         let copied = block.copy_to(&mut out).unwrap();
                         prop_assert_eq!(&out[..copied], &data[..]);
+                        // Every fragment carries the input's EXT64, or none:
+                        // fragment `i` starts `i` aligned MTUs into the block.
+                        let stride = DEFAULT_MTU - DEFAULT_MTU % FRAME_ALIGNMENT;
+                        for index in 0..plan.fragments(data.len() as u32) {
+                            let at = (offset + index * stride) as usize;
+                            let word0 = Word0::unpack(u64::from_le_bytes(
+                                term[at..at + 8].try_into().unwrap(),
+                            ))
+                            .unwrap();
+                            prop_assert_eq!(word0.flags().ext(), spec.extension.is_some());
+                            if let Some(expected) = spec.extension {
+                                let start = at + HEADER_LENGTH as usize;
+                                let ext = TraceExtension::decode(
+                                    &term[start..start + EXTENSION_LENGTH as usize],
+                                )
+                                .unwrap();
+                                prop_assert_eq!(ext, expected);
+                            }
+                        }
                     }
                     other => prop_assert!(false, "expected a message, got {other:?}"),
                 }
