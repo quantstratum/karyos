@@ -10,23 +10,30 @@
 //! of [`Region::attach`], and builds the client conductor over the
 //! attached command ring and broadcast buffer.
 //!
+//! Its log buffer grants (`quantstratum-docs: karyos/design/ipc-data-path.md`,
+//! The client) complete as [`Outcome::Fetchable`](crate::Outcome::Fetchable);
+//! [`RemoteClient::take_publication`], [`RemoteClient::take_concurrent_publication`]
+//! and [`RemoteClient::take_subscription`] fetch one, check its manifest
+//! record and region against the request, adopt it and return a handle
+//! that owns its own mapping. Dropping that handle unmaps the mapping and
+//! then sends the grant's `Detach`.
+//!
 //! The process keeps the one-process contract of the first profile: it
 //! does not fork while it holds the socket, a received descriptor or a
-//! mapping. Closing a [`RemoteClient`] closes the conductor, unmaps every
-//! region and then sends `Leave`; a failed attach does the same with what
-//! it had received. The client never hands out an owner of a mapping (the
-//! conductor, its ring producer and broadcast receiver, or the counters
-//! reader), only calls that borrow them, so no mapping outlives the client
-//! and `Leave` is a true release proof. In this step hand-over keys cannot be taken yet: log
-//! buffers in regions come with i2.
+//! mapping. The socket, the fetch counter and the set of live exports form
+//! a session shared by the [`RemoteClient`] and every handle it took.
+//! Closing the client closes the conductor and unmaps the CnC regions;
+//! when the last handle is gone too, and every export was detached, the
+//! session sends `Leave`, the proof that no access can follow. A failed
+//! attach unmaps what it had received and sends `Leave`.
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use karyos_protocol::admission::{
-    MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION, refusal,
+    Capability, MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION, refusal,
 };
 use karyos_protocol::cnc::{StreamKey, SubscriberRole};
 use karyos_sys::broadcast::BroadcastReceiver;
@@ -34,9 +41,16 @@ use karyos_sys::command_ring::RingProducer;
 use karyos_sys::counters::{CellRead, CountersReader};
 use karyos_sys::error::SysError;
 use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, RegionRecord, Sent};
+use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Role, Subscription};
+use karyos_sys::term_bytes::SharedTerms;
 
-use crate::conductor::{ClientConductor, Completion, ConductorError, ConductorPoll};
-use crate::link::{ClientLink, Owner};
+use crate::concurrent::ClientConcurrentPublication;
+use crate::conductor::{
+    ClientConductor, Completion, ConductorError, ConductorPoll, Fetchable, Request,
+};
+use crate::link::{ClientLink, Export, Owner};
+use crate::publication::ClientPublication;
+use crate::subscription::ClientSubscription;
 
 /// Why an attach failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -74,7 +88,87 @@ pub struct RemoteClient {
     client: u64,
     conductor: Option<ClientConductor>,
     counters: Option<CountersReader>,
-    socket: Option<OwnedFd>,
+    /// Shared with every handle taken; dropped last, after the CnC
+    /// mappings above.
+    session: Option<Arc<Session>>,
+}
+
+/// The socket, the fetch counter and the live exports of one client
+/// (`quantstratum-docs: karyos/design/ipc-data-path.md`, The client,
+/// Session). The last reference sends `Leave` if every export was
+/// detached; its control sends block at most the attach timeout and are
+/// made only from `Drop`, `close` and the `take_*` calls.
+#[derive(Debug)]
+struct Session {
+    instance: u128,
+    socket: OwnedFd,
+    /// Held for a whole Fetch, Manifest and Region exchange, aborts
+    /// included: replies carry no thread, so one fetch at a time reads the
+    /// socket.
+    fetching: Mutex<()>,
+    state: Mutex<SessionState>,
+}
+
+#[derive(Debug)]
+struct SessionState {
+    /// The next fetch id; 0 was the bootstrap.
+    next_fetch: u64,
+    /// Exports whose descriptor arrived and which were not detached.
+    live: Vec<u64>,
+    /// A send failed: nothing more is sent, and the driver releases what
+    /// is charged at this process's exit proof.
+    broken: bool,
+}
+
+impl Session {
+    fn state(&self) -> std::sync::MutexGuard<'_, SessionState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Sends `Detach { export }` once its mapping is gone, and forgets the
+    /// export.
+    fn detach(&self, export: u64) {
+        let mut state = self.state();
+        if state.broken {
+            return;
+        }
+        if send(&self.socket, &Message::Detach { export }, None).is_err() {
+            state.broken = true;
+            return;
+        }
+        state.live.retain(|live| *live != export);
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        // Leave only once nothing is left mapped or charged: the driver's
+        // own rule. Otherwise the exit proof releases the rest.
+        if !state.broken && state.live.is_empty() {
+            let _ = send(&self.socket, &Message::Leave, None);
+        }
+    }
+}
+
+/// The export of a handle taken from a fetch: dropped after the handle's
+/// mapping, it sends the grant's `Detach`.
+#[derive(Debug)]
+struct Detach {
+    session: Arc<Session>,
+    export: u64,
+}
+
+impl Drop for Detach {
+    fn drop(&mut self) {
+        self.session.detach(self.export);
+    }
+}
+
+/// A fetched log buffer: its record and the attached buffer.
+struct Fetched {
+    record: Record,
+    buffer: Arc<LogBuffer<SharedTerms>>,
 }
 
 /// One received message, with its descriptor.
@@ -241,13 +335,25 @@ pub fn attach(
         Ok((instance, client, conductor, counters))
     });
     match built {
-        Ok((instance, client, conductor, counters)) => Ok(RemoteClient {
-            instance,
-            client,
-            conductor: Some(conductor),
-            counters: Some(counters),
-            socket: Some(socket),
-        }),
+        Ok((instance, client, mut conductor, counters)) => {
+            conductor.set_remote();
+            Ok(RemoteClient {
+                instance,
+                client,
+                conductor: Some(conductor),
+                counters: Some(counters),
+                session: Some(Arc::new(Session {
+                    instance,
+                    socket,
+                    fetching: Mutex::new(()),
+                    state: Mutex::new(SessionState {
+                        next_fetch: 1,
+                        live: Vec::new(),
+                        broken: false,
+                    }),
+                })),
+            })
+        }
         Err(error) => {
             // Everything staged is unmapped by now (dropped); tell the
             // driver, which may have admitted this client.
@@ -259,11 +365,11 @@ pub fn attach(
 
 impl RemoteClient {
     /// The admission socket while it is open: the transport of fetches.
-    /// Test hook until the client fetches its own grants (issue #2, d3).
+    /// Test hook for raw admission messages.
     #[doc(hidden)]
     #[must_use]
     pub fn admission_socket(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-        self.socket.as_ref().map(AsFd::as_fd)
+        self.session.as_ref().map(|session| session.socket.as_fd())
     }
 
     /// The driver instance id.
@@ -352,6 +458,135 @@ impl RemoteClient {
             .map_or(CellRead::Free, |counters| counters.read(index))
     }
 
+    /// Takes the exclusive publication of a [`Fetchable`] grant: fetches
+    /// it, checks it against the request and adopts it. Blocks at most the
+    /// attach timeout per message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttachError::Refused`] when the driver refuses the fetch,
+    /// [`AttachError::Protocol`] for a grant of another kind than
+    /// `fetchable` asked for or a manifest or region that does not match
+    /// it, [`AttachError::Timeout`], and [`AttachError::Sys`]. A grant
+    /// whose descriptor arrived is unmapped and detached.
+    pub fn take_publication(
+        &self,
+        fetchable: &Fetchable,
+    ) -> Result<ClientPublication<SharedTerms>, AttachError> {
+        let Request::Publication {
+            allow_unconnected, ..
+        } = fetchable.request
+        else {
+            return Err(AttachError::Protocol);
+        };
+        self.take(fetchable, |fetched, export| {
+            if fetched.record.capability != Capability::ExclusivePublication {
+                return Err(AttachError::Protocol);
+            }
+            let inner = Publication::prepare_adopt(Arc::clone(&fetched.buffer), export)?
+                .activate()
+                .map_err(|refused| AttachError::Sys(refused.error))?;
+            Ok(ClientPublication::new(inner, allow_unconnected))
+        })
+    }
+
+    /// Takes a concurrent publication handle of a [`Fetchable`] grant, as
+    /// [`RemoteClient::take_publication`].
+    ///
+    /// # Errors
+    ///
+    /// As [`RemoteClient::take_publication`].
+    pub fn take_concurrent_publication(
+        &self,
+        fetchable: &Fetchable,
+    ) -> Result<ClientConcurrentPublication<SharedTerms>, AttachError> {
+        let Request::ConcurrentPublication {
+            allow_unconnected, ..
+        } = fetchable.request
+        else {
+            return Err(AttachError::Protocol);
+        };
+        self.take(fetchable, |fetched, export| {
+            let Capability::ConcurrentPublication { slot } = fetched.record.capability else {
+                return Err(AttachError::Protocol);
+            };
+            let slot = usize::try_from(slot).map_err(|_| AttachError::Protocol)?;
+            let inner =
+                ConcurrentPublication::prepare_adopt(Arc::clone(&fetched.buffer), slot, export)?
+                    .activate()
+                    .map_err(|refused| AttachError::Sys(refused.error))?;
+            Ok(ClientConcurrentPublication::new(inner, allow_unconnected))
+        })
+    }
+
+    /// Takes the subscription of a [`Fetchable`] grant, as
+    /// [`RemoteClient::take_publication`].
+    ///
+    /// # Errors
+    ///
+    /// As [`RemoteClient::take_publication`].
+    pub fn take_subscription(
+        &self,
+        fetchable: &Fetchable,
+    ) -> Result<ClientSubscription<SharedTerms>, AttachError> {
+        let Request::Subscription { role, .. } = fetchable.request else {
+            return Err(AttachError::Protocol);
+        };
+        self.take(fetchable, |fetched, export| {
+            let (cell, granted) = match fetched.record.capability {
+                Capability::RequiredSubscriber { cell } => (cell, SubscriberRole::Required),
+                Capability::OptionalSubscriber { cell } => (cell, SubscriberRole::Optional),
+                _ => return Err(AttachError::Protocol),
+            };
+            if granted != role {
+                return Err(AttachError::Protocol);
+            }
+            let role = match role {
+                SubscriberRole::Required => Role::Required,
+                SubscriberRole::Optional => Role::Optional,
+            };
+            let cell = usize::try_from(cell).map_err(|_| AttachError::Protocol)?;
+            let inner =
+                Subscription::prepare_adopt(Arc::clone(&fetched.buffer), cell, role, export)?
+                    .activate()
+                    .map_err(|refused| AttachError::Sys(refused.error))?;
+            Ok(ClientSubscription::new(inner))
+        })
+    }
+
+    /// Fetches `fetchable`'s grant, checks the record and the buffer against
+    /// the request, and builds the handle with `adopt`. On any failure
+    /// after the descriptor arrived, the mapping is dropped and the export
+    /// detached.
+    fn take<H>(
+        &self,
+        fetchable: &Fetchable,
+        adopt: impl FnOnce(&Fetched, u64) -> Result<H, AttachError>,
+    ) -> Result<H, AttachError>
+    where
+        H: WithExport,
+    {
+        let session = self.session.as_ref().ok_or(AttachError::Protocol)?;
+        let fetched = fetch(session, fetchable)?;
+        let export = fetched.record.export;
+        let built = check(&fetched, &fetchable.request).and_then(|()| adopt(&fetched, export));
+        match built {
+            Ok(handle) => {
+                drop(fetched);
+                Ok(handle.with_export(Export::new(Detach {
+                    session: Arc::clone(session),
+                    export,
+                })))
+            }
+            Err(error) => {
+                // Unmapped first: the Detach is the proof.
+                drop(fetched);
+                session.detach(export);
+                Err(error)
+            }
+        }
+    }
+
     fn conductor_mut(&mut self) -> Result<&mut ClientConductor, ConductorError> {
         self.conductor.as_mut().ok_or(ConductorError::Closed)
     }
@@ -365,10 +600,180 @@ impl RemoteClient {
 
 impl Drop for RemoteClient {
     fn drop(&mut self) {
+        // The CnC mappings go first; the session sends Leave once its last
+        // handle is gone too.
         drop(self.conductor.take());
         drop(self.counters.take());
-        if let Some(socket) = self.socket.take() {
-            let _ = send(&socket, &Message::Leave, None);
+        drop(self.session.take());
+    }
+}
+
+/// A handle that keeps the export of the grant it was adopted from.
+trait WithExport {
+    fn with_export(self, export: Export) -> Self;
+}
+
+impl WithExport for ClientPublication<SharedTerms> {
+    fn with_export(self, export: Export) -> Self {
+        ClientPublication::with_export(self, export)
+    }
+}
+
+impl WithExport for ClientConcurrentPublication<SharedTerms> {
+    fn with_export(self, export: Export) -> Self {
+        ClientConcurrentPublication::with_export(self, export)
+    }
+}
+
+impl WithExport for ClientSubscription<SharedTerms> {
+    fn with_export(self, export: Export) -> Self {
+        ClientSubscription::with_export(self, export)
+    }
+}
+
+/// Sends `Fetch` for `fetchable` and receives its `Manifest` and its one
+/// `Region`: the manifest must answer this fetch, with its key and the
+/// registration of the `Ready` response, and carry one log buffer record;
+/// the region is attached against that record and the session's full
+/// instance.
+fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachError> {
+    let _exchange = session
+        .fetching
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let fetch = {
+        let mut state = session.state();
+        if state.broken {
+            return Err(AttachError::Protocol);
         }
+        let fetch = state.next_fetch;
+        state.next_fetch = fetch.checked_add(1).ok_or(AttachError::Protocol)?;
+        fetch
+    };
+    send(
+        &session.socket,
+        &Message::Fetch {
+            fetch,
+            key: fetchable.key,
+        },
+        None,
+    )?;
+    let record = match receive(&session.socket)? {
+        (Message::Refused { fetch: got, code }, None) if got == fetch => {
+            return Err(AttachError::Refused { code });
+        }
+        (
+            Message::Manifest {
+                fetch: got,
+                key,
+                registration,
+                records,
+            },
+            None,
+        ) if got == fetch => {
+            let expected = key == fetchable.key && registration == fetchable.registration;
+            match records[..] {
+                [record] if expected && record.kind == WireKind::LogBuffer => record,
+                // Not the grant requested: the fetch is aborted, but its
+                // regions still follow; each descriptor is closed and its
+                // export detached, so nothing stays charged.
+                _ => {
+                    abort(session, fetch, &records);
+                    return Err(AttachError::Protocol);
+                }
+            }
+        }
+        // A message for no fetch of ours: the session is out of step.
+        _ => {
+            session.state().broken = true;
+            return Err(AttachError::Protocol);
+        }
+    };
+    let received = receive(&session.socket)?;
+    let (
+        Message::Region {
+            fetch: got,
+            index: 0,
+        },
+        Some(fd),
+    ) = received
+    else {
+        session.state().broken = true;
+        return Err(AttachError::Protocol);
+    };
+    if got != fetch {
+        session.state().broken = true;
+        return Err(AttachError::Protocol);
+    }
+    // The descriptor arrived: from here the export is charged and must be
+    // detached.
+    session.state().live.push(record.export);
+    let attached = log_buffer_region(session.instance, &record)
+        .and_then(|expected| Region::attach(fd, expected).map_err(AttachError::from))
+        .and_then(|region| LogBuffer::attach(region).map_err(AttachError::from));
+    match attached {
+        Ok(buffer) => Ok(Fetched {
+            record,
+            buffer: Arc::new(buffer),
+        }),
+        Err(error) => {
+            session.detach(record.export);
+            Err(error)
+        }
+    }
+}
+
+/// Receives and discards the regions of an aborted fetch, detaching each
+/// export whose descriptor arrived.
+fn abort(session: &Session, fetch: u64, records: &[Record]) {
+    for (index, record) in (0u64..).zip(records) {
+        match receive(&session.socket) {
+            Ok((
+                Message::Region {
+                    fetch: got,
+                    index: at,
+                },
+                Some(fd),
+            )) if got == fetch && at == index => {
+                session.state().live.push(record.export);
+                drop(fd);
+                session.detach(record.export);
+            }
+            _ => {
+                session.state().broken = true;
+                return;
+            }
+        }
+    }
+}
+
+/// The region header a log buffer record describes.
+fn log_buffer_region(instance: u128, record: &Record) -> Result<RegionRecord, AttachError> {
+    Ok(RegionRecord {
+        instance,
+        region: record.region,
+        kind: RegionKind::LogBuffer,
+        generation: record.generation,
+        layout: u64::from(record.layout),
+        structure_length: usize::try_from(record.structure_length)
+            .map_err(|_| AttachError::Protocol)?,
+    })
+}
+
+/// Checks a fetched record and its buffer against the request: consistent
+/// data alone does not prove it is the grant that was requested.
+fn check(fetched: &Fetched, request: &Request) -> Result<(), AttachError> {
+    let stream = request.stream();
+    let config = fetched.buffer.config();
+    let record = &fetched.record;
+    let matches = record.stream_id == stream.stream_id
+        && record.session_id == stream.session_id
+        && config.stream_id == stream.stream_id
+        && config.session_id == stream.session_id
+        && record.lane == config.lane.get();
+    if matches {
+        Ok(())
+    } else {
+        Err(AttachError::Protocol)
     }
 }

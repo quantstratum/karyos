@@ -15,7 +15,7 @@ use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::error::ClientError;
 use crate::generation::{End, GenerationLink, Next, Successor, representable};
-use crate::link::{Lease, Origin};
+use crate::link::{Export, Lease, Origin};
 use crate::publication::CommitOutcome;
 
 /// Result of [`ClientConcurrentPublication::offer`]. Each call performs at
@@ -178,9 +178,23 @@ pub struct ClientConcurrentPublication<T: TermBytes = HeapTerms> {
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
+    /// The export of a handle adopted from another process's grant. Last:
+    /// it is dropped after the mapping, and its drop sends `Detach`.
+    _export: Option<Export>,
 }
 
 impl<T: TermBytes> ClientConcurrentPublication<T> {
+    /// Attaches the export of a grant adopted from another process.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    #[must_use]
+    pub(crate) fn with_export(mut self, export: Export) -> Self {
+        self._export = Some(export);
+        self
+    }
+
     /// Wraps a concurrent handle. Connectivity, limits and the lane are
     /// read from the buffer the handle publishes to.
     #[must_use]
@@ -192,6 +206,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             link: None,
             base: 0,
             _lease: None,
+            _export: None,
         }
     }
 

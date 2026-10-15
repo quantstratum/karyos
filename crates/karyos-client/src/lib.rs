@@ -24,7 +24,7 @@ pub use concurrent::{
 };
 pub use conductor::{
     ClientConductor, Completion, ConductorError, ConductorPoll, DEFAULT_DRIVER_TIMEOUT,
-    DEFAULT_HEARTBEAT_INTERVAL, EVENT_QUEUE, Outcome,
+    DEFAULT_HEARTBEAT_INTERVAL, EVENT_QUEUE, Fetchable, Outcome, Request,
 };
 pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};

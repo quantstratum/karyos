@@ -697,6 +697,14 @@ impl<T: TermBytes> LogBuffer<T> {
         self.config.lane
     }
 
+    /// The configuration the buffer was created with; for a buffer attached
+    /// from a region, the one its region carries, validated at attach.
+    #[inline]
+    #[must_use]
+    pub fn config(&self) -> &LogBufferConfig {
+        &self.config
+    }
+
     /// The term length in bytes.
     #[inline]
     #[must_use]

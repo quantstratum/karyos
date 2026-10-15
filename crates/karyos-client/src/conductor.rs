@@ -58,6 +58,11 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     ConcurrentPublication(ClientConcurrentPublication<T>),
     /// The subscription, ready to poll.
     Subscription(ClientSubscription<T>),
+    /// A remote client's grant, answered with its hand-over key: the
+    /// client takes it with `RemoteClient::take_publication`,
+    /// `take_concurrent_publication` or `take_subscription`
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, The client).
+    Fetchable(Fetchable),
     /// The command succeeded.
     Succeeded,
     /// The driver refused the command; it had no effect.
@@ -91,6 +96,56 @@ impl<T: TermBytes> Outcome<T> {
     }
 }
 
+/// What a request asked for, kept per request sequence: the handle needs
+/// it and neither the response nor the wire record carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Request {
+    /// The stream's exclusive publication.
+    Publication {
+        /// The stream.
+        stream: StreamKey,
+        /// Accept offers with no subscriber attached.
+        allow_unconnected: bool,
+    },
+    /// A concurrent publication handle.
+    ConcurrentPublication {
+        /// The stream.
+        stream: StreamKey,
+        /// Accept offers with no subscriber attached.
+        allow_unconnected: bool,
+    },
+    /// A subscription.
+    Subscription {
+        /// The stream.
+        stream: StreamKey,
+        /// Its role.
+        role: SubscriberRole,
+    },
+}
+
+impl Request {
+    /// The stream requested.
+    #[must_use]
+    pub fn stream(&self) -> StreamKey {
+        match *self {
+            Self::Publication { stream, .. }
+            | Self::ConcurrentPublication { stream, .. }
+            | Self::Subscription { stream, .. } => stream,
+        }
+    }
+}
+
+/// A remote client's grant, ready to fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fetchable {
+    /// The hand-over key of the response, which the fetch names.
+    pub key: u64,
+    /// The registration the response answered.
+    pub registration: u64,
+    /// What was requested.
+    pub request: Request,
+}
+
 /// A completed request.
 #[derive(Debug)]
 pub struct Completion<T: TermBytes = HeapTerms> {
@@ -122,6 +177,8 @@ enum Kind {
 struct Pending {
     sequence: u64,
     kind: Kind,
+    /// What an `Add*` asked for; `None` for a remove.
+    request: Option<Request>,
 }
 
 /// A client's conductor (not `Clone`). Dropping it closes the client: the
@@ -153,6 +210,9 @@ pub struct ClientConductor<T: TermBytes = HeapTerms> {
     events: VecDeque<Event>,
     /// Events dropped because the queue was full.
     events_dropped: u64,
+    /// A client of a driver in another process: its grants complete as
+    /// [`Outcome::Fetchable`], never through the in-process hand-over.
+    remote: bool,
 }
 
 /// Driver events a client keeps until the application takes them.
@@ -190,7 +250,17 @@ impl<T: TermBytes> ClientConductor<T> {
             driver_lost: false,
             events: VecDeque::with_capacity(EVENT_QUEUE),
             events_dropped: 0,
+            remote: false,
         }
+    }
+
+    /// Marks this conductor as a remote client's.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn set_remote(&mut self) {
+        self.remote = true;
     }
 
     /// Sets the heartbeat interval and the driver timeout, both on this
@@ -269,10 +339,16 @@ impl<T: TermBytes> ClientConductor<T> {
         stream: StreamKey,
         allow_unconnected: bool,
     ) -> Result<u64, ConductorError> {
-        self.submit(Kind::AddPublication, |sequence| Command::AddPublication {
-            sequence,
+        let request = Request::Publication {
             stream,
             allow_unconnected,
+        };
+        self.submit(Kind::AddPublication, Some(request), |sequence| {
+            Command::AddPublication {
+                sequence,
+                stream,
+                allow_unconnected,
+            }
         })
     }
 
@@ -289,7 +365,11 @@ impl<T: TermBytes> ClientConductor<T> {
         stream: StreamKey,
         allow_unconnected: bool,
     ) -> Result<u64, ConductorError> {
-        self.submit(Kind::AddConcurrentPublication, |sequence| {
+        let request = Request::ConcurrentPublication {
+            stream,
+            allow_unconnected,
+        };
+        self.submit(Kind::AddConcurrentPublication, Some(request), |sequence| {
             Command::AddConcurrentPublication {
                 sequence,
                 stream,
@@ -308,10 +388,13 @@ impl<T: TermBytes> ClientConductor<T> {
         stream: StreamKey,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
-        self.submit(Kind::AddSubscription, |sequence| Command::AddSubscription {
-            sequence,
-            stream,
-            role,
+        let request = Request::Subscription { stream, role };
+        self.submit(Kind::AddSubscription, Some(request), |sequence| {
+            Command::AddSubscription {
+                sequence,
+                stream,
+                role,
+            }
         })
     }
 
@@ -332,7 +415,7 @@ impl<T: TermBytes> ClientConductor<T> {
         let Some(registration) = self.owned(publication.origin()) else {
             return Err((publication, ConductorError::ForeignHandle));
         };
-        match self.submit(Kind::Remove, |sequence| Command::RemovePublication {
+        match self.submit(Kind::Remove, None, |sequence| Command::RemovePublication {
             sequence,
             registration,
         }) {
@@ -367,7 +450,7 @@ impl<T: TermBytes> ClientConductor<T> {
         let Some(registration) = self.owned(publication.origin()) else {
             return Err((publication, ConductorError::ForeignHandle));
         };
-        match self.submit(Kind::Remove, |sequence| Command::RemovePublication {
+        match self.submit(Kind::Remove, None, |sequence| Command::RemovePublication {
             sequence,
             registration,
         }) {
@@ -402,7 +485,7 @@ impl<T: TermBytes> ClientConductor<T> {
         let Some(registration) = self.owned(subscription.origin()) else {
             return Err((subscription, ConductorError::ForeignHandle));
         };
-        match self.submit(Kind::Remove, |sequence| Command::RemoveSubscription {
+        match self.submit(Kind::Remove, None, |sequence| Command::RemoveSubscription {
             sequence,
             registration,
         }) {
@@ -440,6 +523,7 @@ impl<T: TermBytes> ClientConductor<T> {
     fn submit(
         &mut self,
         kind: Kind,
+        request: Option<Request>,
         command: impl FnOnce(u64) -> Command,
     ) -> Result<u64, ConductorError> {
         if self.closed() {
@@ -462,7 +546,11 @@ impl<T: TermBytes> ClientConductor<T> {
         match producer.write(command.type_id(), bytes.get(..length).unwrap_or(&[])) {
             Ok(_) => {
                 self.next_sequence = next;
-                self.pending.push(Pending { sequence, kind });
+                self.pending.push(Pending {
+                    sequence,
+                    kind,
+                    request,
+                });
                 Ok(sequence)
             }
             Err(RingError::Full) => Err(ConductorError::Full),
@@ -544,7 +632,7 @@ impl<T: TermBytes> ClientConductor<T> {
                 continue;
             };
             let pending = self.pending.swap_remove(index);
-            let outcome = self.outcome(pending.kind, response);
+            let outcome = self.outcome(pending, response);
             on(Completion {
                 sequence: pending.sequence,
                 outcome,
@@ -553,7 +641,37 @@ impl<T: TermBytes> ClientConductor<T> {
         report
     }
 
-    fn outcome(&self, kind: Kind, response: Response) -> Outcome<T> {
+    fn outcome(&self, pending: Pending, response: Response) -> Outcome<T> {
+        let kind = pending.kind;
+        // A remote client's grant is fetched, never taken from the
+        // in-process hand-over table.
+        if self.remote {
+            match (pending.request, response) {
+                (
+                    Some(request),
+                    Response::PublicationReady {
+                        registration, key, ..
+                    }
+                    | Response::SubscriptionReady {
+                        registration, key, ..
+                    },
+                ) if matches!(
+                    (kind, response),
+                    (
+                        Kind::AddPublication | Kind::AddConcurrentPublication,
+                        Response::PublicationReady { .. }
+                    ) | (Kind::AddSubscription, Response::SubscriptionReady { .. })
+                ) =>
+                {
+                    return Outcome::Fetchable(Fetchable {
+                        key,
+                        registration,
+                        request,
+                    });
+                }
+                _ => {}
+            }
+        }
         match (kind, response) {
             (
                 Kind::AddPublication,
