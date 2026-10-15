@@ -235,3 +235,33 @@ impl ClientCounters {
         let _ = self.manager.free(counter);
     }
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "test helpers, as ADR-0007 allows in tests"
+)]
+mod tests {
+    use super::*;
+
+    /// A client's stray store of `FREE` into a cell another client holds
+    /// never hands that cell to a second owner (review of #120).
+    #[test]
+    fn a_clobbered_state_word_never_reallocates_a_held_cell() {
+        let mut counters = ClientCounters::new(2, 2).unwrap();
+        let (held, _) = counters
+            .allocate(1, 1, "held", CounterKeys::DRIVER)
+            .unwrap();
+        counters.manager.clobber_state_free(held);
+        let (other, _) = counters
+            .allocate(2, 1, "other", CounterKeys::DRIVER)
+            .unwrap();
+        assert_ne!(other, held);
+        // Every remaining cell is held: the region is exhausted even though
+        // the clobbered state word reads free.
+        assert_eq!(
+            counters.allocate(2, 1, "third", CounterKeys::DRIVER),
+            Err(Refusal::Exhausted)
+        );
+    }
+}

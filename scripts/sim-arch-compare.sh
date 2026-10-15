@@ -86,8 +86,11 @@ else
     printf 'emulated linux/amd64: not verifiable on this host (exit %s after %s s)\n' \
         "$emulated_status" "$emulated_seconds"
 fi
+# The same name linux-test.sh gives the emulated leg's volume, honoring a
+# KARYOS_LINUX_TARGET override.
 tree="$(basename "$root" | tr -c 'A-Za-z0-9_.-\n' '-')"
 sum="$(printf '%s' "$root" | cksum | cut -d ' ' -f 1)"
-printf 'emulated target volume: karyos-linux-target-%s-%s-linux-amd64\n' "$tree" "$sum"
-printf 'remove it with: docker volume rm karyos-linux-target-%s-%s-linux-amd64\n' "$tree" "$sum"
+volume="${KARYOS_LINUX_TARGET:-karyos-linux-target-$tree-$sum}-linux-amd64"
+printf 'emulated target volume: %s\n' "$volume"
+printf 'remove it with: docker volume rm %s\n' "$volume"
 exit "$native"

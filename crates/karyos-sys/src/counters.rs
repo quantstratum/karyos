@@ -870,9 +870,10 @@ mod owned {
         }
 
         /// Stores `FREE` into cell `index`'s state word as a stray client
-        /// write would, leaving its capability alive (tests only).
-        #[cfg(test)]
-        pub(crate) fn clobber_state_free(&self, index: usize) {
+        /// write would, leaving its capability alive (tests, and dependent
+        /// crates' tests through feature `test-hooks`).
+        #[cfg(any(test, feature = "test-hooks"))]
+        pub fn clobber_state_free(&self, index: usize) {
             if let Some(cell) = self.region.cell(index) {
                 let _ = cell.free();
             }
