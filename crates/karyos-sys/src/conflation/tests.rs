@@ -54,6 +54,34 @@ fn configuration_is_checked() {
 }
 
 #[test]
+fn publication_config_rejects_invalid_keys_and_oversized_values() {
+    let config = ConflationConfig {
+        keys: 3,
+        value_capacity: 8,
+        journal_capacity: 1024,
+    };
+    assert_eq!(config.validate_publication(0, 8), Ok(()));
+    assert_eq!(
+        config.validate_publication(-1, 1),
+        Err(ConflationError::KeyOutOfRange { key: -1 })
+    );
+    assert_eq!(
+        config.validate_publication(i64::from(u32::MAX) + 1, 1),
+        Err(ConflationError::KeyOutOfRange {
+            key: i64::from(u32::MAX) + 1
+        })
+    );
+    assert_eq!(
+        config.validate_publication(3, 1),
+        Err(ConflationError::KeyOutOfRange { key: 3 })
+    );
+    assert_eq!(
+        config.validate_publication(1, 9),
+        Err(ConflationError::ValueTooLarge { length: 9, max: 8 })
+    );
+}
+
+#[test]
 fn every_length_round_trips_and_shorter_values_leave_no_stale_bytes() {
     let mut writer = conflation(2, 40, 1024).unwrap();
     let mut reader = writer.reader();

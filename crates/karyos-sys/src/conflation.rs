@@ -55,7 +55,7 @@ pub enum ConflationError {
     #[error("key {key} is out of range")]
     KeyOutOfRange {
         /// The rejected key.
-        key: u32,
+        key: i64,
     },
     /// The value is longer than the slot capacity.
     #[error("value of {length} bytes exceeds the slot capacity of {max}")]
@@ -71,6 +71,47 @@ pub enum ConflationError {
     /// The table is closed; no further writes are accepted.
     #[error("conflation table closed")]
     Closed,
+}
+
+/// Configuration shared by a conflated publication and its table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflationConfig {
+    /// Number of dense keys, valid keys are `0..keys`.
+    pub keys: u32,
+    /// Maximum value size in bytes.
+    pub value_capacity: usize,
+    /// Capacity of the update journal in bytes.
+    pub journal_capacity: usize,
+}
+
+impl ConflationConfig {
+    /// Checks a publication's reserved value and payload length before it
+    /// attempts a reservation.
+    pub fn validate_publication(
+        &self,
+        reserved_value: i64,
+        value_length: usize,
+    ) -> Result<(), ConflationError> {
+        if self.keys == 0 || self.value_capacity == 0 {
+            return Err(ConflationError::InvalidConfig);
+        }
+        if u32::try_from(reserved_value)
+            .ok()
+            .filter(|key| *key < self.keys)
+            .is_none()
+        {
+            return Err(ConflationError::KeyOutOfRange {
+                key: reserved_value,
+            });
+        }
+        if value_length > self.value_capacity {
+            return Err(ConflationError::ValueTooLarge {
+                length: value_length,
+                max: self.value_capacity,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The words of one slot: version, length and value words.
@@ -322,10 +363,9 @@ mod owned {
                     max: self.value_capacity,
                 });
             }
-            let slot = self
-                .table
-                .slot(key)
-                .ok_or(ConflationError::KeyOutOfRange { key })?;
+            let slot = self.table.slot(key).ok_or(ConflationError::KeyOutOfRange {
+                key: i64::from(key),
+            })?;
             // Admit the journal record before the slot changes: under the
             // single writer, the transmit below then cannot fail, so every
             // committed version gets its record.

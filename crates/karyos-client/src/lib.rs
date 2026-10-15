@@ -4,12 +4,14 @@
 //!
 //! That is the planned scope from `quantstratum-docs: karyos/SPEC.md` §14. Implemented so far: the
 //! embedded-mode publication and subscription API over one lane's log buffer
-//! (copy delivery), and the client conductor that requests them from the
-//! driver through the command ring and the broadcast buffer. Conflation,
-//! lanes beyond one and IPC attachment do not exist yet.
+//! (copy delivery), a bounded client view over the keyed conflation table,
+//! and the client conductor that requests capabilities from the driver.
+//! The driver feeder and lanes beyond one do not yet exist. Linux IPC
+//! attachment is implemented.
 
 pub mod concurrent;
 pub mod conductor;
+pub mod conflated_subscription;
 pub mod error;
 pub mod generation;
 #[cfg(target_os = "linux")]
@@ -27,6 +29,7 @@ pub use conductor::{
     ClientConductor, Completion, ConductorError, ConductorPoll, DEFAULT_DRIVER_TIMEOUT,
     DEFAULT_HEARTBEAT_INTERVAL, EVENT_QUEUE, Fetchable, Outcome, Request,
 };
+pub use conflated_subscription::ConflatedSubscription;
 pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
