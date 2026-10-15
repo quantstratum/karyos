@@ -40,9 +40,9 @@ each claim: [RELEASE-NOTES-0.1.0-alpha.1.md](RELEASE-NOTES-0.1.0-alpha.1.md).
 
 | Platform | What runs | Evidence for this alpha |
 | --- | --- | --- |
-| Linux, aarch64 | All alpha features, including the cross-process control path | Docker (TODO(A3): kernel and test counts) |
-| Linux, x86_64 | All alpha features, including the cross-process control path | Not yet run for this alpha (TODO(A3)) |
-| macOS, arm64 | Embedded driver; cross-process IPC is Linux only | Development host (TODO(A3): Loom and Miri results) |
+| Linux, aarch64 | All alpha features, including the cross-process control path | Docker (`rust:1.99`) on kernel 6.8.0 aarch64: the workspace tests, including the process and platform tests, pass |
+| Linux, x86_64 | All alpha features, including the cross-process control path | Not run for this alpha |
+| macOS, arm64 | Embedded driver; cross-process IPC is Linux only | Apple M5 Max: Loom models and Miri on `karyos-sys` pass |
 
 Docker and virtual machines give functional evidence only. No latency or
 throughput figure is claimed for this alpha.
@@ -69,6 +69,20 @@ scripts/linux-test.sh -p karyos-sys --locked  # any cargo test arguments
 ```
 
 Hosted CI is not running; the gates above are run locally before a merge.
+
+The cross-process control path is exercised by the Linux tests of
+`karyos-driver`: `tests/admission.rs` (admission in one process),
+`tests/processes.rs` (child processes killed, stopped and restarted) and
+`tests/admission_platform.rs` (modes, owners, stale files, backlog, size
+seals, descriptor counts):
+
+```sh
+scripts/linux-test.sh -p karyos-driver --locked
+```
+
+A driver opens its admission socket with `EmbeddedDriver::with_ipc` and
+serves it from `do_work`; a client process attaches with
+`karyos_client::ipc::attach`. There is no example binary yet.
 
 ## Crates
 
