@@ -191,7 +191,7 @@ fn add_stream_with(
                 claim_deadline,
                 publication,
             },
-            allow_unconnected: true,
+            allow_unconnected: false,
             on_required_loss: LossPolicy::Hold,
         })
         .unwrap()
