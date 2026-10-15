@@ -416,6 +416,130 @@ fn test_ipc_data_a_stopped_writer_holding_a_claim_is_aborted_at_the_deadline() {
     assert!(child.0.wait().unwrap().success());
 }
 
+/// Runs duty cycles and polls `subscription` until it reports nothing new
+/// for a while; returns the messages and whether an aborted block was
+/// reported. Every duty cycle must succeed.
+fn drain_local(
+    driver: &mut IpcDriver,
+    subscription: &mut karyos_client::ClientSubscription<SharedTerms>,
+) -> (Vec<Vec<u8>>, bool) {
+    let mut received = Vec::new();
+    let mut aborted = false;
+    let mut quiet = 0;
+    let start = Instant::now();
+    while quiet < 200 {
+        assert!(start.elapsed() < Duration::from_secs(10), "never quiet");
+        let _ = driver.do_work().unwrap();
+        let summary = subscription
+            .poll(
+                |payload, _| received.push(payload.to_vec()),
+                MessageLimit::new(32),
+            )
+            .unwrap();
+        aborted |= summary.aborted.is_some();
+        if summary.delivered == 0 && summary.aborted.is_none() {
+            quiet += 1;
+        } else {
+            quiet = 0;
+        }
+        std::thread::yield_now();
+    }
+    (received, aborted)
+}
+
+/// An exclusive publisher process killed at `scenario`'s pause point: its
+/// exit proof ends its registration at once and the publication is never
+/// issued again; returns what a local reader then drains.
+fn kill_paused_writer(name: &str, scenario: &str) -> (Vec<Vec<u8>>, bool) {
+    let dir = dir(name);
+    let mut driver = driver(&dir);
+    let stream = add_stream(&mut driver);
+    let mut subscription = driver
+        .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+        .unwrap();
+    let (mut child, reports) = spawn(scenario, &dir);
+    // The required reader keeps reading while the writer runs to its
+    // pause, so it is never back-pressured short of it.
+    let mut received = Vec::new();
+    let mut aborted = false;
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(10), "never paused");
+        let _ = driver.do_work().unwrap();
+        let summary = subscription
+            .poll(
+                |payload, _| received.push(payload.to_vec()),
+                MessageLimit::new(32),
+            )
+            .unwrap();
+        aborted |= summary.aborted.is_some();
+        if let Ok(report) = reports.try_recv() {
+            assert_eq!(report, "paused");
+            break;
+        }
+        std::thread::yield_now();
+    }
+    child.0.kill().unwrap();
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = child.0.wait();
+    assert_eq!(counter(&driver, "grants ended"), 1);
+    let (rest, rest_aborted) = drain_local(&mut driver, &mut subscription);
+    received.extend(rest);
+    assert!(driver.publication(stream).is_err());
+    (received, aborted || rest_aborted)
+}
+
+/// Killed after reserving a block and before writing any of it
+/// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Tests, d4): the
+/// exit proof aborts exactly the reserved block; the reader gets every
+/// message before it and then skips it.
+#[test]
+fn test_ipc_data_an_exclusive_publisher_killed_mid_offer_is_aborted_at_its_exit() {
+    let (received, aborted) = kill_paused_writer("killed-mid-offer", "kill-at-reserved");
+    assert_eq!(received, vec![b"before".to_vec()]);
+    assert!(aborted, "the reserved block was not aborted");
+}
+
+/// Killed while updating its claim record, its serial odd: the exit proof
+/// invalidates the torn record without reading it, nothing was reserved,
+/// so nothing is aborted, and every later duty cycle succeeds.
+#[test]
+fn test_ipc_data_an_exclusive_publisher_killed_mid_record_update_leaves_no_torn_state() {
+    let (received, aborted) = kill_paused_writer("killed-mid-record", "kill-at-record");
+    assert_eq!(received, vec![b"before".to_vec()]);
+    assert!(!aborted, "a block was aborted with nothing reserved");
+}
+
+/// Killed after reserving the rest of its term and before writing the
+/// `PAD`: the exit proof closes the range as `PAD`, so the reader gets
+/// every message and crosses into the next term with nothing aborted.
+#[test]
+fn test_ipc_data_an_exclusive_publisher_killed_across_the_term_end_is_padded() {
+    let (received, aborted) = kill_paused_writer("killed-term-end", "kill-at-term-end");
+    assert!(received.len() > 1, "{}", received.len());
+    for (index, message) in received.iter().enumerate() {
+        assert_eq!(
+            message.as_slice(),
+            filler(index).as_slice(),
+            "message {index}"
+        );
+    }
+    assert!(!aborted, "the padded range was reported aborted");
+}
+
+/// The messages of the term-end scenario: large enough that a term holds
+/// only a few dozen.
+fn filler(index: usize) -> Vec<u8> {
+    vec![index as u8; 1500]
+}
+
+/// Reports the pause and waits to be killed.
+fn pause_here(_: karyos_sys::test_pause::PausePoint) {
+    report("paused");
+    std::thread::sleep(Duration::from_secs(30));
+    std::process::exit(1);
+}
+
 /// A concurrent publisher process killed with an open block while an
 /// in-process publisher keeps writing in the same term: the live
 /// publisher's messages are never aborted, the dead block is aborted by
@@ -829,6 +953,42 @@ fn child() {
             std::mem::forget(client);
             std::thread::sleep(Duration::from_secs(30));
             std::process::exit(1);
+        }
+        "kill-at-reserved" | "kill-at-record" | "kill-at-term-end" => {
+            use karyos_sys::test_pause::{PausePoint, arm};
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, false);
+            let mut publication = client.take_publication(&fetchable).unwrap();
+            let offer = |publication: &mut karyos_client::ClientPublication<SharedTerms>,
+                         payload: &[u8]| {
+                let start = Instant::now();
+                while !matches!(
+                    publication.offer(payload).unwrap(),
+                    OfferOutcome::Accepted { .. }
+                ) {
+                    assert!(start.elapsed() < Duration::from_secs(10), "offer");
+                }
+            };
+            match scenario.to_str().unwrap() {
+                "kill-at-reserved" => {
+                    offer(&mut publication, b"before");
+                    arm(PausePoint::ExclusiveReserved, pause_here);
+                    offer(&mut publication, b"never written");
+                }
+                "kill-at-record" => {
+                    offer(&mut publication, b"before");
+                    arm(PausePoint::ClaimRecordOdd, pause_here);
+                    let _ = publication.try_claim(64);
+                }
+                _ => {
+                    arm(PausePoint::TermEndReserved, pause_here);
+                    // At most a term's worth: the term end comes first.
+                    for index in 0..1000 {
+                        offer(&mut publication, &filler(index));
+                    }
+                }
+            }
+            panic!("never paused");
         }
         "claim-wait-commit" => {
             let mut client = attach(&dir, timeout, 16).unwrap();

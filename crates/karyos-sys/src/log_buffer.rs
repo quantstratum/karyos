@@ -1967,6 +1967,8 @@ impl<T: TermBytes> PublicationContext<'_, T> {
                 tail,
                 position,
             } => {
+                #[cfg(feature = "test-hooks")]
+                crate::test_pause::reached(crate::test_pause::PausePoint::ExclusiveReserved);
                 self.write_block(slot, count, tail, payload, &plan, options);
                 Ok(AppendOutcome::Appended { position })
             }
@@ -2078,6 +2080,8 @@ impl<T: TermBytes> PublicationContext<'_, T> {
             }
             let next = count.next()?;
             buffer.reserved_head().store(boundary, Ordering::Release);
+            #[cfg(feature = "test-hooks")]
+            crate::test_pause::reached(crate::test_pause::PausePoint::TermEndReserved);
             if remaining > 0 {
                 self.write_pad(slot, count, tail, remaining);
             }

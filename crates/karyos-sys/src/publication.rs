@@ -121,6 +121,8 @@ pub fn abort_block(first: &AtomicU64, reserved: Word0, aborted: Word0) -> bool {
 pub fn write_claim_record(serial: &AtomicU64, record: &AtomicU64, value: u64) {
     let current = serial.load(Ordering::Relaxed);
     serial.store(current.wrapping_add(1), Ordering::Relaxed);
+    #[cfg(all(feature = "test-hooks", not(loom)))]
+    crate::test_pause::reached(crate::test_pause::PausePoint::ClaimRecordOdd);
     fence(Ordering::Release);
     record.store(value, Ordering::Relaxed);
     serial.store(current.wrapping_add(2), Ordering::Release);

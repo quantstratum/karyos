@@ -57,5 +57,8 @@ pub mod term_bytes;
 // Real memory with std atomics; the Loom model covers `publication` instead.
 #[cfg(not(loom))]
 pub mod term_memory;
+// Pause points for multi-process tests (feature `test-hooks`).
+#[cfg(all(feature = "test-hooks", not(loom)))]
+pub mod test_pause;
 
 pub use error::{LayoutError, SysError};
