@@ -45,6 +45,7 @@ karyos-bench = { path = "crates/karyos-bench", version = "0.1.0-alpha.1" }
 
 # External dependencies; each admission is recorded in deps/dependencies.md.
 loom = { version = "0.7.2", default-features = false }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "mm", "net", "param", "process"] }
 thiserror = { version = "2.0.21", default-features = false }
 

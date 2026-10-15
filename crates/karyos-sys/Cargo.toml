@@ -18,6 +18,9 @@ test-hooks = []
 [dependencies]
 thiserror.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix.workspace = true
 

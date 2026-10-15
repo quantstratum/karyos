@@ -15,6 +15,51 @@ pub const EXTENSION_LENGTH: u32 = 64;
 pub const FRAME_ALIGNMENT: u32 = 32;
 /// Protocol version written in word 0.
 pub const PROTOCOL_VERSION: u8 = 1;
+/// Version of the trace extension layout.
+pub const EXTENSION_VERSION: u8 = 1;
+/// Extension feature bits defined by version 1 (none).
+pub const DEFINED_EXTENSION_FLAGS: u16 = 0;
+
+/// Why a trace extension's fixed fields are invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtensionFault {
+    /// `extension_version` is not [`EXTENSION_VERSION`].
+    Version,
+    /// The reserved byte at offset 1 or a byte of 48 to 63 is not zero.
+    Reserved,
+    /// A feature bit outside [`DEFINED_EXTENSION_FLAGS`] is set.
+    Flags,
+    /// `extension_length` is not [`EXTENSION_LENGTH`].
+    Length,
+}
+
+/// Checks the fixed fields of a trace extension (SPEC.md §4): its version,
+/// the reserved byte at offset 1, the feature bits, `extension_length` and
+/// the reserved bytes 48 to 63. The identity fields are not interpreted.
+///
+/// # Errors
+///
+/// Returns the first [`ExtensionFault`] found.
+pub fn check_extension(bytes: &[u8; EXTENSION_LENGTH as usize]) -> Result<(), ExtensionFault> {
+    let [version, reserved, flags_lo, flags_hi, l0, l1, l2, l3, ..] = *bytes;
+    if version != EXTENSION_VERSION {
+        return Err(ExtensionFault::Version);
+    }
+    if reserved != 0
+        || bytes
+            .get(48..)
+            .is_none_or(|tail| tail.iter().any(|b| *b != 0))
+    {
+        return Err(ExtensionFault::Reserved);
+    }
+    if u16::from_le_bytes([flags_lo, flags_hi]) & !DEFINED_EXTENSION_FLAGS != 0 {
+        return Err(ExtensionFault::Flags);
+    }
+    if u32::from_le_bytes([l0, l1, l2, l3]) != EXTENSION_LENGTH {
+        return Err(ExtensionFault::Length);
+    }
+    Ok(())
+}
 
 const FLAG_BEGIN: u8 = 0x01;
 const FLAG_END: u8 = 0x02;

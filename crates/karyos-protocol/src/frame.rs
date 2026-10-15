@@ -6,14 +6,11 @@
 //! re-exported here.
 
 pub use karyos_sys::frame::{
-    EXTENSION_LENGTH, FRAME_ALIGNMENT, Flags, FrameType, HEADER_LENGTH, Lane, PROTOCOL_VERSION,
-    Word0,
+    DEFINED_EXTENSION_FLAGS, EXTENSION_LENGTH, EXTENSION_VERSION, FRAME_ALIGNMENT, Flags,
+    FrameType, HEADER_LENGTH, Lane, PROTOCOL_VERSION, Word0,
 };
 
 use crate::error::ProtocolError;
-
-/// Version of the trace extension layout.
-pub const EXTENSION_VERSION: u8 = 1;
 
 /// The 32-byte base frame header.
 ///
@@ -96,9 +93,6 @@ pub struct TraceExtension {
     /// Logical message identity shared by its fragments.
     pub message_id: u64,
 }
-
-/// Extension feature bits defined by version 1 (none).
-const DEFINED_EXTENSION_FLAGS: u16 = 0;
 
 impl TraceExtension {
     /// Writes the extension into the first 64 bytes of `out`.

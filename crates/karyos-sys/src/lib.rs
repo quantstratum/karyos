@@ -39,6 +39,7 @@ pub mod log_buffer;
 #[cfg(target_os = "linux")]
 pub mod mmap;
 pub mod publication;
+pub mod receive;
 pub mod record_journal;
 pub mod registration;
 pub mod sizing;
