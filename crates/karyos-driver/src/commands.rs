@@ -22,7 +22,7 @@ use karyos_protocol::cnc::{
     MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey, SubscriberRole,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
-use karyos_sys::log_buffer::{LossPolicy, Revocation, Role};
+use karyos_sys::log_buffer::{LossPolicy, Revocation, Role, SealState};
 
 use crate::counters::Event;
 use crate::embedded::EmbeddedDriver;
@@ -220,6 +220,9 @@ impl EmbeddedDriver {
                 session_id: target.session_id,
             };
             let position = target.conductor.cell_position(cell).unwrap_or(0);
+            // Sealing is idempotent: only the revocation that moves the
+            // stream out of `Active` reports its closing.
+            let was_active = target.conductor.seal_state() == SealState::Active;
             let revocation = target.conductor.revoke_participant(cell, occupant, policy);
             let revocation = match revocation {
                 Ok(Revocation::Stale) | Err(_) => continue,
@@ -257,7 +260,7 @@ impl EmbeddedDriver {
                         position,
                     });
                 }
-                Revocation::Sealed => self.emit(&DriverEvent::PublicationClosed {
+                Revocation::Sealed if was_active => self.emit(&DriverEvent::PublicationClosed {
                     stream: key,
                     reason: CloseReason::RequiredParticipantLost,
                 }),

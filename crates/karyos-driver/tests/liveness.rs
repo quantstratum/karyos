@@ -447,3 +447,38 @@ fn test_driver_events_an_orderly_close_at_the_deadline_is_not_a_loss() {
     assert_eq!(counter(&driver, "required participants lost"), 0);
     assert_eq!(driver.seal_state(stream).unwrap(), SealState::Active);
 }
+
+#[test]
+fn test_driver_events_abort_reports_one_closing_for_two_lost_participants() {
+    let (mut driver, clock) = driver();
+    let _stream = driver.add_stream(stream_config(LossPolicy::Abort)).unwrap();
+    let mut observer = beating(&mut driver);
+    let mut client = beating(&mut driver);
+    for _ in 0..2 {
+        let _ = client
+            .add_subscription(LOST_STREAM, SubscriberRole::Required)
+            .unwrap();
+    }
+    let mut done = Vec::new();
+    while done.len() < 2 {
+        assert!(observed_work(&mut driver, &mut observer).is_empty());
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    assert!(observed_work(&mut driver, &mut observer).is_empty());
+    time_out(&clock);
+    let events = observed_work(&mut driver, &mut observer);
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_lost(&events[0], LossPolicyCode::Abort);
+    let closings = events
+        .iter()
+        .filter(|event| matches!(event, Event::PublicationClosed { .. }))
+        .count();
+    assert_eq!(closings, 1, "{events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::ParticipantLost { .. }))
+            .count(),
+        2
+    );
+}
