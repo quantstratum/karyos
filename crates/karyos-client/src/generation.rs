@@ -391,6 +391,12 @@ mod tests {
     use karyos_sys::term::TermId;
 
     fn successor() -> Successor {
+        tracked().0
+    }
+
+    /// A successor whose buffer only it holds, and a weak reference that
+    /// fails to upgrade once the successor is dropped.
+    fn tracked() -> (Successor, std::sync::Weak<LogBuffer>) {
         let buffer = Arc::new(
             LogBuffer::new(LogBufferConfig {
                 term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
@@ -407,7 +413,10 @@ mod tests {
             })
             .unwrap(),
         );
-        Successor::Publication(buffer.publication_owned().unwrap().unwrap())
+        let weak = Arc::downgrade(&buffer);
+        let successor = Successor::Publication(buffer.publication_owned().unwrap().unwrap());
+        drop(buffer);
+        (successor, weak)
     }
 
     #[test]
@@ -481,29 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn close_ends_a_link_in_any_state_and_returns_its_offer() {
-        for remote in [false, true] {
-            let link = GenerationLink::<HeapTerms>::with_remote(remote);
-            assert!(link.set_pending());
-            assert!(link.offer(5, successor()).is_ok());
-            assert!(matches!(link.close(), Some(Successor::Publication(_))));
-            assert_eq!(link.status(), LinkStatus::Closed);
-            assert!(matches!(link.next(true), Next::End));
-            assert_eq!(End::peek(Some(&link)), End::Closed);
-            assert!(link.offer(9, successor()).is_err());
-            assert!(!link.set_pending());
-            // A fence keeps it closed.
-            assert!(link.fence().is_none());
-            assert_eq!(link.status(), LinkStatus::Closed);
-        }
-        let link = GenerationLink::<HeapTerms>::new_remote();
-        assert!(link.close().is_none());
-        assert!(matches!(link.next(true), Next::End));
-    }
-
-    /// The allocation counts of the handle tests are meaningful: the
-    /// counter sees an allocation and its free.
-    #[test]
     fn the_counting_allocator_sees_an_allocation_and_its_free() {
         let ((), operations) = karyos_sys::alloc_count::count(|| {
             drop(std::hint::black_box(vec![0u8; 64]));
@@ -530,5 +516,123 @@ mod tests {
         assert!(link.fence().is_none());
         assert_eq!(link.status(), LinkStatus::Fenced);
         assert!(matches!(link.next(true), Next::End));
+    }
+
+    /// The link's states, reached from `Current`.
+    #[derive(Debug, Clone, Copy)]
+    enum Start {
+        Current,
+        Pending,
+        Offered,
+        Fenced,
+    }
+
+    /// Drives `link` to `start`; returns the weak reference of an offered
+    /// successor.
+    fn drive(link: &GenerationLink, start: Start) -> Option<std::sync::Weak<LogBuffer>> {
+        match start {
+            Start::Current => None,
+            Start::Pending => {
+                assert!(link.set_pending());
+                None
+            }
+            Start::Offered => {
+                assert!(link.set_pending());
+                let (successor, weak) = tracked();
+                assert!(link.offer(5, successor).is_ok());
+                Some(weak)
+            }
+            Start::Fenced => {
+                assert!(link.set_pending());
+                assert!(link.fence().is_none());
+                None
+            }
+        }
+    }
+
+    /// rejoin-policies.md, Tests: with a retained clone of the link, `close`
+    /// from each of `Current`, `Pending`, `Offered` and `Fenced` is terminal;
+    /// an offered successor is handed back and dropped.
+    #[test]
+    fn test_generation_link_close_is_terminal() {
+        for remote in [false, true] {
+            for start in [
+                Start::Current,
+                Start::Pending,
+                Start::Offered,
+                Start::Fenced,
+            ] {
+                let link = GenerationLink::<HeapTerms>::with_remote(remote);
+                let retained = Arc::clone(&link);
+                let offered = drive(&link, start);
+                let returned = retained.close();
+                assert_eq!(returned.is_some(), offered.is_some(), "{start:?}");
+                drop(returned);
+                if let Some(weak) = offered {
+                    assert!(weak.upgrade().is_none(), "the offered successor is dropped");
+                }
+                drop(link);
+                assert_eq!(retained.status(), LinkStatus::Closed, "{start:?}");
+                assert!(!retained.set_pending());
+                let (late, weak) = tracked();
+                let refused = retained.offer(9, late);
+                assert!(refused.is_err(), "{start:?}: a late offer is given back");
+                drop(refused);
+                assert!(weak.upgrade().is_none());
+                assert!(matches!(retained.next(true), Next::End));
+                assert!(matches!(retained.next(false), Next::End));
+                assert!(retained.fence().is_none());
+                assert!(retained.close().is_none());
+                assert_eq!(retained.status(), LinkStatus::Closed, "{start:?}");
+            }
+        }
+    }
+
+    /// `close` races the driver's cutover (`set_pending`, `offer`), its fence
+    /// and the handle's move: every successor offered ends up with exactly
+    /// one owner and is dropped, and the link ends `Closed`.
+    #[test]
+    fn close_races_the_cutover_the_fence_and_the_move() {
+        for round in 0..500 {
+            for remote in [false, true] {
+                let link = GenerationLink::<HeapTerms>::with_remote(remote);
+                let (successor, weak) = tracked();
+                let start = std::sync::Barrier::new(4);
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        start.wait();
+                        let _ = link.set_pending();
+                        drop(link.offer(5, successor));
+                    });
+                    scope.spawn(|| {
+                        start.wait();
+                        drop(link.fence());
+                    });
+                    scope.spawn(|| {
+                        start.wait();
+                        drop(link.close());
+                    });
+                    scope.spawn(|| {
+                        start.wait();
+                        for _ in 0..4 {
+                            match link.next(true) {
+                                Next::Moved { successor, .. } => drop(successor),
+                                Next::Wait => std::thread::yield_now(),
+                                Next::End => break,
+                            }
+                        }
+                    });
+                });
+                assert!(
+                    weak.upgrade().is_none(),
+                    "round {round}: the successor was kept"
+                );
+                // Close is terminal whatever won; a move before it left the
+                // link `Current`, which close then ended.
+                assert_eq!(link.status(), LinkStatus::Closed, "round {round}");
+                assert!(!link.set_pending());
+                assert!(matches!(link.next(true), Next::End));
+            }
+        }
     }
 }
