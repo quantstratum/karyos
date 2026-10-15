@@ -184,6 +184,8 @@ fn mode_publishers(plan: &StreamPlan) -> u8 {
     match plan.publication {
         PublicationMode::Exclusive => 1,
         PublicationMode::Concurrent { .. } => plan.publishers.max(1),
+        // An image has no local publisher: its receive owner writes it.
+        PublicationMode::Image { .. } => 0,
     }
 }
 
@@ -264,6 +266,8 @@ impl<'s> Sim<'s> {
                         add(Kind::Concurrent(publication));
                     }
                 }
+                // No scenario drives an image's receive owner yet.
+                PublicationMode::Image { .. } => {}
             }
             streams.push(Stream {
                 handle,
