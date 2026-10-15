@@ -546,3 +546,90 @@ fn ending_the_exclusive_publication_of_a_concurrent_buffer_is_refused() {
         Err(SysError::InvalidPublicationMode { .. })
     ));
 }
+
+#[test]
+fn a_prepared_publication_touches_nothing_until_activated() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    // Prepared before the grant exists: nothing shared was read or written.
+    let early = Publication::prepare_adopt(&buffer, 11).unwrap();
+    assert!(matches!(
+        Publication::prepare_adopt(&buffer, 0),
+        Err(SysError::Protocol { .. })
+    ));
+    let refused = early.activate().unwrap_err();
+    assert!(matches!(refused.error, SysError::Protocol { .. }));
+    assert!(conductor.register_publication(11).unwrap());
+    // A refused activation of another export spends nothing: the prepared
+    // handle comes back and the right one still activates.
+    let wrong = Publication::prepare_adopt(&buffer, 12).unwrap();
+    let back = wrong.activate().unwrap_err();
+    assert!(back.prepared.is_some());
+    let mut adopted = refused.prepared.unwrap().activate().unwrap();
+    assert!(matches!(
+        adopted.append(&message(1), AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+    // Spent: a second prepared handle for the same grant fails.
+    assert!(
+        Publication::prepare_adopt(&buffer, 11)
+            .unwrap()
+            .activate()
+            .is_err()
+    );
+}
+
+#[test]
+fn a_prepared_subscription_activates_once() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert!(matches!(
+        Subscription::prepare_adopt(&buffer, 0, Role::Required, 7),
+        Err(SysError::Protocol { .. })
+    ));
+    assert!(matches!(
+        Subscription::prepare_adopt(&buffer, usize::MAX, Role::Required, 7),
+        Err(SysError::Protocol { .. })
+    ));
+    let cell = conductor.register_subscriber(Role::Required, 7).unwrap();
+    let optional = Subscription::prepare_adopt(&buffer, cell, Role::Optional, 7).unwrap();
+    assert!(optional.activate().unwrap_err().prepared.is_some());
+    let prepared = Subscription::prepare_adopt(&buffer, cell, Role::Required, 7).unwrap();
+    let again = Subscription::prepare_adopt(&buffer, cell, Role::Required, 7).unwrap();
+    let adopted = prepared.activate().unwrap();
+    assert_eq!(adopted.cell(), cell);
+    assert!(again.activate().is_err());
+}
+
+#[test]
+fn a_prepared_concurrent_handle_activates_once() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    assert!(matches!(
+        ConcurrentPublication::prepare_adopt(&buffer, 2, 21),
+        Err(SysError::Protocol { .. })
+    ));
+    let early = ConcurrentPublication::prepare_adopt(&buffer, 0, 21).unwrap();
+    // The slot is free: refused, and the prepared handle comes back.
+    let refused = early.activate().unwrap_err();
+    let slot = conductor.register_concurrent_publication(21).unwrap().unwrap();
+    assert_eq!(slot, 0);
+    let mut adopted = refused.prepared.unwrap().activate().unwrap();
+    assert!(matches!(
+        adopted.offer(&message(5), AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { .. }
+    ));
+    assert_eq!(poll_message(&mut subscription), Some(message(5)));
+    assert!(
+        ConcurrentPublication::prepare_adopt(&buffer, slot, 21)
+            .unwrap()
+            .activate()
+            .is_err()
+    );
+    let exclusive = new_buffer(config(3, 3)).unwrap();
+    assert!(matches!(
+        ConcurrentPublication::prepare_adopt(&exclusive, 0, 21),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+}
