@@ -284,6 +284,10 @@ fn descriptor_driver(dir: &Path) {
     serve_until(&mut driver, |driver| driver.clients() == 0);
     release(&mut warm.0);
     assert!(warm.0.wait().unwrap().success());
+    // Its stdout reader thread closes the pipe at EOF, asynchronously; the
+    // thread drops its sender only after the pipe, so a disconnected
+    // channel proves the pipe is closed before the count.
+    while reports.recv().is_ok() {}
     let before = open_descriptors();
     let (mut client, reports) = spawn("subscribe-many", dir);
     serve_until_report(&mut driver, &reports, "rounds done");
