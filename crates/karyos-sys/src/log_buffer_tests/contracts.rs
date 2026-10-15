@@ -107,6 +107,72 @@ fn test_log_buffer_message_sizes_8000_fits_8001_refused_writers_never_interleave
     });
 }
 
+/// §13 "Concurrent publication": a fragmented reservation aborted after its
+/// payload is written remains one extent, even when another writer commits
+/// behind it. The reader must not expose the later message through the gap.
+#[test]
+fn test_log_buffer_aborted_fragmented_offer_with_two_writers_never_interleaves() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    let first_data = tagged_message(1, 0, 8000);
+    let second_data = tagged_message(2, 0, 5000);
+    let first_extent = reserved_of(&first_data);
+    let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            first
+                .offer_pausing(
+                    &first_data,
+                    AppendOptions::default(),
+                    &mut |point| {
+                        if point == WriterPause::Commit {
+                            paused_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }
+                    },
+                )
+                .unwrap()
+        });
+
+        // The first writer has filled every fragment but has not committed
+        // the block. A later committed block must remain hidden behind it.
+        paused_rx.recv().unwrap();
+        assert_eq!(poll_message(&mut subscription), None);
+        assert!(matches!(
+            second.offer(&second_data, AppendOptions::default()).unwrap(),
+            ConcurrentOfferOutcome::Appended { position } if position == u64::from(first_extent)
+        ));
+        assert_eq!(poll_message(&mut subscription), None);
+
+        // The deadline turns the first reservation into exactly one aborted
+        // extent, after which the reader can consume the intact second block.
+        assert_eq!(serve(&mut conductor, 0), waiting());
+        assert_eq!(
+            serve(&mut conductor, DEADLINE),
+            aborted(1, u64::from(first_extent))
+        );
+        assert_eq!(
+            poll(&mut subscription),
+            PollOutcome::Aborted {
+                position: 0,
+                extent: first_extent,
+            }
+        );
+        assert_eq!(poll_message(&mut subscription), Some(second_data));
+
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            writer.join().unwrap(),
+            ConcurrentOfferOutcome::Aborted { position: 0 }
+        );
+    });
+}
+
 /// Sets the flag when dropped: at the end of a participant's scope, also
 /// when it unwinds.
 struct StopOnDrop<'a>(&'a AtomicBool);
