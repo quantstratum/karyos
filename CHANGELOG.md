@@ -69,8 +69,12 @@ cross-process control path on Linux. See
   socket with a version exchange, a bounded connect, the per-client command
   ring, broadcast responses and read-only counters in sealed regions,
   `Leave`, retirement, release by the exit proof, and a driver restart that
-  keeps the old mappings. A file at the socket path that is not the
-  driver's socket is never deleted.
+  keeps the old mappings. At start the driver removes a file at its socket
+  path only if it is a socket of the driver's uid with mode 0600 that
+  refuses connections; anything else (a regular file, a symlink, a socket
+  of another owner or mode, or a live driver's socket) is kept and the
+  start fails. A stale socket that matches the rule is removed even if it
+  belonged to something else.
 
 ### Tracing (`karyos-trace`)
 

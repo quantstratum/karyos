@@ -94,7 +94,7 @@ during development; the last row is the gate run on the release commit.
 | Region tests after the Linux-only kind check | `7186e77` | macOS arm64, Apple M5 Max | 4 of 4 pass; no full Miri rerun after it |
 | `make loom` | `1316b00` | macOS arm64, Apple M5 Max | Pass |
 | `scripts/linux-test.sh` (`cargo test --workspace`) | `5484971` (the process tests on the admission server) | Docker `rust:1.99`, kernel 6.8.0 aarch64 (colima VM) | All pass, including the `karyos-sys` library tests (322) |
-| Process tests (`karyos-driver/tests/processes.rs`: a killed client released by its exit proof, a stopped client kept charged then resumed, a driver restart that keeps the old mappings readable) | `e3784dd` | Docker, kernel 6.8.0 aarch64 | 4 of 4 pass |
+| Process tests (`karyos-driver/tests/processes.rs`: a killed client released by its exit proof, a stopped client kept charged then resumed, a driver restart that keeps the old mappings readable) | `e3784dd`, merged as `b2d15cb` | Docker, kernel 6.8.0 aarch64 | 4 of 4 pass, five consecutive runs |
 | Platform tests (`karyos-driver/tests/admission_platform.rs`: modes, owners, stale and foreign files, backlog, size seals, descriptor counts) | `ebd8e77` on `b1ce50a` | Docker as root, kernel 6.8.0-117-generic aarch64 | 11 of 11 pass, three consecutive runs |
 | Release gates (`make pre-push`, `make miri`, `make sim`, `scripts/linux-test.sh`) | TODO(final gate-run SHA) | TODO(final gate-run SHA) | TODO(final gate-run SHA) |
 | Linux x86_64, kernels 6.9 and later | none | Not run for this alpha | Not claimed |
