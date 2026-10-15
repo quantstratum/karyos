@@ -187,6 +187,12 @@ impl ConcurrentDeadlines {
         self.scan(buffer, &mut scan_now)
     }
 
+    /// The stream position of the frontier: every block below it is
+    /// terminal.
+    pub(super) fn frontier_position<T: TermBytes>(&self, buffer: &LogBuffer<T>) -> u64 {
+        buffer.position(self.frontier.count, self.frontier.offset)
+    }
+
     /// Whether an observation or a span walk remains.
     pub(super) fn waiting(&self) -> bool {
         !self.marked.is_empty() || self.span.is_some()

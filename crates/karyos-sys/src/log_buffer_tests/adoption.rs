@@ -311,3 +311,71 @@ fn a_dropped_concurrent_handle_clears_its_slot_registration() {
         0
     );
 }
+
+#[test]
+fn an_ended_concurrent_registration_frees_its_slot_at_the_next_service() {
+    let buffer = new_buffer(deadline_concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let slot = conductor.register_concurrent_publication(21).unwrap().unwrap();
+    assert_eq!(conductor.end_concurrent_publication(slot, 22), Ok(false));
+    assert_eq!(conductor.end_concurrent_publication(9, 21), Ok(false));
+    assert_eq!(conductor.end_concurrent_publication(slot, 21), Ok(true));
+    assert_eq!(conductor.end_concurrent_publication(slot, 21), Ok(false));
+    // Ended: the grant cannot be adopted, and the slot is held until a
+    // service passes the head observed at the end.
+    assert!(matches!(
+        ConcurrentPublication::adopt(&buffer, slot, 21),
+        Err(SysError::Protocol { .. })
+    ));
+    assert_eq!(conductor.ending_publishers(), 1);
+    assert!(conductor.concurrent_publication().unwrap().is_none());
+    assert_eq!(serve(&mut conductor, 0), DeadlineReport::default());
+    assert_eq!(conductor.ending_publishers(), 0);
+    assert!(conductor.concurrent_publication().unwrap().is_some());
+}
+
+#[test]
+fn a_dead_concurrent_publisher_is_resolved_by_the_deadline_only() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let slot = conductor.register_concurrent_publication(21).unwrap().unwrap();
+    let mut dead = ConcurrentPublication::adopt(&buffer, slot, 21).unwrap();
+    let mut live = conductor.concurrent_publication().unwrap().unwrap();
+    // The dead publisher dies with a block open; the live one keeps
+    // writing in the same term.
+    core::mem::forget(concurrent_claimed(dead.try_claim(8, AppendOptions::default())));
+    core::mem::forget(dead);
+    assert!(matches!(
+        live.offer(&message(1), AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { .. }
+    ));
+    assert_eq!(conductor.end_concurrent_publication(slot, 21), Ok(true));
+    assert_eq!(serve(&mut conductor, 0), waiting());
+    // Before the deadline nothing is aborted and the slot keeps its loan.
+    assert_eq!(serve(&mut conductor, DEADLINE - 1), waiting());
+    assert_eq!(conductor.ending_publishers(), 1);
+    assert_ne!(buffer.cells()[slot].loan.load(Ordering::Acquire), 0);
+    let report = serve(&mut conductor, DEADLINE);
+    assert_eq!(report.aborted, 1);
+    let _ = serve(&mut conductor, DEADLINE);
+    assert_eq!(conductor.ending_publishers(), 0);
+    assert_eq!(buffer.cells()[slot].loan.load(Ordering::Acquire), 0);
+    // Readers skip the aborted block and get the live publisher's message.
+    assert!(matches!(poll(&mut subscription), PollOutcome::Aborted { .. }));
+    assert_eq!(poll_message(&mut subscription), Some(message(1)));
+    // The freed slot is issued again; the live one is still held.
+    let _reissued = conductor.concurrent_publication().unwrap().unwrap();
+    assert!(conductor.concurrent_publication().unwrap().is_none());
+    drop(live);
+}
+
+#[test]
+fn ending_a_concurrent_publication_of_an_exclusive_buffer_is_refused() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert!(matches!(
+        conductor.end_concurrent_publication(0, 21),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+}

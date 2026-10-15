@@ -56,8 +56,8 @@ use crate::publication::{
     SEAL_POSITIONED, SEAL_SEALED, abort_block, active_term_count, commit_block, deadline_abort,
     fence_rotation, fence_tail, issuer_sees_seal, load_interior, mark_block, observe_block,
     observe_seal, position_seal, publication_released, publication_taken, publish_block,
-    read_claim_record, release_publication, seal, store_interior, take_publication,
-    write_claim_record,
+    read_claim_record, release_publication, release_publisher_slot, seal, store_interior,
+    take_publication, write_claim_record,
 };
 use crate::registration::{self, claim, valid_export};
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
@@ -1131,6 +1131,7 @@ fn issue_conductor<O: BufferOwner>(owner: O) -> Option<Conductor<O>> {
         quarantined: Vec::new(),
         observed: None,
         deadlines: deadline::ConcurrentDeadlines::new(publishers),
+        ending: Vec::with_capacity(publishers),
     })
 }
 
@@ -2626,6 +2627,19 @@ pub struct Conductor<O: BufferOwner> {
     observed: Option<(u64, u64)>,
     /// The concurrent deadline state (`quantstratum-docs: karyos/design/concurrent-deadline.md`).
     deadlines: deadline::ConcurrentDeadlines,
+    /// Ended concurrent publishers whose slot and write loan are held
+    /// until the deadline resolves their blocks, `P` entries reserved at
+    /// issue.
+    ending: Vec<Ending>,
+}
+
+/// An ended concurrent publisher: its slot, and the reserved head observed
+/// when it ended. Every block below that head is its or another writer's,
+/// and is resolved once the deadline frontier reaches it.
+#[derive(Debug, Clone, Copy)]
+struct Ending {
+    slot: usize,
+    head: u64,
 }
 
 /// Every outcome of one [`Conductor::service_deadlines`] call
@@ -2790,6 +2804,81 @@ impl<O: BufferOwner> Conductor<O> {
         }
         found.state.store(CELL_FREE, Ordering::Release);
         true
+    }
+
+    /// Ends the registration of the concurrent publisher registered in
+    /// publisher slot `slot` for `export`, adopted or not
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Ending a
+    /// registration). Returns whether it did; a slot registered for
+    /// another export, or none, is left untouched.
+    ///
+    /// The registration ends at once, so no adoption can follow. Shared
+    /// memory does not say which undecided block was this publisher's, so
+    /// none is aborted early: the slot and its write loan stay held until
+    /// the commit deadline (`karyos/design/concurrent-deadline.md`) has
+    /// resolved every block below the reserved head observed now; a later
+    /// [`Conductor::service_deadlines`] then releases the loan and frees
+    /// the slot.
+    ///
+    /// The caller must hold a proof that the publisher makes no further
+    /// access, as for [`Conductor::end_subscriber`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidPublicationMode`] for an exclusive buffer
+    /// and errors reading the reserved head.
+    pub fn end_concurrent_publication(
+        &mut self,
+        slot: usize,
+        export: u64,
+    ) -> Result<bool, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if !buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "a concurrent handle of an exclusive buffer",
+            });
+        }
+        let Some(found) = buffer.publisher_lines().get(slot) else {
+            return Ok(false);
+        };
+        // Read before the end: the registration is the participant's, and
+        // the head bounds its reservations, all made before the proof.
+        let head = buffer.conductor_head()?;
+        if !registration::end(&found.registration, export) {
+            return Ok(false);
+        }
+        // At most one entry per slot: the registration ended once, and the
+        // slot is not reissued while held. `P` entries were reserved.
+        self.ending.push(Ending { slot, head });
+        Ok(true)
+    }
+
+    /// Ended concurrent publishers whose slot is still held.
+    #[must_use]
+    pub fn ending_publishers(&self) -> usize {
+        self.ending.len()
+    }
+
+    /// Releases the write loan and frees the slot of every ended concurrent
+    /// publisher whose blocks the deadline frontier has passed.
+    fn release_ended_publishers(&mut self) {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let frontier = self.deadlines.frontier_position(buffer);
+        let mut index = 0;
+        while let Some(ending) = self.ending.get(index).copied() {
+            if frontier < ending.head {
+                index += 1;
+                continue;
+            }
+            if let Ok(cell) = buffer.cell(ending.slot) {
+                release_loan(&cell.loan);
+            }
+            let active = buffer.active_count().load(Ordering::Acquire) as u32;
+            if let Some(word) = buffer.publisher(ending.slot) {
+                release_publisher_slot(word, active);
+            }
+            self.ending.swap_remove(index);
+        }
     }
 
     /// Revokes the reader that occupies `cell` as `occupant`, whose client
@@ -3097,6 +3186,9 @@ impl<O: BufferOwner> Conductor<O> {
             let result = self
                 .deadlines
                 .service(buffer, clock, &mut report, after_marked);
+            if result.is_ok() {
+                self.release_ended_publishers();
+            }
             report.waiting = self.deadlines.waiting();
             return match result {
                 Ok(()) => Ok(report),
