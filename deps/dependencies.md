@@ -13,7 +13,7 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | Crate | Version | Source | Features | Scope | Targets | Licence | Family approval |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `thiserror` | 2.0.21 | crates.io | default features off | runtime, `karyos-sys`, `karyos-protocol`, `karyos-client`, `karyos-driver`, `karyos-trace`, `karyos` | all | MIT OR Apache-2.0 | ADR-0033 (`thiserror`, all crates) |
-| `rustix` | 1.1.5 | crates.io | default features off; `std`, `fs`, `mm`, `param`, `net`, `process` (the last two owner approved 2026-10-15 for IPC, quantstratum-docs: karyos/design/ipc-implementation.md) | runtime, `karyos-sys` | Linux only (`cfg(target_os = "linux")`) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | ADR-0033 (`rustix`, sys and io) |
+| `rustix` | 1.1.5 | crates.io | default features off; `std`, `fs`, `mm`, `param`, `net` (owner approved 2026-10-15 for IPC, quantstratum-docs: karyos/design/ipc-implementation.md; `process` is approved for i3 and not enabled yet) | runtime, `karyos-sys` | Linux only (`cfg(target_os = "linux")`) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | ADR-0033 (`rustix`, sys and io) |
 | `loom` | 0.7.2 | crates.io | default features off | model checking, only under `--cfg loom` | all | MIT | ADR-0033 (`loom`, dev only) |
 
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
