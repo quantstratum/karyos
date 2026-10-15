@@ -795,6 +795,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// The export ledger of remote client `client`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn ledger(&self, client: u64) -> Option<&Ledger> {
+        self.clients
+            .iter()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_ref())
+    }
+
     /// A remote client's `Remove*` of `registration`: a grant never sent is
     /// ended at once, its participant released in the buffer; a sent one
     /// stays charged until its `Detach` or the client's exit proof.

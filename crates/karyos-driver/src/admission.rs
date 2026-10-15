@@ -14,7 +14,8 @@
 //! retired.
 //!
 //! A client ends with `Leave` or with the exit proof (its pidfd becomes
-//! readable). `Leave` is accepted at any time, also while the bootstrap is
+//! readable). `Leave` is accepted while no grant of its export ledger was
+//! sent (otherwise it is a protocol error), also while the bootstrap is
 //! still queued: the client sends it only after unmapping every region it
 //! attached and closing every descriptor it received, which is also how it
 //! rolls back a failed attach. Messages still queued for it are dropped
@@ -271,7 +272,7 @@ impl<T: StreamTerms> Admission<T> {
         // One datagram per client, then its outbound queue.
         let mut index = 0;
         while let Some(remote) = self.remotes.get_mut(index) {
-            let step = match Self::receive(remote, self.config.max_outbound_per_client) {
+            let step = match Self::receive(remote, driver, self.config.max_outbound_per_client) {
                 Step::Keep => Self::drain(remote),
                 other => other,
             };
@@ -426,14 +427,22 @@ impl<T: StreamTerms> Admission<T> {
     }
 
     /// Reads at most one datagram of an admitted client.
-    fn receive(remote: &mut Remote<T>, bound: usize) -> Step {
+    fn receive(remote: &mut Remote<T>, driver: &EmbeddedDriver<T>, bound: usize) -> Step {
         let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
         match ipc::recv(remote.socket.as_fd(), &mut buffer) {
             Ok(Recv::WouldBlock) => Step::Keep,
             Ok(Recv::Message(received)) if received.fd.is_none() => {
                 let bytes = buffer.get(..received.len).unwrap_or(&[]);
                 match Message::decode(bytes) {
-                    Ok(Message::Leave) => Step::Leave,
+                    // Leave releases the client like its exit proof, so it
+                    // is accepted only while nothing was exported; otherwise
+                    // it is a protocol error and everything sent stays
+                    // charged until the exit proof.
+                    Ok(Message::Leave)
+                        if driver.ledger(remote.client).is_none_or(Ledger::only_held) =>
+                    {
+                        Step::Leave
+                    }
                     // Log buffers in regions come with i2: no key is held
                     // for a remote client yet.
                     Ok(Message::Fetch { fetch, .. }) => Self::queue(

@@ -91,6 +91,18 @@ impl Ledger {
         Some(self.grants.swap_remove(index))
     }
 
+    /// Whether no grant was sent: the client may `Leave`, which ends every
+    /// grant like the exit proof.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn only_held(&self) -> bool {
+        self.grants
+            .iter()
+            .all(|grant| grant.state == GrantState::Held && !grant.sent)
+    }
+
     /// Removes and returns every grant whose descriptor never left.
     pub(crate) fn take_unsent(&mut self) -> Vec<Grant> {
         let (unsent, sent) = core::mem::take(&mut self.grants)
@@ -127,5 +139,38 @@ impl Ledger {
     #[cfg(test)]
     pub(crate) fn grants(&self) -> &[Grant] {
         &self.grants
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(registration: u64) -> Grant {
+        Grant {
+            export: registration + 100,
+            registration,
+            key: registration,
+            stream: 1,
+            participant: Participant::Exclusive,
+            state: GrantState::Held,
+            sent: false,
+        }
+    }
+
+    #[test]
+    fn leave_is_allowed_only_while_nothing_was_sent() {
+        let mut ledger = Ledger::new(4);
+        assert!(ledger.only_held());
+        ledger.push(grant(1));
+        ledger.push(grant(2));
+        assert!(ledger.only_held());
+        ledger.mark_sent(2);
+        assert!(!ledger.only_held());
+        // A retirement ends the unsent one and keeps the sent one.
+        let unsent = ledger.take_unsent();
+        assert_eq!(unsent.len(), 1);
+        assert_eq!(unsent[0].registration, 1);
+        assert_eq!(ledger.grants().len(), 1);
     }
 }
