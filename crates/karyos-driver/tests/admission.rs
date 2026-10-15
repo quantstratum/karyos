@@ -634,3 +634,162 @@ fn an_unfetchable_grant_is_refused_at_its_command() {
     ));
     assert_eq!(counter(&driver, "grants reserved"), 0);
 }
+
+/// Admits a remote client, takes a required subscription on stream 2 and
+/// fetches it with fetch id 1; returns the client, the export and the
+/// region's descriptor (the client's mapping stand-in).
+fn fetched_subscription(driver: &mut IpcDriver, dir: &Path) -> (RemoteClient, u64, OwnedFd) {
+    let mut client = attach_serving(driver, dir).unwrap();
+    let _ = client
+        .add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    let mut done: Vec<Completion> = Vec::new();
+    let start = Instant::now();
+    while done.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    let socket = client.admission_socket().unwrap();
+    let fetch = encode(&Message::Fetch { fetch: 1, key: 1 });
+    assert_eq!(ipc::send(socket, &fetch, None).unwrap(), Sent::Sent);
+    let (Message::Manifest { records, .. }, _) = next_message(driver, socket) else {
+        panic!("no manifest");
+    };
+    let (_, fd) = next_message(driver, socket);
+    (client, records[0].export, fd.unwrap())
+}
+
+/// The fetch id high-water mark moves before the key and bounds are
+/// checked, so a refused id stays consumed; a refusal changes no grant, and
+/// the next id fetches the same grant (`quantstratum-docs:
+/// karyos/design/ipc-data-path.md`, Grants and the export ledger).
+#[test]
+fn a_refused_fetch_id_stays_consumed_and_the_grant_stays_held() {
+    let dir = dir("refused-id");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let _ = client
+        .add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    let mut done: Vec<Completion> = Vec::new();
+    let start = Instant::now();
+    while done.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    let socket = client.admission_socket().unwrap();
+    let mut exchange = |fetch: u64, key: u64| {
+        let message = encode(&Message::Fetch { fetch, key });
+        assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
+        next_message(&mut driver, socket)
+    };
+    assert_eq!(
+        exchange(8, 77).0,
+        Message::Refused {
+            fetch: 8,
+            code: refusal::UNKNOWN_KEY
+        }
+    );
+    // The same id with the right key: consumed, refused.
+    assert_eq!(
+        exchange(8, 1).0,
+        Message::Refused {
+            fetch: 8,
+            code: refusal::LIMIT
+        }
+    );
+    // The grant is still Held: the next id fetches it.
+    assert!(matches!(
+        exchange(9, 1).0,
+        Message::Manifest {
+            fetch: 9,
+            key: 1,
+            ..
+        }
+    ));
+    let (region, fd) = next_message(&mut driver, socket);
+    assert_eq!(region, Message::Region { fetch: 9, index: 0 });
+    assert!(fd.is_some());
+    assert_eq!(counter(&driver, "grants exported"), 1);
+    // A refusal of the consumed key leaves it exported.
+    let again = encode(&Message::Fetch { fetch: 10, key: 1 });
+    assert_eq!(ipc::send(socket, &again, None).unwrap(), Sent::Sent);
+    assert_eq!(
+        next_message(&mut driver, socket).0,
+        Message::Refused {
+            fetch: 10,
+            code: refusal::UNKNOWN_KEY
+        }
+    );
+    assert_eq!(counter(&driver, "grants exported"), 1);
+}
+
+/// `max_fetch_bytes` counts whole regions, header included: a grant whose
+/// region is exactly the bound is fetched, one header byte over is refused
+/// at its command.
+#[test]
+fn the_fetch_byte_bound_counts_the_region_header() {
+    // The region size of this stream's log buffer.
+    let probe_dir = dir("bytes-probe");
+    let mut probe = system_driver(&probe_dir);
+    let _stream = probe.add_stream(shared_stream_config()).unwrap();
+    let (_client, _export, fd) = fetched_subscription(&mut probe, &probe_dir);
+    let size = std::fs::File::from(fd).metadata().unwrap().len();
+    for (bound, accepted) in [(size, true), (size - 1, false)] {
+        let dir = dir(if accepted {
+            "bytes-exact"
+        } else {
+            "bytes-over"
+        });
+        let mut driver = EmbeddedDriver::with_ipc(
+            DriverConfig::default(),
+            IpcConfig {
+                max_fetch_bytes: bound,
+                ..ipc_config(&dir, 5_000_000_000)
+            },
+            Box::new(SystemClock::new()),
+        )
+        .unwrap();
+        let _stream = driver.add_stream(shared_stream_config()).unwrap();
+        let mut client = attach_serving(&mut driver, &dir).unwrap();
+        let _ = client
+            .add_subscription(
+                StreamKey {
+                    stream_id: 2,
+                    session_id: 1,
+                },
+                SubscriberRole::Required,
+            )
+            .unwrap();
+        let mut done: Vec<Completion> = Vec::new();
+        let start = Instant::now();
+        while done.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+            let _ = driver.do_work().unwrap();
+            let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        }
+        let refused = matches!(
+            done[0].outcome,
+            Outcome::Refused {
+                code: ErrorCode::ResourcesUnavailable,
+                ..
+            }
+        );
+        assert_eq!(refused, !accepted, "bound {bound} for a region of {size}");
+    }
+}
