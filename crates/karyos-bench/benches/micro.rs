@@ -5,7 +5,7 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_main};
 use karyos_protocol::trace_hook::{PublicationIdentity, PublishContext, TraceHook};
 use karyos_sys::conflation::{Budget, conflation};
 use karyos_sys::frame::Lane;
@@ -84,5 +84,15 @@ fn trace_decisions(c: &mut Criterion) {
     trace_sampling(c, "trace hook decision all", Sampling::All);
 }
 
-criterion_group!(benches, conflation_write_poll, trace_decisions);
+// criterion 0.7's `criterion_group!` generates an undocumented public
+// function, which the workspace `missing_docs` lint would reject.
+#[allow(
+    missing_docs,
+    reason = "criterion_group! generates an undocumented pub fn"
+)]
+mod group {
+    use super::{conflation_write_poll, trace_decisions};
+    criterion::criterion_group!(benches, conflation_write_poll, trace_decisions);
+}
+use group::benches;
 criterion_main!(benches);
