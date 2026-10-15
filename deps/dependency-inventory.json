@@ -400,6 +400,7 @@
         "net",
         "netlink",
         "no_std",
+        "prctl",
         "xdp"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#linux-raw-sys@0.12.1",
@@ -781,10 +782,12 @@
       "edges": [
         {
           "features": [
+            "event",
             "fs",
             "mm",
             "net",
             "param",
+            "process",
             "std"
           ],
           "from": "workspace:karyos-sys@0.1.0",
@@ -795,10 +798,12 @@
       ],
       "features": [
         "alloc",
+        "event",
         "fs",
         "mm",
         "net",
         "param",
+        "process",
         "std"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",

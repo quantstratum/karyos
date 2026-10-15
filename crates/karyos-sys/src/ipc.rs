@@ -482,6 +482,71 @@ pub fn peer_credentials(socket: BorrowedFd<'_>) -> Result<rustix::net::UCred, Sy
     rustix::net::sockopt::socket_peercred(socket).map_err(os("getsockopt(SO_PEERCRED)"))
 }
 
+/// A pidfd of this process (`pidfd_open(getpid())`), the descriptor a
+/// client passes with `Hello` as its exit proof
+/// (`quantstratum-docs: karyos/design/ipc-admission.md`). Close-on-exec, as every pidfd.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when `pidfd_open` fails (Linux before 5.3).
+pub fn pidfd_self() -> Result<OwnedFd, SysError> {
+    rustix::process::pidfd_open(
+        rustix::process::getpid(),
+        rustix::process::PidfdFlags::empty(),
+    )
+    .map_err(os("pidfd_open"))
+}
+
+/// The pid a pidfd names, read from the `Pid:` field of its `fdinfo`:
+/// `Some(pid)` while the process is not yet reaped, `None` once it is
+/// (the kernel reports `-1`), and an error when `fd` is not a pidfd.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when the `fdinfo` cannot be read, and
+/// [`SysError::Protocol`] when it has no valid `Pid:` field (the
+/// descriptor is not a pidfd).
+pub fn pidfd_pid(fd: BorrowedFd<'_>) -> Result<Option<i32>, SysError> {
+    use rustix::fd::AsRawFd;
+    let path = format!("/proc/self/fdinfo/{}", fd.as_raw_fd());
+    let info = std::fs::read_to_string(path).map_err(|error| SysError::Os {
+        operation: "read(fdinfo)",
+        errno: error.raw_os_error().unwrap_or(0),
+    })?;
+    let pid = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Pid:"))
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .ok_or(SysError::Protocol {
+            reason: "not a pidfd",
+        })?;
+    Ok((pid > 0).then_some(pid))
+}
+
+/// Whether the process a pidfd names has exited: the pidfd is readable
+/// (`poll` with a zero timeout), which the kernel reports from the exit on,
+/// also while the process is a zombie.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when `poll` fails.
+pub fn pidfd_exited(fd: BorrowedFd<'_>) -> Result<bool, SysError> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+    let ready = poll(
+        &mut fds,
+        Some(&Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    )
+    .map_err(os("poll(pidfd)"))?;
+    Ok(ready > 0
+        && fds
+            .iter()
+            .any(|fd| fd.revents().intersects(PollFlags::IN | PollFlags::HUP)))
+}
+
 // Miri cannot execute these system calls.
 #[cfg(test)]
 #[cfg(not(miri))]
@@ -737,5 +802,43 @@ mod tests {
         );
         let owner = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata("/proc/self").unwrap());
         assert_eq!(credentials.uid.as_raw(), owner);
+    }
+
+    #[test]
+    fn a_pidfd_names_its_process_until_it_exits() {
+        let own = pidfd_self().unwrap();
+        let pid = rustix::process::getpid().as_raw_nonzero().get();
+        assert_eq!(pidfd_pid(own.as_fd()).unwrap(), Some(pid));
+        assert!(!pidfd_exited(own.as_fd()).unwrap());
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let child_pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        let pidfd =
+            rustix::process::pidfd_open(child_pid, rustix::process::PidfdFlags::empty()).unwrap();
+        assert_eq!(
+            pidfd_pid(pidfd.as_fd()).unwrap(),
+            Some(child_pid.as_raw_nonzero().get())
+        );
+        assert!(!pidfd_exited(pidfd.as_fd()).unwrap());
+        child.kill().unwrap();
+        // Exited is reported from the exit on, before and after the reap.
+        while !pidfd_exited(pidfd.as_fd()).unwrap() {
+            std::thread::yield_now();
+        }
+        child.wait().unwrap();
+        assert!(pidfd_exited(pidfd.as_fd()).unwrap());
+        assert_eq!(pidfd_pid(pidfd.as_fd()).unwrap(), None);
+    }
+
+    #[test]
+    fn a_descriptor_that_is_not_a_pidfd_is_refused() {
+        let region = Region::create(record()).unwrap();
+        assert!(matches!(
+            pidfd_pid(region.descriptor().unwrap()),
+            Err(SysError::Protocol { .. })
+        ));
     }
 }
