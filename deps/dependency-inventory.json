@@ -461,7 +461,7 @@
       "edges": [
         {
           "features": [],
-          "from": "workspace:karyos-sys@0.1.0",
+          "from": "workspace:karyos-sys@0.1.0-alpha.1",
           "kind": "normal",
           "target": "cfg(loom)",
           "uses_default_features": false
@@ -790,7 +790,7 @@
             "process",
             "std"
           ],
-          "from": "workspace:karyos-sys@0.1.0",
+          "from": "workspace:karyos-sys@0.1.0-alpha.1",
           "kind": "normal",
           "target": "cfg(target_os = \"linux\")",
           "uses_default_features": false
@@ -979,42 +979,42 @@
       "edges": [
         {
           "features": [],
-          "from": "workspace:karyos-client@0.1.0",
+          "from": "workspace:karyos-client@0.1.0-alpha.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-driver@0.1.0",
+          "from": "workspace:karyos-driver@0.1.0-alpha.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-protocol@0.1.0",
+          "from": "workspace:karyos-protocol@0.1.0-alpha.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-sys@0.1.0",
+          "from": "workspace:karyos-sys@0.1.0-alpha.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-trace@0.1.0",
+          "from": "workspace:karyos-trace@0.1.0-alpha.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos@0.1.0",
+          "from": "workspace:karyos@0.1.0-alpha.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
