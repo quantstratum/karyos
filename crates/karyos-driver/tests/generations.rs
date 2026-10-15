@@ -113,6 +113,19 @@ fn read(subscription: &mut ClientSubscription) -> (Vec<(u64, Vec<u8>)>, PollSumm
     }
 }
 
+/// The value of the driver counter labelled `label`.
+fn counter(driver: &EmbeddedDriver, label: &str) -> u64 {
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .find_map(|index| match reader.read(index) {
+            karyos_sys::counters::CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == label.as_bytes() => Some(value),
+            _ => None,
+        })
+        .unwrap()
+}
+
 fn accepted(outcome: OfferOutcome) -> u64 {
     match outcome {
         OfferOutcome::Accepted { position, .. } => position,
@@ -341,6 +354,7 @@ fn retained_generations_are_bounded_and_released() {
         driver.reconfigure_stream(stream, larger()),
         Err(DriverError::Sys(SysError::ResourcesUnavailable))
     ));
+    assert_eq!(counter(&driver, "retirement pool exhausted"), 1);
     // Released once the holder reads to the end and drops.
     let (_, summary) = read(&mut holder);
     assert!(summary.closed.is_some());

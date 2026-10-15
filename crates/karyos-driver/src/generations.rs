@@ -400,6 +400,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::CutoverPending { stream: target.id });
         }
         if target.retained.len() >= max_retained {
+            self.counters
+                .add(crate::counters::Event::RetirementPoolExhausted, 1);
             return Err(DriverError::Sys(SysError::ResourcesUnavailable));
         }
         let generation = target

@@ -48,6 +48,10 @@
 //! | `positions sampled at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds of the last completed pass |
 //! | `counters unavailable` | event | counter allocations refused for lack of a free cell |
 //! | `generations retired` | gauge | mappings retired but not yet reclaimed, over all streams |
+//! | `slots quarantined` | gauge | slots in `RECLAIMING` with a live loan, over all streams and retained mappings |
+//! | `spare reservations in use` | gauge | spare-slot credits held by admitted subscribers, over all streams and retained mappings |
+//! | `loans outstanding` | gauge | non-zero loan words, over all streams and retained mappings |
+//! | `retirement pool exhausted` | event | reconfigurations refused because `max_retained_generations` predecessors are retained |
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! "Per-stream positions") are allocated, set and released only inside a
@@ -81,7 +85,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 35] = [
+const LABELS: [(u64, &str); 39] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -117,6 +121,10 @@ const LABELS: [(u64, &str); 35] = [
     (TYPE_TIMESTAMP, "positions sampled at"),
     (TYPE_EVENTS, "counters unavailable"),
     (TYPE_GAUGE, "generations retired"),
+    (TYPE_GAUGE, "slots quarantined"),
+    (TYPE_GAUGE, "spare reservations in use"),
+    (TYPE_GAUGE, "loans outstanding"),
+    (TYPE_EVENTS, "retirement pool exhausted"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -208,6 +216,14 @@ pub(crate) enum Event {
     CountersUnavailable,
     /// Mappings retired but not yet reclaimed, over all streams.
     GenerationsRetired,
+    /// Slots in `RECLAIMING` with a live loan.
+    SlotsQuarantined,
+    /// Spare-slot credits held by admitted subscribers.
+    SpareReservationsInUse,
+    /// Non-zero loan words.
+    LoansOutstanding,
+    /// Reconfigurations refused because the retirement pool is full.
+    RetirementPoolExhausted,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -425,6 +441,10 @@ mod tests {
             (Event::PositionsSampledAt, "positions sampled at"),
             (Event::CountersUnavailable, "counters unavailable"),
             (Event::GenerationsRetired, "generations retired"),
+            (Event::SlotsQuarantined, "slots quarantined"),
+            (Event::SpareReservationsInUse, "spare reservations in use"),
+            (Event::LoansOutstanding, "loans outstanding"),
+            (Event::RetirementPoolExhausted, "retirement pool exhausted"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();
