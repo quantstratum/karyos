@@ -44,6 +44,23 @@
 //! | `claim clock steps back` | event | timers a deadline call re-anchored (`clock_went_back`); repeats per call |
 //! | `claim deadlines unrepresentable` | event | points whose expiry instant does not fit `u64` (`unrepresentable`); repeats per call |
 //! | `claims waiting` | gauge | streams whose latest deadline call reported `waiting` |
+//! | `positions epoch` | gauge | sampling pass sequence: odd while a pass writes the position cells |
+//! | `positions sampled at` | timestamp | host `CLOCK_MONOTONIC` nanoseconds of the last completed pass |
+//! | `counters unavailable` | event | counter allocations refused for lack of a free cell |
+//! | `generations retired` | gauge | mappings retired but not yet reclaimed, over all streams |
+//!
+//! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+//! "Per-stream positions") are allocated, set and released only inside a
+//! sampling pass, between its odd and its even `positions epoch`, with the
+//! layout version 2 key words: per stream lane `stream limit`, `stream
+//! head` and `stream floor` (key0 the stream, key1 its lane), and per
+//! attached subscriber cell `subscriber position generation G cell N` (key1
+//! also kind subscriber, key2 its registration, 0 for an in-process
+//! subscription without one); during a cutover a subscriber that has not
+//! moved yet is sampled in its predecessor mapping. The region holds
+//! `counters_capacity` cells; when none is free a cell is not allocated,
+//! `counters unavailable` counts it once, tools show that position as
+//! unavailable, and later passes retry.
 //!
 //! The cells are allocated once, when the driver is created. A reader
 //! keeps the region alive after the driver is dropped; the driver's
@@ -58,9 +75,13 @@ use crate::error::DriverError;
 pub const TYPE_EVENTS: u64 = 1;
 /// Type id of a gauge (current value).
 pub const TYPE_GAUGE: u64 = 2;
+/// Type id of a stream position in bytes, sampled by the driver.
+pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
+/// Type id of a host `CLOCK_MONOTONIC` time in nanoseconds.
+pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 31] = [
+const LABELS: [(u64, &str); 35] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -92,7 +113,14 @@ const LABELS: [(u64, &str); 31] = [
     (TYPE_EVENTS, "grants exported"),
     (TYPE_EVENTS, "grants detached"),
     (TYPE_EVENTS, "grants fenced"),
+    (TYPE_GAUGE, "positions epoch"),
+    (TYPE_TIMESTAMP, "positions sampled at"),
+    (TYPE_EVENTS, "counters unavailable"),
+    (TYPE_GAUGE, "generations retired"),
 ];
+
+/// The fixed counters, which every counters region must hold.
+pub(crate) const FIXED_COUNTERS: usize = LABELS.len();
 
 /// One of the driver's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,27 +200,58 @@ pub(crate) enum Event {
     GrantsDetached,
     /// Successor grants fenced at a cutover deadline.
     GrantsFenced,
+    /// The sampling pass sequence: odd while a pass writes.
+    PositionsEpoch,
+    /// Host `CLOCK_MONOTONIC` nanoseconds of the last completed pass.
+    PositionsSampledAt,
+    /// Counter allocations refused for lack of a free cell.
+    CountersUnavailable,
+    /// Mappings retired but not yet reclaimed, over all streams.
+    GenerationsRetired,
 }
 
 /// The driver's counters region and its counter capabilities.
 #[derive(Debug)]
 pub(crate) struct DriverCounters {
-    _manager: CountersManager,
+    manager: CountersManager,
     reader: CountersReader,
     counters: Vec<Counter>,
 }
 
 impl DriverCounters {
-    /// Allocates the region and every counter (control path).
+    /// Allocates a region of exactly the fixed counters (control path).
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self, DriverError> {
-        let (manager, reader) = counters(LABELS.len()).map_err(|_| DriverError::InvalidConfig)?;
+        Self::with_capacity(FIXED_COUNTERS)
+    }
+
+    /// Allocates a region of `capacity` cells and every fixed counter; the
+    /// rest serve position cells (control path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::InvalidConfig`] when `capacity` cannot hold
+    /// the fixed counters or cannot be allocated.
+    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, DriverError> {
+        if capacity < FIXED_COUNTERS {
+            return Err(DriverError::InvalidConfig);
+        }
+        let (manager, reader) = counters(capacity).map_err(|_| DriverError::InvalidConfig)?;
         Self::allocate(manager, reader)
     }
 
-    /// Allocates the region in a shared region (IPC mode).
+    /// Allocates the region in a shared region (IPC mode), with `capacity`
+    /// cells.
     #[cfg(target_os = "linux")]
-    pub(crate) fn new_in(instance: u128, region: u64) -> Result<Self, DriverError> {
-        let (manager, reader) = karyos_sys::counters::counters_in(instance, region, LABELS.len())?;
+    pub(crate) fn new_in(
+        instance: u128,
+        region: u64,
+        capacity: usize,
+    ) -> Result<Self, DriverError> {
+        if capacity < FIXED_COUNTERS {
+            return Err(DriverError::InvalidConfig);
+        }
+        let (manager, reader) = karyos_sys::counters::counters_in(instance, region, capacity)?;
         Self::allocate(manager, reader)
     }
 
@@ -203,10 +262,61 @@ impl DriverCounters {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| DriverError::InvalidConfig)?;
         Ok(Self {
-            _manager: manager,
+            manager,
             reader,
             counters,
         })
+    }
+
+    /// Allocates a keyed counter outside the fixed set (inside a sampling
+    /// pass); `None`, counted in `counters unavailable`, when no cell is
+    /// free.
+    pub(crate) fn allocate_keyed(
+        &mut self,
+        type_id: u64,
+        label: &str,
+        keys: karyos_sys::counters::CounterKeys,
+    ) -> Option<Counter> {
+        match self.manager.allocate_keyed(type_id, label, keys) {
+            Ok(counter) => Some(counter),
+            Err(_) => {
+                self.add(Event::CountersUnavailable, 1);
+                None
+            }
+        }
+    }
+
+    /// Allocates a keyed counter again after an earlier refusal that
+    /// [`allocate_keyed`](Self::allocate_keyed) already counted; `None`,
+    /// not counted again, when still no cell is free.
+    pub(crate) fn retry_keyed(
+        &mut self,
+        type_id: u64,
+        label: &str,
+        keys: karyos_sys::counters::CounterKeys,
+    ) -> Option<Counter> {
+        self.manager.allocate_keyed(type_id, label, keys).ok()
+    }
+
+    /// Frees a keyed counter at once (inside a sampling pass).
+    pub(crate) fn free(&mut self, counter: Counter) {
+        // A refused free leaves the cell pending release, so it is not
+        // reused while anything might still name it.
+        let _ = self.manager.free(counter);
+    }
+
+    /// Begins a sampling pass with the odd `epoch`.
+    pub(crate) fn begin_pass(&self, epoch: u64) {
+        if let Some(counter) = self.counter(Event::PositionsEpoch) {
+            counter.begin_pass(epoch);
+        }
+    }
+
+    /// Ends a sampling pass with the even `epoch`.
+    pub(crate) fn end_pass(&self, epoch: u64) {
+        if let Some(counter) = self.counter(Event::PositionsEpoch) {
+            counter.end_pass(epoch);
+        }
     }
 
     fn counter(&self, event: Event) -> Option<&Counter> {
@@ -305,6 +415,10 @@ mod tests {
             (Event::GrantsExported, "grants exported"),
             (Event::GrantsDetached, "grants detached"),
             (Event::GrantsFenced, "grants fenced"),
+            (Event::PositionsEpoch, "positions epoch"),
+            (Event::PositionsSampledAt, "positions sampled at"),
+            (Event::CountersUnavailable, "counters unavailable"),
+            (Event::GenerationsRetired, "generations retired"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

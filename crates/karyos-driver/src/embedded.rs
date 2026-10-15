@@ -168,6 +168,18 @@ pub struct DriverConfig {
     pub conflation_feeder_budget: NonZeroU32,
     /// Key reads and retries per [`ConflatedSubscription`] poll.
     pub conflated_subscription_budget: ConflationBudget,
+    /// Cells of the counters region: the fixed driver counters plus the
+    /// per-stream and per-subscriber position cells. At least the number of
+    /// fixed counters; positions that find no free cell are shown as
+    /// unavailable and counted in `counters unavailable`.
+    pub counters_capacity: usize,
+    /// How often the driver samples stream positions into the counters
+    /// region, in host `CLOCK_MONOTONIC` nanoseconds, the clock of
+    /// `positions sampled at`
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`).
+    /// The driver's injectable clock is not read for it, so it is read only
+    /// for deadlines.
+    pub position_sample_interval: u64,
 }
 
 impl Default for DriverConfig {
@@ -193,6 +205,8 @@ impl Default for DriverConfig {
                 keys: 1024,
                 retries: 3,
             },
+            counters_capacity: 1024,
+            position_sample_interval: 10_000_000,
         }
     }
 }
@@ -338,6 +352,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) holding: Vec<crate::commands::Holding>,
     /// When the driver last advanced its heartbeat, in clock units.
     pub(crate) last_beat: Option<u64>,
+    /// The per-stream positions sampling state.
+    pub(crate) positions: crate::positions::Positions,
     /// The admission socket and its connections (IPC mode).
     #[cfg(target_os = "linux")]
     pub(crate) admission: Option<crate::admission::Admission<T>>,
@@ -424,6 +440,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let valid = config.max_clients > 0
             && config.max_streams > 0
             && config.max_retained_generations > 0
+            && config.counters_capacity >= crate::counters::FIXED_COUNTERS
+            && config.position_sample_interval > 0
             && config.cutover_deadline > 0
             && config.heartbeat_interval > 0
             && config
@@ -450,12 +468,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     config.broadcast_capacity,
                 )
                 .map_err(|_| DriverError::InvalidConfig)?;
-                let counters = DriverCounters::new_in(instance, crate::admission::COUNTERS_REGION)?;
+                let counters = DriverCounters::new_in(
+                    instance,
+                    crate::admission::COUNTERS_REGION,
+                    config.counters_capacity,
+                )?;
                 (broadcast, counters, Some(admission))
             }
             None => (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
-                DriverCounters::new()?,
+                DriverCounters::with_capacity(config.counters_capacity)?,
                 None,
             ),
         };
@@ -464,7 +486,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let _ = ipc;
             (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
-                DriverCounters::new()?,
+                DriverCounters::with_capacity(config.counters_capacity)?,
             )
         };
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
@@ -494,6 +516,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             next_export: 1,
             holding: Vec::new(),
             last_beat: None,
+            positions: crate::positions::Positions::default(),
             #[cfg(target_os = "linux")]
             admission,
         })
@@ -576,6 +599,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         {
             Some(leases) => self.counters.set(Event::LeasesLive, leases),
             None => self.counters.add(Event::CounterOverflows, 1),
+        }
+        let retained = self.streams.iter().map(|s| s.retained.len()).sum();
+        self.counters
+            .set(Event::GenerationsRetired, gauge(retained));
+    }
+
+    /// Runs a positions sampling pass when `position_sample_interval` has
+    /// elapsed (`quantstratum-docs: karyos/design/observability-and-tools.md`).
+    fn sample_positions(&mut self) {
+        let now = karyos_sys::host_clock::host_monotonic_ns();
+        if self
+            .positions
+            .due(now, self.config.position_sample_interval)
+        {
+            self.positions
+                .sample(now, &mut self.counters, &self.streams);
         }
     }
 
@@ -947,6 +986,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
         }
         self.update_stream_gauges();
+        self.sample_positions();
         match first_error {
             Some(error) => Err(error),
             None => Ok(work),
