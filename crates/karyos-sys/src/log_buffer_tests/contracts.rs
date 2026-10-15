@@ -51,19 +51,30 @@ fn test_log_buffer_message_sizes_8000_fits_8001_refused_writers_never_interleave
     // Two writers, each publishing multi-fragment messages at once.
     let per_writer: u32 = if cfg!(miri) { 4 } else { 200 };
     let lengths = [8000usize, 2900, 5000];
-    let done = AtomicBool::new(false);
+    // Every participant stops when any of them ends early (a failed
+    // assertion or an unexpected outcome) or when the deadline passes, so a
+    // contract violation fails the test instead of hanging it.
+    let stop = AtomicBool::new(false);
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(if cfg!(miri) { 3600 } else { 60 });
+    let running = || !stop.load(Ordering::Acquire) && std::time::Instant::now() < deadline;
     std::thread::scope(|scope| {
+        let stop = &stop;
         scope.spawn(|| {
-            while !done.load(Ordering::Acquire) {
+            let _stop = StopOnDrop(stop);
+            while running() {
                 let _ = conductor.duty_cycle().unwrap();
                 std::thread::yield_now();
             }
         });
         for (writer, handle) in [(1u8, &mut first), (2u8, &mut second)] {
             scope.spawn(move || {
+                // Only a writer that ends early stops the others.
+                let mut early = Some(StopOnDrop(stop));
                 for sequence in 1..=per_writer {
                     let data = tagged_message(writer, sequence, lengths[sequence as usize % 3]);
                     loop {
+                        assert!(running(), "writer {writer} stopped before its last offer");
                         match handle.offer(&data, AppendOptions::default()).unwrap() {
                             ConcurrentOfferOutcome::Appended { .. } => break,
                             ConcurrentOfferOutcome::BackPressured
@@ -72,10 +83,13 @@ fn test_log_buffer_message_sizes_8000_fits_8001_refused_writers_never_interleave
                         }
                     }
                 }
+                core::mem::forget(early.take());
             });
         }
+        let _stop = StopOnDrop(stop);
         let mut next = [1u32, 1u32];
         while next != [per_writer + 1; 2] {
+            assert!(running(), "messages missing: next {next:?}");
             match poll_message(&mut subscription) {
                 Some(message) => {
                     let writer = message[0];
@@ -90,8 +104,17 @@ fn test_log_buffer_message_sizes_8000_fits_8001_refused_writers_never_interleave
                 None => std::thread::yield_now(),
             }
         }
-        done.store(true, Ordering::Release);
     });
+}
+
+/// Sets the flag when dropped: at the end of a participant's scope, also
+/// when it unwinds.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 /// §13 "Cleaner lag": the driver conductor is paused for longer than one
