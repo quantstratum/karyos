@@ -49,8 +49,8 @@ use crate::frame::{
     Word0,
 };
 use crate::loan::{
-    LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held, publish,
-    release_loan, take_loan,
+    LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held,
+    participant_quiescent, publish, release_loan, revoke, take_loan,
 };
 use crate::publication::{
     SEAL_POSITIONED, SEAL_SEALED, abort_block, active_term_count, commit_block, deadline_abort,
@@ -107,6 +107,40 @@ const CELL_FREE: u64 = 0;
 const CELL_REQUIRED: u64 = 1;
 const CELL_OPTIONAL: u64 = 2;
 const CELL_PUBLICATION: u64 = 3;
+/// A required reader admitted under `continue`: it bounds the publisher
+/// and holds a spare-slot credit (quantstratum-docs: `karyos/design/required-participant-loss.md`).
+const CELL_REQUIRED_RESERVED: u64 = 4;
+/// A revoked required reader under `hold`: it still bounds the publisher
+/// until a scan after the revocation finds its loan word empty.
+const CELL_LOST_HOLDING: u64 = 5;
+/// A revoked reader that no longer bounds and holds no credit.
+const CELL_LOST: u64 = 6;
+/// A revoked reader that keeps its credit until it is freed.
+const CELL_LOST_RESERVED: u64 = 7;
+
+/// Whether a subscriber cell in `state` bounds the publication limit.
+const fn bounds(state: u64) -> bool {
+    matches!(
+        state,
+        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_LOST_HOLDING
+    )
+}
+
+/// Whether a subscriber cell in `state` keeps the publication connected.
+const fn connected(state: u64) -> bool {
+    matches!(
+        state,
+        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL
+    )
+}
+
+/// Whether a subscriber cell in `state` holds a spare-slot credit.
+const fn holds_credit(state: u64) -> bool {
+    matches!(
+        state,
+        CELL_OPTIONAL | CELL_REQUIRED_RESERVED | CELL_LOST_RESERVED
+    )
+}
 
 /// The seal position bits of the seal word (`quantstratum-docs: karyos/design/publication-seal.md`):
 /// `0` while active, `SEAL_SEALED` once sealed, and `SEAL_SEALED |
@@ -120,6 +154,36 @@ pub enum Role {
     Required,
     /// Does not bound the publisher; lapped readers rejoin at the head.
     Optional,
+}
+
+/// What the conductor does with a required participant whose client was
+/// lost (SPEC.md §4 `on_required_loss`;
+/// quantstratum-docs: `karyos/design/required-participant-loss.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum LossPolicy {
+    /// The revoked reader keeps bounding the publisher until a scan after
+    /// the revocation finds its loan word empty.
+    #[default]
+    Hold,
+    /// The bound is withdrawn at once; the reader was admitted with a
+    /// reservation, which a held loan stays inside.
+    Continue,
+    /// The publication is sealed.
+    Abort,
+}
+
+/// What [`Conductor::revoke_participant`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation {
+    /// The cell holds another occupant, or is free: nothing was done.
+    Stale,
+    /// Revoked under `hold`; it still bounds the publisher while its loan
+    /// word is held.
+    Holding,
+    /// Revoked; it no longer bounds the publisher.
+    Withdrawn,
+    /// Revoked under `abort`, and the buffer is sealed.
+    Sealed,
 }
 
 /// Construction parameters of a [`LogBuffer`].
@@ -660,7 +724,7 @@ impl<T: TermBytes> LogBuffer<T> {
             .cells()
             .iter()
             .skip(self.first_subscriber_cell())
-            .filter(|cell| cell.state.load(Ordering::Acquire) != CELL_FREE)
+            .filter(|cell| connected(cell.state.load(Ordering::Acquire)))
             .count();
         u32::try_from(attached).unwrap_or(u32::MAX)
     }
@@ -1060,7 +1124,10 @@ impl<O: BufferOwner> Subscription<O> {
             Role::Required => CELL_REQUIRED,
             Role::Optional => CELL_OPTIONAL,
         };
-        if found.state.load(Ordering::Acquire) != expected || !claim(&found.registration, export) {
+        let state = found.state.load(Ordering::Acquire);
+        let admitted =
+            state == expected || (expected == CELL_REQUIRED && state == CELL_REQUIRED_RESERVED);
+        if !admitted || !claim(&found.registration, export) {
             return Err(NOT_GRANTED);
         }
         let position = found.position.load(Ordering::Acquire);
@@ -1980,6 +2047,14 @@ pub enum PollOutcome {
     },
     /// Nothing published at the position yet.
     Pending,
+    /// The subscriber was revoked: its client was lost, and the driver
+    /// handled the loss under the publication's policy (quantstratum-docs: `karyos/design/required-participant-loss.md`). Terminal
+    /// for this subscription, for both roles; a client that reconnects
+    /// subscribes again. Every later poll returns it again.
+    Revoked {
+        /// The subscriber's read position.
+        position: u64,
+    },
     /// The buffer is sealed and the subscriber reached the seal position:
     /// no message can follow. Every later poll returns it again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
@@ -2196,7 +2271,12 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         )? {
             LoanOutcome::Granted => {}
             LoanOutcome::Retry => return Ok(Step::Done(PollOutcome::Pending)),
-            LoanOutcome::Overrun | LoanOutcome::Revoked => return self.overrun(),
+            LoanOutcome::Overrun => return self.overrun(),
+            LoanOutcome::Revoked => {
+                return Ok(Step::Done(PollOutcome::Revoked {
+                    position: self.cursor.position,
+                }));
+            }
         }
         // Retention admission point: the floor is checked after the loan is
         // granted and before any plain read.
@@ -2554,6 +2634,8 @@ pub struct DutyReport {
     pub prepared: bool,
     /// Whether no FREE slot was available for the next term (cleaner lag).
     pub lagging: bool,
+    /// Revoked `hold` readers whose bound this cycle withdrew.
+    pub bounds_withdrawn: u32,
 }
 
 /// The buffer's only conductor; every operation takes `&mut self`.
@@ -2649,16 +2731,134 @@ impl<O: BufferOwner> Conductor<O> {
     /// As [`Conductor::subscribe`]; [`SysError::Protocol`] for export 0 or
     /// an export with bit 63 set.
     pub fn register_subscriber(&mut self, role: Role, export: u64) -> Result<usize, SysError> {
+        self.register_subscriber_with(role, false, export)
+    }
+
+    /// [`Conductor::register_subscriber`], with `reserve` as in
+    /// [`Conductor::subscribe_as`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::register_subscriber`].
+    pub fn register_subscriber_with(
+        &mut self,
+        role: Role,
+        reserve: bool,
+        export: u64,
+    ) -> Result<usize, SysError> {
         if !valid_export(export) {
             return Err(NOT_GRANTED);
         }
-        let cursor = self.context().subscribe(role)?;
+        Ok(self.context().subscribe_with(role, reserve, export)?.cell)
+    }
+
+    /// Admits a subscriber in this process as occupant `occupant` of its
+    /// cell (quantstratum-docs: `karyos/design/required-participant-loss.md`: nonzero, never
+    /// reused, from the same namespace as export ids). With `reserve`, a
+    /// required reader is admitted with a spare-slot credit, as the
+    /// `continue` loss policy needs; an optional reader always takes one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::subscribe`]; [`SysError::Protocol`] for an occupant
+    /// that is not a valid export id.
+    pub fn subscribe_as(
+        &mut self,
+        role: Role,
+        reserve: bool,
+        occupant: u64,
+    ) -> Result<Subscription<O>, SysError> {
+        if !valid_export(occupant) {
+            return Err(NOT_GRANTED);
+        }
+        let cursor = self.context().subscribe_with(role, reserve, occupant)?;
+        Ok(Subscription {
+            buffer: self.buffer.clone(),
+            cursor,
+        })
+    }
+
+    /// Revokes the reader that occupies `cell` as `occupant`, whose client
+    /// was lost, under `policy` (quantstratum-docs: `karyos/design/required-participant-loss.md`).
+    /// A cell that is free or holds another occupant is left untouched
+    /// ([`Revocation::Stale`]): the action outlived its participant.
+    ///
+    /// - A required reader under `hold` moves to `LOST_HOLDING`: it keeps
+    ///   bounding the publisher until a duty cycle's scan finds its loan
+    ///   word empty, or at once if this call's scan does.
+    /// - A reader admitted with a reservation, under `continue`, and any
+    ///   optional reader move to `LOST_RESERVED`: the bound, if any, is
+    ///   withdrawn at once; a held loan stays inside the reservation.
+    /// - A required reader under `abort` moves to `LOST` and the buffer is
+    ///   sealed.
+    ///
+    /// The revocation flag stays set until the cell is freed by the
+    /// reader's own detach (the detach proof); the reader's next loan
+    /// attempt fails and its poll reports [`PollOutcome::Revoked`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Protocol`] for `continue` on a required reader
+    /// admitted without a reservation, and errors from the descriptor
+    /// protocol, which indicate a broken invariant.
+    pub fn revoke_participant(
+        &mut self,
+        cell: usize,
+        occupant: u64,
+        policy: LossPolicy,
+    ) -> Result<Revocation, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        buffer
-            .cell(cursor.cell)?
-            .registration
-            .store(export, Ordering::Release);
-        Ok(cursor.cell)
+        if cell < buffer.first_subscriber_cell() {
+            return Ok(Revocation::Stale);
+        }
+        let Some(found) = buffer.cells().get(cell) else {
+            return Ok(Revocation::Stale);
+        };
+        if found.registration.load(Ordering::Acquire) & !ADOPTED != occupant || occupant == 0 {
+            return Ok(Revocation::Stale);
+        }
+        let state = found.state.load(Ordering::Acquire);
+        let target = match (state, policy) {
+            (CELL_OPTIONAL, _) | (CELL_REQUIRED_RESERVED, LossPolicy::Continue) => {
+                CELL_LOST_RESERVED
+            }
+            (CELL_REQUIRED, LossPolicy::Hold) => CELL_LOST_HOLDING,
+            (CELL_REQUIRED | CELL_REQUIRED_RESERVED, LossPolicy::Abort) => CELL_LOST,
+            (CELL_REQUIRED, LossPolicy::Continue) | (CELL_REQUIRED_RESERVED, LossPolicy::Hold) => {
+                return Err(SysError::Protocol {
+                    reason: "the loss policy does not match the reader's admission",
+                });
+            }
+            _ => return Ok(Revocation::Stale),
+        };
+        let quiescent = revoke(&found.revoked, core::slice::from_ref(&found.loan))?;
+        // From the expected state only: a detach that stored FREE first
+        // means the participant left and nothing was lost.
+        if found
+            .state
+            .compare_exchange(state, target, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(Revocation::Stale);
+        }
+        match target {
+            CELL_LOST_HOLDING if quiescent => {
+                // The scan after the revocation found the word empty.
+                let _ = found.state.compare_exchange(
+                    CELL_LOST_HOLDING,
+                    CELL_LOST,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                Ok(Revocation::Withdrawn)
+            }
+            CELL_LOST_HOLDING => Ok(Revocation::Holding),
+            CELL_LOST => {
+                self.seal()?;
+                Ok(Revocation::Sealed)
+            }
+            _ => Ok(Revocation::Withdrawn),
+        }
     }
 
     /// Registers the exclusive publication for a participant in another
@@ -2743,7 +2943,9 @@ impl<O: BufferOwner> Conductor<O> {
         }
         let cell = buffer.cells().get(cell)?;
         match cell.state.load(Ordering::Acquire) {
-            CELL_REQUIRED | CELL_OPTIONAL => Some(cell.position.load(Ordering::Acquire)),
+            CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL => {
+                Some(cell.position.load(Ordering::Acquire))
+            }
             _ => None,
         }
     }
@@ -2782,10 +2984,8 @@ impl<O: BufferOwner> Conductor<O> {
                     .iter()
                     .skip(buffer.first_subscriber_cell())
                     .filter(|cell| {
-                        matches!(
-                            cell.state.load(Ordering::Acquire),
-                            CELL_REQUIRED | CELL_OPTIONAL
-                        )
+                        let state = cell.state.load(Ordering::Acquire);
+                        bounds(state) || state == CELL_OPTIONAL
                     })
                     .all(|cell| cell.position.load(Ordering::Acquire) >= position);
                 if passed {
@@ -2996,8 +3196,21 @@ struct ConductorContext<'a, T: TermBytes> {
 
 impl<T: TermBytes> ConductorContext<'_, T> {
     fn subscribe(&mut self, role: Role) -> Result<Cursor, SysError> {
+        self.subscribe_with(role, false, 0)
+    }
+
+    /// Admits a subscriber: `reserve` admits a required reader with a
+    /// spare-slot credit (`CELL_REQUIRED_RESERVED`, for `continue`), and
+    /// `occupant` is stored in the cell's registration word before the
+    /// state is published.
+    fn subscribe_with(
+        &mut self,
+        role: Role,
+        reserve: bool,
+        occupant: u64,
+    ) -> Result<Cursor, SysError> {
         let buffer = self.buffer;
-        let mut optional = 0u32;
+        let mut credited = 0u32;
         let mut free = None;
         for (index, cell) in buffer
             .cells()
@@ -3006,15 +3219,16 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             .skip(buffer.first_subscriber_cell())
         {
             match cell.state.load(Ordering::Acquire) {
-                CELL_OPTIONAL => optional += 1,
                 CELL_FREE if free.is_none() => free = Some(index),
+                state if holds_credit(state) => credited += 1,
                 _ => {}
             }
         }
         // Publisher credits are reserved for the buffer's life: 1 for the
         // exclusive publication, `P` for concurrent ones.
         let publishers = buffer.first_subscriber_cell() as u32;
-        let credits = optional + publishers + u32::from(role == Role::Optional);
+        let takes_credit = role == Role::Optional || reserve;
+        let credits = credited + publishers + u32::from(takes_credit);
         if credits > u32::from(buffer.spare_slots - CLEANING_HEADROOM) {
             return Err(SysError::ResourcesUnavailable);
         }
@@ -3024,11 +3238,13 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // loan release happens before this reuse; its loan word is zero.
         debug_assert_eq!(cell.loan.load(Ordering::Relaxed), 0);
         cell.revoked.store(0, Ordering::Relaxed);
+        cell.registration.store(occupant, Ordering::Relaxed);
         let start = buffer.conductor_head()?;
         cell.position.store(start, Ordering::Relaxed);
-        let state = match role {
-            Role::Required => CELL_REQUIRED,
-            Role::Optional => CELL_OPTIONAL,
+        let state = match (role, reserve) {
+            (Role::Required, false) => CELL_REQUIRED,
+            (Role::Required, true) => CELL_REQUIRED_RESERVED,
+            (Role::Optional, _) => CELL_OPTIONAL,
         };
         cell.state.store(state, Ordering::Release);
         Ok(Cursor {
@@ -3042,7 +3258,10 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     }
 
     fn duty_cycle(&mut self) -> Result<DutyReport, SysError> {
-        let mut report = DutyReport::default();
+        let mut report = DutyReport {
+            bounds_withdrawn: self.rescan_revoked()?,
+            ..DutyReport::default()
+        };
         self.publish_floor_and_limit()?;
         self.position_seal()?;
         // A sealed buffer starts no later term.
@@ -3054,6 +3273,31 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         Ok(report)
     }
 
+    /// Moves every `hold` cell whose loan word a scan finds empty to
+    /// `CELL_LOST`: the revocation came before this scan, so no later
+    /// acquisition succeeds, and the bound is withdrawn. Returns how many.
+    fn rescan_revoked(&mut self) -> Result<u32, SysError> {
+        let buffer = self.buffer;
+        let mut withdrawn = 0u32;
+        for cell in buffer.cells().iter().skip(buffer.first_subscriber_cell()) {
+            if cell.state.load(Ordering::Acquire) == CELL_LOST_HOLDING
+                && participant_quiescent(core::slice::from_ref(&cell.loan))?
+                && cell
+                    .state
+                    .compare_exchange(
+                        CELL_LOST_HOLDING,
+                        CELL_LOST,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                withdrawn = withdrawn.saturating_add(1);
+            }
+        }
+        Ok(withdrawn)
+    }
+
     /// Floor and limit from one head snapshot; the floor is published first.
     fn publish_floor_and_limit(&self) -> Result<(), SysError> {
         let buffer = self.buffer;
@@ -3061,7 +3305,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let head = buffer.conductor_head()?;
         let mut bound = None::<u64>;
         for cell in buffer.cells().iter().skip(buffer.first_subscriber_cell()) {
-            if cell.state.load(Ordering::Acquire) == CELL_REQUIRED {
+            if bounds(cell.state.load(Ordering::Acquire)) {
                 let position = cell.position.load(Ordering::Acquire);
                 bound = Some(bound.map_or(position, |b| b.min(position)));
             }
@@ -3388,6 +3632,7 @@ mod heap_tests {
     include!("log_buffer_tests/seal.rs");
     include!("log_buffer_tests/adoption.rs");
     include!("log_buffer_tests/contracts.rs");
+    include!("log_buffer_tests/loss.rs");
 }
 
 #[cfg(test)]
@@ -3411,6 +3656,7 @@ mod shared_tests {
     include!("log_buffer_tests/seal.rs");
     include!("log_buffer_tests/adoption.rs");
     include!("log_buffer_tests/contracts.rs");
+    include!("log_buffer_tests/loss.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber
