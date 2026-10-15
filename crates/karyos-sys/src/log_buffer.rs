@@ -3503,6 +3503,61 @@ impl<O: BufferOwner> Conductor<O> {
         }
     }
 
+    /// Fences the successor grant `export` of subscriber cell `cell`, which
+    /// its participant has not adopted by the cutover deadline
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Generations
+    /// across processes). Returns whether the fence won the registration
+    /// word against the adoption; if it did, the cell leaves the bounding
+    /// and connected states for `LOST`, so a fenced participant never holds
+    /// the successor's writers back, and stays out of reuse until its grant
+    /// ends (`end_subscriber` accepts a fenced export).
+    pub fn fence_subscriber(&mut self, cell: usize, export: u64) -> bool {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if cell < buffer.first_subscriber_cell() {
+            return false;
+        }
+        let Some(found) = buffer.cells().get(cell) else {
+            return false;
+        };
+        if !registration::fence(&found.registration, export) {
+            return false;
+        }
+        // Never adopted, so it holds no loan: it leaves flow control at once.
+        found.revoked.store(crate::loan::REVOKED, Ordering::SeqCst);
+        let state = found.state.load(Ordering::Acquire);
+        if matches!(
+            state,
+            CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER
+        ) {
+            let _ =
+                found
+                    .state
+                    .compare_exchange(state, CELL_LOST, Ordering::AcqRel, Ordering::Acquire);
+        }
+        true
+    }
+
+    /// Fences the successor grant `export` of the exclusive publication, as
+    /// [`Conductor::fence_subscriber`]: once fenced it can never be adopted,
+    /// and it is never issued again.
+    pub fn fence_publication(&mut self, export: u64) -> bool {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        !buffer.concurrent()
+            && registration::fence(&buffer.control().publication_registration.word, export)
+    }
+
+    /// Fences the successor grant `export` of publisher slot `slot`, as
+    /// [`Conductor::fence_subscriber`]. The slot stays held until the grant
+    /// ends (`end_concurrent_publication`).
+    pub fn fence_concurrent_publication(&mut self, slot: usize, export: u64) -> bool {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer.concurrent()
+            && buffer
+                .publisher_lines()
+                .get(slot)
+                .is_some_and(|line| registration::fence(&line.registration, export))
+    }
+
     /// Registers the exclusive publication for a participant in another
     /// process, for export `export`: taken as
     /// [`LogBuffer::publication`] takes it, without a loan (the participant
