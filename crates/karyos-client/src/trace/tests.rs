@@ -154,7 +154,7 @@ fn test_trace_publish_and_poll_records_match() {
         ),
         (PUBLICATION, SUBSCRIBER, lane, position)
     );
-    // The boundary is the message's end: 3 x 1408 + align32(96 + 776) for
+    // The boundary is the message's end: 3 x 1408 + align32(96 + 1064) for
     // 5000 bytes with EXT64.
     assert_eq!(traced_end(0, 5000), 5408);
     assert_eq!(subscription.delivery_boundary(), traced_end(position, 5000));

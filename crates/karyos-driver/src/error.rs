@@ -69,6 +69,9 @@ pub enum DriverError {
     /// The process has used every driver identity.
     #[error("driver identities exhausted")]
     DriverIdsExhausted,
+    /// Every trace number of this driver instance was handed out.
+    #[error("trace numbers exhausted")]
+    TraceNumbersExhausted,
     /// The driver has used every shared region identity.
     #[error("region identities exhausted")]
     RegionIdsExhausted,

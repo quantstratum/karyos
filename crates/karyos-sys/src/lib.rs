@@ -40,6 +40,7 @@ pub mod log_buffer;
 #[cfg(target_os = "linux")]
 pub mod mmap;
 pub mod publication;
+pub mod random;
 // Used only by `log_buffer`, which Loom builds leave out.
 #[cfg(not(loom))]
 pub mod receive;
