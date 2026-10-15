@@ -286,6 +286,12 @@ impl DriverCounters {
         }
     }
 
+    /// Counts an allocation refused without scanning the region, because
+    /// an earlier allocation in the same pass already found it full.
+    pub(crate) fn count_unavailable(&self) {
+        self.add(Event::CountersUnavailable, 1);
+    }
+
     /// Allocates a keyed counter again after an earlier refusal that
     /// [`allocate_keyed`](Self::allocate_keyed) already counted; `None`,
     /// not counted again, when still no cell is free.
