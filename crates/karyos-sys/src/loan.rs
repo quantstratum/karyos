@@ -349,6 +349,50 @@ pub fn publish(descriptor: &AtomicU64, value: Descriptor) {
     descriptor.store(value.encode(), Ordering::Release);
 }
 
+/// Conductor: prepares the slot that holds `free` for the term of `ready`
+/// (SPEC.md §4 rotation; `quantstratum-docs:
+/// karyos/design/concurrent-publication.md`, State). Initialises the
+/// slot's raw tail to `term_id << 32`, then publishes `ready` with
+/// `Release`, so a producer whose loan validation reads `READY` or its
+/// `ACTIVE` successor sees the initialised tail. A slot that no longer
+/// holds `free` is left untouched, tail included, so a repeated
+/// preparation never initialises a tail twice. Returns `ready`.
+///
+/// # Errors
+///
+/// Returns [`SysError::WrongSourceState`] when `free` is not a `Free`
+/// descriptor or `ready` not a `Ready` one, without reading the slot, and
+/// [`SysError::UnexpectedDescriptor`] when the slot does not hold `free`.
+pub fn prepare_slot(
+    descriptor: &AtomicU64,
+    tail: &AtomicU64,
+    free: Descriptor,
+    ready: Descriptor,
+) -> Result<Descriptor, SysError> {
+    for (given, required) in [(free, SlotState::Free), (ready, SlotState::Ready)] {
+        if given.state() != required {
+            return Err(SysError::WrongSourceState {
+                required: required as u8,
+                given: given.state() as u8,
+            });
+        }
+    }
+    // Only the conductor moves a slot out of `FREE`, so the slot cannot
+    // change between this load and the publication below.
+    let found = descriptor.load(Ordering::Acquire);
+    if found != free.encode() {
+        return Err(SysError::UnexpectedDescriptor {
+            expected: free.encode(),
+            found,
+        });
+    }
+    // The slot is `FREE`: no loan, no producer. The `Release` below orders
+    // this store before any access through the published term.
+    tail.store(u64::from(ready.term_id().get()) << 32, Ordering::Relaxed);
+    publish(descriptor, ready);
+    Ok(ready)
+}
+
 /// Rotation: moves `ready` to `ACTIVE`. Finding the slot already `ACTIVE` with
 /// the same identity counts as success, so the step can be repeated.
 ///
@@ -613,6 +657,42 @@ mod tests {
         release_loan(&words[1]);
         assert_eq!(participant_quiescent(&words), Ok(true));
     }
+
+    #[test]
+    fn a_slot_is_prepared_once_tail_first() {
+        let free = descriptor(1, SlotState::Free);
+        let ready = descriptor(4, SlotState::Ready);
+        let desc = AtomicU64::new(free.encode());
+        let tail = AtomicU64::new(0xDEAD);
+        assert_eq!(prepare_slot(&desc, &tail, free, ready), Ok(ready));
+        assert_eq!(desc.load(Ordering::SeqCst), ready.encode());
+        assert_eq!(
+            tail.load(Ordering::SeqCst),
+            u64::from(ready.term_id().get()) << 32
+        );
+        // A producer reserved; a repeated preparation touches nothing.
+        tail.fetch_add(32, Ordering::SeqCst);
+        assert_eq!(
+            prepare_slot(&desc, &tail, free, ready),
+            Err(SysError::UnexpectedDescriptor {
+                expected: free.encode(),
+                found: ready.encode(),
+            })
+        );
+        assert_eq!(
+            tail.load(Ordering::SeqCst),
+            (u64::from(ready.term_id().get()) << 32) + 32
+        );
+        // Wrong argument states are refused without reading the slot.
+        assert!(matches!(
+            prepare_slot(&desc, &tail, ready, ready),
+            Err(SysError::WrongSourceState { .. })
+        ));
+        assert!(matches!(
+            prepare_slot(&desc, &tail, free, free),
+            Err(SysError::WrongSourceState { .. })
+        ));
+    }
 }
 
 /// What one rotation attempt did (SPEC.md §4 rotation).
@@ -670,6 +750,9 @@ pub fn rotate_to(
                 Err(SysError::UnexpectedDescriptor { .. }) => return Ok(Rotation::Superseded),
                 Err(error) => return Err(error),
             }
+            // Activated, count not advanced: the owner's pause point.
+            #[cfg(any(feature = "test-hooks", loom))]
+            crate::test_pause::reached(crate::test_pause::PausePoint::RotationActivated);
         }
         SlotState::Active => {}
         SlotState::Reclaiming | SlotState::Cleaning | SlotState::Free => {

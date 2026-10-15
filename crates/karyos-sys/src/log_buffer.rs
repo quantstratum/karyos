@@ -49,8 +49,8 @@ use crate::frame::{
     Word0,
 };
 use crate::loan::{
-    Loan, LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held, publish,
-    release_loan, take_loan,
+    Loan, LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held,
+    prepare_slot, publish, release_loan, take_loan,
 };
 use crate::publication::{
     SEAL_POSITIONED, SEAL_SEALED, abort_block, active_term_count, commit_block, deadline_abort,
@@ -4296,24 +4296,24 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         for slot in 0..buffer.slots {
             let found = Descriptor::decode(buffer.descriptor(slot)?.load(Ordering::Acquire))?;
             if found.state() == SlotState::Free {
-                free = Some(slot);
+                free = Some((slot, found));
                 break;
             }
         }
-        let Some(slot) = free else {
+        let Some((slot, found)) = free else {
             report.lagging = true;
             return Ok(());
         };
         let term_id = buffer.initial_term_id.advanced_by(next);
         // The slot is FREE: no loan, no producer. Its tail is ready before
-        // the READY publication below (Release) makes the term reachable.
-        buffer
-            .tail(slot)?
-            .store(u64::from(term_id.get()) << 32, Ordering::Relaxed);
-        publish(
+        // the READY publication (Release) makes the term reachable; the
+        // Loom models check this helper (`loom_rotation_helpers.rs`).
+        let _ = prepare_slot(
             buffer.descriptor(slot)?,
+            buffer.tail(slot)?,
+            found,
             Descriptor::new(term_id, buffer.generation, SlotState::Ready),
-        );
+        )?;
         let entry = buffer.table_slot(next)?;
         let previous = entry.load(Ordering::Acquire);
         let _ = entry.compare_exchange(
