@@ -511,6 +511,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.counters.add(Event::CommandsServed, 1);
             let Some(response) = self.serve(client, &link, command) else {
                 // A protocol violation: no response, the client is faulty.
+                self.diagnostics.error(
+                    &mut self.counters,
+                    crate::diagnostics::ErrorCode::ClientProtocolViolation,
+                    [client, copied.map_or(0, |(type_id, _)| u64::from(type_id))],
+                    "release of a counter the client does not own; the client is retired",
+                );
                 self.retire_faulty(index);
                 continue;
             };
@@ -816,12 +822,28 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 cell: cell as u64,
                 registration,
             },
-            Err(Refusal::ClientLimit) => refuse(ErrorCode::ResourcesUnavailable, 0),
-            Err(Refusal::Exhausted) => {
-                self.counters.add(Event::CountersUnavailable, 1);
-                refuse(ErrorCode::ResourcesUnavailable, 0)
+            Err(refusal) => {
+                // Keyed by client and reason: repeats update one record.
+                let (reason, message) = match refusal {
+                    Refusal::ClientLimit => (1, "client counter limit reached"),
+                    Refusal::Exhausted => (2, "no free client counter cell"),
+                    Refusal::IdentitiesExhausted => (3, "counter identities exhausted"),
+                };
+                self.diagnostics.error(
+                    &mut self.counters,
+                    crate::diagnostics::ErrorCode::CounterAllocationRefused,
+                    [client, reason],
+                    message,
+                );
+                match refusal {
+                    Refusal::ClientLimit => refuse(ErrorCode::ResourcesUnavailable, 0),
+                    Refusal::Exhausted => {
+                        self.counters.add(Event::CountersUnavailable, 1);
+                        refuse(ErrorCode::ResourcesUnavailable, 0)
+                    }
+                    Refusal::IdentitiesExhausted => refuse(ErrorCode::IdentitiesExhausted, 0),
+                }
             }
-            Err(Refusal::IdentitiesExhausted) => refuse(ErrorCode::IdentitiesExhausted, 0),
         }
     }
 }
@@ -2261,6 +2283,14 @@ mod tests {
             ]
         ));
         assert_eq!(counter(&driver, "counters unavailable"), unavailable + 1);
+        // Both refusals are in the error log, keyed by client and reason.
+        let mut refused = Vec::new();
+        let _ = driver.error_log().scan(&mut 0, |record| {
+            if record.code == crate::diagnostics::ErrorCode::CounterAllocationRefused as u32 {
+                refused.push(record.key);
+            }
+        });
+        assert_eq!(refused, [[first, 1], [second, 2]]);
         assert_eq!(driver.client_counters.owned_by(first), 2);
         assert_eq!(driver.client_counters.owned_by(second), 1);
         // A release makes room for the same client again.
@@ -2342,6 +2372,14 @@ mod tests {
                 }
             ));
             assert_eq!(driver.client_counters.owned_by(owner), 1);
+            // The violation is in the error log under the sender.
+            let mut violations = Vec::new();
+            let _ = driver.error_log().scan(&mut 0, |record| {
+                if record.code == crate::diagnostics::ErrorCode::ClientProtocolViolation as u32 {
+                    violations.push(record.key[0]);
+                }
+            });
+            assert!(violations.contains(&sender), "case {case}");
         }
     }
 

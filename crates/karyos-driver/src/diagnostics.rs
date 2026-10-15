@@ -26,7 +26,9 @@ pub enum ErrorCode {
     FetchDeadlineMissed = 3,
     /// A stream configuration was refused.
     StreamConfigRejected = 4,
-    /// A counter allocation was refused.
+    /// A client counter allocation was refused for lack of resources; the
+    /// key is the client and the reason (1 client limit, 2 no free cell,
+    /// 3 identities exhausted).
     CounterAllocationRefused = 5,
     /// The cleaner fell behind (phase 2).
     CleanerLag = 6,
@@ -48,7 +50,9 @@ pub enum ErrorSource {
 pub enum LossKind {
     /// A subscriber was overrun (`ReportLoss`).
     Overrun = 1,
-    /// A required participant was lost.
+    /// A required participant was lost. Its range is `[position,
+    /// position)`, empty: the participant's position at the loss, with no
+    /// data claimed lost.
     RequiredParticipantLost = 2,
     /// An incarnation was aborted by the `abort` policy.
     AbortedIncarnation = 3,

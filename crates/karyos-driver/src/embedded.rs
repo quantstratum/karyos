@@ -511,7 +511,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     config.client_counters_capacity,
                     config.max_counters_per_client,
                 )?;
-                (broadcast, counters, client_counters, Some(admission), diagnostics)
+                (
+                    broadcast,
+                    counters,
+                    client_counters,
+                    Some(admission),
+                    diagnostics,
+                )
             }
             None => (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,

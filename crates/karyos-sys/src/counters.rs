@@ -699,7 +699,7 @@ mod owned {
     /// layout of [`counters_in`] under the kind `ClientCounters`. Clients
     /// write their own cells, so the region keeps the size seals only
     /// ([`crate::ipc::Region::create`]), as a command ring does; clients
-    /// attach it writable with [`ClientCells::attach`].
+    /// attach it writable with `ClientCells::attach` (Linux).
     ///
     /// # Errors
     ///
@@ -1030,7 +1030,7 @@ mod owned {
     /// "Client counters"): it turns a cell the driver allocated for a client
     /// into that client's [`ClientCounter`]. In-process clients share the
     /// driver's region through [`client_counters`]; a client process attaches
-    /// the region it received with [`ClientCells::attach`].
+    /// the region it received with `ClientCells::attach` (Linux).
     #[derive(Debug, Clone)]
     pub struct ClientCells {
         region: Arc<Region>,

@@ -227,7 +227,9 @@ pub(crate) enum Event {
     LoansOutstanding,
     /// Reconfigurations refused because the retirement pool is full.
     RetirementPoolExhausted,
-    /// Error events lost before reaching the error log.
+    /// Error events lost before reaching the error log: today only when
+    /// the log's sequences are exhausted; phase 2 also counts events the
+    /// agents' bounded queue to the conductor drops.
     ErrorEventsDropped,
     /// Error log records overwritten.
     ErrorRecordsOverwritten,
