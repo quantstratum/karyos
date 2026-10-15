@@ -11,6 +11,7 @@
 //! of `karyos-sys` (`journal`). Concurrent shared-memory access and URI
 //! parsing do not exist yet.
 
+pub mod admission;
 pub mod cnc;
 pub mod error;
 pub mod frame;
