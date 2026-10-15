@@ -2,8 +2,8 @@
 
 //! Multi-process tests (IPC batch i4, Linux): clients in separate
 //! processes against one driver, over the admission socket and the CnC
-//! regions (`quantstratum-docs: karyos/design/ipc-implementation.md`, i4;
-//! `quantstratum-docs: karyos/design/ipc-admission.md`). Each child is this test binary run
+//! regions (quantstratum-docs: karyos/`design/ipc-implementation.md`, i4;
+//! quantstratum-docs: karyos/`design/ipc-admission.md`). Each child is this test binary run
 //! again with `--exact <child test>`; it reports on stdout, one line per
 //! step, and the parent runs the driver's duty cycles meanwhile.
 //!
@@ -26,6 +26,7 @@ use karyos_client::ipc::{RemoteClient, attach};
 use karyos_client::{Completion, Outcome};
 use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, SystemClock};
 use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
+use karyos_sys::counters::CellRead;
 
 const SCENARIO: &str = "KARYOS_PROCESS_SCENARIO";
 const DIR: &str = "KARYOS_PROCESS_DIR";
@@ -175,14 +176,16 @@ fn test_ipc_client_stopped_keeps_its_slot_and_resumes() {
     assert!(child.0.wait().unwrap().success());
 }
 
-/// A driver restart while a client is attached: the client's mappings of
-/// the old instance stay readable, its socket reports the old driver gone,
-/// and it attaches to the new driver, which has a new instance id.
+/// A driver restart while a client is attached: the client's mapping of
+/// the old instance's counters stays readable with the values the old
+/// driver last wrote, and the client attaches to the new driver, which has
+/// a new instance id.
 #[test]
 fn test_ipc_driver_restart_new_instance_old_mappings_stay() {
     let dir = dir("restart");
     let mut first = driver(&dir);
     let (mut child, reports) = spawn("restart", &dir);
+    serve_until_report(&mut first, &reports, "refused unknown stream");
     serve_until_report(&mut first, &reports, "attached");
     let old = first.instance().unwrap();
     drop(first);
@@ -265,13 +268,48 @@ fn child() {
             drop(client);
         }
         "restart" => {
-            let client = attach(&dir, timeout, 16).unwrap();
+            let mut client = attach(&dir, timeout, 16).unwrap();
             let old = client.instance();
+            round_trip(&mut client);
+            let read = |client: &RemoteClient| -> Vec<CellRead> {
+                (0..client.counter_capacity())
+                    .map(|index| client.read_counter(index))
+                    .collect()
+            };
+            let before = read(&client);
+            // The old driver counted this client and its command.
+            assert!(before.iter().any(|cell| matches!(
+                cell,
+                CellRead::Allocated { value, .. } if *value > 0
+            )));
             report("attached");
             wait_for_go();
-            // The old instance's counters region is still mapped and
-            // readable after its driver is gone.
-            assert!(client.counter_capacity() > 0);
+            // The old instance's counters region is still mapped after its
+            // driver is gone: every counter it had allocated is still there
+            // with its label, and no event count went backwards (the old
+            // driver may have written more before it was dropped).
+            let after = read(&client);
+            for (was, is) in before.iter().zip(&after) {
+                match (was, is) {
+                    (
+                        CellRead::Allocated {
+                            metadata: m0,
+                            value: v0,
+                            ..
+                        },
+                        CellRead::Allocated {
+                            metadata: m1,
+                            value: v1,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(m0.label(), m1.label());
+                        assert!(v1 >= v0 || m0.type_id != 1, "{:?} went back", m0.label());
+                    }
+                    (CellRead::Allocated { .. }, other) => panic!("lost {other:?}"),
+                    _ => {}
+                }
+            }
             report("old mappings readable");
             let again = attach(&dir, timeout, 16).unwrap();
             assert_ne!(again.instance(), old);
