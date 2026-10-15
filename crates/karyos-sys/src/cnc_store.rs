@@ -232,7 +232,9 @@ mod tests {
     use crate::command_ring::{RingConsumer, RingProducer};
     use crate::counters::{CellRead, CountersReader};
     use crate::error::SysError;
-    use crate::ipc::{Recv, Region, RegionKind, Sent, recv, send, seqpacket_pair};
+    use crate::ipc::{
+        ReadOnlyRegion, Recv, Region, RegionKind, SealProfile, Sent, recv, send, seqpacket_pair,
+    };
 
     /// Passes `region`'s descriptor over a socket pair and attaches it as a
     /// participant would, expecting `record`.
@@ -249,6 +251,35 @@ mod tests {
         let mut record = region.record();
         record.kind = kind;
         Region::attach(received.fd.unwrap(), record)
+    }
+
+    /// As [`pass`], attaching the received descriptor read-only with
+    /// `profile`.
+    fn pass_read_only(
+        region: &Region,
+        kind: RegionKind,
+        profile: SealProfile,
+    ) -> Result<ReadOnlyRegion, SysError> {
+        let (a, b) = seqpacket_pair().unwrap();
+        assert_eq!(
+            send(a.as_fd(), b"r", region.descriptor()).unwrap(),
+            Sent::Sent
+        );
+        let mut buffer = [0u8; 8];
+        let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
+        let mut record = region.record();
+        record.kind = kind;
+        ReadOnlyRegion::attach(received.fd.unwrap(), record, profile)
+    }
+
+    fn counters_reader(region: &Region) -> Result<CountersReader, SysError> {
+        CountersReader::attach_read_only(pass_read_only(
+            region,
+            RegionKind::Counters,
+            SealProfile::DriverOnly,
+        )?)
     }
 
     #[test]
@@ -321,7 +352,7 @@ mod tests {
     fn counters_cross_a_region() {
         let (mut manager, local) = crate::counters::counters_in(7, 3, 4).unwrap();
         let region = local.region().unwrap();
-        let reader = CountersReader::attach(pass(region, RegionKind::Counters).unwrap()).unwrap();
+        let reader = counters_reader(region).unwrap();
         assert_eq!(reader.capacity(), 4);
         let sent = manager.allocate(9, "bytes sent").unwrap();
         sent.increment(41).unwrap();
@@ -347,13 +378,10 @@ mod tests {
             let word = config.get(index).unwrap();
             let good = word.load(Ordering::Acquire);
             word.store(bad, Ordering::Release);
-            assert!(
-                CountersReader::attach(pass(region, RegionKind::Counters).unwrap()).is_err(),
-                "word {index} = {bad}"
-            );
+            assert!(counters_reader(region).is_err(), "word {index} = {bad}");
             word.store(good, Ordering::Release);
         }
-        assert!(CountersReader::attach(pass(region, RegionKind::Counters).unwrap()).is_ok());
+        assert!(counters_reader(region).is_ok());
         assert!(crate::counters::counters_in(7, 3, 0).is_err());
 
         // Layout version 2 carries the key words across the region.
@@ -379,7 +407,7 @@ mod tests {
         let structure_length = (capacity * 2 * crate::counters::STRIDE_WORDS
             + crate::counters::STRIDE_WORDS)
             * crate::atomic_view::WORD_BYTES;
-        let v1 = crate::ipc::Region::create(crate::ipc::RegionRecord {
+        let v1 = crate::ipc::Region::create_driver_only(crate::ipc::RegionRecord {
             instance: 7,
             region: 3,
             kind: RegionKind::Counters,
@@ -393,7 +421,82 @@ mod tests {
             .unwrap()
             .store(capacity as u64, Ordering::Release);
         assert_eq!(crate::counters::LAYOUT_VERSION, 2);
-        assert!(CountersReader::attach(pass(&v1, RegionKind::Counters).unwrap()).is_err());
+        assert!(counters_reader(&v1).is_err());
+    }
+
+    /// A read-only attach reads what the writable path writes, and accepts
+    /// only the seal set of its profile.
+    #[test]
+    fn a_read_only_view_reads_the_writable_values_and_checks_its_profile() {
+        let shared = crate::ipc::Region::create(crate::ipc::RegionRecord {
+            instance: 7,
+            region: 5,
+            kind: RegionKind::Broadcast,
+            generation: 0,
+            layout: 1,
+            structure_length: 128,
+        })
+        .unwrap();
+        for (index, word) in shared.structure().as_slice().iter().enumerate() {
+            word.store(index as u64 * 3, Ordering::Release);
+        }
+        let view = pass_read_only(&shared, RegionKind::Broadcast, SealProfile::Shared).unwrap();
+        for index in 0..8 {
+            assert_eq!(view.structure().load_acquire(index), Some(index as u64 * 3));
+        }
+        // A later store is seen through the read-only mapping too.
+        shared
+            .structure()
+            .get(0)
+            .unwrap()
+            .store(99, Ordering::Release);
+        assert_eq!(view.structure().load_acquire(0), Some(99));
+        assert!(matches!(
+            pass_read_only(&shared, RegionKind::Broadcast, SealProfile::DriverOnly),
+            Err(SysError::SealMismatch { .. })
+        ));
+        let (_manager, local) = crate::counters::counters_in(7, 6, 2).unwrap();
+        let driver_only = local.region().unwrap();
+        assert!(matches!(
+            pass_read_only(driver_only, RegionKind::Counters, SealProfile::Shared),
+            Err(SysError::SealMismatch { .. })
+        ));
+    }
+
+    /// A2: a participant cannot map a driver-only region writable, through
+    /// `Region::attach` (its seal check) or a raw shared writable mapping
+    /// (the kernel refuses it after `F_SEAL_FUTURE_WRITE`).
+    #[test]
+    fn a_driver_only_region_cannot_be_mapped_writable() {
+        let (_manager, local) = crate::counters::counters_in(7, 6, 2).unwrap();
+        let region = local.region().unwrap();
+        assert!(matches!(
+            pass(region, RegionKind::Counters),
+            Err(SysError::SealMismatch { .. })
+        ));
+        let fd = region.descriptor().unwrap();
+        let len = crate::ipc::HEADER_STRIDE + region.record().structure_length;
+        // SAFETY: a fresh mapping attempt with a null hint over a sealed
+        // file of exactly `len` bytes; it is unmapped at once if the kernel
+        // grants it, which this test asserts it does not.
+        let mapped = unsafe {
+            rustix::mm::mmap(
+                core::ptr::null_mut(),
+                len,
+                rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+                rustix::mm::MapFlags::SHARED,
+                fd,
+                0,
+            )
+        };
+        match mapped {
+            Ok(raw) => {
+                // SAFETY: unmaps exactly the range just mapped.
+                let _ = unsafe { rustix::mm::munmap(raw, len) };
+                panic!("a writable mapping of a driver-only region was granted");
+            }
+            Err(errno) => assert_eq!(errno, rustix::io::Errno::PERM),
+        }
     }
 
     #[test]

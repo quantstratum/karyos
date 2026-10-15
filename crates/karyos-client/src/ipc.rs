@@ -40,7 +40,9 @@ use karyos_sys::broadcast::BroadcastReceiver;
 use karyos_sys::command_ring::RingProducer;
 use karyos_sys::counters::{CellRead, CountersReader};
 use karyos_sys::error::SysError;
-use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, RegionRecord, Sent};
+use karyos_sys::ipc::{
+    self, PidFd, ReadOnlyRegion, Recv, Region, RegionKind, RegionRecord, SealProfile, Sent,
+};
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Role, Subscription};
 use karyos_sys::term_bytes::SharedTerms;
 
@@ -216,12 +218,14 @@ fn expected(instance: u128, record: &Record) -> Result<RegionRecord, AttachError
     })
 }
 
-/// The CnC regions of a bootstrap, mapped and checked.
+/// The CnC regions of a bootstrap, mapped and checked. The driver counters
+/// are mapped read-only: only the driver writes them (owner decision Q7,
+/// A2).
 #[derive(Default)]
 struct Staged {
     ring: Option<Region>,
     broadcast: Option<Region>,
-    counters: Option<Region>,
+    counters: Option<ReadOnlyRegion>,
 }
 
 /// Receives the bootstrap after `Hello`: `Admitted`, then one `Region`
@@ -269,14 +273,24 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
         if got != index {
             return Err(AttachError::Protocol);
         }
-        let region = Region::attach(fd, expected(instance, record)?)?;
-        let slot = match record.kind {
-            WireKind::CommandRing => &mut staged.ring,
-            WireKind::Broadcast => &mut staged.broadcast,
-            WireKind::Counters => &mut staged.counters,
+        let expected = expected(instance, record)?;
+        let duplicate = match record.kind {
+            WireKind::CommandRing => staged.ring.replace(Region::attach(fd, expected)?).is_some(),
+            WireKind::Broadcast => staged
+                .broadcast
+                .replace(Region::attach(fd, expected)?)
+                .is_some(),
+            WireKind::Counters => staged
+                .counters
+                .replace(ReadOnlyRegion::attach(
+                    fd,
+                    expected,
+                    SealProfile::DriverOnly,
+                )?)
+                .is_some(),
             WireKind::LogBuffer => return Err(AttachError::Protocol),
         };
-        if slot.replace(region).is_some() {
+        if duplicate {
             return Err(AttachError::Protocol);
         }
     }
@@ -320,7 +334,7 @@ pub fn attach(
         };
         let producer = RingProducer::attach(ring)?;
         let receiver = BroadcastReceiver::attach(broadcast)?;
-        let counters = CountersReader::attach(counters)?;
+        let counters = CountersReader::attach_read_only(counters)?;
         let owner = Owner {
             driver: instance as u64,
             client,

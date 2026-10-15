@@ -117,6 +117,146 @@ impl<'a> AtomicWords<'a> {
     }
 }
 
+/// A borrowed, load-only view of a region as 64-bit words: it exposes atomic
+/// loads and nothing that could store, so it can view memory mapped without
+/// write access (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+/// "Read-only views"). Plain atomic loads of naturally aligned, lock-free
+/// 64-bit words are allowed on read-only memory; no read-modify-write or
+/// store is ever issued through it.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadOnlyWords<'a> {
+    words: &'a [AtomicU64],
+}
+
+impl<'a> ReadOnlyWords<'a> {
+    /// Validates a raw region and views it as load-only words.
+    ///
+    /// Checks the same address and length properties as
+    /// [`AtomicWords::from_raw`].
+    ///
+    /// # Safety
+    ///
+    /// For the whole lifetime `'a`: `base..base + len_bytes` must be one
+    /// allocation or mapping that `base` has provenance over, not wrapping
+    /// the address space; every byte must be initialized and readable (it
+    /// need not be writable) and stay mapped and the same size; and this
+    /// process must access those bytes only through atomic operations on
+    /// naturally aligned 64-bit words. The view itself only loads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidRegion`] when a check fails.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read-only mappings exist only on Linux")
+    )]
+    pub(crate) unsafe fn from_raw(base: *const u8, len_bytes: usize) -> Result<Self, SysError> {
+        let address = base.addr();
+        let valid = !base.is_null()
+            && address.is_multiple_of(align_of::<AtomicU64>())
+            && len_bytes > 0
+            && len_bytes.is_multiple_of(WORD_BYTES)
+            && isize::try_from(len_bytes).is_ok();
+        if !valid {
+            return Err(SysError::InvalidRegion {
+                address,
+                len: len_bytes,
+            });
+        }
+        let count = len_bytes / WORD_BYTES;
+        // SAFETY: `base` is non-null and aligned (checked); the caller
+        // guarantees `count * 8` readable, initialized bytes that stay
+        // mapped for `'a`, accessed only atomically, and `len_bytes <=
+        // isize::MAX` (checked). The shared references are never used to
+        // store: this type exposes only loads.
+        let words = unsafe { core::slice::from_raw_parts(base.cast::<AtomicU64>(), count) };
+        Ok(Self { words })
+    }
+
+    /// An empty view, used only as an unreachable fallback for regions that
+    /// were already validated.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "read-only mappings exist only on Linux")
+    )]
+    #[inline]
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self { words: &[] }
+    }
+
+    /// A load-only view of words this process may also write: for readers
+    /// that must work over either mapping.
+    #[inline]
+    #[must_use]
+    pub fn of(words: AtomicWords<'a>) -> Self {
+        Self {
+            words: words.as_slice(),
+        }
+    }
+
+    /// Number of words.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Whether the view has no words.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// Loads the word at `index` with a `Relaxed` load, if in bounds.
+    ///
+    /// The view may cover `PROT_READ` memory, where Rust guarantees only
+    /// `Relaxed` loads of at most word size
+    /// (<https://doc.rust-lang.org/std/sync/atomic/index.html#atomic-accesses-to-read-only-memory>);
+    /// stronger orderings are therefore not offered. Order later reads with
+    /// [`load_acquire`](Self::load_acquire) or an explicit `Acquire` fence.
+    #[inline]
+    #[must_use]
+    pub fn load(&self, index: usize) -> Option<u64> {
+        self.words
+            .get(index)
+            .map(|word| word.load(core::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Loads the word at `index` with acquire semantics, if in bounds: a
+    /// `Relaxed` load followed by an `Acquire` fence, which synchronizes
+    /// with a `Release` store of the value read (or a `Release` fence before
+    /// it) without an acquire load on read-only memory.
+    #[inline]
+    #[must_use]
+    pub fn load_acquire(&self, index: usize) -> Option<u64> {
+        let value = self.load(index);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+        value
+    }
+
+    /// The words from `index` on; empty when `index` is past the end.
+    #[inline]
+    #[must_use]
+    pub fn slice_from(&self, index: usize) -> Self {
+        Self {
+            words: self.words.get(index..).unwrap_or(&[]),
+        }
+    }
+
+    /// The words `index..index + count`; empty when out of bounds.
+    #[inline]
+    #[must_use]
+    pub fn range(&self, index: usize, count: usize) -> Self {
+        let words = index
+            .checked_add(count)
+            .and_then(|end| self.words.get(index..end))
+            .unwrap_or(&[]);
+        Self { words }
+    }
+}
+
 /// Heap-backed atomic words, for tests and single-process use. Built through
 /// the same internal constructor as a mapping (`AtomicWords::from_raw`), so
 /// Miri exercises that path.
@@ -277,6 +417,93 @@ mod tests {
         // SAFETY: as above; a length that is not a multiple of 8 is rejected.
         unsafe {
             assert!(AtomicWords::from_raw(base, 12).is_err());
+        }
+    }
+
+    /// A read-only view over a heap block: built through the raw
+    /// constructor that mappings use, so Miri checks its provenance and
+    /// bounds.
+    fn read_only(heap: &HeapWords) -> ReadOnlyWords<'_> {
+        let base = heap.words().as_slice().as_ptr().cast::<u8>();
+        // SAFETY: `base` covers `heap.count()` initialized, aligned words of
+        // one allocation that `heap` keeps alive for the borrow, accessed
+        // only atomically.
+        unsafe { ReadOnlyWords::from_raw(base, heap.count() * WORD_BYTES) }.unwrap()
+    }
+
+    #[test]
+    fn read_only_from_raw_reads_heap_words() {
+        let heap = HeapWords::zeroed(6).unwrap();
+        for (index, word) in heap.words().as_slice().iter().enumerate() {
+            word.store(index as u64 * 10, Ordering::Release);
+        }
+        let view = read_only(&heap);
+        assert_eq!(view.len(), 6);
+        assert!(!view.is_empty());
+        assert_eq!(view.load(0), Some(0));
+        assert_eq!(view.load_acquire(5), Some(50));
+        assert_eq!(view.load(6), None);
+        assert_eq!(view.load_acquire(usize::MAX), None);
+        // A later store through the writable view is seen by the reader.
+        heap.words().get(2).unwrap().store(7, Ordering::Release);
+        assert_eq!(view.load_acquire(2), Some(7));
+    }
+
+    #[test]
+    fn read_only_subviews_stay_in_bounds() {
+        let heap = HeapWords::zeroed(6).unwrap();
+        for (index, word) in heap.words().as_slice().iter().enumerate() {
+            word.store(index as u64, Ordering::Relaxed);
+        }
+        let view = read_only(&heap);
+        let tail = view.slice_from(4);
+        assert_eq!(
+            (tail.len(), tail.load(0), tail.load(1)),
+            (2, Some(4), Some(5))
+        );
+        assert_eq!(tail.load(2), None);
+        assert!(view.slice_from(6).is_empty());
+        assert!(view.slice_from(usize::MAX).is_empty());
+        let range = view.range(1, 3);
+        assert_eq!(range.len(), 3);
+        assert_eq!(
+            (range.load(0), range.load(2), range.load(3)),
+            (Some(1), Some(3), None)
+        );
+        assert_eq!(range.range(1, 2).load(1), Some(3));
+        assert!(view.range(4, 3).is_empty());
+        assert!(view.range(usize::MAX, 2).is_empty());
+        assert!(view.range(2, usize::MAX).is_empty());
+        assert!(ReadOnlyWords::empty().is_empty());
+        assert_eq!(ReadOnlyWords::empty().load(0), None);
+        let of = ReadOnlyWords::of(heap.words());
+        assert_eq!((of.len(), of.load(3)), (6, Some(3)));
+    }
+
+    #[test]
+    fn read_only_from_raw_rejects_invalid_regions() {
+        let heap = HeapWords::zeroed(2).unwrap();
+        let base = heap.words().as_slice().as_ptr().cast::<u8>();
+        // SAFETY: every call below is rejected by the checks before any
+        // reference is created.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(core::ptr::null(), 8).is_err());
+        }
+        // SAFETY: as above; misaligned base is rejected.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(base.wrapping_add(1), 8).is_err());
+        }
+        // SAFETY: as above; zero length is rejected.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(base, 0).is_err());
+        }
+        // SAFETY: as above; a length that is not a multiple of 8 is rejected.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(base, 12).is_err());
+        }
+        // SAFETY: as above; a length over isize::MAX is rejected.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(base, usize::MAX - 7).is_err());
         }
     }
 }
