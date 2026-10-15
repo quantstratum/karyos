@@ -482,31 +482,89 @@ pub fn peer_credentials(socket: BorrowedFd<'_>) -> Result<rustix::net::UCred, Sy
     rustix::net::sockopt::socket_peercred(socket).map_err(os("getsockopt(SO_PEERCRED)"))
 }
 
-/// A pidfd of this process (`pidfd_open(getpid())`), the descriptor a
-/// client passes with `Hello` as its exit proof
-/// (`quantstratum-docs: karyos/design/ipc-admission.md`). Close-on-exec, as every pidfd.
-///
-/// # Errors
-///
-/// Returns [`SysError::Os`] when `pidfd_open` fails (Linux before 5.3).
-pub fn pidfd_self() -> Result<OwnedFd, SysError> {
-    rustix::process::pidfd_open(
-        rustix::process::getpid(),
-        rustix::process::PidfdFlags::empty(),
-    )
-    .map_err(os("pidfd_open"))
+/// A descriptor known to be a pidfd: the client's exit proof
+/// (`quantstratum-docs: karyos/design/ipc-admission.md`). Validated once, when it is built, so
+/// [`PidFd::exited`] never mistakes another readable descriptor for an
+/// exited process.
+#[derive(Debug)]
+pub struct PidFd {
+    fd: OwnedFd,
+    pid: i32,
 }
 
-/// The pid a pidfd names, read from the `Pid:` field of its `fdinfo`:
-/// `Some(pid)` while the process is not yet reaped, `None` once it is
-/// (the kernel reports `-1`), and an error when `fd` is not a pidfd.
-///
-/// # Errors
-///
-/// Returns [`SysError::Os`] when the `fdinfo` cannot be read, and
-/// [`SysError::Protocol`] when it has no valid `Pid:` field (the
-/// descriptor is not a pidfd).
-pub fn pidfd_pid(fd: BorrowedFd<'_>) -> Result<Option<i32>, SysError> {
+impl PidFd {
+    /// A pidfd of this process (`pidfd_open(getpid())`), the descriptor a
+    /// client passes with `Hello`. Close-on-exec, as every pidfd.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Os`] when `pidfd_open` fails (Linux before 5.3).
+    pub fn of_self() -> Result<Self, SysError> {
+        let fd = rustix::process::pidfd_open(
+            rustix::process::getpid(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .map_err(os("pidfd_open"))?;
+        Self::validate(fd)
+    }
+
+    /// Validates a received descriptor as a pidfd of a process not yet
+    /// reaped: its `fdinfo` has a `Pid:` field naming a positive pid. A
+    /// descriptor that is not a pidfd, or whose process is already reaped,
+    /// is refused (and closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Os`] when the `fdinfo` cannot be read, and
+    /// [`SysError::Protocol`] when the descriptor is not a pidfd or names
+    /// no live pid.
+    pub fn validate(fd: OwnedFd) -> Result<Self, SysError> {
+        let pid = fdinfo_pid(fd.as_fd())?.ok_or(SysError::Protocol {
+            reason: "the pidfd names a reaped process",
+        })?;
+        Ok(Self { fd, pid })
+    }
+
+    /// The pid it named when validated.
+    #[must_use]
+    pub fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    /// The descriptor, to pass it.
+    #[must_use]
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    /// Whether the process has exited: the pidfd is readable (`poll` with
+    /// a zero timeout), which the kernel reports from the exit on, also
+    /// while the process is a zombie.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Os`] when `poll` fails.
+    pub fn exited(&self) -> Result<bool, SysError> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        let mut fds = [PollFd::new(&self.fd, PollFlags::IN)];
+        let ready = poll(
+            &mut fds,
+            Some(&Timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            }),
+        )
+        .map_err(os("poll(pidfd)"))?;
+        Ok(ready > 0
+            && fds
+                .iter()
+                .any(|fd| fd.revents().intersects(PollFlags::IN | PollFlags::HUP)))
+    }
+}
+
+/// The pid a pidfd names, from the `Pid:` field of its `fdinfo`: `None`
+/// once the process is reaped (the kernel reports `-1`).
+fn fdinfo_pid(fd: BorrowedFd<'_>) -> Result<Option<i32>, SysError> {
     use rustix::fd::AsRawFd;
     let path = format!("/proc/self/fdinfo/{}", fd.as_raw_fd());
     let info = std::fs::read_to_string(path).map_err(|error| SysError::Os {
@@ -521,30 +579,6 @@ pub fn pidfd_pid(fd: BorrowedFd<'_>) -> Result<Option<i32>, SysError> {
             reason: "not a pidfd",
         })?;
     Ok((pid > 0).then_some(pid))
-}
-
-/// Whether the process a pidfd names has exited: the pidfd is readable
-/// (`poll` with a zero timeout), which the kernel reports from the exit on,
-/// also while the process is a zombie.
-///
-/// # Errors
-///
-/// Returns [`SysError::Os`] when `poll` fails.
-pub fn pidfd_exited(fd: BorrowedFd<'_>) -> Result<bool, SysError> {
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
-    let mut fds = [PollFd::new(&fd, PollFlags::IN)];
-    let ready = poll(
-        &mut fds,
-        Some(&Timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        }),
-    )
-    .map_err(os("poll(pidfd)"))?;
-    Ok(ready > 0
-        && fds
-            .iter()
-            .any(|fd| fd.revents().intersects(PollFlags::IN | PollFlags::HUP)))
 }
 
 // Miri cannot execute these system calls.
@@ -806,38 +840,43 @@ mod tests {
 
     #[test]
     fn a_pidfd_names_its_process_until_it_exits() {
-        let own = pidfd_self().unwrap();
-        let pid = rustix::process::getpid().as_raw_nonzero().get();
-        assert_eq!(pidfd_pid(own.as_fd()).unwrap(), Some(pid));
-        assert!(!pidfd_exited(own.as_fd()).unwrap());
+        let own = PidFd::of_self().unwrap();
+        assert_eq!(own.pid(), rustix::process::getpid().as_raw_nonzero().get());
+        assert!(!own.exited().unwrap());
 
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
         let child_pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-        let pidfd =
-            rustix::process::pidfd_open(child_pid, rustix::process::PidfdFlags::empty()).unwrap();
-        assert_eq!(
-            pidfd_pid(pidfd.as_fd()).unwrap(),
-            Some(child_pid.as_raw_nonzero().get())
-        );
-        assert!(!pidfd_exited(pidfd.as_fd()).unwrap());
+        let open = || {
+            rustix::process::pidfd_open(child_pid, rustix::process::PidfdFlags::empty()).unwrap()
+        };
+        let pidfd = PidFd::validate(open()).unwrap();
+        assert_eq!(pidfd.pid(), child_pid.as_raw_nonzero().get());
+        assert!(!pidfd.exited().unwrap());
         child.kill().unwrap();
         // Exited is reported from the exit on, before and after the reap.
-        while !pidfd_exited(pidfd.as_fd()).unwrap() {
+        while !pidfd.exited().unwrap() {
             std::thread::yield_now();
         }
+        let zombie = open();
         child.wait().unwrap();
-        assert!(pidfd_exited(pidfd.as_fd()).unwrap());
-        assert_eq!(pidfd_pid(pidfd.as_fd()).unwrap(), None);
+        assert!(pidfd.exited().unwrap());
+        // A pidfd whose process is reaped is refused at validation.
+        assert!(matches!(
+            PidFd::validate(zombie),
+            Err(SysError::Protocol { .. })
+        ));
     }
 
     #[test]
-    fn a_descriptor_that_is_not_a_pidfd_is_refused() {
+    fn a_readable_descriptor_that_is_not_a_pidfd_is_refused() {
+        // A memfd polls readable: it must never pass as an exited pidfd.
         let region = Region::create(record()).unwrap();
+        let fd = region.descriptor().unwrap().try_clone_to_owned().unwrap();
         assert!(matches!(
-            pidfd_pid(region.descriptor().unwrap()),
+            PidFd::validate(fd),
             Err(SysError::Protocol { .. })
         ));
     }
