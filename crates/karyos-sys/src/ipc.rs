@@ -332,6 +332,20 @@ impl Region {
         self.fd.as_ref().map(AsFd::as_fd)
     }
 
+    /// A read-only descriptor of the region for a tool (owner decision Q7,
+    /// A1): the creator's descriptor reopened with [`reopen_read_only`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Protocol`] for a region without a descriptor (an
+    /// attached one), and the errors of [`reopen_read_only`].
+    pub fn read_only_descriptor(&self) -> Result<OwnedFd, SysError> {
+        let fd = self.descriptor().ok_or(SysError::Protocol {
+            reason: "only the creator of a region holds its descriptor",
+        })?;
+        reopen_read_only(fd)
+    }
+
     /// The region's structure: the words after the header stride.
     #[must_use]
     pub fn structure(&self) -> AtomicWords<'_> {
@@ -488,6 +502,46 @@ fn check_seals(fd: &OwnedFd, expected: SealFlags) -> Result<(), SysError> {
             found: found.bits(),
         })
     }
+}
+
+/// Reopens the file behind `fd` read-only through `/proc/self/fd/<n>` with
+/// `O_RDONLY | O_CLOEXEC` (owner decision Q7, A1;
+/// `quantstratum-docs: karyos/design/observability-and-tools.md`, Tool
+/// attach). The result is a new open file description of the same file:
+/// its seals and size are the file's, but the kernel refuses a shared
+/// writable mapping of it (`EACCES`), and `mprotect` cannot add write
+/// access to a mapping made from it later. The new descriptor is checked
+/// to be read-only and to name the same file (`st_dev`, `st_ino`) as `fd`.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when `/proc` cannot reopen the file or a check
+/// cannot be made, and [`SysError::Protocol`] when the result is not a
+/// read-only descriptor of the same file.
+pub fn reopen_read_only(fd: BorrowedFd<'_>) -> Result<OwnedFd, SysError> {
+    use rustix::fd::AsRawFd;
+    use rustix::fs::{Mode, OFlags};
+    let path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    let reopened = rustix::fs::open(
+        path.as_str(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOCTTY,
+        Mode::empty(),
+    )
+    .map_err(os("open(/proc/self/fd)"))?;
+    let flags = rustix::fs::fcntl_getfl(&reopened).map_err(os("fcntl(F_GETFL)"))?;
+    if flags.intersection(OFlags::RWMODE) != OFlags::RDONLY {
+        return Err(SysError::Protocol {
+            reason: "the reopened descriptor is not read-only",
+        });
+    }
+    let original = rustix::fs::fstat(fd).map_err(os("fstat"))?;
+    let copy = rustix::fs::fstat(&reopened).map_err(os("fstat"))?;
+    if (original.st_dev, original.st_ino) != (copy.st_dev, copy.st_ino) {
+        return Err(SysError::Protocol {
+            reason: "the reopened descriptor names another file",
+        });
+    }
+    Ok(reopened)
 }
 
 fn create_memfd() -> Result<OwnedFd, SysError> {
@@ -657,6 +711,118 @@ pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<Recv, SysError>
         len: message.bytes,
         fd,
     }))
+}
+
+/// Whether a receive on `socket` would not block: a message, an error or
+/// the peer's close is pending (`poll` with a zero timeout). A tool uses it
+/// to notice, without blocking, that the driver closed its connection.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when `poll` fails.
+pub fn readable(socket: BorrowedFd<'_>) -> Result<bool, SysError> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds = [PollFd::new(&socket, PollFlags::IN)];
+    let ready = poll(
+        &mut fds,
+        Some(&Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        }),
+    )
+    .map_err(os("poll(socket)"))?;
+    Ok(ready > 0
+        && fds.iter().any(|fd| {
+            fd.revents()
+                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+        }))
+}
+
+/// Test hooks over raw descriptors (feature `test-hooks`): probes that the
+/// kernel refuses write access to a region's memory.
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod probe {
+    use rustix::fd::BorrowedFd;
+    use rustix::mm::{MapFlags, MprotectFlags, ProtFlags};
+
+    use super::os;
+    use crate::error::SysError;
+
+    /// The size of the file behind `fd`, as a mapping length.
+    fn length(fd: BorrowedFd<'_>) -> Result<usize, SysError> {
+        let stat = rustix::fs::fstat(fd).map_err(os("fstat"))?;
+        usize::try_from(stat.st_size)
+            .ok()
+            .filter(|len| *len > 0)
+            .ok_or(SysError::InvalidRegion { address: 0, len: 0 })
+    }
+
+    /// Tries one shared writable mapping of the whole file behind `fd`:
+    /// `Ok(None)` when the kernel grants it (it is unmapped at once,
+    /// untouched), `Ok(Some(errno))` with the error it refused it with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Os`] when `fstat` fails and
+    /// [`SysError::InvalidRegion`] for an empty file.
+    pub fn writable_mapping(fd: BorrowedFd<'_>) -> Result<Option<i32>, SysError> {
+        let len = length(fd)?;
+        // SAFETY: a fresh mapping at an address chosen by the kernel (null
+        // hint) over the whole file; nothing references it, and it is
+        // unmapped below without being accessed.
+        let mapped = unsafe {
+            rustix::mm::mmap(
+                core::ptr::null_mut(),
+                len,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::SHARED,
+                fd,
+                0,
+            )
+        };
+        match mapped {
+            Ok(raw) => {
+                // SAFETY: unmaps exactly the range just mapped, which
+                // nothing references.
+                let _ = unsafe { rustix::mm::munmap(raw, len) };
+                Ok(None)
+            }
+            Err(errno) => Ok(Some(errno.raw_os_error())),
+        }
+    }
+
+    /// Maps the whole file behind `fd` shared and read-only, then tries to
+    /// add write access with `mprotect`: `Ok(None)` when the kernel grants
+    /// it, `Ok(Some(errno))` with the error it refused it with. The mapping
+    /// is unmapped, untouched, either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Os`] when `fstat` or the read-only mapping
+    /// fails, and [`SysError::InvalidRegion`] for an empty file.
+    pub fn mprotect_writable(fd: BorrowedFd<'_>) -> Result<Option<i32>, SysError> {
+        let len = length(fd)?;
+        // SAFETY: as in `writable_mapping`, read-only.
+        let raw = unsafe {
+            rustix::mm::mmap(
+                core::ptr::null_mut(),
+                len,
+                ProtFlags::READ,
+                MapFlags::SHARED,
+                fd,
+                0,
+            )
+        }
+        .map_err(os("mmap"))?;
+        // SAFETY: changes the protection of exactly the range just mapped,
+        // which nothing references.
+        let changed =
+            unsafe { rustix::mm::mprotect(raw, len, MprotectFlags::READ | MprotectFlags::WRITE) };
+        // SAFETY: unmaps exactly the range just mapped, which nothing
+        // references.
+        let _ = unsafe { rustix::mm::munmap(raw, len) };
+        Ok(changed.err().map(rustix::io::Errno::raw_os_error))
+    }
 }
 
 /// The peer's credentials (`SO_PEERCRED`), cached by the kernel at connect
@@ -1042,6 +1208,94 @@ mod tests {
             region.structure().get(9).unwrap().load(Ordering::Acquire),
             7
         );
+    }
+
+    /// A1: a descriptor reopened read-only names the same sealed file,
+    /// attaches read-only under the region's own seal profile and reads
+    /// what the creator writes, but the kernel refuses a shared writable
+    /// mapping of it and write access added later by `mprotect` (`EACCES`),
+    /// and a write through it (`EBADF`); for a shared region as for a
+    /// driver-only one.
+    #[test]
+    fn a_reopened_descriptor_is_read_only() {
+        for (region, profile) in [
+            (Region::create(record()).unwrap(), SealProfile::Shared),
+            (
+                Region::create_driver_only(record()).unwrap(),
+                SealProfile::DriverOnly,
+            ),
+        ] {
+            let fd = region.read_only_descriptor().unwrap();
+            let flags = rustix::fs::fcntl_getfl(&fd).unwrap();
+            assert_eq!(
+                flags.intersection(rustix::fs::OFlags::RWMODE),
+                rustix::fs::OFlags::RDONLY
+            );
+            assert!(
+                rustix::io::fcntl_getfd(&fd)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC)
+            );
+            let errno = rustix::io::Errno::ACCESS.raw_os_error();
+            assert_eq!(probe::writable_mapping(fd.as_fd()).unwrap(), Some(errno));
+            assert_eq!(probe::mprotect_writable(fd.as_fd()).unwrap(), Some(errno));
+            assert_eq!(
+                rustix::io::pwrite(&fd, &[1], 200),
+                Err(rustix::io::Errno::BADF)
+            );
+            // Passed like any descriptor, it attaches read-only.
+            let (a, b) = seqpacket_pair().unwrap();
+            assert_eq!(
+                send(a.as_fd(), b"ro", Some(fd.as_fd())).unwrap(),
+                Sent::Sent
+            );
+            drop(fd);
+            let mut buffer = [0u8; 8];
+            let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+                panic!("no message");
+            };
+            let view = ReadOnlyRegion::attach(received.fd.unwrap(), record(), profile).unwrap();
+            region
+                .structure()
+                .get(5)
+                .unwrap()
+                .store(77, Ordering::Release);
+            assert_eq!(view.structure().load_acquire(5), Some(77));
+        }
+        // The creator's own descriptor of a shared region stays writable:
+        // the probe can tell the two apart.
+        let shared = Region::create(record()).unwrap();
+        assert_eq!(
+            probe::writable_mapping(shared.descriptor().unwrap()).unwrap(),
+            None
+        );
+        // An attached region has no descriptor to reopen.
+        let attached = Region::attach(pass(&shared), record()).unwrap();
+        assert!(matches!(
+            attached.read_only_descriptor(),
+            Err(SysError::Protocol { .. })
+        ));
+    }
+
+    /// A socket is readable once a message is pending or the peer closed.
+    #[test]
+    fn readable_reports_a_pending_message_and_a_closed_peer() {
+        let (a, b) = seqpacket_pair().unwrap();
+        assert!(!readable(b.as_fd()).unwrap());
+        assert_eq!(send(a.as_fd(), b"x", None).unwrap(), Sent::Sent);
+        assert!(readable(b.as_fd()).unwrap());
+        let mut buffer = [0u8; 8];
+        assert!(matches!(
+            recv(b.as_fd(), &mut buffer).unwrap(),
+            Recv::Message(_)
+        ));
+        assert!(!readable(b.as_fd()).unwrap());
+        drop(a);
+        assert!(readable(b.as_fd()).unwrap());
+        assert!(matches!(
+            recv(b.as_fd(), &mut buffer).unwrap(),
+            Recv::PeerClosed
+        ));
     }
 
     #[test]

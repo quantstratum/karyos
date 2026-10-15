@@ -24,7 +24,7 @@ mod positions;
 mod remote_generations;
 
 #[cfg(target_os = "linux")]
-pub use admission::IpcConfig;
+pub use admission::{DEFAULT_MAX_TOOLS, IpcConfig};
 pub use clock::{MonotonicClock, SystemClock};
 pub use embedded::{
     DriverConfig, EmbeddedDriver, FIRST_INCARNATION, StreamConfig, StreamHandle, StreamState,

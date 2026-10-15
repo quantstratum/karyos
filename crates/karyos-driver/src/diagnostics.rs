@@ -166,4 +166,16 @@ impl Diagnostics {
     pub(crate) fn loss_reader(&self) -> LossReportReader {
         self.losses.reader()
     }
+
+    /// The error log's region, to grant it to tools; `None` on the heap.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn error_region(&self) -> Option<&karyos_sys::ipc::Region> {
+        self.errors.region()
+    }
+
+    /// The loss report's region, to grant it to tools; `None` on the heap.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn loss_region(&self) -> Option<&karyos_sys::ipc::Region> {
+        self.losses.region()
+    }
 }

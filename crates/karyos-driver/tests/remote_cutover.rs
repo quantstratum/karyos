@@ -69,6 +69,7 @@ fn driver_with(dir: &Path, deadline_ns: u64, max_exports: usize) -> IpcDriver {
             max_fetches_per_client: 4,
             max_regions_per_fetch: 4,
             max_fetch_bytes: 1 << 30,
+            max_tools: karyos_driver::DEFAULT_MAX_TOOLS,
         },
         Box::new(SystemClock::new()),
     )

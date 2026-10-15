@@ -28,6 +28,8 @@ pub mod link;
 pub mod loss;
 pub mod publication;
 pub mod subscription;
+#[cfg(target_os = "linux")]
+pub mod tool;
 pub mod trace;
 
 pub use concurrent::{

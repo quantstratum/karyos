@@ -20,10 +20,26 @@
 //! | `0x02` | `Fetch` | fetch id (nonzero); hand-over key |
 //! | `0x03` | `Detach` | export id (nonzero) |
 //! | `0x04` | `Leave` | none |
+//! | `0x05` | `ToolHello` | version |
 //! | `0x81` | `Admitted` | instance (low, high); protocol version; client id; record count; records |
 //! | `0x82` | `Manifest` | fetch id; hand-over key; registration; stream registration (nonzero); incarnation (nonzero); record count; records |
 //! | `0x83` | `Region` | fetch id; record index |
 //! | `0x84` | `Refused` | fetch id or 0; code (nonzero) |
+//! | `0x85` | `ToolAdmitted` | instance (low, high); protocol version; record count; records (capability none) |
+//!
+//! **Tools** (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+//! Tool attach). A tool sends `ToolHello` instead of `Hello`, without a
+//! descriptor; the driver answers `ToolAdmitted` with the records of its
+//! four diagnostic regions (driver counters, client counters, error log,
+//! loss report), then one `Region` with fetch id 0 per record, each with a
+//! read-only descriptor, or `Refused`. A tool gets no client id, command
+//! ring or capability: every record of `ToolAdmitted` carries capability
+//! none, and decoding refuses any other. The first two words of
+//! `ToolHello` (type, version) are fixed for every version, as `Hello`'s,
+//! and [`tool_hello_version`] reads them. Both messages are new types, so
+//! adding them changed no existing layout; the two region kinds they need
+//! (error log 6, loss report 7) are new record values that an older
+//! decoder refuses.
 //!
 //! **Versions.** The client announces its protocol version in `Hello`;
 //! the driver answers `Admitted` carrying the version it runs (equal to the
@@ -90,9 +106,22 @@ pub mod refusal {
 /// version words are fixed. `None` when the datagram is not a `Hello`.
 #[must_use]
 pub fn hello_version(bytes: &[u8]) -> Option<u64> {
+    version_of(HELLO, bytes)
+}
+
+/// The protocol version of a `ToolHello` datagram of any version: its type
+/// and version words are fixed. `None` when the datagram is not a
+/// `ToolHello`.
+#[must_use]
+pub fn tool_hello_version(bytes: &[u8]) -> Option<u64> {
+    version_of(TOOL_HELLO, bytes)
+}
+
+/// The second word of a datagram whose first word is `kind`.
+fn version_of(kind: u64, bytes: &[u8]) -> Option<u64> {
     let (chunks, _) = bytes.as_chunks::<8>();
     match chunks {
-        [kind, version, ..] if u64::from_le_bytes(*kind) == HELLO => {
+        [first, version, ..] if u64::from_le_bytes(*first) == kind => {
             Some(u64::from_le_bytes(*version))
         }
         _ => None,
@@ -103,10 +132,12 @@ const HELLO: u64 = 0x01;
 const FETCH: u64 = 0x02;
 const DETACH: u64 = 0x03;
 const LEAVE: u64 = 0x04;
+const TOOL_HELLO: u64 = 0x05;
 const ADMITTED: u64 = 0x81;
 const MANIFEST: u64 = 0x82;
 const REGION: u64 = 0x83;
 const REFUSED: u64 = 0x84;
+const TOOL_ADMITTED: u64 = 0x85;
 
 /// `Hello` flags: the first profile accepted, and no fork while holding the
 /// socket, a descriptor or a mapping.
@@ -159,6 +190,10 @@ pub enum RegionKind {
     /// The client counters, which the client maps writable to update the
     /// cells the driver allocated for it.
     ClientCounters,
+    /// The error log, which only the driver writes (tools only).
+    ErrorLog,
+    /// The loss report, which only the driver writes (tools only).
+    LossReport,
 }
 
 impl RegionKind {
@@ -169,6 +204,8 @@ impl RegionKind {
             Self::Counters => 3,
             Self::LogBuffer => 4,
             Self::ClientCounters => 5,
+            Self::ErrorLog => 6,
+            Self::LossReport => 7,
         }
     }
 
@@ -179,6 +216,8 @@ impl RegionKind {
             3 => Some(Self::Counters),
             4 => Some(Self::LogBuffer),
             5 => Some(Self::ClientCounters),
+            6 => Some(Self::ErrorLog),
+            7 => Some(Self::LossReport),
             _ => None,
         }
     }
@@ -335,6 +374,12 @@ pub enum Message {
     },
     /// The client is done: every export detached, no fetch open.
     Leave,
+    /// A tool's first message: it asks for the diagnostic regions only, and
+    /// carries no descriptor.
+    ToolHello {
+        /// The protocol version.
+        version: u64,
+    },
     /// The bootstrap answer: fetch 0, the client's CnC regions.
     Admitted {
         /// The driver instance id.
@@ -376,6 +421,16 @@ pub enum Message {
         fetch: u64,
         /// Why (nonzero).
         code: u64,
+    },
+    /// The answer to `ToolHello`: the diagnostic regions, whose `Region`
+    /// messages (fetch id 0) follow in record order.
+    ToolAdmitted {
+        /// The driver instance id.
+        instance: u128,
+        /// The protocol version the driver runs: the tool's.
+        version: u64,
+        /// The diagnostic regions; each carries capability none.
+        records: Vec<Record>,
     },
 }
 
@@ -428,6 +483,7 @@ impl Message {
             Self::Fetch { fetch, key } => words.extend([FETCH, *fetch, *key]),
             Self::Detach { export } => words.extend([DETACH, *export]),
             Self::Leave => words.push(LEAVE),
+            Self::ToolHello { version } => words.extend([TOOL_HELLO, *version]),
             Self::Admitted {
                 instance,
                 version,
@@ -463,6 +519,19 @@ impl Message {
             }
             Self::Region { fetch, index } => words.extend([REGION, *fetch, *index]),
             Self::Refused { fetch, code } => words.extend([REFUSED, *fetch, *code]),
+            Self::ToolAdmitted {
+                instance,
+                version,
+                records,
+            } => {
+                words.extend([
+                    TOOL_ADMITTED,
+                    *instance as u64,
+                    (*instance >> 64) as u64,
+                    *version,
+                ]);
+                records_words(records, &mut words)?;
+            }
         }
         Ok(words)
     }
@@ -481,6 +550,15 @@ impl Message {
             | Self::Manifest { incarnation: 0, .. }
             | Self::Refused { code: 0, .. } => return Err(AdmissionError::Reserved),
             Self::Admitted { records, .. } | Self::Manifest { records, .. } => records.as_slice(),
+            Self::ToolAdmitted { records, .. } => {
+                if records
+                    .iter()
+                    .any(|record| record.capability != Capability::None)
+                {
+                    return Err(AdmissionError::Reserved);
+                }
+                records.as_slice()
+            }
             _ => &[],
         };
         if records.iter().any(|record| record.export == 0) {
@@ -495,7 +573,8 @@ impl Message {
     ///
     /// Returns [`AdmissionError::Reserved`] for a message that could not be
     /// decoded (a zero fetch id, export id, refusal code, or stream
-    /// registration or incarnation of a manifest),
+    /// registration or incarnation of a manifest, or a `ToolAdmitted`
+    /// record with a capability),
     /// [`AdmissionError::TooManyRecords`] and
     /// [`AdmissionError::BufferTooShort`].
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, AdmissionError> {
@@ -574,6 +653,10 @@ impl Message {
                 exact(1)?;
                 Ok(Self::Leave)
             }
+            TOOL_HELLO => {
+                exact(2)?;
+                Ok(Self::ToolHello { version: word(1) })
+            }
             ADMITTED => Ok(Self::Admitted {
                 instance: u128::from(word(1)) | (u128::from(word(2)) << 64),
                 version: word(3),
@@ -608,6 +691,21 @@ impl Message {
                 Ok(Self::Refused {
                     fetch: word(1),
                     code: word(2),
+                })
+            }
+            TOOL_ADMITTED => {
+                let records = records_from(4, &words)?;
+                // A tool is granted no capability.
+                if records
+                    .iter()
+                    .any(|record| record.capability != Capability::None)
+                {
+                    return Err(AdmissionError::Reserved);
+                }
+                Ok(Self::ToolAdmitted {
+                    instance: u128::from(word(1)) | (u128::from(word(2)) << 64),
+                    version: word(3),
+                    records,
                 })
             }
             _ => Err(AdmissionError::UnknownType),
@@ -929,6 +1027,194 @@ mod tests {
             Err(AdmissionError::WrongLength { .. })
         ));
     }
+
+    /// The four diagnostic records a driver grants a tool.
+    fn tool_records() -> Vec<Record> {
+        [
+            RegionKind::Counters,
+            RegionKind::ClientCounters,
+            RegionKind::ErrorLog,
+            RegionKind::LossReport,
+        ]
+        .into_iter()
+        .zip(1u64..)
+        .map(|(kind, export)| Record {
+            kind,
+            stream_id: 0,
+            session_id: 0,
+            lane: 0,
+            generation: 0,
+            ..record(export, Capability::None)
+        })
+        .collect()
+    }
+
+    fn words_of(bytes: &[u8]) -> Vec<u64> {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
+            .collect()
+    }
+
+    fn bytes_of(words: &[u64]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// The tool messages, literally: `ToolHello` is its type and version;
+    /// `ToolAdmitted` is its type, the instance low word first, the version
+    /// and the record count, then the records.
+    #[test]
+    fn the_tool_messages_round_trip_with_their_layouts() {
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let hello = Message::ToolHello { version: VERSION };
+        let length = hello.encode(&mut out).unwrap();
+        assert_eq!(words_of(&out[..length]), [TOOL_HELLO, VERSION]);
+        round_trip(&hello);
+        let admitted = Message::ToolAdmitted {
+            instance: 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10,
+            version: VERSION,
+            records: tool_records(),
+        };
+        let length = admitted.encode(&mut out).unwrap();
+        assert_eq!(length, (5 + 4 * RECORD_WORDS) * 8);
+        let words = words_of(&out[..length]);
+        assert_eq!(
+            words[..5],
+            [
+                TOOL_ADMITTED,
+                0x090A_0B0C_0D0E_0F10,
+                0x0102_0304_0506_0708,
+                VERSION,
+                4
+            ]
+        );
+        // The kinds of the diagnostic regions: error log 6, loss report 7.
+        assert_eq!(words[5 + 2], 3 | 1 << 8);
+        assert_eq!(words[5 + RECORD_WORDS + 2], 5 | 1 << 8);
+        assert_eq!(words[5 + 2 * RECORD_WORDS + 2], 6 | 1 << 8);
+        assert_eq!(words[5 + 3 * RECORD_WORDS + 2], 7 | 1 << 8);
+        round_trip(&admitted);
+        round_trip(&Message::ToolAdmitted {
+            instance: 0,
+            version: 9,
+            records: Vec::new(),
+        });
+        round_trip(&Message::ToolAdmitted {
+            instance: u128::MAX,
+            version: VERSION,
+            records: vec![tool_records()[0]; MAX_RECORDS],
+        });
+    }
+
+    #[test]
+    fn the_tool_messages_decode_strictly() {
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        // A ToolHello with a third word, or without its version.
+        assert!(matches!(
+            Message::decode(&bytes_of(&[TOOL_HELLO, VERSION, 0])),
+            Err(AdmissionError::WrongLength { .. })
+        ));
+        assert!(matches!(
+            Message::decode(&bytes_of(&[TOOL_HELLO])),
+            Err(AdmissionError::WrongLength { .. })
+        ));
+        let length = Message::ToolAdmitted {
+            instance: 5,
+            version: VERSION,
+            records: tool_records(),
+        }
+        .encode(&mut out)
+        .unwrap();
+        let admitted = out[..length].to_vec();
+        // A count that disagrees with the records, or above the bound.
+        for (count, short) in [(3u8, true), (5, true), (200, false)] {
+            let mut bad = admitted.clone();
+            bad[32] = count;
+            let decoded = Message::decode(&bad);
+            if short {
+                assert!(
+                    matches!(decoded, Err(AdmissionError::WrongLength { .. })),
+                    "{count}"
+                );
+            } else {
+                assert!(matches!(
+                    decoded,
+                    Err(AdmissionError::TooManyRecords { .. })
+                ));
+            }
+        }
+        // A record with export 0, an unknown kind, or any capability: a
+        // tool is granted none, even one without an index.
+        let first = 40;
+        for (offset, value) in [
+            (first + 8, 0u8),
+            (first + 16, 8),
+            (first + 49, 1),
+            (first + 49, 3),
+            (first + 49, 5),
+        ] {
+            let mut bad = admitted.clone();
+            bad[offset] = value;
+            assert_eq!(
+                Message::decode(&bad),
+                Err(AdmissionError::Reserved),
+                "byte {offset}"
+            );
+        }
+        // Too short for its header.
+        assert_eq!(
+            Message::decode(&bytes_of(&[TOOL_ADMITTED, 1, 2, 3])),
+            Err(AdmissionError::Reserved)
+        );
+        // The encoder refuses what the decoder refuses.
+        for capability in [
+            Capability::ExclusivePublication,
+            Capability::RequiredSubscriber { cell: 0 },
+            Capability::ConcurrentPublication { slot: 1 },
+        ] {
+            let mut records = tool_records();
+            records[1].capability = capability;
+            assert_eq!(
+                Message::ToolAdmitted {
+                    instance: 1,
+                    version: VERSION,
+                    records,
+                }
+                .encode(&mut out),
+                Err(AdmissionError::Reserved)
+            );
+        }
+        let mut records = tool_records();
+        records[3].export = 0;
+        assert_eq!(
+            Message::ToolAdmitted {
+                instance: 1,
+                version: VERSION,
+                records,
+            }
+            .encode(&mut out),
+            Err(AdmissionError::Reserved)
+        );
+    }
+
+    #[test]
+    fn the_version_of_any_tool_hello_can_be_read() {
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let length = Message::ToolHello { version: 7 }.encode(&mut out).unwrap();
+        assert_eq!(tool_hello_version(&out[..length]), Some(7));
+        assert_eq!(hello_version(&out[..length]), None);
+        // A longer ToolHello of a future version still yields its version.
+        let mut future = out[..length].to_vec();
+        future.extend_from_slice(&[0xCD; 24]);
+        assert!(Message::decode(&future).is_err());
+        assert_eq!(tool_hello_version(&future), Some(7));
+        // A client Hello is not a tool's.
+        let length = Message::Hello { version: 7 }.encode(&mut out).unwrap();
+        assert_eq!(tool_hello_version(&out[..length]), None);
+        assert_eq!(tool_hello_version(&bytes_of(&[TOOL_HELLO])), None);
+    }
 }
 
 /// Decoder properties of the admission messages (issue #121, the control
@@ -949,8 +1235,17 @@ mod properties {
 
     use super::*;
 
-    const TYPES: [u64; 8] = [
-        HELLO, FETCH, DETACH, LEAVE, ADMITTED, MANIFEST, REGION, REFUSED,
+    const TYPES: [u64; 10] = [
+        HELLO,
+        FETCH,
+        DETACH,
+        LEAVE,
+        TOOL_HELLO,
+        ADMITTED,
+        MANIFEST,
+        REGION,
+        REFUSED,
+        TOOL_ADMITTED,
     ];
 
     fn encoded(message: &Message) -> Result<Vec<u8>, AdmissionError> {
@@ -965,21 +1260,35 @@ mod properties {
         Some(u64::from_le_bytes(chunk.try_into().unwrap()))
     }
 
-    /// Canonicality, and [`hello_version`] against a model: the second
-    /// word of anything at least two words long whose first word is
-    /// `Hello`'s type.
+    /// Canonicality, and [`hello_version`] and [`tool_hello_version`]
+    /// against a model: the second word of anything at least two words
+    /// long whose first word is the type of `Hello` (or `ToolHello`).
     fn check_decoded(bytes: &[u8]) -> Result<bool, TestCaseError> {
-        let version = match (word(bytes, 0), word(bytes, 1)) {
-            (Some(HELLO), Some(version)) => Some(version),
+        let version = |kind: u64| match (word(bytes, 0), word(bytes, 1)) {
+            (Some(first), Some(version)) if first == kind => Some(version),
             _ => None,
         };
-        prop_assert_eq!(hello_version(bytes), version);
+        prop_assert_eq!(hello_version(bytes), version(HELLO));
+        prop_assert_eq!(tool_hello_version(bytes), version(TOOL_HELLO));
         match Message::decode(bytes) {
             Ok(message) => {
                 prop_assert!(bytes.len() <= MAX_MESSAGE_LENGTH);
                 prop_assert_eq!(&encoded(&message).unwrap()[..], bytes);
-                if let Message::Hello { version } = message {
-                    prop_assert_eq!(hello_version(bytes), Some(version));
+                match message {
+                    Message::Hello { version } => {
+                        prop_assert_eq!(hello_version(bytes), Some(version));
+                    }
+                    Message::ToolHello { version } => {
+                        prop_assert_eq!(tool_hello_version(bytes), Some(version));
+                    }
+                    Message::ToolAdmitted { records, .. } => {
+                        prop_assert!(
+                            records
+                                .iter()
+                                .all(|record| record.capability == Capability::None)
+                        );
+                    }
+                    _ => {}
                 }
                 Ok(true)
             }
@@ -1008,7 +1317,7 @@ mod properties {
         prop_oneof![
             3 => 0u64..=MAX_RECORDS as u64 + 1,
             1 => prop::sample::select(&TYPES[..]),
-            1 => (1u64..=5, any::<u32>()).prop_map(|(kind, layout)| kind | u64::from(layout) << 8),
+            1 => (1u64..=7, any::<u32>()).prop_map(|(kind, layout)| kind | u64::from(layout) << 8),
             1 => (any::<u8>(), 0u64..=5).prop_map(|(lane, capability)| u64::from(lane) | capability << 8),
             2 => any::<u64>(),
         ]
@@ -1026,7 +1335,7 @@ mod properties {
             field(any::<u64>().boxed()),
             field((0u64..=3).boxed()),
             field(
-                (0u64..=6, 0u64..=3)
+                (0u64..=8, 0u64..=3)
                     .prop_map(|(kind, layout)| kind | layout << 8)
                     .boxed(),
             ),
@@ -1049,8 +1358,8 @@ mod properties {
 
     /// Any bytes up to a word past the largest message; or words with a
     /// known type first, of any count, of the type's fixed count, or (for
-    /// `Admitted` and `Manifest`) with a record count and that many
-    /// record-shaped records.
+    /// `Admitted`, `Manifest` and `ToolAdmitted`) with a record count and
+    /// that many record-shaped records.
     fn input() -> impl Strategy<Value = Vec<u8>> {
         prop_oneof![
             1 => prop::collection::vec(any::<u8>(), 0..=MAX_MESSAGE_LENGTH + 8),
@@ -1060,7 +1369,15 @@ mod properties {
             )
                 .prop_map(|(kind, rest)| to_bytes(core::iter::once(kind).chain(rest).collect())),
             2 => prop::sample::select(
-                &[(HELLO, 2), (FETCH, 2), (DETACH, 1), (LEAVE, 0), (REGION, 2), (REFUSED, 2)][..],
+                &[
+                    (HELLO, 2),
+                    (FETCH, 2),
+                    (DETACH, 1),
+                    (LEAVE, 0),
+                    (TOOL_HELLO, 1),
+                    (REGION, 2),
+                    (REFUSED, 2),
+                ][..],
             )
                 .prop_flat_map(|(kind, count)| {
                     prop::collection::vec(small_word(), count).prop_map(move |rest| {
@@ -1068,12 +1385,16 @@ mod properties {
                     })
                 }),
             4 => (
-                prop::sample::select(&[ADMITTED, MANIFEST][..]),
+                prop::sample::select(&[ADMITTED, MANIFEST, TOOL_ADMITTED][..]),
                 prop::collection::vec(prop_oneof![3 => 1u64..=8, 1 => 0u64..=0], 5),
                 prop::collection::vec(record_words(), 0..=MAX_RECORDS),
             )
                 .prop_map(|(kind, header, records)| {
-                    let header = &header[..if kind == ADMITTED { 4 } else { 5 }];
+                    let header = &header[..match kind {
+                        ADMITTED => 4,
+                        MANIFEST => 5,
+                        _ => 3,
+                    }];
                     to_bytes(
                         core::iter::once(kind)
                             .chain(header.iter().copied())
@@ -1093,6 +1414,8 @@ mod properties {
                 RegionKind::Counters,
                 RegionKind::LogBuffer,
                 RegionKind::ClientCounters,
+                RegionKind::ErrorLog,
+                RegionKind::LossReport,
             ][..],
         );
         let capability = prop_oneof![
@@ -1183,6 +1506,23 @@ mod properties {
             ),
             any::<(u64, u64)>().prop_map(|(fetch, index)| Message::Region { fetch, index }),
             (any::<u64>(), id()).prop_map(|(fetch, code)| Message::Refused { fetch, code }),
+            any::<u64>().prop_map(|version| Message::ToolHello { version }),
+            // A valid tool record carries capability none; otherwise any
+            // capability, which the encoder must refuse.
+            (any::<u128>(), any::<u64>(), records()).prop_map(
+                move |(instance, version, mut records)| {
+                    if valid {
+                        for record in &mut records {
+                            record.capability = Capability::None;
+                        }
+                    }
+                    Message::ToolAdmitted {
+                        instance,
+                        version,
+                        records,
+                    }
+                }
+            ),
         ]
     }
 
@@ -1254,6 +1594,23 @@ mod properties {
             later.extend_from_slice(&rest);
             prop_assert_eq!(hello_version(&later), Some(version));
             prop_assert_eq!(hello_version(&bytes[..15]), None);
+            prop_assert_eq!(tool_hello_version(&later), None);
+        }
+
+        /// A `ToolHello` of any version, and of any later layout that keeps
+        /// its first two words, yields its version; it is never a `Hello`.
+        #[test]
+        fn tool_hello_version_reads_any_tool_hello(
+            version in any::<u64>(),
+            rest in prop::collection::vec(any::<u8>(), 0..=64),
+        ) {
+            let bytes = encoded(&Message::ToolHello { version }).unwrap();
+            prop_assert_eq!(tool_hello_version(&bytes), Some(version));
+            prop_assert_eq!(hello_version(&bytes), None);
+            let mut later = bytes[..16].to_vec();
+            later.extend_from_slice(&rest);
+            prop_assert_eq!(tool_hello_version(&later), Some(version));
+            prop_assert_eq!(tool_hello_version(&bytes[..15]), None);
         }
     }
 }

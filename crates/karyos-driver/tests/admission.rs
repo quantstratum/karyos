@@ -68,6 +68,7 @@ fn ipc_config(dir: &Path, timeout: u64) -> IpcConfig {
         max_fetches_per_client: 4,
         max_regions_per_fetch: 4,
         max_fetch_bytes: 1 << 30,
+        max_tools: karyos_driver::DEFAULT_MAX_TOOLS,
     }
 }
 
@@ -1421,4 +1422,156 @@ fn a_handle_dropped_after_its_client_detaches_then_leaves() {
     serve_until(&mut driver, |driver| driver.clients() == 0);
     assert_eq!(counter(&driver, "grants detached"), 1);
     assert_eq!(counter(&driver, "clients faulty"), 0);
+}
+
+/// A tool attached over the admission socket (`quantstratum-docs:
+/// karyos/design/observability-and-tools.md`, Tool attach) reads, through
+/// its read-only mappings, what the driver writes: the driver counters
+/// cell for cell, a client counter a remote client wrote, the error record
+/// of a refused hello and the loss record of an overrun remote subscriber;
+/// a later error shows through the same mapping. It holds no client slot,
+/// and it notices the driver's exit when the socket closes, after which
+/// its mappings stay readable.
+#[test]
+fn a_tool_reads_the_diagnostics_the_driver_writes() {
+    let dir = dir("tool-reads");
+    let mut driver = system_driver(&dir);
+    let stream = driver
+        .add_stream(StreamConfig {
+            allow_unconnected: true,
+            ..shared_stream_config()
+        })
+        .unwrap();
+    // An error record: a hello without its pidfd.
+    let hello = encode(&Message::Hello { version: VERSION });
+    assert_eq!(
+        raw_hello(&mut driver, &dir, &hello, None),
+        Some(Message::Refused {
+            fetch: 0,
+            code: refusal::PROFILE
+        })
+    );
+    // A loss record: an optional remote subscriber that is overrun.
+    let (mut client, subscription, registration) =
+        remote_subscriber_as(&mut driver, &dir, SubscriberRole::Optional);
+    // A client counter written by the remote client.
+    let _ = client.allocate_counter(9, "tool visible", 0, 0).unwrap();
+    let mut done: Vec<Completion> = Vec::new();
+    let start = Instant::now();
+    while done.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "timed out");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    let Outcome::Counter(handle) = done.pop().unwrap().outcome else {
+        panic!("expected a counter");
+    };
+    assert_eq!(handle.increment(41), Ok(41));
+    let mut subscription = subscription.with_rejoin(karyos_client::RejoinPolicy::RejoinAtHead);
+    let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
+    for _ in 0..300 {
+        let start = Instant::now();
+        while !matches!(
+            publication.offer(&[7u8; 512]).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ) {
+            assert!(start.elapsed() < Duration::from_secs(5), "never accepted");
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    let summary = subscription.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    assert!(summary.overrun.is_some());
+    let mut losses = Vec::new();
+    let start = Instant::now();
+    while losses.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no loss record");
+        let _ = client.poll(usize::MAX, |completion| {
+            panic!("unexpected completion {completion:?}");
+        });
+        let _ = driver.do_work().unwrap();
+        let _ = driver
+            .loss_report()
+            .scan(&mut 0, |_, record| losses.push(record));
+    }
+
+    let mut tool = serve_while(&mut driver, || {
+        karyos_client::tool::attach_tool(&dir, Duration::from_secs(5))
+    })
+    .unwrap();
+    assert_eq!(tool.instance(), driver_instance(&driver));
+    assert_eq!(driver.tools(), 1);
+    assert_eq!(driver.clients(), 1);
+    // The driver counters, cell for cell (nothing runs between the reads).
+    let own = driver.counters();
+    assert_eq!(tool.counters().capacity(), own.capacity());
+    for index in 0..own.capacity() {
+        assert_eq!(tool.counters().read(index), own.read(index), "cell {index}");
+    }
+    assert_eq!(
+        (0..tool.counters().capacity()).find_map(|index| match tool.counters().read(index) {
+            karyos_sys::counters::CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == b"clients admitted" => Some(value),
+            _ => None,
+        }),
+        Some(counter(&driver, "clients admitted"))
+    );
+    // The client counter.
+    let karyos_sys::counters::CellRead::Allocated {
+        metadata, value, ..
+    } = tool.client_counters().read(handle.cell())
+    else {
+        panic!("expected the client's cell");
+    };
+    assert_eq!((value, metadata.label()), (41, &b"tool visible"[..]));
+    // The error log.
+    let mut errors = Vec::new();
+    let mut cursor = 0;
+    let _ = tool
+        .error_log()
+        .scan(&mut cursor, |record| errors.push(record));
+    let [error] = &errors[..] else {
+        panic!("expected one error record, got {errors:?}");
+    };
+    assert_eq!(
+        (error.code, error.key, error.occurrences),
+        (
+            karyos_driver::diagnostics::ErrorCode::HelloRejected as u32,
+            [0, refusal::PROFILE],
+            1
+        )
+    );
+    // The loss report.
+    let mut seen = Vec::new();
+    let _ = tool
+        .loss_report()
+        .scan(&mut 0, |_, record| seen.push(record));
+    assert_eq!(seen, losses);
+    assert_eq!(seen[0].participant, registration);
+    // A later error shows through the same mapping.
+    let _ = raw_hello(&mut driver, &dir, &hello, None);
+    let mut again = Vec::new();
+    let _ = tool.error_log().scan(&mut 0, |record| again.push(record));
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].occurrences, 2);
+
+    drop(publication);
+    serve_while(&mut driver, move || {
+        drop(handle);
+        drop(subscription);
+        drop(client);
+    });
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert!(!tool.driver_closed().unwrap());
+    assert_eq!(driver.tools(), 1);
+    drop(driver);
+    // Another test's spawned child can hold a copy of the driver's socket
+    // between its fork and exec, so the close can take a moment.
+    let start = Instant::now();
+    while !tool.driver_closed().unwrap() {
+        assert!(start.elapsed() < Duration::from_secs(5), "never closed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(tool.loss_report().scan(&mut 0, |_, _| {}).delivered, 1);
 }
