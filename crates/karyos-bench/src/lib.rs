@@ -53,6 +53,19 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
             });
         }
     }
+    for workload in [Workload::TraceOff, Workload::TraceOn] {
+        for message in [32, 256, 1024] {
+            configs.push(Config {
+                workload,
+                message,
+                publishers: 1,
+                iterations,
+                warmup,
+                term_length,
+                target_rate: None,
+            });
+        }
+    }
     for publishers in [1, 2] {
         configs.push(Config {
             workload: Workload::Throughput,

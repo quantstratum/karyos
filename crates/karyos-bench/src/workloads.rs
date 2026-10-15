@@ -15,6 +15,7 @@ use karyos_client::{
 };
 use karyos_driver::{EmbeddedDriver, StreamConfig, StreamHandle};
 use karyos_protocol::frame::FrameHeader;
+use karyos_protocol::trace_hook::{SubscriberIdentity, TraceHook};
 use karyos_sys::frame::{Flags, FrameType, Lane, Word0};
 use karyos_sys::log_buffer::{
     AppendOptions, ConcurrentOfferOutcome as SysConcurrentOfferOutcome, LogBuffer, LogBufferConfig,
@@ -25,6 +26,10 @@ use karyos_sys::sizing::{DEFAULT_MTU, TermLength};
 use karyos_sys::term::{TermCount, TermId};
 use karyos_trace::clocks::Latency;
 use karyos_trace::histogram::Histogram;
+use karyos_trace::{
+    BufferedIds, MonotonicClock, ObserverId, OsRandom, Sampling, TraceAgent, TraceCollector,
+    trace_journal,
+};
 
 /// A named workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,11 +54,15 @@ pub enum Workload {
     /// A receive owner compares each frame's duplicate with the committed
     /// one: the cost of redundant paths.
     ReceiveDuplicate,
+    /// Offer and poll with no trace hooks attached.
+    TraceOff,
+    /// Offer and poll with publication and subscriber trace hooks attached.
+    TraceOn,
 }
 
 impl Workload {
     /// Every workload.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::OfferPoll,
         Self::Claim,
         Self::PingPong,
@@ -62,6 +71,8 @@ impl Workload {
         Self::CleanerThroughput,
         Self::Receive,
         Self::ReceiveDuplicate,
+        Self::TraceOff,
+        Self::TraceOn,
     ];
 
     /// Its name on the command line and in the history.
@@ -76,6 +87,8 @@ impl Workload {
             Self::CleanerThroughput => "cleaner-throughput",
             Self::Receive => "receive",
             Self::ReceiveDuplicate => "receive-duplicate",
+            Self::TraceOff => "trace-off",
+            Self::TraceOn => "trace-on",
         }
     }
 
@@ -245,7 +258,8 @@ fn receive(
 /// Returns the first driver or client error.
 pub fn run(config: Config) -> Result<Measurement, BenchError> {
     match config.workload {
-        Workload::OfferPoll | Workload::Claim => single_thread(config),
+        Workload::OfferPoll | Workload::Claim | Workload::TraceOff => single_thread(config, false),
+        Workload::TraceOn => single_thread(config, true),
         Workload::PingPong => ping_pong(config),
         Workload::Throughput => throughput(config),
         Workload::OpenLoop => open_loop(config),
@@ -397,7 +411,7 @@ fn header(word0: Word0, term: TermId, offset: u32, reserved_value: i64) -> Frame
     }
 }
 
-fn single_thread(config: Config) -> Result<Measurement, BenchError> {
+fn single_thread(config: Config, traced: bool) -> Result<Measurement, BenchError> {
     let resolution = resolution();
     let mut driver = EmbeddedDriver::new().map_err(|cause| error("driver", cause))?;
     let handle = stream(&mut driver, 1, &config, PublicationMode::Exclusive)?;
@@ -407,6 +421,30 @@ fn single_thread(config: Config) -> Result<Measurement, BenchError> {
     let mut publication = driver
         .publication(handle)
         .map_err(|cause| error("publication", cause))?;
+    let mut _trace_collectors: Vec<TraceCollector> = Vec::new();
+    if traced {
+        let publication_identity = driver
+            .trace_identity(handle)
+            .map_err(|cause| error("trace identity", cause))?;
+        let subscriber_identity = SubscriberIdentity {
+            driver: driver.driver_id(),
+            registration: driver
+                .next_trace_number()
+                .map_err(|cause| error("trace identity", cause))?,
+            incarnation: 1,
+        };
+        let total = config
+            .warmup
+            .checked_add(config.iterations)
+            .ok_or_else(|| BenchError("trace iteration count overflow".into()))?;
+        let (publish_hook, publish_collector) = trace_hook(&mut driver, total)?;
+        let (delivery_hook, delivery_collector) = trace_hook(&mut driver, total)?;
+        publication = publication.with_trace(publish_hook, publication_identity);
+        subscription =
+            subscription.with_trace(delivery_hook, publication_identity, subscriber_identity);
+        _trace_collectors.push(publish_collector);
+        _trace_collectors.push(delivery_collector);
+    }
     let payload = vec![7u8; config.message];
     let length = u32::try_from(config.message).map_err(|cause| error("message", cause))?;
     let mut latencies = histogram()?;
@@ -417,24 +455,38 @@ fn single_thread(config: Config) -> Result<Measurement, BenchError> {
             measured_from = Instant::now();
         }
         let begin = Instant::now();
+        if traced {
+            publication.trace_maintenance();
+            subscription.trace_maintenance();
+        }
+        let trace_decision = traced.then(|| publication.trace_message(None));
         loop {
-            let done = match config.workload {
-                Workload::Claim => match publication
-                    .try_claim(length)
-                    .map_err(|cause| error("claim", cause))?
-                {
-                    ClaimOutcome::Claimed(mut claim) => {
-                        claim.payload().copy_from_slice(&payload);
-                        matches!(claim.commit(), CommitOutcome::Accepted { .. })
-                    }
-                    _ => false,
-                },
-                _ => matches!(
+            let done = if let Some(decision) = &trace_decision {
+                matches!(
                     publication
-                        .offer(&payload)
+                        .offer_with_trace(&payload, decision)
                         .map_err(|cause| error("offer", cause))?,
                     OfferOutcome::Accepted { .. }
-                ),
+                )
+            } else {
+                match config.workload {
+                    Workload::Claim => match publication
+                        .try_claim(length)
+                        .map_err(|cause| error("claim", cause))?
+                    {
+                        ClaimOutcome::Claimed(mut claim) => {
+                            claim.payload().copy_from_slice(&payload);
+                            matches!(claim.commit(), CommitOutcome::Accepted { .. })
+                        }
+                        _ => false,
+                    },
+                    _ => matches!(
+                        publication
+                            .offer(&payload)
+                            .map_err(|cause| error("offer", cause))?,
+                        OfferOutcome::Accepted { .. }
+                    ),
+                }
             };
             if done {
                 break;
@@ -461,6 +513,34 @@ fn single_thread(config: Config) -> Result<Measurement, BenchError> {
         cleaned_slots_per_second: None,
         term_rotations_per_second: None,
     })
+}
+
+fn trace_hook(
+    driver: &mut EmbeddedDriver,
+    messages: u64,
+) -> Result<(Box<dyn TraceHook>, TraceCollector), BenchError> {
+    let journal = driver
+        .next_trace_number()
+        .map_err(|cause| error("trace journal identity", cause))?;
+    let records = usize::try_from(messages)
+        .map_err(|cause| error("trace journal capacity", cause))?
+        .checked_next_power_of_two()
+        .ok_or_else(|| BenchError("trace journal capacity overflow".into()))?
+        .max(4);
+    let id_words = usize::try_from(messages)
+        .map_err(|cause| error("trace id capacity", cause))?
+        .checked_mul(3)
+        .ok_or_else(|| BenchError("trace id capacity overflow".into()))?
+        .max(2);
+    let ids = BufferedIds::new(id_words, OsRandom).map_err(|cause| error("trace ids", cause))?;
+    let observer = ObserverId {
+        driver: driver.driver_id(),
+        journal,
+    };
+    let (writer, collector) = trace_journal(records, 4, observer, journal)
+        .map_err(|cause| error("trace journal", cause))?;
+    let agent = TraceAgent::new(Sampling::All, ids, MonotonicClock::new(journal), writer);
+    Ok((Box::new(agent), collector))
 }
 
 /// Runs the driver's duty on its own thread until `stop` is set.
