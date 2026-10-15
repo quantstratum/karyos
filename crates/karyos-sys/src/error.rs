@@ -91,6 +91,12 @@ pub enum SysError {
         /// Raw OS error number.
         errno: i32,
     },
+    /// A peer broke the IPC transport protocol (`quantstratum-docs: karyos/design/ipc-admission.md`).
+    #[error("IPC protocol violation: {reason}")]
+    Protocol {
+        /// What was wrong.
+        reason: &'static str,
+    },
     /// A sealed backing does not carry exactly the required seals.
     #[error("backing seals are {found:#x}, expected exactly {expected:#x}")]
     SealMismatch {
