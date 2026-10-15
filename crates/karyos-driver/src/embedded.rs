@@ -180,6 +180,15 @@ pub struct DriverConfig {
     /// The driver's injectable clock is not read for it, so it is read only
     /// for deadlines.
     pub position_sample_interval: u64,
+    /// Records of the error log
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`).
+    pub error_log_records: usize,
+    /// Records of the loss report.
+    pub loss_report_records: usize,
+    /// How long after its last occurrence a repeated error updates its
+    /// record instead of writing a new one, in host `CLOCK_MONOTONIC`
+    /// nanoseconds.
+    pub error_dedup_window: u64,
 }
 
 impl Default for DriverConfig {
@@ -207,6 +216,9 @@ impl Default for DriverConfig {
             },
             counters_capacity: 1024,
             position_sample_interval: 10_000_000,
+            error_log_records: karyos_sys::diag::DEFAULT_ERROR_RECORDS,
+            loss_report_records: karyos_sys::diag::DEFAULT_LOSS_RECORDS,
+            error_dedup_window: 1_000_000_000,
         }
     }
 }
@@ -357,6 +369,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// The admission socket and its connections (IPC mode).
     #[cfg(target_os = "linux")]
     pub(crate) admission: Option<crate::admission::Admission<T>>,
+    /// The error log and the loss report.
+    pub(crate) diagnostics: crate::diagnostics::Diagnostics,
 }
 
 /// The incarnation of a stream's publication in the embedded driver: one per
@@ -442,6 +456,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             && config.max_retained_generations > 0
             && config.counters_capacity >= crate::counters::FIXED_COUNTERS
             && config.position_sample_interval > 0
+            && config.error_log_records > 0
+            && config.loss_report_records > 0
             && config.cutover_deadline > 0
             && config.heartbeat_interval > 0
             && config
@@ -459,9 +475,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::InvalidConfig);
         }
         #[cfg(target_os = "linux")]
-        let (broadcast, counters, admission) = match ipc {
+        let (broadcast, counters, admission, diagnostics) = match ipc {
             Some(ipc) => {
-                let (admission, instance) = crate::admission::Admission::new(ipc)?;
+                let (mut admission, instance) = crate::admission::Admission::new(ipc)?;
                 let broadcast = BroadcastTransmitter::create_in(
                     instance,
                     crate::admission::BROADCAST_REGION,
@@ -473,20 +489,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     crate::admission::COUNTERS_REGION,
                     config.counters_capacity,
                 )?;
-                (broadcast, counters, Some(admission))
+                let diagnostics = crate::diagnostics::Diagnostics::new_in(&mut admission, &config)?;
+                (broadcast, counters, Some(admission), diagnostics)
             }
             None => (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
                 DriverCounters::with_capacity(config.counters_capacity)?,
                 None,
+                crate::diagnostics::Diagnostics::new(&config)?,
             ),
         };
         #[cfg(not(target_os = "linux"))]
-        let (broadcast, counters) = {
+        let (broadcast, counters, diagnostics) = {
             let _ = ipc;
             (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
                 DriverCounters::with_capacity(config.counters_capacity)?,
+                crate::diagnostics::Diagnostics::new(&config)?,
             )
         };
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
@@ -519,6 +538,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             positions: crate::positions::Positions::default(),
             #[cfg(target_os = "linux")]
             admission,
+            diagnostics,
         })
     }
 
@@ -710,8 +730,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// Returns configuration and allocation errors; no stream is added on
-    /// error.
+    /// error, and the refusal is recorded in the error log.
     pub fn add_stream(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
+        let key = [
+            u64::from(config.buffer.stream_id.cast_unsigned()),
+            u64::from(config.buffer.session_id.cast_unsigned()),
+        ];
+        let added = self.add_stream_checked(config);
+        if let Err(error) = &added {
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::StreamConfigRejected,
+                key,
+                &error.to_string(),
+            );
+        }
+        added
+    }
+
+    fn add_stream_checked(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
         // A key in use (active or retiring) is reported before the quota.
         let key = (config.buffer.stream_id, config.buffer.session_id);
         if self
@@ -1101,6 +1138,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .iter_mut()
             .find(|s| s.id == stream.stream)
             .ok_or(unknown)
+    }
+
+    /// A reader of the driver's error log
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`).
+    #[must_use]
+    pub fn error_log(&self) -> karyos_sys::diag::ErrorLogReader {
+        self.diagnostics.error_reader()
+    }
+
+    /// A reader of the driver's loss report.
+    #[must_use]
+    pub fn loss_report(&self) -> karyos_sys::diag::LossReportReader {
+        self.diagnostics.loss_reader()
     }
 
     /// The driver instance's random 128-bit `driver_id` (SPEC.md §4), as

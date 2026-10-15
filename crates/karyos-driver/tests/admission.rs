@@ -230,6 +230,22 @@ fn hellos_that_break_the_profile_are_refused() {
         None
     );
     assert_eq!(driver.clients(), 0);
+    // Each refusal reached the error log, keyed by its code: three
+    // profile refusals and one version refusal (P7 o3).
+    let mut occurrences = std::collections::HashMap::new();
+    let _ = driver.error_log().scan(&mut 0, |record| {
+        assert_eq!(
+            record.code,
+            karyos_driver::diagnostics::ErrorCode::HelloRejected as u32
+        );
+        *occurrences.entry(record.key).or_insert(0) += record.occurrences;
+    });
+    assert_eq!(occurrences.get(&[0, refusal::PROFILE]), Some(&3));
+    assert_eq!(
+        occurrences.get(&[0, refusal::INCOMPATIBLE_VERSION]),
+        Some(&1)
+    );
+    assert_eq!(occurrences.len(), 2);
 }
 
 #[test]

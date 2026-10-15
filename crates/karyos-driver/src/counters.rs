@@ -85,7 +85,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 39] = [
+const LABELS: [(u64, &str); 42] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -125,6 +125,9 @@ const LABELS: [(u64, &str); 39] = [
     (TYPE_GAUGE, "spare reservations in use"),
     (TYPE_GAUGE, "loans outstanding"),
     (TYPE_EVENTS, "retirement pool exhausted"),
+    (TYPE_EVENTS, "error events dropped"),
+    (TYPE_EVENTS, "error records overwritten"),
+    (TYPE_EVENTS, "loss records overwritten"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -224,6 +227,12 @@ pub(crate) enum Event {
     LoansOutstanding,
     /// Reconfigurations refused because the retirement pool is full.
     RetirementPoolExhausted,
+    /// Error events lost before reaching the error log.
+    ErrorEventsDropped,
+    /// Error log records overwritten.
+    ErrorRecordsOverwritten,
+    /// Loss report records overwritten.
+    LossRecordsOverwritten,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -445,6 +454,9 @@ mod tests {
             (Event::SpareReservationsInUse, "spare reservations in use"),
             (Event::LoansOutstanding, "loans outstanding"),
             (Event::RetirementPoolExhausted, "retirement pool exhausted"),
+            (Event::ErrorEventsDropped, "error events dropped"),
+            (Event::ErrorRecordsOverwritten, "error records overwritten"),
+            (Event::LossRecordsOverwritten, "loss records overwritten"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

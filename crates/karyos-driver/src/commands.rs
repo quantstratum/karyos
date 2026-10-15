@@ -247,6 +247,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 continue;
             }
             self.counters.add(Event::RequiredParticipantsLost, 1);
+            let [high, low] = self.driver_id;
+            let loss = karyos_sys::diag::LossRecord {
+                kind: crate::diagnostics::LossKind::RequiredParticipantLost as u16,
+                configured_policy: crate::diagnostics::policy_code(policy),
+                applied_policy: crate::diagnostics::policy_code(policy),
+                instance: u128::from(high) << 64 | u128::from(low),
+                stream_registration: stream,
+                incarnation: crate::embedded::FIRST_INCARNATION,
+                stream_id: u64::from(key.stream_id.cast_unsigned()),
+                from: position,
+                to: position,
+                participant: registration,
+                client,
+                ..karyos_sys::diag::LossRecord::default()
+            };
+            self.diagnostics.loss(&mut self.counters, loss);
+            if matches!(revocation, Revocation::Sealed) && was_active {
+                // The `abort` policy sealed the incarnation at `position`.
+                let aborted = karyos_sys::diag::LossRecord {
+                    kind: crate::diagnostics::LossKind::AbortedIncarnation as u16,
+                    ..loss
+                };
+                self.diagnostics.loss(&mut self.counters, aborted);
+            }
             self.emit(&DriverEvent::ParticipantLost {
                 stream: key,
                 registration,
@@ -455,6 +479,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             served += 1;
             let Some(command) = decoded else {
                 // Malformed: no response, the client is faulty.
+                self.diagnostics.error(
+                    &mut self.counters,
+                    crate::diagnostics::ErrorCode::ClientProtocolViolation,
+                    [client, copied.map_or(0, |(type_id, _)| u64::from(type_id))],
+                    "malformed command; the client is retired",
+                );
                 self.retire_faulty(index);
                 continue;
             };
@@ -1595,6 +1625,19 @@ mod tests {
         let _ = driver.do_work().unwrap();
         // No response, client retired and told so, slot still charged.
         assert_eq!(observer.receive(), Received::Pending);
+        // The error log names the client and the command type.
+        let mut records = Vec::new();
+        let _ = driver
+            .error_log()
+            .scan(&mut 0, |record| records.push(record));
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            (records[0].code, records[0].key),
+            (
+                crate::diagnostics::ErrorCode::ClientProtocolViolation as u32,
+                [driver.clients[0].id, 0x99]
+            )
+        );
         assert_eq!(driver.clients(), 1);
         assert!(driver.clients[0].consumer.is_none());
         assert!(producer.is_closed());
