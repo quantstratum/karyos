@@ -11,9 +11,13 @@ use karyos_sys::log_buffer::{
 };
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
+use karyos_protocol::frame::TraceExtension;
+use karyos_protocol::trace_hook::{PublicationIdentity, TraceHook};
+
 use crate::error::ClientError;
 use crate::generation::{End, GenerationLink, Next, Successor, representable};
 use crate::link::{Export, Lease, Origin};
+use crate::trace::{PublishTrace, TraceDecision};
 
 /// Result of an offer. Each call performs at most one append attempt:
 /// padding, rotation and waiting for the driver are reported to the caller
@@ -134,6 +138,8 @@ pub struct ClientClaim<'a, T: TermBytes = HeapTerms> {
     lane: Lane,
     /// The base of the claim's mapping generation.
     base: u64,
+    /// The handle's trace and the claim's extension, for a traced claim.
+    trace: Option<(&'a mut PublishTrace, TraceExtension)>,
 }
 
 impl<T: TermBytes> ClientClaim<'_, T> {
@@ -154,14 +160,19 @@ impl<T: TermBytes> ClientClaim<'_, T> {
         self.inner.payload()
     }
 
-    /// Commits the block: exactly one of commit and abort wins.
+    /// Commits the block: exactly one of commit and abort wins. A traced
+    /// claim records its `Publish` observation after a winning commit; an
+    /// aborted one records nothing.
     pub fn commit(self) -> CommitOutcome {
         let (lane, base) = (self.lane, self.base);
         match self.inner.commit() {
-            SysCommitOutcome::Committed { position } => CommitOutcome::Accepted {
-                lane,
-                position: base + position,
-            },
+            SysCommitOutcome::Committed { position } => {
+                let position = base + position;
+                if let Some((trace, extension)) = self.trace {
+                    trace.committed(&extension, lane, position);
+                }
+                CommitOutcome::Accepted { lane, position }
+            }
             SysCommitOutcome::Aborted { position } => CommitOutcome::Aborted {
                 lane,
                 position: base + position,
@@ -186,6 +197,8 @@ pub struct ClientPublication<T: TermBytes = HeapTerms> {
     link: Option<Arc<GenerationLink<T>>>,
     /// The stream position where this handle's mapping starts.
     base: u64,
+    /// The trace hook and publication identity, for a traced handle.
+    trace: Option<PublishTrace>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -216,9 +229,89 @@ impl<T: TermBytes> ClientPublication<T> {
             origin: None,
             link: None,
             base: 0,
+            trace: None,
             _lease: None,
             _export: None,
         }
+    }
+
+    /// Traces this handle's messages through `hook`, which records them for
+    /// the publication `identity` (control path).
+    #[must_use]
+    pub fn with_trace(mut self, hook: Box<dyn TraceHook>, identity: PublicationIdentity) -> Self {
+        self.trace = Some(PublishTrace::new(hook, identity));
+        self
+    }
+
+    /// Whether the handle has a trace hook.
+    #[must_use]
+    pub fn is_traced(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// Control path: lets the hook refill what the data path consumes. Call
+    /// it from the handle's thread in the application's control loop.
+    pub fn trace_maintenance(&mut self) {
+        if let Some(trace) = &mut self.trace {
+            trace.maintain();
+        }
+    }
+
+    /// Decides once whether to trace a logical message caused by `parent`
+    /// (the trace context of the message being handled, if any). Pass the
+    /// decision to every attempt of that message; without a hook the
+    /// message is untraced.
+    pub fn trace_message(&mut self, parent: Option<&TraceExtension>) -> TraceDecision {
+        let lane = self.inner.buffer().lane();
+        match &mut self.trace {
+            Some(trace) => trace.decide(parent, lane),
+            None => TraceDecision::UNTRACED,
+        }
+    }
+
+    /// Offers one message with `decision`'s extension in every fragment. A
+    /// return other than `Accepted` appended nothing: retry with the same
+    /// decision. An accepted traced message records its `Publish`
+    /// observation.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientPublication::offer`]; the extension is part of the
+    /// message size.
+    pub fn offer_with_trace(
+        &mut self,
+        payload: &[u8],
+        decision: &TraceDecision,
+    ) -> Result<OfferOutcome, ClientError> {
+        let options = AppendOptions {
+            extension: decision.bytes(),
+            ..AppendOptions::default()
+        };
+        let outcome = self.offer_with(payload, options)?;
+        if let (OfferOutcome::Accepted { lane, position }, Some(extension), Some(trace)) =
+            (outcome, decision.extension(), &mut self.trace)
+        {
+            trace.committed(&extension, lane, position);
+        }
+        Ok(outcome)
+    }
+
+    /// Claims with `decision`'s extension; the claim records the `Publish`
+    /// observation when its commit wins.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientPublication::try_claim`].
+    pub fn try_claim_with_trace(
+        &mut self,
+        length: u32,
+        decision: &TraceDecision,
+    ) -> Result<ClaimOutcome<'_, T>, ClientError> {
+        let options = AppendOptions {
+            extension: decision.bytes(),
+            ..AppendOptions::default()
+        };
+        self.claim(length, options, decision.extension())
     }
 
     /// Attaches the generation link the driver keeps for this handle, and
@@ -361,6 +454,16 @@ impl<T: TermBytes> ClientPublication<T> {
         length: u32,
         options: AppendOptions,
     ) -> Result<ClaimOutcome<'_, T>, ClientError> {
+        self.claim(length, options, None)
+    }
+
+    /// One claim attempt; a traced claim carries the handle's trace.
+    fn claim(
+        &mut self,
+        length: u32,
+        options: AppendOptions,
+        extension: Option<TraceExtension>,
+    ) -> Result<ClaimOutcome<'_, T>, ClientError> {
         // A forgotten claim is resolved before any early return; the
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
@@ -378,10 +481,17 @@ impl<T: TermBytes> ClientPublication<T> {
         let lane = self.inner.buffer().lane();
         let base = self.base;
         let link = self.link.as_deref();
+        let trace = match (extension, &mut self.trace) {
+            (Some(extension), Some(trace)) => Some((trace, extension)),
+            _ => None,
+        };
         Ok(match self.inner.try_claim(length, options)? {
-            SysClaimOutcome::Claimed(inner) => {
-                ClaimOutcome::Claimed(ClientClaim { inner, lane, base })
-            }
+            SysClaimOutcome::Claimed(inner) => ClaimOutcome::Claimed(ClientClaim {
+                inner,
+                lane,
+                base,
+                trace,
+            }),
             SysClaimOutcome::BackPressured => ClaimOutcome::BackPressured,
             SysClaimOutcome::AdminAction => ClaimOutcome::AdminAction,
             SysClaimOutcome::Aborted { position } => ClaimOutcome::Aborted {

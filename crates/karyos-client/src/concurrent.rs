@@ -13,10 +13,14 @@ use karyos_sys::log_buffer::{
 };
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
+use karyos_protocol::frame::TraceExtension;
+use karyos_protocol::trace_hook::{PublicationIdentity, TraceHook};
+
 use crate::error::ClientError;
 use crate::generation::{End, GenerationLink, Next, Successor, representable};
 use crate::link::{Export, Lease, Origin};
 use crate::publication::CommitOutcome;
+use crate::trace::{PublishTrace, TraceDecision};
 
 /// Result of [`ClientConcurrentPublication::offer`]. Each call performs at
 /// most one reservation attempt and one rotation attempt; nothing is
@@ -120,6 +124,8 @@ pub struct ClientConcurrentClaim<'a, T: TermBytes = HeapTerms> {
     lane: Lane,
     /// The base of the claim's mapping generation.
     base: u64,
+    /// The handle's trace and the claim's extension, for a traced claim.
+    trace: Option<(&'a mut PublishTrace, TraceExtension)>,
 }
 
 impl<T: TermBytes> ClientConcurrentClaim<'_, T> {
@@ -140,14 +146,19 @@ impl<T: TermBytes> ClientConcurrentClaim<'_, T> {
         self.inner.payload()
     }
 
-    /// Commits the block: exactly one of commit and abort wins.
+    /// Commits the block: exactly one of commit and abort wins. A traced
+    /// claim records its `Publish` observation after a winning commit; an
+    /// aborted one records nothing.
     pub fn commit(self) -> CommitOutcome {
         let (lane, base) = (self.lane, self.base);
         match self.inner.commit() {
-            SysCommitOutcome::Committed { position } => CommitOutcome::Accepted {
-                lane,
-                position: base + position,
-            },
+            SysCommitOutcome::Committed { position } => {
+                let position = base + position;
+                if let Some((trace, extension)) = self.trace {
+                    trace.committed(&extension, lane, position);
+                }
+                CommitOutcome::Accepted { lane, position }
+            }
             SysCommitOutcome::Aborted { position } => CommitOutcome::Aborted {
                 lane,
                 position: base + position,
@@ -175,6 +186,8 @@ pub struct ClientConcurrentPublication<T: TermBytes = HeapTerms> {
     link: Option<Arc<GenerationLink<T>>>,
     /// The stream position where this handle's mapping starts.
     base: u64,
+    /// The trace hook and publication identity, for a traced handle.
+    trace: Option<PublishTrace>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -205,6 +218,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             origin: None,
             link: None,
             base: 0,
+            trace: None,
             _lease: None,
             _export: None,
         }
@@ -318,6 +332,80 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         }
     }
 
+    /// Traces this handle's messages through `hook`, which records them for
+    /// the publication `identity` (control path).
+    #[must_use]
+    pub fn with_trace(mut self, hook: Box<dyn TraceHook>, identity: PublicationIdentity) -> Self {
+        self.trace = Some(PublishTrace::new(hook, identity));
+        self
+    }
+
+    /// Whether the handle has a trace hook.
+    #[must_use]
+    pub fn is_traced(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// Control path: lets the hook refill what the data path consumes.
+    pub fn trace_maintenance(&mut self) {
+        if let Some(trace) = &mut self.trace {
+            trace.maintain();
+        }
+    }
+
+    /// Decides once whether to trace a logical message caused by `parent`;
+    /// pass the decision to every attempt of that message.
+    pub fn trace_message(&mut self, parent: Option<&TraceExtension>) -> TraceDecision {
+        let lane = self.inner.buffer().lane();
+        match &mut self.trace {
+            Some(trace) => trace.decide(parent, lane),
+            None => TraceDecision::UNTRACED,
+        }
+    }
+
+    /// Offers one message with `decision`'s extension in every fragment; an
+    /// accepted traced message records its `Publish` observation. Any other
+    /// return appended nothing: retry with the same decision.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConcurrentPublication::offer`].
+    pub fn offer_with_trace(
+        &mut self,
+        payload: &[u8],
+        decision: &TraceDecision,
+    ) -> Result<ConcurrentOfferOutcome, ClientError> {
+        let options = AppendOptions {
+            extension: decision.bytes(),
+            ..AppendOptions::default()
+        };
+        let outcome = self.offer_with(payload, options)?;
+        if let (ConcurrentOfferOutcome::Accepted { lane, position }, Some(extension), Some(trace)) =
+            (outcome, decision.extension(), &mut self.trace)
+        {
+            trace.committed(&extension, lane, position);
+        }
+        Ok(outcome)
+    }
+
+    /// Claims with `decision`'s extension; the claim records the `Publish`
+    /// observation when its commit wins.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConcurrentPublication::try_claim`].
+    pub fn try_claim_with_trace(
+        &mut self,
+        length: u32,
+        decision: &TraceDecision,
+    ) -> Result<ConcurrentClaimOutcome<'_, T>, ClientError> {
+        let options = AppendOptions {
+            extension: decision.bytes(),
+            ..AppendOptions::default()
+        };
+        self.claim(length, options, decision.extension())
+    }
+
     /// Claims one unfragmented block of `length` payload bytes.
     ///
     /// # Errors
@@ -341,6 +429,16 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         length: u32,
         options: AppendOptions,
     ) -> Result<ConcurrentClaimOutcome<'_, T>, ClientError> {
+        self.claim(length, options, None)
+    }
+
+    /// One claim attempt; a traced claim carries the handle's trace.
+    fn claim(
+        &mut self,
+        length: u32,
+        options: AppendOptions,
+        extension: Option<TraceExtension>,
+    ) -> Result<ConcurrentClaimOutcome<'_, T>, ClientError> {
         // A forgotten claim is resolved before any early return; the
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
@@ -358,11 +456,16 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         let lane = self.inner.buffer().lane();
         let base = self.base;
         let end = End::peek(self.link.as_deref());
+        let trace = match (extension, &mut self.trace) {
+            (Some(extension), Some(trace)) => Some((trace, extension)),
+            _ => None,
+        };
         Ok(claim_outcome(
             self.inner.try_claim(length, options)?,
             lane,
             base,
             end,
+            trace,
         ))
     }
 
@@ -431,16 +534,20 @@ fn offer_outcome(outcome: SysOfferOutcome, lane: Lane, base: u64) -> ConcurrentO
 
 /// The sys claim outcome on the buffer's lane.
 /// `end` is what a just-closed handle reports: the next call moves.
-fn claim_outcome<T: TermBytes>(
-    outcome: SysClaimOutcome<'_, Arc<LogBuffer<T>>>,
+fn claim_outcome<'a, T: TermBytes>(
+    outcome: SysClaimOutcome<'a, Arc<LogBuffer<T>>>,
     lane: Lane,
     base: u64,
     end: End,
-) -> ConcurrentClaimOutcome<'_, T> {
+    trace: Option<(&'a mut PublishTrace, TraceExtension)>,
+) -> ConcurrentClaimOutcome<'a, T> {
     match outcome {
-        SysClaimOutcome::Claimed(inner) => {
-            ConcurrentClaimOutcome::Claimed(ClientConcurrentClaim { inner, lane, base })
-        }
+        SysClaimOutcome::Claimed(inner) => ConcurrentClaimOutcome::Claimed(ClientConcurrentClaim {
+            inner,
+            lane,
+            base,
+            trace,
+        }),
         SysClaimOutcome::BackPressured => ConcurrentClaimOutcome::BackPressured,
         SysClaimOutcome::AdminAction => ConcurrentClaimOutcome::AdminAction,
         SysClaimOutcome::Aborted { position } => ConcurrentClaimOutcome::Aborted {
@@ -485,15 +592,21 @@ mod tests {
             ConcurrentOfferOutcome::AdminAction
         );
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::Aborted { position: 128 }, lane, 1000, End::Closed),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::Aborted { position: 128 }, lane, 1000, End::Closed, None),
             ConcurrentClaimOutcome::Aborted { lane: l, position: 1128 } if l == lane
         ));
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::BackPressured, lane, 1000, End::Closed),
+            claim_outcome::<HeapTerms>(
+                SysClaimOutcome::BackPressured,
+                lane,
+                1000,
+                End::Closed,
+                None
+            ),
             ConcurrentClaimOutcome::BackPressured
         ));
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::AdminAction, lane, 1000, End::Closed),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::AdminAction, lane, 1000, End::Closed, None),
             ConcurrentClaimOutcome::AdminAction
         ));
         assert_eq!(
@@ -501,12 +614,12 @@ mod tests {
             ConcurrentOfferOutcome::Closed
         );
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::Closed, lane, 1000, End::Closed),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::Closed, lane, 1000, End::Closed, None),
             ConcurrentClaimOutcome::Closed
         ));
         // A cutover is coming: the just-closed handle retries.
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::Closed, lane, 1000, End::Retry),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::Closed, lane, 1000, End::Retry, None),
             ConcurrentClaimOutcome::AdminAction
         ));
     }

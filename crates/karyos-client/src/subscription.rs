@@ -17,9 +17,13 @@ use karyos_sys::frame::EXTENSION_LENGTH;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SkipReason, Subscription};
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
+use karyos_protocol::frame::TraceExtension;
+use karyos_protocol::trace_hook::{PublicationIdentity, SubscriberIdentity, TraceHook};
+
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Next, Successor, representable};
 use crate::link::{Export, Lease, Origin};
+use crate::trace::DeliveryTrace;
 
 /// Metadata delivered with each message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +36,18 @@ pub struct MessageInfo {
     pub end_of_stream: bool,
     /// The opaque trace extension, if the message carries one.
     pub extension: Option<[u8; EXTENSION_LENGTH as usize]>,
+}
+
+impl MessageInfo {
+    /// The decoded trace context (SPEC.md §10, `Fragment::trace()`): `None`
+    /// for an untraced message and for an extension that does not decode,
+    /// which the subscription counts. Pass it as the parent of the messages
+    /// this one causes.
+    #[must_use]
+    pub fn trace(&self) -> Option<TraceExtension> {
+        self.extension
+            .and_then(|bytes| TraceExtension::decode(&bytes).ok())
+    }
 }
 
 /// Upper bound on whole messages delivered by one poll. Counts reassembled
@@ -136,6 +152,11 @@ pub struct ClientSubscription<T: TermBytes = HeapTerms> {
     link: Option<Arc<GenerationLink<T>>>,
     /// The stream position where this handle's mapping starts.
     base: u64,
+    /// The trace hook, identities and delivery boundary, for a traced
+    /// subscription.
+    trace: Option<DeliveryTrace>,
+    /// Messages whose extension did not decode; delivered untraced.
+    invalid_extensions: u64,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -167,9 +188,55 @@ impl<T: TermBytes> ClientSubscription<T> {
             origin: None,
             link: None,
             base: 0,
+            trace: None,
+            invalid_extensions: 0,
             _lease: None,
             _export: None,
         }
+    }
+
+    /// Records the `SubscriberPoll` observation of every traced message
+    /// through `hook`, for messages of `publication` received by
+    /// `subscriber` (control path). Each position is recorded at its first
+    /// delivery attempt only.
+    #[must_use]
+    pub fn with_trace(
+        mut self,
+        hook: Box<dyn TraceHook>,
+        publication: PublicationIdentity,
+        subscriber: SubscriberIdentity,
+    ) -> Self {
+        self.trace = Some(DeliveryTrace::new(hook, publication, subscriber));
+        self
+    }
+
+    /// Whether the subscription has a trace hook.
+    #[must_use]
+    pub fn is_traced(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// Control path: lets the hook refill what it consumes.
+    pub fn trace_maintenance(&mut self) {
+        if let Some(trace) = &mut self.trace {
+            trace.maintain();
+        }
+    }
+
+    /// The delivery boundary of a traced subscription: one past the start of
+    /// the highest message it attempted to deliver, advanced before the
+    /// handler runs and independently of acknowledgement; 0 before the
+    /// first attempt or without a hook. A message at `p` was attempted when
+    /// the boundary is above `p`.
+    #[must_use]
+    pub fn delivery_boundary(&self) -> u64 {
+        self.trace.as_ref().map_or(0, DeliveryTrace::boundary)
+    }
+
+    /// Messages delivered whose extension did not decode.
+    #[must_use]
+    pub fn invalid_extensions(&self) -> u64 {
+        self.invalid_extensions
     }
 
     /// Attaches the generation link the driver keeps for this handle, and
@@ -285,6 +352,17 @@ impl<T: TermBytes> ClientSubscription<T> {
                         end_of_stream,
                         extension,
                     };
+                    if let Some(trace) = &mut self.trace {
+                        let decoded = info.trace();
+                        if decoded.is_none() && extension.is_some() {
+                            self.invalid_extensions += 1;
+                        }
+                        let lane = self.inner.buffer().lane();
+                        trace.attempt(decoded.as_ref(), lane, info.position);
+                    } else if extension.is_some_and(|bytes| TraceExtension::decode(&bytes).is_err())
+                    {
+                        self.invalid_extensions += 1;
+                    }
                     let message = self.scratch.get(..length as usize).unwrap_or(&[]);
                     handler(message, info);
                     // Reached only if the handler returned.
