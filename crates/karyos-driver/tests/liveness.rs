@@ -432,3 +432,18 @@ fn test_driver_events_an_optional_subscriber_loss_reports_nothing() {
     assert!(observed_work(&mut driver, &mut observer).is_empty());
     assert_eq!(counter(&driver, "participants revoked"), 1);
 }
+
+#[test]
+fn test_driver_events_an_orderly_close_at_the_deadline_is_not_a_loss() {
+    let (mut driver, clock) = driver();
+    let stream = driver.add_stream(stream_config(LossPolicy::Abort)).unwrap();
+    let mut observer = beating(&mut driver);
+    let (client, subscription) = required_subscriber(&mut driver, &mut observer);
+    time_out(&clock);
+    drop(subscription);
+    client.close();
+    assert!(observed_work(&mut driver, &mut observer).is_empty());
+    assert_eq!(counter(&driver, "clients timed out"), 0);
+    assert_eq!(counter(&driver, "required participants lost"), 0);
+    assert_eq!(driver.seal_state(stream).unwrap(), SealState::Active);
+}
