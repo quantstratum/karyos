@@ -136,6 +136,9 @@ pub enum RegionKind {
     Counters,
     /// One log buffer generation.
     LogBuffer,
+    /// The client counters, which the client maps writable to update the
+    /// cells the driver allocated for it.
+    ClientCounters,
 }
 
 impl RegionKind {
@@ -145,6 +148,7 @@ impl RegionKind {
             Self::Broadcast => 2,
             Self::Counters => 3,
             Self::LogBuffer => 4,
+            Self::ClientCounters => 5,
         }
     }
 
@@ -154,6 +158,7 @@ impl RegionKind {
             2 => Some(Self::Broadcast),
             3 => Some(Self::Counters),
             4 => Some(Self::LogBuffer),
+            5 => Some(Self::ClientCounters),
             _ => None,
         }
     }
@@ -604,11 +609,18 @@ mod tests {
             instance: u128::MAX - 7,
             version: VERSION,
             client: 4,
-            records: vec![Record {
-                kind: RegionKind::CommandRing,
-                capability: Capability::None,
-                ..record(1, Capability::None)
-            }],
+            records: vec![
+                Record {
+                    kind: RegionKind::CommandRing,
+                    capability: Capability::None,
+                    ..record(1, Capability::None)
+                },
+                Record {
+                    kind: RegionKind::ClientCounters,
+                    capability: Capability::None,
+                    ..record(2, Capability::None)
+                },
+            ],
         });
         let capabilities = [
             Capability::None,

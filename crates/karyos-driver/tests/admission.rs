@@ -187,6 +187,53 @@ fn a_remote_client_is_admitted_served_and_leaves() {
     serve_until(&mut driver, |driver| driver.clients() == 0);
 }
 
+/// A remote client maps the client counters region writable: a counter it
+/// writes is read by the driver, and while it lives the client does not
+/// send `Leave`, so its cell stays charged; once it is gone, `Leave`
+/// releases the slot and the cell.
+#[test]
+fn a_remote_client_counter_is_written_and_outlives_its_client() {
+    let dir = dir("counter");
+    let mut driver = system_driver(&dir);
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let id = client.client();
+    let sequence = client.allocate_counter(9, "remote events", 0, 0).unwrap();
+    let mut done: Vec<Completion> = Vec::new();
+    let start = Instant::now();
+    while done.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "timed out");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    let completion = done.pop().unwrap();
+    assert_eq!(completion.sequence, sequence);
+    let Outcome::Counter(counter) = completion.outcome else {
+        panic!("expected a counter, got {:?}", completion.outcome);
+    };
+    assert_eq!(counter.increment(6), Ok(6));
+    let reader = driver.client_counters();
+    let karyos_sys::counters::CellRead::Allocated {
+        metadata, value, ..
+    } = reader.read(counter.cell())
+    else {
+        panic!("expected an allocated cell");
+    };
+    assert_eq!(value, 6);
+    assert_eq!(metadata.registration_id, counter.registration());
+    assert_eq!(metadata.keys.participant, id);
+    // The client is closed while its counter lives: no Leave yet.
+    drop(client);
+    for _ in 0..10 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(driver.clients(), 1);
+    assert_eq!(counter.increment(1), Ok(7));
+    let cell = counter.cell();
+    drop(counter);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(reader.read(cell), karyos_sys::counters::CellRead::Free);
+}
+
 #[test]
 fn hellos_that_break_the_profile_are_refused() {
     let dir = dir("hello");

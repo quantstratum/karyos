@@ -7,7 +7,8 @@
 //! A connection must send a valid `Hello` with the client's pidfd within
 //! the hello timeout. The driver then creates the client's command ring in
 //! a region, registers the client, and queues `Admitted` with the manifest
-//! of its CnC regions (command ring, broadcast buffer, counters), followed
+//! of its CnC regions (command ring, broadcast buffer, counters, client
+//! counters), followed
 //! by one `Region` message per record with its descriptor. Every socket is
 //! non-blocking; each client's outbound queue is bounded and drained from
 //! the duty cycle, and a client whose next message does not fit is
@@ -56,8 +57,11 @@ pub(crate) const BROADCAST_REGION: u64 = 1;
 pub(crate) const COUNTERS_REGION: u64 = 2;
 /// First region id of the command rings.
 const FIRST_RING_REGION: u64 = 3;
+/// CnC regions of the bootstrap: the command ring, the broadcast buffer,
+/// the driver counters and the client counters.
+const BOOTSTRAP_REGIONS: u64 = 4;
 /// Messages of the bootstrap: `Admitted` and one `Region` per CnC record.
-const BOOTSTRAP_MESSAGES: usize = 4;
+const BOOTSTRAP_MESSAGES: usize = 1 + BOOTSTRAP_REGIONS as usize;
 
 /// Settings of the admission socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,7 +74,7 @@ pub struct IpcConfig {
     /// How long a connection has to send `Hello`, in the driver clock's
     /// unit.
     pub hello_timeout: u64,
-    /// Messages queued for one client; at least the four of its bootstrap.
+    /// Messages queued for one client; at least the five of its bootstrap.
     pub max_outbound_per_client: usize,
     /// How long a client has to take its bootstrap (`Admitted` and its
     /// `Region` messages), in the driver clock's unit; a client that has
@@ -210,6 +214,7 @@ fn record(region: &Region, export: u64) -> Option<Record> {
         RegionKind::Broadcast => WireKind::Broadcast,
         RegionKind::Counters => WireKind::Counters,
         RegionKind::LogBuffer => WireKind::LogBuffer,
+        RegionKind::ClientCounters => WireKind::ClientCounters,
         // Granted to tools, not over the client manifest (P7 o4).
         RegionKind::ErrorLog | RegionKind::LossReport => return None,
     };
@@ -457,13 +462,14 @@ impl<T: StreamTerms> Admission<T> {
         let mut next_region = self.next_region;
         let mut next_export = driver.next_export;
         let region = Self::take_ids(&mut next_region, 1)?;
-        let first_export = Self::take_ids(&mut next_export, 3)?;
+        let first_export = Self::take_ids(&mut next_export, BOOTSTRAP_REGIONS)?;
         let consumer =
             RingConsumer::create_in(self.instance, region, driver.config.ring_capacity).ok()?;
         let regions = [
             consumer.region()?,
             driver.broadcast.region()?,
             driver.counters.region()?,
+            driver.client_counters.region()?,
         ];
         let mut records = Vec::with_capacity(regions.len());
         let mut fds = Vec::with_capacity(regions.len());

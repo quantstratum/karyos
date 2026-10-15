@@ -47,6 +47,7 @@ use karyos_sys::term::Generation;
 use karyos_sys::term_bytes::SharedTerms;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
+use crate::client_counters::ClientCounters;
 use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
 use crate::counters::{DriverCounters, Event};
@@ -189,6 +190,13 @@ pub struct DriverConfig {
     /// record instead of writing a new one, in host `CLOCK_MONOTONIC`
     /// nanoseconds.
     pub error_dedup_window: u64,
+    /// Cells of the client counters region, which clients allocate with
+    /// `AllocateCounter` (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Client counters").
+    pub client_counters_capacity: usize,
+    /// Client counter cells one client holds at once; an allocation beyond
+    /// it is refused with `ResourcesUnavailable`.
+    pub max_counters_per_client: usize,
 }
 
 impl Default for DriverConfig {
@@ -219,6 +227,8 @@ impl Default for DriverConfig {
             error_log_records: karyos_sys::diag::DEFAULT_ERROR_RECORDS,
             loss_report_records: karyos_sys::diag::DEFAULT_LOSS_RECORDS,
             error_dedup_window: 1_000_000_000,
+            client_counters_capacity: 1024,
+            max_counters_per_client: 64,
         }
     }
 }
@@ -353,6 +363,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) scan_cursor: usize,
     pub(crate) terminal: bool,
     pub(crate) counters: DriverCounters,
+    /// The client counters region and the owner of each allocated cell.
+    pub(crate) client_counters: ClientCounters,
     /// The clock of claim deadlines and of the admission timeout.
     pub(crate) clock: Box<dyn MonotonicClock>,
     /// The next export id: one checked namespace, never reused, for the
@@ -458,6 +470,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             && config.position_sample_interval > 0
             && config.error_log_records > 0
             && config.loss_report_records > 0
+            && config.client_counters_capacity > 0
+            && config.max_counters_per_client > 0
             && config.cutover_deadline > 0
             && config.heartbeat_interval > 0
             && config
@@ -475,7 +489,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::InvalidConfig);
         }
         #[cfg(target_os = "linux")]
-        let (broadcast, counters, admission, diagnostics) = match ipc {
+        let (broadcast, counters, client_counters, admission, diagnostics) = match ipc {
             Some(ipc) => {
                 let (mut admission, instance) = crate::admission::Admission::new(ipc)?;
                 let broadcast = BroadcastTransmitter::create_in(
@@ -490,21 +504,42 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     config.counters_capacity,
                 )?;
                 let diagnostics = crate::diagnostics::Diagnostics::new_in(&mut admission, &config)?;
-                (broadcast, counters, Some(admission), diagnostics)
+                let (_, region) = admission.next_region()?;
+                let client_counters = ClientCounters::new_in(
+                    instance,
+                    region,
+                    config.client_counters_capacity,
+                    config.max_counters_per_client,
+                )?;
+                (
+                    broadcast,
+                    counters,
+                    client_counters,
+                    Some(admission),
+                    diagnostics,
+                )
             }
             None => (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
                 DriverCounters::with_capacity(config.counters_capacity)?,
+                ClientCounters::new(
+                    config.client_counters_capacity,
+                    config.max_counters_per_client,
+                )?,
                 None,
                 crate::diagnostics::Diagnostics::new(&config)?,
             ),
         };
         #[cfg(not(target_os = "linux"))]
-        let (broadcast, counters, diagnostics) = {
+        let (broadcast, counters, client_counters, diagnostics) = {
             let _ = ipc;
             (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
                 DriverCounters::with_capacity(config.counters_capacity)?,
+                ClientCounters::new(
+                    config.client_counters_capacity,
+                    config.max_counters_per_client,
+                )?,
                 crate::diagnostics::Diagnostics::new(&config)?,
             )
         };
@@ -518,6 +553,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         karyos_sys::random::fill_u64s(&mut driver_id)?;
         Ok(Self {
             counters,
+            client_counters,
             id,
             driver_id,
             next_trace_number: 1,
@@ -597,6 +633,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     #[must_use]
     pub fn counters(&self) -> karyos_sys::counters::CountersReader {
         self.counters.reader()
+    }
+
+    /// A read-only view of the client counters region, for tools: the cells
+    /// clients allocated with `AllocateCounter` (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Client counters").
+    #[must_use]
+    pub fn client_counters(&self) -> karyos_sys::counters::CountersReader {
+        self.client_counters.reader()
     }
 
     /// Refreshes every gauge from the current state.

@@ -297,7 +297,7 @@ fn test_admission_handed_out_regions_refuse_resize() {
     let mut regions = Vec::new();
     let mut admitted = false;
     let start = Instant::now();
-    while regions.len() < 3 {
+    while regions.len() < 4 {
         assert!(start.elapsed() < Duration::from_secs(5), "timed out");
         let _ = driver.do_work().unwrap();
         let mut buffer = [0u8; MAX_MESSAGE_LENGTH];

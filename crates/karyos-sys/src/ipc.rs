@@ -93,6 +93,9 @@ pub enum RegionKind {
     ErrorLog,
     /// The loss report (driver only).
     LossReport,
+    /// The client counters: the driver allocates the cells and each client
+    /// writes its own, so the region keeps the size seals only.
+    ClientCounters,
 }
 
 impl RegionKind {
@@ -104,6 +107,7 @@ impl RegionKind {
             Self::LogBuffer => 4,
             Self::ErrorLog => 6,
             Self::LossReport => 7,
+            Self::ClientCounters => 8,
         }
     }
 }

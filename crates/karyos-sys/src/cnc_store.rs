@@ -502,6 +502,85 @@ mod tests {
         }
     }
 
+    /// A client counters region crosses as a shared region: a client
+    /// attaches it writable and writes the cells allocated for it, which the
+    /// driver's reader and a read-only view see; its configuration line and
+    /// its kind are checked.
+    #[test]
+    fn a_client_counters_region_is_written_by_a_client_and_read_by_tools() {
+        let (mut manager, reader, _cells) = crate::counters::client_counters_in(7, 8, 4).unwrap();
+        let region = reader.region().unwrap();
+        assert_eq!(region.record().kind, RegionKind::ClientCounters);
+        let allocated = manager
+            .allocate_keyed(
+                crate::counters::TYPE_EVENT,
+                "loss reports dropped",
+                crate::counters::CounterKeys {
+                    stream: 0,
+                    lane: 0,
+                    kind: crate::counters::KIND_CLIENT,
+                    participant: 3,
+                },
+            )
+            .unwrap();
+        // The client side: a writable attach with the size seals only.
+        let cells =
+            crate::counters::ClientCells::attach(pass(region, RegionKind::ClientCounters).unwrap())
+                .unwrap();
+        assert_eq!(cells.capacity(), 4);
+        assert!(
+            cells
+                .counter(allocated.index(), allocated.registration_id() + 1)
+                .is_none()
+        );
+        assert!(cells.counter(4, allocated.registration_id()).is_none());
+        let counter = cells
+            .counter(allocated.index(), allocated.registration_id())
+            .unwrap();
+        assert_eq!(counter.increment(5), Ok(5));
+        assert!(matches!(
+            reader.read(allocated.index()),
+            CellRead::Allocated { value: 5, .. }
+        ));
+        // A tool reads it through a read-only view of the shared profile.
+        let tool = CountersReader::attach_read_only(
+            pass_read_only(region, RegionKind::ClientCounters, SealProfile::Shared).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            tool.read(allocated.index()),
+            CellRead::Allocated { value: 5, .. }
+        ));
+        // A region of another kind is no client counters region.
+        let (_driver, driver_reader) = crate::counters::counters_in(7, 9, 4).unwrap();
+        assert!(pass(driver_reader.region().unwrap(), RegionKind::Counters).is_err());
+        let ring = RingConsumer::create_in(7, 10, 1024).unwrap();
+        assert!(
+            crate::counters::ClientCells::attach(
+                pass(ring.region().unwrap(), RegionKind::CommandRing).unwrap()
+            )
+            .is_err()
+        );
+        // The configuration line is checked against the region.
+        let config = region.structure();
+        for (index, bad) in [(0usize, 0u64), (0, 5), (1, 1)] {
+            let word = config.get(index).unwrap();
+            let good = word.load(Ordering::Acquire);
+            word.store(bad, Ordering::Release);
+            assert!(
+                crate::counters::ClientCells::attach(
+                    pass(region, RegionKind::ClientCounters).unwrap()
+                )
+                .is_err(),
+                "word {index} = {bad}"
+            );
+            word.store(good, Ordering::Release);
+        }
+        assert!(crate::counters::client_counters_in(7, 11, 0).is_err());
+        drop(counter);
+        manager.free(allocated).unwrap();
+    }
+
     #[test]
     fn creation_checks_the_geometry() {
         assert!(RingConsumer::create_in(7, 1, 512).is_err());
