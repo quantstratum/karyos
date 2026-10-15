@@ -804,6 +804,21 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     }
 }
 
+impl<O: BufferOwner> ConcurrentPublication<O> {
+    /// Test hook: the holder dies. Nothing it owns in the buffer is
+    /// released (no claim resolution, loan release or slot release), as for
+    /// a process that exited; only its private heap memory is freed, so
+    /// leak checkers stay quiet.
+    #[cfg(test)]
+    pub(super) fn die(self) {
+        let mut this = core::mem::ManuallyDrop::new(self);
+        drop(core::mem::take(&mut this.staging));
+        // SAFETY: `this` is never used again and its destructor never
+        // runs; the owner is dropped once, here.
+        unsafe { core::ptr::drop_in_place(&raw mut this.buffer) };
+    }
+}
+
 impl<O: BufferOwner> Drop for ConcurrentPublication<O> {
     fn drop(&mut self) {
         self.resolve_claim();
