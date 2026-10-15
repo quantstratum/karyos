@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test loom loom-full sim bench miri build-release deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint doc test loom loom-full sim sim-arch unsafe-report bench miri build-release deny deps-inventory deps-check lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -38,6 +38,17 @@ sim:
 	end=$$(date +%s); \
 	printf 'simulator sweep elapsed: %s seconds (fixed seeds 1..=2000)\n' "$$((end - start))"; \
 	exit $$status
+
+# aarch64 native against emulated linux/amd64 (issue #11): timings and
+# outcomes only, never a gate; an emulated run that cannot complete is
+# reported as not verifiable on this host.
+sim-arch:
+	scripts/sim-arch-compare.sh
+
+# The workspace's `unsafe` surface from the source (issue #11): a report,
+# never a gate.
+unsafe-report:
+	scripts/unsafe-report.sh
 
 bench:
 	$(CARGO) run -p karyos-bench --release --locked -- $(BENCH_ARGS)
