@@ -302,15 +302,20 @@ impl LogBuffer<SharedTerms> {
     ///
     /// # Errors
     ///
-    /// Returns [`SysError::InvalidRegion`] for a configuration block that
-    /// is not valid or does not match the region, and the validation
-    /// errors of [`LogBuffer::new`].
+    /// Returns [`SysError::InvalidRegion`] for a region that is not a log
+    /// buffer region, a configuration block that is not valid or does not
+    /// match the region, and the validation errors of [`LogBuffer::new`].
     pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
         let record = region.record();
         let invalid = SysError::InvalidRegion {
             address: 0,
             len: record.structure_length,
         };
+        // The header matched the caller's record, which may name any kind:
+        // only a log buffer region holds this layout.
+        if record.kind != crate::ipc::RegionKind::LogBuffer {
+            return Err(invalid);
+        }
         let structure = region.structure();
         let mut words = [0u64; CONFIG_WORDS];
         for (index, word) in words.iter_mut().enumerate() {
@@ -3633,5 +3638,41 @@ mod region_tests {
             panic!("no message");
         };
         assert!(Region::attach(received.fd.unwrap(), other).is_err());
+    }
+
+    /// A self-consistent region of another kind whose structure holds a
+    /// valid log buffer layout passes the region's own header check, and
+    /// is refused by the kind gate of `LogBuffer::attach`.
+    #[test]
+    fn attach_refuses_a_region_of_another_kind() {
+        let creator =
+            LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
+        let record = creator.region().unwrap().record();
+        let imposter = Region::create(RegionRecord {
+            kind: RegionKind::Counters,
+            region: 8,
+            ..record
+        })
+        .unwrap();
+        let source = creator.region().unwrap().structure();
+        let target = imposter.structure();
+        for index in 0..CONFIG_WORDS {
+            let value = source.get(index).unwrap().load(Ordering::Acquire);
+            target.get(index).unwrap().store(value, Ordering::Release);
+        }
+        let (a, b) = seqpacket_pair().unwrap();
+        assert_eq!(
+            send(a.as_fd(), b"lb", imposter.descriptor()).unwrap(),
+            Sent::Sent
+        );
+        let mut buffer = [0u8; 8];
+        let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
+        let attached = Region::attach(received.fd.unwrap(), imposter.record()).unwrap();
+        assert!(matches!(
+            LogBuffer::attach(attached),
+            Err(SysError::InvalidRegion { .. })
+        ));
     }
 }
