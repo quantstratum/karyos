@@ -793,3 +793,67 @@ fn the_fetch_byte_bound_counts_the_region_header() {
         assert_eq!(refused, !accepted, "bound {bound} for a region of {size}");
     }
 }
+
+/// Serves until the driver closes `socket` (the client was retired or
+/// left).
+fn serve_until_closed(driver: &mut IpcDriver, socket: BorrowedFd<'_>) {
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(5), "never closed");
+        let _ = driver.do_work().unwrap();
+        let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
+        match ipc::recv(socket, &mut buffer) {
+            Ok(Recv::PeerClosed) | Err(_) => return,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// `Detach` of an exported grant ends its registration; `Leave` is then
+/// accepted and releases the client.
+#[test]
+fn a_detach_ends_an_exported_grant_and_then_leave_is_accepted() {
+    let dir = dir("detach");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let (client, export, fd) = fetched_subscription(&mut driver, &dir);
+    // The client unmapped the region: then it detaches.
+    drop(fd);
+    let socket = client.admission_socket().unwrap();
+    let detach = encode(&Message::Detach { export });
+    assert_eq!(ipc::send(socket, &detach, None).unwrap(), Sent::Sent);
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants detached") == 1
+    });
+    assert_eq!(counter(&driver, "grants ended"), 1);
+    let leave = encode(&Message::Leave);
+    assert_eq!(ipc::send(socket, &leave, None).unwrap(), Sent::Sent);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    drop(client);
+}
+
+/// `Leave` with an export left, and `Detach` of an export the client does
+/// not own, are protocol errors: the client is retired and its exported
+/// grant stays charged until the exit proof.
+#[test]
+fn leave_with_an_export_left_and_a_foreign_detach_retire_the_client() {
+    for message in [Message::Leave, Message::Detach { export: 1 << 40 }] {
+        let dir = dir("early-leave");
+        let mut driver = system_driver(&dir);
+        let _stream = driver.add_stream(shared_stream_config()).unwrap();
+        let (client, _export, _fd) = fetched_subscription(&mut driver, &dir);
+        let socket = client.admission_socket().unwrap();
+        assert_eq!(
+            ipc::send(socket, &encode(&message), None).unwrap(),
+            Sent::Sent
+        );
+        serve_until_closed(&mut driver, socket);
+        // This process lives on: the slot and the grant stay charged.
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(driver.clients(), 1);
+        assert_eq!(counter(&driver, "grants ended"), 0);
+        drop(client);
+    }
+}

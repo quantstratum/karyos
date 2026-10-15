@@ -13,16 +13,22 @@
 //! the duty cycle, and a client whose next message does not fit is
 //! retired.
 //!
+//! A client's log buffer grants (`quantstratum-docs:
+//! karyos/design/ipc-data-path.md`) live in its export ledger: a `Fetch` of
+//! a `Held` grant queues its `Manifest` and `Region` messages, and a
+//! `Detach` of an exported (or failed) grant ends its registration.
+//!
 //! A client ends with `Leave` or with the exit proof (its pidfd becomes
-//! readable). `Leave` is accepted while no grant of its export ledger was
-//! sent (otherwise it is a protocol error), also while the bootstrap is
-//! still queued: the client sends it only after unmapping every region it
-//! attached and closing every descriptor it received, which is also how it
-//! rolls back a failed attach. Messages still queued for it are dropped
-//! with their descriptors. Its regions are never reused, so the release
-//! frees admission capacity only. A socket closed without `Leave`, or any protocol error, stops
-//! serving the client but keeps its slot charged until the exit proof. In
-//! this step a `Fetch` is refused: log buffers in regions come with i2.
+//! readable). `Leave` is accepted only while no grant was exported and no
+//! fetch is open, also while the bootstrap is still queued: the client
+//! sends it only after unmapping every region it attached and closing
+//! every descriptor it received, which is also how it rolls back a failed
+//! attach. Messages still queued for it are dropped with their
+//! descriptors. Its regions are never reused, so the release frees
+//! admission capacity only. A socket closed without `Leave`, a `Leave`
+//! with exports left, or any other protocol error stops serving the
+//! client: grants never sent end at once, and the rest stays charged until
+//! the exit proof.
 
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, OwnedFd};
@@ -493,6 +499,7 @@ impl<T: StreamTerms> Admission<T> {
                     Ok(Message::Fetch { fetch, key }) => {
                         Self::fetch(remote, driver, config, fetch, key)
                     }
+                    Ok(Message::Detach { export }) => Self::detach(remote, driver, export),
                     _ => Step::Retire,
                 }
             }
@@ -605,6 +612,24 @@ impl<T: StreamTerms> Admission<T> {
             mark: mark(true, true),
         });
         remote.open.push(fetch);
+        Step::Keep
+    }
+
+    /// Serves `Detach { export }` (`quantstratum-docs:
+    /// karyos/design/ipc-data-path.md`, Detach, exit and Leave): accepted
+    /// only from the socket of the client that owns the export, for an
+    /// `Exported` or `Failed` grant; the client unmapped it first, which is
+    /// the proof that ends its registration. Anything else is a protocol
+    /// error.
+    fn detach(remote: &Remote<T>, driver: &mut EmbeddedDriver<T>, export: u64) -> Step {
+        let Some(grant) = driver
+            .ledger_mut(remote.client)
+            .and_then(|ledger| ledger.detach(export))
+        else {
+            return Step::Retire;
+        };
+        driver.end_grant(&grant);
+        driver.counters.add(Event::GrantsDetached, 1);
         Step::Keep
     }
 

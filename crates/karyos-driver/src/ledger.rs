@@ -112,6 +112,20 @@ impl Ledger {
         Some(self.grants.swap_remove(index))
     }
 
+    /// Removes and returns the grant of `export` if its fetch is over
+    /// (`Exported` or `Failed`): the only grants a `Detach` may end.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn detach(&mut self, export: u64) -> Option<Grant> {
+        let index = self.grants.iter().position(|grant| {
+            grant.export == export
+                && matches!(grant.state, GrantState::Exported | GrantState::Failed)
+        })?;
+        Some(self.grants.swap_remove(index))
+    }
+
     /// Whether no grant was sent: the client may `Leave`, which ends every
     /// grant like the exit proof.
     #[cfg_attr(
