@@ -771,4 +771,30 @@ fn first_zero(bits: &[u64], start: usize, limit: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests;
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]
+mod heap_tests {
+    use super::*;
+
+    type Terms = HeapTerms;
+
+    fn new_image(config: crate::log_buffer::LogBufferConfig) -> Result<LogBuffer<Terms>, SysError> {
+        LogBuffer::new(config)
+    }
+
+    include!("receive_owner/tests.rs");
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]
+mod shared_tests {
+    use super::*;
+    use crate::term_bytes::SharedTerms;
+
+    type Terms = SharedTerms;
+
+    fn new_image(config: crate::log_buffer::LogBufferConfig) -> Result<LogBuffer<Terms>, SysError> {
+        LogBuffer::new_shared(config)
+    }
+
+    include!("receive_owner/tests.rs");
+}

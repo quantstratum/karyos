@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Receive owner tests on heap terms (`quantstratum-docs: karyos/design/receive-publication.md`,
-//! tests "Overlap", "Duplicates", "Stale terms", "Window", "Activation",
-//! "Image positions", "Comparison horizon", "ABORTED and PAD", "Arbitrary
-//! arrival orders" and the concurrent reader under Miri).
-
-#![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::panic)]
+// Receive owner tests (`quantstratum-docs: karyos/design/receive-publication.md`,
+// tests "Overlap", "Duplicates", "Stale terms", "Window", "Activation",
+// "Image positions", "Comparison horizon", "ABORTED and PAD", "Arbitrary
+// arrival orders", the fragments and the concurrent readers), included once
+// per term backing by `receive_owner.rs`; the including module defines
+// `Terms` and `new_image`.
 
 use proptest::prelude::*;
 
-use super::*;
 use crate::frame::{Flags, FrameType, Word0};
 use crate::log_buffer::IMAGE_OWNER_CELLS;
 use crate::log_buffer::Lookup;
@@ -36,9 +35,9 @@ fn params() -> ImageParams {
     .unwrap()
 }
 
-fn image(join: u64) -> Arc<LogBuffer<HeapTerms>> {
+fn image(join: u64) -> Arc<LogBuffer<Terms>> {
     Arc::new(
-        LogBuffer::new(LogBufferConfig {
+        new_image(LogBufferConfig {
             term_length: TermLength::try_new(TERM).unwrap(),
             spare_slots: 5,
             max_subscribers: 2,
@@ -55,7 +54,7 @@ fn image(join: u64) -> Arc<LogBuffer<HeapTerms>> {
     )
 }
 
-fn owner(buffer: &Arc<LogBuffer<HeapTerms>>) -> ReceiveOwner {
+fn owner(buffer: &Arc<LogBuffer<Terms>>) -> ReceiveOwner<Terms> {
     ReceiveOwner::new(params(), vec![Arc::clone(buffer)]).unwrap()
 }
 
@@ -108,7 +107,7 @@ fn pad(term: u32, offset: u32) -> Vec<u8> {
     record(FrameType::Pad, term, offset, TERM - offset)
 }
 
-fn recv(owner: &mut ReceiveOwner, bytes: &[u8]) -> Result<Received, ReceiveError> {
+fn recv(owner: &mut ReceiveOwner<Terms>, bytes: &[u8]) -> Result<Received, ReceiveError> {
     let datagram = ValidatedDatagram::parse(bytes, &params()).unwrap();
     let Some(Item::Frame(frame)) = datagram.items().next() else {
         panic!("no frame")
@@ -129,7 +128,7 @@ fn conflict(position: u64, extent: u32) -> Result<Received, ReceiveError> {
 }
 
 /// Fills term `count` from `offset` to its end with one PAD.
-fn finish(owner: &mut ReceiveOwner, count: u32, offset: u32) {
+fn finish(owner: &mut ReceiveOwner<Terms>, count: u32, offset: u32) {
     let start = u64::from(count) * u64::from(TERM) + u64::from(offset);
     assert_eq!(
         recv(owner, &pad(count, offset)),
@@ -331,7 +330,7 @@ fn copies_half_a_term_behind_are_compared_even_with_a_caught_up_reader() {
     let t = u64::from(TERM);
     let mut out = [0u8; 256];
     let mut catch_up =
-        |subscription: &mut crate::log_buffer::Subscription<&LogBuffer<HeapTerms>>| loop {
+        |subscription: &mut crate::log_buffer::Subscription<&LogBuffer<Terms>>| loop {
             match subscription.poll(&mut out).unwrap() {
                 PollOutcome::Pending => break,
                 _ => subscription.acknowledge(),
@@ -424,7 +423,7 @@ fn a_frame_for_another_image_is_refused() {
         panic!("no frame")
     };
     assert_eq!(owner.receive(&frame), Err(ReceiveError::Foreign));
-    assert!(ReceiveOwner::<HeapTerms>::new(params(), vec![Arc::clone(&buffer)]).is_err());
+    assert!(ReceiveOwner::<Terms>::new(params(), vec![Arc::clone(&buffer)]).is_err());
 }
 
 #[test]
@@ -476,7 +475,7 @@ fn an_image_needs_spare_slots_for_its_owner() {
         ..image(0).config
     };
     assert_eq!(
-        LogBuffer::new(config).map(|_| ()),
+        new_image(config).map(|_| ()),
         Err(SysError::ResourcesUnavailable)
     );
 }
@@ -679,7 +678,7 @@ impl Model {
 
 /// Reads the image independently of the owner: every committed piece's
 /// word 0 and bytes, and a zero word 0 at every piece not committed.
-fn check_image(buffer: &LogBuffer<HeapTerms>, pieces: &[Piece], model: &Model) {
+fn check_image(buffer: &LogBuffer<Terms>, pieces: &[Piece], model: &Model) {
     let Lookup::Slot(slot) = buffer.lookup(TermCount::ZERO).unwrap() else {
         panic!("term 0 is not in the table")
     };
@@ -788,7 +787,7 @@ fn fragment(term: u32, offset: u32, payload: usize, begin: bool, end: bool, fill
     out
 }
 
-fn poll(subscription: &mut crate::log_buffer::Subscription<&LogBuffer<HeapTerms>>) -> PollOutcome {
+fn poll(subscription: &mut crate::log_buffer::Subscription<&LogBuffer<Terms>>) -> PollOutcome {
     let mut out = vec![0u8; 16 * 1024];
     subscription.poll(&mut out).unwrap()
 }
@@ -958,7 +957,7 @@ fn a_join_point_off_the_frame_alignment_is_refused() {
         };
         assert!(
             matches!(
-                LogBuffer::new(config),
+                new_image(config),
                 Err(SysError::InvalidPublicationMode { .. })
             ),
             "{join}"
