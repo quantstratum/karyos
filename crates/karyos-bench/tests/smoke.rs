@@ -150,3 +150,28 @@ fn cleaner_defaults_cover_at_least_a_thousand_term_rotations() {
         assert!(config.warmup >= config.iterations / 10, "{config}");
     }
 }
+
+/// Trace-on refills nothing inside the timed loop: with the id buffer
+/// refilled per message the run grows with the square of its length, so a
+/// long run would far exceed this bound.
+#[test]
+fn a_long_trace_on_run_takes_bounded_time() {
+    let config = defaults(200)
+        .into_iter()
+        .find(|config| config.workload == Workload::TraceOn)
+        .unwrap_or_else(|| panic!("no trace-on workload"));
+    let config = Config {
+        iterations: 50_000,
+        warmup: 0,
+        ..config
+    };
+    let started = std::time::Instant::now();
+    let measurement = run(config).unwrap_or_else(|cause| panic!("{cause}"));
+    let elapsed = started.elapsed();
+    assert!(measurement.rate > 0.0);
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "trace-on took {elapsed:?} for {} messages",
+        config.iterations
+    );
+}

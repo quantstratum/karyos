@@ -455,10 +455,9 @@ fn single_thread(config: Config, traced: bool) -> Result<Measurement, BenchError
             measured_from = Instant::now();
         }
         let begin = Instant::now();
-        if traced {
-            publication.trace_maintenance();
-            subscription.trace_maintenance();
-        }
+        // No trace maintenance in the timed loop: `trace_hook` presizes each
+        // id buffer for every message and fills it at creation, so a refill
+        // here would only add its cost to the measurement.
         let trace_decision = traced.then(|| publication.trace_message(None));
         loop {
             let done = if let Some(decision) = &trace_decision {
@@ -527,6 +526,8 @@ fn trace_hook(
         .checked_next_power_of_two()
         .ok_or_else(|| BenchError("trace journal capacity overflow".into()))?
         .max(4);
+    // A traced message takes three id words (a two-word trace id and a span
+    // id), so the buffer filled at creation lasts the whole run.
     let id_words = usize::try_from(messages)
         .map_err(|cause| error("trace id capacity", cause))?
         .checked_mul(3)
