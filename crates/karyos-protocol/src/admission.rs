@@ -379,13 +379,33 @@ impl Message {
         Ok(words)
     }
 
+    /// Refuses a message that [`Message::decode`] would refuse, so that
+    /// every encoded message decodes to itself.
+    fn check(&self) -> Result<(), AdmissionError> {
+        let records = match self {
+            Self::Fetch { fetch: 0, .. }
+            | Self::Detach { export: 0 }
+            | Self::Manifest { fetch: 0, .. }
+            | Self::Refused { code: 0, .. } => return Err(AdmissionError::Reserved),
+            Self::Admitted { records, .. } | Self::Manifest { records, .. } => records.as_slice(),
+            _ => &[],
+        };
+        if records.iter().any(|record| record.export == 0) {
+            return Err(AdmissionError::Reserved);
+        }
+        Ok(())
+    }
+
     /// Encodes the message into `out`; returns the length.
     ///
     /// # Errors
     ///
-    /// Returns [`AdmissionError::TooManyRecords`] and
+    /// Returns [`AdmissionError::Reserved`] for a message that could not be
+    /// decoded (a zero fetch id, export id or refusal code),
+    /// [`AdmissionError::TooManyRecords`] and
     /// [`AdmissionError::BufferTooShort`].
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, AdmissionError> {
+        self.check()?;
         let words = self.words()?;
         let required = words.len() * 8;
         let available = out.len();
@@ -577,15 +597,22 @@ mod tests {
         let mut hello = encode(&Message::Hello { version: 1 });
         hello[16] = 1;
         assert_eq!(Message::decode(&hello), Err(AdmissionError::Reserved));
-        let fetch_zero = encode(&Message::Fetch { fetch: 0, key: 1 });
-        assert_eq!(Message::decode(&fetch_zero), Err(AdmissionError::Reserved));
-        let detach_zero = encode(&Message::Detach { export: 0 });
-        assert_eq!(Message::decode(&detach_zero), Err(AdmissionError::Reserved));
-        let refused_zero = encode(&Message::Refused { fetch: 1, code: 0 });
-        assert_eq!(
-            Message::decode(&refused_zero),
-            Err(AdmissionError::Reserved)
-        );
+        // Raw words that `encode` refuses to produce.
+        let raw = |words: &[u64]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        };
+        for words in [
+            vec![FETCH, 0, 1],
+            vec![DETACH, 0],
+            vec![REFUSED, 1, 0],
+            vec![MANIFEST, 0, 1, 2, 0],
+        ] {
+            assert_eq!(
+                Message::decode(&raw(&words)),
+                Err(AdmissionError::Reserved),
+                "{words:?}"
+            );
+        }
         let mut leave = encode(&Message::Leave);
         leave.extend([0u8; 8]);
         assert!(matches!(
@@ -647,5 +674,38 @@ mod tests {
             Message::Leave.encode(&mut []),
             Err(AdmissionError::BufferTooShort { .. })
         ));
+    }
+
+    #[test]
+    fn what_cannot_be_decoded_is_not_encoded() {
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        for message in [
+            Message::Fetch { fetch: 0, key: 0 },
+            Message::Detach { export: 0 },
+            Message::Refused { fetch: 1, code: 0 },
+            Message::Manifest {
+                fetch: 0,
+                key: 1,
+                registration: 2,
+                records: Vec::new(),
+            },
+            Message::Manifest {
+                fetch: 1,
+                key: 1,
+                registration: 2,
+                records: vec![record(0, Capability::None)],
+            },
+            Message::Admitted {
+                instance: 1,
+                client: 1,
+                records: vec![record(0, Capability::None)],
+            },
+        ] {
+            assert_eq!(
+                message.encode(&mut out),
+                Err(AdmissionError::Reserved),
+                "{message:?}"
+            );
+        }
     }
 }
