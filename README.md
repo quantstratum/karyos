@@ -40,8 +40,8 @@ each claim: [RELEASE-NOTES-0.1.0-alpha.1.md](RELEASE-NOTES-0.1.0-alpha.1.md).
 
 | Platform | What runs | Evidence for this alpha |
 | --- | --- | --- |
-| Linux, aarch64 | Everything, including the cross-process control path | Docker (TODO(A3): kernel and test counts) |
-| Linux, x86_64 | Everything, including the cross-process control path | Not yet run for this alpha (TODO(A3)) |
+| Linux, aarch64 | All alpha features, including the cross-process control path | Docker (TODO(A3): kernel and test counts) |
+| Linux, x86_64 | All alpha features, including the cross-process control path | Not yet run for this alpha (TODO(A3)) |
 | macOS, arm64 | Embedded driver; cross-process IPC is Linux only | Development host (TODO(A3): Loom and Miri results) |
 
 Docker and virtual machines give functional evidence only. No latency or
@@ -50,7 +50,11 @@ throughput figure is claimed for this alpha.
 ## Build and test
 
 Requirements: the Rust toolchain pinned in `rust-toolchain.toml` (rustup
-installs it), and Docker to run the Linux tests from macOS.
+installs it); Python 3 for the dependency inventory check (`make
+deps-check`, part of `make pre-push`); for `make miri`, the nightly
+toolchain pinned in the Makefile with its Miri component (`rustup
+toolchain install <nightly> --component miri`); and Docker to run the
+Linux tests from macOS.
 
 ```sh
 make test            # cargo test --workspace --locked

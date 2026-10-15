@@ -7,7 +7,7 @@ All notable changes to Karyos are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); before 1.0 any
 release may break APIs, wire formats and shared-memory layouts.
 
-## [0.1.0-alpha.1] - TODO(A7): release date
+## [0.1.0-alpha.1]: TODO(A7): release date
 
 First alpha: the embedded driver on every supported platform and the
 cross-process control path on Linux. See
