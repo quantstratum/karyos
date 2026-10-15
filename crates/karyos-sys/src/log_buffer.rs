@@ -50,7 +50,7 @@ use crate::term::{Generation, TermCount, TermId};
 use crate::term_bytes::sealed::{Access as _, Token};
 use crate::term_bytes::{HeapTerms, SharedTerms, TermBytes};
 use core::ptr::NonNull;
-use storage::{Backing, CONFIG_WORDS, Cell, Control, Layout, Line};
+use storage::{Backing, CONFIG_WORDS, Cell, Control, Layout, Line, PublisherSlot};
 
 mod concurrent;
 mod deadline;
@@ -178,7 +178,7 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     table: NonNull<[AtomicU64]>,
     tails: NonNull<[Line]>,
     cells: NonNull<[Cell]>,
-    publishers: NonNull<[Line]>,
+    publishers: NonNull<[PublisherSlot]>,
     /// Every word more than one party touches: heap words of this process
     /// or a shared region.
     backing: Arc<Backing>,
@@ -251,8 +251,124 @@ impl LogBuffer<SharedTerms> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl LogBuffer<SharedTerms> {
+    /// Creates a buffer in a new shared region (driver side,
+    /// `quantstratum-docs: karyos/design/ipc-log-buffer.md`): the region is created and
+    /// size-sealed for this layout, then initialised. Its descriptor is
+    /// passed to participants through [`LogBuffer::region`].
+    ///
+    /// # Errors
+    ///
+    /// As [`LogBuffer::new`], and the errors of [`crate::ipc::Region::create`].
+    pub fn create_in(
+        instance: u128,
+        region: u64,
+        config: LogBufferConfig,
+        generation: Generation,
+    ) -> Result<Self, SysError> {
+        let (layout, slots, max_message_length) = Self::plan(&config)?;
+        let structure_length = layout
+            .total
+            .checked_mul(crate::atomic_view::WORD_BYTES)
+            .ok_or(SysError::InvalidRegion { address: 0, len: 0 })?;
+        let mapped = crate::ipc::Region::create(crate::ipc::RegionRecord {
+            instance,
+            region,
+            kind: crate::ipc::RegionKind::LogBuffer,
+            generation: u64::from(generation.get()),
+            layout: LAYOUT_VERSION,
+            structure_length,
+        })?;
+        let backing = Arc::new(Backing::Region(mapped));
+        let buffer = Self::over(
+            backing,
+            layout,
+            config,
+            generation,
+            slots,
+            max_message_length,
+        )?;
+        buffer.initialise();
+        Ok(buffer)
+    }
+
+    /// Attaches to a buffer in an attached region (participant side). The
+    /// configuration block is read once and validated as
+    /// [`LogBuffer::new`] validates a configuration; the layout it implies
+    /// must fill the region exactly, and its generation and layout version
+    /// must match the region's. Every later index comes from this validated
+    /// copy. The attached buffer never issues a conductor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidRegion`] for a configuration block that
+    /// is not valid or does not match the region, and the validation
+    /// errors of [`LogBuffer::new`].
+    pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
+        let record = region.record();
+        let invalid = SysError::InvalidRegion {
+            address: 0,
+            len: record.structure_length,
+        };
+        let structure = region.structure();
+        let mut words = [0u64; CONFIG_WORDS];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = structure.get(index).ok_or(invalid)?.load(Ordering::Acquire);
+        }
+        let (config, generation, max_message_length) = parse_config(&words).ok_or(invalid)?;
+        let (layout, slots, expected_max) = Self::plan(&config)?;
+        let structure_length = layout.total.checked_mul(crate::atomic_view::WORD_BYTES);
+        if record.layout != LAYOUT_VERSION
+            || record.generation != u64::from(generation.get())
+            || structure_length != Some(record.structure_length)
+            || max_message_length != expected_max
+        {
+            return Err(invalid);
+        }
+        let backing = Arc::new(Backing::Region(region));
+        let buffer = Self::over(
+            backing,
+            layout,
+            config,
+            generation,
+            slots,
+            max_message_length,
+        )?;
+        buffer.conductor_taken.store(true, Ordering::Relaxed);
+        Ok(buffer)
+    }
+
+    /// The region of a buffer created in or attached to one: its record and,
+    /// for the creator, the descriptor to pass.
+    #[must_use]
+    pub fn region(&self) -> Option<&crate::ipc::Region> {
+        match &*self.backing {
+            Backing::Region(region) => Some(region),
+            Backing::Heap(_) => None,
+        }
+    }
+}
+
 impl<T: TermBytes> LogBuffer<T> {
     fn build(config: LogBufferConfig, generation: Generation) -> Result<Self, SysError> {
+        let (layout, slots, max_message_length) = Self::plan(&config)?;
+        let backing = Arc::new(Backing::Heap(HeapWords::zeroed(layout.total)?));
+        let buffer = Self::over(
+            backing,
+            layout,
+            config,
+            generation,
+            slots,
+            max_message_length,
+        )?;
+        buffer.initialise();
+        Ok(buffer)
+    }
+
+    /// Validates `config` and computes its layout, slot count and largest
+    /// message: the same checks for a new buffer and for an attachment.
+    fn plan(config: &LogBufferConfig) -> Result<(Layout, u8, u32), SysError> {
         let slots = config
             .spare_slots
             .checked_add(3)
@@ -266,7 +382,7 @@ impl<T: TermBytes> LogBuffer<T> {
                 value: config.claim_deadline,
             });
         }
-        check_publication_mode(&config)?;
+        check_publication_mode(config)?;
         let plan = FragmentPlan::new(config.mtu, Flags::NONE)?;
         let max_message_length =
             plan.max_message_length(config.max_reserved, config.term_length)?;
@@ -278,17 +394,7 @@ impl<T: TermBytes> LogBuffer<T> {
             config.term_length.get(),
             T::IN_BACKING,
         )?;
-        let backing = Arc::new(Backing::Heap(HeapWords::zeroed(layout.total)?));
-        let buffer = Self::over(
-            backing,
-            layout,
-            config,
-            generation,
-            slots,
-            max_message_length,
-        )?;
-        buffer.initialise();
-        Ok(buffer)
+        Ok((layout, slots, max_message_length))
     }
 
     /// A buffer over `backing` laid out as `layout`, its section pointers
@@ -416,7 +522,7 @@ impl<T: TermBytes> LogBuffer<T> {
         unsafe { self.cells.as_ref() }
     }
 
-    fn publisher_lines(&self) -> &[Line] {
+    fn publisher_lines(&self) -> &[PublisherSlot] {
         // SAFETY: as `control`, for the publisher slots (possibly empty: an
         // empty slice is never indexed).
         unsafe { self.publishers.as_ref() }
@@ -791,21 +897,7 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
     // The staging buffer of claims on a backing without direct bytes, sized
     // for the largest admissible claim and allocated fallibly before the
     // publication is issued.
-    let staging = if <O::Terms as crate::term_bytes::sealed::Access>::DIRECT {
-        Box::default()
-    } else {
-        let plan = FragmentPlan::new(
-            buffer.config.mtu,
-            Flags::new(true, true, false, false, buffer.config.lane),
-        )?;
-        let size = plan.payload_per_fragment().min(buffer.max_message_length) as usize;
-        let mut staging = Vec::new();
-        staging
-            .try_reserve_exact(size)
-            .map_err(|_| SysError::ResourcesUnavailable)?;
-        staging.resize(size, 0u8);
-        staging.into_boxed_slice()
-    };
+    let staging = staging_buffer(buffer)?;
     // `SeqCst` with the seal load below and the conductor's seal store and
     // positioning load: at least one side observes the other
     // (`quantstratum-docs: karyos/design/publication-seal.md`, issuance).
@@ -817,6 +909,13 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
         release_publication(buffer.exclusive_released());
         return Err(SysError::Sealed);
     }
+    first_loan(owner, staging).map(Some)
+}
+
+/// The exclusive publication's initial write loan on term 0, for a fresh
+/// publication taken by this process or adopted from a registration.
+fn first_loan<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Result<Publication<O>, SysError> {
+    let buffer: &LogBuffer<O::Terms> = &owner;
     let cell = buffer.cell(0)?;
     let slot = SlotIndex::try_new(0)?;
     let target = LoanTarget::new(
@@ -826,7 +925,7 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
         TermCount::ZERO,
     );
     match take_loan(&cell.loan, &cell.revoked, buffer.descriptor(0)?, target)? {
-        LoanOutcome::Granted => Ok(Some(Publication {
+        LoanOutcome::Granted => Ok(Publication {
             buffer: owner,
             state: PublicationState::Active {
                 count: TermCount::ZERO,
@@ -835,11 +934,109 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
             },
             pending: None,
             staging,
-        })),
+        }),
         _ => Err(SysError::CorruptTerm {
             offset: 0,
             reason: "initial term not active",
         }),
+    }
+}
+
+/// The staging buffer of claims on a backing without direct bytes, sized for
+/// the largest admissible claim and allocated fallibly; empty otherwise.
+fn staging_buffer<T: TermBytes>(buffer: &LogBuffer<T>) -> Result<Box<[u8]>, SysError> {
+    if <T as crate::term_bytes::sealed::Access>::DIRECT {
+        return Ok(Box::default());
+    }
+    let plan = FragmentPlan::new(
+        buffer.config.mtu,
+        Flags::new(true, true, false, false, buffer.config.lane),
+    )?;
+    let size = plan.payload_per_fragment().min(buffer.max_message_length) as usize;
+    let mut staging = Vec::new();
+    staging
+        .try_reserve_exact(size)
+        .map_err(|_| SysError::ResourcesUnavailable)?;
+    staging.resize(size, 0u8);
+    Ok(staging.into_boxed_slice())
+}
+
+/// The refusal of an adoption whose registration does not match its grant.
+const NOT_GRANTED: SysError = SysError::Protocol {
+    reason: "the registration does not match the grant",
+};
+
+impl<O: BufferOwner> Publication<O> {
+    /// Adopts the exclusive publication that the creator registered for
+    /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): taken, not
+    /// released, registered for exactly this export, and fresh (nothing
+    /// reserved yet). Takes the initial write loan in this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidPublicationMode`] for a concurrent buffer
+    /// and [`SysError::Protocol`] when the registration does not match.
+    pub fn adopt(owner: O, export: u64) -> Result<Self, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &owner;
+        if buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "the exclusive publication of a concurrent buffer",
+            });
+        }
+        let control = buffer.control();
+        if export == 0
+            || control
+                .publication_registration
+                .word
+                .load(Ordering::Acquire)
+                != export
+            || buffer.publication_taken().load(Ordering::Acquire) == 0
+            || buffer.exclusive_released().load(Ordering::Acquire) != 0
+            || buffer.reserved_head().load(Ordering::Acquire) != 0
+        {
+            return Err(NOT_GRANTED);
+        }
+        let staging = staging_buffer(buffer)?;
+        first_loan(owner, staging)
+    }
+}
+
+impl<O: BufferOwner> Subscription<O> {
+    /// Adopts the subscriber cell `cell` that the creator registered with
+    /// `role` for export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`). The
+    /// subscription resumes at the cell's published position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Protocol`] when the cell is not a subscriber cell
+    /// attached with `role` and registered for exactly this export.
+    pub fn adopt(owner: O, cell: usize, role: Role, export: u64) -> Result<Self, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &owner;
+        if cell < buffer.first_subscriber_cell() || export == 0 {
+            return Err(NOT_GRANTED);
+        }
+        let found = buffer.cell(cell).map_err(|_| NOT_GRANTED)?;
+        let expected = match role {
+            Role::Required => CELL_REQUIRED,
+            Role::Optional => CELL_OPTIONAL,
+        };
+        if found.registration.load(Ordering::Acquire) != export
+            || found.state.load(Ordering::Acquire) != expected
+        {
+            return Err(NOT_GRANTED);
+        }
+        let position = found.position.load(Ordering::Acquire);
+        Ok(Self {
+            buffer: owner,
+            cursor: Cursor {
+                cell,
+                role,
+                position,
+                acknowledged: position,
+                pending: None,
+                detached: false,
+            },
+        })
     }
 }
 
@@ -2403,6 +2600,64 @@ impl<O: BufferOwner> Conductor<O> {
         })
     }
 
+    /// Registers a subscriber for a participant in another process, for
+    /// export `export` (nonzero, never reused): the cell is attached as
+    /// [`Conductor::subscribe`] attaches it, and its registration word
+    /// records the export. Returns the cell, which the participant adopts
+    /// with [`Subscription::adopt`] (`quantstratum-docs: karyos/design/ipc-log-buffer.md`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::subscribe`]; [`SysError::Protocol`] for export 0.
+    pub fn register_subscriber(&mut self, role: Role, export: u64) -> Result<usize, SysError> {
+        if export == 0 {
+            return Err(NOT_GRANTED);
+        }
+        let cursor = self.context().subscribe(role)?;
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer
+            .cell(cursor.cell)?
+            .registration
+            .store(export, Ordering::Release);
+        Ok(cursor.cell)
+    }
+
+    /// Registers the exclusive publication for a participant in another
+    /// process, for export `export`: taken as
+    /// [`LogBuffer::publication`] takes it, without a loan (the participant
+    /// takes its own with [`Publication::adopt`]). Returns `false` when it
+    /// was already issued.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::InvalidPublicationMode`] for a concurrent buffer,
+    /// [`SysError::Sealed`] for a sealed one, [`SysError::Protocol`] for
+    /// export 0.
+    pub fn register_publication(&mut self, export: u64) -> Result<bool, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if export == 0 {
+            return Err(NOT_GRANTED);
+        }
+        if buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "the exclusive publication of a concurrent buffer",
+            });
+        }
+        if !take_publication(buffer.publication_taken()) {
+            return Ok(false);
+        }
+        if issuer_sees_seal(buffer.seal()) {
+            release_publication(buffer.exclusive_released());
+            return Err(SysError::Sealed);
+        }
+        buffer
+            .control()
+            .publication_registration
+            .word
+            .store(export, Ordering::Release);
+        Ok(true)
+    }
+
     /// One duty cycle: flow control and retention, rotation help,
     /// reclamation and cleaning, and preparation of the next term.
     ///
@@ -3013,6 +3268,63 @@ fn config_words(
     words
 }
 
+/// The configuration, generation and largest message of a configuration
+/// block, or `None` when a field is out of its type's range or the version
+/// is unknown. Range checks of the configuration itself are left to
+/// [`LogBuffer::new`]'s validation.
+#[cfg(target_os = "linux")]
+fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generation, u32)> {
+    let [
+        version,
+        term_length,
+        spare_slots,
+        max_subscribers,
+        mtu,
+        max_reserved,
+        initial_term_id,
+        lane,
+        session_id,
+        stream_id,
+        claim_deadline,
+        mode,
+        publishers,
+        allow_non_lse,
+        generation,
+        max_message_length,
+        rest @ ..,
+    ] = words;
+    if *version != LAYOUT_VERSION || rest.iter().any(|word| *word != 0) {
+        return None;
+    }
+    let small = |value: &u64| u32::try_from(*value).ok();
+    let publication = match (*mode, *allow_non_lse) {
+        (1, 0) if *publishers == 0 => PublicationMode::Exclusive,
+        (2, flag @ (0 | 1)) => PublicationMode::Concurrent {
+            publishers: u8::try_from(*publishers).ok()?,
+            allow_non_lse: flag == 1,
+        },
+        _ => return None,
+    };
+    let config = LogBufferConfig {
+        term_length: TermLength::try_new(small(term_length)?).ok()?,
+        spare_slots: u8::try_from(*spare_slots).ok()?,
+        max_subscribers: u8::try_from(*max_subscribers).ok()?,
+        mtu: small(mtu)?,
+        max_reserved: small(max_reserved)?,
+        initial_term_id: TermId::new(small(initial_term_id)?),
+        lane: Lane::try_new(u8::try_from(*lane).ok()?).ok()?,
+        session_id: small(session_id)?.cast_signed(),
+        stream_id: small(stream_id)?.cast_signed(),
+        claim_deadline: *claim_deadline,
+        publication,
+    };
+    Some((
+        config,
+        Generation::try_new(small(generation)?).ok()?,
+        small(max_message_length)?,
+    ))
+}
+
 /// The layout version of the shared log buffer region.
 pub const LAYOUT_VERSION: u64 = 1;
 
@@ -3035,6 +3347,7 @@ mod heap_tests {
 
     include!("log_buffer_tests/common.rs");
     include!("log_buffer_tests/seal.rs");
+    include!("log_buffer_tests/adoption.rs");
 }
 
 #[cfg(test)]
@@ -3056,6 +3369,7 @@ mod shared_tests {
 
     include!("log_buffer_tests/common.rs");
     include!("log_buffer_tests/seal.rs");
+    include!("log_buffer_tests/adoption.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber
@@ -3124,5 +3438,181 @@ mod shared_tests {
                 std::thread::yield_now();
             }
         });
+    }
+}
+
+// A buffer in a shared region, attached through a passed descriptor
+// (`quantstratum-docs: karyos/design/ipc-log-buffer.md`), in one process on Linux.
+#[cfg(all(test, target_os = "linux", not(miri)))]
+// Test helpers outside #[test] functions are not covered by clippy.toml's
+// test exemptions (ADR-0007 exempts tests from these lints).
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+mod region_tests {
+    use super::*;
+    use crate::ipc::{Recv, Region, RegionKind, RegionRecord, Sent, recv, send, seqpacket_pair};
+    use crate::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH};
+    use rustix::fd::AsFd;
+
+    fn config(publication: PublicationMode) -> LogBufferConfig {
+        LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 4,
+            max_subscribers: 3,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 2,
+            claim_deadline: DEFAULT_CLAIM_DEADLINE,
+            publication,
+        }
+    }
+
+    fn generation() -> Generation {
+        Generation::try_new(3).unwrap()
+    }
+
+    /// Passes the creator's region descriptor over a socket pair and
+    /// attaches it as a participant would.
+    fn attach(creator: &LogBuffer<SharedTerms>) -> Result<LogBuffer<SharedTerms>, SysError> {
+        let region = creator.region().unwrap();
+        let (a, b) = seqpacket_pair().unwrap();
+        assert_eq!(
+            send(a.as_fd(), b"lb", region.descriptor()).unwrap(),
+            Sent::Sent
+        );
+        let mut buffer = [0u8; 8];
+        let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
+        let attached = Region::attach(received.fd.unwrap(), region.record())?;
+        LogBuffer::attach(attached)
+    }
+
+    #[test]
+    fn a_participant_attaches_adopts_and_exchanges_messages() {
+        let creator = Arc::new(
+            LogBuffer::create_in(1, 5, config(PublicationMode::Exclusive), generation()).unwrap(),
+        );
+        let mut conductor = creator.conductor_owned().unwrap();
+        assert!(conductor.register_publication(31).unwrap());
+        let cell = conductor.register_subscriber(Role::Required, 32).unwrap();
+        let participant = Arc::new(attach(&creator).unwrap());
+        assert_eq!(participant.generation(), generation());
+        assert!(participant.conductor_owned().is_none());
+        let mut writer = Publication::adopt(Arc::clone(&participant), 31).unwrap();
+        let mut reader =
+            Subscription::adopt(Arc::clone(&creator), cell, Role::Required, 32).unwrap();
+        let mut out = vec![0u8; 8192];
+        for round in 0..600u32 {
+            let payload = round.to_le_bytes().repeat(100);
+            loop {
+                match writer.append(&payload, AppendOptions::default()).unwrap() {
+                    AppendOutcome::Appended { .. } => break,
+                    _ => {
+                        // Drain and let the creator's conductor rotate.
+                        while let PollOutcome::Message { .. } = reader.poll(&mut out).unwrap() {
+                            reader.acknowledge();
+                        }
+                        let _ = conductor.duty_cycle().unwrap();
+                    }
+                }
+            }
+            match reader.poll(&mut out).unwrap() {
+                PollOutcome::Message { length, .. } => {
+                    assert_eq!(&out[..length as usize], payload.as_slice());
+                    reader.acknowledge();
+                }
+                other => panic!("round {round}: {other:?}"),
+            }
+            let _ = conductor.duty_cycle().unwrap();
+        }
+        // Many rotations through the shared slots.
+        assert!(creator.active_count().load(Ordering::Acquire) >= 2);
+    }
+
+    #[test]
+    fn concurrent_handles_adopted_on_both_sides_share_one_buffer() {
+        let mode = PublicationMode::Concurrent {
+            publishers: 2,
+            allow_non_lse: true,
+        };
+        let creator = Arc::new(LogBuffer::create_in(1, 6, config(mode), generation()).unwrap());
+        let mut conductor = creator.conductor_owned().unwrap();
+        let mut reader = conductor.subscribe(Role::Optional).unwrap();
+        let slot = conductor
+            .register_concurrent_publication(41)
+            .unwrap()
+            .unwrap();
+        let local = conductor.concurrent_publication().unwrap().unwrap();
+        let participant = Arc::new(attach(&creator).unwrap());
+        let mut remote = ConcurrentPublication::adopt(Arc::clone(&participant), slot, 41).unwrap();
+        let mut local = local;
+        for (handle, payload) in [(&mut remote, b"remote"), (&mut local, b"local!")] {
+            assert!(matches!(
+                handle.offer(payload, AppendOptions::default()).unwrap(),
+                ConcurrentOfferOutcome::Appended { .. }
+            ));
+        }
+        let mut out = vec![0u8; 64];
+        let mut seen = Vec::new();
+        while let PollOutcome::Message { length, .. } = reader.poll(&mut out).unwrap() {
+            seen.push(out[..length as usize].to_vec());
+        }
+        assert_eq!(seen, vec![b"remote".to_vec(), b"local!".to_vec()]);
+    }
+
+    #[test]
+    fn attach_refuses_a_configuration_block_that_does_not_validate() {
+        let creator =
+            LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
+        // Valid as created.
+        assert!(attach(&creator).is_ok());
+        let structure = creator.region().unwrap().structure();
+        let corrupt = |index: usize, value: u64| {
+            let word = structure.get(index).unwrap();
+            let before = word.swap(value, Ordering::AcqRel);
+            let result = attach(&creator);
+            word.store(before, Ordering::Release);
+            result
+        };
+        // Version, term length, spare slots beyond the slot bound, a zero
+        // claim deadline, an unknown mode, a generation that differs from
+        // the region's, a largest message that differs, a trailing word.
+        for (index, value) in [
+            (0, 2),
+            (1, 1000),
+            (2, 200),
+            (10, 0),
+            (11, 3),
+            (14, 4),
+            (15, 1),
+            (20, 1),
+        ] {
+            assert!(
+                corrupt(index, value).is_err(),
+                "word {index} = {value} accepted"
+            );
+        }
+        // More subscribers than the region holds: the layout no longer fits.
+        assert!(corrupt(3, 9).is_err());
+        // A record of another kind or generation never attaches (the
+        // header check of the region).
+        let region = creator.region().unwrap();
+        let other = RegionRecord {
+            kind: RegionKind::Counters,
+            ..region.record()
+        };
+        let (a, b) = seqpacket_pair().unwrap();
+        assert_eq!(
+            send(a.as_fd(), b"lb", region.descriptor()).unwrap(),
+            Sent::Sent
+        );
+        let mut buffer = [0u8; 8];
+        let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
+        assert!(Region::attach(received.fd.unwrap(), other).is_err());
     }
 }

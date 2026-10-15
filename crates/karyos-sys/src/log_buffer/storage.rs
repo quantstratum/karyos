@@ -59,6 +59,19 @@ pub(crate) struct Cell {
     _padding: [AtomicU64; LINE_WORDS - 5],
 }
 
+/// One concurrent publisher slot, alone on its stride.
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct PublisherSlot {
+    /// The slot word (`quantstratum-docs: karyos/design/concurrent-publication.md`).
+    pub(crate) word: AtomicU64,
+    /// The export id of the grant that registered it (IPC), 0 otherwise.
+    pub(crate) registration: AtomicU64,
+    /// The term count the registered handle starts from (IPC).
+    pub(crate) from: AtomicU64,
+    _padding: [AtomicU64; LINE_WORDS - 3],
+}
+
 /// The single control words, each on its own stride.
 #[repr(C)]
 #[derive(Debug)]
@@ -88,6 +101,10 @@ unsafe impl Overlay for Cell {
     const WORDS: usize = LINE_WORDS;
 }
 // SAFETY: as above.
+unsafe impl Overlay for PublisherSlot {
+    const WORDS: usize = LINE_WORDS;
+}
+// SAFETY: as above.
 unsafe impl Overlay for Control {
     const WORDS: usize = 10 * LINE_WORDS;
 }
@@ -96,6 +113,10 @@ const _: () = {
     assert!(size_of::<Line>() == Line::WORDS * WORD_BYTES);
     assert!(size_of::<Cell>() == Cell::WORDS * WORD_BYTES);
     assert!(size_of::<Control>() == Control::WORDS * WORD_BYTES);
+    assert!(size_of::<PublisherSlot>() == PublisherSlot::WORDS * WORD_BYTES);
+    assert!(align_of::<PublisherSlot>() == align_of::<AtomicU64>());
+    assert!(offset_of!(PublisherSlot, registration) == 8);
+    assert!(offset_of!(PublisherSlot, from) == 16);
     assert!(align_of::<Line>() == align_of::<AtomicU64>());
     assert!(align_of::<Cell>() == align_of::<AtomicU64>());
     assert!(align_of::<Control>() == align_of::<AtomicU64>());
