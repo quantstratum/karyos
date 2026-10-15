@@ -364,22 +364,8 @@ fn check_invariants(bytes: &[u8]) {
     }
 }
 
-/// Under Miri, fewer cases and no failure file (Miri's isolation forbids
-/// the file system access that persistence needs).
-fn config() -> ProptestConfig {
-    if cfg!(miri) {
-        ProptestConfig {
-            cases: 8,
-            failure_persistence: None,
-            ..ProptestConfig::default()
-        }
-    } else {
-        ProptestConfig::default()
-    }
-}
-
 proptest! {
-    #![proptest_config(config())]
+    #![proptest_config(super::tests_config())]
 
     #[test]
     fn generated_datagrams_parse_to_their_frames(specs in prop::collection::vec(spec(), 1..12)) {

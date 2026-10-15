@@ -200,6 +200,27 @@ impl ImageParams {
         })
     }
 
+    /// The image's session alias.
+    #[inline]
+    #[must_use]
+    pub const fn session_id(&self) -> i32 {
+        self.session_id
+    }
+
+    /// The image's stream id.
+    #[inline]
+    #[must_use]
+    pub const fn stream_id(&self) -> i32 {
+        self.stream_id
+    }
+
+    /// The image's lane count.
+    #[inline]
+    #[must_use]
+    pub const fn lanes(&self) -> u8 {
+        self.lanes
+    }
+
     /// The image's term length.
     #[inline]
     #[must_use]
@@ -332,6 +353,7 @@ pub enum FrameKind {
 /// owner. Built only by [`ValidatedDatagram::parse`]; its fields are private.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidatedFrame<'a> {
+    params: ImageParams,
     kind: FrameKind,
     lane: Lane,
     term_id: TermId,
@@ -342,6 +364,12 @@ pub struct ValidatedFrame<'a> {
 }
 
 impl<'a> ValidatedFrame<'a> {
+    /// The image parameters the frame was validated against; a receive
+    /// owner accepts it only for an image with exactly these.
+    pub(crate) const fn params(&self) -> &ImageParams {
+        &self.params
+    }
+
     /// The frame's type.
     #[inline]
     #[must_use]
@@ -542,6 +570,7 @@ fn decode<'a>(
             .get(offset..offset + length as usize)
             .ok_or(truncated)?;
         let frame = ValidatedFrame {
+            params: *params,
             kind: FrameKind::Data,
             lane,
             term_id,
@@ -584,6 +613,7 @@ fn decode<'a>(
         .get(offset..offset + HEADER_LENGTH as usize)
         .ok_or(truncated)?;
     let frame = ValidatedFrame {
+        params: *params,
         kind,
         lane,
         term_id,
@@ -593,6 +623,22 @@ fn decode<'a>(
         wire,
     };
     Ok((Item::Frame(frame), offset + HEADER_LENGTH as usize))
+}
+
+/// Property test settings shared by the receive tests: under Miri, fewer
+/// cases and no failure file (Miri's isolation forbids the file system
+/// access that persistence needs).
+#[cfg(test)]
+pub(crate) fn tests_config() -> proptest::test_runner::Config {
+    if cfg!(miri) {
+        proptest::test_runner::Config {
+            cases: 8,
+            failure_persistence: None,
+            ..proptest::test_runner::Config::default()
+        }
+    } else {
+        proptest::test_runner::Config::default()
+    }
 }
 
 #[cfg(test)]
