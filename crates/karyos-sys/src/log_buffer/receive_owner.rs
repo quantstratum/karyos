@@ -27,7 +27,7 @@ use crate::frame::{FRAME_ALIGNMENT, Lane};
 use crate::loan::{LoanOutcome, Rotation, release_loan, rotate_to, take_loan};
 use crate::publication::{active_term_count, observe_block, publish_block, take_publication};
 use crate::receive::{ImageParams, ValidatedFrame};
-use crate::term::TermCount;
+use crate::term::{TERM_COUNT_LIMIT, TermCount};
 use crate::term_bytes::{HeapTerms, TermBytes};
 
 /// Bits per bitmap word.
@@ -325,7 +325,7 @@ impl<T: TermBytes> LaneOwner<T> {
         if start < self.join {
             return Ok(Received::Late);
         }
-        let (r, _) = buffer.split(self.rebuild)?;
+        let (r, _) = self.split_end(self.rebuild)?;
         let (c, rr) = (count.get(), r.get());
         if c > rr.saturating_add(1) {
             return Ok(Received::Ahead);
@@ -397,6 +397,18 @@ impl<T: TermBytes> LaneOwner<T> {
             position: start,
             extent: frame.extent(),
         })
+    }
+
+    /// [`LogBuffer::split`], except that the end of the incarnation's last
+    /// term, which no term count names, is the end of that term: once the
+    /// last term is complete the window stays on it, every later copy is
+    /// compared there, and nothing new is ever written.
+    fn split_end(&self, position: u64) -> Result<(TermCount, u32), SysError> {
+        let term_length = self.buffer.term_length;
+        if position == u64::from(TERM_COUNT_LIMIT) * u64::from(term_length) {
+            return Ok((TermCount::try_new(TERM_COUNT_LIMIT - 1)?, term_length));
+        }
+        self.buffer.split(position)
     }
 
     fn set(&self, index: usize) -> Result<&Set, SysError> {
@@ -536,7 +548,7 @@ impl<T: TermBytes> LaneOwner<T> {
         let buffer = Arc::clone(&self.buffer);
         // At most the two window terms can be crossed in one advance.
         for _ in 0..3 {
-            let (count, offset) = buffer.split(self.rebuild)?;
+            let (count, offset) = self.split_end(self.rebuild)?;
             let Some(index) = self.set_of(count) else {
                 break;
             };
@@ -555,7 +567,7 @@ impl<T: TermBytes> LaneOwner<T> {
         buffer
             .reserved_head()
             .store(self.rebuild, Ordering::Release);
-        let (r, _) = buffer.split(self.rebuild)?;
+        let (r, _) = self.split_end(self.rebuild)?;
         for parity in 0..2 {
             let loan = self.loan(parity)?;
             if let Some((held, _)) = *loan

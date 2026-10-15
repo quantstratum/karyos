@@ -11,10 +11,11 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::frame::{Flags, FrameType, Word0};
+use crate::log_buffer::IMAGE_OWNER_CELLS;
 use crate::log_buffer::{DEFAULT_CLAIM_DEADLINE, LogBufferConfig, PollOutcome, Role, SkipReason};
 use crate::receive::{Item, ValidatedDatagram};
 use crate::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
-use crate::term::TermId;
+use crate::term::{TERM_COUNT_LIMIT, TermId};
 
 const SESSION: i32 = 3;
 const STREAM: i32 = 4;
@@ -787,4 +788,112 @@ fn a_late_joiner_inside_a_partial_message_skips_its_rest() {
         poll(&mut subscription),
         skipped(128, 64, SkipReason::JoinedMidMessage)
     );
+}
+
+#[test]
+fn a_join_point_off_the_frame_alignment_is_refused() {
+    for join in [1, 8, 16, u64::from(TERM) + 40] {
+        let config = LogBufferConfig {
+            publication: PublicationMode::Image { join },
+            ..image(0).config
+        };
+        assert!(
+            matches!(
+                LogBuffer::new(config),
+                Err(SysError::InvalidPublicationMode { .. })
+            ),
+            "{join}"
+        );
+    }
+}
+
+#[test]
+fn an_image_can_start_in_the_last_term() {
+    let last = TERM_COUNT_LIMIT - 1;
+    let start = u64::from(last) * u64::from(TERM);
+    let buffer = image(start);
+    let mut owner = owner(&buffer);
+    assert_eq!(
+        recv(&mut owner, &data(last, 0, 64, 1)),
+        committed(start, 64)
+    );
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(start + 64));
+}
+
+#[test]
+fn finishing_the_last_term_ends_the_window_there() {
+    let last = TERM_COUNT_LIMIT - 1;
+    let t = u64::from(TERM);
+    let buffer = image(u64::from(last - 1) * t);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = owner(&buffer);
+    let first_pad = pad(last - 1, 0);
+    assert_eq!(
+        recv(&mut owner, &first_pad),
+        committed(u64::from(last - 1) * t, TERM)
+    );
+    conductor.duty_cycle().unwrap();
+    let last_pad = pad(last, 0);
+    assert_eq!(
+        recv(&mut owner, &last_pad),
+        committed(u64::from(last) * t, TERM)
+    );
+    let end = u64::from(TERM_COUNT_LIMIT) * t;
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(end));
+    assert_eq!(buffer.reserved_head().load(Ordering::Acquire), end);
+    // Repeated calls stay consistent: copies are compared, nothing is
+    // written, and the owner keeps only the last term's write loan.
+    for _ in 0..2 {
+        assert_eq!(recv(&mut owner, &last_pad), Ok(Received::Duplicate));
+        assert_eq!(recv(&mut owner, &first_pad), Ok(Received::Duplicate));
+        assert_eq!(
+            recv(&mut owner, &data(last, 0, 64, 1)),
+            conflict(u64::from(last) * t, 64)
+        );
+    }
+    let held: Vec<bool> = (0..IMAGE_OWNER_CELLS)
+        .map(|cell| buffer.cell(cell).unwrap().loan.load(Ordering::Acquire) != 0)
+        .collect();
+    assert_eq!(held, [false, true, false]);
+    drop(owner);
+    assert!(
+        (0..IMAGE_OWNER_CELLS)
+            .all(|cell| buffer.cell(cell).unwrap().loan.load(Ordering::Acquire) == 0)
+    );
+}
+
+#[test]
+fn a_concurrent_reader_sees_only_complete_fragmented_messages() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    let messages: u32 = if cfg!(miri) { 3 } else { 100 };
+    // Each message: three 64-byte fragments, published one by one.
+    let parts = |m: u32| -> Vec<Vec<u8>> {
+        (0..3u32)
+            .map(|f| fragment(0, m * 192 + f * 64, 32, f == 0, f == 2, (m * 3 + f) as u8))
+            .collect()
+    };
+    let writer = std::thread::spawn(move || {
+        for m in 0..messages {
+            for part in parts(m) {
+                recv(&mut owner, &part).unwrap();
+            }
+        }
+    });
+    let mut out = [0u8; 256];
+    let mut seen = 0u32;
+    while seen < messages {
+        match subscription.poll(&mut out).unwrap() {
+            PollOutcome::Message { length, .. } => {
+                let expected: Vec<u8> = parts(seen).iter().flat_map(|p| p[32..].to_vec()).collect();
+                assert_eq!(&out[..length as usize], &expected[..]);
+                seen += 1;
+            }
+            PollOutcome::Pending => std::thread::yield_now(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    writer.join().unwrap();
 }

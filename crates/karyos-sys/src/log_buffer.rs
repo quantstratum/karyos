@@ -550,12 +550,13 @@ impl<T: TermBytes> LogBuffer<T> {
             .and_then(|count| TermCount::try_new(count).ok())
             .unwrap_or(TermCount::ZERO);
         let t0 = self.initial_term_id.advanced_by(start);
-        let next = start.next().unwrap_or(start);
-        let one = self.initial_term_id.advanced_by(next);
+        // The last term of the incarnation has no next term to prepare.
+        let next = start.next().ok();
+        let one = next.map_or(t0, |next| self.initial_term_id.advanced_by(next));
         for (slot, line) in self.descriptors().iter().enumerate() {
             let state = match slot {
                 0 => Descriptor::new(t0, self.generation, SlotState::Active),
-                1 => Descriptor::new(one, self.generation, SlotState::Ready),
+                1 if next.is_some() => Descriptor::new(one, self.generation, SlotState::Ready),
                 _ => Descriptor::new(t0, self.generation, SlotState::Free),
             };
             line.word.store(state.encode(), Ordering::Relaxed);
@@ -564,7 +565,9 @@ impl<T: TermBytes> LogBuffer<T> {
         if let Some(entry) = self.table().get((start.get() % table_len) as usize) {
             entry.store(table_entry(start.get(), 0), Ordering::Relaxed);
         }
-        if let Some(entry) = self.table().get((next.get() % table_len) as usize) {
+        if let Some(next) = next
+            && let Some(entry) = self.table().get((next.get() % table_len) as usize)
+        {
             entry.store(table_entry(next.get(), 1), Ordering::Relaxed);
         }
         self.active_count()
@@ -581,7 +584,7 @@ impl<T: TermBytes> LogBuffer<T> {
             cell.state.store(state, Ordering::Relaxed);
         }
         for (slot, line) in self.tails().iter().enumerate() {
-            let term = if slot == 0 { t0 } else { one };
+            let term = if slot == 0 || next.is_none() { t0 } else { one };
             line.word
                 .store(u64::from(term.get()) << 32, Ordering::Relaxed);
         }
@@ -922,6 +925,13 @@ fn window(config: &LogBufferConfig) -> u64 {
 /// Creation checks of an image: its join point names a term count below
 /// `2^31`, and the spare slots cover the owner's loans.
 fn check_image(config: &LogBufferConfig, join: u64) -> Result<(), SysError> {
+    // Readers and the owner access word 0 at the join point: a frame
+    // boundary, aligned like every frame.
+    if !join.is_multiple_of(u64::from(FRAME_ALIGNMENT)) {
+        return Err(SysError::InvalidPublicationMode {
+            reason: "the join point is not a multiple of the frame alignment",
+        });
+    }
     let count = join / u64::from(config.term_length.get());
     if count >= u64::from(crate::term::TERM_COUNT_LIMIT) {
         return Err(SysError::InvalidPublicationMode {
