@@ -39,6 +39,7 @@ use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, Sent};
 
 use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
+use crate::ledger::Ledger;
 
 /// Region id of the broadcast buffer.
 pub(crate) const BROADCAST_REGION: u64 = 1;
@@ -66,6 +67,10 @@ pub struct IpcConfig {
     /// `Region` messages), in the driver clock's unit; a client that has
     /// not drained it by then is retired.
     pub fetch_deadline: u64,
+    /// Grants one client holds at once, in any state but ended
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Bounds); a
+    /// command beyond it is refused and reserves nothing.
+    pub max_exports_per_client: usize,
 }
 
 /// A connection waiting for its `Hello`.
@@ -178,6 +183,7 @@ impl<T: StreamTerms> Admission<T> {
         if config.max_pending_hellos == 0
             || config.hello_timeout == 0
             || config.fetch_deadline == 0
+            || config.max_exports_per_client == 0
             || config.max_outbound_per_client < BOOTSTRAP_MESSAGES
         {
             return Err(DriverError::InvalidConfig);
@@ -394,7 +400,10 @@ impl<T: StreamTerms> Admission<T> {
             fds.push(region.descriptor()?.try_clone_to_owned().ok()?);
         }
         let link = Arc::new(ClientLink::new());
-        let client = driver.admit(consumer, Arc::clone(&link)).ok()?;
+        let ledger = Ledger::new(self.config.max_exports_per_client);
+        let client = driver
+            .admit(consumer, Arc::clone(&link), Some(ledger))
+            .ok()?;
         self.next_region = next_region;
         driver.next_export = next_export;
         let mut outbound = VecDeque::with_capacity(BOOTSTRAP_MESSAGES);

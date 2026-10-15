@@ -56,6 +56,7 @@ fn driver(dir: &Path) -> IpcDriver {
                 hello_timeout: 5_000_000_000,
                 max_outbound_per_client: 16,
                 fetch_deadline: 5_000_000_000,
+                max_exports_per_client: 16,
             },
             Box::new(SystemClock::new()),
         );

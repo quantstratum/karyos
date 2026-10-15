@@ -22,12 +22,14 @@ use karyos_protocol::cnc::{
     MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey, SubscriberRole,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
-use karyos_sys::log_buffer::{LossPolicy, Revocation, Role, SealState};
+use karyos_sys::log_buffer::{LossPolicy, PublicationEnd, Revocation, Role, SealState};
+use karyos_sys::registration;
 
 use crate::counters::Event;
 use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::generations::MemberKind;
+use crate::ledger::{Grant, GrantState, Ledger, Participant};
 
 /// A client's registration in the driver.
 /// A lost `hold` participant whose bound has not been withdrawn yet.
@@ -51,6 +53,9 @@ pub(crate) struct ClientSlot<T: StreamTerms> {
     /// The client heartbeat last seen and the driver time it was first
     /// seen at; `None` until the first sample.
     seen: Option<(u64, u64)>,
+    /// The export ledger of a remote client; `None` for an in-process one
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`).
+    pub(crate) ledger: Option<Ledger>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +103,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             command_ring(self.config.ring_capacity).map_err(|_| DriverError::InvalidConfig)?;
         let link = Arc::new(ClientLink::new());
         let receiver = self.broadcast.receiver();
-        let id = self.admit(consumer, Arc::clone(&link))?;
+        let id = self.admit(consumer, Arc::clone(&link), None)?;
         Ok(ClientConductor::new(
             Owner {
                 driver: self.id,
@@ -111,13 +116,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         ))
     }
 
-    /// Registers an admitted client with its ring's consumer and link;
-    /// returns its id. The caller checked the terminal state and
-    /// `max_clients`.
+    /// Registers an admitted client with its ring's consumer and link, and
+    /// the export ledger of a remote client; returns its id. The caller
+    /// checked the terminal state and `max_clients`.
     pub(crate) fn admit(
         &mut self,
         consumer: RingConsumer,
         link: Arc<ClientLink<T>>,
+        ledger: Option<Ledger>,
     ) -> Result<u64, DriverError> {
         let id = self.next_client;
         let next = id.checked_add(1).ok_or(DriverError::ClientIdsExhausted)?;
@@ -128,6 +134,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             consumer: Some(consumer),
             link,
             seen: None,
+            ledger,
         });
         self.update_stream_gauges();
         Ok(id)
@@ -479,6 +486,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let Some(index) = self.find_stream(stream) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
+                let remote = self
+                    .clients
+                    .iter()
+                    .find(|slot| slot.id == client)
+                    .and_then(|slot| slot.ledger.as_ref())
+                    .map(Ledger::full);
+                match remote {
+                    // The export bound refuses before anything is reserved.
+                    Some(true) => return refuse(ErrorCode::ResourcesUnavailable, detail),
+                    Some(false) => return self.add_remote(client, index, command, request),
+                    None => {}
+                }
                 if link.held() >= self.config.max_pending_per_client
                     || self.held_total() >= self.config.max_hand_over
                 {
@@ -628,8 +647,180 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // Drops a capability still held; a taken one was dropped by
                 // the client's remove.
                 link.drop_entry(registration);
+                self.remove_remote(client, registration);
                 Response::OperationSucceeded { request }
             }
+        }
+    }
+}
+
+impl<T: StreamTerms> EmbeddedDriver<T> {
+    /// A remote client's `Add*` (`quantstratum-docs:
+    /// karyos/design/ipc-data-path.md`, Grants and the export ledger, step
+    /// 1): reserves the participant in the buffer under the next export id,
+    /// stored in its registration word before anything is sent, records
+    /// the grant `Held` and answers with its key. No in-process capability
+    /// is created.
+    fn add_remote(
+        &mut self,
+        client: u64,
+        index: usize,
+        command: Command,
+        request: RequestId,
+    ) -> Response {
+        let refuse = |code: ErrorCode, detail: u64| Response::Error {
+            request,
+            code,
+            detail,
+        };
+        let registration = self.next_registration;
+        let Some(next) = registration.checked_add(1) else {
+            return refuse(ErrorCode::IdentitiesExhausted, 0);
+        };
+        let export = self.next_export;
+        // Export ids stop below the adoption and fence marks; they never
+        // wrap.
+        if !registration::valid_export(export) {
+            return refuse(ErrorCode::IdentitiesExhausted, 0);
+        }
+        let Some(target) = self.streams.get_mut(index) else {
+            return refuse(ErrorCode::UnknownStream, 0);
+        };
+        let detail = u64::from(target.stream_id.cast_unsigned());
+        if target.issuing().is_err() {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        }
+        let participant = match command {
+            Command::AddPublication { .. } => {
+                // A spare publication is the driver's own issuance.
+                if target.spare.is_some() {
+                    return refuse(ErrorCode::PublicationTaken, detail);
+                }
+                match target.conductor.register_publication(export) {
+                    Ok(true) => Participant::Exclusive,
+                    Ok(false) => return refuse(ErrorCode::PublicationTaken, detail),
+                    Err(error) => return refuse(issue_refusal(&error), detail),
+                }
+            }
+            Command::AddConcurrentPublication { .. } => {
+                match target.conductor.register_concurrent_publication(export) {
+                    Ok(Some(slot)) => Participant::Concurrent { slot },
+                    Ok(None) => return refuse(ErrorCode::PublicationTaken, detail),
+                    Err(error) => return refuse(issue_refusal(&error), detail),
+                }
+            }
+            _ => {
+                let role = match command {
+                    Command::AddSubscription {
+                        role: SubscriberRole::Optional,
+                        ..
+                    } => Role::Optional,
+                    _ => Role::Required,
+                };
+                let reserve = role == Role::Required && target.policy == LossPolicy::Continue;
+                match target
+                    .conductor
+                    .register_subscriber_with(role, reserve, export)
+                {
+                    Ok(cell) => Participant::Subscriber { cell, role },
+                    Err(_) => return refuse(ErrorCode::ResourcesUnavailable, detail),
+                }
+            }
+        };
+        // Effect: everything below cannot fail.
+        let stream = target.id;
+        self.next_registration = next;
+        self.next_export = export + 1;
+        if let Some(ledger) = self
+            .clients
+            .iter_mut()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_mut())
+        {
+            ledger.push(Grant {
+                export,
+                registration,
+                key: registration,
+                stream,
+                participant,
+                state: GrantState::Held,
+                sent: false,
+            });
+        }
+        let (kind, subscriber) = match participant {
+            Participant::Subscriber { cell, role } => {
+                (Kind::Subscription, Some((cell, export, role)))
+            }
+            Participant::Exclusive | Participant::Concurrent { .. } => (Kind::Publication, None),
+        };
+        self.registrations.push(Registration {
+            id: registration,
+            client,
+            stream,
+            kind,
+            // A remote registration has no in-process lease: it ends with
+            // its grant.
+            end: Arc::new(LeaseEnd::default()),
+            subscriber,
+        });
+        self.counters.add(Event::GrantsReserved, 1);
+        match kind {
+            Kind::Publication => Response::PublicationReady {
+                request,
+                registration,
+                key: registration,
+            },
+            Kind::Subscription => Response::SubscriptionReady {
+                request,
+                registration,
+                key: registration,
+            },
+        }
+    }
+
+    /// A remote client's `Remove*` of `registration`: a grant never sent is
+    /// ended at once, its participant released in the buffer; a sent one
+    /// stays charged until its `Detach` or the client's exit proof.
+    fn remove_remote(&mut self, client: u64, registration: u64) {
+        let Some(ledger) = self
+            .clients
+            .iter_mut()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_mut())
+        else {
+            return;
+        };
+        if ledger
+            .by_registration(registration)
+            .is_none_or(|grant| grant.sent)
+        {
+            return;
+        }
+        let Some(grant) = ledger.remove_registration(registration) else {
+            return;
+        };
+        self.end_grant(&grant);
+    }
+
+    /// Ends `grant`'s registration in its stream's buffer. The caller holds
+    /// the proof that no access follows: the grant was never sent, or its
+    /// `Detach` or the client's exit proof arrived.
+    pub(crate) fn end_grant(&mut self, grant: &Grant) {
+        let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
+            return;
+        };
+        let conductor = &mut stream.conductor;
+        let ended = match grant.participant {
+            Participant::Subscriber { cell, .. } => conductor.end_subscriber(cell, grant.export),
+            Participant::Exclusive => conductor
+                .end_publication(grant.export)
+                .is_ok_and(|end| end != PublicationEnd::Stale),
+            Participant::Concurrent { slot } => conductor
+                .end_concurrent_publication(slot, grant.export)
+                .unwrap_or(false),
+        };
+        if ended {
+            self.counters.add(Event::GrantsEnded, 1);
         }
     }
 }
@@ -666,11 +857,15 @@ mod tests {
     use karyos_sys::term::TermId;
 
     use super::*;
-    use crate::embedded::StreamConfig;
+    use crate::embedded::{StreamConfig, StreamHandle};
 
     fn driver() -> EmbeddedDriver {
+        driver_with_stream().0
+    }
+
+    fn driver_with_stream() -> (EmbeddedDriver, StreamHandle) {
         let mut driver = EmbeddedDriver::new().unwrap();
-        let _ = driver
+        let stream = driver
             .add_stream(StreamConfig {
                 buffer: LogBufferConfig {
                     term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
@@ -689,7 +884,7 @@ mod tests {
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
             })
             .unwrap();
-        driver
+        (driver, stream)
     }
 
     /// Admits a raw client whose producer the test controls.
@@ -703,8 +898,229 @@ mod tests {
             consumer: Some(consumer),
             link: Arc::clone(&link),
             seen: None,
+            ledger: None,
         });
         (id, producer, link)
+    }
+
+    /// Admits a raw remote client with an export ledger of `limit` grants.
+    fn remote_client(driver: &mut EmbeddedDriver, limit: usize) -> (u64, RingProducer) {
+        let (producer, consumer) = command_ring(1024).unwrap();
+        let link = Arc::new(ClientLink::new());
+        let id = driver
+            .admit(consumer, link, Some(Ledger::new(limit)))
+            .unwrap();
+        (id, producer)
+    }
+
+    /// Every response the broadcast buffer carries from `observer`'s cursor.
+    fn responses(observer: &mut karyos_sys::broadcast::BroadcastReceiver) -> Vec<Response> {
+        let mut out = Vec::new();
+        while let Received::Message {
+            type_id, payload, ..
+        } = observer.receive()
+        {
+            if let Ok(response) = Response::decode(type_id, payload) {
+                out.push(response);
+            }
+        }
+        out
+    }
+
+    fn ledger(driver: &EmbeddedDriver, client: u64) -> &[Grant] {
+        driver
+            .clients
+            .iter()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_ref())
+            .unwrap()
+            .grants()
+    }
+
+    const KEY: StreamKey = StreamKey {
+        stream_id: 2,
+        session_id: 1,
+    };
+
+    #[test]
+    fn a_remote_subscription_is_reserved_under_an_export_and_answered_with_its_key() {
+        let mut driver = driver();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let [
+            Response::SubscriptionReady {
+                registration, key, ..
+            },
+        ] = responses(&mut observer)[..]
+        else {
+            panic!("expected one SubscriptionReady");
+        };
+        let grants = ledger(&driver, client);
+        assert_eq!(grants.len(), 1);
+        let grant = grants[0];
+        assert_eq!((grant.registration, grant.key), (registration, key));
+        assert_eq!(grant.state, GrantState::Held);
+        assert!(!grant.sent);
+        let Participant::Subscriber { cell, role } = grant.participant else {
+            panic!("a subscriber grant");
+        };
+        assert_eq!(role, Role::Required);
+        // Nothing waits in the in-process hand-over table, and the export
+        // is in the registration word before anything is sent: a
+        // participant adopts the cell with it.
+        assert_eq!(driver.clients[0].link.held(), 0);
+        let buffer = Arc::clone(&driver.streams[0].buffer);
+        assert_eq!(buffer.attached_subscribers(), 1);
+        assert!(
+            karyos_sys::log_buffer::Subscription::adopt(buffer, cell, Role::Required, grant.export)
+                .is_ok()
+        );
+        assert_eq!(driver.next_export, grant.export + 1);
+    }
+
+    #[test]
+    fn removing_a_held_remote_grant_ends_it_in_the_buffer() {
+        let mut driver = driver();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Optional,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let registration = ledger(&driver, client)[0].registration;
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 2,
+                registration,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert!(matches!(
+            responses(&mut observer)[..],
+            [
+                Response::SubscriptionReady { .. },
+                Response::OperationSucceeded { .. }
+            ]
+        ));
+        assert!(ledger(&driver, client).is_empty());
+        assert_eq!(driver.streams[0].buffer.attached_subscribers(), 0);
+        assert!(driver.registrations.is_empty());
+    }
+
+    #[test]
+    fn the_export_bound_refuses_a_command_without_reserving() {
+        let mut driver = driver();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 1);
+        for sequence in 1..=2 {
+            write(
+                &mut producer,
+                Command::AddSubscription {
+                    sequence,
+                    stream: KEY,
+                    role: SubscriberRole::Optional,
+                },
+            );
+            let _ = driver.do_work().unwrap();
+        }
+        let export = driver.next_export;
+        assert!(matches!(
+            responses(&mut observer)[..],
+            [
+                Response::SubscriptionReady { .. },
+                Response::Error {
+                    code: ErrorCode::ResourcesUnavailable,
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(ledger(&driver, client).len(), 1);
+        assert_eq!(driver.streams[0].buffer.attached_subscribers(), 1);
+        assert_eq!(driver.next_export, export);
+    }
+
+    #[test]
+    fn a_remote_exclusive_publication_takes_the_one_issuance() {
+        let (mut driver, stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        for sequence in 1..=2 {
+            write(
+                &mut producer,
+                Command::AddPublication {
+                    sequence,
+                    stream: KEY,
+                    allow_unconnected: false,
+                },
+            );
+            let _ = driver.do_work().unwrap();
+        }
+        assert!(matches!(
+            responses(&mut observer)[..],
+            [
+                Response::PublicationReady { .. },
+                Response::Error {
+                    code: ErrorCode::PublicationTaken,
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(
+            ledger(&driver, client)[0].participant,
+            Participant::Exclusive
+        );
+        assert!(matches!(
+            driver.publication(stream),
+            Err(DriverError::PublicationTaken)
+        ));
+    }
+
+    #[test]
+    fn a_sent_grant_outlives_its_remove_and_keeps_its_stream() {
+        let (mut driver, stream) = driver_with_stream();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Optional,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let registration = ledger(&driver, client)[0].registration;
+        // A descriptor of it left: it is charged until Detach or exit.
+        if let Some(slot) = driver.clients.iter_mut().find(|slot| slot.id == client) {
+            slot.ledger.as_mut().unwrap().mark_sent(registration);
+        }
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 2,
+                registration,
+            },
+        );
+        driver.remove_stream(stream).unwrap();
+        let _ = driver.do_work().unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(ledger(&driver, client).len(), 1);
+        assert_eq!(driver.streams[0].buffer.attached_subscribers(), 1);
+        assert_eq!(driver.streams.len(), 1);
     }
 
     fn write(producer: &mut RingProducer, command: Command) {
