@@ -300,8 +300,19 @@ pub fn reserved_extent(
 
 /// The seal word once sealed (`quantstratum-docs: karyos/design/publication-seal.md`).
 pub const SEAL_SEALED: u64 = 1 << 63;
-/// The seal word's mark of a known seal position, held in the bits below.
+/// The seal word's mark of a known seal position, held in the bits below
+/// [`SEAL_SUCCESSOR`].
 pub const SEAL_POSITIONED: u64 = 1 << 62;
+/// The seal word's mark of a seal for a mapping-generation cutover: the
+/// stream continues in a successor mapping (owner decision 2026-10-15, ACS
+/// 13103; `quantstratum-docs: karyos/design/ipc-data-path.md`, Generations
+/// across processes). Written in the same swap as [`SEAL_SEALED`] and kept
+/// by [`position_seal`], so a reader that sees the seal sees whether a
+/// successor exists in the same load. Seal positions stay below `2^61`
+/// (`2^31` terms of at most `2^30` bytes).
+pub const SEAL_SUCCESSOR: u64 = 1 << 61;
+/// The bits of a positioned seal word that hold the position.
+pub const SEAL_POSITION_MASK: u64 = SEAL_SUCCESSOR - 1;
 
 /// Seals (conductor): writes `SEAL_SEALED`, then a zero `limit`. A
 /// publisher whose Acquire load of the limit reads that zero then observes
@@ -317,6 +328,20 @@ pub const SEAL_POSITIONED: u64 = 1 << 62;
 pub fn seal(seal: &AtomicU64, limit: &AtomicU64) {
     let _ = seal.swap(SEAL_SEALED, Ordering::AcqRel);
     limit.store(0, Ordering::Release);
+}
+
+/// Seals for a cutover (conductor), as [`seal`], with [`SEAL_SUCCESSOR`]
+/// in the same swap.
+#[inline]
+pub fn seal_for_cutover(seal: &AtomicU64, limit: &AtomicU64) {
+    let _ = seal.swap(SEAL_SEALED | SEAL_SUCCESSOR, Ordering::AcqRel);
+    limit.store(0, Ordering::Release);
+}
+
+/// Whether a seal word read by Acquire marks a seal with a successor.
+#[inline]
+pub fn seal_has_successor(raw: u64) -> bool {
+    raw & SEAL_SEALED != 0 && raw & SEAL_SUCCESSOR != 0
 }
 
 /// A publisher's check after an attempt that was not granted: whether the
@@ -405,13 +430,23 @@ pub fn fence_tail(tail: &AtomicU64, term_length: u32) -> u64 {
     tail.fetch_add(u64::from(term_length), Ordering::AcqRel)
 }
 
-/// Writes the seal position (conductor), once every publisher released.
-/// A swap, like every write to the seal word, so that the issuer's
-/// read-modify-write in [`issuer_sees_seal`] is ordered with all of them.
+/// Writes the seal position (conductor), once every publisher released,
+/// keeping [`SEAL_SUCCESSOR`]. A read-modify-write, like every write to the
+/// seal word, so that the issuer's read-modify-write in
+/// [`issuer_sees_seal`] is ordered with all of them; the update reads the
+/// latest word, so the successor mark it keeps is the one the seal wrote.
 #[inline]
 pub fn position_seal(seal: &AtomicU64, position: u64) {
-    let _ = seal.swap(
-        SEAL_SEALED | SEAL_POSITIONED | (position & (SEAL_POSITIONED - 1)),
+    let positioned = SEAL_SEALED | SEAL_POSITIONED | (position & SEAL_POSITION_MASK);
+    let mut old = seal.load(Ordering::Relaxed);
+    // Only an issuer's `fetch_or(0)` can interleave, and it changes no bit,
+    // so a retry rewrites the same value.
+    while let Err(actual) = seal.compare_exchange_weak(
+        old,
+        positioned | (old & SEAL_SUCCESSOR),
         Ordering::AcqRel,
-    );
+        Ordering::Relaxed,
+    ) {
+        old = actual;
+    }
 }

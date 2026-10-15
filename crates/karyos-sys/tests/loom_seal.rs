@@ -12,7 +12,9 @@
 //! - one exclusive writer racing the seal, with the same property over
 //!   `reserved_head` and the release flag;
 //! - the exclusive issuance racing the seal: either the issuer is refused,
-//!   or positioning waits for the issued writer's release.
+//!   or positioning waits for the issued writer's release;
+//! - a seal for a cutover racing an issuer's read and a reader: every load
+//!   that sees the seal sees its successor mark, and positioning keeps it.
 //!
 //! Negative controls must fail: a concurrent release stored before the
 //! last `fetch_add`; positioning that loads the slot and the tail Relaxed;
@@ -28,9 +30,10 @@
 #![cfg(loom)]
 
 use karyos_sys::publication::{
-    PUBLISHER_HELD, SEAL_POSITIONED, issuer_sees_seal, observe_seal, position_seal,
-    publication_released, publication_taken, publisher_slot_free, release_publication,
-    release_publisher_slot, seal, take_publication,
+    PUBLISHER_HELD, SEAL_POSITION_MASK, SEAL_POSITIONED, SEAL_SEALED, SEAL_SUCCESSOR,
+    issuer_sees_seal, observe_seal, position_seal, publication_released, publication_taken,
+    publisher_slot_free, release_publication, release_publisher_slot, seal, seal_for_cutover,
+    seal_has_successor, take_publication,
 };
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::sync::Arc;
@@ -49,7 +52,7 @@ const GRANTS: u64 = 2;
 
 fn position(word: &AtomicU64) -> Option<u64> {
     let raw = word.load(Ordering::Acquire);
-    (raw & SEAL_POSITIONED != 0).then_some(raw & (SEAL_POSITIONED - 1))
+    (raw & SEAL_POSITIONED != 0).then_some(raw & SEAL_POSITION_MASK)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -332,4 +335,80 @@ fn issuance_and_seal_observe_each_other() {
 #[should_panic(expected = "the issued writer reserved above the seal position")]
 fn control_plain_issuance_accesses() {
     issuance_model(Issuance::PlainAccesses);
+}
+
+/// A cutover seal and its positioning race an issuer's read-modify-write
+/// and a reader: whenever a load sees the seal, it sees the successor mark
+/// in the same load, and the positioned word keeps the mark and the exact
+/// position.
+#[test]
+fn a_cutover_seal_is_seen_with_its_successor_and_positioning_keeps_it() {
+    builder().check(|| {
+        let shared = Arc::new(Shared {
+            tail: AtomicU64::new(0),
+            limit: AtomicU64::new(OPEN),
+            seal: AtomicU64::new(0),
+            slots: [AtomicU64::new(0), AtomicU64::new(0)],
+        });
+        let conductor = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                seal_for_cutover(&shared.seal, &shared.limit);
+                position_seal(&shared.seal, 7);
+            })
+        };
+        let issuer = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let _ = issuer_sees_seal(&shared.seal);
+            })
+        };
+        for _ in 0..2 {
+            let raw = shared.seal.load(Ordering::Acquire);
+            if raw & SEAL_SEALED != 0 {
+                assert!(seal_has_successor(raw), "a seal seen without its mark");
+            }
+            thread::yield_now();
+        }
+        conductor.join().unwrap();
+        issuer.join().unwrap();
+        let raw = shared.seal.load(Ordering::Acquire);
+        assert_eq!(
+            raw,
+            SEAL_SEALED | SEAL_POSITIONED | SEAL_SUCCESSOR | 7,
+            "positioning lost the mark or the position"
+        );
+        assert_eq!(position(&shared.seal), Some(7));
+    });
+}
+
+/// A final seal never carries the mark.
+#[test]
+fn a_final_seal_has_no_successor() {
+    builder().check(|| {
+        let word = AtomicU64::new(0);
+        let limit = AtomicU64::new(OPEN);
+        seal(&word, &limit);
+        assert!(!seal_has_successor(word.load(Ordering::Acquire)));
+        position_seal(&word, 3);
+        assert!(!seal_has_successor(word.load(Ordering::Acquire)));
+        assert_eq!(position(&word), Some(3));
+    });
+}
+
+/// Negative control: positioning with a plain swap of the positioned value,
+/// as before the successor mark, loses the mark.
+#[test]
+#[should_panic(expected = "positioning lost the mark")]
+fn control_positioning_with_a_plain_swap() {
+    builder().check(|| {
+        let word = AtomicU64::new(0);
+        let limit = AtomicU64::new(OPEN);
+        seal_for_cutover(&word, &limit);
+        let _ = word.swap(SEAL_SEALED | SEAL_POSITIONED | 7, Ordering::AcqRel);
+        assert!(
+            seal_has_successor(word.load(Ordering::Acquire)),
+            "positioning lost the mark"
+        );
+    });
 }

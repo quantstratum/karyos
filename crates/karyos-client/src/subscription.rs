@@ -459,7 +459,7 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// cutover (`Some(false)`); `None` when no successor will come.
     fn after_end(&mut self) -> Option<bool> {
         let link = self.link.as_ref()?;
-        match link.next() {
+        match link.next(self.inner.buffer().sealed_with_successor()) {
             Next::Wait => Some(false),
             Next::Moved {
                 base,
@@ -710,7 +710,7 @@ mod tests {
         let _ = publication
             .append(b"before", AppendOptions::default())
             .unwrap();
-        conductor.seal().unwrap();
+        conductor.seal_for_cutover().unwrap();
         assert_eq!(
             publication
                 .append(b"late", AppendOptions::default())

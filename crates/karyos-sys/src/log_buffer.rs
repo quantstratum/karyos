@@ -154,7 +154,7 @@ const fn holds_credit(state: u64) -> bool {
 /// The seal position bits of the seal word (`quantstratum-docs: karyos/design/publication-seal.md`):
 /// `0` while active, `SEAL_SEALED` once sealed, and `SEAL_SEALED |
 /// SEAL_POSITIONED | position` once the seal position is known.
-const SEAL_POSITION: u64 = SEAL_POSITIONED - 1;
+const SEAL_POSITION: u64 = crate::publication::SEAL_POSITION_MASK;
 
 /// A subscriber's role (SPEC.md §4 reader roles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -777,6 +777,15 @@ impl<T: TermBytes> LogBuffer<T> {
     #[must_use]
     pub fn generation(&self) -> Generation {
         self.generation
+    }
+
+    /// Whether the buffer is sealed for a mapping-generation cutover: the
+    /// stream continues in a successor mapping (Acquire). `false` while
+    /// active and for a final seal.
+    #[inline]
+    #[must_use]
+    pub fn sealed_with_successor(&self) -> bool {
+        crate::publication::seal_has_successor(self.seal().load(Ordering::Acquire))
     }
 
     /// Largest message without the trace extension.
@@ -3645,12 +3654,31 @@ impl<O: BufferOwner> Conductor<O> {
     /// Returns errors from the descriptor protocol, which indicate a broken
     /// invariant.
     pub fn seal(&mut self) -> Result<(), SysError> {
+        self.seal_with(false)
+    }
+
+    /// Seals the buffer for a mapping-generation cutover, as
+    /// [`Conductor::seal`], marking the seal word with a successor: a reader
+    /// that sees this seal knows the stream continues in another mapping.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::seal`].
+    pub fn seal_for_cutover(&mut self) -> Result<(), SysError> {
+        self.seal_with(true)
+    }
+
+    fn seal_with(&mut self, successor: bool) -> Result<(), SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         if buffer.seal().load(Ordering::Relaxed) != 0 {
             return Ok(());
         }
         // Every reservation ends above the zero limit this stores.
-        seal(buffer.seal(), buffer.limit());
+        if successor {
+            crate::publication::seal_for_cutover(buffer.seal(), buffer.limit());
+        } else {
+            seal(buffer.seal(), buffer.limit());
+        }
         if buffer.concurrent() {
             self.context().fence()?;
         }
@@ -4389,8 +4417,11 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
     ))
 }
 
-/// The layout version of the shared log buffer region.
-pub const LAYOUT_VERSION: u64 = 1;
+/// The layout version of the shared log buffer region. Version 2 gives bit
+/// 61 of the seal word a meaning (`SEAL_SUCCESSOR`, ADR-0061) and narrows
+/// the seal position to bits 0..60, so a reader of version 1 would misread
+/// a cutover seal; version 1 regions are refused at attach.
+pub const LAYOUT_VERSION: u64 = 2;
 
 #[cfg(test)]
 mod heap_tests {
@@ -4731,7 +4762,8 @@ mod region_tests {
         // claim deadline, an unknown mode, a generation that differs from
         // the region's, a largest message that differs, a trailing word.
         for (index, value) in [
-            (0, 2),
+            (0, 1),
+            (0, 3),
             (1, 1000),
             (2, 200),
             (10, 0),
@@ -4764,6 +4796,53 @@ mod region_tests {
             panic!("no message");
         };
         assert!(Region::attach(received.fd.unwrap(), other).is_err());
+    }
+
+    /// A region of layout version 1, from before the seal word's successor
+    /// bit (ADR-0061), is refused at attach: by its record and by its
+    /// configuration block, so a mixed build never misreads a seal.
+    #[test]
+    fn attach_refuses_a_version_1_region() {
+        assert_eq!(LAYOUT_VERSION, 2);
+        let creator =
+            LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
+        let record = creator.region().unwrap().record();
+        let source = creator.region().unwrap().structure();
+        for (record_layout, block_version) in [(1, 1), (1, 2), (2, 1)] {
+            let old = Region::create(RegionRecord {
+                region: 9,
+                layout: record_layout,
+                ..record
+            })
+            .unwrap();
+            let target = old.structure();
+            for index in 0..CONFIG_WORDS {
+                let value = source.get(index).unwrap().load(Ordering::Acquire);
+                target.get(index).unwrap().store(value, Ordering::Release);
+            }
+            // Word 0 of the configuration block is its layout version.
+            target
+                .get(0)
+                .unwrap()
+                .store(block_version, Ordering::Release);
+            let (a, b) = seqpacket_pair().unwrap();
+            assert_eq!(
+                send(a.as_fd(), b"lb", old.descriptor()).unwrap(),
+                Sent::Sent
+            );
+            let mut buffer = [0u8; 8];
+            let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+                panic!("no message");
+            };
+            let attached = Region::attach(received.fd.unwrap(), old.record()).unwrap();
+            assert!(
+                matches!(
+                    LogBuffer::attach(attached),
+                    Err(SysError::InvalidRegion { .. })
+                ),
+                "record layout {record_layout}, block version {block_version} accepted"
+            );
+        }
     }
 
     /// A self-consistent region of another kind whose structure holds a
