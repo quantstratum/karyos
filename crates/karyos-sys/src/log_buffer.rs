@@ -3372,6 +3372,7 @@ mod heap_tests {
     include!("log_buffer_tests/common.rs");
     include!("log_buffer_tests/seal.rs");
     include!("log_buffer_tests/adoption.rs");
+    include!("log_buffer_tests/contracts.rs");
 }
 
 #[cfg(test)]
@@ -3394,6 +3395,7 @@ mod shared_tests {
     include!("log_buffer_tests/common.rs");
     include!("log_buffer_tests/seal.rs");
     include!("log_buffer_tests/adoption.rs");
+    include!("log_buffer_tests/contracts.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber
