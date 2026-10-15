@@ -333,7 +333,7 @@ struct Fetched {
 }
 
 /// One received message, with its descriptor.
-fn receive(socket: &OwnedFd) -> Result<(Message, Option<OwnedFd>), AttachError> {
+pub(crate) fn receive(socket: &OwnedFd) -> Result<(Message, Option<OwnedFd>), AttachError> {
     let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
     match ipc::recv(socket.as_fd(), &mut buffer)? {
         Recv::Message(received) => {
@@ -346,7 +346,11 @@ fn receive(socket: &OwnedFd) -> Result<(Message, Option<OwnedFd>), AttachError> 
     }
 }
 
-fn send(socket: &OwnedFd, message: &Message, fd: Option<&OwnedFd>) -> Result<(), AttachError> {
+pub(crate) fn send(
+    socket: &OwnedFd,
+    message: &Message,
+    fd: Option<&OwnedFd>,
+) -> Result<(), AttachError> {
     let mut out = [0u8; MAX_MESSAGE_LENGTH];
     let length = message
         .encode(&mut out)
@@ -365,7 +369,11 @@ fn expected(instance: u128, record: &Record) -> Result<RegionRecord, AttachError
         WireKind::Broadcast => RegionKind::Broadcast,
         WireKind::Counters => RegionKind::Counters,
         WireKind::ClientCounters => RegionKind::ClientCounters,
-        WireKind::LogBuffer => return Err(AttachError::Protocol),
+        // Log buffers come with a fetch; the error log and the loss report
+        // are granted to tools only.
+        WireKind::LogBuffer | WireKind::ErrorLog | WireKind::LossReport => {
+            return Err(AttachError::Protocol);
+        }
     };
     Ok(RegionRecord {
         instance,
@@ -454,7 +462,9 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
                 .client_counters
                 .replace(Region::attach(fd, expected)?)
                 .is_some(),
-            WireKind::LogBuffer => return Err(AttachError::Protocol),
+            WireKind::LogBuffer | WireKind::ErrorLog | WireKind::LossReport => {
+                return Err(AttachError::Protocol);
+            }
         };
         if duplicate {
             return Err(AttachError::Protocol);

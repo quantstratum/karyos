@@ -30,6 +30,21 @@
 //! with exports left, or any other protocol error stops serving the
 //! client: grants never sent end at once, and the rest stays charged until
 //! the exit proof.
+//!
+//! A tool (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+//! Tool attach) sends `ToolHello` instead, without a descriptor. The driver
+//! checks its uid (`SO_PEERCRED`) as for a client and admits at most
+//! `max_tools` tool connections, also while the driver is terminal, so
+//! that its diagnostics stay readable. A tool gets no client slot, command
+//! ring or capability: it is answered `ToolAdmitted` with the records of the
+//! four diagnostic regions (driver counters, client counters, error log,
+//! loss report), then one `Region` per record, in record order, each with
+//! the region's descriptor reopened read-only (owner decision Q7, A1). The
+//! connection stays open after this bootstrap, so the tool notices the
+//! driver's exit when it closes. A tool holds nothing the driver must
+//! reclaim (diagnostic regions are never reused while the driver lives), so
+//! closing its socket frees its connection; any message it sends after
+//! `ToolHello` closes the connection too.
 
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, OwnedFd};
@@ -39,7 +54,7 @@ use std::sync::Arc;
 use karyos_client::link::ClientLink;
 use karyos_protocol::admission::{
     Capability, MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION,
-    hello_version, refusal,
+    hello_version, refusal, tool_hello_version,
 };
 use karyos_sys::command_ring::RingConsumer;
 use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, Sent};
@@ -61,6 +76,11 @@ const FIRST_RING_REGION: u64 = 3;
 const BOOTSTRAP_REGIONS: u64 = 4;
 /// Messages of the bootstrap: `Admitted` and one `Region` per CnC record.
 const BOOTSTRAP_MESSAGES: usize = 1 + BOOTSTRAP_REGIONS as usize;
+/// Diagnostic regions granted to a tool: the driver counters, the client
+/// counters, the error log and the loss report.
+const TOOL_REGIONS: u64 = 4;
+/// A small default for [`IpcConfig::max_tools`].
+pub const DEFAULT_MAX_TOOLS: usize = 4;
 
 /// Settings of the admission socket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +112,9 @@ pub struct IpcConfig {
     /// Bytes of the regions of one fetch; a larger grant is refused with
     /// `LIMIT`.
     pub max_fetch_bytes: u64,
+    /// Tool connections admitted at once (nonzero; [`DEFAULT_MAX_TOOLS`] is
+    /// a small default); a `ToolHello` beyond it is refused with `LIMIT`.
+    pub max_tools: usize,
 }
 
 /// A connection waiting for its `Hello`.
@@ -139,6 +162,17 @@ struct Remote<T: StreamTerms> {
     open: Vec<u64>,
 }
 
+/// An admitted tool: its socket and what is still queued of its bootstrap.
+/// It holds nothing else.
+#[derive(Debug)]
+struct Tool {
+    socket: OwnedFd,
+    outbound: VecDeque<Outgoing>,
+    /// When it was admitted: a bootstrap not drained within
+    /// `fetch_deadline` closes the connection.
+    since: u64,
+}
+
 /// A client whose socket is gone, charged until its exit proof.
 #[derive(Debug)]
 struct Retiring<T: StreamTerms> {
@@ -162,6 +196,7 @@ pub(crate) struct Admission<T: StreamTerms> {
     pending: Vec<Pending>,
     remotes: Vec<Remote<T>>,
     retiring: Vec<Retiring<T>>,
+    tools: Vec<Tool>,
     next_region: u64,
 }
 
@@ -201,7 +236,7 @@ fn refuse(socket: &OwnedFd, code: u64) {
     }
 }
 
-/// The manifest record of one CnC grant of `region`.
+/// The manifest record of one CnC or diagnostic grant of `region`.
 fn record(region: &Region, export: u64) -> Option<Record> {
     let header = region.record();
     let kind = match header.kind {
@@ -210,8 +245,9 @@ fn record(region: &Region, export: u64) -> Option<Record> {
         RegionKind::Counters => WireKind::Counters,
         RegionKind::LogBuffer => WireKind::LogBuffer,
         RegionKind::ClientCounters => WireKind::ClientCounters,
-        // Granted to tools, not over the client manifest (P7 o4).
-        RegionKind::ErrorLog | RegionKind::LossReport => return None,
+        // Granted to tools only (P7 o4).
+        RegionKind::ErrorLog => WireKind::ErrorLog,
+        RegionKind::LossReport => WireKind::LossReport,
     };
     Some(Record {
         region: header.region,
@@ -239,6 +275,7 @@ impl<T: StreamTerms> Admission<T> {
             || config.max_fetches_per_client == 0
             || config.max_regions_per_fetch == 0
             || config.max_fetch_bytes == 0
+            || config.max_tools == 0
             || config.max_outbound_per_client < BOOTSTRAP_MESSAGES
         {
             return Err(DriverError::InvalidConfig);
@@ -252,6 +289,7 @@ impl<T: StreamTerms> Admission<T> {
             pending: Vec::new(),
             remotes: Vec::new(),
             retiring: Vec::new(),
+            tools: Vec::new(),
             next_region: FIRST_RING_REGION,
         })
     }
@@ -372,6 +410,7 @@ impl<T: StreamTerms> Admission<T> {
                 }
             }
         }
+        work = work.saturating_add(self.serve_tools(driver, &mut now));
         // Exit proofs.
         let before = self.remotes.len() + self.retiring.len();
         self.remotes.retain(|remote| {
@@ -402,6 +441,9 @@ impl<T: StreamTerms> Admission<T> {
         fd: Option<OwnedFd>,
         now: u64,
     ) {
+        if let Some(version) = tool_hello_version(bytes) {
+            return self.tool_hello(driver, socket, bytes, fd, version, now);
+        }
         let Some(version) = hello_version(bytes) else {
             return;
         };
@@ -499,6 +541,148 @@ impl<T: StreamTerms> Admission<T> {
             });
         }
         Some((client, link, outbound))
+    }
+
+    /// Handles a `ToolHello` of `version`: admits the tool or refuses it and
+    /// closes the connection. Refusals reach the error log as a client
+    /// hello's do.
+    fn tool_hello(
+        &mut self,
+        driver: &mut EmbeddedDriver<T>,
+        socket: OwnedFd,
+        bytes: &[u8],
+        fd: Option<OwnedFd>,
+        version: u64,
+        now: u64,
+    ) {
+        if version != VERSION {
+            return reject(
+                driver,
+                &socket,
+                refusal::INCOMPATIBLE_VERSION,
+                "incompatible tool version",
+            );
+        }
+        // A tool passes no descriptor; one that does is closed with the
+        // refusal.
+        if fd.is_some() || !matches!(Message::decode(bytes), Ok(Message::ToolHello { .. })) {
+            return reject(driver, &socket, refusal::PROFILE, "malformed tool hello");
+        }
+        let same_uid = ipc::peer_credentials(socket.as_fd())
+            .is_ok_and(|peer| peer.uid.as_raw() == ipc::own_uid());
+        if !same_uid {
+            return reject(driver, &socket, refusal::PROFILE, "tool of another uid");
+        }
+        if self.tools.len() >= self.config.max_tools {
+            return reject(driver, &socket, refusal::LIMIT, "tool limit");
+        }
+        match self.tool_bootstrap(driver) {
+            Some(outbound) => self.tools.push(Tool {
+                socket,
+                outbound,
+                since: now,
+            }),
+            None => reject(
+                driver,
+                &socket,
+                refusal::RESOURCES,
+                "tool bootstrap resources",
+            ),
+        }
+    }
+
+    /// Builds a tool's bootstrap: `ToolAdmitted` with the four diagnostic
+    /// records, then one `Region` per record with a read-only descriptor
+    /// (A1). Export ids come from the driver's checked counter, so no id is
+    /// ever given twice, although no ledger charges a tool's grants.
+    fn tool_bootstrap(&self, driver: &mut EmbeddedDriver<T>) -> Option<VecDeque<Outgoing>> {
+        let regions = [
+            driver.counters.region()?,
+            driver.client_counters.region()?,
+            driver.diagnostics.error_region()?,
+            driver.diagnostics.loss_region()?,
+        ];
+        let mut next_export = driver.next_export;
+        let first_export = Self::take_ids(&mut next_export, TOOL_REGIONS)?;
+        let mut records = Vec::with_capacity(regions.len());
+        let mut fds = Vec::with_capacity(regions.len());
+        for (offset, region) in (0u64..).zip(regions) {
+            records.push(record(region, first_export.checked_add(offset)?)?);
+            fds.push(region.read_only_descriptor().ok()?);
+        }
+        let mut outbound = VecDeque::with_capacity(regions.len() + 1);
+        outbound.push_back(Outgoing {
+            bytes: encode(&Message::ToolAdmitted {
+                instance: self.instance,
+                version: VERSION,
+                records,
+            })?,
+            fd: None,
+            mark: None,
+        });
+        for (index, fd) in (0u64..).zip(fds) {
+            outbound.push_back(Outgoing {
+                bytes: encode(&Message::Region { fetch: 0, index })?,
+                fd: Some(fd),
+                mark: None,
+            });
+        }
+        driver.next_export = next_export;
+        Some(outbound)
+    }
+
+    /// One step of every tool connection: a tool sends nothing after
+    /// `ToolHello`, so any datagram, a closed socket or a receive error
+    /// closes the connection; then its bootstrap is drained, and a
+    /// bootstrap not drained within `fetch_deadline` closes it too. Returns
+    /// work done.
+    fn serve_tools(&mut self, driver: &mut EmbeddedDriver<T>, now: &mut Option<u64>) -> u32 {
+        let mut work = 0u32;
+        let mut index = 0;
+        while let Some(tool) = self.tools.get_mut(index) {
+            let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
+            let mut keep = matches!(
+                ipc::recv(tool.socket.as_fd(), &mut buffer),
+                Ok(Recv::WouldBlock)
+            );
+            while keep && let Some(next) = tool.outbound.front() {
+                match ipc::send(
+                    tool.socket.as_fd(),
+                    &next.bytes,
+                    next.fd.as_ref().map(AsFd::as_fd),
+                ) {
+                    Ok(Sent::Sent) => {
+                        drop(tool.outbound.pop_front());
+                        work = work.saturating_add(1);
+                    }
+                    Ok(Sent::WouldBlock) => break,
+                    Err(_) => keep = false,
+                }
+            }
+            if keep
+                && !tool.outbound.is_empty()
+                && now
+                    .get_or_insert_with(|| driver.clock.now())
+                    .saturating_sub(tool.since)
+                    >= self.config.fetch_deadline
+            {
+                driver.diagnostics.error(
+                    &mut driver.counters,
+                    crate::diagnostics::ErrorCode::FetchDeadlineMissed,
+                    [0, 0],
+                    "tool bootstrap not drained within the fetch deadline",
+                );
+                keep = false;
+            }
+            if keep {
+                index += 1;
+            } else {
+                // Closes the socket; queued descriptors are closed with it.
+                drop(self.tools.swap_remove(index));
+                work = work.saturating_add(1);
+            }
+        }
+        work
     }
 
     /// Reads at most one datagram of an admitted client.
@@ -806,6 +990,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let work = admission.serve(self);
         self.admission = Some(admission);
         work
+    }
+
+    /// Tool connections admitted and not yet closed; 0 without IPC.
+    #[must_use]
+    pub fn tools(&self) -> usize {
+        self.admission
+            .as_ref()
+            .map_or(0, |admission| admission.tools.len())
     }
 
     /// The driver instance id, in IPC mode: the `driver_id` as one value,
