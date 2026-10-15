@@ -15,7 +15,9 @@
 //! (`quantstratum-docs: karyos/design/rejoin-policies.md`, SPEC.md §4,
 //! Recovery of an overrun reader): it rejoins at the head, rebuilds through
 //! a snapshot source, or closes; `replay` falls back to a secondary policy
-//! in phase 1, which has no Archive.
+//! in phase 1, which has no Archive. A subscription handed over by a client
+//! conductor also queues a loss report of each overrun for its conductor
+//! ([`crate::loss`]).
 
 use std::sync::Arc;
 
@@ -29,6 +31,7 @@ use karyos_protocol::trace_hook::{PublicationIdentity, SubscriberIdentity, Trace
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Next, Retired, RetiredHandle, Successor, representable};
 use crate::link::{Export, Lease, Origin};
+use crate::loss::LossReporter;
 use crate::trace::DeliveryTrace;
 
 /// Metadata delivered with each message.
@@ -345,6 +348,10 @@ pub struct ClientSubscription<T: TermBytes = HeapTerms> {
     trace: Option<DeliveryTrace>,
     /// Messages whose extension did not decode; delivered untraced.
     invalid_extensions: InvalidExtensions,
+    /// Where each overrun is reported, for a handle from a client
+    /// conductor that knows the stream's identity; boxed, since overruns
+    /// are rare and the handle stays small.
+    loss: Option<Box<LossReporter>>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -380,6 +387,7 @@ impl<T: TermBytes> ClientSubscription<T> {
             base: 0,
             trace: None,
             invalid_extensions: InvalidExtensions::default(),
+            loss: None,
             _lease: None,
             _export: None,
         }
@@ -490,6 +498,13 @@ impl<T: TermBytes> ClientSubscription<T> {
         subscription
     }
 
+    /// Reports each overrun through `reporter` (control path).
+    #[must_use]
+    pub(crate) fn with_loss_reports(mut self, reporter: LossReporter) -> Self {
+        self.loss = Some(Box::new(reporter));
+        self
+    }
+
     /// The owner and registration, for a handle from a client conductor.
     #[must_use]
     pub fn origin(&self) -> Option<&Origin> {
@@ -595,9 +610,14 @@ impl<T: TermBytes> ClientSubscription<T> {
                         lost_to: self.base + lost_to,
                         resume: self.base + resume,
                     };
+                    // Read before a `close` outcome drops the cell.
+                    let lane = inner.buffer().lane().get();
                     summary.overrun = Some(overrun);
                     let outcome = self.rejoin(&overrun);
                     summary.rejoin = Some(outcome);
+                    if let Some(loss) = &self.loss {
+                        loss.report(lane, &overrun, &self.rejoin, outcome);
+                    }
                     if outcome.closed() {
                         summary.closed_by_overrun = Some(overrun);
                     }

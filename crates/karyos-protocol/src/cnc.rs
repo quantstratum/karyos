@@ -23,6 +23,7 @@
 //! | `0x05` | `AddConcurrentPublication` | sequence | stream and session as above | flags as `AddPublication` | |
 //! | `0x06` | `AllocateCounter` | sequence | type id | stream registration or 0 | participant registration or 0 |
 //! | `0x07` | `ReleaseCounter` | sequence | cell | registration | |
+//! | `0x08` | `ReportLoss` | sequence | driver instance id, high word | driver instance id, low word | stream registration |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
@@ -34,6 +35,19 @@
 //! after its four words with the label: word 4 is its length in bytes (at
 //! most [`MAX_LABEL_LENGTH`], the other bits zero), and words 5 to 12 hold
 //! its UTF-8 bytes, padded with zero bytes.
+//!
+//! `ReportLoss` (`quantstratum-docs:
+//! karyos/design/observability-and-tools.md`, "Loss reports from clients")
+//! continues after its four words: word 4 is the stream's incarnation,
+//! word 5 the subscription's registration, words 6 and 7 the lost range
+//! (from and to, half open, `from <= to`), and word 8 packs the lane (bits
+//! 7 to 0, below 4), the configured rejoin policy (bits 15 to 8, a
+//! [`RejoinPolicyCode`]), the applied outcome (bits 23 to 16, a
+//! [`RejoinOutcomeCode`]) and the replay fallback reason (bits 31 to 24, a
+//! [`FallbackReasonCode`], nonzero exactly when the configured policy is
+//! `replay`); the other bits are zero. The outcome must be one the
+//! configured policy can produce. The driver answers `OperationSucceeded`
+//! when it recorded the report, and nothing for a protocol violation.
 //!
 //! Driver events (record types `0xC0` to `0xFF`, [`Event`]) answer no
 //! request and are broadcast to every client:
@@ -55,6 +69,8 @@ const LABEL_WORDS: usize = MAX_LABEL_LENGTH / 8;
 /// Words of an encoded `AllocateCounter`: four, the label length and the
 /// label.
 const ALLOCATE_COUNTER_WORDS: usize = 5 + LABEL_WORDS;
+/// Words of an encoded `ReportLoss`.
+const REPORT_LOSS_WORDS: usize = 9;
 /// Largest encoded command, in bytes: `AllocateCounter`.
 pub const MAX_COMMAND_LENGTH: usize = ALLOCATE_COUNTER_WORDS * 8;
 /// Largest encoded response, in bytes.
@@ -69,6 +85,7 @@ const REMOVE_SUBSCRIPTION: u32 = 0x04;
 const ADD_CONCURRENT_PUBLICATION: u32 = 0x05;
 const ALLOCATE_COUNTER: u32 = 0x06;
 const RELEASE_COUNTER: u32 = 0x07;
+const REPORT_LOSS: u32 = 0x08;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -81,6 +98,9 @@ const SUCCESSOR_READY: u32 = 0xC4;
 const FENCED: u32 = 0xC5;
 
 const ALLOW_UNCONNECTED: u64 = 1;
+
+// Every command fits the bound.
+const _: () = assert!(REPORT_LOSS_WORDS * 8 <= MAX_COMMAND_LENGTH);
 
 /// Errors decoding or encoding CnC messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -201,6 +221,180 @@ impl CounterLabel {
     }
 }
 
+/// A subscription's configured rejoin policy, as a loss report carries
+/// it: a stable `u8` code, never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RejoinPolicyCode {
+    /// `rejoin at head`.
+    RejoinAtHead = 1,
+    /// `snapshot`.
+    Snapshot = 2,
+    /// `close`.
+    Close = 3,
+    /// `replay`, which falls back to a secondary policy in phase 1.
+    Replay = 4,
+}
+
+impl RejoinPolicyCode {
+    const fn from_code(code: u64) -> Option<Self> {
+        Some(match code {
+            1 => Self::RejoinAtHead,
+            2 => Self::Snapshot,
+            3 => Self::Close,
+            4 => Self::Replay,
+            _ => return None,
+        })
+    }
+}
+
+/// What the rejoin policy actually applied did, as a loss report carries
+/// it: a stable `u8` code, never reused. For a `replay` that fell back,
+/// it is the secondary policy's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RejoinOutcomeCode {
+    /// Delivery continued at the head.
+    ResumedAtHead = 1,
+    /// The snapshot source rebuilt the state.
+    SnapshotRebuilt = 2,
+    /// The snapshot source failed: the subscription closed.
+    SnapshotFailed = 3,
+    /// The subscription closed.
+    Closed = 4,
+}
+
+impl RejoinOutcomeCode {
+    const fn from_code(code: u64) -> Option<Self> {
+        Some(match code {
+            1 => Self::ResumedAtHead,
+            2 => Self::SnapshotRebuilt,
+            3 => Self::SnapshotFailed,
+            4 => Self::Closed,
+            _ => return None,
+        })
+    }
+
+    /// Whether the policy `configured` (directly, or as the secondary of
+    /// `replay`) can produce this outcome.
+    const fn follows(self, configured: RejoinPolicyCode) -> bool {
+        matches!(
+            (configured, self),
+            (RejoinPolicyCode::RejoinAtHead, Self::ResumedAtHead)
+                | (
+                    RejoinPolicyCode::Snapshot,
+                    Self::SnapshotRebuilt | Self::SnapshotFailed
+                )
+                | (RejoinPolicyCode::Close, Self::Closed)
+                | (RejoinPolicyCode::Replay, _)
+        )
+    }
+}
+
+/// Why `replay` fell back to its secondary policy, as a loss report
+/// carries it: a stable `u8` code, never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum FallbackReasonCode {
+    /// No Archive exists (phase 1).
+    NoArchive = 1,
+    /// No recording covers the gap (phase 3).
+    NoRecording = 2,
+    /// The recording's retention does not reach the gap (phase 3).
+    RetentionShort = 3,
+}
+
+impl FallbackReasonCode {
+    const fn from_code(code: u64) -> Option<Self> {
+        Some(match code {
+            1 => Self::NoArchive,
+            2 => Self::NoRecording,
+            3 => Self::RetentionShort,
+            _ => return None,
+        })
+    }
+}
+
+/// An overrun as the subscription captured it when it happened
+/// (`quantstratum-docs: karyos/design/observability-and-tools.md`, "Loss
+/// reports from clients"): the stream's full publication identity, the
+/// subscription, the lane, the lost range and the rejoin policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReportedLoss {
+    /// The driver instance id of the publication's identity, two words.
+    pub driver: [u64; 2],
+    /// The stream registration of the publication's identity.
+    pub stream_registration: u64,
+    /// The incarnation of the publication's identity.
+    pub incarnation: u64,
+    /// The overrun subscription's registration.
+    pub subscription: u64,
+    /// The lane, below 4.
+    pub lane: u8,
+    /// First position lost.
+    pub from: u64,
+    /// End of the lost range (exclusive), at least `from`.
+    pub to: u64,
+    /// The configured rejoin policy.
+    pub configured: RejoinPolicyCode,
+    /// The outcome of the policy applied: for `replay`, the secondary's.
+    pub applied: RejoinOutcomeCode,
+    /// Why `replay` fell back; `Some` exactly when `configured` is
+    /// [`RejoinPolicyCode::Replay`].
+    pub fallback: Option<FallbackReasonCode>,
+}
+
+impl ReportedLoss {
+    fn packed(&self) -> u64 {
+        u64::from(self.lane)
+            | u64::from(self.configured as u8) << 8
+            | u64::from(self.applied as u8) << 16
+            | u64::from(self.fallback.map_or(0, |reason| reason as u8)) << 24
+    }
+
+    fn decode(words: [u64; REPORT_LOSS_WORDS - 1]) -> Option<Self> {
+        let [
+            high,
+            low,
+            stream_registration,
+            incarnation,
+            subscription,
+            from,
+            to,
+            packed,
+        ] = words;
+        if packed >> 32 != 0 || from > to {
+            return None;
+        }
+        let lane = u8::try_from(packed & 0xFF)
+            .ok()
+            .filter(|&lane| lane < karyos_sys::frame::Lane::COUNT)?;
+        let configured = RejoinPolicyCode::from_code((packed >> 8) & 0xFF)?;
+        let applied = RejoinOutcomeCode::from_code((packed >> 16) & 0xFF)?;
+        let fallback = match (packed >> 24) & 0xFF {
+            0 => None,
+            code => Some(FallbackReasonCode::from_code(code)?),
+        };
+        if !applied.follows(configured)
+            || fallback.is_some() != (configured == RejoinPolicyCode::Replay)
+        {
+            return None;
+        }
+        Some(Self {
+            driver: [high, low],
+            stream_registration,
+            incarnation,
+            subscription,
+            lane,
+            from,
+            to,
+            configured,
+            applied,
+            fallback,
+        })
+    }
+}
+
 /// A command from a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -269,6 +463,14 @@ pub enum Command {
         cell: u64,
         /// The allocation's registration.
         registration: u64,
+    },
+    /// Report an overrun of one of the client's subscriptions, for the
+    /// driver's loss report and overrun counters.
+    ReportLoss {
+        /// Request sequence.
+        sequence: u64,
+        /// The loss as captured.
+        loss: ReportedLoss,
     },
 }
 
@@ -414,6 +616,7 @@ impl Command {
             Self::RemoveSubscription { .. } => REMOVE_SUBSCRIPTION,
             Self::AllocateCounter { .. } => ALLOCATE_COUNTER,
             Self::ReleaseCounter { .. } => RELEASE_COUNTER,
+            Self::ReportLoss { .. } => REPORT_LOSS,
         }
     }
 
@@ -427,7 +630,8 @@ impl Command {
             | Self::RemovePublication { sequence, .. }
             | Self::RemoveSubscription { sequence, .. }
             | Self::AllocateCounter { sequence, .. }
-            | Self::ReleaseCounter { sequence, .. } => sequence,
+            | Self::ReleaseCounter { sequence, .. }
+            | Self::ReportLoss { sequence, .. } => sequence,
         }
     }
 
@@ -497,6 +701,20 @@ impl Command {
                 cell,
                 registration,
             } => write_words(&[sequence, cell, registration], out),
+            Self::ReportLoss { sequence, loss } => write_words(
+                &[
+                    sequence,
+                    loss.driver[0],
+                    loss.driver[1],
+                    loss.stream_registration,
+                    loss.incarnation,
+                    loss.subscription,
+                    loss.from,
+                    loss.to,
+                    loss.packed(),
+                ],
+                out,
+            ),
         }
     }
 
@@ -594,6 +812,20 @@ impl Command {
                     sequence,
                     cell,
                     registration,
+                })
+            }
+            REPORT_LOSS => {
+                let words = read_words::<REPORT_LOSS_WORDS>(type_id, bytes)?;
+                let reserved = CncError::Reserved { type_id };
+                let (sequence, rest) = words.split_first().ok_or(reserved)?;
+                let loss = rest
+                    .first_chunk::<{ REPORT_LOSS_WORDS - 1 }>()
+                    .copied()
+                    .and_then(ReportedLoss::decode)
+                    .ok_or(reserved)?;
+                Ok(Self::ReportLoss {
+                    sequence: *sequence,
+                    loss,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -970,6 +1202,21 @@ mod tests {
         }
     }
 
+    fn loss() -> ReportedLoss {
+        ReportedLoss {
+            driver: [0x0102, 0x0304],
+            stream_registration: 5,
+            incarnation: 1,
+            subscription: 6,
+            lane: 1,
+            from: 4096,
+            to: 8192,
+            configured: RejoinPolicyCode::Snapshot,
+            applied: RejoinOutcomeCode::SnapshotRebuilt,
+            fallback: None,
+        }
+    }
+
     #[test]
     fn commands_round_trip() {
         let commands = [
@@ -1026,6 +1273,23 @@ mod tests {
                 sequence: 8,
                 cell: 3,
                 registration: 13,
+            },
+            Command::ReportLoss {
+                sequence: 9,
+                loss: loss(),
+            },
+            Command::ReportLoss {
+                sequence: 10,
+                loss: ReportedLoss {
+                    driver: [u64::MAX, 0],
+                    lane: 3,
+                    from: 7,
+                    to: 7,
+                    configured: RejoinPolicyCode::Replay,
+                    applied: RejoinOutcomeCode::SnapshotFailed,
+                    fallback: Some(FallbackReasonCode::RetentionShort),
+                    ..loss()
+                },
             },
         ];
         for command in commands {
@@ -1212,7 +1476,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x08, &out[..length]),
+            Command::decode(0x09, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         let mut response = [0u8; MAX_RESPONSE_LENGTH];
@@ -1381,6 +1645,124 @@ mod tests {
             Response::decode(0x85, &out[..24]),
             Err(CncError::WrongLength { .. })
         ));
+    }
+
+    /// Literal bytes of `ReportLoss`.
+    #[test]
+    fn report_loss_golden_bytes() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let command = Command::ReportLoss {
+            sequence: 9,
+            loss: ReportedLoss {
+                lane: 2,
+                configured: RejoinPolicyCode::Replay,
+                applied: RejoinOutcomeCode::Closed,
+                fallback: Some(FallbackReasonCode::NoArchive),
+                ..loss()
+            },
+        };
+        assert_eq!(command.type_id(), 0x08);
+        let length = command.encode(&mut out).unwrap();
+        assert_eq!(
+            &out[..length],
+            &[
+                9, 0, 0, 0, 0, 0, 0, 0, // sequence
+                2, 1, 0, 0, 0, 0, 0, 0, // driver, high word
+                4, 3, 0, 0, 0, 0, 0, 0, // driver, low word
+                5, 0, 0, 0, 0, 0, 0, 0, // stream registration
+                1, 0, 0, 0, 0, 0, 0, 0, // incarnation
+                6, 0, 0, 0, 0, 0, 0, 0, // subscription
+                0, 0x10, 0, 0, 0, 0, 0, 0, // from
+                0, 0x20, 0, 0, 0, 0, 0, 0, // to
+                2, 4, 4, 1, 0, 0, 0, 0, // lane, policy, outcome, reason
+            ]
+        );
+    }
+
+    #[test]
+    fn report_loss_is_decoded_strictly() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let command = Command::ReportLoss {
+            sequence: 1,
+            loss: loss(),
+        };
+        let length = command.encode(&mut out).unwrap();
+        assert_eq!(length, 72);
+        assert_eq!(Command::decode(0x08, &out[..length]), Ok(command));
+        assert!(matches!(
+            Command::decode(0x08, &out[..length - 8]),
+            Err(CncError::WrongLength { .. })
+        ));
+        assert!(matches!(
+            Command::decode(0x08, &out[..length + 8]),
+            Err(CncError::WrongLength { .. })
+        ));
+        // The packed word: byte 64 lane, 65 policy, 66 outcome, 67
+        // reason, 68 to 71 reserved.
+        let bad_packed = [
+            (64, 4), // lane 4
+            (65, 0), // no policy
+            (65, 5), // unknown policy
+            (66, 0), // no outcome
+            (66, 5), // unknown outcome
+            (66, 1), // snapshot cannot resume at head
+            (66, 4), // snapshot cannot close without failing
+            (67, 1), // a reason without replay
+            (68, 1), // reserved bits
+            (71, 0x80),
+        ];
+        for (byte, value) in bad_packed {
+            let mut bad = out;
+            bad[byte] = value;
+            assert_eq!(
+                Command::decode(0x08, &bad[..length]),
+                Err(CncError::Reserved { type_id: 0x08 }),
+                "byte {byte} = {value}"
+            );
+        }
+        // Replay without a reason, and with an unknown one.
+        let mut bad = out;
+        bad[65] = 4;
+        assert_eq!(
+            Command::decode(0x08, &bad[..length]),
+            Err(CncError::Reserved { type_id: 0x08 })
+        );
+        bad[67] = 4;
+        assert_eq!(
+            Command::decode(0x08, &bad[..length]),
+            Err(CncError::Reserved { type_id: 0x08 })
+        );
+        bad[67] = 1;
+        assert!(Command::decode(0x08, &bad[..length]).is_ok());
+        // A range whose end is below its start.
+        let mut bad = out;
+        bad[48..56].copy_from_slice(&8193u64.to_le_bytes());
+        assert_eq!(
+            Command::decode(0x08, &bad[..length]),
+            Err(CncError::Reserved { type_id: 0x08 })
+        );
+        // Each configured policy and the outcomes it can produce.
+        let policies = [
+            (RejoinPolicyCode::RejoinAtHead, 1u8),
+            (RejoinPolicyCode::Snapshot, 2),
+            (RejoinPolicyCode::Close, 3),
+            (RejoinPolicyCode::Replay, 4),
+        ];
+        for (policy, code) in policies {
+            assert_eq!(policy as u8, code);
+            for outcome in 1..=4u8 {
+                let mut case = out;
+                case[65] = code;
+                case[66] = outcome;
+                case[67] = u8::from(policy == RejoinPolicyCode::Replay);
+                let expected = matches!((code, outcome), (1, 1) | (2, 2 | 3) | (3, 4) | (4, _));
+                assert_eq!(
+                    Command::decode(0x08, &case[..length]).is_ok(),
+                    expected,
+                    "policy {code} outcome {outcome}"
+                );
+            }
+        }
     }
 
     #[test]

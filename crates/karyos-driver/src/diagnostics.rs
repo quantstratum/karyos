@@ -48,7 +48,10 @@ pub enum ErrorSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum LossKind {
-    /// A subscriber was overrun (`ReportLoss`).
+    /// A subscriber was overrun (`ReportLoss`). The configured policy is a
+    /// `RejoinPolicyCode`, the applied one a `RejoinOutcomeCode` (for
+    /// `replay`, its secondary's outcome) and the reason a
+    /// `FallbackReasonCode`, 0 unless `replay` fell back.
     Overrun = 1,
     /// A required participant was lost. Its range is `[position,
     /// position)`, empty: the participant's position at the loss, with no
@@ -57,6 +60,10 @@ pub enum LossKind {
     /// An incarnation was aborted by the `abort` policy.
     AbortedIncarnation = 3,
 }
+
+/// The loss record flag of a report the driver could not verify: its
+/// participant had already ended (bit 0).
+pub(crate) const LOSS_UNVERIFIED: u8 = 1;
 
 /// A rejoin policy as a loss record carries it: the wire codes of
 /// `LossPolicyCode`.

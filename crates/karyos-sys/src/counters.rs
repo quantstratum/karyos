@@ -827,6 +827,24 @@ mod owned {
             label: &str,
             keys: super::CounterKeys,
         ) -> Result<Counter, CounterError> {
+            self.allocate_keyed_where(type_id, label, keys, |_| true)
+        }
+
+        /// Allocates as [`CountersManager::allocate_keyed`], considering
+        /// only the cells for which `eligible` holds. A region that other
+        /// processes can write (client counters) uses it to skip every cell
+        /// the allocator still tracks, whatever its state word says.
+        ///
+        /// # Errors
+        ///
+        /// As [`CountersManager::allocate`].
+        pub fn allocate_keyed_where(
+            &mut self,
+            type_id: u64,
+            label: &str,
+            keys: super::CounterKeys,
+            eligible: impl Fn(usize) -> bool,
+        ) -> Result<Counter, CounterError> {
             let next = self
                 .next_registration
                 .checked_add(1)
@@ -835,9 +853,10 @@ mod owned {
                 CounterMetadata::new(self.next_registration, type_id, label)?.with_keys(keys);
             let index = (0..self.region.capacity)
                 .find(|&index| {
-                    self.region.cell(index).is_some_and(|cell| {
-                        matches!(cell.state(), STATE_FREE | STATE_RELEASE_PENDING)
-                    })
+                    eligible(index)
+                        && self.region.cell(index).is_some_and(|cell| {
+                            matches!(cell.state(), STATE_FREE | STATE_RELEASE_PENDING)
+                        })
                 })
                 .ok_or(CounterError::Exhausted)?;
             let cell = self.region.cell(index).ok_or(CounterError::Exhausted)?;
@@ -848,6 +867,15 @@ mod owned {
                 index,
                 registration_id: metadata.registration_id,
             })
+        }
+
+        /// Stores `FREE` into cell `index`'s state word as a stray client
+        /// write would, leaving its capability alive (tests only).
+        #[cfg(test)]
+        pub(crate) fn clobber_state_free(&self, index: usize) {
+            if let Some(cell) = self.region.cell(index) {
+                let _ = cell.free();
+            }
         }
 
         /// Frees a counter at once; its cell becomes `FREE`.
@@ -1267,6 +1295,37 @@ mod tests {
             }
         ));
         assert!(counters(0).is_err());
+    }
+
+    #[test]
+    fn allocation_considers_only_eligible_cells() {
+        let (mut manager, _reader, _cells) = client_counters(3).unwrap();
+        // Cell 0 is free but not eligible: the allocator still holds it.
+        let counter = manager
+            .allocate_keyed_where(TYPE_EVENT, "x", CounterKeys::DRIVER, |index| index != 0)
+            .unwrap();
+        assert_eq!(counter.index(), 1);
+        // A stray client write marks the held cell 0 free: a plain
+        // allocation would hand it to a second owner, the eligibility check
+        // does not.
+        let held = manager
+            .allocate_keyed_where(TYPE_EVENT, "held", CounterKeys::DRIVER, |_| true)
+            .unwrap();
+        assert_eq!(held.index(), 0);
+        manager.clobber_state_free(0);
+        let other = manager
+            .allocate_keyed_where(TYPE_EVENT, "z", CounterKeys::DRIVER, |index| {
+                index != held.index() && index != counter.index()
+            })
+            .unwrap();
+        assert_eq!(other.index(), 2);
+        // With no eligible free cell, the region is exhausted.
+        assert_eq!(
+            manager
+                .allocate_keyed_where(TYPE_EVENT, "y", CounterKeys::DRIVER, |index| index == 1)
+                .unwrap_err(),
+            CounterError::Exhausted
+        );
     }
 
     #[test]
