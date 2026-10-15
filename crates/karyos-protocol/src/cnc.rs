@@ -101,6 +101,19 @@ pub enum SubscriberRole {
     Required,
     /// Does not bound the publisher; may be lapped.
     Optional,
+    /// Does not bound the publisher, may be lapped, and only copies
+    /// (`quantstratum-docs: karyos/design/observer-role.md`).
+    Observer,
+}
+
+impl From<SubscriberRole> for karyos_sys::log_buffer::Role {
+    fn from(role: SubscriberRole) -> Self {
+        match role {
+            SubscriberRole::Required => Self::Required,
+            SubscriberRole::Optional => Self::Optional,
+            SubscriberRole::Observer => Self::Observer,
+        }
+    }
 }
 
 /// A request, identified by the client (as known to the driver) and the
@@ -343,6 +356,7 @@ impl Command {
                 let role = match role {
                     SubscriberRole::Required => 0,
                     SubscriberRole::Optional => 1,
+                    SubscriberRole::Observer => 2,
                 };
                 write_words(&[sequence, stream_word(stream), role], out)
             }
@@ -391,6 +405,7 @@ impl Command {
                 let role = match role {
                     0 => SubscriberRole::Required,
                     1 => SubscriberRole::Optional,
+                    2 => SubscriberRole::Observer,
                     _ => return Err(CncError::Reserved { type_id }),
                 };
                 Ok(Self::AddSubscription {
@@ -726,6 +741,11 @@ mod tests {
                 stream: stream(),
                 role: SubscriberRole::Optional,
             },
+            Command::AddSubscription {
+                sequence: 5,
+                stream: stream(),
+                role: SubscriberRole::Observer,
+            },
             Command::AddConcurrentPublication {
                 sequence: 2,
                 stream: stream(),
@@ -904,7 +924,7 @@ mod tests {
             Command::decode(0x81, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
-        out[16] = 2;
+        out[16] = 3;
         assert!(matches!(
             Command::decode(command.type_id(), &out[..length]),
             Err(CncError::Reserved { .. })

@@ -174,6 +174,12 @@ pub enum Capability {
         /// The registry cell.
         cell: u64,
     },
+    /// An observer subscriber registered in `cell`
+    /// (`quantstratum-docs: karyos/design/observer-role.md`).
+    ObserverSubscriber {
+        /// The registry cell.
+        cell: u64,
+    },
     /// The exclusive publication.
     ExclusivePublication,
     /// A concurrent handle registered in publisher slot `slot`.
@@ -191,6 +197,7 @@ impl Capability {
             Self::OptionalSubscriber { cell } => (2, cell),
             Self::ExclusivePublication => (3, 0),
             Self::ConcurrentPublication { slot } => (4, slot),
+            Self::ObserverSubscriber { cell } => (5, cell),
         }
     }
 
@@ -201,6 +208,7 @@ impl Capability {
             (2, cell) => Some(Self::OptionalSubscriber { cell }),
             (3, 0) => Some(Self::ExclusivePublication),
             (4, slot) => Some(Self::ConcurrentPublication { slot }),
+            (5, cell) => Some(Self::ObserverSubscriber { cell }),
             _ => None,
         }
     }
@@ -608,6 +616,7 @@ mod tests {
             Capability::OptionalSubscriber { cell: 0 },
             Capability::ExclusivePublication,
             Capability::ConcurrentPublication { slot: 2 },
+            Capability::ObserverSubscriber { cell: 3 },
         ];
         let records: Vec<Record> = capabilities
             .iter()

@@ -745,6 +745,12 @@ fn grant_record(
             } => Capability::OptionalSubscriber {
                 cell: u64::try_from(cell).ok()?,
             },
+            Participant::Subscriber {
+                cell,
+                role: Role::Observer,
+            } => Capability::ObserverSubscriber {
+                cell: u64::try_from(cell).ok()?,
+            },
         },
     })
 }

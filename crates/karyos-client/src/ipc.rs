@@ -536,15 +536,13 @@ impl RemoteClient {
             let (cell, granted) = match fetched.record.capability {
                 Capability::RequiredSubscriber { cell } => (cell, SubscriberRole::Required),
                 Capability::OptionalSubscriber { cell } => (cell, SubscriberRole::Optional),
+                Capability::ObserverSubscriber { cell } => (cell, SubscriberRole::Observer),
                 _ => return Err(AttachError::Protocol),
             };
             if granted != role {
                 return Err(AttachError::Protocol);
             }
-            let role = match role {
-                SubscriberRole::Required => Role::Required,
-                SubscriberRole::Optional => Role::Optional,
-            };
+            let role = Role::from(role);
             let cell = usize::try_from(cell).map_err(|_| AttachError::Protocol)?;
             let inner =
                 Subscription::prepare_adopt(Arc::clone(&fetched.buffer), cell, role, export)?
