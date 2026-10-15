@@ -22,7 +22,8 @@ use karyos_client::{
     ClientPublication, ClientSubscription, Completion, MessageLimit, OfferOutcome, Outcome,
 };
 use karyos_driver::{
-    DriverConfig, EmbeddedDriver, IpcConfig, LossPolicy, MonotonicClock, StreamConfig, SystemClock,
+    DriverConfig, EmbeddedDriver, IpcConfig, LossPolicy, MonotonicClock, Reconfiguration,
+    StreamConfig, SystemClock,
 };
 use karyos_protocol::admission::{MAX_MESSAGE_LENGTH, Message, VERSION, refusal};
 use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
@@ -337,25 +338,7 @@ fn other_pidfd(pid: u32) -> OwnedFd {
 fn an_ipc_driver_keeps_its_streams_in_shared_regions() {
     let dir = dir("streams");
     let mut driver = system_driver(&dir);
-    let stream = driver
-        .add_stream(StreamConfig {
-            buffer: LogBufferConfig {
-                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
-                spare_slots: 3,
-                max_subscribers: 4,
-                mtu: DEFAULT_MTU,
-                max_reserved: MIN_TERM_LENGTH / 8,
-                initial_term_id: TermId::new(7),
-                lane: Lane::ZERO,
-                session_id: 1,
-                stream_id: 2,
-                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
-                publication: PublicationMode::Exclusive,
-            },
-            allow_unconnected: false,
-            on_required_loss: LossPolicy::Hold,
-        })
-        .unwrap();
+    let stream = driver.add_stream(shared_stream_config()).unwrap();
     let mut subscription: ClientSubscription<SharedTerms> =
         driver.subscribe(stream, Role::Required).unwrap();
     let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
@@ -377,4 +360,74 @@ fn an_ipc_driver_keeps_its_streams_in_shared_regions() {
         )
         .unwrap();
     assert_eq!(received, vec![vec![0u8; 40], vec![1u8; 40], vec![2u8; 40]]);
+}
+
+fn shared_stream_config() -> StreamConfig {
+    StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 3,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 2,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Exclusive,
+        },
+        allow_unconnected: false,
+        on_required_loss: LossPolicy::Hold,
+    }
+}
+
+/// A reconfiguration of an IPC stream creates its successor in a new shared
+/// region, and in-process handles move to it across the cutover.
+#[test]
+fn an_ipc_stream_moves_to_a_successor_in_a_new_shared_region() {
+    let dir = dir("cutover");
+    let mut driver = system_driver(&dir);
+    let stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut subscription: ClientSubscription<SharedTerms> =
+        driver.subscribe(stream, Role::Required).unwrap();
+    let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
+    assert!(matches!(
+        publication.offer(b"one").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    let _ = driver
+        .reconfigure_stream(
+            stream,
+            Reconfiguration {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                spare_slots: 5,
+            },
+        )
+        .unwrap();
+    // The writer moves to the successor and publishes there.
+    let mut moved = false;
+    for _ in 0..16 {
+        let _ = driver.do_work().unwrap();
+        if matches!(
+            publication.offer(b"two").unwrap(),
+            OfferOutcome::Accepted { .. }
+        ) {
+            moved = true;
+            break;
+        }
+    }
+    assert!(moved, "the writer never reached the successor");
+    let generations = driver.generations(stream).unwrap();
+    assert_eq!(generations.last().unwrap().generation.get(), 1);
+    let mut received = Vec::new();
+    for _ in 0..4 {
+        let _ = subscription
+            .poll(
+                |payload, _| received.push(payload.to_vec()),
+                MessageLimit::new(8),
+            )
+            .unwrap();
+    }
+    assert_eq!(received, vec![b"one".to_vec(), b"two".to_vec()]);
 }
