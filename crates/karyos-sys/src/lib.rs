@@ -37,6 +37,7 @@ pub mod error;
 pub mod frame;
 pub mod host_clock;
 pub mod loan;
+pub mod participant;
 // Real memory with std atomics, like `term_memory`.
 #[cfg(not(loom))]
 #[cfg(target_os = "linux")]
