@@ -185,3 +185,129 @@ fn a_grant_is_adopted_once() {
         ));
     }
 }
+
+#[test]
+fn an_ended_subscriber_frees_its_cell_and_its_grant_is_spent() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let cell = conductor.register_subscriber(Role::Required, 7).unwrap();
+    assert_eq!(buffer.attached_subscribers(), 1);
+    // A wrong export, a publisher cell and an out of range cell are stale.
+    assert!(!conductor.end_subscriber(cell, 8));
+    assert!(!conductor.end_subscriber(0, 7));
+    assert!(!conductor.end_subscriber(usize::MAX, 7));
+    // Never adopted: the driver ends it on its own knowledge.
+    assert!(conductor.end_subscriber(cell, 7));
+    assert_eq!(buffer.attached_subscribers(), 0);
+    assert_eq!(buffer.cells()[cell].registration.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        Subscription::adopt(&buffer, cell, Role::Required, 7),
+        Err(SysError::Protocol { .. })
+    ));
+    assert!(!conductor.end_subscriber(cell, 7));
+}
+
+#[test]
+fn an_adopted_subscriber_is_ended_with_its_loan() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let cell = conductor.register_subscriber(Role::Required, 7).unwrap();
+    let adopted = Subscription::adopt(&buffer, cell, Role::Required, 7).unwrap();
+    // The participant died holding a loan; its handle is never dropped.
+    let found = &buffer.cells()[cell];
+    let target = buffer.target(0, TermCount::ZERO).unwrap();
+    assert_eq!(
+        take_loan(&found.loan, &found.revoked, buffer.descriptor(0).unwrap(), target),
+        Ok(LoanOutcome::Granted)
+    );
+    core::mem::forget(adopted);
+    assert!(conductor.end_subscriber(cell, 7));
+    assert_eq!(found.loan.load(Ordering::Acquire), 0);
+    assert_eq!(found.registration.load(Ordering::Acquire), 0);
+    assert_eq!(buffer.attached_subscribers(), 0);
+}
+
+#[test]
+fn a_delayed_end_never_touches_a_later_occupant() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let cell = conductor.register_subscriber(Role::Required, 7).unwrap();
+    assert!(conductor.end_subscriber(cell, 7));
+    // Reused by another remote grant, then by an in-process subscriber.
+    assert_eq!(conductor.register_subscriber(Role::Required, 9).unwrap(), cell);
+    assert!(!conductor.end_subscriber(cell, 7));
+    assert_eq!(buffer.attached_subscribers(), 1);
+    assert!(conductor.end_subscriber(cell, 9));
+    let local = conductor.subscribe(Role::Required).unwrap();
+    assert_eq!(local.cell(), cell);
+    assert!(!conductor.end_subscriber(cell, 7));
+    assert!(!conductor.end_subscriber(cell, 9));
+    assert_eq!(buffer.attached_subscribers(), 1);
+}
+
+#[test]
+fn an_ordinary_detach_clears_the_registration_before_freeing() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let cell = conductor.register_subscriber(Role::Optional, 7).unwrap();
+    let adopted = Subscription::adopt(&buffer, cell, Role::Optional, 7).unwrap();
+    drop(adopted);
+    assert_eq!(buffer.cells()[cell].registration.load(Ordering::Acquire), 0);
+    // The delayed Detach that follows ends nothing.
+    assert!(!conductor.end_subscriber(cell, 7));
+}
+
+#[test]
+fn ended_publications_clear_their_registration() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert!(conductor.register_publication(11).unwrap());
+    let adopted = Publication::adopt(&buffer, 11).unwrap();
+    drop(adopted);
+    assert_eq!(
+        buffer
+            .control()
+            .publication_registration
+            .word
+            .load(Ordering::Acquire),
+        0
+    );
+}
+
+#[test]
+fn an_export_at_a_mark_is_refused() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    for export in [0, registration::FENCED, registration::ADOPTED] {
+        assert!(matches!(
+            conductor.register_subscriber(Role::Required, export),
+            Err(SysError::Protocol { .. })
+        ));
+    }
+    assert!(
+        conductor
+            .register_subscriber(Role::Required, registration::MAX_EXPORT)
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_dropped_concurrent_handle_clears_its_slot_registration() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let slot = conductor.register_concurrent_publication(21).unwrap().unwrap();
+    let adopted = ConcurrentPublication::adopt(&buffer, slot, 21).unwrap();
+    assert_eq!(
+        buffer.publisher_lines()[slot]
+            .registration
+            .load(Ordering::Acquire),
+        21 | registration::ADOPTED
+    );
+    drop(adopted);
+    assert_eq!(
+        buffer.publisher_lines()[slot]
+            .registration
+            .load(Ordering::Acquire),
+        0
+    );
+}

@@ -17,6 +17,7 @@ use crate::publication::{
     ABORTING_MARKER, abort_block, acquire_publisher_slot, commit_block, mark_block, observe_block,
     observe_seal, publisher_slot_free, reissue_from, release_publisher_slot,
 };
+use crate::registration;
 use crate::slot::{Descriptor, SlotState};
 use crate::term::TermCount;
 use crate::term_bytes::sealed::Access as _;
@@ -702,6 +703,9 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             && let Ok(cell) = buffer.cell(self.index)
         {
             release_loan(&cell.loan);
+        }
+        if let Some(slot) = buffer.publisher_lines().get(self.index) {
+            registration::clear(&slot.registration);
         }
         let active = buffer.active_count().load(Ordering::Acquire) as u32;
         if let Some(word) = buffer.publisher(self.index) {
