@@ -29,6 +29,7 @@
 //! journals of agents in this process; an opaque clock gets no automatic
 //! calibration, only those given to [`TraceReport::add_calibration`].
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::attribution::{AttributionConfig, Attributor, Verdict, combine};
@@ -167,6 +168,10 @@ pub struct TraceReport {
     journals: Vec<Journal>,
     messages: HashMap<(PublicationId, u8, u64), Message>,
     calibrations: Vec<Calibration>,
+    /// Set when [`TraceReport::trace`] first returns a final answer: from
+    /// then on the registered journals are frozen, so no later journal can
+    /// widen an expected set a final answer was given for.
+    frozen: Cell<bool>,
 }
 
 impl TraceReport {
@@ -180,6 +185,7 @@ impl TraceReport {
             journals: Vec::new(),
             messages: HashMap::new(),
             calibrations: Vec::new(),
+            frozen: Cell::new(false),
         }
     }
 
@@ -190,6 +196,9 @@ impl TraceReport {
         kind: Kind,
         publication: PublicationId,
     ) -> Result<JournalId, TraceError> {
+        if self.frozen.get() {
+            return Err(TraceError::MembershipFrozen);
+        }
         let id = JournalId(self.journals.len());
         self.journals.push(Journal {
             observer: collector.observer(),
@@ -213,8 +222,10 @@ impl TraceReport {
     ///
     /// # Errors
     ///
-    /// Returns [`TraceError::Attribution`] when the attributor's tables
-    /// cannot be allocated.
+    /// Returns [`TraceError::MembershipFrozen`] once the report gave any
+    /// final answer (coordinator decision ACS 12667), and
+    /// [`TraceError::Attribution`] when the attributor's tables cannot be
+    /// allocated.
     pub fn add_publisher(
         &mut self,
         collector: TraceCollector,
@@ -333,9 +344,19 @@ impl TraceReport {
         Ok(())
     }
 
-    /// What the report can say about the trace `trace_id` now.
+    /// What the report can say about the trace `trace_id` now. A final
+    /// answer freezes the registered journals: later registrations fail
+    /// with [`TraceError::MembershipFrozen`].
     #[must_use]
     pub fn trace(&self, trace_id: [u64; 2]) -> TraceAnswer {
+        let answer = self.answer(trace_id);
+        if matches!(answer, TraceAnswer::Final(_)) {
+            self.frozen.set(true);
+        }
+        answer
+    }
+
+    fn answer(&self, trace_id: [u64; 2]) -> TraceAnswer {
         let messages: Vec<_> = self
             .messages
             .iter()

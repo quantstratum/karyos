@@ -11,6 +11,7 @@ use karyos_protocol::trace_hook::{
 use super::*;
 use crate::agent::TraceAgent;
 use crate::clocks::Unavailable;
+use crate::error::TraceError;
 use crate::ids::{BufferedIds, OsRandom};
 use crate::journal::trace_journal;
 use crate::record::ObservedTime;
@@ -414,5 +415,56 @@ fn test_trace_an_open_publisher_keeps_the_answer_provisional() {
     assert_eq!(
         report.trace(root.trace_id),
         TraceAnswer::Final(Verdict::Incomplete)
+    );
+}
+
+/// Once the report gave a final answer, no journal can be added: the set it
+/// answered for stays frozen (coordinator decision ACS 12667). An early
+/// Incomplete freezes it too.
+#[test]
+fn test_trace_registration_after_a_final_answer_is_refused() {
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    let (mut publisher, pub_id) = std_agent(&mut report, 1, 8, None);
+    let (mut subscriber, sub_id) = std_agent(&mut report, 2, 8, Some(0));
+    let ext = publish(&mut publisher, 64);
+    deliver(&mut subscriber, &ext, 9, 64);
+    report.drain().unwrap();
+    // Provisional answers do not freeze.
+    assert_eq!(report.trace(ext.trace_id), TraceAnswer::Provisional);
+    let (mut late, late_id) = std_agent(&mut report, 3, 8, Some(0));
+    publisher.close();
+    subscriber.close();
+    late.close();
+    report.closed(pub_id, None);
+    report.closed(sub_id, Some(65));
+    report.closed(late_id, Some(0));
+    report.drain().unwrap();
+    assert_eq!(
+        report.trace(ext.trace_id),
+        TraceAnswer::Final(Verdict::Complete)
+    );
+    let (_writer, collector) = trace_journal(
+        8,
+        4,
+        ObserverId {
+            driver: IDENTITY.driver,
+            journal: 4,
+        },
+        4,
+    )
+    .unwrap();
+    assert!(matches!(
+        report.add_subscriber(
+            collector,
+            ClockProvenance::StdMonotonic,
+            PublicationId::from(IDENTITY),
+            0
+        ),
+        Err(TraceError::MembershipFrozen)
+    ));
+    // The answer is unchanged.
+    assert_eq!(
+        report.trace(ext.trace_id),
+        TraceAnswer::Final(Verdict::Complete)
     );
 }

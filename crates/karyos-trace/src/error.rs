@@ -49,6 +49,10 @@ pub enum TraceError {
     /// observed.
     #[error("the journal has not been observed closed")]
     NotClosed,
+    /// The report already gave a final answer: its journals are frozen and
+    /// no journal can be added.
+    #[error("the trace report already gave a final answer; no journal can be added")]
+    MembershipFrozen,
     /// The underlying journal failed.
     #[error(transparent)]
     Journal(#[from] JournalError),
