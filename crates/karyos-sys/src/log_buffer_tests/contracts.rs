@@ -176,6 +176,112 @@ fn test_log_buffer_aborted_fragmented_offer_with_two_writers_never_interleaves()
     });
 }
 
+/// §13 "Concurrent publication": the deadline aborts a fragmented writer
+/// paused between fragment copies while a later fragmented writer commits.
+#[test]
+fn test_log_buffer_aborted_fragmented_offer_mid_copy_with_two_writers_never_interleaves() {
+    let buffer = new_buffer(deadline_concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut first = conductor.concurrent_publication().unwrap().unwrap();
+    let mut second = conductor.concurrent_publication().unwrap().unwrap();
+    let first_data = tagged_message(1, 0, 8000);
+    let second_data = tagged_message(2, 0, 5000);
+    let first_extent = reserved_of(&first_data);
+    let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            first
+                .offer_pausing(
+                    &first_data,
+                    AppendOptions::default(),
+                    &mut |point| {
+                        if point == WriterPause::AfterFragment(0) {
+                            paused_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }
+                    },
+                )
+                .unwrap()
+        });
+
+        // One fragment is copied. The first word0 is still reserved, so the
+        // reader cannot expose this incomplete message.
+        paused_rx.recv().unwrap();
+        assert_eq!(poll_message(&mut subscription), None);
+        assert!(matches!(
+            second.offer(&second_data, AppendOptions::default()).unwrap(),
+            ConcurrentOfferOutcome::Appended { position } if position == u64::from(first_extent)
+        ));
+        assert_eq!(poll_message(&mut subscription), None);
+
+        // The deadline publishes one aborted extent, then the reader gets
+        // the later writer's intact fragmented message.
+        assert_eq!(serve(&mut conductor, 0), waiting());
+        assert_eq!(
+            serve(&mut conductor, DEADLINE),
+            aborted(1, u64::from(first_extent))
+        );
+        assert_eq!(
+            poll(&mut subscription),
+            PollOutcome::Aborted {
+                position: 0,
+                extent: first_extent,
+            }
+        );
+        assert_eq!(poll_message(&mut subscription), Some(second_data));
+
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            writer.join().unwrap(),
+            ConcurrentOfferOutcome::Aborted { position: 0 }
+        );
+    });
+}
+
+/// Negative control for the between-fragments pause: without a deadline,
+/// resuming the writer commits the complete message and never exposes a
+/// partial prefix.
+#[test]
+fn test_log_buffer_fragmented_offer_after_fragment_pause_commits_intact() {
+    let buffer = new_buffer(deadline_concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut publication = conductor.concurrent_publication().unwrap().unwrap();
+    let data = tagged_message(1, 0, 8000);
+    let expected = data.clone();
+    let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            publication
+                .offer_pausing(
+                    &data,
+                    AppendOptions::default(),
+                    &mut |point| {
+                        if point == WriterPause::AfterFragment(0) {
+                            paused_tx.send(()).unwrap();
+                            resume_rx.recv().unwrap();
+                        }
+                    },
+                )
+                .unwrap()
+        });
+
+        paused_rx.recv().unwrap();
+        assert_eq!(poll_message(&mut subscription), None);
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            writer.join().unwrap(),
+            ConcurrentOfferOutcome::Appended { position: 0 }
+        );
+        assert_eq!(poll_message(&mut subscription), Some(expected));
+    });
+}
+
 /// Sets the flag when dropped: at the end of a participant's scope, also
 /// when it unwinds.
 struct StopOnDrop<'a>(&'a AtomicBool);

@@ -6,10 +6,14 @@
 //! the crossing owner's `PAD`, and catching up to the active term. Rotation
 //! is completed by the conductor; publisher-side rotation comes in batch b.
 
+#[cfg(not(any(test, feature = "test-hooks")))]
+use super::write_fragments;
+#[cfg(any(test, feature = "test-hooks"))]
+use super::write_fragments_pausing;
 use super::{
     ActivateError, AppendOptions, AppendOutcome, BufferOwner, CommitOutcome, Conductor,
     FragmentPlan, HEADER_LENGTH, LayoutError, LogBuffer, Lookup, NOT_GRANTED, SysError, TermBytes,
-    claim, staging_buffer, valid_export, write_fragments, write_header_tail,
+    claim, staging_buffer, valid_export, write_header_tail,
 };
 use crate::frame::{FRAME_ALIGNMENT, Flags, FrameType, PROTOCOL_VERSION, Word0};
 use crate::loan::{LoanOutcome, release_loan, rotate_to, take_loan};
@@ -530,6 +534,17 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             span_taken(buffer, word, start)?;
             return Ok(ConcurrentOfferOutcome::Aborted { position });
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        let first = write_fragments_pausing(
+            buffer,
+            slot,
+            count,
+            start,
+            payload,
+            (&plan, options),
+            &mut |index| pause(WriterPause::AfterFragment(index)),
+        );
+        #[cfg(not(any(test, feature = "test-hooks")))]
         let first = write_fragments(buffer, slot, count, start, payload, &plan, options);
         pause(WriterPause::Commit);
         if !commit_block(word, reserved_word, first) {
@@ -1027,9 +1042,11 @@ impl<O: BufferOwner> Drop for ConcurrentClaim<'_, O> {
 }
 
 /// Where a test pauses a concurrent writer: `Reserve` after the limit
-/// admitted it and before its `fetch_add`; the others after its
-/// `fetch_add`, before the named compare-exchange of its block or of its
-/// crossing `PAD`.
+/// admitted it and before its `fetch_add`; `Mark` before marking the block;
+/// `Commit` after copying the whole message and before committing it; and
+/// `PadMark` / `PadCommit` around marking and committing a crossing `PAD`.
+/// `AfterFragment` is available in tests and `test-hooks` builds, after the
+/// indexed fragment is written and before the next one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WriterPause {
     Reserve,
@@ -1037,6 +1054,8 @@ pub(super) enum WriterPause {
     Commit,
     PadMark,
     PadCommit,
+    #[cfg(any(test, feature = "test-hooks"))]
+    AfterFragment(u32),
 }
 
 /// Result of one reservation attempt.
