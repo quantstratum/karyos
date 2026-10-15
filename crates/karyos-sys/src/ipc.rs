@@ -513,6 +513,13 @@ fn check_seals(fd: &OwnedFd, expected: SealFlags) -> Result<(), SysError> {
 /// access to a mapping made from it later. The new descriptor is checked
 /// to be read-only and to name the same file (`st_dev`, `st_ino`) as `fd`.
 ///
+/// A1 protects against mistakes, not against a deliberate process of the
+/// same uid (Q7): a holder of the read-only descriptor can reopen the same
+/// path with `O_RDWR` and map a region that has only the size seals (the
+/// client counters) writable. For the driver-only regions the A2 seal
+/// `F_SEAL_FUTURE_WRITE` is what holds: a writable mapping is refused
+/// whatever the descriptor's access mode (review of #129).
+///
 /// # Errors
 ///
 /// Returns [`SysError::Os`] when `/proc` cannot reopen the file or a check
@@ -1275,6 +1282,35 @@ mod tests {
             attached.read_only_descriptor(),
             Err(SysError::Protocol { .. })
         ));
+    }
+
+    /// A deliberate `O_RDWR` reopen through `/proc` defeats A1 alone: a
+    /// shared region then maps writable. A driver-only region still refuses
+    /// a writable mapping (A2, `EPERM`), which is the real enforcement.
+    #[test]
+    fn a_read_write_reopen_is_stopped_only_by_the_driver_only_seal() {
+        use rustix::fd::AsRawFd;
+        use rustix::fs::{Mode, OFlags};
+        let reopen_read_write = |fd: BorrowedFd<'_>| {
+            rustix::fs::open(
+                format!("/proc/self/fd/{}", fd.as_raw_fd()).as_str(),
+                OFlags::RDWR | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap()
+        };
+        let shared = Region::create(record()).unwrap();
+        let read_only = shared.read_only_descriptor().unwrap();
+        let writable = reopen_read_write(read_only.as_fd());
+        assert_eq!(probe::writable_mapping(writable.as_fd()).unwrap(), None);
+
+        let driver_only = Region::create_driver_only(record()).unwrap();
+        let read_only = driver_only.read_only_descriptor().unwrap();
+        let writable = reopen_read_write(read_only.as_fd());
+        assert_eq!(
+            probe::writable_mapping(writable.as_fd()).unwrap(),
+            Some(rustix::io::Errno::PERM.raw_os_error())
+        );
     }
 
     /// A socket is readable once a message is pending or the peer closed.
