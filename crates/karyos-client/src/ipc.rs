@@ -102,6 +102,10 @@ pub struct RemoteClient {
 struct Session {
     instance: u128,
     socket: OwnedFd,
+    /// Held for a whole Fetch, Manifest and Region exchange, aborts
+    /// included: replies carry no thread, so one fetch at a time reads the
+    /// socket.
+    fetching: Mutex<()>,
     state: Mutex<SessionState>,
 }
 
@@ -341,6 +345,7 @@ pub fn attach(
                 session: Some(Arc::new(Session {
                     instance,
                     socket,
+                    fetching: Mutex::new(()),
                     state: Mutex::new(SessionState {
                         next_fetch: 1,
                         live: Vec::new(),
@@ -632,6 +637,10 @@ impl WithExport for ClientSubscription<SharedTerms> {
 /// the region is attached against that record and the session's full
 /// instance.
 fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachError> {
+    let _exchange = session
+        .fetching
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let fetch = {
         let mut state = session.state();
         if state.broken {

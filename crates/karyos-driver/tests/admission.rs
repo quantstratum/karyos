@@ -983,3 +983,48 @@ fn an_aborted_fetch_detaches_what_arrived() {
     serve_until(&mut driver, |driver| driver.clients() == 0);
     assert_eq!(counter(&driver, "grants detached"), 1);
 }
+
+/// Two threads take grants of one client at once: the session serializes
+/// the fetch exchanges, so both handles are delivered, both grants are
+/// detached when they drop, and the client still leaves.
+#[test]
+fn concurrent_takes_share_one_session() {
+    let dir = dir("concurrent-take");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let key = StreamKey {
+        stream_id: 2,
+        session_id: 1,
+    };
+    serve_while(&mut driver, move || {
+        for _ in 0..2 {
+            let _ = client
+                .add_subscription(key, SubscriberRole::Required)
+                .unwrap();
+        }
+        let mut fetchable = Vec::new();
+        let start = Instant::now();
+        while fetchable.len() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(5), "no completions");
+            let _ = client.poll(usize::MAX, |completion| {
+                if let Outcome::Fetchable(grant) = completion.outcome {
+                    fetchable.push(grant);
+                }
+            });
+        }
+        let client = &client;
+        std::thread::scope(|scope| {
+            let takes: Vec<_> = fetchable
+                .iter()
+                .map(|grant| scope.spawn(move || client.take_subscription(grant)))
+                .collect();
+            for take in takes {
+                assert!(take.join().unwrap().is_ok());
+            }
+        });
+    });
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants exported"), 2);
+    assert_eq!(counter(&driver, "grants detached"), 2);
+}
