@@ -200,3 +200,36 @@ fn test_log_buffer_loss_a_policy_that_does_not_match_the_admission_is_refused() 
         ));
     }
 }
+
+/// A revoked required reader whose data the publisher then overwrote (its
+/// bound was withdrawn under `continue`) is told it was revoked, not that a
+/// required reader was lapped: a resumed reader gets `Revoked`
+/// (`quantstratum-docs: karyos/design/required-participant-loss.md`).
+#[test]
+fn test_log_buffer_loss_a_revoked_reader_whose_data_is_gone_is_revoked() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = conductor.subscribe_as(Role::Required, true, 9).unwrap();
+    assert_eq!(
+        conductor.revoke_participant(reader.cell(), 9, LossPolicy::Continue),
+        Ok(Revocation::Withdrawn)
+    );
+    // The publisher runs far past the reader's data.
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut appended = 0;
+    for sequence in 0..2000 {
+        if let AppendOutcome::Appended { .. } = publication
+            .append(&message(sequence), AppendOptions::default())
+            .unwrap()
+        {
+            appended += 1;
+        }
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    assert!(appended > 1000, "{appended}");
+    let mut out = vec![0u8; 8192];
+    assert!(matches!(
+        reader.poll(&mut out),
+        Ok(PollOutcome::Revoked { .. })
+    ));
+}

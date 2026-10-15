@@ -267,6 +267,48 @@ fn poll_once(subscription: &mut ClientSubscription) -> PollSummary {
     subscription.poll(|_, _| {}, MessageLimit::new(16)).unwrap()
 }
 
+/// required-participant-loss.md, Tests: a timed-out client that resumes
+/// gets `Disconnected` (its command ring is closed: every new request is
+/// refused) and `Revoked`, and can only rejoin through a new admission.
+#[test]
+fn test_driver_loss_a_resumed_client_is_disconnected_and_revoked() {
+    for policy in [LossPolicy::Hold, LossPolicy::Continue, LossPolicy::Abort] {
+        let (mut driver, clock) = driver();
+        let _stream = driver.add_stream(stream_config(policy)).unwrap();
+        let (mut client, mut subscription) = lost_required_subscriber(&mut driver, &clock);
+        // The client resumes.
+        let refused = client.add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Optional,
+        );
+        assert!(
+            matches!(refused, Err(ConductorError::Closed)),
+            "{policy:?}: {refused:?}"
+        );
+        assert!(
+            poll_once(&mut subscription).revoked.is_some(),
+            "{policy:?}: not revoked"
+        );
+        // A new admission is a new client.
+        let mut again = beating(&mut driver);
+        assert!(
+            again
+                .add_subscription(
+                    StreamKey {
+                        stream_id: 2,
+                        session_id: 1,
+                    },
+                    SubscriberRole::Optional,
+                )
+                .is_ok(),
+            "{policy:?}"
+        );
+    }
+}
+
 #[test]
 fn test_driver_loss_hold_revokes_a_lost_clients_required_subscriber() {
     let (mut driver, clock) = driver();

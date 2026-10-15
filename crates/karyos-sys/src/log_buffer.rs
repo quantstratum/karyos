@@ -2920,6 +2920,17 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     /// floor and head reads (tests reproduce a pause there).
     fn overrun_with(&mut self, between: &mut dyn FnMut()) -> Result<Step, SysError> {
         if self.cursor.role == Role::Required {
+            // A revoked required reader no longer bounds the publisher, so
+            // its data may be gone: that is its revocation, not a broken
+            // bound (`quantstratum-docs: karyos/design/required-participant-loss.md`,
+            // a resumed reader gets `Revoked`). SeqCst, as `take_loan`
+            // reads the flag.
+            let cell = self.buffer.cell(self.cursor.cell)?;
+            if cell.revoked.load(Ordering::SeqCst) != 0 {
+                return Ok(Step::Done(PollOutcome::Revoked {
+                    position: self.cursor.position,
+                }));
+            }
             return Err(SysError::RequiredSubscriberLapped {
                 position: self.cursor.position,
             });
