@@ -965,6 +965,34 @@ impl<T: TermBytes> LogBuffer<T> {
     pub fn inject_deadline_fault(&self) {
         self.deadline_fault.store(true, Ordering::Relaxed);
     }
+
+    /// Test hook (feature `test-hooks`): takes a read loan on term 0 for
+    /// the reader in `cell`, as a reader paused inside its copy would hold
+    /// it, so dependent crates can observe a lost `hold` reader that still
+    /// bounds the publisher. Returns whether the loan was granted.
+    #[doc(hidden)]
+    pub fn hold_read_loan(&self, cell: usize) -> bool {
+        let (Some(found), Ok(descriptor), Ok(target)) = (
+            self.cells().get(cell),
+            self.descriptor(0),
+            self.target(0, TermCount::ZERO),
+        ) else {
+            return false;
+        };
+        matches!(
+            take_loan(&found.loan, &found.revoked, descriptor, target),
+            Ok(LoanOutcome::Granted)
+        )
+    }
+
+    /// Test hook (feature `test-hooks`): ends the loan
+    /// [`Self::hold_read_loan`] took.
+    #[doc(hidden)]
+    pub fn release_read_loan(&self, cell: usize) {
+        if let Some(found) = self.cells().get(cell) {
+            release_loan(&found.loan);
+        }
+    }
 }
 
 fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>, SysError> {
@@ -2879,6 +2907,18 @@ impl<O: BufferOwner> Conductor<O> {
             }
             self.ending.swap_remove(index);
         }
+    }
+
+    /// Whether `cell` is still held by `occupant` in the `hold` state: it
+    /// was revoked and still bounds the publisher because its loan word was
+    /// held at the last scan.
+    #[must_use]
+    pub fn holding(&self, cell: usize, occupant: u64) -> bool {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer.cells().get(cell).is_some_and(|found| {
+            found.state.load(Ordering::Acquire) == CELL_LOST_HOLDING
+                && registration::names(found.registration.load(Ordering::Acquire), occupant)
+        })
     }
 
     /// Revokes the reader that occupies `cell` as `occupant`, whose client

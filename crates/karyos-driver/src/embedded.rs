@@ -218,6 +218,8 @@ pub struct EmbeddedDriver {
     /// cell this driver registers (quantstratum-docs:
     /// `karyos/design/required-participant-loss.md`, Occupants).
     pub(crate) next_export: u64,
+    /// Lost `hold` participants whose bound is still in force.
+    pub(crate) holding: Vec<crate::commands::Holding>,
     /// When the driver last advanced its heartbeat, in clock units.
     pub(crate) last_beat: Option<u64>,
     /// The admission socket and its connections (IPC mode).
@@ -358,6 +360,7 @@ impl EmbeddedDriver {
             terminal: false,
             clock,
             next_export: 1,
+            holding: Vec::new(),
             last_beat: None,
             #[cfg(target_os = "linux")]
             admission,
@@ -713,6 +716,9 @@ impl EmbeddedDriver {
             }
             stream.forget_unused();
         }
+        if !self.holding.is_empty() {
+            self.report_withdrawn_bounds();
+        }
         self.update_stream_gauges();
         match first_error {
             Some(error) => Err(error),
@@ -859,11 +865,13 @@ fn add_work(
 mod tests {
     use super::*;
     use crate::clock::MonotonicClock;
-    use karyos_client::{ClaimOutcome, CommitOutcome};
+    use karyos_client::{ClaimOutcome, ClientConductor, CommitOutcome};
+    use karyos_protocol::cnc::StreamKey;
     use karyos_sys::error::SysError;
     use karyos_sys::frame::Lane;
     use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
     use karyos_sys::term::TermId;
+    use std::time::Duration;
 
     #[derive(Debug, Clone, Default)]
     struct ManualClock(Arc<AtomicU64>);
@@ -892,6 +900,110 @@ mod tests {
             allow_unconnected: false,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
         }
+    }
+
+    /// A beat from `observer`, a driver cycle, then the events it took.
+    fn observed_work(
+        driver: &mut EmbeddedDriver,
+        observer: &mut ClientConductor,
+    ) -> Vec<karyos_protocol::cnc::Event> {
+        let _ = observer.poll(usize::MAX, |_| {});
+        let _ = driver.do_work().unwrap();
+        let _ = observer.poll(usize::MAX, |_| {});
+        observer.take_events().collect()
+    }
+
+    #[test]
+    fn a_lost_hold_reader_with_a_loan_reports_the_withdrawal_when_the_loan_ends() {
+        use karyos_protocol::cnc::{Event as DriverEvent, LossPolicyCode, SubscriberRole};
+        let clock = ManualClock::default();
+        let driver_config = DriverConfig {
+            heartbeat_interval: 10,
+            client_liveness_timeout: 100,
+            ..DriverConfig::default()
+        };
+        let mut driver =
+            EmbeddedDriver::with_clock(driver_config, Box::new(clock.clone())).unwrap();
+        let stream = driver.add_stream(config(2)).unwrap();
+        let mut observer = driver.connect().unwrap();
+        observer.set_liveness(Duration::ZERO, Duration::from_secs(3600));
+        let mut client = driver.connect().unwrap();
+        let key = StreamKey {
+            stream_id: 2,
+            session_id: 1,
+        };
+        let _ = client
+            .add_subscription(key, SubscriberRole::Required)
+            .unwrap();
+        // The completion owns the subscription: keep it alive.
+        let mut done = Vec::new();
+        while done.is_empty() {
+            assert!(observed_work(&mut driver, &mut observer).is_empty());
+            let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        }
+        let cell = driver
+            .registrations
+            .iter()
+            .find_map(|registration| registration.subscriber)
+            .unwrap()
+            .0;
+        let buffer = Arc::clone(&driver.stream(stream).unwrap().buffer);
+        assert!(buffer.hold_read_loan(cell));
+        assert!(observed_work(&mut driver, &mut observer).is_empty());
+        clock.0.store(100, Ordering::Relaxed);
+        let lost = observed_work(&mut driver, &mut observer);
+        assert!(
+            matches!(
+                lost.as_slice(),
+                [DriverEvent::ParticipantLost {
+                    policy: LossPolicyCode::Hold,
+                    ..
+                }]
+            ),
+            "{lost:?}"
+        );
+        // The bound holds while the loan does.
+        assert!(observed_work(&mut driver, &mut observer).is_empty());
+        assert_eq!(driver.holding.len(), 1);
+        buffer.release_read_loan(cell);
+        let withdrawn = observed_work(&mut driver, &mut observer);
+        assert!(
+            matches!(
+                withdrawn.as_slice(),
+                [DriverEvent::RequiredBoundWithdrawn { stream, .. }] if *stream == key
+            ),
+            "{withdrawn:?}"
+        );
+        assert!(driver.holding.is_empty());
+        assert!(observed_work(&mut driver, &mut observer).is_empty());
+    }
+
+    #[test]
+    fn a_client_keeps_the_newest_events_and_counts_the_dropped_ones() {
+        use karyos_client::EVENT_QUEUE;
+        use karyos_protocol::cnc::{CloseReason, Event as DriverEvent};
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let mut observer = driver.connect().unwrap();
+        let extra = 6;
+        for stream_id in 0..i32::try_from(EVENT_QUEUE + extra).unwrap() {
+            driver.emit(&DriverEvent::PublicationClosed {
+                stream: StreamKey {
+                    stream_id,
+                    session_id: 1,
+                },
+                reason: CloseReason::RequiredParticipantLost,
+            });
+        }
+        let _ = observer.poll(usize::MAX, |_| {});
+        assert_eq!(observer.events_dropped(), u64::try_from(extra).unwrap());
+        let events: Vec<_> = observer.take_events().collect();
+        assert_eq!(events.len(), EVENT_QUEUE);
+        // The oldest were dropped: the first kept is the seventh sent.
+        assert!(matches!(
+            events[0],
+            DriverEvent::PublicationClosed { stream, .. } if stream.stream_id == 6
+        ));
+        assert_eq!(observer.take_events().count(), 0);
     }
 
     #[test]

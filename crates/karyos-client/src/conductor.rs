@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use karyos_protocol::cnc::ErrorCode;
-use karyos_protocol::cnc::{Command, MAX_COMMAND_LENGTH, Response, StreamKey, SubscriberRole};
+use karyos_protocol::cnc::{
+    Command, Event, MAX_COMMAND_LENGTH, Response, StreamKey, SubscriberRole,
+};
 use karyos_sys::broadcast::{BroadcastReceiver, Received};
 use karyos_sys::command_ring::{RingError, RingProducer};
 use thiserror::Error;
@@ -146,7 +148,14 @@ pub struct ClientConductor {
     /// The driver heartbeat last seen and when it was first seen.
     driver_seen: Option<(u64, Instant)>,
     driver_lost: bool,
+    /// Driver events received and not yet taken, at most [`EVENT_QUEUE`].
+    events: VecDeque<Event>,
+    /// Events dropped because the queue was full.
+    events_dropped: u64,
 }
+
+/// Driver events a client keeps until the application takes them.
+pub const EVENT_QUEUE: usize = 64;
 
 /// Default heartbeat interval of a client.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
@@ -178,6 +187,8 @@ impl ClientConductor {
             last_beat: None,
             driver_seen: None,
             driver_lost: false,
+            events: VecDeque::with_capacity(EVENT_QUEUE),
+            events_dropped: 0,
         }
     }
 
@@ -187,6 +198,20 @@ impl ClientConductor {
     pub fn set_liveness(&mut self, heartbeat_interval: Duration, driver_timeout: Duration) {
         self.heartbeat_interval = heartbeat_interval;
         self.driver_timeout = driver_timeout.max(heartbeat_interval.saturating_mul(10));
+    }
+
+    /// Takes the driver events received by earlier polls, oldest first
+    /// (quantstratum-docs: `karyos/design/required-participant-loss.md`,
+    /// Reporting): every client sees every event, and filters by stream.
+    pub fn take_events(&mut self) -> impl Iterator<Item = Event> + '_ {
+        self.events.drain(..)
+    }
+
+    /// Events dropped because the application did not take them before
+    /// [`EVENT_QUEUE`] more arrived.
+    #[must_use]
+    pub fn events_dropped(&self) -> u64 {
+        self.events_dropped
     }
 
     /// Whether the driver's heartbeat stopped for the driver timeout: the
@@ -466,6 +491,20 @@ impl ClientConductor {
             let step = match self.receiver.receive() {
                 Received::Pending => None,
                 Received::Lapped { .. } => Some(None),
+                Received::Message {
+                    type_id, payload, ..
+                } if Event::is_event_type(type_id) => {
+                    // Driver events answer no request: queue them for the
+                    // application, dropping the oldest when full.
+                    if let Ok(event) = Event::decode(type_id, payload) {
+                        if self.events.len() == EVENT_QUEUE {
+                            self.events.pop_front();
+                            self.events_dropped = self.events_dropped.saturating_add(1);
+                        }
+                        self.events.push_back(event);
+                    }
+                    Some(Some(None))
+                }
                 Received::Message {
                     type_id, payload, ..
                 } => Some(Some(Response::decode(type_id, payload).ok())),
