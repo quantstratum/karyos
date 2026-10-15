@@ -3373,3 +3373,77 @@ fn a_committed_frontier_does_not_replay_the_lookahead() {
     }
     assert_eq!(serve(&mut conductor, 3 + DEADLINE), aborted(1, 64));
 }
+
+/// Layout properties of a log buffer across rotations (SPEC.md §13, "Log
+/// buffers, codecs": base and EXT64 sizing, MTU fragmentation, rotation and
+/// padding; issue #10). Random base and EXT64 messages through the
+/// exclusive publication: each block starts where the model of SPEC.md §4
+/// puts it (aligned, never crossing a term end, a PAD filling exactly the
+/// remainder a block does not fit), and a required reader receives every
+/// message intact at that position.
+mod layout_properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn message_specs() -> impl Strategy<Value = Vec<(usize, bool)>> {
+        let count = if cfg!(miri) { 1..12 } else { 1..120 };
+        prop::collection::vec((4usize..=6000, any::<bool>()), count)
+    }
+
+    proptest! {
+        #![proptest_config(crate::receive::tests_config())]
+
+        #[test]
+        fn blocks_are_aligned_never_cross_a_term_and_pads_fill_the_rest(specs in message_specs()) {
+            let buffer = new_buffer(config(3, 2)).unwrap();
+            let mut conductor = buffer.conductor().unwrap();
+            let mut subscription = conductor.subscribe(Role::Required).unwrap();
+            let mut publication = buffer.publication().unwrap().unwrap();
+            let base = FragmentPlan::new(DEFAULT_MTU, Flags::NONE).unwrap();
+            let ext = FragmentPlan::new(DEFAULT_MTU, Flags::new(false, false, false, true, Lane::ZERO))
+                .unwrap();
+            let mut out = vec![0u8; 8192];
+            let mut expected = 0u64;
+            for (sequence, (len, with_extension)) in specs.into_iter().enumerate() {
+                let sequence = sequence as u32;
+                let data = sized_message(sequence, len);
+                let plan = if with_extension { ext } else { base };
+                let reserved = u64::from(plan.reserved(len as u32).unwrap());
+                prop_assert_eq!(reserved % u64::from(FRAME_ALIGNMENT), 0);
+                // A block that does not fit the rest of its term moves to
+                // the next one; a PAD fills exactly that rest.
+                let offset = expected % TERM;
+                if offset + reserved > TERM {
+                    expected += TERM - offset;
+                }
+                let options = AppendOptions {
+                    extension: with_extension.then_some([sequence as u8; EXTENSION_LENGTH as usize]),
+                    ..AppendOptions::default()
+                };
+                let position = loop {
+                    match publication.append(&data, options).unwrap() {
+                        AppendOutcome::Appended { position } => break position,
+                        AppendOutcome::Closed => panic!("not sealed"),
+                        _ => {
+                            let _ = conductor.duty_cycle().unwrap();
+                        }
+                    }
+                };
+                prop_assert_eq!(position, expected);
+                prop_assert!(position % TERM + reserved <= TERM, "a block crossed a term end");
+                let _ = conductor.duty_cycle().unwrap();
+                match subscription.poll(&mut out).unwrap() {
+                    PollOutcome::Message { position: read, length, extension, .. } => {
+                        subscription.acknowledge();
+                        prop_assert_eq!(read, expected);
+                        prop_assert_eq!(&out[..length as usize], &data[..]);
+                        prop_assert_eq!(extension, options.extension);
+                    }
+                    other => prop_assert!(false, "expected a message, got {other:?}"),
+                }
+                expected += reserved;
+            }
+        }
+    }
+}

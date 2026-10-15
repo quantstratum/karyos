@@ -1307,3 +1307,142 @@ mod tests {
         }
     }
 }
+
+/// Codec layout properties (SPEC.md §13, "Log buffers, codecs"; issue #10):
+/// random base and EXT64 messages appended to one term scan back as the
+/// same blocks, at contiguous aligned offsets with the reservation of
+/// SPEC.md §4, and a PAD fills exactly the rest of a full term.
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::sizing::DEFAULT_MTU;
+
+    const TERM: u32 = 64 * 1024;
+
+    #[derive(Debug, Clone)]
+    struct Spec {
+        len: usize,
+        extension: Option<TraceExtension>,
+        end_of_stream: bool,
+        reserved_value: i64,
+    }
+
+    fn spec() -> impl Strategy<Value = Spec> {
+        (
+            1usize..=6000,
+            any::<Option<u64>>(),
+            any::<bool>(),
+            any::<i64>(),
+        )
+            .prop_map(|(len, message_id, end_of_stream, reserved_value)| Spec {
+                len,
+                extension: message_id.map(|message_id| TraceExtension {
+                    message_id,
+                    ..TraceExtension::default()
+                }),
+                end_of_stream,
+                reserved_value,
+            })
+    }
+
+    fn identity() -> impl Strategy<Value = TermIdentity> {
+        (0..Lane::COUNT, any::<i32>(), any::<i32>(), any::<i32>()).prop_map(
+            |(lane, session_id, stream_id, term_id)| TermIdentity {
+                lane: Lane::try_new(lane).unwrap(),
+                session_id,
+                stream_id,
+                term_id,
+            },
+        )
+    }
+
+    fn payload(len: usize, seed: usize) -> Vec<u8> {
+        (0..len).map(|i| (i ^ seed) as u8).collect()
+    }
+
+    proptest! {
+        #[test]
+        fn appended_blocks_scan_back_and_a_pad_fills_the_rest(
+            identity in identity(),
+            specs in prop::collection::vec(spec(), 1..40),
+        ) {
+            let term_length = TermLength::try_new(TERM).unwrap();
+            let mut term = vec![0u8; TERM as usize];
+            let mut appended = Vec::new();
+            let mut full = false;
+            {
+                let mut appender =
+                    TermAppender::new(&mut term, term_length, identity, DEFAULT_MTU, TERM / 8)
+                        .unwrap();
+                for (index, spec) in specs.iter().enumerate() {
+                    let data = payload(spec.len, index);
+                    let options = AppendOptions {
+                        end_of_stream: spec.end_of_stream,
+                        extension: spec.extension,
+                        reserved_value: spec.reserved_value,
+                    };
+                    let tail = appender.tail();
+                    match appender.append(&data, options).unwrap() {
+                        AppendOutcome::Appended { offset, reserved } => {
+                            let flags = Flags::new(
+                                false, false, false, spec.extension.is_some(), identity.lane,
+                            );
+                            let plan = FragmentPlan::new(DEFAULT_MTU, flags).unwrap();
+                            prop_assert_eq!(offset, tail);
+                            prop_assert_eq!(offset % FRAME_ALIGNMENT, 0);
+                            prop_assert_eq!(reserved, plan.reserved(spec.len as u32).unwrap());
+                            prop_assert!(offset + reserved <= TERM);
+                            prop_assert_eq!(appender.tail(), offset + reserved);
+                            appended.push((offset, reserved, data, spec.clone(), plan));
+                        }
+                        AppendOutcome::TermFull => {
+                            // Only a block that does not fit fills the term.
+                            let flags = Flags::new(
+                                false, false, false, spec.extension.is_some(), identity.lane,
+                            );
+                            let reserved = FragmentPlan::new(DEFAULT_MTU, flags)
+                                .unwrap()
+                                .reserved(spec.len as u32)
+                                .unwrap();
+                            prop_assert!(tail + reserved > TERM);
+                            full = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            let mut scanner = TermScanner::new(&term, term_length, identity).unwrap();
+            let mut out = vec![0u8; 8192];
+            for (offset, reserved, data, spec, plan) in &appended {
+                match scanner.next_item().unwrap() {
+                    ScanItem::Message(block) => {
+                        prop_assert_eq!(block.offset(), *offset);
+                        prop_assert_eq!(block.reserved(), *reserved);
+                        prop_assert_eq!(block.length() as usize, data.len());
+                        prop_assert_eq!(block.lane(), identity.lane);
+                        prop_assert_eq!(block.end_of_stream(), spec.end_of_stream);
+                        prop_assert_eq!(block.reserved_value(), spec.reserved_value);
+                        prop_assert_eq!(
+                            block.fragments().count() as u32,
+                            plan.fragments(data.len() as u32)
+                        );
+                        let copied = block.copy_to(&mut out).unwrap();
+                        prop_assert_eq!(&out[..copied], &data[..]);
+                    }
+                    other => prop_assert!(false, "expected a message, got {other:?}"),
+                }
+            }
+            if full {
+                // The PAD ends the term exactly at its end.
+                prop_assert_eq!(scanner.next_item().unwrap(), ScanItem::End);
+                prop_assert_eq!(scanner.offset(), TERM);
+            } else {
+                let tail = appended.last().map_or(0, |(offset, reserved, ..)| offset + reserved);
+                let expected = if tail == TERM { ScanItem::End } else { ScanItem::Pending };
+                prop_assert_eq!(scanner.next_item().unwrap(), expected);
+            }
+        }
+    }
+}

@@ -426,3 +426,103 @@ mod tests {
         );
     }
 }
+
+/// Layout properties of word 0 and the flags byte (SPEC.md §13, "Log
+/// buffers, codecs"): every field round-trips through the packed word, and
+/// unpacking accepts exactly the words whose reserved flag bits are clear.
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn flags() -> impl Strategy<Value = Flags> {
+        (any::<[bool; 4]>(), 0..Lane::COUNT).prop_map(|([begin, end, eos, ext], lane)| {
+            Flags::new(begin, end, eos, ext, Lane::try_new(lane).unwrap())
+        })
+    }
+
+    proptest! {
+        #![proptest_config(crate::receive::tests_config())]
+
+        #[test]
+        fn flags_round_trip_through_their_byte(flags in flags()) {
+            prop_assert_eq!(flags.get() & RESERVED_FLAGS, 0);
+            let parsed = Flags::try_new(flags.get()).unwrap();
+            prop_assert_eq!(parsed, flags);
+            let rebuilt = Flags::new(
+                parsed.begin(),
+                parsed.end(),
+                parsed.eos(),
+                parsed.ext(),
+                parsed.lane(),
+            );
+            prop_assert_eq!(rebuilt, flags);
+        }
+
+        #[test]
+        fn a_flags_byte_is_valid_exactly_without_reserved_bits(raw in any::<u8>()) {
+            match Flags::try_new(raw) {
+                Ok(flags) => {
+                    prop_assert_eq!(raw & RESERVED_FLAGS, 0);
+                    prop_assert_eq!(flags.get(), raw);
+                }
+                Err(error) => {
+                    prop_assert_ne!(raw & RESERVED_FLAGS, 0);
+                    prop_assert_eq!(error, LayoutError::ReservedFlags { flags: raw });
+                }
+            }
+        }
+
+        #[test]
+        fn word0_fields_round_trip(
+            frame_length in any::<i32>(),
+            flags in flags(),
+            code in prop::sample::select(vec![
+                0x00u16, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x10, 0x11, 0x12, 0x13,
+            ]),
+        ) {
+            let frame_type = FrameType::try_from_code(code).unwrap();
+            prop_assert_eq!(frame_type.code(), code);
+            let word0 = Word0::new(frame_length, flags, frame_type);
+            let packed = word0.pack();
+            // Little-endian bytes 0..8: length, version, flags, type.
+            prop_assert_eq!(packed as u32 as i32, frame_length);
+            prop_assert_eq!((packed >> 32) as u8, PROTOCOL_VERSION);
+            prop_assert_eq!((packed >> 40) as u8, flags.get());
+            prop_assert_eq!((packed >> 48) as u16, code);
+            prop_assert_eq!(Word0::unpack(packed).unwrap(), word0);
+        }
+
+        #[test]
+        fn any_word_without_reserved_flags_unpacks_and_repacks(raw in any::<u64>()) {
+            let flags = (raw >> 40) as u8;
+            match Word0::unpack(raw) {
+                Ok(word0) => {
+                    prop_assert_eq!(flags & RESERVED_FLAGS, 0);
+                    // Version and type are returned as found, for callers to check.
+                    prop_assert_eq!(word0.pack(), raw);
+                }
+                Err(error) => {
+                    prop_assert_ne!(flags & RESERVED_FLAGS, 0);
+                    prop_assert_eq!(error, LayoutError::ReservedFlags { flags });
+                }
+            }
+        }
+
+        #[test]
+        fn unknown_type_codes_are_refused(code in any::<u16>()) {
+            let known = matches!(code, 0x00..=0x08 | 0x10..=0x13);
+            match FrameType::try_from_code(code) {
+                Ok(frame_type) => {
+                    prop_assert!(known);
+                    prop_assert_eq!(frame_type.code(), code);
+                }
+                Err(error) => {
+                    prop_assert!(!known);
+                    prop_assert_eq!(error, LayoutError::UnknownFrameType { code });
+                }
+            }
+        }
+    }
+}

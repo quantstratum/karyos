@@ -15,7 +15,7 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `thiserror` | 2.0.21 | crates.io | default features off | runtime, `karyos-sys`, `karyos-protocol`, `karyos-client`, `karyos-driver`, `karyos-trace`, `karyos` | all | MIT OR Apache-2.0 | ADR-0033 (`thiserror`, all crates) |
 | `rustix` | 1.1.5 | crates.io | default features off; `std`, `event`, `fs`, `mm`, `net`, `param`, `process` (`net` and `process` owner approved 2026-10-15 for IPC, quantstratum-docs: karyos/design/ipc-implementation.md; `event`, for polling the client's pidfd, owner approved 2026-10-15 for i3) | runtime, `karyos-sys` | Linux only (`cfg(target_os = "linux")`) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | ADR-0033 (`rustix`, sys and io) |
 | `loom` | 0.7.2 | crates.io | default features off | model checking, only under `--cfg loom` | all | MIT | ADR-0033 (`loom`, dev only) |
-| `proptest` | 1.11.0 | crates.io | default features off; `std` | dev-dependency of `karyos-sys` (tests only) | all | MIT OR Apache-2.0 | ADR-0033 (`proptest`, dev only); owner confirmed phase 1 on 2026-10-15 (Q25, issue #40) |
+| `proptest` | 1.11.0 | crates.io | default features off; `std` | dev-dependency of `karyos-sys` and `karyos-protocol` (tests only; `karyos-protocol` added for the layout properties of issue #10, coordinator approved 2026-10-15) | all | MIT OR Apache-2.0 | ADR-0033 (`proptest`, dev only); owner confirmed phase 1 on 2026-10-15 (Q25, issue #40) |
 
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
 absent from every normal and release build and from the graph shipped to
