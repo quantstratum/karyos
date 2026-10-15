@@ -503,12 +503,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let Some(index) = self.find_stream(stream) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
-                let remote = self
-                    .clients
-                    .iter()
-                    .find(|slot| slot.id == client)
-                    .and_then(|slot| slot.ledger.as_ref())
-                    .map(Ledger::full);
+                let remote = self.ledger(client).map(Ledger::full);
                 match remote {
                     // The export bound refuses before anything is reserved.
                     Some(true) => return refuse(ErrorCode::ResourcesUnavailable, detail),
@@ -707,6 +702,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if target.issuing().is_err() {
             return refuse(ErrorCode::ResourcesUnavailable, detail);
         }
+        // A grant no fetch could carry is refused rather than handed a key
+        // (one log buffer region per grant: one lane).
+        let bytes = fetch_bytes(&target.buffer);
+        let fetchable = self
+            .clients
+            .iter()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_ref())
+            .is_some_and(|ledger| ledger.fetchable(1, bytes));
+        if !fetchable {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        }
+        let Some(target) = self.streams.get_mut(index) else {
+            return refuse(ErrorCode::UnknownStream, 0);
+        };
         let participant = match command {
             Command::AddPublication { .. } => {
                 // A spare publication is the driver's own issuance.
@@ -748,12 +758,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let stream = target.id;
         self.next_registration = next;
         self.next_export = export + 1;
-        if let Some(ledger) = self
-            .clients
-            .iter_mut()
-            .find(|slot| slot.id == client)
-            .and_then(|slot| slot.ledger.as_mut())
-        {
+        if let Some(ledger) = self.ledger_mut(client) {
             ledger.push(Grant {
                 export,
                 registration,
@@ -796,10 +801,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// The export ledger of remote client `client`.
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "remote clients are admitted only on Linux")
-    )]
     pub(crate) fn ledger(&self, client: u64) -> Option<&Ledger> {
         self.clients
             .iter()
@@ -807,16 +808,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .and_then(|slot| slot.ledger.as_ref())
     }
 
+    /// The export ledger of remote client `client`, to change.
+    pub(crate) fn ledger_mut(&mut self, client: u64) -> Option<&mut Ledger> {
+        self.clients
+            .iter_mut()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_mut())
+    }
+
     /// A remote client's `Remove*` of `registration`: a grant never sent is
     /// ended at once, its participant released in the buffer; a sent one
     /// stays charged until its `Detach` or the client's exit proof.
     fn remove_remote(&mut self, client: u64, registration: u64) {
-        let Some(ledger) = self
-            .clients
-            .iter_mut()
-            .find(|slot| slot.id == client)
-            .and_then(|slot| slot.ledger.as_mut())
-        else {
+        let Some(ledger) = self.ledger_mut(client) else {
             return;
         };
         if ledger
@@ -851,6 +855,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if ended {
             self.counters.add(Event::GrantsEnded, 1);
         }
+    }
+}
+
+/// The bytes a fetch of `buffer` carries: its whole region, header
+/// included (`quantstratum-docs: karyos/design/ipc-data-path.md`, Bounds);
+/// 0 for a heap buffer, which has no region to carry.
+fn fetch_bytes<T: StreamTerms>(buffer: &karyos_sys::log_buffer::LogBuffer<T>) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // A full region: its header stride and its structure; a size that
+        // does not fit counts as too large.
+        <T as crate::embedded::sealed::Create>::region(buffer).map_or(0, |region| {
+            region
+                .record()
+                .structure_length
+                .checked_add(karyos_sys::ipc::HEADER_STRIDE)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = buffer;
+        0
     }
 }
 
@@ -937,7 +965,7 @@ mod tests {
         let (producer, consumer) = command_ring(1024).unwrap();
         let link = Arc::new(ClientLink::new());
         let id = driver
-            .admit(consumer, link, Some(Ledger::new(limit)))
+            .admit(consumer, link, Some(Ledger::new(limit, 4, 1 << 30)))
             .unwrap();
         (id, producer)
     }

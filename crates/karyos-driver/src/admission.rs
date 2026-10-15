@@ -38,9 +38,11 @@ use karyos_sys::command_ring::RingConsumer;
 use karyos_sys::error::SysError;
 use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, Sent};
 
+use crate::counters::Event;
 use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
-use crate::ledger::Ledger;
+use crate::ledger::{Grant, GrantState, Ledger, Participant};
+use karyos_sys::log_buffer::Role;
 
 /// Region id of the broadcast buffer.
 pub(crate) const BROADCAST_REGION: u64 = 1;
@@ -72,6 +74,15 @@ pub struct IpcConfig {
     /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Bounds); a
     /// command beyond it is refused and reserves nothing.
     pub max_exports_per_client: usize,
+    /// Fetches of one client whose messages are still queued; a `Fetch`
+    /// beyond it is refused with `LIMIT`.
+    pub max_fetches_per_client: usize,
+    /// Records in one manifest; a grant of more regions is refused with
+    /// `LIMIT`.
+    pub max_regions_per_fetch: usize,
+    /// Bytes of the regions of one fetch; a larger grant is refused with
+    /// `LIMIT`.
+    pub max_fetch_bytes: u64,
 }
 
 /// A connection waiting for its `Hello`.
@@ -81,11 +92,25 @@ struct Pending {
     since: u64,
 }
 
-/// A message waiting for its client's socket, with its descriptor.
+/// A message waiting for its client's socket, with its descriptor and,
+/// for a fetch of a grant, what its sending means for the grant.
 #[derive(Debug)]
 struct Outgoing {
     bytes: Vec<u8>,
     fd: Option<OwnedFd>,
+    mark: Option<Mark>,
+}
+
+/// The place of one message in a grant's fetch.
+#[derive(Debug, Clone, Copy)]
+struct Mark {
+    fetch: u64,
+    registration: u64,
+    /// It carries a descriptor of the grant: once sent, the grant is
+    /// charged until its `Detach` or the exit proof.
+    descriptor: bool,
+    /// The fetch's last message: once sent, the grant is `Exported`.
+    last: bool,
 }
 
 /// An admitted client with an open socket.
@@ -96,8 +121,13 @@ struct Remote<T: StreamTerms> {
     pidfd: PidFd,
     link: Arc<ClientLink<T>>,
     outbound: VecDeque<Outgoing>,
-    /// When its bootstrap was queued, until the bootstrap is sent.
-    bootstrap_since: Option<u64>,
+    /// Since when its queue has been non-empty: a fetch (the bootstrap
+    /// included) that does not drain within `fetch_deadline` retires it.
+    draining_since: Option<u64>,
+    /// The last fetch id it used; ids only grow.
+    last_fetch: u64,
+    /// Its fetches whose messages are still queued.
+    open: Vec<u64>,
 }
 
 /// A client whose socket is gone, charged until its exit proof.
@@ -185,6 +215,9 @@ impl<T: StreamTerms> Admission<T> {
             || config.hello_timeout == 0
             || config.fetch_deadline == 0
             || config.max_exports_per_client == 0
+            || config.max_fetches_per_client == 0
+            || config.max_regions_per_fetch == 0
+            || config.max_fetch_bytes == 0
             || config.max_outbound_per_client < BOOTSTRAP_MESSAGES
         {
             return Err(DriverError::InvalidConfig);
@@ -272,24 +305,27 @@ impl<T: StreamTerms> Admission<T> {
         // One datagram per client, then its outbound queue.
         let mut index = 0;
         while let Some(remote) = self.remotes.get_mut(index) {
-            let step = match Self::receive(remote, driver, self.config.max_outbound_per_client) {
-                Step::Keep => Self::drain(remote),
+            let step = match Self::receive(remote, driver, &self.config) {
+                Step::Keep => {
+                    let (step, sent) = Self::drain(remote);
+                    Self::account(driver, remote.client, &sent);
+                    step
+                }
                 other => other,
             };
-            let step = match (step, remote.bootstrap_since) {
-                (Step::Keep, Some(since)) => {
-                    if remote.outbound.is_empty() {
-                        remote.bootstrap_since = None;
-                        Step::Keep
-                    } else if now
+            if remote.outbound.is_empty() {
+                remote.draining_since = None;
+            } else if remote.draining_since.is_none() {
+                remote.draining_since = Some(*now.get_or_insert_with(|| driver.clock.now()));
+            }
+            let step = match (step, remote.draining_since) {
+                (Step::Keep, Some(since))
+                    if now
                         .get_or_insert_with(|| driver.clock.now())
                         .saturating_sub(since)
-                        >= self.config.fetch_deadline
-                    {
-                        Step::Retire
-                    } else {
-                        Step::Keep
-                    }
+                        >= self.config.fetch_deadline =>
+                {
+                    Step::Retire
                 }
                 (step, _) => step,
             };
@@ -297,11 +333,13 @@ impl<T: StreamTerms> Admission<T> {
                 Step::Keep => index += 1,
                 Step::Leave => {
                     let remote = self.remotes.swap_remove(index);
+                    Self::fail_open(driver, &remote);
                     remote.link.mark_closed();
                     work = work.saturating_add(1);
                 }
                 Step::Retire => {
                     let remote = self.remotes.swap_remove(index);
+                    Self::fail_open(driver, &remote);
                     driver.retire_faulty_client(remote.client);
                     self.retiring.push(Retiring {
                         pidfd: remote.pidfd,
@@ -371,7 +409,9 @@ impl<T: StreamTerms> Admission<T> {
                 pidfd,
                 link,
                 outbound,
-                bootstrap_since: Some(now),
+                draining_since: Some(now),
+                last_fetch: 0,
+                open: Vec::new(),
             }),
             None => refuse(&socket, refusal::RESOURCES),
         }
@@ -401,7 +441,11 @@ impl<T: StreamTerms> Admission<T> {
             fds.push(region.descriptor()?.try_clone_to_owned().ok()?);
         }
         let link = Arc::new(ClientLink::new());
-        let ledger = Ledger::new(self.config.max_exports_per_client);
+        let ledger = Ledger::new(
+            self.config.max_exports_per_client,
+            self.config.max_regions_per_fetch,
+            self.config.max_fetch_bytes,
+        );
         let client = driver
             .admit(consumer, Arc::clone(&link), Some(ledger))
             .ok()?;
@@ -416,18 +460,20 @@ impl<T: StreamTerms> Admission<T> {
                 records,
             })?,
             fd: None,
+            mark: None,
         });
         for (index, fd) in (0u64..).zip(fds) {
             outbound.push_back(Outgoing {
                 bytes: encode(&Message::Region { fetch: 0, index })?,
                 fd: Some(fd),
+                mark: None,
             });
         }
         Some((client, link, outbound))
     }
 
     /// Reads at most one datagram of an admitted client.
-    fn receive(remote: &mut Remote<T>, driver: &EmbeddedDriver<T>, bound: usize) -> Step {
+    fn receive(remote: &mut Remote<T>, driver: &mut EmbeddedDriver<T>, config: &IpcConfig) -> Step {
         let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
         match ipc::recv(remote.socket.as_fd(), &mut buffer) {
             Ok(Recv::WouldBlock) => Step::Keep,
@@ -435,30 +481,163 @@ impl<T: StreamTerms> Admission<T> {
                 let bytes = buffer.get(..received.len).unwrap_or(&[]);
                 match Message::decode(bytes) {
                     // Leave releases the client like its exit proof, so it
-                    // is accepted only while nothing was exported; otherwise
-                    // it is a protocol error and everything sent stays
-                    // charged until the exit proof.
+                    // is accepted only while nothing was exported and no
+                    // fetch is open; otherwise it is a protocol error and
+                    // everything sent stays charged until the exit proof.
                     Ok(Message::Leave)
-                        if driver.ledger(remote.client).is_none_or(Ledger::only_held) =>
+                        if remote.open.is_empty()
+                            && driver.ledger(remote.client).is_none_or(Ledger::only_held) =>
                     {
                         Step::Leave
                     }
-                    // Log buffers in regions come with i2: no key is held
-                    // for a remote client yet.
-                    Ok(Message::Fetch { fetch, .. }) => Self::queue(
-                        remote,
-                        &Message::Refused {
-                            fetch,
-                            code: refusal::UNKNOWN_KEY,
-                        },
-                        bound,
-                    ),
+                    Ok(Message::Fetch { fetch, key }) => {
+                        Self::fetch(remote, driver, config, fetch, key)
+                    }
                     _ => Step::Retire,
                 }
             }
             // A descriptor on a message that takes none, a closed socket or
             // a receive error.
             Ok(Recv::Message(_) | Recv::PeerClosed) | Err(_) => Step::Retire,
+        }
+    }
+
+    /// Serves `Fetch { fetch, key }` (`quantstratum-docs:
+    /// karyos/design/ipc-data-path.md`, Grants and the export ledger, step
+    /// 2): only for a `Held` grant of this client, moved to `Exporting`
+    /// before anything is queued, so a second fetch of the key is refused.
+    /// Queues one `Manifest` and one `Region` per record.
+    fn fetch(
+        remote: &mut Remote<T>,
+        driver: &mut EmbeddedDriver<T>,
+        config: &IpcConfig,
+        fetch: u64,
+        key: u64,
+    ) -> Step {
+        // Fetch 0 is the bootstrap's alone.
+        if fetch == 0 {
+            return Step::Retire;
+        }
+        let bound = config.max_outbound_per_client;
+        let refuse = |remote: &mut Remote<T>, code: u64| {
+            Self::queue(remote, &Message::Refused { fetch, code }, bound)
+        };
+        // Fetch ids only grow; a reused one is refused.
+        if fetch <= remote.last_fetch {
+            return refuse(remote, refusal::LIMIT);
+        }
+        remote.last_fetch = fetch;
+        if remote.open.len() >= config.max_fetches_per_client {
+            return refuse(remote, refusal::LIMIT);
+        }
+        let Some(grant) = driver
+            .ledger(remote.client)
+            .and_then(|ledger| ledger.held(key))
+            .copied()
+        else {
+            return refuse(remote, refusal::UNKNOWN_KEY);
+        };
+        let Some(stream) = driver.streams.iter().find(|s| s.id == grant.stream) else {
+            return refuse(remote, refusal::RESOURCES);
+        };
+        let Some(region) = <T as crate::embedded::sealed::Create>::region(&stream.buffer) else {
+            return refuse(remote, refusal::RESOURCES);
+        };
+        let Some(record) = grant_record(
+            region,
+            &grant,
+            stream.stream_id,
+            stream.session_id,
+            stream.config.lane.get(),
+        ) else {
+            return refuse(remote, refusal::RESOURCES);
+        };
+        // One log buffer region per grant: one lane. The byte bound counts
+        // whole regions, header included.
+        let bytes = u64::try_from(karyos_sys::ipc::HEADER_STRIDE)
+            .ok()
+            .and_then(|header| record.structure_length.checked_add(header));
+        if config.max_regions_per_fetch < 1
+            || bytes.is_none_or(|bytes| bytes > config.max_fetch_bytes)
+        {
+            return refuse(remote, refusal::LIMIT);
+        }
+        let Some(fd) = region
+            .descriptor()
+            .and_then(|fd| fd.try_clone_to_owned().ok())
+        else {
+            return refuse(remote, refusal::RESOURCES);
+        };
+        let (Some(manifest), Some(region_message)) = (
+            encode(&Message::Manifest {
+                fetch,
+                key,
+                registration: grant.registration,
+                records: vec![record],
+            }),
+            encode(&Message::Region { fetch, index: 0 }),
+        ) else {
+            return refuse(remote, refusal::RESOURCES);
+        };
+        if remote.outbound.len() + 2 > bound {
+            return Step::Retire;
+        }
+        // Effect: the grant is spent before anything is queued.
+        if let Some(ledger) = driver.ledger_mut(remote.client) {
+            ledger.set_state(grant.registration, GrantState::Exporting);
+        }
+        let mark = |descriptor: bool, last: bool| {
+            Some(Mark {
+                fetch,
+                registration: grant.registration,
+                descriptor,
+                last,
+            })
+        };
+        remote.outbound.push_back(Outgoing {
+            bytes: manifest,
+            fd: None,
+            mark: mark(false, false),
+        });
+        remote.outbound.push_back(Outgoing {
+            bytes: region_message,
+            fd: Some(fd),
+            mark: mark(true, true),
+        });
+        remote.open.push(fetch);
+        Step::Keep
+    }
+
+    /// Applies what the sent messages mean for their grants: a sent
+    /// descriptor charges the grant, a fetch's last message exports it.
+    fn account(driver: &mut EmbeddedDriver<T>, client: u64, sent: &[Mark]) {
+        if sent.is_empty() {
+            return;
+        }
+        let Some(ledger) = driver.ledger_mut(client) else {
+            return;
+        };
+        let mut exported = 0u64;
+        for mark in sent {
+            if mark.descriptor {
+                ledger.mark_sent(mark.registration);
+            }
+            if mark.last {
+                ledger.set_state(mark.registration, GrantState::Exported);
+                exported += 1;
+            }
+        }
+        driver.counters.add(Event::GrantsExported, exported);
+    }
+
+    /// Marks `Failed` every grant whose fetch still had messages queued
+    /// when the client left or was retired.
+    fn fail_open(driver: &mut EmbeddedDriver<T>, remote: &Remote<T>) {
+        let Some(ledger) = driver.ledger_mut(remote.client) else {
+            return;
+        };
+        for mark in remote.outbound.iter().filter_map(|outgoing| outgoing.mark) {
+            ledger.set_state(mark.registration, GrantState::Failed);
         }
     }
 
@@ -471,12 +650,18 @@ impl<T: StreamTerms> Admission<T> {
         if remote.outbound.len() >= bound {
             return Step::Retire;
         }
-        remote.outbound.push_back(Outgoing { bytes, fd: None });
+        remote.outbound.push_back(Outgoing {
+            bytes,
+            fd: None,
+            mark: None,
+        });
         Step::Keep
     }
 
-    /// Sends queued messages while the socket takes them.
-    fn drain(remote: &mut Remote<T>) -> Step {
+    /// Sends queued messages while the socket takes them; returns the
+    /// marks of the messages sent.
+    fn drain(remote: &mut Remote<T>) -> (Step, Vec<Mark>) {
+        let mut sent = Vec::new();
         while let Some(next) = remote.outbound.front() {
             match ipc::send(
                 remote.socket.as_fd(),
@@ -484,14 +669,59 @@ impl<T: StreamTerms> Admission<T> {
                 next.fd.as_ref().map(AsFd::as_fd),
             ) {
                 Ok(Sent::Sent) => {
-                    remote.outbound.pop_front();
+                    if let Some(mark) = remote.outbound.pop_front().and_then(|done| done.mark) {
+                        if mark.last {
+                            remote.open.retain(|open| *open != mark.fetch);
+                        }
+                        sent.push(mark);
+                    }
                 }
                 Ok(Sent::WouldBlock) => break,
-                Err(_) => return Step::Retire,
+                Err(_) => return (Step::Retire, sent),
             }
         }
-        Step::Keep
+        (Step::Keep, sent)
     }
+}
+
+/// The manifest record of a grant's log buffer region.
+fn grant_record(
+    region: &Region,
+    grant: &Grant,
+    stream_id: i32,
+    session_id: i32,
+    lane: u8,
+) -> Option<Record> {
+    let header = region.record();
+    Some(Record {
+        region: header.region,
+        export: grant.export,
+        kind: WireKind::LogBuffer,
+        layout: u32::try_from(header.layout).ok()?,
+        structure_length: u64::try_from(header.structure_length).ok()?,
+        generation: header.generation,
+        stream_id,
+        session_id,
+        lane,
+        capability: match grant.participant {
+            Participant::Exclusive => Capability::ExclusivePublication,
+            Participant::Concurrent { slot } => Capability::ConcurrentPublication {
+                slot: u64::try_from(slot).ok()?,
+            },
+            Participant::Subscriber {
+                cell,
+                role: Role::Required,
+            } => Capability::RequiredSubscriber {
+                cell: u64::try_from(cell).ok()?,
+            },
+            Participant::Subscriber {
+                cell,
+                role: Role::Optional,
+            } => Capability::OptionalSubscriber {
+                cell: u64::try_from(cell).ok()?,
+            },
+        },
+    })
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {

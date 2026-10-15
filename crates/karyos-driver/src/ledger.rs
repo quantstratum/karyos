@@ -9,10 +9,19 @@ use karyos_sys::log_buffer::Role;
 
 /// The state of a grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "fetches are served only on Linux")
+)]
 pub(crate) enum GrantState {
-    /// Reserved and answered; not fetched yet. `Fetch` (d2c) adds the
-    /// exporting, exported and failed states.
+    /// Reserved and answered; not fetched yet.
     Held,
+    /// Its fetch is being sent.
+    Exporting,
+    /// Every message of its fetch was sent.
+    Exported,
+    /// A send of its fetch failed; it is never fetched again.
+    Failed,
 }
 
 /// The participant a grant reserves in its stream's log buffer.
@@ -50,6 +59,10 @@ pub(crate) struct Ledger {
     grants: Vec<Grant>,
     /// `max_exports_per_client`: grants in any state.
     limit: usize,
+    /// `max_regions_per_fetch` and `max_fetch_bytes`: a grant beyond them
+    /// could never be fetched, so its command is refused.
+    max_regions: usize,
+    max_bytes: u64,
 }
 
 impl Ledger {
@@ -58,11 +71,19 @@ impl Ledger {
         not(target_os = "linux"),
         allow(dead_code, reason = "remote clients are admitted only on Linux")
     )]
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, max_regions: usize, max_bytes: u64) -> Self {
         Self {
             grants: Vec::new(),
             limit,
+            max_regions,
+            max_bytes,
         }
+    }
+
+    /// Whether a grant of `regions` regions of `bytes` bytes in all fits
+    /// one fetch.
+    pub(crate) fn fetchable(&self, regions: usize, bytes: u64) -> bool {
+        regions <= self.max_regions && bytes <= self.max_bytes
     }
 
     /// Whether a new grant would exceed the client's bound.
@@ -122,9 +143,38 @@ impl Ledger {
         self.grants.iter().any(|grant| grant.stream == stream)
     }
 
+    /// The `Held` grant whose response carried `key`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn held(&self, key: u64) -> Option<&Grant> {
+        self.grants
+            .iter()
+            .find(|grant| grant.key == key && grant.state == GrantState::Held)
+    }
+
+    /// Moves the grant answering `registration` to `state`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn set_state(&mut self, registration: u64, state: GrantState) {
+        if let Some(grant) = self
+            .grants
+            .iter_mut()
+            .find(|grant| grant.registration == registration)
+        {
+            grant.state = state;
+        }
+    }
+
     /// Records that a descriptor of the grant answering `registration` has
     /// left the outbound queue.
-    #[cfg(test)]
+    #[cfg_attr(
+        all(not(target_os = "linux"), not(test)),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
     pub(crate) fn mark_sent(&mut self, registration: u64) {
         if let Some(grant) = self
             .grants
@@ -160,7 +210,7 @@ mod tests {
 
     #[test]
     fn leave_is_allowed_only_while_nothing_was_sent() {
-        let mut ledger = Ledger::new(4);
+        let mut ledger = Ledger::new(4, 4, 1 << 30);
         assert!(ledger.only_held());
         ledger.push(grant(1));
         ledger.push(grant(2));

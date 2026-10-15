@@ -57,6 +57,9 @@ fn driver(dir: &Path) -> IpcDriver {
                 max_outbound_per_client: 16,
                 fetch_deadline: 5_000_000_000,
                 max_exports_per_client: 16,
+                max_fetches_per_client: 4,
+                max_regions_per_fetch: 4,
+                max_fetch_bytes: 1 << 30,
             },
             Box::new(SystemClock::new()),
         );
