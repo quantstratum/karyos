@@ -183,6 +183,18 @@ fn encode(message: &Message) -> Option<Vec<u8>> {
     out.get(..length).map(<[u8]>::to_vec)
 }
 
+/// Refuses a hello, recording why in the error log (keyed by the refusal
+/// code, so a flood of refused hellos updates one record).
+fn reject<T: StreamTerms>(driver: &mut EmbeddedDriver<T>, socket: &OwnedFd, code: u64, why: &str) {
+    driver.diagnostics.error(
+        &mut driver.counters,
+        crate::diagnostics::ErrorCode::HelloRejected,
+        [0, code],
+        why,
+    );
+    refuse(socket, code);
+}
+
 /// Sends one refusal on a connection that is then closed; best effort.
 fn refuse(socket: &OwnedFd, code: u64) {
     if let Some(bytes) = encode(&Message::Refused { fetch: 0, code }) {
@@ -333,6 +345,12 @@ impl<T: StreamTerms> Admission<T> {
                         .saturating_sub(since)
                         >= self.config.fetch_deadline =>
                 {
+                    driver.diagnostics.error(
+                        &mut driver.counters,
+                        crate::diagnostics::ErrorCode::FetchDeadlineMissed,
+                        [remote.client, 0],
+                        "admission messages not drained within the fetch deadline",
+                    );
                     Step::Retire
                 }
                 (step, _) => step,
@@ -391,24 +409,29 @@ impl<T: StreamTerms> Admission<T> {
             return;
         };
         if version != VERSION {
-            refuse(&socket, refusal::INCOMPATIBLE_VERSION);
+            reject(
+                driver,
+                &socket,
+                refusal::INCOMPATIBLE_VERSION,
+                "incompatible version",
+            );
             return;
         }
         let pidfd = match (Message::decode(bytes), fd) {
             (Ok(Message::Hello { .. }), Some(fd)) => match PidFd::validate(fd) {
                 Ok(pidfd) => pidfd,
-                Err(_) => return refuse(&socket, refusal::PROFILE),
+                Err(_) => return reject(driver, &socket, refusal::PROFILE, "invalid pidfd"),
             },
-            _ => return refuse(&socket, refusal::PROFILE),
+            _ => return reject(driver, &socket, refusal::PROFILE, "malformed hello"),
         };
         let proven = ipc::peer_credentials(socket.as_fd()).is_ok_and(|peer| {
             peer.uid.as_raw() == ipc::own_uid() && peer.pid.as_raw_nonzero().get() == pidfd.pid()
         });
         if !proven || pidfd.exited().unwrap_or(true) {
-            return refuse(&socket, refusal::PROFILE);
+            return reject(driver, &socket, refusal::PROFILE, "peer not proven");
         }
         if driver.terminal || driver.clients.len() >= driver.config.max_clients {
-            return refuse(&socket, refusal::LIMIT);
+            return reject(driver, &socket, refusal::LIMIT, "client limit or terminal");
         }
         match self.bootstrap(driver) {
             Some((client, link, outbound)) => self.remotes.push(Remote {
@@ -421,7 +444,7 @@ impl<T: StreamTerms> Admission<T> {
                 last_fetch: 0,
                 open: Vec::new(),
             }),
-            None => refuse(&socket, refusal::RESOURCES),
+            None => reject(driver, &socket, refusal::RESOURCES, "bootstrap resources"),
         }
     }
 

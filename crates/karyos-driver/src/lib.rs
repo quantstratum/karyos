@@ -14,6 +14,7 @@ pub mod admission;
 pub mod clock;
 mod commands;
 pub mod counters;
+pub mod diagnostics;
 pub mod embedded;
 pub mod error;
 mod generations;

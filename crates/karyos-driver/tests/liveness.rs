@@ -263,6 +263,16 @@ fn lost_required_subscriber(
     (client, subscription)
 }
 
+/// Every loss record the driver's loss report retains.
+fn losses(driver: &EmbeddedDriver) -> Vec<karyos_sys::diag::LossRecord> {
+    let mut records = Vec::new();
+    let scan = driver
+        .loss_report()
+        .scan(&mut 0, |_, record| records.push(record));
+    assert_eq!((scan.overwritten, scan.stopped), (0, None));
+    records
+}
+
 fn poll_once(subscription: &mut ClientSubscription) -> PollSummary {
     subscription.poll(|_, _| {}, MessageLimit::new(16)).unwrap()
 }
@@ -342,6 +352,10 @@ fn test_driver_loss_continue_admits_with_a_reservation_and_revokes() {
     assert_eq!(counter(&driver, "required participants lost"), 1);
     assert!(poll_once(&mut subscription).revoked.is_some());
     assert_eq!(driver.seal_state(stream).unwrap(), SealState::Active);
+    // Only the lost participant is reported: the incarnation goes on.
+    let records = losses(&driver);
+    assert_eq!(records.len(), 1);
+    assert_eq!((records[0].kind, records[0].applied_policy), (2, 2));
 }
 
 #[test]
@@ -351,6 +365,24 @@ fn test_driver_loss_abort_seals_the_stream() {
     let (_client, _subscription) = lost_required_subscriber(&mut driver, &clock);
     assert_eq!(counter(&driver, "required participants lost"), 1);
     assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
+    // The loss report names the lost participant, then the aborted
+    // incarnation, both under the abort policy (code 3).
+    let records = losses(&driver);
+    let kinds: Vec<_> = records.iter().map(|record| record.kind).collect();
+    assert_eq!(kinds, [2, 3]);
+    let identity = driver.trace_identity(stream).unwrap();
+    for record in &records {
+        assert_eq!((record.configured_policy, record.applied_policy), (3, 3));
+        assert_eq!(
+            record.instance,
+            u128::from(identity.driver[0]) << 64 | u128::from(identity.driver[1])
+        );
+        assert_eq!(record.stream_registration, identity.registration);
+        assert_eq!(record.incarnation, identity.incarnation);
+        assert_eq!(record.stream_id, 2);
+        assert_ne!((record.participant, record.client), (0, 0));
+        assert!(record.time > 0);
+    }
 }
 
 #[test]
