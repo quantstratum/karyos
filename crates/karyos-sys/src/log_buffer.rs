@@ -2174,6 +2174,42 @@ fn write_fragments<T: TermBytes>(
     plan: &FragmentPlan,
     options: AppendOptions,
 ) -> Word0 {
+    write_fragments_inner(buffer, slot, count, start, payload, (plan, options), |_| {})
+}
+
+/// Test hook for pausing a concurrent offer after an individual fragment.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(super) fn write_fragments_pausing<T: TermBytes>(
+    buffer: &LogBuffer<T>,
+    slot: u8,
+    count: TermCount,
+    start: u32,
+    payload: &[u8],
+    plan_options: (&FragmentPlan, AppendOptions),
+    after_fragment: &mut dyn FnMut(u32),
+) -> Word0 {
+    write_fragments_inner(
+        buffer,
+        slot,
+        count,
+        start,
+        payload,
+        plan_options,
+        after_fragment,
+    )
+}
+
+#[inline(always)]
+fn write_fragments_inner<T: TermBytes, F: FnMut(u32)>(
+    buffer: &LogBuffer<T>,
+    slot: u8,
+    count: TermCount,
+    start: u32,
+    payload: &[u8],
+    plan_options: (&FragmentPlan, AppendOptions),
+    mut after_fragment: F,
+) -> Word0 {
+    let (plan, options) = plan_options;
     let ext = options.extension.is_some();
     let lane = buffer.config.lane;
     let fragments = plan.fragments(payload.len() as u32);
@@ -2214,6 +2250,7 @@ fn write_fragments<T: TermBytes>(
             // SAFETY: write loan held; 32-aligned frame start in range.
             store_interior(unsafe { buffer.regions.word0(slot, offset) }, word0);
         }
+        after_fragment(index);
         offset += frame_reserved;
     }
     first.unwrap_or(Word0::new(0, Flags::NONE, FrameType::Data))
