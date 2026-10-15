@@ -20,10 +20,18 @@
 //! | `0x02` | `Fetch` | fetch id (nonzero); hand-over key |
 //! | `0x03` | `Detach` | export id (nonzero) |
 //! | `0x04` | `Leave` | none |
-//! | `0x81` | `Admitted` | instance (low, high); client id; record count; records |
+//! | `0x81` | `Admitted` | instance (low, high); protocol version; client id; record count; records |
 //! | `0x82` | `Manifest` | fetch id; hand-over key; registration; record count; records |
 //! | `0x83` | `Region` | fetch id; record index |
 //! | `0x84` | `Refused` | fetch id or 0; code (nonzero) |
+//!
+//! **Versions.** The client announces its protocol version in `Hello`;
+//! the driver answers `Admitted` carrying the version it runs (equal to the
+//! client's), or `Refused` with [`refusal::INCOMPATIBLE_VERSION`]. The
+//! first two words of `Hello` (type, version) and the whole `Refused`
+//! layout are fixed for every version, so a driver can read the version of
+//! any `Hello` with [`hello_version`] and refuse it in a form every client
+//! can decode.
 //!
 //! A record is eight words: region id; export id; kind (bits 0..8) and
 //! layout version (bits 8..40); structure length; generation; stream id
@@ -40,8 +48,36 @@ pub const VERSION: u64 = 1;
 pub const MAX_RECORDS: usize = 16;
 /// Words of one record.
 pub const RECORD_WORDS: usize = 8;
-/// Largest encoded message, in bytes: a manifest with [`MAX_RECORDS`].
-pub const MAX_MESSAGE_LENGTH: usize = (5 + MAX_RECORDS * RECORD_WORDS) * 8;
+/// Largest encoded message, in bytes: `Admitted` with [`MAX_RECORDS`].
+pub const MAX_MESSAGE_LENGTH: usize = (6 + MAX_RECORDS * RECORD_WORDS) * 8;
+
+/// Refusal codes of `Refused` (nonzero). A client treats a code it does not
+/// know as a refusal without a reason.
+pub mod refusal {
+    /// The driver does not run the protocol version of the `Hello`.
+    pub const INCOMPATIBLE_VERSION: u64 = 1;
+    /// The `Hello` breaks the first profile: flags, uid, or its pidfd.
+    pub const PROFILE: u64 = 2;
+    /// A limit is reached: clients, pending hellos, fetches or exports.
+    pub const LIMIT: u64 = 3;
+    /// The driver failed to create or describe a region.
+    pub const RESOURCES: u64 = 4;
+    /// The fetch names no hand-over entry held for this client.
+    pub const UNKNOWN_KEY: u64 = 5;
+}
+
+/// The protocol version of a `Hello` datagram of any version: its type and
+/// version words are fixed. `None` when the datagram is not a `Hello`.
+#[must_use]
+pub fn hello_version(bytes: &[u8]) -> Option<u64> {
+    let (chunks, _) = bytes.as_chunks::<8>();
+    match chunks {
+        [kind, version, ..] if u64::from_le_bytes(*kind) == HELLO => {
+            Some(u64::from_le_bytes(*version))
+        }
+        _ => None,
+    }
+}
 
 const HELLO: u64 = 0x01;
 const FETCH: u64 = 0x02;
@@ -270,6 +306,8 @@ pub enum Message {
     Admitted {
         /// The driver instance id.
         instance: u128,
+        /// The protocol version the driver runs: the client's.
+        version: u64,
         /// The client id.
         client: u64,
         /// The CnC regions.
@@ -353,6 +391,7 @@ impl Message {
             Self::Leave => words.push(LEAVE),
             Self::Admitted {
                 instance,
+                version,
                 client,
                 records,
             } => {
@@ -360,6 +399,7 @@ impl Message {
                     ADMITTED,
                     *instance as u64,
                     (*instance >> 64) as u64,
+                    *version,
                     *client,
                 ]);
                 records_words(records, &mut words)?;
@@ -482,8 +522,9 @@ impl Message {
             }
             ADMITTED => Ok(Self::Admitted {
                 instance: u128::from(word(1)) | (u128::from(word(2)) << 64),
-                client: word(3),
-                records: records_from(4, &words)?,
+                version: word(3),
+                client: word(4),
+                records: records_from(5, &words)?,
             }),
             MANIFEST => {
                 if word(1) == 0 {
@@ -553,6 +594,7 @@ mod tests {
         round_trip(&Message::Refused { fetch: 3, code: 6 });
         round_trip(&Message::Admitted {
             instance: u128::MAX - 7,
+            version: VERSION,
             client: 4,
             records: vec![Record {
                 kind: RegionKind::CommandRing,
@@ -697,6 +739,7 @@ mod tests {
             },
             Message::Admitted {
                 instance: 1,
+                version: VERSION,
                 client: 1,
                 records: vec![record(0, Capability::None)],
             },
@@ -707,5 +750,34 @@ mod tests {
                 "{message:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_version_of_any_hello_can_be_read() {
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let len = Message::Hello { version: 7 }.encode(&mut out).unwrap();
+        assert_eq!(hello_version(&out[..len]), Some(7));
+        // A longer Hello of a future version still yields its version.
+        let mut future = out[..len].to_vec();
+        future.extend_from_slice(&[0xAB; 16]);
+        assert!(Message::decode(&future).is_err());
+        assert_eq!(hello_version(&future), Some(7));
+        let len = Message::Leave.encode(&mut out).unwrap();
+        assert_eq!(hello_version(&out[..len]), None);
+        assert_eq!(hello_version(&[1, 0, 0, 0, 0, 0, 0, 0]), None);
+        // The refusal of an incompatible version decodes as any refusal.
+        round_trip(&Message::Refused {
+            fetch: 0,
+            code: refusal::INCOMPATIBLE_VERSION,
+        });
+        // The largest message is an Admitted with every record.
+        let records = vec![record(1, Capability::None); MAX_RECORDS];
+        let admitted = Message::Admitted {
+            instance: 1,
+            version: VERSION,
+            client: 2,
+            records,
+        };
+        assert_eq!(admitted.encode(&mut out), Ok(MAX_MESSAGE_LENGTH));
     }
 }
