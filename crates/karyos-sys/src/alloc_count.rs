@@ -36,7 +36,10 @@ fn note() {
 
 // SAFETY: every method forwards its arguments unchanged to `System`, which
 // upholds the `GlobalAlloc` contract; `note` only touches const-initialized
-// thread-local cells and never allocates.
+// thread-local cells, which need no destructor. On the targets these tests
+// run on (Linux and macOS, native thread-locals) touching them never
+// allocates, so the allocator never re-enters itself; a target with the
+// OS-key thread-local fallback would allocate on first access.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         note();
@@ -67,9 +70,19 @@ unsafe impl GlobalAlloc for CountingAllocator {
 /// reallocations and frees it made on this thread. Meaningful only when
 /// [`CountingAllocator`] is the global allocator.
 pub fn count<R>(call: impl FnOnce() -> R) -> (R, u64) {
+    /// Disarms the thread on every exit, a panic in `call` included.
+    struct Disarm;
+
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            let _ = ARMED.try_with(|armed| armed.set(false));
+        }
+    }
+
     SEEN.with(|seen| seen.set(0));
     ARMED.with(|armed| armed.set(true));
+    let disarm = Disarm;
     let result = call();
-    ARMED.with(|armed| armed.set(false));
+    drop(disarm);
     (result, SEEN.with(Cell::get))
 }

@@ -367,6 +367,7 @@ impl<T: TermBytes> GenerationLink<T> {
     pub(crate) fn fail_activation(&self, retired: Retired<T>) {
         let mut inner = self.lock();
         inner.state = State::Closed;
+        debug_assert!(inner.retired.is_none(), "one retired entry at a time");
         if inner.retired.is_none() {
             inner.retired = Some(retired);
         }
