@@ -30,9 +30,13 @@ layouts will change.
   - Sealed shared-memory regions passed as descriptors: the client's
     command ring, the broadcast buffer and the counters.
   - Release of a client and its resources by the process exit proof
-    (pidfd).
-  - TODO(A2): confirm against the merged admission server and remote
-    client.
+    (pidfd): a killed client is released, a stopped one keeps its slot
+    and resumes, and a restarted driver starts a new instance while the
+    old mappings stay valid for clients that hold them.
+  - Entry points: `EmbeddedDriver::with_ipc` and `do_work` on the driver
+    side, `karyos_client::ipc::attach` on the client side. There is no
+    example binary yet; the Linux tests of `karyos-driver` are the
+    runnable evidence.
 - **Libraries** for later releases, usable directly: the keyed conflation
   table, the bounded record journal, trace records, sampling, clock
   calibration and latency histograms, the deterministic simulator and the
@@ -66,7 +70,13 @@ layouts will change.
 - Shared-memory regions are writable by every admitted process; read-only
   tool access does not exist yet.
 - Hosted CI is not running; the gates are run locally.
-- TODO(A3): limitations found by the process tests.
+- A listening socket that was just closed can stay held by a process
+  forked at that moment until it calls `exec` (close-on-exec acts only at
+  `exec`), so a restarted driver's listen may be refused briefly; the
+  tests retry for up to 2 s.
+- The refusal of a thread pidfd as an exit proof is checked only on
+  kernels before 6.9 (the `EINVAL` branch); no kernel 6.9 or later was
+  run.
 
 ## Evidence
 
@@ -75,13 +85,13 @@ latency on physical hosts.
 
 | Check | Environment | Result |
 | --- | --- | --- |
-| `make pre-push` (format, lint, docs, tests, Loom, release build) | TODO(A5): host, OS and architecture | TODO |
-| `make miri` (`karyos-sys`, nightly-2026-10-11) | TODO(A5): host | TODO |
-| `make loom` | TODO(A5): host | TODO |
-| `make sim` (seeds) | TODO(A5): host and seed count | TODO |
-| `scripts/linux-test.sh` (workspace tests in Docker) | TODO(A3): kernel and architecture printed by the script | TODO: pass and skip counts |
-| Cross-process control process tests (exit proof after a kill, a stopped client kept charged, driver restart, platform checks) | TODO(A3): kernel and architecture | TODO(A3) |
-| Linux x86_64 | Not run for this alpha | Not claimed |
+| `make miri` (`karyos-sys` library tests, nightly-2026-10-11) | macOS arm64, Apple M5 Max | 306 of 306 pass, no undefined behaviour reported |
+| `make loom` | macOS arm64, Apple M5 Max | Pass |
+| `scripts/linux-test.sh` (`cargo test --workspace`) | Docker `rust:1.99`, kernel 6.8.0 aarch64 (colima VM) | All pass, including the `karyos-sys` library tests (322) |
+| Process tests (`karyos-driver/tests/processes.rs`: a killed client released by its exit proof, a stopped client kept charged then resumed, a driver restart) | Docker, kernel 6.8.0 aarch64 | Pass |
+| Platform tests (`karyos-driver/tests/admission_platform.rs`: modes, owners, stale and foreign files, backlog, size seals, descriptor counts) | Docker as root, kernel 6.8.0-117-generic aarch64 | 11 of 11 pass, three consecutive runs |
+| Final gate run on the release commit (`make pre-push`, `make sim`) | TODO(final gate-run SHA) | TODO(final gate-run SHA) |
+| Linux x86_64, kernels 6.9 and later | Not run for this alpha | Not claimed |
 
 ## Upgrading
 

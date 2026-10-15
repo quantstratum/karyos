@@ -64,8 +64,13 @@ cross-process control path on Linux. See
 - The command ring, the broadcast buffer and the counters in shared
   regions.
 - Process exit proof through pidfd.
-- TODO(A1, A2): the log buffer over a shared region and the admission
-  server with remote client attach, once merged.
+- The log buffer over a shared region, validated in `karyos-sys`.
+- The admission server and remote client attach: admission over the Unix
+  socket with a version exchange, a bounded connect, the per-client command
+  ring, broadcast responses and read-only counters in sealed regions,
+  `Leave`, retirement, release by the exit proof, and a driver restart that
+  keeps the old mappings. A file at the socket path that is not the
+  driver's socket is never deleted.
 
 ### Tracing (`karyos-trace`)
 
