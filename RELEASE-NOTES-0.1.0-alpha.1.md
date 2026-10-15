@@ -85,13 +85,13 @@ Functional evidence only. Docker and virtual machines say nothing about
 latency on physical hosts.
 
 Rows with a commit are historical evidence for that commit, recorded
-during development; the last row is the gate run on the release commit.
+during development; the release-gates row is the run on the release commit.
 
 | Check | Commit | Environment | Result |
 | --- | --- | --- | --- |
 | Miri, `karyos-sys` library tests (nightly-2026-10-11) | `438f0cc` | macOS arm64, Apple M5 Max | 306 of 306 pass, no undefined behaviour reported |
 | Miri, region adoption tests | `458b833` | macOS arm64, Apple M5 Max | 10 of 10 pass |
-| Region tests after the Linux-only kind check | `7186e77` | macOS arm64, Apple M5 Max | 4 of 4 pass; no full Miri rerun after it |
+| Region tests after the Linux-only kind check | `7186e77` | Docker, kernel 6.8.0-117-generic aarch64 | 4 of 4 pass; no full Miri rerun after it |
 | `make loom` | `1316b00` | macOS arm64, Apple M5 Max | Pass |
 | `scripts/linux-test.sh` (`cargo test --workspace`) | `5484971` (the process tests on the admission server) | Docker `rust:1.99`, kernel 6.8.0 aarch64 (colima VM) | All pass, including the `karyos-sys` library tests (322) |
 | Process tests (`karyos-driver/tests/processes.rs`: a killed client released by its exit proof, a stopped client kept charged then resumed, a driver restart that keeps the old mappings readable) | `e3784dd`, merged as `b2d15cb` | Docker, kernel 6.8.0 aarch64 | 4 of 4 pass, five consecutive runs |
