@@ -140,3 +140,22 @@ fn a_reader_outlives_the_driver_with_the_last_values() {
         .unwrap();
     assert_eq!(admitted, (1, true));
 }
+
+#[test]
+fn lifetime_gauges_follow_credits_and_loans() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver.add_stream(stream_config(2)).unwrap();
+    let loans = value(&driver, "loans outstanding");
+    let _reader = driver
+        .subscribe(stream, karyos_sys::log_buffer::Role::Optional)
+        .unwrap();
+    let mut writer = driver.publication(stream).unwrap();
+    let _ = writer.offer(b"one").unwrap();
+    let _ = driver.do_work().unwrap();
+    // The exclusive publication's credit and the optional reader's; the
+    // writer holds its term write loan; nothing is quarantined.
+    assert_eq!(value(&driver, "spare reservations in use"), 2);
+    assert!(value(&driver, "loans outstanding") > loans);
+    assert_eq!(value(&driver, "slots quarantined"), 0);
+    assert_eq!(value(&driver, "retirement pool exhausted"), 0);
+}

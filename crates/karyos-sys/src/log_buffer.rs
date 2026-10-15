@@ -3717,6 +3717,44 @@ impl<O: BufferOwner> Conductor<O> {
         buffer.floor().load(Ordering::Acquire)
     }
 
+    /// Slots still quarantined by a loan after the last duty cycle: in
+    /// `RECLAIMING` with a live loan. Diagnostics sample it
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+    /// `slots quarantined`).
+    #[must_use]
+    pub fn quarantined_slots(&self) -> usize {
+        self.quarantined.len()
+    }
+
+    /// Spare-slot credits in use, as admission counts them: the publisher
+    /// credits reserved for the buffer's life (1 for the exclusive
+    /// publication, `P` for concurrent ones) plus the subscriber cells
+    /// holding a credit (Acquire loads of their states). Diagnostics
+    /// sample it (`spare reservations in use`).
+    #[must_use]
+    pub fn spare_credits(&self) -> usize {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let subscribers = buffer
+            .cells()
+            .iter()
+            .skip(buffer.first_subscriber_cell())
+            .filter(|cell| holds_credit(cell.state.load(Ordering::Acquire)))
+            .count();
+        buffer.first_subscriber_cell().saturating_add(subscribers)
+    }
+
+    /// Registry cells, publisher cells included, whose loan word is not
+    /// empty (Acquire loads). Diagnostics sample it (`loans outstanding`).
+    #[must_use]
+    pub fn loans_outstanding(&self) -> usize {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer
+            .cells()
+            .iter()
+            .filter(|cell| cell.loan.load(Ordering::Acquire) != 0)
+            .count()
+    }
+
     /// The attached subscriber cells, in cell order: each one's cell index,
     /// registration (the occupant or export id, its marks cleared; 0 for a
     /// subscription without one) and position, each loaded with Acquire.
@@ -4450,6 +4488,7 @@ mod heap_tests {
     include!("log_buffer_tests/contracts.rs");
     include!("log_buffer_tests/loss.rs");
     include!("log_buffer_tests/observer.rs");
+    include!("log_buffer_tests/diagnostics.rs");
 }
 
 #[cfg(test)]
@@ -4475,6 +4514,7 @@ mod shared_tests {
     include!("log_buffer_tests/contracts.rs");
     include!("log_buffer_tests/loss.rs");
     include!("log_buffer_tests/observer.rs");
+    include!("log_buffer_tests/diagnostics.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber

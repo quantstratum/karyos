@@ -603,6 +603,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let retained = self.streams.iter().map(|s| s.retained.len()).sum();
         self.counters
             .set(Event::GenerationsRetired, gauge(retained));
+        // Over every live mapping: the current one and the retained
+        // predecessors, which still hold slots, credits and loans.
+        let (mut quarantined, mut credits, mut loans) = (0usize, 0usize, 0usize);
+        for stream in &self.streams {
+            let conductors = core::iter::once(&stream.conductor)
+                .chain(stream.retained.iter().map(|retained| &retained.conductor));
+            for conductor in conductors {
+                quarantined = quarantined.saturating_add(conductor.quarantined_slots());
+                credits = credits.saturating_add(conductor.spare_credits());
+                loans = loans.saturating_add(conductor.loans_outstanding());
+            }
+        }
+        self.counters
+            .set(Event::SlotsQuarantined, gauge(quarantined));
+        self.counters
+            .set(Event::SpareReservationsInUse, gauge(credits));
+        self.counters.set(Event::LoansOutstanding, gauge(loans));
     }
 
     /// Runs a positions sampling pass when `position_sample_interval` has
