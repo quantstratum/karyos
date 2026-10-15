@@ -230,9 +230,10 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
 }
 
 /// One thread: validate a datagram of one frame and hand it to the image's
-/// receive owner, measuring the owner's call: the commit, or with
-/// `duplicate` the comparison of a second copy. A PAD closes each term and
-/// the conductor prepares the next; neither is measured.
+/// receive owner, measuring only the owner's call: the commit, or with
+/// `duplicate` the comparison of a second copy. Parsing and validation
+/// happen before the timer starts. A PAD closes each term and the conductor
+/// prepares the next; neither is measured.
 fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchError> {
     let resolution = resolution();
     let term_length =
@@ -317,11 +318,20 @@ fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchE
         )
         .encode(&mut bytes)
         .map_err(|cause| error("header", cause))?;
+        let datagram =
+            ValidatedDatagram::parse(&bytes, &params).map_err(|cause| error("parse", cause))?;
+        let Some(Item::Frame(frame)) = datagram.items().next() else {
+            return Err(BenchError("no frame".into()));
+        };
         let begin = Instant::now();
-        let first = handle(&mut owner, &bytes)?;
+        let first = owner
+            .receive(&frame)
+            .map_err(|cause| error("receive", cause))?;
         let end = if duplicate {
             let begin = Instant::now();
-            let second = handle(&mut owner, &bytes)?;
+            let second = owner
+                .receive(&frame)
+                .map_err(|cause| error("receive", cause))?;
             if second != Received::Duplicate {
                 return Err(BenchError(format!("a duplicate was {second:?}")));
             }
