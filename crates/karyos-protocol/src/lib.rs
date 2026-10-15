@@ -8,8 +8,9 @@
 //! flyweights that append message blocks to, and scan them from, a term held
 //! in a byte slice; and the client command and driver response messages of
 //! the CnC structures (`cnc`); and a re-export of the bounded record journal
-//! of `karyos-sys` (`journal`). Concurrent shared-memory access and URI
-//! parsing do not exist yet.
+//! of `karyos-sys` (`journal`); and the data-path tracing hook that
+//! `karyos-trace` implements (`trace_hook`). Concurrent shared-memory access
+//! and URI parsing do not exist yet.
 
 pub mod admission;
 pub mod cnc;
@@ -18,5 +19,6 @@ pub mod frame;
 pub mod journal;
 pub mod sizing;
 pub mod term;
+pub mod trace_hook;
 
 pub use error::{LayoutError, ProtocolError};
