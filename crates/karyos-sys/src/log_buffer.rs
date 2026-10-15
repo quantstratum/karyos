@@ -4371,8 +4371,11 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
     ))
 }
 
-/// The layout version of the shared log buffer region.
-pub const LAYOUT_VERSION: u64 = 1;
+/// The layout version of the shared log buffer region. Version 2 gives bit
+/// 61 of the seal word a meaning (`SEAL_SUCCESSOR`, ADR-0061) and narrows
+/// the seal position to bits 0..60, so a reader of version 1 would misread
+/// a cutover seal; version 1 regions are refused at attach.
+pub const LAYOUT_VERSION: u64 = 2;
 
 #[cfg(test)]
 mod heap_tests {
@@ -4713,7 +4716,8 @@ mod region_tests {
         // claim deadline, an unknown mode, a generation that differs from
         // the region's, a largest message that differs, a trailing word.
         for (index, value) in [
-            (0, 2),
+            (0, 1),
+            (0, 3),
             (1, 1000),
             (2, 200),
             (10, 0),
@@ -4746,6 +4750,53 @@ mod region_tests {
             panic!("no message");
         };
         assert!(Region::attach(received.fd.unwrap(), other).is_err());
+    }
+
+    /// A region of layout version 1, from before the seal word's successor
+    /// bit (ADR-0061), is refused at attach: by its record and by its
+    /// configuration block, so a mixed build never misreads a seal.
+    #[test]
+    fn attach_refuses_a_version_1_region() {
+        assert_eq!(LAYOUT_VERSION, 2);
+        let creator =
+            LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
+        let record = creator.region().unwrap().record();
+        let source = creator.region().unwrap().structure();
+        for (record_layout, block_version) in [(1, 1), (1, 2), (2, 1)] {
+            let old = Region::create(RegionRecord {
+                region: 9,
+                layout: record_layout,
+                ..record
+            })
+            .unwrap();
+            let target = old.structure();
+            for index in 0..CONFIG_WORDS {
+                let value = source.get(index).unwrap().load(Ordering::Acquire);
+                target.get(index).unwrap().store(value, Ordering::Release);
+            }
+            // Word 0 of the configuration block is its layout version.
+            target
+                .get(0)
+                .unwrap()
+                .store(block_version, Ordering::Release);
+            let (a, b) = seqpacket_pair().unwrap();
+            assert_eq!(
+                send(a.as_fd(), b"lb", old.descriptor()).unwrap(),
+                Sent::Sent
+            );
+            let mut buffer = [0u8; 8];
+            let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+                panic!("no message");
+            };
+            let attached = Region::attach(received.fd.unwrap(), old.record()).unwrap();
+            assert!(
+                matches!(
+                    LogBuffer::attach(attached),
+                    Err(SysError::InvalidRegion { .. })
+                ),
+                "record layout {record_layout}, block version {block_version} accepted"
+            );
+        }
     }
 
     /// A self-consistent region of another kind whose structure holds a
