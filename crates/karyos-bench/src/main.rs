@@ -3,12 +3,14 @@
 //! `karyos-bench`: runs the embedded workloads and reports them.
 //!
 //! ```text
-//! karyos-bench [--workload <name>] [--iterations <n>] [--record <dir>] [--compare <dir>]
+//! karyos-bench [--workload <name>] [--iterations <n>] [--rate <messages/s>]
+//!              [--record <dir>] [--compare <dir>]
 //! ```
 //!
 //! `--record` appends to `<dir>/history.jsonl`; `--compare` prints the
 //! change against the last record with the same workload, configuration,
-//! host and profile. Comparisons report, they never fail.
+//! host and profile. `--rate` changes the scheduled rate for `open-loop`.
+//! Comparisons report, they never fail.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,6 +22,7 @@ use karyos_bench::{Workload, defaults, report, run};
 struct Options {
     workload: Option<Workload>,
     iterations: u64,
+    rate: Option<u64>,
     record: Option<PathBuf>,
     compare: Option<PathBuf>,
 }
@@ -28,6 +31,7 @@ fn parse() -> Result<Options, String> {
     let mut options = Options {
         workload: None,
         iterations: 20_000,
+        rate: None,
         record: None,
         compare: None,
     };
@@ -44,6 +48,11 @@ fn parse() -> Result<Options, String> {
                 options.iterations = value()?
                     .parse()
                     .map_err(|_| "--iterations needs a number".to_string())?;
+            }
+            "--rate" => {
+                options.rate = Some(value()?.parse().map_err(|_| {
+                    "--rate needs a positive messages-per-second value".to_string()
+                })?);
             }
             "--record" => options.record = Some(PathBuf::from(value()?)),
             "--compare" => options.compare = Some(PathBuf::from(value()?)),
@@ -71,10 +80,15 @@ fn main() -> ExitCode {
         .and_then(|dir| std::fs::read_to_string(history(dir)).ok())
         .unwrap_or_default();
     let mut lines = Vec::new();
-    for config in defaults(options.iterations)
+    for mut config in defaults(options.iterations)
         .into_iter()
         .filter(|config| options.workload.is_none_or(|w| w == config.workload))
     {
+        if config.workload == Workload::OpenLoop
+            && let Some(rate) = options.rate
+        {
+            config.target_rate = Some(rate);
+        }
         let measurement = match run(config) {
             Ok(measurement) => measurement,
             Err(cause) => {

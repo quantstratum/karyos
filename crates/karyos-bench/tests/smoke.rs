@@ -36,6 +36,24 @@ fn every_workload_runs_and_reports() {
             assert!(text.contains("round trip"), "{text}");
             assert!(text.contains("symmetric paths"), "{text}");
         }
+        if config.workload == Workload::OpenLoop {
+            assert!(
+                text.contains("scheduled latency (due time to delivery)"),
+                "{text}"
+            );
+            assert_eq!(
+                report::field(&line, "target_rate"),
+                Some(
+                    config
+                        .target_rate
+                        .map_or_else(|| "none".to_string(), |rate| rate.to_string())
+                        .as_str()
+                )
+            );
+            assert!(measurement.producer_lateness.is_some());
+            assert!(report::field(&line, "producer_lateness_p50_ns").is_some());
+            assert!(text.contains("producer lateness (scheduled time to accepted offer,"));
+        }
     }
 }
 
@@ -67,4 +85,22 @@ fn history_fields_read_back() {
     assert_eq!(report::field(line, "rate"), Some("12"));
     assert_eq!(report::field(line, "p50_ns"), Some("300"));
     assert_eq!(report::field(line, "p99_ns"), None);
+}
+
+#[test]
+fn existing_workload_configuration_key_keeps_its_original_shape() {
+    let config = defaults(200)[0];
+    assert_eq!(
+        config.to_string(),
+        "offer-poll message=32 publishers=1 iterations=200 warmup=20 term=65536"
+    );
+
+    let labels = Labels::detect();
+    let measurement = run(config).unwrap_or_else(|cause| panic!("{config}: {cause}"));
+    let line = report::history_line(&measurement, &labels);
+    let previous = format!(
+        "{{\"key\":\"{}\",\"commit\":\"prior\",\"rate\":100,\"p50_ns\":100}}",
+        report::key(&measurement, &labels)
+    );
+    assert!(report::compare(&previous, &line).is_some());
 }

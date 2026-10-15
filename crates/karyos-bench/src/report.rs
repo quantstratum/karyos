@@ -66,10 +66,10 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
         labels.qualification
     );
     if let Some(histogram) = &measurement.latency {
-        let what = if measurement.config.workload == Workload::PingPong {
-            "round trip"
-        } else {
-            "latency"
+        let what = match measurement.config.workload {
+            Workload::PingPong => "round trip",
+            Workload::OpenLoop => "scheduled latency (due time to delivery)",
+            _ => "latency",
         };
         out.push_str(&format!(
             "  {what} (interval width {} ns):",
@@ -92,6 +92,19 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
             ));
         }
     }
+    if let Some(histogram) = &measurement.producer_lateness {
+        out.push_str(&format!(
+            "  producer lateness (scheduled time to accepted offer, interval width {} ns):",
+            measurement.resolution
+        ));
+        for (name, numerator, denominator) in QUANTILES {
+            out.push_str(&format!(
+                " {name} {}",
+                interval(histogram, numerator, denominator)
+            ));
+        }
+        out.push('\n');
+    }
     out.push_str(&format!("  rate {:.0} messages/s\n", measurement.rate));
     out
 }
@@ -108,6 +121,12 @@ pub fn history_line(measurement: &Measurement, labels: &Labels) -> String {
         format!("\"iterations\":{}", config.iterations),
         format!("\"warmup\":{}", config.warmup),
         format!("\"term\":{}", config.term_length),
+        format!(
+            "\"target_rate\":{}",
+            config
+                .target_rate
+                .map_or_else(|| "null".into(), |rate| rate.to_string())
+        ),
         format!("\"host\":\"{}\"", labels.host),
         format!("\"cpu\":\"{}\"", labels.cpu),
         format!("\"os\":\"{}\"", labels.os),
@@ -121,6 +140,13 @@ pub fn history_line(measurement: &Measurement, labels: &Labels) -> String {
         for (name, numerator, denominator) in QUANTILES {
             if let Some(value) = upper(histogram, numerator, denominator) {
                 fields.push(format!("\"{name}_ns\":{value}"));
+            }
+        }
+    }
+    if let Some(histogram) = &measurement.producer_lateness {
+        for (name, numerator, denominator) in QUANTILES {
+            if let Some(value) = upper(histogram, numerator, denominator) {
+                fields.push(format!("\"producer_lateness_{name}_ns\":{value}"));
             }
         }
     }
@@ -157,6 +183,11 @@ pub fn compare(history: &str, line: &str) -> Option<String> {
         .iter()
         .map(|(name, ..)| format!("{name}_ns"))
         .chain(["rate".to_string()])
+        .chain(
+            QUANTILES
+                .iter()
+                .map(|(name, ..)| format!("producer_lateness_{name}_ns")),
+        )
     {
         let (Some(before), Some(after)) = (
             field(previous, &name).and_then(|v| v.parse::<f64>().ok()),
