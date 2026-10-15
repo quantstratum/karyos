@@ -345,7 +345,7 @@ fn a_dead_concurrent_publisher_is_resolved_by_the_deadline_only() {
     // The dead publisher dies with a block open; the live one keeps
     // writing in the same term.
     core::mem::forget(concurrent_claimed(dead.try_claim(8, AppendOptions::default())));
-    core::mem::forget(dead);
+    dead.die();
     assert!(matches!(
         live.offer(&message(1), AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::Appended { .. }
