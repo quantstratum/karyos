@@ -88,6 +88,11 @@ pub enum RegionKind {
     Counters,
     /// One log buffer generation.
     LogBuffer,
+    /// The error log (driver only). Code 5 is reserved for the trace
+    /// journal.
+    ErrorLog,
+    /// The loss report (driver only).
+    LossReport,
 }
 
 impl RegionKind {
@@ -97,6 +102,8 @@ impl RegionKind {
             Self::Broadcast => 2,
             Self::Counters => 3,
             Self::LogBuffer => 4,
+            Self::ErrorLog => 6,
+            Self::LossReport => 7,
         }
     }
 }

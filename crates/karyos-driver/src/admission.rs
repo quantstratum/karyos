@@ -198,6 +198,8 @@ fn record(region: &Region, export: u64) -> Option<Record> {
         RegionKind::Broadcast => WireKind::Broadcast,
         RegionKind::Counters => WireKind::Counters,
         RegionKind::LogBuffer => WireKind::LogBuffer,
+        // Granted to tools, not over the client manifest (P7 o4).
+        RegionKind::ErrorLog | RegionKind::LossReport => return None,
     };
     Some(Record {
         region: header.region,
