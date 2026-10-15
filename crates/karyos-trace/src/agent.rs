@@ -61,15 +61,49 @@ impl From<SubscriberIdentity> for SubscriberId {
     }
 }
 
-/// What the agent's records did, for the report and for tests.
+/// One of the [`AgentCounts`] counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentCounter {
+    /// [`AgentCounts::stored`].
+    Stored,
+    /// [`AgentCounts::dropped`].
+    Dropped,
+    /// [`AgentCounts::refused`].
+    Refused,
+}
+
+/// What the agent's records did, for the report and for tests. Counters are
+/// checked: a counter that would overflow keeps its value, never wraps or
+/// saturates silently, and the first such counter is reported in
+/// `overflowed` (SPEC.md §14, ADR-0007). An overflow never changes the
+/// observation itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AgentCounts {
     /// Records stored in the journal.
     pub stored: u64,
     /// Records the full journal dropped (also counted in its drop ranges).
     pub dropped: u64,
-    /// Records the journal refused (closed, exhausted, clock regression).
+    /// Records the journal refused (closed, exhausted, a collection clock
+    /// other than the writer's).
     pub refused: u64,
+    /// The first counter that would have overflowed; it stays set.
+    pub overflowed: Option<AgentCounter>,
+}
+
+impl AgentCounts {
+    fn count(&mut self, counter: AgentCounter) {
+        let value = match counter {
+            AgentCounter::Stored => &mut self.stored,
+            AgentCounter::Dropped => &mut self.dropped,
+            AgentCounter::Refused => &mut self.refused,
+        };
+        match value.checked_add(1) {
+            Some(next) => *value = next,
+            None => {
+                self.overflowed.get_or_insert(counter);
+            }
+        }
+    }
 }
 
 /// The trace hook of one client handle. It owns its journal's writer; its
@@ -85,8 +119,10 @@ pub struct TraceAgent<R = OsRandom, C = MonotonicClock> {
 
 impl<R: RandomSource, C: TraceClock> TraceAgent<R, C> {
     /// An agent deciding with `policy`, taking ids from `ids`, stamping with
-    /// `clock` and recording into `writer`, whose collection clock must be
-    /// `clock`'s domain (control path).
+    /// `clock` and recording into `writer` (control path). The writer's
+    /// collection clock must be `clock`'s domain: every stamp is taken from
+    /// `clock`, so with another collection clock every record is refused
+    /// and counted in [`AgentCounts::refused`].
     #[must_use]
     pub fn new(policy: Sampling, ids: BufferedIds<R>, clock: C, writer: TraceWriter) -> Self {
         Self {
@@ -127,9 +163,9 @@ impl<R: RandomSource, C: TraceClock> TraceAgent<R, C> {
             epoch: observed.epoch,
         };
         match self.writer.record(&record, collected) {
-            Ok(Append::Stored { .. }) => self.counts.stored += 1,
-            Ok(Append::Dropped { .. }) => self.counts.dropped += 1,
-            Err(_) => self.counts.refused += 1,
+            Ok(Append::Stored { .. }) => self.counts.count(AgentCounter::Stored),
+            Ok(Append::Dropped { .. }) => self.counts.count(AgentCounter::Dropped),
+            Err(_) => self.counts.count(AgentCounter::Refused),
         }
     }
 }

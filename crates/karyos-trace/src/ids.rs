@@ -45,6 +45,9 @@ impl RandomSource for OsRandom {
 #[derive(Debug)]
 pub struct BufferedIds<R = OsRandom> {
     words: Box<[u64]>,
+    /// The next buffer: a refill writes here and swaps only on success, so
+    /// a source that fails part way changes nothing.
+    spare: Box<[u64]>,
     available: usize,
     source: R,
 }
@@ -57,8 +60,10 @@ impl<R: RandomSource> BufferedIds<R> {
     ///
     /// Returns the source's error.
     pub fn new(capacity: usize, source: R) -> io::Result<Self> {
+        let capacity = capacity.max(2);
         let mut ids = Self {
-            words: vec![0; capacity.max(2)].into_boxed_slice(),
+            words: vec![0; capacity].into_boxed_slice(),
+            spare: vec![0; capacity].into_boxed_slice(),
             available: 0,
             source,
         };
@@ -72,16 +77,21 @@ impl<R: RandomSource> BufferedIds<R> {
         self.available
     }
 
-    /// Refills the whole buffer from the source (control path).
+    /// Refills the whole buffer from the source (control path). The source
+    /// writes a spare buffer, which replaces the current one only when the
+    /// fill succeeds.
     ///
     /// # Errors
     ///
-    /// Returns the source's error; the buffer is then unchanged.
+    /// Returns the source's error; the buffer, its words and the count
+    /// available are then unchanged, even if the source wrote part of the
+    /// spare before failing.
     pub fn refill(&mut self) -> io::Result<()> {
         if self.available == self.words.len() {
             return Ok(());
         }
-        self.source.fill(&mut self.words)?;
+        self.source.fill(&mut self.spare)?;
+        core::mem::swap(&mut self.words, &mut self.spare);
         self.available = self.words.len();
         Ok(())
     }
@@ -140,6 +150,34 @@ mod tests {
         // A full buffer is not refilled again.
         ids.refill().unwrap();
         assert_eq!(ids.source.1, 2);
+    }
+
+    /// Writes one word, then fails, on its second fill.
+    struct FailsPartWay(usize);
+
+    impl RandomSource for FailsPartWay {
+        fn fill(&mut self, words: &mut [u64]) -> io::Result<()> {
+            self.0 += 1;
+            if self.0 == 1 {
+                for (word, value) in words.iter_mut().zip(1..) {
+                    *word = value;
+                }
+                return Ok(());
+            }
+            words[0] = 999;
+            Err(io::Error::other("source failed"))
+        }
+    }
+
+    #[test]
+    fn a_failed_refill_changes_nothing() {
+        let mut ids = BufferedIds::new(4, FailsPartWay(0)).unwrap();
+        assert_eq!(ids.span_id(), Some(4));
+        assert!(ids.refill().is_err());
+        assert_eq!(ids.available(), 3);
+        assert_eq!(ids.trace_id(), Some([3, 2]));
+        assert_eq!(ids.span_id(), Some(1));
+        assert_eq!(ids.span_id(), None);
     }
 
     #[test]

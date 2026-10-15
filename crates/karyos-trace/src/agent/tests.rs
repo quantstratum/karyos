@@ -273,3 +273,46 @@ fn test_trace_extension_and_ids_convert_both_ways() {
     ext.encode(&mut bytes).unwrap();
     assert_eq!(TraceExtension::decode(&bytes).unwrap(), ext);
 }
+
+#[test]
+fn counters_are_checked_and_report_the_first_overflow() {
+    let (mut agent, _collector, _) = new_agent(Sampling::All, 64, 8);
+    let ext = agent.on_publish(None, &context()).unwrap();
+    let at = Committed {
+        publication: PUBLICATION,
+        lane: Lane::ZERO,
+        position: 0,
+    };
+    agent.counts.stored = u64::MAX;
+    agent.on_committed(&ext, &at);
+    assert_eq!(agent.counts().stored, u64::MAX);
+    assert_eq!(agent.counts().overflowed, Some(super::AgentCounter::Stored));
+    // Refusals after close: the refused counter at its limit stays there,
+    // and the first overflow stays reported.
+    agent.close();
+    agent.counts.refused = u64::MAX - 1;
+    agent.on_committed(&ext, &at);
+    assert_eq!(agent.counts().refused, u64::MAX);
+    agent.on_committed(&ext, &at);
+    assert_eq!(agent.counts().refused, u64::MAX);
+    assert_eq!(agent.counts().overflowed, Some(super::AgentCounter::Stored));
+}
+
+#[test]
+fn the_dropped_counter_is_checked() {
+    let (mut agent, _collector, _) = new_agent(Sampling::All, 64, 1);
+    let ext = agent.on_publish(None, &context()).unwrap();
+    let at = Committed {
+        publication: PUBLICATION,
+        lane: Lane::ZERO,
+        position: 0,
+    };
+    agent.on_committed(&ext, &at);
+    agent.counts.dropped = u64::MAX;
+    agent.on_committed(&ext, &at);
+    assert_eq!(agent.counts().dropped, u64::MAX);
+    assert_eq!(
+        agent.counts().overflowed,
+        Some(super::AgentCounter::Dropped)
+    );
+}
