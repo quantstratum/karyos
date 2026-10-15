@@ -26,16 +26,25 @@
 //! when the last handle is gone too, and every export was detached, the
 //! session sends `Leave`, the proof that no access can follow. A failed
 //! attach unmaps what it had received and sends `Leave`.
+//!
+//! Each taken handle gets a remote generation link
+//! (`quantstratum-docs: karyos/design/ipc-data-path.md`, Generations across
+//! processes). [`RemoteClient::poll`], the control path, serves the driver's
+//! cutover events: on `SuccessorReady` it fetches the successor grant, checks
+//! it as any fetch, prepares its adoption and offers it to the handle's link;
+//! on `Fenced`, on a `PublicationClosed` of the handle's stream and when the
+//! driver is lost it closes the link. It also drops what a handle left in its
+//! link when it moved, unmapping the predecessor and sending its `Detach`.
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use karyos_protocol::admission::{
     Capability, MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION, refusal,
 };
-use karyos_protocol::cnc::{StreamKey, SubscriberRole};
+use karyos_protocol::cnc::{Event, StreamKey, SubscriberRole};
 use karyos_sys::broadcast::BroadcastReceiver;
 use karyos_sys::command_ring::RingProducer;
 use karyos_sys::counters::{CellRead, CountersReader};
@@ -43,13 +52,18 @@ use karyos_sys::error::SysError;
 use karyos_sys::ipc::{
     self, PidFd, ReadOnlyRegion, Recv, Region, RegionKind, RegionRecord, SealProfile, Sent,
 };
-use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Role, Subscription};
+use karyos_sys::log_buffer::{
+    ConcurrentPublication, LogBuffer, PreparedConcurrentPublication, PreparedPublication,
+    PreparedSubscription, Publication, Role, Subscription,
+};
 use karyos_sys::term_bytes::SharedTerms;
 
 use crate::concurrent::ClientConcurrentPublication;
 use crate::conductor::{
     ClientConductor, Completion, ConductorError, ConductorPoll, Fetchable, Request,
 };
+use crate::error::ClientError;
+use crate::generation::{GenerationLink, Successor};
 use crate::link::{ClientLink, Export, Owner};
 use crate::publication::ClientPublication;
 use crate::subscription::ClientSubscription;
@@ -109,6 +123,20 @@ struct Session {
     /// socket.
     fetching: Mutex<()>,
     state: Mutex<SessionState>,
+    /// The generation links of the handles taken, for the cutover events.
+    links: Mutex<Vec<RemoteLink>>,
+}
+
+/// A taken handle's link, with what its successor fetches are checked
+/// against.
+#[derive(Debug)]
+struct RemoteLink {
+    /// The registration its grants answer, the same across generations.
+    registration: u64,
+    request: Request,
+    /// The generation of the latest mapping offered or taken.
+    generation: u64,
+    link: Weak<GenerationLink<SharedTerms>>,
 }
 
 #[derive(Debug)]
@@ -125,6 +153,110 @@ struct SessionState {
 impl Session {
     fn state(&self) -> std::sync::MutexGuard<'_, SessionState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn links(&self) -> std::sync::MutexGuard<'_, Vec<RemoteLink>> {
+        self.links.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Control path: drops what moved handles left behind, then serves the
+    /// cutover `events` in order; with `driver_lost`, closes every link.
+    fn serve_cutovers(self: &Arc<Self>, events: Vec<Event>, driver_lost: bool) {
+        let live: Vec<Arc<GenerationLink<SharedTerms>>> = {
+            let mut links = self.links();
+            links.retain(|entry| entry.link.strong_count() > 0);
+            links
+                .iter()
+                .filter_map(|entry| entry.link.upgrade())
+                .collect()
+        };
+        // The handle's mapping is unmapped by this drop, then its `Detach`
+        // is sent: the predecessor of a move, or a failed successor.
+        for link in &live {
+            drop(link.take_retired());
+        }
+        for event in events {
+            match event {
+                Event::SuccessorReady {
+                    registration,
+                    key,
+                    base,
+                    generation,
+                    ..
+                } => self.offer_successor(registration, key, base, generation),
+                Event::Fenced { registration, .. } => {
+                    self.close_where(|entry| entry.registration == registration);
+                }
+                Event::PublicationClosed { stream, .. } => {
+                    self.close_where(|entry| entry.request.stream() == stream);
+                }
+                _ => {}
+            }
+        }
+        if driver_lost {
+            self.close_where(|_| true);
+        }
+    }
+
+    /// Closes the links whose entry matches; an offered successor is
+    /// dropped here, on the control path.
+    fn close_where(&self, matches: impl Fn(&RemoteLink) -> bool) {
+        let closing: Vec<Arc<GenerationLink<SharedTerms>>> = self
+            .links()
+            .iter()
+            .filter(|entry| matches(entry))
+            .filter_map(|entry| entry.link.upgrade())
+            .collect();
+        for link in closing {
+            drop(link.close());
+        }
+    }
+
+    /// Fetches the successor grant `key` of `registration`, checks it
+    /// against the handle's request and the event's `generation`, prepares
+    /// its adoption and offers it at `base`. Any failure leaves the handle
+    /// to the driver's fence; a successor the link does not take is dropped
+    /// (unmapped, then detached).
+    fn offer_successor(self: &Arc<Self>, registration: u64, key: u64, base: u64, generation: u64) {
+        let target = self
+            .links()
+            .iter()
+            .find(|entry| entry.registration == registration && entry.generation < generation)
+            .and_then(|entry| entry.link.upgrade().map(|link| (entry.request, link)));
+        let Some((request, link)) = target else {
+            return;
+        };
+        let fetchable = Fetchable {
+            key,
+            registration,
+            request,
+        };
+        let Ok(fetched) = fetch(self, &fetchable) else {
+            return;
+        };
+        let export = fetched.record.export;
+        let prepared = check(&fetched, &request)
+            .and_then(|()| {
+                (fetched.record.generation == generation)
+                    .then_some(())
+                    .ok_or(AttachError::Protocol)
+            })
+            .and_then(|()| prepare_successor(&fetched, &request, export, self));
+        drop(fetched);
+        match prepared {
+            Ok(successor) => {
+                if link.offer(base, successor).is_ok()
+                    && let Some(entry) = self
+                        .links()
+                        .iter_mut()
+                        .find(|entry| entry.registration == registration)
+                {
+                    entry.generation = generation;
+                }
+            }
+            // Unmapped first: the Detach is the proof.
+            Err(_) => self.detach(export),
+        }
     }
 
     /// Sends `Detach { export }` once its mapping is gone, and forgets the
@@ -365,6 +497,7 @@ pub fn attach(
                         live: Vec::new(),
                         broken: false,
                     }),
+                    links: Mutex::new(Vec::new()),
                 })),
             })
         }
@@ -440,16 +573,25 @@ impl RemoteClient {
         self.conductor_mut()?.add_subscription(stream, role)
     }
 
-    /// Reports completed requests to `on`, as [`ClientConductor::poll`].
+    /// Reports completed requests to `on`, as [`ClientConductor::poll`],
+    /// then serves the cutovers of the handles taken: it fetches and
+    /// prepares their successors, closes the fenced ones and drops what
+    /// moved handles left behind (the control path; it may block on the
+    /// admission socket for the attach timeout per message).
     pub fn poll<F>(&mut self, limit: usize, on: F) -> ConductorPoll
     where
         F: FnMut(Completion),
     {
-        self.conductor
-            .as_mut()
-            .map_or_else(ConductorPoll::default, |conductor| {
-                conductor.poll(limit, on)
-            })
+        let Some(conductor) = self.conductor.as_mut() else {
+            return ConductorPoll::default();
+        };
+        let report = conductor.poll(limit, on);
+        let events = conductor.take_cutover_events();
+        let driver_lost = conductor.driver_lost();
+        if let Some(session) = &self.session {
+            session.serve_cutovers(events, driver_lost);
+        }
+        report
     }
 
     /// Takes the driver events received by earlier polls, as
@@ -503,10 +645,7 @@ impl RemoteClient {
             return Err(AttachError::Protocol);
         };
         self.take(fetchable, |fetched, export| {
-            if fetched.record.capability != Capability::ExclusivePublication {
-                return Err(AttachError::Protocol);
-            }
-            let inner = Publication::prepare_adopt(Arc::clone(&fetched.buffer), export)?
+            let inner = prepare_publication(fetched, export)?
                 .activate()
                 .map_err(|refused| AttachError::Sys(refused.error))?;
             Ok(ClientPublication::new(inner, allow_unconnected))
@@ -530,14 +669,9 @@ impl RemoteClient {
             return Err(AttachError::Protocol);
         };
         self.take(fetchable, |fetched, export| {
-            let Capability::ConcurrentPublication { slot } = fetched.record.capability else {
-                return Err(AttachError::Protocol);
-            };
-            let slot = usize::try_from(slot).map_err(|_| AttachError::Protocol)?;
-            let inner =
-                ConcurrentPublication::prepare_adopt(Arc::clone(&fetched.buffer), slot, export)?
-                    .activate()
-                    .map_err(|refused| AttachError::Sys(refused.error))?;
+            let inner = prepare_concurrent(fetched, export)?
+                .activate()
+                .map_err(|refused| AttachError::Sys(refused.error))?;
             Ok(ClientConcurrentPublication::new(inner, allow_unconnected))
         })
     }
@@ -556,29 +690,18 @@ impl RemoteClient {
             return Err(AttachError::Protocol);
         };
         self.take(fetchable, |fetched, export| {
-            let (cell, granted) = match fetched.record.capability {
-                Capability::RequiredSubscriber { cell } => (cell, SubscriberRole::Required),
-                Capability::OptionalSubscriber { cell } => (cell, SubscriberRole::Optional),
-                Capability::ObserverSubscriber { cell } => (cell, SubscriberRole::Observer),
-                _ => return Err(AttachError::Protocol),
-            };
-            if granted != role {
-                return Err(AttachError::Protocol);
-            }
-            let role = Role::from(role);
-            let cell = usize::try_from(cell).map_err(|_| AttachError::Protocol)?;
-            let inner =
-                Subscription::prepare_adopt(Arc::clone(&fetched.buffer), cell, role, export)?
-                    .activate()
-                    .map_err(|refused| AttachError::Sys(refused.error))?;
+            let inner = prepare_subscription(fetched, role, export)?
+                .activate()
+                .map_err(|refused| AttachError::Sys(refused.error))?;
             Ok(ClientSubscription::new(inner))
         })
     }
 
     /// Fetches `fetchable`'s grant, checks the record and the buffer against
-    /// the request, and builds the handle with `adopt`. On any failure
-    /// after the descriptor arrived, the mapping is dropped and the export
-    /// detached.
+    /// the request, and builds the handle with `adopt`, with its export and
+    /// a remote generation link registered for the cutover events. On any
+    /// failure after the descriptor arrived, the mapping is dropped and the
+    /// export detached.
     fn take<H>(
         &self,
         fetchable: &Fetchable,
@@ -590,14 +713,28 @@ impl RemoteClient {
         let session = self.session.as_ref().ok_or(AttachError::Protocol)?;
         let fetched = fetch(session, fetchable)?;
         let export = fetched.record.export;
+        let generation = fetched.record.generation;
         let built = check(&fetched, &fetchable.request).and_then(|()| adopt(&fetched, export));
         match built {
             Ok(handle) => {
                 drop(fetched);
-                Ok(handle.with_export(Export::new(Detach {
-                    session: Arc::clone(session),
-                    export,
-                })))
+                let link = GenerationLink::new_remote();
+                // The first mapping starts at position 0. A refusal drops the
+                // handle, which unmaps and detaches.
+                let handle = handle
+                    .with_export(Export::new(Detach {
+                        session: Arc::clone(session),
+                        export,
+                    }))
+                    .with_link(Arc::clone(&link))
+                    .map_err(|_| AttachError::Protocol)?;
+                session.links().push(RemoteLink {
+                    registration: fetchable.registration,
+                    request: fetchable.request,
+                    generation,
+                    link: Arc::downgrade(&link),
+                });
+                Ok(handle)
             }
             Err(error) => {
                 // Unmapped first: the Detach is the proof.
@@ -629,14 +766,20 @@ impl Drop for RemoteClient {
     }
 }
 
-/// A handle that keeps the export of the grant it was adopted from.
-trait WithExport {
+/// A handle that keeps the export of the grant it was adopted from and
+/// its remote generation link.
+trait WithExport: Sized {
     fn with_export(self, export: Export) -> Self;
+    fn with_link(self, link: Arc<GenerationLink<SharedTerms>>) -> Result<Self, ClientError>;
 }
 
 impl WithExport for ClientPublication<SharedTerms> {
     fn with_export(self, export: Export) -> Self {
         ClientPublication::with_export(self, export)
+    }
+
+    fn with_link(self, link: Arc<GenerationLink<SharedTerms>>) -> Result<Self, ClientError> {
+        self.with_generation(link, 0)
     }
 }
 
@@ -644,12 +787,112 @@ impl WithExport for ClientConcurrentPublication<SharedTerms> {
     fn with_export(self, export: Export) -> Self {
         ClientConcurrentPublication::with_export(self, export)
     }
+
+    fn with_link(self, link: Arc<GenerationLink<SharedTerms>>) -> Result<Self, ClientError> {
+        self.with_generation(link, 0)
+    }
 }
 
 impl WithExport for ClientSubscription<SharedTerms> {
     fn with_export(self, export: Export) -> Self {
         ClientSubscription::with_export(self, export)
     }
+
+    fn with_link(self, link: Arc<GenerationLink<SharedTerms>>) -> Result<Self, ClientError> {
+        self.with_generation(link, 0)
+    }
+}
+
+/// Prepares the exclusive publication of a fetched grant.
+fn prepare_publication(
+    fetched: &Fetched,
+    export: u64,
+) -> Result<PreparedPublication<Arc<LogBuffer<SharedTerms>>>, AttachError> {
+    if fetched.record.capability != Capability::ExclusivePublication {
+        return Err(AttachError::Protocol);
+    }
+    Ok(Publication::prepare_adopt(
+        Arc::clone(&fetched.buffer),
+        export,
+    )?)
+}
+
+/// Prepares the publisher slot of a fetched grant.
+fn prepare_concurrent(
+    fetched: &Fetched,
+    export: u64,
+) -> Result<PreparedConcurrentPublication<Arc<LogBuffer<SharedTerms>>>, AttachError> {
+    let Capability::ConcurrentPublication { slot } = fetched.record.capability else {
+        return Err(AttachError::Protocol);
+    };
+    let slot = usize::try_from(slot).map_err(|_| AttachError::Protocol)?;
+    Ok(ConcurrentPublication::prepare_adopt(
+        Arc::clone(&fetched.buffer),
+        slot,
+        export,
+    )?)
+}
+
+/// Prepares the subscriber cell of a fetched grant, which must have the
+/// requested `role`.
+fn prepare_subscription(
+    fetched: &Fetched,
+    role: SubscriberRole,
+    export: u64,
+) -> Result<PreparedSubscription<Arc<LogBuffer<SharedTerms>>>, AttachError> {
+    let (cell, granted) = match fetched.record.capability {
+        Capability::RequiredSubscriber { cell } => (cell, SubscriberRole::Required),
+        Capability::OptionalSubscriber { cell } => (cell, SubscriberRole::Optional),
+        Capability::ObserverSubscriber { cell } => (cell, SubscriberRole::Observer),
+        _ => return Err(AttachError::Protocol),
+    };
+    if granted != role {
+        return Err(AttachError::Protocol);
+    }
+    let cell = usize::try_from(cell).map_err(|_| AttachError::Protocol)?;
+    Ok(Subscription::prepare_adopt(
+        Arc::clone(&fetched.buffer),
+        cell,
+        Role::from(role),
+        export,
+    )?)
+}
+
+/// Prepares a fetched successor grant of the kind `request` asked for,
+/// with its export and, for a subscription, its copy buffer (control
+/// path: everything that allocates happens here).
+fn prepare_successor(
+    fetched: &Fetched,
+    request: &Request,
+    export: u64,
+    session: &Arc<Session>,
+) -> Result<Successor<SharedTerms>, AttachError> {
+    let detach = || {
+        Export::new(Detach {
+            session: Arc::clone(session),
+            export,
+        })
+    };
+    Ok(match *request {
+        Request::Publication { .. } => Successor::PreparedPublication {
+            prepared: prepare_publication(fetched, export)?,
+            export: detach(),
+        },
+        Request::ConcurrentPublication { .. } => Successor::PreparedConcurrent {
+            prepared: prepare_concurrent(fetched, export)?,
+            export: detach(),
+        },
+        Request::Subscription { role, .. } => {
+            let prepared = prepare_subscription(fetched, role, export)?;
+            let length = usize::try_from(fetched.buffer.max_message_length())
+                .map_err(|_| AttachError::Protocol)?;
+            Successor::PreparedSubscription {
+                prepared,
+                scratch: vec![0u8; length].into_boxed_slice(),
+                export: detach(),
+            }
+        }
+    })
 }
 
 /// Sends `Fetch` for `fetchable` and receives its `Manifest` and its one
