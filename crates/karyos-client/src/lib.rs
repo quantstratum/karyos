@@ -19,6 +19,7 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
 pub mod concurrent;
 pub mod conductor;
 pub mod conflated_subscription;
+pub mod counter;
 pub mod error;
 pub mod generation;
 #[cfg(target_os = "linux")]
@@ -37,6 +38,7 @@ pub use conductor::{
     DEFAULT_HEARTBEAT_INTERVAL, EVENT_QUEUE, Fetchable, Outcome, Request,
 };
 pub use conflated_subscription::ConflatedSubscription;
+pub use counter::{ClientCounterHandle, CounterReleases};
 pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};

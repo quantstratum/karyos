@@ -9,6 +9,13 @@
 //! broadcast closed or the driver dropped) completes as
 //! [`Outcome::Unknown`], terminally: it is never retried automatically, and
 //! a late response for it is ignored.
+//!
+//! Client counters (`quantstratum-docs:
+//! karyos/design/observability-and-tools.md`, "Client counters") are
+//! requested with [`ClientConductor::allocate_counter`] and complete as
+//! [`Outcome::Counter`]. A released or dropped counter queues its release,
+//! which the next [`ClientConductor::poll`] sends as `ReleaseCounter`; that
+//! request is the conductor's own and never reported.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -16,14 +23,16 @@ use std::time::{Duration, Instant};
 
 use karyos_protocol::cnc::ErrorCode;
 use karyos_protocol::cnc::{
-    Command, Event, MAX_COMMAND_LENGTH, Response, StreamKey, SubscriberRole,
+    Command, CounterLabel, Event, MAX_COMMAND_LENGTH, Response, StreamKey, SubscriberRole,
 };
 use karyos_sys::broadcast::{BroadcastReceiver, Received};
 use karyos_sys::command_ring::{RingError, RingProducer};
+use karyos_sys::counters::ClientCells;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 use thiserror::Error;
 
 use crate::concurrent::ClientConcurrentPublication;
+use crate::counter::{ClientCounterHandle, Release};
 use crate::generation::GenerationLink;
 use crate::link::{Capability, ClientLink, Origin, Owner};
 use crate::publication::ClientPublication;
@@ -47,6 +56,9 @@ pub enum ConductorError {
     /// The handle was not issued through this conductor.
     #[error("the handle belongs to another client")]
     ForeignHandle,
+    /// A counter label is longer than 64 bytes.
+    #[error("counter label longer than 64 bytes")]
+    LabelTooLong,
 }
 
 /// How a request ended.
@@ -63,6 +75,8 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     /// `take_concurrent_publication` or `take_subscription`
     /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, The client).
     Fetchable(Fetchable),
+    /// A client counter, ready to update.
+    Counter(ClientCounterHandle),
     /// The command succeeded.
     Succeeded,
     /// The driver refused the command; it had no effect.
@@ -171,6 +185,9 @@ enum Kind {
     AddConcurrentPublication,
     AddSubscription,
     Remove,
+    AllocateCounter,
+    /// The conductor's own `ReleaseCounter`: never reported.
+    ReleaseCounter,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +234,13 @@ pub struct ClientConductor<T: TermBytes = HeapTerms> {
     /// `PublicationClosed`), kept for its control path whatever the
     /// application does with its own queue.
     cutover_events: Vec<Event>,
+    /// The writer view of the driver's client counters region; `None`
+    /// when the driver gave none, and allocated counters then complete as
+    /// `Unknown`.
+    cells: Option<ClientCells>,
+    /// A remote client's admission session, which each counter handle
+    /// keeps; dropped after `cells`.
+    session: Option<Arc<dyn core::any::Any + Send + Sync>>,
 }
 
 /// Driver events a client keeps until the application takes them.
@@ -256,7 +280,27 @@ impl<T: TermBytes> ClientConductor<T> {
             events_dropped: 0,
             remote: false,
             cutover_events: Vec::new(),
+            cells: None,
+            session: None,
         }
+    }
+
+    /// The same conductor with the writer view of the driver's client
+    /// counters region, from which it builds the counters it is allocated.
+    #[must_use]
+    pub fn with_counters(mut self, cells: ClientCells) -> Self {
+        self.cells = Some(cells);
+        self
+    }
+
+    /// Keeps a remote client's admission session in every counter handle,
+    /// so that `Leave` is not sent while one lives.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn set_session(&mut self, session: Arc<dyn core::any::Any + Send + Sync>) {
+        self.session = Some(session);
     }
 
     /// Marks this conductor as a remote client's.
@@ -517,6 +561,58 @@ impl<T: TermBytes> ClientConductor<T> {
         }
     }
 
+    /// Requests a client counter cell (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Client counters") of
+    /// `type_id` with `label`, keyed to the stream registration `stream`
+    /// and to this client's participant registration `participant`, each
+    /// 0 for none; returns the request sequence. It completes as
+    /// [`Outcome::Counter`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConductorError::LabelTooLong`] for a label of more than 64
+    /// bytes, and the other [`ConductorError`]s; nothing is submitted on
+    /// error.
+    pub fn allocate_counter(
+        &mut self,
+        type_id: u64,
+        label: &str,
+        stream: u64,
+        participant: u64,
+    ) -> Result<u64, ConductorError> {
+        let label = CounterLabel::new(label).ok_or(ConductorError::LabelTooLong)?;
+        self.submit(Kind::AllocateCounter, None, |sequence| {
+            Command::AllocateCounter {
+                sequence,
+                type_id,
+                label,
+                stream,
+                participant,
+            }
+        })
+    }
+
+    /// Sends the releases the client's counter handles queued, in order,
+    /// while the ring and the pending bound take them; the rest wait for a
+    /// later poll.
+    fn send_releases(&mut self) {
+        let releases = Arc::clone(self.link.counter_releases());
+        while let Some(release) = releases.pop() {
+            let Release { cell, registration } = release;
+            let sent = self.submit(Kind::ReleaseCounter, None, |sequence| {
+                Command::ReleaseCounter {
+                    sequence,
+                    cell,
+                    registration,
+                }
+            });
+            if sent.is_err() {
+                releases.unpop(release);
+                break;
+            }
+        }
+    }
+
     fn owned(&self, origin: Option<&Origin>) -> Option<u64> {
         origin
             .filter(|origin| origin.owner == self.owner)
@@ -589,6 +685,7 @@ impl<T: TermBytes> ClientConductor<T> {
             self.fail_pending(&mut on);
         } else {
             self.deliver_unknown(&mut on);
+            self.send_releases();
         }
         while report.records < limit {
             // Copy what is needed out of the receiver before acting on it.
@@ -657,6 +754,10 @@ impl<T: TermBytes> ClientConductor<T> {
                 continue;
             };
             let pending = self.pending.swap_remove(index);
+            // The conductor's own release: nothing to report.
+            if pending.kind == Kind::ReleaseCounter {
+                continue;
+            }
             let outcome = self.outcome(pending, response);
             on(Completion {
                 sequence: pending.sequence,
@@ -764,6 +865,29 @@ impl<T: TermBytes> ClientConductor<T> {
                 Err(_) => Outcome::Unknown,
             },
             (Kind::Remove, Response::OperationSucceeded { .. }) => Outcome::Succeeded,
+            (
+                Kind::AllocateCounter,
+                Response::CounterAllocated {
+                    cell, registration, ..
+                },
+            ) => {
+                // A cell the region does not hold for this allocation would
+                // be a driver defect: the outcome is not known, and the cell
+                // stays charged until the client's exit proof.
+                let counter = usize::try_from(cell).ok().and_then(|cell| {
+                    self.cells
+                        .as_ref()
+                        .and_then(|cells| cells.counter(cell, registration))
+                });
+                match counter {
+                    Some(counter) => Outcome::Counter(ClientCounterHandle::new(
+                        counter,
+                        Arc::clone(self.link.counter_releases()),
+                        self.session.clone(),
+                    )),
+                    None => Outcome::Unknown,
+                }
+            }
             (_, Response::Error { code, detail, .. }) => Outcome::Refused { code, detail },
             // A response of the wrong kind would be a driver defect; the
             // outcome is not known.
@@ -775,8 +899,13 @@ impl<T: TermBytes> ClientConductor<T> {
     /// runs (a late response can no longer match it), then delivers the
     /// notifications.
     fn fail_pending<F: FnMut(Completion<T>)>(&mut self, on: &mut F) {
-        self.unknown
-            .extend(self.pending.drain(..).map(|pending| pending.sequence));
+        // The conductor's own releases are not reported.
+        self.unknown.extend(
+            self.pending
+                .drain(..)
+                .filter(|pending| pending.kind != Kind::ReleaseCounter)
+                .map(|pending| pending.sequence),
+        );
         self.deliver_unknown(on);
     }
 

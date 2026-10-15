@@ -10,6 +10,16 @@
 //! its effect and transmits exactly one response, after the duty cycle has
 //! verified that the broadcast buffer can take it. A driver that cannot
 //! answer enters its terminal state instead.
+//!
+//! Client counters (`quantstratum-docs:
+//! karyos/design/observability-and-tools.md`, "Client counters"):
+//! `AllocateCounter` allocates a cell of the client counters region owned by
+//! the sending client, keyed to a live stream and to a live participant of
+//! that client (each optional), within `max_counters_per_client`.
+//! `ReleaseCounter` frees the owner's exact allocation; any other
+//! `ReleaseCounter` is a protocol violation, which frees nothing and
+//! retires the client as faulty, without a response. A client's remaining
+//! cells are freed only when its slot is removed after its close flag.
 
 use std::sync::Arc;
 
@@ -18,13 +28,15 @@ use karyos_client::link::{
     Capability, ClientLink, HandOverEntry, Lease, LeaseEnd, LeaseState, Owner,
 };
 use karyos_protocol::cnc::{
-    CloseReason, Command, ErrorCode, Event as DriverEvent, LossPolicyCode, MAX_COMMAND_LENGTH,
-    MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey,
+    CloseReason, Command, CounterLabel, ErrorCode, Event as DriverEvent, LossPolicyCode,
+    MAX_COMMAND_LENGTH, MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
+use karyos_sys::counters::{CounterKeys, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER};
 use karyos_sys::log_buffer::{LossPolicy, PublicationEnd, Revocation, Role, SealState};
 use karyos_sys::registration;
 
+use crate::client_counters::Refusal;
 use crate::counters::Event;
 use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
@@ -120,7 +132,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             receiver,
             link,
             self.config.max_pending_per_client,
-        ))
+        )
+        .with_counters(self.client_counters.cells()))
     }
 
     /// Registers an admitted client with its ring's consumer and link, and
@@ -354,9 +367,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Releases every client whose close flag is set: its ring, its
-    /// admission slot, its untaken hand-over entries and its registrations.
-    /// Handles it still holds keep their leases.
+    /// admission slot, its untaken hand-over entries, its registrations and
+    /// its client counter cells (those of an in-process client once its
+    /// last counter handle is gone). Handles it still holds keep their
+    /// leases.
     pub(crate) fn retire_closed_clients(&mut self) {
+        self.client_counters.free_orphans();
         let mut index = 0;
         while let Some(slot) = self.clients.get(index) {
             if slot.link.is_closed() {
@@ -365,6 +381,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 slot.link.drop_all(false);
                 self.registrations
                     .retain(|registration| registration.client != slot.id);
+                // The close flag is the exit proof (or Leave) of a remote
+                // client, and the conductor's drop of an in-process one.
+                self.client_counters
+                    .client_removed(slot.id, slot.link.counter_releases());
                 // The close flag of a remote client is its exit proof (or
                 // its Leave): every grant it holds ends, sent or not.
                 if let Some(ledger) = slot.ledger.take() {
@@ -489,7 +509,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 continue;
             };
             self.counters.add(Event::CommandsServed, 1);
-            let response = self.execute(client, &link, command);
+            let Some(response) = self.serve(client, &link, command) else {
+                // A protocol violation: no response, the client is faulty.
+                self.retire_faulty(index);
+                continue;
+            };
             if matches!(response, Response::Error { .. }) {
                 self.counters.add(Event::CommandsRefused, 1);
             }
@@ -519,6 +543,32 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     pub(crate) fn held_total(&self) -> usize {
         self.clients.iter().map(|slot| slot.link.held()).sum()
+    }
+
+    /// Serves one decoded command: its single response, or `None` for a
+    /// protocol violation, which has no effect.
+    fn serve(
+        &mut self,
+        client: u64,
+        link: &Arc<ClientLink<T>>,
+        command: Command,
+    ) -> Option<Response> {
+        if let Command::ReleaseCounter {
+            sequence,
+            cell,
+            registration,
+        } = command
+        {
+            // Only the owner's release of its exact allocation: anything
+            // else frees nothing and is a protocol violation.
+            return self
+                .client_counters
+                .release(client, cell, registration)
+                .then_some(Response::OperationSucceeded {
+                    request: RequestId { client, sequence },
+                });
+        }
+        Some(self.execute(client, link, command))
     }
 
     /// Preflight, then effect. Returns the single response.
@@ -687,6 +737,91 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 self.remove_remote(client, registration);
                 Response::OperationSucceeded { request }
             }
+            Command::AllocateCounter {
+                type_id,
+                label,
+                stream,
+                participant,
+                ..
+            } => self.allocate_counter(client, request, type_id, label, stream, participant),
+            // Served by `serve`, which never passes it here.
+            Command::ReleaseCounter { registration, .. } => {
+                refuse(ErrorCode::UnknownRegistration, registration)
+            }
+        }
+    }
+
+    /// Serves `AllocateCounter` (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Client counters"): a
+    /// nonzero `stream` must be a live, not retiring, stream registration
+    /// and a nonzero `participant` a live registration of this client, on
+    /// that stream when both are given; otherwise the answer is an `Error`
+    /// and nothing is allocated. `key0` is the stream, `key1` the
+    /// participant's lane and kind (kind client when there is none) and
+    /// `key2` the participant or the client.
+    fn allocate_counter(
+        &mut self,
+        client: u64,
+        request: RequestId,
+        type_id: u64,
+        label: CounterLabel,
+        stream: u64,
+        participant: u64,
+    ) -> Response {
+        let refuse = |code: ErrorCode, detail: u64| Response::Error {
+            request,
+            code,
+            detail,
+        };
+        if stream != 0 && !self.streams.iter().any(|s| s.id == stream && !s.retiring) {
+            return refuse(ErrorCode::UnknownStream, stream);
+        }
+        let keys = if participant == 0 {
+            CounterKeys {
+                stream,
+                lane: 0,
+                kind: KIND_CLIENT,
+                participant: client,
+            }
+        } else {
+            let Some(found) = self
+                .registrations
+                .iter()
+                .find(|r| r.id == participant && r.client == client)
+                .filter(|r| stream == 0 || r.stream == stream)
+            else {
+                return refuse(ErrorCode::UnknownRegistration, participant);
+            };
+            let lane = self
+                .streams
+                .iter()
+                .find(|s| s.id == found.stream)
+                .map_or(0, |s| s.config.lane.get());
+            CounterKeys {
+                stream,
+                lane,
+                kind: match found.kind {
+                    Kind::Subscription => KIND_SUBSCRIBER,
+                    Kind::Publication => KIND_PUBLICATION,
+                },
+                participant,
+            }
+        };
+        match self
+            .client_counters
+            .allocate(client, type_id, label.as_str(), keys)
+        {
+            Ok((cell, registration)) => Response::CounterAllocated {
+                request,
+                cell: cell as u64,
+                registration,
+            },
+            Err(Refusal::ClientLimit) => refuse(ErrorCode::ResourcesUnavailable, 0),
+            Err(Refusal::Exhausted) => {
+                self.counters.add(Event::CountersUnavailable, 1);
+                refuse(ErrorCode::ResourcesUnavailable, 0)
+            }
+            Err(Refusal::IdentitiesExhausted) => refuse(ErrorCode::IdentitiesExhausted, 0),
         }
     }
 }
@@ -1902,6 +2037,488 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    fn allocate(sequence: u64, label: &str, stream: u64, participant: u64) -> Command {
+        Command::AllocateCounter {
+            sequence,
+            type_id: 7,
+            label: CounterLabel::new(label).unwrap(),
+            stream,
+            participant,
+        }
+    }
+
+    fn client_cell(driver: &EmbeddedDriver, cell: u64) -> karyos_sys::counters::CellRead {
+        driver
+            .client_counters()
+            .read(usize::try_from(cell).unwrap())
+    }
+
+    fn allocated(response: &Response) -> (u64, u64) {
+        match *response {
+            Response::CounterAllocated {
+                cell, registration, ..
+            } => (cell, registration),
+            other => panic!("expected CounterAllocated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_client_counter_is_keyed_to_its_client_stream_and_participant() {
+        let (mut driver, stream) = driver_with_stream();
+        let stream_registration = driver.trace_identity(stream).unwrap().registration;
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer, link) = raw_client(&mut driver);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Optional,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let [Response::SubscriptionReady { registration, .. }] = responses(&mut observer)[..]
+        else {
+            panic!("expected one SubscriptionReady");
+        };
+        // Keep the capability held, so the registration stays live.
+        assert_eq!(link.held(), 1);
+        let stream_id = stream_registration;
+        write(&mut producer, allocate(2, "client wide", 0, 0));
+        let _ = driver.do_work().unwrap();
+        write(
+            &mut producer,
+            allocate(3, "per subscription", stream_id, registration),
+        );
+        let _ = driver.do_work().unwrap();
+        write(&mut producer, allocate(4, "per stream", stream_id, 0));
+        let _ = driver.do_work().unwrap();
+        let answered = responses(&mut observer);
+        assert_eq!(answered.len(), 3);
+        let expected = [
+            ("client wide", 0, 0, KIND_CLIENT, client),
+            (
+                "per subscription",
+                stream_id,
+                0,
+                KIND_SUBSCRIBER,
+                registration,
+            ),
+            ("per stream", stream_id, 0, KIND_CLIENT, client),
+        ];
+        for (response, (label, key0, lane, kind, key2)) in answered.iter().zip(expected) {
+            let (cell, registration) = allocated(response);
+            let karyos_sys::counters::CellRead::Allocated {
+                metadata,
+                value: 0,
+                release_pending: false,
+            } = client_cell(&driver, cell)
+            else {
+                panic!("expected an allocated cell");
+            };
+            assert_eq!(metadata.registration_id, registration);
+            assert_eq!(metadata.type_id, 7);
+            assert_eq!(metadata.label(), label.as_bytes());
+            assert_eq!(
+                metadata.keys,
+                CounterKeys {
+                    stream: key0,
+                    lane,
+                    kind,
+                    participant: key2,
+                }
+            );
+        }
+        assert_eq!(driver.client_counters.owned_by(client), 3);
+    }
+
+    #[test]
+    fn a_counter_for_an_unknown_stream_or_a_foreign_participant_is_refused() {
+        let (mut driver, stream) = driver_with_stream();
+        let stream_registration = driver.trace_identity(stream).unwrap().registration;
+        let mut observer = driver.broadcast.receiver();
+        let (_owner, mut owner_producer, _owner_link) = raw_client(&mut driver);
+        write(
+            &mut owner_producer,
+            Command::AddPublication {
+                sequence: 1,
+                stream: KEY,
+                allow_unconnected: false,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let [Response::PublicationReady { registration, .. }] = responses(&mut observer)[..] else {
+            panic!("expected one PublicationReady");
+        };
+        let (client, mut producer, _link) = raw_client(&mut driver);
+        let other_stream = stream_registration + 100;
+        for (sequence, command) in [
+            // A stream registration never issued.
+            (1, allocate(1, "x", other_stream, 0)),
+            // Another client's participant.
+            (2, allocate(2, "x", 0, registration)),
+            // A participant never issued.
+            (3, allocate(3, "x", 0, registration + 100)),
+        ] {
+            write(&mut producer, command);
+            let _ = driver.do_work().unwrap();
+            let [Response::Error { request, code, .. }] = responses(&mut observer)[..] else {
+                panic!("expected one Error");
+            };
+            assert_eq!(request.sequence, sequence);
+            let expected = if sequence == 1 {
+                ErrorCode::UnknownStream
+            } else {
+                ErrorCode::UnknownRegistration
+            };
+            assert_eq!(code, expected);
+        }
+        // The owner's participant on another stream than the one named.
+        let second = driver
+            .add_stream(StreamConfig {
+                buffer: LogBufferConfig {
+                    stream_id: 3,
+                    ..driver.streams[0].config
+                },
+                allow_unconnected: false,
+                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: None,
+            })
+            .unwrap();
+        let second = driver.trace_identity(second).unwrap().registration;
+        write(&mut owner_producer, allocate(2, "x", second, registration));
+        let _ = driver.do_work().unwrap();
+        assert!(matches!(
+            responses(&mut observer)[..],
+            [Response::Error {
+                code: ErrorCode::UnknownRegistration,
+                ..
+            }]
+        ));
+        // A retiring stream takes no new counter.
+        driver.remove_stream(stream).unwrap();
+        write(&mut producer, allocate(4, "x", stream_registration, 0));
+        let _ = driver.do_work().unwrap();
+        assert!(matches!(
+            responses(&mut observer)[..],
+            [Response::Error {
+                code: ErrorCode::UnknownStream,
+                ..
+            }]
+        ));
+        assert_eq!(driver.client_counters.owned_by(client), 0);
+        let reader = driver.client_counters();
+        assert!(
+            (0..reader.capacity())
+                .all(|cell| reader.read(cell) == karyos_sys::counters::CellRead::Free)
+        );
+    }
+
+    #[test]
+    fn counters_per_client_and_cells_are_bounded() {
+        let mut driver = EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+            client_counters_capacity: 3,
+            max_counters_per_client: 2,
+            ..crate::embedded::DriverConfig::default()
+        })
+        .unwrap();
+        let mut observer = driver.broadcast.receiver();
+        let (first, mut first_producer, _first_link) = raw_client(&mut driver);
+        let (second, mut second_producer, _second_link) = raw_client(&mut driver);
+        for sequence in 1..=3 {
+            write(&mut first_producer, allocate(sequence, "x", 0, 0));
+            let _ = driver.do_work().unwrap();
+        }
+        let answered = responses(&mut observer);
+        assert!(matches!(
+            answered[..],
+            [
+                Response::CounterAllocated { .. },
+                Response::CounterAllocated { .. },
+                Response::Error {
+                    code: ErrorCode::ResourcesUnavailable,
+                    ..
+                }
+            ]
+        ));
+        // The region has one cell left: the second client takes it, then
+        // finds none free, which counts `counters unavailable`.
+        let unavailable = counter(&driver, "counters unavailable");
+        for sequence in 1..=2 {
+            write(&mut second_producer, allocate(sequence, "y", 0, 0));
+            let _ = driver.do_work().unwrap();
+        }
+        assert!(matches!(
+            responses(&mut observer)[..],
+            [
+                Response::CounterAllocated { .. },
+                Response::Error {
+                    code: ErrorCode::ResourcesUnavailable,
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(counter(&driver, "counters unavailable"), unavailable + 1);
+        assert_eq!(driver.client_counters.owned_by(first), 2);
+        assert_eq!(driver.client_counters.owned_by(second), 1);
+        // A release makes room for the same client again.
+        let (cell, registration) = allocated(&answered[0]);
+        write(
+            &mut first_producer,
+            Command::ReleaseCounter {
+                sequence: 4,
+                cell,
+                registration,
+            },
+        );
+        write(&mut first_producer, allocate(5, "x", 0, 0));
+        let _ = driver.do_work().unwrap();
+        let _ = driver.do_work().unwrap();
+        let answered = responses(&mut observer);
+        assert!(matches!(
+            answered[..],
+            [
+                Response::OperationSucceeded { .. },
+                Response::CounterAllocated { .. }
+            ]
+        ));
+        // The freed cell was reused with a fresh registration.
+        let (reused, fresh) = allocated(&answered[1]);
+        assert_eq!(reused, cell);
+        assert_ne!(fresh, registration);
+    }
+
+    #[test]
+    fn a_foreign_or_stale_release_is_a_protocol_violation_and_frees_nothing() {
+        // Another client's allocation, the owner's cell with a wrong
+        // registration, and a cell the owner does not hold.
+        for case in 0..3u64 {
+            let mut driver = driver();
+            let mut observer = driver.broadcast.receiver();
+            let (owner, mut owner_producer, _owner_link) = raw_client(&mut driver);
+            write(&mut owner_producer, allocate(1, "owned", 0, 0));
+            let _ = driver.do_work().unwrap();
+            let [ref response] = responses(&mut observer)[..] else {
+                panic!("expected one response");
+            };
+            let (cell, registration) = allocated(response);
+            let (sender, mut producer) = if case == 0 {
+                let (intruder, producer, _link) = raw_client(&mut driver);
+                (intruder, producer)
+            } else {
+                (owner, owner_producer)
+            };
+            let (named_cell, named_registration) = match case {
+                0 => (cell, registration),
+                1 => (cell, registration + 1),
+                _ => (cell + 1, registration),
+            };
+            write(
+                &mut producer,
+                Command::ReleaseCounter {
+                    sequence: 9,
+                    cell: named_cell,
+                    registration: named_registration,
+                },
+            );
+            let faulty = counter(&driver, "clients faulty");
+            let _ = driver.do_work().unwrap();
+            // No response, the sender retired as faulty, the cell intact.
+            assert_eq!(responses(&mut observer), Vec::new(), "case {case}");
+            assert_eq!(counter(&driver, "clients faulty"), faulty + 1);
+            let slot = driver
+                .clients
+                .iter()
+                .find(|slot| slot.id == sender)
+                .unwrap();
+            assert!(slot.consumer.is_none());
+            assert!(matches!(
+                client_cell(&driver, cell),
+                karyos_sys::counters::CellRead::Allocated {
+                    release_pending: false,
+                    ..
+                }
+            ));
+            assert_eq!(driver.client_counters.owned_by(owner), 1);
+        }
+    }
+
+    #[test]
+    fn cells_are_freed_only_when_the_slot_is_removed_after_the_close_flag() {
+        let mut driver = driver();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(&mut producer, allocate(1, "kept", 0, 0));
+        let _ = driver.do_work().unwrap();
+        let [ref response] = responses(&mut observer)[..] else {
+            panic!("expected one response");
+        };
+        let (cell, _) = allocated(response);
+        let index = driver
+            .clients
+            .iter()
+            .position(|slot| slot.id == client)
+            .unwrap();
+        // Retired as faulty (as a timeout or a closed socket would): the
+        // cell stays charged.
+        driver.retire_faulty(index);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.client_counters.owned_by(client), 1);
+        assert!(matches!(
+            client_cell(&driver, cell),
+            karyos_sys::counters::CellRead::Allocated { .. }
+        ));
+        // The exit proof (the close flag) frees it with the slot.
+        driver.clients[index].link.mark_closed();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.clients(), 0);
+        assert_eq!(driver.client_counters.owned_by(client), 0);
+        assert_eq!(
+            client_cell(&driver, cell),
+            karyos_sys::counters::CellRead::Free
+        );
+    }
+
+    fn take_counter(
+        driver: &mut EmbeddedDriver,
+        client: &mut ClientConductor,
+        stream: u64,
+        participant: u64,
+    ) -> karyos_client::ClientCounterHandle {
+        let sequence = client
+            .allocate_counter(9, "messages handled", stream, participant)
+            .unwrap();
+        let _ = driver.do_work().unwrap();
+        let mut done = Vec::new();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        let [completion] = <[_; 1]>::try_from(done).unwrap();
+        assert_eq!(completion.sequence, sequence);
+        match completion.outcome {
+            Outcome::Counter(counter) => counter,
+            other => panic!("expected a counter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_in_process_client_writes_its_counter_and_releases_it() {
+        let (mut driver, stream) = driver_with_stream();
+        let stream_registration = driver.trace_identity(stream).unwrap().registration;
+        let mut client = driver.connect().unwrap();
+        let first = take_counter(&mut driver, &mut client, stream_registration, 0);
+        assert_eq!(first.increment(4), Ok(4));
+        assert_eq!(
+            first.increment(u64::MAX),
+            Err(karyos_sys::counters::CounterError::Overflow)
+        );
+        let (cell, registration) = (first.cell() as u64, first.registration());
+        let karyos_sys::counters::CellRead::Allocated {
+            metadata, value, ..
+        } = client_cell(&driver, cell)
+        else {
+            panic!("expected an allocated cell");
+        };
+        assert_eq!((metadata.registration_id, value), (registration, 4));
+        assert_eq!(metadata.keys.kind, KIND_CLIENT);
+        assert_eq!(metadata.keys.stream, stream_registration);
+        // `release` queues it; the next poll sends it and the driver frees
+        // the cell. The conductor reports nothing for it.
+        first.release();
+        let mut done = Vec::new();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        assert!(done.is_empty());
+        assert_eq!(client.pending(), 0);
+        assert_eq!(
+            client_cell(&driver, cell),
+            karyos_sys::counters::CellRead::Free
+        );
+        // Dropping a handle releases it too.
+        let second = take_counter(&mut driver, &mut client, 0, 0);
+        second.set(11);
+        let cell = second.cell() as u64;
+        drop(second);
+        let _ = client.poll(usize::MAX, |_| {});
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            client_cell(&driver, cell),
+            karyos_sys::counters::CellRead::Free
+        );
+        assert_eq!(driver.client_counters.owned_by(client.owner().client), 0);
+    }
+
+    #[test]
+    fn a_counter_keyed_to_an_in_process_participant_names_its_lane_and_kind() {
+        let (mut driver, stream) = driver_with_stream();
+        let stream_registration = driver.trace_identity(stream).unwrap().registration;
+        let mut client = driver.connect().unwrap();
+        let _ = client.add_publication(KEY, false).unwrap();
+        let _ = driver.do_work().unwrap();
+        let mut publication = None;
+        let _ = client.poll(usize::MAX, |completion| {
+            if let Outcome::Publication(handle) = completion.outcome {
+                publication = Some(handle);
+            }
+        });
+        let publication = publication.unwrap();
+        let registration = publication.origin().unwrap().registration();
+        let counter = take_counter(&mut driver, &mut client, stream_registration, registration);
+        let karyos_sys::counters::CellRead::Allocated { metadata, .. } =
+            client_cell(&driver, counter.cell() as u64)
+        else {
+            panic!("expected an allocated cell");
+        };
+        assert_eq!(
+            metadata.keys,
+            CounterKeys {
+                stream: stream_registration,
+                lane: 0,
+                kind: KIND_PUBLICATION,
+                participant: registration,
+            }
+        );
+        drop(publication);
+    }
+
+    /// A handle can outlive its conductor: the client's slot goes with the
+    /// close flag, but its cells stay charged until the last handle is gone.
+    #[test]
+    fn a_handle_outliving_its_conductor_keeps_its_cell() {
+        let mut driver = driver();
+        let mut client = driver.connect().unwrap();
+        let id = client.owner().client;
+        let kept = take_counter(&mut driver, &mut client, 0, 0);
+        let forgotten_release = take_counter(&mut driver, &mut client, 0, 0);
+        let (kept_cell, other_cell) = (kept.cell() as u64, forgotten_release.cell() as u64);
+        // Released but never sent: the conductor closes first.
+        drop(forgotten_release);
+        drop(client);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.clients(), 0);
+        assert_eq!(driver.client_counters.owned_by(id), 2);
+        // A new allocation takes another cell; the old writer still writes
+        // only its own.
+        let mut other = driver.connect().unwrap();
+        let fresh = take_counter(&mut driver, &mut other, 0, 0);
+        assert_ne!(fresh.cell() as u64, kept_cell);
+        assert_ne!(fresh.cell() as u64, other_cell);
+        assert_eq!(kept.increment(2), Ok(2));
+        assert!(matches!(
+            client_cell(&driver, kept_cell),
+            karyos_sys::counters::CellRead::Allocated { value: 2, .. }
+        ));
+        drop(kept);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.client_counters.owned_by(id), 0);
+        for cell in [kept_cell, other_cell] {
+            assert_eq!(
+                client_cell(&driver, cell),
+                karyos_sys::counters::CellRead::Free
+            );
+        }
+        drop(fresh);
     }
 
     #[test]

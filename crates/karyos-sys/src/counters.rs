@@ -495,9 +495,11 @@ pub fn read_pass<R>(
 }
 
 #[cfg(not(loom))]
-pub use owned::{Counter, CountersManager, CountersReader, counters};
+pub use owned::{
+    ClientCells, ClientCounter, Counter, CountersManager, CountersReader, client_counters, counters,
+};
 #[cfg(all(not(loom), target_os = "linux"))]
-pub use owned::{LAYOUT_VERSION, counters_in};
+pub use owned::{LAYOUT_VERSION, client_counters_in, counters_in};
 
 #[cfg(not(loom))]
 mod owned {
@@ -604,6 +606,30 @@ mod owned {
         )
     }
 
+    /// The allocator, a reader and the client writer view of one client
+    /// counters region.
+    fn client_triple(region: Region) -> (CountersManager, CountersReader, ClientCells) {
+        let (manager, reader) = pair(region);
+        let cells = ClientCells {
+            region: Arc::clone(&manager.region),
+        };
+        (manager, reader, cells)
+    }
+
+    /// The cells of `capacity` counters on the heap.
+    fn heap(capacity: usize) -> Result<Region, SysError> {
+        let words = capacity
+            .checked_mul(STRIDE_WORDS)
+            .ok_or(SysError::InvalidRegion { address: 0, len: 0 })?;
+        Ok(Region {
+            store: Store::Heap {
+                values: HeapWords::zeroed(words)?,
+                metadata: HeapWords::zeroed(words)?,
+            },
+            capacity,
+        })
+    }
+
     /// Creates a region of `capacity` counters: its single allocator and a
     /// reader (control path: allocates `2 * capacity` strides).
     ///
@@ -611,16 +637,22 @@ mod owned {
     ///
     /// Returns [`SysError::InvalidRegion`] for a zero or oversized capacity.
     pub fn counters(capacity: usize) -> Result<(CountersManager, CountersReader), SysError> {
-        let words = capacity
-            .checked_mul(STRIDE_WORDS)
-            .ok_or(SysError::InvalidRegion { address: 0, len: 0 })?;
-        Ok(pair(Region {
-            store: Store::Heap {
-                values: HeapWords::zeroed(words)?,
-                metadata: HeapWords::zeroed(words)?,
-            },
-            capacity,
-        }))
+        Ok(pair(heap(capacity)?))
+    }
+
+    /// Creates a client counters region of `capacity` counters on the heap
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+    /// "Client counters"): the driver's single allocator, a reader, and the
+    /// writer view that in-process clients share (control path: allocates
+    /// `2 * capacity` strides).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidRegion`] for a zero or oversized capacity.
+    pub fn client_counters(
+        capacity: usize,
+    ) -> Result<(CountersManager, CountersReader, ClientCells), SysError> {
+        Ok(client_triple(heap(capacity)?))
     }
 
     /// Words of a counters region's structure: the configuration line and
@@ -653,30 +685,115 @@ mod owned {
         region: u64,
         capacity: usize,
     ) -> Result<(CountersManager, CountersReader), SysError> {
+        Ok(pair(mapped(
+            instance,
+            region,
+            capacity,
+            crate::ipc::RegionKind::Counters,
+        )?))
+    }
+
+    /// Creates a client counters region of `capacity` counters in a new
+    /// shared region (driver side; `quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Client counters"): the
+    /// layout of [`counters_in`] under the kind `ClientCounters`. Clients
+    /// write their own cells, so the region keeps the size seals only
+    /// ([`crate::ipc::Region::create`]), as a command ring does; clients
+    /// attach it writable with [`ClientCells::attach`].
+    ///
+    /// # Errors
+    ///
+    /// As [`counters_in`].
+    #[cfg(target_os = "linux")]
+    pub fn client_counters_in(
+        instance: u128,
+        region: u64,
+        capacity: usize,
+    ) -> Result<(CountersManager, CountersReader, ClientCells), SysError> {
+        Ok(client_triple(mapped(
+            instance,
+            region,
+            capacity,
+            crate::ipc::RegionKind::ClientCounters,
+        )?))
+    }
+
+    /// A new shared counters region of `kind`, its configuration line
+    /// written.
+    #[cfg(target_os = "linux")]
+    fn mapped(
+        instance: u128,
+        region: u64,
+        capacity: usize,
+        kind: crate::ipc::RegionKind,
+    ) -> Result<Region, SysError> {
         let invalid = SysError::InvalidRegion { address: 0, len: 0 };
         let structure_length = structure_words(capacity)
             .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES))
             .filter(|_| capacity > 0)
             .ok_or(invalid)?;
-        // Only the driver writes this region: A2 seal order (owner decision
-        // Q7), so clients and tools can map it only read-only.
-        let mapped = crate::ipc::Region::create_driver_only(crate::ipc::RegionRecord {
+        let record = crate::ipc::RegionRecord {
             instance,
             region,
-            kind: crate::ipc::RegionKind::Counters,
+            kind,
             generation: 0,
             layout: LAYOUT_VERSION,
             structure_length,
-        })?;
+        };
+        let mapped = if kind == crate::ipc::RegionKind::Counters {
+            // Only the driver writes this region: A2 seal order (owner
+            // decision Q7), so clients and tools can map it only read-only.
+            crate::ipc::Region::create_driver_only(record)?
+        } else {
+            crate::ipc::Region::create(record)?
+        };
         mapped
             .structure()
             .get(0)
             .ok_or(invalid)?
             .store(capacity as u64, Ordering::Release);
-        Ok(pair(Region {
+        Ok(Region {
             store: Store::Mapped(mapped),
             capacity,
-        }))
+        })
+    }
+
+    /// Validates the record and the configuration line of an attached
+    /// counters region (`load` reads structure word `index`) and returns its
+    /// capacity: the kind must be one of `kinds`, the layout this one, the
+    /// capacity nonzero, the unused words zero, and the layout must fill
+    /// the region exactly.
+    #[cfg(target_os = "linux")]
+    fn configured_capacity(
+        record: crate::ipc::RegionRecord,
+        kinds: &[crate::ipc::RegionKind],
+        load: impl Fn(usize) -> Option<u64>,
+    ) -> Result<usize, SysError> {
+        let invalid = SysError::InvalidRegion {
+            address: 0,
+            len: record.structure_length,
+        };
+        if !kinds.contains(&record.kind)
+            || record.layout != LAYOUT_VERSION
+            || record.generation != 0
+        {
+            return Err(invalid);
+        }
+        let mut config = [0u64; STRIDE_WORDS];
+        for (index, word) in config.iter_mut().enumerate() {
+            *word = load(index).ok_or(invalid)?;
+        }
+        let [capacity, rest @ ..] = config;
+        let capacity = usize::try_from(capacity).map_err(|_| invalid)?;
+        let structure_length = structure_words(capacity)
+            .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES));
+        if capacity == 0
+            || rest.iter().any(|word| *word != 0)
+            || structure_length != Some(record.structure_length)
+        {
+            return Err(invalid);
+        }
+        Ok(capacity)
     }
 
     /// The region's only allocator (not `Clone`).
@@ -831,7 +948,8 @@ mod owned {
     impl CountersReader {
         /// A reader of a counters region mapped read-only (client and tool
         /// side; owner decision Q7, A2: the driver creates it with
-        /// `F_SEAL_FUTURE_WRITE`, so no other mapping can write). The
+        /// `F_SEAL_FUTURE_WRITE`, so no other mapping can write), or of a
+        /// client counters region, which has the same layout. The
         /// configuration line is read once: the capacity must be nonzero,
         /// the unused words zero, and the layout must fill the region
         /// exactly. Every cell read is validated as on the heap, with loads
@@ -843,32 +961,15 @@ mod owned {
         /// counters region of this layout that matches its configuration.
         #[cfg(target_os = "linux")]
         pub fn attach_read_only(region: crate::ipc::ReadOnlyRegion) -> Result<Self, SysError> {
-            let record = region.record();
-            let invalid = SysError::InvalidRegion {
-                address: 0,
-                len: record.structure_length,
-            };
-            if record.kind != crate::ipc::RegionKind::Counters
-                || record.layout != LAYOUT_VERSION
-                || record.generation != 0
-            {
-                return Err(invalid);
-            }
             let structure = region.structure();
-            let mut config = [0u64; STRIDE_WORDS];
-            for (index, word) in config.iter_mut().enumerate() {
-                *word = structure.load_acquire(index).ok_or(invalid)?;
-            }
-            let [capacity, rest @ ..] = config;
-            let capacity = usize::try_from(capacity).map_err(|_| invalid)?;
-            let structure_length = structure_words(capacity)
-                .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES));
-            if capacity == 0
-                || rest.iter().any(|word| *word != 0)
-                || structure_length != Some(record.structure_length)
-            {
-                return Err(invalid);
-            }
+            let capacity = configured_capacity(
+                region.record(),
+                &[
+                    crate::ipc::RegionKind::Counters,
+                    crate::ipc::RegionKind::ClientCounters,
+                ],
+                |index| structure.load_acquire(index),
+            )?;
             Ok(Self {
                 region: Arc::new(Region {
                     store: Store::ReadOnly(region),
@@ -921,6 +1022,120 @@ mod owned {
             self.region
                 .cell(index)
                 .map_or(CellRead::Free, |cell| cell.read())
+        }
+    }
+
+    /// The client writer view of a client counters region
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+    /// "Client counters"): it turns a cell the driver allocated for a client
+    /// into that client's [`ClientCounter`]. In-process clients share the
+    /// driver's region through [`client_counters`]; a client process attaches
+    /// the region it received with [`ClientCells::attach`].
+    #[derive(Debug, Clone)]
+    pub struct ClientCells {
+        region: Arc<Region>,
+    }
+
+    impl ClientCells {
+        /// The writer view of a client counters region attached writable
+        /// (client side): the region must be a client counters region of
+        /// this layout whose configuration line, read once, matches it, as
+        /// [`CountersReader::attach_read_only`] checks.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SysError::InvalidRegion`] otherwise.
+        #[cfg(target_os = "linux")]
+        pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
+            let capacity = {
+                let structure = region.structure();
+                configured_capacity(
+                    region.record(),
+                    &[crate::ipc::RegionKind::ClientCounters],
+                    |index| {
+                        structure
+                            .get(index)
+                            .map(|word| word.load(Ordering::Acquire))
+                    },
+                )?
+            };
+            Ok(Self {
+                region: Arc::new(Region {
+                    store: Store::Mapped(region),
+                    capacity,
+                }),
+            })
+        }
+
+        /// Number of cells.
+        #[must_use]
+        pub fn capacity(&self) -> usize {
+            self.region.capacity
+        }
+
+        /// The capability to write cell `cell`, only while the cell holds the
+        /// allocation `registration` (allocated, not pending release); `None`
+        /// otherwise. The driver allocated the cell for this client and frees
+        /// it only on the client's release or exit proof.
+        #[must_use]
+        pub fn counter(&self, cell: usize, registration: u64) -> Option<ClientCounter> {
+            match self.region.cell(cell)?.read() {
+                CellRead::Allocated {
+                    metadata,
+                    release_pending: false,
+                    ..
+                } if metadata.registration_id == registration => Some(ClientCounter {
+                    region: Arc::clone(&self.region),
+                    index: cell,
+                    registration_id: registration,
+                }),
+                _ => None,
+            }
+        }
+    }
+
+    /// A client's capability to update one cell of a client counters region
+    /// (not `Clone`). It has no effect on the cell when dropped: the driver
+    /// frees the cell on the client's `ReleaseCounter` or exit proof, so
+    /// memory safety never depends on this drop.
+    #[derive(Debug)]
+    pub struct ClientCounter {
+        region: Arc<Region>,
+        index: usize,
+        registration_id: u64,
+    }
+
+    impl ClientCounter {
+        /// The cell index.
+        #[must_use]
+        pub fn cell(&self) -> usize {
+            self.index
+        }
+
+        /// The allocation's registration id.
+        #[must_use]
+        pub fn registration(&self) -> u64 {
+            self.registration_id
+        }
+
+        /// Adds `delta` with a checked Relaxed read-modify-write; never wraps
+        /// or saturates.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`CounterError::Overflow`], leaving the value unchanged,
+        /// when the sum exceeds `u64::MAX`.
+        pub fn increment(&self, delta: u64) -> Result<u64, CounterError> {
+            self.region
+                .cell(self.index)
+                .map_or(Ok(0), |cell| cell.increment(delta))
+        }
+
+        /// Sets the value with a Relaxed swap (gauges).
+        pub fn set(&self, value: u64) {
+            if let Some(cell) = self.region.cell(self.index) {
+                cell.set(value);
+            }
         }
     }
 }
@@ -1052,6 +1267,68 @@ mod tests {
             }
         ));
         assert!(counters(0).is_err());
+    }
+
+    #[test]
+    fn client_cells_write_only_the_exact_allocation() {
+        let (mut manager, reader, cells) = client_counters(2).unwrap();
+        assert_eq!(cells.capacity(), 2);
+        // A free cell gives no capability.
+        assert!(cells.counter(0, 1).is_none());
+        let allocated = manager
+            .allocate_keyed(
+                TYPE_EVENT,
+                "messages dropped",
+                CounterKeys {
+                    stream: 4,
+                    lane: 1,
+                    kind: KIND_SUBSCRIBER,
+                    participant: 9,
+                },
+            )
+            .unwrap();
+        let (cell, registration) = (allocated.index(), allocated.registration_id());
+        assert!(cells.counter(cell, registration + 1).is_none());
+        assert!(cells.counter(2, registration).is_none());
+        let counter = cells.counter(cell, registration).unwrap();
+        assert_eq!(
+            (counter.cell(), counter.registration()),
+            (cell, registration)
+        );
+        assert_eq!(counter.increment(3), Ok(3));
+        counter.set(u64::MAX - 1);
+        assert_eq!(counter.increment(2), Err(CounterError::Overflow));
+        assert_eq!(counter.increment(1), Ok(u64::MAX));
+        let CellRead::Allocated {
+            metadata, value, ..
+        } = reader.read(cell)
+        else {
+            panic!("expected an allocated cell");
+        };
+        assert_eq!(value, u64::MAX);
+        assert_eq!(metadata.keys.participant, 9);
+        // Dropping the client's capability changes nothing in the cell.
+        drop(counter);
+        assert!(matches!(
+            reader.read(cell),
+            CellRead::Allocated {
+                release_pending: false,
+                ..
+            }
+        ));
+        // Once the driver freed the cell, the old allocation gives nothing,
+        // and a reuse has its own registration.
+        manager.free(allocated).unwrap();
+        assert!(cells.counter(cell, registration).is_none());
+        let reused = manager.allocate(TYPE_EVENT, "again").unwrap();
+        assert_eq!(reused.index(), cell);
+        assert!(cells.counter(cell, registration).is_none());
+        assert!(cells.counter(cell, reused.registration_id()).is_some());
+        // A capability the driver dropped (pending release) gives nothing.
+        let reused_id = reused.registration_id();
+        drop(reused);
+        assert!(cells.counter(cell, reused_id).is_none());
+        assert!(client_counters(0).is_err());
     }
 
     #[test]

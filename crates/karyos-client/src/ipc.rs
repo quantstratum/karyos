@@ -8,7 +8,10 @@
 //! process, and receives `Admitted` and one `Region` per record. It maps
 //! each region only after the descriptor checks and the header comparison
 //! of [`Region::attach`], and builds the client conductor over the
-//! attached command ring and broadcast buffer.
+//! attached command ring and broadcast buffer. The driver counters are
+//! mapped read-only; the client counters region is mapped writable, and
+//! each counter the client is allocated keeps the session, so `Leave` is
+//! sent only after the last one is gone and the region unmapped.
 //!
 //! Its log buffer grants (`quantstratum-docs: karyos/design/ipc-data-path.md`,
 //! The client) complete as [`Outcome::Fetchable`](crate::Outcome::Fetchable);
@@ -47,7 +50,7 @@ use karyos_protocol::admission::{
 use karyos_protocol::cnc::{Event, StreamKey, SubscriberRole};
 use karyos_sys::broadcast::BroadcastReceiver;
 use karyos_sys::command_ring::RingProducer;
-use karyos_sys::counters::{CellRead, CountersReader};
+use karyos_sys::counters::{CellRead, ClientCells, CountersReader};
 use karyos_sys::error::SysError;
 use karyos_sys::ipc::{
     self, PidFd, ReadOnlyRegion, Recv, Region, RegionKind, RegionRecord, SealProfile, Sent,
@@ -337,6 +340,7 @@ fn expected(instance: u128, record: &Record) -> Result<RegionRecord, AttachError
         WireKind::CommandRing => RegionKind::CommandRing,
         WireKind::Broadcast => RegionKind::Broadcast,
         WireKind::Counters => RegionKind::Counters,
+        WireKind::ClientCounters => RegionKind::ClientCounters,
         WireKind::LogBuffer => return Err(AttachError::Protocol),
     };
     Ok(RegionRecord {
@@ -352,12 +356,14 @@ fn expected(instance: u128, record: &Record) -> Result<RegionRecord, AttachError
 
 /// The CnC regions of a bootstrap, mapped and checked. The driver counters
 /// are mapped read-only: only the driver writes them (owner decision Q7,
-/// A2).
+/// A2). The client counters are mapped writable: the client writes its own
+/// cells.
 #[derive(Default)]
 struct Staged {
     ring: Option<Region>,
     broadcast: Option<Region>,
     counters: Option<ReadOnlyRegion>,
+    client_counters: Option<Region>,
 }
 
 /// Receives the bootstrap after `Hello`: `Admitted`, then one `Region`
@@ -420,6 +426,10 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
                     SealProfile::DriverOnly,
                 )?)
                 .is_some(),
+            WireKind::ClientCounters => staged
+                .client_counters
+                .replace(Region::attach(fd, expected)?)
+                .is_some(),
             WireKind::LogBuffer => return Err(AttachError::Protocol),
         };
         if duplicate {
@@ -459,14 +469,18 @@ pub fn attach(
     )?;
     drop(pidfd_fd);
     let built = bootstrap(&socket).and_then(|(instance, client, staged)| {
-        let (Some(ring), Some(broadcast), Some(counters)) =
-            (staged.ring, staged.broadcast, staged.counters)
-        else {
+        let (Some(ring), Some(broadcast), Some(counters), Some(client_counters)) = (
+            staged.ring,
+            staged.broadcast,
+            staged.counters,
+            staged.client_counters,
+        ) else {
             return Err(AttachError::Protocol);
         };
         let producer = RingProducer::attach(ring)?;
         let receiver = BroadcastReceiver::attach(broadcast)?;
         let counters = CountersReader::attach_read_only(counters)?;
+        let cells = ClientCells::attach(client_counters)?;
         let owner = Owner {
             driver: instance as u64,
             client,
@@ -477,28 +491,31 @@ pub fn attach(
             receiver,
             Arc::new(ClientLink::new()),
             max_pending,
-        );
+        )
+        .with_counters(cells);
         Ok((instance, client, conductor, counters))
     });
     match built {
         Ok((instance, client, mut conductor, counters)) => {
             conductor.set_remote();
+            let session = Arc::new(Session {
+                instance,
+                socket,
+                fetching: Mutex::new(()),
+                state: Mutex::new(SessionState {
+                    next_fetch: 1,
+                    live: Vec::new(),
+                    broken: false,
+                }),
+                links: Mutex::new(Vec::new()),
+            });
+            conductor.set_session(Arc::clone(&session) as Arc<dyn core::any::Any + Send + Sync>);
             Ok(RemoteClient {
                 instance,
                 client,
                 conductor: Some(conductor),
                 counters: Some(counters),
-                session: Some(Arc::new(Session {
-                    instance,
-                    socket,
-                    fetching: Mutex::new(()),
-                    state: Mutex::new(SessionState {
-                        next_fetch: 1,
-                        live: Vec::new(),
-                        broken: false,
-                    }),
-                    links: Mutex::new(Vec::new()),
-                })),
+                session: Some(session),
             })
         }
         Err(error) => {
@@ -571,6 +588,24 @@ impl RemoteClient {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?.add_subscription(stream, role)
+    }
+
+    /// Requests a client counter, as [`ClientConductor::allocate_counter`];
+    /// it completes as [`Outcome::Counter`](crate::Outcome::Counter), whose
+    /// handle writes the client counters region this client mapped.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::allocate_counter`].
+    pub fn allocate_counter(
+        &mut self,
+        type_id: u64,
+        label: &str,
+        stream: u64,
+        participant: u64,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .allocate_counter(type_id, label, stream, participant)
     }
 
     /// Reports completed requests to `on`, as [`ClientConductor::poll`],

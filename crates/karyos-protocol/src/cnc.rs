@@ -21,10 +21,19 @@
 //! | `0x03` | `RemovePublication` | sequence | registration | | |
 //! | `0x04` | `RemoveSubscription` | sequence | registration | | |
 //! | `0x05` | `AddConcurrentPublication` | sequence | stream and session as above | flags as `AddPublication` | |
+//! | `0x06` | `AllocateCounter` | sequence | type id | stream registration or 0 | participant registration or 0 |
+//! | `0x07` | `ReleaseCounter` | sequence | cell | registration | |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
 //! | `0x84` | `Error` | client | sequence | code (1 to 6, see [`ErrorCode`]) | detail |
+//! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
+//!
+//! `AllocateCounter` (`quantstratum-docs:
+//! karyos/design/observability-and-tools.md`, "Client counters") continues
+//! after its four words with the label: word 4 is its length in bytes (at
+//! most [`MAX_LABEL_LENGTH`], the other bits zero), and words 5 to 12 hold
+//! its UTF-8 bytes, padded with zero bytes.
 //!
 //! Driver events (record types `0xC0` to `0xFF`, [`Event`]) answer no
 //! request and are broadcast to every client:
@@ -39,8 +48,15 @@
 
 use thiserror::Error;
 
-/// Largest encoded command, in bytes.
-pub const MAX_COMMAND_LENGTH: usize = 3 * 8;
+/// Longest counter label, in bytes: the label of a counter cell.
+pub const MAX_LABEL_LENGTH: usize = karyos_sys::counters::MAX_LABEL_LENGTH;
+/// Words of an encoded counter label.
+const LABEL_WORDS: usize = MAX_LABEL_LENGTH / 8;
+/// Words of an encoded `AllocateCounter`: four, the label length and the
+/// label.
+const ALLOCATE_COUNTER_WORDS: usize = 5 + LABEL_WORDS;
+/// Largest encoded command, in bytes: `AllocateCounter`.
+pub const MAX_COMMAND_LENGTH: usize = ALLOCATE_COUNTER_WORDS * 8;
 /// Largest encoded response, in bytes.
 pub const MAX_RESPONSE_LENGTH: usize = 4 * 8;
 /// Largest encoded driver event, in bytes.
@@ -51,10 +67,13 @@ const ADD_SUBSCRIPTION: u32 = 0x02;
 const REMOVE_PUBLICATION: u32 = 0x03;
 const REMOVE_SUBSCRIPTION: u32 = 0x04;
 const ADD_CONCURRENT_PUBLICATION: u32 = 0x05;
+const ALLOCATE_COUNTER: u32 = 0x06;
+const RELEASE_COUNTER: u32 = 0x07;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
 const ERROR: u32 = 0x84;
+const COUNTER_ALLOCATED: u32 = 0x85;
 const PARTICIPANT_LOST: u32 = 0xC1;
 const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
 const PUBLICATION_CLOSED: u32 = 0xC3;
@@ -139,6 +158,49 @@ pub struct StreamKey {
     pub session_id: i32,
 }
 
+/// The label of a client counter: UTF-8 of at most [`MAX_LABEL_LENGTH`]
+/// bytes, stored inline so that [`Command`] stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CounterLabel {
+    bytes: [u8; MAX_LABEL_LENGTH],
+    length: u8,
+}
+
+impl CounterLabel {
+    /// The label `label`; `None` when it exceeds [`MAX_LABEL_LENGTH`]
+    /// bytes.
+    #[must_use]
+    pub fn new(label: &str) -> Option<Self> {
+        Self::from_bytes(label.as_bytes())
+    }
+
+    /// The label of `bytes`; `None` unless they are UTF-8 of at most
+    /// [`MAX_LABEL_LENGTH`] bytes.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        core::str::from_utf8(bytes).ok()?;
+        let length = u8::try_from(bytes.len())
+            .ok()
+            .filter(|&length| usize::from(length) <= MAX_LABEL_LENGTH)?;
+        let mut stored = [0u8; MAX_LABEL_LENGTH];
+        stored.get_mut(..bytes.len())?.copy_from_slice(bytes);
+        Some(Self {
+            bytes: stored,
+            length,
+        })
+    }
+
+    /// The label.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        // Only UTF-8 is ever stored (checked by every constructor).
+        self.bytes
+            .get(..usize::from(self.length))
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .unwrap_or("")
+    }
+}
+
 /// A command from a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -182,6 +244,30 @@ pub enum Command {
         /// Request sequence.
         sequence: u64,
         /// The registration.
+        registration: u64,
+    },
+    /// Allocate a client counter cell, owned by the client, in the client
+    /// counters region (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Client counters").
+    AllocateCounter {
+        /// Request sequence.
+        sequence: u64,
+        /// Application-defined counter type.
+        type_id: u64,
+        /// The counter's label.
+        label: CounterLabel,
+        /// Registration of a live stream, or 0.
+        stream: u64,
+        /// Registration of a live participant of this client, or 0.
+        participant: u64,
+    },
+    /// Release the client counter allocation `registration` in `cell`.
+    ReleaseCounter {
+        /// Request sequence.
+        sequence: u64,
+        /// The cell.
+        cell: u64,
+        /// The allocation's registration.
         registration: u64,
     },
 }
@@ -264,6 +350,15 @@ pub enum Response {
         /// A bounded detail value (for example the stream id).
         detail: u64,
     },
+    /// A client counter cell was allocated for the client.
+    CounterAllocated {
+        /// The request.
+        request: RequestId,
+        /// The cell in the client counters region.
+        cell: u64,
+        /// The allocation's fresh registration.
+        registration: u64,
+    },
 }
 
 fn stream_word(stream: StreamKey) -> u64 {
@@ -317,6 +412,8 @@ impl Command {
             Self::AddSubscription { .. } => ADD_SUBSCRIPTION,
             Self::RemovePublication { .. } => REMOVE_PUBLICATION,
             Self::RemoveSubscription { .. } => REMOVE_SUBSCRIPTION,
+            Self::AllocateCounter { .. } => ALLOCATE_COUNTER,
+            Self::ReleaseCounter { .. } => RELEASE_COUNTER,
         }
     }
 
@@ -328,7 +425,9 @@ impl Command {
             | Self::AddConcurrentPublication { sequence, .. }
             | Self::AddSubscription { sequence, .. }
             | Self::RemovePublication { sequence, .. }
-            | Self::RemoveSubscription { sequence, .. } => sequence,
+            | Self::RemoveSubscription { sequence, .. }
+            | Self::AllocateCounter { sequence, .. }
+            | Self::ReleaseCounter { sequence, .. } => sequence,
         }
     }
 
@@ -372,6 +471,32 @@ impl Command {
                 sequence,
                 registration,
             } => write_words(&[sequence, registration], out),
+            Self::AllocateCounter {
+                sequence,
+                type_id,
+                label,
+                stream,
+                participant,
+            } => {
+                let mut words = [0u64; ALLOCATE_COUNTER_WORDS];
+                let (head, tail) = words.split_at_mut(5);
+                head.copy_from_slice(&[
+                    sequence,
+                    type_id,
+                    stream,
+                    participant,
+                    u64::from(label.length),
+                ]);
+                for (word, chunk) in tail.iter_mut().zip(label.bytes.as_chunks::<8>().0) {
+                    *word = u64::from_le_bytes(*chunk);
+                }
+                write_words(&words, out)
+            }
+            Self::ReleaseCounter {
+                sequence,
+                cell,
+                registration,
+            } => write_words(&[sequence, cell, registration], out),
         }
     }
 
@@ -432,6 +557,45 @@ impl Command {
                     registration,
                 })
             }
+            ALLOCATE_COUNTER => {
+                let words = read_words::<ALLOCATE_COUNTER_WORDS>(type_id, bytes)?;
+                let reserved = CncError::Reserved { type_id };
+                let [sequence, counter_type, stream, participant, length] =
+                    *words.first_chunk::<5>().ok_or(reserved)?;
+                let length = usize::try_from(length)
+                    .ok()
+                    .filter(|&length| length <= MAX_LABEL_LENGTH)
+                    .ok_or(reserved)?;
+                let mut label = [0u8; MAX_LABEL_LENGTH];
+                for (chunk, word) in label
+                    .as_chunks_mut::<8>()
+                    .0
+                    .iter_mut()
+                    .zip(words.iter().skip(5))
+                {
+                    *chunk = word.to_le_bytes();
+                }
+                // The padding after the label is zero.
+                let (text, padding) = label.split_at(length);
+                if padding.iter().any(|byte| *byte != 0) {
+                    return Err(reserved);
+                }
+                Ok(Self::AllocateCounter {
+                    sequence,
+                    type_id: counter_type,
+                    label: CounterLabel::from_bytes(text).ok_or(reserved)?,
+                    stream,
+                    participant,
+                })
+            }
+            RELEASE_COUNTER => {
+                let [sequence, cell, registration] = read_words::<3>(type_id, bytes)?;
+                Ok(Self::ReleaseCounter {
+                    sequence,
+                    cell,
+                    registration,
+                })
+            }
             _ => Err(CncError::UnknownType { type_id }),
         }
     }
@@ -446,6 +610,7 @@ impl Response {
             Self::SubscriptionReady { .. } => SUBSCRIPTION_READY,
             Self::OperationSucceeded { .. } => OPERATION_SUCCEEDED,
             Self::Error { .. } => ERROR,
+            Self::CounterAllocated { .. } => COUNTER_ALLOCATED,
         }
     }
 
@@ -456,7 +621,8 @@ impl Response {
             Self::PublicationReady { request, .. }
             | Self::SubscriptionReady { request, .. }
             | Self::OperationSucceeded { request }
-            | Self::Error { request, .. } => request,
+            | Self::Error { request, .. }
+            | Self::CounterAllocated { request, .. } => request,
         }
     }
 
@@ -488,6 +654,11 @@ impl Response {
                 &[request.client, request.sequence, code.code(), detail],
                 out,
             ),
+            Self::CounterAllocated {
+                request,
+                cell,
+                registration,
+            } => write_words(&[request.client, request.sequence, cell, registration], out),
         }
     }
 
@@ -529,6 +700,14 @@ impl Response {
                     request: RequestId { client, sequence },
                     code,
                     detail,
+                })
+            }
+            COUNTER_ALLOCATED => {
+                let [client, sequence, cell, registration] = read_words::<4>(type_id, bytes)?;
+                Ok(Self::CounterAllocated {
+                    request: RequestId { client, sequence },
+                    cell,
+                    registration,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -822,6 +1001,32 @@ mod tests {
                 sequence: 4,
                 registration: 10,
             },
+            Command::AllocateCounter {
+                sequence: 5,
+                type_id: u64::MAX,
+                label: CounterLabel::new("loss reports dropped").unwrap(),
+                stream: 11,
+                participant: 12,
+            },
+            Command::AllocateCounter {
+                sequence: 6,
+                type_id: 1,
+                label: CounterLabel::new("").unwrap(),
+                stream: 0,
+                participant: 0,
+            },
+            Command::AllocateCounter {
+                sequence: 7,
+                type_id: 2,
+                label: CounterLabel::new(&"\u{e9}".repeat(32)).unwrap(),
+                stream: 0,
+                participant: 0,
+            },
+            Command::ReleaseCounter {
+                sequence: 8,
+                cell: 3,
+                registration: 13,
+            },
         ];
         for command in commands {
             let mut out = [0u8; MAX_COMMAND_LENGTH];
@@ -860,6 +1065,11 @@ mod tests {
                 request,
                 code: ErrorCode::InvalidPublicationMode,
                 detail: 6,
+            },
+            Response::CounterAllocated {
+                request,
+                cell: 7,
+                registration: 8,
             },
         ];
         for response in responses {
@@ -1002,7 +1212,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x06, &out[..length]),
+            Command::decode(0x08, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         let mut response = [0u8; MAX_RESPONSE_LENGTH];
@@ -1022,6 +1232,155 @@ mod tests {
                 available: 15
             })
         );
+    }
+
+    #[test]
+    fn counter_labels_are_bounded_utf8() {
+        assert_eq!(
+            CounterLabel::new("bytes sent").unwrap().as_str(),
+            "bytes sent"
+        );
+        assert_eq!(
+            CounterLabel::new(&"x".repeat(64)).unwrap().as_str().len(),
+            64
+        );
+        assert!(CounterLabel::new(&"x".repeat(65)).is_none());
+        assert!(CounterLabel::from_bytes(&[0xFF, 0xFE]).is_none());
+        assert!(CounterLabel::from_bytes(b"ok").is_some());
+        // The largest command fits the bound exactly.
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = Command::AllocateCounter {
+            sequence: 1,
+            type_id: 1,
+            label: CounterLabel::new(&"x".repeat(64)).unwrap(),
+            stream: 0,
+            participant: 0,
+        }
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(length, MAX_COMMAND_LENGTH);
+        assert_eq!(MAX_COMMAND_LENGTH, 104);
+    }
+
+    /// Literal bytes of the counter messages.
+    #[test]
+    fn counter_golden_bytes() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = Command::AllocateCounter {
+            sequence: 0x0102,
+            type_id: 4,
+            label: CounterLabel::new("ab").unwrap(),
+            stream: 5,
+            participant: 6,
+        }
+        .encode(&mut out)
+        .unwrap();
+        let mut expected = vec![
+            0x02, 0x01, 0, 0, 0, 0, 0, 0, // sequence
+            4, 0, 0, 0, 0, 0, 0, 0, // type id
+            5, 0, 0, 0, 0, 0, 0, 0, // stream
+            6, 0, 0, 0, 0, 0, 0, 0, // participant
+            2, 0, 0, 0, 0, 0, 0, 0, // label length
+            b'a', b'b', 0, 0, 0, 0, 0, 0, // label
+        ];
+        expected.resize(MAX_COMMAND_LENGTH, 0);
+        assert_eq!(&out[..length], &expected[..]);
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = Command::ReleaseCounter {
+            sequence: 1,
+            cell: 2,
+            registration: 3,
+        }
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(
+            &out[..length],
+            &[
+                1, 0, 0, 0, 0, 0, 0, 0, // sequence
+                2, 0, 0, 0, 0, 0, 0, 0, // cell
+                3, 0, 0, 0, 0, 0, 0, 0, // registration
+            ]
+        );
+        let response = Response::CounterAllocated {
+            request: RequestId {
+                client: 1,
+                sequence: 2,
+            },
+            cell: 3,
+            registration: 4,
+        };
+        assert_eq!(response.type_id(), 0x85);
+        let mut out = [0u8; MAX_RESPONSE_LENGTH];
+        assert_eq!(response.encode(&mut out), Ok(MAX_RESPONSE_LENGTH));
+    }
+
+    #[test]
+    fn counter_commands_are_decoded_strictly() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let command = Command::AllocateCounter {
+            sequence: 1,
+            type_id: 1,
+            label: CounterLabel::new("abc").unwrap(),
+            stream: 0,
+            participant: 0,
+        };
+        let length = command.encode(&mut out).unwrap();
+        assert_eq!(Command::decode(0x06, &out[..length]), Ok(command));
+        // Wrong lengths.
+        assert!(matches!(
+            Command::decode(0x06, &out[..length - 8]),
+            Err(CncError::WrongLength { .. })
+        ));
+        let mut longer = [0u8; MAX_COMMAND_LENGTH + 8];
+        longer[..length].copy_from_slice(&out[..length]);
+        assert!(matches!(
+            Command::decode(0x06, &longer),
+            Err(CncError::WrongLength { .. })
+        ));
+        assert!(matches!(
+            Command::decode(0x07, &out[..16]),
+            Err(CncError::WrongLength { .. })
+        ));
+        // A label length above 64, or with high bits set.
+        for (byte, value) in [(32usize, 65u8), (33, 1)] {
+            let mut bad = out;
+            bad[byte] = value;
+            assert_eq!(
+                Command::decode(0x06, &bad[..length]),
+                Err(CncError::Reserved { type_id: 0x06 }),
+                "byte {byte} = {value}"
+            );
+        }
+        // Nonzero padding after the label.
+        let mut bad = out;
+        bad[40 + 3] = b'd';
+        assert_eq!(
+            Command::decode(0x06, &bad[..length]),
+            Err(CncError::Reserved { type_id: 0x06 })
+        );
+        bad[103] = 1;
+        bad[40 + 3] = 0;
+        assert_eq!(
+            Command::decode(0x06, &bad[..length]),
+            Err(CncError::Reserved { type_id: 0x06 })
+        );
+        // A label that is not UTF-8.
+        let mut bad = out;
+        bad[40] = 0xFF;
+        assert_eq!(
+            Command::decode(0x06, &bad[..length]),
+            Err(CncError::Reserved { type_id: 0x06 })
+        );
+        // A response type is no command, and a counter response decodes
+        // only at its exact length.
+        assert!(matches!(
+            Command::decode(0x85, &out[..32]),
+            Err(CncError::UnknownType { .. })
+        ));
+        assert!(matches!(
+            Response::decode(0x85, &out[..24]),
+            Err(CncError::WrongLength { .. })
+        ));
     }
 
     #[test]
@@ -1068,6 +1427,7 @@ mod tests {
             SUBSCRIPTION_READY,
             OPERATION_SUCCEEDED,
             ERROR,
+            COUNTER_ALLOCATED,
         ] {
             assert!(!Event::is_event_type(response_type));
         }

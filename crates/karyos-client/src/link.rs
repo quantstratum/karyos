@@ -2,8 +2,8 @@
 
 //! State shared by a client conductor and its driver registration in
 //! embedded mode (quantstratum-docs: karyos/design/client-commands.md): the close flag, the
-//! hand-over table, and the capability leases that keep a stream charged
-//! while any of its capabilities lives.
+//! hand-over table, the capability leases that keep a stream charged
+//! while any of its capabilities lives, and the client's counter releases.
 //!
 //! The hand-over table is control-path state behind a mutex; the data path
 //! never touches it. Crossing processes replaces these mechanisms under
@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
+use crate::counter::CounterReleases;
 use crate::generation::GenerationLink;
 
 /// Who issued a capability: the driver instance and the client id. A handle
@@ -218,6 +219,9 @@ struct HandOver<T: TermBytes = HeapTerms> {
 pub struct ClientLink<T: TermBytes = HeapTerms> {
     closed: AtomicBool,
     hand_over: Mutex<HandOver<T>>,
+    /// The client's counter handles: their queued releases and how many
+    /// are alive.
+    counters: Arc<CounterReleases>,
 }
 
 /// Why a hand-over put or take failed.
@@ -235,6 +239,7 @@ impl<T: TermBytes> Default for ClientLink<T> {
                 entries: Vec::new(),
                 driver_gone: false,
             }),
+            counters: Arc::new(CounterReleases::default()),
         }
     }
 }
@@ -264,6 +269,14 @@ impl<T: TermBytes> ClientLink<T> {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// The client's counter releases and live counter handles
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+    /// "Client counters").
+    #[must_use]
+    pub fn counter_releases(&self) -> &Arc<CounterReleases> {
+        &self.counters
     }
 
     /// Driver side: holds `entry` for the client (`Held`).
