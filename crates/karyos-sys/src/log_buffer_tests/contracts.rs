@@ -493,6 +493,9 @@ fn test_log_buffer_immediate_offer_has_one_reservation_and_no_rotation() {
         ConcurrentOfferOutcome::Appended { position: 0 }
     );
     assert_eq!(publication.offer_attempt_counts(), (1, 0));
+
+    drop(publication.try_claim(8, AppendOptions::default()).unwrap());
+    assert_eq!(publication.offer_attempt_counts(), (1, 0));
 }
 
 /// Drains an optional reader, which may be overrun: it never bounds.
