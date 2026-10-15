@@ -13,11 +13,10 @@
 // test exemptions (ADR-0007 exempts tests from these lints).
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -237,50 +236,32 @@ fn test_admission_unserved_driver_makes_attach_time_out() {
 }
 
 #[test]
-fn test_admission_full_backlog_holds_connections_until_served() {
+fn test_admission_full_backlog_bounds_connect_until_served() {
     let _serial = serial();
     let dir = dir("backlog");
     let clock = ManualClock::default();
     // A backlog of 1: the kernel queues at most two unaccepted
-    // connections on a Unix socket.
+    // connections on a Unix socket; no duty cycle accepts them.
     let mut driver = driver_with(&dir, 1, &clock);
-    let (done, completions) = mpsc::channel();
-    let connectors: Vec<_> = (0..4)
-        .map(|_| {
-            let dir = dir.clone();
-            let done = done.clone();
-            std::thread::spawn(move || {
-                let socket = ipc::connect(&dir, Duration::from_millis(20));
-                done.send(()).unwrap();
-                socket
-            })
-        })
-        .collect();
-    drop(done);
-    // Unserved, some connections stay blocked in connect.
-    std::thread::sleep(Duration::from_millis(300));
-    let early = completions.try_iter().count();
-    assert!(
-        early <= 2,
-        "{early} connections completed past a backlog of 1"
-    );
-    // Served: silent connections are accepted, closed at the hello timeout
-    // and make room, so every blocked connect completes.
+    let bound = Duration::from_millis(100);
+    let first = ipc::connect(&dir, bound).unwrap();
+    let second = ipc::connect(&dir, bound).unwrap();
+    // The third finds the backlog full: connect retries until its bound and
+    // then fails, instead of blocking.
     let start = Instant::now();
-    let mut completed = early;
-    while completed < 4 {
-        assert!(start.elapsed() < Duration::from_secs(5), "timed out");
-        clock.now.fetch_add(100, Ordering::Relaxed);
+    assert!(ipc::connect(&dir, bound).is_err());
+    let waited = start.elapsed();
+    assert!(waited >= bound, "gave up after {waited:?}");
+    assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+    // Served: the silent connections are accepted and closed at the hello
+    // timeout, which empties the backlog.
+    for _ in 0..4 {
         let _ = driver.do_work().unwrap();
-        completed += completions.try_iter().count();
-        std::thread::yield_now();
+        clock.now.fetch_add(100, Ordering::Relaxed);
     }
-    let sockets: Vec<OwnedFd> = connectors
-        .into_iter()
-        .map(|connector| connector.join().unwrap().unwrap())
-        .collect();
-    drop(sockets);
-    // The driver still admits a real client afterwards.
+    let _ = driver.do_work().unwrap();
+    drop((first, second));
+    // The driver admits a real client afterwards.
     let client = attach_serving(&mut driver, &dir).unwrap();
     drop(client);
     serve_until(&mut driver, |driver| driver.clients() == 0);
