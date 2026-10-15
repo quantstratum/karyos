@@ -97,11 +97,13 @@ fn attach_serving(driver: &mut IpcDriver, dir: &Path) -> Result<RemoteClient, At
     })
 }
 
-/// Duty cycles until `done` or a few seconds pass.
+/// Duty cycles until `done` or a bound passes. The bound is generous: the
+/// suite runs tests and child processes in parallel on few CPUs, and it
+/// only limits a failing test.
 fn serve_until(driver: &mut IpcDriver, mut done: impl FnMut(&IpcDriver) -> bool) {
     let start = Instant::now();
     while !done(driver) {
-        assert!(start.elapsed() < Duration::from_secs(5), "timed out");
+        assert!(start.elapsed() < Duration::from_secs(30), "timed out");
         let _ = driver.do_work().unwrap();
         std::thread::yield_now();
     }
@@ -856,4 +858,128 @@ fn leave_with_an_export_left_and_a_foreign_detach_retire_the_client() {
         assert_eq!(counter(&driver, "grants ended"), 0);
         drop(client);
     }
+}
+
+/// Serves the driver while `client` runs on another thread; returns its
+/// result once it finished.
+fn serve_while<R: Send>(driver: &mut IpcDriver, client: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(client);
+        let start = Instant::now();
+        while !handle.is_finished() {
+            assert!(start.elapsed() < Duration::from_secs(30), "client stuck");
+            let _ = driver.do_work().unwrap();
+            // Leave CPU to the client thread and to other tests.
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        handle.join().unwrap()
+    })
+}
+
+/// A remote client takes a subscription and a publication through fetches
+/// (`quantstratum-docs: karyos/design/ipc-data-path.md`, The client): each
+/// handle owns its own mapping, they exchange a message through the shared
+/// stream, dropping them detaches both grants, and dropping the client then
+/// sends a Leave the driver accepts.
+#[test]
+fn a_remote_client_takes_handles_that_exchange_and_detach_on_drop() {
+    let dir = dir("take");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let key = StreamKey {
+        stream_id: 2,
+        session_id: 1,
+    };
+    let received = serve_while(&mut driver, move || {
+        let _ = client
+            .add_subscription(key, SubscriberRole::Required)
+            .unwrap();
+        let _ = client.add_publication(key, false).unwrap();
+        let mut fetchable = Vec::new();
+        let start = Instant::now();
+        while fetchable.len() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(5), "no completions");
+            let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                Outcome::Fetchable(grant) => fetchable.push(grant),
+                other => panic!("expected a fetchable grant, got {other:?}"),
+            });
+        }
+        // A grant of another kind than requested is refused before any
+        // fetch.
+        assert_eq!(
+            client.take_publication(&fetchable[0]).err(),
+            Some(AttachError::Protocol)
+        );
+        let mut subscription = client.take_subscription(&fetchable[0]).unwrap();
+        let mut publication = client.take_publication(&fetchable[1]).unwrap();
+        let start = Instant::now();
+        while !matches!(
+            publication.offer(b"remote").unwrap(),
+            OfferOutcome::Accepted { .. }
+        ) {
+            assert!(start.elapsed() < Duration::from_secs(5), "never accepted");
+        }
+        let mut received = Vec::new();
+        let start = Instant::now();
+        while received.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(5), "never received");
+            let _ = subscription
+                .poll(
+                    |payload, _| received.push(payload.to_vec()),
+                    MessageLimit::new(8),
+                )
+                .unwrap();
+        }
+        drop(subscription);
+        drop(publication);
+        drop(client);
+        received
+    });
+    assert_eq!(received, vec![b"remote".to_vec()]);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants exported"), 2);
+    assert_eq!(counter(&driver, "grants detached"), 2);
+}
+
+/// A manifest that does not answer the request (here, another
+/// registration than the `Ready` response's) aborts the fetch: its region
+/// is still received, closed and detached, so nothing stays charged and the
+/// client can still leave.
+#[test]
+fn an_aborted_fetch_detaches_what_arrived() {
+    let dir = dir("abort");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    serve_while(&mut driver, move || {
+        let _ = client
+            .add_subscription(
+                StreamKey {
+                    stream_id: 2,
+                    session_id: 1,
+                },
+                SubscriberRole::Optional,
+            )
+            .unwrap();
+        let mut fetchable = None;
+        let start = Instant::now();
+        while fetchable.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+            let _ = client.poll(usize::MAX, |completion| {
+                if let Outcome::Fetchable(grant) = completion.outcome {
+                    fetchable = Some(grant);
+                }
+            });
+        }
+        let mut forged = fetchable.unwrap();
+        forged.registration += 1;
+        assert_eq!(
+            client.take_subscription(&forged).err(),
+            Some(AttachError::Protocol)
+        );
+        drop(client);
+    });
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants detached"), 1);
 }

@@ -19,7 +19,7 @@ use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Next, Successor, representable};
-use crate::link::{Lease, Origin};
+use crate::link::{Export, Lease, Origin};
 
 /// Metadata delivered with each message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,9 +124,23 @@ pub struct ClientSubscription<T: TermBytes = HeapTerms> {
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
+    /// The export of a handle adopted from another process's grant. Last:
+    /// it is dropped after the mapping, and its drop sends `Detach`.
+    _export: Option<Export>,
 }
 
 impl<T: TermBytes> ClientSubscription<T> {
+    /// Attaches the export of a grant adopted from another process.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    #[must_use]
+    pub(crate) fn with_export(mut self, export: Export) -> Self {
+        self._export = Some(export);
+        self
+    }
+
     /// Wraps a log buffer subscription, allocating its private copy buffer
     /// (control path) for the largest message of the buffer it reads.
     #[must_use]
@@ -139,6 +153,7 @@ impl<T: TermBytes> ClientSubscription<T> {
             link: None,
             base: 0,
             _lease: None,
+            _export: None,
         }
     }
 

@@ -147,6 +147,29 @@ impl Drop for Lease {
     }
 }
 
+/// The export of a handle adopted from another process's grant
+/// (`quantstratum-docs: karyos/design/ipc-data-path.md`, The client): kept
+/// as the handle's last field, so it is dropped after the handle's mapping,
+/// and its drop sends the grant's `Detach`.
+#[derive(Debug)]
+pub struct Export {
+    /// Held only for its drop.
+    _detach: Box<dyn core::any::Any + Send + Sync>,
+}
+
+impl Export {
+    /// Wraps the value whose drop detaches the grant.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn new(detach: impl core::any::Any + Send + Sync) -> Self {
+        Self {
+            _detach: Box::new(detach),
+        }
+    }
+}
+
 /// A capability created by the driver for a registration.
 #[derive(Debug)]
 pub enum Capability<T: TermBytes = HeapTerms> {
