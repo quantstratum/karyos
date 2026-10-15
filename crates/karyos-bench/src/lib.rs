@@ -76,14 +76,24 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
         });
     }
     for message in [32, 256, 1024] {
+        let iterations = iterations.max(cleaner_minimum_iterations(message, term_length));
         configs.push(Config {
             workload: Workload::CleanerThroughput,
             message,
             publishers: 1,
             iterations,
-            warmup,
+            warmup: (iterations / 10).max(warmup),
             term_length,
+            target_rate: None,
         });
     }
     configs
+}
+
+fn cleaner_minimum_iterations(message: usize, term_length: u32) -> u64 {
+    const MINIMUM_ROTATIONS: u64 = 1_000;
+    let message = u64::try_from(message).unwrap_or(u64::MAX);
+    let block = message.saturating_add(32).div_ceil(32).saturating_mul(32);
+    let messages_per_rotation = u64::from(term_length).div_ceil(block).saturating_add(1);
+    MINIMUM_ROTATIONS.saturating_mul(messages_per_rotation)
 }

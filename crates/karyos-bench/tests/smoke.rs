@@ -125,8 +125,28 @@ fn cleaner_workload_observes_term_rotation_and_reclamation() {
         iterations: 6_000,
         warmup: 1_000,
         term_length: 64 * 1024,
+        target_rate: None,
     };
     let measurement = run(config).unwrap_or_else(|cause| panic!("{config}: {cause}"));
     assert!(measurement.term_rotations_per_second.unwrap_or_default() > 0.0);
     assert!(measurement.cleaned_slots_per_second.unwrap_or_default() > 0.0);
+}
+
+#[test]
+fn cleaner_defaults_cover_at_least_a_thousand_term_rotations() {
+    let configs: Vec<_> = defaults(20_000)
+        .into_iter()
+        .filter(|config| config.workload == Workload::CleanerThroughput)
+        .collect();
+    assert_eq!(configs.len(), 3);
+    for config in configs {
+        let message_block = u64::try_from(config.message + 32)
+            .unwrap_or(u64::MAX)
+            .div_ceil(32)
+            .saturating_mul(32);
+        let estimated_rotations =
+            config.iterations.saturating_mul(message_block) / u64::from(config.term_length);
+        assert!(estimated_rotations >= 1_000, "{config}");
+        assert!(config.warmup >= config.iterations / 10, "{config}");
+    }
 }

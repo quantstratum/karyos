@@ -40,7 +40,8 @@ pub enum Workload {
     /// One publisher follows a fixed send schedule; latency starts at the
     /// scheduled instant, so late sends retain their full delay.
     OpenLoop,
-    /// Concurrent term production against the log buffer cleaner.
+    /// Concurrent term production against the log buffer cleaner, with no
+    /// subscriber so the run measures publication and reclamation only.
     CleanerThroughput,
     /// A receive owner commits each validated frame into an image
     /// (`quantstratum-docs: karyos/design/receive-publication.md`).
@@ -789,20 +790,25 @@ fn cleaner_throughput(config: Config) -> Result<Measurement, BenchError> {
             outcome = Err(cause);
         }
     }
+    // Snapshot the cleaner while the producers are done and before stopping
+    // its thread, so the rates exclude cleaner work after term production.
+    let measured_cleaned_end = cleaned.load(Ordering::Relaxed);
+    let measured_term_end = max_term.load(Ordering::Relaxed);
+    let measured_end = Instant::now();
     stop.store(true, Ordering::Release);
     let joined = join(cleaner);
     outcome?;
     joined?;
-    let seconds = measured_from.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
-    let cleaned_slots = cleaned
-        .load(Ordering::Relaxed)
-        .saturating_sub(measured_cleaned_start);
-    let measured_rotations = max_term
-        .load(Ordering::Relaxed)
-        .saturating_sub(measured_term_start);
+    let seconds = measured_end
+        .saturating_duration_since(measured_from)
+        .as_secs_f64()
+        .max(f64::MIN_POSITIVE);
+    let cleaned_slots = measured_cleaned_end.saturating_sub(measured_cleaned_start);
+    let measured_rotations = measured_term_end.saturating_sub(measured_term_start);
     Ok(Measurement {
         config,
         latency: None,
+        producer_lateness: None,
         rate: (config.iterations * u64::from(publishers)) as f64 / seconds,
         resolution: 0,
         cleaned_slots_per_second: Some(cleaned_slots as f64 / seconds),
@@ -963,6 +969,8 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
         producer_lateness: Some(producer_lateness),
         rate: config.iterations as f64 / seconds,
         resolution,
+        cleaned_slots_per_second: None,
+        term_rotations_per_second: None,
     })
 }
 
