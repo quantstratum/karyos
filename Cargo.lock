@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "karyos"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-archive",
  "karyos-client",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-archive"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-client",
  "karyos-codec",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-bench"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos",
  "karyos-archive",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-client"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-protocol",
  "karyos-sys",
@@ -112,21 +112,21 @@ dependencies = [
 
 [[package]]
 name = "karyos-cluster"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-archive",
 ]
 
 [[package]]
 name = "karyos-codec"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-protocol",
 ]
 
 [[package]]
 name = "karyos-driver"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-client",
  "karyos-io",
@@ -137,21 +137,21 @@ dependencies = [
 
 [[package]]
 name = "karyos-feed"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-client",
 ]
 
 [[package]]
 name = "karyos-io"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-sys",
 ]
 
 [[package]]
 name = "karyos-protocol"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-sys",
  "thiserror",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-sim"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-archive",
  "karyos-client",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-sys"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "loom",
  "rustix",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-tools"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos",
  "karyos-archive",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-trace"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "karyos-protocol",
  "thiserror",

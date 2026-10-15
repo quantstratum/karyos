@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.99"
 license = "Apache-2.0"
@@ -28,20 +28,20 @@ repository = "https://github.com/quantstratum/karyos"
 publish = false
 
 [workspace.dependencies]
-karyos-sys = { path = "crates/karyos-sys", version = "0.1.0" }
-karyos-io = { path = "crates/karyos-io", version = "0.1.0" }
-karyos-protocol = { path = "crates/karyos-protocol", version = "0.1.0" }
-karyos-codec = { path = "crates/karyos-codec", version = "0.1.0" }
-karyos-client = { path = "crates/karyos-client", version = "0.1.0" }
-karyos-driver = { path = "crates/karyos-driver", version = "0.1.0" }
-karyos-trace = { path = "crates/karyos-trace", version = "0.1.0" }
-karyos-archive = { path = "crates/karyos-archive", version = "0.1.0" }
-karyos-cluster = { path = "crates/karyos-cluster", version = "0.1.0" }
-karyos-feed = { path = "crates/karyos-feed", version = "0.1.0" }
-karyos-sim = { path = "crates/karyos-sim", version = "0.1.0" }
-karyos = { path = "crates/karyos", version = "0.1.0" }
-karyos-tools = { path = "crates/karyos-tools", version = "0.1.0" }
-karyos-bench = { path = "crates/karyos-bench", version = "0.1.0" }
+karyos-sys = { path = "crates/karyos-sys", version = "0.1.0-alpha.1" }
+karyos-io = { path = "crates/karyos-io", version = "0.1.0-alpha.1" }
+karyos-protocol = { path = "crates/karyos-protocol", version = "0.1.0-alpha.1" }
+karyos-codec = { path = "crates/karyos-codec", version = "0.1.0-alpha.1" }
+karyos-client = { path = "crates/karyos-client", version = "0.1.0-alpha.1" }
+karyos-driver = { path = "crates/karyos-driver", version = "0.1.0-alpha.1" }
+karyos-trace = { path = "crates/karyos-trace", version = "0.1.0-alpha.1" }
+karyos-archive = { path = "crates/karyos-archive", version = "0.1.0-alpha.1" }
+karyos-cluster = { path = "crates/karyos-cluster", version = "0.1.0-alpha.1" }
+karyos-feed = { path = "crates/karyos-feed", version = "0.1.0-alpha.1" }
+karyos-sim = { path = "crates/karyos-sim", version = "0.1.0-alpha.1" }
+karyos = { path = "crates/karyos", version = "0.1.0-alpha.1" }
+karyos-tools = { path = "crates/karyos-tools", version = "0.1.0-alpha.1" }
+karyos-bench = { path = "crates/karyos-bench", version = "0.1.0-alpha.1" }
 
 # External dependencies; each admission is recorded in deps/dependencies.md.
 loom = { version = "0.7.2", default-features = false }
