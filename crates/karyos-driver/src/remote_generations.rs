@@ -13,7 +13,8 @@
 //! registration word, so exactly one wins. A fenced grant never sent ends
 //! at once; a sent one stays charged until its `Detach` or the exit proof.
 //! A predecessor is retained while any remote grant of its generation is
-//! charged.
+//! charged. A fenced grant is never moved by a later cutover: its
+//! participant never reached that generation.
 
 use karyos_protocol::cnc::{Event as DriverEvent, StreamKey};
 use karyos_sys::log_buffer::LossPolicy;
@@ -35,14 +36,35 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     .grants()
                     .iter()
                     .filter(|grant| {
-                        grant.stream == stream && grant.generation == predecessor && grant.sent
+                        grant.stream == stream
+                            && grant.generation == predecessor
+                            && grant.sent
+                            && !grant.fenced
                     })
                     .map(move |grant| (client, *grant))
             })
             .collect();
         let deadline = self.config.cutover_deadline;
         for (client, old) in movers {
-            let reserved = self.reserve_successor(stream, &old);
+            // The successor is a new grant: it is bound by the client's
+            // ledger exactly as a command's (`max_exports_per_client`, and
+            // one fetch must carry its region); beyond them it cannot be
+            // reserved.
+            let bytes = self
+                .streams
+                .iter()
+                .find(|s| s.id == stream)
+                .map_or(u64::MAX, |target| {
+                    crate::commands::fetch_bytes(&target.buffer)
+                });
+            let admitted = self
+                .ledger(client)
+                .is_some_and(|ledger| !ledger.full() && ledger.fetchable(1, bytes));
+            let reserved = if admitted {
+                self.reserve_successor(stream, &old)
+            } else {
+                None
+            };
             let Some(target) = self.streams.iter().find(|s| s.id == stream) else {
                 return;
             };
@@ -64,6 +86,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             sent: false,
                             generation,
                             fence_at: Some(now.saturating_add(deadline)),
+                            fenced: false,
                         });
                     }
                     self.counters.add(crate::counters::Event::GrantsReserved, 1);
@@ -75,8 +98,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         generation: u64::from(generation),
                     });
                 }
-                // No successor participant could be reserved: the handle
-                // cannot move, as if fenced at once.
+                // No successor participant could be reserved, or the
+                // client's ledger has no room for it: the handle cannot
+                // move, as if fenced at once.
                 None => self.emit(&DriverEvent::Fenced {
                     stream: key,
                     registration: old.registration,
@@ -162,6 +186,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .find(|entry| entry.export == grant.export)
             {
                 entry.fence_at = None;
+                entry.fenced = fenced;
             }
             if unsent {
                 ledger

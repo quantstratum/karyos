@@ -759,6 +759,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 sent: false,
                 generation,
                 fence_at: None,
+                fenced: false,
             });
         }
         let (kind, subscriber) = match participant {
@@ -858,7 +859,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 /// The bytes a fetch of `buffer` carries: its whole region, header
 /// included (`quantstratum-docs: karyos/design/ipc-data-path.md`, Bounds);
 /// 0 for a heap buffer, which has no region to carry.
-fn fetch_bytes<T: StreamTerms>(buffer: &karyos_sys::log_buffer::LogBuffer<T>) -> u64 {
+pub(crate) fn fetch_bytes<T: StreamTerms>(buffer: &karyos_sys::log_buffer::LogBuffer<T>) -> u64 {
     #[cfg(target_os = "linux")]
     {
         // A full region: its header stride and its structure; a size that
@@ -968,11 +969,14 @@ mod tests {
 
     /// Admits a raw remote client with an export ledger of `limit` grants.
     fn remote_client(driver: &mut EmbeddedDriver, limit: usize) -> (u64, RingProducer) {
+        remote_client_with(driver, Ledger::new(limit, 4, 1 << 30))
+    }
+
+    /// Admits a raw remote client with `ledger`.
+    fn remote_client_with(driver: &mut EmbeddedDriver, ledger: Ledger) -> (u64, RingProducer) {
         let (producer, consumer) = command_ring(1024).unwrap();
         let link = Arc::new(ClientLink::new());
-        let id = driver
-            .admit(consumer, link, Some(Ledger::new(limit, 4, 1 << 30)))
-            .unwrap();
+        let id = driver.admit(consumer, link, Some(ledger)).unwrap();
         (id, producer)
     }
 
@@ -1286,6 +1290,108 @@ mod tests {
         assert_eq!(driver.generations(stream).unwrap().len(), 1);
     }
 
+    #[test]
+    fn a_fenced_sent_successor_is_not_moved_by_a_later_cutover() {
+        let mut driver = EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+            cutover_deadline: 50_000_000,
+            ..crate::embedded::DriverConfig::default()
+        })
+        .unwrap();
+        let stream = driver
+            .add_stream(StreamConfig {
+                buffer: LogBufferConfig {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 3,
+                    max_subscribers: 4,
+                    mtu: DEFAULT_MTU,
+                    max_reserved: MIN_TERM_LENGTH / 8,
+                    initial_term_id: TermId::new(7),
+                    lane: Lane::ZERO,
+                    session_id: 1,
+                    stream_id: 2,
+                    claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                    publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                },
+                allow_unconnected: false,
+                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+            })
+            .unwrap();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let old = ledger(&driver, client)[0];
+        remote_ledger(&mut driver, client).mark_sent(old.export);
+        let first = driver
+            .reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 5,
+                },
+            )
+            .unwrap();
+        // The successor's descriptor leaves, but its participant never
+        // adopts it: the fence wins and the sent grant stays charged.
+        let start = std::time::Instant::now();
+        while counter(&driver, "grants fenced") == 0 {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "never fenced"
+            );
+            let _ = driver.do_work().unwrap();
+            let successor = ledger(&driver, client)
+                .iter()
+                .find(|grant| grant.generation == first.get() && !grant.sent)
+                .map(|grant| grant.export);
+            if let Some(export) = successor {
+                remote_ledger(&mut driver, client).mark_sent(export);
+            }
+        }
+        let fenced = ledger(&driver, client)
+            .iter()
+            .find(|grant| grant.generation == first.get())
+            .copied()
+            .unwrap();
+        assert!(fenced.sent && fenced.fenced && fenced.fence_at.is_none());
+        let _ = responses(&mut observer);
+        // A later cutover moves nothing: the client never reached `first`.
+        let second = driver
+            .reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 5,
+                },
+            )
+            .unwrap();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+        }
+        let grants = ledger(&driver, client);
+        assert_eq!(grants.len(), 2, "{grants:?}");
+        assert!(grants.iter().all(|grant| grant.generation != second.get()));
+        while let Received::Message {
+            type_id, payload, ..
+        } = observer.receive()
+        {
+            assert!(
+                !matches!(
+                    karyos_protocol::cnc::Event::decode(type_id, payload),
+                    Ok(karyos_protocol::cnc::Event::SuccessorReady { .. })
+                ),
+                "a fenced grant was moved"
+            );
+        }
+    }
+
     fn counter(driver: &EmbeddedDriver, label: &str) -> u64 {
         let reader = driver.counters();
         (0..reader.capacity())
@@ -1374,6 +1480,67 @@ mod tests {
             ),
             Err(DriverError::CutoverPending { .. })
         ));
+    }
+
+    #[test]
+    fn a_successor_beyond_the_export_bound_is_fenced_at_once() {
+        // At `max_exports_per_client`; the fetch bound needs a region, so
+        // the admission tests cover it.
+        let (mut driver, stream) = driver_with_stream();
+        let bounds = Ledger::new(1, 4, 1 << 30);
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client_with(&mut driver, bounds);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let old = ledger(&driver, client)[0];
+        remote_ledger(&mut driver, client).mark_sent(old.export);
+        let _ = responses(&mut observer);
+        driver
+            .reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 5,
+                },
+            )
+            .unwrap();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+        }
+        // Nothing was reserved; the client is told at once.
+        let grants = ledger(&driver, client);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].export, old.export);
+        let mut events = Vec::new();
+        while let Received::Message {
+            type_id, payload, ..
+        } = observer.receive()
+        {
+            if let Ok(event) = karyos_protocol::cnc::Event::decode(type_id, payload) {
+                events.push(event);
+            }
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                karyos_protocol::cnc::Event::Fenced { registration, .. }
+                    if *registration == old.registration
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, karyos_protocol::cnc::Event::SuccessorReady { .. })),
+            "{events:?}"
+        );
     }
 
     #[test]

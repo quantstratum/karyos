@@ -1223,3 +1223,53 @@ fn a_remote_subscriber_that_does_not_move_is_fenced() {
     ));
     assert_eq!(counter(&driver, "grants fenced"), 1);
 }
+
+/// A successor whose region exceeds the client's `max_fetch_bytes` could
+/// never be fetched: it is not reserved, and the client is told `Fenced`
+/// at once, as a command would be refused.
+#[test]
+fn a_successor_no_fetch_could_carry_is_fenced_at_once() {
+    // The region size of this stream's log buffer.
+    let probe_dir = dir("successor-bytes-probe");
+    let mut probe = system_driver(&probe_dir);
+    let _stream = probe.add_stream(shared_stream_config()).unwrap();
+    let (_client, _export, fd) = fetched_subscription(&mut probe, &probe_dir);
+    let size = std::fs::File::from(fd).metadata().unwrap().len();
+    let dir = dir("successor-bytes");
+    let mut driver = EmbeddedDriver::with_ipc(
+        DriverConfig {
+            cutover_deadline: 5_000_000_000,
+            ..DriverConfig::default()
+        },
+        IpcConfig {
+            max_fetch_bytes: size,
+            ..ipc_config(&dir, 5_000_000_000)
+        },
+        Box::new(SystemClock::new()),
+    )
+    .unwrap();
+    let stream = driver.add_stream(shared_stream_config()).unwrap();
+    let (mut client, subscription) = remote_subscriber(&mut driver, &dir);
+    let _ = driver
+        .reconfigure_stream(
+            stream,
+            karyos_driver::Reconfiguration {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                spare_slots: 5,
+            },
+        )
+        .unwrap();
+    let event = serve_while(&mut driver, move || {
+        let event = cutover_event(&mut client);
+        std::mem::forget(subscription);
+        std::mem::forget(client);
+        event
+    });
+    // Told long before the 5 s deadline, and nothing was reserved.
+    assert!(
+        matches!(event, karyos_protocol::cnc::Event::Fenced { .. }),
+        "{event:?}"
+    );
+    assert_eq!(counter(&driver, "grants reserved"), 1);
+    assert_eq!(counter(&driver, "grants fenced"), 0);
+}

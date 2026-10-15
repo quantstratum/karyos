@@ -57,6 +57,11 @@ pub(crate) struct Grant {
     /// it if its participant has not adopted it (`quantstratum-docs:
     /// karyos/design/ipc-data-path.md`, Generations across processes).
     pub(crate) fence_at: Option<u64>,
+    /// Whether the driver fenced it before its participant adopted it: its
+    /// participant never reached this generation, so a later cutover does
+    /// not move it, yet a sent one stays charged until its `Detach` or the
+    /// client's exit proof.
+    pub(crate) fenced: bool,
 }
 
 /// The grants of one remote client.
@@ -225,6 +230,7 @@ mod tests {
             sent: false,
             generation: 0,
             fence_at: None,
+            fenced: false,
         }
     }
 
