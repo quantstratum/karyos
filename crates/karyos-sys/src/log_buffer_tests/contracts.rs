@@ -796,6 +796,47 @@ fn test_log_buffer_immediate_offer_has_one_reservation_and_no_rotation() {
     assert_eq!(publication.offer_attempt_counts(), (1, 0));
 }
 
+/// §13 "Required set transitions", the guard itself: the duty cycle never
+/// lowers a published limit or floor, even when its own computation gives
+/// less. A limit and a floor are published above what the required set
+/// yields (as a later transition could, with a bound that moved back); the
+/// next duty cycles keep both, and the publisher may use the published
+/// limit. Without the `max` guards the limit would fall back to `base +
+/// window`.
+#[test]
+fn test_log_buffer_required_set_a_published_limit_and_floor_are_never_lowered() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let window = TERM / 2;
+    let mut conductor = buffer.conductor().unwrap();
+    let mut required = conductor.subscribe(Role::Required).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = vec![8u8; 1000];
+    let _ = append_retrying(&mut publication, &mut conductor, &data, || {});
+    while poll_message(&mut required).is_some() {}
+    let _ = conductor.duty_cycle().unwrap();
+    // The required reader is at the head: the computed limit.
+    let computed = buffer.reserved_head().load(Ordering::Acquire) + window;
+    assert_eq!(buffer.limit().load(Ordering::Acquire), computed);
+    // A limit and a floor above the computation are published.
+    let raised = computed + 4096;
+    buffer.limit().store(raised, Ordering::Release);
+    let floor = buffer.floor().load(Ordering::Acquire);
+    buffer.floor().store(floor + 64, Ordering::Release);
+    for _ in 0..3 {
+        let _ = conductor.duty_cycle().unwrap();
+        assert_eq!(
+            buffer.limit().load(Ordering::Acquire),
+            raised,
+            "the duty cycle lowered the published limit"
+        );
+        assert_eq!(
+            buffer.floor().load(Ordering::Acquire),
+            floor + 64,
+            "the duty cycle lowered the published floor"
+        );
+    }
+}
+
 /// Slots pinned outside the rotation: every slot that is not `FREE` and
 /// does not hold the previous, active or next term, in any state.
 fn pinned_outside_rotation(buffer: &LogBuffer<Terms>) -> Vec<u8> {
