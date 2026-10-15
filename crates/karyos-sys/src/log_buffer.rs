@@ -70,6 +70,10 @@ use storage::{Backing, CONFIG_WORDS, Cell, Control, Layout, Line, PublisherSlot}
 
 mod concurrent;
 mod deadline;
+mod image_read;
+mod receive_owner;
+
+pub use receive_owner::{ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received};
 pub(crate) mod storage;
 
 #[cfg(test)]
@@ -232,6 +236,14 @@ pub enum PublicationMode {
         /// Allow concurrent mode on aarch64 without LSE, where `fetch_add`
         /// is not a single instruction (SPEC.md §4, ADR-0012).
         allow_non_lse: bool,
+    },
+    /// An image: the lane of a remote stream written only by its receive
+    /// owner (`quantstratum-docs: karyos/design/receive-publication.md`).
+    /// It issues no publication. Its head is the owner's rebuild position,
+    /// which starts at `join`, the join point of the image.
+    Image {
+        /// The join point: the stream position where the image starts.
+        join: u64,
     },
 }
 
@@ -530,23 +542,38 @@ impl<T: TermBytes> LogBuffer<T> {
     /// every other slot `FREE`, the table, the cells, the tails, the limit
     /// and the configuration block. Only for a buffer no other party sees.
     fn initialise(&self) {
-        let t0 = self.initial_term_id;
-        let one = TermCount::ZERO.next().map_or(t0, |one| t0.advanced_by(one));
+        // An image starts at the term of its join point; every other
+        // buffer at term 0. Creation checked the count.
+        let join = self.join();
+        let start = u32::try_from(join / u64::from(self.term_length))
+            .ok()
+            .and_then(|count| TermCount::try_new(count).ok())
+            .unwrap_or(TermCount::ZERO);
+        let t0 = self.initial_term_id.advanced_by(start);
+        // The last term of the incarnation has no next term to prepare.
+        let next = start.next().ok();
+        let one = next.map_or(t0, |next| self.initial_term_id.advanced_by(next));
         for (slot, line) in self.descriptors().iter().enumerate() {
             let state = match slot {
                 0 => Descriptor::new(t0, self.generation, SlotState::Active),
-                1 => Descriptor::new(one, self.generation, SlotState::Ready),
+                1 if next.is_some() => Descriptor::new(one, self.generation, SlotState::Ready),
                 _ => Descriptor::new(t0, self.generation, SlotState::Free),
             };
             line.word.store(state.encode(), Ordering::Relaxed);
         }
         let table_len = u32::from(self.slots);
-        if let Some(entry) = self.table().first() {
-            entry.store(table_entry(0, 0), Ordering::Relaxed);
+        if let Some(entry) = self.table().get((start.get() % table_len) as usize) {
+            entry.store(table_entry(start.get(), 0), Ordering::Relaxed);
         }
-        if let Some(entry) = self.table().get((1 % table_len) as usize) {
-            entry.store(table_entry(1, 1), Ordering::Relaxed);
+        if let Some(next) = next
+            && let Some(entry) = self.table().get((next.get() % table_len) as usize)
+        {
+            entry.store(table_entry(next.get(), 1), Ordering::Relaxed);
         }
+        self.active_count()
+            .store(u64::from(start.get()), Ordering::Relaxed);
+        self.reserved_head().store(join, Ordering::Relaxed);
+        self.floor().store(join, Ordering::Relaxed);
         let publisher_cells = self.layout.publisher_count;
         for (index, cell) in self.cells().iter().enumerate() {
             let state = if index < publisher_cells {
@@ -557,12 +584,26 @@ impl<T: TermBytes> LogBuffer<T> {
             cell.state.store(state, Ordering::Relaxed);
         }
         for (slot, line) in self.tails().iter().enumerate() {
-            let term = if slot == 0 { t0 } else { one };
+            let term = if slot == 0 || next.is_none() { t0 } else { one };
             line.word
                 .store(u64::from(term.get()) << 32, Ordering::Relaxed);
         }
-        self.limit().store(window(&self.config), Ordering::Relaxed);
+        self.limit()
+            .store(join + window(&self.config), Ordering::Relaxed);
         self.write_config();
+    }
+
+    /// Whether this buffer is an image.
+    fn image(&self) -> bool {
+        matches!(self.config.publication, PublicationMode::Image { .. })
+    }
+
+    /// The join point of an image; 0 for any other buffer.
+    fn join(&self) -> u64 {
+        match self.config.publication {
+            PublicationMode::Image { join } => join,
+            _ => 0,
+        }
     }
 
     /// The configuration block (`quantstratum-docs: karyos/design/ipc-log-buffer.md`).
@@ -857,15 +898,21 @@ fn publisher_cells(mode: PublicationMode) -> usize {
     match mode {
         PublicationMode::Exclusive => 1,
         PublicationMode::Concurrent { publishers, .. } => usize::from(publishers),
+        PublicationMode::Image { .. } => IMAGE_OWNER_CELLS,
     }
 }
+
+/// Loan words of an image's receive owner, per lane: a standing write loan
+/// on each of the two terms it may write and a transient read loan on the
+/// trailing term it compares (`L = 3`, owner decision D2).
+const IMAGE_OWNER_CELLS: usize = 3;
 
 /// The publication window: `term_length / 2`, less the concurrent
 /// overshoot `(P - 1) × max_reserved` (SPEC.md §4 IPC flow control).
 fn window(config: &LogBufferConfig) -> u64 {
     let half = u64::from(config.term_length.get() / 2);
     match config.publication {
-        PublicationMode::Exclusive => half,
+        PublicationMode::Exclusive | PublicationMode::Image { .. } => half,
         PublicationMode::Concurrent { publishers, .. } => {
             let overshoot =
                 u64::from(publishers.saturating_sub(1)) * u64::from(config.max_reserved);
@@ -873,6 +920,28 @@ fn window(config: &LogBufferConfig) -> u64 {
             half.max(overshoot) - overshoot
         }
     }
+}
+
+/// Creation checks of an image: its join point names a term count below
+/// `2^31`, and the spare slots cover the owner's loans.
+fn check_image(config: &LogBufferConfig, join: u64) -> Result<(), SysError> {
+    // Readers and the owner access word 0 at the join point: a frame
+    // boundary, aligned like every frame.
+    if !join.is_multiple_of(u64::from(FRAME_ALIGNMENT)) {
+        return Err(SysError::InvalidPublicationMode {
+            reason: "the join point is not a multiple of the frame alignment",
+        });
+    }
+    let count = join / u64::from(config.term_length.get());
+    if count >= u64::from(crate::term::TERM_COUNT_LIMIT) {
+        return Err(SysError::InvalidPublicationMode {
+            reason: "the join point is past the last term of the incarnation",
+        });
+    }
+    if IMAGE_OWNER_CELLS > usize::from(config.spare_slots.saturating_sub(CLEANING_HEADROOM)) {
+        return Err(SysError::ResourcesUnavailable);
+    }
+    Ok(())
 }
 
 /// Creation checks of the publication mode
@@ -884,12 +953,13 @@ fn check_publication_mode(config: &LogBufferConfig) -> Result<(), SysError> {
 /// [`check_publication_mode`] for a target whose `fetch_add` is (`lse`) or
 /// is not a single instruction.
 fn check_publication_mode_on(config: &LogBufferConfig, lse: bool) -> Result<(), SysError> {
-    let PublicationMode::Concurrent {
-        publishers,
-        allow_non_lse,
-    } = config.publication
-    else {
-        return Ok(());
+    let (publishers, allow_non_lse) = match config.publication {
+        PublicationMode::Exclusive => return Ok(()),
+        PublicationMode::Image { join } => return check_image(config, join),
+        PublicationMode::Concurrent {
+            publishers,
+            allow_non_lse,
+        } => (publishers, allow_non_lse),
     };
     let invalid = |reason| Err(SysError::InvalidPublicationMode { reason });
     if publishers == 0 {
@@ -1009,6 +1079,11 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
     if buffer.concurrent() {
         return Err(SysError::InvalidPublicationMode {
             reason: "the exclusive publication of a concurrent buffer",
+        });
+    }
+    if buffer.image() {
+        return Err(SysError::InvalidPublicationMode {
+            reason: "the exclusive publication of an image",
         });
     }
     // Already issued: no allocation. The compare-exchange below still
@@ -1287,6 +1362,7 @@ impl<O: BufferOwner> PreparedSubscription<O> {
             });
         }
         let position = found.position.load(Ordering::Acquire);
+        let joining = self.owner.image();
         Ok(Subscription {
             buffer: self.owner,
             cursor: Cursor {
@@ -1296,6 +1372,7 @@ impl<O: BufferOwner> PreparedSubscription<O> {
                 acknowledged: position,
                 pending: None,
                 detached: false,
+                joining,
             },
         })
     }
@@ -2242,6 +2319,18 @@ pub enum PollOutcome {
         /// Bytes skipped.
         extent: u32,
     },
+    /// Only on an image (`quantstratum-docs: karyos/design/receive-publication.md`,
+    /// fragments are published one by one): a range that delivers no
+    /// message was skipped, and reading continues after it. It needs no
+    /// acknowledgement.
+    Skipped {
+        /// Stream position of the skipped range.
+        position: u64,
+        /// Bytes skipped.
+        extent: u32,
+        /// Why the range delivers no message.
+        reason: SkipReason,
+    },
     /// The subscriber was lapped. Data in `[from, lost_to)` is no longer
     /// retained (below the retention floor). Under `rejoin_at_head` the
     /// subscriber resumes at `resume`, the reserved head; data in
@@ -2257,6 +2346,26 @@ pub enum PollOutcome {
     },
 }
 
+/// Why an image reader skipped a range (`PollOutcome::Skipped`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SkipReason {
+    /// A message whose reserved length or payload exceeds the image's
+    /// `max_reserved_length` or `max_message_length`: skipped from its
+    /// BEGIN to the end of the fragment that crossed the bound.
+    MessageTooLarge,
+    /// A message with no END before the term end: skipped to the term end.
+    MissingEnd,
+    /// A message interrupted by an ABORTED, PAD or new BEGIN frame:
+    /// skipped up to the interrupting frame, which is read next.
+    Interrupted,
+    /// Fragments without their BEGIN, after this reader joined: a peer
+    /// fault.
+    Orphan,
+    /// Fragments without their BEGIN where this reader joined, in the
+    /// middle of a message: the rest of a message it never saw start.
+    JoinedMidMessage,
+}
+
 /// A registered subscriber's private cursor.
 #[derive(Debug)]
 struct Cursor {
@@ -2270,6 +2379,9 @@ struct Cursor {
     /// acknowledged message.
     pending: Option<u64>,
     detached: bool,
+    /// An image reader that has not yet reached a BEGIN, ABORTED or PAD
+    /// frame since it joined.
+    joining: bool,
 }
 
 /// A registered subscriber.
@@ -2458,8 +2570,29 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         }
         let result = self.read_block(slot, offset, out);
         release_loan(&cell.loan);
-        match result? {
+        let result = result?;
+        if !matches!(
+            result,
+            Read::Pending
+                | Read::Skip {
+                    reason: SkipReason::Orphan | SkipReason::JoinedMidMessage,
+                    ..
+                }
+        ) {
+            // The cursor reached a BEGIN, ABORTED or PAD frame.
+            self.cursor.joining = false;
+        }
+        match result {
             Read::Pending => Ok(Step::Done(PollOutcome::Pending)),
+            Read::Skip { extent, reason } => {
+                let position = self.cursor.position;
+                self.advance_to(position + u64::from(extent));
+                Ok(Step::Done(PollOutcome::Skipped {
+                    position,
+                    extent,
+                    reason,
+                }))
+            }
             Read::Pad => Ok(Step::NextTerm),
             Read::Aborted { extent } => {
                 let position = self.cursor.position;
@@ -2497,6 +2630,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             Validated::Pending => Ok(Read::Pending),
             Validated::Pad => Ok(Read::Pad),
             Validated::Aborted { extent } => Ok(Read::Aborted { extent }),
+            Validated::Skip { extent, reason } => Ok(Read::Skip { extent, reason }),
             Validated::Block(block) => self.copy_block(slot, start, block, out),
         }
     }
@@ -2504,6 +2638,9 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     /// First pass: classifies the block at `start` from its first word 0
     /// and, for data, walks and checks every fragment's word 0.
     fn validate_block(&self, slot: u8, start: u32) -> Result<Validated, SysError> {
+        if self.buffer.image() {
+            return self.validate_image_block(slot, start);
+        }
         let buffer = self.buffer;
         let term_length = buffer.term_length;
         // SAFETY: read loan held for this slot's term; `start` is a block
@@ -2719,6 +2856,8 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         }
         let resume = head.max(from);
         self.advance_to(resume);
+        // A rejoin is a new join: an image reader may land inside a message.
+        self.cursor.joining = self.buffer.image();
         Ok(Step::Done(PollOutcome::Overrun {
             from,
             lost_to,
@@ -2766,7 +2905,14 @@ enum Step {
 enum Validated {
     Pending,
     Pad,
-    Aborted { extent: u32 },
+    Aborted {
+        extent: u32,
+    },
+    /// Only on an image: a range that delivers no message.
+    Skip {
+        extent: u32,
+        reason: SkipReason,
+    },
     Block(Block),
 }
 
@@ -2788,6 +2934,10 @@ enum Read {
     Pad,
     Aborted {
         extent: u32,
+    },
+    Skip {
+        extent: u32,
+        reason: SkipReason,
     },
     Message {
         length: u32,
@@ -3327,6 +3477,11 @@ impl<O: BufferOwner> Conductor<O> {
                 reason: "the exclusive publication of a concurrent buffer",
             });
         }
+        if buffer.image() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "the exclusive publication of an image",
+            });
+        }
         if !take_publication(buffer.publication_taken()) {
             return Ok(false);
         }
@@ -3702,6 +3857,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             acknowledged: start,
             pending: None,
             detached: false,
+            joining: buffer.image(),
         })
     }
 
@@ -3762,6 +3918,18 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // without required participants, `head_snapshot - window` bounded
         // below by position 0 through an explicit comparison.
         let (floor, base) = match bound {
+            // An image keeps its floor at least half a term behind the
+            // rebuild position whatever its subscribers do, so the owner can
+            // compare late copies (receive-publication.md, owner decision
+            // D1); a lagging required subscriber only lowers it. It never
+            // goes below the join point.
+            _ if buffer.image() => {
+                let trailing = (head.max(window) - window).max(buffer.join());
+                (
+                    bound.map_or(trailing, |required| required.min(trailing)),
+                    head,
+                )
+            }
             Some(required) => (required, required),
             // `max` bounds the subtraction at the publication start without
             // wrapping or saturating arithmetic.
@@ -3967,12 +4135,13 @@ fn config_words(
     generation: Generation,
     max_message_length: u32,
 ) -> [u64; CONFIG_WORDS] {
-    let (mode, publishers, allow_non_lse) = match config.publication {
-        PublicationMode::Exclusive => (1, 0, 0),
+    let (mode, publishers, allow_non_lse, join) = match config.publication {
+        PublicationMode::Exclusive => (1, 0, 0, 0),
         PublicationMode::Concurrent {
             publishers,
             allow_non_lse,
-        } => (2, u64::from(publishers), u64::from(allow_non_lse)),
+        } => (2, u64::from(publishers), u64::from(allow_non_lse), 0),
+        PublicationMode::Image { join } => (3, 0, 0, join),
     };
     let mut words = [0u64; CONFIG_WORDS];
     let fields = [
@@ -3992,6 +4161,7 @@ fn config_words(
         allow_non_lse,
         u64::from(generation.get()),
         u64::from(max_message_length),
+        join,
     ];
     for (word, field) in words.iter_mut().zip(fields) {
         *word = field;
@@ -4022,6 +4192,7 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
         allow_non_lse,
         generation,
         max_message_length,
+        join,
         rest @ ..,
     ] = words;
     if *version != LAYOUT_VERSION || rest.iter().any(|word| *word != 0) {
@@ -4029,11 +4200,12 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
     }
     let small = |value: &u64| u32::try_from(*value).ok();
     let publication = match (*mode, *allow_non_lse) {
-        (1, 0) if *publishers == 0 => PublicationMode::Exclusive,
-        (2, flag @ (0 | 1)) => PublicationMode::Concurrent {
+        (1, 0) if *publishers == 0 && *join == 0 => PublicationMode::Exclusive,
+        (2, flag @ (0 | 1)) if *join == 0 => PublicationMode::Concurrent {
             publishers: u8::try_from(*publishers).ok()?,
             allow_non_lse: flag == 1,
         },
+        (3, 0) if *publishers == 0 => PublicationMode::Image { join: *join },
         _ => return None,
     };
     let config = LogBufferConfig {

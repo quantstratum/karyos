@@ -704,6 +704,7 @@ fn concurrent_publication_reuse_and_subscribers() {
                     PollOutcome::Aborted { .. } => panic!("nothing was aborted"),
                     PollOutcome::Closed { .. } => panic!("not sealed"),
                     PollOutcome::Revoked { .. } => panic!("not revoked"),
+                    PollOutcome::Skipped { .. } => panic!("not an image"),
                     PollOutcome::Pending => {
                         // Done once everything is published and the
                         // cursor reached the final head; receiving the
