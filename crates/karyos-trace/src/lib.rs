@@ -31,7 +31,9 @@ pub use clocks::{
 pub use error::TraceError;
 pub use histogram::{Histogram, HistogramError, Quantile};
 pub use ids::{BufferedIds, OsRandom, RandomSource};
-pub use journal::{Collected, ObserverId, TraceCollector, TraceWriter, trace_journal};
+pub use journal::{
+    Collected, ObserverId, TraceCollector, TraceWriter, trace_journal, trace_writer,
+};
 pub use record::{
     MAX_LANE, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId, RECORD_VERSION,
     RECORD_WORDS, SubscriberId, TraceIds, TraceRecord, decode_record, encode_record,

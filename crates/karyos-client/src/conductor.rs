@@ -30,6 +30,12 @@
 //! `max_counters_per_client`. If that allocation is refused or its outcome
 //! is unknown, the conductor keeps counting locally and does not ask again;
 //! nothing ever waits for it.
+//!
+//! Trace journals (`quantstratum-docs: karyos/design/trace-journal-region.md`;
+//! [`crate::journal`]) are requested with [`ClientConductor::trace_journal`]
+//! and complete as [`Outcome::Journal`], or as [`Outcome::FetchableJournal`]
+//! for a remote client; [`ClientConductor::close_journal`] gives a journal's
+//! final delivery boundary and completes as [`Outcome::Succeeded`].
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -42,12 +48,14 @@ use karyos_protocol::cnc::{
 use karyos_sys::broadcast::{BroadcastReceiver, Received};
 use karyos_sys::command_ring::{RingError, RingProducer};
 use karyos_sys::counters::ClientCells;
+use karyos_sys::record_journal::JournalLayout;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 use thiserror::Error;
 
 use crate::concurrent::ClientConcurrentPublication;
 use crate::counter::{ClientCounterHandle, Release};
 use crate::generation::GenerationLink;
+use crate::journal::{ClientJournal, FetchableJournal};
 use crate::link::{Capability, ClientLink, Origin, Owner};
 use crate::loss::LossReporter;
 use crate::publication::ClientPublication;
@@ -74,6 +82,11 @@ pub enum ConductorError {
     /// A counter label is longer than 64 bytes.
     #[error("counter label longer than 64 bytes")]
     LabelTooLong,
+    /// Journal sizes the driver would refuse to decode (a capacity that is
+    /// not a nonzero power of two, no payload word or no drop range), or
+    /// journal number 0.
+    #[error("invalid trace journal request")]
+    InvalidJournal,
 }
 
 /// How a request ended.
@@ -92,6 +105,11 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     Fetchable(Fetchable),
     /// A client counter, ready to update.
     Counter(ClientCounterHandle),
+    /// A trace journal, ready to append.
+    Journal(ClientJournal),
+    /// A remote client's trace journal, answered with its hand-over key:
+    /// the client takes it with `RemoteClient::take_journal`.
+    FetchableJournal(FetchableJournal),
     /// The command succeeded.
     Succeeded,
     /// The driver refused the command; it had no effect.
@@ -208,6 +226,8 @@ enum Kind {
     /// The conductor's own `AllocateCounter` of `loss reports dropped`:
     /// never reported.
     DroppedCounter,
+    TraceJournal,
+    CloseJournal,
 }
 
 impl Kind {
@@ -243,6 +263,8 @@ struct Pending {
     kind: Kind,
     /// What an `Add*` asked for; `None` for a remove.
     request: Option<Request>,
+    /// The sizes a `TraceJournal` asked for.
+    journal: Option<JournalLayout>,
 }
 
 /// A client's conductor (not `Clone`). Dropping it closes the client: the
@@ -642,6 +664,67 @@ impl<T: TermBytes> ClientConductor<T> {
         })
     }
 
+    /// Requests a trace journal of `layout` (`quantstratum-docs:
+    /// karyos/design/trace-journal-region.md`) observing `subscription`,
+    /// the registration of one of this client's live subscriptions, or
+    /// `None` for a publisher-side journal; returns the request sequence.
+    /// It completes as [`Outcome::Journal`] (in process) or
+    /// [`Outcome::FetchableJournal`] (remote), or is refused with
+    /// `UnknownRegistration` (a subscription that is not a live one of this
+    /// client), `TraceJournalsExhausted` or `ResourcesUnavailable`. The
+    /// driver takes the subscription's join position from its own record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConductorError::InvalidJournal`] for sizes the driver
+    /// would refuse to decode or `Some(0)`, and the other
+    /// [`ConductorError`]s; nothing is submitted on error.
+    pub fn trace_journal(
+        &mut self,
+        layout: JournalLayout,
+        subscription: Option<u64>,
+    ) -> Result<u64, ConductorError> {
+        if layout.validate().is_err() || subscription == Some(0) {
+            return Err(ConductorError::InvalidJournal);
+        }
+        let words = |value: usize| u64::try_from(value).map_err(|_| ConductorError::InvalidJournal);
+        let (capacity, payload_words, drop_ranges) = (
+            words(layout.capacity)?,
+            words(layout.payload_words)?,
+            words(layout.drop_ranges)?,
+        );
+        self.submit_journal(Kind::TraceJournal, Some(layout), |sequence| {
+            Command::TraceJournal {
+                sequence,
+                capacity,
+                payload_words,
+                drop_ranges,
+                subscription: subscription.unwrap_or(0),
+            }
+        })
+    }
+
+    /// Gives the driver the final delivery boundary of trace journal
+    /// `journal`, before the client closes it; returns the request
+    /// sequence. It completes as [`Outcome::Succeeded`], or is refused with
+    /// `UnknownRegistration` for a journal that is not an open journal of
+    /// this client without a boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConductorError::InvalidJournal`] for journal 0, and the
+    /// other [`ConductorError`]s; nothing is submitted on error.
+    pub fn close_journal(&mut self, journal: u64, boundary: u64) -> Result<u64, ConductorError> {
+        if journal == 0 {
+            return Err(ConductorError::InvalidJournal);
+        }
+        self.submit_journal(Kind::CloseJournal, None, |sequence| Command::CloseJournal {
+            sequence,
+            journal,
+            boundary,
+        })
+    }
+
     /// Loss reports of this client's subscriptions dropped because the
     /// queue was full: the local count, complete whether or not the client
     /// counter `loss reports dropped` could be allocated.
@@ -795,6 +878,25 @@ impl<T: TermBytes> ClientConductor<T> {
         request: Option<Request>,
         command: impl FnOnce(u64) -> Command,
     ) -> Result<u64, ConductorError> {
+        self.submit_with(kind, request, None, command)
+    }
+
+    fn submit_journal(
+        &mut self,
+        kind: Kind,
+        journal: Option<JournalLayout>,
+        command: impl FnOnce(u64) -> Command,
+    ) -> Result<u64, ConductorError> {
+        self.submit_with(kind, None, journal, command)
+    }
+
+    fn submit_with(
+        &mut self,
+        kind: Kind,
+        request: Option<Request>,
+        journal: Option<JournalLayout>,
+        command: impl FnOnce(u64) -> Command,
+    ) -> Result<u64, ConductorError> {
         if self.closed() {
             return Err(ConductorError::Closed);
         }
@@ -819,6 +921,7 @@ impl<T: TermBytes> ClientConductor<T> {
                     sequence,
                     kind,
                     request,
+                    journal,
                 });
                 Ok(sequence)
             }
@@ -962,6 +1065,15 @@ impl<T: TermBytes> ClientConductor<T> {
                 }
                 _ => {}
             }
+            if let (Kind::TraceJournal, Some(layout), Response::JournalReady { journal, key, .. }) =
+                (kind, pending.journal, response)
+            {
+                return Outcome::FetchableJournal(FetchableJournal {
+                    journal,
+                    key,
+                    layout,
+                });
+            }
         }
         match (kind, response) {
             (
@@ -1037,7 +1149,16 @@ impl<T: TermBytes> ClientConductor<T> {
                 }
                 Err(_) => Outcome::Unknown,
             },
-            (Kind::Remove, Response::OperationSucceeded { .. }) => Outcome::Succeeded,
+            (Kind::Remove | Kind::CloseJournal, Response::OperationSucceeded { .. }) => {
+                Outcome::Succeeded
+            }
+            // The writer waits in the hand-over table under its key.
+            (Kind::TraceJournal, Response::JournalReady { journal, key, .. }) => {
+                match self.link.take_journal(key) {
+                    Ok(writer) => Outcome::Journal(ClientJournal::new(journal, writer)),
+                    Err(_) => Outcome::Unknown,
+                }
+            }
             (
                 Kind::AllocateCounter,
                 Response::CounterAllocated {

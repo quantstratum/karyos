@@ -34,6 +34,24 @@
 //! once under the policy actually applied (`overruns rejoin at head`,
 //! `overruns snapshot` whether the source rebuilt or failed, `overruns
 //! close`), and a `replay` fallback also in `replay fallbacks`.
+//!
+//! Trace journals (`quantstratum-docs:
+//! karyos/design/trace-journal-region.md`, J2 and J3; see
+//! `trace_journals`): `TraceJournal` reserves a table entry and creates the
+//! journal, on the heap for an in-process client (its writer waits in the
+//! client's hand-over table) or as a `Journal` region for a remote client
+//! (a `Held` grant of stream 0 in its export ledger, fetched like a log
+//! buffer, bound by `max_exports_per_client` and the fetch bounds), and
+//! answers `JournalReady` with the journal number (a trace number) and a
+//! hand-over key taken from the registration counter, so it never names
+//! another grant. A journal that names a subscription must name a live
+//! subscription of the sender; otherwise it is refused with
+//! `UnknownRegistration` before anything is created. The table entry then
+//! carries the subscription, its stream and its join position, which the
+//! driver recorded when it registered the subscription (the mapping's base
+//! plus the cell's position); a publisher-side journal (subscription 0) has
+//! none. `CloseJournal` records the boundary of the client's own open
+//! journal, once.
 
 use std::sync::Arc;
 
@@ -49,6 +67,7 @@ use karyos_protocol::cnc::{
 use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::counters::{CounterKeys, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER};
 use karyos_sys::log_buffer::{LossPolicy, PublicationEnd, Revocation, Role, SealState};
+use karyos_sys::record_journal::{JournalDrain, JournalLayout};
 use karyos_sys::registration;
 
 use crate::client_counters::Refusal;
@@ -101,6 +120,11 @@ pub(crate) struct Registration {
     end: Arc<LeaseEnd>,
     /// For a subscription: its cell, its occupant id and its role.
     pub(crate) subscriber: Option<(usize, u64, Role)>,
+    /// For a subscription: its join position, the stream position of its
+    /// cell when the driver registered it (the mapping's base plus the
+    /// cell's position), which a trace journal of it carries
+    /// (`quantstratum-docs: karyos/design/trace-journal-region.md`, J3).
+    pub(crate) join: Option<u64>,
 }
 
 impl<T: StreamTerms> ClientSlot<T> {
@@ -790,6 +814,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         }
                     }
                 };
+                // Recorded by the driver, never taken from the client.
+                let join = subscriber.and_then(|(cell, _, _)| {
+                    target
+                        .conductor
+                        .cell_position(cell)
+                        .map(|position| target.base.saturating_add(position))
+                });
                 // Effect: everything below cannot fail.
                 let member = match &capability {
                     Capability::Publication { .. } => MemberKind::Exclusive,
@@ -828,6 +859,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     kind,
                     end,
                     subscriber,
+                    join,
                 });
                 match kind {
                     Kind::Publication => Response::PublicationReady {
@@ -877,7 +909,176 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Command::ReportLoss { loss, .. } => {
                 refuse(ErrorCode::UnknownRegistration, loss.subscription)
             }
+            Command::TraceJournal {
+                capacity,
+                payload_words,
+                drop_ranges,
+                subscription,
+                ..
+            } => self.trace_journal(
+                client,
+                link,
+                request,
+                JournalRequest {
+                    capacity,
+                    payload_words,
+                    drop_ranges,
+                    subscription,
+                },
+            ),
+            Command::CloseJournal {
+                journal, boundary, ..
+            } => {
+                if self.trace_journals.close(client, journal, boundary) {
+                    Response::OperationSucceeded { request }
+                } else {
+                    refuse(ErrorCode::UnknownRegistration, journal)
+                }
+            }
         }
+    }
+
+    /// Serves `TraceJournal` (see the module documentation): every check
+    /// first (the observed subscription, sizes, bytes budget, a free table
+    /// entry, identities, the export bounds and the region of a remote
+    /// client), then the effects, which cannot fail.
+    fn trace_journal(
+        &mut self,
+        client: u64,
+        link: &Arc<ClientLink<T>>,
+        request: RequestId,
+        asked: JournalRequest,
+    ) -> Response {
+        let refuse = |code: ErrorCode| Response::Error {
+            request,
+            code,
+            detail: 0,
+        };
+        let JournalRequest {
+            capacity,
+            payload_words,
+            drop_ranges,
+            subscription,
+        } = asked;
+        // A nonzero subscription must be a live subscription of the
+        // sender; its stream and join position are the driver's record.
+        let observed = if subscription == 0 {
+            None
+        } else {
+            let live = self.registrations.iter().find(|registration| {
+                registration.id == subscription
+                    && registration.client == client
+                    && registration.kind == Kind::Subscription
+                    && registration.end.state() == LeaseState::Alive
+            });
+            match live {
+                Some(registration) => Some((subscription, registration.stream, registration.join)),
+                None => {
+                    return Response::Error {
+                        request,
+                        code: ErrorCode::UnknownRegistration,
+                        detail: subscription,
+                    };
+                }
+            }
+        };
+        let (Ok(capacity), Ok(payload_words), Ok(drop_ranges)) = (
+            usize::try_from(capacity),
+            usize::try_from(payload_words),
+            usize::try_from(drop_ranges),
+        ) else {
+            return refuse(ErrorCode::ResourcesUnavailable);
+        };
+        let layout = JournalLayout {
+            capacity,
+            payload_words,
+            drop_ranges,
+        };
+        let (index, bytes) = match self.trace_journals.preflight(&layout) {
+            Ok(found) => found,
+            Err(crate::trace_journals::Refusal::Exhausted) => {
+                return refuse(ErrorCode::TraceJournalsExhausted);
+            }
+            Err(crate::trace_journals::Refusal::Resources) => {
+                return refuse(ErrorCode::ResourcesUnavailable);
+            }
+        };
+        let key = self.next_registration;
+        let journal = self.next_trace_number;
+        let (Some(next_key), Some(next_journal)) = (key.checked_add(1), journal.checked_add(1))
+        else {
+            return refuse(ErrorCode::IdentitiesExhausted);
+        };
+        let drain = match self
+            .ledger(client)
+            .map(|ledger| (ledger.full(), ledger.fetchable(1, bytes)))
+        {
+            // A remote client: a region and a `Held` grant.
+            Some((false, true)) => {
+                let export = self.next_export;
+                if !registration::valid_export(export) {
+                    return refuse(ErrorCode::IdentitiesExhausted);
+                }
+                let Some(drain) = self.journal_region(layout) else {
+                    return refuse(ErrorCode::ResourcesUnavailable);
+                };
+                // Effect: everything below cannot fail.
+                self.next_export = export + 1;
+                if let Some(ledger) = self.ledger_mut(client) {
+                    ledger.push(Grant {
+                        export,
+                        registration: journal,
+                        key,
+                        stream: 0,
+                        participant: Participant::Journal { journal },
+                        state: GrantState::Held,
+                        sent: false,
+                        generation: 0,
+                        fence_at: None,
+                        fenced: false,
+                    });
+                }
+                self.counters.add(Event::GrantsReserved, 1);
+                drain
+            }
+            // Beyond the export bound, or a region no fetch could carry.
+            Some(_) => return refuse(ErrorCode::ResourcesUnavailable),
+            // An in-process client: a heap journal, its writer held.
+            None => {
+                let Ok((writer, drain)) = karyos_sys::record_journal::journal_block(layout) else {
+                    return refuse(ErrorCode::ResourcesUnavailable);
+                };
+                link.hold_journal(key, writer);
+                drain
+            }
+        };
+        self.next_registration = next_key;
+        self.next_trace_number = next_journal;
+        self.trace_journals
+            .insert(index, journal, client, observed, drain, bytes);
+        Response::JournalReady {
+            request,
+            journal,
+            key,
+        }
+    }
+
+    /// A journal region for a remote client; `None` when it cannot be
+    /// created.
+    #[cfg(target_os = "linux")]
+    fn journal_region(&mut self, layout: JournalLayout) -> Option<JournalDrain> {
+        let (instance, region) = self.admission.as_mut()?.next_region().ok()?;
+        karyos_sys::record_journal::journal_region(instance, region, layout).ok()
+    }
+
+    /// Remote clients exist only on Linux.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the Linux version creates the region through the admission"
+    )]
+    fn journal_region(&mut self, _layout: JournalLayout) -> Option<JournalDrain> {
+        None
     }
 
     /// Serves `AllocateCounter` (`quantstratum-docs:
@@ -1053,6 +1254,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
         };
+        // Recorded by the driver, never taken from the client.
+        let join = match participant {
+            Participant::Subscriber { cell, .. } => target
+                .conductor
+                .cell_position(cell)
+                .map(|position| target.base.saturating_add(position)),
+            _ => None,
+        };
         // Effect: everything below cannot fail.
         let stream = target.id;
         let generation = target.generation.get();
@@ -1076,7 +1285,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Subscriber { cell, role } => {
                 (Kind::Subscription, Some((cell, export, role)))
             }
-            Participant::Exclusive | Participant::Concurrent { .. } => (Kind::Publication, None),
+            // Never built here: a journal grant comes from `TraceJournal`.
+            Participant::Exclusive
+            | Participant::Concurrent { .. }
+            | Participant::Journal { .. } => (Kind::Publication, None),
         };
         self.registrations.push(Registration {
             id: registration,
@@ -1087,6 +1299,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // its grant.
             end: Arc::new(LeaseEnd::default()),
             subscriber,
+            join,
         });
         self.counters.add(Event::GrantsReserved, 1);
         match kind {
@@ -1135,6 +1348,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// the proof that no access follows: the grant was never sent, or its
     /// `Detach` or the client's exit proof arrived.
     pub(crate) fn end_grant(&mut self, grant: &Grant) {
+        // A journal grant names no stream: its writer is gone.
+        if let Participant::Journal { journal } = grant.participant {
+            self.trace_journals
+                .writer_gone(journal, &mut self.diagnostics, &mut self.counters);
+            self.counters.add(Event::GrantsEnded, 1);
+            return;
+        }
         let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
             return;
         };
@@ -1159,11 +1379,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Concurrent { slot } => conductor
                 .end_concurrent_publication(slot, grant.export)
                 .unwrap_or(false),
+            Participant::Journal { .. } => false,
         };
         if ended {
             self.counters.add(Event::GrantsEnded, 1);
         }
     }
+}
+
+/// What a `TraceJournal` asked for.
+#[derive(Debug, Clone, Copy)]
+struct JournalRequest {
+    capacity: u64,
+    payload_words: u64,
+    drop_ranges: u64,
+    /// The observed subscription's registration, 0 for none.
+    subscription: u64,
 }
 
 /// The bytes a fetch of `buffer` carries: its whole region, header

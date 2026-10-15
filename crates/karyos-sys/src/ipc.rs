@@ -88,14 +88,21 @@ pub enum RegionKind {
     Counters,
     /// One log buffer generation.
     LogBuffer,
-    /// The error log (driver only). Code 5 is reserved for the trace
-    /// journal.
+    /// A client's trace journal (`quantstratum-docs:
+    /// karyos/design/trace-journal-region.md`): the client writes the
+    /// records and the driver writes `consumed`, so the region keeps the
+    /// size seals only.
+    Journal,
+    /// The error log (driver only).
     ErrorLog,
     /// The loss report (driver only).
     LossReport,
     /// The client counters: the driver allocates the cells and each client
     /// writes its own, so the region keeps the size seals only.
     ClientCounters,
+    /// The trace mirror (driver only): the journal table and the record
+    /// ring the driver fills from the client journals it drains.
+    TraceMirror,
 }
 
 impl RegionKind {
@@ -105,9 +112,11 @@ impl RegionKind {
             Self::Broadcast => 2,
             Self::Counters => 3,
             Self::LogBuffer => 4,
+            Self::Journal => 5,
             Self::ErrorLog => 6,
             Self::LossReport => 7,
             Self::ClientCounters => 8,
+            Self::TraceMirror => 9,
         }
     }
 }

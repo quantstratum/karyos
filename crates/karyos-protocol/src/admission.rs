@@ -22,7 +22,7 @@
 //! | `0x04` | `Leave` | none |
 //! | `0x05` | `ToolHello` | version |
 //! | `0x81` | `Admitted` | instance (low, high); protocol version; client id; record count; records |
-//! | `0x82` | `Manifest` | fetch id; hand-over key; registration; stream registration (nonzero); incarnation (nonzero); record count; records |
+//! | `0x82` | `Manifest` | fetch id; hand-over key; registration; stream registration; incarnation; record count; records |
 //! | `0x83` | `Region` | fetch id; record index |
 //! | `0x84` | `Refused` | fetch id or 0; code (nonzero) |
 //! | `0x85` | `ToolAdmitted` | instance (low, high); protocol version; record count; records (capability none) |
@@ -30,16 +30,27 @@
 //! **Tools** (`quantstratum-docs: karyos/design/observability-and-tools.md`,
 //! Tool attach). A tool sends `ToolHello` instead of `Hello`, without a
 //! descriptor; the driver answers `ToolAdmitted` with the records of its
-//! four diagnostic regions (driver counters, client counters, error log,
-//! loss report), then one `Region` with fetch id 0 per record, each with a
-//! read-only descriptor, or `Refused`. A tool gets no client id, command
+//! five diagnostic regions (driver counters, client counters, error log,
+//! loss report, trace mirror), then one `Region` with fetch id 0 per
+//! record, each with a read-only descriptor, or `Refused`. A tool gets no client id, command
 //! ring or capability: every record of `ToolAdmitted` carries capability
 //! none, and decoding refuses any other. The first two words of
 //! `ToolHello` (type, version) are fixed for every version, as `Hello`'s,
 //! and [`tool_hello_version`] reads them. Both messages are new types, so
 //! adding them changed no existing layout; the two region kinds they need
 //! (error log 6, loss report 7) are new record values that an older
-//! decoder refuses.
+//! decoder refuses. The trace mirror (`quantstratum-docs:
+//! karyos/design/trace-journal-region.md`) made the set five records, with
+//! [`VERSION`] 2 (see "Layout changes within a version").
+//!
+//! **Journals** (`quantstratum-docs: karyos/design/trace-journal-region.md`,
+//! J2). A trace journal grant is fetched as a log buffer grant: one
+//! `Manifest` with one `Journal` record, then its `Region`. A journal
+//! belongs to no stream, so a manifest whose records are journals carries
+//! the journal number as its registration and zero stream registration and
+//! incarnation; every other manifest carries both nonzero, and a manifest
+//! never mixes journal records with others. The `Journal` kind (8) is new,
+//! so an older decoder refuses such a manifest.
 //!
 //! **Versions.** The client announces its protocol version in `Hello`;
 //! the driver answers `Admitted` carrying the version it runs (equal to the
@@ -57,10 +68,21 @@
 //! and the old and new layouts of the changed message can never have the
 //! same length for any record count; a change that keeps some length equal
 //! (for example one that adds exactly one record's words) must bump
-//! [`VERSION`] instead (review of #124). The stream registration and incarnation words of `Manifest`
-//! follow that rule (coordinator decision, ACS 13555: they carry the
-//! publication identity of the grant, whose driver part is the instance of
-//! `Admitted`).
+//! [`VERSION`] instead (review of #124). The stream registration and
+//! incarnation words of `Manifest` follow that rule (coordinator decision,
+//! ACS 13555: they carry the publication identity of the grant, whose
+//! driver part is the instance of `Admitted`).
+//!
+//! **Version 2** (coordinator decision, ACS 13677). The trace journal
+//! region adds the `Journal` and `TraceMirror` kinds and a fifth
+//! `ToolAdmitted` record. `ToolAdmitted` with five records has the length
+//! an older `ToolAdmitted` would have with five, so the length rule above
+//! does not cover the change: a peer of another build would fail only
+//! because its decoder refuses an unknown kind, at whichever message first
+//! carries one, with a protocol error rather than a version refusal. The
+//! bump to 2 makes a mixed build fail at `Hello` or `ToolHello` with a
+//! clean `IncompatibleVersion`; the unknown kind refusal stays as the
+//! second line of defence.
 //!
 //! **Instance.** The instance of `Admitted` is the driver's 128-bit
 //! `driver_id` (SPEC.md §4), the one id per driver instance (ACS 13555).
@@ -78,7 +100,7 @@
 use thiserror::Error;
 
 /// The protocol version a client announces in `Hello`.
-pub const VERSION: u64 = 1;
+pub const VERSION: u64 = 2;
 /// Most records in one manifest.
 pub const MAX_RECORDS: usize = 16;
 /// Words of one record.
@@ -194,6 +216,11 @@ pub enum RegionKind {
     ErrorLog,
     /// The loss report, which only the driver writes (tools only).
     LossReport,
+    /// A client's trace journal, which the client maps writable to append
+    /// its records and the driver drains.
+    Journal,
+    /// The trace mirror, which only the driver writes (tools only).
+    TraceMirror,
 }
 
 impl RegionKind {
@@ -206,6 +233,8 @@ impl RegionKind {
             Self::ClientCounters => 5,
             Self::ErrorLog => 6,
             Self::LossReport => 7,
+            Self::Journal => 8,
+            Self::TraceMirror => 9,
         }
     }
 
@@ -218,8 +247,55 @@ impl RegionKind {
             5 => Some(Self::ClientCounters),
             6 => Some(Self::ErrorLog),
             7 => Some(Self::LossReport),
+            8 => Some(Self::Journal),
+            9 => Some(Self::TraceMirror),
             _ => None,
         }
+    }
+}
+
+/// The wire kinds and the region kinds of `karyos_sys::ipc` they name: the
+/// one table both sides map through (Linux). The codes differ on purpose:
+/// a region header carries the sys code (`Journal` 5 to `TraceMirror` 9,
+/// `quantstratum-docs: karyos/design/trace-journal-region.md`), while wire
+/// code 5 was already `ClientCounters` when the journal kind was reserved,
+/// so the wire numbers the later kinds after it. Each side keeps its own
+/// codes; only this table relates them.
+#[cfg(target_os = "linux")]
+pub const SYS_KINDS: [(RegionKind, karyos_sys::ipc::RegionKind); 9] = {
+    use karyos_sys::ipc::RegionKind as Sys;
+    [
+        (RegionKind::CommandRing, Sys::CommandRing),
+        (RegionKind::Broadcast, Sys::Broadcast),
+        (RegionKind::Counters, Sys::Counters),
+        (RegionKind::LogBuffer, Sys::LogBuffer),
+        (RegionKind::ClientCounters, Sys::ClientCounters),
+        (RegionKind::ErrorLog, Sys::ErrorLog),
+        (RegionKind::LossReport, Sys::LossReport),
+        (RegionKind::Journal, Sys::Journal),
+        (RegionKind::TraceMirror, Sys::TraceMirror),
+    ]
+};
+
+#[cfg(target_os = "linux")]
+impl RegionKind {
+    /// The region kind of `karyos_sys::ipc` this wire kind names
+    /// ([`SYS_KINDS`]).
+    #[must_use]
+    pub fn to_sys(self) -> karyos_sys::ipc::RegionKind {
+        SYS_KINDS
+            .iter()
+            .find(|(wire, _)| *wire == self)
+            .map_or(karyos_sys::ipc::RegionKind::CommandRing, |(_, sys)| *sys)
+    }
+
+    /// The wire kind of a `karyos_sys::ipc` region kind ([`SYS_KINDS`]).
+    #[must_use]
+    pub fn from_sys(kind: karyos_sys::ipc::RegionKind) -> Self {
+        SYS_KINDS
+            .iter()
+            .find(|(_, sys)| *sys == kind)
+            .map_or(Self::CommandRing, |(wire, _)| *wire)
     }
 }
 
@@ -397,13 +473,15 @@ pub enum Message {
         fetch: u64,
         /// The hand-over key fetched.
         key: u64,
-        /// The registration the regions belong to.
+        /// The registration the regions belong to; the journal number for a
+        /// journal grant.
         registration: u64,
         /// The registration of the grant's stream: with the driver instance
         /// of `Admitted` and `incarnation`, the publication identity a loss
-        /// report of the grant names (nonzero).
+        /// report of the grant names (nonzero; zero for a journal grant).
         stream_registration: u64,
-        /// The publication incarnation of the grant's stream (nonzero).
+        /// The publication incarnation of the grant's stream (nonzero; zero
+        /// for a journal grant).
         incarnation: u64,
         /// The regions.
         records: Vec<Record>,
@@ -468,6 +546,30 @@ fn records_from(header: usize, words: &[u64]) -> Result<Vec<Record>, AdmissionEr
         .iter()
         .map(|record| Record::from_words(record))
         .collect()
+}
+
+/// The identity rule of a manifest: records that are all journals carry a
+/// zero stream registration and incarnation; any other manifest carries
+/// both nonzero; journal records never share a manifest with others.
+fn check_manifest_identity(
+    records: &[Record],
+    stream_registration: u64,
+    incarnation: u64,
+) -> Result<(), AdmissionError> {
+    let journals = records
+        .iter()
+        .filter(|record| record.kind == RegionKind::Journal)
+        .count();
+    let valid = if journals == 0 {
+        stream_registration != 0 && incarnation != 0
+    } else {
+        journals == records.len() && stream_registration == 0 && incarnation == 0
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(AdmissionError::Reserved)
+    }
 }
 
 impl Message {
@@ -543,13 +645,17 @@ impl Message {
             Self::Fetch { fetch: 0, .. }
             | Self::Detach { export: 0 }
             | Self::Manifest { fetch: 0, .. }
-            | Self::Manifest {
-                stream_registration: 0,
-                ..
-            }
-            | Self::Manifest { incarnation: 0, .. }
             | Self::Refused { code: 0, .. } => return Err(AdmissionError::Reserved),
-            Self::Admitted { records, .. } | Self::Manifest { records, .. } => records.as_slice(),
+            Self::Manifest {
+                stream_registration,
+                incarnation,
+                records,
+                ..
+            } => {
+                check_manifest_identity(records, *stream_registration, *incarnation)?;
+                records.as_slice()
+            }
+            Self::Admitted { records, .. } => records.as_slice(),
             Self::ToolAdmitted { records, .. } => {
                 if records
                     .iter()
@@ -572,8 +678,8 @@ impl Message {
     /// # Errors
     ///
     /// Returns [`AdmissionError::Reserved`] for a message that could not be
-    /// decoded (a zero fetch id, export id, refusal code, or stream
-    /// registration or incarnation of a manifest, or a `ToolAdmitted`
+    /// decoded (a zero fetch id, export id or refusal code, a manifest that
+    /// breaks the identity rule of journal grants, or a `ToolAdmitted`
     /// record with a capability),
     /// [`AdmissionError::TooManyRecords`] and
     /// [`AdmissionError::BufferTooShort`].
@@ -664,16 +770,18 @@ impl Message {
                 records: records_from(5, &words)?,
             }),
             MANIFEST => {
-                if word(1) == 0 || word(4) == 0 || word(5) == 0 {
+                if word(1) == 0 {
                     return Err(AdmissionError::Reserved);
                 }
+                let records = records_from(6, &words)?;
+                check_manifest_identity(&records, word(4), word(5))?;
                 Ok(Self::Manifest {
                     fetch: word(1),
                     key: word(2),
                     registration: word(3),
                     stream_registration: word(4),
                     incarnation: word(5),
-                    records: records_from(6, &words)?,
+                    records,
                 })
             }
             REGION => {
@@ -802,7 +910,7 @@ mod tests {
             out.truncate(len);
             out
         };
-        let mut hello = encode(&Message::Hello { version: 1 });
+        let mut hello = encode(&Message::Hello { version: VERSION });
         hello[16] = 1;
         assert_eq!(Message::decode(&hello), Err(AdmissionError::Reserved));
         // Raw words that `encode` refuses to produce.
@@ -857,7 +965,7 @@ mod tests {
         ));
         // A record with export 0, an unknown kind, an unknown capability or
         // an index on a capability without one.
-        for (offset, value) in [(64, 0u8), (72, 9), (105, 7), (112, 1)] {
+        for (offset, value) in [(64, 0u8), (72, 10), (105, 7), (112, 1)] {
             let mut bad = encode(&Message::Manifest {
                 fetch: 1,
                 key: 2,
@@ -986,6 +1094,32 @@ mod tests {
         assert_eq!(admitted.encode(&mut out), Ok(MAX_MESSAGE_LENGTH - 8));
     }
 
+    /// Every wire kind and every sys kind appears in the table exactly
+    /// once, so the two mappings are inverse bijections.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kind_table_is_a_bijection() {
+        for (wire, sys) in SYS_KINDS {
+            assert_eq!(wire.to_sys(), sys);
+            assert_eq!(RegionKind::from_sys(sys), wire);
+        }
+        for code in 1..=9 {
+            let wire = RegionKind::from_code(code).unwrap();
+            assert_eq!(RegionKind::from_sys(wire.to_sys()), wire);
+        }
+        assert_eq!(RegionKind::from_code(10), None);
+    }
+
+    /// The protocol version is 2 (ACS 13677): the trace journal kinds.
+    #[test]
+    fn the_version_is_two() {
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let length = Message::Hello { version: VERSION }
+            .encode(&mut out)
+            .unwrap();
+        assert_eq!(words_of(&out[..length]), [HELLO, 2, PROFILE_FLAGS]);
+    }
+
     /// The manifest's words, literally: the stream registration and the
     /// incarnation follow the registration, before the record count.
     #[test]
@@ -1026,6 +1160,65 @@ mod tests {
             Message::decode(&long),
             Err(AdmissionError::WrongLength { .. })
         ));
+    }
+
+    /// A journal grant's manifest: journal records only, the journal number
+    /// as registration, zero stream registration and incarnation; anything
+    /// else with a journal record is refused, both ways.
+    #[test]
+    fn a_journal_manifest_follows_the_identity_rule() {
+        let journal = Record {
+            kind: RegionKind::Journal,
+            stream_id: 0,
+            session_id: 0,
+            lane: 0,
+            generation: 0,
+            ..record(4, Capability::None)
+        };
+        let manifest = |records: Vec<Record>, stream_registration, incarnation| Message::Manifest {
+            fetch: 1,
+            key: 2,
+            registration: 9,
+            stream_registration,
+            incarnation,
+            records,
+        };
+        let valid = manifest(vec![journal], 0, 0);
+        round_trip(&valid);
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let length = valid.encode(&mut out).unwrap();
+        let words = words_of(&out[..length]);
+        assert_eq!(words[..7], [MANIFEST, 1, 2, 9, 0, 0, 1]);
+        // The journal kind is 8 on the wire, the trace mirror 9.
+        assert_eq!(words[7 + 2] & 0xFF, 8);
+        for refused in [
+            manifest(vec![journal], 3, 0),
+            manifest(vec![journal], 0, 1),
+            manifest(vec![journal, record(5, Capability::None)], 0, 0),
+            manifest(vec![journal, record(5, Capability::None)], 3, 1),
+            manifest(vec![record(5, Capability::None)], 0, 0),
+            manifest(Vec::new(), 0, 0),
+        ] {
+            assert_eq!(
+                refused.encode(&mut out),
+                Err(AdmissionError::Reserved),
+                "{refused:?}"
+            );
+        }
+        // The decoder refuses the same words.
+        let mut raw = words.clone();
+        raw[4] = 3;
+        assert_eq!(
+            Message::decode(&bytes_of(&raw)),
+            Err(AdmissionError::Reserved)
+        );
+        let mut raw = words;
+        raw[7 + 2] = RegionKind::TraceMirror.code() | 1 << 8;
+        assert_eq!(
+            Message::decode(&bytes_of(&raw)),
+            Err(AdmissionError::Reserved),
+            "a mirror record needs a stream identity outside a journal manifest"
+        );
     }
 
     /// The four diagnostic records a driver grants a tool.
@@ -1150,7 +1343,7 @@ mod tests {
         let first = 40;
         for (offset, value) in [
             (first + 8, 0u8),
-            (first + 16, 8),
+            (first + 16, 10),
             (first + 49, 1),
             (first + 49, 3),
             (first + 49, 5),
@@ -1317,7 +1510,7 @@ mod properties {
         prop_oneof![
             3 => 0u64..=MAX_RECORDS as u64 + 1,
             1 => prop::sample::select(&TYPES[..]),
-            1 => (1u64..=7, any::<u32>()).prop_map(|(kind, layout)| kind | u64::from(layout) << 8),
+            1 => (1u64..=9, any::<u32>()).prop_map(|(kind, layout)| kind | u64::from(layout) << 8),
             1 => (any::<u8>(), 0u64..=5).prop_map(|(lane, capability)| u64::from(lane) | capability << 8),
             2 => any::<u64>(),
         ]
@@ -1335,7 +1528,7 @@ mod properties {
             field(any::<u64>().boxed()),
             field((0u64..=3).boxed()),
             field(
-                (0u64..=8, 0u64..=3)
+                (0u64..=10, 0u64..=3)
                     .prop_map(|(kind, layout)| kind | layout << 8)
                     .boxed(),
             ),
@@ -1416,6 +1609,8 @@ mod properties {
                 RegionKind::ClientCounters,
                 RegionKind::ErrorLog,
                 RegionKind::LossReport,
+                RegionKind::Journal,
+                RegionKind::TraceMirror,
             ][..],
         );
         let capability = prop_oneof![
@@ -1492,18 +1687,52 @@ mod properties {
                     records,
                 }
             ),
-            (id(), any::<(u64, u64)>(), id(), id(), records()).prop_map(
-                |(fetch, (key, registration), stream_registration, incarnation, records)| {
-                    Message::Manifest {
+            // A valid manifest follows the identity rule: journal records
+            // only, with zero stream registration and incarnation, or no
+            // journal record.
+            (
+                id(),
+                any::<(u64, u64)>(),
+                id(),
+                id(),
+                records(),
+                any::<bool>()
+            )
+                .prop_map(
+                    move |(
                         fetch,
-                        key,
-                        registration,
+                        (key, registration),
                         stream_registration,
                         incarnation,
-                        records,
+                        mut records,
+                        journal,
+                    )| {
+                        let (stream_registration, incarnation) =
+                            if valid && journal && !records.is_empty() {
+                                for record in &mut records {
+                                    record.kind = RegionKind::Journal;
+                                }
+                                (0, 0)
+                            } else {
+                                if valid {
+                                    for record in &mut records {
+                                        if record.kind == RegionKind::Journal {
+                                            record.kind = RegionKind::LogBuffer;
+                                        }
+                                    }
+                                }
+                                (stream_registration, incarnation)
+                            };
+                        Message::Manifest {
+                            fetch,
+                            key,
+                            registration,
+                            stream_registration,
+                            incarnation,
+                            records,
+                        }
                     }
-                }
-            ),
+                ),
             any::<(u64, u64)>().prop_map(|(fetch, index)| Message::Region { fetch, index }),
             (any::<u64>(), id()).prop_map(|(fetch, code)| Message::Refused { fetch, code }),
             any::<u64>().prop_map(|version| Message::ToolHello { version }),

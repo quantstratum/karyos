@@ -630,6 +630,18 @@ pub struct LossSnapshot {
 
 #[cfg(not(loom))]
 pub use owned::{JournalConsumer, JournalWriter, Losses, Record, Taken, record_journal};
+#[cfg(not(loom))]
+pub use shared::{
+    Drained, JOURNAL_LAYOUT_VERSION, JOURNAL_MAGIC, JournalDrain, JournalLayout, Violation,
+    journal_block,
+};
+#[cfg(not(loom))]
+#[cfg(target_os = "linux")]
+pub use shared::{attach_journal, journal_region};
+
+// Journals in one block of words: journal regions and their drain.
+#[cfg(not(loom))]
+mod shared;
 
 #[cfg(not(loom))]
 mod owned {
@@ -640,26 +652,68 @@ mod owned {
     };
     use crate::atomic_view::HeapWords;
 
+    /// Where a journal's words live.
     #[derive(Debug)]
-    struct Region {
-        records: HeapWords,
-        control: HeapWords,
-        ranges: HeapWords,
-        record_words: usize,
-        capacity: usize,
-        range_count: usize,
-        payload_words: usize,
+    pub(super) enum Backing {
+        /// Three heap allocations: records, control and drop ranges.
+        Heap {
+            records: HeapWords,
+            control: HeapWords,
+            ranges: HeapWords,
+        },
+        /// One heap block in the layout of a journal region's structure
+        /// ([`super::JournalLayout`]).
+        Block(HeapWords),
+        /// A journal region (Linux): created by the driver or attached by
+        /// its client.
+        #[cfg(target_os = "linux")]
+        Mapped(crate::ipc::Region),
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Region {
+        pub(super) backing: Backing,
+        pub(super) record_words: usize,
+        pub(super) capacity: usize,
+        pub(super) range_count: usize,
+        pub(super) payload_words: usize,
     }
 
     impl Region {
-        fn words(&self) -> Result<JournalWords<'_>, JournalError> {
+        /// The words of a block backing: the whole structure.
+        pub(super) fn block(&self) -> Option<&[crate::sync::AtomicU64]> {
+            match &self.backing {
+                Backing::Heap { .. } => None,
+                Backing::Block(heap) => Some(heap.words().as_slice()),
+                #[cfg(target_os = "linux")]
+                Backing::Mapped(region) => Some(region.structure().as_slice()),
+            }
+        }
+
+        pub(super) fn words(&self) -> Result<JournalWords<'_>, JournalError> {
             let invalid = JournalError::InvalidConfig;
+            if let Some(block) = self.block() {
+                let layout = super::JournalLayout {
+                    capacity: self.capacity,
+                    payload_words: self.payload_words,
+                    drop_ranges: self.range_count,
+                };
+                return layout.words(block).ok_or(invalid);
+            }
+            let Backing::Heap {
+                records,
+                control,
+                ranges,
+            } = &self.backing
+            else {
+                return Err(invalid);
+            };
             JournalWords::new(
-                self.records
+                records
                     .range(0, self.capacity * self.record_words)
                     .ok_or(invalid)?,
-                self.control.range(0, CONTROL_WORDS).ok_or(invalid)?,
-                self.ranges
+                control.range(0, CONTROL_WORDS).ok_or(invalid)?,
+                ranges
                     .range(0, self.range_count * RANGE_WORDS)
                     .ok_or(invalid)?,
                 self.payload_words,
@@ -691,9 +745,11 @@ mod owned {
         let ranges = HeapWords::zeroed(drop_ranges.checked_mul(RANGE_WORDS).ok_or(invalid)?)
             .map_err(|_| invalid)?;
         let region = Arc::new(Region {
-            records,
-            control,
-            ranges,
+            backing: Backing::Heap {
+                records,
+                control,
+                ranges,
+            },
             record_words,
             capacity,
             range_count: drop_ranges,
@@ -703,6 +759,7 @@ mod owned {
         Ok((
             JournalWriter {
                 region: Arc::clone(&region),
+                guard: None,
             },
             JournalConsumer {
                 payload: vec![0; payload_words].into_boxed_slice(),
@@ -717,7 +774,10 @@ mod owned {
     /// journal.
     #[derive(Debug)]
     pub struct JournalWriter {
-        region: Arc<Region>,
+        pub(super) region: Arc<Region>,
+        /// Dropped after the writer's last access and after `region`: a
+        /// remote client's detach, sent once its mapping is gone.
+        pub(super) guard: Option<Box<dyn core::any::Any + Send + Sync>>,
     }
 
     impl JournalWriter {
@@ -735,6 +795,27 @@ mod owned {
             if let Ok(words) = self.region.words() {
                 words.close();
             }
+        }
+
+        /// The same writer with `guard`, a value dropped after the writer's
+        /// storage: for a journal region, after its mapping is gone (a
+        /// remote client sends its `Detach` from it).
+        #[must_use]
+        pub fn with_guard(mut self, guard: impl core::any::Any + Send + Sync) -> Self {
+            self.guard = Some(Box::new(guard));
+            self
+        }
+
+        /// Words per record payload.
+        #[must_use]
+        pub fn payload_words(&self) -> usize {
+            self.region.payload_words
+        }
+
+        /// Records the journal holds.
+        #[must_use]
+        pub fn capacity(&self) -> usize {
+            self.region.capacity
         }
 
         #[cfg(test)]
@@ -758,6 +839,8 @@ mod owned {
 
     impl Drop for JournalWriter {
         fn drop(&mut self) {
+            // Then the fields drop in order: the storage (a mapping is
+            // unmapped with its last reference) before the guard.
             self.close();
         }
     }

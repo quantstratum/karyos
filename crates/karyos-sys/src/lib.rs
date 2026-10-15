@@ -62,6 +62,9 @@ pub mod term_bytes;
 // Real memory with std atomics; the Loom model covers `publication` instead.
 #[cfg(not(loom))]
 pub mod term_memory;
+// The trace mirror over `diag_ring`, like the typed rings of `diag`.
+#[cfg(not(loom))]
+pub mod trace_mirror;
 // Pause points for multi-process tests (feature `test-hooks`) and Loom models.
 #[cfg(any(feature = "test-hooks", loom))]
 pub mod test_pause;
