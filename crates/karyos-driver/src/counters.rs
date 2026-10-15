@@ -49,7 +49,7 @@
 //! | `counters unavailable` | event | counter allocations refused for lack of a free cell |
 //! | `generations retired` | gauge | mappings retired but not yet reclaimed, over all streams |
 //! | `slots quarantined` | gauge | slots in `RECLAIMING` with a live loan, over all streams and retained mappings |
-//! | `spare reservations in use` | gauge | spare-slot credits held by admitted subscribers, over all streams and retained mappings |
+//! | `spare reservations in use` | gauge | spare-slot credits in use as admission counts them (publisher credits plus subscriber credits), over all streams and retained mappings |
 //! | `loans outstanding` | gauge | non-zero loan words, over all streams and retained mappings |
 //! | `retirement pool exhausted` | event | reconfigurations refused because `max_retained_generations` predecessors are retained |
 //!

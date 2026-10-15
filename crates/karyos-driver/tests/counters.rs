@@ -152,9 +152,9 @@ fn lifetime_gauges_follow_credits_and_loans() {
     let mut writer = driver.publication(stream).unwrap();
     let _ = writer.offer(b"one").unwrap();
     let _ = driver.do_work().unwrap();
-    // The optional reader holds a spare-slot credit and the writer its
-    // term write loan; nothing is quarantined.
-    assert_eq!(value(&driver, "spare reservations in use"), 1);
+    // The exclusive publication's credit and the optional reader's; the
+    // writer holds its term write loan; nothing is quarantined.
+    assert_eq!(value(&driver, "spare reservations in use"), 2);
     assert!(value(&driver, "loans outstanding") > loans);
     assert_eq!(value(&driver, "slots quarantined"), 0);
     assert_eq!(value(&driver, "retirement pool exhausted"), 0);

@@ -250,6 +250,11 @@ fn a_loan_quarantines_its_slot_until_released() {
         let _ = publication.append(&data, AppendOptions::default()).unwrap();
         let report = conductor.duty_cycle().unwrap();
         quarantined |= report.quarantined > 0;
+        // The diagnostic accessor reports what the cycle left quarantined.
+        assert_eq!(
+            conductor.quarantined_slots(),
+            report.quarantined as usize
+        );
         let state =
             Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
         assert_eq!(state.term_id(), buffer.initial_term_id);
@@ -259,6 +264,7 @@ fn a_loan_quarantines_its_slot_until_released() {
     release_loan(&pinned.loan);
     let report = conductor.duty_cycle().unwrap();
     assert!(report.cleaned > 0);
+    assert_eq!(conductor.quarantined_slots(), 0);
     let state = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire))
         .unwrap()
         .state();

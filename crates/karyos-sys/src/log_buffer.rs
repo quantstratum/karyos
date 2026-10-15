@@ -3722,17 +3722,21 @@ impl<O: BufferOwner> Conductor<O> {
         self.quarantined.len()
     }
 
-    /// Subscriber cells holding a spare-slot credit (Acquire loads of their
-    /// states). Diagnostics sample it (`spare reservations in use`).
+    /// Spare-slot credits in use, as admission counts them: the publisher
+    /// credits reserved for the buffer's life (1 for the exclusive
+    /// publication, `P` for concurrent ones) plus the subscriber cells
+    /// holding a credit (Acquire loads of their states). Diagnostics
+    /// sample it (`spare reservations in use`).
     #[must_use]
     pub fn spare_credits(&self) -> usize {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        buffer
+        let subscribers = buffer
             .cells()
             .iter()
             .skip(buffer.first_subscriber_cell())
             .filter(|cell| holds_credit(cell.state.load(Ordering::Acquire)))
-            .count()
+            .count();
+        buffer.first_subscriber_cell().saturating_add(subscribers)
     }
 
     /// Registry cells, publisher cells included, whose loan word is not
