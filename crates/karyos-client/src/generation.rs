@@ -574,6 +574,7 @@ mod tests {
                 }
                 drop(link);
                 assert_eq!(retained.status(), LinkStatus::Closed, "{start:?}");
+                assert_eq!(End::peek(Some(&retained)), End::Closed, "{start:?}");
                 assert!(!retained.set_pending());
                 let (late, weak) = tracked();
                 let refused = retained.offer(9, late);
