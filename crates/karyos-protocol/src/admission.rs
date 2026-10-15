@@ -930,3 +930,330 @@ mod tests {
         ));
     }
 }
+
+/// Decoder properties of the admission messages (issue #121, the control
+/// protocol harness standing in for fuzzing, #11 option B), in the style
+/// of the frame parser's. The driver decodes datagrams from processes it
+/// has not admitted yet, so: decoding any bytes never panics; every valid
+/// message round-trips within [`MAX_MESSAGE_LENGTH`], and an encodable
+/// message always decodes to itself; decoding is canonical (whatever
+/// decodes re-encodes to the same bytes); a flipped byte or a changed
+/// length is refused unless the result re-encodes to exactly the input;
+/// and [`hello_version`] reads the version of a `Hello` of any layout.
+#[cfg(test)]
+// Test helpers outside #[test] functions are not covered by clippy.toml's
+// test exemptions (ADR-0007 exempts tests from these lints).
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const TYPES: [u64; 8] = [
+        HELLO, FETCH, DETACH, LEAVE, ADMITTED, MANIFEST, REGION, REFUSED,
+    ];
+
+    fn encoded(message: &Message) -> Result<Vec<u8>, AdmissionError> {
+        let mut out = vec![0u8; MAX_MESSAGE_LENGTH];
+        let length = message.encode(&mut out)?;
+        out.truncate(length);
+        Ok(out)
+    }
+
+    fn word(bytes: &[u8], index: usize) -> Option<u64> {
+        let chunk = bytes.get(index * 8..index * 8 + 8)?;
+        Some(u64::from_le_bytes(chunk.try_into().unwrap()))
+    }
+
+    /// Canonicality, and [`hello_version`] against a model: the second
+    /// word of anything at least two words long whose first word is
+    /// `Hello`'s type.
+    fn check_decoded(bytes: &[u8]) -> Result<bool, TestCaseError> {
+        let version = match (word(bytes, 0), word(bytes, 1)) {
+            (Some(HELLO), Some(version)) => Some(version),
+            _ => None,
+        };
+        prop_assert_eq!(hello_version(bytes), version);
+        match Message::decode(bytes) {
+            Ok(message) => {
+                prop_assert!(bytes.len() <= MAX_MESSAGE_LENGTH);
+                prop_assert_eq!(&encoded(&message).unwrap()[..], bytes);
+                if let Message::Hello { version } = message {
+                    prop_assert_eq!(hello_version(bytes), Some(version));
+                }
+                Ok(true)
+            }
+            Err(AdmissionError::UnknownType) => {
+                prop_assert!(word(bytes, 0).is_none_or(|kind| !TYPES.contains(&kind)));
+                Ok(false)
+            }
+            Err(AdmissionError::WrongLength { length, .. }) => {
+                prop_assert_eq!(length, bytes.len());
+                Ok(false)
+            }
+            Err(AdmissionError::TooManyRecords { count }) => {
+                prop_assert!(count > MAX_RECORDS as u64);
+                Ok(false)
+            }
+            Err(AdmissionError::Reserved) => Ok(false),
+            Err(error) => {
+                prop_assert!(false, "decoding returned {error:?}");
+                Ok(false)
+            }
+        }
+    }
+
+    /// A word biased to the small values the layouts give meaning to.
+    fn small_word() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            3 => 0u64..=MAX_RECORDS as u64 + 1,
+            1 => prop::sample::select(&TYPES[..]),
+            1 => (1u64..=5, any::<u32>()).prop_map(|(kind, layout)| kind | u64::from(layout) << 8),
+            1 => (any::<u8>(), 0u64..=5).prop_map(|(lane, capability)| u64::from(lane) | capability << 8),
+            2 => any::<u64>(),
+        ]
+    }
+
+    fn to_bytes(words: Vec<u64>) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// The words of a record, each shaped like its field (kind and layout,
+    /// lane and capability) or, now and then, anything.
+    fn record_words() -> impl Strategy<Value = Vec<u64>> {
+        let field = |shaped: BoxedStrategy<u64>| prop_oneof![7 => shaped, 1 => any::<u64>()];
+        (
+            field(any::<u64>().boxed()),
+            field((0u64..=3).boxed()),
+            field(
+                (0u64..=6, 0u64..=3)
+                    .prop_map(|(kind, layout)| kind | layout << 8)
+                    .boxed(),
+            ),
+            any::<[u64; 3]>(),
+            field(
+                (0u64..=4, 0u64..=6)
+                    .prop_map(|(lane, capability)| lane | capability << 8)
+                    .boxed(),
+            ),
+            field((0u64..=2).boxed()),
+        )
+            .prop_map(
+                |(region, export, kind, [length, generation, identity], lane, index)| {
+                    vec![
+                        region, export, kind, length, generation, identity, lane, index,
+                    ]
+                },
+            )
+    }
+
+    /// Any bytes up to a word past the largest message; or words with a
+    /// known type first, of any count, of the type's fixed count, or (for
+    /// `Admitted` and `Manifest`) with a record count and that many
+    /// record-shaped records.
+    fn input() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            1 => prop::collection::vec(any::<u8>(), 0..=MAX_MESSAGE_LENGTH + 8),
+            1 => (
+                prop::sample::select(&TYPES[..]),
+                prop::collection::vec(small_word(), 0..=8),
+            )
+                .prop_map(|(kind, rest)| to_bytes(core::iter::once(kind).chain(rest).collect())),
+            2 => prop::sample::select(
+                &[(HELLO, 2), (FETCH, 2), (DETACH, 1), (LEAVE, 0), (REGION, 2), (REFUSED, 2)][..],
+            )
+                .prop_flat_map(|(kind, count)| {
+                    prop::collection::vec(small_word(), count).prop_map(move |rest| {
+                        to_bytes(core::iter::once(kind).chain(rest).collect())
+                    })
+                }),
+            4 => (
+                prop::sample::select(&[ADMITTED, MANIFEST][..]),
+                prop::collection::vec(prop_oneof![3 => 1u64..=8, 1 => 0u64..=0], 5),
+                prop::collection::vec(record_words(), 0..=MAX_RECORDS),
+            )
+                .prop_map(|(kind, header, records)| {
+                    let header = &header[..if kind == ADMITTED { 4 } else { 5 }];
+                    to_bytes(
+                        core::iter::once(kind)
+                            .chain(header.iter().copied())
+                            .chain(core::iter::once(records.len() as u64))
+                            .chain(records.into_iter().flatten())
+                            .collect(),
+                    )
+                }),
+        ]
+    }
+
+    fn record(nonzero: bool) -> impl Strategy<Value = Record> {
+        let kind = prop::sample::select(
+            &[
+                RegionKind::CommandRing,
+                RegionKind::Broadcast,
+                RegionKind::Counters,
+                RegionKind::LogBuffer,
+                RegionKind::ClientCounters,
+            ][..],
+        );
+        let capability = prop_oneof![
+            Just(Capability::None),
+            any::<u64>().prop_map(|cell| Capability::RequiredSubscriber { cell }),
+            any::<u64>().prop_map(|cell| Capability::OptionalSubscriber { cell }),
+            any::<u64>().prop_map(|cell| Capability::ObserverSubscriber { cell }),
+            Just(Capability::ExclusivePublication),
+            any::<u64>().prop_map(|slot| Capability::ConcurrentPublication { slot }),
+        ];
+        let export = if nonzero {
+            (1..=u64::MAX).boxed()
+        } else {
+            prop_oneof![1..=u64::MAX, Just(0u64)].boxed()
+        };
+        (
+            any::<u64>(),
+            export,
+            kind,
+            any::<u32>(),
+            any::<[u64; 2]>(),
+            any::<(i32, i32, u8)>(),
+            capability,
+        )
+            .prop_map(
+                |(
+                    region,
+                    export,
+                    kind,
+                    layout,
+                    [structure_length, generation],
+                    (stream_id, session_id, lane),
+                    capability,
+                )| Record {
+                    region,
+                    export,
+                    kind,
+                    layout,
+                    structure_length,
+                    generation,
+                    stream_id,
+                    session_id,
+                    lane,
+                    capability,
+                },
+            )
+    }
+
+    /// A message; `valid` keeps every value decodable (nonzero where the
+    /// layout requires it, at most [`MAX_RECORDS`] records), otherwise
+    /// zeros and long manifests are frequent.
+    fn message(valid: bool) -> impl Strategy<Value = Message> {
+        let id = move || {
+            if valid {
+                (1..=u64::MAX).boxed()
+            } else {
+                prop_oneof![1..=u64::MAX, Just(0u64)].boxed()
+            }
+        };
+        let records = move || {
+            let most = if valid { MAX_RECORDS } else { MAX_RECORDS + 2 };
+            prop::collection::vec(record(valid), 0..=most)
+        };
+        prop_oneof![
+            any::<u64>().prop_map(|version| Message::Hello { version }),
+            (id(), any::<u64>()).prop_map(|(fetch, key)| Message::Fetch { fetch, key }),
+            id().prop_map(|export| Message::Detach { export }),
+            Just(Message::Leave),
+            (any::<u128>(), any::<(u64, u64)>(), records()).prop_map(
+                |(instance, (version, client), records)| Message::Admitted {
+                    instance,
+                    version,
+                    client,
+                    records,
+                }
+            ),
+            (id(), any::<(u64, u64)>(), id(), id(), records()).prop_map(
+                |(fetch, (key, registration), stream_registration, incarnation, records)| {
+                    Message::Manifest {
+                        fetch,
+                        key,
+                        registration,
+                        stream_registration,
+                        incarnation,
+                        records,
+                    }
+                }
+            ),
+            any::<(u64, u64)>().prop_map(|(fetch, index)| Message::Region { fetch, index }),
+            (any::<u64>(), id()).prop_map(|(fetch, code)| Message::Refused { fetch, code }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn any_datagram_is_refused_or_canonical(bytes in input()) {
+            check_decoded(&bytes)?;
+        }
+
+        #[test]
+        fn messages_round_trip_and_resist_mutation(
+            message in message(true),
+            flip in any::<prop::sample::Index>(),
+            mask in 1u8..=255,
+            cut in any::<prop::sample::Index>(),
+            extra in prop::collection::vec(any::<u8>(), 1..=16),
+        ) {
+            let bytes = encoded(&message).unwrap();
+            prop_assert!(bytes.len() <= MAX_MESSAGE_LENGTH);
+            prop_assert_eq!(Message::decode(&bytes).unwrap(), message.clone());
+            prop_assert!(check_decoded(&bytes)?);
+            let mut short = vec![0u8; bytes.len() - 1];
+            prop_assert_eq!(
+                message.encode(&mut short),
+                Err(AdmissionError::BufferTooShort {
+                    required: bytes.len(),
+                    available: bytes.len() - 1,
+                })
+            );
+
+            let mut flipped = bytes.clone();
+            flipped[flip.index(bytes.len())] ^= mask;
+            check_decoded(&flipped)?;
+
+            // The type fixes the length (with the record count, which the
+            // bytes keep): a prefix or an extension is refused.
+            prop_assert!(!check_decoded(&bytes[..cut.index(bytes.len())])?);
+            let mut longer = bytes.clone();
+            longer.extend_from_slice(&extra);
+            prop_assert!(!check_decoded(&longer)?);
+        }
+
+        /// What encodes decodes to itself: the encoder refuses exactly the
+        /// values the decoder could not return.
+        #[test]
+        fn an_encodable_message_decodes_to_itself(message in message(false)) {
+            match encoded(&message) {
+                Ok(bytes) => {
+                    prop_assert_eq!(Message::decode(&bytes).unwrap(), message);
+                }
+                Err(AdmissionError::Reserved) => {}
+                Err(AdmissionError::TooManyRecords { count }) => {
+                    prop_assert!(count > MAX_RECORDS as u64);
+                }
+                Err(error) => prop_assert!(false, "encoding returned {error:?}"),
+            }
+        }
+
+        /// A `Hello` of any version, and of any later layout that keeps its
+        /// first two words, yields its version.
+        #[test]
+        fn hello_version_reads_any_hello(
+            version in any::<u64>(),
+            rest in prop::collection::vec(any::<u8>(), 0..=64),
+        ) {
+            let bytes = encoded(&Message::Hello { version }).unwrap();
+            prop_assert_eq!(hello_version(&bytes), Some(version));
+            let mut later = bytes[..16].to_vec();
+            later.extend_from_slice(&rest);
+            prop_assert_eq!(hello_version(&later), Some(version));
+            prop_assert_eq!(hello_version(&bytes[..15]), None);
+        }
+    }
+}

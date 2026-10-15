@@ -1825,3 +1825,521 @@ mod tests {
         assert!(Event::decode(PUBLICATION_CLOSED, &out[..length]).is_err());
     }
 }
+
+/// Decoder properties of the client commands, the responses and the driver
+/// events (issue #121, the control protocol harness standing in for
+/// fuzzing, #11 option B), in the style of the frame parser's. Commands
+/// come from untrusted clients and every client parses the broadcast, so
+/// for each direction: decoding any record type and bytes never panics;
+/// every valid value round-trips within the direction's largest length;
+/// decoding is canonical (whatever decodes re-encodes to the same type and
+/// bytes); and a flipped byte, a changed length or another record type of
+/// the direction is refused unless the result re-encodes to exactly the
+/// bytes and type decoded.
+#[cfg(test)]
+// Test helpers outside #[test] functions are not covered by clippy.toml's
+// test exemptions (ADR-0007 exempts tests from these lints).
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod properties {
+    use core::fmt::Debug;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// The codec of one direction.
+    struct Codec<T> {
+        decode: fn(u32, &[u8]) -> Result<T, CncError>,
+        encode: fn(&T, &mut [u8]) -> Result<usize, CncError>,
+        type_id: fn(&T) -> u32,
+        max: usize,
+        types: &'static [u32],
+    }
+
+    const COMMANDS: Codec<Command> = Codec {
+        decode: Command::decode,
+        encode: Command::encode,
+        type_id: Command::type_id,
+        max: MAX_COMMAND_LENGTH,
+        types: &[
+            ADD_PUBLICATION,
+            ADD_SUBSCRIPTION,
+            REMOVE_PUBLICATION,
+            REMOVE_SUBSCRIPTION,
+            ADD_CONCURRENT_PUBLICATION,
+            ALLOCATE_COUNTER,
+            RELEASE_COUNTER,
+            REPORT_LOSS,
+        ],
+    };
+
+    const RESPONSES: Codec<Response> = Codec {
+        decode: Response::decode,
+        encode: Response::encode,
+        type_id: Response::type_id,
+        max: MAX_RESPONSE_LENGTH,
+        types: &[
+            PUBLICATION_READY,
+            SUBSCRIPTION_READY,
+            OPERATION_SUCCEEDED,
+            ERROR,
+            COUNTER_ALLOCATED,
+        ],
+    };
+
+    const EVENTS: Codec<Event> = Codec {
+        decode: Event::decode,
+        encode: Event::encode,
+        type_id: Event::type_id,
+        max: MAX_EVENT_LENGTH,
+        types: &[
+            PARTICIPANT_LOST,
+            REQUIRED_BOUND_WITHDRAWN,
+            PUBLICATION_CLOSED,
+            SUCCESSOR_READY,
+            FENCED,
+        ],
+    };
+
+    impl<T: PartialEq + Debug> Codec<T> {
+        fn encoded(&self, value: &T) -> Vec<u8> {
+            let mut out = vec![0u8; self.max];
+            let length = (self.encode)(value, &mut out).unwrap();
+            out.truncate(length);
+            out
+        }
+
+        /// Canonicality: a decoded value has the record type it was
+        /// decoded from, and re-encodes to exactly the bytes.
+        fn check_decoded(&self, type_id: u32, bytes: &[u8]) -> Result<bool, TestCaseError> {
+            match (self.decode)(type_id, bytes) {
+                Ok(value) => {
+                    prop_assert_eq!((self.type_id)(&value), type_id);
+                    prop_assert!(bytes.len() <= self.max);
+                    prop_assert_eq!(&self.encoded(&value)[..], bytes);
+                    Ok(true)
+                }
+                Err(CncError::UnknownType { type_id: found }) => {
+                    prop_assert_eq!(found, type_id);
+                    prop_assert!(!self.types.contains(&type_id));
+                    Ok(false)
+                }
+                Err(CncError::WrongLength {
+                    type_id: found,
+                    length,
+                    expected,
+                }) => {
+                    prop_assert_eq!(found, type_id);
+                    prop_assert_eq!(length, bytes.len());
+                    prop_assert_ne!(length, expected);
+                    prop_assert!(expected <= self.max);
+                    Ok(false)
+                }
+                Err(CncError::Reserved { type_id: found }) => {
+                    prop_assert_eq!(found, type_id);
+                    Ok(false)
+                }
+                Err(error) => {
+                    prop_assert!(false, "decoding returned {error:?}");
+                    Ok(false)
+                }
+            }
+        }
+
+        /// Round trip: `value` encodes within the largest length, into no
+        /// shorter buffer, and decodes to itself; every single byte flip,
+        /// length change or other record type of the direction is refused
+        /// or yields a value that re-encodes to the changed input.
+        fn check_value(
+            &self,
+            value: &T,
+            flip: prop::sample::Index,
+            mask: u8,
+            cut: prop::sample::Index,
+            other: prop::sample::Index,
+        ) -> Result<(), TestCaseError> {
+            let bytes = self.encoded(value);
+            let type_id = (self.type_id)(value);
+            prop_assert!(bytes.len() <= self.max);
+            prop_assert!(bytes.len().is_multiple_of(8));
+            prop_assert!(self.types.contains(&type_id));
+            prop_assert_eq!(&(self.decode)(type_id, &bytes).unwrap(), value);
+            let mut short = vec![0u8; bytes.len() - 1];
+            prop_assert_eq!(
+                (self.encode)(value, &mut short),
+                Err(CncError::BufferTooShort {
+                    required: bytes.len(),
+                    available: bytes.len() - 1,
+                })
+            );
+
+            let mut flipped = bytes.clone();
+            flipped[flip.index(bytes.len())] ^= mask;
+            self.check_decoded(type_id, &flipped)?;
+
+            // Every layout has a fixed length: a prefix or an extension is
+            // refused.
+            let prefix = &bytes[..cut.index(bytes.len())];
+            prop_assert!(!self.check_decoded(type_id, prefix)?);
+            let mut longer = bytes.clone();
+            longer.resize(bytes.len() + 1 + cut.index(16), 0);
+            prop_assert!(!self.check_decoded(type_id, &longer)?);
+
+            let other = self.types[other.index(self.types.len())];
+            self.check_decoded(other, &bytes)?;
+            Ok(())
+        }
+    }
+
+    /// A record type: one of `types`, a neighbour of one, or anything.
+    fn type_id(types: &'static [u32]) -> impl Strategy<Value = u32> {
+        prop_oneof![
+            4 => prop::sample::select(types),
+            1 => prop::sample::select(types).prop_map(|type_id| type_id ^ 0x40),
+            1 => 0u32..=0x100,
+            1 => any::<u32>(),
+        ]
+    }
+
+    /// A word biased to the small values the layouts give meaning to.
+    fn word() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            2 => 0u64..=8,
+            1 => (0u64..4, 1u64..=4, 1u64..=4, 0u64..=3).prop_map(|(lane, policy, outcome, reason)| {
+                lane | policy << 8 | outcome << 16 | reason << 24
+            }),
+            2 => any::<u64>(),
+            1 => any::<u32>().prop_map(u64::from),
+        ]
+    }
+
+    fn to_bytes(words: Vec<u64>) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// A record type and bytes: any type with arbitrary bytes of any length
+    /// up to a word past the largest, or with biased words of any count; or
+    /// a type of `layouts` with biased words of its layout's count.
+    fn input(
+        types: &'static [u32],
+        max: usize,
+        layouts: &'static [(u32, usize)],
+    ) -> impl Strategy<Value = (u32, Vec<u8>)> {
+        prop_oneof![
+            1 => (type_id(types), prop::collection::vec(any::<u8>(), 0..=max + 8)),
+            1 => (type_id(types), prop::collection::vec(word(), 0..=max / 8 + 1).prop_map(to_bytes)),
+            3 => prop::sample::select(layouts).prop_flat_map(|(type_id, count)| {
+                (Just(type_id), prop::collection::vec(word(), count).prop_map(to_bytes))
+            }),
+        ]
+    }
+
+    fn stream() -> impl Strategy<Value = StreamKey> {
+        (any::<i32>(), any::<i32>()).prop_map(|(stream_id, session_id)| StreamKey {
+            stream_id,
+            session_id,
+        })
+    }
+
+    fn request() -> impl Strategy<Value = RequestId> {
+        (any::<u64>(), any::<u64>()).prop_map(|(client, sequence)| RequestId { client, sequence })
+    }
+
+    /// A label of at most [`MAX_LABEL_LENGTH`] bytes of any characters,
+    /// NUL included.
+    fn label() -> impl Strategy<Value = CounterLabel> {
+        prop::collection::vec(any::<char>(), 0..=MAX_LABEL_LENGTH).prop_map(|chars| {
+            let mut text = String::new();
+            for c in chars {
+                if text.len() + c.len_utf8() <= MAX_LABEL_LENGTH {
+                    text.push(c);
+                }
+            }
+            CounterLabel::new(&text).unwrap()
+        })
+    }
+
+    fn loss() -> impl Strategy<Value = ReportedLoss> {
+        use FallbackReasonCode::{NoArchive, NoRecording, RetentionShort};
+        use RejoinOutcomeCode::{Closed, ResumedAtHead, SnapshotFailed, SnapshotRebuilt};
+        use RejoinPolicyCode::{Close, RejoinAtHead, Replay, Snapshot};
+        (
+            any::<[u64; 5]>(),
+            0..karyos_sys::frame::Lane::COUNT,
+            any::<(u64, u64)>(),
+            prop::sample::select(&[RejoinAtHead, Snapshot, Close, Replay][..]),
+            any::<prop::sample::Index>(),
+            prop::sample::select(&[NoArchive, NoRecording, RetentionShort][..]),
+        )
+            .prop_map(
+                |(
+                    [high, low, stream_registration, incarnation, subscription],
+                    lane,
+                    (a, b),
+                    configured,
+                    outcome,
+                    reason,
+                )| {
+                    let outcomes: &[RejoinOutcomeCode] = match configured {
+                        RejoinAtHead => &[ResumedAtHead],
+                        Snapshot => &[SnapshotRebuilt, SnapshotFailed],
+                        Close => &[Closed],
+                        Replay => &[ResumedAtHead, SnapshotRebuilt, SnapshotFailed, Closed],
+                    };
+                    ReportedLoss {
+                        driver: [high, low],
+                        stream_registration,
+                        incarnation,
+                        subscription,
+                        lane,
+                        from: a.min(b),
+                        to: a.max(b),
+                        configured,
+                        applied: *outcome.get(outcomes),
+                        fallback: (configured == Replay).then_some(reason),
+                    }
+                },
+            )
+    }
+
+    fn command() -> impl Strategy<Value = Command> {
+        let role = prop::sample::select(
+            &[
+                SubscriberRole::Required,
+                SubscriberRole::Optional,
+                SubscriberRole::Observer,
+            ][..],
+        );
+        prop_oneof![
+            (any::<u64>(), stream(), any::<bool>()).prop_map(
+                |(sequence, stream, allow_unconnected)| Command::AddPublication {
+                    sequence,
+                    stream,
+                    allow_unconnected,
+                }
+            ),
+            (any::<u64>(), stream(), any::<bool>()).prop_map(
+                |(sequence, stream, allow_unconnected)| Command::AddConcurrentPublication {
+                    sequence,
+                    stream,
+                    allow_unconnected,
+                }
+            ),
+            (any::<u64>(), stream(), role).prop_map(|(sequence, stream, role)| {
+                Command::AddSubscription {
+                    sequence,
+                    stream,
+                    role,
+                }
+            }),
+            any::<(u64, u64)>().prop_map(|(sequence, registration)| {
+                Command::RemovePublication {
+                    sequence,
+                    registration,
+                }
+            }),
+            any::<(u64, u64)>().prop_map(|(sequence, registration)| {
+                Command::RemoveSubscription {
+                    sequence,
+                    registration,
+                }
+            }),
+            (any::<[u64; 4]>(), label()).prop_map(
+                |([sequence, type_id, stream, participant], label)| Command::AllocateCounter {
+                    sequence,
+                    type_id,
+                    label,
+                    stream,
+                    participant,
+                }
+            ),
+            any::<[u64; 3]>().prop_map(|[sequence, cell, registration]| {
+                Command::ReleaseCounter {
+                    sequence,
+                    cell,
+                    registration,
+                }
+            }),
+            (any::<u64>(), loss())
+                .prop_map(|(sequence, loss)| Command::ReportLoss { sequence, loss }),
+        ]
+    }
+
+    fn response() -> impl Strategy<Value = Response> {
+        let code = prop::sample::select(
+            &[
+                ErrorCode::PublicationTaken,
+                ErrorCode::UnknownStream,
+                ErrorCode::UnknownRegistration,
+                ErrorCode::ResourcesUnavailable,
+                ErrorCode::IdentitiesExhausted,
+                ErrorCode::InvalidPublicationMode,
+            ][..],
+        );
+        prop_oneof![
+            (request(), any::<(u64, u64)>()).prop_map(|(request, (registration, key))| {
+                Response::PublicationReady {
+                    request,
+                    registration,
+                    key,
+                }
+            }),
+            (request(), any::<(u64, u64)>()).prop_map(|(request, (registration, key))| {
+                Response::SubscriptionReady {
+                    request,
+                    registration,
+                    key,
+                }
+            }),
+            request().prop_map(|request| Response::OperationSucceeded { request }),
+            (request(), code, any::<u64>()).prop_map(|(request, code, detail)| {
+                Response::Error {
+                    request,
+                    code,
+                    detail,
+                }
+            }),
+            (request(), any::<(u64, u64)>()).prop_map(|(request, (cell, registration))| {
+                Response::CounterAllocated {
+                    request,
+                    cell,
+                    registration,
+                }
+            }),
+        ]
+    }
+
+    fn event() -> impl Strategy<Value = Event> {
+        let policy = prop::sample::select(
+            &[
+                LossPolicyCode::Hold,
+                LossPolicyCode::Continue,
+                LossPolicyCode::Abort,
+            ][..],
+        );
+        prop_oneof![
+            (stream(), any::<[u64; 3]>(), policy).prop_map(
+                |(stream, [registration, client, position], policy)| Event::ParticipantLost {
+                    stream,
+                    registration,
+                    client,
+                    policy,
+                    position,
+                }
+            ),
+            (stream(), any::<(u64, u64)>()).prop_map(|(stream, (registration, position))| {
+                Event::RequiredBoundWithdrawn {
+                    stream,
+                    registration,
+                    position,
+                }
+            }),
+            stream().prop_map(|stream| Event::PublicationClosed {
+                stream,
+                reason: CloseReason::RequiredParticipantLost,
+            }),
+            (stream(), any::<[u64; 4]>()).prop_map(
+                |(stream, [registration, key, base, generation])| Event::SuccessorReady {
+                    stream,
+                    registration,
+                    key,
+                    base,
+                    generation,
+                }
+            ),
+            (stream(), any::<u64>()).prop_map(|(stream, registration)| Event::Fenced {
+                stream,
+                registration,
+            }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn any_command_input_is_refused_or_canonical(
+            (type_id, bytes) in input(
+                COMMANDS.types,
+                MAX_COMMAND_LENGTH,
+                &[
+                    (ADD_PUBLICATION, 3),
+                    (ADD_SUBSCRIPTION, 3),
+                    (REMOVE_PUBLICATION, 2),
+                    (REMOVE_SUBSCRIPTION, 2),
+                    (ADD_CONCURRENT_PUBLICATION, 3),
+                    (ALLOCATE_COUNTER, ALLOCATE_COUNTER_WORDS),
+                    (RELEASE_COUNTER, 3),
+                    (REPORT_LOSS, REPORT_LOSS_WORDS),
+                ],
+            ),
+        ) {
+            COMMANDS.check_decoded(type_id, &bytes)?;
+        }
+
+        #[test]
+        fn any_response_input_is_refused_or_canonical(
+            (type_id, bytes) in input(
+                RESPONSES.types,
+                MAX_RESPONSE_LENGTH,
+                &[
+                    (PUBLICATION_READY, 4),
+                    (SUBSCRIPTION_READY, 4),
+                    (OPERATION_SUCCEEDED, 2),
+                    (ERROR, 4),
+                    (COUNTER_ALLOCATED, 4),
+                ],
+            ),
+        ) {
+            RESPONSES.check_decoded(type_id, &bytes)?;
+        }
+
+        #[test]
+        fn any_event_input_is_refused_or_canonical(
+            (type_id, bytes) in input(
+                EVENTS.types,
+                MAX_EVENT_LENGTH,
+                &[
+                    (PARTICIPANT_LOST, 5),
+                    (REQUIRED_BOUND_WITHDRAWN, 3),
+                    (PUBLICATION_CLOSED, 2),
+                    (SUCCESSOR_READY, 5),
+                    (FENCED, 2),
+                ],
+            ),
+        ) {
+            EVENTS.check_decoded(type_id, &bytes)?;
+        }
+
+        #[test]
+        fn commands_round_trip_and_resist_mutation(
+            command in command(),
+            flip in any::<prop::sample::Index>(),
+            mask in 1u8..=255,
+            cut in any::<prop::sample::Index>(),
+            other in any::<prop::sample::Index>(),
+        ) {
+            COMMANDS.check_value(&command, flip, mask, cut, other)?;
+        }
+
+        #[test]
+        fn responses_round_trip_and_resist_mutation(
+            response in response(),
+            flip in any::<prop::sample::Index>(),
+            mask in 1u8..=255,
+            cut in any::<prop::sample::Index>(),
+            other in any::<prop::sample::Index>(),
+        ) {
+            RESPONSES.check_value(&response, flip, mask, cut, other)?;
+        }
+
+        #[test]
+        fn events_round_trip_and_resist_mutation(
+            event in event(),
+            flip in any::<prop::sample::Index>(),
+            mask in 1u8..=255,
+            cut in any::<prop::sample::Index>(),
+            other in any::<prop::sample::Index>(),
+        ) {
+            EVENTS.check_value(&event, flip, mask, cut, other)?;
+        }
+    }
+}

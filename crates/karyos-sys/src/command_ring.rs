@@ -795,3 +795,357 @@ mod tests {
         assert!(producer.is_closed());
     }
 }
+
+/// Consumer properties over untrusted producer memory (issue #121, the
+/// control protocol harness standing in for fuzzing, #11 option B), in the
+/// style of the frame parser's: whatever words and positions a faulty or
+/// hostile client stores, the consumer never panics or reads outside the
+/// data area, every record it delivers satisfies the producer's framing
+/// rules, and it closes the ring rather than stall; a well-formed ring
+/// delivers exactly what was written, in order.
+#[cfg(all(test, not(loom)))]
+// Test helpers outside #[test] functions are not covered by clippy.toml's
+// test exemptions (ADR-0007 exempts tests from these lints).
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod properties {
+    use std::collections::VecDeque;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// A ring of `2^log_words` data words and its trailer.
+    struct Memory {
+        data: Vec<AtomicU64>,
+        trailer: Vec<AtomicU64>,
+        max_extent: u64,
+    }
+
+    impl Memory {
+        fn new(log_words: u32, extent_words: u64) -> Self {
+            let words = 1usize << log_words;
+            let capacity = words as u64 * 8;
+            // A multiple of 8 between 16 and half the capacity.
+            let max_extent = (extent_words * 8).clamp(16, capacity / 2);
+            Self {
+                data: (0..words).map(|_| AtomicU64::new(0)).collect(),
+                trailer: (0..TRAILER_WORDS).map(|_| AtomicU64::new(0)).collect(),
+                max_extent,
+            }
+        }
+
+        fn words(&self) -> RingWords<'_> {
+            RingWords::new(&self.data, &self.trailer, self.max_extent).unwrap()
+        }
+    }
+
+    /// Geometry: 4 to 128 data words, and the record limit in words.
+    fn geometry() -> impl Strategy<Value = (u32, u64)> {
+        (2u32..=7, 2u64..=64)
+    }
+
+    /// A data word as a hostile producer might store it: often a header with
+    /// a plausible length (or the padding type), sometimes anything.
+    fn hostile_word() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            2 => any::<u64>(),
+            1 => (any::<u32>(), 0u64..=1100).prop_map(|(type_id, length)| {
+                (u64::from(type_id) << 32) | length
+            }),
+            1 => (0u64..=1100).prop_map(|length| (u64::from(PAD_TYPE) << 32) | length),
+            6 => (0u32..=4, 8u64..=64).prop_map(|(type_id, length)| {
+                (u64::from(type_id) << 32) | length
+            }),
+            1 => Just(0u64),
+        ]
+    }
+
+    /// A position: from the start, anywhere, or near the end of the `u64`
+    /// range.
+    fn base() -> impl Strategy<Value = u64> {
+        prop_oneof![0u64..=4096, any::<u64>(), (u64::MAX - 4096)..=u64::MAX]
+    }
+
+    fn load(words: &RingWords<'_>, position: u64) -> u64 {
+        words.word_at(position).unwrap().load(Ordering::Relaxed)
+    }
+
+    fn positions(words: &RingWords<'_>) -> (u64, u64) {
+        let tail = words.trailer(TAIL).unwrap().load(Ordering::Relaxed);
+        let head = words.trailer(HEAD).unwrap().load(Ordering::Relaxed);
+        (tail, head)
+    }
+
+    /// One record the consumer delivered.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Delivered {
+        position: u64,
+        type_id: u32,
+        payload: Vec<u8>,
+    }
+
+    /// How draining ended.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum End {
+        /// Every published byte was consumed.
+        Drained,
+        /// The consumer found a malformed record or position.
+        Malformed,
+    }
+
+    /// Reads until the ring is drained or closed, checking every step
+    /// against the framing rules; returns what was delivered and how it
+    /// ended. Each read either consumes at least 8 bytes or ends, so the
+    /// loop is bounded by the published bytes.
+    fn drain(words: &RingWords<'_>) -> Result<(Vec<Delivered>, End), TestCaseError> {
+        let capacity = words.capacity;
+        let max_payload = words.max_payload();
+        let mut out = vec![0u8; max_payload];
+        let mut delivered = Vec::new();
+        let (tail, start) = positions(words);
+        let limit = tail.wrapping_sub(start).min(capacity) / 8 + 3;
+        for _ in 0..limit {
+            let (tail, head) = positions(words);
+            match words.read(&mut out) {
+                Ok(RingRead::Message {
+                    position,
+                    type_id,
+                    length,
+                }) => {
+                    let (_, after) = positions(words);
+                    let extent = align8(length as u64 + 8).unwrap();
+                    prop_assert_ne!(type_id, PAD_TYPE);
+                    prop_assert!(length <= max_payload);
+                    prop_assert!(extent <= words.max_extent);
+                    prop_assert!(position >= head && position.is_multiple_of(8));
+                    prop_assert_eq!(position + extent, after);
+                    prop_assert!(after <= tail);
+                    // A record never wraps around the end of the area.
+                    prop_assert!((position & (capacity - 1)) + extent <= capacity);
+                    // The header names the record, and the payload is the
+                    // words after it.
+                    prop_assert_eq!(
+                        load(words, position),
+                        (u64::from(type_id) << 32) | (length as u64 + 8)
+                    );
+                    let expected: Vec<u8> = (0..extent / 8 - 1)
+                        .flat_map(|index| load(words, position + 8 + index * 8).to_le_bytes())
+                        .take(length)
+                        .collect();
+                    prop_assert_eq!(&out[..length], &expected[..]);
+                    // Anything between the old head and the record is one
+                    // padding record that reaches the end of the area.
+                    if position != head {
+                        prop_assert_eq!(position & (capacity - 1), 0);
+                        prop_assert_eq!(load(words, head) >> 32, u64::from(PAD_TYPE));
+                    }
+                    delivered.push(Delivered {
+                        position,
+                        type_id,
+                        payload: expected,
+                    });
+                }
+                Ok(RingRead::Pending) => {
+                    let (_, after) = positions(words);
+                    prop_assert!(head <= after && after <= tail);
+                    if after == tail {
+                        return Ok((delivered, End::Drained));
+                    }
+                    // Only stepping over padding leaves bytes pending.
+                    prop_assert!(after > head);
+                }
+                Err(RingError::Malformed { position }) => {
+                    let (_, after) = positions(words);
+                    prop_assert_eq!(position, after);
+                    prop_assert!(words.is_closed());
+                    prop_assert_eq!(words.read(&mut out), Err(RingError::Closed));
+                    return Ok((delivered, End::Malformed));
+                }
+                Err(other) => prop_assert!(false, "unexpected read error {other:?}"),
+            }
+        }
+        Err(TestCaseError::fail(
+            "the consumer neither drained nor closed the ring",
+        ))
+    }
+
+    /// One producer step of a model run.
+    #[derive(Debug, Clone)]
+    enum Step {
+        Write { type_id: u32, payload: Vec<u8> },
+        Read,
+    }
+
+    /// A write (mostly small payloads, sometimes past any limit, sometimes
+    /// of the reserved type) or, with weight `reads` against 4, a read.
+    fn step(reads: u32) -> impl Strategy<Value = Step> {
+        let payload = prop_oneof![0usize..=24, 0usize..=520]
+            .prop_flat_map(|length| prop::collection::vec(any::<u8>(), length));
+        prop_oneof![
+            4 => (
+                prop_oneof![8 => 0u32..=8, 4 => any::<u32>(), 1 => Just(PAD_TYPE)],
+                payload,
+            )
+                .prop_map(|(type_id, payload)| Step::Write { type_id, payload }),
+            reads => Just(Step::Read),
+        ]
+    }
+
+    /// Runs `steps` against a ring whose positions start at `seed`, checking
+    /// writes and reads against a FIFO model; returns the records written
+    /// and not yet read, with their positions.
+    fn run(
+        words: &RingWords<'_>,
+        seed: u64,
+        steps: &[Step],
+    ) -> Result<VecDeque<Delivered>, TestCaseError> {
+        words.seed(seed);
+        let max_payload = words.max_payload();
+        let mut out = vec![0u8; max_payload];
+        let mut model: VecDeque<Delivered> = VecDeque::new();
+        for step in steps {
+            match step {
+                Step::Write { type_id, payload } => match words.write(*type_id, payload) {
+                    Ok(position) => {
+                        prop_assert_ne!(*type_id, PAD_TYPE);
+                        prop_assert!(payload.len() <= max_payload);
+                        model.push_back(Delivered {
+                            position,
+                            type_id: *type_id,
+                            payload: payload.clone(),
+                        });
+                    }
+                    Err(RingError::ReservedType { type_id: rejected }) => {
+                        prop_assert_eq!(rejected, PAD_TYPE);
+                        prop_assert_eq!(*type_id, PAD_TYPE);
+                    }
+                    Err(RingError::MessageTooLarge { length, max }) => {
+                        prop_assert_eq!(length, payload.len());
+                        prop_assert_eq!(max, max_payload);
+                        prop_assert!(payload.len() > max_payload);
+                    }
+                    // Any record within the limit fits an empty ring.
+                    Err(RingError::Full) => prop_assert!(!model.is_empty()),
+                    Err(other) => prop_assert!(false, "unexpected write error {other:?}"),
+                },
+                Step::Read => match words.read(&mut out) {
+                    Ok(RingRead::Message {
+                        position,
+                        type_id,
+                        length,
+                    }) => {
+                        let expected = model.pop_front();
+                        prop_assert_eq!(
+                            Some(Delivered {
+                                position,
+                                type_id,
+                                payload: out[..length].to_vec(),
+                            }),
+                            expected
+                        );
+                    }
+                    Ok(RingRead::Pending) => prop_assert!(model.is_empty()),
+                    Err(other) => prop_assert!(false, "unexpected read error {other:?}"),
+                },
+            }
+        }
+        Ok(model)
+    }
+
+    proptest! {
+        #![proptest_config(crate::receive::tests_config())]
+
+        /// Arbitrary data words and positions: no panic, no read outside
+        /// the area, only well-framed records delivered, and the consumer
+        /// either drains the published bytes or closes the ring.
+        #[test]
+        fn a_consumer_survives_any_producer_memory(
+            ((log_words, extent_words), contents) in geometry().prop_flat_map(|geometry| {
+                (Just(geometry), prop::collection::vec(hostile_word(), 1usize << geometry.0))
+            }),
+            head in prop_oneof![3 => base().prop_map(|position| position & !7), 1 => base()],
+            // Mostly whole words up to the capacity (taken modulo the word
+            // count), sometimes any distance.
+            published in prop_oneof![6 => (0u64..=128).prop_map(Ok), 2 => any::<u64>().prop_map(Err)],
+        ) {
+            let memory = Memory::new(log_words, extent_words);
+            let words = memory.words();
+            for (word, value) in memory.data.iter().zip(&contents) {
+                word.store(*value, Ordering::Relaxed);
+            }
+            let published = published
+                .map_or_else(|raw| raw, |count| count % (words.capacity / 8 + 1) * 8);
+            let tail = head.wrapping_add(published);
+            words.set_positions(tail, head);
+            let valid = tail >= head
+                && tail - head <= words.capacity
+                && head.is_multiple_of(8)
+                && tail.is_multiple_of(8);
+            let (_, end) = drain(&words)?;
+            // Impossible positions are refused before anything is read.
+            if !valid {
+                prop_assert_eq!(end, End::Malformed);
+            }
+        }
+
+        /// A correct producer and consumer, interleaved from any starting
+        /// position: every record is delivered once, in order, unchanged.
+        #[test]
+        fn written_records_are_read_back_in_order(
+            (log_words, extent_words) in geometry(),
+            seed in base().prop_map(|position| position.min(u64::MAX - (1 << 20)) & !7),
+            steps in prop::collection::vec(step(2), 1..64),
+        ) {
+            let memory = Memory::new(log_words, extent_words);
+            let words = memory.words();
+            let pending = run(&words, seed, &steps)?;
+            let (delivered, end) = drain(&words)?;
+            prop_assert_eq!(end, End::Drained);
+            prop_assert_eq!(delivered, Vec::from(pending));
+        }
+
+        /// A well-formed ring with one data word overwritten: records that
+        /// end before the overwritten word are delivered unchanged, the rest
+        /// only as well-framed records, and a word outside the published
+        /// bytes changes nothing.
+        #[test]
+        fn one_corrupted_word_only_affects_what_follows_it(
+            (log_words, extent_words) in geometry(),
+            seed in base().prop_map(|position| position.min(u64::MAX - (1 << 20)) & !7),
+            steps in prop::collection::vec(step(1), 1..64),
+            index in any::<prop::sample::Index>(),
+            corruption in prop_oneof![
+                hostile_word().prop_map(|value| (value, true)),
+                (0u32..64).prop_map(|bit| (1u64 << bit, false)),
+            ],
+        ) {
+            let memory = Memory::new(log_words, extent_words);
+            let words = memory.words();
+            let pending = run(&words, seed, &steps)?;
+            let (tail, head) = positions(&words);
+            let capacity = words.capacity;
+            let offset = index.index(memory.data.len()) as u64 * 8;
+            let original = load(&words, offset);
+            let (value, replace) = corruption;
+            let value = if replace { value } else { original ^ value };
+            words.corrupt(offset, value);
+            // The stream position of the overwritten word, if published.
+            let corrupted = head + (offset.wrapping_sub(head) & (capacity - 1));
+            let (delivered, end) = drain(&words)?;
+            if corrupted >= tail || value == original {
+                prop_assert_eq!(end, End::Drained);
+                prop_assert_eq!(delivered, Vec::from(pending));
+            } else {
+                let intact: Vec<Delivered> = pending
+                    .into_iter()
+                    .take_while(|record| {
+                        record.position + align8(record.payload.len() as u64 + 8).unwrap()
+                            <= corrupted
+                    })
+                    .collect();
+                prop_assert!(delivered.len() >= intact.len());
+                prop_assert_eq!(&delivered[..intact.len()], &intact[..]);
+            }
+        }
+    }
+}
