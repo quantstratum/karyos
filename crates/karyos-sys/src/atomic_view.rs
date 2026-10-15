@@ -419,4 +419,91 @@ mod tests {
             assert!(AtomicWords::from_raw(base, 12).is_err());
         }
     }
+
+    /// A read-only view over a heap block: built through the raw
+    /// constructor that mappings use, so Miri checks its provenance and
+    /// bounds.
+    fn read_only(heap: &HeapWords) -> ReadOnlyWords<'_> {
+        let base = heap.words().as_slice().as_ptr().cast::<u8>();
+        // SAFETY: `base` covers `heap.count()` initialized, aligned words of
+        // one allocation that `heap` keeps alive for the borrow, accessed
+        // only atomically.
+        unsafe { ReadOnlyWords::from_raw(base, heap.count() * WORD_BYTES) }.unwrap()
+    }
+
+    #[test]
+    fn read_only_from_raw_reads_heap_words() {
+        let heap = HeapWords::zeroed(6).unwrap();
+        for (index, word) in heap.words().as_slice().iter().enumerate() {
+            word.store(index as u64 * 10, Ordering::Release);
+        }
+        let view = read_only(&heap);
+        assert_eq!(view.len(), 6);
+        assert!(!view.is_empty());
+        assert_eq!(view.load(0), Some(0));
+        assert_eq!(view.load_acquire(5), Some(50));
+        assert_eq!(view.load(6), None);
+        assert_eq!(view.load_acquire(usize::MAX), None);
+        // A later store through the writable view is seen by the reader.
+        heap.words().get(2).unwrap().store(7, Ordering::Release);
+        assert_eq!(view.load_acquire(2), Some(7));
+    }
+
+    #[test]
+    fn read_only_subviews_stay_in_bounds() {
+        let heap = HeapWords::zeroed(6).unwrap();
+        for (index, word) in heap.words().as_slice().iter().enumerate() {
+            word.store(index as u64, Ordering::Relaxed);
+        }
+        let view = read_only(&heap);
+        let tail = view.slice_from(4);
+        assert_eq!(
+            (tail.len(), tail.load(0), tail.load(1)),
+            (2, Some(4), Some(5))
+        );
+        assert_eq!(tail.load(2), None);
+        assert!(view.slice_from(6).is_empty());
+        assert!(view.slice_from(usize::MAX).is_empty());
+        let range = view.range(1, 3);
+        assert_eq!(range.len(), 3);
+        assert_eq!(
+            (range.load(0), range.load(2), range.load(3)),
+            (Some(1), Some(3), None)
+        );
+        assert_eq!(range.range(1, 2).load(1), Some(3));
+        assert!(view.range(4, 3).is_empty());
+        assert!(view.range(usize::MAX, 2).is_empty());
+        assert!(view.range(2, usize::MAX).is_empty());
+        assert!(ReadOnlyWords::empty().is_empty());
+        assert_eq!(ReadOnlyWords::empty().load(0), None);
+        let of = ReadOnlyWords::of(heap.words());
+        assert_eq!((of.len(), of.load(3)), (6, Some(3)));
+    }
+
+    #[test]
+    fn read_only_from_raw_rejects_invalid_regions() {
+        let heap = HeapWords::zeroed(2).unwrap();
+        let base = heap.words().as_slice().as_ptr().cast::<u8>();
+        // SAFETY: every call below is rejected by the checks before any
+        // reference is created.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(core::ptr::null(), 8).is_err());
+        }
+        // SAFETY: as above; misaligned base is rejected.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(base.wrapping_add(1), 8).is_err());
+        }
+        // SAFETY: as above; zero length is rejected.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(base, 0).is_err());
+        }
+        // SAFETY: as above; a length that is not a multiple of 8 is rejected.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(base, 12).is_err());
+        }
+        // SAFETY: as above; a length over isize::MAX is rejected.
+        unsafe {
+            assert!(ReadOnlyWords::from_raw(base, usize::MAX - 7).is_err());
+        }
+    }
 }
