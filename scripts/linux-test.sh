@@ -14,13 +14,16 @@
 # worktrees replace each other's test binaries, and a log can then show
 # another tree's tests. Each tree therefore gets its own target volume,
 # named from KARYOS_LINUX_TARGET or, by default,
-# karyos-linux-target-<basename of the repository root>.
+# karyos-linux-target-<basename>-<checksum>: the basename of the
+# repository root, for reading, and the POSIX cksum of its full physical
+# path, so that two trees with the same basename get different volumes.
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 image="${KARYOS_LINUX_IMAGE:-rust:1.99}"
 tree="$(basename "$root" | tr -c 'A-Za-z0-9_.-\n' '-')"
-target="${KARYOS_LINUX_TARGET:-karyos-linux-target-$tree}"
+sum="$(printf '%s' "$root" | cksum | cut -d ' ' -f 1)"
+target="${KARYOS_LINUX_TARGET:-karyos-linux-target-$tree-$sum}"
 args=("$@")
 if [ ${#args[@]} -eq 0 ]; then
     args=(--workspace --locked)
