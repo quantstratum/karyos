@@ -29,6 +29,7 @@ pub mod conflation;
 pub mod counters;
 pub mod error;
 pub mod frame;
+pub mod host_clock;
 pub mod loan;
 // Real memory with std atomics, like `term_memory`.
 #[cfg(not(loom))]

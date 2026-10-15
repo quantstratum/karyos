@@ -4,7 +4,9 @@
 //!
 //! A counters region has a fixed number of cells. Each cell has a value word
 //! on its own 128-byte stride and a metadata record (version, state,
-//! registration id, type id and a label of up to 64 bytes) published with a
+//! registration id, type id, a label of up to 64 bytes and, from layout
+//! version 2, three key words; `quantstratum-docs:
+//! karyos/design/observability-and-tools.md`, "Counters") published with a
 //! seqlock: the allocator makes the version odd, issues a Release fence,
 //! writes the metadata with Relaxed stores, resets the value with a Relaxed
 //! swap (a read-modify-write), and makes the version even with a Release
@@ -46,8 +48,74 @@ const META_REGISTRATION: usize = 2;
 const META_TYPE: usize = 3;
 const META_LABEL_LENGTH: usize = 4;
 const META_LABEL: usize = 5;
-/// Metadata words used per cell (the rest of the stride is reserved).
-pub const META_WORDS: usize = META_LABEL + LABEL_WORDS;
+const META_KEYS: usize = META_LABEL + LABEL_WORDS;
+/// Key words per cell (layout version 2).
+pub const KEY_WORDS: usize = 3;
+/// Metadata words used per cell: the whole stride from layout version 2.
+pub const META_WORDS: usize = META_KEYS + KEY_WORDS;
+
+/// Counter type: an event count (cnc-primitives.md).
+pub const TYPE_EVENT: u64 = 1;
+/// Counter type: a gauge (cnc-primitives.md).
+pub const TYPE_GAUGE: u64 = 2;
+/// Counter type: a stream position in bytes, sampled by the driver.
+pub const TYPE_POSITION: u64 = 4;
+/// Counter type: a host `CLOCK_MONOTONIC` time in nanoseconds.
+pub const TYPE_TIMESTAMP: u64 = 5;
+
+/// Participant kind in `key1` bits 15 to 8: none.
+pub const KIND_NONE: u8 = 0;
+/// Participant kind: a subscriber.
+pub const KIND_SUBSCRIBER: u8 = 1;
+/// Participant kind: a publication.
+pub const KIND_PUBLICATION: u8 = 2;
+/// Participant kind: a client.
+pub const KIND_CLIENT: u8 = 3;
+
+/// The three key words that let tools group counters without parsing
+/// labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CounterKeys {
+    /// `key0`: registration id of the stream, 0 for driver-wide counters.
+    pub stream: u64,
+    /// `key1` bits 7 to 0: the lane.
+    pub lane: u8,
+    /// `key1` bits 15 to 8: the participant kind (`KIND_*`).
+    pub kind: u8,
+    /// `key2`: registration id of the participant or client, 0 when none.
+    pub participant: u64,
+}
+
+impl CounterKeys {
+    /// Keys of a driver-wide counter: all zero.
+    pub const DRIVER: Self = Self {
+        stream: 0,
+        lane: 0,
+        kind: KIND_NONE,
+        participant: 0,
+    };
+
+    fn words(self) -> [u64; KEY_WORDS] {
+        [
+            self.stream,
+            u64::from(self.lane) | (u64::from(self.kind) << 8),
+            self.participant,
+        ]
+    }
+
+    /// Decodes the key words; `None` when `key1` has bits set above bit 15.
+    fn from_words([stream, key1, participant]: [u64; KEY_WORDS]) -> Option<Self> {
+        if key1 >> 16 != 0 {
+            return None;
+        }
+        Some(Self {
+            stream,
+            lane: (key1 & 0xFF) as u8,
+            kind: ((key1 >> 8) & 0xFF) as u8,
+            participant,
+        })
+    }
+}
 
 /// The cell holds no counter.
 pub const STATE_FREE: u64 = 0;
@@ -73,6 +141,8 @@ pub struct CounterMetadata {
     pub registration_id: u64,
     /// Application-defined counter type.
     pub type_id: u64,
+    /// The key words.
+    pub keys: CounterKeys,
     label: [u8; MAX_LABEL_LENGTH],
     label_length: u8,
 }
@@ -102,9 +172,17 @@ impl CounterMetadata {
         Ok(Self {
             registration_id,
             type_id,
+            keys: CounterKeys::DRIVER,
             label: stored,
             label_length: length,
         })
+    }
+
+    /// The same metadata with `keys`.
+    #[must_use]
+    pub fn with_keys(mut self, keys: CounterKeys) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// The label bytes.
@@ -214,14 +292,24 @@ impl<'a> CellWords<'a> {
             }
         };
         let empty = [0u8; MAX_LABEL_LENGTH];
-        let (registration, type_id, length, label) = metadata.map_or((0, 0, 0, &empty), |m| {
-            (m.registration_id, m.type_id, m.label_length, &m.label)
-        });
+        let (registration, type_id, length, label, keys) =
+            metadata.map_or((0, 0, 0, &empty, CounterKeys::DRIVER), |m| {
+                (
+                    m.registration_id,
+                    m.type_id,
+                    m.label_length,
+                    &m.label,
+                    m.keys,
+                )
+            });
         store(META_REGISTRATION, registration);
         store(META_TYPE, type_id);
         store(META_LABEL_LENGTH, u64::from(length));
         for (index, chunk) in label.as_chunks::<8>().0.iter().enumerate() {
             store(META_LABEL + index, u64::from_le_bytes(*chunk));
+        }
+        for (index, key) in keys.words().into_iter().enumerate() {
+            store(META_KEYS + index, key);
         }
         // A swap, not a store: the reset heads the release sequence that
         // later increments extend.
@@ -290,6 +378,10 @@ impl<'a> CellWords<'a> {
             for (index, chunk) in label.as_chunks_mut::<8>().0.iter_mut().enumerate() {
                 *chunk = load(META_LABEL + index).to_le_bytes();
             }
+            let mut keys = [0u64; KEY_WORDS];
+            for (index, key) in keys.iter_mut().enumerate() {
+                *key = load(META_KEYS + index);
+            }
             let value = self.value.load(Ordering::Relaxed);
             fence(Ordering::Acquire);
             if version.load(Ordering::Relaxed) != before {
@@ -303,10 +395,14 @@ impl<'a> CellWords<'a> {
                     else {
                         return CellRead::Changing;
                     };
+                    let Some(keys) = CounterKeys::from_words(keys) else {
+                        return CellRead::Changing;
+                    };
                     CellRead::Allocated {
                         metadata: CounterMetadata {
                             registration_id,
                             type_id,
+                            keys,
                             label,
                             label_length,
                         },
@@ -431,9 +527,11 @@ mod owned {
             .checked_add(STRIDE_WORDS)
     }
 
-    /// Layout version of a counters region.
+    /// Layout version of a counters region: 2 adds the key words
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`).
+    /// Readers reject any other version.
     #[cfg(target_os = "linux")]
-    pub const LAYOUT_VERSION: u64 = 1;
+    pub const LAYOUT_VERSION: u64 = 2;
 
     /// Creates a region of `capacity` counters in a new shared region
     /// (driver side, `quantstratum-docs: karyos/design/ipc-cnc-regions.md`): its single
@@ -490,11 +588,27 @@ mod owned {
         /// pending release, [`CounterError::LabelTooLong`] and
         /// [`CounterError::IdentitiesExhausted`].
         pub fn allocate(&mut self, type_id: u64, label: &str) -> Result<Counter, CounterError> {
+            self.allocate_keyed(type_id, label, super::CounterKeys::DRIVER)
+        }
+
+        /// Allocates a counter with value 0 and its key words (control
+        /// path).
+        ///
+        /// # Errors
+        ///
+        /// As [`CountersManager::allocate`].
+        pub fn allocate_keyed(
+            &mut self,
+            type_id: u64,
+            label: &str,
+            keys: super::CounterKeys,
+        ) -> Result<Counter, CounterError> {
             let next = self
                 .next_registration
                 .checked_add(1)
                 .ok_or(CounterError::IdentitiesExhausted)?;
-            let metadata = CounterMetadata::new(self.next_registration, type_id, label)?;
+            let metadata =
+                CounterMetadata::new(self.next_registration, type_id, label)?.with_keys(keys);
             let index = (0..self.region.capacity)
                 .find(|&index| {
                     self.region.cell(index).is_some_and(|cell| {
@@ -690,6 +804,38 @@ mod tests {
         let index = sent.index();
         manager.free(sent).unwrap();
         assert_eq!(reader.read(index), CellRead::Free);
+    }
+
+    #[test]
+    fn keys_round_trip_and_a_bad_key1_is_never_accepted() {
+        let (mut manager, reader) = counters(2).unwrap();
+        let keys = CounterKeys {
+            stream: u64::MAX,
+            lane: 0xFF,
+            kind: KIND_CLIENT,
+            participant: 7,
+        };
+        let keyed = manager
+            .allocate_keyed(TYPE_TIMESTAMP, "positions sampled at", keys)
+            .unwrap();
+        let CellRead::Allocated { metadata, .. } = reader.read(keyed.index()) else {
+            panic!("expected an allocated cell");
+        };
+        assert_eq!(metadata.keys, keys);
+        let plain = manager.allocate(TYPE_EVENT, "events").unwrap();
+        let CellRead::Allocated { metadata, .. } = reader.read(plain.index()) else {
+            panic!("expected an allocated cell");
+        };
+        assert_eq!(metadata.keys, CounterKeys::DRIVER);
+        // key1 bits above 15 are reserved: a cell carrying them is never
+        // accepted as a snapshot.
+        let meta: Vec<AtomicU64> = (0..META_WORDS).map(|_| AtomicU64::new(0)).collect();
+        let value = AtomicU64::new(0);
+        let cell = CellWords::new(&meta, &value).unwrap();
+        cell.allocate(&CounterMetadata::new(1, TYPE_EVENT, "x").unwrap())
+            .unwrap();
+        meta[META_KEYS + 1].store(1 << 16, Ordering::Relaxed);
+        assert_eq!(cell.read(), CellRead::Changing);
     }
 
     #[test]

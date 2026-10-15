@@ -15,7 +15,7 @@
 
 #![cfg(loom)]
 
-use karyos_sys::counters::{CellRead, CellWords, CounterMetadata, META_WORDS};
+use karyos_sys::counters::{CellRead, CellWords, CounterKeys, CounterMetadata, META_WORDS};
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::sync::Arc;
 use loom::thread;
@@ -45,12 +45,28 @@ impl Cell {
     }
 }
 
+// A and B differ in every key word too, so a read mixing their keys is
+// caught like one mixing their labels (layout version 2).
 fn metadata_a() -> CounterMetadata {
-    CounterMetadata::new(1, 10, &"a".repeat(64)).unwrap()
+    CounterMetadata::new(1, 10, &"a".repeat(64))
+        .unwrap()
+        .with_keys(CounterKeys {
+            stream: 1,
+            lane: 1,
+            kind: 1,
+            participant: 1,
+        })
 }
 
 fn metadata_b() -> CounterMetadata {
-    CounterMetadata::new(2, 20, &"b".repeat(64)).unwrap()
+    CounterMetadata::new(2, 20, &"b".repeat(64))
+        .unwrap()
+        .with_keys(CounterKeys {
+            stream: 2,
+            lane: 2,
+            kind: 2,
+            participant: 2,
+        })
 }
 
 /// Checks a concurrent read: A's metadata only with A's values, B's only
