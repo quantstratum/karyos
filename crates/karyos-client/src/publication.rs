@@ -538,7 +538,7 @@ impl<T: TermBytes> ClientPublication<T> {
         let Some(link) = &self.link else {
             return End::Closed;
         };
-        match link.next() {
+        match link.next(self.inner.buffer().sealed_with_successor()) {
             Next::Wait => End::Retry,
             Next::Moved {
                 base,
@@ -909,7 +909,7 @@ mod tests {
             publication.offer(b"before").unwrap(),
             OfferOutcome::Accepted { position: 0, .. }
         ));
-        conductor.seal().unwrap();
+        conductor.seal_for_cutover().unwrap();
         // The seal is unresolved until the control path offers a successor.
         assert_eq!(
             publication.offer(b"after").unwrap(),
@@ -959,7 +959,7 @@ mod tests {
             .with_generation(Arc::clone(&link), 0)
             .unwrap()
             .with_export(Export::new(DropMark(Arc::clone(&detached))));
-        conductor.seal().unwrap();
+        conductor.seal_for_cutover().unwrap();
         let (successor, mut successor_conductor) = fresh_exclusive();
         assert!(successor_conductor.register_publication(7).unwrap());
         let prepared = Publication::prepare_adopt(Arc::clone(&successor), 7).unwrap();
@@ -981,6 +981,17 @@ mod tests {
         assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 0);
         drop(link.take_retired());
         assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_remote_publication_closes_at_once_at_a_final_seal() {
+        let (_buffer, mut conductor, publication) = setup(true);
+        let link = GenerationLink::new_remote();
+        let mut publication = publication.with_generation(Arc::clone(&link), 0).unwrap();
+        conductor.seal().unwrap();
+        // No successor mark: no wait, whatever the control path knows.
+        assert_eq!(publication.offer(b"after").unwrap(), OfferOutcome::Closed);
+        assert!(matches!(publication.try_claim(8), Ok(ClaimOutcome::Closed)));
     }
 
     /// A fresh exclusive buffer whose publication is not issued.

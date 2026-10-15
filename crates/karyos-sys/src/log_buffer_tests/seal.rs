@@ -186,6 +186,37 @@ fn an_unissued_or_dropped_publication_does_not_delay_the_position() {
 }
 
 #[test]
+fn a_cutover_seal_marks_its_successor_and_positioning_keeps_the_mark() {
+    for cutover in [false, true] {
+        let buffer = new_buffer(config(3, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        assert!(matches!(
+            publication.append(&message(0), AppendOptions::default()).unwrap(),
+            AppendOutcome::Appended { .. }
+        ));
+        let end = buffer.reserved_head().load(Ordering::Acquire);
+        assert!(!buffer.sealed_with_successor());
+        if cutover {
+            conductor.seal_for_cutover().unwrap();
+        } else {
+            conductor.seal().unwrap();
+        }
+        assert_eq!(conductor.seal_state(), SealState::Sealed);
+        assert_eq!(buffer.sealed_with_successor(), cutover);
+        drop(publication);
+        let _ = conductor.duty_cycle().unwrap();
+        // The position is the same either way; the mark survives it.
+        assert_eq!(conductor.seal_state(), SealState::Retired { position: end });
+        assert_eq!(buffer.sealed_with_successor(), cutover);
+        // A later seal of either kind changes nothing.
+        conductor.seal().unwrap();
+        conductor.seal_for_cutover().unwrap();
+        assert_eq!(buffer.sealed_with_successor(), cutover);
+    }
+}
+
+#[test]
 fn a_second_seal_has_no_effect() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();

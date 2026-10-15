@@ -427,3 +427,68 @@ fn the_counting_allocator_counts_in_this_binary() {
     let ((), operations) = count(|| drop(std::hint::black_box(vec![0u8; 64])));
     assert_eq!(operations, 2);
 }
+
+/// A final seal carries no successor mark: a remote publication and a
+/// remote subscription close at once at `remove_stream`, without waiting
+/// for any event from their client's control path.
+#[test]
+fn remote_handles_close_at_once_at_a_final_seal() {
+    let dir = dir("final");
+    let mut driver = driver(&dir, 5_000_000_000);
+    let stream = driver
+        .add_stream(stream_config(PublicationMode::Exclusive))
+        .unwrap();
+    let path = dir.clone();
+    let (client, mut publication, mut subscription) = serve_while(&mut driver, move || {
+        let mut client = attach(&path, Duration::from_secs(5), 16).unwrap();
+        let publishing = client.add_publication(KEY, false).unwrap();
+        let _ = client
+            .add_subscription(KEY, SubscriberRole::Required)
+            .unwrap();
+        let mut grants = Vec::new();
+        let start = Instant::now();
+        while grants.len() < 2 {
+            assert!(start.elapsed() < Duration::from_secs(5), "no grants");
+            let _ = client.poll(usize::MAX, |completion| {
+                if let Outcome::Fetchable(grant) = completion.outcome {
+                    grants.push((completion.sequence, grant));
+                }
+            });
+        }
+        let (mut publication, mut subscription) = (None, None);
+        for (sequence, grant) in grants {
+            if sequence == publishing {
+                publication = Some(client.take_publication(&grant).unwrap());
+            } else {
+                subscription = Some(client.take_subscription(&grant).unwrap());
+            }
+        }
+        (client, publication.unwrap(), subscription.unwrap())
+    });
+    assert!(matches!(
+        publication.offer(b"last").unwrap(),
+        OfferOutcome::Accepted { position: 0, .. }
+    ));
+    driver.remove_stream(stream).unwrap();
+    // The publication's next attempt sees the final seal and ends.
+    assert_eq!(publication.offer(b"late").unwrap(), OfferOutcome::Closed);
+    drop(publication);
+    // The subscription reads the backlog, then the end, once the driver
+    // positions the seal; its client is never polled.
+    let mut seen = Vec::new();
+    let mut closed = None;
+    serve_until(&mut driver, |_| {
+        let summary = subscription
+            .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+            .unwrap();
+        closed = summary.closed;
+        closed.is_some()
+    });
+    assert_eq!(seen, vec![b"last".to_vec()]);
+    assert_eq!(
+        subscription.generation_link().unwrap().status(),
+        LinkStatus::Current
+    );
+    drop(subscription);
+    drop(client);
+}

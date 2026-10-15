@@ -20,9 +20,10 @@
 //! step, and leaves its predecessor in the link's retired slot, which the
 //! control path drops later (unmapping it and sending its `Detach`). A
 //! remote handle learns of a cutover only from the driver's broadcast, which
-//! can come after its data path sees the seal, so its link reports an
-//! unresolved seal as pending until the control path offers a successor or
-//! closes the link.
+//! can come after its data path sees the seal; the seal word marks whether
+//! a successor exists (owner decision 2026-10-15, ACS 13103). A remote link
+//! reports a seal with a successor as pending until the control path offers
+//! the successor or closes the link, and a seal without one as the end.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -195,8 +196,8 @@ impl End {
         };
         match link.status() {
             LinkStatus::Pending | LinkStatus::Offered => Self::Retry,
-            // A remote handle's seal is unresolved until its control path
-            // offers a successor or closes the link.
+            // Read before the seal word is: retry, and the next call decides
+            // from the seal's successor mark.
             LinkStatus::Current if link.remote => Self::Retry,
             _ => Self::Closed,
         }
@@ -322,13 +323,14 @@ impl<T: TermBytes> GenerationLink<T> {
         }
     }
 
-    /// Handle: its mapping ended. Takes an offered successor (the link is
-    /// `Current` again, for a later cutover), or reports a pending cutover
-    /// or the end. A `Current` link means no cutover was started: the end,
-    /// except for a remote link, whose control path may not have heard of
+    /// Handle: its mapping ended, with a seal that marks a `successor` or
+    /// not. Takes an offered successor (the link is `Current` again, for a
+    /// later cutover), or reports a pending cutover or the end. A `Current`
+    /// link means no cutover was started: the end, except for a remote link
+    /// whose seal marks a successor, whose control path has not heard of
     /// the cutover yet. A remote handle whose retired slot is still full
     /// waits until its control path empties it.
-    pub(crate) fn next(&self) -> Next<T> {
+    pub(crate) fn next(&self, successor: bool) -> Next<T> {
         let mut inner = self.lock();
         if self.remote && inner.retired.is_some() && matches!(inner.state, State::Offered { .. }) {
             return Next::Wait;
@@ -339,7 +341,7 @@ impl<T: TermBytes> GenerationLink<T> {
                 inner.state = State::Pending;
                 Next::Wait
             }
-            State::Current if self.remote => Next::Wait,
+            State::Current if self.remote && successor => Next::Wait,
             ended @ (State::Fenced | State::Closed) => {
                 inner.state = ended;
                 Next::End
@@ -412,14 +414,14 @@ mod tests {
     fn a_link_moves_through_pending_and_offered_to_current() {
         let link = GenerationLink::<HeapTerms>::new();
         assert_eq!(link.status(), LinkStatus::Current);
-        assert!(matches!(link.next(), Next::End));
+        assert!(matches!(link.next(true), Next::End));
         assert!(link.offer(5, successor()).is_err());
         assert!(link.set_pending());
         assert!(!link.set_pending());
-        assert!(matches!(link.next(), Next::Wait));
+        assert!(matches!(link.next(true), Next::Wait));
         assert!(link.offer(5, successor()).is_ok());
         assert_eq!(link.status(), LinkStatus::Offered);
-        assert!(matches!(link.next(), Next::Moved { base: 5, .. }));
+        assert!(matches!(link.next(true), Next::Moved { base: 5, .. }));
         assert_eq!(link.status(), LinkStatus::Current);
         // Admitted: a late fence changes nothing.
         assert!(link.fence().is_none());
@@ -433,8 +435,8 @@ mod tests {
         assert!(link.offer(5, successor()).is_ok());
         assert!(matches!(link.fence(), Some(Successor::Publication(_))));
         assert_eq!(link.status(), LinkStatus::Fenced);
-        assert!(matches!(link.next(), Next::End));
-        assert!(matches!(link.next(), Next::End));
+        assert!(matches!(link.next(true), Next::End));
+        assert!(matches!(link.next(true), Next::End));
         assert!(!link.set_pending());
         assert!(link.offer(9, successor()).is_err());
     }
@@ -442,13 +444,25 @@ mod tests {
     #[test]
     fn a_remote_link_waits_at_an_unresolved_seal_and_takes_an_offer_without_pending() {
         let link = GenerationLink::<HeapTerms>::new_remote();
-        assert!(matches!(link.next(), Next::Wait));
+        assert!(matches!(link.next(true), Next::Wait));
         assert_eq!(End::peek(Some(&link)), End::Retry);
         assert!(link.offer(5, successor()).is_ok());
-        assert!(matches!(link.next(), Next::Moved { base: 5, .. }));
+        assert!(matches!(link.next(true), Next::Moved { base: 5, .. }));
         assert_eq!(link.status(), LinkStatus::Current);
         // The next mapping's seal is unresolved again.
-        assert!(matches!(link.next(), Next::Wait));
+        assert!(matches!(link.next(true), Next::Wait));
+    }
+
+    #[test]
+    fn a_remote_link_ends_at_a_seal_without_a_successor() {
+        let link = GenerationLink::<HeapTerms>::new_remote();
+        assert!(matches!(link.next(false), Next::End));
+        // An offer that came first is still taken.
+        assert!(link.offer(5, successor()).is_ok());
+        assert!(matches!(link.next(false), Next::Moved { base: 5, .. }));
+        // The in-process link ignores the mark.
+        let link = GenerationLink::<HeapTerms>::new();
+        assert!(matches!(link.next(true), Next::End));
     }
 
     #[test]
@@ -459,11 +473,11 @@ mod tests {
             _export: None,
         });
         assert!(link.offer(5, successor()).is_ok());
-        assert!(matches!(link.next(), Next::Wait));
+        assert!(matches!(link.next(true), Next::Wait));
         assert_eq!(link.status(), LinkStatus::Offered);
         assert!(link.take_retired().is_some());
         assert!(link.take_retired().is_none());
-        assert!(matches!(link.next(), Next::Moved { base: 5, .. }));
+        assert!(matches!(link.next(true), Next::Moved { base: 5, .. }));
     }
 
     #[test]
@@ -474,7 +488,7 @@ mod tests {
             assert!(link.offer(5, successor()).is_ok());
             assert!(matches!(link.close(), Some(Successor::Publication(_))));
             assert_eq!(link.status(), LinkStatus::Closed);
-            assert!(matches!(link.next(), Next::End));
+            assert!(matches!(link.next(true), Next::End));
             assert_eq!(End::peek(Some(&link)), End::Closed);
             assert!(link.offer(9, successor()).is_err());
             assert!(!link.set_pending());
@@ -484,7 +498,7 @@ mod tests {
         }
         let link = GenerationLink::<HeapTerms>::new_remote();
         assert!(link.close().is_none());
-        assert!(matches!(link.next(), Next::End));
+        assert!(matches!(link.next(true), Next::End));
     }
 
     /// The allocation counts of the handle tests are meaningful: the
@@ -505,7 +519,7 @@ mod tests {
             _export: None,
         });
         assert_eq!(link.status(), LinkStatus::Closed);
-        assert!(matches!(link.next(), Next::End));
+        assert!(matches!(link.next(true), Next::End));
         assert!(link.take_retired().is_some());
     }
 
@@ -515,6 +529,6 @@ mod tests {
         assert!(link.set_pending());
         assert!(link.fence().is_none());
         assert_eq!(link.status(), LinkStatus::Fenced);
-        assert!(matches!(link.next(), Next::End));
+        assert!(matches!(link.next(true), Next::End));
     }
 }

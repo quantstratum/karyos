@@ -154,7 +154,7 @@ const fn holds_credit(state: u64) -> bool {
 /// The seal position bits of the seal word (`quantstratum-docs: karyos/design/publication-seal.md`):
 /// `0` while active, `SEAL_SEALED` once sealed, and `SEAL_SEALED |
 /// SEAL_POSITIONED | position` once the seal position is known.
-const SEAL_POSITION: u64 = SEAL_POSITIONED - 1;
+const SEAL_POSITION: u64 = crate::publication::SEAL_POSITION_MASK;
 
 /// A subscriber's role (SPEC.md §4 reader roles).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -766,6 +766,15 @@ impl<T: TermBytes> LogBuffer<T> {
     #[must_use]
     pub fn generation(&self) -> Generation {
         self.generation
+    }
+
+    /// Whether the buffer is sealed for a mapping-generation cutover: the
+    /// stream continues in a successor mapping (Acquire). `false` while
+    /// active and for a final seal.
+    #[inline]
+    #[must_use]
+    pub fn sealed_with_successor(&self) -> bool {
+        crate::publication::seal_has_successor(self.seal().load(Ordering::Acquire))
     }
 
     /// Largest message without the trace extension.
@@ -3634,12 +3643,31 @@ impl<O: BufferOwner> Conductor<O> {
     /// Returns errors from the descriptor protocol, which indicate a broken
     /// invariant.
     pub fn seal(&mut self) -> Result<(), SysError> {
+        self.seal_with(false)
+    }
+
+    /// Seals the buffer for a mapping-generation cutover, as
+    /// [`Conductor::seal`], marking the seal word with a successor: a reader
+    /// that sees this seal knows the stream continues in another mapping.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::seal`].
+    pub fn seal_for_cutover(&mut self) -> Result<(), SysError> {
+        self.seal_with(true)
+    }
+
+    fn seal_with(&mut self, successor: bool) -> Result<(), SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         if buffer.seal().load(Ordering::Relaxed) != 0 {
             return Ok(());
         }
         // Every reservation ends above the zero limit this stores.
-        seal(buffer.seal(), buffer.limit());
+        if successor {
+            crate::publication::seal_for_cutover(buffer.seal(), buffer.limit());
+        } else {
+            seal(buffer.seal(), buffer.limit());
+        }
         if buffer.concurrent() {
             self.context().fence()?;
         }

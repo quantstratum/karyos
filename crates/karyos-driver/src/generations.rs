@@ -442,8 +442,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .conductor_owned()
             .ok_or(SysError::ResourcesUnavailable)?;
         let target = self.active_stream_mut(stream)?;
-        // Effect.
-        target.conductor.seal()?;
+        // Effect. The seal marks the successor, so a remote handle that sees
+        // it waits for its successor rather than closing.
+        target.conductor.seal_for_cutover()?;
         target.spare = None;
         let snapshot = target
             .members

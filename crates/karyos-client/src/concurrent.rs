@@ -503,7 +503,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         let Some(link) = &self.link else {
             return End::Closed;
         };
-        match link.next() {
+        match link.next(self.inner.buffer().sealed_with_successor()) {
             Next::Wait => End::Retry,
             Next::Moved {
                 base,
@@ -811,7 +811,7 @@ mod tests {
             .with_generation(Arc::clone(&link), 0)
             .unwrap()
             .with_export(crate::link::Export::new(DropMark(Arc::clone(&detached))));
-            conductor.seal().unwrap();
+            conductor.seal_for_cutover().unwrap();
             assert_eq!(
                 publication.offer(b"late").unwrap(),
                 ConcurrentOfferOutcome::AdminAction,
