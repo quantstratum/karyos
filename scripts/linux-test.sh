@@ -24,16 +24,39 @@ image="${KARYOS_LINUX_IMAGE:-rust:1.99}"
 tree="$(basename "$root" | tr -c 'A-Za-z0-9_.-\n' '-')"
 sum="$(printf '%s' "$root" | cksum | cut -d ' ' -f 1)"
 target="${KARYOS_LINUX_TARGET:-karyos-linux-target-$tree-$sum}"
+# KARYOS_LINUX_PLATFORM selects another container platform, for example
+# linux/amd64 under emulation. Its build artifacts get their own target
+# volume, so they never replace the native ones.
+platform_args=()
+if [ -n "${KARYOS_LINUX_PLATFORM:-}" ]; then
+    platform_args=(--platform "$KARYOS_LINUX_PLATFORM")
+    target="$target-$(printf '%s' "$KARYOS_LINUX_PLATFORM" | tr -c 'A-Za-z0-9_.-' '-')"
+fi
+# KARYOS_LINUX_NAME names the container, so a caller can stop it.
+name_args=()
+if [ -n "${KARYOS_LINUX_NAME:-}" ]; then
+    name_args=(--name "$KARYOS_LINUX_NAME")
+fi
+# The simulator's seed selection passes through to the container.
+env_args=()
+for name in KARYOS_SIM_SEED KARYOS_SIM_SEEDS; do
+    if [ -n "${!name+set}" ]; then
+        env_args+=(-e "$name=${!name}")
+    fi
+done
 args=("$@")
 if [ ${#args[@]} -eq 0 ]; then
     args=(--workspace --locked)
 fi
 
 exec docker run --rm \
+    ${platform_args[@]+"${platform_args[@]}"} \
+    ${name_args[@]+"${name_args[@]}"} \
     -v "$root":/work \
     -v "$target":/target \
     -v karyos-linux-cargo:/usr/local/cargo/registry \
     -e CARGO_TARGET_DIR=/target \
+    ${env_args[@]+"${env_args[@]}"} \
     -w /work \
     "$image" \
     sh -c 'echo "kernel $(uname -r) $(uname -m) target volume $1"; shift; cargo test "$@"' \
