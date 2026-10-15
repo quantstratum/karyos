@@ -27,6 +27,7 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::atomic_view::HeapWords;
 use crate::error::{LayoutError, SysError};
 use crate::frame::{
     EXTENSION_LENGTH, FRAME_ALIGNMENT, Flags, FrameType, HEADER_LENGTH, Lane, PROTOCOL_VERSION,
@@ -48,9 +49,12 @@ use crate::slot::{Descriptor, SlotIndex, SlotState};
 use crate::term::{Generation, TermCount, TermId};
 use crate::term_bytes::sealed::{Access as _, Token};
 use crate::term_bytes::{HeapTerms, SharedTerms, TermBytes};
+use core::ptr::NonNull;
+use storage::{Backing, CONFIG_WORDS, Cell, Control, Layout, Line, PublisherSlot};
 
 mod concurrent;
 mod deadline;
+pub(crate) mod storage;
 
 #[cfg(test)]
 use crate::loan::{Rotation, rotate_to};
@@ -153,25 +157,6 @@ pub enum PublicationMode {
 /// A default commit deadline of claims: one second in nanoseconds.
 pub const DEFAULT_CLAIM_DEADLINE: u64 = 1_000_000_000;
 
-#[derive(Debug)]
-struct Cell {
-    loan: AtomicU64,
-    revoked: AtomicU64,
-    position: AtomicU64,
-    state: AtomicU64,
-}
-
-impl Cell {
-    fn new(state: u64) -> Self {
-        Self {
-            loan: AtomicU64::new(0),
-            revoked: AtomicU64::new(0),
-            position: AtomicU64::new(0),
-            state: AtomicU64::new(state),
-        }
-    }
-}
-
 /// One lane's log buffer. Its term memory `T` fixes how payload bytes are
 /// moved: [`HeapTerms`] (the default) with plain copies, [`SharedTerms`]
 /// only as atomic words.
@@ -185,35 +170,33 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     generation: Generation,
     config: LogBufferConfig,
     max_message_length: u32,
-    descriptors: Box<[AtomicU64]>,
-    table: Box<[AtomicU64]>,
-    active_count: AtomicU64,
-    reserved_head: AtomicU64,
-    limit: AtomicU64,
-    floor: AtomicU64,
-    cells: Box<[Cell]>,
-    /// `1` once the exclusive publication was issued (never reissued).
-    publication_taken: AtomicU64,
+    /// Section pointers into `backing`, checked at construction
+    /// (`quantstratum-docs: karyos/design/ipc-log-buffer.md`). Declared before `backing` so that
+    /// nothing derived from it outlives it.
+    control: NonNull<Control>,
+    descriptors: NonNull<[Line]>,
+    table: NonNull<[AtomicU64]>,
+    tails: NonNull<[Line]>,
+    cells: NonNull<[Cell]>,
+    publishers: NonNull<[PublisherSlot]>,
+    /// Every word more than one party touches: heap words of this process
+    /// or a shared region.
+    backing: Arc<Backing>,
+    layout: Layout,
+    /// Local: only the creator issues the conductor.
     conductor_taken: AtomicBool,
-    /// The seal word, written only by the conductor.
-    seal: AtomicU64,
-    /// The exclusive publication's release after its last reservation
-    /// (`quantstratum-docs: karyos/design/publication-seal.md`).
-    exclusive_released: AtomicU64,
-    /// The claim record and its seqlock serial
-    /// (`quantstratum-docs: karyos/design/claim-deadline.md`).
-    claim_record: AtomicU64,
-    claim_serial: AtomicU64,
-    /// Raw tail of each physical slot: `term_id << 32 | offset`
-    /// (concurrent mode; initialised for every prepared term).
-    tails: Box<[AtomicU64]>,
-    /// Publisher slots of concurrent handles
-    /// (`quantstratum-docs: karyos/design/concurrent-publication.md`).
-    publishers: Box<[AtomicU64]>,
     /// Test hook: an injected deadline fault (feature `test-hooks`).
     #[cfg(feature = "test-hooks")]
     deadline_fault: AtomicBool,
 }
+
+// SAFETY: the section pointers point into `backing`, an `Arc` the buffer
+// holds for its whole life; they are only turned into shared references to
+// overlays made of `AtomicU64` (`Sync`) by accessors borrowing `self`. The
+// other fields are `Send` and `Sync` when `T` is.
+unsafe impl<T: TermBytes> Send for LogBuffer<T> {}
+// SAFETY: see the `Send` impl.
+unsafe impl<T: TermBytes> Sync for LogBuffer<T> {}
 
 impl LogBuffer<HeapTerms> {
     /// Creates a buffer in a private heap allocation holding `ACTIVE(t0)`
@@ -268,8 +251,129 @@ impl LogBuffer<SharedTerms> {
     }
 }
 
+#[cfg(target_os = "linux")]
+impl LogBuffer<SharedTerms> {
+    /// Creates a buffer in a new shared region (driver side,
+    /// `quantstratum-docs: karyos/design/ipc-log-buffer.md`): the region is created and
+    /// size-sealed for this layout, then initialised. Its descriptor is
+    /// passed to participants through [`LogBuffer::region`].
+    ///
+    /// # Errors
+    ///
+    /// As [`LogBuffer::new`], and the errors of [`crate::ipc::Region::create`].
+    pub fn create_in(
+        instance: u128,
+        region: u64,
+        config: LogBufferConfig,
+        generation: Generation,
+    ) -> Result<Self, SysError> {
+        let (layout, slots, max_message_length) = Self::plan(&config)?;
+        let structure_length = layout
+            .total
+            .checked_mul(crate::atomic_view::WORD_BYTES)
+            .ok_or(SysError::InvalidRegion { address: 0, len: 0 })?;
+        let mapped = crate::ipc::Region::create(crate::ipc::RegionRecord {
+            instance,
+            region,
+            kind: crate::ipc::RegionKind::LogBuffer,
+            generation: u64::from(generation.get()),
+            layout: LAYOUT_VERSION,
+            structure_length,
+        })?;
+        let backing = Arc::new(Backing::Region(mapped));
+        let buffer = Self::over(
+            backing,
+            layout,
+            config,
+            generation,
+            slots,
+            max_message_length,
+        )?;
+        buffer.initialise();
+        Ok(buffer)
+    }
+
+    /// Attaches to a buffer in an attached region (participant side). The
+    /// configuration block is read once and validated as
+    /// [`LogBuffer::new`] validates a configuration; the layout it implies
+    /// must fill the region exactly, and its generation and layout version
+    /// must match the region's. Every later index comes from this validated
+    /// copy. The attached buffer never issues a conductor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidRegion`] for a region that is not a log
+    /// buffer region, a configuration block that is not valid or does not
+    /// match the region, and the validation errors of [`LogBuffer::new`].
+    pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
+        let record = region.record();
+        let invalid = SysError::InvalidRegion {
+            address: 0,
+            len: record.structure_length,
+        };
+        // The header matched the caller's record, which may name any kind:
+        // only a log buffer region holds this layout.
+        if record.kind != crate::ipc::RegionKind::LogBuffer {
+            return Err(invalid);
+        }
+        let structure = region.structure();
+        let mut words = [0u64; CONFIG_WORDS];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = structure.get(index).ok_or(invalid)?.load(Ordering::Acquire);
+        }
+        let (config, generation, max_message_length) = parse_config(&words).ok_or(invalid)?;
+        let (layout, slots, expected_max) = Self::plan(&config)?;
+        let structure_length = layout.total.checked_mul(crate::atomic_view::WORD_BYTES);
+        if record.layout != LAYOUT_VERSION
+            || record.generation != u64::from(generation.get())
+            || structure_length != Some(record.structure_length)
+            || max_message_length != expected_max
+        {
+            return Err(invalid);
+        }
+        let backing = Arc::new(Backing::Region(region));
+        let buffer = Self::over(
+            backing,
+            layout,
+            config,
+            generation,
+            slots,
+            max_message_length,
+        )?;
+        buffer.conductor_taken.store(true, Ordering::Relaxed);
+        Ok(buffer)
+    }
+
+    /// The region of a buffer created in or attached to one: its record and,
+    /// for the creator, the descriptor to pass.
+    #[must_use]
+    pub fn region(&self) -> Option<&crate::ipc::Region> {
+        match &*self.backing {
+            Backing::Region(region) => Some(region),
+            Backing::Heap(_) => None,
+        }
+    }
+}
+
 impl<T: TermBytes> LogBuffer<T> {
     fn build(config: LogBufferConfig, generation: Generation) -> Result<Self, SysError> {
+        let (layout, slots, max_message_length) = Self::plan(&config)?;
+        let backing = Arc::new(Backing::Heap(HeapWords::zeroed(layout.total)?));
+        let buffer = Self::over(
+            backing,
+            layout,
+            config,
+            generation,
+            slots,
+            max_message_length,
+        )?;
+        buffer.initialise();
+        Ok(buffer)
+    }
+
+    /// Validates `config` and computes its layout, slot count and largest
+    /// message: the same checks for a new buffer and for an attachment.
+    fn plan(config: &LogBufferConfig) -> Result<(Layout, u8, u32), SysError> {
         let slots = config
             .spare_slots
             .checked_add(3)
@@ -283,78 +387,194 @@ impl<T: TermBytes> LogBuffer<T> {
                 value: config.claim_deadline,
             });
         }
-        check_publication_mode(&config)?;
+        check_publication_mode(config)?;
         let plan = FragmentPlan::new(config.mtu, Flags::NONE)?;
         let max_message_length =
             plan.max_message_length(config.max_reserved, config.term_length)?;
-        let regions = T::allocate(Token::new(), config.term_length, slots)?;
-        let t0 = config.initial_term_id;
-        let one = TermCount::ZERO.next()?;
-        let descriptors: Box<[AtomicU64]> = (0..slots)
-            .map(|slot| {
-                let state = match slot {
-                    0 => Descriptor::new(t0, generation, SlotState::Active),
-                    1 => Descriptor::new(t0.advanced_by(one), generation, SlotState::Ready),
-                    _ => Descriptor::new(t0, generation, SlotState::Free),
-                };
-                AtomicU64::new(state.encode())
-            })
-            .collect();
-        let table: Box<[AtomicU64]> = (0..slots).map(|_| AtomicU64::new(0)).collect();
-        let table_len = u32::from(slots);
-        if let Some(entry) = table.first() {
-            entry.store(table_entry(0, 0), Ordering::Relaxed);
-        }
-        if let Some(entry) = table.get((1 % table_len) as usize) {
-            entry.store(table_entry(1, 1), Ordering::Relaxed);
-        }
         let publisher_cells = publisher_cells(config.publication);
-        let cells: Box<[Cell]> = (0..usize::from(config.max_subscribers) + publisher_cells)
-            .map(|index| {
-                Cell::new(if index < publisher_cells {
-                    CELL_PUBLICATION
-                } else {
-                    CELL_FREE
-                })
-            })
-            .collect();
-        let tails: Box<[AtomicU64]> = (0..slots)
-            .map(|slot| {
-                let term = match slot {
-                    0 => t0,
-                    _ => t0.advanced_by(one),
-                };
-                AtomicU64::new(u64::from(term.get()) << 32)
-            })
-            .collect();
-        let window = window(&config);
+        let layout = Layout::new(
+            slots,
+            usize::from(config.max_subscribers) + publisher_cells,
+            publisher_cells,
+            config.term_length.get(),
+            T::IN_BACKING,
+        )?;
+        Ok((layout, slots, max_message_length))
+    }
+
+    /// A buffer over `backing` laid out as `layout`, its section pointers
+    /// derived after their bounds are checked. Writes nothing.
+    fn over(
+        backing: Arc<Backing>,
+        layout: Layout,
+        config: LogBufferConfig,
+        generation: Generation,
+        slots: u8,
+        max_message_length: u32,
+    ) -> Result<Self, SysError> {
+        let regions = T::create(
+            Token::new(),
+            config.term_length,
+            slots,
+            &backing,
+            layout.terms,
+        )?;
+        let control = backing
+            .overlays::<Control>(layout.control, 1)?
+            .cast::<Control>();
         Ok(Self {
             regions,
             slots,
             spare_slots: config.spare_slots,
             term_length: config.term_length.get(),
-            initial_term_id: t0,
+            initial_term_id: config.initial_term_id,
             generation,
             config,
             max_message_length,
-            descriptors,
-            table,
-            active_count: AtomicU64::new(0),
-            reserved_head: AtomicU64::new(0),
-            limit: AtomicU64::new(window),
-            floor: AtomicU64::new(0),
-            cells,
-            publication_taken: AtomicU64::new(0),
+            control,
+            descriptors: backing.overlays(layout.descriptors, layout.slots)?,
+            table: backing.overlays(layout.table, layout.slots)?,
+            tails: backing.overlays(layout.tails, layout.slots)?,
+            cells: backing.overlays(layout.cells, layout.cell_count)?,
+            publishers: backing.overlays(layout.publishers, layout.publisher_count)?,
+            backing,
+            layout,
             conductor_taken: AtomicBool::new(false),
-            seal: AtomicU64::new(0),
-            exclusive_released: AtomicU64::new(0),
-            claim_record: AtomicU64::new(0),
-            claim_serial: AtomicU64::new(0),
-            tails,
-            publishers: (0..publisher_cells).map(|_| AtomicU64::new(0)).collect(),
             #[cfg(feature = "test-hooks")]
             deadline_fault: AtomicBool::new(false),
         })
+    }
+
+    /// The initial state of a new buffer: `ACTIVE(t0)` and `READY(t0 + 1)`,
+    /// every other slot `FREE`, the table, the cells, the tails, the limit
+    /// and the configuration block. Only for a buffer no other party sees.
+    fn initialise(&self) {
+        let t0 = self.initial_term_id;
+        let one = TermCount::ZERO.next().map_or(t0, |one| t0.advanced_by(one));
+        for (slot, line) in self.descriptors().iter().enumerate() {
+            let state = match slot {
+                0 => Descriptor::new(t0, self.generation, SlotState::Active),
+                1 => Descriptor::new(one, self.generation, SlotState::Ready),
+                _ => Descriptor::new(t0, self.generation, SlotState::Free),
+            };
+            line.word.store(state.encode(), Ordering::Relaxed);
+        }
+        let table_len = u32::from(self.slots);
+        if let Some(entry) = self.table().first() {
+            entry.store(table_entry(0, 0), Ordering::Relaxed);
+        }
+        if let Some(entry) = self.table().get((1 % table_len) as usize) {
+            entry.store(table_entry(1, 1), Ordering::Relaxed);
+        }
+        let publisher_cells = self.layout.publisher_count;
+        for (index, cell) in self.cells().iter().enumerate() {
+            let state = if index < publisher_cells {
+                CELL_PUBLICATION
+            } else {
+                CELL_FREE
+            };
+            cell.state.store(state, Ordering::Relaxed);
+        }
+        for (slot, line) in self.tails().iter().enumerate() {
+            let term = if slot == 0 { t0 } else { one };
+            line.word
+                .store(u64::from(term.get()) << 32, Ordering::Relaxed);
+        }
+        self.limit().store(window(&self.config), Ordering::Relaxed);
+        self.write_config();
+    }
+
+    /// The configuration block (`quantstratum-docs: karyos/design/ipc-log-buffer.md`).
+    fn write_config(&self) {
+        let words = config_words(&self.config, self.generation, self.max_message_length);
+        for (index, value) in words.into_iter().enumerate() {
+            if let Some(word) = self.backing.word(self.layout.config + index) {
+                word.store(value, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // Accessors of the shared words. Each turns a section pointer, derived
+    // from `backing` after a bounds check, into a reference that borrows
+    // `self` and therefore the `Arc` that keeps `backing` alive.
+
+    fn control(&self) -> &Control {
+        // SAFETY: `control` points to one `Control` inside `backing`
+        // (checked by `overlays` at construction), which lives as long as
+        // `self`. `Control` is an `Overlay`: only `AtomicU64` words, every
+        // bit pattern valid, accessed only atomically, aligned as
+        // `AtomicU64` like every backing word.
+        unsafe { self.control.as_ref() }
+    }
+
+    fn descriptors(&self) -> &[Line] {
+        // SAFETY: as `control`, for the descriptor section.
+        unsafe { self.descriptors.as_ref() }
+    }
+
+    fn table(&self) -> &[AtomicU64] {
+        // SAFETY: as `control`, for the slot table.
+        unsafe { self.table.as_ref() }
+    }
+
+    fn tails(&self) -> &[Line] {
+        // SAFETY: as `control`, for the tails.
+        unsafe { self.tails.as_ref() }
+    }
+
+    fn cells(&self) -> &[Cell] {
+        // SAFETY: as `control`, for the registry cells.
+        unsafe { self.cells.as_ref() }
+    }
+
+    fn publisher_lines(&self) -> &[PublisherSlot] {
+        // SAFETY: as `control`, for the publisher slots (possibly empty: an
+        // empty slice is never indexed).
+        unsafe { self.publishers.as_ref() }
+    }
+
+    fn publisher(&self, index: usize) -> Option<&AtomicU64> {
+        self.publisher_lines().get(index).map(|line| &line.word)
+    }
+
+    fn publisher_words(&self) -> impl Iterator<Item = &AtomicU64> {
+        self.publisher_lines().iter().map(|line| &line.word)
+    }
+
+    fn active_count(&self) -> &AtomicU64 {
+        &self.control().active_count.word
+    }
+
+    fn reserved_head(&self) -> &AtomicU64 {
+        &self.control().reserved_head.word
+    }
+
+    fn limit(&self) -> &AtomicU64 {
+        &self.control().limit.word
+    }
+
+    fn floor(&self) -> &AtomicU64 {
+        &self.control().floor.word
+    }
+
+    fn seal(&self) -> &AtomicU64 {
+        &self.control().seal.word
+    }
+
+    fn publication_taken(&self) -> &AtomicU64 {
+        &self.control().publication_taken.word
+    }
+
+    fn exclusive_released(&self) -> &AtomicU64 {
+        &self.control().exclusive_released.word
+    }
+
+    fn claim_record(&self) -> &AtomicU64 {
+        &self.control().claim_record.word
+    }
+
+    fn claim_serial(&self) -> &AtomicU64 {
+        &self.control().claim_serial.word
     }
 
     /// Takes the only publication, borrowing the buffer. Returns `None` once
@@ -422,7 +642,7 @@ impl<T: TermBytes> LogBuffer<T> {
     #[must_use]
     pub fn attached_subscribers(&self) -> u32 {
         let attached = self
-            .cells
+            .cells()
             .iter()
             .skip(self.first_subscriber_cell())
             .filter(|cell| cell.state.load(Ordering::Acquire) != CELL_FREE)
@@ -431,18 +651,21 @@ impl<T: TermBytes> LogBuffer<T> {
     }
 
     fn cell(&self, index: usize) -> Result<&Cell, SysError> {
-        self.cells.get(index).ok_or(SysError::ResourcesUnavailable)
+        self.cells()
+            .get(index)
+            .ok_or(SysError::ResourcesUnavailable)
     }
 
     fn descriptor(&self, slot: u8) -> Result<&AtomicU64, SysError> {
-        self.descriptors
+        self.descriptors()
             .get(usize::from(slot))
+            .map(|line| &line.word)
             .ok_or(SysError::ResourcesUnavailable)
     }
 
     fn table_slot(&self, count: TermCount) -> Result<&AtomicU64, SysError> {
         let index = count.get() % u32::from(self.slots);
-        self.table
+        self.table()
             .get(index as usize)
             .ok_or(SysError::ResourcesUnavailable)
     }
@@ -462,8 +685,9 @@ impl<T: TermBytes> LogBuffer<T> {
     }
 
     fn tail(&self, slot: u8) -> Result<&AtomicU64, SysError> {
-        self.tails
+        self.tails()
             .get(usize::from(slot))
+            .map(|line| &line.word)
             .ok_or(SysError::ResourcesUnavailable)
     }
 
@@ -475,9 +699,9 @@ impl<T: TermBytes> LogBuffer<T> {
     /// paused): no head is fabricated.
     fn head(&self) -> Result<Option<u64>, SysError> {
         if !self.concurrent() {
-            return Ok(Some(self.reserved_head.load(Ordering::Acquire)));
+            return Ok(Some(self.reserved_head().load(Ordering::Acquire)));
         }
-        let count = TermCount::try_new(self.active_count.load(Ordering::Acquire) as u32)?;
+        let count = TermCount::try_new(self.active_count().load(Ordering::Acquire) as u32)?;
         let Lookup::Slot(slot) = self.lookup(count)? else {
             return Ok(None);
         };
@@ -494,10 +718,12 @@ impl<T: TermBytes> LogBuffer<T> {
         let head = self.position(count, offset);
         // A fenced term's tail is past its end; the seal position is the end
         // of what was granted (`quantstratum-docs: karyos/design/mapping-generations.md`).
-        Ok(Some(match decode_seal(self.seal.load(Ordering::Acquire)) {
-            SealWord::Positioned(position) => head.min(position),
-            _ => head,
-        }))
+        Ok(Some(
+            match decode_seal(self.seal().load(Ordering::Acquire)) {
+                SealWord::Positioned(position) => head.min(position),
+                _ => head,
+            },
+        ))
     }
 
     /// The head as the conductor sees it: it is the only party that
@@ -645,7 +871,7 @@ fn decode_record(record: u64) -> Option<(u8, u32, u32)> {
 impl<T: TermBytes> LogBuffer<T> {
     /// Rewrites the claim record; only the publication calls it.
     fn write_record(&self, value: u64) {
-        write_claim_record(&self.claim_serial, &self.claim_record, value);
+        write_claim_record(self.claim_serial(), self.claim_record(), value);
     }
 }
 
@@ -670,38 +896,31 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
     }
     // Already issued: no allocation. The compare-exchange below still
     // decides a race.
-    if buffer.publication_taken.load(Ordering::Acquire) != 0 {
+    if buffer.publication_taken().load(Ordering::Acquire) != 0 {
         return Ok(None);
     }
     // The staging buffer of claims on a backing without direct bytes, sized
     // for the largest admissible claim and allocated fallibly before the
     // publication is issued.
-    let staging = if <O::Terms as crate::term_bytes::sealed::Access>::DIRECT {
-        Box::default()
-    } else {
-        let plan = FragmentPlan::new(
-            buffer.config.mtu,
-            Flags::new(true, true, false, false, buffer.config.lane),
-        )?;
-        let size = plan.payload_per_fragment().min(buffer.max_message_length) as usize;
-        let mut staging = Vec::new();
-        staging
-            .try_reserve_exact(size)
-            .map_err(|_| SysError::ResourcesUnavailable)?;
-        staging.resize(size, 0u8);
-        staging.into_boxed_slice()
-    };
+    let staging = staging_buffer(buffer)?;
     // `SeqCst` with the seal load below and the conductor's seal store and
     // positioning load: at least one side observes the other
     // (`quantstratum-docs: karyos/design/publication-seal.md`, issuance).
-    if !take_publication(&buffer.publication_taken) {
+    if !take_publication(buffer.publication_taken()) {
         return Ok(None);
     }
-    if issuer_sees_seal(&buffer.seal) {
+    if issuer_sees_seal(buffer.seal()) {
         // Taken but never used: released at once, and never reissued.
-        release_publication(&buffer.exclusive_released);
+        release_publication(buffer.exclusive_released());
         return Err(SysError::Sealed);
     }
+    first_loan(owner, staging).map(Some)
+}
+
+/// The exclusive publication's initial write loan on term 0, for a fresh
+/// publication taken by this process or adopted from a registration.
+fn first_loan<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Result<Publication<O>, SysError> {
+    let buffer: &LogBuffer<O::Terms> = &owner;
     let cell = buffer.cell(0)?;
     let slot = SlotIndex::try_new(0)?;
     let target = LoanTarget::new(
@@ -711,7 +930,7 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
         TermCount::ZERO,
     );
     match take_loan(&cell.loan, &cell.revoked, buffer.descriptor(0)?, target)? {
-        LoanOutcome::Granted => Ok(Some(Publication {
+        LoanOutcome::Granted => Ok(Publication {
             buffer: owner,
             state: PublicationState::Active {
                 count: TermCount::ZERO,
@@ -720,11 +939,127 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
             },
             pending: None,
             staging,
-        })),
+        }),
         _ => Err(SysError::CorruptTerm {
             offset: 0,
             reason: "initial term not active",
         }),
+    }
+}
+
+/// The staging buffer of claims on a backing without direct bytes, sized for
+/// the largest admissible claim and allocated fallibly; empty otherwise.
+fn staging_buffer<T: TermBytes>(buffer: &LogBuffer<T>) -> Result<Box<[u8]>, SysError> {
+    if <T as crate::term_bytes::sealed::Access>::DIRECT {
+        return Ok(Box::default());
+    }
+    let plan = FragmentPlan::new(
+        buffer.config.mtu,
+        Flags::new(true, true, false, false, buffer.config.lane),
+    )?;
+    let size = plan.payload_per_fragment().min(buffer.max_message_length) as usize;
+    let mut staging = Vec::new();
+    staging
+        .try_reserve_exact(size)
+        .map_err(|_| SysError::ResourcesUnavailable)?;
+    staging.resize(size, 0u8);
+    Ok(staging.into_boxed_slice())
+}
+
+/// The refusal of an adoption whose registration does not match its grant.
+const NOT_GRANTED: SysError = SysError::Protocol {
+    reason: "the registration does not match the grant",
+};
+
+/// Bit of a registration word set by the one adoption of its grant. Export
+/// ids are below it, so an adopted registration never equals an export.
+const ADOPTED: u64 = 1 << 63;
+
+/// Whether `export` can name a registration: nonzero, below [`ADOPTED`].
+fn valid_export(export: u64) -> bool {
+    export != 0 && export & ADOPTED == 0
+}
+
+/// Claims the registration word for its one adoption: it must hold exactly
+/// `export`, and is marked adopted in the same step, so a second adoption
+/// of the same grant, concurrent or later, is refused. A claim is never
+/// returned: an adoption that fails after it leaves the grant spent, and
+/// the registration ends with the driver's.
+fn claim(word: &AtomicU64, export: u64) -> bool {
+    valid_export(export)
+        && word
+            .compare_exchange(
+                export,
+                export | ADOPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+}
+
+impl<O: BufferOwner> Publication<O> {
+    /// Adopts the exclusive publication that the creator registered for
+    /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): taken, not
+    /// released, registered for exactly this export, and fresh (nothing
+    /// reserved yet). Takes the initial write loan in this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidPublicationMode`] for a concurrent buffer
+    /// and [`SysError::Protocol`] when the registration does not match.
+    pub fn adopt(owner: O, export: u64) -> Result<Self, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &owner;
+        if buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "the exclusive publication of a concurrent buffer",
+            });
+        }
+        if buffer.publication_taken().load(Ordering::Acquire) == 0
+            || buffer.exclusive_released().load(Ordering::Acquire) != 0
+            || buffer.reserved_head().load(Ordering::Acquire) != 0
+            || !claim(&buffer.control().publication_registration.word, export)
+        {
+            return Err(NOT_GRANTED);
+        }
+        let staging = staging_buffer(buffer)?;
+        first_loan(owner, staging)
+    }
+}
+
+impl<O: BufferOwner> Subscription<O> {
+    /// Adopts the subscriber cell `cell` that the creator registered with
+    /// `role` for export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`). The
+    /// subscription resumes at the cell's published position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Protocol`] when the cell is not a subscriber cell
+    /// attached with `role` and registered for exactly this export.
+    pub fn adopt(owner: O, cell: usize, role: Role, export: u64) -> Result<Self, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &owner;
+        if cell < buffer.first_subscriber_cell() {
+            return Err(NOT_GRANTED);
+        }
+        let found = buffer.cell(cell).map_err(|_| NOT_GRANTED)?;
+        let expected = match role {
+            Role::Required => CELL_REQUIRED,
+            Role::Optional => CELL_OPTIONAL,
+        };
+        if found.state.load(Ordering::Acquire) != expected || !claim(&found.registration, export) {
+            return Err(NOT_GRANTED);
+        }
+        let position = found.position.load(Ordering::Acquire);
+        Ok(Self {
+            buffer: owner,
+            cursor: Cursor {
+                cell,
+                role,
+                position,
+                acknowledged: position,
+                pending: None,
+                detached: false,
+            },
+        })
     }
 }
 
@@ -986,7 +1321,7 @@ impl<O: BufferOwner> Publication<O> {
     /// returns `Closed` at once (`quantstratum-docs: karyos/design/publication-seal.md`). The
     /// caller resolved any forgotten claim first.
     fn observe_seal(&mut self) -> bool {
-        if !observe_seal(&self.buffer.seal) {
+        if !observe_seal(self.buffer.seal()) {
             return false;
         }
         self.release();
@@ -1002,7 +1337,7 @@ impl<O: BufferOwner> Publication<O> {
         {
             release_loan(&cell.loan);
         }
-        release_publication(&self.buffer.exclusive_released);
+        release_publication(self.buffer.exclusive_released());
     }
 
     fn finish_claim(&mut self, step: ClaimStep) -> Result<ClaimOutcome<'_, O>, SysError> {
@@ -1293,7 +1628,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
             return Err(LayoutError::MessageTooLarge { length, max }.into());
         }
         // Both record rewrites of this claim must fit the serial.
-        if buffer.claim_serial.load(Ordering::Relaxed) > u64::MAX - CLAIM_SERIAL_COST {
+        if buffer.claim_serial().load(Ordering::Relaxed) > u64::MAX - CLAIM_SERIAL_COST {
             return Err(SysError::ResourcesUnavailable);
         }
         let (count, slot, tail, position) = match self.reserve(reserved, Some(pause))? {
@@ -1361,7 +1696,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
         let PublicationState::Active { count, slot, tail } = *self.state else {
             return Ok(Reservation::Outcome(AppendOutcome::AdminAction));
         };
-        let limit = buffer.limit.load(Ordering::Acquire);
+        let limit = buffer.limit().load(Ordering::Acquire);
         let remaining = buffer.term_length - tail;
         if reserved > remaining {
             // Reserve only the PAD up to the term boundary.
@@ -1370,7 +1705,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
                 return Ok(Reservation::Outcome(AppendOutcome::BackPressured));
             }
             let next = count.next()?;
-            buffer.reserved_head.store(boundary, Ordering::Release);
+            buffer.reserved_head().store(boundary, Ordering::Release);
             if remaining > 0 {
                 self.write_pad(slot, count, tail, remaining);
             }
@@ -1391,7 +1726,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
             buffer.write_record(encode_record(slot, tail, reserved));
             pause(ClaimPause::BeforeHead);
         }
-        buffer.reserved_head.store(end, Ordering::Release);
+        buffer.reserved_head().store(end, Ordering::Release);
         *self.state = PublicationState::Active {
             count,
             slot,
@@ -1426,7 +1761,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
             _ => return Ok(AppendOutcome::AdminAction),
         }
         let previous = u64::from(next.get() - 1);
-        let _ = buffer.active_count.compare_exchange(
+        let _ = buffer.active_count().compare_exchange(
             previous,
             u64::from(next.get()),
             Ordering::AcqRel,
@@ -1744,7 +2079,7 @@ impl<O: BufferOwner> Subscription<O> {
         // Only where the poll found nothing: the seal is positioned once
         // every block below it is terminal, so a cursor at the position has
         // read everything (`quantstratum-docs: karyos/design/publication-seal.md`).
-        match decode_seal(self.buffer.seal.load(Ordering::Acquire)) {
+        match decode_seal(self.buffer.seal().load(Ordering::Acquire)) {
             SealWord::Positioned(position) if self.cursor.position >= position => {
                 Ok(PollOutcome::Closed { position })
             }
@@ -1850,7 +2185,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         }
         // Retention admission point: the floor is checked after the loan is
         // granted and before any plain read.
-        if self.cursor.position < buffer.floor.load(Ordering::Acquire) {
+        if self.cursor.position < buffer.floor().load(Ordering::Acquire) {
             release_loan(&cell.loan);
             return self.overrun();
         }
@@ -2105,7 +2440,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         let from = self.cursor.position;
         // The floor first: the head read after it is at or above it (the
         // conductor publishes a floor only from an earlier head snapshot).
-        let lost_to = self.buffer.floor.load(Ordering::Acquire).max(from);
+        let lost_to = self.buffer.floor().load(Ordering::Acquire).max(from);
         between();
         let Some(head) = self.buffer.head()? else {
             // No consistent head now: retry later instead of rejoining.
@@ -2288,6 +2623,65 @@ impl<O: BufferOwner> Conductor<O> {
         })
     }
 
+    /// Registers a subscriber for a participant in another process, for
+    /// export `export` (nonzero, never reused): the cell is attached as
+    /// [`Conductor::subscribe`] attaches it, and its registration word
+    /// records the export. Returns the cell, which the participant adopts
+    /// with [`Subscription::adopt`] (`quantstratum-docs: karyos/design/ipc-log-buffer.md`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::subscribe`]; [`SysError::Protocol`] for export 0 or
+    /// an export with bit 63 set.
+    pub fn register_subscriber(&mut self, role: Role, export: u64) -> Result<usize, SysError> {
+        if !valid_export(export) {
+            return Err(NOT_GRANTED);
+        }
+        let cursor = self.context().subscribe(role)?;
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer
+            .cell(cursor.cell)?
+            .registration
+            .store(export, Ordering::Release);
+        Ok(cursor.cell)
+    }
+
+    /// Registers the exclusive publication for a participant in another
+    /// process, for export `export`: taken as
+    /// [`LogBuffer::publication`] takes it, without a loan (the participant
+    /// takes its own with [`Publication::adopt`]). Returns `false` when it
+    /// was already issued.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::InvalidPublicationMode`] for a concurrent buffer,
+    /// [`SysError::Sealed`] for a sealed one, [`SysError::Protocol`] for
+    /// export 0 or an export with bit 63 set.
+    pub fn register_publication(&mut self, export: u64) -> Result<bool, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if !valid_export(export) {
+            return Err(NOT_GRANTED);
+        }
+        if buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "the exclusive publication of a concurrent buffer",
+            });
+        }
+        if !take_publication(buffer.publication_taken()) {
+            return Ok(false);
+        }
+        if issuer_sees_seal(buffer.seal()) {
+            release_publication(buffer.exclusive_released());
+            return Err(SysError::Sealed);
+        }
+        buffer
+            .control()
+            .publication_registration
+            .word
+            .store(export, Ordering::Release);
+        Ok(true)
+    }
+
     /// One duty cycle: flow control and retention, rotation help,
     /// reclamation and cleaning, and preparation of the next term.
     ///
@@ -2312,11 +2706,11 @@ impl<O: BufferOwner> Conductor<O> {
     /// invariant.
     pub fn seal(&mut self) -> Result<(), SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        if buffer.seal.load(Ordering::Relaxed) != 0 {
+        if buffer.seal().load(Ordering::Relaxed) != 0 {
             return Ok(());
         }
         // Every reservation ends above the zero limit this stores.
-        seal(&buffer.seal, &buffer.limit);
+        seal(buffer.seal(), buffer.limit());
         if buffer.concurrent() {
             self.context().fence()?;
         }
@@ -2332,7 +2726,7 @@ impl<O: BufferOwner> Conductor<O> {
         if cell < buffer.first_subscriber_cell() {
             return None;
         }
-        let cell = buffer.cells.get(cell)?;
+        let cell = buffer.cells().get(cell)?;
         match cell.state.load(Ordering::Acquire) {
             CELL_REQUIRED | CELL_OPTIONAL => Some(cell.position.load(Ordering::Acquire)),
             _ => None,
@@ -2345,7 +2739,7 @@ impl<O: BufferOwner> Conductor<O> {
     #[must_use]
     pub fn limit(&self) -> u64 {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        buffer.limit.load(Ordering::Acquire)
+        buffer.limit().load(Ordering::Acquire)
     }
 
     /// The head: the end of what was reserved, capped at a positioned seal.
@@ -2364,12 +2758,12 @@ impl<O: BufferOwner> Conductor<O> {
     #[must_use]
     pub fn seal_state(&self) -> SealState {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        match decode_seal(buffer.seal.load(Ordering::Acquire)) {
+        match decode_seal(buffer.seal().load(Ordering::Acquire)) {
             SealWord::Active => SealState::Active,
             SealWord::Sealed => SealState::Sealed,
             SealWord::Positioned(position) => {
                 let passed = buffer
-                    .cells
+                    .cells()
                     .iter()
                     .skip(buffer.first_subscriber_cell())
                     .filter(|cell| {
@@ -2501,7 +2895,8 @@ impl<O: BufferOwner> Conductor<O> {
         clock: &mut dyn FnMut() -> u64,
     ) -> Result<ClaimDeadline, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        let Some((serial, record)) = read_claim_record(&buffer.claim_serial, &buffer.claim_record)
+        let Some((serial, record)) =
+            read_claim_record(buffer.claim_serial(), buffer.claim_record())
         else {
             self.observed = None;
             return Ok(ClaimDeadline::Idle);
@@ -2590,7 +2985,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let mut optional = 0u32;
         let mut free = None;
         for (index, cell) in buffer
-            .cells
+            .cells()
             .iter()
             .enumerate()
             .skip(buffer.first_subscriber_cell())
@@ -2636,7 +3031,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         self.publish_floor_and_limit()?;
         self.position_seal()?;
         // A sealed buffer starts no later term.
-        if self.buffer.seal.load(Ordering::Relaxed) == 0 {
+        if self.buffer.seal().load(Ordering::Relaxed) == 0 {
             self.help_rotation()?;
         }
         self.reclaim(&mut report)?;
@@ -2650,7 +3045,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let window = window(&buffer.config);
         let head = buffer.conductor_head()?;
         let mut bound = None::<u64>;
-        for cell in buffer.cells.iter().skip(buffer.first_subscriber_cell()) {
+        for cell in buffer.cells().iter().skip(buffer.first_subscriber_cell()) {
             if cell.state.load(Ordering::Acquire) == CELL_REQUIRED {
                 let position = cell.position.load(Ordering::Acquire);
                 bound = Some(bound.map_or(position, |b| b.min(position)));
@@ -2666,12 +3061,12 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             None => (head.max(window) - window, head),
         };
         // Neither the floor nor the limit ever decreases.
-        let floor = floor.max(buffer.floor.load(Ordering::Relaxed));
-        let limit = (base + window).max(buffer.limit.load(Ordering::Relaxed));
-        buffer.floor.store(floor, Ordering::Release);
+        let floor = floor.max(buffer.floor().load(Ordering::Relaxed));
+        let limit = (base + window).max(buffer.limit().load(Ordering::Relaxed));
+        buffer.floor().store(floor, Ordering::Release);
         // A sealed buffer's limit stays zero (only the conductor seals).
-        if buffer.seal.load(Ordering::Relaxed) == 0 {
-            buffer.limit.store(limit, Ordering::Release);
+        if buffer.seal().load(Ordering::Relaxed) == 0 {
+            buffer.limit().store(limit, Ordering::Release);
         }
         Ok(())
     }
@@ -2684,16 +3079,16 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     fn position_seal(&self) -> Result<(), SysError> {
         let buffer = self.buffer;
         if buffer.concurrent()
-            || decode_seal(buffer.seal.load(Ordering::Relaxed)) != SealWord::Sealed
+            || decode_seal(buffer.seal().load(Ordering::Relaxed)) != SealWord::Sealed
         {
             return Ok(());
         }
-        if publication_taken(&buffer.publication_taken)
-            && !publication_released(&buffer.exclusive_released)
+        if publication_taken(buffer.publication_taken())
+            && !publication_released(buffer.exclusive_released())
         {
             return Ok(());
         }
-        position_seal(&buffer.seal, buffer.conductor_head()?);
+        position_seal(buffer.seal(), buffer.conductor_head()?);
         Ok(())
     }
 
@@ -2703,7 +3098,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     /// the seal position. The head is capped there from then on.
     fn fence(&self) -> Result<(), SysError> {
         let buffer = self.buffer;
-        let count = TermCount::try_new(fence_rotation(&buffer.active_count))?;
+        let count = TermCount::try_new(fence_rotation(buffer.active_count()))?;
         let Lookup::Slot(slot) = buffer.lookup(count)? else {
             return Err(corrupt(0, "active term without a slot"));
         };
@@ -2721,14 +3116,14 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // crossing's end is clamped at the term end, where its owner pads.
         let offset = (old as u32).min(term_length);
         let position = buffer.position(count, offset);
-        position_seal(&buffer.seal, position);
+        position_seal(buffer.seal(), position);
         Ok(())
     }
 
     /// Completes a full term's rotation the publication left half-done.
     fn help_rotation(&self) -> Result<(), SysError> {
         let buffer = self.buffer;
-        let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
+        let active = TermCount::try_new(buffer.active_count().load(Ordering::Acquire) as u32)?;
         let boundary = buffer.position(active, buffer.term_length);
         if buffer.conductor_head()? < boundary {
             return Ok(());
@@ -2745,7 +3140,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         if found.state() == SlotState::Ready {
             let _ = activate(word, found)?;
         }
-        let _ = buffer.active_count.compare_exchange(
+        let _ = buffer.active_count().compare_exchange(
             u64::from(active.get()),
             u64::from(next.get()),
             Ordering::AcqRel,
@@ -2757,9 +3152,9 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     /// Reclaims and cleans every term wholly below the floor.
     fn reclaim(&mut self, report: &mut DutyReport) -> Result<(), SysError> {
         let buffer = self.buffer;
-        let floor = buffer.floor.load(Ordering::Acquire);
+        let floor = buffer.floor().load(Ordering::Acquire);
         let active = u64::from(active_term_count(
-            buffer.active_count.load(Ordering::Acquire),
+            buffer.active_count().load(Ordering::Acquire),
         ));
         for slot in 0..buffer.slots {
             let word = buffer.descriptor(slot)?;
@@ -2799,7 +3194,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     /// Scans every registry cell, publication included.
     fn loan_held(&self, slot: u8, reclaiming: Descriptor) -> Result<bool, SysError> {
         let index = SlotIndex::try_new(slot)?;
-        for cell in self.buffer.cells.iter() {
+        for cell in self.buffer.cells().iter() {
             if loan_held(core::slice::from_ref(&cell.loan), index, reclaiming)? {
                 return Ok(true);
             }
@@ -2810,7 +3205,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
     /// Prepares `t + 1` in any FREE slot if it is not prepared yet.
     fn prepare_next(&self, report: &mut DutyReport) -> Result<(), SysError> {
         let buffer = self.buffer;
-        let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
+        let active = TermCount::try_new(buffer.active_count().load(Ordering::Acquire) as u32)?;
         let Ok(next) = active.next() else {
             return Ok(());
         };
@@ -2857,6 +3252,106 @@ fn corrupt(offset: u32, reason: &'static str) -> SysError {
 }
 
 /// The log buffer tests run on both backings.
+/// The configuration block of a buffer (`quantstratum-docs: karyos/design/ipc-log-buffer.md`):
+/// a layout version, every configuration field, the generation and the
+/// largest message, padded with zeros to [`CONFIG_WORDS`].
+fn config_words(
+    config: &LogBufferConfig,
+    generation: Generation,
+    max_message_length: u32,
+) -> [u64; CONFIG_WORDS] {
+    let (mode, publishers, allow_non_lse) = match config.publication {
+        PublicationMode::Exclusive => (1, 0, 0),
+        PublicationMode::Concurrent {
+            publishers,
+            allow_non_lse,
+        } => (2, u64::from(publishers), u64::from(allow_non_lse)),
+    };
+    let mut words = [0u64; CONFIG_WORDS];
+    let fields = [
+        LAYOUT_VERSION,
+        u64::from(config.term_length.get()),
+        u64::from(config.spare_slots),
+        u64::from(config.max_subscribers),
+        u64::from(config.mtu),
+        u64::from(config.max_reserved),
+        u64::from(config.initial_term_id.get()),
+        u64::from(config.lane.get()),
+        u64::from(config.session_id.cast_unsigned()),
+        u64::from(config.stream_id.cast_unsigned()),
+        config.claim_deadline,
+        mode,
+        publishers,
+        allow_non_lse,
+        u64::from(generation.get()),
+        u64::from(max_message_length),
+    ];
+    for (word, field) in words.iter_mut().zip(fields) {
+        *word = field;
+    }
+    words
+}
+
+/// The configuration, generation and largest message of a configuration
+/// block, or `None` when a field is out of its type's range or the version
+/// is unknown. Range checks of the configuration itself are left to
+/// [`LogBuffer::new`]'s validation.
+#[cfg(target_os = "linux")]
+fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generation, u32)> {
+    let [
+        version,
+        term_length,
+        spare_slots,
+        max_subscribers,
+        mtu,
+        max_reserved,
+        initial_term_id,
+        lane,
+        session_id,
+        stream_id,
+        claim_deadline,
+        mode,
+        publishers,
+        allow_non_lse,
+        generation,
+        max_message_length,
+        rest @ ..,
+    ] = words;
+    if *version != LAYOUT_VERSION || rest.iter().any(|word| *word != 0) {
+        return None;
+    }
+    let small = |value: &u64| u32::try_from(*value).ok();
+    let publication = match (*mode, *allow_non_lse) {
+        (1, 0) if *publishers == 0 => PublicationMode::Exclusive,
+        (2, flag @ (0 | 1)) => PublicationMode::Concurrent {
+            publishers: u8::try_from(*publishers).ok()?,
+            allow_non_lse: flag == 1,
+        },
+        _ => return None,
+    };
+    let config = LogBufferConfig {
+        term_length: TermLength::try_new(small(term_length)?).ok()?,
+        spare_slots: u8::try_from(*spare_slots).ok()?,
+        max_subscribers: u8::try_from(*max_subscribers).ok()?,
+        mtu: small(mtu)?,
+        max_reserved: small(max_reserved)?,
+        initial_term_id: TermId::new(small(initial_term_id)?),
+        lane: Lane::try_new(u8::try_from(*lane).ok()?).ok()?,
+        session_id: small(session_id)?.cast_signed(),
+        stream_id: small(stream_id)?.cast_signed(),
+        claim_deadline: *claim_deadline,
+        publication,
+    };
+    Some((
+        config,
+        Generation::try_new(small(generation)?).ok()?,
+        small(max_message_length)?,
+    ))
+}
+
+/// The layout version of the shared log buffer region.
+pub const LAYOUT_VERSION: u64 = 1;
+
 #[cfg(test)]
 mod heap_tests {
     use super::*;
@@ -2876,6 +3371,7 @@ mod heap_tests {
 
     include!("log_buffer_tests/common.rs");
     include!("log_buffer_tests/seal.rs");
+    include!("log_buffer_tests/adoption.rs");
 }
 
 #[cfg(test)]
@@ -2897,6 +3393,7 @@ mod shared_tests {
 
     include!("log_buffer_tests/common.rs");
     include!("log_buffer_tests/seal.rs");
+    include!("log_buffer_tests/adoption.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber
@@ -2917,7 +3414,7 @@ mod shared_tests {
         let mutations = AtomicU64::new(0);
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let words = buffer.regions.words();
+                let words = &buffer.regions;
                 let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
                 while !stop.load(Ordering::Relaxed) {
                     state ^= state << 13;
@@ -2934,7 +3431,7 @@ mod shared_tests {
                     } else {
                         state
                     };
-                    if let Some(word) = words.get(index) {
+                    if let Some(word) = words.test_word(index) {
                         word.store(value, Ordering::Relaxed);
                         mutations.fetch_add(1, Ordering::Relaxed);
                     }
@@ -2965,5 +3462,217 @@ mod shared_tests {
                 std::thread::yield_now();
             }
         });
+    }
+}
+
+// A buffer in a shared region, attached through a passed descriptor
+// (`quantstratum-docs: karyos/design/ipc-log-buffer.md`), in one process on Linux.
+#[cfg(all(test, target_os = "linux", not(miri)))]
+// Test helpers outside #[test] functions are not covered by clippy.toml's
+// test exemptions (ADR-0007 exempts tests from these lints).
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
+mod region_tests {
+    use super::*;
+    use crate::ipc::{Recv, Region, RegionKind, RegionRecord, Sent, recv, send, seqpacket_pair};
+    use crate::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH};
+    use rustix::fd::AsFd;
+
+    fn config(publication: PublicationMode) -> LogBufferConfig {
+        LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 4,
+            max_subscribers: 3,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 2,
+            claim_deadline: DEFAULT_CLAIM_DEADLINE,
+            publication,
+        }
+    }
+
+    fn generation() -> Generation {
+        Generation::try_new(3).unwrap()
+    }
+
+    /// Passes the creator's region descriptor over a socket pair and
+    /// attaches it as a participant would.
+    fn attach(creator: &LogBuffer<SharedTerms>) -> Result<LogBuffer<SharedTerms>, SysError> {
+        let region = creator.region().unwrap();
+        let (a, b) = seqpacket_pair().unwrap();
+        assert_eq!(
+            send(a.as_fd(), b"lb", region.descriptor()).unwrap(),
+            Sent::Sent
+        );
+        let mut buffer = [0u8; 8];
+        let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
+        let attached = Region::attach(received.fd.unwrap(), region.record())?;
+        LogBuffer::attach(attached)
+    }
+
+    #[test]
+    fn a_participant_attaches_adopts_and_exchanges_messages() {
+        let creator = Arc::new(
+            LogBuffer::create_in(1, 5, config(PublicationMode::Exclusive), generation()).unwrap(),
+        );
+        let mut conductor = creator.conductor_owned().unwrap();
+        assert!(conductor.register_publication(31).unwrap());
+        let cell = conductor.register_subscriber(Role::Required, 32).unwrap();
+        let participant = Arc::new(attach(&creator).unwrap());
+        assert_eq!(participant.generation(), generation());
+        assert!(participant.conductor_owned().is_none());
+        let mut writer = Publication::adopt(Arc::clone(&participant), 31).unwrap();
+        let mut reader =
+            Subscription::adopt(Arc::clone(&creator), cell, Role::Required, 32).unwrap();
+        let mut out = vec![0u8; 8192];
+        for round in 0..600u32 {
+            let payload = round.to_le_bytes().repeat(100);
+            loop {
+                match writer.append(&payload, AppendOptions::default()).unwrap() {
+                    AppendOutcome::Appended { .. } => break,
+                    _ => {
+                        // Drain and let the creator's conductor rotate.
+                        while let PollOutcome::Message { .. } = reader.poll(&mut out).unwrap() {
+                            reader.acknowledge();
+                        }
+                        let _ = conductor.duty_cycle().unwrap();
+                    }
+                }
+            }
+            match reader.poll(&mut out).unwrap() {
+                PollOutcome::Message { length, .. } => {
+                    assert_eq!(&out[..length as usize], payload.as_slice());
+                    reader.acknowledge();
+                }
+                other => panic!("round {round}: {other:?}"),
+            }
+            let _ = conductor.duty_cycle().unwrap();
+        }
+        // Many rotations through the shared slots.
+        assert!(creator.active_count().load(Ordering::Acquire) >= 2);
+    }
+
+    #[test]
+    fn concurrent_handles_adopted_on_both_sides_share_one_buffer() {
+        let mode = PublicationMode::Concurrent {
+            publishers: 2,
+            allow_non_lse: true,
+        };
+        let creator = Arc::new(LogBuffer::create_in(1, 6, config(mode), generation()).unwrap());
+        let mut conductor = creator.conductor_owned().unwrap();
+        let mut reader = conductor.subscribe(Role::Optional).unwrap();
+        let slot = conductor
+            .register_concurrent_publication(41)
+            .unwrap()
+            .unwrap();
+        let local = conductor.concurrent_publication().unwrap().unwrap();
+        let participant = Arc::new(attach(&creator).unwrap());
+        let mut remote = ConcurrentPublication::adopt(Arc::clone(&participant), slot, 41).unwrap();
+        let mut local = local;
+        for (handle, payload) in [(&mut remote, b"remote"), (&mut local, b"local!")] {
+            assert!(matches!(
+                handle.offer(payload, AppendOptions::default()).unwrap(),
+                ConcurrentOfferOutcome::Appended { .. }
+            ));
+        }
+        let mut out = vec![0u8; 64];
+        let mut seen = Vec::new();
+        while let PollOutcome::Message { length, .. } = reader.poll(&mut out).unwrap() {
+            seen.push(out[..length as usize].to_vec());
+        }
+        assert_eq!(seen, vec![b"remote".to_vec(), b"local!".to_vec()]);
+    }
+
+    #[test]
+    fn attach_refuses_a_configuration_block_that_does_not_validate() {
+        let creator =
+            LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
+        // Valid as created.
+        assert!(attach(&creator).is_ok());
+        let structure = creator.region().unwrap().structure();
+        let corrupt = |index: usize, value: u64| {
+            let word = structure.get(index).unwrap();
+            let before = word.swap(value, Ordering::AcqRel);
+            let result = attach(&creator);
+            word.store(before, Ordering::Release);
+            result
+        };
+        // Version, term length, spare slots beyond the slot bound, a zero
+        // claim deadline, an unknown mode, a generation that differs from
+        // the region's, a largest message that differs, a trailing word.
+        for (index, value) in [
+            (0, 2),
+            (1, 1000),
+            (2, 200),
+            (10, 0),
+            (11, 3),
+            (14, 4),
+            (15, 1),
+            (20, 1),
+        ] {
+            assert!(
+                corrupt(index, value).is_err(),
+                "word {index} = {value} accepted"
+            );
+        }
+        // More subscribers than the region holds: the layout no longer fits.
+        assert!(corrupt(3, 9).is_err());
+        // A record of another kind or generation never attaches (the
+        // header check of the region).
+        let region = creator.region().unwrap();
+        let other = RegionRecord {
+            kind: RegionKind::Counters,
+            ..region.record()
+        };
+        let (a, b) = seqpacket_pair().unwrap();
+        assert_eq!(
+            send(a.as_fd(), b"lb", region.descriptor()).unwrap(),
+            Sent::Sent
+        );
+        let mut buffer = [0u8; 8];
+        let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
+        assert!(Region::attach(received.fd.unwrap(), other).is_err());
+    }
+
+    /// A self-consistent region of another kind whose structure holds a
+    /// valid log buffer layout passes the region's own header check, and
+    /// is refused by the kind gate of `LogBuffer::attach`.
+    #[test]
+    fn attach_refuses_a_region_of_another_kind() {
+        let creator =
+            LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
+        let record = creator.region().unwrap().record();
+        let imposter = Region::create(RegionRecord {
+            kind: RegionKind::Counters,
+            region: 8,
+            ..record
+        })
+        .unwrap();
+        let source = creator.region().unwrap().structure();
+        let target = imposter.structure();
+        for index in 0..CONFIG_WORDS {
+            let value = source.get(index).unwrap().load(Ordering::Acquire);
+            target.get(index).unwrap().store(value, Ordering::Release);
+        }
+        let (a, b) = seqpacket_pair().unwrap();
+        assert_eq!(
+            send(a.as_fd(), b"lb", imposter.descriptor()).unwrap(),
+            Sent::Sent
+        );
+        let mut buffer = [0u8; 8];
+        let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
+        let attached = Region::attach(received.fd.unwrap(), imposter.record()).unwrap();
+        assert!(matches!(
+            LogBuffer::attach(attached),
+            Err(SysError::InvalidRegion { .. })
+        ));
     }
 }

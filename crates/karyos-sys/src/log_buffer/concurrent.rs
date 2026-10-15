@@ -8,14 +8,14 @@
 
 use super::{
     AppendOptions, AppendOutcome, BufferOwner, CommitOutcome, Conductor, FragmentPlan,
-    HEADER_LENGTH, LayoutError, LogBuffer, Lookup, SysError, TermBytes, write_fragments,
-    write_header_tail,
+    HEADER_LENGTH, LayoutError, LogBuffer, Lookup, NOT_GRANTED, SysError, TermBytes, claim,
+    staging_buffer, valid_export, write_fragments, write_header_tail,
 };
 use crate::frame::{FRAME_ALIGNMENT, Flags, FrameType, PROTOCOL_VERSION, Word0};
 use crate::loan::{LoanOutcome, release_loan, rotate_to, take_loan};
 use crate::publication::{
     ABORTING_MARKER, abort_block, acquire_publisher_slot, commit_block, mark_block, observe_block,
-    observe_seal, reissue_from, release_publisher_slot,
+    observe_seal, publisher_slot_free, reissue_from, release_publisher_slot,
 };
 use crate::slot::{Descriptor, SlotState};
 use crate::term::TermCount;
@@ -190,33 +190,73 @@ impl<O: BufferOwner> Conductor<O> {
                 reason: "a concurrent handle of an exclusive buffer",
             });
         }
+        // Allocated before a slot is taken, so a failure leaves no slot held.
+        let staging = staging_buffer(buffer)?;
+        let Some((index, from)) = self.acquire_slot()? else {
+            return Ok(None);
+        };
+        let mut handle = ConcurrentPublication {
+            buffer: self.buffer.clone(),
+            index,
+            state: HandleState::Waiting { from },
+            pending: None,
+            staging,
+        };
+        let _ = handle.catch_up()?;
+        Ok(Some(handle))
+    }
+
+    /// Registers a concurrent handle for a participant in another process,
+    /// for export `export` (nonzero, never reused): a publisher slot is
+    /// taken as [`Conductor::concurrent_publication`] takes it, and the
+    /// slot records the export and the term count the handle starts from.
+    /// Returns the slot, which the participant adopts with
+    /// [`ConcurrentPublication::adopt`] (`quantstratum-docs: karyos/design/ipc-log-buffer.md`),
+    /// or `None` while all `P` slots are held.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::concurrent_publication`]; [`SysError::Protocol`] for
+    /// export 0.
+    pub fn register_concurrent_publication(
+        &mut self,
+        export: u64,
+    ) -> Result<Option<usize>, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if !valid_export(export) {
+            return Err(NOT_GRANTED);
+        }
+        if !buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "a concurrent handle of an exclusive buffer",
+            });
+        }
+        let Some((index, from)) = self.acquire_slot()? else {
+            return Ok(None);
+        };
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if let Some(slot) = buffer.publisher_lines().get(index) {
+            slot.from.store(u64::from(from.get()), Ordering::Relaxed);
+            // Release: an adopter that reads the export reads `from` too.
+            slot.registration.store(export, Ordering::Release);
+        }
+        Ok(Some(index))
+    }
+
+    /// Takes a publisher slot and the term count its handle starts from, or
+    /// `None` while every slot is held. Refuses a sealed buffer.
+    fn acquire_slot(&mut self) -> Result<Option<(usize, TermCount)>, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
         // The conductor alone seals and issues, so a seal load here sees
         // every earlier seal (`quantstratum-docs: karyos/design/publication-seal.md`).
-        if buffer.seal.load(Ordering::Relaxed) != 0 {
+        if buffer.seal().load(Ordering::Relaxed) != 0 {
             return Err(SysError::Sealed);
         }
-        // Allocated before a slot is taken, so a failure leaves no slot held.
-        let staging = if <O::Terms as crate::term_bytes::sealed::Access>::DIRECT {
-            Box::default()
-        } else {
-            let plan = FragmentPlan::new(
-                buffer.config.mtu,
-                Flags::new(true, true, false, false, buffer.config.lane),
-            )?;
-            let size = plan.payload_per_fragment().min(buffer.max_message_length) as usize;
-            let mut staging = Vec::new();
-            staging
-                .try_reserve_exact(size)
-                .map_err(|_| SysError::ResourcesUnavailable)?;
-            staging.resize(size, 0u8);
-            staging.into_boxed_slice()
-        };
         // The Acquire load observes a closing holder's Release of FREE,
         // made after its last access.
         let Some((index, previous)) =
             buffer
-                .publishers
-                .iter()
+                .publisher_words()
                 .enumerate()
                 .find_map(|(index, word)| {
                     acquire_publisher_slot(word).map(|previous| (index, previous))
@@ -225,7 +265,7 @@ impl<O: BufferOwner> Conductor<O> {
             return Ok(None);
         };
         let issue = || -> Result<TermCount, SysError> {
-            let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
+            let active = TermCount::try_new(buffer.active_count().load(Ordering::Acquire) as u32)?;
             let mut crossed_error = None;
             let from = reissue_from(previous, active.get(), || {
                 // `t_close` is still active here.
@@ -249,7 +289,7 @@ impl<O: BufferOwner> Conductor<O> {
             Ok(from) => from,
             Err(error) => {
                 // Not issued: give the slot back as it was.
-                if let Some(word) = buffer.publishers.get(index) {
+                if let Some(word) = buffer.publisher(index) {
                     word.store(
                         previous.map_or(0, |t_close| u64::from(t_close) + 1),
                         Ordering::Release,
@@ -258,15 +298,45 @@ impl<O: BufferOwner> Conductor<O> {
                 return Err(error);
             }
         };
-        let mut handle = ConcurrentPublication {
-            buffer: self.buffer.clone(),
-            index,
+        Ok(Some((index, from)))
+    }
+}
+
+impl<O: BufferOwner> ConcurrentPublication<O> {
+    /// Adopts the publisher slot `slot` that the creator registered for
+    /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): held, and
+    /// registered for exactly this export. The handle starts from the term
+    /// count the registration recorded, as the issuing call would have.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidPublicationMode`] for an exclusive buffer,
+    /// [`SysError::Protocol`] when the registration does not match, and the
+    /// errors of the first catch-up.
+    pub fn adopt(owner: O, slot: usize, export: u64) -> Result<Self, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &owner;
+        if !buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "a concurrent handle of an exclusive buffer",
+            });
+        }
+        let found = buffer.publisher_lines().get(slot).ok_or(NOT_GRANTED)?;
+        if publisher_slot_free(&found.word) || !claim(&found.registration, export) {
+            return Err(NOT_GRANTED);
+        }
+        let from = TermCount::try_new(
+            u32::try_from(found.from.load(Ordering::Relaxed)).map_err(|_| NOT_GRANTED)?,
+        )?;
+        let staging = staging_buffer(buffer)?;
+        let mut handle = Self {
+            buffer: owner,
+            index: slot,
             state: HandleState::Waiting { from },
             pending: None,
             staging,
         };
         let _ = handle.catch_up()?;
-        Ok(Some(handle))
+        Ok(handle)
     }
 }
 
@@ -543,7 +613,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }
         // The head of the handle's own term, never above the true head.
         let head = buffer.position(count, offset);
-        if head + u64::from(reserved) > buffer.limit.load(Ordering::Acquire) {
+        if head + u64::from(reserved) > buffer.limit().load(Ordering::Acquire) {
             return Ok(Reserved::Outcome(AppendOutcome::BackPressured));
         }
         // Admitted by the limit it read; a fence may still come first.
@@ -616,7 +686,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// `Closed` at once (`quantstratum-docs: karyos/design/publication-seal.md`). The caller
     /// resolved any forgotten claim first.
     fn observe_seal(&mut self) -> bool {
-        if !observe_seal(&self.buffer.seal) {
+        if !observe_seal(self.buffer.seal()) {
             return false;
         }
         self.release();
@@ -633,8 +703,8 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         {
             release_loan(&cell.loan);
         }
-        let active = buffer.active_count.load(Ordering::Acquire) as u32;
-        if let Some(word) = buffer.publishers.get(self.index) {
+        let active = buffer.active_count().load(Ordering::Acquire) as u32;
+        if let Some(word) = buffer.publisher(self.index) {
             // After the handle's last access.
             release_publisher_slot(word, active);
         }
@@ -654,7 +724,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         };
         let _ = rotate_to(
             buffer.descriptor(slot)?,
-            &buffer.active_count,
+            buffer.active_count(),
             buffer.initial_term_id.advanced_by(next),
             buffer.generation,
             next,
@@ -679,7 +749,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// attempt (`help`) when a crossed handle finds no later active term.
     fn catch_up_helping(&mut self, help: &mut bool) -> Result<bool, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
+        let active = TermCount::try_new(buffer.active_count().load(Ordering::Acquire) as u32)?;
         let cell = buffer.cell(self.index)?;
         match self.state {
             HandleState::Active { crossed: false, .. } => return Ok(true),
