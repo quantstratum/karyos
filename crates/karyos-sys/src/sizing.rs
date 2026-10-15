@@ -381,3 +381,196 @@ mod tests {
         }
     }
 }
+
+/// Layout properties (SPEC.md §13, "Log buffers, codecs": base and EXT64
+/// sizing, MTU boundaries, checked arithmetic and fragmentation), checked
+/// against an explicit `u64` model of the formulas in SPEC.md §4.
+#[cfg(test)]
+mod properties {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::frame::Lane;
+
+    fn flags() -> impl Strategy<Value = Flags> {
+        (any::<[bool; 4]>(), 0..Lane::COUNT).prop_map(|([begin, end, eos, ext], lane)| {
+            Flags::new(begin, end, eos, ext, Lane::try_new(lane).unwrap())
+        })
+    }
+
+    /// Any `u32`, often near the boundaries where checked arithmetic fails.
+    fn length() -> impl Strategy<Value = u32> {
+        prop_oneof![
+            any::<u32>(),
+            0u32..=20_000,
+            (i32::MAX as u32 - 200)..=(i32::MAX as u32 + 200),
+            (u32::MAX - 200)..=u32::MAX,
+        ]
+    }
+
+    fn align_model(value: u64) -> u64 {
+        value.div_ceil(u64::from(FRAME_ALIGNMENT)) * u64::from(FRAME_ALIGNMENT)
+    }
+
+    /// Fragments of a `length`-byte message with `c` payload bytes each, by
+    /// walking the message: the reserved bytes of every fragment.
+    fn fragment_model(header: u32, c: u32, length: u32) -> Vec<u64> {
+        let mut reserved = Vec::new();
+        let mut left = u64::from(length);
+        loop {
+            let payload = left.min(u64::from(c));
+            reserved.push(align_model(u64::from(header) + payload));
+            left -= payload;
+            if left == 0 {
+                return reserved;
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(crate::receive::tests_config())]
+
+        #[test]
+        fn align_frame_is_the_next_multiple_or_overflow(value in length()) {
+            let model = align_model(u64::from(value));
+            match align_frame(value) {
+                Ok(aligned) => prop_assert_eq!(u64::from(aligned), model),
+                Err(error) => {
+                    prop_assert!(model > u64::from(u32::MAX));
+                    prop_assert_eq!(error, LayoutError::LengthOverflow { value: u64::from(value) });
+                }
+            }
+        }
+
+        #[test]
+        fn frame_and_reserved_lengths_follow_the_header(flags in flags(), payload in length()) {
+            let header = u64::from(if flags.ext() { 96u32 } else { 32 });
+            prop_assert_eq!(u64::from(flags.header_length()), header);
+            let model = header + u64::from(payload);
+            match (frame_length(flags, payload), reserved_length(flags, payload)) {
+                (Ok(frame), Ok(reserved)) => {
+                    prop_assert!(model <= i32::MAX as u64);
+                    prop_assert_eq!(u64::from(frame), model);
+                    prop_assert_eq!(u64::from(reserved), align_model(model));
+                }
+                (Err(frame), Err(reserved)) => {
+                    prop_assert!(model > i32::MAX as u64);
+                    prop_assert_eq!(frame, reserved);
+                }
+                (frame, reserved) => prop_assert!(false, "{frame:?} and {reserved:?} disagree"),
+            }
+        }
+
+        #[test]
+        fn a_plan_exists_exactly_when_the_aligned_mtu_holds_a_payload_byte(
+            flags in flags(),
+            mtu in prop_oneof![any::<u32>(), 0u32..=9000],
+        ) {
+            let aligned = mtu - mtu % FRAME_ALIGNMENT;
+            match FragmentPlan::new(mtu, flags) {
+                Ok(plan) => {
+                    prop_assert!(aligned > flags.header_length());
+                    prop_assert_eq!(plan.payload_per_fragment(), aligned - flags.header_length());
+                }
+                Err(error) => {
+                    prop_assert!(aligned <= flags.header_length());
+                    prop_assert_eq!(
+                        error,
+                        LayoutError::InvalidMtu { value: mtu, header_length: flags.header_length() }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn fragmentation_matches_a_walk_of_the_message(
+            flags in flags(),
+            mtu in prop_oneof![Just(DEFAULT_MTU), 128u32..=9000],
+            length in 0u32..=200_000,
+        ) {
+            let plan = FragmentPlan::new(mtu, flags).unwrap();
+            let c = plan.payload_per_fragment();
+            let fragments = fragment_model(flags.header_length(), c, length);
+            prop_assert_eq!(plan.fragments(length) as usize, fragments.len());
+            // Every fragment fits the aligned MTU; only the last may be short.
+            let aligned = u64::from(mtu - mtu % FRAME_ALIGNMENT);
+            for (index, reserved) in fragments.iter().enumerate() {
+                prop_assert!(*reserved <= aligned);
+                prop_assert_eq!(*reserved % u64::from(FRAME_ALIGNMENT), 0);
+                if index + 1 < fragments.len() {
+                    prop_assert_eq!(*reserved, aligned);
+                }
+            }
+            let total: u64 = fragments.iter().sum();
+            prop_assert_eq!(u64::from(plan.reserved(length).unwrap()), total);
+            // One more byte never reserves less.
+            prop_assert!(plan.reserved(length + 1).unwrap() >= plan.reserved(length).unwrap());
+        }
+
+        #[test]
+        fn large_reservations_overflow_exactly_past_u32(
+            flags in flags(),
+            mtu in prop_oneof![Just(DEFAULT_MTU), 128u32..=9000],
+            length in length(),
+        ) {
+            let plan = FragmentPlan::new(mtu, flags).unwrap();
+            let c = u64::from(plan.payload_per_fragment());
+            let n = u64::from(plan.fragments(length));
+            let last = u64::from(length) - (n - 1) * c;
+            let model = (n - 1) * u64::from(mtu - mtu % FRAME_ALIGNMENT)
+                + align_model(u64::from(flags.header_length()) + last);
+            match plan.reserved(length) {
+                Ok(reserved) => prop_assert_eq!(u64::from(reserved), model),
+                Err(error) => {
+                    prop_assert!(model > u64::from(u32::MAX));
+                    prop_assert_eq!(error, LayoutError::LengthOverflow { value: u64::from(length) });
+                }
+            }
+        }
+
+        #[test]
+        fn the_maximum_message_is_the_largest_that_fits(
+            flags in flags(),
+            mtu in prop_oneof![Just(DEFAULT_MTU), 128u32..=9000],
+            shift in 16u32..=30,
+            max_reserved in prop_oneof![0u32..=4096, any::<u32>()],
+        ) {
+            let term_length = TermLength::try_new(1 << shift).unwrap();
+            let plan = FragmentPlan::new(mtu, flags).unwrap();
+            let max_reserved = max_reserved % (term_length.max_reserved_limit() + 64);
+            let smallest = align_model(u64::from(flags.header_length()) + 1);
+            match plan.max_message_length(max_reserved, term_length) {
+                Ok(max) => {
+                    prop_assert!(u64::from(max_reserved) >= smallest);
+                    prop_assert!(max_reserved <= term_length.max_reserved_limit());
+                    prop_assert!(plan.reserved(max).unwrap() <= max_reserved);
+                    prop_assert!(plan.reserved(max + 1).unwrap() > max_reserved);
+                    prop_assert!(FragmentPlan::check_message(max, max).is_ok());
+                    prop_assert_eq!(
+                        FragmentPlan::check_message(max + 1, max),
+                        Err(LayoutError::MessageTooLarge { length: max + 1, max })
+                    );
+                }
+                Err(error) => {
+                    prop_assert!(
+                        u64::from(max_reserved) < smallest
+                            || max_reserved > term_length.max_reserved_limit()
+                    );
+                    prop_assert_eq!(
+                        error,
+                        LayoutError::InvalidMaxReservedLength {
+                            value: max_reserved,
+                            limit: term_length.max_reserved_limit(),
+                        }
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn term_lengths_are_the_powers_of_two_in_range(value in prop_oneof![any::<u32>(), (16u32..=30).prop_map(|s| 1 << s)]) {
+            let valid = value.is_power_of_two() && (MIN_TERM_LENGTH..=MAX_TERM_LENGTH).contains(&value);
+            prop_assert_eq!(TermLength::try_new(value).is_ok(), valid);
+        }
+    }
+}
