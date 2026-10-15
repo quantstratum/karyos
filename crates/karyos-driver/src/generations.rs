@@ -363,6 +363,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ) -> Result<Generation, DriverError> {
         let max_retained = self.config.max_retained_generations;
         let deadline = self.config.cutover_deadline;
+        let id = self.active_stream_mut(stream)?.id;
+        // A remote participant cannot follow a cutover until generations
+        // across processes land: refused, never silently.
+        if self.clients.iter().any(|client| {
+            client
+                .ledger
+                .as_ref()
+                .is_some_and(|ledger| ledger.names_stream(id))
+        }) {
+            return Err(DriverError::RemoteParticipants { stream: id });
+        }
         let target = self.active_stream_mut(stream)?;
         if target.cutover.is_some() {
             return Err(DriverError::CutoverPending { stream: target.id });

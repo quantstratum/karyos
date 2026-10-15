@@ -1191,6 +1191,32 @@ mod tests {
     }
 
     #[test]
+    fn reconfiguring_a_stream_with_a_remote_grant_is_refused() {
+        let (mut driver, stream) = driver_with_stream();
+        let (_client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert!(matches!(
+            driver.reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 5,
+                }
+            ),
+            Err(DriverError::RemoteParticipants { .. })
+        ));
+        assert_eq!(driver.streams[0].generation.get(), 0);
+    }
+
+    #[test]
     fn a_sent_grant_outlives_its_remove_and_keeps_its_stream() {
         let (mut driver, stream) = driver_with_stream();
         let (client, mut producer) = remote_client(&mut driver, 4);

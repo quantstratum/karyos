@@ -60,7 +60,7 @@ pub const TYPE_EVENTS: u64 = 1;
 pub const TYPE_GAUGE: u64 = 2;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 29] = [
+const LABELS: [(u64, &str); 30] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -90,6 +90,7 @@ const LABELS: [(u64, &str); 29] = [
     (TYPE_EVENTS, "grants reserved"),
     (TYPE_EVENTS, "grants ended"),
     (TYPE_EVENTS, "grants exported"),
+    (TYPE_EVENTS, "grants detached"),
 ];
 
 /// One of the driver's counters.
@@ -162,6 +163,12 @@ pub(crate) enum Event {
         allow(dead_code, reason = "fetches are served only on Linux")
     )]
     GrantsExported,
+    /// Grants a client ended with `Detach`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "Detach is served only on Linux")
+    )]
+    GrantsDetached,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -293,6 +300,7 @@ mod tests {
             (Event::GrantsReserved, "grants reserved"),
             (Event::GrantsEnded, "grants ended"),
             (Event::GrantsExported, "grants exported"),
+            (Event::GrantsDetached, "grants detached"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

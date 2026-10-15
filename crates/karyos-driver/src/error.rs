@@ -69,6 +69,13 @@ pub enum DriverError {
     /// The process has used every driver identity.
     #[error("driver identities exhausted")]
     DriverIdsExhausted,
+    /// The stream has participants in other processes, which cannot move
+    /// to a successor yet (issue #2, batch d5).
+    #[error("stream {stream} has remote participants")]
+    RemoteParticipants {
+        /// The stream.
+        stream: u64,
+    },
     /// The driver has used every shared region identity.
     #[error("region identities exhausted")]
     RegionIdsExhausted,

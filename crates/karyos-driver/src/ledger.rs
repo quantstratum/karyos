@@ -112,6 +112,32 @@ impl Ledger {
         Some(self.grants.swap_remove(index))
     }
 
+    /// Removes and returns the grant of `export` if its fetch is over
+    /// (`Exported` or `Failed`): the only grants a `Detach` may end.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn detach(&mut self, export: u64) -> Option<Grant> {
+        let index = self.grants.iter().position(|grant| {
+            grant.export == export
+                && matches!(grant.state, GrantState::Exported | GrantState::Failed)
+        })?;
+        Some(self.grants.swap_remove(index))
+    }
+
+    /// Whether every grant is still `Held`: nothing was exported, so the
+    /// client may `Leave`.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn only_held(&self) -> bool {
+        self.grants
+            .iter()
+            .all(|grant| grant.state == GrantState::Held && !grant.sent)
+    }
+
     /// Removes and returns every grant whose descriptor never left.
     pub(crate) fn take_unsent(&mut self) -> Vec<Grant> {
         let (unsent, sent) = core::mem::take(&mut self.grants)
