@@ -11,7 +11,7 @@ use proptest::prelude::*;
 
 use super::*;
 use crate::frame::{Flags, FrameType, Word0};
-use crate::log_buffer::{DEFAULT_CLAIM_DEADLINE, LogBufferConfig, PollOutcome, Role};
+use crate::log_buffer::{DEFAULT_CLAIM_DEADLINE, LogBufferConfig, PollOutcome, Role, SkipReason};
 use crate::receive::{Item, ValidatedDatagram};
 use crate::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use crate::term::TermId;
@@ -615,4 +615,176 @@ fn a_concurrent_reader_sees_only_complete_frames() {
         }
     }
     writer.join().unwrap();
+}
+
+// Image read mode (batch r3): fragments published one by one.
+
+/// A DATA fragment of `payload` bytes with explicit BEGIN and END flags.
+fn fragment(term: u32, offset: u32, payload: usize, begin: bool, end: bool, fill: u8) -> Vec<u8> {
+    let flags = Flags::new(begin, end, false, false, Lane::ZERO);
+    let word0 = Word0::new(32 + payload as i32, flags, FrameType::Data);
+    let mut out = header(word0, term, offset, 0);
+    out.extend((0..payload).map(|i| fill.wrapping_add(i as u8)));
+    out
+}
+
+fn poll(subscription: &mut crate::log_buffer::Subscription<&LogBuffer<HeapTerms>>) -> PollOutcome {
+    let mut out = vec![0u8; 16 * 1024];
+    subscription.poll(&mut out).unwrap()
+}
+
+fn skipped(position: u64, extent: u32, reason: SkipReason) -> PollOutcome {
+    PollOutcome::Skipped {
+        position,
+        extent,
+        reason,
+    }
+}
+
+#[test]
+fn a_message_is_delivered_once_every_fragment_arrived() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    // Three fragments of 64 bytes each: END first, then BEGIN, then the middle.
+    let parts = [
+        fragment(0, 0, 32, true, false, 1),
+        fragment(0, 64, 32, false, false, 2),
+        fragment(0, 128, 32, false, true, 3),
+    ];
+    assert_eq!(recv(&mut owner, &parts[2]), committed(128, 64));
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+    assert_eq!(recv(&mut owner, &parts[0]), committed(0, 64));
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+    assert_eq!(recv(&mut owner, &parts[1]), committed(64, 64));
+    let mut out = [0u8; 256];
+    let PollOutcome::Message {
+        position, length, ..
+    } = subscription.poll(&mut out).unwrap()
+    else {
+        panic!("no message")
+    };
+    assert_eq!((position, length), (0, 96));
+    let expected: Vec<u8> = parts.iter().flat_map(|p| p[32..].to_vec()).collect();
+    assert_eq!(&out[..96], &expected[..]);
+}
+
+#[test]
+fn an_interrupted_message_is_skipped_up_to_the_interruption() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &fragment(0, 0, 32, true, false, 1)).unwrap();
+    recv(&mut owner, &record(FrameType::Aborted, 0, 64, 64)).unwrap();
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(0, 64, SkipReason::Interrupted)
+    );
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: 64,
+            extent: 64
+        }
+    );
+    // A new BEGIN interrupts too.
+    recv(&mut owner, &fragment(0, 128, 32, true, false, 2)).unwrap();
+    recv(&mut owner, &fragment(0, 192, 32, true, true, 3)).unwrap();
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(128, 64, SkipReason::Interrupted)
+    );
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Message { position: 192, .. }
+    ));
+}
+
+#[test]
+fn a_message_over_the_bound_is_skipped() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    // Six full 1408-byte fragments reserve 8448 bytes, over TERM / 8.
+    let full = 1408 - 32;
+    for i in 0..6u32 {
+        let bytes = fragment(0, i * 1408, full, i == 0, false, i as u8);
+        recv(&mut owner, &bytes).unwrap();
+    }
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(0, 6 * 1408, SkipReason::MessageTooLarge)
+    );
+}
+
+#[test]
+fn a_message_without_end_is_skipped_to_the_term_end() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &record(FrameType::Aborted, 0, 0, TERM - 128)).unwrap();
+    recv(&mut owner, &fragment(0, TERM - 128, 96, true, false, 1)).unwrap();
+    recv(&mut owner, &data(1, 0, 64, 2)).unwrap();
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Aborted { .. }
+    ));
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(u64::from(TERM - 128), 128, SkipReason::MissingEnd)
+    );
+    assert!(
+        matches!(poll(&mut subscription), PollOutcome::Message { position, .. } if position == u64::from(TERM))
+    );
+}
+
+#[test]
+fn orphans_where_a_reader_joined_are_not_a_fault() {
+    // The image joins between two fragments of one message.
+    let buffer = image(64);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &fragment(0, 64, 32, false, false, 1)).unwrap();
+    // The run stops at the uncommitted END; it arrives later.
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(64, 64, SkipReason::JoinedMidMessage)
+    );
+    recv(&mut owner, &fragment(0, 128, 32, false, true, 2)).unwrap();
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(128, 64, SkipReason::JoinedMidMessage)
+    );
+    recv(&mut owner, &data(0, 192, 64, 3)).unwrap();
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Message { position: 192, .. }
+    ));
+    // After a BEGIN, the same shape is a peer fault.
+    recv(&mut owner, &fragment(0, 256, 32, false, true, 4)).unwrap();
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(256, 64, SkipReason::Orphan)
+    );
+}
+
+#[test]
+fn a_late_joiner_inside_a_partial_message_skips_its_rest() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &fragment(0, 0, 32, true, false, 1)).unwrap();
+    recv(&mut owner, &fragment(0, 64, 32, false, false, 2)).unwrap();
+    // Joins at the rebuild position, 128, inside the message.
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    recv(&mut owner, &fragment(0, 128, 32, false, true, 3)).unwrap();
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(128, 64, SkipReason::JoinedMidMessage)
+    );
 }

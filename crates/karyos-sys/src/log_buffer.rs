@@ -70,6 +70,7 @@ use storage::{Backing, CONFIG_WORDS, Cell, Control, Layout, Line, PublisherSlot}
 
 mod concurrent;
 mod deadline;
+mod image_read;
 mod receive_owner;
 
 pub use receive_owner::{ReceiveCounters, ReceiveError, ReceiveOwner, Received};
@@ -1351,6 +1352,7 @@ impl<O: BufferOwner> PreparedSubscription<O> {
             });
         }
         let position = found.position.load(Ordering::Acquire);
+        let joining = self.owner.image();
         Ok(Subscription {
             buffer: self.owner,
             cursor: Cursor {
@@ -1360,6 +1362,7 @@ impl<O: BufferOwner> PreparedSubscription<O> {
                 acknowledged: position,
                 pending: None,
                 detached: false,
+                joining,
             },
         })
     }
@@ -2306,6 +2309,18 @@ pub enum PollOutcome {
         /// Bytes skipped.
         extent: u32,
     },
+    /// Only on an image (`quantstratum-docs: karyos/design/receive-publication.md`,
+    /// fragments are published one by one): a range that delivers no
+    /// message was skipped, and reading continues after it. It needs no
+    /// acknowledgement.
+    Skipped {
+        /// Stream position of the skipped range.
+        position: u64,
+        /// Bytes skipped.
+        extent: u32,
+        /// Why the range delivers no message.
+        reason: SkipReason,
+    },
     /// The subscriber was lapped. Data in `[from, lost_to)` is no longer
     /// retained (below the retention floor). Under `rejoin_at_head` the
     /// subscriber resumes at `resume`, the reserved head; data in
@@ -2321,6 +2336,26 @@ pub enum PollOutcome {
     },
 }
 
+/// Why an image reader skipped a range (`PollOutcome::Skipped`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SkipReason {
+    /// A message whose reserved length or payload exceeds the image's
+    /// `max_reserved_length` or `max_message_length`: skipped from its
+    /// BEGIN to the end of the fragment that crossed the bound.
+    MessageTooLarge,
+    /// A message with no END before the term end: skipped to the term end.
+    MissingEnd,
+    /// A message interrupted by an ABORTED, PAD or new BEGIN frame:
+    /// skipped up to the interrupting frame, which is read next.
+    Interrupted,
+    /// Fragments without their BEGIN, after this reader joined: a peer
+    /// fault.
+    Orphan,
+    /// Fragments without their BEGIN where this reader joined, in the
+    /// middle of a message: the rest of a message it never saw start.
+    JoinedMidMessage,
+}
+
 /// A registered subscriber's private cursor.
 #[derive(Debug)]
 struct Cursor {
@@ -2334,6 +2369,9 @@ struct Cursor {
     /// acknowledged message.
     pending: Option<u64>,
     detached: bool,
+    /// An image reader that has not yet reached a BEGIN, ABORTED or PAD
+    /// frame since it joined.
+    joining: bool,
 }
 
 /// A registered subscriber.
@@ -2522,8 +2560,29 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         }
         let result = self.read_block(slot, offset, out);
         release_loan(&cell.loan);
-        match result? {
+        let result = result?;
+        if !matches!(
+            result,
+            Read::Pending
+                | Read::Skip {
+                    reason: SkipReason::Orphan | SkipReason::JoinedMidMessage,
+                    ..
+                }
+        ) {
+            // The cursor reached a BEGIN, ABORTED or PAD frame.
+            self.cursor.joining = false;
+        }
+        match result {
             Read::Pending => Ok(Step::Done(PollOutcome::Pending)),
+            Read::Skip { extent, reason } => {
+                let position = self.cursor.position;
+                self.advance_to(position + u64::from(extent));
+                Ok(Step::Done(PollOutcome::Skipped {
+                    position,
+                    extent,
+                    reason,
+                }))
+            }
             Read::Pad => Ok(Step::NextTerm),
             Read::Aborted { extent } => {
                 let position = self.cursor.position;
@@ -2561,6 +2620,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             Validated::Pending => Ok(Read::Pending),
             Validated::Pad => Ok(Read::Pad),
             Validated::Aborted { extent } => Ok(Read::Aborted { extent }),
+            Validated::Skip { extent, reason } => Ok(Read::Skip { extent, reason }),
             Validated::Block(block) => self.copy_block(slot, start, block, out),
         }
     }
@@ -2568,6 +2628,9 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     /// First pass: classifies the block at `start` from its first word 0
     /// and, for data, walks and checks every fragment's word 0.
     fn validate_block(&self, slot: u8, start: u32) -> Result<Validated, SysError> {
+        if self.buffer.image() {
+            return self.validate_image_block(slot, start);
+        }
         let buffer = self.buffer;
         let term_length = buffer.term_length;
         // SAFETY: read loan held for this slot's term; `start` is a block
@@ -2830,7 +2893,14 @@ enum Step {
 enum Validated {
     Pending,
     Pad,
-    Aborted { extent: u32 },
+    Aborted {
+        extent: u32,
+    },
+    /// Only on an image: a range that delivers no message.
+    Skip {
+        extent: u32,
+        reason: SkipReason,
+    },
     Block(Block),
 }
 
@@ -2852,6 +2922,10 @@ enum Read {
     Pad,
     Aborted {
         extent: u32,
+    },
+    Skip {
+        extent: u32,
+        reason: SkipReason,
     },
     Message {
         length: u32,
@@ -3771,6 +3845,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             acknowledged: start,
             pending: None,
             detached: false,
+            joining: buffer.image(),
         })
     }
 

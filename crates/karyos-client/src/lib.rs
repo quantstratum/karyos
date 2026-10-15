@@ -31,4 +31,5 @@ pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
     Aborted, ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,
+    Skipped,
 };

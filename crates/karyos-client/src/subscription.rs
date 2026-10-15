@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use karyos_sys::frame::EXTENSION_LENGTH;
-use karyos_sys::log_buffer::{LogBuffer, PollOutcome, Subscription};
+use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SkipReason, Subscription};
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::error::ClientError;
@@ -76,6 +76,18 @@ pub struct Aborted {
     pub extent: u32,
 }
 
+/// A range of an image skipped because it delivers no message
+/// (`quantstratum-docs: karyos/design/receive-publication.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Skipped {
+    /// Stream position of the range.
+    pub position: u64,
+    /// Bytes skipped.
+    pub extent: u32,
+    /// Why the range delivers no message.
+    pub reason: SkipReason,
+}
+
 /// What one poll did. A poll stops at the first overrun or aborted block,
 /// so no loss or abort report is ever overwritten or hidden behind later
 /// deliveries.
@@ -89,6 +101,9 @@ pub struct PollSummary {
     /// The aborted block that stopped the poll, if any; the next poll
     /// resumes after it.
     pub aborted: Option<Aborted>,
+    /// The skipped range of an image that stopped the poll, if any; the
+    /// next poll resumes after it.
+    pub skipped: Option<Skipped>,
     /// The seal position, when the poll reached it: the stream is sealed
     /// and no message can follow (`quantstratum-docs: karyos/design/publication-seal.md`).
     /// Every later poll reports it again.
@@ -225,6 +240,10 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// gone. A message handed to the handler and not yet acknowledged stays
     /// pending for redelivery; a PAD stepped over before the failure may
     /// still have been acknowledged.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error carries the whole summary by value so a failed poll reports its progress; the Ok summary is as large, so boxing the error saves nothing"
+    )]
     pub fn poll<H>(
         &mut self,
         mut handler: H,
@@ -288,6 +307,18 @@ impl<T: TermBytes> ClientSubscription<T> {
                     summary.aborted = Some(Aborted {
                         position: self.base + position,
                         extent,
+                    });
+                    break;
+                }
+                PollOutcome::Skipped {
+                    position,
+                    extent,
+                    reason,
+                } => {
+                    summary.skipped = Some(Skipped {
+                        position: self.base + position,
+                        extent,
+                        reason,
                     });
                     break;
                 }
