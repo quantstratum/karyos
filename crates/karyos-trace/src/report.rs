@@ -14,10 +14,13 @@
 //! A trace's expected set is the union, over its messages, of the
 //! publishing journal and the subscription journals eligible for the
 //! message: those that joined at or before its position and whose delivery
-//! boundary passed it. The set is decided only once every journal that
-//! could be eligible reached its terminal close; until then a trace gets a
-//! provisional answer, never a final `Complete`. `Incomplete` is final as
-//! soon as it is reached.
+//! boundary passed it. Any journal still open could still be eligible: an
+//! open publisher journal could publish another message of the trace, such
+//! as a child. So the set is frozen, and a final `Complete` possible, only
+//! once every journal registered in the report reached its terminal close
+//! (coordinator decision ACS 12662 on trace-data-path.md, "Trace-wide
+//! expected set"); until then a trace gets a provisional answer.
+//! `Incomplete` is final as soon as it is reached.
 //!
 //! Automatic calibration: two [`ClockProvenance::StdMonotonic`] clocks with
 //! the same epoch (one process start) share their source, so a latency
@@ -344,6 +347,10 @@ impl TraceReport {
         let mut expected: Vec<usize> = Vec::new();
         let mut decided = true;
         let mut publish_missing = false;
+        // Per message: an eligible subscription journal, terminally closed
+        // without this message's SubscriberPoll, makes the trace Incomplete,
+        // even if the journal holds the trace for another message.
+        let mut poll_missing = false;
         for ((publication, _lane, position), message) in &messages {
             match message.publish {
                 Some((JournalId(journal), _)) => expected.push(journal),
@@ -357,7 +364,16 @@ impl TraceReport {
                     continue;
                 }
                 match journal.eligible(publication, *position) {
-                    Some(true) => expected.push(index),
+                    Some(true) => {
+                        expected.push(index);
+                        let polled = message
+                            .polls
+                            .iter()
+                            .any(|(JournalId(journal), _)| *journal == index);
+                        if journal.terminal() && !polled {
+                            poll_missing = true;
+                        }
+                    }
                     Some(false) => {}
                     None => decided = false,
                 }
@@ -372,14 +388,18 @@ impl TraceReport {
             .collect();
         // Incomplete is final as soon as it is reached: a reported loss, or
         // a terminally closed expected journal without the trace.
-        let incomplete = verdicts.iter().any(|(terminal, verdict)| {
-            *verdict == Some(Verdict::Incomplete) || (*terminal && verdict.is_none())
-        });
+        let incomplete = poll_missing
+            || verdicts.iter().any(|(terminal, verdict)| {
+                *verdict == Some(Verdict::Incomplete) || (*terminal && verdict.is_none())
+            });
         if incomplete {
             return TraceAnswer::Final(Verdict::Incomplete);
         }
         let all_terminal = verdicts.iter().all(|(terminal, _)| *terminal);
-        if !decided || !all_terminal {
+        // Every registered journal, not only those already holding the
+        // trace: an open one could still add a message of it.
+        let registered_terminal = self.journals.iter().all(Journal::terminal);
+        if !decided || !all_terminal || !registered_terminal {
             return TraceAnswer::Provisional;
         }
         if publish_missing {

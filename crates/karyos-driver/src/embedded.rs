@@ -309,6 +309,10 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) admission: Option<crate::admission::Admission<T>>,
 }
 
+/// The incarnation of a stream's publication in the embedded driver: one per
+/// stream registration, kept across mapping cutovers.
+pub const FIRST_INCARNATION: u64 = 1;
+
 impl EmbeddedDriver<HeapTerms> {
     /// An empty driver.
     ///
@@ -873,11 +877,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// The publication identity trace records of `stream` carry
-    /// (`quantstratum-docs: karyos/design/trace-data-path.md`): this
-    /// driver's `driver_id`, the stream's registration, its wire stream and
-    /// session ids, and its current mapping generation as the incarnation.
-    /// Publisher and subscriber hooks of the stream use the same identity,
-    /// so their records pair.
+    /// (`quantstratum-docs: karyos/design/trace-data-path.md`; SPEC.md §5,
+    /// `(driver_id, registration_id, incarnation)`): this driver's
+    /// `driver_id`, the stream's registration, its wire stream and session
+    /// ids, and the incarnation. The embedded driver opens one incarnation
+    /// per stream registration, and registrations are never reused, so the
+    /// incarnation is [`FIRST_INCARNATION`]; a mapping cutover keeps it
+    /// (a successor mapping is not a new incarnation). Publisher and
+    /// subscriber hooks of the stream use the same identity before and
+    /// after a cutover, so their records pair.
     ///
     /// # Errors
     ///
@@ -894,7 +902,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             registration: found.id,
             stream_id: found.stream_id,
             session_id: found.session_id,
-            incarnation: u64::from(found.generation.get()),
+            incarnation: FIRST_INCARNATION,
         })
     }
 
@@ -1094,6 +1102,21 @@ mod tests {
         assert_eq!(identity.session_id, 1);
         assert_eq!(identity.registration, stream.stream);
         // Stable for the same mapping.
+        assert_eq!(driver.trace_identity(stream).unwrap(), identity);
+        assert_eq!(identity.incarnation, FIRST_INCARNATION);
+        // A cutover to a successor mapping is not a new incarnation: a
+        // writer bound before it and a subscriber bound after it share the
+        // identity (review finding on #93).
+        let generation = driver
+            .reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 6,
+                },
+            )
+            .unwrap();
+        assert!(generation.get() > 0);
         assert_eq!(driver.trace_identity(stream).unwrap(), identity);
         let mut other = EmbeddedDriver::new().unwrap();
         assert!(matches!(

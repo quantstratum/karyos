@@ -15,13 +15,21 @@ use crate::ids::{BufferedIds, OsRandom};
 use crate::journal::trace_journal;
 use crate::record::ObservedTime;
 use crate::sampling::Sampling;
-use crate::trace_clock::{MonotonicClock, TraceClock};
+use crate::trace_clock::{ClockProvenance, MonotonicClock, TraceClock};
 
 const IDENTITY: PublicationIdentity = PublicationIdentity {
     driver: [1, 2],
     registration: 3,
     stream_id: 10,
     session_id: 1,
+    incarnation: 1,
+};
+
+const IDENTITY_B: PublicationIdentity = PublicationIdentity {
+    driver: [1, 2],
+    registration: 4,
+    stream_id: 11,
+    session_id: 2,
     incarnation: 1,
 };
 
@@ -289,6 +297,122 @@ fn test_trace_missing_publish_record_is_incomplete() {
     report.drain().unwrap();
     assert_eq!(
         report.trace(second.trace_id),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+}
+
+/// Two messages of one trace, a subscription eligible for both that
+/// recorded only the first: Incomplete, though the journal holds the trace
+/// (review finding on #93).
+#[test]
+fn test_trace_each_message_needs_its_own_poll_record() {
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    let (mut publisher, pub_id) = std_agent(&mut report, 1, 8, None);
+    let (mut subscriber, sub_id) = std_agent(&mut report, 2, 8, Some(0));
+    let root = publish(&mut publisher, 64);
+    // A child in the same trace, at 128.
+    let child = publisher
+        .on_publish(
+            Some(&root),
+            &PublishContext {
+                publication: IDENTITY,
+                lane: Lane::ZERO,
+            },
+        )
+        .unwrap();
+    assert_eq!(child.trace_id, root.trace_id);
+    publisher.on_committed(
+        &child,
+        &Committed {
+            publication: IDENTITY,
+            lane: Lane::ZERO,
+            position: 128,
+        },
+    );
+    deliver(&mut subscriber, &root, 9, 64);
+    publisher.close();
+    subscriber.close();
+    report.closed(pub_id, None);
+    report.closed(sub_id, Some(192));
+    report.drain().unwrap();
+    assert_eq!(
+        report.trace(root.trace_id),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+}
+
+/// A trace stays provisional while any registered journal is open: an open
+/// publisher can still add a child to it after its root's journals closed
+/// (review finding on #93; coordinator decision ACS 12662).
+#[test]
+fn test_trace_an_open_publisher_keeps_the_answer_provisional() {
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    let (mut publisher_a, a_id) = std_agent(&mut report, 1, 8, None);
+    let (mut subscriber_a, sub_a_id) = std_agent(&mut report, 2, 8, Some(0));
+    // Publication B and its subscription, registered from the start.
+    let observer = |journal| ObserverId {
+        driver: IDENTITY.driver,
+        journal,
+    };
+    let (writer_b, collector_b) = trace_journal(8, 4, observer(3), 3).unwrap();
+    let mut publisher_b = TraceAgent::new(
+        Sampling::All,
+        BufferedIds::new(64, OsRandom).unwrap(),
+        MonotonicClock::new(3),
+        writer_b,
+    );
+    let b_id = report
+        .add_publisher(
+            collector_b,
+            ClockProvenance::StdMonotonic,
+            PublicationId::from(IDENTITY_B),
+        )
+        .unwrap();
+    let (writer_sb, collector_sb) = trace_journal(8, 4, observer(4), 4).unwrap();
+    let sub_b_id = report
+        .add_subscriber(
+            collector_sb,
+            ClockProvenance::StdMonotonic,
+            PublicationId::from(IDENTITY_B),
+            0,
+        )
+        .unwrap();
+    let root = publish(&mut publisher_a, 64);
+    deliver(&mut subscriber_a, &root, 9, 64);
+    publisher_a.close();
+    subscriber_a.close();
+    report.closed(a_id, None);
+    report.closed(sub_a_id, Some(65));
+    report.drain().unwrap();
+    // A's journals are closed and complete, but B is open: not final.
+    assert_eq!(report.trace(root.trace_id), TraceAnswer::Provisional);
+    // B publishes a child of the root; its subscriber never records it.
+    let child = publisher_b
+        .on_publish(
+            Some(&root),
+            &PublishContext {
+                publication: IDENTITY_B,
+                lane: Lane::ZERO,
+            },
+        )
+        .unwrap();
+    publisher_b.on_committed(
+        &child,
+        &Committed {
+            publication: IDENTITY_B,
+            lane: Lane::ZERO,
+            position: 0,
+        },
+    );
+    report.drain().unwrap();
+    assert_eq!(report.trace(root.trace_id), TraceAnswer::Provisional);
+    publisher_b.close();
+    drop(writer_sb);
+    report.closed(b_id, None);
+    report.closed(sub_b_id, Some(1));
+    report.drain().unwrap();
+    assert_eq!(
+        report.trace(root.trace_id),
         TraceAnswer::Final(Verdict::Incomplete)
     );
 }
