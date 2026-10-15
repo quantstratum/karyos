@@ -60,7 +60,7 @@ pub const TYPE_EVENTS: u64 = 1;
 pub const TYPE_GAUGE: u64 = 2;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 25] = [
+const LABELS: [(u64, &str); 26] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -86,6 +86,7 @@ const LABELS: [(u64, &str); 25] = [
     (TYPE_EVENTS, "participants revoked"),
     (TYPE_EVENTS, "required participants lost"),
     (TYPE_EVENTS, "required bounds withdrawn"),
+    (TYPE_EVENTS, "events not sent"),
 ];
 
 /// One of the driver's counters.
@@ -146,6 +147,8 @@ pub(crate) enum Event {
     RequiredParticipantsLost,
     /// Revoked `hold` subscribers whose bound a later scan withdrew.
     RequiredBoundsWithdrawn,
+    /// Driver events the broadcast buffer had no room for.
+    EventsNotSent,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -273,6 +276,7 @@ mod tests {
                 "required participants lost",
             ),
             (Event::RequiredBoundsWithdrawn, "required bounds withdrawn"),
+            (Event::EventsNotSent, "events not sent"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

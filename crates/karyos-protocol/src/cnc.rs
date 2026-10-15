@@ -25,6 +25,15 @@
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
 //! | `0x84` | `Error` | client | sequence | code (1 to 6, see [`ErrorCode`]) | detail |
+//!
+//! Driver events (record types `0xC0` to `0xFF`, [`Event`]) answer no
+//! request and are broadcast to every client:
+//!
+//! | Type | Event | Word 0 | Word 1 | Word 2 | Word 3 | Word 4 |
+//! | --- | --- | --- | --- | --- | --- | --- |
+//! | `0xC1` | `ParticipantLost` | stream and session | registration | client | policy: 1 hold, 2 continue, 3 abort | position |
+//! | `0xC2` | `RequiredBoundWithdrawn` | stream and session | registration | position | | |
+//! | `0xC3` | `PublicationClosed` | stream and session | reason: 1 required participant lost | | | |
 
 use thiserror::Error;
 
@@ -32,6 +41,8 @@ use thiserror::Error;
 pub const MAX_COMMAND_LENGTH: usize = 3 * 8;
 /// Largest encoded response, in bytes.
 pub const MAX_RESPONSE_LENGTH: usize = 4 * 8;
+/// Largest encoded driver event, in bytes.
+pub const MAX_EVENT_LENGTH: usize = 5 * 8;
 
 const ADD_PUBLICATION: u32 = 0x01;
 const ADD_SUBSCRIPTION: u32 = 0x02;
@@ -42,6 +53,9 @@ const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
 const ERROR: u32 = 0x84;
+const PARTICIPANT_LOST: u32 = 0xC1;
+const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
+const PUBLICATION_CLOSED: u32 = 0xC3;
 
 const ALLOW_UNCONNECTED: u64 = 1;
 
@@ -503,6 +517,191 @@ impl Response {
     }
 }
 
+/// What `on_required_loss` did with a lost required participant
+/// (quantstratum-docs: `karyos/design/required-participant-loss.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LossPolicyCode {
+    /// `hold`: it keeps bounding the publisher until its loan ends.
+    Hold,
+    /// `continue`: its bound was withdrawn at once.
+    Continue,
+    /// `abort`: the publication was sealed.
+    Abort,
+}
+
+impl LossPolicyCode {
+    const fn code(self) -> u64 {
+        match self {
+            Self::Hold => 1,
+            Self::Continue => 2,
+            Self::Abort => 3,
+        }
+    }
+
+    const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::Hold),
+            2 => Some(Self::Continue),
+            3 => Some(Self::Abort),
+            _ => None,
+        }
+    }
+}
+
+/// Why a publication was closed, reported with its `Closed` outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CloseReason {
+    /// A required participant was lost under the `abort` policy.
+    RequiredParticipantLost,
+}
+
+impl CloseReason {
+    const fn code(self) -> u64 {
+        match self {
+            Self::RequiredParticipantLost => 1,
+        }
+    }
+
+    const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::RequiredParticipantLost),
+            _ => None,
+        }
+    }
+}
+
+/// A driver event on the broadcast buffer: not an answer to a request, so
+/// every client sees it (quantstratum-docs:
+/// `karyos/design/required-participant-loss.md`, Reporting). A client that
+/// does not know an event type skips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// A participant of a lost client was handled by the stream's
+    /// `on_required_loss` policy, at the time out, under every policy.
+    ParticipantLost {
+        /// The stream.
+        stream: StreamKey,
+        /// The participant's registration.
+        registration: u64,
+        /// Its client.
+        client: u64,
+        /// The policy applied.
+        policy: LossPolicyCode,
+        /// Its last published position.
+        position: u64,
+    },
+    /// A lost `hold` participant stopped bounding the publisher: a scan
+    /// after its revocation found its loan ended. It may never come for a
+    /// participant paused with a loan.
+    RequiredBoundWithdrawn {
+        /// The stream.
+        stream: StreamKey,
+        /// The participant's registration.
+        registration: u64,
+        /// Its last published position.
+        position: u64,
+    },
+    /// The stream's publication was closed for `reason`.
+    PublicationClosed {
+        /// The stream.
+        stream: StreamKey,
+        /// Why.
+        reason: CloseReason,
+    },
+}
+
+impl Event {
+    /// The record type of this event.
+    #[must_use]
+    pub const fn type_id(&self) -> u32 {
+        match self {
+            Self::ParticipantLost { .. } => PARTICIPANT_LOST,
+            Self::RequiredBoundWithdrawn { .. } => REQUIRED_BOUND_WITHDRAWN,
+            Self::PublicationClosed { .. } => PUBLICATION_CLOSED,
+        }
+    }
+
+    /// Whether `type_id` is an event's record type (as opposed to a
+    /// response's).
+    #[must_use]
+    pub const fn is_event_type(type_id: u32) -> bool {
+        type_id & 0xC0 == 0xC0
+    }
+
+    /// Encodes the event into `out`; returns the length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CncError::BufferTooShort`].
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CncError> {
+        match *self {
+            Self::ParticipantLost {
+                stream,
+                registration,
+                client,
+                policy,
+                position,
+            } => write_words(
+                &[
+                    stream_word(stream),
+                    registration,
+                    client,
+                    policy.code(),
+                    position,
+                ],
+                out,
+            ),
+            Self::RequiredBoundWithdrawn {
+                stream,
+                registration,
+                position,
+            } => write_words(&[stream_word(stream), registration, position], out),
+            Self::PublicationClosed { stream, reason } => {
+                write_words(&[stream_word(stream), reason.code()], out)
+            }
+        }
+    }
+
+    /// Decodes an event of record type `type_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CncError::UnknownType`], [`CncError::WrongLength`] and
+    /// [`CncError::Reserved`].
+    pub fn decode(type_id: u32, bytes: &[u8]) -> Result<Self, CncError> {
+        match type_id {
+            PARTICIPANT_LOST => {
+                let [stream, registration, client, policy, position] =
+                    read_words::<5>(type_id, bytes)?;
+                Ok(Self::ParticipantLost {
+                    stream: stream_from(stream),
+                    registration,
+                    client,
+                    policy: LossPolicyCode::from_code(policy)
+                        .ok_or(CncError::Reserved { type_id })?,
+                    position,
+                })
+            }
+            REQUIRED_BOUND_WITHDRAWN => {
+                let [stream, registration, position] = read_words::<3>(type_id, bytes)?;
+                Ok(Self::RequiredBoundWithdrawn {
+                    stream: stream_from(stream),
+                    registration,
+                    position,
+                })
+            }
+            PUBLICATION_CLOSED => {
+                let [stream, reason] = read_words::<2>(type_id, bytes)?;
+                Ok(Self::PublicationClosed {
+                    stream: stream_from(stream),
+                    reason: CloseReason::from_code(reason).ok_or(CncError::Reserved { type_id })?,
+                })
+            }
+            _ => Err(CncError::UnknownType { type_id }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,5 +939,53 @@ mod tests {
                 available: 15
             })
         );
+    }
+
+    #[test]
+    fn events_round_trip_and_are_told_apart_from_responses() {
+        let events = [
+            Event::ParticipantLost {
+                stream: stream(),
+                registration: 7,
+                client: 3,
+                policy: LossPolicyCode::Continue,
+                position: 4096,
+            },
+            Event::RequiredBoundWithdrawn {
+                stream: stream(),
+                registration: 7,
+                position: 8192,
+            },
+            Event::PublicationClosed {
+                stream: stream(),
+                reason: CloseReason::RequiredParticipantLost,
+            },
+        ];
+        for event in events {
+            let mut out = [0u8; MAX_EVENT_LENGTH];
+            let length = event.encode(&mut out).unwrap();
+            assert!(Event::is_event_type(event.type_id()));
+            assert_eq!(Event::decode(event.type_id(), &out[..length]), Ok(event));
+            // A response decoder does not take an event.
+            assert!(Response::decode(event.type_id(), &out[..length]).is_err());
+        }
+        for response_type in [
+            PUBLICATION_READY,
+            SUBSCRIPTION_READY,
+            OPERATION_SUCCEEDED,
+            ERROR,
+        ] {
+            assert!(!Event::is_event_type(response_type));
+        }
+        // Unknown policy and reason codes are refused.
+        let mut out = [0u8; 64];
+        let length = Event::PublicationClosed {
+            stream: stream(),
+            reason: CloseReason::RequiredParticipantLost,
+        }
+        .encode(&mut out)
+        .unwrap();
+        out[8] = 9;
+        assert!(Event::decode(PUBLICATION_CLOSED, &out[..length]).is_err());
     }
 }
