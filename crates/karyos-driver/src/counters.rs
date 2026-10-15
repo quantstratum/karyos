@@ -60,7 +60,7 @@ pub const TYPE_EVENTS: u64 = 1;
 pub const TYPE_GAUGE: u64 = 2;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 21] = [
+const LABELS: [(u64, &str); 22] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -82,6 +82,7 @@ const LABELS: [(u64, &str); 21] = [
     (TYPE_EVENTS, "claim clock steps back"),
     (TYPE_EVENTS, "claim deadlines unrepresentable"),
     (TYPE_GAUGE, "claims waiting"),
+    (TYPE_EVENTS, "clients timed out"),
 ];
 
 /// One of the driver's counters.
@@ -133,6 +134,8 @@ pub(crate) enum Event {
     ClaimDeadlinesUnrepresentable,
     /// Streams whose latest deadline call returned `Waiting`.
     ClaimsWaiting,
+    /// Clients whose heartbeat stopped for the liveness timeout.
+    ClientsTimedOut,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -253,6 +256,7 @@ mod tests {
                 "claim deadlines unrepresentable",
             ),
             (Event::ClaimsWaiting, "claims waiting"),
+            (Event::ClientsTimedOut, "clients timed out"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

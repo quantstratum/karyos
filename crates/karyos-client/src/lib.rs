@@ -22,7 +22,10 @@ pub use concurrent::{
     ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,
     ConcurrentOfferOutcome,
 };
-pub use conductor::{ClientConductor, Completion, ConductorError, ConductorPoll, Outcome};
+pub use conductor::{
+    ClientConductor, Completion, ConductorError, ConductorPoll, DEFAULT_DRIVER_TIMEOUT,
+    DEFAULT_HEARTBEAT_INTERVAL, Outcome,
+};
 pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};

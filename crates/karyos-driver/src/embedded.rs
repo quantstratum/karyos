@@ -74,6 +74,13 @@ pub struct DriverConfig {
     /// the last observed progress for subscribers
     /// (`quantstratum-docs: karyos/design/mapping-generations.md`).
     pub cutover_deadline: u64,
+    /// How often the driver advances its heartbeat, in the clock's unit
+    /// (quantstratum-docs: `karyos/design/required-participant-loss.md`).
+    pub heartbeat_interval: u64,
+    /// How long a client's heartbeat may stay unchanged, in the clock's
+    /// unit, before the client is timed out: its command ring is closed and
+    /// it is no longer served. At least ten heartbeat intervals.
+    pub client_liveness_timeout: u64,
 }
 
 impl Default for DriverConfig {
@@ -89,6 +96,8 @@ impl Default for DriverConfig {
             max_streams: 64,
             max_retained_generations: 2,
             cutover_deadline: 1_000_000_000,
+            heartbeat_interval: 100_000_000,
+            client_liveness_timeout: 10_000_000_000,
         }
     }
 }
@@ -197,6 +206,8 @@ pub struct EmbeddedDriver {
     pub(crate) counters: DriverCounters,
     /// The clock of claim deadlines and of the admission timeout.
     pub(crate) clock: Box<dyn MonotonicClock>,
+    /// When the driver last advanced its heartbeat, in clock units.
+    pub(crate) last_beat: Option<u64>,
     /// The admission socket and its connections (IPC mode).
     #[cfg(target_os = "linux")]
     pub(crate) admission: Option<crate::admission::Admission>,
@@ -272,6 +283,11 @@ impl EmbeddedDriver {
             && config.max_streams > 0
             && config.max_retained_generations > 0
             && config.cutover_deadline > 0
+            && config.heartbeat_interval > 0
+            && config
+                .heartbeat_interval
+                .checked_mul(10)
+                .is_some_and(|minimum| config.client_liveness_timeout >= minimum)
             && config.max_pending_per_client > 0
             && config.max_hand_over > 0
             && config.command_budget > 0
@@ -329,6 +345,7 @@ impl EmbeddedDriver {
             scan_cursor: 0,
             terminal: false,
             clock,
+            last_beat: None,
             #[cfg(target_os = "linux")]
             admission,
         })
@@ -636,10 +653,14 @@ impl EmbeddedDriver {
         let admitted = self.serve_admission();
         #[cfg(not(target_os = "linux"))]
         let admitted = 0;
+        let alive = self.serve_liveness();
         self.retire_closed_clients();
         self.sweep_ended_registrations();
         self.free_retired_streams();
-        let mut work = self.serve_commands().saturating_add(admitted);
+        let mut work = self
+            .serve_commands()
+            .saturating_add(admitted)
+            .saturating_add(alive);
         let mut first_error = None;
         let clock = &mut self.clock;
         let counters = &self.counters;

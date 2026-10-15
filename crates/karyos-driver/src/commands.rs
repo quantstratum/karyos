@@ -37,6 +37,9 @@ pub(crate) struct ClientSlot {
     /// client's producer is known to be detached (its close flag).
     consumer: Option<RingConsumer>,
     link: Arc<ClientLink>,
+    /// The client heartbeat last seen and the driver time it was first
+    /// seen at; `None` until the first sample.
+    seen: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +114,7 @@ impl EmbeddedDriver {
             id,
             consumer: Some(consumer),
             link,
+            seen: None,
         });
         self.update_stream_gauges();
         Ok(id)
@@ -123,6 +127,51 @@ impl EmbeddedDriver {
         if let Some(index) = self.clients.iter().position(|slot| slot.id == client) {
             self.retire_faulty(index);
         }
+    }
+
+    /// Liveness (quantstratum-docs:
+    /// `karyos/design/required-participant-loss.md`): while clients are
+    /// admitted, advances the driver heartbeat once per heartbeat interval
+    /// and samples each served client's heartbeat. A client whose
+    /// heartbeat has not changed for the liveness timeout of driver time is
+    /// timed out: it is no longer served and its ring is closed, as for a
+    /// faulty client. Timing out is not a detach proof: its slot stays until
+    /// its close flag, `Leave` or exit proof. The clock is read only while a
+    /// client is admitted. Returns the clients timed out.
+    pub(crate) fn serve_liveness(&mut self) -> u32 {
+        if self.clients.is_empty() {
+            return 0;
+        }
+        let now = self.clock.now();
+        let due = self
+            .last_beat
+            .is_none_or(|last| now.saturating_sub(last) >= self.config.heartbeat_interval);
+        if due {
+            // A closed broadcast buffer stays closed; nothing to advance.
+            let _ = self.broadcast.beat();
+            self.last_beat = Some(now);
+        }
+        let timeout = self.config.client_liveness_timeout;
+        let mut late = Vec::new();
+        for (index, slot) in self.clients.iter_mut().enumerate() {
+            let Some(consumer) = slot.consumer.as_ref() else {
+                continue;
+            };
+            let beat = consumer.heartbeat();
+            match slot.seen {
+                Some((seen, since)) if seen == beat => {
+                    if now.saturating_sub(since) >= timeout {
+                        late.push(index);
+                    }
+                }
+                _ => slot.seen = Some((beat, now)),
+            }
+        }
+        let timed_out = u32::try_from(late.len()).unwrap_or(u32::MAX);
+        for index in late {
+            self.stop_serving(index, Event::ClientsTimedOut);
+        }
+        timed_out
     }
 
     /// Clients currently admitted, including retired ones whose producer has
@@ -154,9 +203,16 @@ impl EmbeddedDriver {
     /// hand-over entries and its registrations, but keeps its admission slot
     /// until its producer is known to be detached.
     fn retire_faulty(&mut self, index: usize) {
+        self.stop_serving(index, Event::ClientsFaulty);
+    }
+
+    /// Stops serving client `index`, counting `reason` once: closes and
+    /// discards its ring, drops its untaken hand-over entries and forgets
+    /// its registrations. The slot stays until the client's close flag.
+    fn stop_serving(&mut self, index: usize, reason: Event) {
         if let Some(slot) = self.clients.get_mut(index) {
             if slot.consumer.is_some() {
-                self.counters.add(Event::ClientsFaulty, 1);
+                self.counters.add(reason, 1);
             }
             // Publish the closure to the producer before discarding the
             // consumer.
@@ -493,6 +549,7 @@ mod tests {
             id,
             consumer: Some(consumer),
             link: Arc::clone(&link),
+            seen: None,
         });
         (id, producer, link)
     }

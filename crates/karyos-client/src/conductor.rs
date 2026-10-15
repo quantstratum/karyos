@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use karyos_protocol::cnc::ErrorCode;
 use karyos_protocol::cnc::{Command, MAX_COMMAND_LENGTH, Response, StreamKey, SubscriberRole};
@@ -135,7 +136,22 @@ pub struct ClientConductor {
     /// its callback returns, so a panicking callback loses none.
     unknown: VecDeque<u64>,
     max_pending: usize,
+    /// Liveness (quantstratum-docs:
+    /// `karyos/design/required-participant-loss.md`), on this client's own
+    /// monotonic clock: how often it advances its heartbeat, and how long
+    /// the driver's may stay unchanged before the driver is presumed lost.
+    heartbeat_interval: Duration,
+    driver_timeout: Duration,
+    last_beat: Option<Instant>,
+    /// The driver heartbeat last seen and when it was first seen.
+    driver_seen: Option<(u64, Instant)>,
+    driver_lost: bool,
 }
+
+/// Default heartbeat interval of a client.
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+/// Default time a client waits for the driver's heartbeat to change.
+pub const DEFAULT_DRIVER_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ClientConductor {
     /// Creates the conductor for an admitted client (called by the driver,
@@ -157,6 +173,50 @@ impl ClientConductor {
             pending: Vec::with_capacity(max_pending),
             unknown: VecDeque::with_capacity(max_pending),
             max_pending,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            driver_timeout: DEFAULT_DRIVER_TIMEOUT,
+            last_beat: None,
+            driver_seen: None,
+            driver_lost: false,
+        }
+    }
+
+    /// Sets the heartbeat interval and the driver timeout, both on this
+    /// client's own monotonic clock. A timeout shorter than ten intervals
+    /// is raised to ten intervals.
+    pub fn set_liveness(&mut self, heartbeat_interval: Duration, driver_timeout: Duration) {
+        self.heartbeat_interval = heartbeat_interval;
+        self.driver_timeout = driver_timeout.max(heartbeat_interval.saturating_mul(10));
+    }
+
+    /// Whether the driver's heartbeat stopped for the driver timeout: the
+    /// client then refuses new requests and fails those pending, and keeps
+    /// what it already holds until it is dropped.
+    #[must_use]
+    pub fn driver_lost(&self) -> bool {
+        self.driver_lost
+    }
+
+    /// Advances this client's heartbeat once per interval and samples the
+    /// driver's; called by every poll, the client's duty.
+    fn serve_liveness(&mut self) {
+        let now = Instant::now();
+        let due = self
+            .last_beat
+            .is_none_or(|last| now.saturating_duration_since(last) >= self.heartbeat_interval);
+        if due && let Some(producer) = self.producer.as_mut() {
+            // An exhausted heartbeat closes the ring, which `closed` sees.
+            let _ = producer.beat();
+            self.last_beat = Some(now);
+        }
+        let beat = self.receiver.heartbeat();
+        match self.driver_seen {
+            Some((seen, since)) if seen == beat => {
+                if now.saturating_duration_since(since) >= self.driver_timeout {
+                    self.driver_lost = true;
+                }
+            }
+            _ => self.driver_seen = Some((beat, now)),
         }
     }
 
@@ -348,6 +408,7 @@ impl ClientConductor {
             .is_none_or(karyos_sys::command_ring::RingProducer::is_closed)
             || self.receiver.is_closed()
             || self.link.driver_gone()
+            || self.driver_lost
     }
 
     fn submit(
@@ -392,6 +453,7 @@ impl ClientConductor {
         F: FnMut(Completion),
     {
         let mut report = ConductorPoll::default();
+        self.serve_liveness();
         // A closed client resolves its pending requests now, however small
         // the budget and however busy the broadcast buffer.
         if self.closed() {
