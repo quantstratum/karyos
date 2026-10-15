@@ -7,9 +7,9 @@
 //! is completed by the conductor; publisher-side rotation comes in batch b.
 
 use super::{
-    AppendOptions, AppendOutcome, BufferOwner, CommitOutcome, Conductor, FragmentPlan,
-    HEADER_LENGTH, LayoutError, LogBuffer, Lookup, NOT_GRANTED, SysError, TermBytes, claim,
-    staging_buffer, valid_export, write_fragments, write_header_tail,
+    ActivateError, AppendOptions, AppendOutcome, BufferOwner, CommitOutcome, Conductor,
+    FragmentPlan, HEADER_LENGTH, LayoutError, LogBuffer, Lookup, NOT_GRANTED, SysError, TermBytes,
+    claim, staging_buffer, valid_export, write_fragments, write_header_tail,
 };
 use crate::frame::{FRAME_ALIGNMENT, Flags, FrameType, PROTOCOL_VERSION, Word0};
 use crate::loan::{LoanOutcome, release_loan, rotate_to, take_loan};
@@ -303,40 +303,120 @@ impl<O: BufferOwner> Conductor<O> {
     }
 }
 
+/// A concurrent handle prepared for adoption: its handle memory and
+/// staging scratch are allocated, and no shared word has been touched
+/// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Preparing off the
+/// data path).
+#[derive(Debug)]
+pub struct PreparedConcurrentPublication<O: BufferOwner> {
+    owner: O,
+    slot: usize,
+    export: u64,
+    staging: Box<[u8]>,
+}
+
 impl<O: BufferOwner> ConcurrentPublication<O> {
-    /// Adopts the publisher slot `slot` that the creator registered for
-    /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): held, and
-    /// registered for exactly this export. The handle starts from the term
-    /// count the registration recorded, as the issuing call would have.
+    /// Prepares the adoption of publisher slot `slot`, registered for
+    /// `export`, as [`super::Publication::prepare_adopt`].
     ///
     /// # Errors
     ///
     /// Returns [`SysError::InvalidPublicationMode`] for an exclusive buffer,
-    /// [`SysError::Protocol`] when the registration does not match, and the
-    /// errors of the first catch-up.
-    pub fn adopt(owner: O, slot: usize, export: u64) -> Result<Self, SysError> {
+    /// [`SysError::Protocol`] for a slot outside the buffer or an export
+    /// that is not valid, and [`SysError::ResourcesUnavailable`] when the
+    /// scratch cannot be allocated.
+    pub fn prepare_adopt(
+        owner: O,
+        slot: usize,
+        export: u64,
+    ) -> Result<PreparedConcurrentPublication<O>, SysError> {
         let buffer: &LogBuffer<O::Terms> = &owner;
         if !buffer.concurrent() {
             return Err(SysError::InvalidPublicationMode {
                 reason: "a concurrent handle of an exclusive buffer",
             });
         }
-        let found = buffer.publisher_lines().get(slot).ok_or(NOT_GRANTED)?;
-        if publisher_slot_free(&found.word) || !claim(&found.registration, export) {
+        if slot >= buffer.publisher_lines().len() || !valid_export(export) {
             return Err(NOT_GRANTED);
         }
-        let from = TermCount::try_new(
-            u32::try_from(found.from.load(Ordering::Relaxed)).map_err(|_| NOT_GRANTED)?,
-        )?;
         let staging = staging_buffer(buffer)?;
-        let mut handle = Self {
-            buffer: owner,
-            index: slot,
+        Ok(PreparedConcurrentPublication {
+            owner,
+            slot,
+            export,
+            staging,
+        })
+    }
+
+    /// Adopts the publisher slot `slot` that the creator registered for
+    /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): held, and
+    /// registered for exactly this export. The handle starts from the term
+    /// count the registration recorded, as the issuing call would have.
+    /// [`ConcurrentPublication::prepare_adopt`] then
+    /// [`PreparedConcurrentPublication::activate`].
+    ///
+    /// # Errors
+    ///
+    /// As those two calls.
+    pub fn adopt(owner: O, slot: usize, export: u64) -> Result<Self, SysError> {
+        Self::prepare_adopt(owner, slot, export)?
+            .activate()
+            .map_err(|refused| refused.error)
+    }
+}
+
+impl<O: BufferOwner> PreparedConcurrentPublication<O> {
+    /// Adopts the prepared handle: the registration compare-exchange, the
+    /// term count it starts from and its first catch-up (at most one loan
+    /// and one rotation attempt), with no allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the prepared handle with [`SysError::Protocol`] when the slot
+    /// is free or not registered for exactly this export. An error of the
+    /// first catch-up, which only a corrupt buffer reports, returns no
+    /// prepared handle: the adopted one was dropped, releasing its slot.
+    pub fn activate(self) -> Result<ConcurrentPublication<O>, ActivateError<Self>> {
+        let buffer: &LogBuffer<O::Terms> = &self.owner;
+        let Some(found) = buffer.publisher_lines().get(self.slot) else {
+            return Err(ActivateError {
+                error: NOT_GRANTED,
+                prepared: Some(self),
+            });
+        };
+        if publisher_slot_free(&found.word) || !claim(&found.registration, self.export) {
+            return Err(ActivateError {
+                error: NOT_GRANTED,
+                prepared: Some(self),
+            });
+        }
+        let from = match u32::try_from(found.from.load(Ordering::Relaxed))
+            .map_err(|_| NOT_GRANTED)
+            .and_then(TermCount::try_new)
+        {
+            Ok(from) => from,
+            Err(error) => {
+                return Err(ActivateError {
+                    error,
+                    prepared: Some(self),
+                });
+            }
+        };
+        let mut handle = ConcurrentPublication {
+            buffer: self.owner,
+            index: self.slot,
             state: HandleState::Waiting { from },
             pending: None,
-            staging,
+            staging: self.staging,
         };
-        let _ = handle.catch_up()?;
+        // A corrupt buffer: the handle drops and releases its slot.
+        if let Err(error) = handle.catch_up() {
+            drop(handle);
+            return Err(ActivateError {
+                error,
+                prepared: None,
+            });
+        }
         Ok(handle)
     }
 }

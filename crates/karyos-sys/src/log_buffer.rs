@@ -49,15 +49,15 @@ use crate::frame::{
     Word0,
 };
 use crate::loan::{
-    LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held,
+    Loan, LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held,
     participant_quiescent, publish, release_loan, revoke, take_loan,
 };
 use crate::publication::{
     SEAL_POSITIONED, SEAL_SEALED, abort_block, active_term_count, commit_block, deadline_abort,
-    fence_rotation, fence_tail, issuer_sees_seal, load_interior, mark_block, observe_block,
-    observe_seal, position_seal, publication_released, publication_taken, publish_block,
-    read_claim_record, release_publication, release_publisher_slot, seal, store_interior,
-    take_publication, write_claim_record,
+    fence_rotation, fence_tail, invalidate_claim_record, issuer_sees_seal, load_interior,
+    mark_block, observe_block, observe_seal, position_seal, publication_released,
+    publication_taken, publish_block, read_claim_record, release_publication,
+    release_publisher_slot, seal, store_interior, take_publication, write_claim_record,
 };
 use crate::registration::{self, claim, valid_export};
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
@@ -77,6 +77,7 @@ use crate::loan::{Rotation, rotate_to};
 
 pub use concurrent::{
     ConcurrentClaim, ConcurrentClaimOutcome, ConcurrentOfferOutcome, ConcurrentPublication,
+    PreparedConcurrentPublication,
 };
 
 mod sealed {
@@ -1028,7 +1029,13 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
 /// The exclusive publication's initial write loan on term 0, for a fresh
 /// publication taken by this process or adopted from a registration.
 fn first_loan<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Result<Publication<O>, SysError> {
-    let buffer: &LogBuffer<O::Terms> = &owner;
+    take_initial_loan(&owner)?;
+    Ok(initial_publication(owner, staging))
+}
+
+/// Takes the exclusive publication's write loan on term 0, in slot 0: a
+/// fixed number of atomic operations, no allocation.
+fn take_initial_loan<T: TermBytes>(buffer: &LogBuffer<T>) -> Result<(), SysError> {
     let cell = buffer.cell(0)?;
     let slot = SlotIndex::try_new(0)?;
     let target = LoanTarget::new(
@@ -1038,20 +1045,25 @@ fn first_loan<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Result<Publicatio
         TermCount::ZERO,
     );
     match take_loan(&cell.loan, &cell.revoked, buffer.descriptor(0)?, target)? {
-        LoanOutcome::Granted => Ok(Publication {
-            buffer: owner,
-            state: PublicationState::Active {
-                count: TermCount::ZERO,
-                slot: 0,
-                tail: 0,
-            },
-            pending: None,
-            staging,
-        }),
+        LoanOutcome::Granted => Ok(()),
         _ => Err(SysError::CorruptTerm {
             offset: 0,
             reason: "initial term not active",
         }),
+    }
+}
+
+/// The exclusive publication at term 0 under its initial write loan.
+fn initial_publication<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Publication<O> {
+    Publication {
+        buffer: owner,
+        state: PublicationState::Active {
+            count: TermCount::ZERO,
+            slot: 0,
+            tail: 0,
+        },
+        pending: None,
+        staging,
     }
 }
 
@@ -1079,66 +1091,199 @@ const NOT_GRANTED: SysError = SysError::Protocol {
     reason: "the registration does not match the grant",
 };
 
+/// An activation that failed (`quantstratum-docs:
+/// karyos/design/ipc-data-path.md`, Preparing off the data path): the
+/// prepared handle comes back, so that the caller drops it, and the memory
+/// it holds, on its control path.
+#[derive(Debug)]
+pub struct ActivateError<P> {
+    /// Why the activation failed.
+    pub error: SysError,
+    /// The prepared handle, unless the activation got as far as building
+    /// the adopted one, which was dropped (a corrupt buffer). A grant whose
+    /// registration was claimed is spent: activating it again fails.
+    pub prepared: Option<P>,
+}
+
+/// An exclusive publication prepared for adoption: its handle memory and
+/// staging scratch are allocated, and no shared word has been touched.
+#[derive(Debug)]
+pub struct PreparedPublication<O: BufferOwner> {
+    owner: O,
+    export: u64,
+    staging: Box<[u8]>,
+}
+
 impl<O: BufferOwner> Publication<O> {
-    /// Adopts the exclusive publication that the creator registered for
-    /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): taken, not
-    /// released, registered for exactly this export, and fresh (nothing
-    /// reserved yet). Takes the initial write loan in this process.
+    /// Prepares the adoption of the exclusive publication registered for
+    /// `export` (`quantstratum-docs: karyos/design/ipc-data-path.md`,
+    /// Preparing off the data path): everything that allocates, and no
+    /// access to a shared word. [`PreparedPublication::activate`] then
+    /// adopts it without allocating.
     ///
     /// # Errors
     ///
-    /// Returns [`SysError::InvalidPublicationMode`] for a concurrent buffer
-    /// and [`SysError::Protocol`] when the registration does not match.
-    pub fn adopt(owner: O, export: u64) -> Result<Self, SysError> {
+    /// Returns [`SysError::InvalidPublicationMode`] for a concurrent buffer,
+    /// [`SysError::Protocol`] for an export that is not valid, and
+    /// [`SysError::ResourcesUnavailable`] when the scratch cannot be
+    /// allocated.
+    pub fn prepare_adopt(owner: O, export: u64) -> Result<PreparedPublication<O>, SysError> {
         let buffer: &LogBuffer<O::Terms> = &owner;
         if buffer.concurrent() {
             return Err(SysError::InvalidPublicationMode {
                 reason: "the exclusive publication of a concurrent buffer",
             });
         }
-        if buffer.publication_taken().load(Ordering::Acquire) == 0
-            || buffer.exclusive_released().load(Ordering::Acquire) != 0
-            || buffer.reserved_head().load(Ordering::Acquire) != 0
-            || !claim(&buffer.control().publication_registration.word, export)
-        {
+        if !valid_export(export) {
             return Err(NOT_GRANTED);
         }
         let staging = staging_buffer(buffer)?;
-        first_loan(owner, staging)
+        Ok(PreparedPublication {
+            owner,
+            export,
+            staging,
+        })
+    }
+
+    /// Adopts the exclusive publication that the creator registered for
+    /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): taken, not
+    /// released, registered for exactly this export, and fresh (nothing
+    /// reserved yet). Takes the initial write loan in this process.
+    /// [`Publication::prepare_adopt`] then [`PreparedPublication::activate`].
+    ///
+    /// # Errors
+    ///
+    /// As those two calls.
+    pub fn adopt(owner: O, export: u64) -> Result<Self, SysError> {
+        Self::prepare_adopt(owner, export)?
+            .activate()
+            .map_err(|refused| refused.error)
     }
 }
 
+impl<O: BufferOwner> PreparedPublication<O> {
+    /// Adopts the prepared publication: the registration compare-exchange
+    /// and the initial write loan, a bounded number of atomic operations
+    /// and no allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the prepared handle with [`SysError::Protocol`] when the
+    /// publication is not taken, released, fresh and registered for exactly
+    /// this export, and with [`SysError::CorruptTerm`] when the initial term
+    /// is not active.
+    pub fn activate(self) -> Result<Publication<O>, ActivateError<Self>> {
+        let buffer: &LogBuffer<O::Terms> = &self.owner;
+        if buffer.publication_taken().load(Ordering::Acquire) == 0
+            || buffer.exclusive_released().load(Ordering::Acquire) != 0
+            || buffer.reserved_head().load(Ordering::Acquire) != 0
+            || !claim(&buffer.control().publication_registration.word, self.export)
+        {
+            return Err(ActivateError {
+                error: NOT_GRANTED,
+                prepared: Some(self),
+            });
+        }
+        if let Err(error) = take_initial_loan(buffer) {
+            return Err(ActivateError {
+                error,
+                prepared: Some(self),
+            });
+        }
+        Ok(initial_publication(self.owner, self.staging))
+    }
+}
+
+/// A subscription prepared for adoption. A subscription allocates nothing,
+/// so preparing only checks the shape of the request.
+#[derive(Debug)]
+pub struct PreparedSubscription<O: BufferOwner> {
+    owner: O,
+    cell: usize,
+    role: Role,
+    export: u64,
+}
+
 impl<O: BufferOwner> Subscription<O> {
+    /// Prepares the adoption of subscriber cell `cell`, registered with
+    /// `role` for `export`, as [`Publication::prepare_adopt`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Protocol`] for a cell that is not a subscriber
+    /// cell of the buffer or an export that is not valid.
+    pub fn prepare_adopt(
+        owner: O,
+        cell: usize,
+        role: Role,
+        export: u64,
+    ) -> Result<PreparedSubscription<O>, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &owner;
+        if cell < buffer.first_subscriber_cell() || cell >= buffer.cells().len() {
+            return Err(NOT_GRANTED);
+        }
+        if !valid_export(export) {
+            return Err(NOT_GRANTED);
+        }
+        Ok(PreparedSubscription {
+            owner,
+            cell,
+            role,
+            export,
+        })
+    }
+
     /// Adopts the subscriber cell `cell` that the creator registered with
     /// `role` for export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`). The
     /// subscription resumes at the cell's published position.
+    /// [`Subscription::prepare_adopt`] then [`PreparedSubscription::activate`].
     ///
     /// # Errors
     ///
     /// Returns [`SysError::Protocol`] when the cell is not a subscriber cell
     /// attached with `role` and registered for exactly this export.
     pub fn adopt(owner: O, cell: usize, role: Role, export: u64) -> Result<Self, SysError> {
-        let buffer: &LogBuffer<O::Terms> = &owner;
-        if cell < buffer.first_subscriber_cell() {
-            return Err(NOT_GRANTED);
-        }
-        let found = buffer.cell(cell).map_err(|_| NOT_GRANTED)?;
-        let expected = match role {
+        Self::prepare_adopt(owner, cell, role, export)?
+            .activate()
+            .map_err(|refused| refused.error)
+    }
+}
+
+impl<O: BufferOwner> PreparedSubscription<O> {
+    /// Adopts the prepared subscription: the cell's state check, the
+    /// registration compare-exchange and its position, with no allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the prepared handle with [`SysError::Protocol`] when the cell
+    /// is not attached with its role and registered for exactly its export.
+    pub fn activate(self) -> Result<Subscription<O>, ActivateError<Self>> {
+        let buffer: &LogBuffer<O::Terms> = &self.owner;
+        let Ok(found) = buffer.cell(self.cell) else {
+            return Err(ActivateError {
+                error: NOT_GRANTED,
+                prepared: Some(self),
+            });
+        };
+        let expected = match self.role {
             Role::Required => CELL_REQUIRED,
             Role::Optional => CELL_OPTIONAL,
         };
         let state = found.state.load(Ordering::Acquire);
         let admitted =
             state == expected || (expected == CELL_REQUIRED && state == CELL_REQUIRED_RESERVED);
-        if !admitted || !claim(&found.registration, export) {
-            return Err(NOT_GRANTED);
+        if !admitted || !claim(&found.registration, self.export) {
+            return Err(ActivateError {
+                error: NOT_GRANTED,
+                prepared: Some(self),
+            });
         }
         let position = found.position.load(Ordering::Acquire);
-        Ok(Self {
-            buffer: owner,
+        Ok(Subscription {
+            buffer: self.owner,
             cursor: Cursor {
-                cell,
-                role,
+                cell: self.cell,
+                role: self.role,
                 position,
                 acknowledged: position,
                 pending: None,
@@ -1478,6 +1623,20 @@ impl<O: BufferOwner> Publication<O> {
         let _ = abort_block(word, claim.reserved, claim.aborted);
         // Terminal: the record may go, before any loan release.
         self.buffer.write_record(0);
+    }
+}
+
+impl<O: BufferOwner> Publication<O> {
+    /// Test hook: the holder dies. Nothing it owns in the buffer is
+    /// released (no claim resolution, loan or publication release), as for
+    /// a process that exited; only its private heap memory is freed.
+    #[cfg(test)]
+    fn die(self) {
+        let mut this = core::mem::ManuallyDrop::new(self);
+        drop(core::mem::take(&mut this.staging));
+        // SAFETY: `this` is never used again and its destructor never
+        // runs; the owner is dropped once, here.
+        unsafe { core::ptr::drop_in_place(&raw mut this.buffer) };
     }
 }
 
@@ -2661,6 +2820,92 @@ pub struct Conductor<O: BufferOwner> {
     ending: Vec<Ending>,
 }
 
+/// What [`Conductor::end_publication`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationEnd {
+    /// The registration names another export or none: nothing was done.
+    Stale,
+    /// Ended; every block below the reserved head was terminal.
+    Ended,
+    /// Ended; the pending range at `position`, of `extent` bytes, was
+    /// aborted.
+    Aborted {
+        /// Its stream position.
+        position: u64,
+        /// Its extent in bytes.
+        extent: u32,
+    },
+    /// Ended; the reservation reached the term end with nothing written:
+    /// padded from `position` to the term end.
+    Padded {
+        /// Its stream position.
+        position: u64,
+        /// Its extent in bytes.
+        extent: u32,
+    },
+}
+
+/// Resolves the exclusive writer's pending range in the term its standing
+/// write loan names (see [`Conductor::end_publication`]). The loan is
+/// still set, so the slot holds that term and is not reclaimed.
+fn resolve_pending<T: TermBytes>(buffer: &LogBuffer<T>) -> Result<PublicationEnd, SysError> {
+    let Some(loan) = Loan::decode(buffer.cell(0)?.loan.load(Ordering::Acquire))? else {
+        return Ok(PublicationEnd::Ended);
+    };
+    let slot = loan.slot().get();
+    let count = loan.term_id().count_from(buffer.initial_term_id)?;
+    let term_length = buffer.term_length;
+    let base = buffer.position(count, 0);
+    let head = buffer.conductor_head()?;
+    let end = buffer.position(count, term_length);
+    let bound = (head.min(end).saturating_sub(base)) as u32;
+    let lane = buffer.config.lane;
+    let mut offset = 0;
+    while offset < bound {
+        // SAFETY: the writer's loan on `count` in `slot` is still set, so
+        // the slot holds that term and is neither reclaimed nor cleaned;
+        // `offset` is a frame start below the reserved head, a location
+        // accessed only atomically during this incarnation.
+        let first = unsafe { buffer.regions.word0(slot, offset) };
+        let raw = observe_block(first);
+        if raw == 0 || (raw as u32 as i32) < 0 {
+            let extent = bound - offset;
+            let position = buffer.position(count, offset);
+            if raw == 0 && head >= end {
+                // A crossing whose padding was not written, as the crossing
+                // writer would have written it.
+                let pad = Word0::new(
+                    extent as i32,
+                    Flags::new(false, false, false, false, lane),
+                    FrameType::Pad,
+                );
+                publish_block(first, pad);
+                return Ok(PublicationEnd::Padded { position, extent });
+            }
+            let aborted = Word0::new(
+                extent as i32,
+                Flags::new(false, false, false, false, lane),
+                FrameType::Aborted,
+            );
+            if !deadline_abort(first, extent, lane, aborted) {
+                return Err(corrupt(offset, "pending block"));
+            }
+            return Ok(PublicationEnd::Aborted { position, extent });
+        }
+        let word0 = Word0::unpack(raw).map_err(|_| corrupt(offset, "reserved flags"))?;
+        if word0.version() != PROTOCOL_VERSION {
+            return Err(corrupt(offset, "version"));
+        }
+        let length = u32::try_from(word0.frame_length()).map_err(|_| corrupt(offset, "length"))?;
+        let extent = align_frame(length)?;
+        if extent == 0 || extent > term_length - offset {
+            return Err(corrupt(offset, "frame past term end"));
+        }
+        offset += extent;
+    }
+    Ok(PublicationEnd::Ended)
+}
+
 /// An ended concurrent publisher: its slot, and the reserved head observed
 /// when it ended. Every block below that head is its or another writer's,
 /// and is resolved once the deadline frontier reaches it.
@@ -2879,6 +3124,55 @@ impl<O: BufferOwner> Conductor<O> {
         // slot is not reissued while held. `P` entries were reserved.
         self.ending.push(Ending { slot, head });
         Ok(true)
+    }
+
+    /// Ends the registration of the exclusive publication registered for
+    /// `export`, adopted or not, and releases it for good
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Ending a
+    /// registration): it is never issued again, as when an in-process
+    /// handle drops.
+    ///
+    /// There is one writer, so every undecided block below the reserved
+    /// head is its own and is resolved at once. In order: the claim record
+    /// is invalidated (the writer may have died mid-update); the term the
+    /// standing write loan names is walked block by block from its start,
+    /// keeping every terminal block; the first undecided block starts the
+    /// pending range, which runs to the reserved head clamped to the term
+    /// end and is closed as `PAD` if the reservation reached the term end
+    /// with nothing written, else `ABORTED` with the deadline's protocol;
+    /// then the write loan is released, the registration word cleared and
+    /// the publication released. A half-done rotation is completed by a
+    /// later duty cycle.
+    ///
+    /// The caller must hold a proof that the writer makes no further
+    /// access, as for [`Conductor::end_subscriber`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidPublicationMode`] for a concurrent buffer,
+    /// [`SysError::CorruptTerm`] for a block word that no writer of this
+    /// buffer writes, and errors from the descriptor protocol. On error
+    /// nothing is released.
+    pub fn end_publication(&mut self, export: u64) -> Result<PublicationEnd, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "the exclusive publication of a concurrent buffer",
+            });
+        }
+        let word = &buffer.control().publication_registration.word;
+        if !registration::names(word.load(Ordering::Acquire), export) {
+            return Ok(PublicationEnd::Stale);
+        }
+        invalidate_claim_record(buffer.claim_serial(), buffer.claim_record());
+        self.observed = None;
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let ended = resolve_pending(buffer)?;
+        release_loan(&buffer.cell(0)?.loan);
+        let cleared = registration::end(word, export);
+        debug_assert!(cleared, "only the conductor ends a registration");
+        release_publication(buffer.exclusive_released());
+        Ok(ended)
     }
 
     /// Ended concurrent publishers whose slot is still held.

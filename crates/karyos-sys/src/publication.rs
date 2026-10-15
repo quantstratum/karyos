@@ -126,6 +126,21 @@ pub fn write_claim_record(serial: &AtomicU64, record: &AtomicU64, value: u64) {
     serial.store(current.wrapping_add(2), Ordering::Release);
 }
 
+/// Invalidates the claim record on behalf of a writer that can make no
+/// further access (`quantstratum-docs: karyos/design/ipc-data-path.md`,
+/// Ending a registration): the writer may have died with the serial odd,
+/// so this does not wait for an even snapshot. It stores an empty record
+/// under an odd serial and then the next even serial with Release, so no
+/// reader takes the torn contents.
+#[inline]
+pub fn invalidate_claim_record(serial: &AtomicU64, record: &AtomicU64) {
+    let odd = serial.load(Ordering::Relaxed) | 1;
+    serial.store(odd, Ordering::Relaxed);
+    fence(Ordering::Release);
+    record.store(0, Ordering::Relaxed);
+    serial.store(odd.wrapping_add(1), Ordering::Release);
+}
+
 /// Reads a consistent claim record: `(serial, record)` when both serial
 /// loads are equal and even, `None` while the publication rewrites it.
 #[inline]

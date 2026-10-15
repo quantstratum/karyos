@@ -379,3 +379,257 @@ fn ending_a_concurrent_publication_of_an_exclusive_buffer_is_refused() {
         Err(SysError::InvalidPublicationMode { .. })
     ));
 }
+
+/// Runs `call`, dying (unwinding) at `at`: the writer stops there and never
+/// resumes.
+fn die_at<O: BufferOwner>(publication: &mut Publication<O>, at: ClaimPause) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = publication.try_claim_pausing(64, AppendOptions::default(), &mut |point| {
+            if point == at {
+                std::panic::resume_unwind(Box::new("died"));
+            }
+        });
+    }));
+    assert!(result.is_err());
+}
+
+fn publication_registration(buffer: &LogBuffer<Terms>) -> u64 {
+    buffer
+        .control()
+        .publication_registration
+        .word
+        .load(Ordering::Acquire)
+}
+
+#[test]
+fn an_ended_exclusive_grant_never_adopted_is_released_for_good() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert!(conductor.register_publication(11).unwrap());
+    assert_eq!(conductor.end_publication(12), Ok(PublicationEnd::Stale));
+    assert_eq!(conductor.end_publication(11), Ok(PublicationEnd::Ended));
+    assert_eq!(conductor.end_publication(11), Ok(PublicationEnd::Stale));
+    assert_eq!(publication_registration(&buffer), 0);
+    assert!(matches!(
+        Publication::adopt(&buffer, 11),
+        Err(SysError::Protocol { .. })
+    ));
+    assert!(buffer.publication().unwrap().is_none());
+}
+
+#[test]
+fn a_writer_dead_with_a_marked_claim_is_aborted_at_its_end() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    assert!(conductor.register_publication(11).unwrap());
+    let mut dead = Publication::adopt(&buffer, 11).unwrap();
+    assert!(matches!(
+        dead.append(&message(1), AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+    let ClaimOutcome::Claimed(claim) = dead.try_claim(64, AppendOptions::default()).unwrap() else {
+        panic!("not claimed");
+    };
+    let position = claim.position();
+    core::mem::forget(claim);
+    dead.die();
+    assert_eq!(
+        conductor.end_publication(11),
+        Ok(PublicationEnd::Aborted {
+            position,
+            extent: 96
+        })
+    );
+    assert_eq!(buffer.cells()[0].loan.load(Ordering::Acquire), 0);
+    assert_eq!(publication_registration(&buffer), 0);
+    // The claim record is empty and even: the deadline finds nothing.
+    let (serial, record) =
+        read_claim_record(buffer.claim_serial(), buffer.claim_record()).unwrap();
+    assert!(serial.is_multiple_of(2));
+    assert_eq!(record, 0);
+    assert_eq!(poll_message(&mut subscription), Some(message(1)));
+    assert!(matches!(poll(&mut subscription), PollOutcome::Aborted { .. }));
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+    assert!(buffer.publication().unwrap().is_none());
+}
+
+#[test]
+fn a_writer_dead_before_its_mark_is_aborted_and_one_dead_before_its_head_ends_clean() {
+    for (at, aborted) in [(ClaimPause::BeforeMark, true), (ClaimPause::BeforeHead, false)] {
+        let buffer = new_buffer(config(3, 3)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Required).unwrap();
+        assert!(conductor.register_publication(11).unwrap());
+        let mut dead = Publication::adopt(&buffer, 11).unwrap();
+        die_at(&mut dead, at);
+        dead.die();
+        let ended = conductor.end_publication(11).unwrap();
+        if aborted {
+            assert_eq!(
+                ended,
+                PublicationEnd::Aborted {
+                    position: 0,
+                    extent: 96
+                }
+            );
+            assert!(matches!(poll(&mut subscription), PollOutcome::Aborted { .. }));
+        } else {
+            // Not admitted: nothing below the head is pending.
+            assert_eq!(ended, PublicationEnd::Ended);
+        }
+        assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+        let (_, record) = read_claim_record(buffer.claim_serial(), buffer.claim_record()).unwrap();
+        assert_eq!(record, 0);
+    }
+}
+
+#[test]
+fn a_claim_record_left_mid_update_is_invalidated() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert!(conductor.register_publication(11).unwrap());
+    let mut dead = Publication::adopt(&buffer, 11).unwrap();
+    die_at(&mut dead, ClaimPause::BeforeMark);
+    dead.die();
+    // The writer died rewriting its record: the serial is odd.
+    let serial = buffer.claim_serial().load(Ordering::Relaxed);
+    buffer.claim_serial().store(serial | 1, Ordering::Relaxed);
+    assert!(read_claim_record(buffer.claim_serial(), buffer.claim_record()).is_none());
+    assert!(matches!(
+        conductor.end_publication(11),
+        Ok(PublicationEnd::Aborted { .. })
+    ));
+    assert_eq!(
+        read_claim_record(buffer.claim_serial(), buffer.claim_record()),
+        Some(((serial | 1) + 1, 0))
+    );
+}
+
+#[test]
+fn a_crossing_whose_padding_was_not_written_is_padded_and_rotation_completes() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    assert!(conductor.register_publication(11).unwrap());
+    let mut dead = Publication::adopt(&buffer, 11).unwrap();
+    assert!(matches!(
+        dead.append(&message(1), AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+    let tail = buffer.conductor_head().unwrap();
+    // The writer died crossing: the head is at the term end, nothing was
+    // written past its last block, and its loan still names term 0.
+    let term_end = u64::from(buffer.term_length);
+    buffer.reserved_head().store(term_end, Ordering::Release);
+    dead.die();
+    assert_eq!(
+        conductor.end_publication(11),
+        Ok(PublicationEnd::Padded {
+            position: tail,
+            extent: (term_end - tail) as u32
+        })
+    );
+    assert_eq!(poll_message(&mut subscription), Some(message(1)));
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
+    let _ = poll(&mut subscription);
+    assert_eq!(subscription.position(), term_end);
+}
+
+#[test]
+fn ending_the_exclusive_publication_of_a_concurrent_buffer_is_refused() {
+    let buffer = new_buffer(concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert!(matches!(
+        conductor.end_publication(11),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+}
+
+#[test]
+fn a_prepared_publication_touches_nothing_until_activated() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    // Prepared before the grant exists: nothing shared was read or written.
+    let early = Publication::prepare_adopt(&buffer, 11).unwrap();
+    assert!(matches!(
+        Publication::prepare_adopt(&buffer, 0),
+        Err(SysError::Protocol { .. })
+    ));
+    let refused = early.activate().unwrap_err();
+    assert!(matches!(refused.error, SysError::Protocol { .. }));
+    assert!(conductor.register_publication(11).unwrap());
+    // A refused activation of another export spends nothing: the prepared
+    // handle comes back and the right one still activates.
+    let wrong = Publication::prepare_adopt(&buffer, 12).unwrap();
+    let back = wrong.activate().unwrap_err();
+    assert!(back.prepared.is_some());
+    let mut adopted = refused.prepared.unwrap().activate().unwrap();
+    assert!(matches!(
+        adopted.append(&message(1), AppendOptions::default()).unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+    // Spent: a second prepared handle for the same grant fails.
+    assert!(
+        Publication::prepare_adopt(&buffer, 11)
+            .unwrap()
+            .activate()
+            .is_err()
+    );
+}
+
+#[test]
+fn a_prepared_subscription_activates_once() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert!(matches!(
+        Subscription::prepare_adopt(&buffer, 0, Role::Required, 7),
+        Err(SysError::Protocol { .. })
+    ));
+    assert!(matches!(
+        Subscription::prepare_adopt(&buffer, usize::MAX, Role::Required, 7),
+        Err(SysError::Protocol { .. })
+    ));
+    let cell = conductor.register_subscriber(Role::Required, 7).unwrap();
+    let optional = Subscription::prepare_adopt(&buffer, cell, Role::Optional, 7).unwrap();
+    assert!(optional.activate().unwrap_err().prepared.is_some());
+    let prepared = Subscription::prepare_adopt(&buffer, cell, Role::Required, 7).unwrap();
+    let again = Subscription::prepare_adopt(&buffer, cell, Role::Required, 7).unwrap();
+    let adopted = prepared.activate().unwrap();
+    assert_eq!(adopted.cell(), cell);
+    assert!(again.activate().is_err());
+}
+
+#[test]
+fn a_prepared_concurrent_handle_activates_once() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    assert!(matches!(
+        ConcurrentPublication::prepare_adopt(&buffer, 2, 21),
+        Err(SysError::Protocol { .. })
+    ));
+    let early = ConcurrentPublication::prepare_adopt(&buffer, 0, 21).unwrap();
+    // The slot is free: refused, and the prepared handle comes back.
+    let refused = early.activate().unwrap_err();
+    let slot = conductor.register_concurrent_publication(21).unwrap().unwrap();
+    assert_eq!(slot, 0);
+    let mut adopted = refused.prepared.unwrap().activate().unwrap();
+    assert!(matches!(
+        adopted.offer(&message(5), AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { .. }
+    ));
+    assert_eq!(poll_message(&mut subscription), Some(message(5)));
+    assert!(
+        ConcurrentPublication::prepare_adopt(&buffer, slot, 21)
+            .unwrap()
+            .activate()
+            .is_err()
+    );
+    let exclusive = new_buffer(config(3, 3)).unwrap();
+    assert!(matches!(
+        ConcurrentPublication::prepare_adopt(&exclusive, 0, 21),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+}
