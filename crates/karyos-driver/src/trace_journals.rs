@@ -12,7 +12,9 @@
 //!   creates nothing. The driver assigns the journal number (a trace
 //!   number, never reused) and answers with it and a hand-over key.
 //! - **Consumption (J1).** Each duty cycle drains the journals into the
-//!   trace mirror, at most `trace_drain_budget` records over all of them,
+//!   trace mirror, at most `trace_drain_budget` records over all of them
+//!   (the loss accounting is reread only for journals that took a record,
+//!   ended, or showed a range in progress),
 //!   from a cursor that rotates across the table: a cycle whose budget runs
 //!   out at a journal starts the next cycle at the journal after it. The
 //!   journal's memory is untrusted ([`JournalDrain`]): a violation records
@@ -331,8 +333,17 @@ impl TraceJournals {
                 }
             }
         }
-        match drain.losses() {
-            Ok(losses) => {
+        // The loss accounting changes only while records are pending: a
+        // writer drops only into a full journal, whose records a visit with
+        // budget then takes, and its attempted count grows only with a
+        // stored or dropped record. So it is refreshed when this visit took
+        // a record, the journal ended, or the last read saw a range still
+        // being written; an idle journal costs one `head` load per cycle,
+        // not `MIRROR_RANGES` seqlock reads (review of #131).
+        let refresh = taken > 0 || ended.is_some() || held.entry.unstable > 0;
+        match refresh.then(|| drain.losses()) {
+            None => {}
+            Some(Ok(losses)) => {
                 let entry = &mut held.entry;
                 entry.attempted = losses.attempted;
                 entry.stored = losses.stored;
@@ -344,7 +355,7 @@ impl TraceJournals {
                     *target = *range;
                 }
             }
-            Err(_) => ended = Some(JournalState::WriterLost),
+            Some(Err(_)) => ended = Some(JournalState::WriterLost),
         }
         if let Some(state) = ended {
             if drain.fault().is_some() {
