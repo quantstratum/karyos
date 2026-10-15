@@ -9,6 +9,7 @@ use karyos_sys::log_buffer::{
     AppendOptions, AppendOutcome, Claim, ClaimOutcome as SysClaimOutcome,
     CommitOutcome as SysCommitOutcome, LogBuffer, Publication,
 };
+use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::error::ClientError;
 use crate::generation::{End, GenerationLink, Next, Successor, representable};
@@ -49,9 +50,9 @@ pub enum OfferOutcome {
 /// those land.
 #[derive(Debug)]
 #[must_use = "back pressure and admin actions must be handled"]
-pub enum ClaimOutcome<'a> {
+pub enum ClaimOutcome<'a, T: TermBytes = HeapTerms> {
     /// A block was reserved; write the payload, then commit.
-    Claimed(ClientClaim<'a>),
+    Claimed(ClientClaim<'a, T>),
     /// The flow-control limit does not admit the claim; retry later.
     BackPressured,
     /// The call only padded or rotated, or waits for the driver; retry.
@@ -128,14 +129,14 @@ pub enum CommitOutcome {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ClientClaim<'a> {
-    inner: Claim<'a, Arc<LogBuffer>>,
+pub struct ClientClaim<'a, T: TermBytes = HeapTerms> {
+    inner: Claim<'a, Arc<LogBuffer<T>>>,
     lane: Lane,
     /// The base of the claim's mapping generation.
     base: u64,
 }
 
-impl ClientClaim<'_> {
+impl<T: TermBytes> ClientClaim<'_, T> {
     /// The lane of the block.
     #[must_use]
     pub fn lane(&self) -> Lane {
@@ -176,13 +177,13 @@ impl ClientClaim<'_> {
 
 /// An exclusive publication on one stream.
 #[derive(Debug)]
-pub struct ClientPublication {
-    inner: Publication<Arc<LogBuffer>>,
+pub struct ClientPublication<T: TermBytes = HeapTerms> {
+    inner: Publication<Arc<LogBuffer<T>>>,
     allow_unconnected: bool,
     origin: Option<Origin>,
     /// The link to the stream's successor mappings, if the driver gave one
     /// (`quantstratum-docs: karyos/design/mapping-generations.md`).
-    link: Option<Arc<GenerationLink>>,
+    link: Option<Arc<GenerationLink<T>>>,
     /// The stream position where this handle's mapping starts.
     base: u64,
     /// The stream lease of a handle from the direct driver API, held only
@@ -190,11 +191,11 @@ pub struct ClientPublication {
     _lease: Option<Lease>,
 }
 
-impl ClientPublication {
+impl<T: TermBytes> ClientPublication<T> {
     /// Wraps the buffer's publication. Connectivity, limits and the lane
     /// are read from the buffer the publication itself appends to.
     #[must_use]
-    pub fn new(inner: Publication<Arc<LogBuffer>>, allow_unconnected: bool) -> Self {
+    pub fn new(inner: Publication<Arc<LogBuffer<T>>>, allow_unconnected: bool) -> Self {
         Self {
             inner,
             allow_unconnected,
@@ -215,7 +216,7 @@ impl ClientPublication {
     /// then dropped, releasing what it holds.
     pub fn with_generation(
         mut self,
-        link: Arc<GenerationLink>,
+        link: Arc<GenerationLink<T>>,
         base: u64,
     ) -> Result<Self, ClientError> {
         if !representable(base, self.inner.buffer()) {
@@ -228,7 +229,7 @@ impl ClientPublication {
 
     /// The handle's generation link, if any.
     #[must_use]
-    pub fn generation_link(&self) -> Option<&Arc<GenerationLink>> {
+    pub fn generation_link(&self) -> Option<&Arc<GenerationLink<T>>> {
         self.link.as_ref()
     }
 
@@ -236,7 +237,7 @@ impl ClientPublication {
     /// stream's lease until it is dropped.
     #[must_use]
     pub fn with_lease(
-        inner: Publication<Arc<LogBuffer>>,
+        inner: Publication<Arc<LogBuffer<T>>>,
         allow_unconnected: bool,
         lease: Lease,
     ) -> Self {
@@ -250,7 +251,7 @@ impl ClientPublication {
     /// handle keeps the stream's lease until it is dropped.
     #[must_use]
     pub fn from_hand_over(
-        inner: Publication<Arc<LogBuffer>>,
+        inner: Publication<Arc<LogBuffer<T>>>,
         allow_unconnected: bool,
         origin: Origin,
     ) -> Self {
@@ -330,7 +331,7 @@ impl ClientPublication {
     /// and lower-layer errors, such as `ResourcesUnavailable` once the claim
     /// record's serial is exhausted. An error makes no new reservation; a
     /// forgotten claim is still resolved first.
-    pub fn try_claim(&mut self, length: u32) -> Result<ClaimOutcome<'_>, ClientError> {
+    pub fn try_claim(&mut self, length: u32) -> Result<ClaimOutcome<'_, T>, ClientError> {
         self.try_claim_with(length, AppendOptions::default())
     }
 
@@ -344,7 +345,7 @@ impl ClientPublication {
         &mut self,
         length: u32,
         options: AppendOptions,
-    ) -> Result<ClaimOutcome<'_>, ClientError> {
+    ) -> Result<ClaimOutcome<'_, T>, ClientError> {
         // A forgotten claim is resolved before any early return; the
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
@@ -416,7 +417,7 @@ impl End {
         }
     }
 
-    fn claim<'a>(self) -> ClaimOutcome<'a> {
+    fn claim<'a, T: TermBytes>(self) -> ClaimOutcome<'a, T> {
         match self {
             End::Retry => ClaimOutcome::AdminAction,
             End::Closed => ClaimOutcome::Closed,

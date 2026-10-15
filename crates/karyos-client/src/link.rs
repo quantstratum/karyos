@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
+use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::generation::GenerationLink;
 
@@ -148,11 +149,11 @@ impl Drop for Lease {
 
 /// A capability created by the driver for a registration.
 #[derive(Debug)]
-pub enum Capability {
+pub enum Capability<T: TermBytes = HeapTerms> {
     /// A stream's exclusive publication.
     Publication {
         /// The log buffer capability.
-        inner: Publication<Arc<LogBuffer>>,
+        inner: Publication<Arc<LogBuffer<T>>>,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
     },
@@ -160,40 +161,40 @@ pub enum Capability {
     /// slots, held until the handle or the entry is dropped.
     ConcurrentPublication {
         /// The log buffer capability.
-        inner: ConcurrentPublication<Arc<LogBuffer>>,
+        inner: ConcurrentPublication<Arc<LogBuffer<T>>>,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
     },
     /// An admitted subscriber.
-    Subscription(Subscription<Arc<LogBuffer>>),
+    Subscription(Subscription<Arc<LogBuffer<T>>>),
 }
 
 /// A capability with its lease and owner, waiting in the hand-over table.
 #[derive(Debug)]
-pub struct HandOverEntry {
+pub struct HandOverEntry<T: TermBytes = HeapTerms> {
     /// The hand-over key from the response.
     pub key: u64,
     /// The capability.
-    pub capability: Capability,
+    pub capability: Capability<T>,
     /// Its lease.
     pub lease: Lease,
     /// The generation link and base the delivered handle starts with
     /// (`quantstratum-docs: karyos/design/mapping-generations.md`), when the driver keeps one.
-    pub generation: Option<(Arc<GenerationLink>, u64)>,
+    pub generation: Option<(Arc<GenerationLink<T>>, u64)>,
 }
 
-#[derive(Debug, Default)]
-struct HandOver {
-    entries: Vec<HandOverEntry>,
+#[derive(Debug)]
+struct HandOver<T: TermBytes = HeapTerms> {
+    entries: Vec<HandOverEntry<T>>,
     /// Set when the driver is dropped: takes fail from then on.
     driver_gone: bool,
 }
 
 /// State shared by one client conductor and its driver registration.
-#[derive(Debug, Default)]
-pub struct ClientLink {
+#[derive(Debug)]
+pub struct ClientLink<T: TermBytes = HeapTerms> {
     closed: AtomicBool,
-    hand_over: Mutex<HandOver>,
+    hand_over: Mutex<HandOver<T>>,
 }
 
 /// Why a hand-over put or take failed.
@@ -203,14 +204,26 @@ pub enum HandOverError {
     Closed,
 }
 
-impl ClientLink {
+impl<T: TermBytes> Default for ClientLink<T> {
+    fn default() -> Self {
+        Self {
+            closed: AtomicBool::new(false),
+            hand_over: Mutex::new(HandOver {
+                entries: Vec::new(),
+                driver_gone: false,
+            }),
+        }
+    }
+}
+
+impl<T: TermBytes> ClientLink<T> {
     /// A new link.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn table(&self) -> MutexGuard<'_, HandOver> {
+    fn table(&self) -> MutexGuard<'_, HandOver<T>> {
         // Every critical section is a single push, remove or clear, so a
         // panic elsewhere cannot leave the table half updated.
         self.hand_over
@@ -231,7 +244,7 @@ impl ClientLink {
     }
 
     /// Driver side: holds `entry` for the client (`Held`).
-    pub fn hold(&self, entry: HandOverEntry) {
+    pub fn hold(&self, entry: HandOverEntry<T>) {
         self.table().entries.push(entry);
     }
 
@@ -275,7 +288,7 @@ impl ClientLink {
     ///
     /// Returns [`HandOverError::Closed`] if the driver is gone or the entry
     /// is missing or was dropped.
-    pub fn take(&self, key: u64) -> Result<HandOverEntry, HandOverError> {
+    pub fn take(&self, key: u64) -> Result<HandOverEntry<T>, HandOverError> {
         let mut table = self.table();
         if table.driver_gone {
             return Err(HandOverError::Closed);
