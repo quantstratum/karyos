@@ -482,6 +482,140 @@ pub fn peer_credentials(socket: BorrowedFd<'_>) -> Result<rustix::net::UCred, Sy
     rustix::net::sockopt::socket_peercred(socket).map_err(os("getsockopt(SO_PEERCRED)"))
 }
 
+/// The file name of the driver's admission socket in its directory.
+pub const SOCKET_NAME: &str = "driver.sock";
+
+/// The effective uid of this process.
+#[must_use]
+pub fn own_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// Checks that `path` is a directory (not a symbolic link) owned by this
+/// uid with mode `0700`.
+fn check_private_dir(path: &std::path::Path) -> Result<(), SysError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).map_err(io_error("stat(dir)"))?;
+    if !metadata.is_dir() || metadata.uid() != own_uid() || metadata.mode() & 0o777 != 0o700 {
+        return Err(SysError::Protocol {
+            reason: "the socket directory is not a private directory of this uid",
+        });
+    }
+    Ok(())
+}
+
+fn io_error(operation: &'static str) -> impl Fn(std::io::Error) -> SysError {
+    move |error| SysError::Os {
+        operation,
+        errno: error.raw_os_error().unwrap_or(0),
+    }
+}
+
+fn unix_address(path: &std::path::Path) -> Result<rustix::net::SocketAddrUnix, SysError> {
+    rustix::net::SocketAddrUnix::new(path).map_err(os("sockaddr_un"))
+}
+
+fn seqpacket(flags: SocketFlags) -> Result<OwnedFd, SysError> {
+    rustix::net::socket_with(AddressFamily::UNIX, SocketType::SEQPACKET, flags, None)
+        .map_err(os("socket"))
+}
+
+/// The driver's admission socket in `dir` (`quantstratum-docs: karyos/design/ipc-admission.md`):
+/// the directory is created with mode `0700` if absent and must otherwise
+/// be a private directory of this uid; the socket, `0600`, non-blocking
+/// and close-on-exec, listens with `backlog`. A socket file of a live
+/// driver is never replaced; one that refuses connections is stale and
+/// removed first.
+///
+/// # Errors
+///
+/// Returns [`SysError::Protocol`] for a directory that is not private or a
+/// socket of a live driver, and [`SysError::Os`] when a call fails.
+pub fn listen(dir: &std::path::Path, backlog: i32) -> Result<OwnedFd, SysError> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io_error("mkdir")(error)),
+    }
+    check_private_dir(dir)?;
+    let path = dir.join(SOCKET_NAME);
+    let address = unix_address(&path)?;
+    if std::fs::symlink_metadata(&path).is_ok() {
+        let probe = seqpacket(SocketFlags::CLOEXEC)?;
+        match rustix::net::connect(&probe, &address) {
+            Ok(()) => {
+                return Err(SysError::Protocol {
+                    reason: "a live driver holds the socket",
+                });
+            }
+            Err(rustix::io::Errno::CONNREFUSED) => {
+                std::fs::remove_file(&path).map_err(io_error("unlink(socket)"))?;
+            }
+            Err(errno) => return Err(os("connect(probe)")(errno)),
+        }
+    }
+    let listener = seqpacket(SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)?;
+    rustix::net::bind(&listener, &address).map_err(os("bind"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(io_error("chmod(socket)"))?;
+    rustix::net::listen(&listener, backlog).map_err(os("listen"))?;
+    Ok(listener)
+}
+
+/// Accepts one pending connection, non-blocking and close-on-exec; `None`
+/// when none is pending.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when `accept` fails otherwise.
+pub fn accept(listener: BorrowedFd<'_>) -> Result<Option<OwnedFd>, SysError> {
+    match rustix::net::accept_with(listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
+        Ok(socket) => Ok(Some(socket)),
+        Err(rustix::io::Errno::AGAIN) => Ok(None),
+        Err(errno) => Err(os("accept")(errno)),
+    }
+}
+
+/// Connects to the driver's admission socket in `dir` (client side,
+/// `quantstratum-docs: karyos/design/ipc-admission.md`): the directory must be a private
+/// directory of this uid, the socket a socket of this uid with mode
+/// `0600`, and the connected peer (`SO_PEERCRED`) this uid. Blocking, with
+/// `timeout` on every receive; close-on-exec.
+///
+/// # Errors
+///
+/// Returns [`SysError::Protocol`] when a check fails, and [`SysError::Os`]
+/// when a call fails.
+pub fn connect(dir: &std::path::Path, timeout: core::time::Duration) -> Result<OwnedFd, SysError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    check_private_dir(dir)?;
+    let path = dir.join(SOCKET_NAME);
+    let metadata = std::fs::symlink_metadata(&path).map_err(io_error("stat(socket)"))?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != own_uid()
+        || metadata.mode() & 0o777 != 0o600
+    {
+        return Err(SysError::Protocol {
+            reason: "the admission socket is not a socket of this uid with mode 0600",
+        });
+    }
+    let socket = seqpacket(SocketFlags::CLOEXEC)?;
+    rustix::net::connect(&socket, &unix_address(&path)?).map_err(os("connect"))?;
+    if peer_credentials(socket.as_fd())?.uid.as_raw() != own_uid() {
+        return Err(SysError::Protocol {
+            reason: "the driver runs as another uid",
+        });
+    }
+    rustix::net::sockopt::set_socket_timeout(
+        &socket,
+        rustix::net::sockopt::Timeout::Recv,
+        Some(timeout),
+    )
+    .map_err(os("setsockopt(SO_RCVTIMEO)"))?;
+    Ok(socket)
+}
+
 /// A descriptor known to be a pidfd: the client's exit proof
 /// (`quantstratum-docs: karyos/design/ipc-admission.md`). Validated once, when it is built, so
 /// [`PidFd::exited`] never mistakes another readable descriptor for an
@@ -505,6 +639,23 @@ impl PidFd {
             rustix::process::PidfdFlags::empty(),
         )
         .map_err(os("pidfd_open"))?;
+        Self::validate(fd)
+    }
+
+    /// A pidfd of process `pid` (test hook: a driver never opens a pidfd by
+    /// pid, which could name a reused pid; it validates the one it
+    /// receives).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::Os`] when `pidfd_open` fails.
+    #[cfg(feature = "test-hooks")]
+    pub fn open(pid: i32) -> Result<Self, SysError> {
+        let pid = rustix::process::Pid::from_raw(pid).ok_or(SysError::Protocol {
+            reason: "not a pid",
+        })?;
+        let fd = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+            .map_err(os("pidfd_open"))?;
         Self::validate(fd)
     }
 
@@ -906,5 +1057,78 @@ mod tests {
         }
         // A process pidfd of the same process carries no such flag.
         assert!(PidFd::of_self().is_ok());
+    }
+
+    fn private_dir() -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("karyos-ipc-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_client_connects_to_the_listening_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir().join("driver");
+        let listener = listen(&dir, 8).unwrap();
+        assert_eq!(
+            std::fs::metadata(dir.join(SOCKET_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(accept(listener.as_fd()).unwrap().is_none());
+        let client = connect(&dir, core::time::Duration::from_secs(1)).unwrap();
+        let server = accept(listener.as_fd()).unwrap().unwrap();
+        assert_eq!(send(client.as_fd(), b"hi", None).unwrap(), Sent::Sent);
+        let mut buffer = [0u8; 8];
+        assert!(matches!(
+            recv(server.as_fd(), &mut buffer).unwrap(),
+            Recv::Message(_)
+        ));
+        // A second driver cannot take a live socket.
+        assert!(matches!(listen(&dir, 8), Err(SysError::Protocol { .. })));
+        // A stale socket file (no listener) is replaced. Another test that
+        // spawns a process can hold a copy of the listener between its fork
+        // and exec (close-on-exec acts only at exec), so retry briefly.
+        drop(listener);
+        let start = std::time::Instant::now();
+        let again = loop {
+            match listen(&dir, 8) {
+                Ok(again) => break again,
+                Err(_) if start.elapsed() < core::time::Duration::from_secs(2) => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("{error:?}"),
+            }
+        };
+        drop(connect(&dir, core::time::Duration::from_secs(1)).unwrap());
+        assert!(accept(again.as_fd()).unwrap().is_some());
+    }
+
+    #[test]
+    fn modes_and_owners_are_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir();
+        let listener = listen(&dir, 8).unwrap();
+        let socket = dir.join(SOCKET_NAME);
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(matches!(
+            connect(&dir, core::time::Duration::from_secs(1)),
+            Err(SysError::Protocol { .. })
+        ));
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            connect(&dir, core::time::Duration::from_secs(1)),
+            Err(SysError::Protocol { .. })
+        ));
+        drop(listener);
+        assert!(matches!(listen(&dir, 8), Err(SysError::Protocol { .. })));
     }
 }

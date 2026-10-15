@@ -195,8 +195,11 @@ pub struct EmbeddedDriver {
     pub(crate) scan_cursor: usize,
     pub(crate) terminal: bool,
     pub(crate) counters: DriverCounters,
-    /// The clock of claim deadlines.
-    clock: Box<dyn MonotonicClock>,
+    /// The clock of claim deadlines and of the admission timeout.
+    pub(crate) clock: Box<dyn MonotonicClock>,
+    /// The admission socket and its connections (IPC mode).
+    #[cfg(target_os = "linux")]
+    pub(crate) admission: Option<crate::admission::Admission>,
 }
 
 impl EmbeddedDriver {
@@ -233,6 +236,33 @@ impl EmbeddedDriver {
         config: DriverConfig,
         clock: Box<dyn MonotonicClock>,
     ) -> Result<Self, DriverError> {
+        Self::build(config, clock, None)
+    }
+
+    /// A driver that also admits clients of other processes through its
+    /// admission socket (`quantstratum-docs: karyos/design/ipc-admission-server.md`, Linux).
+    /// Its broadcast buffer and counters live in shared regions.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::with_config`], [`DriverError::InvalidConfig`]
+    /// for a zero admission limit, and [`DriverError::Sys`] when the
+    /// socket or a region cannot be created.
+    #[cfg(target_os = "linux")]
+    pub fn with_ipc(
+        config: DriverConfig,
+        ipc: crate::admission::IpcConfig,
+        clock: Box<dyn MonotonicClock>,
+    ) -> Result<Self, DriverError> {
+        Self::build(config, clock, Some(ipc))
+    }
+
+    fn build(
+        config: DriverConfig,
+        clock: Box<dyn MonotonicClock>,
+        #[cfg(target_os = "linux")] ipc: Option<crate::admission::IpcConfig>,
+        #[cfg(not(target_os = "linux"))] ipc: Option<core::convert::Infallible>,
+    ) -> Result<Self, DriverError> {
         let needed = RESPONSE_EXTENT
             .checked_mul(2)
             .and_then(|n| n.checked_mul(config.command_budget))
@@ -252,12 +282,36 @@ impl EmbeddedDriver {
         if !valid {
             return Err(DriverError::InvalidConfig);
         }
-        let broadcast =
-            broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?;
+        #[cfg(target_os = "linux")]
+        let (broadcast, counters, admission) = match ipc {
+            Some(ipc) => {
+                let (admission, instance) = crate::admission::Admission::new(ipc)?;
+                let broadcast = BroadcastTransmitter::create_in(
+                    instance,
+                    crate::admission::BROADCAST_REGION,
+                    config.broadcast_capacity,
+                )
+                .map_err(|_| DriverError::InvalidConfig)?;
+                let counters = DriverCounters::new_in(instance, crate::admission::COUNTERS_REGION)?;
+                (broadcast, counters, Some(admission))
+            }
+            None => (
+                broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
+                DriverCounters::new()?,
+                None,
+            ),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (broadcast, counters) = {
+            let _ = ipc;
+            (
+                broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
+                DriverCounters::new()?,
+            )
+        };
         if !broadcast.has_room(MAX_RESPONSE_LENGTH) {
             return Err(DriverError::InvalidConfig);
         }
-        let counters = DriverCounters::new()?;
         let id = NEXT_DRIVER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| DriverError::DriverIdsExhausted)?;
@@ -275,6 +329,8 @@ impl EmbeddedDriver {
             scan_cursor: 0,
             terminal: false,
             clock,
+            #[cfg(target_os = "linux")]
+            admission,
         })
     }
 
@@ -576,10 +632,14 @@ impl EmbeddedDriver {
     /// [`DriverError::WorkCountOverflow`] when the work count does not fit
     /// `u32`.
     pub fn do_work(&mut self) -> Result<u32, DriverError> {
+        #[cfg(target_os = "linux")]
+        let admitted = self.serve_admission();
+        #[cfg(not(target_os = "linux"))]
+        let admitted = 0;
         self.retire_closed_clients();
         self.sweep_ended_registrations();
         self.free_retired_streams();
-        let mut work = self.serve_commands();
+        let mut work = self.serve_commands().saturating_add(admitted);
         let mut first_error = None;
         let clock = &mut self.clock;
         let counters = &self.counters;
