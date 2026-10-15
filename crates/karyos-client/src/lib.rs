@@ -31,7 +31,7 @@ pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
-    Aborted, ClientSubscription, MessageInfo, MessageLimit, Overrun, PollError, PollSummary,
-    Skipped,
+    Aborted, ClientSubscription, InvalidExtensions, MessageInfo, MessageLimit, Overrun, PollError,
+    PollSummary, Skipped,
 };
 pub use trace::TraceDecision;

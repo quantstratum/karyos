@@ -116,9 +116,9 @@ pub(crate) struct DeliveryTrace {
     hook: Box<dyn TraceHook>,
     publication: PublicationIdentity,
     subscriber: SubscriberIdentity,
-    /// One past the start of the highest message the subscription attempted
-    /// to deliver; 0 before the first. It advances before the observation
-    /// and the handler, independently of acknowledgement.
+    /// The end of the highest message the subscription attempted to
+    /// deliver; 0 before the first. It advances before the observation and
+    /// the handler, independently of acknowledgement.
     boundary: u64,
 }
 
@@ -133,16 +133,19 @@ impl fmt::Debug for DeliveryTrace {
 }
 
 impl DeliveryTrace {
+    /// A trace starting at `boundary`: 0 for a new subscription, the
+    /// previous boundary when a hook is rebound.
     pub(crate) fn new(
         hook: Box<dyn TraceHook>,
         publication: PublicationIdentity,
         subscriber: SubscriberIdentity,
+        boundary: u64,
     ) -> Self {
         Self {
             hook,
             publication,
             subscriber,
-            boundary: 0,
+            boundary,
         }
     }
 
@@ -150,21 +153,22 @@ impl DeliveryTrace {
         self.boundary
     }
 
-    /// A delivery attempt of the message at `position`, before its handler
-    /// runs: advances the boundary and records the observation of a traced
-    /// message the first time its position is attempted, so a redelivery
-    /// after a handler panic records nothing.
+    /// A delivery attempt of the message at `position`, ending at `end`,
+    /// before its handler runs: advances the boundary and records the
+    /// observation of a traced message the first time its position is
+    /// attempted, so a redelivery after a handler panic records nothing.
     pub(crate) fn attempt(
         &mut self,
         extension: Option<&TraceExtension>,
         lane: Lane,
         position: u64,
+        end: u64,
     ) {
         let first = position >= self.boundary;
         if !first {
             return;
         }
-        self.boundary = position.saturating_add(1);
+        self.boundary = end;
         if let Some(extension) = extension {
             self.hook.on_delivered(
                 extension,

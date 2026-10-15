@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use karyos_protocol::frame::{Lane, TraceExtension};
 use karyos_protocol::trace_hook::{PublicationIdentity, SubscriberIdentity};
+use karyos_sys::frame::Flags;
 use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig, PublicationMode, Role};
-use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+use karyos_sys::sizing::{DEFAULT_MTU, FragmentPlan, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
 use super::test_hook::recording;
@@ -50,6 +51,18 @@ fn buffer(publication: PublicationMode) -> Arc<LogBuffer> {
         })
         .unwrap(),
     )
+}
+
+/// The end of a traced block of `length` payload bytes at `position`,
+/// computed independently of the subscription: the EXT64 fragmentation of
+/// SPEC.md §4.
+fn traced_end(position: u64, length: u32) -> u64 {
+    let flags = Flags::new(false, false, false, true, Lane::ZERO);
+    let reserved = FragmentPlan::new(DEFAULT_MTU, flags)
+        .unwrap()
+        .reserved(length)
+        .unwrap();
+    position + u64::from(reserved)
 }
 
 /// Polls one message and returns its bytes and decoded trace context.
@@ -141,7 +154,10 @@ fn test_trace_publish_and_poll_records_match() {
         ),
         (PUBLICATION, SUBSCRIBER, lane, position)
     );
-    assert_eq!(subscription.delivery_boundary(), position + 1);
+    // The boundary is the message's end: 3 x 1408 + align32(96 + 776) for
+    // 5000 bytes with EXT64.
+    assert_eq!(traced_end(0, 5000), 5408);
+    assert_eq!(subscription.delivery_boundary(), traced_end(position, 5000));
 }
 
 #[test]
@@ -258,7 +274,10 @@ fn test_trace_redelivery_records_first_delivery_only() {
     }));
     assert!(panicked.is_err());
     // Attempted, not acknowledged: the boundary passed the message.
-    assert_eq!(subscription.delivery_boundary(), position + 1);
+    assert_eq!(
+        subscription.delivery_boundary(),
+        traced_end(position, b"panics once".len() as u32)
+    );
     assert_eq!(subscription.position(), 0);
     let (bytes, _) = poll_one(&mut subscription).unwrap();
     assert_eq!(bytes, b"panics once");
@@ -289,7 +308,8 @@ fn test_trace_invalid_ext_delivered_untraced() {
         poll_one(&mut subscription),
         Some((b"odd ext".to_vec(), None))
     );
-    assert_eq!(subscription.invalid_extensions(), 1);
+    assert_eq!(subscription.invalid_extensions().count, 1);
+    assert!(!subscription.invalid_extensions().overflowed);
     assert!(sub_seen.lock().unwrap().delivered.is_empty());
 }
 
@@ -346,4 +366,37 @@ fn test_trace_concurrent_offer_and_claim_record_their_commits() {
     drop(seen);
     assert_eq!(poll_one(&mut subscription).unwrap().1, first.extension());
     assert_eq!(poll_one(&mut subscription).unwrap().1, second.extension());
+}
+
+#[test]
+fn rebinding_a_hook_keeps_the_boundary_and_records_nothing_twice() {
+    let buffer = buffer(PublicationMode::Exclusive);
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let (first_hook, first_seen) = recording(false);
+    let mut subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap())
+        .with_trace(first_hook, PUBLICATION, SUBSCRIBER);
+    let (hook, _seen) = recording(true);
+    let mut publication =
+        ClientPublication::new(buffer.publication_owned().unwrap().unwrap(), false)
+            .with_trace(hook, PUBLICATION);
+    let decision = publication.trace_message(None);
+    let OfferOutcome::Accepted { position, .. } =
+        publication.offer_with_trace(b"once", &decision).unwrap()
+    else {
+        panic!("not accepted");
+    };
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = subscription.poll(|_, _| panic!("handler failed"), MessageLimit::new(1));
+    }));
+    assert!(panicked.is_err());
+    let boundary = subscription.delivery_boundary();
+    assert_eq!(boundary, traced_end(position, 4));
+    // A new hook bound to the same subscription keeps its history.
+    let (second_hook, second_seen) = recording(false);
+    let mut subscription = subscription.with_trace(second_hook, PUBLICATION, SUBSCRIBER);
+    assert_eq!(subscription.delivery_boundary(), boundary);
+    let (bytes, _) = poll_one(&mut subscription).unwrap();
+    assert_eq!(bytes, b"once");
+    assert_eq!(first_seen.lock().unwrap().delivered.len(), 1);
+    assert!(second_seen.lock().unwrap().delivered.is_empty());
 }
