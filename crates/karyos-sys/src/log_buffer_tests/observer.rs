@@ -133,7 +133,11 @@ fn test_observer_is_revoked_like_an_optional_reader() {
 
 /// SPEC.md §13 "Stall isolation and capacity", phase 1 part: a paused claim
 /// of one concurrent publisher, optional readers and an observer paused
-/// inside their copies, while another publisher runs ten terms.
+/// inside their copies, while another publisher runs ten terms; then one
+/// more admission arrives. Pinned slots are counted in every state outside
+/// the three rotation slots (an `ACTIVE` or `READY` slot of an earlier term
+/// counts as much as a `RECLAIMING` or `CLEANING` one), and the publisher's
+/// outcomes are matched explicitly against `ResourcesUnavailable`.
 #[test]
 fn test_stall_isolation_optional_observer_claim() {
     // Two publishers, two optional readers and an observer: five credits.
@@ -180,29 +184,69 @@ fn test_stall_isolation_optional_observer_claim() {
     let target = 10 * TERM;
     let mut appended = 0u64;
     let mut cycles = 0u32;
+    let mut most_pinned = 0usize;
     while appended < target {
-        match running.offer(&data, AppendOptions::default()).unwrap() {
-            ConcurrentOfferOutcome::Appended { .. } => appended += data.len() as u64,
-            ConcurrentOfferOutcome::BackPressured => panic!("back-pressured by a paused reader"),
-            ConcurrentOfferOutcome::AdminAction => {}
+        match running.offer(&data, AppendOptions::default()) {
+            Ok(ConcurrentOfferOutcome::Appended { .. }) => appended += data.len() as u64,
+            Ok(ConcurrentOfferOutcome::BackPressured) => {
+                panic!("back-pressured by a paused reader")
+            }
+            Ok(ConcurrentOfferOutcome::AdminAction) => {}
+            Err(SysError::ResourcesUnavailable) => {
+                panic!("the running publisher got ResourcesUnavailable")
+            }
             other => panic!("unexpected {other:?}"),
         }
         let _ = conductor.duty_cycle().unwrap();
         cycles += 1;
         assert!(cycles < 100_000, "publisher B made no progress");
-        // Pinned plus uncleaned slots never exceed S.
-        let pinned = (0..buffer.slots)
-            .filter(|slot| {
-                let state = Descriptor::decode(
-                    buffer.descriptor(*slot).unwrap().load(Ordering::Acquire),
-                )
+        // Pinned plus uncleaned slots never exceed S: every slot that is not
+        // FREE and does not hold the previous, active or next term, in any
+        // state, ACTIVE and READY included.
+        let active = buffer.active_count().load(Ordering::Acquire) as u32;
+        let mut pinned = 0usize;
+        let mut pinned_live = 0usize;
+        for slot in 0..buffer.slots {
+            let descriptor =
+                Descriptor::decode(buffer.descriptor(slot).unwrap().load(Ordering::Acquire))
+                    .unwrap();
+            if descriptor.state() == SlotState::Free {
+                continue;
+            }
+            let count = descriptor
+                .term_id()
+                .count_from(buffer.initial_term_id)
                 .unwrap()
-                .state();
-                matches!(state, SlotState::Reclaiming | SlotState::Cleaning)
-            })
-            .count();
-        assert!(pinned <= usize::from(buffer.spare_slots));
+                .get();
+            if count + 1 < active || count > active + 1 {
+                pinned += 1;
+                if matches!(descriptor.state(), SlotState::Active | SlotState::Ready) {
+                    pinned_live += 1;
+                }
+            }
+        }
+        assert!(
+            pinned <= usize::from(buffer.spare_slots),
+            "{pinned} slots pinned ({pinned_live} ACTIVE or READY), S = {}",
+            buffer.spare_slots
+        );
+        // A term below the floor leaves ACTIVE in the duty cycle that finds
+        // it there, loans or not: what stays pinned is RECLAIMING.
+        assert_eq!(pinned_live, 0, "an earlier term stayed ACTIVE or READY");
+        most_pinned = most_pinned.max(pinned);
     }
+    // The stalled holders did pin something, within the spares.
+    assert!(most_pinned >= 1, "no slot was ever pinned");
+    // One more admission after the run still does not fit the spares, and
+    // the running publisher is unaffected by the refusal.
+    assert_eq!(
+        conductor.subscribe(Role::Optional).err(),
+        Some(SysError::ResourcesUnavailable)
+    );
+    assert!(matches!(
+        running.offer(&data, AppendOptions::default()),
+        Ok(ConcurrentOfferOutcome::Appended { .. } | ConcurrentOfferOutcome::AdminAction)
+    ));
     // Term 0, under the readers' loans, was never cleaned or reused.
     let state = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
     assert_eq!(state.term_id(), buffer.initial_term_id);
