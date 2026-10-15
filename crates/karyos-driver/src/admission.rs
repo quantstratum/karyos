@@ -440,7 +440,11 @@ impl<T: StreamTerms> Admission<T> {
             fds.push(region.descriptor()?.try_clone_to_owned().ok()?);
         }
         let link = Arc::new(ClientLink::new());
-        let ledger = Ledger::new(self.config.max_exports_per_client);
+        let ledger = Ledger::new(
+            self.config.max_exports_per_client,
+            self.config.max_regions_per_fetch,
+            self.config.max_fetch_bytes,
+        );
         let client = driver
             .admit(consumer, Arc::clone(&link), Some(ledger))
             .ok()?;

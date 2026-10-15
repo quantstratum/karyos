@@ -59,6 +59,10 @@ pub(crate) struct Ledger {
     grants: Vec<Grant>,
     /// `max_exports_per_client`: grants in any state.
     limit: usize,
+    /// `max_regions_per_fetch` and `max_fetch_bytes`: a grant beyond them
+    /// could never be fetched, so its command is refused.
+    max_regions: usize,
+    max_bytes: u64,
 }
 
 impl Ledger {
@@ -67,11 +71,19 @@ impl Ledger {
         not(target_os = "linux"),
         allow(dead_code, reason = "remote clients are admitted only on Linux")
     )]
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, max_regions: usize, max_bytes: u64) -> Self {
         Self {
             grants: Vec::new(),
             limit,
+            max_regions,
+            max_bytes,
         }
+    }
+
+    /// Whether a grant of `regions` regions of `bytes` bytes in all fits
+    /// one fetch.
+    pub(crate) fn fetchable(&self, regions: usize, bytes: u64) -> bool {
+        regions <= self.max_regions && bytes <= self.max_bytes
     }
 
     /// Whether a new grant would exceed the client's bound.

@@ -702,6 +702,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if target.issuing().is_err() {
             return refuse(ErrorCode::ResourcesUnavailable, detail);
         }
+        // A grant no fetch could carry is refused rather than handed a key
+        // (one log buffer region per grant: one lane).
+        let bytes = fetch_bytes(&target.buffer);
+        let fetchable = self
+            .clients
+            .iter()
+            .find(|slot| slot.id == client)
+            .and_then(|slot| slot.ledger.as_ref())
+            .is_some_and(|ledger| ledger.fetchable(1, bytes));
+        if !fetchable {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        }
+        let Some(target) = self.streams.get_mut(index) else {
+            return refuse(ErrorCode::UnknownStream, 0);
+        };
         let participant = match command {
             Command::AddPublication { .. } => {
                 // A spare publication is the driver's own issuance.
@@ -843,6 +858,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 }
 
+/// The bytes a fetch of `buffer` carries: its region's structure; 0 on
+/// the heap, which no remote client reaches.
+fn fetch_bytes<T: StreamTerms>(buffer: &karyos_sys::log_buffer::LogBuffer<T>) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        <T as crate::embedded::sealed::Create>::region(buffer)
+            .and_then(|region| u64::try_from(region.record().structure_length).ok())
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = buffer;
+        0
+    }
+}
+
 /// The refusal code of a failed publication issuance: a kind that does not
 /// match the stream's mode, or a resource (staging, loan) not available.
 fn issue_refusal(error: &karyos_sys::error::SysError) -> ErrorCode {
@@ -926,7 +957,7 @@ mod tests {
         let (producer, consumer) = command_ring(1024).unwrap();
         let link = Arc::new(ClientLink::new());
         let id = driver
-            .admit(consumer, link, Some(Ledger::new(limit)))
+            .admit(consumer, link, Some(Ledger::new(limit, 4, 1 << 30)))
             .unwrap();
         (id, producer)
     }

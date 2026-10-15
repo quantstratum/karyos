@@ -592,3 +592,45 @@ fn a_fetched_subscription_reads_what_an_in_process_publisher_writes() {
         }
     );
 }
+
+/// A grant no fetch could carry (its region exceeds `max_fetch_bytes`) is
+/// refused at its command instead of being handed a key.
+#[test]
+fn an_unfetchable_grant_is_refused_at_its_command() {
+    let dir = dir("unfetchable");
+    let mut driver = EmbeddedDriver::with_ipc(
+        DriverConfig::default(),
+        IpcConfig {
+            max_fetch_bytes: 128,
+            ..ipc_config(&dir, 5_000_000_000)
+        },
+        Box::new(SystemClock::new()),
+    )
+    .unwrap();
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let _ = client
+        .add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    let mut done: Vec<Completion> = Vec::new();
+    let start = Instant::now();
+    while done.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    assert!(matches!(
+        done[0].outcome,
+        Outcome::Refused {
+            code: ErrorCode::ResourcesUnavailable,
+            ..
+        }
+    ));
+    assert_eq!(counter(&driver, "grants reserved"), 0);
+}
