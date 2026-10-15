@@ -486,9 +486,10 @@ impl<T: StreamTerms> Admission<T> {
             Ok(Recv::Message(received)) if received.fd.is_none() => {
                 let bytes = buffer.get(..received.len).unwrap_or(&[]);
                 match Message::decode(bytes) {
-                    // Leave only once nothing was exported and no fetch is
-                    // open; otherwise everything stays charged until the
-                    // exit proof.
+                    // Leave releases the client like its exit proof, so it
+                    // is accepted only while nothing was exported and no
+                    // fetch is open; otherwise it is a protocol error and
+                    // everything sent stays charged until the exit proof.
                     Ok(Message::Leave)
                         if remote.open.is_empty()
                             && driver.ledger(remote.client).is_none_or(Ledger::only_held) =>
@@ -558,8 +559,14 @@ impl<T: StreamTerms> Admission<T> {
         ) else {
             return refuse(remote, refusal::RESOURCES);
         };
-        // One log buffer region per grant: one lane.
-        if config.max_regions_per_fetch < 1 || record.structure_length > config.max_fetch_bytes {
+        // One log buffer region per grant: one lane. The byte bound counts
+        // whole regions, header included.
+        let bytes = u64::try_from(karyos_sys::ipc::HEADER_STRIDE)
+            .ok()
+            .and_then(|header| record.structure_length.checked_add(header));
+        if config.max_regions_per_fetch < 1
+            || bytes.is_none_or(|bytes| bytes > config.max_fetch_bytes)
+        {
             return refuse(remote, refusal::LIMIT);
         }
         let Some(fd) = region

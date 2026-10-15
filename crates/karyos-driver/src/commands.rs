@@ -858,14 +858,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 }
 
-/// The bytes a fetch of `buffer` carries: its region's structure; 0 on
-/// the heap, which no remote client reaches.
+/// The bytes a fetch of `buffer` carries: its whole region, header
+/// included (`quantstratum-docs: karyos/design/ipc-data-path.md`, Bounds);
+/// 0 for a heap buffer, which has no region to carry.
 fn fetch_bytes<T: StreamTerms>(buffer: &karyos_sys::log_buffer::LogBuffer<T>) -> u64 {
     #[cfg(target_os = "linux")]
     {
-        <T as crate::embedded::sealed::Create>::region(buffer)
-            .and_then(|region| u64::try_from(region.record().structure_length).ok())
-            .unwrap_or(0)
+        // A full region: its header stride and its structure; a size that
+        // does not fit counts as too large.
+        <T as crate::embedded::sealed::Create>::region(buffer).map_or(0, |region| {
+            region
+                .record()
+                .structure_length
+                .checked_add(karyos_sys::ipc::HEADER_STRIDE)
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .unwrap_or(u64::MAX)
+        })
     }
     #[cfg(not(target_os = "linux"))]
     {
