@@ -49,8 +49,8 @@ use crate::frame::{
     Word0,
 };
 use crate::loan::{
-    Loan, LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held,
-    participant_quiescent, publish, release_loan, revoke, take_loan,
+    Loan, LoanOutcome, LoanTarget, activate, begin_cleaning, begin_reclaim, loan_held, publish,
+    release_loan, take_loan,
 };
 use crate::publication::{
     SEAL_POSITIONED, SEAL_SEALED, abort_block, active_term_count, commit_block, deadline_abort,
@@ -109,31 +109,10 @@ impl<T: TermBytes> BufferOwner for Arc<LogBuffer<T>> {
 /// Slots reserved as headroom for slots awaiting cleaning (`C`).
 pub const CLEANING_HEADROOM: u8 = 1;
 
-const CELL_FREE: u64 = 0;
-const CELL_REQUIRED: u64 = 1;
-const CELL_OPTIONAL: u64 = 2;
-const CELL_PUBLICATION: u64 = 3;
-/// A required reader admitted under `continue`: it bounds the publisher
-/// and holds a spare-slot credit (quantstratum-docs: `karyos/design/required-participant-loss.md`).
-const CELL_REQUIRED_RESERVED: u64 = 4;
-/// A revoked required reader under `hold`: it still bounds the publisher
-/// until a scan after the revocation finds its loan word empty.
-const CELL_LOST_HOLDING: u64 = 5;
-/// A revoked reader that no longer bounds and holds no credit.
-const CELL_LOST: u64 = 6;
-/// A revoked reader that keeps its credit until it is freed.
-const CELL_LOST_RESERVED: u64 = 7;
-/// An observer: copies only, never bounds, holds a spare-slot credit
-/// (`quantstratum-docs: karyos/design/observer-role.md`).
-const CELL_OBSERVER: u64 = 8;
-
-/// Whether a subscriber cell in `state` bounds the publication limit.
-const fn bounds(state: u64) -> bool {
-    matches!(
-        state,
-        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_LOST_HOLDING
-    )
-}
+use crate::participant::{
+    self, CELL_FREE, CELL_LOST, CELL_LOST_HOLDING, CELL_LOST_RESERVED, CELL_OBSERVER,
+    CELL_OPTIONAL, CELL_PUBLICATION, CELL_REQUIRED, CELL_REQUIRED_RESERVED, bounds,
+};
 
 /// Whether a subscriber cell in `state` keeps the publication connected.
 const fn connected(state: u64) -> bool {
@@ -2984,8 +2963,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             // delayed end of this export never touches the next occupant.
             // No loan is held outside `poll`; publishing FREE is the last
             // access of this holder to its cell.
-            registration::clear(&cell.registration);
-            cell.state.store(CELL_FREE, Ordering::Release);
+            participant::leave(&cell.state, &cell.registration);
         }
     }
 }
@@ -3520,25 +3498,17 @@ impl<O: BufferOwner> Conductor<O> {
             }
             _ => return Ok(Revocation::Stale),
         };
-        let quiescent = revoke(&found.revoked, core::slice::from_ref(&found.loan))?;
         // From the expected state only: a detach that stored FREE first
         // means the participant left and nothing was lost.
-        if found
-            .state
-            .compare_exchange(state, target, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let Some(quiescent) =
+            participant::revoke_cell(&found.state, &found.revoked, &found.loan, state, target)?
+        else {
             return Ok(Revocation::Stale);
-        }
+        };
         match target {
             CELL_LOST_HOLDING if quiescent => {
                 // The scan after the revocation found the word empty.
-                let _ = found.state.compare_exchange(
-                    CELL_LOST_HOLDING,
-                    CELL_LOST,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+                let _ = participant::withdraw(&found.state);
                 Ok(Revocation::Withdrawn)
             }
             CELL_LOST_HOLDING => Ok(Revocation::Holding),
@@ -4081,8 +4051,6 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // The Acquire load above observed the previous holder's FREE, so its
         // loan release happens before this reuse; its loan word is zero.
         debug_assert_eq!(cell.loan.load(Ordering::Relaxed), 0);
-        cell.revoked.store(0, Ordering::Relaxed);
-        cell.registration.store(occupant, Ordering::Relaxed);
         let start = buffer.conductor_head()?;
         cell.position.store(start, Ordering::Relaxed);
         let state = match (role, reserve) {
@@ -4091,7 +4059,13 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             (Role::Optional, _) => CELL_OPTIONAL,
             (Role::Observer, _) => CELL_OBSERVER,
         };
-        cell.state.store(state, Ordering::Release);
+        participant::admit(
+            &cell.state,
+            &cell.revoked,
+            &cell.registration,
+            occupant,
+            state,
+        );
         Ok(Cursor {
             cell: index,
             role,
@@ -4126,18 +4100,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let buffer = self.buffer;
         let mut withdrawn = 0u32;
         for cell in buffer.cells().iter().skip(buffer.first_subscriber_cell()) {
-            if cell.state.load(Ordering::Acquire) == CELL_LOST_HOLDING
-                && participant_quiescent(core::slice::from_ref(&cell.loan))?
-                && cell
-                    .state
-                    .compare_exchange(
-                        CELL_LOST_HOLDING,
-                        CELL_LOST,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-            {
+            if participant::withdraw_if_quiescent(&cell.state, &cell.loan)? {
                 withdrawn = withdrawn.saturating_add(1);
             }
         }
