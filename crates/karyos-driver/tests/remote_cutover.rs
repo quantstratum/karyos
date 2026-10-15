@@ -593,3 +593,181 @@ fn a_client_at_its_export_bound_is_fenced_at_once() {
     drop(subscription);
     drop(client);
 }
+
+fn subscriber_grant(
+    driver: &mut IpcDriver,
+    dir: &Path,
+) -> (RemoteClient, ClientSubscriptionShared) {
+    remote_grant(
+        driver,
+        dir,
+        |client| {
+            let _ = client
+                .add_subscription(KEY, SubscriberRole::Required)
+                .unwrap();
+        },
+        |client, fetchable| client.take_subscription(fetchable).unwrap(),
+    )
+}
+
+type ClientSubscriptionShared = karyos_client::ClientSubscription<SharedTerms>;
+
+/// Polls the client's control path until the subscription's successor is
+/// staged in its link; the in-process `publication` offers meanwhile, so it
+/// reaches the predecessor's seal and the cutover opens.
+fn stage(
+    driver: &mut IpcDriver,
+    client: RemoteClient,
+    link: &std::sync::Arc<karyos_client::GenerationLink<SharedTerms>>,
+    publication: &mut karyos_client::ClientPublication<SharedTerms>,
+) -> RemoteClient {
+    let staged = std::sync::Arc::clone(link);
+    serve_while(driver, move || {
+        let mut client = client;
+        let start = Instant::now();
+        while staged.status() != LinkStatus::Offered {
+            assert!(start.elapsed() < Duration::from_secs(10), "never staged");
+            let _ = publication.offer(b"staging");
+            let _ = client.poll(usize::MAX, |_| {});
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        client
+    })
+}
+
+/// A required remote subscriber whose process stops while mapped, after
+/// staging its successor (`quantstratum-docs: karyos/design/ipc-data-path.md`,
+/// Tests, d5): at the deadline the driver fences it, its successor cell
+/// stops bounding the writers, and an in-process publisher advances on the
+/// successor far past a window the stopped reader could have held.
+#[test]
+fn a_required_subscriber_fenced_while_stopped_does_not_hold_the_successor_back() {
+    let dir = dir("fenced-stopped");
+    let mut driver = driver(&dir, 50_000_000);
+    // Unconnected offers are allowed: once the fenced cell stops counting,
+    // the writer has no reader left to wait for.
+    let stream = driver
+        .add_stream(StreamConfig {
+            allow_unconnected: true,
+            ..stream_config(PublicationMode::Exclusive)
+        })
+        .unwrap();
+    let (client, subscription) = subscriber_grant(&mut driver, &dir);
+    let link = std::sync::Arc::clone(subscription.generation_link().unwrap());
+    let mut publication = driver.publication(stream).unwrap();
+    reconfigure(&mut driver, stream);
+    let client = stage(&mut driver, client, &link, &mut publication);
+    serve_until(&mut driver, |driver| counter(driver, "grants fenced") == 1);
+    // The "stopped" reader neither polls nor detaches. The writer moves to
+    // the successor and writes many times its span (2 terms of 128 KiB per
+    // window) without being back-pressured for good.
+    let payload = [5u8; 1000];
+    let mut accepted = 0u32;
+    let start = Instant::now();
+    while accepted < 2000 {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the fenced reader held the writer at {accepted}"
+        );
+        if let OfferOutcome::Accepted { .. } = publication.offer(&payload).unwrap() {
+            accepted += 1;
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    drop(publication);
+    drop(subscription);
+    drop(client);
+}
+
+/// A moved handle's predecessor grant is detached late, by the control
+/// path's next poll: that `Detach` ends only the old generation's grant,
+/// and the handle keeps reading its successor afterwards.
+#[test]
+fn a_delayed_detach_of_the_old_generation_ends_only_that_generation() {
+    let dir = dir("delayed-detach");
+    let mut driver = driver(&dir, 5_000_000_000);
+    let stream = driver
+        .add_stream(stream_config(PublicationMode::Exclusive))
+        .unwrap();
+    let (client, mut subscription) = subscriber_grant(&mut driver, &dir);
+    let link = std::sync::Arc::clone(subscription.generation_link().unwrap());
+    let mut publication = driver.publication(stream).unwrap();
+    reconfigure(&mut driver, stream);
+    let mut client = stage(&mut driver, client, &link, &mut publication);
+    // The handle moves at the seal; its predecessor waits in the link.
+    let mut seen = Vec::new();
+    serve_until(&mut driver, |driver| {
+        let _ = driver;
+        if let Ok(OfferOutcome::Accepted { position, .. }) = publication.offer(b"first") {
+            seen.push(position);
+        }
+        let _ = subscription.poll(|_, _| {}, MessageLimit::new(8));
+        link.status() == LinkStatus::Current && !seen.is_empty()
+    });
+    assert_eq!(counter(&driver, "grants detached"), 0);
+    // The delayed Detach of the old generation.
+    let _ = client.poll(usize::MAX, |_| {});
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants detached") == 1
+    });
+    serve_until(&mut driver, |driver| {
+        driver.generations(stream).unwrap().len() == 1
+    });
+    // The successor grant is untouched: the handle still reads.
+    let mut delivered = Vec::new();
+    serve_until(&mut driver, |_| {
+        let _ = publication.offer(b"after the detach");
+        let _ = subscription.poll(
+            |bytes, _| delivered.push(bytes.to_vec()),
+            MessageLimit::new(8),
+        );
+        delivered.iter().any(|bytes| bytes == b"after the detach")
+    });
+    assert_eq!(counter(&driver, "grants detached"), 1);
+    assert_eq!(counter(&driver, "grants fenced"), 0);
+    drop(subscription);
+    drop(client);
+}
+
+/// A predecessor still held by an in-process handle after the last remote
+/// `Detach` is not freed until that handle moves.
+#[test]
+fn a_predecessor_held_in_process_outlives_the_last_remote_detach() {
+    let dir = dir("held-in-process");
+    let mut driver = driver(&dir, 5_000_000_000);
+    let stream = driver
+        .add_stream(stream_config(PublicationMode::Exclusive))
+        .unwrap();
+    let (client, mut remote) = subscriber_grant(&mut driver, &dir);
+    let link = std::sync::Arc::clone(remote.generation_link().unwrap());
+    let mut local = driver.subscribe(stream, Role::Optional).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    reconfigure(&mut driver, stream);
+    let mut client = stage(&mut driver, client, &link, &mut publication);
+    // The remote handle moves and its predecessor is detached; the local
+    // optional reader has not polled, so it still reads the predecessor.
+    serve_until(&mut driver, |_| {
+        let _ = publication.offer(b"on the successor");
+        let _ = remote.poll(|_, _| {}, MessageLimit::new(8));
+        link.status() == LinkStatus::Current
+    });
+    let _ = client.poll(usize::MAX, |_| {});
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants detached") == 1
+    });
+    for _ in 0..50 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        driver.generations(stream).unwrap().len(),
+        2,
+        "freed while the local reader holds it"
+    );
+    // The local reader reaches the seal and moves: the predecessor goes.
+    serve_until(&mut driver, |driver| {
+        let _ = local.poll(|_, _| {}, MessageLimit::new(64));
+        driver.generations(stream).unwrap().len() == 1
+    });
+    drop(remote);
+    drop(client);
+}

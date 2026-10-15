@@ -379,6 +379,43 @@ fn test_ipc_data_an_exclusive_publisher_killed_mid_claim_is_resolved_at_its_exit
     assert!(driver.publication(stream).is_err());
 }
 
+/// An exclusive writer process stopped (SIGSTOP) with a claim open
+/// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Tests): readers are
+/// not blocked beyond the commit deadline, which aborts the claim, and
+/// after SIGCONT the writer's commit reports the abort.
+#[test]
+fn test_ipc_data_a_stopped_writer_holding_a_claim_is_aborted_at_the_deadline() {
+    let dir = dir("stopped-claim");
+    let mut driver = driver(&dir);
+    // 100 ms of the system clock.
+    let stream = add_stream_with(&mut driver, PublicationMode::Exclusive, 100_000_000);
+    let mut subscription = driver
+        .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+        .unwrap();
+    let (mut child, reports) = spawn("claim-wait-commit", &dir);
+    serve_until_report(&mut driver, &reports, "claimed");
+    signal(&child.0, "STOP");
+    // The reader gets the message before the claim, then the claimed block
+    // aborted by the deadline, while the writer stays stopped.
+    let (received, mut aborted) = read_local(&mut driver, &mut subscription, 1);
+    assert_eq!(received, vec![b"before".to_vec()]);
+    let start = Instant::now();
+    while !aborted {
+        assert!(start.elapsed() < Duration::from_secs(10), "never aborted");
+        let _ = driver.do_work().unwrap();
+        aborted = subscription
+            .poll(|_, _| {}, MessageLimit::new(8))
+            .unwrap()
+            .aborted
+            .is_some();
+    }
+    signal(&child.0, "CONT");
+    release(&mut child.0);
+    serve_until_report(&mut driver, &reports, "commit aborted");
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert!(child.0.wait().unwrap().success());
+}
+
 /// A concurrent publisher process killed with an open block while an
 /// in-process publisher keeps writing in the same term: the live
 /// publisher's messages are never aborted, the dead block is aborted by
@@ -792,6 +829,33 @@ fn child() {
             std::mem::forget(client);
             std::thread::sleep(Duration::from_secs(30));
             std::process::exit(1);
+        }
+        "claim-wait-commit" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, false);
+            let mut publication = client.take_publication(&fetchable).unwrap();
+            let start = Instant::now();
+            while !matches!(
+                publication.offer(b"before").unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                assert!(start.elapsed() < Duration::from_secs(10), "offer");
+            }
+            let karyos_client::ClaimOutcome::Claimed(mut claim) =
+                publication.try_claim(64).unwrap()
+            else {
+                panic!("not claimed");
+            };
+            claim.payload().fill(0xAB);
+            report("claimed");
+            // Stopped here by the parent; the deadline aborts the claim.
+            wait_for_go();
+            match claim.commit() {
+                karyos_client::CommitOutcome::Aborted { .. } => report("commit aborted"),
+                karyos_client::CommitOutcome::Accepted { .. } => report("commit accepted"),
+            }
+            drop(publication);
+            drop(client);
         }
         "concurrent-claim" => {
             let mut client = attach(&dir, timeout, 16).unwrap();

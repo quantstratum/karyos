@@ -1188,3 +1188,29 @@ fn a_successor_no_fetch_could_carry_is_fenced_at_once() {
     assert_eq!(counter(&driver, "grants reserved"), 1);
     assert_eq!(counter(&driver, "grants fenced"), 0);
 }
+
+/// Session (`quantstratum-docs: karyos/design/ipc-data-path.md`, Tests,
+/// d3): a remote handle dropped after its `RemoteClient`, with the process
+/// still alive, sends its `Detach` and then the session's `Leave`; the
+/// driver releases the client without any exit proof and without counting
+/// a fault.
+#[test]
+fn a_handle_dropped_after_its_client_detaches_then_leaves() {
+    let dir = dir("handle-after-client");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let (client, subscription) = remote_subscriber(&mut driver, &dir);
+    // The client goes first: its handle keeps the session, so the driver
+    // keeps the client and its grant.
+    drop(client);
+    for _ in 0..20 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(driver.clients(), 1);
+    assert_eq!(counter(&driver, "grants detached"), 0);
+    // The handle goes last: Detach, then Leave.
+    drop(subscription);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants detached"), 1);
+    assert_eq!(counter(&driver, "clients faulty"), 0);
+}
