@@ -99,7 +99,7 @@ fn stamp(time: u64) -> Stamp {
 
 /// Requests a journal and polls until it completes as fetchable.
 fn fetchable(client: &mut RemoteClient) -> FetchableJournal {
-    let _ = client.trace_journal(LAYOUT).unwrap();
+    let _ = client.trace_journal(LAYOUT, None).unwrap();
     let mut found = None;
     let start = Instant::now();
     while found.is_none() {

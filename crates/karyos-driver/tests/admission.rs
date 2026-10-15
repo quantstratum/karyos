@@ -264,12 +264,24 @@ fn hellos_that_break_the_profile_are_refused() {
     );
     child.kill().unwrap();
     child.wait().unwrap();
-    // Another protocol version, even one with a longer Hello.
+    // Another protocol version, even one with a longer Hello: a later one,
+    // and version 1, the build before the trace journal kinds.
     let own = own_pidfd();
-    let mut future = encode(&Message::Hello { version: 2 });
+    let mut future = encode(&Message::Hello {
+        version: VERSION + 1,
+    });
     future.extend_from_slice(&[0u8; 16]);
     assert_eq!(
         raw_hello(&mut driver, &dir, &future, Some(&own)),
+        refused(refusal::INCOMPATIBLE_VERSION)
+    );
+    assert_eq!(
+        raw_hello(
+            &mut driver,
+            &dir,
+            &encode(&Message::Hello { version: 1 }),
+            Some(&own)
+        ),
         refused(refusal::INCOMPATIBLE_VERSION)
     );
     // Not a Hello: closed without an answer.
@@ -279,7 +291,7 @@ fn hellos_that_break_the_profile_are_refused() {
     );
     assert_eq!(driver.clients(), 0);
     // Each refusal reached the error log, keyed by its code: three
-    // profile refusals and one version refusal (P7 o3).
+    // profile refusals and two version refusals (P7 o3).
     let mut occurrences = std::collections::HashMap::new();
     let _ = driver.error_log().scan(&mut 0, |record| {
         assert_eq!(
@@ -291,7 +303,7 @@ fn hellos_that_break_the_profile_are_refused() {
     assert_eq!(occurrences.get(&[0, refusal::PROFILE]), Some(&3));
     assert_eq!(
         occurrences.get(&[0, refusal::INCOMPATIBLE_VERSION]),
-        Some(&1)
+        Some(&2)
     );
     assert_eq!(occurrences.len(), 2);
 }

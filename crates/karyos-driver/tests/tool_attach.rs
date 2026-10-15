@@ -31,7 +31,7 @@ use karyos_driver::{DriverConfig, DriverError, EmbeddedDriver, IpcConfig, System
 use karyos_protocol::admission::{
     Capability, MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION, refusal,
 };
-use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, Sent, probe};
+use karyos_sys::ipc::{self, PidFd, Recv, Region, Sent, probe};
 use karyos_sys::term_bytes::SharedTerms;
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -475,14 +475,7 @@ fn wire(region: &Region, export: u64) -> Record {
     Record {
         region: header.region,
         export,
-        kind: match header.kind {
-            RegionKind::Counters => WireKind::Counters,
-            RegionKind::ClientCounters => WireKind::ClientCounters,
-            RegionKind::ErrorLog => WireKind::ErrorLog,
-            RegionKind::LossReport => WireKind::LossReport,
-            RegionKind::TraceMirror => WireKind::TraceMirror,
-            other => panic!("not a diagnostic region: {other:?}"),
-        },
+        kind: WireKind::from_sys(header.kind),
         layout: u32::try_from(header.layout).unwrap(),
         structure_length: header.structure_length as u64,
         generation: header.generation,

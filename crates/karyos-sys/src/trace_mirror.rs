@@ -30,11 +30,12 @@
 //! | 1 | Journal number (0: the entry is free) |
 //! | 2 | Client |
 //! | 3 | State (bits 0..8: 1 open, 2 closed, 3 writer lost), flags (bits 8..16: join, boundary, last record, watermark), drop range count (bits 16..24) |
-//! | 4, 5 | Join position, final delivery boundary |
+//! | 4, 5 | Join position (valid when its flag is set), final delivery boundary |
 //! | 6 | Ring sequence of the journal's last mirrored record |
 //! | 7, 8 | Payload words and capacity of the journal |
 //! | 9, 10, 11 | Attempted horizon, stored count, records mirrored |
 //! | 12, 13 | Watermark (`lost_before`), unstable loss entries |
+//! | 14, 15 | Observed subscription's registration and its stream's registration (both 0 for a publisher-side journal) |
 //! | 16 to 63 | Drop ranges: first, last, first time, last time, clock, epoch |
 //!
 //! Readers issue only `Relaxed` loads and `Acquire` fences, so they work
@@ -124,7 +125,15 @@ pub struct JournalEntry {
     pub client: u64,
     /// Its state.
     pub state: JournalState,
-    /// The join position of its subscription, when known.
+    /// The registration of the subscription it observes; 0 for a
+    /// publisher-side journal.
+    pub subscription: u64,
+    /// The registration of that subscription's stream; 0 for a
+    /// publisher-side journal.
+    pub stream: u64,
+    /// The join position of its subscription, as the driver recorded it;
+    /// `None` for a publisher-side journal, which has none (the join flag
+    /// of word 3 is clear).
     pub join: Option<u64>,
     /// Its final delivery boundary (`CloseJournal`), when known.
     pub boundary: Option<u64>,
@@ -161,6 +170,8 @@ impl JournalEntry {
             journal,
             client,
             state: JournalState::Open,
+            subscription: 0,
+            stream: 0,
             join: None,
             boundary: None,
             last_record: None,
@@ -205,6 +216,8 @@ impl JournalEntry {
             self.mirrored,
             self.lost_before.unwrap_or(0),
             self.unstable,
+            self.subscription,
+            self.stream,
         ];
         for (word, value) in words.iter_mut().zip(fixed) {
             *word = value;
@@ -273,6 +286,8 @@ impl JournalEntry {
             journal,
             client: word(2),
             state,
+            subscription: word(14),
+            stream: word(15),
             join: when(HAS_JOIN, word(4)),
             boundary: when(HAS_BOUNDARY, word(5)),
             last_record: when(HAS_LAST, word(6)),
@@ -642,6 +657,9 @@ mod tests {
 
     fn entry(journal: u64) -> JournalEntry {
         let mut entry = JournalEntry::open(journal, 7, 25, 64);
+        entry.subscription = 12;
+        entry.stream = 3;
+        entry.join = Some(0);
         entry.boundary = Some(4096);
         entry.last_record = Some(3);
         entry.lost_before = Some(2);
@@ -679,6 +697,17 @@ mod tests {
             panic!("entry");
         };
         assert_eq!(read.ranges().len(), 2);
+        // A join at position 0 is told apart from no join by its flag.
+        assert_eq!(
+            (read.join, read.subscription, read.stream),
+            (Some(0), 12, 3)
+        );
+        let mut publisher = written;
+        (publisher.join, publisher.subscription, publisher.stream) = (None, 0, 0);
+        assert!(mirror.write_entry(1, Some(&publisher)));
+        let EntryRead::Entry(read) = reader.entry(1) else {
+            panic!("entry");
+        };
         assert_eq!(read.join, None);
         assert!(mirror.write_entry(1, None));
         assert_eq!(reader.entry(1), EntryRead::Free);

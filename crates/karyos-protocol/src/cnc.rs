@@ -52,10 +52,17 @@
 //! configured policy can produce. The driver answers `OperationSucceeded`
 //! when it recorded the report, and nothing for a protocol violation.
 //!
+//! `TraceJournal` continues after its four words with word 4, the
+//! registration of the observed subscription (0 for a publisher-side
+//! journal).
+//!
 //! `TraceJournal` and `CloseJournal` (`quantstratum-docs:
 //! karyos/design/trace-journal-region.md`, J2 and J3): a client asks the
 //! driver for a trace journal of its sizes, which the driver creates and
-//! drains; the answer `JournalReady` carries the journal number the driver
+//! drains, naming the subscription the journal observes (a live
+//! subscription of the client, whose stream and join position the driver
+//! takes from its own record, or `Error` with `UnknownRegistration`) or 0
+//! for a publisher-side journal; the answer `JournalReady` carries the journal number the driver
 //! assigned and the hand-over key under which the client takes it, or
 //! `Error` with `TraceJournalsExhausted` when the driver's journal table has
 //! no free entry. `CloseJournal` gives the journal's final delivery
@@ -501,6 +508,9 @@ pub enum Command {
         payload_words: u64,
         /// Drop-range entries, nonzero.
         drop_ranges: u64,
+        /// The registration of the subscription the journal observes; 0
+        /// for a publisher-side journal, which has no join position.
+        subscription: u64,
     },
     /// The final delivery boundary of one of the client's journals, sent
     /// before the client closes it.
@@ -779,7 +789,11 @@ impl Command {
                 capacity,
                 payload_words,
                 drop_ranges,
-            } => write_words(&[sequence, capacity, payload_words, drop_ranges], out),
+                subscription,
+            } => write_words(
+                &[sequence, capacity, payload_words, drop_ranges, subscription],
+                out,
+            ),
             Self::CloseJournal {
                 sequence,
                 journal,
@@ -899,8 +913,8 @@ impl Command {
                 })
             }
             TRACE_JOURNAL => {
-                let [sequence, capacity, payload_words, drop_ranges] =
-                    read_words::<4>(type_id, bytes)?;
+                let [sequence, capacity, payload_words, drop_ranges, subscription] =
+                    read_words::<5>(type_id, bytes)?;
                 if !capacity.is_power_of_two() || payload_words == 0 || drop_ranges == 0 {
                     return Err(CncError::Reserved { type_id });
                 }
@@ -909,6 +923,7 @@ impl Command {
                     capacity,
                     payload_words,
                     drop_ranges,
+                    subscription,
                 })
             }
             CLOSE_JOURNAL => {
@@ -1973,10 +1988,23 @@ mod journal_tests {
             capacity: 64,
             payload_words: 25,
             drop_ranges: 8,
+            subscription: 11,
         };
         let length = open.encode(&mut out).unwrap();
         assert_eq!(open.type_id(), 0x09);
-        assert_eq!(words_of(&out[..length]), [3, 64, 25, 8]);
+        assert_eq!(words_of(&out[..length]), [3, 64, 25, 8, 11]);
+        assert_eq!(Command::decode(0x09, &out[..length]), Ok(open));
+        let publisher = Command::TraceJournal {
+            sequence: 3,
+            capacity: 64,
+            payload_words: 25,
+            drop_ranges: 8,
+            subscription: 0,
+        };
+        let length = publisher.encode(&mut out).unwrap();
+        assert_eq!(words_of(&out[..length]), [3, 64, 25, 8, 0]);
+        assert_eq!(Command::decode(0x09, &out[..length]), Ok(publisher));
+        let length = open.encode(&mut out).unwrap();
         assert_eq!(Command::decode(0x09, &out[..length]), Ok(open));
         let close = Command::CloseJournal {
             sequence: 4,
@@ -2015,7 +2043,12 @@ mod journal_tests {
     fn journal_commands_are_decoded_strictly() {
         // A capacity that is zero or not a power of two, no payload or no
         // drop range, and journal 0.
-        for words in [[1u64, 0, 25, 8], [1, 3, 25, 8], [1, 4, 0, 8], [1, 4, 25, 0]] {
+        for words in [
+            [1u64, 0, 25, 8, 0],
+            [1, 3, 25, 8, 0],
+            [1, 4, 0, 8, 0],
+            [1, 4, 25, 0, 5],
+        ] {
             assert_eq!(
                 Command::decode(TRACE_JOURNAL, &bytes_of(&words)),
                 Err(CncError::Reserved {
@@ -2034,8 +2067,9 @@ mod journal_tests {
             Command::decode(CLOSE_JOURNAL, &bytes_of(&[1, 2, 3, 4])),
             Err(CncError::WrongLength { .. })
         ));
+        // The layout before the subscription word is refused by length.
         assert!(matches!(
-            Command::decode(TRACE_JOURNAL, &bytes_of(&[1, 2, 3])),
+            Command::decode(TRACE_JOURNAL, &bytes_of(&[1, 4, 25, 8])),
             Err(CncError::WrongLength { .. })
         ));
         assert!(matches!(
@@ -2379,14 +2413,24 @@ mod properties {
             }),
             (any::<u64>(), loss())
                 .prop_map(|(sequence, loss)| Command::ReportLoss { sequence, loss }),
-            (any::<u64>(), 0u32..64, 1..=u64::MAX, 1..=u64::MAX).prop_map(
-                |(sequence, shift, payload_words, drop_ranges)| Command::TraceJournal {
-                    sequence,
-                    capacity: 1 << shift,
-                    payload_words,
-                    drop_ranges,
-                }
-            ),
+            (
+                any::<u64>(),
+                0u32..64,
+                1..=u64::MAX,
+                1..=u64::MAX,
+                prop_oneof![Just(0u64), any::<u64>()],
+            )
+                .prop_map(
+                    |(sequence, shift, payload_words, drop_ranges, subscription)| {
+                        Command::TraceJournal {
+                            sequence,
+                            capacity: 1 << shift,
+                            payload_words,
+                            drop_ranges,
+                            subscription,
+                        }
+                    }
+                ),
             (any::<u64>(), 1..=u64::MAX, any::<u64>()).prop_map(|(sequence, journal, boundary)| {
                 Command::CloseJournal {
                     sequence,
@@ -2509,7 +2553,7 @@ mod properties {
                     (ALLOCATE_COUNTER, ALLOCATE_COUNTER_WORDS),
                     (RELEASE_COUNTER, 3),
                     (REPORT_LOSS, REPORT_LOSS_WORDS),
-                    (TRACE_JOURNAL, 4),
+                    (TRACE_JOURNAL, 5),
                     (CLOSE_JOURNAL, 3),
                 ],
             ),

@@ -69,14 +69,15 @@ fn request(
     driver: &mut EmbeddedDriver,
     conductor: &mut ClientConductor,
     layout: JournalLayout,
+    subscription: Option<u64>,
 ) -> Outcome {
     complete(driver, conductor, |conductor| {
-        conductor.trace_journal(layout)
+        conductor.trace_journal(layout, subscription)
     })
 }
 
 fn journal(driver: &mut EmbeddedDriver, conductor: &mut ClientConductor) -> ClientJournal {
-    match request(driver, conductor, LAYOUT) {
+    match request(driver, conductor, LAYOUT, None) {
         Outcome::Journal(journal) => journal,
         other => panic!("expected a journal, got {other:?}"),
     }
@@ -296,7 +297,7 @@ fn ended_journals_churn_through_a_small_table() {
     let mut a = journal(&mut driver, &mut conductor);
     let mut b = journal(&mut driver, &mut conductor);
     assert_eq!(
-        refused(&request(&mut driver, &mut conductor, LAYOUT)),
+        refused(&request(&mut driver, &mut conductor, LAYOUT, None)),
         ErrorCode::TraceJournalsExhausted
     );
     append(&mut a, [1]);
@@ -308,7 +309,7 @@ fn ended_journals_churn_through_a_small_table() {
     let _ = driver.do_work().unwrap();
     assert_eq!(entry(&driver, a_number).state, JournalState::Closed);
     assert_eq!(
-        refused(&request(&mut driver, &mut conductor, LAYOUT)),
+        refused(&request(&mut driver, &mut conductor, LAYOUT, None)),
         ErrorCode::TraceJournalsExhausted
     );
     check(&driver, &mut cursor);
@@ -433,7 +434,7 @@ fn the_budget_and_the_sizes_refuse_without_creating() {
         },
     ] {
         assert_eq!(
-            refused(&request(&mut driver, &mut conductor, layout)),
+            refused(&request(&mut driver, &mut conductor, layout, None)),
             ErrorCode::ResourcesUnavailable,
             "{layout:?}"
         );
@@ -446,10 +447,13 @@ fn the_budget_and_the_sizes_refuse_without_creating() {
     assert_eq!(next.journal(), 2);
     // Sizes the driver would refuse to decode are not even sent.
     assert_eq!(
-        conductor.trace_journal(JournalLayout {
-            capacity: 3,
-            ..LAYOUT
-        }),
+        conductor.trace_journal(
+            JournalLayout {
+                capacity: 3,
+                ..LAYOUT
+            },
+            None
+        ),
         Err(ConductorError::InvalidJournal)
     );
     assert_eq!(
@@ -555,11 +559,158 @@ fn a_gone_writer_is_drained_and_marked_writer_lost() {
 fn an_untaken_journal_ends_with_its_client() {
     let mut driver = driver(4, 64, 64);
     let mut conductor = driver.connect().unwrap();
-    let _ = conductor.trace_journal(LAYOUT).unwrap();
+    let _ = conductor.trace_journal(LAYOUT, None).unwrap();
     let _ = driver.do_work().unwrap();
     assert_eq!(entries(&driver)[0].state, JournalState::Open);
     drop(conductor);
     let _ = driver.do_work().unwrap();
     let _ = driver.do_work().unwrap();
     assert_eq!(entries(&driver)[0].state, JournalState::Closed);
+}
+
+/// A stream that accepts offers without a subscriber, so that a later
+/// subscription joins at a nonzero position.
+fn stream(driver: &mut EmbeddedDriver) -> crate::StreamHandle {
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+    driver
+        .add_stream(crate::StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                // Room for the spare-slot credits of two optional readers.
+                spare_slots: 8,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 5,
+                claim_deadline: 100,
+                publication: PublicationMode::Exclusive,
+            },
+            allow_unconnected: true,
+            on_required_loss: LossPolicy::Hold,
+            conflation: None,
+        })
+        .unwrap()
+}
+
+const KEY: karyos_protocol::cnc::StreamKey = karyos_protocol::cnc::StreamKey {
+    stream_id: 5,
+    session_id: 1,
+};
+
+/// A subscription of `conductor`'s client on the test stream, with its
+/// registration.
+fn subscribe(
+    driver: &mut EmbeddedDriver,
+    conductor: &mut ClientConductor,
+) -> (karyos_client::ClientSubscription, u64) {
+    let outcome = complete(driver, conductor, |conductor| {
+        conductor.add_subscription(KEY, karyos_protocol::cnc::SubscriberRole::Optional)
+    });
+    let Outcome::Subscription(subscription) = outcome else {
+        panic!("expected a subscription, got {outcome:?}");
+    };
+    let registration = subscription.origin().unwrap().registration();
+    (subscription, registration)
+}
+
+/// A journal that observes the sender's live subscription carries the
+/// subscription, its stream and the join position the driver recorded
+/// when it registered the subscription (here past messages published
+/// before it joined); a publisher-side journal carries none, which a
+/// reader tells apart from a join at 0.
+#[test]
+fn a_journal_of_a_subscription_carries_the_driver_recorded_join() {
+    let mut driver = driver(4, 64, 64);
+    let handle = stream(&mut driver);
+    let stream_registration = driver.trace_identity(handle).unwrap().registration;
+    let mut publication = driver.publication(handle).unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            publication.offer(b"before the join").unwrap(),
+            karyos_client::OfferOutcome::Accepted { .. }
+        ));
+    }
+    let mut conductor = driver.connect().unwrap();
+    let (subscription, registration) = subscribe(&mut driver, &mut conductor);
+    let joined = subscription.position();
+    assert!(joined > 0, "the subscription joined after three messages");
+    // Messages after the join do not move the recorded join.
+    let _ = publication.offer(b"after the join").unwrap();
+    let observing = match request(&mut driver, &mut conductor, LAYOUT, Some(registration)) {
+        Outcome::Journal(journal) => journal,
+        other => panic!("expected a journal, got {other:?}"),
+    };
+    let observed = entry(&driver, observing.journal());
+    assert_eq!(
+        (observed.subscription, observed.stream, observed.join),
+        (registration, stream_registration, Some(joined))
+    );
+    let publisher = journal(&mut driver, &mut conductor);
+    let unobserved = entry(&driver, publisher.journal());
+    assert_eq!(
+        (unobserved.subscription, unobserved.stream, unobserved.join),
+        (0, 0, None)
+    );
+    // `Some(0)` would name no subscription: refused before it is sent.
+    assert_eq!(
+        conductor.trace_journal(LAYOUT, Some(0)),
+        Err(ConductorError::InvalidJournal)
+    );
+}
+
+/// A journal naming another client's subscription, an ended subscription,
+/// a publication or a registration that never existed is refused with
+/// `UnknownRegistration`, and nothing is created: no table entry, no
+/// bytes charged, no trace number, no hand-over writer.
+#[test]
+fn a_journal_of_a_subscription_that_is_not_the_senders_live_one_creates_nothing() {
+    let mut driver = driver(4, 64, 64);
+    let handle = stream(&mut driver);
+    let mut owner = driver.connect().unwrap();
+    let mut other = driver.connect().unwrap();
+    let _ = handle;
+    // The publication first: subscribers are admitted once the stream has
+    // its publication.
+    let publication = complete(&mut driver, &mut other, |conductor| {
+        conductor.add_publication(KEY, true)
+    });
+    let Outcome::Publication(publication) = publication else {
+        panic!("expected a publication, got {publication:?}");
+    };
+    let publication_registration = publication.origin().unwrap().registration();
+    let (_kept, foreign) = subscribe(&mut driver, &mut owner);
+    let (ended, ended_registration) = subscribe(&mut driver, &mut other);
+    drop(ended);
+    let _ = driver.do_work().unwrap();
+    for (case, subscription) in [
+        ("another client's subscription", foreign),
+        ("an ended subscription", ended_registration),
+        ("a publication", publication_registration),
+        ("a registration never issued", 999),
+    ] {
+        let outcome = request(&mut driver, &mut other, LAYOUT, Some(subscription));
+        match outcome {
+            Outcome::Refused { code, detail } => {
+                assert_eq!(
+                    (code, detail),
+                    (ErrorCode::UnknownRegistration, subscription),
+                    "{case}"
+                );
+            }
+            other => panic!("{case}: expected a refusal, got {other:?}"),
+        }
+        assert!(entries(&driver).is_empty(), "{case}");
+        assert_eq!(driver.trace_journals.bytes, 0, "{case}");
+        assert_eq!(driver.next_trace_number, 1, "{case}");
+    }
+    // The next journal is the first one created.
+    let created = journal(&mut driver, &mut other);
+    assert_eq!(created.journal(), 1);
+    assert_eq!(entries(&driver).len(), 1);
 }

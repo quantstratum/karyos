@@ -44,8 +44,14 @@
 //! buffer, bound by `max_exports_per_client` and the fetch bounds), and
 //! answers `JournalReady` with the journal number (a trace number) and a
 //! hand-over key taken from the registration counter, so it never names
-//! another grant. `CloseJournal` records the boundary of the client's own
-//! open journal, once.
+//! another grant. A journal that names a subscription must name a live
+//! subscription of the sender; otherwise it is refused with
+//! `UnknownRegistration` before anything is created. The table entry then
+//! carries the subscription, its stream and its join position, which the
+//! driver recorded when it registered the subscription (the mapping's base
+//! plus the cell's position); a publisher-side journal (subscription 0) has
+//! none. `CloseJournal` records the boundary of the client's own open
+//! journal, once.
 
 use std::sync::Arc;
 
@@ -114,6 +120,11 @@ pub(crate) struct Registration {
     end: Arc<LeaseEnd>,
     /// For a subscription: its cell, its occupant id and its role.
     pub(crate) subscriber: Option<(usize, u64, Role)>,
+    /// For a subscription: its join position, the stream position of its
+    /// cell when the driver registered it (the mapping's base plus the
+    /// cell's position), which a trace journal of it carries
+    /// (`quantstratum-docs: karyos/design/trace-journal-region.md`, J3).
+    pub(crate) join: Option<u64>,
 }
 
 impl<T: StreamTerms> ClientSlot<T> {
@@ -803,6 +814,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         }
                     }
                 };
+                // Recorded by the driver, never taken from the client.
+                let join = subscriber.and_then(|(cell, _, _)| {
+                    target
+                        .conductor
+                        .cell_position(cell)
+                        .map(|position| target.base.saturating_add(position))
+                });
                 // Effect: everything below cannot fail.
                 let member = match &capability {
                     Capability::Publication { .. } => MemberKind::Exclusive,
@@ -841,6 +859,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     kind,
                     end,
                     subscriber,
+                    join,
                 });
                 match kind {
                     Kind::Publication => Response::PublicationReady {
@@ -894,8 +913,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 capacity,
                 payload_words,
                 drop_ranges,
+                subscription,
                 ..
-            } => self.trace_journal(client, link, request, capacity, payload_words, drop_ranges),
+            } => self.trace_journal(
+                client,
+                link,
+                request,
+                JournalRequest {
+                    capacity,
+                    payload_words,
+                    drop_ranges,
+                    subscription,
+                },
+            ),
             Command::CloseJournal {
                 journal, boundary, ..
             } => {
@@ -909,22 +939,48 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Serves `TraceJournal` (see the module documentation): every check
-    /// first (sizes, bytes budget, a free table entry, identities, the
-    /// export bounds and the region of a remote client), then the effects,
-    /// which cannot fail.
+    /// first (the observed subscription, sizes, bytes budget, a free table
+    /// entry, identities, the export bounds and the region of a remote
+    /// client), then the effects, which cannot fail.
     fn trace_journal(
         &mut self,
         client: u64,
         link: &Arc<ClientLink<T>>,
         request: RequestId,
-        capacity: u64,
-        payload_words: u64,
-        drop_ranges: u64,
+        asked: JournalRequest,
     ) -> Response {
         let refuse = |code: ErrorCode| Response::Error {
             request,
             code,
             detail: 0,
+        };
+        let JournalRequest {
+            capacity,
+            payload_words,
+            drop_ranges,
+            subscription,
+        } = asked;
+        // A nonzero subscription must be a live subscription of the
+        // sender; its stream and join position are the driver's record.
+        let observed = if subscription == 0 {
+            None
+        } else {
+            let live = self.registrations.iter().find(|registration| {
+                registration.id == subscription
+                    && registration.client == client
+                    && registration.kind == Kind::Subscription
+                    && registration.end.state() == LeaseState::Alive
+            });
+            match live {
+                Some(registration) => Some((subscription, registration.stream, registration.join)),
+                None => {
+                    return Response::Error {
+                        request,
+                        code: ErrorCode::UnknownRegistration,
+                        detail: subscription,
+                    };
+                }
+            }
         };
         let (Ok(capacity), Ok(payload_words), Ok(drop_ranges)) = (
             usize::try_from(capacity),
@@ -999,7 +1055,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.next_registration = next_key;
         self.next_trace_number = next_journal;
         self.trace_journals
-            .insert(index, journal, client, drain, bytes);
+            .insert(index, journal, client, observed, drain, bytes);
         Response::JournalReady {
             request,
             journal,
@@ -1198,6 +1254,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
         };
+        // Recorded by the driver, never taken from the client.
+        let join = match participant {
+            Participant::Subscriber { cell, .. } => target
+                .conductor
+                .cell_position(cell)
+                .map(|position| target.base.saturating_add(position)),
+            _ => None,
+        };
         // Effect: everything below cannot fail.
         let stream = target.id;
         let generation = target.generation.get();
@@ -1235,6 +1299,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // its grant.
             end: Arc::new(LeaseEnd::default()),
             subscriber,
+            join,
         });
         self.counters.add(Event::GrantsReserved, 1);
         match kind {
@@ -1320,6 +1385,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.counters.add(Event::GrantsEnded, 1);
         }
     }
+}
+
+/// What a `TraceJournal` asked for.
+#[derive(Debug, Clone, Copy)]
+struct JournalRequest {
+    capacity: u64,
+    payload_words: u64,
+    drop_ranges: u64,
+    /// The observed subscription's registration, 0 for none.
+    subscription: u64,
 }
 
 /// The bytes a fetch of `buffer` carries: its whole region, header

@@ -41,7 +41,7 @@ use std::time::Duration;
 use karyos_protocol::admission::{Message, Record, RegionKind as WireKind, VERSION, refusal};
 use karyos_sys::counters::CountersReader;
 use karyos_sys::diag::{ErrorLogReader, LossReportReader};
-use karyos_sys::ipc::{self, ReadOnlyRegion, Recv, RegionKind, RegionRecord, SealProfile};
+use karyos_sys::ipc::{self, ReadOnlyRegion, Recv, RegionRecord, SealProfile};
 use karyos_sys::trace_mirror::TraceMirrorReader;
 
 use crate::ipc::{AttachError, receive, send};
@@ -99,20 +99,13 @@ impl Staged {
 /// The region header a tool's record describes, under the full instance
 /// of `ToolAdmitted`: the wire record carries no instance.
 fn expected(instance: u128, record: &Record) -> Result<RegionRecord, AttachError> {
-    let kind = match record.kind {
-        WireKind::Counters => RegionKind::Counters,
-        WireKind::ClientCounters => RegionKind::ClientCounters,
-        WireKind::ErrorLog => RegionKind::ErrorLog,
-        WireKind::LossReport => RegionKind::LossReport,
-        WireKind::TraceMirror => RegionKind::TraceMirror,
-        WireKind::CommandRing | WireKind::Broadcast | WireKind::LogBuffer | WireKind::Journal => {
-            return Err(AttachError::Protocol);
-        }
-    };
+    if !TOOL_KINDS.contains(&record.kind) {
+        return Err(AttachError::Protocol);
+    }
     Ok(RegionRecord {
         instance,
         region: record.region,
-        kind,
+        kind: record.kind.to_sys(),
         generation: record.generation,
         layout: u64::from(record.layout),
         structure_length: usize::try_from(record.structure_length)

@@ -40,11 +40,8 @@
 //! adding them changed no existing layout; the two region kinds they need
 //! (error log 6, loss report 7) are new record values that an older
 //! decoder refuses. The trace mirror (`quantstratum-docs:
-//! karyos/design/trace-journal-region.md`, kind 9) made the set five
-//! records: `ToolAdmitted`'s layout is unchanged (a record count and that
-//! many records), and the new record carries a kind an older decoder
-//! refuses, so a peer of another build still fails at that message
-//! without a [`VERSION`] change.
+//! karyos/design/trace-journal-region.md`) made the set five records, with
+//! [`VERSION`] 2 (see "Layout changes within a version").
 //!
 //! **Journals** (`quantstratum-docs: karyos/design/trace-journal-region.md`,
 //! J2). A trace journal grant is fetched as a log buffer grant: one
@@ -71,10 +68,21 @@
 //! and the old and new layouts of the changed message can never have the
 //! same length for any record count; a change that keeps some length equal
 //! (for example one that adds exactly one record's words) must bump
-//! [`VERSION`] instead (review of #124). The stream registration and incarnation words of `Manifest`
-//! follow that rule (coordinator decision, ACS 13555: they carry the
-//! publication identity of the grant, whose driver part is the instance of
-//! `Admitted`).
+//! [`VERSION`] instead (review of #124). The stream registration and
+//! incarnation words of `Manifest` follow that rule (coordinator decision,
+//! ACS 13555: they carry the publication identity of the grant, whose
+//! driver part is the instance of `Admitted`).
+//!
+//! **Version 2** (coordinator decision, ACS 13677). The trace journal
+//! region adds the `Journal` and `TraceMirror` kinds and a fifth
+//! `ToolAdmitted` record. `ToolAdmitted` with five records has the length
+//! an older `ToolAdmitted` would have with five, so the length rule above
+//! does not cover the change: a peer of another build would fail only
+//! because its decoder refuses an unknown kind, at whichever message first
+//! carries one, with a protocol error rather than a version refusal. The
+//! bump to 2 makes a mixed build fail at `Hello` or `ToolHello` with a
+//! clean `IncompatibleVersion`; the unknown kind refusal stays as the
+//! second line of defence.
 //!
 //! **Instance.** The instance of `Admitted` is the driver's 128-bit
 //! `driver_id` (SPEC.md §4), the one id per driver instance (ACS 13555).
@@ -92,7 +100,7 @@
 use thiserror::Error;
 
 /// The protocol version a client announces in `Hello`.
-pub const VERSION: u64 = 1;
+pub const VERSION: u64 = 2;
 /// Most records in one manifest.
 pub const MAX_RECORDS: usize = 16;
 /// Words of one record.
@@ -243,6 +251,51 @@ impl RegionKind {
             9 => Some(Self::TraceMirror),
             _ => None,
         }
+    }
+}
+
+/// The wire kinds and the region kinds of `karyos_sys::ipc` they name: the
+/// one table both sides map through (Linux). The codes differ on purpose:
+/// a region header carries the sys code (`Journal` 5 to `TraceMirror` 9,
+/// `quantstratum-docs: karyos/design/trace-journal-region.md`), while wire
+/// code 5 was already `ClientCounters` when the journal kind was reserved,
+/// so the wire numbers the later kinds after it. Each side keeps its own
+/// codes; only this table relates them.
+#[cfg(target_os = "linux")]
+pub const SYS_KINDS: [(RegionKind, karyos_sys::ipc::RegionKind); 9] = {
+    use karyos_sys::ipc::RegionKind as Sys;
+    [
+        (RegionKind::CommandRing, Sys::CommandRing),
+        (RegionKind::Broadcast, Sys::Broadcast),
+        (RegionKind::Counters, Sys::Counters),
+        (RegionKind::LogBuffer, Sys::LogBuffer),
+        (RegionKind::ClientCounters, Sys::ClientCounters),
+        (RegionKind::ErrorLog, Sys::ErrorLog),
+        (RegionKind::LossReport, Sys::LossReport),
+        (RegionKind::Journal, Sys::Journal),
+        (RegionKind::TraceMirror, Sys::TraceMirror),
+    ]
+};
+
+#[cfg(target_os = "linux")]
+impl RegionKind {
+    /// The region kind of `karyos_sys::ipc` this wire kind names
+    /// ([`SYS_KINDS`]).
+    #[must_use]
+    pub fn to_sys(self) -> karyos_sys::ipc::RegionKind {
+        SYS_KINDS
+            .iter()
+            .find(|(wire, _)| *wire == self)
+            .map_or(karyos_sys::ipc::RegionKind::CommandRing, |(_, sys)| *sys)
+    }
+
+    /// The wire kind of a `karyos_sys::ipc` region kind ([`SYS_KINDS`]).
+    #[must_use]
+    pub fn from_sys(kind: karyos_sys::ipc::RegionKind) -> Self {
+        SYS_KINDS
+            .iter()
+            .find(|(_, sys)| *sys == kind)
+            .map_or(Self::CommandRing, |(wire, _)| *wire)
     }
 }
 
@@ -857,7 +910,7 @@ mod tests {
             out.truncate(len);
             out
         };
-        let mut hello = encode(&Message::Hello { version: 1 });
+        let mut hello = encode(&Message::Hello { version: VERSION });
         hello[16] = 1;
         assert_eq!(Message::decode(&hello), Err(AdmissionError::Reserved));
         // Raw words that `encode` refuses to produce.
@@ -1039,6 +1092,32 @@ mod tests {
             records,
         };
         assert_eq!(admitted.encode(&mut out), Ok(MAX_MESSAGE_LENGTH - 8));
+    }
+
+    /// Every wire kind and every sys kind appears in the table exactly
+    /// once, so the two mappings are inverse bijections.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kind_table_is_a_bijection() {
+        for (wire, sys) in SYS_KINDS {
+            assert_eq!(wire.to_sys(), sys);
+            assert_eq!(RegionKind::from_sys(sys), wire);
+        }
+        for code in 1..=9 {
+            let wire = RegionKind::from_code(code).unwrap();
+            assert_eq!(RegionKind::from_sys(wire.to_sys()), wire);
+        }
+        assert_eq!(RegionKind::from_code(10), None);
+    }
+
+    /// The protocol version is 2 (ACS 13677): the trace journal kinds.
+    #[test]
+    fn the_version_is_two() {
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let length = Message::Hello { version: VERSION }
+            .encode(&mut out)
+            .unwrap();
+        assert_eq!(words_of(&out[..length]), [HELLO, 2, PROFILE_FLAGS]);
     }
 
     /// The manifest's words, literally: the stream registration and the

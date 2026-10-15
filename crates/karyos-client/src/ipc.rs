@@ -71,9 +71,7 @@ use karyos_sys::broadcast::BroadcastReceiver;
 use karyos_sys::command_ring::RingProducer;
 use karyos_sys::counters::{CellRead, ClientCells, CountersReader};
 use karyos_sys::error::SysError;
-use karyos_sys::ipc::{
-    self, PidFd, ReadOnlyRegion, Recv, Region, RegionKind, RegionRecord, SealProfile, Sent,
-};
+use karyos_sys::ipc::{self, PidFd, ReadOnlyRegion, Recv, Region, RegionRecord, SealProfile, Sent};
 use karyos_sys::log_buffer::{
     ConcurrentPublication, LogBuffer, PreparedConcurrentPublication, PreparedPublication,
     PreparedSubscription, Publication, Role, Subscription,
@@ -375,25 +373,19 @@ pub(crate) fn send(
 
 /// The region header a record describes.
 fn expected(instance: u128, record: &Record) -> Result<RegionRecord, AttachError> {
-    let kind = match record.kind {
-        WireKind::CommandRing => RegionKind::CommandRing,
-        WireKind::Broadcast => RegionKind::Broadcast,
-        WireKind::Counters => RegionKind::Counters,
-        WireKind::ClientCounters => RegionKind::ClientCounters,
-        // Log buffers and journals come with a fetch; the error log, the
-        // loss report and the trace mirror are granted to tools only.
-        WireKind::LogBuffer
-        | WireKind::Journal
-        | WireKind::ErrorLog
-        | WireKind::LossReport
-        | WireKind::TraceMirror => {
-            return Err(AttachError::Protocol);
-        }
-    };
+    // Only the CnC kinds: log buffers and journals come with a fetch; the
+    // error log, the loss report and the trace mirror are granted to tools
+    // only.
+    if !matches!(
+        record.kind,
+        WireKind::CommandRing | WireKind::Broadcast | WireKind::Counters | WireKind::ClientCounters
+    ) {
+        return Err(AttachError::Protocol);
+    }
     Ok(RegionRecord {
         instance,
         region: record.region,
-        kind,
+        kind: record.kind.to_sys(),
         generation: record.generation,
         layout: u64::from(record.layout),
         structure_length: usize::try_from(record.structure_length)
@@ -677,7 +669,7 @@ impl RemoteClient {
             .allocate_counter(type_id, label, stream, participant)
     }
 
-    /// Requests a trace journal of `layout`, as
+    /// Requests a trace journal of `layout` observing `subscription`, as
     /// [`ClientConductor::trace_journal`]; it completes as
     /// [`Outcome::FetchableJournal`](crate::Outcome::FetchableJournal).
     ///
@@ -687,8 +679,9 @@ impl RemoteClient {
     pub fn trace_journal(
         &mut self,
         layout: karyos_sys::record_journal::JournalLayout,
+        subscription: Option<u64>,
     ) -> Result<u64, ConductorError> {
-        self.conductor_mut()?.trace_journal(layout)
+        self.conductor_mut()?.trace_journal(layout, subscription)
     }
 
     /// Gives the final delivery boundary of `journal`, as
@@ -1236,15 +1229,13 @@ fn abort(session: &Session, fetch: u64, records: &[Record]) {
 /// The region header a fetched record describes: a log buffer or a
 /// journal.
 fn fetched_region(instance: u128, record: &Record) -> Result<RegionRecord, AttachError> {
-    let kind = match record.kind {
-        WireKind::LogBuffer => RegionKind::LogBuffer,
-        WireKind::Journal => RegionKind::Journal,
-        _ => return Err(AttachError::Protocol),
-    };
+    if !matches!(record.kind, WireKind::LogBuffer | WireKind::Journal) {
+        return Err(AttachError::Protocol);
+    }
     Ok(RegionRecord {
         instance,
         region: record.region,
-        kind,
+        kind: record.kind.to_sys(),
         generation: record.generation,
         layout: u64::from(record.layout),
         structure_length: usize::try_from(record.structure_length)

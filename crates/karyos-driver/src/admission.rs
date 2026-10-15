@@ -64,7 +64,7 @@ use karyos_protocol::admission::{
     hello_version, refusal, tool_hello_version,
 };
 use karyos_sys::command_ring::RingConsumer;
-use karyos_sys::ipc::{self, PidFd, Recv, Region, RegionKind, Sent};
+use karyos_sys::ipc::{self, PidFd, Recv, Region, Sent};
 
 use crate::counters::Event;
 use crate::embedded::{EmbeddedDriver, StreamTerms};
@@ -246,18 +246,8 @@ fn refuse(socket: &OwnedFd, code: u64) {
 /// The manifest record of one CnC or diagnostic grant of `region`.
 fn record(region: &Region, export: u64) -> Option<Record> {
     let header = region.record();
-    let kind = match header.kind {
-        RegionKind::CommandRing => WireKind::CommandRing,
-        RegionKind::Broadcast => WireKind::Broadcast,
-        RegionKind::Counters => WireKind::Counters,
-        RegionKind::LogBuffer => WireKind::LogBuffer,
-        RegionKind::ClientCounters => WireKind::ClientCounters,
-        // Granted to tools only (P7 o4, P6c).
-        RegionKind::ErrorLog => WireKind::ErrorLog,
-        RegionKind::LossReport => WireKind::LossReport,
-        RegionKind::TraceMirror => WireKind::TraceMirror,
-        RegionKind::Journal => WireKind::Journal,
-    };
+    // The one wire and sys kind table (`karyos_protocol::admission::SYS_KINDS`).
+    let kind = WireKind::from_sys(header.kind);
     Some(Record {
         region: header.region,
         export,

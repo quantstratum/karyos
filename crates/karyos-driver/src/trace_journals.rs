@@ -158,21 +158,29 @@ impl TraceJournals {
 
     /// Opens `journal` of `client` in entry `index` (from
     /// [`TraceJournals::preflight`]) with its drain.
+    /// `observed` is the subscription the journal observes, with its
+    /// stream and join position, or `None` for a publisher-side journal.
     pub(crate) fn insert(
         &mut self,
         index: usize,
         journal: u64,
         client: u64,
+        observed: Option<(u64, u64, Option<u64>)>,
         drain: JournalDrain,
         bytes: u64,
     ) {
         let layout = drain.layout();
-        let entry = JournalEntry::open(
+        let mut entry = JournalEntry::open(
             journal,
             client,
             layout.payload_words as u64,
             layout.capacity as u64,
         );
+        if let Some((subscription, stream, join)) = observed {
+            entry.subscription = subscription;
+            entry.stream = stream;
+            entry.join = join;
+        }
         if let Some(slot) = self.slots.get_mut(index) {
             self.mirror.write_entry(index, Some(&entry));
             self.bytes = self.bytes.saturating_add(bytes);
