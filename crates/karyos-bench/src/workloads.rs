@@ -7,7 +7,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use karyos_client::{
     ClaimOutcome, ClientSubscription, CommitOutcome, ConcurrentOfferOutcome, MessageLimit,
@@ -36,6 +36,9 @@ pub enum Workload {
     PingPong,
     /// Concurrent publishers and one subscriber on their own threads.
     Throughput,
+    /// One publisher follows a fixed send schedule; latency starts at the
+    /// scheduled instant, so late sends retain their full delay.
+    OpenLoop,
     /// A receive owner commits each validated frame into an image
     /// (`quantstratum-docs: karyos/design/receive-publication.md`).
     Receive,
@@ -46,11 +49,12 @@ pub enum Workload {
 
 impl Workload {
     /// Every workload.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::OfferPoll,
         Self::Claim,
         Self::PingPong,
         Self::Throughput,
+        Self::OpenLoop,
         Self::Receive,
         Self::ReceiveDuplicate,
     ];
@@ -63,6 +67,7 @@ impl Workload {
             Self::Claim => "claim",
             Self::PingPong => "ping-pong",
             Self::Throughput => "throughput",
+            Self::OpenLoop => "open-loop",
             Self::Receive => "receive",
             Self::ReceiveDuplicate => "receive-duplicate",
         }
@@ -93,19 +98,23 @@ pub struct Config {
     pub warmup: u64,
     /// Term length in bytes.
     pub term_length: u32,
+    /// Scheduled messages per second for `open-loop`.
+    pub target_rate: Option<u64>,
 }
 
 impl fmt::Display for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{} message={} publishers={} iterations={} warmup={} term={}",
+            "{} message={} publishers={} iterations={} warmup={} term={} target_rate={}",
             self.workload.name(),
             self.message,
             self.publishers,
             self.iterations,
             self.warmup,
-            self.term_length
+            self.term_length,
+            self.target_rate
+                .map_or_else(|| "none".into(), |rate| rate.to_string())
         )
     }
 }
@@ -224,6 +233,7 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
         Workload::OfferPoll | Workload::Claim => single_thread(config),
         Workload::PingPong => ping_pong(config),
         Workload::Throughput => throughput(config),
+        Workload::OpenLoop => open_loop(config),
         Workload::Receive => receive_frames(config, false),
         Workload::ReceiveDuplicate => receive_frames(config, true),
     }
@@ -640,4 +650,207 @@ fn throughput(config: Config) -> Result<Measurement, BenchError> {
         rate: (iterations * u64::from(publishers)) as f64 / seconds,
         resolution: 0,
     })
+}
+
+/// One producer sends at the configured rate regardless of how late an
+/// earlier offer became. Every sample is measured from its scheduled time
+/// through delivery, including time spent waiting to publish.
+fn open_loop(config: Config) -> Result<Measurement, BenchError> {
+    let target_rate = config
+        .target_rate
+        .filter(|rate| *rate > 0 && *rate <= 1_000_000_000)
+        .ok_or_else(|| {
+            BenchError("open-loop target rate must be 1..=1000000000 messages/s".into())
+        })?;
+    if config.iterations == 0 {
+        return Err(BenchError("open-loop iterations must be positive".into()));
+    }
+    let total = config
+        .warmup
+        .checked_add(config.iterations)
+        .ok_or_else(|| BenchError("open-loop iteration count overflow".into()))?;
+    let schedule_start = Instant::now()
+        .checked_add(Duration::from_millis(10))
+        .ok_or_else(|| BenchError("open-loop start instant overflow".into()))?;
+    let measured_start = scheduled_instant(schedule_start, config.warmup, target_rate)?;
+    let _ = scheduled_instant(schedule_start, total - 1, target_rate)?;
+    let mut latencies = histogram()?;
+    let resolution = resolution();
+    let mut driver = EmbeddedDriver::new().map_err(|cause| error("driver", cause))?;
+    let handle = stream(&mut driver, 1, &config, PublicationMode::Exclusive)?;
+    let mut subscription = driver
+        .subscribe(handle, Role::Required)
+        .map_err(|cause| error("subscribe", cause))?;
+    let mut publication = driver
+        .publication(handle)
+        .map_err(|cause| error("publication", cause))?;
+    let stop_duty = Arc::new(AtomicBool::new(false));
+    let duty = duty_thread(driver, Arc::clone(&stop_duty));
+    let failed = Arc::new(AtomicBool::new(false));
+    let producer_failed = Arc::clone(&failed);
+    let payload = vec![7u8; config.message];
+    let producer = thread::spawn(move || -> Result<(), BenchError> {
+        for index in 0..total {
+            if producer_failed.load(Ordering::Acquire) {
+                return Err(BenchError(
+                    "receiver stopped before the schedule finished".into(),
+                ));
+            }
+            let scheduled = scheduled_instant(schedule_start, index, target_rate)?;
+            if !wait_until(scheduled, &producer_failed) {
+                return Err(BenchError(
+                    "receiver stopped before the schedule finished".into(),
+                ));
+            }
+            loop {
+                match publication.offer(&payload) {
+                    Ok(OfferOutcome::Accepted { .. }) => break,
+                    Ok(_) => thread::yield_now(),
+                    Err(cause) => {
+                        producer_failed.store(true, Ordering::Release);
+                        return Err(error("offer", cause));
+                    }
+                }
+                if producer_failed.load(Ordering::Acquire) {
+                    return Err(BenchError(
+                        "receiver stopped before the offer completed".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    });
+
+    let mut received = 0u64;
+    let mut receive_result = Ok(());
+    while received < total {
+        if failed.load(Ordering::Acquire) {
+            receive_result = Err(BenchError("the scheduled producer failed".into()));
+            break;
+        }
+        let mut sample_error = None;
+        let summary = match subscription.poll(
+            |_, _| {
+                if received >= config.warmup && sample_error.is_none() {
+                    let sample =
+                        scheduled_instant(schedule_start, received, target_rate).and_then(|due| {
+                            record(
+                                &mut latencies,
+                                scheduled_latency_ns(due, Instant::now()),
+                                resolution,
+                            )
+                        });
+                    if let Err(cause) = sample {
+                        sample_error = Some(cause);
+                    }
+                }
+                received = received.saturating_add(1);
+            },
+            MessageLimit::new(64),
+        ) {
+            Ok(summary) => summary,
+            Err(cause) => {
+                failed.store(true, Ordering::Release);
+                receive_result = Err(error("poll", cause));
+                break;
+            }
+        };
+        if let Some(cause) = sample_error {
+            failed.store(true, Ordering::Release);
+            receive_result = Err(cause);
+            break;
+        }
+        if received > total {
+            failed.store(true, Ordering::Release);
+            receive_result = Err(BenchError("received more messages than scheduled".into()));
+            break;
+        }
+        if receive_result.is_err() {
+            break;
+        }
+        if summary.delivered == 0 {
+            thread::yield_now();
+        }
+    }
+    if receive_result.is_err() {
+        failed.store(true, Ordering::Release);
+    }
+    let finished = Instant::now();
+    stop_duty.store(true, Ordering::Release);
+    let producer_result = join(producer);
+    join(duty)?;
+    receive_result?;
+    producer_result?;
+    let seconds = finished
+        .saturating_duration_since(measured_start)
+        .as_secs_f64()
+        .max(f64::MIN_POSITIVE);
+    Ok(Measurement {
+        config,
+        latency: Some(latencies),
+        rate: config.iterations as f64 / seconds,
+        resolution,
+    })
+}
+
+fn scheduled_instant(start: Instant, index: u64, target_rate: u64) -> Result<Instant, BenchError> {
+    let offset = (u128::from(index) * 1_000_000_000) / u128::from(target_rate);
+    let offset = u64::try_from(offset)
+        .map_err(|_| BenchError("open-loop schedule duration overflow".into()))?;
+    start
+        .checked_add(Duration::from_nanos(offset))
+        .ok_or_else(|| BenchError("open-loop scheduled instant overflow".into()))
+}
+
+fn scheduled_latency_ns(scheduled: Instant, delivered: Instant) -> u128 {
+    delivered.saturating_duration_since(scheduled).as_nanos()
+}
+
+fn wait_until(scheduled: Instant, stop: &AtomicBool) -> bool {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        let remaining = scheduled.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        let spin_window = Duration::from_micros(20);
+        if remaining > spin_window {
+            thread::sleep(
+                remaining
+                    .saturating_sub(spin_window)
+                    .min(Duration::from_millis(10)),
+            );
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scheduled_instant, scheduled_latency_ns};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn open_loop_schedule_is_anchored_to_start_not_previous_send() {
+        let start = Instant::now();
+        assert_eq!(
+            scheduled_instant(start, 10, 3).unwrap_or_else(|cause| panic!("{cause}")),
+            start + Duration::from_nanos(3_333_333_333)
+        );
+        assert_eq!(
+            scheduled_instant(start, 11, 3).unwrap_or_else(|cause| panic!("{cause}")),
+            start + Duration::from_nanos(3_666_666_666)
+        );
+    }
+
+    #[test]
+    fn open_loop_latency_keeps_time_before_a_late_send() {
+        let scheduled = Instant::now();
+        let late_send = scheduled + Duration::from_micros(900);
+        let delivered = late_send + Duration::from_micros(100);
+        assert_eq!(scheduled_latency_ns(scheduled, delivered), 1_000_000);
+    }
 }

@@ -66,10 +66,10 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
         labels.qualification
     );
     if let Some(histogram) = &measurement.latency {
-        let what = if measurement.config.workload == Workload::PingPong {
-            "round trip"
-        } else {
-            "latency"
+        let what = match measurement.config.workload {
+            Workload::PingPong => "round trip",
+            Workload::OpenLoop => "scheduled latency (due time to delivery)",
+            _ => "latency",
         };
         out.push_str(&format!(
             "  {what} (interval width {} ns):",
@@ -108,6 +108,12 @@ pub fn history_line(measurement: &Measurement, labels: &Labels) -> String {
         format!("\"iterations\":{}", config.iterations),
         format!("\"warmup\":{}", config.warmup),
         format!("\"term\":{}", config.term_length),
+        format!(
+            "\"target_rate\":{}",
+            config
+                .target_rate
+                .map_or_else(|| "null".into(), |rate| rate.to_string())
+        ),
         format!("\"host\":\"{}\"", labels.host),
         format!("\"cpu\":\"{}\"", labels.cpu),
         format!("\"os\":\"{}\"", labels.os),

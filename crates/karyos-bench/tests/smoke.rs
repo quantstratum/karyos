@@ -36,6 +36,21 @@ fn every_workload_runs_and_reports() {
             assert!(text.contains("round trip"), "{text}");
             assert!(text.contains("symmetric paths"), "{text}");
         }
+        if config.workload == Workload::OpenLoop {
+            assert!(
+                text.contains("scheduled latency (due time to delivery)"),
+                "{text}"
+            );
+            assert_eq!(
+                report::field(&line, "target_rate"),
+                Some(
+                    config
+                        .target_rate
+                        .map_or_else(|| "none".to_string(), |rate| rate.to_string())
+                        .as_str()
+                )
+            );
+        }
     }
 }
 
