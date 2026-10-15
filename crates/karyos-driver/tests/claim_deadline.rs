@@ -58,6 +58,7 @@ fn config(stream_id: i32, claim_deadline: u64) -> StreamConfig {
         },
         allow_unconnected: false,
         on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+        conflation: None,
     }
 }
 

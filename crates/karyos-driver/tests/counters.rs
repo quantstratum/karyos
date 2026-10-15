@@ -34,6 +34,7 @@ fn stream_config(stream_id: i32) -> StreamConfig {
         },
         allow_unconnected: true,
         on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+        conflation: None,
     }
 }
 

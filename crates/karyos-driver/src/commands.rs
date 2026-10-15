@@ -946,6 +946,7 @@ mod tests {
                 },
                 allow_unconnected: false,
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: None,
             })
             .unwrap();
         (driver, stream)
@@ -1232,6 +1233,7 @@ mod tests {
                 },
                 allow_unconnected: false,
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: None,
             })
             .unwrap();
         let mut observer = driver.broadcast.receiver();
@@ -1314,6 +1316,7 @@ mod tests {
                 },
                 allow_unconnected: false,
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: None,
             })
             .unwrap();
         let mut observer = driver.broadcast.receiver();

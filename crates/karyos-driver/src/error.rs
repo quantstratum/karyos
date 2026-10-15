@@ -3,6 +3,7 @@
 //! Errors of the driver.
 
 use karyos_client::ClientError;
+use karyos_sys::conflation::ConflationError;
 use karyos_sys::error::SysError;
 use thiserror::Error;
 
@@ -84,6 +85,12 @@ pub enum DriverError {
     /// handle of an exclusive one.
     #[error("the publication kind does not match the stream's mode")]
     InvalidPublicationMode,
+    /// The stream has no keyed conflation table.
+    #[error("the stream is not configured for conflation")]
+    NotConflated,
+    /// A keyed conflation operation failed.
+    #[error(transparent)]
+    Conflation(#[from] ConflationError),
     /// A duty cycle's work count does not fit `u32`; the work was done
     /// and the count keeps its previous value.
     #[error("work count overflow: {count} + {delta}")]

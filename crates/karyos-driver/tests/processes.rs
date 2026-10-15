@@ -193,6 +193,7 @@ fn add_stream_with(
             },
             allow_unconnected: false,
             on_required_loss: LossPolicy::Hold,
+            conflation: None,
         })
         .unwrap()
 }

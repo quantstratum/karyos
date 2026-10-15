@@ -57,6 +57,7 @@ pub(crate) enum MemberKind {
     Exclusive,
     Concurrent,
     Subscriber { role: Role, cell: usize },
+    Feeder,
 }
 
 /// A predecessor mapping, kept while anything references it.
@@ -98,6 +99,8 @@ pub(crate) struct Offer<T: StreamTerms> {
     link: Weak<GenerationLink<T>>,
     /// A subscriber's progress lease; `None` for a publisher.
     lease: Option<ProgressLease>,
+    /// A feeder must move to its successor, but is never deadline-fenced.
+    fenceable: bool,
 }
 
 /// A subscriber's progress, as sampled by the driver: its predecessor cell,
@@ -167,6 +170,9 @@ impl<T: StreamTerms> Stream<T> {
             if link.status() != LinkStatus::Offered {
                 // Moved (admitted) or fenced.
                 return false;
+            }
+            if !offer.fenceable {
+                return true;
             }
             match &mut offer.lease {
                 None => {
@@ -257,6 +263,15 @@ impl<T: StreamTerms> Stream<T> {
                         Some(lease),
                     ))
                 }),
+                MemberKind::Feeder => conductor.subscribe(Role::Required).map(|inner| {
+                    let scratch =
+                        vec![0u8; inner.buffer().max_message_length() as usize].into_boxed_slice();
+                    Some((
+                        Successor::Subscription { inner, scratch },
+                        MemberKind::Feeder,
+                        None,
+                    ))
+                }),
             };
             match issued {
                 Ok(Some(entry)) => prepared.push((link, entry)),
@@ -293,6 +308,7 @@ impl<T: StreamTerms> Stream<T> {
                     offers.push(Offer {
                         link: Arc::downgrade(&link),
                         lease,
+                        fenceable: !matches!(kind, MemberKind::Feeder),
                     });
                     members.push(Member {
                         link: Arc::downgrade(&link),
@@ -515,6 +531,7 @@ mod tests {
                 },
                 allow_unconnected: true,
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: None,
             })
             .unwrap()
     }

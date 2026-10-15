@@ -28,4 +28,5 @@ pub use embedded::{
 };
 pub use error::DriverError;
 pub use generations::{GenerationInfo, Reconfiguration};
+pub use karyos_client::ConflatedSubscription;
 pub use karyos_sys::log_buffer::{LossPolicy, SealState};
