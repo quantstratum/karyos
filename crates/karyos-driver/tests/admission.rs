@@ -394,6 +394,7 @@ fn shared_stream_config() -> StreamConfig {
         },
         allow_unconnected: false,
         on_required_loss: LossPolicy::Hold,
+        conflation: None,
     }
 }
 

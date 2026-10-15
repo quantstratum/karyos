@@ -223,6 +223,7 @@ fn stream_config(policy: LossPolicy) -> StreamConfig {
         },
         allow_unconnected: true,
         on_required_loss: policy,
+        conflation: None,
     }
 }
 

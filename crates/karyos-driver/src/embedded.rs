@@ -23,16 +23,19 @@
 //! cycle frees it when no capability lease and no registration of it
 //! remains (quantstratum-docs: karyos/design/stream-lifecycle.md).
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_client::link::{Lease, LeaseEnd, StreamLeases};
 use karyos_client::{
-    ClientConcurrentPublication, ClientPublication, ClientSubscription, GenerationLink,
+    ClientConcurrentPublication, ClientPublication, ClientSubscription, ConflatedSubscription,
+    GenerationLink, MessageLimit,
 };
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
+use karyos_sys::conflation::{ConflationConfig, ConflationWriter, conflation};
 use karyos_sys::log_buffer::{
     Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, LossPolicy, Publication,
     Role, SealState,
@@ -158,6 +161,9 @@ pub struct DriverConfig {
     /// unit, before the client is timed out: its command ring is closed and
     /// it is no longer served. At least ten heartbeat intervals.
     pub client_liveness_timeout: u64,
+    /// Maximum log messages copied into the keyed conflation table per
+    /// conductor duty cycle.
+    pub conflation_feeder_budget: NonZeroU32,
 }
 
 impl Default for DriverConfig {
@@ -175,6 +181,10 @@ impl Default for DriverConfig {
             cutover_deadline: 1_000_000_000,
             heartbeat_interval: 100_000_000,
             client_liveness_timeout: 10_000_000_000,
+            conflation_feeder_budget: match NonZeroU32::new(1024) {
+                Some(value) => value,
+                None => NonZeroU32::MIN,
+            },
         }
     }
 }
@@ -194,6 +204,8 @@ pub struct StreamConfig {
     /// `karyos/design/required-participant-loss.md`). Under `Continue`
     /// required subscribers are admitted with a spare-slot credit.
     pub on_required_loss: LossPolicy,
+    /// Optional keyed conflation table, fed by a required subscriber.
+    pub conflation: Option<ConflationConfig>,
 }
 
 /// Names a stream of one [`EmbeddedDriver`]. It is distinct from the wire
@@ -238,6 +250,8 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// The current mapping's configuration and generation, and the stream
     /// position where it starts (`quantstratum-docs: karyos/design/mapping-generations.md`).
     pub(crate) config: LogBufferConfig,
+    /// The optional keyed conflation configuration shared by publishers.
+    pub(crate) conflation: Option<ConflationConfig>,
     pub(crate) generation: Generation,
     pub(crate) base: u64,
     /// The generation links of the handles on the current mapping.
@@ -249,6 +263,19 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// The current mapping's exclusive publication, returned by a fence,
     /// for the next issuance.
     pub(crate) spare: Option<Publication<Arc<LogBuffer<T>>>>,
+    /// The required subscriber and keyed table writer, when conflation is
+    /// configured. The table itself survives mapping generations.
+    pub(crate) feeder: Option<ConflationFeeder<T>>,
+    /// Terminal table failure that sealed this stream. Kept for internal
+    /// lifecycle state until the public seal reason is designed.
+    pub(crate) conflation_terminal: Option<karyos_sys::conflation::ConflationError>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ConflationFeeder<T: StreamTerms> {
+    pub(crate) subscription: ClientSubscription<T>,
+    pub(crate) writer: ConflationWriter,
+    pub(crate) config: ConflationConfig,
 }
 
 impl<T: StreamTerms> Stream<T> {
@@ -563,6 +590,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let target = self.stream(stream)?;
         if !target.retiring {
             target.conductor.seal()?;
+            if let Some(mut feeder) = target.feeder.take() {
+                feeder.writer.close();
+            }
             // A cutover ends with the stream: its handles are fenced and its
             // successor, if not current yet, is dropped.
             if let Some(cutover) = target.cutover.take() {
@@ -641,9 +671,33 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             config.buffer,
             Generation::default(),
         )?);
-        let conductor = buffer
+        let mut conductor = buffer
             .conductor_owned()
             .ok_or(karyos_sys::error::SysError::ResourcesUnavailable)?;
+        let (feeder, members) = match config.conflation {
+            Some(conflation_config) => {
+                let writer = conflation(
+                    conflation_config.keys,
+                    conflation_config.value_capacity,
+                    conflation_config.journal_capacity,
+                )?;
+                let inner = conductor.subscribe(Role::Required)?;
+                let link = GenerationLink::new();
+                let subscription =
+                    ClientSubscription::new(inner).with_generation(Arc::clone(&link), 0)?;
+                let feeder = ConflationFeeder {
+                    subscription,
+                    writer,
+                    config: conflation_config,
+                };
+                let member = Member {
+                    link: Arc::downgrade(&link),
+                    kind: MemberKind::Feeder,
+                };
+                (Some(feeder), vec![member])
+            }
+            None => (None, Vec::new()),
+        };
         self.next_stream = next;
         self.streams.push(Stream {
             id,
@@ -657,12 +711,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             session_id: key.1,
             claim_waiting: false,
             config: config.buffer,
+            conflation: config.conflation,
             generation: Generation::default(),
             base: 0,
-            members: Vec::new(),
+            members,
             cutover: None,
             retained: Vec::new(),
             spare: None,
+            feeder,
+            conflation_terminal: None,
         });
         self.update_stream_gauges();
         Ok(StreamHandle {
@@ -696,8 +753,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
         let (link, base) = stream.join(MemberKind::Exclusive);
-        let publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease)
-            .with_generation(link, base)?;
+        let conflation = stream.conflation;
+        let mut publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease);
+        if let Some(config) = conflation {
+            publication = publication.with_conflation(config);
+        }
+        let publication = publication.with_generation(link, base)?;
         self.update_stream_gauges();
         Ok(publication)
     }
@@ -728,9 +789,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .ok_or(DriverError::PublicationTaken)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
         let (link, base) = stream.join(MemberKind::Concurrent);
-        let publication =
-            ClientConcurrentPublication::with_lease(inner, stream.allow_unconnected, lease)
-                .with_generation(link, base)?;
+        let conflation = stream.conflation;
+        let mut publication =
+            ClientConcurrentPublication::with_lease(inner, stream.allow_unconnected, lease);
+        if let Some(config) = conflation {
+            publication = publication.with_conflation(config);
+        }
+        let publication = publication.with_generation(link, base)?;
         self.update_stream_gauges();
         Ok(publication)
     }
@@ -761,6 +826,31 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ClientSubscription::with_lease(inner, lease).with_generation(link, base)?;
         self.update_stream_gauges();
         Ok(subscription)
+    }
+
+    /// Subscribes to the latest values in a stream's keyed conflation table.
+    /// This reader is independent of log mapping generations and may skip
+    /// intermediate versions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::NotConflated`] when the stream was created
+    /// without conflation, [`DriverError::StreamRetiring`] for a removed
+    /// stream, and [`DriverError::UnknownStream`] for a foreign or freed
+    /// stream.
+    pub fn subscribe_conflated(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<ConflatedSubscription, DriverError> {
+        let stream = self.active_stream(stream)?;
+        let feeder = stream.feeder.as_ref().ok_or(DriverError::NotConflated)?;
+        Ok(ConflatedSubscription::new(
+            feeder.writer.reader(),
+            karyos_sys::conflation::Budget {
+                keys: 1024,
+                retries: 3,
+            },
+        ))
     }
 
     /// Runs one duty cycle: retires closed clients, serves client commands,
@@ -849,11 +939,61 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !self.holding.is_empty() {
             self.report_withdrawn_bounds();
         }
+        match self.feed_conflation() {
+            Ok(feeder_work) => work = work.saturating_add(feeder_work),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
         self.update_stream_gauges();
         match first_error {
             Some(error) => Err(error),
             None => Ok(work),
         }
+    }
+
+    /// Copies a bounded number of messages into each configured keyed table.
+    fn feed_conflation(&mut self) -> Result<u32, DriverError> {
+        let budget = self.config.conflation_feeder_budget.get();
+        let mut work = 0u32;
+        for stream in &mut self.streams {
+            if stream.conflation_terminal.is_some() {
+                seal_conflation_terminal(&mut stream.conflation_terminal, None, || {
+                    stream.conductor.seal()
+                })?;
+                continue;
+            }
+            let Some(feeder) = &mut stream.feeder else {
+                continue;
+            };
+            let ConflationFeeder {
+                subscription,
+                writer,
+                config,
+            } = feeder;
+            let mut terminal = None;
+            let summary = subscription
+                .poll(
+                    |value, info| {
+                        if config
+                            .validate_publication(info.reserved_value, value.len())
+                            .is_ok()
+                            && let Ok(key) = u32::try_from(info.reserved_value)
+                            && let Err(error) = writer.write(key, value)
+                            && error == karyos_sys::conflation::ConflationError::VersionsExhausted
+                        {
+                            terminal = Some(error);
+                        }
+                    },
+                    MessageLimit::new(budget),
+                )
+                .map_err(|error| DriverError::Client(error.cause))?;
+            work = work.saturating_add(summary.delivered);
+            seal_conflation_terminal(&mut stream.conflation_terminal, terminal, || {
+                stream.conductor.seal()
+            })?;
+        }
+        Ok(work)
     }
 
     fn stream(&mut self, stream: StreamHandle) -> Result<&mut Stream<T>, DriverError> {
@@ -952,6 +1092,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     pub(crate) fn clock_now(&mut self) -> u64 {
         self.clock.now()
     }
+}
+
+fn seal_conflation_terminal<E>(
+    terminal: &mut Option<karyos_sys::conflation::ConflationError>,
+    error: Option<karyos_sys::conflation::ConflationError>,
+    mut seal: impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    if let Some(error) = error {
+        *terminal = Some(error);
+    }
+    if terminal.is_some() {
+        seal()?;
+    }
+    Ok(())
 }
 
 /// One conductor duty cycle, its work added.
@@ -1081,7 +1235,40 @@ mod tests {
             },
             allow_unconnected: false,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+            conflation: None,
         }
+    }
+
+    #[test]
+    fn conflation_version_exhaustion_stores_cause_and_retries_a_failed_seal() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let _stream = driver.add_stream(config(42)).unwrap();
+        let stream = driver.streams.first_mut().unwrap();
+        let Stream {
+            conflation_terminal,
+            conductor,
+            ..
+        } = stream;
+        let mut fail_first_seal = true;
+        let error = karyos_sys::conflation::ConflationError::VersionsExhausted;
+
+        let first = seal_conflation_terminal(conflation_terminal, Some(error), || {
+            if fail_first_seal {
+                fail_first_seal = false;
+                Err("injected seal failure")
+            } else {
+                conductor.seal().map_err(|_| "conductor seal failed")
+            }
+        });
+        assert_eq!(first, Err("injected seal failure"));
+        assert_eq!(*conflation_terminal, Some(error));
+        assert_eq!(conductor.seal_state(), SealState::Active);
+
+        let retry = seal_conflation_terminal(conflation_terminal, None, || {
+            conductor.seal().map_err(|_| "conductor seal failed")
+        });
+        assert_eq!(retry, Ok(()));
+        assert_eq!(conductor.seal_state(), SealState::Sealed);
     }
 
     #[test]

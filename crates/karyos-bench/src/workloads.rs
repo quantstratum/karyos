@@ -216,6 +216,7 @@ fn stream(
             },
             allow_unconnected: false,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+            conflation: None,
         })
         .map_err(|cause| error("stream", cause))
 }

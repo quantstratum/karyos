@@ -33,6 +33,7 @@ fn config(allow_unconnected: bool) -> StreamConfig {
         },
         allow_unconnected,
         on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+        conflation: None,
     }
 }
 

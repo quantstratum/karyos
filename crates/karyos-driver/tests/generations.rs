@@ -77,6 +77,7 @@ fn stream(
             },
             allow_unconnected: true,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+            conflation: None,
         })
         .unwrap()
 }
