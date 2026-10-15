@@ -32,6 +32,7 @@ fn config(allow_unconnected: bool) -> StreamConfig {
             publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
         },
         allow_unconnected,
+        on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
     }
 }
 

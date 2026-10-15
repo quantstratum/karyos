@@ -33,8 +33,8 @@ use karyos_client::{
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::log_buffer::{
-    Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, Publication, Role,
-    SealState,
+    Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, LossPolicy, Publication,
+    Role, SealState,
 };
 use karyos_sys::term::Generation;
 
@@ -112,6 +112,11 @@ pub struct StreamConfig {
     pub buffer: LogBufferConfig,
     /// Allow offers while no subscriber is attached (SPEC.md §4).
     pub allow_unconnected: bool,
+    /// What happens to a required subscriber whose client is lost
+    /// (SPEC.md §4 `on_required_loss`; quantstratum-docs:
+    /// `karyos/design/required-participant-loss.md`). Under `Continue`
+    /// required subscribers are admitted with a spare-slot credit.
+    pub on_required_loss: LossPolicy,
 }
 
 /// Names a stream of one [`EmbeddedDriver`]. It is distinct from the wire
@@ -147,6 +152,8 @@ pub(crate) struct Stream {
     pub(crate) conductor: Conductor<Arc<LogBuffer>>,
     pub(crate) leases: Arc<StreamLeases>,
     allow_unconnected: bool,
+    /// The stream's `on_required_loss` policy.
+    pub(crate) policy: LossPolicy,
     pub(crate) stream_id: i32,
     pub(crate) session_id: i32,
     /// Whether the latest deadline call returned `Waiting`.
@@ -206,6 +213,11 @@ pub struct EmbeddedDriver {
     pub(crate) counters: DriverCounters,
     /// The clock of claim deadlines and of the admission timeout.
     pub(crate) clock: Box<dyn MonotonicClock>,
+    /// The next export id: one checked namespace, never reused, for the
+    /// exports of remote clients and the occupant ids of every subscriber
+    /// cell this driver registers (quantstratum-docs:
+    /// `karyos/design/required-participant-loss.md`, Occupants).
+    pub(crate) next_export: u64,
     /// When the driver last advanced its heartbeat, in clock units.
     pub(crate) last_beat: Option<u64>,
     /// The admission socket and its connections (IPC mode).
@@ -345,6 +357,7 @@ impl EmbeddedDriver {
             scan_cursor: 0,
             terminal: false,
             clock,
+            next_export: 1,
             last_beat: None,
             #[cfg(target_os = "linux")]
             admission,
@@ -525,6 +538,7 @@ impl EmbeddedDriver {
             conductor,
             leases: Arc::new(StreamLeases::default()),
             allow_unconnected: config.allow_unconnected,
+            policy: config.on_required_loss,
             stream_id: key.0,
             session_id: key.1,
             claim_waiting: false,
@@ -761,6 +775,12 @@ fn duty(
         Ok(report) => {
             add_work(counters, work, first_error, report.cleaned);
             add_work(counters, work, first_error, u32::from(report.prepared));
+            if report.bounds_withdrawn > 0 {
+                counters.add(
+                    Event::RequiredBoundsWithdrawn,
+                    u64::from(report.bounds_withdrawn),
+                );
+            }
         }
         Err(error) => {
             first_error.get_or_insert(DriverError::from(error));
@@ -868,6 +888,7 @@ mod tests {
                 publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
             },
             allow_unconnected: false,
+            on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
         }
     }
 

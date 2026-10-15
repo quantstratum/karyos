@@ -22,7 +22,7 @@ use karyos_protocol::cnc::{
     SubscriberRole,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
-use karyos_sys::log_buffer::Role;
+use karyos_sys::log_buffer::{LossPolicy, Revocation, Role};
 
 use crate::counters::Event;
 use crate::embedded::EmbeddedDriver;
@@ -56,6 +56,8 @@ pub(crate) struct Registration {
     stream: u64,
     kind: Kind,
     end: Arc<LeaseEnd>,
+    /// For a subscription: its cell, its occupant id and its role.
+    subscriber: Option<(usize, u64, Role)>,
 }
 
 impl Registration {
@@ -169,9 +171,44 @@ impl EmbeddedDriver {
         }
         let timed_out = u32::try_from(late.len()).unwrap_or(u32::MAX);
         for index in late {
+            if let Some(client) = self.clients.get(index).map(|slot| slot.id) {
+                self.revoke_client(client);
+            }
             self.stop_serving(index, Event::ClientsTimedOut);
         }
         timed_out
+    }
+
+    /// Hands every subscriber of a lost client to its stream's loss policy
+    /// (quantstratum-docs: `karyos/design/required-participant-loss.md`):
+    /// each cell is revoked as its occupant, so a cell that changed hands
+    /// is left alone.
+    fn revoke_client(&mut self, client: u64) {
+        let lost: Vec<(u64, usize, u64, Role)> = self
+            .registrations
+            .iter()
+            .filter(|registration| registration.client == client)
+            .filter_map(|registration| {
+                registration
+                    .subscriber
+                    .map(|(cell, occupant, role)| (registration.stream, cell, occupant, role))
+            })
+            .collect();
+        for (stream, cell, occupant, role) in lost {
+            let Some(target) = self.streams.iter_mut().find(|s| s.id == stream) else {
+                continue;
+            };
+            let policy = target.policy;
+            match target.conductor.revoke_participant(cell, occupant, policy) {
+                Ok(Revocation::Stale) | Err(_) => {}
+                Ok(_) => {
+                    self.counters.add(Event::ParticipantsRevoked, 1);
+                    if role == Role::Required {
+                        self.counters.add(Event::RequiredParticipantsLost, 1);
+                    }
+                }
+            }
+        }
     }
 
     /// Clients currently admitted, including retired ones whose producer has
@@ -362,6 +399,9 @@ impl EmbeddedDriver {
                 if target.issuing().is_err() {
                     return refuse(ErrorCode::ResourcesUnavailable, detail);
                 }
+                let occupant = self.next_export;
+                let mut subscriber = None;
+                let mut occupant_used = None;
                 let (capability, kind) = match command {
                     Command::AddPublication {
                         allow_unconnected, ..
@@ -406,8 +446,19 @@ impl EmbeddedDriver {
                             } => Role::Optional,
                             _ => Role::Required,
                         };
-                        match target.conductor.subscribe(role) {
-                            Ok(inner) => (Capability::Subscription(inner), Kind::Subscription),
+                        // A required reader of a `continue` stream reserves
+                        // its slots like an optional one.
+                        let reserve =
+                            role == Role::Required && target.policy == LossPolicy::Continue;
+                        let Some(next_occupant) = occupant.checked_add(1) else {
+                            return refuse(ErrorCode::IdentitiesExhausted, 0);
+                        };
+                        match target.conductor.subscribe_as(role, reserve, occupant) {
+                            Ok(inner) => {
+                                subscriber = Some((inner.cell(), occupant, role));
+                                occupant_used = Some(next_occupant);
+                                (Capability::Subscription(inner), Kind::Subscription)
+                            }
                             Err(_) => return refuse(ErrorCode::ResourcesUnavailable, detail),
                         }
                     }
@@ -438,12 +489,16 @@ impl EmbeddedDriver {
                     generation,
                 });
                 let stream_id = target.id;
+                if let Some(next) = occupant_used {
+                    self.next_export = next;
+                }
                 self.registrations.push(Registration {
                     id: registration,
                     client,
                     stream: stream_id,
                     kind,
                     end,
+                    subscriber,
                 });
                 match kind {
                     Kind::Publication => Response::PublicationReady {
@@ -534,6 +589,7 @@ mod tests {
                     publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
                 },
                 allow_unconnected: false,
+                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
             })
             .unwrap();
         driver

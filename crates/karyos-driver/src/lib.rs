@@ -24,4 +24,4 @@ pub use clock::{MonotonicClock, SystemClock};
 pub use embedded::{DriverConfig, EmbeddedDriver, StreamConfig, StreamHandle, StreamState};
 pub use error::DriverError;
 pub use generations::{GenerationInfo, Reconfiguration};
-pub use karyos_sys::log_buffer::SealState;
+pub use karyos_sys::log_buffer::{LossPolicy, SealState};
