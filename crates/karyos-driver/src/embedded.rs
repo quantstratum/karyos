@@ -35,7 +35,9 @@ use karyos_client::{
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
-use karyos_sys::conflation::{ConflationConfig, ConflationWriter, conflation};
+use karyos_sys::conflation::{
+    Budget as ConflationBudget, ConflationConfig, ConflationWriter, conflation,
+};
 use karyos_sys::log_buffer::{
     Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, LossPolicy, Publication,
     Role, SealState,
@@ -164,6 +166,8 @@ pub struct DriverConfig {
     /// Maximum log messages copied into the keyed conflation table per
     /// conductor duty cycle.
     pub conflation_feeder_budget: NonZeroU32,
+    /// Key reads and retries per [`ConflatedSubscription`] poll.
+    pub conflated_subscription_budget: ConflationBudget,
 }
 
 impl Default for DriverConfig {
@@ -184,6 +188,10 @@ impl Default for DriverConfig {
             conflation_feeder_budget: match NonZeroU32::new(1024) {
                 Some(value) => value,
                 None => NonZeroU32::MIN,
+            },
+            conflated_subscription_budget: ConflationBudget {
+                keys: 1024,
+                retries: 3,
             },
         }
     }
@@ -275,7 +283,6 @@ pub(crate) struct Stream<T: StreamTerms> {
 pub(crate) struct ConflationFeeder<T: StreamTerms> {
     pub(crate) subscription: ClientSubscription<T>,
     pub(crate) writer: ConflationWriter,
-    pub(crate) config: ConflationConfig,
 }
 
 impl<T: StreamTerms> Stream<T> {
@@ -688,7 +695,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let feeder = ConflationFeeder {
                     subscription,
                     writer,
-                    config: conflation_config,
                 };
                 let member = Member {
                     link: Arc::downgrade(&link),
@@ -842,15 +848,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         &mut self,
         stream: StreamHandle,
     ) -> Result<ConflatedSubscription, DriverError> {
+        let budget = self.config.conflated_subscription_budget;
         let stream = self.active_stream(stream)?;
         let feeder = stream.feeder.as_ref().ok_or(DriverError::NotConflated)?;
-        Ok(ConflatedSubscription::new(
-            feeder.writer.reader(),
-            karyos_sys::conflation::Budget {
-                keys: 1024,
-                retries: 3,
-            },
-        ))
+        Ok(ConflatedSubscription::new(feeder.writer.reader(), budget))
     }
 
     /// Runs one duty cycle: retires closed clients, serves client commands,
@@ -956,44 +957,80 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     fn feed_conflation(&mut self) -> Result<u32, DriverError> {
         let budget = self.config.conflation_feeder_budget.get();
         let mut work = 0u32;
+        let mut first_error: Option<DriverError> = None;
         for stream in &mut self.streams {
             if stream.conflation_terminal.is_some() {
-                seal_conflation_terminal(&mut stream.conflation_terminal, None, || {
-                    stream.conductor.seal()
-                })?;
-                continue;
+                if let Some(cutover) = stream.cutover.take() {
+                    cutover.abandon();
+                }
+                if let Err(error) =
+                    seal_conflation_terminal(&mut stream.conflation_terminal, None, || {
+                        stream.conductor.seal()
+                    })
+                {
+                    first_error.get_or_insert(DriverError::from(error));
+                }
             }
+            let Some(config) = stream.conflation else {
+                continue;
+            };
             let Some(feeder) = &mut stream.feeder else {
                 continue;
             };
             let ConflationFeeder {
                 subscription,
                 writer,
-                config,
             } = feeder;
             let mut terminal = None;
-            let summary = subscription
-                .poll(
-                    |value, info| {
-                        if config
-                            .validate_publication(info.reserved_value, value.len())
-                            .is_ok()
-                            && let Ok(key) = u32::try_from(info.reserved_value)
-                            && let Err(error) = writer.write(key, value)
-                            && error == karyos_sys::conflation::ConflationError::VersionsExhausted
-                        {
-                            terminal = Some(error);
-                        }
-                    },
-                    MessageLimit::new(budget),
-                )
-                .map_err(|error| DriverError::Client(error.cause))?;
+            let summary = match subscription.poll(
+                |value, info| {
+                    if config
+                        .validate_publication(info.reserved_value, value.len())
+                        .is_ok()
+                        && let Ok(key) = u32::try_from(info.reserved_value)
+                        && let Err(error) = writer.write(key, value)
+                        && error == karyos_sys::conflation::ConflationError::VersionsExhausted
+                    {
+                        terminal = Some(error);
+                    }
+                },
+                MessageLimit::new(budget),
+            ) {
+                Ok(summary) => summary,
+                Err(error) => {
+                    first_error.get_or_insert(DriverError::Client(error.cause));
+                    continue;
+                }
+            };
             work = work.saturating_add(summary.delivered);
-            seal_conflation_terminal(&mut stream.conflation_terminal, terminal, || {
-                stream.conductor.seal()
-            })?;
+            if (terminal.is_some() || stream.conflation_terminal.is_some())
+                && let Some(cutover) = stream.cutover.take()
+            {
+                cutover.abandon();
+            }
+            if let Err(error) =
+                seal_conflation_terminal(&mut stream.conflation_terminal, terminal, || {
+                    stream.conductor.seal()
+                })
+            {
+                first_error.get_or_insert(DriverError::from(error));
+            }
+            if summary.closed.is_some() {
+                if let Some(mut feeder) = stream.feeder.take() {
+                    feeder.writer.close();
+                }
+                stream
+                    .members
+                    .retain(|member| member.kind != MemberKind::Feeder);
+                if let Some(cutover) = stream.cutover.take() {
+                    cutover.abandon();
+                }
+            }
         }
-        Ok(work)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(work),
+        }
     }
 
     fn stream(&mut self, stream: StreamHandle) -> Result<&mut Stream<T>, DriverError> {

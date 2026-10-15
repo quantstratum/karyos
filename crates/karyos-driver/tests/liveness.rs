@@ -15,13 +15,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use karyos_client::{
-    ClientConductor, ClientSubscription, ConductorError, MessageLimit, OfferOutcome, Outcome,
-    PollSummary,
+    ClientConductor, ClientSubscription, ConductorError, ConflatedSubscription, MessageLimit,
+    OfferOutcome, Outcome, PollSummary,
 };
 use karyos_driver::{
     DriverConfig, EmbeddedDriver, LossPolicy, MonotonicClock, SealState, StreamConfig,
 };
 use karyos_protocol::cnc::{CloseReason, Event, LossPolicyCode, StreamKey, SubscriberRole};
+use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::counters::CellRead;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
@@ -308,6 +309,31 @@ fn test_driver_loss_abort_seals_the_stream() {
     let (_client, _subscription) = lost_required_subscriber(&mut driver, &clock);
     assert_eq!(counter(&driver, "required participants lost"), 1);
     assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
+}
+
+#[test]
+fn test_abort_seal_closes_conflation_table_after_feeder_reaches_end() {
+    let (mut driver, clock) = driver();
+    let mut config = stream_config(LossPolicy::Abort);
+    config.conflation = Some(ConflationConfig {
+        keys: 4,
+        value_capacity: 8,
+        journal_capacity: 1024,
+    });
+    let stream = driver.add_stream(config).unwrap();
+    let mut conflated: ConflatedSubscription = driver.subscribe_conflated(stream).unwrap();
+    let (_client, _subscription) = lost_required_subscriber(&mut driver, &clock);
+    assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
+
+    let mut report = conflated.poll_changed(|_, _| {});
+    for _ in 0..8 {
+        let _ = driver.do_work().unwrap();
+        report = conflated.poll_changed(|_, _| {});
+        if report.closed {
+            break;
+        }
+    }
+    assert!(report.closed, "Abort seal must close the conflation writer");
 }
 
 // ---- p4b-2b: the driver reports losses as events ----
