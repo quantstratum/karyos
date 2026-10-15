@@ -313,6 +313,14 @@ impl<'a> JournalWords<'a> {
         self.payload_words
     }
 
+    /// The attempted count `A` alone (Acquire): every append, stored or
+    /// dropped, raises it, so a consumer can tell whether the loss
+    /// accounting changed without reading it.
+    #[must_use]
+    pub fn attempted(&self) -> u64 {
+        self.load(ATTEMPTED, Ordering::Acquire)
+    }
+
     /// Whether the writer closed the journal (Acquire).
     #[must_use]
     pub fn is_closed(&self) -> bool {

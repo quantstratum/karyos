@@ -12,7 +12,10 @@
 //!   creates nothing. The driver assigns the journal number (a trace
 //!   number, never reused) and answers with it and a hand-over key.
 //! - **Consumption (J1).** Each duty cycle drains the journals into the
-//!   trace mirror, at most `trace_drain_budget` records over all of them,
+//!   trace mirror, at most `trace_drain_budget` records over all of them
+//!   (the loss accounting is reread only when the journal's attempted count
+//!   moved, it took a record, ended, showed a range in progress, or is on
+//!   its final visit),
 //!   from a cursor that rotates across the table: a cycle whose budget runs
 //!   out at a journal starts the next cycle at the journal after it. The
 //!   journal's memory is untrusted ([`JournalDrain`]): a violation records
@@ -236,7 +239,9 @@ impl TraceJournals {
             .and_then(Option::as_ref)
             .and_then(|held| held.drain.as_ref())
             .map_or(0, |drain| drain.layout().capacity.saturating_add(1));
-        self.drain_one(index, limit, diagnostics, counters);
+        // The final visit rereads the loss accounting whatever it took, so
+        // a drop recorded after the last read reaches the entry for good.
+        self.drain_one(index, limit, true, diagnostics, counters);
         if let Some(Some(held)) = self.slots.get_mut(index)
             && let Some(drain) = held.drain.take()
         {
@@ -271,7 +276,7 @@ impl TraceJournals {
             if !draining {
                 continue;
             }
-            let taken = self.drain_one(index, left, diagnostics, counters);
+            let taken = self.drain_one(index, left, false, diagnostics, counters);
             left = left.saturating_sub(taken);
             if left == 0 {
                 // The next cycle starts after the journal that used the
@@ -290,6 +295,7 @@ impl TraceJournals {
         &mut self,
         index: usize,
         limit: usize,
+        final_visit: bool,
         diagnostics: &mut Diagnostics,
         counters: &mut DriverCounters,
     ) -> usize {
@@ -331,8 +337,20 @@ impl TraceJournals {
                 }
             }
         }
-        match drain.losses() {
-            Ok(losses) => {
+        // Every append, stored or dropped, raises the attempted count, so
+        // the loss accounting is reread only when that count moved since the
+        // last read, this visit took a record or ended the journal, the last
+        // read saw a range still being written, or this is the final visit:
+        // an idle journal costs one load per cycle, not `MIRROR_RANGES`
+        // seqlock reads (review of #131 and #135).
+        let refresh = final_visit
+            || taken > 0
+            || ended.is_some()
+            || held.entry.unstable > 0
+            || drain.attempted() != Some(held.entry.attempted);
+        match refresh.then(|| drain.losses()) {
+            None => {}
+            Some(Ok(losses)) => {
                 let entry = &mut held.entry;
                 entry.attempted = losses.attempted;
                 entry.stored = losses.stored;
@@ -344,7 +362,7 @@ impl TraceJournals {
                     *target = *range;
                 }
             }
-            Err(_) => ended = Some(JournalState::WriterLost),
+            Some(Err(_)) => ended = Some(JournalState::WriterLost),
         }
         if let Some(state) = ended {
             if drain.fault().is_some() {
