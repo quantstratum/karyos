@@ -323,6 +323,8 @@ impl<'a> CellWords<'a> {
 
 #[cfg(not(loom))]
 pub use owned::{Counter, CountersManager, CountersReader, counters};
+#[cfg(all(not(loom), target_os = "linux"))]
+pub use owned::{LAYOUT_VERSION, counters_in};
 
 #[cfg(not(loom))]
 mod owned {
@@ -334,25 +336,71 @@ mod owned {
     };
     use crate::atomic_view::HeapWords;
     use crate::error::SysError;
+    use crate::sync::AtomicU64;
+    #[cfg(target_os = "linux")]
+    use crate::sync::Ordering;
+
+    /// Where the cells live.
+    #[derive(Debug)]
+    enum Store {
+        /// Two heap allocations of this process.
+        Heap {
+            values: HeapWords,
+            metadata: HeapWords,
+        },
+        /// A shared region (Linux): a configuration line, the values and
+        /// then the metadata (`quantstratum-docs: karyos/design/ipc-cnc-regions.md`).
+        #[cfg(target_os = "linux")]
+        Mapped(crate::ipc::Region),
+    }
 
     #[derive(Debug)]
     struct Region {
-        values: HeapWords,
-        metadata: HeapWords,
+        store: Store,
         capacity: usize,
     }
 
     impl Region {
-        fn cell(&self, index: usize) -> Option<CellWords<'_>> {
-            let start = index.checked_mul(STRIDE_WORDS)?;
-            let meta = self
-                .metadata
-                .words()
-                .as_slice()
-                .get(start..start.checked_add(META_WORDS)?)?;
-            let value = self.values.words().get(start)?;
-            CellWords::new(meta, value)
+        /// The values and the metadata, `capacity` strides each.
+        fn sections(&self) -> (&[AtomicU64], &[AtomicU64]) {
+            match &self.store {
+                Store::Heap { values, metadata } => {
+                    (values.words().as_slice(), metadata.words().as_slice())
+                }
+                #[cfg(target_os = "linux")]
+                Store::Mapped(region) => {
+                    let words = region.structure().as_slice();
+                    let section = self.capacity.saturating_mul(STRIDE_WORDS);
+                    let values = words
+                        .get(STRIDE_WORDS..)
+                        .and_then(|rest| rest.get(..section))
+                        .unwrap_or(&[]);
+                    let metadata = words
+                        .get(STRIDE_WORDS.saturating_add(section)..)
+                        .and_then(|rest| rest.get(..section))
+                        .unwrap_or(&[]);
+                    (values, metadata)
+                }
+            }
         }
+
+        fn cell(&self, index: usize) -> Option<CellWords<'_>> {
+            let (values, metadata) = self.sections();
+            let start = index.checked_mul(STRIDE_WORDS)?;
+            let meta = metadata.get(start..start.checked_add(META_WORDS)?)?;
+            CellWords::new(meta, values.get(start)?)
+        }
+    }
+
+    fn pair(region: Region) -> (CountersManager, CountersReader) {
+        let region = Arc::new(region);
+        (
+            CountersManager {
+                region: Arc::clone(&region),
+                next_registration: 1,
+            },
+            CountersReader { region },
+        )
     }
 
     /// Creates a region of `capacity` counters: its single allocator and a
@@ -365,18 +413,65 @@ mod owned {
         let words = capacity
             .checked_mul(STRIDE_WORDS)
             .ok_or(SysError::InvalidRegion { address: 0, len: 0 })?;
-        let region = Arc::new(Region {
-            values: HeapWords::zeroed(words)?,
-            metadata: HeapWords::zeroed(words)?,
-            capacity,
-        });
-        Ok((
-            CountersManager {
-                region: Arc::clone(&region),
-                next_registration: 1,
+        Ok(pair(Region {
+            store: Store::Heap {
+                values: HeapWords::zeroed(words)?,
+                metadata: HeapWords::zeroed(words)?,
             },
-            CountersReader { region },
-        ))
+            capacity,
+        }))
+    }
+
+    /// Words of a counters region's structure: the configuration line and
+    /// two sections of `capacity` strides.
+    #[cfg(target_os = "linux")]
+    fn structure_words(capacity: usize) -> Option<usize> {
+        capacity
+            .checked_mul(2 * STRIDE_WORDS)?
+            .checked_add(STRIDE_WORDS)
+    }
+
+    /// Layout version of a counters region.
+    #[cfg(target_os = "linux")]
+    pub const LAYOUT_VERSION: u64 = 1;
+
+    /// Creates a region of `capacity` counters in a new shared region
+    /// (driver side, `quantstratum-docs: karyos/design/ipc-cnc-regions.md`): its single
+    /// allocator and a reader. Clients attach readers through
+    /// [`CountersReader::region`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SysError::InvalidRegion`] for a zero or oversized capacity,
+    /// and the errors of [`crate::ipc::Region::create`].
+    #[cfg(target_os = "linux")]
+    pub fn counters_in(
+        instance: u128,
+        region: u64,
+        capacity: usize,
+    ) -> Result<(CountersManager, CountersReader), SysError> {
+        let invalid = SysError::InvalidRegion { address: 0, len: 0 };
+        let structure_length = structure_words(capacity)
+            .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES))
+            .filter(|_| capacity > 0)
+            .ok_or(invalid)?;
+        let mapped = crate::ipc::Region::create(crate::ipc::RegionRecord {
+            instance,
+            region,
+            kind: crate::ipc::RegionKind::Counters,
+            generation: 0,
+            layout: LAYOUT_VERSION,
+            structure_length,
+        })?;
+        mapped
+            .structure()
+            .get(0)
+            .ok_or(invalid)?
+            .store(capacity as u64, Ordering::Release);
+        Ok(pair(Region {
+            store: Store::Mapped(mapped),
+            capacity,
+        }))
     }
 
     /// The region's only allocator (not `Clone`).
@@ -498,6 +593,61 @@ mod owned {
     }
 
     impl CountersReader {
+        /// A reader of a counters region in an attached region (client
+        /// side). The configuration line is read once: the capacity must be
+        /// nonzero, the unused words zero, and the layout must fill the
+        /// region exactly. Every cell read is validated as on the heap.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SysError::InvalidRegion`] unless the region is a
+        /// counters region of this layout that matches its configuration.
+        #[cfg(target_os = "linux")]
+        pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
+            let record = region.record();
+            let invalid = SysError::InvalidRegion {
+                address: 0,
+                len: record.structure_length,
+            };
+            if record.kind != crate::ipc::RegionKind::Counters
+                || record.layout != LAYOUT_VERSION
+                || record.generation != 0
+            {
+                return Err(invalid);
+            }
+            let structure = region.structure();
+            let mut config = [0u64; STRIDE_WORDS];
+            for (index, word) in config.iter_mut().enumerate() {
+                *word = structure.get(index).ok_or(invalid)?.load(Ordering::Acquire);
+            }
+            let [capacity, rest @ ..] = config;
+            let capacity = usize::try_from(capacity).map_err(|_| invalid)?;
+            let structure_length = structure_words(capacity)
+                .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES));
+            if capacity == 0
+                || rest.iter().any(|word| *word != 0)
+                || structure_length != Some(record.structure_length)
+            {
+                return Err(invalid);
+            }
+            Ok(Self {
+                region: Arc::new(Region {
+                    store: Store::Mapped(region),
+                    capacity,
+                }),
+            })
+        }
+
+        /// The shared region, to pass its descriptor; `None` on the heap.
+        #[cfg(target_os = "linux")]
+        #[must_use]
+        pub fn region(&self) -> Option<&crate::ipc::Region> {
+            match &self.region.store {
+                Store::Mapped(region) => Some(region),
+                Store::Heap { .. } => None,
+            }
+        }
+
         /// Number of cells.
         #[must_use]
         pub fn capacity(&self) -> usize {

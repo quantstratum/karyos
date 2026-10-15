@@ -230,6 +230,7 @@ mod tests {
 
     use crate::broadcast::{BroadcastReceiver, BroadcastTransmitter, Received};
     use crate::command_ring::{RingConsumer, RingProducer};
+    use crate::counters::{CellRead, CountersReader};
     use crate::error::SysError;
     use crate::ipc::{Recv, Region, RegionKind, Sent, recv, send, seqpacket_pair};
 
@@ -314,6 +315,46 @@ mod tests {
             word.store(good, Ordering::Release);
         }
         assert!(RingProducer::attach(pass(region, RegionKind::CommandRing).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn counters_cross_a_region() {
+        let (mut manager, local) = crate::counters::counters_in(7, 3, 4).unwrap();
+        let region = local.region().unwrap();
+        let reader = CountersReader::attach(pass(region, RegionKind::Counters).unwrap()).unwrap();
+        assert_eq!(reader.capacity(), 4);
+        let sent = manager.allocate(9, "bytes sent").unwrap();
+        sent.increment(41).unwrap();
+        sent.increment(1).unwrap();
+        let CellRead::Allocated {
+            metadata, value, ..
+        } = reader.read(sent.index())
+        else {
+            panic!("expected an allocated cell");
+        };
+        assert_eq!(
+            (metadata.type_id, metadata.label(), value),
+            (9, &b"bytes sent"[..], 42)
+        );
+        let index = sent.index();
+        manager.free(sent).unwrap();
+        assert_eq!(reader.read(index), CellRead::Free);
+        assert_eq!(reader.read(4), CellRead::Free);
+
+        // The configuration line is checked against the region.
+        let config = region.structure();
+        for (index, bad) in [(0usize, 0u64), (0, 5), (0, 3), (1, 1)] {
+            let word = config.get(index).unwrap();
+            let good = word.load(Ordering::Acquire);
+            word.store(bad, Ordering::Release);
+            assert!(
+                CountersReader::attach(pass(region, RegionKind::Counters).unwrap()).is_err(),
+                "word {index} = {bad}"
+            );
+            word.store(good, Ordering::Release);
+        }
+        assert!(CountersReader::attach(pass(region, RegionKind::Counters).unwrap()).is_ok());
+        assert!(crate::counters::counters_in(7, 3, 0).is_err());
     }
 
     #[test]
