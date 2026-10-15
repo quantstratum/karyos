@@ -966,6 +966,32 @@ const NOT_GRANTED: SysError = SysError::Protocol {
     reason: "the registration does not match the grant",
 };
 
+/// Bit of a registration word set by the one adoption of its grant. Export
+/// ids are below it, so an adopted registration never equals an export.
+const ADOPTED: u64 = 1 << 63;
+
+/// Whether `export` can name a registration: nonzero, below [`ADOPTED`].
+fn valid_export(export: u64) -> bool {
+    export != 0 && export & ADOPTED == 0
+}
+
+/// Claims the registration word for its one adoption: it must hold exactly
+/// `export`, and is marked adopted in the same step, so a second adoption
+/// of the same grant, concurrent or later, is refused. A claim is never
+/// returned: an adoption that fails after it leaves the grant spent, and
+/// the registration ends with the driver's.
+fn claim(word: &AtomicU64, export: u64) -> bool {
+    valid_export(export)
+        && word
+            .compare_exchange(
+                export,
+                export | ADOPTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+}
+
 impl<O: BufferOwner> Publication<O> {
     /// Adopts the exclusive publication that the creator registered for
     /// export `export` (`quantstratum-docs: karyos/design/ipc-log-buffer.md`): taken, not
@@ -983,16 +1009,10 @@ impl<O: BufferOwner> Publication<O> {
                 reason: "the exclusive publication of a concurrent buffer",
             });
         }
-        let control = buffer.control();
-        if export == 0
-            || control
-                .publication_registration
-                .word
-                .load(Ordering::Acquire)
-                != export
-            || buffer.publication_taken().load(Ordering::Acquire) == 0
+        if buffer.publication_taken().load(Ordering::Acquire) == 0
             || buffer.exclusive_released().load(Ordering::Acquire) != 0
             || buffer.reserved_head().load(Ordering::Acquire) != 0
+            || !claim(&buffer.control().publication_registration.word, export)
         {
             return Err(NOT_GRANTED);
         }
@@ -1012,7 +1032,7 @@ impl<O: BufferOwner> Subscription<O> {
     /// attached with `role` and registered for exactly this export.
     pub fn adopt(owner: O, cell: usize, role: Role, export: u64) -> Result<Self, SysError> {
         let buffer: &LogBuffer<O::Terms> = &owner;
-        if cell < buffer.first_subscriber_cell() || export == 0 {
+        if cell < buffer.first_subscriber_cell() {
             return Err(NOT_GRANTED);
         }
         let found = buffer.cell(cell).map_err(|_| NOT_GRANTED)?;
@@ -1020,9 +1040,7 @@ impl<O: BufferOwner> Subscription<O> {
             Role::Required => CELL_REQUIRED,
             Role::Optional => CELL_OPTIONAL,
         };
-        if found.registration.load(Ordering::Acquire) != export
-            || found.state.load(Ordering::Acquire) != expected
-        {
+        if found.state.load(Ordering::Acquire) != expected || !claim(&found.registration, export) {
             return Err(NOT_GRANTED);
         }
         let position = found.position.load(Ordering::Acquire);
@@ -2608,9 +2626,10 @@ impl<O: BufferOwner> Conductor<O> {
     ///
     /// # Errors
     ///
-    /// As [`Conductor::subscribe`]; [`SysError::Protocol`] for export 0.
+    /// As [`Conductor::subscribe`]; [`SysError::Protocol`] for export 0 or
+    /// an export with bit 63 set.
     pub fn register_subscriber(&mut self, role: Role, export: u64) -> Result<usize, SysError> {
-        if export == 0 {
+        if !valid_export(export) {
             return Err(NOT_GRANTED);
         }
         let cursor = self.context().subscribe(role)?;
@@ -2632,10 +2651,10 @@ impl<O: BufferOwner> Conductor<O> {
     ///
     /// [`SysError::InvalidPublicationMode`] for a concurrent buffer,
     /// [`SysError::Sealed`] for a sealed one, [`SysError::Protocol`] for
-    /// export 0.
+    /// export 0 or an export with bit 63 set.
     pub fn register_publication(&mut self, export: u64) -> Result<bool, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        if export == 0 {
+        if !valid_export(export) {
             return Err(NOT_GRANTED);
         }
         if buffer.concurrent() {

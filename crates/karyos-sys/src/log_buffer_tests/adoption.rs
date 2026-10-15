@@ -131,3 +131,57 @@ fn adoption_refuses_what_was_not_granted() {
         Err(SysError::InvalidPublicationMode { .. })
     ));
 }
+
+#[test]
+fn a_grant_is_adopted_once() {
+    // Subscriber: a second live adoption of the same registration would
+    // share one cell between two cursors.
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let cell = conductor.register_subscriber(Role::Required, 42).unwrap();
+    let first = Subscription::adopt(&buffer, cell, Role::Required, 42).unwrap();
+    assert!(matches!(
+        Subscription::adopt(&buffer, cell, Role::Required, 42),
+        Err(SysError::Protocol { .. })
+    ));
+    drop(first);
+
+    // Exclusive publication: two fresh adoptions would hold two loans.
+    assert!(conductor.register_publication(43).unwrap());
+    let publication = Publication::adopt(&buffer, 43).unwrap();
+    assert!(matches!(
+        Publication::adopt(&buffer, 43),
+        Err(SysError::Protocol { .. })
+    ));
+    drop(publication);
+
+    // Concurrent publication: two handles would share one publisher slot.
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let slot = conductor.register_concurrent_publication(41).unwrap().unwrap();
+    let handle = ConcurrentPublication::adopt(&buffer, slot, 41).unwrap();
+    assert!(matches!(
+        ConcurrentPublication::adopt(&buffer, slot, 41),
+        Err(SysError::Protocol { .. })
+    ));
+    drop(handle);
+
+    // An export with the adopted bit cannot be registered, so no
+    // registration word can equal an adopted one.
+    assert!(matches!(
+        conductor.register_concurrent_publication(41 | 1 << 63),
+        Err(SysError::Protocol { .. })
+    ));
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    for export in [1u64 << 63, u64::MAX] {
+        assert!(matches!(
+            conductor.register_subscriber(Role::Optional, export),
+            Err(SysError::Protocol { .. })
+        ));
+        assert!(matches!(
+            conductor.register_publication(export),
+            Err(SysError::Protocol { .. })
+        ));
+    }
+}

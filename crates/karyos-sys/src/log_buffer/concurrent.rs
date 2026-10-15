@@ -8,8 +8,8 @@
 
 use super::{
     AppendOptions, AppendOutcome, BufferOwner, CommitOutcome, Conductor, FragmentPlan,
-    HEADER_LENGTH, LayoutError, LogBuffer, Lookup, NOT_GRANTED, SysError, TermBytes,
-    staging_buffer, write_fragments, write_header_tail,
+    HEADER_LENGTH, LayoutError, LogBuffer, Lookup, NOT_GRANTED, SysError, TermBytes, claim,
+    staging_buffer, valid_export, write_fragments, write_header_tail,
 };
 use crate::frame::{FRAME_ALIGNMENT, Flags, FrameType, PROTOCOL_VERSION, Word0};
 use crate::loan::{LoanOutcome, release_loan, rotate_to, take_loan};
@@ -223,7 +223,7 @@ impl<O: BufferOwner> Conductor<O> {
         export: u64,
     ) -> Result<Option<usize>, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        if export == 0 {
+        if !valid_export(export) {
             return Err(NOT_GRANTED);
         }
         if !buffer.concurrent() {
@@ -321,10 +321,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
             });
         }
         let found = buffer.publisher_lines().get(slot).ok_or(NOT_GRANTED)?;
-        if export == 0
-            || found.registration.load(Ordering::Acquire) != export
-            || publisher_slot_free(&found.word)
-        {
+        if publisher_slot_free(&found.word) || !claim(&found.registration, export) {
             return Err(NOT_GRANTED);
         }
         let from = TermCount::try_new(
