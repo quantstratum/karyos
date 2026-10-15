@@ -898,6 +898,16 @@ mod owned {
         /// out of range.
         #[must_use]
         pub fn load_value(&self, index: usize) -> Option<u64> {
+            #[cfg(target_os = "linux")]
+            if let Store::ReadOnly(region) = &self.region.store {
+                // The value word of cell `index` follows the configuration
+                // stride; a Relaxed load is valid on read-only memory.
+                let word = index
+                    .checked_mul(STRIDE_WORDS)
+                    .filter(|_| index < self.region.capacity)?
+                    .checked_add(STRIDE_WORDS)?;
+                return region.structure().load(word);
+            }
             self.region.cell(index).map(|cell| cell.load_value())
         }
 

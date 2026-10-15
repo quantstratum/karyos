@@ -367,6 +367,9 @@ mod tests {
             (metadata.type_id, metadata.label(), value),
             (9, &b"bytes sent"[..], 42)
         );
+        // A sampling pass reads value words alone, Relaxed, read-only.
+        assert_eq!(reader.load_value(sent.index()), Some(42));
+        assert_eq!(reader.load_value(4), None);
         let index = sent.index();
         manager.free(sent).unwrap();
         assert_eq!(reader.read(index), CellRead::Free);
