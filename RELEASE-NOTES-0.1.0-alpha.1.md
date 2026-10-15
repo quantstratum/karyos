@@ -81,6 +81,10 @@ layouts will change.
 
 ## Evidence
 
+Commit ids marked "legacy" name commits of the pre-migration
+history, kept in the private legacy repository; the others are
+commits of this repository.
+
 Functional evidence only. Docker and virtual machines say nothing about
 latency on physical hosts.
 
@@ -89,13 +93,13 @@ during development; the release-gates row is the run on the release commit.
 
 | Check | Commit | Environment | Result |
 | --- | --- | --- | --- |
-| Miri, `karyos-sys` library tests (nightly-2026-10-11) | `438f0cc` | macOS arm64, Apple M5 Max | 306 of 306 pass, no undefined behaviour reported |
-| Miri, region adoption tests | `458b833` | macOS arm64, Apple M5 Max | 10 of 10 pass |
-| Region tests after the Linux-only kind check | `7186e77` | Docker, kernel 6.8.0-117-generic aarch64 | 4 of 4 pass; no full Miri rerun after it |
-| `make loom` | `b2d15cb` | macOS arm64 (Darwin 27.0.0), Apple M5 Max, rustc 1.99.0 | 15 suites, 64 passed, 0 failed, 0 ignored |
-| `scripts/linux-test.sh` (`cargo test --workspace`) | `b2d15cb` | Docker `rust:1.99` (rustc 1.99.0), kernel 6.8.0-117-generic aarch64 (colima VM) | 591 passed, 0 failed, 0 ignored, including the `karyos-sys` library tests (340), admission (6), platform (11) and process (4) tests |
-| Process tests (`karyos-driver/tests/processes.rs`: a killed client released by its exit proof, a stopped client kept charged then resumed, a driver restart that keeps the old mappings readable) | `e3784dd`, merged as `b2d15cb` | Docker, kernel 6.8.0 aarch64 | 4 of 4 pass, five consecutive runs |
-| Platform tests (`karyos-driver/tests/admission_platform.rs`: modes, owners, stale and foreign files, backlog, size seals, descriptor counts) | `ebd8e77` on `b1ce50a` | Docker as root, kernel 6.8.0-117-generic aarch64 | 11 of 11 pass, three consecutive runs |
+| Miri, `karyos-sys` library tests (nightly-2026-10-11) | `legacy 438f0cc` | macOS arm64, Apple M5 Max | 306 of 306 pass, no undefined behaviour reported |
+| Miri, region adoption tests | `b8165eb` | macOS arm64, Apple M5 Max | 10 of 10 pass |
+| Region tests after the Linux-only kind check | `4be1f09` | Docker, kernel 6.8.0-117-generic aarch64 | 4 of 4 pass; no full Miri rerun after it |
+| `make loom` | `553f873` | macOS arm64 (Darwin 27.0.0), Apple M5 Max, rustc 1.99.0 | 15 suites, 64 passed, 0 failed, 0 ignored |
+| `scripts/linux-test.sh` (`cargo test --workspace`) | `553f873` | Docker `rust:1.99` (rustc 1.99.0), kernel 6.8.0-117-generic aarch64 (colima VM) | 591 passed, 0 failed, 0 ignored, including the `karyos-sys` library tests (340), admission (6), platform (11) and process (4) tests |
+| Process tests (`karyos-driver/tests/processes.rs`: a killed client released by its exit proof, a stopped client kept charged then resumed, a driver restart that keeps the old mappings readable) | `4dbb003`, merged as `553f873` | Docker, kernel 6.8.0 aarch64 | 4 of 4 pass, five consecutive runs |
+| Platform tests (`karyos-driver/tests/admission_platform.rs`: modes, owners, stale and foreign files, backlog, size seals, descriptor counts) | `1f7d080` on `ad8c1e9` | Docker as root, kernel 6.8.0-117-generic aarch64 | 11 of 11 pass, three consecutive runs |
 | Release gates (`make pre-push`, `make miri`, `make sim`, `scripts/linux-test.sh`) | TODO(final gate-run SHA) | TODO(final gate-run SHA) | TODO(final gate-run SHA) |
 | Linux x86_64, kernels 6.9 and later | none | Not run for this alpha | Not claimed |
 
