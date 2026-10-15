@@ -87,8 +87,8 @@ fn required_subscriber_reads_everything_through_many_rotations() {
             expected += 1;
         }
         let _ = conductor.duty_cycle().unwrap();
-        let head = buffer.reserved_head.load(Ordering::Acquire);
-        assert!(head - buffer.floor.load(Ordering::Acquire) <= TERM);
+        let head = buffer.reserved_head().load(Ordering::Acquire);
+        assert!(head - buffer.floor().load(Ordering::Acquire) <= TERM);
     }
     while expected < total {
         let _ = conductor.duty_cycle().unwrap();
@@ -99,7 +99,7 @@ fn required_subscriber_reads_everything_through_many_rotations() {
     }
     // Many terms went through five slots: slots were reused.
     let minimum = if cfg!(miri) { 2 } else { 10 };
-    assert!(buffer.active_count.load(Ordering::Acquire) > minimum);
+    assert!(buffer.active_count().load(Ordering::Acquire) > minimum);
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn required_subscriber_back_pressures_the_publication() {
     }
     assert!(pressured, "the publication was never back-pressured");
     // Never more than the window ahead of the required subscriber.
-    let head = buffer.reserved_head.load(Ordering::Acquire);
+    let head = buffer.reserved_head().load(Ordering::Acquire);
     assert!(head <= TERM / 2);
     // Reading releases the publication.
     while poll_message(&mut subscription).is_some() {}
@@ -149,7 +149,7 @@ fn lapped_optional_subscriber_rejoins_at_the_head() {
         let _ = append_retrying(&mut publication, &mut conductor, &message(sequence), || {});
         let _ = conductor.duty_cycle().unwrap();
     }
-    let head = buffer.reserved_head.load(Ordering::Acquire);
+    let head = buffer.reserved_head().load(Ordering::Acquire);
     match poll(&mut lagging) {
         PollOutcome::Overrun {
             from,
@@ -172,7 +172,7 @@ fn rotation_waits_for_the_conductor() {
     let mut conductor = buffer.conductor().unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     // Lift flow control far enough to cross two terms without cycles.
-    buffer.limit.store(4 * TERM, Ordering::Release);
+    buffer.limit().store(4 * TERM, Ordering::Release);
     let data = vec![9u8; 7000];
     let mut admin = 0;
     let mut appended = 0;
@@ -187,7 +187,7 @@ fn rotation_waits_for_the_conductor() {
     // Term 0 and the prepared term 1 filled up; term 2 needs the
     // conductor, so later appends only report AdminAction.
     assert!(appended > 0 && admin > 50);
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
     let report = conductor.duty_cycle().unwrap();
     assert!(report.prepared);
     assert!(matches!(
@@ -230,7 +230,7 @@ fn a_loan_quarantines_its_slot_until_released() {
     let mut conductor = buffer.conductor().unwrap();
     // A paused reader in a spare cell pins term 0 in slot 0, which is
     // ACTIVE from the start.
-    let pinned = buffer.cells.get(1).unwrap();
+    let pinned = buffer.cells().get(1).unwrap();
     let target = buffer.target(0, TermCount::ZERO).unwrap();
     assert_eq!(
         take_loan(
@@ -276,14 +276,14 @@ fn optional_cursors_below_the_floor_are_overrun() {
     let mut conductor = buffer.conductor().unwrap();
     let mut optional = conductor.subscribe(Role::Optional).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
-    buffer.limit.store(4 * TERM, Ordering::Release);
+    buffer.limit().store(4 * TERM, Ordering::Release);
     for _ in 0..48 {
         let _ = publication
             .append(&small, AppendOptions::default())
             .unwrap();
     }
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(buffer.floor.load(Ordering::Acquire), 16_384);
+    assert_eq!(buffer.floor().load(Ordering::Acquire), 16_384);
     assert!(matches!(
         poll(&mut optional),
         PollOutcome::Overrun {
@@ -308,7 +308,7 @@ fn optional_cursors_below_the_floor_are_overrun() {
         assert!(poll_message(&mut required).is_some());
     }
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(buffer.floor.load(Ordering::Acquire), 8192);
+    assert_eq!(buffer.floor().load(Ordering::Acquire), 8192);
     assert!(matches!(
         poll(&mut optional),
         PollOutcome::Overrun {
@@ -328,7 +328,7 @@ fn the_floor_is_rechecked_after_the_loan_is_granted() {
     let _ = append_retrying(&mut publication, &mut conductor, &message(1), || {});
     // The term is still ACTIVE, but the floor has passed the position, as
     // if raised while the subscriber was paused before its loan.
-    buffer.floor.store(1, Ordering::Release);
+    buffer.floor().store(1, Ordering::Release);
     assert!(matches!(
         poll(&mut subscription),
         PollOutcome::Overrun { from: 0, .. }
@@ -341,16 +341,16 @@ fn the_conductor_completes_a_half_done_rotation() {
     let mut conductor = buffer.conductor().unwrap();
     // The publication filled term 0 and stopped after publishing its
     // boundary, before activating term 1 and advancing the count.
-    buffer.reserved_head.store(TERM, Ordering::Release);
+    buffer.reserved_head().store(TERM, Ordering::Release);
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
     let state = Descriptor::decode(buffer.descriptor(1).unwrap().load(Ordering::Acquire))
         .unwrap()
         .state();
     assert_eq!(state, SlotState::Active);
     // A second cycle is idempotent.
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
 }
 
 /// Vectors: 60 payloads of 992 bytes reserve 61440; an 8000-byte message
@@ -361,7 +361,7 @@ fn pad_then_retry_and_exact_fill_vectors() {
     let buffer = new_buffer(config(2, 1)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
-    buffer.limit.store(4 * TERM, Ordering::Release);
+    buffer.limit().store(4 * TERM, Ordering::Release);
     let small = vec![1u8; 992];
     for _ in 0..60 {
         assert!(matches!(
@@ -371,13 +371,13 @@ fn pad_then_retry_and_exact_fill_vectors() {
             AppendOutcome::Appended { .. }
         ));
     }
-    assert_eq!(buffer.reserved_head.load(Ordering::Acquire), 61_440);
+    assert_eq!(buffer.reserved_head().load(Ordering::Acquire), 61_440);
     let big = vec![2u8; 8000];
     assert_eq!(
         publication.append(&big, AppendOptions::default()).unwrap(),
         AppendOutcome::AdminAction
     );
-    assert_eq!(buffer.reserved_head.load(Ordering::Acquire), TERM);
+    assert_eq!(buffer.reserved_head().load(Ordering::Acquire), TERM);
     assert_eq!(
         publication.append(&big, AppendOptions::default()).unwrap(),
         AppendOutcome::Appended { position: TERM }
@@ -386,7 +386,7 @@ fn pad_then_retry_and_exact_fill_vectors() {
 
     let exact = new_buffer(config(2, 1)).unwrap();
     let mut exact_publication = exact.publication().unwrap().unwrap();
-    exact.limit.store(4 * TERM, Ordering::Release);
+    exact.limit().store(4 * TERM, Ordering::Release);
     for _ in 0..64 {
         assert!(matches!(
             exact_publication
@@ -395,7 +395,7 @@ fn pad_then_retry_and_exact_fill_vectors() {
             AppendOutcome::Appended { .. }
         ));
     }
-    assert_eq!(exact.reserved_head.load(Ordering::Acquire), TERM);
+    assert_eq!(exact.reserved_head().load(Ordering::Acquire), TERM);
     // The next append rotates without a PAD and reports AdminAction.
     assert_eq!(
         exact_publication
@@ -490,8 +490,8 @@ fn unacknowledged_messages_are_redelivered_and_keep_bounding() {
         }
     }
     assert!(pressured);
-    assert!(buffer.reserved_head.load(Ordering::Acquire) <= TERM / 2);
-    assert_eq!(buffer.floor.load(Ordering::Acquire), 0);
+    assert!(buffer.reserved_head().load(Ordering::Acquire) <= TERM / 2);
+    assert_eq!(buffer.floor().load(Ordering::Acquire), 0);
     // Acknowledge, then the next poll moves on and the bound advances.
     required.acknowledge();
     assert!(matches!(
@@ -500,7 +500,7 @@ fn unacknowledged_messages_are_redelivered_and_keep_bounding() {
     ));
     required.acknowledge();
     let _ = conductor.duty_cycle().unwrap();
-    assert!(buffer.floor.load(Ordering::Acquire) > 0);
+    assert!(buffer.floor().load(Ordering::Acquire) > 0);
 }
 
 /// A failed redelivery (short buffer) keeps the original pending end, so
@@ -512,7 +512,7 @@ fn failed_redelivery_keeps_the_pending_message() {
     let mut conductor = buffer.conductor().unwrap();
     let mut required = conductor.subscribe(Role::Required).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
-    buffer.limit.store(4 * TERM, Ordering::Release);
+    buffer.limit().store(4 * TERM, Ordering::Release);
     // Fill term 0 so the next message lands after a PAD in term 1.
     let filler = vec![1u8; 992];
     for _ in 0..60 {
@@ -554,7 +554,7 @@ fn failed_redelivery_keeps_the_pending_message() {
     required.acknowledge();
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(
-        buffer.cells[1].position.load(Ordering::Acquire),
+        buffer.cells()[1].position.load(Ordering::Acquire),
         TERM + 8192
     );
     // The next poll delivers the following message, not the
@@ -577,7 +577,7 @@ fn a_required_subscriber_never_skips_silently() {
         .append(&message(1), AppendOptions::default())
         .unwrap();
     // Force an impossible floor above the required position.
-    buffer.floor.store(1, Ordering::Release);
+    buffer.floor().store(1, Ordering::Release);
     let mut out = vec![0u8; 8192];
     assert_eq!(
         required.poll(&mut out),
@@ -709,7 +709,7 @@ fn concurrent_publication_reuse_and_subscribers() {
                         // last message is not required (it may be lost).
                         if published.load(Ordering::Acquire)
                             && optional.position()
-                                >= buffer.reserved_head.load(Ordering::Acquire)
+                                >= buffer.reserved_head().load(Ordering::Acquire)
                         {
                             break (seen, lost);
                         }
@@ -726,7 +726,7 @@ fn concurrent_publication_reuse_and_subscribers() {
         // Slots were cleaned and the term count passed the slot count, so
         // cleaned slots were rewritten while subscribers were running.
         assert!(cleaned > 0);
-        assert!(buffer.active_count.load(Ordering::Acquire) >= slots);
+        assert!(buffer.active_count().load(Ordering::Acquire) >= slots);
     });
 }
 
@@ -1082,12 +1082,12 @@ fn closing_the_publication_resolves_its_claim_then_releases_its_loan() {
     let mut publication = buffer.publication().unwrap().unwrap();
     // Fill term 0 and move the publication's loan to term 1.
     let mut sequence = 0;
-    while buffer.active_count.load(Ordering::Acquire) == 0 {
+    while buffer.active_count().load(Ordering::Acquire) == 0 {
         let _ = append_retrying(&mut publication, &mut conductor, &message(sequence), || {});
         while poll_message(&mut subscription).is_some() {}
         sequence += 1;
     }
-    let active = buffer.active_count.load(Ordering::Acquire) as u32;
+    let active = buffer.active_count().load(Ordering::Acquire) as u32;
     let Lookup::Slot(slot) = buffer.lookup(TermCount::try_new(active).unwrap()).unwrap() else {
         panic!("active term without a slot");
     };
@@ -1211,7 +1211,7 @@ fn claims_are_back_pressured() {
         }
     }
     assert!(pressured);
-    assert!(buffer.reserved_head.load(Ordering::Acquire) <= TERM / 2);
+    assert!(buffer.reserved_head().load(Ordering::Acquire) <= TERM / 2);
 }
 
 #[test]
@@ -1447,7 +1447,7 @@ fn a_claim_before_its_head_store_is_not_admitted() {
                 seen.push(conductor.abort_expired_claims(0).unwrap());
                 seen.push(conductor.abort_expired_claims(u64::MAX).unwrap());
                 let _ = conductor.duty_cycle().unwrap();
-                limit = buffer.limit.load(Ordering::Acquire);
+                limit = buffer.limit().load(Ordering::Acquire);
                 // A required subscriber admitted at the unmoved head.
                 required = Some(conductor.subscribe(Role::Required).unwrap());
             }
@@ -1468,10 +1468,10 @@ fn a_claim_before_its_head_store_is_not_admitted() {
     assert!(matches!(poll(&mut required), PollOutcome::Aborted { position: 0, extent: 96 }));
     let _ = conductor.duty_cycle().unwrap();
     // The limit never goes below one already granted.
-    assert!(buffer.limit.load(Ordering::Acquire) >= limit);
+    assert!(buffer.limit().load(Ordering::Acquire) >= limit);
     let _late = conductor.subscribe(Role::Required).unwrap();
     let _ = conductor.duty_cycle().unwrap();
-    assert!(buffer.limit.load(Ordering::Acquire) >= limit);
+    assert!(buffer.limit().load(Ordering::Acquire) >= limit);
 }
 
 #[test]
@@ -1624,7 +1624,7 @@ fn claims_stop_when_the_record_serial_would_run_out() {
     let mut publication = buffer.publication().unwrap().unwrap();
     // A resting serial is a multiple of four; this one leaves room for
     // exactly one more claim.
-    buffer.claim_serial.store(u64::MAX - 7, Ordering::Relaxed);
+    buffer.claim_serial().store(u64::MAX - 7, Ordering::Relaxed);
     let claim = claimed(publication.try_claim(8, AppendOptions::default()));
     // The last claim is observable and abortable.
     assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
@@ -1633,13 +1633,13 @@ fn claims_stop_when_the_record_serial_would_run_out() {
         ClaimDeadline::Aborted { .. }
     ));
     claim.abort();
-    assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), u64::MAX - 3);
-    let head = buffer.reserved_head.load(Ordering::Acquire);
+    assert_eq!(buffer.claim_serial().load(Ordering::Relaxed), u64::MAX - 3);
+    let head = buffer.reserved_head().load(Ordering::Acquire);
     assert!(matches!(
         publication.try_claim(8, AppendOptions::default()),
         Err(SysError::ResourcesUnavailable)
     ));
-    assert_eq!(buffer.reserved_head.load(Ordering::Acquire), head);
+    assert_eq!(buffer.reserved_head().load(Ordering::Acquire), head);
     // Offers are unaffected.
     assert!(matches!(
         publication.append(&message(0), AppendOptions::default()).unwrap(),
@@ -1654,23 +1654,23 @@ fn the_last_claim_the_serial_admits_can_be_forgotten() {
         let mut conductor = buffer.conductor().unwrap();
         let mut subscription = conductor.subscribe(Role::Optional).unwrap();
         let mut publication = buffer.publication().unwrap().unwrap();
-        buffer.claim_serial.store(u64::MAX - 7, Ordering::Relaxed);
+        buffer.claim_serial().store(u64::MAX - 7, Ordering::Relaxed);
         core::mem::forget(claimed(publication.try_claim(8, AppendOptions::default())));
         // The last admitted claim is observable before it is resolved.
         assert_eq!(conductor.abort_expired_claims(0).unwrap(), ClaimDeadline::Waiting);
         if close {
             publication.close();
         } else {
-            let head = buffer.reserved_head.load(Ordering::Acquire);
+            let head = buffer.reserved_head().load(Ordering::Acquire);
             // The next call resolves the forgotten claim (its clear fits),
             // then refuses the new claim without moving the head.
             assert!(matches!(
                 publication.try_claim(8, AppendOptions::default()),
                 Err(SysError::ResourcesUnavailable)
             ));
-            assert_eq!(buffer.reserved_head.load(Ordering::Acquire), head);
+            assert_eq!(buffer.reserved_head().load(Ordering::Acquire), head);
         }
-        assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), u64::MAX - 3);
+        assert_eq!(buffer.claim_serial().load(Ordering::Relaxed), u64::MAX - 3);
         assert_eq!(conductor.abort_expired_claims(u64::MAX).unwrap(), ClaimDeadline::Idle);
         assert_eq!(
             poll(&mut subscription),
@@ -1736,8 +1736,8 @@ fn an_injected_deadline_fault_leaves_the_protocol_state_intact() {
     let mut conductor = buffer.conductor().unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     let mut claim = claimed(publication.try_claim(8, AppendOptions::default()));
-    let serial = buffer.claim_serial.load(Ordering::Relaxed);
-    let record = buffer.claim_record.load(Ordering::Relaxed);
+    let serial = buffer.claim_serial().load(Ordering::Relaxed);
+    let record = buffer.claim_record().load(Ordering::Relaxed);
     let loan = buffer.cell(0).unwrap().loan.load(Ordering::SeqCst);
     let word = word0_of_term0(&buffer, 0).load(Ordering::Acquire);
     buffer.inject_deadline_fault();
@@ -1752,8 +1752,8 @@ fn an_injected_deadline_fault_leaves_the_protocol_state_intact() {
             error: SysError::ResourcesUnavailable,
         })
     );
-    assert_eq!(buffer.claim_serial.load(Ordering::Relaxed), serial);
-    assert_eq!(buffer.claim_record.load(Ordering::Relaxed), record);
+    assert_eq!(buffer.claim_serial().load(Ordering::Relaxed), serial);
+    assert_eq!(buffer.claim_record().load(Ordering::Relaxed), record);
     assert_eq!(buffer.cell(0).unwrap().loan.load(Ordering::SeqCst), loan);
     assert_eq!(word0_of_term0(&buffer, 0).load(Ordering::Acquire), word);
     claim.payload().fill(1);
@@ -1859,7 +1859,7 @@ fn the_concurrent_head_is_derived_from_the_active_tail() {
     // The limit derives from that head and the concurrent window.
     let _ = conductor.duty_cycle().unwrap();
     let window = TERM / 2 - 8192;
-    assert_eq!(buffer.limit.load(Ordering::Acquire), 96 + window);
+    assert_eq!(buffer.limit().load(Ordering::Acquire), 96 + window);
     // Past the end: clamped to the term end.
     buffer
         .tail(0)
@@ -1883,13 +1883,13 @@ fn the_conductor_rotates_a_full_concurrent_term_and_prepares_tails() {
     let buffer = new_buffer(concurrent_config(2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     let t0 = u64::from(buffer.initial_term_id.get());
-    let limit = buffer.limit.load(Ordering::Acquire);
+    let limit = buffer.limit().load(Ordering::Acquire);
     buffer
         .tail(0)
         .unwrap()
         .store((t0 << 32) | TERM, Ordering::Release);
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
     // Term 1 (slot 1) starts empty; the next term's tail is prepared with
     // its own identity.
     assert_eq!(buffer.head().unwrap(), Some(TERM));
@@ -1904,7 +1904,7 @@ fn the_conductor_rotates_a_full_concurrent_term_and_prepares_tails() {
         buffer.tail(slot).unwrap().load(Ordering::Acquire),
         u64::from(t2.get()) << 32
     );
-    assert!(buffer.limit.load(Ordering::Acquire) >= limit);
+    assert!(buffer.limit().load(Ordering::Acquire) >= limit);
 }
 
 #[test]
@@ -1932,10 +1932,10 @@ fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
     let mut subscription = conductor.subscribe(Role::Optional).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     // Lap the subscriber: its position falls below the floor.
-    while buffer.floor.load(Ordering::Acquire) < TERM {
+    while buffer.floor().load(Ordering::Acquire) < TERM {
         let _ = append_retrying(&mut publication, &mut conductor, &message(1), || {});
     }
-    let before = buffer.reserved_head.load(Ordering::Acquire);
+    let before = buffer.reserved_head().load(Ordering::Acquire);
     let mut context = SubscriptionContext {
         buffer: &buffer,
         cursor: &mut subscription.cursor,
@@ -1944,11 +1944,11 @@ fn a_rejoin_paused_between_its_reads_never_resumes_below_the_lost_range() {
     // conductor publishes a floor above the old head.
     let step = context
         .overrun_with(&mut || {
-            while buffer.reserved_head.load(Ordering::Acquire) <= before + TERM / 2 {
+            while buffer.reserved_head().load(Ordering::Acquire) <= before + TERM / 2 {
                 let _ = append_retrying(&mut publication, &mut conductor, &message(2), || {});
             }
             let _ = conductor.duty_cycle().unwrap();
-            assert!(buffer.floor.load(Ordering::Acquire) > before);
+            assert!(buffer.floor().load(Ordering::Acquire) > before);
         })
         .unwrap();
     match step {
@@ -2047,7 +2047,7 @@ fn concurrent_offers_are_disjoint_contiguous_and_delivered() {
     // Under Miri fewer messages pass one term end; natively several.
     let rotations = if cfg!(miri) { 0 } else { 2 };
     assert!(
-        buffer.active_count.load(Ordering::Acquire) > rotations,
+        buffer.active_count().load(Ordering::Acquire) > rotations,
         "no rotation"
     );
 }
@@ -2092,7 +2092,7 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
     assert_eq!(raw >> 32, t0);
     assert!(raw as u32 >= MIN_TERM_LENGTH);
     // The crossing owner rotated (term 1 was prepared).
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
     // B finds term 0 full: no reservation there.
     assert_eq!(
         b.offer(&data, AppendOptions::default()).unwrap(),
@@ -2117,7 +2117,7 @@ fn a_live_handle_catches_up_after_three_rotations() {
     // The paused handle holds its loan on term 0 while three rotations
     // pass; its slot cannot be reclaimed meanwhile.
     let data = vec![1u8; 6000];
-    while buffer.active_count.load(Ordering::Acquire) < 3 {
+    while buffer.active_count().load(Ordering::Acquire) < 3 {
         let _ = offer_concurrent(&mut writer, &mut conductor, &data, || {
             while poll_message(&mut subscription).is_some() {}
         });
@@ -2136,7 +2136,7 @@ fn a_live_handle_catches_up_after_three_rotations() {
     };
     assert_eq!(
         position / TERM,
-        buffer.active_count.load(Ordering::Acquire)
+        buffer.active_count().load(Ordering::Acquire)
     );
 }
 
@@ -2163,7 +2163,7 @@ fn a_reissued_slot_never_crosses_a_term_twice() {
         .table_slot(TermCount::try_new(1).unwrap())
         .unwrap()
         .store(0, Ordering::Release);
-    buffer.limit.store(2 * TERM, Ordering::Release);
+    buffer.limit().store(2 * TERM, Ordering::Release);
     let data = vec![2u8; 100];
     // The holder crosses term 0, owns the remainder, cannot rotate, and
     // closes while term 0 is still active.
@@ -2172,7 +2172,7 @@ fn a_reissued_slot_never_crosses_a_term_twice() {
         holder.offer(&data, AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::AdminAction
     );
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 0);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 0);
     holder.close();
     // Reissued in the still active, crossed term: it waits.
     let mut reissued = conductor.concurrent_publication().unwrap().unwrap();
@@ -2204,7 +2204,7 @@ fn a_reissue_after_cleaning_and_reassignment_starts_at_the_active_term() {
     let _ = offer_concurrent(&mut closing, &mut conductor, &data, || {});
     closing.close();
     // Rotations pass and term 0's slot is cleaned and reassigned.
-    while buffer.active_count.load(Ordering::Acquire) < 4 {
+    while buffer.active_count().load(Ordering::Acquire) < 4 {
         let _ = offer_concurrent(&mut writer, &mut conductor, &data, || {
             while poll_message(&mut subscription).is_some() {}
         });
@@ -2263,7 +2263,7 @@ fn a_concurrent_handle_stops_at_the_last_term() {
         .unwrap()
         .store((u64::from(term_id.get()) << 32) | (TERM - 32), Ordering::Release);
     buffer
-        .active_count
+        .active_count()
         .store(u64::from(last.get()), Ordering::Release);
     let mut conductor = buffer.conductor().unwrap();
     let mut handle = conductor.concurrent_publication().unwrap().unwrap();
@@ -2282,12 +2282,12 @@ fn a_concurrent_handle_stops_at_the_last_term() {
         .unwrap()
         .store((u64::from(term_id.get()) << 32) | TERM, Ordering::Release);
     handle.close();
-    let free = buffer.publishers[0].load(Ordering::Acquire);
+    let free = buffer.publisher(0).unwrap().load(Ordering::Acquire);
     assert!(matches!(
         conductor.concurrent_publication(),
         Err(SysError::MaxPositionExceeded { .. })
     ));
-    assert_eq!(buffer.publishers[0].load(Ordering::Acquire), free);
+    assert_eq!(buffer.publisher(0).unwrap().load(Ordering::Acquire), free);
 }
 
 // Claims on concurrent handles, batch a3.
@@ -2375,13 +2375,13 @@ fn publishers_rotate_without_the_conductor() {
         .tail(0)
         .unwrap()
         .store((t0 << 32) | (TERM - 32), Ordering::Release);
-    buffer.limit.store(2 * TERM, Ordering::Release);
+    buffer.limit().store(2 * TERM, Ordering::Release);
     // The crossing owner pads and rotates to the prepared term 1.
     assert_eq!(
         handle.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::AdminAction
     );
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
     let t1 = buffer
         .initial_term_id
         .advanced_by(TermCount::try_new(1).unwrap());
@@ -2402,7 +2402,7 @@ fn a_rotation_attempt_is_idempotent_and_detects_supersession() {
     let rotate = |next: TermCount, term: TermId| {
         rotate_to(
             buffer.descriptor(1).unwrap(),
-            &buffer.active_count,
+            buffer.active_count(),
             term,
             buffer.generation,
             next,
@@ -2412,16 +2412,16 @@ fn a_rotation_attempt_is_idempotent_and_detects_supersession() {
     assert_eq!(rotate(one, t1), Rotation::Completed);
     // Repeating it, as a second helper would, changes nothing.
     assert_eq!(rotate(one, t1), Rotation::Completed);
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
     // A helper paused across later rotations finds the count beyond and
     // the slot reassigned to a later term: it writes nothing.
-    buffer.active_count.store(3, Ordering::Release);
+    buffer.active_count().store(3, Ordering::Release);
     let t4 = buffer.initial_term_id.advanced_by(TermCount::try_new(4).unwrap());
     let ready4 = Descriptor::new(t4, buffer.generation, SlotState::Ready).encode();
     buffer.descriptor(1).unwrap().store(ready4, Ordering::Release);
     assert_eq!(rotate(one, t1), Rotation::Superseded);
     assert_eq!(buffer.descriptor(1).unwrap().load(Ordering::Acquire), ready4);
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 3);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 3);
     // A term not prepared yet: the driver is behind.
     let five = TermCount::try_new(5).unwrap();
     let t5 = buffer.initial_term_id.advanced_by(five);
@@ -2440,13 +2440,13 @@ fn a_full_term_is_rotated_by_the_next_publisher_call() {
     let t0 = u64::from(buffer.initial_term_id.get());
     // Exactly full: no crossing reservation will ever happen in term 0.
     buffer.tail(0).unwrap().store((t0 << 32) | TERM, Ordering::Release);
-    buffer.limit.store(2 * TERM, Ordering::Release);
+    buffer.limit().store(2 * TERM, Ordering::Release);
     // The peer finds the term full and rotates; its next call publishes.
     assert_eq!(
         peer.offer(b"x", AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::AdminAction
     );
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
     assert!(matches!(
         peer.offer(b"x", AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::Appended { position } if position == TERM
@@ -2468,7 +2468,7 @@ fn a_full_term_is_rotated_by_the_next_publisher_call() {
         .tail(0)
         .unwrap()
         .store((t0 << 32) | (TERM - 32), Ordering::Release);
-    buffer.limit.store(2 * TERM, Ordering::Release);
+    buffer.limit().store(2 * TERM, Ordering::Release);
     let one = TermCount::try_new(1).unwrap();
     let t1 = buffer.initial_term_id.advanced_by(one);
     let ready = Descriptor::new(t1, buffer.generation, SlotState::Ready).encode();
@@ -2480,14 +2480,14 @@ fn a_full_term_is_rotated_by_the_next_publisher_call() {
         owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::AdminAction
     );
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 0);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 0);
     // The successor becomes ready (as the conductor's preparation would).
     buffer.descriptor(1).unwrap().store(ready, Ordering::Release);
     assert_eq!(
         owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::AdminAction
     );
-    assert_eq!(buffer.active_count.load(Ordering::Acquire), 1);
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
     assert!(matches!(
         owner.offer(&[1u8; 100], AppendOptions::default()).unwrap(),
         ConcurrentOfferOutcome::Appended { position } if position == TERM
@@ -2931,7 +2931,7 @@ fn an_aborted_writer_keeps_its_slot_until_its_accesses_end() {
     assert_eq!(serve(&mut conductor, DEADLINE), aborted(1, 96));
     let data = vec![5u8; 3000];
     let mut quarantined = 0;
-    while buffer.active_count.load(Ordering::Acquire) < 4 {
+    while buffer.active_count().load(Ordering::Acquire) < 4 {
         claim.payload().fill(1);
         let _ = offer_concurrent(&mut other, &mut conductor, &data, || {});
         quarantined += conductor.duty_cycle().unwrap().quarantined;

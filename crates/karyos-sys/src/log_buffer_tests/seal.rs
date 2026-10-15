@@ -31,7 +31,7 @@ fn an_exclusive_seal_closes_the_next_attempt_and_positions_at_the_last_block() {
             AppendOutcome::Appended { .. }
         ));
     }
-    let end = buffer.reserved_head.load(Ordering::Acquire);
+    let end = buffer.reserved_head().load(Ordering::Acquire);
     assert_eq!(conductor.seal_state(), SealState::Active);
     conductor.seal().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Sealed);
@@ -54,7 +54,7 @@ fn an_exclusive_seal_closes_the_next_attempt_and_positions_at_the_last_block() {
     // the last granted block.
     assert_eq!(buffer.cell(0).unwrap().loan.load(Ordering::SeqCst), 0);
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(buffer.limit.load(Ordering::Acquire), 0, "the limit stays zero");
+    assert_eq!(buffer.limit().load(Ordering::Acquire), 0, "the limit stays zero");
     assert_eq!(conductor.seal_state(), SealState::Retired { position: end });
     for _ in 0..2 {
         assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: end });
@@ -175,7 +175,7 @@ fn an_unissued_or_dropped_publication_does_not_delay_the_position() {
     let mut conductor = buffer.conductor().unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication.append(&message(2), AppendOptions::default()).unwrap();
-    let end = buffer.reserved_head.load(Ordering::Acquire);
+    let end = buffer.reserved_head().load(Ordering::Acquire);
     conductor.seal().unwrap();
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Sealed);
@@ -194,9 +194,9 @@ fn a_second_seal_has_no_effect() {
     conductor.seal().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Sealed);
     let _ = conductor.duty_cycle().unwrap();
-    let positioned = buffer.seal.load(Ordering::Acquire);
+    let positioned = buffer.seal().load(Ordering::Acquire);
     conductor.seal().unwrap();
-    assert_eq!(buffer.seal.load(Ordering::Acquire), positioned);
+    assert_eq!(buffer.seal().load(Ordering::Acquire), positioned);
 }
 
 #[test]
@@ -217,7 +217,7 @@ fn the_position_after_a_term_crossing_is_the_next_term_start() {
         let _ = conductor.duty_cycle().unwrap();
     }
     // The crossing padded the term: the head is the next term's start.
-    assert_eq!(buffer.reserved_head.load(Ordering::Acquire), TERM);
+    assert_eq!(buffer.reserved_head().load(Ordering::Acquire), TERM);
     conductor.seal().unwrap();
     assert_eq!(
         publication.append(&data, AppendOptions::default()).unwrap(),
@@ -238,7 +238,7 @@ fn retirement_waits_for_attached_subscribers_only() {
     let lagging = conductor.subscribe(Role::Optional).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication.append(&message(3), AppendOptions::default()).unwrap();
-    let end = buffer.reserved_head.load(Ordering::Acquire);
+    let end = buffer.reserved_head().load(Ordering::Acquire);
     conductor.seal().unwrap();
     assert!(publication.close_if_sealed());
     let _ = conductor.duty_cycle().unwrap();
@@ -266,7 +266,7 @@ fn a_concurrent_seal_is_positioned_at_once_and_handles_close() {
     conductor.seal().unwrap();
     // The fence positions the seal with both handles still holding.
     assert_eq!(conductor.seal_state(), SealState::Positioned { position: end });
-    assert!(!buffer.publishers.iter().all(crate::publication::publisher_slot_free));
+    assert!(!buffer.publisher_words().all(crate::publication::publisher_slot_free));
     assert!(matches!(
         conductor.concurrent_publication(),
         Err(SysError::Sealed)
@@ -286,7 +286,7 @@ fn a_concurrent_seal_is_positioned_at_once_and_handles_close() {
     assert_eq!(buffer.head().unwrap(), Some(end));
     assert!(b.close_if_sealed());
     // Released slots and loans; a closed handle's drop does nothing more.
-    assert!(buffer.publishers.iter().all(crate::publication::publisher_slot_free));
+    assert!(buffer.publisher_words().all(crate::publication::publisher_slot_free));
     drop(a);
     drop(b);
 }
@@ -495,7 +495,7 @@ fn a_fenced_buffer_never_rotates() {
         }
     }
     assert_eq!(
-        crate::publication::active_term_count(buffer.active_count.load(Ordering::Acquire)),
+        crate::publication::active_term_count(buffer.active_count().load(Ordering::Acquire)),
         0
     );
     let (_, end) = drain_to_end(&mut subscription);

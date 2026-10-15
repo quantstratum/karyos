@@ -192,7 +192,7 @@ impl<O: BufferOwner> Conductor<O> {
         }
         // The conductor alone seals and issues, so a seal load here sees
         // every earlier seal (`quantstratum-docs: karyos/design/publication-seal.md`).
-        if buffer.seal.load(Ordering::Relaxed) != 0 {
+        if buffer.seal().load(Ordering::Relaxed) != 0 {
             return Err(SysError::Sealed);
         }
         // Allocated before a slot is taken, so a failure leaves no slot held.
@@ -215,8 +215,7 @@ impl<O: BufferOwner> Conductor<O> {
         // made after its last access.
         let Some((index, previous)) =
             buffer
-                .publishers
-                .iter()
+                .publisher_words()
                 .enumerate()
                 .find_map(|(index, word)| {
                     acquire_publisher_slot(word).map(|previous| (index, previous))
@@ -225,7 +224,7 @@ impl<O: BufferOwner> Conductor<O> {
             return Ok(None);
         };
         let issue = || -> Result<TermCount, SysError> {
-            let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
+            let active = TermCount::try_new(buffer.active_count().load(Ordering::Acquire) as u32)?;
             let mut crossed_error = None;
             let from = reissue_from(previous, active.get(), || {
                 // `t_close` is still active here.
@@ -249,7 +248,7 @@ impl<O: BufferOwner> Conductor<O> {
             Ok(from) => from,
             Err(error) => {
                 // Not issued: give the slot back as it was.
-                if let Some(word) = buffer.publishers.get(index) {
+                if let Some(word) = buffer.publisher(index) {
                     word.store(
                         previous.map_or(0, |t_close| u64::from(t_close) + 1),
                         Ordering::Release,
@@ -543,7 +542,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }
         // The head of the handle's own term, never above the true head.
         let head = buffer.position(count, offset);
-        if head + u64::from(reserved) > buffer.limit.load(Ordering::Acquire) {
+        if head + u64::from(reserved) > buffer.limit().load(Ordering::Acquire) {
             return Ok(Reserved::Outcome(AppendOutcome::BackPressured));
         }
         // Admitted by the limit it read; a fence may still come first.
@@ -616,7 +615,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// `Closed` at once (`quantstratum-docs: karyos/design/publication-seal.md`). The caller
     /// resolved any forgotten claim first.
     fn observe_seal(&mut self) -> bool {
-        if !observe_seal(&self.buffer.seal) {
+        if !observe_seal(self.buffer.seal()) {
             return false;
         }
         self.release();
@@ -633,8 +632,8 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         {
             release_loan(&cell.loan);
         }
-        let active = buffer.active_count.load(Ordering::Acquire) as u32;
-        if let Some(word) = buffer.publishers.get(self.index) {
+        let active = buffer.active_count().load(Ordering::Acquire) as u32;
+        if let Some(word) = buffer.publisher(self.index) {
             // After the handle's last access.
             release_publisher_slot(word, active);
         }
@@ -654,7 +653,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         };
         let _ = rotate_to(
             buffer.descriptor(slot)?,
-            &buffer.active_count,
+            buffer.active_count(),
             buffer.initial_term_id.advanced_by(next),
             buffer.generation,
             next,
@@ -679,7 +678,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// attempt (`help`) when a crossed handle finds no later active term.
     fn catch_up_helping(&mut self, help: &mut bool) -> Result<bool, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        let active = TermCount::try_new(buffer.active_count.load(Ordering::Acquire) as u32)?;
+        let active = TermCount::try_new(buffer.active_count().load(Ordering::Acquire) as u32)?;
         let cell = buffer.cell(self.index)?;
         match self.state {
             HandleState::Active { crossed: false, .. } => return Ok(true),

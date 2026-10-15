@@ -11,8 +11,8 @@
 //!   by allocating; nothing adapts a mapping or other storage into it.
 //! - [`SharedTerms`]: storage that another process may access. Every byte
 //!   is moved as naturally aligned `AtomicU64` words; it has no plain path.
-//!   Today it is built over [`HeapWords`] (single process, for validation);
-//!   construction from an admitted IPC mapping comes with admission.
+//!   Its words live in the log buffer's backing (`quantstratum-docs: karyos/design/ipc-log-buffer.md`):
+//!   heap words of this process, or a shared region.
 //!
 //! Both implement the sealed [`TermBytes`] trait. Every access is an
 //! `unsafe fn` whose caller (the log buffer) proves it holds the right to
@@ -29,11 +29,12 @@ use core::fmt::Debug;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU64;
 
-#[cfg(test)]
-use crate::atomic_view::AtomicWords;
-use crate::atomic_view::{HeapWords, WORD_BYTES};
+use std::sync::Arc;
+
+use crate::atomic_view::WORD_BYTES;
 use crate::error::SysError;
 use crate::frame::FRAME_ALIGNMENT;
+use crate::log_buffer::storage::Backing;
 use crate::publication::{clear_word, load_body, store_body};
 use crate::sizing::TermLength;
 
@@ -44,7 +45,7 @@ const REGION_ALIGNMENT: usize = 4096;
 const WORD0_BYTES: usize = 8;
 
 pub(crate) mod sealed {
-    use super::{AtomicU64, NonNull, SysError, TermLength};
+    use super::{Arc, AtomicU64, Backing, NonNull, SysError, TermLength};
 
     /// Proof that the caller is this crate: only it can build one.
     #[derive(Debug, Clone, Copy)]
@@ -61,8 +62,19 @@ pub(crate) mod sealed {
         /// Whether [`Access::direct_bytes`] exposes term bytes.
         const DIRECT: bool;
 
-        /// Allocates `slots` zeroed terms.
-        fn allocate(token: Token, term_length: TermLength, slots: u8) -> Result<Self, SysError>;
+        /// Whether the terms live in the buffer's backing (the atomic-only
+        /// ABI) rather than in a private allocation.
+        const IN_BACKING: bool;
+
+        /// The `slots` zeroed terms: a private allocation, or the words from
+        /// `first` of `backing` for a backing that holds them.
+        fn create(
+            token: Token,
+            term_length: TermLength,
+            slots: u8,
+            backing: &Arc<Backing>,
+            first: usize,
+        ) -> Result<Self, SysError>;
 
         /// The atomic word 0 at `offset` of `slot`.
         ///
@@ -184,11 +196,14 @@ impl HeapTerms {
 
 impl sealed::Access for HeapTerms {
     const DIRECT: bool = true;
+    const IN_BACKING: bool = false;
 
-    fn allocate(
+    fn create(
         _token: sealed::Token,
         term_length: TermLength,
         slots: u8,
+        _backing: &Arc<Backing>,
+        _first: usize,
     ) -> Result<Self, SysError> {
         let len = checked_len(term_length, slots)?;
         let layout = Layout::from_size_align(len, REGION_ALIGNMENT)
@@ -269,20 +284,28 @@ impl Drop for HeapTerms {
 /// for memory another process may touch. No plain copy reaches it.
 #[derive(Debug)]
 pub struct SharedTerms {
-    words: HeapWords,
+    backing: Arc<Backing>,
+    /// The first word of the terms in the backing.
+    first: usize,
+    /// Words of all terms.
+    count: usize,
     term_length: u32,
     slots: u8,
 }
 
 impl SharedTerms {
     fn word(&self, index: usize) -> Option<&AtomicU64> {
-        self.words.word(index)
+        if index >= self.count {
+            return None;
+        }
+        self.backing.word(self.first.checked_add(index)?)
     }
 
-    /// Every word, for tests that act as a peer keeping the access ABI.
+    /// The word at `index` of the terms, for tests that act as a peer
+    /// keeping the access ABI.
     #[cfg(test)]
-    pub(crate) fn words(&self) -> AtomicWords<'_> {
-        self.words.words()
+    pub(crate) fn test_word(&self, index: usize) -> Option<&AtomicU64> {
+        self.word(index)
     }
 
     /// Index of the word at byte `offset` of `slot`.
@@ -295,15 +318,29 @@ impl SharedTerms {
 
 impl sealed::Access for SharedTerms {
     const DIRECT: bool = false;
+    const IN_BACKING: bool = true;
 
-    fn allocate(
+    fn create(
         _token: sealed::Token,
         term_length: TermLength,
         slots: u8,
+        backing: &Arc<Backing>,
+        first: usize,
     ) -> Result<Self, SysError> {
         let len = checked_len(term_length, slots)?;
+        let count = len / WORD_BYTES;
+        // Every term word must lie inside the backing.
+        let last = first
+            .checked_add(count)
+            .and_then(|end| end.checked_sub(1))
+            .ok_or(SysError::InvalidRegion { address: 0, len })?;
+        if backing.word(last).is_none() {
+            return Err(SysError::InvalidRegion { address: 0, len });
+        }
         Ok(Self {
-            words: HeapWords::zeroed(len / WORD_BYTES)?,
+            backing: Arc::clone(backing),
+            first,
+            count,
             term_length: term_length.get(),
             slots,
         })
