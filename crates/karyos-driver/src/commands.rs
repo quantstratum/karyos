@@ -18,11 +18,11 @@ use karyos_client::link::{
     Capability, ClientLink, HandOverEntry, Lease, LeaseEnd, LeaseState, Owner,
 };
 use karyos_protocol::cnc::{
-    Command, ErrorCode, MAX_COMMAND_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey,
-    SubscriberRole,
+    CloseReason, Command, ErrorCode, Event as DriverEvent, LossPolicyCode, MAX_COMMAND_LENGTH,
+    MAX_EVENT_LENGTH, MAX_RESPONSE_LENGTH, RequestId, Response, StreamKey, SubscriberRole,
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
-use karyos_sys::log_buffer::{LossPolicy, Revocation, Role};
+use karyos_sys::log_buffer::{LossPolicy, Revocation, Role, SealState};
 
 use crate::counters::Event;
 use crate::embedded::EmbeddedDriver;
@@ -30,6 +30,17 @@ use crate::error::DriverError;
 use crate::generations::MemberKind;
 
 /// A client's registration in the driver.
+/// A lost `hold` participant whose bound has not been withdrawn yet.
+#[derive(Debug)]
+pub(crate) struct Holding {
+    stream: u64,
+    key: StreamKey,
+    cell: usize,
+    occupant: u64,
+    registration: u64,
+    position: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct ClientSlot {
     id: u64,
@@ -57,7 +68,7 @@ pub(crate) struct Registration {
     kind: Kind,
     end: Arc<LeaseEnd>,
     /// For a subscription: its cell, its occupant id and its role.
-    subscriber: Option<(usize, u64, Role)>,
+    pub(crate) subscriber: Option<(usize, u64, Role)>,
 }
 
 impl Registration {
@@ -189,30 +200,111 @@ impl EmbeddedDriver {
     /// each cell is revoked as its occupant, so a cell that changed hands
     /// is left alone.
     fn revoke_client(&mut self, client: u64) {
-        let lost: Vec<(u64, usize, u64, Role)> = self
+        let lost: Vec<(u64, u64, usize, u64, Role)> = self
             .registrations
             .iter()
             .filter(|registration| registration.client == client)
             .filter_map(|registration| {
-                registration
-                    .subscriber
-                    .map(|(cell, occupant, role)| (registration.stream, cell, occupant, role))
+                registration.subscriber.map(|(cell, occupant, role)| {
+                    (registration.id, registration.stream, cell, occupant, role)
+                })
             })
             .collect();
-        for (stream, cell, occupant, role) in lost {
+        for (registration, stream, cell, occupant, role) in lost {
             let Some(target) = self.streams.iter_mut().find(|s| s.id == stream) else {
                 continue;
             };
             let policy = target.policy;
-            match target.conductor.revoke_participant(cell, occupant, policy) {
-                Ok(Revocation::Stale) | Err(_) => {}
-                Ok(_) => {
-                    self.counters.add(Event::ParticipantsRevoked, 1);
-                    if role == Role::Required {
-                        self.counters.add(Event::RequiredParticipantsLost, 1);
-                    }
-                }
+            let key = StreamKey {
+                stream_id: target.stream_id,
+                session_id: target.session_id,
+            };
+            let position = target.conductor.cell_position(cell).unwrap_or(0);
+            // Sealing is idempotent: only the revocation that moves the
+            // stream out of `Active` reports its closing.
+            let was_active = target.conductor.seal_state() == SealState::Active;
+            let revocation = target.conductor.revoke_participant(cell, occupant, policy);
+            let revocation = match revocation {
+                Ok(Revocation::Stale) | Err(_) => continue,
+                Ok(revocation) => revocation,
+            };
+            self.counters.add(Event::ParticipantsRevoked, 1);
+            if role != Role::Required {
+                continue;
             }
+            self.counters.add(Event::RequiredParticipantsLost, 1);
+            self.emit(&DriverEvent::ParticipantLost {
+                stream: key,
+                registration,
+                client,
+                policy: match policy {
+                    LossPolicy::Hold => LossPolicyCode::Hold,
+                    LossPolicy::Continue => LossPolicyCode::Continue,
+                    LossPolicy::Abort => LossPolicyCode::Abort,
+                },
+                position,
+            });
+            match revocation {
+                Revocation::Holding => self.holding.push(Holding {
+                    stream,
+                    key,
+                    cell,
+                    occupant,
+                    registration,
+                    position,
+                }),
+                Revocation::Withdrawn if policy == LossPolicy::Hold => {
+                    self.emit(&DriverEvent::RequiredBoundWithdrawn {
+                        stream: key,
+                        registration,
+                        position,
+                    });
+                }
+                Revocation::Sealed if was_active => self.emit(&DriverEvent::PublicationClosed {
+                    stream: key,
+                    reason: CloseReason::RequiredParticipantLost,
+                }),
+                _ => {}
+            }
+        }
+    }
+
+    /// Reports every lost `hold` participant whose bound a duty cycle's
+    /// rescan withdrew (or whose cell was freed by its detach).
+    pub(crate) fn report_withdrawn_bounds(&mut self) {
+        let mut index = 0;
+        while let Some(entry) = self.holding.get(index) {
+            let still = self
+                .streams
+                .iter()
+                .find(|s| s.id == entry.stream)
+                .is_some_and(|s| s.conductor.holding(entry.cell, entry.occupant));
+            if still {
+                index += 1;
+                continue;
+            }
+            let entry = self.holding.swap_remove(index);
+            self.emit(&DriverEvent::RequiredBoundWithdrawn {
+                stream: entry.key,
+                registration: entry.registration,
+                position: entry.position,
+            });
+        }
+    }
+
+    /// Transmits a driver event when the broadcast buffer has room for it;
+    /// otherwise counts it as not sent. Events are best effort: the
+    /// counters record every loss either way.
+    pub(crate) fn emit(&mut self, event: &DriverEvent) {
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let sent = event
+            .encode(&mut out)
+            .ok()
+            .and_then(|length| out.get(..length))
+            .filter(|payload| self.broadcast.has_room(payload.len()))
+            .map(|payload| self.broadcast.transmit(event.type_id(), payload));
+        if !matches!(sent, Some(Ok(_))) {
+            self.counters.add(Event::EventsNotSent, 1);
         }
     }
 
