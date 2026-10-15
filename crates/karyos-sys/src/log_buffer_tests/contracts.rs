@@ -657,6 +657,124 @@ fn test_log_buffer_exact_fill_then_pad_only_offer_has_exact_attempt_counts() {
     assert_eq!(publication.offer_attempt_counts(), (0, 1));
 }
 
+/// The word 0 at `offset` of slot 0, as a reader would load it.
+fn slot0_word0(buffer: &LogBuffer<Terms>, offset: u32) -> Word0 {
+    // SAFETY: single-threaded test; slot 0 holds the published term.
+    Word0::unpack(load_interior(unsafe { buffer.regions.word0(0, offset) })).unwrap()
+}
+
+/// §13 "Offer that only pads", immediate rotation on the concurrent path:
+/// the offer whose reservation crosses the term end makes exactly one
+/// reservation and one rotation attempt, which succeeds at once (the next
+/// term is `READY`), and returns `AdminAction`, never `Appended`. The
+/// remainder of the term is one committed `PAD` frame up to the term end,
+/// read back from the buffer, and a reader crosses it without an abort:
+/// it receives exactly the messages reported `Appended`, the crossing
+/// offer's payload never.
+#[test]
+fn test_log_buffer_pad_only_offer_with_immediate_rotation_commits_one_pad() {
+    let buffer = new_buffer(concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = conductor.concurrent_publication().unwrap().unwrap();
+    // 3104 reserved bytes: never an exact fill of a 64 KiB term.
+    let reserved = reserved_of(&tagged_message(1, 0, 3000));
+    assert_ne!(MIN_TERM_LENGTH % reserved, 0);
+    let mut appended = Vec::new();
+    let mut received = Vec::new();
+    let mut sequence = 0u32;
+    let start = loop {
+        // The conductor prepares the next term before the crossing, so the
+        // crossing offer's rotation succeeds at once.
+        let _ = conductor.duty_cycle().unwrap();
+        while let Some(message) = poll_message(&mut subscription) {
+            received.push(message);
+        }
+        let start = buffer.tail(0).unwrap().load(Ordering::Acquire) as u32;
+        let data = tagged_message(1, sequence, 3000);
+        sequence += 1;
+        match publication.offer(&data, AppendOptions::default()).unwrap() {
+            ConcurrentOfferOutcome::Appended { position } => {
+                assert_eq!(publication.offer_attempt_counts(), (1, 0));
+                assert!(position < TERM);
+                appended.push(data);
+            }
+            ConcurrentOfferOutcome::AdminAction => break start,
+            outcome => panic!("unexpected {outcome:?}"),
+        }
+        assert!(sequence < 100, "term 0 never filled");
+    };
+    // One reservation (the crossing) and one rotation attempt, which
+    // succeeded: term 1 is active.
+    assert!(start + reserved > MIN_TERM_LENGTH);
+    assert_eq!(publication.offer_attempt_counts(), (1, 1));
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 1);
+    // The remainder is one committed PAD frame up to the term end.
+    let pad = slot0_word0(&buffer, start);
+    assert_eq!(pad.frame_type_code(), FrameType::Pad.code());
+    assert_eq!(pad.frame_length(), (MIN_TERM_LENGTH - start) as i32);
+    // The reader reaches the PAD with no abort (`poll_message` panics on
+    // any outcome but a message or `Pending`) and receives exactly what was
+    // reported Appended.
+    while let Some(message) = poll_message(&mut subscription) {
+        received.push(message);
+    }
+    assert_eq!(received, appended);
+    // The next message lands at the start of term 1.
+    let next = tagged_message(1, sequence, 3000);
+    assert_eq!(
+        publication.offer(&next, AppendOptions::default()).unwrap(),
+        ConcurrentOfferOutcome::Appended { position: TERM }
+    );
+    assert_eq!(publication.offer_attempt_counts(), (1, 0));
+    assert_eq!(poll_message(&mut subscription), Some(next));
+}
+
+/// §13 "Offer that only pads", delayed rotation on the concurrent path:
+/// when the next term is not prepared, the crossing offer still commits
+/// its remainder as one `PAD` frame (read back) and returns `AdminAction`
+/// rather than `Appended`, after one reservation and one (failed)
+/// rotation attempt.
+#[test]
+fn test_log_buffer_pad_only_offer_with_delayed_rotation_commits_one_pad() {
+    let buffer = new_buffer(concurrent_config(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    // Connected, so the offer is not refused as unconnected.
+    let _subscription = conductor.subscribe(Role::Optional).unwrap();
+    let t0 = u64::from(buffer.initial_term_id.get());
+    let start = MIN_TERM_LENGTH - 32;
+    buffer
+        .tail(0)
+        .unwrap()
+        .store((t0 << 32) | u64::from(start), Ordering::Release);
+    buffer.reserved_head().store(u64::from(start), Ordering::Release);
+    let t1 = buffer
+        .initial_term_id
+        .advanced_by(TermCount::try_new(1).unwrap());
+    buffer.descriptor(1).unwrap().store(
+        Descriptor::new(t1, buffer.generation, SlotState::Free).encode(),
+        Ordering::Release,
+    );
+    buffer
+        .table_slot(TermCount::try_new(1).unwrap())
+        .unwrap()
+        .store(0, Ordering::Release);
+    buffer.limit().store(2 * TERM, Ordering::Release);
+    let mut publication = conductor.concurrent_publication().unwrap().unwrap();
+
+    assert_eq!(
+        publication
+            .offer(&vec![5u8; 7000], AppendOptions::default())
+            .unwrap(),
+        ConcurrentOfferOutcome::AdminAction
+    );
+    assert_eq!(publication.offer_attempt_counts(), (1, 1));
+    assert_eq!(buffer.active_count().load(Ordering::Acquire), 0);
+    let pad = slot0_word0(&buffer, start);
+    assert_eq!(pad.frame_type_code(), FrameType::Pad.code());
+    assert_eq!(pad.frame_length(), 32);
+}
+
 /// §13 "Immediate offer": one successful append has one reservation and no
 /// rotation attempt.
 #[test]
