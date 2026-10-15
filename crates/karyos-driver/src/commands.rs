@@ -156,6 +156,11 @@ impl EmbeddedDriver {
         let timeout = self.config.client_liveness_timeout;
         let mut late = Vec::new();
         for (index, slot) in self.clients.iter_mut().enumerate() {
+            // A client that closed since retirement ran is retired on the
+            // next cycle, not timed out.
+            if slot.link.is_closed() {
+                continue;
+            }
             let Some(consumer) = slot.consumer.as_ref() else {
                 continue;
             };

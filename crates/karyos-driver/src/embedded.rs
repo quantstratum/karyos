@@ -667,8 +667,10 @@ impl EmbeddedDriver {
         let admitted = self.serve_admission();
         #[cfg(not(target_os = "linux"))]
         let admitted = 0;
-        let alive = self.serve_liveness();
+        // Retire before sampling liveness: an orderly close at the
+        // deadline is a retirement, not a time-out.
         self.retire_closed_clients();
+        let alive = self.serve_liveness();
         self.sweep_ended_registrations();
         self.free_retired_streams();
         let mut work = self
