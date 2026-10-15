@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use karyos_sys::frame::EXTENSION_LENGTH;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, Subscription};
+use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Next, Successor, representable};
@@ -111,13 +112,13 @@ pub struct PollError {
 
 /// A subscription on one stream.
 #[derive(Debug)]
-pub struct ClientSubscription {
-    inner: Subscription<Arc<LogBuffer>>,
+pub struct ClientSubscription<T: TermBytes = HeapTerms> {
+    inner: Subscription<Arc<LogBuffer<T>>>,
     scratch: Box<[u8]>,
     origin: Option<Origin>,
     /// The link to the stream's successor mappings, if the driver gave one
     /// (`quantstratum-docs: karyos/design/mapping-generations.md`).
-    link: Option<Arc<GenerationLink>>,
+    link: Option<Arc<GenerationLink<T>>>,
     /// The stream position where this handle's mapping starts.
     base: u64,
     /// The stream lease of a handle from the direct driver API, held only
@@ -125,11 +126,11 @@ pub struct ClientSubscription {
     _lease: Option<Lease>,
 }
 
-impl ClientSubscription {
+impl<T: TermBytes> ClientSubscription<T> {
     /// Wraps a log buffer subscription, allocating its private copy buffer
     /// (control path) for the largest message of the buffer it reads.
     #[must_use]
-    pub fn new(inner: Subscription<Arc<LogBuffer>>) -> Self {
+    pub fn new(inner: Subscription<Arc<LogBuffer<T>>>) -> Self {
         let max_message_length = inner.buffer().max_message_length();
         Self {
             inner,
@@ -151,7 +152,7 @@ impl ClientSubscription {
     /// then dropped, releasing what it holds.
     pub fn with_generation(
         mut self,
-        link: Arc<GenerationLink>,
+        link: Arc<GenerationLink<T>>,
         base: u64,
     ) -> Result<Self, ClientError> {
         if !representable(base, self.inner.buffer()) {
@@ -164,14 +165,14 @@ impl ClientSubscription {
 
     /// The handle's generation link, if any.
     #[must_use]
-    pub fn generation_link(&self) -> Option<&Arc<GenerationLink>> {
+    pub fn generation_link(&self) -> Option<&Arc<GenerationLink<T>>> {
         self.link.as_ref()
     }
 
     /// Wraps a subscription from the direct driver API; the handle keeps
     /// the stream's lease until it is dropped.
     #[must_use]
-    pub fn with_lease(inner: Subscription<Arc<LogBuffer>>, lease: Lease) -> Self {
+    pub fn with_lease(inner: Subscription<Arc<LogBuffer<T>>>, lease: Lease) -> Self {
         let mut subscription = Self::new(inner);
         subscription._lease = Some(lease);
         subscription
@@ -180,7 +181,7 @@ impl ClientSubscription {
     /// Wraps a subscription handed over through a client conductor; the
     /// handle keeps the stream's lease until it is dropped.
     #[must_use]
-    pub fn from_hand_over(inner: Subscription<Arc<LogBuffer>>, origin: Origin) -> Self {
+    pub fn from_hand_over(inner: Subscription<Arc<LogBuffer<T>>>, origin: Origin) -> Self {
         let mut subscription = Self::new(inner);
         subscription.origin = Some(origin);
         subscription

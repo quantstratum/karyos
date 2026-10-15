@@ -24,10 +24,14 @@ use karyos_client::ipc::{AttachError, RemoteClient, attach};
 use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, MonotonicClock};
 use karyos_protocol::admission::{MAX_MESSAGE_LENGTH, Message, VERSION};
 use karyos_sys::ipc::{self, PidFd, Recv, SOCKET_NAME, Sent};
+use karyos_sys::term_bytes::SharedTerms;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Serializes the tests of this binary (see the module documentation).
+/// The driver of these tests: IPC mode, every stream in a shared region.
+type IpcDriver = EmbeddedDriver<SharedTerms>;
+
 fn serial() -> MutexGuard<'static, ()> {
     SERIAL
         .lock()
@@ -61,7 +65,7 @@ fn config(dir: &Path, pending: usize) -> IpcConfig {
     }
 }
 
-fn driver_with(dir: &Path, pending: usize, clock: &ManualClock) -> EmbeddedDriver {
+fn driver_with(dir: &Path, pending: usize, clock: &ManualClock) -> IpcDriver {
     EmbeddedDriver::with_ipc(
         DriverConfig::default(),
         config(dir, pending),
@@ -80,7 +84,7 @@ fn try_driver(dir: &Path) -> bool {
 }
 
 /// Attaches on another thread while this one runs duty cycles.
-fn attach_serving(driver: &mut EmbeddedDriver, dir: &Path) -> Result<RemoteClient, AttachError> {
+fn attach_serving(driver: &mut IpcDriver, dir: &Path) -> Result<RemoteClient, AttachError> {
     std::thread::scope(|scope| {
         let handle = scope.spawn(|| attach(dir, Duration::from_secs(5), 16));
         while !handle.is_finished() {
@@ -92,7 +96,7 @@ fn attach_serving(driver: &mut EmbeddedDriver, dir: &Path) -> Result<RemoteClien
 }
 
 /// Duty cycles until `done` or a few seconds pass.
-fn serve_until(driver: &mut EmbeddedDriver, mut done: impl FnMut(&EmbeddedDriver) -> bool) {
+fn serve_until(driver: &mut IpcDriver, mut done: impl FnMut(&IpcDriver) -> bool) {
     let start = Instant::now();
     while !done(driver) {
         assert!(start.elapsed() < Duration::from_secs(5), "timed out");

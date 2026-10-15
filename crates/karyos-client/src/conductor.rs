@@ -20,6 +20,7 @@ use karyos_protocol::cnc::{
 };
 use karyos_sys::broadcast::{BroadcastReceiver, Received};
 use karyos_sys::command_ring::{RingError, RingProducer};
+use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 use thiserror::Error;
 
 use crate::concurrent::ClientConcurrentPublication;
@@ -50,13 +51,13 @@ pub enum ConductorError {
 
 /// How a request ended.
 #[derive(Debug)]
-pub enum Outcome {
+pub enum Outcome<T: TermBytes = HeapTerms> {
     /// The publication, ready to offer.
-    Publication(ClientPublication),
+    Publication(ClientPublication<T>),
     /// A concurrent publication handle, ready to offer.
-    ConcurrentPublication(ClientConcurrentPublication),
+    ConcurrentPublication(ClientConcurrentPublication<T>),
     /// The subscription, ready to poll.
-    Subscription(ClientSubscription),
+    Subscription(ClientSubscription<T>),
     /// The command succeeded.
     Succeeded,
     /// The driver refused the command; it had no effect.
@@ -71,11 +72,11 @@ pub enum Outcome {
     Unknown,
 }
 
-impl Outcome {
+impl<T: TermBytes> Outcome<T> {
     /// Attaches a generation link to a delivered handle. A base the handle
     /// refuses would be a driver defect: the handle is dropped and the
     /// outcome is not known.
-    fn with_generation(self, link: Arc<GenerationLink>, base: u64) -> Self {
+    fn with_generation(self, link: Arc<GenerationLink<T>>, base: u64) -> Self {
         let attached = match self {
             Self::Publication(handle) => handle.with_generation(link, base).map(Self::Publication),
             Self::ConcurrentPublication(handle) => handle
@@ -92,11 +93,11 @@ impl Outcome {
 
 /// A completed request.
 #[derive(Debug)]
-pub struct Completion {
+pub struct Completion<T: TermBytes = HeapTerms> {
     /// The request sequence returned when it was submitted.
     pub sequence: u64,
     /// How it ended.
-    pub outcome: Outcome,
+    pub outcome: Outcome<T>,
 }
 
 /// What one [`ClientConductor::poll`] did.
@@ -126,11 +127,11 @@ struct Pending {
 /// A client's conductor (not `Clone`). Dropping it closes the client: the
 /// command ring producer is dropped first, then the close flag is set.
 #[derive(Debug)]
-pub struct ClientConductor {
+pub struct ClientConductor<T: TermBytes = HeapTerms> {
     owner: Owner,
     producer: Option<RingProducer>,
     receiver: BroadcastReceiver,
-    link: Arc<ClientLink>,
+    link: Arc<ClientLink<T>>,
     next_sequence: u64,
     pending: Vec<Pending>,
     /// Requests already terminalized as `Unknown` whose notification has
@@ -162,7 +163,7 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 /// Default time a client waits for the driver's heartbeat to change.
 pub const DEFAULT_DRIVER_TIMEOUT: Duration = Duration::from_secs(10);
 
-impl ClientConductor {
+impl<T: TermBytes> ClientConductor<T> {
     /// Creates the conductor for an admitted client (called by the driver,
     /// control path: allocates the pending list).
     #[must_use]
@@ -170,7 +171,7 @@ impl ClientConductor {
         owner: Owner,
         producer: RingProducer,
         receiver: BroadcastReceiver,
-        link: Arc<ClientLink>,
+        link: Arc<ClientLink<T>>,
         max_pending: usize,
     ) -> Self {
         Self {
@@ -326,8 +327,8 @@ impl ClientConductor {
     )]
     pub fn remove_publication(
         &mut self,
-        publication: ClientPublication,
-    ) -> Result<u64, (ClientPublication, ConductorError)> {
+        publication: ClientPublication<T>,
+    ) -> Result<u64, (ClientPublication<T>, ConductorError)> {
         let Some(registration) = self.owned(publication.origin()) else {
             return Err((publication, ConductorError::ForeignHandle));
         };
@@ -361,8 +362,8 @@ impl ClientConductor {
     )]
     pub fn remove_concurrent_publication(
         &mut self,
-        publication: ClientConcurrentPublication,
-    ) -> Result<u64, (ClientConcurrentPublication, ConductorError)> {
+        publication: ClientConcurrentPublication<T>,
+    ) -> Result<u64, (ClientConcurrentPublication<T>, ConductorError)> {
         let Some(registration) = self.owned(publication.origin()) else {
             return Err((publication, ConductorError::ForeignHandle));
         };
@@ -396,8 +397,8 @@ impl ClientConductor {
     )]
     pub fn remove_subscription(
         &mut self,
-        subscription: ClientSubscription,
-    ) -> Result<u64, (ClientSubscription, ConductorError)> {
+        subscription: ClientSubscription<T>,
+    ) -> Result<u64, (ClientSubscription<T>, ConductorError)> {
         let Some(registration) = self.owned(subscription.origin()) else {
             return Err((subscription, ConductorError::ForeignHandle));
         };
@@ -475,7 +476,7 @@ impl ClientConductor {
     /// Returns early when nothing more is published.
     pub fn poll<F>(&mut self, limit: usize, mut on: F) -> ConductorPoll
     where
-        F: FnMut(Completion),
+        F: FnMut(Completion<T>),
     {
         let mut report = ConductorPoll::default();
         self.serve_liveness();
@@ -552,7 +553,7 @@ impl ClientConductor {
         report
     }
 
-    fn outcome(&self, kind: Kind, response: Response) -> Outcome {
+    fn outcome(&self, kind: Kind, response: Response) -> Outcome<T> {
         match (kind, response) {
             (
                 Kind::AddPublication,
@@ -630,13 +631,13 @@ impl ClientConductor {
     /// Terminalizes every pending request as `Unknown` before any callback
     /// runs (a late response can no longer match it), then delivers the
     /// notifications.
-    fn fail_pending<F: FnMut(Completion)>(&mut self, on: &mut F) {
+    fn fail_pending<F: FnMut(Completion<T>)>(&mut self, on: &mut F) {
         self.unknown
             .extend(self.pending.drain(..).map(|pending| pending.sequence));
         self.deliver_unknown(on);
     }
 
-    fn deliver_unknown<F: FnMut(Completion)>(&mut self, on: &mut F) {
+    fn deliver_unknown<F: FnMut(Completion<T>)>(&mut self, on: &mut F) {
         while let Some(&sequence) = self.unknown.front() {
             on(Completion {
                 sequence,
@@ -653,7 +654,7 @@ impl ClientConductor {
     }
 }
 
-impl Drop for ClientConductor {
+impl<T: TermBytes> Drop for ClientConductor<T> {
     fn drop(&mut self) {
         drop(self.producer.take());
         self.link.mark_closed();

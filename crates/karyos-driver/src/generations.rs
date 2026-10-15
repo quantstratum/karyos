@@ -20,7 +20,7 @@ use karyos_sys::log_buffer::{Conductor, LogBuffer, LogBufferConfig, Role, SealSt
 use karyos_sys::sizing::TermLength;
 use karyos_sys::term::Generation;
 
-use crate::embedded::{EmbeddedDriver, Stream, StreamHandle};
+use crate::embedded::{EmbeddedDriver, Stream, StreamHandle, StreamTerms};
 use crate::error::DriverError;
 
 /// What a reconfiguration changes (SPEC.md §4): the term length and the slot
@@ -46,8 +46,8 @@ pub struct GenerationInfo {
 
 /// A handle on the stream's current mapping, through its generation link.
 #[derive(Debug)]
-pub(crate) struct Member {
-    pub(crate) link: Weak<GenerationLink>,
+pub(crate) struct Member<T: StreamTerms> {
+    pub(crate) link: Weak<GenerationLink<T>>,
     pub(crate) kind: MemberKind,
 }
 
@@ -61,38 +61,41 @@ pub(crate) enum MemberKind {
 
 /// A predecessor mapping, kept while anything references it.
 #[derive(Debug)]
-pub(crate) struct Retained {
+pub(crate) struct Retained<T: StreamTerms> {
     pub(crate) generation: Generation,
     pub(crate) base: u64,
     /// Its seal position, local to the mapping.
     pub(crate) seal: u64,
-    pub(crate) buffer: Arc<LogBuffer>,
-    pub(crate) conductor: Conductor<Arc<LogBuffer>>,
+    pub(crate) buffer: Arc<LogBuffer<T>>,
+    pub(crate) conductor: Conductor<Arc<LogBuffer<T>>>,
 }
 
 /// A cutover in progress.
 #[derive(Debug)]
-pub(crate) enum Cutover {
+pub(crate) enum Cutover<T: StreamTerms> {
     /// The successor exists; the predecessor's seal is not positioned yet.
-    Pending(Box<Pending>),
+    Pending(Box<Pending<T>>),
     /// The successor is current; offered capabilities wait to be taken.
-    Open { opened_at: u64, offers: Vec<Offer> },
+    Open {
+        opened_at: u64,
+        offers: Vec<Offer<T>>,
+    },
 }
 
 /// A pending cutover: the successor and the handles waiting for it.
 #[derive(Debug)]
-pub(crate) struct Pending {
-    successor: Arc<LogBuffer>,
-    conductor: Conductor<Arc<LogBuffer>>,
+pub(crate) struct Pending<T: StreamTerms> {
+    successor: Arc<LogBuffer<T>>,
+    conductor: Conductor<Arc<LogBuffer<T>>>,
     generation: Generation,
     config: LogBufferConfig,
-    snapshot: Vec<Member>,
+    snapshot: Vec<Member<T>>,
 }
 
 /// A successor capability offered to one handle.
 #[derive(Debug)]
-pub(crate) struct Offer {
-    link: Weak<GenerationLink>,
+pub(crate) struct Offer<T: StreamTerms> {
+    link: Weak<GenerationLink<T>>,
     /// A subscriber's progress lease; `None` for a publisher.
     lease: Option<ProgressLease>,
 }
@@ -106,7 +109,7 @@ struct ProgressLease {
     sampled_at: u64,
 }
 
-impl Cutover {
+impl<T: StreamTerms> Cutover<T> {
     pub(crate) fn is_pending(&self) -> bool {
         matches!(self, Self::Pending(_))
     }
@@ -141,7 +144,7 @@ fn expired(since: u64, deadline: u64, now: u64) -> bool {
         .is_some_and(|expiry| now >= expiry)
 }
 
-impl Stream {
+impl<T: StreamTerms> Stream<T> {
     /// One duty cycle of the cutover: opens a pending one once the
     /// predecessor's seal is positioned, then fences the handles whose
     /// deadline or lease expired, and ends the cutover when no offer is
@@ -334,7 +337,7 @@ impl Stream {
     }
 }
 
-impl EmbeddedDriver {
+impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Replaces the stream's mapping with a successor of another term length
     /// or slot count (SPEC.md §4 mapping generations;
     /// `quantstratum-docs: karyos/design/mapping-generations.md`). Control path: creates the
@@ -400,10 +403,13 @@ impl EmbeddedDriver {
         if maximum >= 1 << 63 {
             return Err(DriverError::PositionsExhausted);
         }
-        let successor = Arc::new(LogBuffer::new_with_generation(config, generation)?);
+        let successor = Arc::new(<T as crate::embedded::sealed::Create>::create(
+            self, config, generation,
+        )?);
         let conductor = successor
             .conductor_owned()
             .ok_or(SysError::ResourcesUnavailable)?;
+        let target = self.active_stream_mut(stream)?;
         // Effect.
         target.conductor.seal()?;
         target.spare = None;

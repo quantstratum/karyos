@@ -11,6 +11,7 @@ use karyos_sys::log_buffer::{
     ConcurrentClaimOutcome as SysClaimOutcome, ConcurrentOfferOutcome as SysOfferOutcome,
     ConcurrentPublication, LogBuffer,
 };
+use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use crate::error::ClientError;
 use crate::generation::{End, GenerationLink, Next, Successor, representable};
@@ -57,9 +58,9 @@ pub enum ConcurrentOfferOutcome {
 /// provisional, as [`ConcurrentOfferOutcome`].
 #[derive(Debug)]
 #[must_use = "back pressure, aborts and admin actions must be handled"]
-pub enum ConcurrentClaimOutcome<'a> {
+pub enum ConcurrentClaimOutcome<'a, T: TermBytes = HeapTerms> {
     /// A block was reserved and marked; write the payload, then commit.
-    Claimed(ClientConcurrentClaim<'a>),
+    Claimed(ClientConcurrentClaim<'a, T>),
     /// The flow-control limit does not admit the claim; retry later.
     BackPressured,
     /// The handle waits for a later term, or its reservation crossed or
@@ -114,14 +115,14 @@ pub enum ConcurrentClaimOutcome<'a> {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ClientConcurrentClaim<'a> {
-    inner: ConcurrentClaim<'a, Arc<LogBuffer>>,
+pub struct ClientConcurrentClaim<'a, T: TermBytes = HeapTerms> {
+    inner: ConcurrentClaim<'a, Arc<LogBuffer<T>>>,
     lane: Lane,
     /// The base of the claim's mapping generation.
     base: u64,
 }
 
-impl ClientConcurrentClaim<'_> {
+impl<T: TermBytes> ClientConcurrentClaim<'_, T> {
     /// The lane of the block.
     #[must_use]
     pub fn lane(&self) -> Lane {
@@ -163,15 +164,15 @@ impl ClientConcurrentClaim<'_> {
 /// One concurrent publication handle on a stream: one of the stream's `P`
 /// publisher slots. Each publishing thread holds its own handle.
 #[derive(Debug)]
-pub struct ClientConcurrentPublication {
+pub struct ClientConcurrentPublication<T: TermBytes = HeapTerms> {
     // Declared first: the sys handle frees its publisher slot before the
     // stream lease below ends.
-    inner: ConcurrentPublication<Arc<LogBuffer>>,
+    inner: ConcurrentPublication<Arc<LogBuffer<T>>>,
     allow_unconnected: bool,
     origin: Option<Origin>,
     /// The link to the stream's successor mappings, if the driver gave one
     /// (`quantstratum-docs: karyos/design/mapping-generations.md`).
-    link: Option<Arc<GenerationLink>>,
+    link: Option<Arc<GenerationLink<T>>>,
     /// The stream position where this handle's mapping starts.
     base: u64,
     /// The stream lease of a handle from the direct driver API, held only
@@ -179,11 +180,11 @@ pub struct ClientConcurrentPublication {
     _lease: Option<Lease>,
 }
 
-impl ClientConcurrentPublication {
+impl<T: TermBytes> ClientConcurrentPublication<T> {
     /// Wraps a concurrent handle. Connectivity, limits and the lane are
     /// read from the buffer the handle publishes to.
     #[must_use]
-    pub fn new(inner: ConcurrentPublication<Arc<LogBuffer>>, allow_unconnected: bool) -> Self {
+    pub fn new(inner: ConcurrentPublication<Arc<LogBuffer<T>>>, allow_unconnected: bool) -> Self {
         Self {
             inner,
             allow_unconnected,
@@ -204,7 +205,7 @@ impl ClientConcurrentPublication {
     /// then dropped, releasing what it holds.
     pub fn with_generation(
         mut self,
-        link: Arc<GenerationLink>,
+        link: Arc<GenerationLink<T>>,
         base: u64,
     ) -> Result<Self, ClientError> {
         if !representable(base, self.inner.buffer()) {
@@ -217,7 +218,7 @@ impl ClientConcurrentPublication {
 
     /// The handle's generation link, if any.
     #[must_use]
-    pub fn generation_link(&self) -> Option<&Arc<GenerationLink>> {
+    pub fn generation_link(&self) -> Option<&Arc<GenerationLink<T>>> {
         self.link.as_ref()
     }
 
@@ -225,7 +226,7 @@ impl ClientConcurrentPublication {
     /// lease until it is dropped.
     #[must_use]
     pub fn with_lease(
-        inner: ConcurrentPublication<Arc<LogBuffer>>,
+        inner: ConcurrentPublication<Arc<LogBuffer<T>>>,
         allow_unconnected: bool,
         lease: Lease,
     ) -> Self {
@@ -239,7 +240,7 @@ impl ClientConcurrentPublication {
     /// stream's lease until it is dropped.
     #[must_use]
     pub fn from_hand_over(
-        inner: ConcurrentPublication<Arc<LogBuffer>>,
+        inner: ConcurrentPublication<Arc<LogBuffer<T>>>,
         allow_unconnected: bool,
         origin: Origin,
     ) -> Self {
@@ -310,7 +311,7 @@ impl ClientConcurrentPublication {
     /// (above `max_message_length`, one fragment or the reservation limit)
     /// and lower-layer errors. A validation error makes no new
     /// reservation; a forgotten claim is still resolved first.
-    pub fn try_claim(&mut self, length: u32) -> Result<ConcurrentClaimOutcome<'_>, ClientError> {
+    pub fn try_claim(&mut self, length: u32) -> Result<ConcurrentClaimOutcome<'_, T>, ClientError> {
         self.try_claim_with(length, AppendOptions::default())
     }
 
@@ -324,7 +325,7 @@ impl ClientConcurrentPublication {
         &mut self,
         length: u32,
         options: AppendOptions,
-    ) -> Result<ConcurrentClaimOutcome<'_>, ClientError> {
+    ) -> Result<ConcurrentClaimOutcome<'_, T>, ClientError> {
         // A forgotten claim is resolved before any early return; the
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
@@ -388,7 +389,7 @@ impl End {
         }
     }
 
-    fn concurrent_claim<'a>(self) -> ConcurrentClaimOutcome<'a> {
+    fn concurrent_claim<'a, T: TermBytes>(self) -> ConcurrentClaimOutcome<'a, T> {
         match self {
             End::Retry => ConcurrentClaimOutcome::AdminAction,
             End::Closed => ConcurrentClaimOutcome::Closed,
@@ -415,12 +416,12 @@ fn offer_outcome(outcome: SysOfferOutcome, lane: Lane, base: u64) -> ConcurrentO
 
 /// The sys claim outcome on the buffer's lane.
 /// `end` is what a just-closed handle reports: the next call moves.
-fn claim_outcome(
-    outcome: SysClaimOutcome<'_, Arc<LogBuffer>>,
+fn claim_outcome<T: TermBytes>(
+    outcome: SysClaimOutcome<'_, Arc<LogBuffer<T>>>,
     lane: Lane,
     base: u64,
     end: End,
-) -> ConcurrentClaimOutcome<'_> {
+) -> ConcurrentClaimOutcome<'_, T> {
     match outcome {
         SysClaimOutcome::Claimed(inner) => {
             ConcurrentClaimOutcome::Claimed(ClientConcurrentClaim { inner, lane, base })
@@ -469,15 +470,15 @@ mod tests {
             ConcurrentOfferOutcome::AdminAction
         );
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::Aborted { position: 128 }, lane, 1000, End::Closed),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::Aborted { position: 128 }, lane, 1000, End::Closed),
             ConcurrentClaimOutcome::Aborted { lane: l, position: 1128 } if l == lane
         ));
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::BackPressured, lane, 1000, End::Closed),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::BackPressured, lane, 1000, End::Closed),
             ConcurrentClaimOutcome::BackPressured
         ));
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::AdminAction, lane, 1000, End::Closed),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::AdminAction, lane, 1000, End::Closed),
             ConcurrentClaimOutcome::AdminAction
         ));
         assert_eq!(
@@ -485,12 +486,12 @@ mod tests {
             ConcurrentOfferOutcome::Closed
         );
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::Closed, lane, 1000, End::Closed),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::Closed, lane, 1000, End::Closed),
             ConcurrentClaimOutcome::Closed
         ));
         // A cutover is coming: the just-closed handle retries.
         assert!(matches!(
-            claim_outcome(SysClaimOutcome::Closed, lane, 1000, End::Retry),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::Closed, lane, 1000, End::Retry),
             ConcurrentClaimOutcome::AdminAction
         ));
     }

@@ -16,6 +16,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use karyos_sys::log_buffer::{ConcurrentPublication, LogBuffer, Publication, Subscription};
+use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 /// Stream positions stay below `2^63` (SPEC.md §4).
 pub const POSITION_LIMIT: u64 = 1 << 63;
@@ -26,7 +27,7 @@ pub const POSITION_LIMIT: u64 = 1 << 63;
 /// `2^31 × term_length`. Handles accept only such bases, so their
 /// `base + local` additions never overflow.
 #[must_use]
-pub fn representable(base: u64, buffer: &LogBuffer) -> bool {
+pub fn representable<T: TermBytes>(base: u64, buffer: &LogBuffer<T>) -> bool {
     let span = (1u64 << 31) * u64::from(buffer.term_length());
     base.checked_add(span)
         .is_some_and(|end| end <= POSITION_LIMIT)
@@ -34,25 +35,25 @@ pub fn representable(base: u64, buffer: &LogBuffer) -> bool {
 
 /// A successor capability reserved for one handle.
 #[derive(Debug)]
-pub enum Successor {
+pub enum Successor<T: TermBytes = HeapTerms> {
     /// The successor's exclusive publication.
-    Publication(Publication<Arc<LogBuffer>>),
+    Publication(Publication<Arc<LogBuffer<T>>>),
     /// A publisher slot of the successor.
-    Concurrent(ConcurrentPublication<Arc<LogBuffer>>),
+    Concurrent(ConcurrentPublication<Arc<LogBuffer<T>>>),
     /// A subscriber cell of the successor, with the private copy buffer for
     /// its largest message, allocated by the driver on the control path.
     Subscription {
         /// The cell.
-        inner: Subscription<Arc<LogBuffer>>,
+        inner: Subscription<Arc<LogBuffer<T>>>,
         /// The copy buffer.
         scratch: Box<[u8]>,
     },
 }
 
-impl Successor {
+impl<T: TermBytes> Successor<T> {
     /// The successor mapping's buffer.
     #[must_use]
-    pub fn buffer(&self) -> &LogBuffer {
+    pub fn buffer(&self) -> &LogBuffer<T> {
         match self {
             Self::Publication(inner) => inner.buffer(),
             Self::Concurrent(inner) => inner.buffer(),
@@ -76,20 +77,20 @@ pub enum LinkStatus {
 }
 
 #[derive(Debug)]
-enum State {
+enum State<T: TermBytes = HeapTerms> {
     Current,
     Pending,
-    Offered { base: u64, successor: Successor },
+    Offered { base: u64, successor: Successor<T> },
     Fenced,
 }
 
 /// What a handle finds when its mapping ended.
 #[derive(Debug)]
-pub(crate) enum Next {
+pub(crate) enum Next<T: TermBytes = HeapTerms> {
     /// The cutover is pending: retry later.
     Wait,
     /// Moved: the successor and its base, now the handle's.
-    Moved { base: u64, successor: Successor },
+    Moved { base: u64, successor: Successor<T> },
     /// No successor will come: fenced, or a seal without a successor.
     End,
 }
@@ -105,7 +106,7 @@ pub(crate) enum End {
 
 impl End {
     /// The outcome the link announces, without moving.
-    pub(crate) fn peek(link: Option<&GenerationLink>) -> Self {
+    pub(crate) fn peek<T: TermBytes>(link: Option<&GenerationLink<T>>) -> Self {
         match link.map(GenerationLink::status) {
             Some(LinkStatus::Pending | LinkStatus::Offered) => Self::Retry,
             _ => Self::Closed,
@@ -115,11 +116,11 @@ impl End {
 
 /// The link shared by one handle and its driver.
 #[derive(Debug)]
-pub struct GenerationLink {
-    state: Mutex<State>,
+pub struct GenerationLink<T: TermBytes = HeapTerms> {
+    state: Mutex<State<T>>,
 }
 
-impl GenerationLink {
+impl<T: TermBytes> GenerationLink<T> {
     /// A link in the `Current` state.
     #[must_use]
     pub fn new() -> Arc<Self> {
@@ -128,7 +129,7 @@ impl GenerationLink {
         })
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, State<T>> {
         // Every transition below is a single assignment, so a panic in
         // another holder never leaves a partial state.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -164,7 +165,7 @@ impl GenerationLink {
     ///
     /// Returns the successor when the link is not pending, or when its
     /// mapping starting at `base` is not [`representable`].
-    pub fn offer(&self, base: u64, successor: Successor) -> Result<(), Successor> {
+    pub fn offer(&self, base: u64, successor: Successor<T>) -> Result<(), Successor<T>> {
         if !representable(base, successor.buffer()) {
             return Err(successor);
         }
@@ -181,7 +182,7 @@ impl GenerationLink {
     /// successor it reserved, if any, for the driver to drop or reissue. A
     /// `Current` link (the handle already moved) or a `Fenced` one is left
     /// as it is, and `None` is returned.
-    pub fn fence(&self) -> Option<Successor> {
+    pub fn fence(&self) -> Option<Successor<T>> {
         let mut state = self.lock();
         match core::mem::replace(&mut *state, State::Fenced) {
             State::Offered { successor, .. } => Some(successor),
@@ -196,7 +197,7 @@ impl GenerationLink {
     /// Handle: its mapping ended. Takes an offered successor (the link is
     /// `Current` again, for a later cutover), or reports a pending cutover
     /// or the end. A `Current` link means no cutover was started: the end.
-    pub(crate) fn next(&self) -> Next {
+    pub(crate) fn next(&self) -> Next<T> {
         let mut state = self.lock();
         match core::mem::replace(&mut *state, State::Current) {
             State::Offered { base, successor } => Next::Moved { base, successor },
@@ -243,7 +244,7 @@ mod tests {
 
     #[test]
     fn a_link_moves_through_pending_and_offered_to_current() {
-        let link = GenerationLink::new();
+        let link = GenerationLink::<HeapTerms>::new();
         assert_eq!(link.status(), LinkStatus::Current);
         assert!(matches!(link.next(), Next::End));
         assert!(link.offer(5, successor()).is_err());
@@ -261,7 +262,7 @@ mod tests {
 
     #[test]
     fn a_fence_wins_over_a_later_move_and_returns_the_successor() {
-        let link = GenerationLink::new();
+        let link = GenerationLink::<HeapTerms>::new();
         assert!(link.set_pending());
         assert!(link.offer(5, successor()).is_ok());
         assert!(matches!(link.fence(), Some(Successor::Publication(_))));
@@ -274,7 +275,7 @@ mod tests {
 
     #[test]
     fn a_pending_link_can_be_fenced_before_any_offer() {
-        let link = GenerationLink::new();
+        let link = GenerationLink::<HeapTerms>::new();
         assert!(link.set_pending());
         assert!(link.fence().is_none());
         assert_eq!(link.status(), LinkStatus::Fenced);

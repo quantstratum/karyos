@@ -27,9 +27,13 @@ use karyos_client::{Completion, Outcome};
 use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, SystemClock};
 use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
 use karyos_sys::counters::CellRead;
+use karyos_sys::term_bytes::SharedTerms;
 
 const SCENARIO: &str = "KARYOS_PROCESS_SCENARIO";
 const DIR: &str = "KARYOS_PROCESS_DIR";
+
+/// The driver of these tests: IPC mode, every stream in a shared region.
+type IpcDriver = EmbeddedDriver<SharedTerms>;
 
 fn dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("karyos-proc-{}-{name}", std::process::id()));
@@ -41,7 +45,7 @@ fn dir(name: &str) -> PathBuf {
 /// a copy of a just-dropped listener until its exec (close-on-exec acts
 /// only there), so a restart retries briefly while the old socket still
 /// answers.
-fn driver(dir: &Path) -> EmbeddedDriver {
+fn driver(dir: &Path) -> IpcDriver {
     let start = Instant::now();
     loop {
         let created = EmbeddedDriver::with_ipc(
@@ -99,7 +103,7 @@ fn spawn(scenario: &str, dir: &Path) -> (Guard, Receiver<String>) {
 }
 
 /// Runs duty cycles until the child reports `expected`, or until `limit`.
-fn serve_until_report(driver: &mut EmbeddedDriver, reports: &Receiver<String>, expected: &str) {
+fn serve_until_report(driver: &mut IpcDriver, reports: &Receiver<String>, expected: &str) {
     let start = Instant::now();
     loop {
         assert!(
@@ -116,7 +120,7 @@ fn serve_until_report(driver: &mut EmbeddedDriver, reports: &Receiver<String>, e
     }
 }
 
-fn serve_until(driver: &mut EmbeddedDriver, mut done: impl FnMut(&EmbeddedDriver) -> bool) {
+fn serve_until(driver: &mut IpcDriver, mut done: impl FnMut(&IpcDriver) -> bool) {
     let start = Instant::now();
     while !done(driver) {
         assert!(start.elapsed() < Duration::from_secs(10), "timed out");
