@@ -5,13 +5,13 @@
 //! so that no other test opens or closes descriptors while it counts them.
 
 #![cfg(all(target_os = "linux", not(miri), not(loom)))]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::io::IoSlice;
 use std::mem::MaybeUninit;
 
 use karyos_sys::error::SysError;
-use karyos_sys::ipc::{Region, RegionKind, RegionRecord, Sent, recv, send, seqpacket_pair};
+use karyos_sys::ipc::{Recv, Region, RegionKind, RegionRecord, Sent, recv, send, seqpacket_pair};
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 
@@ -74,7 +74,9 @@ fn every_rejected_datagram_closes_its_descriptors() {
             send(a.as_fd(), b"ok", first.descriptor()).unwrap(),
             Sent::Sent
         );
-        let received = recv(b.as_fd(), &mut buffer).unwrap().unwrap();
+        let Ok(Recv::Message(received)) = recv(b.as_fd(), &mut buffer) else {
+            panic!("no message");
+        };
         assert!(Region::attach(received.fd.unwrap(), record(3)).is_err());
     }
     assert_eq!(open_fds(), before);

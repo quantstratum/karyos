@@ -351,12 +351,18 @@ pub enum Sent {
 /// # Errors
 ///
 /// Returns [`SysError::Os`] when `sendmsg` fails, and
-/// [`SysError::Protocol`] when the kernel took only part of the message.
+/// [`SysError::Protocol`] for an empty message (a receiver could not tell
+/// it from a shutdown) or when the kernel took only part of the message.
 pub fn send(
     socket: BorrowedFd<'_>,
     bytes: &[u8],
     fd: Option<BorrowedFd<'_>>,
 ) -> Result<Sent, SysError> {
+    if bytes.is_empty() {
+        return Err(SysError::Protocol {
+            reason: "empty message",
+        });
+    }
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = SendAncillaryBuffer::new(&mut space);
     let fds = fd.as_slice();
@@ -390,8 +396,21 @@ pub struct Received {
     pub fd: Option<OwnedFd>,
 }
 
+/// What a receive found.
+#[derive(Debug)]
+pub enum Recv {
+    /// One message.
+    Message(Received),
+    /// A non-blocking socket has nothing now.
+    WouldBlock,
+    /// The peer closed the connection (or sent an empty record, which the
+    /// protocol never does: [`send`] refuses empty messages, so an empty
+    /// record without a descriptor is read as the orderly shutdown it is
+    /// indistinguishable from).
+    PeerClosed,
+}
+
 /// Receives one message into `buffer`, with at most one descriptor.
-/// `Ok(None)` when a non-blocking socket has nothing, or the peer closed.
 ///
 /// # Errors
 ///
@@ -399,7 +418,7 @@ pub struct Received {
 /// more than one descriptor, or any other control message (every
 /// descriptor received in that datagram is closed), and [`SysError::Os`]
 /// when `recvmsg` fails.
-pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<Option<Received>, SysError> {
+pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<Recv, SysError> {
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
     let message = match rustix::net::recvmsg(
@@ -409,7 +428,7 @@ pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<Option<Received
         RecvFlags::CMSG_CLOEXEC,
     ) {
         Ok(message) => message,
-        Err(rustix::io::Errno::AGAIN) => return Ok(None),
+        Err(rustix::io::Errno::AGAIN) => return Ok(Recv::WouldBlock),
         Err(errno) => return Err(os("recvmsg")(errno)),
     };
     // Every descriptor the kernel installed is owned here first, so every
@@ -439,7 +458,7 @@ pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<Option<Received
     }
     if message.bytes == 0 && fds.is_empty() {
         // An orderly shutdown of the peer.
-        return Ok(None);
+        return Ok(Recv::PeerClosed);
     }
     let fd = fds.pop();
     if !fds.is_empty() {
@@ -447,7 +466,7 @@ pub fn recv(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<Option<Received
             reason: "more than one descriptor",
         });
     }
-    Ok(Some(Received {
+    Ok(Recv::Message(Received {
         len: message.bytes,
         fd,
     }))
@@ -501,7 +520,9 @@ mod tests {
             Sent::Sent
         );
         let mut buffer = [0u8; 64];
-        let received = recv(b.as_fd(), &mut buffer).unwrap().unwrap();
+        let Recv::Message(received) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
         assert_eq!(&buffer[..received.len], b"region");
         received.fd.unwrap()
     }
@@ -648,8 +669,15 @@ mod tests {
         let mut buffer = [0u8; 16];
         // No descriptor.
         assert_eq!(send(a.as_fd(), b"hello", None).unwrap(), Sent::Sent);
-        let plain = recv(b.as_fd(), &mut buffer).unwrap().unwrap();
+        let Recv::Message(plain) = recv(b.as_fd(), &mut buffer).unwrap() else {
+            panic!("no message");
+        };
         assert_eq!((plain.len, plain.fd.is_none()), (5, true));
+        // An empty message is refused before sending.
+        assert!(matches!(
+            send(a.as_fd(), b"", None),
+            Err(SysError::Protocol { .. })
+        ));
         // Two descriptors in one message: rejected, both closed.
         send_two(
             a.as_fd(),
@@ -668,9 +696,20 @@ mod tests {
             recv(b.as_fd(), &mut buffer),
             Err(SysError::Protocol { .. })
         ));
-        // Peer closed: no message.
+        // Nothing queued on a non-blocking socket, then the peer closes:
+        // two different outcomes.
+        rustix::io::ioctl_fionbio(&b, true).unwrap();
+        assert!(matches!(
+            recv(b.as_fd(), &mut buffer).unwrap(),
+            Recv::WouldBlock
+        ));
         drop(a);
-        assert!(recv(b.as_fd(), &mut buffer).unwrap().is_none());
+        for _ in 0..2 {
+            assert!(matches!(
+                recv(b.as_fd(), &mut buffer).unwrap(),
+                Recv::PeerClosed
+            ));
+        }
     }
 
     #[test]
