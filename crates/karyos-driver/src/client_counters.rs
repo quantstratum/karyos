@@ -145,15 +145,28 @@ impl ClientCounters {
         if self.owned_by(client) >= self.max_per_client {
             return Err(Refusal::ClientLimit);
         }
-        let counter =
-            self.manager
-                .allocate_keyed(type_id, label, keys)
-                .map_err(|error| match error {
-                    CounterError::Exhausted => Refusal::Exhausted,
-                    // The protocol bounds labels to the cell's; the remaining
-                    // errors are identity exhaustion.
-                    _ => Refusal::IdentitiesExhausted,
-                })?;
+        // Clients can write the state words, so the driver's own record of
+        // the cells it still holds decides, never the region: a clobbered
+        // state word cannot hand a held cell to a second owner.
+        let held: Vec<usize> = self
+            .owned
+            .iter()
+            .map(|owned| owned.counter.index())
+            .chain(
+                self.orphans
+                    .iter()
+                    .flat_map(|orphans| orphans.counters.iter().map(Counter::index)),
+            )
+            .collect();
+        let counter = self
+            .manager
+            .allocate_keyed_where(type_id, label, keys, |index| !held.contains(&index))
+            .map_err(|error| match error {
+                CounterError::Exhausted => Refusal::Exhausted,
+                // The protocol bounds labels to the cell's; the remaining
+                // errors are identity exhaustion.
+                _ => Refusal::IdentitiesExhausted,
+            })?;
         let allocated = (counter.index(), counter.registration_id());
         self.owned.push(Owned { client, counter });
         Ok(allocated)
