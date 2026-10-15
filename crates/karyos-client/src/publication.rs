@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     AppendOptions, AppendOutcome, Claim, ClaimOutcome as SysClaimOutcome,
@@ -199,6 +200,8 @@ pub struct ClientPublication<T: TermBytes = HeapTerms> {
     base: u64,
     /// The trace hook and publication identity, for a traced handle.
     trace: Option<PublishTrace>,
+    /// Limits for the stream's conflated view, when configured by the driver.
+    conflation: Option<ConflationConfig>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -230,9 +233,16 @@ impl<T: TermBytes> ClientPublication<T> {
             link: None,
             base: 0,
             trace: None,
+            conflation: None,
             _lease: None,
             _export: None,
         }
+    }
+
+    /// Sets the limits used to validate offers on a conflated stream.
+    #[cfg_attr(not(test), allow(dead_code, reason = "wired by the P5b driver batch"))]
+    pub(crate) fn set_conflation_config(&mut self, config: ConflationConfig) {
+        self.conflation = Some(config);
     }
 
     /// Traces this handle's messages through `hook`, which records them for
@@ -418,6 +428,9 @@ impl<T: TermBytes> ClientPublication<T> {
             }
             return Ok(OfferOutcome::NotConnected);
         }
+        if let Some(config) = self.conflation {
+            config.validate_publication(options.reserved_value, payload.len())?;
+        }
         Ok(match self.inner.append(payload, options)? {
             AppendOutcome::Appended { position } => OfferOutcome::Accepted {
                 lane: self.inner.buffer().lane(),
@@ -477,6 +490,15 @@ impl<T: TermBytes> ClientPublication<T> {
         // here, before the attempt borrows it.
         if self.inner.is_closed() {
             return Ok(self.after_end().claim());
+        }
+        if let Some(config) = self.conflation {
+            let value_length = usize::try_from(length).map_err(|_| {
+                ClientError::from(karyos_sys::conflation::ConflationError::ValueTooLarge {
+                    length: usize::MAX,
+                    max: config.value_capacity,
+                })
+            })?;
+            config.validate_publication(options.reserved_value, value_length)?;
         }
         let lane = self.inner.buffer().lane();
         let base = self.base;
@@ -774,5 +796,56 @@ mod tests {
             publication.try_claim(DEFAULT_MTU),
             Err(ClientError::MessageTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn conflated_offers_and_claims_validate_before_reserving() {
+        let (buffer, mut conductor, mut publication) = setup(true);
+        publication.set_conflation_config(ConflationConfig {
+            keys: 2,
+            value_capacity: 4,
+            journal_capacity: 1024,
+        });
+        let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+
+        assert_eq!(
+            publication.offer_with(
+                b"x",
+                AppendOptions {
+                    reserved_value: -1,
+                    ..AppendOptions::default()
+                }
+            ),
+            Err(ClientError::Conflation(
+                karyos_sys::conflation::ConflationError::KeyOutOfRange { key: -1 }
+            ))
+        );
+        assert!(matches!(
+            publication.try_claim_with(
+                5,
+                AppendOptions {
+                    reserved_value: 1,
+                    ..AppendOptions::default()
+                }
+            ),
+            Err(ClientError::Conflation(
+                karyos_sys::conflation::ConflationError::ValueTooLarge { length: 5, max: 4 }
+            ))
+        ));
+        assert_eq!(subscription.position(), 0);
+
+        assert!(matches!(
+            publication
+                .offer_with(
+                    b"ok",
+                    AppendOptions {
+                        reserved_value: 1,
+                        ..AppendOptions::default()
+                    }
+                )
+                .unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+        drop(buffer);
     }
 }

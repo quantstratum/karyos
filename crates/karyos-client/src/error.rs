@@ -2,6 +2,7 @@
 
 //! Errors of the client API.
 
+use karyos_sys::conflation::ConflationError;
 use karyos_sys::error::{LayoutError, SysError};
 use thiserror::Error;
 
@@ -26,6 +27,9 @@ pub enum ClientError {
         /// The rejected base.
         base: u64,
     },
+    /// A conflated publication rejected its key or value size.
+    #[error(transparent)]
+    Conflation(#[from] ConflationError),
     /// A lower layer failed.
     #[error(transparent)]
     Sys(SysError),

@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     AppendOptions, CommitOutcome as SysCommitOutcome, ConcurrentClaim,
@@ -188,6 +189,8 @@ pub struct ClientConcurrentPublication<T: TermBytes = HeapTerms> {
     base: u64,
     /// The trace hook and publication identity, for a traced handle.
     trace: Option<PublishTrace>,
+    /// Limits for the stream's conflated view, when configured by the driver.
+    conflation: Option<ConflationConfig>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -219,9 +222,16 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             link: None,
             base: 0,
             trace: None,
+            conflation: None,
             _lease: None,
             _export: None,
         }
+    }
+
+    /// Sets the limits used to validate offers on a conflated stream.
+    #[cfg_attr(not(test), allow(dead_code, reason = "wired by the P5b driver batch"))]
+    pub(crate) fn set_conflation_config(&mut self, config: ConflationConfig) {
+        self.conflation = Some(config);
     }
 
     /// Attaches the generation link the driver keeps for this handle, and
@@ -324,6 +334,9 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
                 return Ok(self.after_end().concurrent_offer());
             }
             return Ok(ConcurrentOfferOutcome::NotConnected);
+        }
+        if let Some(config) = self.conflation {
+            config.validate_publication(options.reserved_value, payload.len())?;
         }
         let lane = self.inner.buffer().lane();
         match offer_outcome(self.inner.offer(payload, options)?, lane, self.base) {
@@ -453,6 +466,15 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         if self.inner.is_closed() {
             return Ok(self.after_end().concurrent_claim());
         }
+        if let Some(config) = self.conflation {
+            let value_length = usize::try_from(length).map_err(|_| {
+                ClientError::from(karyos_sys::conflation::ConflationError::ValueTooLarge {
+                    length: usize::MAX,
+                    max: config.value_capacity,
+                })
+            })?;
+            config.validate_publication(options.reserved_value, value_length)?;
+        }
         let lane = self.inner.buffer().lane();
         let base = self.base;
         let end = End::peek(self.link.as_deref());
@@ -561,6 +583,11 @@ fn claim_outcome<'a, T: TermBytes>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use karyos_sys::log_buffer::{
+        Conductor, DEFAULT_CLAIM_DEADLINE, LogBufferConfig, PublicationMode, Role,
+    };
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
 
     // The `Aborted` arms are reached only when the conductor's deadline
     // abort wins between a writer's `fetch_add` and its mark or commit,
@@ -628,5 +655,76 @@ mod tests {
     fn handles_can_move_to_publishing_threads() {
         fn send<T: Send>() {}
         send::<ClientConcurrentPublication>();
+    }
+
+    #[test]
+    fn conflated_concurrent_offers_validate_before_reserving() {
+        let buffer = Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 3,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+                claim_deadline: DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Concurrent {
+                    publishers: 1,
+                    allow_non_lse: true,
+                },
+            })
+            .unwrap(),
+        );
+        let mut conductor: Conductor<Arc<LogBuffer>> = buffer.conductor_owned().unwrap();
+        let inner = conductor.concurrent_publication().unwrap().unwrap();
+        let mut publication = ClientConcurrentPublication::new(inner, true);
+        publication.set_conflation_config(ConflationConfig {
+            keys: 2,
+            value_capacity: 4,
+            journal_capacity: 1024,
+        });
+        let subscription = conductor.subscribe(Role::Required).unwrap();
+        let client_subscription = crate::ClientSubscription::new(subscription);
+
+        assert!(matches!(
+            publication.offer_with(
+                b"x",
+                AppendOptions {
+                    reserved_value: i64::from(u32::MAX) + 1,
+                    ..AppendOptions::default()
+                }
+            ),
+            Err(ClientError::Conflation(
+                karyos_sys::conflation::ConflationError::KeyOutOfRange { .. }
+            ))
+        ));
+        assert!(matches!(
+            publication.offer_with(
+                b"oversize",
+                AppendOptions {
+                    reserved_value: 1,
+                    ..AppendOptions::default()
+                }
+            ),
+            Err(ClientError::Conflation(
+                karyos_sys::conflation::ConflationError::ValueTooLarge { length: 8, max: 4 }
+            ))
+        ));
+        assert_eq!(client_subscription.position(), 0);
+        assert!(matches!(
+            publication
+                .offer_with(
+                    b"ok",
+                    AppendOptions {
+                        reserved_value: 1,
+                        ..AppendOptions::default()
+                    }
+                )
+                .unwrap(),
+            ConcurrentOfferOutcome::Accepted { .. }
+        ));
     }
 }
