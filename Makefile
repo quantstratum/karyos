@@ -33,7 +33,11 @@ loom-full:
 	RUSTFLAGS="--cfg loom" $(CARGO) test -p karyos-sys --release --locked --test 'loom_*' -- --include-ignored
 
 sim:
-	KARYOS_SIM_SEEDS=$${KARYOS_SIM_SEEDS:-2000} $(CARGO) test -p karyos-sim --release --locked --test scenarios
+	@start=$$(date +%s); \
+	KARYOS_SIM_SEED= KARYOS_SIM_SEEDS=2000 $(CARGO) test -p karyos-sim --release --locked --test scenarios; status=$$?; \
+	end=$$(date +%s); \
+	printf 'simulator sweep elapsed: %s seconds (fixed seeds 1..=2000)\n' "$$((end - start))"; \
+	exit $$status
 
 bench:
 	$(CARGO) run -p karyos-bench --release --locked -- $(BENCH_ARGS)
