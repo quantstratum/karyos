@@ -7,9 +7,11 @@
 //! again with `--exact <child test>`; it reports on stdout, one line per
 //! step, and the parent runs the driver's duty cycles meanwhile.
 //!
-//! In the alpha a remote client uses the control channel only (command
-//! ring, broadcast buffer, counters); log buffers shared between processes
-//! come with i3 step 2.
+//! Remote clients also take log buffer grants (issue #2, batch d4;
+//! quantstratum-docs: karyos/`design/ipc-data-path.md`, Tests): a
+//! publisher and a subscriber in two processes exchange messages through a
+//! stream's shared region, and a killed holder is released by its exit
+//! proof.
 
 #![cfg(target_os = "linux")]
 // Test helpers outside #[test] functions are not covered by clippy.toml's
@@ -23,10 +25,16 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use karyos_client::ipc::{RemoteClient, attach};
-use karyos_client::{Completion, Outcome};
-use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, SystemClock};
+use karyos_client::{Completion, Fetchable, MessageLimit, OfferOutcome, Outcome};
+use karyos_driver::{
+    DriverConfig, EmbeddedDriver, IpcConfig, LossPolicy, StreamConfig, StreamHandle, SystemClock,
+};
 use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
 use karyos_sys::counters::CellRead;
+use karyos_sys::frame::Lane;
+use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
+use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+use karyos_sys::term::TermId;
 use karyos_sys::term_bytes::SharedTerms;
 
 const SCENARIO: &str = "KARYOS_PROCESS_SCENARIO";
@@ -147,6 +155,154 @@ fn release(child: &mut Child) {
     writeln!(child.stdin.as_mut().unwrap(), "go").unwrap();
 }
 
+/// The stream the data tests use: stream 2, session 1, exclusive.
+const KEY: StreamKey = StreamKey {
+    stream_id: 2,
+    session_id: 1,
+};
+/// Messages one data test sends.
+const MESSAGES: u32 = 200;
+
+fn add_stream(driver: &mut IpcDriver) -> StreamHandle {
+    driver
+        .add_stream(StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: KEY.session_id,
+                stream_id: KEY.stream_id,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+            },
+            allow_unconnected: false,
+            on_required_loss: LossPolicy::Hold,
+        })
+        .unwrap()
+}
+
+fn counter(driver: &IpcDriver, label: &str) -> u64 {
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .find_map(|index| match reader.read(index) {
+            CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == label.as_bytes() => Some(value),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// Descriptors open in this process.
+fn open_descriptors() -> usize {
+    std::fs::read_dir("/proc/self/fd").unwrap().count()
+}
+
+/// A publisher process and a subscriber process exchange a sequence
+/// through the stream's shared region: the subscriber gets every message,
+/// in order and with its payload, and both detach and leave.
+#[test]
+fn test_ipc_data_a_publisher_and_a_subscriber_process_exchange_in_order() {
+    let dir = dir("exchange");
+    let mut driver = driver(&dir);
+    let _stream = add_stream(&mut driver);
+    let (mut subscriber, subscriber_reports) = spawn("subscribe", &dir);
+    serve_until_report(&mut driver, &subscriber_reports, "subscribed");
+    let (mut publisher, publisher_reports) = spawn("publish", &dir);
+    serve_until_report(&mut driver, &publisher_reports, &format!("sent {MESSAGES}"));
+    serve_until_report(
+        &mut driver,
+        &subscriber_reports,
+        &format!("received {MESSAGES} in order"),
+    );
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    release(&mut subscriber.0);
+    release(&mut publisher.0);
+    assert!(subscriber.0.wait().unwrap().success());
+    assert!(publisher.0.wait().unwrap().success());
+    assert_eq!(counter(&driver, "grants exported"), 2);
+    assert_eq!(counter(&driver, "grants detached"), 2);
+}
+
+/// A subscriber process killed while it holds its cell: the exit proof
+/// ends its registration and frees the cell, and a new subscriber takes
+/// its place.
+#[test]
+fn test_ipc_data_a_killed_subscriber_is_released_and_replaced() {
+    let dir = dir("killed-subscriber");
+    let mut driver = driver(&dir);
+    let _stream = add_stream(&mut driver);
+    let (mut first, reports) = spawn("subscribe-then-wait", &dir);
+    serve_until_report(&mut driver, &reports, "subscribed");
+    assert_eq!(counter(&driver, "grants ended"), 0);
+    first.0.kill().unwrap();
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = first.0.wait();
+    assert_eq!(counter(&driver, "grants ended"), 1);
+    let (mut second, reports) = spawn("subscribe-then-leave", &dir);
+    serve_until_report(&mut driver, &reports, "subscribed");
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    release(&mut second.0);
+    assert!(second.0.wait().unwrap().success());
+}
+
+/// Many fetch, adopt and detach rounds leave the driver's descriptor count
+/// where it started. The driver runs in a child process of its own, which
+/// spawns the clients, so no other test's descriptors are counted.
+#[test]
+fn test_ipc_data_descriptor_counts_are_stable_over_many_grants() {
+    let dir = dir("descriptors");
+    let (mut child, reports) = spawn("descriptor-driver", &dir);
+    let report = reports.recv_timeout(Duration::from_secs(60)).unwrap();
+    assert_eq!(report, "descriptors stable");
+    assert!(child.0.wait().unwrap().success());
+}
+
+/// The driver side of the descriptor test, in its own process.
+fn descriptor_driver(dir: &Path) {
+    let mut driver = driver(dir);
+    let _stream = add_stream(&mut driver);
+    // Warm up: the first client creates what the driver keeps.
+    let (mut warm, reports) = spawn("subscribe-then-leave", dir);
+    serve_until_report(&mut driver, &reports, "subscribed");
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    release(&mut warm.0);
+    assert!(warm.0.wait().unwrap().success());
+    let before = open_descriptors();
+    let (mut client, reports) = spawn("subscribe-many", dir);
+    serve_until_report(&mut driver, &reports, "rounds done");
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    release(&mut client.0);
+    assert!(client.0.wait().unwrap().success());
+    // The reader thread of the client's stdout closes its pipe once it
+    // sees the end: let it finish.
+    let start = Instant::now();
+    let mut after = open_descriptors();
+    while after != before && start.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(10));
+        after = open_descriptors();
+    }
+    if after != before || counter(&driver, "grants detached") != 1 + ROUNDS {
+        report(&format!(
+            "descriptors before {before} after {after}, detached {}, ended {}, exported {}, faulty {}, timed out {}",
+            counter(&driver, "grants detached"),
+            counter(&driver, "grants ended"),
+            counter(&driver, "grants exported"),
+            counter(&driver, "clients faulty"),
+            counter(&driver, "clients timed out"),
+        ));
+        return;
+    }
+    report("descriptors stable");
+}
+
+/// Fetch, adopt and detach rounds of the descriptor test.
+const ROUNDS: u64 = 50;
+
 /// §13 "Shared-memory lifecycle", process kill: a remote client that has
 /// served a command round trip is killed with SIGKILL; the driver releases
 /// its slot through the exit proof, without any `Leave`.
@@ -250,6 +406,28 @@ fn round_trip(client: &mut RemoteClient) {
     report("refused unknown stream");
 }
 
+/// Requests `request` and waits for its fetchable grant.
+fn grant(client: &mut RemoteClient, subscribe: bool) -> Fetchable {
+    if subscribe {
+        let _ = client
+            .add_subscription(KEY, SubscriberRole::Required)
+            .unwrap();
+    } else {
+        let _ = client.add_publication(KEY, false).unwrap();
+    }
+    let mut fetchable = None;
+    let start = Instant::now();
+    while fetchable.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no grant");
+        let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+            Outcome::Fetchable(grant) => fetchable = Some(grant),
+            other => panic!("expected a grant, got {other:?}"),
+        });
+        std::thread::yield_now();
+    }
+    fetchable.unwrap()
+}
+
 /// Runs only as a child process of the tests above.
 #[test]
 fn child() {
@@ -324,6 +502,95 @@ fn child() {
             report(&format!("reattached {:x}", again.instance()));
             drop(client);
             drop(again);
+        }
+        "subscribe" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, true);
+            let mut subscription = client.take_subscription(&fetchable).unwrap();
+            report("subscribed");
+            let mut next = 0u32;
+            let start = Instant::now();
+            while next < MESSAGES {
+                assert!(
+                    start.elapsed() < Duration::from_secs(20),
+                    "stalled at {next}"
+                );
+                let _ = subscription
+                    .poll(
+                        |payload, _| {
+                            assert_eq!(payload, next.to_le_bytes().repeat(8).as_slice());
+                            next += 1;
+                        },
+                        MessageLimit::new(32),
+                    )
+                    .unwrap();
+                std::thread::yield_now();
+            }
+            report(&format!("received {MESSAGES} in order"));
+            drop(subscription);
+            drop(client);
+            // Alive until the driver released this client through its
+            // Leave, not through the exit proof.
+            wait_for_go();
+        }
+        "publish" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, false);
+            let mut publication = client.take_publication(&fetchable).unwrap();
+            let start = Instant::now();
+            let mut sent = 0u32;
+            while sent < MESSAGES {
+                assert!(
+                    start.elapsed() < Duration::from_secs(20),
+                    "stalled at {sent}"
+                );
+                match publication.offer(&sent.to_le_bytes().repeat(8)).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent += 1,
+                    _ => std::thread::yield_now(),
+                }
+            }
+            report(&format!("sent {MESSAGES}"));
+            drop(publication);
+            drop(client);
+            // Alive until the driver released this client through its
+            // Leave, not through the exit proof.
+            wait_for_go();
+        }
+        "subscribe-then-wait" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, true);
+            let subscription = client.take_subscription(&fetchable).unwrap();
+            report("subscribed");
+            // Wait to be killed, holding the cell; bounded.
+            std::mem::forget(subscription);
+            std::mem::forget(client);
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(1);
+        }
+        "subscribe-then-leave" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, true);
+            let subscription = client.take_subscription(&fetchable).unwrap();
+            report("subscribed");
+            drop(subscription);
+            drop(client);
+            // Alive until the driver released this client through its
+            // Leave, not through the exit proof.
+            wait_for_go();
+        }
+        "descriptor-driver" => descriptor_driver(&dir),
+        "subscribe-many" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            for _ in 0..ROUNDS {
+                let fetchable = grant(&mut client, true);
+                let subscription = client.take_subscription(&fetchable).unwrap();
+                drop(subscription);
+            }
+            report("rounds done");
+            drop(client);
+            // Alive until the driver released this client through its
+            // Leave, not through the exit proof.
+            wait_for_go();
         }
         other => panic!("unknown scenario {other}"),
     }
