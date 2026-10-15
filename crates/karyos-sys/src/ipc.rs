@@ -508,9 +508,10 @@ impl PidFd {
         Self::validate(fd)
     }
 
-    /// Validates a received descriptor as a pidfd of a process not yet
-    /// reaped: its `fdinfo` has a `Pid:` field naming a positive pid. A
-    /// descriptor that is not a pidfd, or whose process is already reaped,
+    /// Validates a received descriptor as a process pidfd of a process not
+    /// yet reaped: its `fdinfo` has a `Pid:` field naming a positive pid,
+    /// and it is not a thread pidfd (`PIDFD_THREAD`). A descriptor that is
+    /// not a pidfd, a thread pidfd, or one whose process is already reaped
     /// is refused (and closed).
     ///
     /// # Errors
@@ -522,6 +523,16 @@ impl PidFd {
         let pid = fdinfo_pid(fd.as_fd())?.ok_or(SysError::Protocol {
             reason: "the pidfd names a reaped process",
         })?;
+        // A thread pidfd (`PIDFD_THREAD`, Linux 6.9+, stored as `O_EXCL` in
+        // the file flags) polls readable when its one thread exits, while
+        // the rest of the process and its mappings live on: never an exit
+        // proof.
+        let flags = rustix::fs::fcntl_getfl(&fd).map_err(os("fcntl(F_GETFL)"))?;
+        if flags.contains(rustix::fs::OFlags::EXCL) {
+            return Err(SysError::Protocol {
+                reason: "a thread pidfd is not a process exit proof",
+            });
+        }
         Ok(Self { fd, pid })
     }
 
@@ -879,5 +890,21 @@ mod tests {
             PidFd::validate(fd),
             Err(SysError::Protocol { .. })
         ));
+    }
+
+    #[test]
+    fn a_thread_pidfd_is_refused() {
+        // `PIDFD_THREAD` is `O_EXCL` (Linux 6.9+); older kernels refuse the
+        // flag at `pidfd_open`, and then there is nothing to validate.
+        let thread = rustix::process::PidfdFlags::from_bits_retain(rustix::fs::OFlags::EXCL.bits());
+        match rustix::process::pidfd_open(rustix::process::getpid(), thread) {
+            Ok(fd) => assert!(matches!(
+                PidFd::validate(fd),
+                Err(SysError::Protocol { .. })
+            )),
+            Err(errno) => assert_eq!(errno, rustix::io::Errno::INVAL),
+        }
+        // A process pidfd of the same process carries no such flag.
+        assert!(PidFd::of_self().is_ok());
     }
 }
