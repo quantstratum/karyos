@@ -37,6 +37,9 @@ const STRIDE: usize = 16;
 const TAIL: usize = 0;
 const HEAD: usize = STRIDE;
 const CLOSED: usize = HEAD + 1;
+/// The client heartbeat: a producer-written word on the tail's stride
+/// (quantstratum-docs: `karyos/design/required-participant-loss.md`).
+const HEARTBEAT: usize = TAIL + 1;
 
 /// Errors of the command ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -173,6 +176,31 @@ impl<'a> RingWords<'a> {
     pub fn is_closed(&self) -> bool {
         self.trailer(CLOSED)
             .is_none_or(|word| word.load(Ordering::Acquire) != 0)
+    }
+
+    /// Advances the client heartbeat by one (Release), returning the new
+    /// value. Only the single producer calls this. The heartbeat is a
+    /// counter, never a time: each side samples it with its own clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RingError::Closed`] once the counter would wrap; the
+    /// ring is closed then, since a heartbeat never repeats a value.
+    pub fn beat(&self) -> Result<u64, RingError> {
+        let word = self.trailer(HEARTBEAT).ok_or(RingError::Closed)?;
+        let Some(next) = word.load(Ordering::Relaxed).checked_add(1) else {
+            self.close();
+            return Err(RingError::Closed);
+        };
+        word.store(next, Ordering::Release);
+        Ok(next)
+    }
+
+    /// The client heartbeat (Acquire), as last advanced by the producer.
+    #[must_use]
+    pub fn heartbeat(&self) -> u64 {
+        self.trailer(HEARTBEAT)
+            .map_or(0, |word| word.load(Ordering::Acquire))
     }
 
     /// Closes the ring for good (Release). The consumer calls this when it
@@ -474,6 +502,15 @@ mod owned {
             self.region.words().is_ok_and(|words| words.is_closed())
         }
 
+        /// Advances the client heartbeat; see [`RingWords::beat`].
+        ///
+        /// # Errors
+        ///
+        /// As [`RingWords::beat`].
+        pub fn beat(&mut self) -> Result<u64, RingError> {
+            self.region.words()?.beat()
+        }
+
         #[cfg(test)]
         pub(super) fn words_for_test(&self) -> Result<RingWords<'_>, RingError> {
             self.region.words()
@@ -499,6 +536,12 @@ mod owned {
     }
 
     impl RingConsumer {
+        /// The client heartbeat; see [`RingWords::heartbeat`].
+        #[must_use]
+        pub fn heartbeat(&self) -> u64 {
+            self.region.words().map_or(0, |words| words.heartbeat())
+        }
+
         fn over(region: Arc<Region>) -> Result<Self, RingError> {
             let max = region.words()?.max_payload();
             Ok(Self {
@@ -730,5 +773,25 @@ mod tests {
                 }
             });
         });
+    }
+
+    #[test]
+    fn the_heartbeat_counts_and_leaves_the_records_alone() {
+        let (mut producer, mut consumer) = command_ring(1024).unwrap();
+        assert_eq!(consumer.heartbeat(), 0);
+        producer.write(1, b"x").unwrap();
+        assert_eq!(producer.beat(), Ok(1));
+        assert_eq!(producer.beat(), Ok(2));
+        assert_eq!(consumer.heartbeat(), 2);
+        let read = consumer.read().unwrap().unwrap();
+        assert_eq!((read.type_id, read.payload), (1, &b"x"[..]));
+        // A wrapped counter would repeat a value: the ring closes instead.
+        let words = producer.words_for_test().unwrap();
+        words
+            .trailer(HEARTBEAT)
+            .unwrap()
+            .store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(producer.beat(), Err(RingError::Closed));
+        assert!(producer.is_closed());
     }
 }

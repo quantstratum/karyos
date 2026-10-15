@@ -44,6 +44,9 @@ const TAIL: usize = STRIDE;
 const LATEST: usize = 2 * STRIDE;
 /// Written only by the writer, so it shares the intent's stride.
 const CLOSED: usize = TAIL_INTENT + 1;
+/// The driver heartbeat: a writer-written word on the tail's stride
+/// (quantstratum-docs: `karyos/design/required-participant-loss.md`).
+const HEARTBEAT: usize = TAIL + 1;
 
 /// Errors of the broadcast buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -191,6 +194,31 @@ impl<'a> BroadcastWords<'a> {
         if let Some(word) = self.trailer(CLOSED) {
             word.store(1, Ordering::Release);
         }
+    }
+
+    /// Advances the driver heartbeat by one (Release), returning the new
+    /// value. Only the single writer calls this. The heartbeat is a
+    /// counter, never a time: each side samples it with its own clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::Closed`] once the counter would wrap; the
+    /// buffer is closed then, since a heartbeat never repeats a value.
+    pub fn beat(&self) -> Result<u64, BroadcastError> {
+        let word = self.trailer(HEARTBEAT).ok_or(BroadcastError::Closed)?;
+        let Some(next) = word.load(Ordering::Relaxed).checked_add(1) else {
+            self.close();
+            return Err(BroadcastError::Closed);
+        };
+        word.store(next, Ordering::Release);
+        Ok(next)
+    }
+
+    /// The driver heartbeat (Acquire), as last advanced by the writer.
+    #[must_use]
+    pub fn heartbeat(&self) -> u64 {
+        self.trailer(HEARTBEAT)
+            .map_or(0, |word| word.load(Ordering::Acquire))
     }
 
     /// Whether one more record of up to `payload_length` bytes, with any
@@ -531,6 +559,15 @@ mod owned {
             self.region.words().map_or(true, |words| words.is_closed())
         }
 
+        /// Advances the driver heartbeat; see [`BroadcastWords::beat`].
+        ///
+        /// # Errors
+        ///
+        /// As [`BroadcastWords::beat`].
+        pub fn beat(&mut self) -> Result<u64, BroadcastError> {
+            self.region.words()?.beat()
+        }
+
         /// Closes the buffer for good; see [`BroadcastWords::close`].
         pub fn close(&mut self) {
             if let Ok(words) = self.region.words() {
@@ -634,6 +671,12 @@ mod owned {
         #[must_use]
         pub fn is_closed(&self) -> bool {
             self.region.words().map_or(true, |words| words.is_closed())
+        }
+
+        /// The driver heartbeat; see [`BroadcastWords::heartbeat`].
+        #[must_use]
+        pub fn heartbeat(&self) -> u64 {
+            self.region.words().map_or(0, |words| words.heartbeat())
         }
 
         /// The next position this reader reads.
@@ -848,5 +891,21 @@ mod tests {
                 }
             });
         });
+    }
+
+    #[test]
+    fn the_heartbeat_counts_and_leaves_the_records_alone() {
+        let mut transmitter = broadcast(1024).unwrap();
+        let mut receiver = transmitter.receiver();
+        assert_eq!(receiver.heartbeat(), 0);
+        transmitter.transmit(1, b"x").unwrap();
+        assert_eq!(transmitter.beat(), Ok(1));
+        assert_eq!(transmitter.beat(), Ok(2));
+        assert_eq!(receiver.heartbeat(), 2);
+        assert!(matches!(
+            receiver.receive(),
+            Received::Message { type_id: 1, payload, .. } if payload == b"x"
+        ));
+        assert_eq!(receiver.receive(), Received::Pending);
     }
 }
