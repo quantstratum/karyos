@@ -796,6 +796,176 @@ fn test_log_buffer_immediate_offer_has_one_reservation_and_no_rotation() {
     assert_eq!(publication.offer_attempt_counts(), (1, 0));
 }
 
+/// Slots pinned outside the rotation: every slot that is not `FREE` and
+/// does not hold the previous, active or next term, in any state.
+fn pinned_outside_rotation(buffer: &LogBuffer<Terms>) -> Vec<u8> {
+    let active = buffer.active_count().load(Ordering::Acquire) as u32;
+    (0..buffer.slots)
+        .filter(|slot| {
+            let descriptor =
+                Descriptor::decode(buffer.descriptor(*slot).unwrap().load(Ordering::Acquire))
+                    .unwrap();
+            if descriptor.state() == SlotState::Free {
+                return false;
+            }
+            let count = descriptor
+                .term_id()
+                .count_from(buffer.initial_term_id)
+                .unwrap()
+                .get();
+            count + 1 < active || count > active + 1
+        })
+        .collect()
+}
+
+/// §13 "Required set transitions", the `continue` reservation: a required
+/// reader admitted under `continue` (one spare-slot credit) is revoked
+/// while it holds a read loan on term 0. Its bound is withdrawn at once and
+/// the publisher runs ten terms; at every duty cycle the slots pinned
+/// outside the rotation are exactly the reader's term 0 slot, never more
+/// than its reservation, and that slot is never cleaned or reused. Once the
+/// loan ends the slot is reclaimed and nothing stays pinned.
+#[test]
+fn test_log_buffer_required_set_continue_pins_only_within_its_reservation() {
+    // S = 3, C = 1: the exclusive publication and the reserved reader take
+    // the two credits.
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let reader = conductor.subscribe_as(Role::Required, true, 9).unwrap();
+    let cell = reader.cell();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let data = vec![2u8; 1000];
+    let _ = append_retrying(&mut publication, &mut conductor, &data, || {});
+    let found = buffer.cells().get(cell).unwrap();
+    let target = buffer.target(0, TermCount::ZERO).unwrap();
+    assert_eq!(
+        take_loan(&found.loan, &found.revoked, buffer.descriptor(0).unwrap(), target),
+        Ok(LoanOutcome::Granted)
+    );
+    assert_eq!(
+        conductor.revoke_participant(cell, 9, LossPolicy::Continue),
+        Ok(Revocation::Withdrawn)
+    );
+    let reservation = 1;
+    let mut most = 0;
+    while buffer.reserved_head().load(Ordering::Acquire) < 10 * TERM {
+        let _ = append_retrying(&mut publication, &mut conductor, &data, || {});
+        let _ = conductor.duty_cycle().unwrap();
+        let pinned = pinned_outside_rotation(&buffer);
+        assert!(
+            pinned.len() <= reservation,
+            "continue pinned {pinned:?}, beyond its reservation of {reservation}"
+        );
+        assert!(pinned.iter().all(|slot| *slot == 0), "{pinned:?}");
+        most = most.max(pinned.len());
+    }
+    assert_eq!(most, reservation, "the held loan never pinned its slot");
+    // Term 0's slot was never cleaned or reused under the loan.
+    let held = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
+    assert_eq!(held.term_id(), buffer.initial_term_id);
+    assert_eq!(held.state(), SlotState::Reclaiming);
+    // The loan ends: the slot is reclaimed and nothing stays pinned.
+    release_loan(&found.loan);
+    for _ in 0..3 {
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    assert!(pinned_outside_rotation(&buffer).is_empty());
+    drop(reader);
+}
+
+/// §13 "Required set transitions": limits never decrease across the
+/// `hold`, `continue` and `abort` transitions. A bounding required reader
+/// and a second required reader admitted under the policy read along; the
+/// second is revoked mid-stream, holding a loan under `hold`. The limit is
+/// sampled after every duty cycle, before and after the revocation, the
+/// withdrawal of a held bound and the remaining reader's progress: it
+/// never decreases while the publication is open. Under `abort` the
+/// revocation seals the publication instead (its limit closes to zero by
+/// the seal, not by the required set).
+#[test]
+fn test_log_buffer_required_set_limits_never_decrease_across_hold_continue_abort() {
+    for policy in [LossPolicy::Hold, LossPolicy::Continue, LossPolicy::Abort] {
+        let buffer = new_buffer(config(3, 3)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut steady = conductor.subscribe(Role::Required).unwrap();
+        let reserve = policy == LossPolicy::Continue;
+        let mut lost = conductor.subscribe_as(Role::Required, reserve, 9).unwrap();
+        let cell = lost.cell();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let data = vec![6u8; 1000];
+        let mut limits = Vec::new();
+        // Twenty appends, the steady reader draining, a duty cycle and a
+        // limit sample each; false once the publication is closed.
+        let mut round = |conductor: &mut Conductor<&LogBuffer<Terms>>,
+                         steady: &mut Subscription<&LogBuffer<Terms>>,
+                         limits: &mut Vec<u64>| {
+            for _ in 0..20 {
+                if let AppendOutcome::Closed =
+                    publication.append(&data, AppendOptions::default()).unwrap()
+                {
+                    return false;
+                }
+                while poll_message(steady).is_some() {}
+                let _ = conductor.duty_cycle().unwrap();
+                limits.push(buffer.limit().load(Ordering::Acquire));
+            }
+            true
+        };
+        // Both readers read along.
+        for _ in 0..5 {
+            assert!(round(&mut conductor, &mut steady, &mut limits));
+            while poll_message(&mut lost).is_some() {}
+        }
+        // The second reader is revoked holding a loan.
+        let found = buffer.cells().get(cell).unwrap();
+        let count = buffer
+            .active_count()
+            .load(Ordering::Acquire)
+            .try_into()
+            .unwrap();
+        let slot = buffer
+            .table_slot(TermCount::try_new(count).unwrap())
+            .unwrap()
+            .load(Ordering::Acquire) as u8;
+        let target = buffer.target(slot, TermCount::try_new(count).unwrap()).unwrap();
+        assert_eq!(
+            take_loan(&found.loan, &found.revoked, buffer.descriptor(slot).unwrap(), target),
+            Ok(LoanOutcome::Granted)
+        );
+        let revocation = conductor.revoke_participant(cell, 9, policy).unwrap();
+        limits.push(buffer.limit().load(Ordering::Acquire));
+        let open = (0..5).all(|_| round(&mut conductor, &mut steady, &mut limits));
+        // The loan ends; a held bound is withdrawn.
+        release_loan(&found.loan);
+        let open = open && (0..5).all(|_| round(&mut conductor, &mut steady, &mut limits));
+        let sealed = conductor.seal_state() != SealState::Active;
+        match policy {
+            LossPolicy::Abort => {
+                assert_eq!(revocation, Revocation::Sealed);
+                assert!(sealed && !open, "abort did not seal");
+                // Until the seal the limit never decreased.
+                let until = limits
+                    .iter()
+                    .position(|limit| *limit == 0)
+                    .unwrap_or(limits.len());
+                let open_limits = &limits[..until];
+                assert!(
+                    open_limits.windows(2).all(|pair| pair[0] <= pair[1]),
+                    "{policy:?}: {open_limits:?}"
+                );
+            }
+            _ => {
+                assert!(!sealed && open, "{policy:?} sealed the publication");
+                assert!(
+                    limits.windows(2).all(|pair| pair[0] <= pair[1]),
+                    "{policy:?}: {limits:?}"
+                );
+            }
+        }
+        assert!(matches!(poll(&mut lost), PollOutcome::Revoked { .. }));
+    }
+}
+
 /// Drains an optional reader, which may be overrun: it never bounds.
 fn drain_optional(subscription: &mut Subscription<&LogBuffer<Terms>>) {
     loop {
