@@ -31,6 +31,7 @@ use karyos_client::{
     ClientConcurrentPublication, ClientPublication, ClientSubscription, GenerationLink,
 };
 use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
+use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::log_buffer::{
     Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, LossPolicy, Publication,
@@ -276,6 +277,11 @@ impl<T: StreamTerms> Stream<T> {
 #[derive(Debug)]
 pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) id: u64,
+    /// The random 128-bit `driver_id` of SPEC.md §4, drawn once at start.
+    pub(crate) driver_id: [u64; 2],
+    /// The next trace number: journal numbers and traced subscriber
+    /// registrations, never reused within this driver instance.
+    pub(crate) next_trace_number: u64,
     pub(crate) config: DriverConfig,
     pub(crate) streams: Vec<Stream<T>>,
     pub(crate) broadcast: BroadcastTransmitter,
@@ -310,7 +316,9 @@ impl EmbeddedDriver<HeapTerms> {
     ///
     /// Returns [`DriverError::DriverIdsExhausted`] once the process has
     /// created `u64::MAX - 1` drivers; identities are never reused, so a
-    /// stale handle can never name another driver's stream.
+    /// stale handle can never name another driver's stream. Returns
+    /// [`DriverError::Sys`] when the random source of the `driver_id`
+    /// fails.
     pub fn new() -> Result<Self, DriverError> {
         Self::with_config(DriverConfig::default())
     }
@@ -427,9 +435,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let id = NEXT_DRIVER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| DriverError::DriverIdsExhausted)?;
+        let mut driver_id = [0u64; 2];
+        karyos_sys::random::fill_u64s(&mut driver_id)?;
         Ok(Self {
             counters,
             id,
+            driver_id,
+            next_trace_number: 1,
             config,
             streams: Vec::new(),
             broadcast,
@@ -853,6 +865,54 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .ok_or(unknown)
     }
 
+    /// The driver instance's random 128-bit `driver_id` (SPEC.md §4), as
+    /// two words. Trace records and observers carry it.
+    #[must_use]
+    pub fn driver_id(&self) -> [u64; 2] {
+        self.driver_id
+    }
+
+    /// The publication identity trace records of `stream` carry
+    /// (`quantstratum-docs: karyos/design/trace-data-path.md`): this
+    /// driver's `driver_id`, the stream's registration, its wire stream and
+    /// session ids, and its current mapping generation as the incarnation.
+    /// Publisher and subscriber hooks of the stream use the same identity,
+    /// so their records pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::UnknownStream`] for a handle of another driver
+    /// or a removed stream.
+    pub fn trace_identity(
+        &mut self,
+        stream: StreamHandle,
+    ) -> Result<PublicationIdentity, DriverError> {
+        let driver = self.driver_id;
+        let found = self.stream(stream)?;
+        Ok(PublicationIdentity {
+            driver,
+            registration: found.id,
+            stream_id: found.stream_id,
+            session_id: found.session_id,
+            incarnation: u64::from(found.generation.get()),
+        })
+    }
+
+    /// A new trace number, never reused within this driver instance: for an
+    /// agent's journal number and a traced subscriber's registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::TraceNumbersExhausted`] once `u64::MAX` numbers
+    /// were handed out.
+    pub fn next_trace_number(&mut self) -> Result<u64, DriverError> {
+        let number = self.next_trace_number;
+        self.next_trace_number = number
+            .checked_add(1)
+            .ok_or(DriverError::TraceNumbersExhausted)?;
+        Ok(number)
+    }
+
     fn active_stream(&mut self, stream: StreamHandle) -> Result<&mut Stream<T>, DriverError> {
         let found = self.stream(stream)?;
         if found.retiring {
@@ -1014,6 +1074,50 @@ mod tests {
             allow_unconnected: false,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
         }
+    }
+
+    #[test]
+    fn each_driver_draws_its_own_driver_id() {
+        let first = EmbeddedDriver::new().unwrap();
+        let second = EmbeddedDriver::new().unwrap();
+        assert_ne!(first.driver_id(), [0, 0]);
+        assert_ne!(first.driver_id(), second.driver_id());
+    }
+
+    #[test]
+    fn the_trace_identity_names_the_driver_and_the_stream() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let stream = driver.add_stream(config(42)).unwrap();
+        let identity = driver.trace_identity(stream).unwrap();
+        assert_eq!(identity.driver, driver.driver_id());
+        assert_eq!(identity.stream_id, 42);
+        assert_eq!(identity.session_id, 1);
+        assert_eq!(identity.registration, stream.stream);
+        // Stable for the same mapping.
+        assert_eq!(driver.trace_identity(stream).unwrap(), identity);
+        let mut other = EmbeddedDriver::new().unwrap();
+        assert!(matches!(
+            other.trace_identity(stream),
+            Err(DriverError::UnknownStream { .. })
+        ));
+    }
+
+    #[test]
+    fn trace_numbers_are_never_reused_and_end_with_a_typed_error() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        assert_eq!(driver.next_trace_number().unwrap(), 1);
+        assert_eq!(driver.next_trace_number().unwrap(), 2);
+        driver.next_trace_number = u64::MAX - 1;
+        assert_eq!(driver.next_trace_number().unwrap(), u64::MAX - 1);
+        assert!(matches!(
+            driver.next_trace_number(),
+            Err(DriverError::TraceNumbersExhausted)
+        ));
+        // Exhaustion is sticky: the last number is never handed out twice.
+        assert!(matches!(
+            driver.next_trace_number(),
+            Err(DriverError::TraceNumbersExhausted)
+        ));
     }
 
     /// A beat from `observer`, a driver cycle, then the events it took.

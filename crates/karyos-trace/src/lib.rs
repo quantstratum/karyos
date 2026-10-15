@@ -19,6 +19,7 @@ pub mod histogram;
 pub mod ids;
 pub mod journal;
 pub mod record;
+pub mod report;
 pub mod sampling;
 pub mod trace_clock;
 
@@ -35,5 +36,6 @@ pub use record::{
     MAX_LANE, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId, RECORD_VERSION,
     RECORD_WORDS, SubscriberId, TraceIds, TraceRecord, decode_record, encode_record,
 };
+pub use report::{HistogramConfig, JournalId, TraceAnswer, TraceReport};
 pub use sampling::{Decision, IdSource, Sampler, Sampling};
 pub use trace_clock::{ClockProvenance, MonotonicClock, TraceClock};

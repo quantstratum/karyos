@@ -1244,6 +1244,7 @@
             "net",
             "param",
             "process",
+            "rand",
             "std",
             "time"
           ],
@@ -1261,6 +1262,7 @@
         "net",
         "param",
         "process",
+        "rand",
         "std",
         "time"
       ],
