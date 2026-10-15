@@ -49,6 +49,11 @@ fn dir(name: &str) -> PathBuf {
 
 /// A driver on the system clock, with a cutover deadline of `deadline_ns`.
 fn driver(dir: &Path, deadline_ns: u64) -> IpcDriver {
+    driver_with(dir, deadline_ns, 16)
+}
+
+/// As [`driver`], with at most `max_exports` grants per client.
+fn driver_with(dir: &Path, deadline_ns: u64, max_exports: usize) -> IpcDriver {
     EmbeddedDriver::with_ipc(
         DriverConfig {
             cutover_deadline: deadline_ns,
@@ -60,7 +65,7 @@ fn driver(dir: &Path, deadline_ns: u64) -> IpcDriver {
             hello_timeout: 5_000_000_000,
             max_outbound_per_client: 8,
             fetch_deadline: 5_000_000_000,
-            max_exports_per_client: 16,
+            max_exports_per_client: max_exports,
             max_fetches_per_client: 4,
             max_regions_per_fetch: 4,
             max_fetch_bytes: 1 << 30,
@@ -489,6 +494,102 @@ fn remote_handles_close_at_once_at_a_final_seal() {
         subscription.generation_link().unwrap().status(),
         LinkStatus::Current
     );
+    drop(subscription);
+    drop(client);
+}
+
+/// A client whose control path hears `Fenced` while the successor it staged
+/// is still offered, before its handle polls: the control path closes the
+/// link and drops the successor (unmapped, then detached), and the handle
+/// then reports the end at the seal.
+#[test]
+fn a_fence_heard_while_the_successor_is_offered_closes_the_link() {
+    let dir = dir("fenced-offered");
+    let mut driver = driver(&dir, 50_000_000);
+    let stream = driver
+        .add_stream(stream_config(PublicationMode::Exclusive))
+        .unwrap();
+    let (client, mut subscription) = remote_grant(
+        &mut driver,
+        &dir,
+        |client| {
+            let _ = client
+                .add_subscription(KEY, SubscriberRole::Required)
+                .unwrap();
+        },
+        |client, fetchable| client.take_subscription(fetchable).unwrap(),
+    );
+    let link = std::sync::Arc::clone(subscription.generation_link().unwrap());
+    reconfigure(&mut driver, stream);
+    let staged = std::sync::Arc::clone(&link);
+    let mut client = serve_while(&mut driver, move || {
+        let mut client = client;
+        let start = Instant::now();
+        while staged.status() != LinkStatus::Offered {
+            assert!(start.elapsed() < Duration::from_secs(10), "never staged");
+            let _ = client.poll(usize::MAX, |_| {});
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        client
+    });
+    serve_until(&mut driver, |driver| counter(driver, "grants fenced") == 1);
+    // The control path hears the fence first.
+    let start = Instant::now();
+    while link.status() != LinkStatus::Closed {
+        assert!(start.elapsed() < Duration::from_secs(10), "never closed");
+        let _ = client.poll(usize::MAX, |_| {});
+    }
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants detached") == 1
+    });
+    let summary = subscription
+        .poll(|_, _| panic!("nothing to deliver"), MessageLimit::new(8))
+        .unwrap();
+    assert!(summary.closed.is_some(), "{summary:?}");
+    drop(subscription);
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants detached") == 2
+    });
+    drop(client);
+}
+
+/// A client at its export bound gets no successor: the driver reserves
+/// nothing and sends `Fenced` at once, with no `SuccessorReady`; the
+/// control path closes the link and the handle ends at the seal.
+#[test]
+fn a_client_at_its_export_bound_is_fenced_at_once() {
+    let dir = dir("bound");
+    let mut driver = driver_with(&dir, 5_000_000_000, 1);
+    let stream = driver
+        .add_stream(stream_config(PublicationMode::Exclusive))
+        .unwrap();
+    let (mut client, mut subscription) = remote_grant(
+        &mut driver,
+        &dir,
+        |client| {
+            let _ = client
+                .add_subscription(KEY, SubscriberRole::Required)
+                .unwrap();
+        },
+        |client, fetchable| client.take_subscription(fetchable).unwrap(),
+    );
+    let link = std::sync::Arc::clone(subscription.generation_link().unwrap());
+    reconfigure(&mut driver, stream);
+    let start = Instant::now();
+    while link.status() != LinkStatus::Closed {
+        assert!(start.elapsed() < Duration::from_secs(10), "never fenced");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |_| {});
+    }
+    assert_eq!(counter(&driver, "grants reserved"), 1);
+    let mut closed = None;
+    serve_until(&mut driver, |_| {
+        closed = subscription
+            .poll(|_, _| panic!("nothing to deliver"), MessageLimit::new(8))
+            .unwrap()
+            .closed;
+        closed.is_some()
+    });
     drop(subscription);
     drop(client);
 }

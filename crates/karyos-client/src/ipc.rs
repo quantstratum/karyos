@@ -577,7 +577,11 @@ impl RemoteClient {
     /// then serves the cutovers of the handles taken: it fetches and
     /// prepares their successors, closes the fenced ones and drops what
     /// moved handles left behind (the control path; it may block on the
-    /// admission socket for the attach timeout per message).
+    /// admission socket for the attach timeout per message). A moved
+    /// handle's predecessor stays charged in the driver's ledger until this
+    /// poll detaches it: a client at its export bound whose predecessor is
+    /// still charged gets no successor at the next cutover and is fenced
+    /// at once, so poll between cutovers.
     pub fn poll<F>(&mut self, limit: usize, on: F) -> ConductorPoll
     where
         F: FnMut(Completion),
@@ -1039,5 +1043,163 @@ fn check(fetched: &Fetched, request: &Request) -> Result<(), AttachError> {
         Ok(())
     } else {
         Err(AttachError::Protocol)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    use crate::generation::LinkStatus;
+
+    /// A session over one end of a socket pair; the peer is returned so the
+    /// session's sends do not fail.
+    fn session() -> (Arc<Session>, UnixStream) {
+        let (ours, peer) = UnixStream::pair().unwrap();
+        let session = Arc::new(Session {
+            instance: 1,
+            socket: OwnedFd::from(ours),
+            fetching: Mutex::new(()),
+            state: Mutex::new(SessionState {
+                next_fetch: 1,
+                live: Vec::new(),
+                broken: false,
+            }),
+            links: Mutex::new(Vec::new()),
+        });
+        (session, peer)
+    }
+
+    fn register(
+        session: &Session,
+        registration: u64,
+        request: Request,
+    ) -> Arc<GenerationLink<SharedTerms>> {
+        let link = GenerationLink::new_remote();
+        session.links().push(RemoteLink {
+            registration,
+            request,
+            generation: 0,
+            link: Arc::downgrade(&link),
+        });
+        link
+    }
+
+    const STREAM: StreamKey = StreamKey {
+        stream_id: 2,
+        session_id: 1,
+    };
+    const OTHER: StreamKey = StreamKey {
+        stream_id: 3,
+        session_id: 1,
+    };
+
+    /// A lost driver closes every link, so a remote handle waiting at a
+    /// seal that marks a successor ends instead of waiting for ever: the
+    /// bound of the wait.
+    #[test]
+    fn a_lost_driver_closes_every_remote_link() {
+        let (session, _peer) = session();
+        let first = register(
+            &session,
+            1,
+            Request::Subscription {
+                stream: STREAM,
+                role: SubscriberRole::Required,
+            },
+        );
+        let second = register(
+            &session,
+            2,
+            Request::Publication {
+                stream: OTHER,
+                allow_unconnected: false,
+            },
+        );
+        // Waiting at a seal with a successor.
+        assert!(matches!(first.next(true), crate::generation::Next::Wait));
+        session.serve_cutovers(Vec::new(), false);
+        assert_eq!(first.status(), LinkStatus::Current);
+        session.serve_cutovers(Vec::new(), true);
+        assert_eq!(first.status(), LinkStatus::Closed);
+        assert_eq!(second.status(), LinkStatus::Closed);
+        assert!(matches!(first.next(true), crate::generation::Next::End));
+    }
+
+    /// `PublicationClosed` closes the links of its stream, publication and
+    /// subscription alike, and no other; `Fenced` closes its registration's.
+    #[test]
+    fn publication_closed_and_fenced_close_only_their_links() {
+        let (session, _peer) = session();
+        let subscription = register(
+            &session,
+            1,
+            Request::Subscription {
+                stream: STREAM,
+                role: SubscriberRole::Optional,
+            },
+        );
+        let publication = register(
+            &session,
+            2,
+            Request::Publication {
+                stream: STREAM,
+                allow_unconnected: true,
+            },
+        );
+        let other = register(
+            &session,
+            3,
+            Request::ConcurrentPublication {
+                stream: OTHER,
+                allow_unconnected: true,
+            },
+        );
+        let fenced = register(
+            &session,
+            4,
+            Request::Subscription {
+                stream: OTHER,
+                role: SubscriberRole::Required,
+            },
+        );
+        session.serve_cutovers(
+            vec![Event::PublicationClosed {
+                stream: STREAM,
+                reason: karyos_protocol::cnc::CloseReason::RequiredParticipantLost,
+            }],
+            false,
+        );
+        assert_eq!(subscription.status(), LinkStatus::Closed);
+        assert_eq!(publication.status(), LinkStatus::Closed);
+        assert_eq!(other.status(), LinkStatus::Current);
+        assert_eq!(fenced.status(), LinkStatus::Current);
+        session.serve_cutovers(
+            vec![Event::Fenced {
+                stream: OTHER,
+                registration: 4,
+            }],
+            false,
+        );
+        assert_eq!(fenced.status(), LinkStatus::Closed);
+        assert_eq!(other.status(), LinkStatus::Current);
+    }
+
+    /// A link whose handle is gone is forgotten at the next service.
+    #[test]
+    fn dropped_handles_leave_the_registry() {
+        let (session, _peer) = session();
+        let link = register(
+            &session,
+            1,
+            Request::Publication {
+                stream: STREAM,
+                allow_unconnected: true,
+            },
+        );
+        drop(link);
+        session.serve_cutovers(Vec::new(), false);
+        assert!(session.links().is_empty());
     }
 }
