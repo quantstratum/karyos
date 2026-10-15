@@ -37,8 +37,8 @@
 #![cfg(loom)]
 
 use karyos_sys::loan::{
-    LoanOutcome, LoanTarget, Rotation, begin_cleaning, begin_reclaim, loan_held, publish,
-    release_loan, rotate_to, take_loan,
+    LoanOutcome, LoanTarget, Rotation, begin_cleaning, begin_reclaim, loan_held, prepare_slot,
+    publish, release_loan, rotate_to, take_loan,
 };
 use karyos_sys::slot::{Descriptor, SlotIndex, SlotState};
 use karyos_sys::sync::{AtomicU64, Ordering};
@@ -126,9 +126,16 @@ impl Buffer {
             publish(&self.descriptors[slot], descriptor(value, SlotState::Ready));
             self.tails[slot].store(tail_of(value), Ordering::Relaxed);
         } else {
-            // Production order: the tail, then the Release publication.
-            self.tails[slot].store(tail_of(value), Ordering::Relaxed);
-            publish(&self.descriptors[slot], descriptor(value, SlotState::Ready));
+            // The production preparation (`Conductor::prepare_next`): the
+            // tail, then the Release publication. Both free slots hold
+            // `FREE` of term 0 here.
+            let _ = prepare_slot(
+                &self.descriptors[slot],
+                &self.tails[slot],
+                descriptor(0, SlotState::Free),
+                descriptor(value, SlotState::Ready),
+            )
+            .unwrap();
         }
     }
 }
