@@ -164,6 +164,18 @@ const KEY: StreamKey = StreamKey {
 const MESSAGES: u32 = 200;
 
 fn add_stream(driver: &mut IpcDriver) -> StreamHandle {
+    add_stream_with(
+        driver,
+        PublicationMode::Exclusive,
+        karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+    )
+}
+
+fn add_stream_with(
+    driver: &mut IpcDriver,
+    publication: PublicationMode,
+    claim_deadline: u64,
+) -> StreamHandle {
     driver
         .add_stream(StreamConfig {
             buffer: LogBufferConfig {
@@ -176,10 +188,10 @@ fn add_stream(driver: &mut IpcDriver) -> StreamHandle {
                 lane: Lane::ZERO,
                 session_id: KEY.session_id,
                 stream_id: KEY.stream_id,
-                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
-                publication: PublicationMode::Exclusive,
+                claim_deadline,
+                publication,
             },
-            allow_unconnected: false,
+            allow_unconnected: true,
             on_required_loss: LossPolicy::Hold,
         })
         .unwrap()
@@ -298,6 +310,181 @@ fn descriptor_driver(dir: &Path) {
         return;
     }
     report("descriptors stable");
+}
+
+/// Polls an in-process subscription until `want` messages or an abort
+/// arrive; returns the payloads and whether an aborted block was skipped.
+fn read_local(
+    driver: &mut IpcDriver,
+    subscription: &mut karyos_client::ClientSubscription<SharedTerms>,
+    want: usize,
+) -> (Vec<Vec<u8>>, bool) {
+    let mut received = Vec::new();
+    let mut aborted = false;
+    let start = Instant::now();
+    while received.len() < want {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "read {received:?}"
+        );
+        let _ = driver.do_work().unwrap();
+        let summary = subscription
+            .poll(
+                |payload, _| received.push(payload.to_vec()),
+                MessageLimit::new(32),
+            )
+            .unwrap();
+        aborted |= summary.aborted.is_some();
+        std::thread::yield_now();
+    }
+    (received, aborted)
+}
+
+/// An exclusive publisher process killed with a claim open: its exit
+/// proof ends its registration at once, aborting the claimed block, so
+/// readers skip it; the publication is released for good.
+#[test]
+fn test_ipc_data_an_exclusive_publisher_killed_mid_claim_is_resolved_at_its_exit() {
+    let dir = dir("killed-claim");
+    let mut driver = driver(&dir);
+    let stream = add_stream(&mut driver);
+    let mut subscription = driver
+        .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+        .unwrap();
+    let (mut child, reports) = spawn("publish-then-claim", &dir);
+    serve_until_report(&mut driver, &reports, "claimed");
+    child.0.kill().unwrap();
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = child.0.wait();
+    assert_eq!(counter(&driver, "grants ended"), 1);
+    let (received, mut aborted) = read_local(&mut driver, &mut subscription, 1);
+    assert_eq!(received, vec![b"before".to_vec()]);
+    // The claimed block was aborted: the reader moves past it (maybe in
+    // the same poll that delivered the message).
+    let start = Instant::now();
+    while !aborted {
+        assert!(start.elapsed() < Duration::from_secs(10), "never aborted");
+        let _ = driver.do_work().unwrap();
+        aborted = subscription
+            .poll(|_, _| {}, MessageLimit::new(8))
+            .unwrap()
+            .aborted
+            .is_some();
+    }
+    assert!(driver.publication(stream).is_err());
+}
+
+/// A concurrent publisher process killed with an open block while an
+/// in-process publisher keeps writing in the same term: the live
+/// publisher's messages are never aborted, the dead block is aborted by
+/// the commit deadline, and then the dead publisher's slot is free again.
+#[test]
+fn test_ipc_data_a_concurrent_publisher_killed_with_an_open_block_waits_for_the_deadline() {
+    let dir = dir("killed-concurrent");
+    let mut driver = driver(&dir);
+    let stream = add_stream_with(
+        &mut driver,
+        PublicationMode::Concurrent {
+            publishers: 2,
+            allow_non_lse: true,
+        },
+        // 100 ms of the system clock.
+        100_000_000,
+    );
+    let mut subscription = driver
+        .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+        .unwrap();
+    let (mut child, reports) = spawn("concurrent-claim", &dir);
+    serve_until_report(&mut driver, &reports, "claimed");
+    let mut live = driver.concurrent_publication(stream).unwrap();
+    for index in 0u8..4 {
+        let start = Instant::now();
+        while !matches!(
+            live.offer(&[index; 24]).unwrap(),
+            karyos_client::ConcurrentOfferOutcome::Accepted { .. }
+        ) {
+            assert!(start.elapsed() < Duration::from_secs(10), "live offer");
+            let _ = driver.do_work().unwrap();
+        }
+    }
+    child.0.kill().unwrap();
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = child.0.wait();
+    // The deadline aborts the dead block; every live message arrives.
+    let (received, aborted) = read_local(&mut driver, &mut subscription, 4);
+    assert!(aborted, "the dead block was not aborted");
+    let expected: Vec<Vec<u8>> = (0u8..4).map(|index| vec![index; 24]).collect();
+    assert_eq!(received, expected);
+    // Its slot is released after the deadline: a second handle can be
+    // issued beside the live one.
+    let start = Instant::now();
+    let second = loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "slot never freed"
+        );
+        let _ = driver.do_work().unwrap();
+        if let Ok(handle) = driver.concurrent_publication(stream) {
+            break handle;
+        }
+    };
+    drop(second);
+    drop(live);
+}
+
+/// A required subscriber process stopped with SIGSTOP keeps its position:
+/// an in-process publisher is back-pressured instead of overrunning it;
+/// after SIGCONT the subscriber reads and leaves.
+#[test]
+fn test_ipc_data_a_stopped_required_subscriber_back_pressures_the_publisher() {
+    let dir = dir("stopped-subscriber");
+    let mut driver = driver(&dir);
+    let stream = add_stream(&mut driver);
+    let (mut child, reports) = spawn("subscribe-stop-read", &dir);
+    serve_until_report(&mut driver, &reports, "subscribed");
+    signal(&child.0, "STOP");
+    let mut publication = driver.publication(stream).unwrap();
+    let payload = [7u8; 1000];
+    let mut accepted = 0u32;
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "never back-pressured"
+        );
+        let _ = driver.do_work().unwrap();
+        match publication.offer(&payload).unwrap() {
+            OfferOutcome::Accepted { .. } => accepted += 1,
+            OfferOutcome::BackPressured => break,
+            _ => {}
+        }
+    }
+    assert!(accepted > 0);
+    signal(&child.0, "CONT");
+    release(&mut child.0);
+    serve_until_report(&mut driver, &reports, "read some");
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    release(&mut child.0);
+    assert!(child.0.wait().unwrap().success());
+}
+
+/// The driver is dropped while a remote subscription is mapped: the
+/// client's mapping stays readable and its handle drops without blocking
+/// past the timeout; it then attaches to the new driver instance.
+#[test]
+fn test_ipc_data_a_driver_restart_leaves_a_remote_mapping_readable() {
+    let dir = dir("restart-data");
+    let mut first = driver(&dir);
+    let _stream = add_stream(&mut first);
+    let (mut child, reports) = spawn("subscribe-across-restart", &dir);
+    serve_until_report(&mut first, &reports, "subscribed");
+    drop(first);
+    let mut second = driver(&dir);
+    release(&mut child.0);
+    serve_until_report(&mut second, &reports, "mapping readable");
+    serve_until_report(&mut second, &reports, "reattached");
+    serve_until(&mut second, |driver| driver.clients() == 0);
+    assert!(child.0.wait().unwrap().success());
 }
 
 /// Fetch, adopt and detach rounds of the descriptor test.
@@ -577,6 +764,92 @@ fn child() {
             // Alive until the driver released this client through its
             // Leave, not through the exit proof.
             wait_for_go();
+        }
+        "publish-then-claim" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, false);
+            let mut publication = client.take_publication(&fetchable).unwrap();
+            let start = Instant::now();
+            while !matches!(
+                publication.offer(b"before").unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                assert!(start.elapsed() < Duration::from_secs(10), "offer");
+            }
+            let karyos_client::ClaimOutcome::Claimed(claim) = publication.try_claim(64).unwrap()
+            else {
+                panic!("not claimed");
+            };
+            // Killed with the block claimed and never committed.
+            std::mem::forget(claim);
+            report("claimed");
+            std::mem::forget(publication);
+            std::mem::forget(client);
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(1);
+        }
+        "concurrent-claim" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let _ = client.add_concurrent_publication(KEY, true).unwrap();
+            let mut fetchable = None;
+            let start = Instant::now();
+            while fetchable.is_none() {
+                assert!(start.elapsed() < Duration::from_secs(10), "no grant");
+                let _ = client.poll(usize::MAX, |completion| {
+                    if let Outcome::Fetchable(grant) = completion.outcome {
+                        fetchable = Some(grant);
+                    }
+                });
+            }
+            let mut publication = client
+                .take_concurrent_publication(&fetchable.unwrap())
+                .unwrap();
+            let karyos_client::ConcurrentClaimOutcome::Claimed(claim) =
+                publication.try_claim(64).unwrap()
+            else {
+                panic!("not claimed");
+            };
+            std::mem::forget(claim);
+            report("claimed");
+            std::mem::forget(publication);
+            std::mem::forget(client);
+            std::thread::sleep(Duration::from_secs(30));
+            std::process::exit(1);
+        }
+        "subscribe-stop-read" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, true);
+            let mut subscription = client.take_subscription(&fetchable).unwrap();
+            report("subscribed");
+            // Stopped here by the parent, then released.
+            wait_for_go();
+            let mut read = 0;
+            let start = Instant::now();
+            while read == 0 {
+                assert!(start.elapsed() < Duration::from_secs(10), "nothing to read");
+                let summary = subscription.poll(|_, _| {}, MessageLimit::new(64)).unwrap();
+                read += summary.delivered;
+            }
+            report("read some");
+            drop(subscription);
+            drop(client);
+            wait_for_go();
+        }
+        "subscribe-across-restart" => {
+            let mut client = attach(&dir, timeout, 16).unwrap();
+            let fetchable = grant(&mut client, true);
+            let mut subscription = client.take_subscription(&fetchable).unwrap();
+            report("subscribed");
+            wait_for_go();
+            // The driver that exported it is gone: the mapping still reads.
+            let _ = subscription.poll(|_, _| {}, MessageLimit::new(8)).unwrap();
+            report("mapping readable");
+            // Its Detach and Leave go to a closed socket: bounded, no hang.
+            drop(subscription);
+            drop(client);
+            let again = attach(&dir, timeout, 16).unwrap();
+            report("reattached");
+            drop(again);
         }
         "descriptor-driver" => descriptor_driver(&dir),
         "subscribe-many" => {

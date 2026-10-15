@@ -103,7 +103,11 @@ fn attach_serving(driver: &mut IpcDriver, dir: &Path) -> Result<RemoteClient, At
 fn serve_until(driver: &mut IpcDriver, mut done: impl FnMut(&IpcDriver) -> bool) {
     let start = Instant::now();
     while !done(driver) {
-        assert!(start.elapsed() < Duration::from_secs(30), "timed out");
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "timed out with {} clients",
+            driver.clients()
+        );
         let _ = driver.do_work().unwrap();
         std::thread::yield_now();
     }
@@ -272,12 +276,17 @@ fn a_closed_socket_keeps_the_slot_until_the_exit_proof() {
 
     // A child process that attaches and exits without Leave is released
     // by its exit proof.
+    let admitted = counter(&driver, "clients admitted");
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "child_attaches_and_exits", "--nocapture"])
         .env(CHILD, &dir)
         .spawn()
         .unwrap();
-    serve_until(&mut driver, |driver| driver.clients() == 2);
+    // The child can attach and exit within one duty cycle, so the second
+    // client is observed through the admission counter, not the count.
+    serve_until(&mut driver, |driver| {
+        counter(driver, "clients admitted") == admitted + 1
+    });
     serve_until(&mut driver, |driver| driver.clients() == 1);
     assert!(child.wait().unwrap().success());
 }
