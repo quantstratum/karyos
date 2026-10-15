@@ -22,6 +22,8 @@
 
 pub mod atomic_view;
 pub mod broadcast;
+#[cfg(not(loom))]
+mod cnc_store;
 pub mod command_ring;
 pub mod conflation;
 pub mod counters;

@@ -386,22 +386,22 @@ mod owned {
     use std::sync::Arc;
 
     use super::{MIN_CAPACITY, RingError, RingRead, RingWords, TRAILER_WORDS};
-    use crate::atomic_view::HeapWords;
+    use crate::cnc_store::RingStore;
+    #[cfg(target_os = "linux")]
+    use crate::error::SysError;
+
+    /// A validated store always forms valid ring words.
+    #[cfg(target_os = "linux")]
+    fn invalid_store() -> SysError {
+        SysError::InvalidRegion { address: 0, len: 0 }
+    }
 
     #[derive(Debug)]
-    struct Region {
-        data: HeapWords,
-        trailer: HeapWords,
-        max_extent: u64,
-    }
+    struct Region(RingStore);
 
     impl Region {
         fn words(&self) -> Result<RingWords<'_>, RingError> {
-            RingWords::new(
-                self.data.words().as_slice(),
-                self.trailer.words().as_slice(),
-                self.max_extent,
-            )
+            RingWords::new(self.0.data(), self.0.trailer(), self.0.max_extent())
         }
     }
 
@@ -413,26 +413,12 @@ mod owned {
     /// Returns [`RingError::InvalidGeometry`] unless `capacity` is a power of
     /// two of at least [`MIN_CAPACITY`].
     pub fn command_ring(capacity: usize) -> Result<(RingProducer, RingConsumer), RingError> {
-        if capacity < MIN_CAPACITY || !capacity.is_power_of_two() {
-            return Err(RingError::InvalidGeometry);
-        }
-        let data = HeapWords::zeroed(capacity / 8).map_err(|_| RingError::InvalidGeometry)?;
-        let trailer = HeapWords::zeroed(TRAILER_WORDS).map_err(|_| RingError::InvalidGeometry)?;
-        let max_extent = u64::try_from(capacity / 8).map_err(|_| RingError::InvalidGeometry)?;
-        let region = Arc::new(Region {
-            data,
-            trailer,
-            max_extent,
-        });
-        let max = region.words()?.max_payload();
+        let store = RingStore::heap(capacity, MIN_CAPACITY, TRAILER_WORDS)
+            .ok_or(RingError::InvalidGeometry)?;
+        let region = Arc::new(Region(store));
         Ok((
-            RingProducer {
-                region: Arc::clone(&region),
-            },
-            RingConsumer {
-                region,
-                scratch: vec![0u8; max].into_boxed_slice(),
-            },
+            RingProducer::over(Arc::clone(&region))?,
+            RingConsumer::over(region)?,
         ))
     }
 
@@ -443,6 +429,30 @@ mod owned {
     }
 
     impl RingProducer {
+        fn over(region: Arc<Region>) -> Result<Self, RingError> {
+            region.words()?;
+            Ok(Self { region })
+        }
+
+        /// The producer of a ring in an attached region (client side,
+        /// `quantstratum-docs: karyos/design/ipc-cnc-regions.md`). The driver keeps the consumer.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SysError::InvalidRegion`] unless the region is a command
+        /// ring of this layout whose configuration line describes a valid
+        /// ring that fills it exactly.
+        #[cfg(target_os = "linux")]
+        pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
+            let store = RingStore::attach(
+                region,
+                crate::ipc::RegionKind::CommandRing,
+                MIN_CAPACITY,
+                TRAILER_WORDS,
+            )?;
+            Self::over(Arc::new(Region(store))).map_err(|_| invalid_store())
+        }
+
         /// Writes one record; returns its position.
         ///
         /// # Errors
@@ -489,6 +499,43 @@ mod owned {
     }
 
     impl RingConsumer {
+        fn over(region: Arc<Region>) -> Result<Self, RingError> {
+            let max = region.words()?.max_payload();
+            Ok(Self {
+                region,
+                scratch: vec![0u8; max].into_boxed_slice(),
+            })
+        }
+
+        /// Creates a ring of `capacity` bytes in a new shared region (driver
+        /// side, `quantstratum-docs: karyos/design/ipc-cnc-regions.md`) and returns its consumer.
+        /// The client attaches the producer through [`RingConsumer::region`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SysError::InvalidRegion`] unless `capacity` is a power
+        /// of two of at least [`MIN_CAPACITY`], and the errors of
+        /// [`crate::ipc::Region::create`].
+        #[cfg(target_os = "linux")]
+        pub fn create_in(instance: u128, region: u64, capacity: usize) -> Result<Self, SysError> {
+            let store = RingStore::create_in(
+                instance,
+                region,
+                crate::ipc::RegionKind::CommandRing,
+                capacity,
+                MIN_CAPACITY,
+                TRAILER_WORDS,
+            )?;
+            Self::over(Arc::new(Region(store))).map_err(|_| invalid_store())
+        }
+
+        /// The shared region, to pass its descriptor; `None` on the heap.
+        #[cfg(target_os = "linux")]
+        #[must_use]
+        pub fn region(&self) -> Option<&crate::ipc::Region> {
+            self.region.0.region()
+        }
+
         /// Closes the ring for good, so the producer sees it; see
         /// [`RingWords::close`].
         pub fn close(&mut self) {

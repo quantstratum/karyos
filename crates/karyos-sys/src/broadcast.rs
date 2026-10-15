@@ -437,23 +437,23 @@ mod owned {
     use std::sync::Arc;
 
     use super::{BroadcastError, BroadcastWords, MIN_CAPACITY, Receive, TRAILER_WORDS};
-    use crate::atomic_view::HeapWords;
+    use crate::cnc_store::RingStore;
+    #[cfg(target_os = "linux")]
+    use crate::error::SysError;
 
     #[derive(Debug)]
-    struct Region {
-        data: HeapWords,
-        trailer: HeapWords,
-        max_extent: u64,
-    }
+    struct Region(RingStore);
 
     impl Region {
         fn words(&self) -> Result<BroadcastWords<'_>, BroadcastError> {
-            BroadcastWords::new(
-                self.data.words().as_slice(),
-                self.trailer.words().as_slice(),
-                self.max_extent,
-            )
+            BroadcastWords::new(self.0.data(), self.0.trailer(), self.0.max_extent())
         }
+    }
+
+    /// A validated store always forms valid broadcast words.
+    #[cfg(target_os = "linux")]
+    fn invalid_store() -> SysError {
+        SysError::InvalidRegion { address: 0, len: 0 }
     }
 
     /// Creates a buffer of `capacity` bytes (control path) and its only
@@ -464,19 +464,9 @@ mod owned {
     /// Returns [`BroadcastError::InvalidGeometry`] unless `capacity` is a
     /// power of two of at least [`MIN_CAPACITY`].
     pub fn broadcast(capacity: usize) -> Result<BroadcastTransmitter, BroadcastError> {
-        if capacity < MIN_CAPACITY || !capacity.is_power_of_two() {
-            return Err(BroadcastError::InvalidGeometry);
-        }
-        let data = HeapWords::zeroed(capacity / 8).map_err(|_| BroadcastError::InvalidGeometry)?;
-        let trailer =
-            HeapWords::zeroed(TRAILER_WORDS).map_err(|_| BroadcastError::InvalidGeometry)?;
-        let max_extent =
-            u64::try_from(capacity / 8).map_err(|_| BroadcastError::InvalidGeometry)?;
-        let region = Arc::new(Region {
-            data,
-            trailer,
-            max_extent,
-        });
+        let store = RingStore::heap(capacity, MIN_CAPACITY, TRAILER_WORDS)
+            .ok_or(BroadcastError::InvalidGeometry)?;
+        let region = Arc::new(Region(store));
         region.words()?;
         Ok(BroadcastTransmitter { region })
     }
@@ -488,6 +478,38 @@ mod owned {
     }
 
     impl BroadcastTransmitter {
+        /// Creates a buffer of `capacity` bytes in a new shared region
+        /// (driver side, `quantstratum-docs: karyos/design/ipc-cnc-regions.md`) and returns its
+        /// only transmitter. Clients attach receivers through
+        /// [`BroadcastTransmitter::region`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SysError::InvalidRegion`] unless `capacity` is a power
+        /// of two of at least [`MIN_CAPACITY`], and the errors of
+        /// [`crate::ipc::Region::create`].
+        #[cfg(target_os = "linux")]
+        pub fn create_in(instance: u128, region: u64, capacity: usize) -> Result<Self, SysError> {
+            let store = RingStore::create_in(
+                instance,
+                region,
+                crate::ipc::RegionKind::Broadcast,
+                capacity,
+                MIN_CAPACITY,
+                TRAILER_WORDS,
+            )?;
+            let region = Arc::new(Region(store));
+            region.words().map_err(|_| invalid_store())?;
+            Ok(Self { region })
+        }
+
+        /// The shared region, to pass its descriptor; `None` on the heap.
+        #[cfg(target_os = "linux")]
+        #[must_use]
+        pub fn region(&self) -> Option<&crate::ipc::Region> {
+            self.region.0.region()
+        }
+
         /// Writes one message; returns its position.
         ///
         /// # Errors
@@ -579,6 +601,34 @@ mod owned {
     }
 
     impl BroadcastReceiver {
+        /// A reader of a buffer in an attached region (client side,
+        /// `quantstratum-docs: karyos/design/ipc-cnc-regions.md`), starting at the committed
+        /// tail. The reader trusts nothing it reads: every record is
+        /// validated as with a heap buffer.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`SysError::InvalidRegion`] unless the region is a
+        /// broadcast buffer of this layout whose configuration line
+        /// describes a valid buffer that fills it exactly.
+        #[cfg(target_os = "linux")]
+        pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
+            let store = RingStore::attach(
+                region,
+                crate::ipc::RegionKind::Broadcast,
+                MIN_CAPACITY,
+                TRAILER_WORDS,
+            )?;
+            let region = Arc::new(Region(store));
+            let words = region.words().map_err(|_| invalid_store())?;
+            let (cursor, max) = (words.tail(), words.max_payload());
+            Ok(Self {
+                region,
+                cursor,
+                scratch: vec![0u8; max].into_boxed_slice(),
+            })
+        }
+
         /// Whether the writer closed the buffer. Records committed before
         /// the close can still be received.
         #[must_use]
