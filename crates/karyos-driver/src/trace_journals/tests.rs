@@ -553,6 +553,52 @@ fn a_gone_writer_is_drained_and_marked_writer_lost() {
     assert_eq!(counter(&driver, "trace journals open"), 0);
 }
 
+/// A drop the writer records after the driver's last read reaches the
+/// entry: at the next cycle of an idle open journal (its attempted count
+/// moved), and at the final visit of a gone writer (review of #135).
+#[test]
+fn a_drop_after_the_last_read_reaches_the_entry() {
+    // A late drop: the writer raises the attempted count after the read,
+    // with nothing pending. Words: geometry 0..16, then the control words,
+    // the attempted count at control word 32.
+    fn late_drop(driver: &EmbeddedDriver, journal: u64) {
+        driver
+            .trace_journals
+            .slots
+            .iter()
+            .flatten()
+            .find(|held| held.entry.journal == journal)
+            .and_then(|held| held.drain.as_ref())
+            .unwrap()
+            .hostile_words()[16 + 32]
+            .store(3, std::sync::atomic::Ordering::Release);
+    }
+    let mut driver = driver(4, 64, 64);
+    let mut conductor = driver.connect().unwrap();
+    let mut idle = journal(&mut driver, &mut conductor);
+    let mut gone = journal(&mut driver, &mut conductor);
+    append(&mut idle, 0..2);
+    append(&mut gone, 0..2);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(entry(&driver, idle.journal()).attempted, 2);
+    // An open idle journal shows it at the next cycle.
+    late_drop(&driver, idle.journal());
+    let _ = driver.do_work().unwrap();
+    assert_eq!(entry(&driver, idle.journal()).attempted, 3);
+    assert_eq!(entry(&driver, idle.journal()).state, JournalState::Open);
+    // A gone writer's last drop, after the last cycle, reaches the final
+    // entry through the final visit.
+    assert_eq!(entry(&driver, gone.journal()).attempted, 2);
+    late_drop(&driver, gone.journal());
+    driver.trace_journals.writer_gone(
+        gone.journal(),
+        &mut driver.diagnostics,
+        &mut driver.counters,
+    );
+    let lost = entry(&driver, gone.journal());
+    assert_eq!((lost.state, lost.attempted), (JournalState::WriterLost, 3));
+}
+
 /// A dropped client conductor drops the journal writers it never took:
 /// their journals close and end closed.
 #[test]

@@ -224,6 +224,15 @@ impl JournalDrain {
         self.consumed
     }
 
+    /// The journal's attempted count (one Acquire load), for deciding
+    /// whether its loss accounting changed; `None` when the journal cannot
+    /// be read. The value is untrusted, like every word of the journal:
+    /// it only selects a reread, which `losses` validates.
+    #[must_use]
+    pub fn attempted(&self) -> Option<u64> {
+        Self::words(&self.region, &self.layout).map(|words| words.attempted())
+    }
+
     /// The violation that stopped the drain, if any.
     #[must_use]
     pub fn fault(&self) -> Option<Violation> {
