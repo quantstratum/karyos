@@ -200,6 +200,17 @@ pub enum Revocation {
     Sealed,
 }
 
+/// An attached subscriber cell, as [`Conductor::subscribers`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SubscriberCell {
+    /// The registry cell index.
+    pub cell: usize,
+    /// The occupant or export id registered in the cell, 0 for none.
+    pub registration: u64,
+    /// The subscriber's position.
+    pub position: u64,
+}
+
 /// Construction parameters of a [`LogBuffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogBufferConfig {
@@ -3650,6 +3661,41 @@ impl<O: BufferOwner> Conductor<O> {
             }
             _ => None,
         }
+    }
+
+    /// The retention floor (Acquire): the position below which terms may be
+    /// reclaimed, as the last duty cycle published it (before the limit).
+    /// Diagnostics sample it (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "Per-stream positions").
+    #[must_use]
+    pub fn floor(&self) -> u64 {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer.floor().load(Ordering::Acquire)
+    }
+
+    /// The attached subscriber cells, in cell order: each one's cell index,
+    /// registration (the occupant or export id, its marks cleared; 0 for a
+    /// subscription without one) and position, each loaded with Acquire.
+    /// Detached, lost and free cells are skipped. Diagnostics sample it.
+    pub fn subscribers(&self) -> impl Iterator<Item = SubscriberCell> + '_ {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let first = buffer.first_subscriber_cell();
+        buffer
+            .cells()
+            .iter()
+            .enumerate()
+            .skip(first)
+            .filter_map(|(index, cell)| match cell.state.load(Ordering::Acquire) {
+                CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER => {
+                    Some(SubscriberCell {
+                        cell: index,
+                        registration: cell.registration.load(Ordering::Acquire)
+                            & crate::registration::MAX_EXPORT,
+                        position: cell.position.load(Ordering::Acquire),
+                    })
+                }
+                _ => None,
+            })
     }
 
     /// The publication limit (Acquire): no reservation granted from now on

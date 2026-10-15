@@ -354,6 +354,31 @@ impl<'a> CellWords<'a> {
         let _ = self.value.swap(value, Ordering::Relaxed);
     }
 
+    /// Loads the value word alone with a `Relaxed` load, without the
+    /// metadata: the cells of a sampling pass, its epoch included, are read
+    /// this way ([`read_pass`] adds the fences). Only `Relaxed` so the same
+    /// read is valid over read-only memory.
+    #[must_use]
+    pub fn load_value(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+
+    /// Begins a sampling pass on this epoch cell (`quantstratum-docs:
+    /// karyos/design/observability-and-tools.md`, "The sampling pass"): sets
+    /// the odd `epoch`, then a Release fence orders it before every cell the
+    /// pass writes.
+    pub fn begin_pass(&self, epoch: u64) {
+        self.set(epoch);
+        fence(Ordering::Release);
+    }
+
+    /// Ends a sampling pass: a Release fence orders every cell the pass
+    /// wrote before the even `epoch`.
+    pub fn end_pass(&self, epoch: u64) {
+        fence(Ordering::Release);
+        self.set(epoch);
+    }
+
     /// Reads a consistent snapshot, or reports the cell as changing after a
     /// bounded number of attempts. Never waits.
     #[must_use]
@@ -427,6 +452,46 @@ pub(crate) fn read_cell(meta: impl Fn(usize) -> Option<u64>, value: impl Fn() ->
         };
     }
     CellRead::Changing
+}
+
+/// What a reader of a sampling pass got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassRead<R> {
+    /// The values come from one completed pass.
+    Consistent(R),
+    /// Every attempt overlapped a pass: the values may mix passes. A tool
+    /// shows them marked inconsistent and computes differences with
+    /// checked arithmetic.
+    Inconsistent(R),
+}
+
+/// The reader side of a sampling pass: loads the epoch with `epoch()` (a
+/// `Relaxed` load) and issues an Acquire fence, runs `read` (`Relaxed`
+/// loads of the pass's cells), issues an Acquire fence and loads the epoch
+/// again; accepts when both loads are equal and even. After `attempts` (at
+/// least one) failures it returns the last values as inconsistent. Only
+/// `Relaxed` loads are needed, so the read works over read-only memory.
+pub fn read_pass<R>(
+    epoch: impl Fn() -> u64,
+    mut read: impl FnMut() -> R,
+    attempts: usize,
+) -> PassRead<R> {
+    let mut remaining = attempts.max(1);
+    loop {
+        let before = epoch();
+        // Pairs with the Release fence of `begin_pass`/`end_pass`.
+        fence(Ordering::Acquire);
+        let values = read();
+        fence(Ordering::Acquire);
+        let after = epoch();
+        if before.is_multiple_of(2) && before == after {
+            return PassRead::Consistent(values);
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            return PassRead::Inconsistent(values);
+        }
+    }
 }
 
 #[cfg(not(loom))]
@@ -730,6 +795,21 @@ mod owned {
                 cell.set(value);
             }
         }
+
+        /// Begins a sampling pass with this counter as its epoch; see
+        /// [`CellWords::begin_pass`].
+        pub fn begin_pass(&self, epoch: u64) {
+            if let Some(cell) = self.region.cell(self.index) {
+                cell.begin_pass(epoch);
+            }
+        }
+
+        /// Ends a sampling pass; see [`CellWords::end_pass`].
+        pub fn end_pass(&self, epoch: u64) {
+            if let Some(cell) = self.region.cell(self.index) {
+                cell.end_pass(epoch);
+            }
+        }
     }
 
     impl Drop for Counter {
@@ -811,6 +891,14 @@ mod owned {
         #[must_use]
         pub fn capacity(&self) -> usize {
             self.region.capacity
+        }
+
+        /// Loads the value word of cell `index` alone with a `Relaxed`
+        /// load, for a sampling pass ([`super::read_pass`]); `None` when
+        /// out of range.
+        #[must_use]
+        pub fn load_value(&self, index: usize) -> Option<u64> {
+            self.region.cell(index).map(|cell| cell.load_value())
         }
 
         /// Reads cell `index`; `Free` when out of range.
