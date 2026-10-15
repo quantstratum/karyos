@@ -162,6 +162,13 @@ impl HeapWords {
     /// The first word, for backings that derive section pointers.
     #[inline]
     #[must_use]
+    #[cfg_attr(
+        loom,
+        allow(
+            dead_code,
+            reason = "used by the log buffer storage, absent under loom"
+        )
+    )]
     pub(crate) fn base(&self) -> NonNull<AtomicU64> {
         self.base
     }
@@ -169,6 +176,13 @@ impl HeapWords {
     /// The number of words.
     #[inline]
     #[must_use]
+    #[cfg_attr(
+        loom,
+        allow(
+            dead_code,
+            reason = "used by the log buffer storage, absent under loom"
+        )
+    )]
     pub(crate) fn count(&self) -> usize {
         self.count
     }
