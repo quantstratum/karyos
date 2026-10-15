@@ -14,10 +14,14 @@ use karyos_client::{
     OfferOutcome,
 };
 use karyos_driver::{EmbeddedDriver, StreamConfig, StreamHandle};
-use karyos_sys::frame::Lane;
-use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+use karyos_protocol::frame::FrameHeader;
+use karyos_sys::frame::{Flags, FrameType, Lane, Word0};
+use karyos_sys::log_buffer::{
+    LogBuffer, LogBufferConfig, PublicationMode, ReceiveOwner, Received, Role,
+};
+use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
 use karyos_sys::sizing::{DEFAULT_MTU, TermLength};
-use karyos_sys::term::TermId;
+use karyos_sys::term::{TermCount, TermId};
 use karyos_trace::clocks::Latency;
 use karyos_trace::histogram::Histogram;
 
@@ -32,15 +36,23 @@ pub enum Workload {
     PingPong,
     /// Concurrent publishers and one subscriber on their own threads.
     Throughput,
+    /// A receive owner commits each validated frame into an image
+    /// (`quantstratum-docs: karyos/design/receive-publication.md`).
+    Receive,
+    /// A receive owner compares each frame's duplicate with the committed
+    /// one: the cost of redundant paths.
+    ReceiveDuplicate,
 }
 
 impl Workload {
     /// Every workload.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::OfferPoll,
         Self::Claim,
         Self::PingPong,
         Self::Throughput,
+        Self::Receive,
+        Self::ReceiveDuplicate,
     ];
 
     /// Its name on the command line and in the history.
@@ -51,6 +63,8 @@ impl Workload {
             Self::Claim => "claim",
             Self::PingPong => "ping-pong",
             Self::Throughput => "throughput",
+            Self::Receive => "receive",
+            Self::ReceiveDuplicate => "receive-duplicate",
         }
     }
 
@@ -210,6 +224,147 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
         Workload::OfferPoll | Workload::Claim => single_thread(config),
         Workload::PingPong => ping_pong(config),
         Workload::Throughput => throughput(config),
+        Workload::Receive => receive_frames(config, false),
+        Workload::ReceiveDuplicate => receive_frames(config, true),
+    }
+}
+
+/// One thread: validate a datagram of one frame and hand it to the image's
+/// receive owner, measuring only the owner's call: the commit, or with
+/// `duplicate` the comparison of a second copy. Parsing and validation
+/// happen before the timer starts. A PAD closes each term and the conductor
+/// prepares the next; neither is measured.
+fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchError> {
+    let resolution = resolution();
+    let term_length =
+        TermLength::try_new(config.term_length).map_err(|cause| error("term length", cause))?;
+    let params = ImageParams::new(1, 1, 1, term_length, DEFAULT_MTU)
+        .map_err(|cause| error("image params", cause))?;
+    let buffer = Arc::new(
+        LogBuffer::new(LogBufferConfig {
+            term_length,
+            spare_slots: 6,
+            max_subscribers: 2,
+            mtu: DEFAULT_MTU,
+            max_reserved: config.term_length / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 1,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Image { join: 0 },
+        })
+        .map_err(|cause| error("image", cause))?,
+    );
+    let mut conductor = buffer
+        .conductor()
+        .ok_or_else(|| BenchError("the image's conductor was taken".into()))?;
+    let mut owner = ReceiveOwner::new(params, vec![Arc::clone(&buffer)])
+        .map_err(|cause| error("receive owner", cause))?;
+    let frame_length =
+        u32::try_from(config.message + 32).map_err(|cause| error("message", cause))?;
+    let reserved = frame_length.next_multiple_of(32);
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    let mut bytes = vec![7u8; frame_length as usize];
+    let mut pad = [0u8; 32];
+    let mut latencies = histogram()?;
+    let (mut term, mut offset) = (0u32, 0u32);
+    let mut measured_from = Instant::now();
+    let handle = |owner: &mut ReceiveOwner, bytes: &[u8]| -> Result<Received, BenchError> {
+        let datagram =
+            ValidatedDatagram::parse(bytes, &params).map_err(|cause| error("parse", cause))?;
+        let Some(Item::Frame(frame)) = datagram.items().next() else {
+            return Err(BenchError("no frame".into()));
+        };
+        owner
+            .receive(&frame)
+            .map_err(|cause| error("receive", cause))
+    };
+    for iteration in 0..config.warmup + config.iterations {
+        if iteration == config.warmup {
+            measured_from = Instant::now();
+        }
+        let term_id = TermCount::try_new(term)
+            .map(|count| TermId::new(7).advanced_by(count))
+            .map_err(|cause| error("term", cause))?;
+        if offset + reserved > config.term_length {
+            // A term filled exactly needs no PAD.
+            let extent = config.term_length - offset;
+            if extent > 0 {
+                header(
+                    Word0::new(32, Flags::NONE, FrameType::Pad),
+                    term_id,
+                    offset,
+                    i64::from(extent),
+                )
+                .encode(&mut pad)
+                .map_err(|cause| error("pad", cause))?;
+                handle(&mut owner, &pad)?;
+            }
+            conductor
+                .duty_cycle()
+                .map_err(|cause| error("duty", cause))?;
+            while owner.duty() {}
+            (term, offset) = (term + 1, 0);
+        }
+        let term_id = TermCount::try_new(term)
+            .map(|count| TermId::new(7).advanced_by(count))
+            .map_err(|cause| error("term", cause))?;
+        header(
+            Word0::new(frame_length.cast_signed(), flags, FrameType::Data),
+            term_id,
+            offset,
+            0,
+        )
+        .encode(&mut bytes)
+        .map_err(|cause| error("header", cause))?;
+        let datagram =
+            ValidatedDatagram::parse(&bytes, &params).map_err(|cause| error("parse", cause))?;
+        let Some(Item::Frame(frame)) = datagram.items().next() else {
+            return Err(BenchError("no frame".into()));
+        };
+        let begin = Instant::now();
+        let first = owner
+            .receive(&frame)
+            .map_err(|cause| error("receive", cause))?;
+        let end = if duplicate {
+            let begin = Instant::now();
+            let second = owner
+                .receive(&frame)
+                .map_err(|cause| error("receive", cause))?;
+            if second != Received::Duplicate {
+                return Err(BenchError(format!("a duplicate was {second:?}")));
+            }
+            begin.elapsed().as_nanos()
+        } else {
+            begin.elapsed().as_nanos()
+        };
+        if !matches!(first, Received::Committed { .. }) {
+            return Err(BenchError(format!("a frame was {first:?}")));
+        }
+        if iteration >= config.warmup {
+            record(&mut latencies, end, resolution)?;
+        }
+        offset += reserved;
+    }
+    let seconds = measured_from.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    Ok(Measurement {
+        config,
+        latency: Some(latencies),
+        rate: config.iterations as f64 / seconds,
+        resolution,
+    })
+}
+
+/// The header of a frame of the receive workloads' image.
+fn header(word0: Word0, term: TermId, offset: u32, reserved_value: i64) -> FrameHeader {
+    FrameHeader {
+        word0,
+        term_offset: offset.cast_signed(),
+        session_id: 1,
+        stream_id: 1,
+        term_id: term.get().cast_signed(),
+        reserved_value,
     }
 }
 
