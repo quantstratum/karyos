@@ -1,27 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Embedded log buffer for one lane with exclusive publication and term reuse
-//! (SPEC.md §4; design in `quantstratum-docs: karyos/design/embedded-log-buffer.md`).
+//! Log buffer for one lane (SPEC.md §4; design in quantstratum-docs:
+//! `karyos/design/embedded-log-buffer.md` and the documents named below).
 //!
 //! `LogBuffer` owns `3 + S` term slots, their descriptors, a slot table, the
 //! active term count, a registry of loan cells and the published reserved
-//! head, limit and floor. Three capabilities act on it:
+//! head, limit and floor. Its shared words live in one backing
+//! (quantstratum-docs: karyos/`design/ipc-log-buffer.md`): heap memory of this process, or a
+//! shared region that a driver creates (`LogBuffer::create_in`, Linux) and a
+//! participant in another process attaches to (`LogBuffer::attach`).
+//! Capabilities that act on it:
 //!
-//! - [`Publication`], issued once, appends under a standing write loan and
-//!   rotates through a recoverable no-loan state;
+//! - [`Publication`], the exclusive publication, issued once, appends and
+//!   claims under a standing write loan and rotates through a recoverable
+//!   no-loan state (quantstratum-docs: karyos/`design/claims.md`);
+//! - [`ConcurrentPublication`], one per publisher slot of a concurrent
+//!   buffer, reserves with `fetch_add` on the active tail
+//!   (quantstratum-docs: karyos/`design/concurrent-publication.md`);
 //! - [`Subscription`], one per registry cell, copies messages out under a
 //!   read loan held through the last byte;
-//! - [`Conductor`], issued once, serialises admission, flow control,
-//!   retention, rotation help, reclamation, cleaning and preparation through
-//!   `&mut self`.
+//! - [`Conductor`], issued once per buffer, serialises admission, flow
+//!   control, retention, rotation help, reclamation, cleaning, preparation
+//!   and the claim deadlines through `&mut self`.
 //!
-//! Scope: embedded mode (one process), one lane, copy delivery, `hold`
-//! required subscribers and `rejoin_at_head` optional subscribers. Claims
-//! on the exclusive publication follow `quantstratum-docs: karyos/design/claims.md`, without the
-//! driver's commit-deadline abort. No concurrent publication, observers,
-//! revocation policies or mapping generations. This low-level copy primitive also allows a publication with
-//! no subscribers at all: the `NotConnected` / `allow_unconnected` connection
-//! rules of SPEC.md §4 are left to a later, higher layer.
+//! A participant in another process does not register itself: the driver
+//! registers it and the participant adopts that grant once
+//! ([`Subscription::adopt`], [`Publication::adopt`],
+//! [`ConcurrentPublication::adopt`]). A buffer belongs to one mapping
+//! generation; sealing and fencing it hand its streams over to a successor
+//! (quantstratum-docs: karyos/`design/mapping-generations.md`).
+//!
+//! Scope: one lane, copy delivery, `hold` required subscribers and
+//! `rejoin_at_head` optional subscribers. Not yet: observers, the
+//! `continue` and `abort` loss policies with revocation, and the
+//! `snapshot`, `close` and `replay` rejoin policies. This primitive also
+//! allows a publication with no subscribers at all; the `NotConnected` /
+//! `allow_unconnected` rules of SPEC.md §4 belong to the client layer
+//! (quantstratum-docs: karyos/`design/embedded-api.md`).
 
 use core::ops::Deref;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
