@@ -446,16 +446,19 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// # Errors
     ///
     /// Returns [`ClientError::PositionsExhausted`] when the mapping starting
-    /// at `base` could report a position at or above `2^63`; the handle is
-    /// then dropped, releasing what it holds.
+    /// at `base` could report a position at or above `2^63`, and
+    /// [`ClientError::ClosedByOverrun`] for a subscription its rejoin policy
+    /// closed, which no cutover may reach; the handle is then dropped,
+    /// releasing what it holds.
     pub fn with_generation(
         mut self,
         link: Arc<GenerationLink<T>>,
         base: u64,
     ) -> Result<Self, ClientError> {
-        if let Some(inner) = &self.inner
-            && !representable(base, inner.buffer())
-        {
+        let Some(inner) = &self.inner else {
+            return Err(ClientError::ClosedByOverrun);
+        };
+        if !representable(base, inner.buffer()) {
             return Err(ClientError::PositionsExhausted { base });
         }
         self.link = Some(link);

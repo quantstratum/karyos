@@ -364,4 +364,35 @@ fn test_rejoin_close_during_cutover_releases_successor() {
         .poll(|_, _| panic!("closed"), MessageLimit::new(10))
         .unwrap();
     assert_eq!(later.rejoin, Some(RejoinOutcome::Closed));
+    // The stream lease is released: once removed, the stream is freed
+    // while the closed handle still exists.
+    driver.remove_stream(stream).unwrap();
+    for _ in 0..100 {
+        if driver.generations(stream).is_err() {
+            break;
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    assert!(
+        driver.generations(stream).is_err(),
+        "the closed reader still holds the stream"
+    );
+    drop(lagging);
+}
+
+/// A subscription its rejoin policy closed takes no generation link, so no
+/// later cutover can mark it pending.
+#[test]
+fn a_closed_subscription_refuses_a_generation_link() {
+    let (_driver, _stream, _publication, mut lagging, _) = lapped(RejoinPolicy::Close, 4);
+    let summary = lagging
+        .poll(|_, _| panic!("closed"), MessageLimit::new(10))
+        .unwrap();
+    assert_eq!(summary.rejoin, Some(RejoinOutcome::Closed));
+    let link = karyos_client::GenerationLink::new();
+    assert!(matches!(
+        lagging.with_generation(Arc::clone(&link), 0),
+        Err(karyos_client::ClientError::ClosedByOverrun)
+    ));
+    assert_eq!(link.status(), LinkStatus::Current);
 }
