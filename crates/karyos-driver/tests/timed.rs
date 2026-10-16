@@ -11,7 +11,12 @@
     reason = "tests, as ADR-0007 allows"
 )]
 
-use karyos_client::schedule::{ClockDomain, ScheduleOptions, now};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use karyos_client::schedule::{
+    CLOCK_UNAVAILABLE, ClockDomain, ScheduleClock, ScheduleOptions, now,
+};
 use karyos_client::{ClientError, OfferOutcome};
 use karyos_driver::{DriverError, EmbeddedDriver, StreamConfig, StreamHandle};
 use karyos_sys::frame::Lane;
@@ -276,4 +281,105 @@ fn a_sealed_handle_reports_the_seal_before_a_refused_time() {
     driver.remove_stream(handle).unwrap();
     assert_eq!(publication.offer_at(b"m", 5).unwrap(), OfferOutcome::Closed);
     assert_eq!(publication.offer_at(b"m", 5).unwrap(), OfferOutcome::Closed);
+}
+
+fn counter(driver: &EmbeddedDriver, label: &str) -> u64 {
+    let reader = driver.counters();
+    (0..reader.capacity())
+        .find_map(|index| match reader.read(index) {
+            karyos_sys::counters::CellRead::Allocated {
+                metadata, value, ..
+            } if metadata.label() == label.as_bytes() => Some(value),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A timed lane's offers are counted by outcome, in cells labelled with
+/// its clock domain and checked against the injected clock (timed-tx.md
+/// section 6; ACS 15462).
+#[test]
+fn timed_offers_are_counted_against_the_injected_clock() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 2);
+    let virtual_now = Arc::new(AtomicU64::new(1_000));
+    let clock = {
+        let virtual_now = Arc::clone(&virtual_now);
+        ScheduleClock::new(move || virtual_now.load(Ordering::Relaxed))
+    };
+    driver
+        .schedule_stream_with_clock(
+            handle,
+            ScheduleOptions {
+                max_horizon: 100,
+                ..ScheduleOptions::default()
+            },
+            clock,
+        )
+        .unwrap();
+    assert!(driver.timed_counters(handle).unwrap().is_none());
+    let mut publication = driver.publication(handle).unwrap();
+    assert!(driver.timed_counters(handle).unwrap().is_some());
+    // The horizon is read from the injected clock: 1_100 is the limit.
+    assert!(matches!(
+        publication.offer_at(b"m", 1_101),
+        Err(ClientError::ScheduleTooFar { limit: 1_100, .. })
+    ));
+    assert!(matches!(
+        publication.offer_at(b"m", 1_100).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert!(invalid(publication.offer_at(b"m", 1_000)));
+    assert!(matches!(
+        publication.offer_at(b"m", u64::MAX),
+        Err(ClientError::ScheduleOverflow)
+    ));
+    virtual_now.store(2_000, Ordering::Relaxed);
+    assert!(matches!(
+        publication.offer_at(b"m", 2_000).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert_eq!(
+        publication.offer_at(b"m", 2_001).unwrap(),
+        OfferOutcome::BackPressured
+    );
+    let read = |label: &str| counter(&driver, &format!("{label} (monotonic)"));
+    assert_eq!(read("timed scheduled offers"), 2);
+    assert_eq!(read("timed rejections invalid"), 1);
+    assert_eq!(read("timed rejections too far"), 1);
+    assert_eq!(read("timed rejections overflow"), 1);
+    assert_eq!(read("timed rejections ring full"), 1);
+    assert_eq!(read("timed late sends"), 0);
+    assert_eq!(read("timed deadline aborts"), 0);
+    assert_eq!(read("timed lateness <= 1us"), 0);
+}
+
+/// A clock that cannot read the time refuses every offer with
+/// `ScheduleOverflow`, counted, whatever the horizon (ACS 15475; a zero
+/// horizon is refused at `schedule_stream`).
+#[test]
+fn an_unavailable_clock_refuses_the_offer() {
+    for max_horizon in [1, SECOND] {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let handle = stream(&mut driver, 2);
+        driver
+            .schedule_stream_with_clock(
+                handle,
+                ScheduleOptions {
+                    max_horizon,
+                    ..ScheduleOptions::default()
+                },
+                ScheduleClock::new(|| CLOCK_UNAVAILABLE),
+            )
+            .unwrap();
+        let mut publication = driver.publication(handle).unwrap();
+        for time in [0, 1_000, u64::MAX - SECOND] {
+            assert!(matches!(
+                publication.offer_at(b"m", time),
+                Err(ClientError::ScheduleOverflow)
+            ));
+        }
+        assert_eq!(counter(&driver, "timed rejections overflow (monotonic)"), 3);
+        assert_eq!(counter(&driver, "timed scheduled offers (monotonic)"), 0);
+    }
 }

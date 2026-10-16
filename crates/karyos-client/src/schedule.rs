@@ -9,6 +9,10 @@
 //! with its entry (`karyos_sys::log_buffer::Publication::append_scheduled`,
 //! whose publisher is the sys publication's own).
 
+use std::sync::Arc;
+
+use karyos_sys::counters::Counter;
+
 use crate::error::ClientError;
 
 /// The clock a timed publication's requested times are read in (TT-2).
@@ -23,6 +27,15 @@ pub enum ClockDomain {
 }
 
 impl ClockDomain {
+    /// The domain's name in counter labels.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Monotonic => "monotonic",
+            Self::Tai => "tai",
+        }
+    }
+
     /// The clock of the domain, on this host.
     ///
     /// # Errors
@@ -96,13 +109,83 @@ impl Default for ScheduleOptions {
     }
 }
 
-/// A timed lane's publication side: the settings, the clock and the last
-/// time accepted. The ring's publisher is the sys publication's own, built
-/// from its own lane's ring, so a handle cannot push to another lane's.
+/// The clock a timed lane's offers are checked against, in its domain:
+/// the host's clock of the domain ([`ClockDomain::clock`]) unless the
+/// driver or a simulator sets another.
+///
+/// It runs on the offer path, once per `offer_at`: it must not allocate,
+/// block or take a lock another thread may hold. A clock that cannot read
+/// the time returns [`CLOCK_UNAVAILABLE`], and the offer is refused
+/// (`ScheduleOverflow`), never scheduled on a guess.
+#[derive(Clone)]
+pub struct ScheduleClock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl ScheduleClock {
+    /// A clock that reads `now`.
+    pub fn new(now: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    /// The host clock of `domain`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClockDomain::clock`].
+    pub fn host(domain: ClockDomain) -> Result<Self, ClientError> {
+        Ok(Self::new(domain.clock()?))
+    }
+
+    /// The current time.
+    #[must_use]
+    pub fn now(&self) -> u64 {
+        (self.0)()
+    }
+}
+
+impl core::fmt::Debug for ScheduleClock {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ScheduleClock")
+    }
+}
+
+/// A timed lane's offer counters (`quantstratum-docs:
+/// karyos/design/timed-tx.md`, section 6), cells of the driver's counters
+/// region that the driver allocates for the lane and shares with each of
+/// its handles. A cell the region had no room for is `None`, and its count
+/// is not kept. An increment that would overflow leaves the value
+/// unchanged; it is not counted elsewhere, since a client handle has no
+/// `counter overflows` cell.
+#[derive(Debug, Default)]
+pub struct ScheduleCounters {
+    /// Timed offers accepted.
+    pub scheduled_offers: Option<Counter>,
+    /// Timed offers refused with `InvalidSchedule` (a time below the
+    /// lane's last).
+    pub rejected_invalid: Option<Counter>,
+    /// Timed offers refused with `ScheduleTooFar`.
+    pub rejected_too_far: Option<Counter>,
+    /// Timed offers refused with `ScheduleOverflow`.
+    pub rejected_overflow: Option<Counter>,
+    /// Timed offers back pressured by a full schedule ring.
+    pub rejected_ring_full: Option<Counter>,
+}
+
+/// Adds one to `counter`, if it has a cell; see [`ScheduleCounters`].
+pub(crate) fn count(counter: Option<&Counter>) {
+    if let Some(counter) = counter {
+        let _ = counter.increment(1);
+    }
+}
+
+/// A timed lane's publication side: the settings, the clock, the counters
+/// and the last time accepted. The ring's publisher is the sys
+/// publication's own, built from its own lane's ring, so a handle cannot
+/// push to another lane's.
 #[derive(Debug)]
 pub struct ScheduleBinding {
     options: ScheduleOptions,
-    clock: fn() -> u64,
+    clock: ScheduleClock,
+    pub(crate) counters: Arc<ScheduleCounters>,
     last: Option<u64>,
 }
 
@@ -110,12 +193,27 @@ impl ScheduleBinding {
     /// The binding of a timed lane, its offers read against `clock` in
     /// `options.domain`.
     #[must_use]
-    pub fn new(options: ScheduleOptions, clock: fn() -> u64) -> Self {
+    pub fn new(options: ScheduleOptions, clock: ScheduleClock) -> Self {
         Self {
             options,
             clock,
+            counters: Arc::new(ScheduleCounters::default()),
             last: None,
         }
+    }
+
+    /// The binding counting into `counters`, which the lane's handles
+    /// share.
+    #[must_use]
+    pub fn with_counters(mut self, counters: Arc<ScheduleCounters>) -> Self {
+        self.counters = counters;
+        self
+    }
+
+    /// The lane's offer counters.
+    #[must_use]
+    pub fn counters(&self) -> &ScheduleCounters {
+        &self.counters
     }
 
     /// The publication's settings.
@@ -136,7 +234,21 @@ impl ScheduleBinding {
     /// `now + max_horizon` is `ScheduleTooFar`; a deadline that overflows
     /// is `ScheduleOverflow`, as is a clock that cannot read the time
     /// ([`CLOCK_UNAVAILABLE`]). A time already past is accepted.
+    /// Each refusal counts under its reason.
     pub(crate) fn check(&self, tx_time: u64) -> Result<(), ClientError> {
+        let checked = self.check_time(tx_time);
+        let counter = match &checked {
+            Ok(()) => None,
+            Err(ClientError::InvalidSchedule { .. }) => self.counters.rejected_invalid.as_ref(),
+            Err(ClientError::ScheduleTooFar { .. }) => self.counters.rejected_too_far.as_ref(),
+            Err(ClientError::ScheduleOverflow) => self.counters.rejected_overflow.as_ref(),
+            Err(_) => None,
+        };
+        count(counter);
+        checked
+    }
+
+    fn check_time(&self, tx_time: u64) -> Result<(), ClientError> {
         if self.last.is_some_and(|last| tx_time < last) {
             return Err(ClientError::InvalidSchedule {
                 reason: "a requested time below the lane's last",
@@ -145,7 +257,7 @@ impl ScheduleBinding {
         tx_time
             .checked_add(self.options.lateness_tolerance)
             .ok_or(ClientError::ScheduleOverflow)?;
-        let now = (self.clock)();
+        let now = self.clock.now();
         if now == CLOCK_UNAVAILABLE {
             return Err(ClientError::ScheduleOverflow);
         }
@@ -158,9 +270,10 @@ impl ScheduleBinding {
         Ok(())
     }
 
-    /// Records an accepted message's time.
+    /// Records an accepted message's time, and counts it.
     pub(crate) fn accepted(&mut self, tx_time: u64) {
         self.last = Some(tx_time);
+        count(self.counters.scheduled_offers.as_ref());
     }
 }
 
@@ -179,7 +292,10 @@ mod tests {
     }
 
     fn binding(options: ScheduleOptions) -> ((), ScheduleBinding) {
-        ((), ScheduleBinding::new(options, now_for_tests))
+        (
+            (),
+            ScheduleBinding::new(options, ScheduleClock::new(now_for_tests)),
+        )
     }
 
     fn unavailable() -> u64 {
@@ -197,7 +313,7 @@ mod tests {
                     max_horizon,
                     ..ScheduleOptions::default()
                 },
-                unavailable,
+                ScheduleClock::new(unavailable),
             );
             for time in [0, 1_000, u64::MAX - 1_000_000_000] {
                 assert_eq!(binding.check(time), Err(ClientError::ScheduleOverflow));

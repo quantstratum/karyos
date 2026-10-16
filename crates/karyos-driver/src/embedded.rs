@@ -468,6 +468,60 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// are fixed from then on, even after the handle is dropped, since its
     /// entries stay in the ring (#234 P3).
     pub(crate) schedule_issued: bool,
+    /// A timed lane's clock, when not the host's clock of its domain
+    /// ([`EmbeddedDriver::schedule_stream_with_clock`]).
+    pub(crate) schedule_clock: Option<karyos_client::schedule::ScheduleClock>,
+    /// A timed lane's counters, allocated when its first handle is
+    /// prepared, once its settings are final: the offer counters its
+    /// handles share and the sender's.
+    pub(crate) timed_counters: Option<TimedCounters>,
+}
+
+/// A timed lane's counter cells (`quantstratum-docs:
+/// karyos/design/timed-tx.md`, section 6).
+#[derive(Debug, Clone)]
+pub(crate) struct TimedCounters {
+    offers: Arc<karyos_client::schedule::ScheduleCounters>,
+    sender: Arc<crate::timed_gate::TimedLaneCounters>,
+}
+
+impl TimedCounters {
+    /// The cells of `stream`'s `lane`, labelled with its clock `domain`;
+    /// a cell the region has no room for is `None`, counted in `counters
+    /// unavailable`.
+    fn allocate(
+        counters: &mut DriverCounters,
+        stream: u64,
+        lane: u8,
+        domain: karyos_client::schedule::ClockDomain,
+    ) -> Self {
+        let keys = CounterKeys {
+            stream,
+            lane,
+            kind: KIND_NONE,
+            participant: 0,
+        };
+        let mut allocate = |label: &str| {
+            let label = format!("{label} ({})", domain.label());
+            counters.allocate_keyed(TYPE_EVENTS, &label, keys)
+        };
+        let offers = karyos_client::schedule::ScheduleCounters {
+            scheduled_offers: allocate("timed scheduled offers"),
+            rejected_invalid: allocate("timed rejections invalid"),
+            rejected_too_far: allocate("timed rejections too far"),
+            rejected_overflow: allocate("timed rejections overflow"),
+            rejected_ring_full: allocate("timed rejections ring full"),
+        };
+        let sender = crate::timed_gate::TimedLaneCounters {
+            late_sends: allocate("timed late sends"),
+            deadline_aborts: allocate("timed deadline aborts"),
+            lateness: crate::timed_gate::LATENESS_LABELS.map(&mut allocate),
+        };
+        Self {
+            offers: Arc::new(offers),
+            sender: Arc::new(sender),
+        }
+    }
 }
 
 /// A sealed incarnation a fresh one replaced, retiring like a removed
@@ -1799,6 +1853,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             replaced: Vec::new(),
             schedule: None,
             schedule_issued: false,
+            schedule_clock: None,
+            timed_counters: None,
         })
     }
 
@@ -1841,7 +1897,24 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         // A timed lane's handle gets its schedule binding, prepared before
         // the publication is taken, so a refusal takes nothing.
+        // The binding first, so a refused one allocates no counters; then
+        // the lane's counters, which its handles share.
         let schedule = self.prepare_schedule_binding(stream)?;
+        let schedule = match schedule {
+            Some(binding) => {
+                self.ensure_timed_counters(stream)?;
+                let counters = self
+                    .stream_ref(stream)?
+                    .timed_counters
+                    .as_ref()
+                    .map(|counters| Arc::clone(&counters.offers));
+                Some(match counters {
+                    Some(counters) => binding.with_counters(counters),
+                    None => binding,
+                })
+            }
+            None => None,
+        };
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = match stream.spare.take() {
@@ -1883,10 +1956,96 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Ok(None);
         }
         let options = found.schedule.unwrap_or_default();
-        let clock = options.domain.clock()?;
+        let clock = match &found.schedule_clock {
+            Some(clock) => clock.clone(),
+            None => karyos_client::schedule::ScheduleClock::host(options.domain)?,
+        };
         Ok(Some(karyos_client::schedule::ScheduleBinding::new(
             options, clock,
         )))
+    }
+
+    /// Allocates a timed lane's counters once, when its first handle is
+    /// prepared; nothing for a lane that is not timed.
+    fn ensure_timed_counters(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+        let found = self.stream_ref(stream)?;
+        if found.buffer.schedule_ring().is_none() || found.timed_counters.is_some() {
+            return Ok(());
+        }
+        let (id, lane) = (found.id, found.buffer.lane().get());
+        let domain = found.schedule.unwrap_or_default().domain;
+        let counters = TimedCounters::allocate(&mut self.counters, id, lane, domain);
+        self.stream(stream)?.timed_counters = Some(counters);
+        Ok(())
+    }
+
+    /// The sender's counter cells of a timed lane, for its
+    /// [`crate::timed_gate::TimedGate`]
+    /// ([`crate::timed_gate::TimedGate::attach_counters`]); `None` until
+    /// the lane's first handle is issued, and for a lane that is not
+    /// timed.
+    ///
+    /// # Errors
+    ///
+    /// The stream lookup errors.
+    pub fn timed_counters(
+        &self,
+        stream: StreamHandle,
+    ) -> Result<Option<Arc<crate::timed_gate::TimedLaneCounters>>, DriverError> {
+        Ok(self
+            .stream_ref(stream)?
+            .timed_counters
+            .as_ref()
+            .map(|counters| Arc::clone(&counters.sender)))
+    }
+
+    /// The words of a timed lane's schedule ring, for its sender's
+    /// [`crate::schedule::ScheduleConsumer`]; `None` for a lane that is
+    /// not timed.
+    ///
+    /// # Errors
+    ///
+    /// The stream lookup errors.
+    pub fn schedule_ring(
+        &self,
+        stream: StreamHandle,
+    ) -> Result<Option<&[karyos_sys::sync::AtomicU64]>, DriverError> {
+        Ok(self.stream_ref(stream)?.buffer.schedule_ring())
+    }
+
+    /// Seals a timed lane whose sender's [`crate::timed_gate::TimedGate`]
+    /// found a missed deadline under cancel-on-deadline (G7), with
+    /// `SealReason::DeadlineMissed`: the step between gates
+    /// ([`crate::timed_gate::TimedGate::between_gates`]). A stream already
+    /// sealed keeps its first reason.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Sys`] from the seal (a broken invariant); the stream
+    /// lookup errors.
+    pub fn seal_deadline_missed(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+        let found = self.active_stream(stream)?;
+        crate::timed_gate::seal_deadline_missed(&mut found.conductor)?;
+        Ok(())
+    }
+
+    /// [`Self::schedule_stream`] with the lane's offers checked against
+    /// `clock` instead of the host's clock of `options.domain`: a
+    /// simulator's virtual time, or a driver's own clock. `clock` runs on
+    /// the offer path; see [`karyos_client::schedule::ScheduleClock`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::schedule_stream`].
+    pub fn schedule_stream_with_clock(
+        &mut self,
+        stream: StreamHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+        clock: karyos_client::schedule::ScheduleClock,
+    ) -> Result<(), DriverError> {
+        self.schedule_stream(stream, options)?;
+        self.active_stream(stream)?.schedule_clock = Some(clock);
+        Ok(())
     }
 
     /// Sets a timed lane's settings (`quantstratum-docs:
@@ -1925,6 +2084,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::InvalidConfig);
         }
         found.schedule = Some(options);
+        // Settings that change before any handle relabel the counters: the
+        // next handle allocates them again.
+        found.schedule_clock = None;
+        found.timed_counters = None;
         Ok(())
     }
 

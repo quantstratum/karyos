@@ -132,6 +132,32 @@ release may break APIs, wire formats and shared-memory layouts.
   `TimedGate::stage` takes the datagram's ticket and `left` counts a report
   for another ticket as a fault, and `ScheduleConsumer::new` takes its
   capacity from the ring (`ScheduleReader::capacity`).
+- Timed counters and an injected schedule clock (P2.11 T1 step 6). Public
+  API additions in karyos-client: `schedule::ScheduleClock` (the clock a
+  timed lane's offers are checked against, the host clock of the domain by
+  default; it runs on the offer path and must not allocate or block, and
+  returns `CLOCK_UNAVAILABLE` when it cannot read the time),
+  `ScheduleCounters`, `ScheduleBinding::with_counters` and
+  `ClockDomain::label`; `ScheduleBinding::new` takes a `ScheduleClock`. In
+  karyos-driver, `EmbeddedDriver::schedule_stream_with_clock` and
+  `timed_counters`. When a timed lane's first handle is issued the driver
+  allocates its counters (key0 the stream, key1 the lane, the clock domain
+  in each label): `timed scheduled offers`, `timed rejections` invalid, too
+  far, overflow and ring full, `timed late sends`, `timed deadline aborts`
+  and an 8 cell lateness histogram (`timed_gate::LATENESS_LABELS`), which a
+  `TimedGate` counts into once given them (`attach_counters`). In
+  karyos-sys, `Publication::append_scheduled` now returns
+  `ScheduledOutcome`: an append's `AppendOutcome`, or `ScheduleFull` for a
+  full ring, so a full ring is counted exactly.
+- Timed simulator scenarios (P2.11 T1 step 6): `timed-send-late` and
+  `timed-cancel` in karyos-sim's `tests/timed.rs`, 40 seeds each, drive a
+  timed stream on virtual time through `ScheduleConsumer` and `TimedGate`
+  over the scripted sockets, with an immediate lane beside it. They check
+  that nothing is submitted before its time, that order holds, that the
+  immediate lane is never held, and that a miss under cancel seals
+  `DeadlineMissed` with nothing submitted after it. karyos-sim takes
+  karyos-io (with its test hooks) as a dev-dependency. In karyos-driver,
+  `EmbeddedDriver::schedule_ring` and `seal_deadline_missed`.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

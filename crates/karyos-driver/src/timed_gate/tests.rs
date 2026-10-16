@@ -703,3 +703,67 @@ fn a_report_with_another_ticket_is_a_fault() {
     assert_eq!(f.gate.counts().sent, 0);
     assert_eq!(f.gate.counts().max_lateness, None);
 }
+
+/// The lateness histogram's buckets: negative, each bound inclusive, and
+/// beyond the last bound or beyond `i64`.
+#[test]
+fn lateness_buckets_are_inclusive() {
+    assert_eq!(lateness_bucket(Some(-1)), 0);
+    assert_eq!(lateness_bucket(Some(0)), 1);
+    assert_eq!(lateness_bucket(Some(1_000)), 1);
+    assert_eq!(lateness_bucket(Some(1_001)), 2);
+    assert_eq!(lateness_bucket(Some(1_000_000)), 4);
+    assert_eq!(lateness_bucket(Some(100_000_000)), 6);
+    assert_eq!(lateness_bucket(Some(100_000_001)), 7);
+    assert_eq!(lateness_bucket(None), 7);
+}
+
+/// A lane's attached cells count its late sends, its deadline abort and
+/// the lateness of each submitted timed head (timed-tx.md section 6).
+#[test]
+fn the_lane_cells_count_lateness_and_aborts() {
+    use karyos_sys::counters::{CellRead, CounterKeys, counters};
+
+    let (mut manager, reader) = counters(32).unwrap();
+    let mut allocate = |label: &str| manager.allocate_keyed(1, label, CounterKeys::DRIVER).ok();
+    let cells = Arc::new(TimedLaneCounters {
+        late_sends: allocate("late"),
+        deadline_aborts: allocate("aborts"),
+        lateness: LATENESS_LABELS.map(&mut allocate),
+    });
+    let read = |label: &str| {
+        (0..reader.capacity())
+            .find_map(|index| match reader.read(index) {
+                CellRead::Allocated {
+                    metadata, value, ..
+                } if metadata.label() == label.as_bytes() => Some(value),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let mut f = Fixture::with_policy(1, None, cancel());
+    f.gate.attach_counters(0, Arc::clone(&cells));
+    f.stage(0, Some(NOW));
+    f.stage(0, Some(NOW + 1));
+    f.accept(2);
+    // Both sent at NOW + TOLERANCE: lateness 10 and 9, neither late.
+    let report = f.serve(NOW + TOLERANCE);
+    assert_eq!(served(&report, 0), 128);
+    assert_eq!(read(LATENESS_LABELS[1]), 2);
+    assert_eq!(read("late"), 0);
+    // Without cancel, one sent 2 ms late.
+    let mut g = Fixture::new(1, None);
+    g.gate.attach_counters(0, Arc::clone(&cells));
+    g.stage(0, Some(NOW));
+    g.accept(1);
+    let report = g.serve(NOW + 2_000_000);
+    assert_eq!(served(&report, 0), 64);
+    assert_eq!(read("late"), 1);
+    assert_eq!(read(LATENESS_LABELS[5]), 1);
+    // A miss under cancel counts one abort, once.
+    f.stage(0, Some(FUTURE));
+    f.gate.set_now(FUTURE + TOLERANCE + 1);
+    assert!(!f.gate.admits(0));
+    assert!(!f.gate.admits(0));
+    assert_eq!(read("aborts"), 1);
+}

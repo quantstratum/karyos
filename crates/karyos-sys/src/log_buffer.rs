@@ -1633,6 +1633,19 @@ pub enum AppendOutcome {
     Gated,
 }
 
+/// Result of [`Publication::append_scheduled`]: an append's outcome, or a
+/// full schedule ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "back pressure and admin actions must be handled"]
+pub enum ScheduledOutcome {
+    /// The append ran: its outcome.
+    Append(AppendOutcome),
+    /// The lane's schedule ring is full: nothing was reserved; retry once
+    /// the sender released an entry (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`, section 2).
+    ScheduleFull,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicationState {
     Active {
@@ -1775,7 +1788,8 @@ impl<O: BufferOwner> Publication<O> {
     ///
     /// # Errors
     ///
-    /// As [`Publication::append`]; [`SysError::Schedule`] with
+    /// As [`Publication::append`], a full ring being
+    /// [`ScheduledOutcome::ScheduleFull`]; [`SysError::Schedule`] with
     /// `NotScheduled` for a lane that is not timed, `Backwards` for a time
     /// below the lane's last, `Exhausted` past 2^64 entries and `Invariant`
     /// for counts a peer broke. Nothing is reserved on error.
@@ -1784,7 +1798,7 @@ impl<O: BufferOwner> Publication<O> {
         payload: &[u8],
         options: AppendOptions,
         time: u64,
-    ) -> Result<AppendOutcome, SysError> {
+    ) -> Result<ScheduledOutcome, SysError> {
         self.append_scheduled_with(payload, options, time, &mut || {})
     }
 
@@ -1797,7 +1811,7 @@ impl<O: BufferOwner> Publication<O> {
         options: AppendOptions,
         time: u64,
         pause: &mut dyn FnMut(),
-    ) -> Result<AppendOutcome, SysError> {
+    ) -> Result<ScheduledOutcome, SysError> {
         self.append_scheduled_with(payload, options, time, pause)
     }
 
@@ -1807,10 +1821,10 @@ impl<O: BufferOwner> Publication<O> {
         options: AppendOptions,
         time: u64,
         pause: &mut dyn FnMut(),
-    ) -> Result<AppendOutcome, SysError> {
+    ) -> Result<ScheduledOutcome, SysError> {
         self.resolve_claim();
         if self.state == PublicationState::Closed {
-            return Ok(self.ended_append());
+            return Ok(ScheduledOutcome::Append(self.ended_append()));
         }
         if self.schedule.is_none() {
             return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
@@ -1820,9 +1834,9 @@ impl<O: BufferOwner> Publication<O> {
         }
         if !self.schedule_has_room()? {
             if self.observe_seal() {
-                return Ok(self.ended_append());
+                return Ok(ScheduledOutcome::Append(self.ended_append()));
             }
-            return Ok(AppendOutcome::BackPressured);
+            return Ok(ScheduledOutcome::ScheduleFull);
         }
         let buffer = &*self.buffer;
         let (Some(ring), Some(publisher)) = (buffer.schedule_ring(), self.schedule.as_mut()) else {
@@ -1840,14 +1854,14 @@ impl<O: BufferOwner> Publication<O> {
             debug_assert!(pushed.is_ok(), "{pushed:?}");
             pause();
         })?;
-        match outcome {
+        Ok(ScheduledOutcome::Append(match outcome {
             AppendOutcome::Appended { .. } => {
                 self.last_time = Some(time);
-                Ok(outcome)
+                outcome
             }
-            _ if self.observe_seal() => Ok(self.ended_append()),
-            _ => Ok(outcome),
-        }
+            _ if self.observe_seal() => self.ended_append(),
+            _ => outcome,
+        }))
     }
 
     /// Whether a timed lane's schedule ring has room for one more entry
