@@ -16,8 +16,8 @@
 //!
 //! Each lane keeps a first-loss position, set by its first overrun,
 //! local gap or skipped range and never cleared. The aggregate's terminal
-//! is a clean EOS only when every lane closed at its seal with a normal
-//! reason and no lane has a first loss (L6, GU-13).
+//! is a clean EOS only when every lane closed at its seal on the stream's
+//! removal and no lane has a first loss (L6, GU-13).
 
 use std::sync::Arc;
 
@@ -44,9 +44,11 @@ fn corrupt(reason: &'static str) -> ClientError {
     ClientError::Sys(SysError::CorruptTerm { offset: 0, reason })
 }
 
-/// Zero-charge steps the probe applies itself before it gives up on a lane
-/// for this call; each one costs a unit of the call's work.
-const ZERO_CHARGE_STEPS: u32 = 8;
+/// Peeks one probe makes: a zero-charge `Interrupted` step is applied and
+/// the interrupting frame peeked once more. Such steps cannot chain (the
+/// interrupting frame is never a zero-charge step), so the applied step is
+/// folded into the probe's own unit of work.
+const PEEKS_PER_PROBE: u32 = 2;
 
 /// How a lane ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,14 +72,15 @@ pub enum LaneEnd {
 }
 
 impl LaneEnd {
-    /// Whether the lane ended without loss: closed at its seal with a
-    /// normal reason (L6).
+    /// Whether the lane ended without loss: closed at its seal by the
+    /// stream's removal (L6). `Unspecified` is not clean: it also stands
+    /// for a reason code this build does not know, which could be a loss.
     #[must_use]
     pub fn clean(self) -> bool {
         matches!(
             self,
             Self::Closed {
-                reason: SealReason::StreamRemoved | SealReason::Unspecified,
+                reason: SealReason::StreamRemoved,
                 ..
             }
         )
@@ -235,16 +238,17 @@ impl<T: TermBytes> LaneState<T> {
     }
 
     /// The control step for this lane, outside DRR service: overruns,
-    /// `Ready` messages, cutovers and ends. One unit of work.
-    fn control<H>(&mut self, handler: &mut H)
+    /// `Ready` messages, cutovers and ends. Returns the units of work it
+    /// spent: one per lane it peeked.
+    fn control<H>(&mut self, handler: &mut H) -> u32
     where
         H: FnMut(&[u8], Lane, MessageInfo),
     {
         if self.end.is_some() {
-            return;
+            return 0;
         }
         let Some(reader) = self.reader.as_mut() else {
-            return;
+            return 0;
         };
         match reader.peek() {
             Ok(Peek::Ready) => self.take(handler),
@@ -256,6 +260,7 @@ impl<T: TermBytes> LaneState<T> {
             Ok(Peek::Step { .. } | Peek::Pending) => {}
             Err(error) => self.finish(LaneEnd::Failed(ClientError::from(error))),
         }
+        1
     }
 
     /// Handles a frame reader's end: an overrun applies the rejoin policy,
@@ -383,9 +388,15 @@ impl<T: TermBytes> AggregateSubscription<T> {
             lane.poll = LanePoll::default();
         }
         // The control step, outside DRR service.
+        // Its units come out of the call's work before the DRR runs.
+        let mut spent = 0u32;
         for lane in &mut self.lanes {
-            lane.control(&mut handler);
+            spent = spent.saturating_add(lane.control(&mut handler));
         }
+        let budget = Budget {
+            work: budget.work.saturating_sub(spent),
+            ..budget
+        };
         let max_charge = self.drr.config().max_charge();
         let drr = self.drr.run(
             budget,
@@ -435,7 +446,7 @@ where
         let Some(state) = self.lanes.get_mut(lane) else {
             return Probe::Ineligible;
         };
-        for _ in 0..ZERO_CHARGE_STEPS {
+        for _ in 0..PEEKS_PER_PROBE {
             if state.end.is_some() {
                 return Probe::Ineligible;
             }
@@ -496,26 +507,33 @@ where
             FrameStep::Copied { charge }
             | FrameStep::Complete { charge, .. }
             | FrameStep::Stepped { charge, .. } => charge,
-            // The reader ended or found nothing between the peek and the
-            // serve: nothing was copied.
-            FrameStep::Ready | FrameStep::Pending | FrameStep::Ended(_) => {
+            // Nothing was copied between the peek and the serve. An overrun
+            // found here was consumed by `serve_frame`, which rejoined: its
+            // loss and rejoin policy are applied now, outside any loan.
+            FrameStep::Ended(end) => {
+                state.ended(end);
                 return Service::NotServed;
             }
+            FrameStep::Ready | FrameStep::Pending => return Service::NotServed,
         };
+        if charge != peeked {
+            // Committed frames are immutable: served at the peeked charge
+            // so the DRR's accounting stays bounded, then the lane ends, and
+            // a message it completed is not delivered.
+            debug_assert_eq!(charge, peeked, "a committed frame changed its charge");
+            state.finish(LaneEnd::Failed(corrupt(
+                "a committed frame changed its charge",
+            )));
+            return Service::Served;
+        }
         match step {
             FrameStep::Complete { .. } => state.take(&mut *self.handler),
             FrameStep::Stepped { kind, .. } => state.stepped(kind),
             _ => {}
         }
-        if charge != peeked {
-            // Committed frames are immutable: served at the peeked charge
-            // so the DRR's accounting stays bounded, then the lane ends.
-            debug_assert_eq!(charge, peeked, "a committed frame changed its charge");
-            state.finish(LaneEnd::Failed(corrupt(
-                "a committed frame changed its charge",
-            )));
-        }
         Service::Served
     }
 }
 
+#[cfg(test)]
+mod tests;
