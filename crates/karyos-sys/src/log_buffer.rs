@@ -1424,7 +1424,7 @@ impl<O: BufferOwner> PreparedSubscription<O> {
             });
         }
         let position = found.position.load(Ordering::Acquire);
-        let joining = self.owner.image();
+        let resync = Resync::at_join(self.owner.image());
         Ok(Subscription {
             buffer: self.owner,
             cursor: Cursor {
@@ -1434,7 +1434,9 @@ impl<O: BufferOwner> PreparedSubscription<O> {
                 acknowledged: position,
                 pending: None,
                 detached: false,
-                joining,
+                resync,
+                first_loss: None,
+                interrupted: None,
             },
         })
     }
@@ -2582,6 +2584,11 @@ pub enum SkipReason {
     /// Fragments without their BEGIN where this reader joined, in the
     /// middle of a message: the rest of a message it never saw start.
     JoinedMidMessage,
+    /// Fragments without their BEGIN after a local gap this reader
+    /// reported: the rest of a message whose start was lost locally, not a
+    /// peer fault (`quantstratum-docs:
+    /// karyos/design/gaps-and-unreliable-delivery.md`, GU-3).
+    AfterLoss,
     /// An interval the receive owner sealed as lost: a local gap record
     /// (`quantstratum-docs: karyos/design/local-gap-layout.md`). Nothing
     /// in it was delivered.
@@ -2601,9 +2608,108 @@ struct Cursor {
     /// acknowledged message.
     pending: Option<u64>,
     detached: bool,
-    /// An image reader that has not yet reached a BEGIN, ABORTED or PAD
-    /// frame since it joined.
-    joining: bool,
+    /// Where an image reader stands against message boundaries (GU-3).
+    resync: Resync,
+    /// The position of the first loss outcome returned since the join
+    /// (`quantstratum-docs: karyos/design/gaps-and-unreliable-delivery.md`,
+    /// GU-1): a local gap, an `Interrupted` skip ended by a gap, or an
+    /// `AfterLoss` skip. Never cleared.
+    first_loss: Option<u64>,
+    /// The last outcome was an `Interrupted` skip of `[start, end)`; a
+    /// local gap at `end` makes `start` the loss position.
+    interrupted: Option<(u64, u64)>,
+}
+
+/// An image reader's resynchronization state (GU-3): which reason a run of
+/// fragments without BEGIN gets, and whether the reader stands on a
+/// message boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resync {
+    /// After a join or rejoin: a run without BEGIN is `JoinedMidMessage`.
+    Joining,
+    /// After a local gap outcome: a run without BEGIN is `AfterLoss`.
+    AfterLoss,
+    /// On message boundaries: a run without BEGIN is an `Orphan`.
+    Synchronized,
+}
+
+impl Resync {
+    /// The state at a join: an image reader may land inside a message.
+    fn at_join(image: bool) -> Self {
+        if image {
+            Self::Joining
+        } else {
+            Self::Synchronized
+        }
+    }
+
+    /// The reason of a run of fragments without BEGIN.
+    fn run_reason(self) -> SkipReason {
+        match self {
+            Self::Joining => SkipReason::JoinedMidMessage,
+            Self::AfterLoss => SkipReason::AfterLoss,
+            Self::Synchronized => SkipReason::Orphan,
+        }
+    }
+}
+
+/// What one read returned, for the cursor's resynchronization and loss
+/// tracking (GU-1, GU-3).
+#[derive(Debug, Clone, Copy)]
+enum Outcome {
+    /// Nothing read.
+    Pending,
+    /// A skipped range `[position, position + extent)`.
+    Skip {
+        position: u64,
+        extent: u32,
+        reason: SkipReason,
+    },
+    /// A BEGIN, ABORTED or PAD frame was reached.
+    Boundary,
+}
+
+impl Cursor {
+    /// Updates the resynchronization state and the first loss after a read
+    /// (GU-1, GU-3).
+    fn note(&mut self, outcome: Outcome) {
+        let interrupted = self.interrupted.take();
+        match outcome {
+            Outcome::Pending => self.interrupted = interrupted,
+            Outcome::Boundary => self.resync = Resync::Synchronized,
+            Outcome::Skip {
+                position,
+                extent,
+                reason,
+            } => match reason {
+                SkipReason::LocalGap(_) => {
+                    // A gap ending an interrupted message makes the
+                    // interrupted range the loss.
+                    let first = match interrupted {
+                        Some((start, end)) if end == position => start,
+                        _ => position,
+                    };
+                    self.lost(first);
+                    self.resync = Resync::AfterLoss;
+                }
+                SkipReason::AfterLoss => self.lost(position),
+                SkipReason::Orphan | SkipReason::JoinedMidMessage => {}
+                SkipReason::Interrupted => {
+                    // The reader had reached the message's BEGIN.
+                    self.resync = Resync::Synchronized;
+                    self.interrupted = Some((position, position + u64::from(extent)));
+                }
+                SkipReason::MessageTooLarge | SkipReason::MissingEnd => {
+                    self.resync = Resync::Synchronized;
+                }
+            },
+        }
+    }
+
+    /// Records a loss at `position`; the first one stays.
+    fn lost(&mut self, position: u64) {
+        self.first_loss.get_or_insert(position);
+    }
 }
 
 /// A registered subscriber.
@@ -2641,6 +2747,18 @@ impl<O: BufferOwner> Subscription<O> {
     #[must_use]
     pub fn acknowledged_position(&self) -> u64 {
         self.cursor.acknowledged
+    }
+
+    /// The position of the first loss outcome this subscription returned
+    /// since its join (`quantstratum-docs:
+    /// karyos/design/gaps-and-unreliable-delivery.md`, GU-1): a local gap,
+    /// an `Interrupted` skip ended by a gap, or an `AfterLoss` skip. `None`
+    /// while it returned none; never cleared. Its contiguous delivered
+    /// prefix is its position while `None`, and this position afterwards.
+    #[inline]
+    #[must_use]
+    pub fn first_loss(&self) -> Option<u64> {
+        self.cursor.first_loss
     }
 
     /// The registry cell of this subscriber, for its conductor's
@@ -2796,17 +2914,17 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         let result = self.read_block(slot, offset, out);
         release_loan(&cell.loan);
         let result = result?;
-        if !matches!(
-            result,
-            Read::Pending
-                | Read::Skip {
-                    reason: SkipReason::Orphan | SkipReason::JoinedMidMessage,
-                    ..
-                }
-        ) {
+        let position = self.cursor.position;
+        self.cursor.note(match result {
+            Read::Pending => Outcome::Pending,
+            Read::Skip { extent, reason } => Outcome::Skip {
+                position,
+                extent,
+                reason,
+            },
             // The cursor reached a BEGIN, ABORTED or PAD frame.
-            self.cursor.joining = false;
-        }
+            Read::Pad | Read::Aborted { .. } | Read::Message { .. } => Outcome::Boundary,
+        });
         match result {
             Read::Pending => Ok(Step::Done(PollOutcome::Pending)),
             Read::Skip { extent, reason } => {
@@ -3094,7 +3212,8 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         let resume = head.max(from);
         self.advance_to(resume);
         // A rejoin is a new join: an image reader may land inside a message.
-        self.cursor.joining = self.buffer.image();
+        self.cursor.resync = Resync::at_join(self.buffer.image());
+        self.cursor.interrupted = None;
         Ok(Step::Done(PollOutcome::Overrun {
             from,
             lost_to,
@@ -4264,7 +4383,9 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             acknowledged: start,
             pending: None,
             detached: false,
-            joining: buffer.image(),
+            resync: Resync::at_join(buffer.image()),
+            first_loss: None,
+            interrupted: None,
         })
     }
 

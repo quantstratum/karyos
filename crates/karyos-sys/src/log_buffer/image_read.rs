@@ -144,11 +144,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                 _ => break,
             }
         }
-        let reason = if self.cursor.joining {
-            SkipReason::JoinedMidMessage
-        } else {
-            SkipReason::Orphan
-        };
+        let reason = self.cursor.resync.run_reason();
         Ok(Validated::Skip {
             extent: offset - start,
             reason,

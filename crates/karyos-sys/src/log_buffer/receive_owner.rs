@@ -332,11 +332,30 @@ impl<T: TermBytes> ReceiveOwner<T> {
         self.lanes.get(usize::from(lane.get())).map(|l| l.rebuild)
     }
 
-    /// The highest committed end of `lane`, the high-water mark that loss
-    /// detection compares the rebuild position against.
+    /// The covered end of `lane`: the highest end of any covered extent,
+    /// a real frame or a local gap, which loss detection compares the
+    /// rebuild position against.
     #[must_use]
     pub fn high_water(&self, lane: Lane) -> Option<u64> {
         self.lanes.get(usize::from(lane.get())).map(|l| l.high)
+    }
+
+    /// The received high-water mark of `lane` (`quantstratum-docs:
+    /// karyos/design/gaps-and-unreliable-delivery.md`, GU-1): the highest
+    /// end of a real committed frame. A sealed gap never moves it.
+    #[must_use]
+    pub fn received_high_water(&self, lane: Lane) -> Option<u64> {
+        self.lanes.get(usize::from(lane.get())).map(|l| l.received)
+    }
+
+    /// The first loss of `lane` (GU-1): the start of its lowest local gap,
+    /// `None` while none was sealed. The contiguous received prefix is the
+    /// rebuild position while it is `None`, and this position afterwards.
+    #[must_use]
+    pub fn first_loss(&self, lane: Lane) -> Option<Option<u64>> {
+        self.lanes
+            .get(usize::from(lane.get()))
+            .map(|l| l.first_loss)
     }
 
     /// The owner's lifetime counters.
@@ -375,8 +394,17 @@ struct LaneOwner<T: TermBytes> {
     buffer: Arc<LogBuffer<T>>,
     units: usize,
     join: u64,
+    /// The resolved prefix (GU-1): advances across real frames and local
+    /// gap records.
     rebuild: u64,
+    /// The covered end: the highest end of any covered extent, real or gap.
     high: u64,
+    /// The received high-water mark: the highest end of a real committed
+    /// frame; a gap record never moves it (GU-1).
+    received: u64,
+    /// The start of the lane's lowest local gap, never cleared within the
+    /// incarnation (GU-1).
+    first_loss: Option<u64>,
     sets: [Set; SETS],
     /// Standing write loans, by term parity: the term and its slot.
     loans: [Option<(TermCount, u8)>; 2],
@@ -403,6 +431,8 @@ impl<T: TermBytes> LaneOwner<T> {
             join,
             rebuild: join,
             high: join,
+            received: join,
+            first_loss: None,
             sets: [set(), set(), set(), set()],
             loans: [None, None],
             lagged: false,
@@ -483,6 +513,7 @@ impl<T: TermBytes> LaneOwner<T> {
         set_range(&mut set.covered, unit, units);
         let end = start + u64::from(frame.extent());
         self.high = self.high.max(end);
+        self.received = self.received.max(end);
         if start == self.rebuild {
             self.advance()?;
         }
@@ -589,6 +620,10 @@ impl<T: TermBytes> LaneOwner<T> {
         set_bit(&mut set.gap_starts, unit);
         set_range(&mut set.covered, unit, units);
         self.high = self.high.max(end);
+        self.first_loss = Some(
+            self.first_loss
+                .map_or(position, |first| first.min(position)),
+        );
         if position == self.rebuild {
             self.advance()?;
         }

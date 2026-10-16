@@ -1431,3 +1431,110 @@ fn a_set_is_clean_in_as_many_duty_cycles_as_before() {
     }
     assert_eq!(duties, dirty);
 }
+
+// Positions and resynchronization after loss (GU-1, GU-3).
+
+/// GU-1: a sealed gap advances the resolved prefix and the covered end but
+/// never the received high-water mark, and the first loss is the lowest gap
+/// start, kept once set.
+#[test]
+fn a_gap_moves_the_resolved_prefix_not_the_received_high_water() {
+    let buffer = gap_image(0);
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 0, 64, 1)), committed(0, 64));
+    assert_eq!(owner.received_high_water(Lane::ZERO), Some(64));
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(None));
+    assert_eq!(seal(&mut owner, 128, 64), committed(128, 64));
+    assert_eq!(owner.high_water(Lane::ZERO), Some(192));
+    assert_eq!(owner.received_high_water(Lane::ZERO), Some(64));
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(128)));
+    assert_eq!(seal(&mut owner, 64, 64), committed(64, 64));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(192));
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)), "the lowest gap");
+    assert_eq!(recv(&mut owner, &data(0, 192, 64, 2)), committed(192, 64));
+    assert_eq!(owner.received_high_water(Lane::ZERO), Some(256));
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)), "never cleared");
+}
+
+/// GU-3: fragments without BEGIN after a reported gap are `AfterLoss`,
+/// never `Orphan`; the reader resynchronizes at the next BEGIN, and a later
+/// run without BEGIN and without a gap is an `Orphan` again. The cursor's
+/// first loss is the gap's start, kept once set.
+#[test]
+fn a_run_after_a_gap_is_after_loss_and_a_later_one_is_orphan() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(seal(&mut owner, 0, 64), committed(0, 64));
+    recv(&mut owner, &fragment(0, 64, 32, false, false, 1)).unwrap();
+    recv(&mut owner, &fragment(0, 128, 32, false, true, 2)).unwrap();
+    recv(&mut owner, &fragment(0, 192, 32, true, true, 3)).unwrap();
+    recv(&mut owner, &fragment(0, 256, 32, false, true, 4)).unwrap();
+    assert_eq!(poll(&mut subscription), skipped(0, 64, LOST));
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(64, 128, SkipReason::AfterLoss)
+    );
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Message { position: 192, .. }
+    ));
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(256, 64, SkipReason::Orphan)
+    );
+    assert_eq!(subscription.first_loss(), Some(0));
+}
+
+/// GU-1: a message interrupted by a gap is lost from its BEGIN: the
+/// cursor's first loss is the interrupted range's start, not the gap's.
+#[test]
+fn a_message_interrupted_by_a_gap_is_lost_from_its_begin() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &data(0, 0, 64, 1)).unwrap();
+    recv(&mut owner, &fragment(0, 64, 32, true, false, 2)).unwrap();
+    assert_eq!(seal(&mut owner, 128, 64), committed(128, 64));
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Message { position: 0, .. }
+    ));
+    assert_eq!(subscription.first_loss(), None);
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(64, 64, SkipReason::Interrupted)
+    );
+    // Not a loss on its own: a peer fault until the gap ends it.
+    assert_eq!(subscription.first_loss(), None);
+    assert_eq!(poll(&mut subscription), skipped(128, 64, LOST));
+    assert_eq!(subscription.first_loss(), Some(64));
+}
+
+/// The frame reader keeps the same state: a run after a gap is
+/// `AfterLoss`, and its subscription's first loss is set.
+#[test]
+fn a_frame_reader_reports_after_loss_too() {
+    use crate::log_buffer::{FrameReader, FrameStep, Stepped};
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = FrameReader::new(conductor.subscribe(Role::Optional).unwrap());
+    let mut owner = owner(&buffer);
+    assert_eq!(seal(&mut owner, 0, 64), committed(0, 64));
+    recv(&mut owner, &fragment(0, 64, 32, false, true, 1)).unwrap();
+    let mut reasons = Vec::new();
+    for _ in 0..4 {
+        match reader.serve_frame().unwrap() {
+            FrameStep::Stepped {
+                kind: Stepped::Skipped { reason, .. },
+                ..
+            } => reasons.push(reason),
+            FrameStep::Pending => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(reasons, [LOST, SkipReason::AfterLoss]);
+    assert_eq!(reader.subscription().first_loss(), Some(0));
+}
