@@ -63,6 +63,10 @@ pub(crate) struct GuardedStream<T: TermBytes> {
     bounds: VecDeque<Bound>,
     /// Whether the walker reached the seal and wrote `Ended`.
     ended: bool,
+    /// Positions of the blocks a guard close aborted: the walker labels
+    /// those `GUARD_CLOSED`, every other aborted block `WRITER_ABORTED`
+    /// (G4), whatever the seal state when it walks.
+    guard_aborted: Vec<u64>,
 }
 
 /// What one walk did.
@@ -92,7 +96,29 @@ impl<T: TermBytes> GuardedStream<T> {
             scratch: vec![0; max_message],
             bounds: VecDeque::new(),
             ended: false,
+            guard_aborted: Vec::new(),
         }
+    }
+
+    /// Records a block the guard close aborted (`ClaimDeadline::Aborted`).
+    pub(crate) fn note_guard_abort(&mut self, position: u64) {
+        self.guard_aborted.push(position);
+    }
+
+    /// Abandons every bound ring with an unknown lost count: the walker
+    /// was lapped, a broken invariant.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Outcomes`] for a ring that refuses the record.
+    pub(crate) fn abandon_all(&mut self) -> Result<(), crate::error::DriverError> {
+        for bound in &mut self.bounds {
+            bound
+                .writer
+                .abandon(bound.ring.words(), LOST_UNKNOWN)
+                .map_err(crate::error::DriverError::Outcomes)?;
+        }
+        Ok(())
     }
 
     /// Binds a newly issued handle's ring, for blocks from `from` on.
@@ -125,7 +151,6 @@ impl<T: TermBytes> GuardedStream<T> {
         base: u64,
         lane: u8,
         incarnation: u64,
-        guard_sealed: bool,
     ) -> Result<Walked, crate::error::DriverError> {
         let mut walked = Walked::default();
         if self.ended {
@@ -138,10 +163,13 @@ impl<T: TermBytes> GuardedStream<T> {
                     (position, self.walker.position(), Kind::Submitted, 0)
                 }
                 PollOutcome::Aborted { position, extent } => {
-                    let reason = if guard_sealed {
-                        REASON_GUARD_CLOSED
-                    } else {
-                        REASON_WRITER_ABORTED
+                    let by_close = self.guard_aborted.iter().position(|&at| at == position);
+                    let reason = match by_close {
+                        Some(index) => {
+                            let _ = self.guard_aborted.swap_remove(index);
+                            REASON_GUARD_CLOSED
+                        }
+                        None => REASON_WRITER_ABORTED,
                     };
                     // Positions stay below 2^63 (the stream position range).
                     (
@@ -156,21 +184,11 @@ impl<T: TermBytes> GuardedStream<T> {
                     reason: seal,
                 } => {
                     self.ended = true;
-                    let reason = if seal == SealReason::GuardClosed {
-                        REASON_GUARD_CLOSED
-                    } else {
-                        0
-                    };
-                    (position, position, Kind::Ended, reason)
+                    (position, position, Kind::Ended, end_reason(seal))
                 }
                 PollOutcome::Overrun { .. } => {
                     walked.overrun = true;
-                    for bound in &mut self.bounds {
-                        bound
-                            .writer
-                            .abandon(bound.ring.words(), LOST_UNKNOWN)
-                            .map_err(crate::error::DriverError::Outcomes)?;
-                    }
+                    self.abandon_all()?;
                     return Ok(walked);
                 }
                 // An image's skipped range carries no message; a revoked
@@ -216,6 +234,20 @@ impl<T: TermBytes> GuardedStream<T> {
     }
 }
 
+/// The `AbortReason` (G4) an incarnation's `Ended` record carries for the
+/// seal that ended it: `GUARD_CLOSED` (1) for a guard close,
+/// `DEADLINE_MISSED` (2) for cancel-on-deadline, `DRIVER_SHUTDOWN` (5) for
+/// a removal (an orderly end that cannot drain), and `PUBLICATION_FAULT`
+/// (4) for any other seal. Code 0 is reserved and never written.
+pub(crate) const fn end_reason(seal: SealReason) -> u64 {
+    match seal {
+        SealReason::GuardClosed => REASON_GUARD_CLOSED,
+        SealReason::DeadlineMissed => 2,
+        SealReason::StreamRemoved => 5,
+        _ => 4,
+    }
+}
+
 /// The ring and writer of a new handle: `C_m` message records plus the
 /// one local `Ended` record.
 ///
@@ -231,4 +263,88 @@ pub(crate) fn new_ring(messages: u64) -> Result<(Arc<HeapWords>, OutcomeWriter),
     let ring = Arc::new(HeapWords::zeroed(words));
     karyos_sys::outcome_ring::init(ring.words(), capacity)?;
     Ok((ring, OutcomeWriter::new(capacity)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+    use karyos_sys::outcome_ring::{OutcomeReader, Produced};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    #[test]
+    fn a_lapped_walker_abandons_with_an_unknown_count() {
+        let buffer = Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 3,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: karyos_sys::frame::Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+            })
+            .unwrap(),
+        );
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let walker = conductor.subscribe(Role::Walker).unwrap();
+        let guard = GuardHandle {
+            driver: 1,
+            guard: 1,
+        };
+        let mut guarded = GuardedStream::new(guard, 2, walker, 64);
+        let (ring, writer) = new_ring(2).unwrap();
+        let consumed = Arc::new(AtomicU64::new(0));
+        guarded.bind(Bound {
+            from: 0,
+            epoch: 2,
+            ring: Arc::clone(&ring),
+            consumed: Arc::clone(&consumed),
+            writer,
+        });
+        guarded.abandon_all().unwrap();
+        let bound = guarded.bounds.front_mut().unwrap();
+        assert_eq!(bound.writer.faulted(), Some(LOST_UNKNOWN));
+        let record = Record {
+            kind: Kind::Submitted,
+            lane: 0,
+            receiver: 0,
+            incarnation: 1,
+            start: 0,
+            end: 64,
+            epoch: 2,
+            reason: 0,
+            lost: 0,
+        };
+        assert_eq!(
+            bound
+                .writer
+                .produce(bound.ring.words(), &bound.consumed, record)
+                .unwrap(),
+            Produced::Lost
+        );
+        let mut reader = OutcomeReader::attach(&*ring, 1).unwrap();
+        let mut seen = Vec::new();
+        let _ = reader
+            .poll(&*ring, &consumed, 8, |_, record| seen.push(record))
+            .unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            (seen[0].kind, seen[0].lost),
+            (Kind::OutcomesLost, LOST_UNKNOWN)
+        );
+    }
+
+    #[test]
+    fn every_seal_ends_with_a_defined_reason() {
+        assert_eq!(end_reason(SealReason::GuardClosed), 1);
+        assert_eq!(end_reason(SealReason::DeadlineMissed), 2);
+        assert_eq!(end_reason(SealReason::StreamRemoved), 5);
+        assert_eq!(end_reason(SealReason::Unspecified), 4);
+    }
 }

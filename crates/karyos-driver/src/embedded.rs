@@ -1194,7 +1194,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .guards
             .close(guard, operation, crate::guards::Requester::InProcess, now);
         match &closed {
-            Ok(_) => self.seal_guarded(guard)?,
+            // The close took effect: a failed seal is reported, never
+            // returned as a failed close.
+            Ok(_) => self.seal_guarded_reporting(guard),
             Err(error) => self.report_guard_error(guard.id(), error),
         }
         closed
@@ -1224,13 +1226,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             {
                 first_error.get_or_insert(DriverError::from(error));
             }
-            // The outstanding claim: its commit and this abort race on the
-            // block's decision word, and exactly one wins.
-            if let Err(error) = stream.conductor.abort_admitted_claim() {
-                first_error.get_or_insert(DriverError::from(error));
+            if let Err(error) = abort_guarded_claim(stream) {
+                first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// [`Self::seal_guarded`] after a close that took effect: a failure is
+    /// recorded in the error log (`GuardSealFailed`, keyed by the guard)
+    /// and retried by the walker's duty, never reported as a failed close.
+    pub(crate) fn seal_guarded_reporting(&mut self, guard: GuardHandle) {
+        if let Err(error) = self.seal_guarded(guard) {
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::GuardSealFailed,
+                [guard.id(), 0],
+                &error.to_string(),
+            );
+        }
     }
 
     /// Guards a stream with `guard` on the control path, before any
@@ -1254,7 +1268,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         guard: GuardHandle,
         messages: u64,
     ) -> Result<(), DriverError> {
-        let _ = self.guards.state(guard)?;
+        if let Err(error) = self.guards.state(guard) {
+            self.report_guard_error(guard.id(), &error);
+            return Err(error);
+        }
         let found = self.active_stream(stream)?;
         if !matches!(
             found.config.publication,
@@ -1266,7 +1283,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let fits = messages
             .checked_mul(u64::from(found.config.max_reserved))
             .is_some_and(|span| span <= window);
-        if found.guarded.is_some() || !found.members.is_empty() || messages == 0 || !fits {
+        // An exclusive handle already issued, not a subscriber, rules it out.
+        let issued = found
+            .members
+            .iter()
+            .any(|member| matches!(member.kind, MemberKind::Exclusive));
+        if found.guarded.is_some() || issued || messages == 0 || !fits {
             return Err(DriverError::InvalidConfig);
         }
         let walker = found
@@ -1593,7 +1615,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ) -> Result<ClientPublication<T>, DriverError> {
         // A guarded handle's binding is prepared first, so a refusal takes
         // nothing.
-        let binding = self.prepare_guard_binding(stream)?;
+        let binding = match self.prepare_guard_binding(stream) {
+            Ok(binding) => binding,
+            Err(error) => {
+                let guard = self
+                    .stream_ref(stream)
+                    .ok()
+                    .and_then(|found| found.guarded.as_ref().map(|guarded| guarded.guard.id()));
+                if let Some(guard) = guard {
+                    self.report_guard_error(guard, &error);
+                }
+                return Err(error);
+            }
+        };
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = match stream.spare.take() {
@@ -1867,12 +1901,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut first_error = None;
         let mut lapped = Vec::new();
         for stream in &mut self.streams {
-            let sealed = stream.conductor.seal_reason() == Some(SealReason::GuardClosed);
+            // Until the publication releases at the guard's seal, a claim
+            // admitted after the close's abort ran (its record written,
+            // its head not yet) is aborted here, every duty cycle.
+            if stream.guarded.is_some()
+                && stream.conductor.seal_reason() == Some(SealReason::GuardClosed)
+                && stream.conductor.seal_state() == SealState::Sealed
+                && let Err(error) = abort_guarded_claim(stream)
+            {
+                first_error.get_or_insert(error);
+            }
             let (base, lane, id) = (stream.base, stream.config.lane.get(), stream.id);
             let Some(guarded) = &mut stream.guarded else {
                 continue;
             };
-            match guarded.walk(budget, base, lane, FIRST_INCARNATION, sealed) {
+            match guarded.walk(budget, base, lane, FIRST_INCARNATION) {
                 Ok(walked) => {
                     self.counters
                         .add(Event::GuardOutcomesWritten, u64::from(walked.written));
@@ -1884,7 +1927,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     if walked.overrun {
                         lapped.push(id);
                     }
-                    work = work.saturating_add(walked.written + walked.lost);
+                    add_work(&self.counters, &mut work, &mut first_error, walked.written);
+                    add_work(&self.counters, &mut work, &mut first_error, walked.lost);
                 }
                 Err(error) => {
                     first_error.get_or_insert(error);
@@ -2237,6 +2281,20 @@ fn seal_conflation_terminal<E>(
     }
     if terminal.is_some() {
         seal()?;
+    }
+    Ok(())
+}
+
+/// Aborts a guarded stream's admitted claim for its guard close and
+/// records the block, so the walker labels it `GUARD_CLOSED`.
+fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), DriverError> {
+    // The outstanding claim: its commit and this abort race on the block's
+    // decision word, and exactly one wins.
+    if let karyos_sys::log_buffer::ClaimDeadline::Aborted { position, .. } =
+        stream.conductor.abort_admitted_claim()?
+        && let Some(guarded) = &mut stream.guarded
+    {
+        guarded.note_guard_abort(position);
     }
     Ok(())
 }
