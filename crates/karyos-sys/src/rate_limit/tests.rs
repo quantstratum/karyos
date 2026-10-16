@@ -102,30 +102,47 @@ fn policies_are_validated() {
 proptest! {
     #![proptest_config(crate::receive::tests_config())]
 
-    /// Whatever the times and frames, a bucket never holds more than its
-    /// burst, and over any window the frames admitted never exceed the
-    /// burst plus what the elapsed time earns.
+    /// With the elapsed time injected: a bucket never holds more than its
+    /// burst, and the frames admitted never exceed the burst plus what the
+    /// total elapsed time earns.
     #[test]
     fn admissions_never_exceed_burst_plus_earned(
         per_second in 1..1_000u64,
         burst in 1..50u64,
-        steps in proptest::collection::vec((0..SECOND / 10, any::<bool>()), 1..200),
+        steps in proptest::collection::vec(0..SECOND / 10, 1..200),
     ) {
         let mut limiter = RateLimiter::new(policy(per_second, burst, None), 0);
-        let mut now = 0u64;
-        let mut furthest = 0u64;
+        let mut elapsed = 0u64;
         let mut admitted = 0u64;
-        for (advance, backward) in steps {
-            // Forward, or a backward step (which earns nothing).
-            now = if backward { now.saturating_sub(advance) } else { now + advance };
-            furthest = furthest.max(now);
-            if limiter.admit_frame(now, 1, true) {
+        for step in steps {
+            limiter.refill(step);
+            elapsed += step;
+            if limiter.try_admit(1, true) {
                 admitted += 1;
             }
             prop_assert!(limiter.message_tokens() <= burst);
         }
-        // Only time beyond the furthest point reached earns tokens.
-        let earned = u128::from(furthest) * u128::from(per_second) / NANOS;
+        let earned = u128::from(elapsed) * u128::from(per_second) / NANOS;
         prop_assert!(u128::from(admitted) <= u128::from(burst) + earned);
+    }
+
+    /// Refilling in pieces earns exactly what one refill of the sum earns:
+    /// no fraction of a token is lost.
+    #[test]
+    fn split_refills_earn_the_same(
+        per_second in 1..1_000_000u64,
+        pieces in proptest::collection::vec(0..SECOND, 1..20),
+    ) {
+        let burst = u64::MAX / 1_000_000_000_000;
+        let mut split = RateLimiter::new(policy(per_second, burst, None), 0);
+        // Empty, so nothing caps the refills.
+        split.messages.level = 0;
+        let mut whole = split;
+        let total: u64 = pieces.iter().sum();
+        for piece in pieces {
+            split.refill(piece);
+        }
+        whole.refill(total);
+        prop_assert_eq!(split.message_tokens(), whole.message_tokens());
     }
 }

@@ -10,12 +10,14 @@
 //!   sends.
 //! - A frame is admitted only when every bucket it is charged to holds
 //!   enough; then all of them are charged together, else none is.
-//! - Tokens are refilled from the time elapsed since the last refill, read
-//!   with [`crate::host_clock::age_ns`]: a backward clock step refills
-//!   nothing and never grants early. Levels are kept in nano-tokens, so a
-//!   fraction of a token earned is never lost, and every product and sum is
-//!   checked; a refill that would overflow caps the bucket at its burst, a
-//!   stated limit of the algorithm.
+//! - The core takes the elapsed time ([`RateLimiter::refill`]), so it is
+//!   deterministic; [`RateLimiter::admit_frame`] is the thin wrapper that
+//!   reads it with [`crate::host_clock::age_ns`] against the last refill,
+//!   so a backward clock step refills nothing and never grants early.
+//!   Levels are kept in nano-tokens, so a fraction of a token earned is
+//!   never lost, and every product and sum is checked; a refill that would
+//!   overflow caps the bucket at its burst, a stated limit of the
+//!   algorithm.
 //! - Buckets start full.
 //!
 //! The authoritative buckets live in the driver, at the sender gate; a
@@ -93,16 +95,13 @@ struct Bucket {
     rate: Rate,
     /// The level, in nano-tokens.
     level: u128,
-    /// The time of the last refill, in the clock's nanoseconds.
-    last: u64,
 }
 
 impl Bucket {
-    fn full(rate: Rate, now: u64) -> Self {
+    fn full(rate: Rate) -> Self {
         Self {
             rate,
             level: Self::nanos(rate.burst),
-            last: now,
         }
     }
 
@@ -111,14 +110,8 @@ impl Bucket {
         tokens as u128 * NANOS
     }
 
-    /// Adds the tokens earned since the last refill, capped at the burst.
-    /// A backward step earns nothing and keeps the last refill time.
-    fn refill(&mut self, now: u64) {
-        let elapsed = age_ns(now, self.last);
-        if elapsed == 0 {
-            return;
-        }
-        self.last = now;
+    /// Adds the tokens `elapsed` nanoseconds earn, capped at the burst.
+    fn refill(&mut self, elapsed: u64) {
         let cap = Self::nanos(self.rate.burst);
         // elapsed and the rate are u64: their product fits a u128.
         let earned = u128::from(elapsed) * u128::from(self.rate.per_second);
@@ -149,28 +142,51 @@ impl Bucket {
 pub struct RateLimiter {
     messages: Bucket,
     bytes: Option<Bucket>,
+    /// The clock time of the last refill, for [`Self::admit_frame`].
+    last: u64,
 }
 
 impl RateLimiter {
-    /// Full buckets for `policy` at time `now`. The caller validated the
-    /// policy.
+    /// Full buckets for `policy`, the clock read at `now`. The caller
+    /// validated the policy.
     #[must_use]
     pub fn new(policy: RatePolicy, now: u64) -> Self {
         Self {
-            messages: Bucket::full(policy.messages, now),
-            bytes: policy.bytes.map(|rate| Bucket::full(rate, now)),
+            messages: Bucket::full(policy.messages),
+            bytes: policy.bytes.map(Bucket::full),
+            last: now,
         }
     }
 
-    /// Admits a first-send frame of `length` bytes at time `now`: the first
-    /// frame of a message costs one message token, and with a byte bucket
-    /// every frame costs its length. Either every bucket is charged or none
-    /// is; `false` means the frame waits, in order.
-    pub fn admit_frame(&mut self, now: u64, length: u64, first_of_message: bool) -> bool {
-        self.messages.refill(now);
-        if let Some(bytes) = &mut self.bytes {
-            bytes.refill(now);
+    /// Adds the tokens `elapsed` nanoseconds earn to every bucket, capped
+    /// at its burst. The deterministic core: the caller measures `elapsed`.
+    pub fn refill(&mut self, elapsed: u64) {
+        if elapsed == 0 {
+            return;
         }
+        self.messages.refill(elapsed);
+        if let Some(bytes) = &mut self.bytes {
+            bytes.refill(elapsed);
+        }
+    }
+
+    /// [`Self::refill`] for the time since the last refill, read from the
+    /// clock at `now` with [`age_ns`] (a backward step earns nothing and
+    /// keeps the last refill time), then [`Self::try_admit`].
+    pub fn admit_frame(&mut self, now: u64, length: u64, first_of_message: bool) -> bool {
+        let elapsed = age_ns(now, self.last);
+        if elapsed > 0 {
+            self.last = now;
+            self.refill(elapsed);
+        }
+        self.try_admit(length, first_of_message)
+    }
+
+    /// Admits a first-send frame of `length` bytes with the tokens held:
+    /// the first frame of a message costs one message token, and with a
+    /// byte bucket every frame costs its length. Either every bucket is
+    /// charged or none is; `false` means the frame waits, in order.
+    pub fn try_admit(&mut self, length: u64, first_of_message: bool) -> bool {
         let message_ok = !first_of_message || self.messages.holds(1);
         let bytes_ok = self.bytes.as_ref().is_none_or(|bytes| bytes.holds(length));
         if !(message_ok && bytes_ok) {
