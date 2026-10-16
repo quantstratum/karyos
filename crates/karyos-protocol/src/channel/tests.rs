@@ -108,6 +108,23 @@ fn common_parameters_are_checked() {
         refused(&format!("karyos:ipc?guard={}", "g".repeat(65))),
         ChannelError::InvalidValue { key: "guard", .. }
     ));
+    for name in ["or ders", "orders;x", "ordérs", "a/b"] {
+        assert!(
+            matches!(
+                refused(&format!("karyos:ipc?guard={name}")),
+                ChannelError::InvalidValue { key: "guard", .. }
+            ),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        ChannelConfig::parse("karyos:ipc?guard=Desk_1.orders-A")
+            .unwrap()
+            .common
+            .guard
+            .as_deref(),
+        Some("Desk_1.orders-A")
+    );
     assert_eq!(
         ChannelConfig::parse("karyos:ipc?trace=all")
             .unwrap()

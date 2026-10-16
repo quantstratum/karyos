@@ -23,7 +23,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use crate::frame::Flags;
+use crate::frame::{Flags, Lane};
 use crate::sizing::{FragmentPlan, TermLength};
 
 /// The longest URI accepted, in bytes.
@@ -189,7 +189,7 @@ pub struct CommonConfig {
     pub term_length: Option<TermLength>,
     /// Priority lanes, 1 to 4.
     pub lanes: Option<u8>,
-    /// The guard the publication obeys.
+    /// The guard the publication obeys: 1 to 64 bytes of `[A-Za-z0-9._-]`.
     pub guard: Option<String>,
     /// Message tracing.
     pub trace: Trace,
@@ -558,13 +558,20 @@ fn parse_term_length(value: &str) -> Result<TermLength, ChannelError> {
 
 fn parse_lanes(value: &str) -> Result<u8, ChannelError> {
     decimal::<u8>(value)
-        .filter(|lanes| (1..=4).contains(lanes))
+        .filter(|lanes| (1..=Lane::COUNT).contains(lanes))
         .ok_or_else(|| invalid(Key::Lanes, "an integer from 1 to 4"))
 }
 
 fn parse_guard(value: &str) -> Result<String, ChannelError> {
     if value.len() > MAX_GUARD_NAME {
         return Err(invalid(Key::Guard, "longer than 64 bytes"));
+    }
+    // Guard names appear in tools and logs: a plain identifier only.
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(invalid(Key::Guard, "not made of [A-Za-z0-9._-]"));
     }
     Ok(value.to_owned())
 }
