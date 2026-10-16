@@ -1110,6 +1110,10 @@ fn grant_record(
             } => Capability::ObserverSubscriber {
                 cell: u64::try_from(cell).ok()?,
             },
+            // The driver's walker is never granted to a client.
+            Participant::Subscriber {
+                role: Role::Walker, ..
+            } => return None,
             // A journal or conflation grant has no log buffer record.
             Participant::Journal { .. } | Participant::Conflation => return None,
         },

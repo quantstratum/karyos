@@ -124,23 +124,20 @@ pub const CLEANING_HEADROOM: u8 = 1;
 
 use crate::participant::{
     self, CELL_FREE, CELL_LOST, CELL_LOST_HOLDING, CELL_LOST_RESERVED, CELL_OBSERVER,
-    CELL_OPTIONAL, CELL_PUBLICATION, CELL_REQUIRED, CELL_REQUIRED_RESERVED, bounds,
+    CELL_OPTIONAL, CELL_PUBLICATION, CELL_REQUIRED, CELL_REQUIRED_RESERVED, CELL_WALKER, bounds,
+    counts_for_connection, is_observer_like, is_reader, visible_as_subscriber,
 };
 
 /// Whether a subscriber cell in `state` keeps the publication connected.
+/// The driver's walker (`CELL_WALKER`) does not: it reads for the driver,
+/// not for an application.
 const fn connected(state: u64) -> bool {
-    matches!(
-        state,
-        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER
-    )
+    counts_for_connection(state)
 }
 
 /// Whether a subscriber cell in `state` holds a spare-slot credit.
 const fn holds_credit(state: u64) -> bool {
-    matches!(
-        state,
-        CELL_OPTIONAL | CELL_OBSERVER | CELL_REQUIRED_RESERVED | CELL_LOST_RESERVED
-    )
+    is_observer_like(state) || matches!(state, CELL_REQUIRED_RESERVED | CELL_LOST_RESERVED)
 }
 
 /// The seal position bits of the seal word (`quantstratum-docs: karyos/design/publication-seal.md`):
@@ -160,6 +157,14 @@ pub enum Role {
     /// and its handle will never get an in-place delivery API
     /// (`quantstratum-docs: karyos/design/observer-role.md`).
     Observer,
+    /// The driver's walker of a guarded local stream
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, "Local
+    /// streams"): an observer in every respect (copy only, never bounds,
+    /// one spare-slot credit, lapped with `Overrun`, kept until it passes
+    /// the seal position) except that it does not keep the publication
+    /// connected and is not listed among the subscriber cells. Driver
+    /// only: it is not a wire role.
+    Walker,
 }
 
 /// What the conductor does with a required participant whose client was
@@ -1421,6 +1426,7 @@ impl<O: BufferOwner> PreparedSubscription<O> {
             Role::Required => CELL_REQUIRED,
             Role::Optional => CELL_OPTIONAL,
             Role::Observer => CELL_OBSERVER,
+            Role::Walker => CELL_WALKER,
         };
         let state = found.state.load(Ordering::Acquire);
         let admitted =
@@ -3004,7 +3010,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                 self.cursor.position = next;
                 match self.cursor.role {
                     // The copy is the acknowledgement.
-                    Role::Optional | Role::Observer => self.publish(next),
+                    Role::Optional | Role::Observer | Role::Walker => self.publish(next),
                     Role::Required => self.cursor.pending = Some(next),
                 }
                 Ok(Step::Done(PollOutcome::Message {
@@ -3822,9 +3828,8 @@ impl<O: BufferOwner> Conductor<O> {
         }
         let state = found.state.load(Ordering::Acquire);
         let target = match (state, policy) {
-            (CELL_OPTIONAL | CELL_OBSERVER, _) | (CELL_REQUIRED_RESERVED, LossPolicy::Continue) => {
-                CELL_LOST_RESERVED
-            }
+            (reader, _) if is_observer_like(reader) => CELL_LOST_RESERVED,
+            (CELL_REQUIRED_RESERVED, LossPolicy::Continue) => CELL_LOST_RESERVED,
             (CELL_REQUIRED, LossPolicy::Hold) => CELL_LOST_HOLDING,
             (CELL_REQUIRED | CELL_REQUIRED_RESERVED, LossPolicy::Abort) => CELL_LOST,
             (CELL_REQUIRED, LossPolicy::Continue) | (CELL_REQUIRED_RESERVED, LossPolicy::Hold) => {
@@ -3878,10 +3883,7 @@ impl<O: BufferOwner> Conductor<O> {
         // Never adopted, so it holds no loan: it leaves flow control at once.
         found.revoked.store(crate::loan::REVOKED, Ordering::SeqCst);
         let state = found.state.load(Ordering::Acquire);
-        if matches!(
-            state,
-            CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER
-        ) {
+        if is_reader(state) {
             let _ =
                 found
                     .state
@@ -4040,12 +4042,7 @@ impl<O: BufferOwner> Conductor<O> {
             return None;
         }
         let cell = buffer.cells().get(cell)?;
-        match cell.state.load(Ordering::Acquire) {
-            CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER => {
-                Some(cell.position.load(Ordering::Acquire))
-            }
-            _ => None,
-        }
+        is_reader(cell.state.load(Ordering::Acquire)).then(|| cell.position.load(Ordering::Acquire))
     }
 
     /// The retention floor (Acquire): the position below which terms may be
@@ -4099,7 +4096,9 @@ impl<O: BufferOwner> Conductor<O> {
     /// The attached subscriber cells, in cell order: each one's cell index,
     /// registration (the occupant or export id, its marks cleared; 0 for a
     /// subscription without one) and position, each loaded with Acquire.
-    /// Detached, lost and free cells are skipped. Diagnostics sample it.
+    /// Detached, lost and free cells are skipped, and so is the driver's
+    /// walker (`CELL_WALKER`), which is not a subscriber. Diagnostics
+    /// sample it.
     pub fn subscribers(&self) -> impl Iterator<Item = SubscriberCell> + '_ {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         let first = buffer.first_subscriber_cell();
@@ -4108,16 +4107,12 @@ impl<O: BufferOwner> Conductor<O> {
             .iter()
             .enumerate()
             .skip(first)
-            .filter_map(|(index, cell)| match cell.state.load(Ordering::Acquire) {
-                CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER => {
-                    Some(SubscriberCell {
-                        cell: index,
-                        registration: cell.registration.load(Ordering::Acquire)
-                            & crate::registration::MAX_EXPORT,
-                        position: cell.position.load(Ordering::Acquire),
-                    })
-                }
-                _ => None,
+            .filter(|(_, cell)| visible_as_subscriber(cell.state.load(Ordering::Acquire)))
+            .map(|(index, cell)| SubscriberCell {
+                cell: index,
+                registration: cell.registration.load(Ordering::Acquire)
+                    & crate::registration::MAX_EXPORT,
+                position: cell.position.load(Ordering::Acquire),
             })
     }
 
@@ -4156,7 +4151,8 @@ impl<O: BufferOwner> Conductor<O> {
                     .skip(buffer.first_subscriber_cell())
                     .filter(|cell| {
                         let state = cell.state.load(Ordering::Acquire);
-                        bounds(state) || state == CELL_OPTIONAL || state == CELL_OBSERVER
+                        // The walker too: its last pass reads up to the seal.
+                        bounds(state) || is_observer_like(state)
                     })
                     .all(|cell| cell.position.load(Ordering::Acquire) >= position);
                 if passed {
@@ -4401,7 +4397,11 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // Publisher credits are reserved for the buffer's life: 1 for the
         // exclusive publication, `P` for concurrent ones.
         let publishers = buffer.first_subscriber_cell() as u32;
-        let takes_credit = matches!(role, Role::Optional | Role::Observer) || reserve;
+        // Exhaustive over the roles, so a new role must decide.
+        let takes_credit = match role {
+            Role::Optional | Role::Observer | Role::Walker => true,
+            Role::Required => reserve,
+        };
         let credits = credited + publishers + u32::from(takes_credit);
         if credits > u32::from(buffer.spare_slots - CLEANING_HEADROOM) {
             return Err(SysError::ResourcesUnavailable);
@@ -4418,6 +4418,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             (Role::Required, true) => CELL_REQUIRED_RESERVED,
             (Role::Optional, _) => CELL_OPTIONAL,
             (Role::Observer, _) => CELL_OBSERVER,
+            (Role::Walker, _) => CELL_WALKER,
         };
         participant::admit(
             &cell.state,
@@ -4475,13 +4476,16 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let buffer = self.buffer;
         let window = window(&buffer.config);
         let head = buffer.conductor_head()?;
-        let mut bound = None::<u64>;
-        for cell in buffer.cells().iter().skip(buffer.first_subscriber_cell()) {
-            if bounds(cell.state.load(Ordering::Acquire)) {
-                let position = cell.position.load(Ordering::Acquire);
-                bound = Some(bound.map_or(position, |b| b.min(position)));
-            }
-        }
+        // `bound` drives the limit; `held` (bounding cells and the
+        // driver's walker) holds the floor, so the walker is never lapped
+        // yet never bounds the publisher (coordinator, ACS 15161).
+        let (bound, held) = participant::reader_minima(
+            buffer
+                .cells()
+                .iter()
+                .skip(buffer.first_subscriber_cell())
+                .map(|cell| (&cell.state, &cell.position)),
+        );
         // SPEC.md §4 retention floor: the minimum required position, or,
         // without required participants, `head_snapshot - window` bounded
         // below by position 0 through an explicit comparison.
@@ -4503,6 +4507,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             // wrapping or saturating arithmetic.
             None => (head.max(window) - window, head),
         };
+        let floor = held.map_or(floor, |held| floor.min(held));
         // Neither the floor nor the limit ever decreases.
         let floor = floor.max(buffer.floor().load(Ordering::Relaxed));
         let limit = (base + window).max(buffer.limit().load(Ordering::Relaxed));
@@ -4845,6 +4850,7 @@ mod heap_tests {
     include!("log_buffer_tests/contracts.rs");
     include!("log_buffer_tests/loss.rs");
     include!("log_buffer_tests/observer.rs");
+    include!("log_buffer_tests/walker.rs");
     include!("log_buffer_tests/diagnostics.rs");
     include!("log_buffer_tests/frame_reader.rs");
 }
@@ -4872,6 +4878,7 @@ mod shared_tests {
     include!("log_buffer_tests/contracts.rs");
     include!("log_buffer_tests/loss.rs");
     include!("log_buffer_tests/observer.rs");
+    include!("log_buffer_tests/walker.rs");
     include!("log_buffer_tests/diagnostics.rs");
     include!("log_buffer_tests/frame_reader.rs");
 
