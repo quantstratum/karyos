@@ -53,7 +53,7 @@ fn test_log_buffer_loss_hold_keeps_the_bound_while_a_loan_is_held() {
                 assert_eq!(report.bounds_withdrawn, 0);
             }
             AppendOutcome::Appended { .. } => {}
-            AppendOutcome::Closed => panic!("not sealed"),
+            AppendOutcome::Closed | AppendOutcome::Gated => panic!("not sealed"),
         }
     }
     assert!(back_pressured, "a holding reader stopped bounding");

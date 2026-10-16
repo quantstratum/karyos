@@ -46,7 +46,7 @@ fn append_retrying(
                 drain();
                 let _ = conductor.duty_cycle().unwrap();
             }
-            AppendOutcome::Closed => panic!("not sealed"),
+            AppendOutcome::Closed | AppendOutcome::Gated => panic!("not sealed"),
         }
     }
     panic!("append never succeeded");
@@ -119,7 +119,7 @@ fn required_subscriber_back_pressures_the_publication() {
                 break;
             }
             AppendOutcome::AdminAction => {}
-            AppendOutcome::Closed => panic!("not sealed"),
+            AppendOutcome::Closed | AppendOutcome::Gated => panic!("not sealed"),
         }
         let _ = conductor.duty_cycle().unwrap();
     }
@@ -181,7 +181,7 @@ fn rotation_waits_for_the_conductor() {
             AppendOutcome::Appended { .. } => appended += 1,
             AppendOutcome::AdminAction => admin += 1,
             AppendOutcome::BackPressured => panic!("unexpected back pressure"),
-            AppendOutcome::Closed => panic!("not sealed"),
+            AppendOutcome::Closed | AppendOutcome::Gated => panic!("not sealed"),
         }
     }
     // Term 0 and the prepared term 1 filled up; term 2 needs the
@@ -1147,7 +1147,7 @@ fn claims_at_the_term_end_pad_and_rotate() {
             ClaimOutcome::AdminAction => admin += 1,
             ClaimOutcome::BackPressured => {}
             ClaimOutcome::Aborted { .. } => panic!("nothing aborts"),
-            ClaimOutcome::Closed => panic!("not sealed"),
+            ClaimOutcome::Closed | ClaimOutcome::Gated => panic!("not sealed"),
         }
     }
     assert!(admin > 0, "the claims never reached a term end");
@@ -1215,7 +1215,7 @@ fn claims_are_back_pressured() {
             }
             ClaimOutcome::AdminAction => {}
             ClaimOutcome::Aborted { .. } => panic!("nothing aborts"),
-            ClaimOutcome::Closed => panic!("not sealed"),
+            ClaimOutcome::Closed | ClaimOutcome::Gated => panic!("not sealed"),
         }
     }
     assert!(pressured);
@@ -3430,7 +3430,7 @@ mod layout_properties {
                 let position = loop {
                     match publication.append(&data, options).unwrap() {
                         AppendOutcome::Appended { position } => break position,
-                        AppendOutcome::Closed => panic!("not sealed"),
+                        AppendOutcome::Closed | AppendOutcome::Gated => panic!("not sealed"),
                         _ => {
                             let _ = conductor.duty_cycle().unwrap();
                         }

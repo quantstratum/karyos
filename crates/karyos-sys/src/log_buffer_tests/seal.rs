@@ -59,7 +59,7 @@ fn an_exclusive_seal_closes_the_next_attempt_and_positions_at_the_last_block() {
     for _ in 0..2 {
         assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: end, reason: SealReason::Unspecified });
     }
-    assert!(publication.close_if_sealed());
+    assert!(publication.close_if_sealed().is_some());
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn a_forgotten_claim_is_aborted_before_closed() {
                 ClaimOutcome::Closed
             ));
         } else {
-            assert!(publication.close_if_sealed());
+            assert!(publication.close_if_sealed().is_some());
         }
         let _ = conductor.duty_cycle().unwrap();
         assert_eq!(
@@ -271,7 +271,7 @@ fn retirement_waits_for_attached_subscribers_only() {
     let _ = publication.append(&message(3), AppendOptions::default()).unwrap();
     let end = buffer.reserved_head().load(Ordering::Acquire);
     conductor.seal().unwrap();
-    assert!(publication.close_if_sealed());
+    assert!(publication.close_if_sealed().is_some());
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Positioned { position: end });
     assert_eq!(drain_to_end(&mut reader), (1, PollOutcome::Closed { position: end, reason: SealReason::Unspecified }));
@@ -315,7 +315,7 @@ fn a_concurrent_seal_is_positioned_at_once_and_handles_close() {
     assert_eq!(conductor.seal_state(), SealState::Retired { position: end });
     // The head stays at the seal position across duty cycles.
     assert_eq!(buffer.head().unwrap(), Some(end));
-    assert!(b.close_if_sealed());
+    assert!(b.close_if_sealed().is_some());
     // Released slots and loans; a closed handle's drop does nothing more.
     assert!(buffer.publisher_words().all(crate::publication::publisher_slot_free));
     drop(a);
@@ -382,10 +382,10 @@ fn close_if_sealed_does_nothing_on_an_active_buffer() {
     let buffer = new_buffer(concurrent_config(2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     let mut handle = conductor.concurrent_publication().unwrap().unwrap();
-    assert!(!handle.close_if_sealed());
+    assert!(handle.close_if_sealed().is_none());
     let exclusive = new_buffer(config(3, 2)).unwrap();
     let mut publication = exclusive.publication().unwrap().unwrap();
-    assert!(!publication.close_if_sealed());
+    assert!(publication.close_if_sealed().is_none());
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Active);
     assert!(matches!(
@@ -666,4 +666,70 @@ fn the_first_final_seal_decides_the_reason_and_a_cutover_seal_has_none() {
     // A later terminal seal does not overwrite the cutover's.
     conductor.seal_with_reason(SealReason::StreamRemoved).unwrap();
     assert_eq!(conductor.seal_reason(), None);
+}
+
+/// A guard close or a missed deadline seals with a gate reason: the
+/// publication reports `Gated`, never `Closed`, on every later attempt, and
+/// `close_if_sealed` returns the reason (guards-and-abort.md, GC-8).
+#[test]
+fn a_gate_seal_reports_gated() {
+    for reason in [SealReason::GuardClosed, SealReason::DeadlineMissed] {
+        let buffer = new_buffer(config(3, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let _subscription = conductor.subscribe(Role::Optional).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        conductor.seal_with_reason(reason).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                publication.append(&message(9), AppendOptions::default()).unwrap(),
+                AppendOutcome::Gated,
+                "{reason:?}"
+            );
+            assert!(matches!(
+                publication.try_claim(8, AppendOptions::default()).unwrap(),
+                ClaimOutcome::Gated
+            ));
+        }
+        assert_eq!(publication.close_if_sealed(), Some(reason));
+        assert_eq!(publication.seal_reason(), Some(reason));
+        assert!(reason.is_gate());
+    }
+}
+
+/// Any other reason keeps `Closed`, and `close_if_sealed` returns it.
+#[test]
+fn a_non_gate_seal_reports_closed() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    conductor
+        .seal_with_reason(SealReason::RequiredParticipantLost)
+        .unwrap();
+    assert_eq!(
+        publication.append(&message(9), AppendOptions::default()).unwrap(),
+        AppendOutcome::Closed
+    );
+    assert_eq!(
+        publication.close_if_sealed(),
+        Some(SealReason::RequiredParticipantLost)
+    );
+    assert!(!SealReason::RequiredParticipantLost.is_gate());
+}
+
+/// The reason codes are stable, and an unknown code reads `Unspecified`.
+#[test]
+fn seal_reason_codes_round_trip() {
+    for (reason, code) in [
+        (SealReason::Unspecified, 0),
+        (SealReason::RequiredParticipantLost, 1),
+        (SealReason::ConflationVersionsExhausted, 2),
+        (SealReason::StreamRemoved, 3),
+        (SealReason::ConflationFeederLost, 4),
+        (SealReason::GuardClosed, 5),
+        (SealReason::DeadlineMissed, 6),
+    ] {
+        assert_eq!(reason.code(), code);
+        assert_eq!(SealReason::from_code(code), reason);
+    }
+    assert_eq!(SealReason::from_code(7), SealReason::Unspecified);
 }

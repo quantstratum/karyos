@@ -49,6 +49,11 @@ pub enum OfferOutcome {
     /// The stream is sealed: the publication accepts nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
     Closed,
+    /// The publication's guard closed, or a scheduled message missed its
+    /// deadline: the incarnation ended and accepts nothing again; after a
+    /// reopen the application takes a new publication
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, GC-8).
+    Gated,
 }
 
 /// Result of [`ClientPublication::try_claim`]. Each call makes at most
@@ -78,6 +83,9 @@ pub enum ClaimOutcome<'a, T: TermBytes = HeapTerms> {
     /// The stream is sealed: the publication reserves nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
     Closed,
+    /// The publication's guard closed or a deadline was missed, as
+    /// [`OfferOutcome::Gated`].
+    Gated,
 }
 
 /// Result of [`ClientClaim::commit`]. Embedded API, provisional, as
@@ -434,8 +442,12 @@ impl<T: TermBytes> ClientPublication<T> {
         // A forgotten claim is resolved before any early return.
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
-            // A sealed publication still releases (publication-seal.md).
-            if self.inner.close_if_sealed() {
+            // A sealed publication still releases (publication-seal.md);
+            // a guard or deadline seal is `Gated` (GC-8).
+            if let Some(reason) = self.inner.close_if_sealed() {
+                if reason.is_gate() {
+                    return Ok(OfferOutcome::Gated);
+                }
                 return Ok(self.after_end().offer());
             }
             return Ok(OfferOutcome::NotConnected);
@@ -451,6 +463,7 @@ impl<T: TermBytes> ClientPublication<T> {
             AppendOutcome::BackPressured => OfferOutcome::BackPressured,
             AppendOutcome::AdminAction => OfferOutcome::AdminAction,
             AppendOutcome::Closed => self.after_end().offer(),
+            AppendOutcome::Gated => OfferOutcome::Gated,
         })
     }
 
@@ -493,14 +506,25 @@ impl<T: TermBytes> ClientPublication<T> {
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
-            if self.inner.close_if_sealed() {
+            if let Some(reason) = self.inner.close_if_sealed() {
+                if reason.is_gate() {
+                    return Ok(ClaimOutcome::Gated);
+                }
                 return Ok(self.after_end().claim());
             }
             return Ok(ClaimOutcome::NotConnected);
         }
         // A handle closed by an earlier call moves (or reports the end)
-        // here, before the attempt borrows it.
+        // here, before the attempt borrows it; a guard or deadline seal has
+        // no successor and stays `Gated`.
         if self.inner.is_closed() {
+            if self
+                .inner
+                .seal_reason()
+                .is_some_and(karyos_sys::log_buffer::SealReason::is_gate)
+            {
+                return Ok(ClaimOutcome::Gated);
+            }
             return Ok(self.after_end().claim());
         }
         if let Some(config) = self.conflation {
@@ -534,6 +558,7 @@ impl<T: TermBytes> ClientPublication<T> {
             },
             // Just closed: the next call moves, if a successor is coming.
             SysClaimOutcome::Closed => End::peek(link).claim(),
+            SysClaimOutcome::Gated => ClaimOutcome::Gated,
         })
     }
 
@@ -955,6 +980,30 @@ mod tests {
         assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 1);
         drop(publication);
         assert_eq!(detached.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// A guard close or a missed deadline seals with a gate reason: offers
+    /// and claims report `Gated`, connected or not, never `Closed`
+    /// (guards-and-abort.md, GC-8; quantstratum/karyos#178).
+    #[test]
+    fn a_gate_seal_is_gated_connected_or_not() {
+        use karyos_sys::log_buffer::SealReason;
+        for reason in [SealReason::GuardClosed, SealReason::DeadlineMissed] {
+            for allow_unconnected in [false, true] {
+                let (_buffer, mut conductor, mut publication) = setup(allow_unconnected);
+                conductor.seal_with_reason(reason).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::Gated);
+                    assert!(matches!(publication.try_claim(8), Ok(ClaimOutcome::Gated)));
+                }
+            }
+        }
+        // Any other seal stays `Closed`.
+        let (_buffer, mut conductor, mut publication) = setup(false);
+        conductor
+            .seal_with_reason(SealReason::StreamRemoved)
+            .unwrap();
+        assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::Closed);
     }
 
     #[test]

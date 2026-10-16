@@ -18,7 +18,8 @@ fn claim_through_the_facade(publication: &mut ClientPublication) -> Option<Commi
             | ClaimOutcome::AdminAction
             | ClaimOutcome::NotConnected
             | ClaimOutcome::Aborted { .. }
-            | ClaimOutcome::Closed,
+            | ClaimOutcome::Closed
+            | ClaimOutcome::Gated,
         )
         | Err(_) => None,
     }

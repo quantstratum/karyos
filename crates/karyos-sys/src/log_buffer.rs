@@ -710,6 +710,13 @@ impl<T: TermBytes> LogBuffer<T> {
     /// seal word: `None` while the buffer is not sealed, and also for a
     /// cutover seal, which is not terminal (the stream continues in a
     /// successor mapping).
+    /// The seal line's reason, for a handle that has already observed the
+    /// seal with Acquire (so the reason, stored before the seal swap, is
+    /// visible); [`SealReason::Unspecified`] when none was recorded.
+    pub(crate) fn observed_seal_reason(&self) -> SealReason {
+        SealReason::from_code(seal_reason(self.seal_reason_word()))
+    }
+
     pub(crate) fn terminal_seal_reason(&self) -> Option<SealReason> {
         let raw = self.seal().load(Ordering::Acquire);
         (raw & SEAL_SEALED != 0 && !crate::publication::seal_has_successor(raw))
@@ -1494,6 +1501,11 @@ pub enum AppendOutcome {
     /// The buffer is sealed: this publication reserves nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
     Closed,
+    /// The buffer is sealed by a guard close or a missed deadline
+    /// ([`SealReason::is_gate`]): this publication reserves nothing again,
+    /// and the outcome is `Gated`, as the early guard check reports it
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, GC-8).
+    Gated,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1550,6 +1562,9 @@ pub enum ClaimOutcome<'a, O: BufferOwner> {
     /// The buffer is sealed: this publication reserves nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
     Closed,
+    /// The buffer is sealed by a guard close or a missed deadline, as
+    /// [`AppendOutcome::Gated`].
+    Gated,
 }
 
 /// Result of [`Claim::commit`].
@@ -1601,7 +1616,7 @@ impl<O: BufferOwner> Publication<O> {
     ) -> Result<AppendOutcome, SysError> {
         self.resolve_claim();
         if self.state == PublicationState::Closed {
-            return Ok(AppendOutcome::Closed);
+            return Ok(self.ended_append());
         }
         let outcome = PublicationContext {
             buffer: &self.buffer,
@@ -1610,7 +1625,7 @@ impl<O: BufferOwner> Publication<O> {
         .append(payload, options)?;
         match outcome {
             AppendOutcome::Appended { .. } => Ok(outcome),
-            _ if self.observe_seal() => Ok(AppendOutcome::Closed),
+            _ if self.observe_seal() => Ok(self.ended_append()),
             _ => Ok(outcome),
         }
     }
@@ -1655,7 +1670,7 @@ impl<O: BufferOwner> Publication<O> {
     ) -> Result<ClaimOutcome<'_, O>, SysError> {
         self.resolve_claim();
         if self.state == PublicationState::Closed {
-            return Ok(ClaimOutcome::Closed);
+            return Ok(self.ended_claim());
         }
         let step = PublicationContext {
             buffer: &self.buffer,
@@ -1663,7 +1678,7 @@ impl<O: BufferOwner> Publication<O> {
         }
         .claim(length, options, pause)?;
         if matches!(step, ClaimStep::Outcome(_)) && self.observe_seal() {
-            return Ok(ClaimOutcome::Closed);
+            return Ok(self.ended_claim());
         }
         self.finish_claim(step)
     }
@@ -1673,9 +1688,35 @@ impl<O: BufferOwner> Publication<O> {
     /// (`quantstratum-docs: karyos/design/publication-seal.md`). Resolves a forgotten claim
     /// first. For wrappers that return before an attempt (the connection
     /// rule), so that a sealed publication is still released.
-    pub fn close_if_sealed(&mut self) -> bool {
+    ///
+    /// Returns the seal's reason once the publication is closed, `None`
+    /// while the buffer is not sealed. The reason is read after the seal's
+    /// Acquire (the conductor stores it before the seal swap); a cutover
+    /// seal carries no terminal reason and reads as
+    /// [`SealReason::Unspecified`].
+    pub fn close_if_sealed(&mut self) -> Option<SealReason> {
         self.resolve_claim();
-        self.state == PublicationState::Closed || self.observe_seal()
+        (self.state == PublicationState::Closed || self.observe_seal())
+            .then(|| self.buffer.observed_seal_reason())
+    }
+
+    /// The outcome of an append once the publication is closed: `Gated`
+    /// for a guard or deadline seal, `Closed` otherwise (GC-8).
+    fn ended_append(&self) -> AppendOutcome {
+        if self.buffer.observed_seal_reason().is_gate() {
+            AppendOutcome::Gated
+        } else {
+            AppendOutcome::Closed
+        }
+    }
+
+    /// As [`Self::ended_append`], for a claim.
+    fn ended_claim(&self) -> ClaimOutcome<'_, O> {
+        if self.buffer.observed_seal_reason().is_gate() {
+            ClaimOutcome::Gated
+        } else {
+            ClaimOutcome::Closed
+        }
     }
 
     /// Whether the handle is closed: it observed the seal and released. A
@@ -2388,6 +2429,14 @@ pub enum SealReason {
     /// defect, not a timing case; `quantstratum-docs:
     /// karyos/design/conflation-end-to-end.md`).
     ConflationFeederLost,
+    /// A guard close ended the incarnation (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, GC-8). A publication that meets
+    /// it reports [`AppendOutcome::Gated`], never `Closed`.
+    GuardClosed,
+    /// A scheduled message missed its deadline under cancel-on-deadline
+    /// and ended the incarnation (guards-and-abort.md, G7 and GC-8).
+    /// Reported as [`AppendOutcome::Gated`], as a guard close is.
+    DeadlineMissed,
 }
 
 impl SealReason {
@@ -2400,7 +2449,16 @@ impl SealReason {
             Self::ConflationVersionsExhausted => 2,
             Self::StreamRemoved => 3,
             Self::ConflationFeederLost => 4,
+            Self::GuardClosed => 5,
+            Self::DeadlineMissed => 6,
         }
+    }
+
+    /// Whether a publication that meets this seal reports `Gated` rather
+    /// than `Closed` (guards-and-abort.md, GC-8).
+    #[must_use]
+    pub const fn is_gate(self) -> bool {
+        matches!(self, Self::GuardClosed | Self::DeadlineMissed)
     }
 
     /// The reason a code names; an unknown code is `Unspecified`.
@@ -2411,6 +2469,8 @@ impl SealReason {
             2 => Self::ConflationVersionsExhausted,
             3 => Self::StreamRemoved,
             4 => Self::ConflationFeederLost,
+            5 => Self::GuardClosed,
+            6 => Self::DeadlineMissed,
             _ => Self::Unspecified,
         }
     }

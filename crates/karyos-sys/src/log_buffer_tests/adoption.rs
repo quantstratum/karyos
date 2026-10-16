@@ -660,7 +660,7 @@ fn a_fenced_subscriber_grant_cannot_be_adopted_and_stops_bounding() {
             AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
                 let _ = conductor.duty_cycle().unwrap();
             }
-            AppendOutcome::Closed => panic!("not sealed"),
+            AppendOutcome::Closed | AppendOutcome::Gated => panic!("not sealed"),
         }
         if appended > 4 * u64::from(buffer.term_length()) {
             break;

@@ -21,7 +21,7 @@ fn publish_running_duty(
                 AppendOutcome::Appended { .. } => break,
                 AppendOutcome::BackPressured => back_pressured += 1,
                 AppendOutcome::AdminAction => {}
-                AppendOutcome::Closed => panic!("not sealed"),
+                AppendOutcome::Closed | AppendOutcome::Gated => panic!("not sealed"),
             }
             let _ = conductor.duty_cycle().unwrap();
         }
