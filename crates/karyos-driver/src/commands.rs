@@ -302,6 +302,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 continue;
             };
             let policy = target.policy;
+            let publication = target.aggregate.registration;
+            let lane = target.config.lane.get();
             let key = StreamKey {
                 stream_id: target.stream_id,
                 session_id: target.session_id,
@@ -326,7 +328,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 configured_policy: crate::diagnostics::policy_code(policy),
                 applied_policy: crate::diagnostics::policy_code(policy),
                 instance: u128::from(high) << 64 | u128::from(low),
-                stream_registration: stream,
+                stream_registration: publication,
+                lane,
                 incarnation: crate::embedded::FIRST_INCARNATION,
                 stream_id: u64::from(key.stream_id.cast_unsigned()),
                 from: position,
@@ -673,10 +676,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .iter()
             .find(|r| r.id == loss.subscription)
         {
+            // The report names the aggregate's registration and the lane;
+            // the subscription's lane stream must be that pair.
             Some(live)
                 if live.client == client
                     && live.kind == Kind::Subscription
-                    && live.stream == loss.stream_registration =>
+                    && self.streams.iter().any(|s| {
+                        s.id == live.stream
+                            && s.aggregate.registration == loss.stream_registration
+                            && s.config.lane.get() == loss.lane
+                    }) =>
             {
                 true
             }
@@ -691,7 +700,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let stream_id = self
             .streams
             .iter()
-            .find(|s| s.id == loss.stream_registration)
+            .find(|s| s.aggregate.registration == loss.stream_registration)
             .map_or(0, |s| u64::from(s.stream_id.cast_unsigned()));
         let [high, low] = loss.driver;
         self.diagnostics.loss(
@@ -868,7 +877,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let generation = Some(target.join(member));
                 let publication = karyos_protocol::trace_hook::PublicationIdentity {
                     driver: self.driver_id,
-                    registration: target.id,
+                    registration: target.aggregate.registration,
                     stream_id: target.stream_id,
                     session_id: target.session_id,
                     incarnation: crate::embedded::FIRST_INCARNATION,
@@ -1131,10 +1140,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 };
             }
         };
+        let Some((publication, lane)) = self
+            .streams
+            .iter()
+            .find(|s| s.id == live.stream)
+            .map(|s| (s.aggregate.registration, s.config.lane.get()))
+        else {
+            return Response::Error {
+                request,
+                code: ErrorCode::UnknownRegistration,
+                detail: registration,
+            };
+        };
         let mut observed = Observed {
             kind,
             registration,
-            stream: live.stream,
+            stream: publication,
+            lane,
             // One incarnation per stream registration (see
             // `EmbeddedDriver::trace_identity`).
             incarnation: crate::embedded::FIRST_INCARNATION,
@@ -1286,7 +1308,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             code,
             detail,
         };
-        if stream != 0 && !self.streams.iter().any(|s| s.id == stream && !s.retiring) {
+        // `stream` names an aggregate by its registration.
+        if stream != 0
+            && !self
+                .streams
+                .iter()
+                .any(|s| s.aggregate.registration == stream && !s.retiring)
+        {
             return refuse(ErrorCode::UnknownStream, stream);
         }
         let keys = if participant == 0 {
@@ -1301,7 +1329,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .registrations
                 .iter()
                 .find(|r| r.id == participant && r.client == client)
-                .filter(|r| stream == 0 || r.stream == stream)
+                .filter(|r| {
+                    stream == 0
+                        || self
+                            .streams
+                            .iter()
+                            .any(|s| s.id == r.stream && s.aggregate.registration == stream)
+                })
             else {
                 return refuse(ErrorCode::UnknownRegistration, participant);
             };
@@ -3694,6 +3728,94 @@ mod tests {
         assert_eq!(counter(&driver, "overruns snapshot"), 1);
         assert_eq!(counter(&driver, "loss reports unverified"), 0);
         assert_eq!(counter(&driver, "clients faulty"), 0);
+    }
+
+    /// A loss report names the aggregate's registration and the lane: a
+    /// subscription on lane 2 is verified when the report names lane 2,
+    /// and a report naming another lane retires the client.
+    #[test]
+    fn a_loss_report_names_the_aggregate_and_the_lane() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let aggregate = driver
+            .add_aggregate(crate::embedded::AggregateConfig {
+                stream: StreamConfig {
+                    buffer: LogBufferConfig {
+                        term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                        spare_slots: 3,
+                        max_subscribers: 4,
+                        mtu: DEFAULT_MTU,
+                        max_reserved: MIN_TERM_LENGTH / 8,
+                        initial_term_id: TermId::new(7),
+                        lane: Lane::ZERO,
+                        session_id: 1,
+                        stream_id: 5,
+                        claim_deadline: 100,
+                        publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                    },
+                    allow_unconnected: true,
+                    on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                    conflation: None,
+                },
+                quanta: vec![u64::from(DEFAULT_MTU.next_multiple_of(32)); 3],
+            })
+            .unwrap();
+        let lane = |number| Lane::try_new(number).unwrap();
+        let registration = driver
+            .stream_ref(aggregate.lane(lane(0)).unwrap())
+            .unwrap()
+            .id;
+        let lane_two = driver
+            .stream_ref(aggregate.lane(lane(2)).unwrap())
+            .unwrap()
+            .id;
+        let (client, mut producer, _link) = raw_client(&mut driver);
+        let subscription = driver.next_registration;
+        driver.next_registration += 1;
+        driver.registrations.push(Registration {
+            id: subscription,
+            client,
+            stream: lane_two,
+            kind: Kind::Subscription,
+            end: Arc::new(LeaseEnd::default()),
+            subscriber: None,
+            join: None,
+        });
+        let report = |lane| ReportedLoss {
+            driver: driver.driver_id,
+            stream_registration: registration,
+            incarnation: crate::embedded::FIRST_INCARNATION,
+            subscription,
+            lane,
+            from: 0,
+            to: 64,
+            configured: RejoinPolicyCode::RejoinAtHead,
+            applied: RejoinOutcomeCode::ResumedAtHead,
+            fallback: None,
+        };
+        let (two, one) = (report(2), report(1));
+        write(
+            &mut producer,
+            Command::ReportLoss {
+                sequence: 1,
+                loss: two,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let [record] = losses(&driver)[..] else {
+            panic!("expected one loss record");
+        };
+        assert_eq!(record.flags, 0);
+        assert_eq!((record.stream_registration, record.lane), (registration, 2));
+        assert_eq!(record.stream_id, 5);
+        write(
+            &mut producer,
+            Command::ReportLoss {
+                sequence: 2,
+                loss: one,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert_eq!(counter(&driver, "clients faulty"), 1);
     }
 
     #[test]

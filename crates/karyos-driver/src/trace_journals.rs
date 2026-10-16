@@ -90,8 +90,10 @@ pub(crate) struct Observed {
     pub(crate) kind: JournalKind,
     /// The observed subscription or publication.
     pub(crate) registration: u64,
-    /// Its stream's registration.
+    /// Its publication's registration (the aggregate's).
     pub(crate) stream: u64,
+    /// Its lane: journals pair within a lane.
+    pub(crate) lane: u8,
     /// The publication's incarnation.
     pub(crate) incarnation: u64,
     /// A subscription's join position; `None` for a publisher journal.
@@ -141,6 +143,9 @@ struct Held {
     /// For a subscriber journal that ended: the publisher journals noted at
     /// its end.
     notes: Option<Vec<Note>>,
+    /// The observed lane; a subscriber journal pairs with publisher
+    /// journals of its lane only.
+    lane: u8,
 }
 
 impl Held {
@@ -409,6 +414,7 @@ impl TraceJournals {
             drain: Some(drain),
             bytes,
             notes: None,
+            lane: observed.lane,
         });
     }
 
@@ -423,12 +429,17 @@ impl TraceJournals {
         if subscriber.entry.kind != JournalKind::Subscriber || subscriber.notes.is_some() {
             return;
         }
-        let (stream, incarnation) = (subscriber.entry.stream, subscriber.entry.incarnation);
+        let (stream, incarnation, lane) = (
+            subscriber.entry.stream,
+            subscriber.entry.incarnation,
+            subscriber.lane,
+        );
         let mut notes = Vec::new();
         for held in self.slots.iter_mut().flatten().filter(|held| {
             held.entry.kind == JournalKind::Publisher
                 && held.entry.stream == stream
                 && held.entry.incarnation == incarnation
+                && held.lane == lane
         }) {
             let journal = held.entry.journal;
             let note = match held.drain.as_mut().map(JournalDrain::losses) {

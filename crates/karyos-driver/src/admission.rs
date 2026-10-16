@@ -914,7 +914,16 @@ impl<T: StreamTerms> Admission<T> {
         // names no stream: both are zero.
         let (stream_registration, incarnation) = match grant.participant {
             Participant::Journal { .. } => (0, 0),
-            _ => (grant.stream, crate::embedded::FIRST_INCARNATION),
+            // The publication's identity: the aggregate's registration; the
+            // record's lane names the lane.
+            _ => (
+                driver
+                    .streams
+                    .iter()
+                    .find(|s| s.id == grant.stream)
+                    .map_or(grant.stream, |s| s.aggregate.registration),
+                crate::embedded::FIRST_INCARNATION,
+            ),
         };
         let (Some(manifest), Some(region_message)) = (
             encode(&Message::Manifest {

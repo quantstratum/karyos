@@ -20,7 +20,7 @@ use karyos_sys::log_buffer::{Conductor, LogBuffer, LogBufferConfig, Role, SealSt
 use karyos_sys::sizing::TermLength;
 use karyos_sys::term::Generation;
 
-use crate::embedded::{EmbeddedDriver, Stream, StreamHandle, StreamTerms};
+use crate::embedded::{AggregateHandle, EmbeddedDriver, Stream, StreamHandle, StreamTerms};
 use crate::error::DriverError;
 
 /// What a reconfiguration changes (SPEC.md §4): the term length and the slot
@@ -358,6 +358,15 @@ impl<T: StreamTerms> Stream<T> {
     }
 }
 
+/// A cutover checked and its successor created, not yet started.
+pub(crate) struct PreparedCutover<T: StreamTerms> {
+    stream: StreamHandle,
+    successor: Arc<LogBuffer<T>>,
+    conductor: Conductor<Arc<LogBuffer<T>>>,
+    generation: Generation,
+    config: LogBufferConfig,
+}
+
 impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Replaces the stream's mapping with a successor of another term length
     /// or slot count (SPEC.md §4 mapping generations;
@@ -382,9 +391,57 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream: StreamHandle,
         reconfiguration: Reconfiguration,
     ) -> Result<Generation, DriverError> {
+        let target = self.active_stream_mut(stream)?;
+        if target.aggregate.lanes > 1 {
+            return Err(DriverError::LaneOfAggregate { stream: target.id });
+        }
+        let prepared = self.prepare_cutover(stream, reconfiguration)?;
+        self.commit_cutover(prepared)
+    }
+
+    /// Reconfigures every lane of an aggregate (`quantstratum-docs:
+    /// karyos/design/aggregate-ownership.md`, coordinator decision ACS
+    /// 14640): every lane's successor is prepared first, privately, and a
+    /// lane that cannot be prepared refuses the whole reconfiguration with
+    /// no effect; then every lane's cutover is admitted, in lane order, in
+    /// one control step. Each lane completes its cutover as a stream does.
+    /// A reconfiguration changes the term length and the spare slots, never
+    /// the MTU, so the quanta stay valid. Returns the lanes' new generation.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::reconfigure_stream`] for any lane, with no
+    /// effect on any lane.
+    pub fn reconfigure_aggregate(
+        &mut self,
+        aggregate: &AggregateHandle,
+        reconfiguration: Reconfiguration,
+    ) -> Result<Generation, DriverError> {
+        let lanes: Vec<StreamHandle> = aggregate.streams().collect();
+        let mut prepared = Vec::with_capacity(lanes.len());
+        for lane in lanes {
+            prepared.push(self.prepare_cutover(lane, reconfiguration)?);
+        }
+        let mut generation = None;
+        for lane in prepared {
+            generation.get_or_insert(self.commit_cutover(lane)?);
+        }
+        generation.ok_or(DriverError::InvalidConfig)
+    }
+
+    /// Every check of a cutover and its successor's creation: no effect on
+    /// the stream.
+    fn prepare_cutover(
+        &mut self,
+        stream: StreamHandle,
+        reconfiguration: Reconfiguration,
+    ) -> Result<PreparedCutover<T>, DriverError> {
         let max_retained = self.config.max_retained_generations;
-        let deadline = self.config.cutover_deadline;
         let id = self.active_stream_mut(stream)?.id;
+        #[cfg(test)]
+        if self.fail_at == Some(id) {
+            return Err(DriverError::Sys(SysError::ResourcesUnavailable));
+        }
         // A remote successor of the last cutover still waiting for its
         // adoption or its fence keeps that cutover in progress.
         if self.clients.iter().any(|client| {
@@ -443,6 +500,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let conductor = successor
             .conductor_owned()
             .ok_or(SysError::ResourcesUnavailable)?;
+        Ok(PreparedCutover {
+            stream,
+            successor,
+            conductor,
+            generation,
+            config,
+        })
+    }
+
+    /// The effect of a prepared cutover: the seal, the pending handles and
+    /// the cutover's start. Fails only on a broken invariant.
+    fn commit_cutover(&mut self, prepared: PreparedCutover<T>) -> Result<Generation, DriverError> {
+        let deadline = self.config.cutover_deadline;
+        let PreparedCutover {
+            stream,
+            successor,
+            conductor,
+            generation,
+            config,
+        } = prepared;
+        let id = self.active_stream_mut(stream)?.id;
         let target = self.active_stream_mut(stream)?;
         // Effect. The seal marks the successor, so a remote handle that sees
         // it waits for its successor rather than closing.
