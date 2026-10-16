@@ -351,4 +351,20 @@ mod tests {
         assert_eq!(socket.recv(&mut buffer), RecvResult::Error(Errno::AGAIN));
         assert_eq!((socket.recv_calls(), socket.unscripted_recvs()), (5, 1));
     }
+
+    #[test]
+    fn a_payload_as_long_as_the_buffer_is_not_truncated() {
+        let mut socket = ScriptedSocket::new();
+        socket.push_recv_datagram(b"abcd", None);
+        let mut buffer = [0_u8; 4];
+        assert_eq!(
+            socket.recv(&mut buffer),
+            RecvResult::Datagram {
+                len: 4,
+                truncated: None,
+                source: None
+            }
+        );
+        assert_eq!(&buffer, b"abcd");
+    }
 }

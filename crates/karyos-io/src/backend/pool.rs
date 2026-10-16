@@ -19,6 +19,10 @@ use super::ClaimError;
 
 /// The state of one slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+)]
 pub(crate) enum SlotState {
     /// In the pool; no references.
     Free,
@@ -34,6 +38,10 @@ pub(crate) enum SlotState {
 
 /// One granted slot and the generation of this claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+)]
 pub(crate) struct ClaimedSlot {
     /// The slot index.
     pub(crate) slot: u32,
@@ -42,6 +50,10 @@ pub(crate) struct ClaimedSlot {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+)]
 struct Meta {
     state: SlotState,
     /// The last generation granted; 0 before the first claim.
@@ -51,16 +63,26 @@ struct Meta {
 /// A fixed set of TX slots. Every allocation happens in [`SlotPool::new`],
 /// on the control path; no later call allocates or frees.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+)]
 pub(crate) struct SlotPool {
     meta: Box<[Meta]>,
     /// Free slot indices; its capacity is the slot count, so pushing never
     /// reallocates.
     free: Vec<u32>,
     retired: u32,
+    /// Slots in Quarantined; reset frees them.
+    quarantined: u32,
 }
 
 impl SlotPool {
     /// A pool of `slots` Free slots that have never been claimed.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn new(slots: NonZeroU16) -> Self {
         let count = slots.get();
         let meta = (0..count)
@@ -76,31 +98,61 @@ impl SlotPool {
             meta,
             free,
             retired: 0,
+            quarantined: 0,
         }
     }
 
     /// Slots in the pool, whatever their state.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn len(&self) -> usize {
         self.meta.len()
     }
 
     /// Slots that a claim can take.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn free_count(&self) -> usize {
         self.free.len()
     }
 
     /// Slots retired for generation overflow.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn retired_count(&self) -> u32 {
         self.retired
     }
 
+    /// Slots quarantined until reset.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
+    pub(crate) fn quarantined_count(&self) -> u32 {
+        self.quarantined
+    }
+
     /// The state of `slot`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn state(&self, slot: u32) -> Option<SlotState> {
         self.meta_of(slot).map(|meta| meta.state)
     }
 
     /// The last generation granted for `slot`, or `None` before its first
     /// claim or for an index outside the pool.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn generation(&self, slot: u32) -> Option<NonZeroU64> {
         self.meta_of(slot)
             .and_then(|meta| NonZeroU64::new(meta.last_generation))
@@ -109,8 +161,14 @@ impl SlotPool {
     /// Grants one Free slot with its next generation.
     ///
     /// When no slot is free, the result is `IdentityExhausted` if slots
-    /// were retired for generation overflow and `PoolExhausted` otherwise
-    /// (3.6).
+    /// were retired for generation overflow and none is quarantined, so
+    /// that no reset can free a slot; otherwise `PoolExhausted`, which a
+    /// reset clears (3.6). Under the ledger's accounting a claim that
+    /// passed `QueueFull` finds the pool dry only after retirement.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn claim(&mut self) -> Result<ClaimedSlot, ClaimError> {
         while let Some(slot) = self.free.pop() {
             let Some(meta) = usize::try_from(slot)
@@ -136,7 +194,7 @@ impl SlotPool {
                 None => self.retire(slot),
             }
         }
-        if self.retired > 0 {
+        if self.retired > 0 && self.quarantined == 0 {
             Err(ClaimError::IdentityExhausted)
         } else {
             Err(ClaimError::PoolExhausted)
@@ -144,54 +202,111 @@ impl SlotPool {
     }
 
     /// Claimed to Pending: a successful commit.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn commit(&mut self, slot: u32) -> bool {
         self.transition(slot, SlotState::Claimed, SlotState::Pending)
     }
 
     /// Claimed to Free: the frame was dropped.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn release_claim(&mut self, slot: u32) -> bool {
         self.state(slot) == Some(SlotState::Claimed) && self.free_slot(slot)
     }
 
     /// Pending to Free: the item was submitted with release at submission,
     /// or returned without exposure.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn release_pending(&mut self, slot: u32) -> bool {
         self.state(slot) == Some(SlotState::Pending) && self.free_slot(slot)
     }
 
     /// Pending to Quarantined: exposure unproven.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn quarantine(&mut self, slot: u32) -> bool {
-        self.transition(slot, SlotState::Pending, SlotState::Quarantined)
+        let quarantined = self.transition(slot, SlotState::Pending, SlotState::Quarantined);
+        if quarantined {
+            // At most one quarantine per slot, and slots fit in a `u16`.
+            match self.quarantined.checked_add(1) {
+                Some(count) => self.quarantined = count,
+                None => debug_assert!(false, "the quarantine count fits the slot count"),
+            }
+        }
+        quarantined
     }
 
     /// Frees every Quarantined slot (reset, once nothing is pending) and
     /// returns how many.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn release_quarantined(&mut self) -> usize {
-        (0..self.slot_count())
+        let released = (0..self.slot_count())
             .filter(|slot| {
                 self.state(*slot) == Some(SlotState::Quarantined) && self.free_slot(*slot)
             })
-            .count()
+            .count();
+        debug_assert_eq!(
+            u32::try_from(released).ok(),
+            Some(self.quarantined),
+            "the quarantine count matches the Quarantined slots"
+        );
+        self.quarantined = 0;
+        released
     }
 
     /// The slot count as a slot index bound; it fits, as `new` takes a
     /// `u16` count.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     fn slot_count(&self) -> u32 {
-        u32::try_from(self.meta.len()).unwrap_or_default()
+        match u32::try_from(self.meta.len()) {
+            Ok(count) => count,
+            Err(_) => {
+                debug_assert!(false, "a pool of a u16 slot count fits a u32");
+                0
+            }
+        }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     fn meta_of(&self, slot: u32) -> Option<&Meta> {
         usize::try_from(slot)
             .ok()
             .and_then(|index| self.meta.get(index))
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     fn meta_of_mut(&mut self, slot: u32) -> Option<&mut Meta> {
         usize::try_from(slot)
             .ok()
             .and_then(|index| self.meta.get_mut(index))
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     fn transition(&mut self, slot: u32, from: SlotState, to: SlotState) -> bool {
         match self.meta_of_mut(slot) {
             Some(meta) if meta.state == from => {
@@ -204,6 +319,10 @@ impl SlotPool {
 
     /// Returns `slot` to the free list, or retires it when its generation
     /// cannot advance again.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     fn free_slot(&mut self, slot: u32) -> bool {
         let Some(meta) = self.meta_of_mut(slot) else {
             return false;
@@ -218,12 +337,17 @@ impl SlotPool {
         true
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     fn retire(&mut self, slot: u32) {
         if let Some(meta) = self.meta_of_mut(slot) {
             meta.state = SlotState::Retired;
             // At most one retirement per slot, and slots fit in a `u16`.
-            if let Some(retired) = self.retired.checked_add(1) {
-                self.retired = retired;
+            match self.retired.checked_add(1) {
+                Some(retired) => self.retired = retired,
+                None => debug_assert!(false, "the retired count fits the slot count"),
             }
         }
     }
@@ -308,6 +432,27 @@ mod tests {
         assert_eq!(pool.release_quarantined(), 1);
         assert_eq!(pool.state(0), Some(SlotState::Free));
         assert_eq!(pool.claim().unwrap().generation.get(), 2);
+    }
+
+    #[test]
+    fn a_dry_pool_with_quarantine_is_pool_exhausted_even_after_retirement() {
+        let mut pool = pool(2);
+        // Retire slot 0.
+        pool.set_last_generation(0, u64::MAX - 1);
+        pool.claim().unwrap();
+        assert!(pool.release_claim(0));
+        assert_eq!(pool.retired_count(), 1);
+        // Quarantine slot 1: a reset would free it, so not terminal.
+        pool.claim().unwrap();
+        assert!(pool.commit(1));
+        assert!(pool.quarantine(1));
+        assert_eq!(pool.quarantined_count(), 1);
+        assert_eq!(pool.claim(), Err(ClaimError::PoolExhausted));
+        assert_eq!(pool.release_quarantined(), 1);
+        assert_eq!(pool.quarantined_count(), 0);
+        pool.claim().unwrap();
+        // Now only retirement keeps the pool dry: terminal.
+        assert_eq!(pool.claim(), Err(ClaimError::IdentityExhausted));
     }
 
     #[test]

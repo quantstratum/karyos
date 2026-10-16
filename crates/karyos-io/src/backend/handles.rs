@@ -5,20 +5,28 @@
 //!
 //! Generations count per instance, not per epoch: one counter per table,
 //! which never restarts, also across `reset` and `reopen`; its overflow is
-//! terminal. Each handle carries the epoch it was issued in, and a lookup
-//! compares epoch, index and generation, so a handle from before a reset
-//! never matches an entry of the new epoch, even one at the same index.
+//! terminal. The table stores the current epoch, which [`HandleTable::clear`]
+//! replaces at reset. Each handle carries the epoch it was issued in, and a
+//! lookup compares it with the table's epoch, then the index and generation,
+//! so a handle from before a reset never matches an entry of the new epoch,
+//! even one at the same index, whatever the endpoint checks.
 
 use std::num::{NonZeroU16, NonZeroU32};
 
 use super::{BackendEpoch, RouteId, TxQueueId};
 
 /// A handle a [`HandleTable`] issues.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+)]
 pub(crate) trait Handle: Copy + Eq {
     /// Builds the handle of `index` with `generation` in `epoch`.
     fn issue(epoch: BackendEpoch, index: u16, generation: NonZeroU32) -> Self;
     /// The table index the handle names.
     fn table_index(self) -> u16;
+    /// The epoch the handle was issued in.
+    fn issue_epoch(self) -> BackendEpoch;
 }
 
 impl Handle for TxQueueId {
@@ -28,6 +36,10 @@ impl Handle for TxQueueId {
 
     fn table_index(self) -> u16 {
         self.index()
+    }
+
+    fn issue_epoch(self) -> BackendEpoch {
+        self.epoch()
     }
 }
 
@@ -39,10 +51,18 @@ impl Handle for RouteId {
     fn table_index(self) -> u16 {
         self.index()
     }
+
+    fn issue_epoch(self) -> BackendEpoch {
+        self.epoch()
+    }
 }
 
 /// Why a handle could not be issued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+)]
 pub(crate) enum IssueError {
     /// Every entry is in use.
     Full,
@@ -52,30 +72,60 @@ pub(crate) enum IssueError {
 
 /// Up to `capacity` live entries, each named by one handle.
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+)]
 pub(crate) struct HandleTable<H, T> {
     entries: Box<[Option<(H, T)>]>,
+    /// The epoch new handles are issued in; only handles of this epoch
+    /// match.
+    epoch: BackendEpoch,
     /// The last generation issued; 0 before the first.
     last_generation: u32,
 }
 
 impl<H: Handle, T> HandleTable<H, T> {
-    /// An empty table of `capacity` entries, allocated here, on the control
-    /// path.
-    pub(crate) fn new(capacity: NonZeroU16) -> Self {
+    /// An empty table of `capacity` entries in `epoch`, allocated here, on
+    /// the control path.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
+    pub(crate) fn new(capacity: NonZeroU16, epoch: BackendEpoch) -> Self {
         let entries = (0..capacity.get()).map(|_| None).collect();
         Self {
             entries,
+            epoch,
             last_generation: 0,
         }
     }
 
     /// Whether an entry is free.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn has_free(&self) -> bool {
         self.entries.iter().any(Option::is_none)
     }
 
-    /// Stores `value` in the first free entry and returns its handle.
-    pub(crate) fn insert(&mut self, epoch: BackendEpoch, value: T) -> Result<H, IssueError> {
+    /// The epoch new handles are issued in.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
+    pub(crate) fn epoch(&self) -> BackendEpoch {
+        self.epoch
+    }
+
+    /// Stores `value` in the first free entry and returns its handle,
+    /// issued in the table's epoch.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
+    pub(crate) fn insert(&mut self, value: T) -> Result<H, IssueError> {
         let (index, free) = self
             .entries
             .iter_mut()
@@ -88,15 +138,22 @@ impl<H: Handle, T> HandleTable<H, T> {
             .checked_add(1)
             .and_then(NonZeroU32::new)
             .ok_or(IssueError::IdentityExhausted)?;
-        let handle = H::issue(epoch, index, generation);
+        let handle = H::issue(self.epoch, index, generation);
         *free = Some((handle, value));
         self.last_generation = generation.get();
         Ok(handle)
     }
 
-    /// The entry `handle` names, if it is live: epoch, index and generation
-    /// all match.
+    /// The entry `handle` names, if it is live: its epoch is the table's,
+    /// and the index and generation match.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn get(&self, handle: H) -> Option<&T> {
+        if handle.issue_epoch() != self.epoch {
+            return None;
+        }
         match self.entries.get(usize::from(handle.table_index())) {
             Some(Some((live, value))) if *live == handle => Some(value),
             _ => None,
@@ -104,7 +161,14 @@ impl<H: Handle, T> HandleTable<H, T> {
     }
 
     /// The entry `handle` names, mutably, if it is live.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn get_mut(&mut self, handle: H) -> Option<&mut T> {
+        if handle.issue_epoch() != self.epoch {
+            return None;
+        }
         match self.entries.get_mut(usize::from(handle.table_index())) {
             Some(Some((live, value))) if *live == handle => Some(value),
             _ => None,
@@ -112,7 +176,14 @@ impl<H: Handle, T> HandleTable<H, T> {
     }
 
     /// Removes the entry `handle` names, if it is live.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn remove(&mut self, handle: H) -> Option<T> {
+        if handle.issue_epoch() != self.epoch {
+            return None;
+        }
         let entry = self.entries.get_mut(usize::from(handle.table_index()))?;
         match entry {
             Some((live, _)) if *live == handle => entry.take().map(|(_, value)| value),
@@ -120,12 +191,23 @@ impl<H: Handle, T> HandleTable<H, T> {
         }
     }
 
-    /// Removes every entry (reset). The generation counter is kept.
-    pub(crate) fn clear(&mut self) {
+    /// Removes every entry and moves the table to `new_epoch` (reset), so
+    /// no handle of an earlier epoch matches again. The generation counter
+    /// is kept.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
+    pub(crate) fn clear(&mut self, new_epoch: BackendEpoch) {
         self.entries.iter_mut().for_each(|entry| *entry = None);
+        self.epoch = new_epoch;
     }
 
     /// The live entries with their handles.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (H, &T)> {
         self.entries
             .iter()
@@ -152,8 +234,9 @@ mod tests {
 
     #[test]
     fn a_handle_matches_only_its_own_epoch_index_and_generation() {
-        let mut table: HandleTable<TxQueueId, u8> = HandleTable::new(capacity(2));
-        let first = table.insert(epoch(1), 10).unwrap();
+        let mut table: HandleTable<TxQueueId, u8> = HandleTable::new(capacity(2), epoch(1));
+        let first = table.insert(10).unwrap();
+        assert_eq!(first.epoch(), epoch(1));
         assert_eq!(table.get(first), Some(&10));
         // Same index and generation, another epoch: no match.
         let other_epoch = TxQueueId::new(epoch(2), first.index(), first.generation());
@@ -168,10 +251,12 @@ mod tests {
 
     #[test]
     fn handles_across_reset_never_match_a_reused_index() {
-        let mut table: HandleTable<RouteId, u8> = HandleTable::new(capacity(2));
-        let old = table.insert(epoch(1), 1).unwrap();
-        table.clear();
-        let new = table.insert(epoch(2), 2).unwrap();
+        let mut table: HandleTable<RouteId, u8> = HandleTable::new(capacity(2), epoch(1));
+        let old = table.insert(1).unwrap();
+        table.clear(epoch(2));
+        assert_eq!(table.epoch(), epoch(2));
+        let new = table.insert(2).unwrap();
+        assert_eq!(new.epoch(), epoch(2));
         assert_eq!(new.index(), old.index(), "the index is reused");
         assert!(
             new.generation() > old.generation(),
@@ -182,21 +267,38 @@ mod tests {
         assert_eq!(table.get(new), Some(&2));
         // Generation exhaustion is terminal.
         table.set_last_generation(u32::MAX);
-        assert_eq!(
-            table.insert(epoch(2), 3),
-            Err(IssueError::IdentityExhausted)
-        );
+        assert_eq!(table.insert(3), Err(IssueError::IdentityExhausted));
         assert_eq!(table.iter().count(), 1);
     }
 
     #[test]
     fn a_full_table_issues_nothing() {
-        let mut table: HandleTable<TxQueueId, u8> = HandleTable::new(capacity(1));
+        let mut table: HandleTable<TxQueueId, u8> = HandleTable::new(capacity(1), epoch(1));
         assert!(table.has_free());
-        let handle = table.insert(epoch(1), 1).unwrap();
+        let handle = table.insert(1).unwrap();
         assert!(!table.has_free());
-        assert_eq!(table.insert(epoch(1), 2), Err(IssueError::Full));
+        assert_eq!(table.insert(2), Err(IssueError::Full));
         *table.get_mut(handle).unwrap() = 7;
         assert_eq!(table.iter().collect::<Vec<_>>(), vec![(handle, &7)]);
+    }
+
+    #[test]
+    fn a_stale_epoch_handle_never_matches_even_with_a_reused_generation() {
+        let mut table: HandleTable<TxQueueId, u8> = HandleTable::new(capacity(1), epoch(1));
+        let old = table.insert(1).unwrap();
+        table.clear(epoch(2));
+        // Force the next handle to reuse the old index and generation: only
+        // the stored epoch tells them apart.
+        table.set_last_generation(old.generation().get() - 1);
+        let new = table.insert(2).unwrap();
+        assert_eq!(
+            (new.index(), new.generation()),
+            (old.index(), old.generation())
+        );
+        assert_ne!(new, old);
+        assert_eq!(table.get(old), None);
+        assert_eq!(table.get_mut(old), None);
+        assert_eq!(table.remove(old), None);
+        assert_eq!(table.get(new), Some(&2));
     }
 }

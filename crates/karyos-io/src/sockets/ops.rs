@@ -35,7 +35,8 @@ impl RouteAddr {
 ///
 /// The named constants are the codes the sockets backend classifies
 /// (section 4.7) and probes (8.2), with the values of the build target:
-/// Linux (`asm-generic`, x86_64 and aarch64) or macOS.
+/// Linux on an `asm-generic` errno architecture (such as x86_64 and
+/// aarch64), or macOS. Any other target fails to compile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Errno(i32);
 
@@ -90,6 +91,28 @@ impl Errno {
     }
 }
 
+// The Linux values of `include/uapi/asm-generic/errno-base.h` and
+// `errno.h`. They hold only on architectures that use the asm-generic
+// table: mips, sparc and alpha define their own numbers, so they are
+// rejected below rather than given wrong values.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "mips32r6",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    )
+))]
+compile_error!("the Linux errno table of karyos-io covers asm-generic architectures only");
+
+// Every other target, Android included (it uses the Linux numbers), needs
+// its own reviewed table.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("karyos-io has errno values for Linux and macOS only (SPEC.md §16.2)");
+
 #[cfg(target_os = "linux")]
 mod codes {
     pub(super) const EPERM: i32 = 1;
@@ -112,7 +135,7 @@ mod codes {
 }
 
 // The BSD values of macOS, the other supported platform (SPEC.md §16.2).
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 mod codes {
     pub(super) const EPERM: i32 = 1;
     pub(super) const EINTR: i32 = 4;
@@ -186,12 +209,11 @@ mod tests {
         Error::from_raw_os_error(errno.raw()).kind()
     }
 
-    fn message(errno: Errno) -> String {
-        Error::from_raw_os_error(errno.raw()).to_string()
-    }
-
     /// The constants match the platform: checked through the standard
-    /// library's errno mapping and messages, without a `libc` dependency.
+    /// library's errno to `ErrorKind` mapping where that mapping is stable,
+    /// and otherwise against the numbers of the platform headers. No
+    /// `strerror` text is compared, as it differs between C libraries
+    /// (glibc, musl, the BSDs).
     #[test]
     fn errno_constants_match_the_platform() {
         assert_eq!(kind(Errno::AGAIN), ErrorKind::WouldBlock);
@@ -206,12 +228,30 @@ mod tests {
         assert_eq!(kind(Errno::NETUNREACH), ErrorKind::NetworkUnreachable);
         assert_eq!(kind(Errno::HOSTUNREACH), ErrorKind::HostUnreachable);
         assert_eq!(kind(Errno::CONNREFUSED), ErrorKind::ConnectionRefused);
-        assert!(message(Errno::BADF).starts_with("Bad file descriptor"));
-        assert!(message(Errno::FAULT).starts_with("Bad address"));
-        assert!(message(Errno::NOTSOCK).starts_with("Socket operation on non-socket"));
-        assert!(message(Errno::MSGSIZE).starts_with("Message too long"));
-        assert!(message(Errno::NOBUFS).starts_with("No buffer space available"));
-        assert!(message(Errno::PERM).starts_with("Operation not permitted"));
+        // Codes without a stable `ErrorKind`: the raw number round trips
+        // through `std::io::Error` and equals the header value.
+        #[cfg(target_os = "linux")]
+        let expected = [
+            (Errno::PERM, 1),
+            (Errno::BADF, 9),
+            (Errno::FAULT, 14),
+            (Errno::NOTSOCK, 88),
+            (Errno::MSGSIZE, 90),
+            (Errno::NOBUFS, 105),
+        ];
+        #[cfg(target_os = "macos")]
+        let expected = [
+            (Errno::PERM, 1),
+            (Errno::BADF, 9),
+            (Errno::FAULT, 14),
+            (Errno::NOTSOCK, 38),
+            (Errno::MSGSIZE, 40),
+            (Errno::NOBUFS, 55),
+        ];
+        for (errno, raw) in expected {
+            assert_eq!(errno.raw(), raw);
+            assert_eq!(Error::from_raw_os_error(raw).raw_os_error(), Some(raw));
+        }
         assert_eq!(Errno::from_raw(Errno::AGAIN.raw()), Errno::AGAIN);
     }
 

@@ -18,26 +18,11 @@
 
 // The sockets endpoint (P2.3 batch S2) is the first user of the handle
 // table, the slot pool, the queue table and the ledger; until then only
-// their unit tests use them.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
+// their unit tests use them, and each unused item carries its own
+// `expect(dead_code)`, which S2 removes item by item.
 mod handles;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 mod ledger;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 mod pool;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 mod queues;
 
 use std::net::SocketAddr;
@@ -207,7 +192,11 @@ impl SubmissionId {
     /// Builds the identity of one claim of `slot`.
     #[inline]
     #[must_use]
-    pub const fn new(
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
+    pub(crate) const fn new(
         instance: InstanceId,
         epoch: BackendEpoch,
         slot: u32,
@@ -260,7 +249,11 @@ impl TxTicket {
     /// The ticket of the pending item `id`.
     #[inline]
     #[must_use]
-    pub const fn new(id: SubmissionId) -> Self {
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
+    )]
+    pub(crate) const fn new(id: SubmissionId) -> Self {
         Self(id)
     }
 
@@ -952,9 +945,15 @@ pub struct CancelOutcome {
 // 3.6 Errors
 // ---------------------------------------------------------------------------
 
-/// Why `claim_tx` granted no frame. Checked in declaration order, except
-/// that `PoolExhausted` and `IdentityExhausted` are the two outcomes of an
-/// empty pool.
+/// Why `claim_tx` granted no frame.
+///
+/// Checked in this order (3.6), which is not the declaration order:
+/// `NotActive`, `UnknownQueue`, `Empty`, `TooLarge`, `QueueFull`. If no
+/// slot is free after that, the result is `IdentityExhausted` when only
+/// slots retired for generation overflow keep the pool dry, and
+/// `PoolExhausted` when a reset would free a quarantined slot. Quarantined
+/// slots stay charged to their queue, so the pool runs dry only after
+/// retirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ClaimError {
     /// `len` is 0.
@@ -968,13 +967,15 @@ pub enum ClaimError {
         /// The datagram limit in bytes.
         max: u16,
     },
-    /// The queue already holds `max_pending` claimed and pending frames.
+    /// The queue already holds `max_pending` claimed, pending and
+    /// quarantined slots.
     #[error("queue is full at {max_pending} claimed and pending frames")]
     QueueFull {
         /// The queue's capacity.
         max_pending: u16,
     },
-    /// No slot is free, and none was retired.
+    /// No slot is free, but a reset would free a quarantined one.
+    /// Reachable only after slot retirement.
     #[error("tx slot pool exhausted")]
     PoolExhausted,
     /// The queue is closed or the handle is stale.
@@ -983,8 +984,8 @@ pub enum ClaimError {
     /// The endpoint is resetting or retired.
     #[error("endpoint is not active")]
     NotActive,
-    /// No slot is free and slots were retired for generation overflow.
-    /// Terminal.
+    /// No slot is free, slots were retired for generation overflow and
+    /// none is quarantined, so no reset frees one. Terminal.
     #[error("tx slot identities exhausted")]
     IdentityExhausted,
 }
