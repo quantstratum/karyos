@@ -185,3 +185,37 @@ fn ipc_child() {
         result.unwrap_or_else(|cause| panic!("{cause}"));
     }
 }
+
+/// A child that fails makes the IPC workloads fail promptly instead of
+/// waiting for it (review of #146).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failing_ipc_child_fails_the_workload_promptly() {
+    use karyos_bench::ipc::{CHILD_FAIL, ping_pong_with, throughput_with};
+    let config = |workload| Config {
+        workload,
+        message: 32,
+        publishers: 1,
+        iterations: 200,
+        warmup: 20,
+        term_length: 64 * 1024,
+        target_rate: None,
+    };
+    for (name, run) in [
+        (
+            "ipc-ping-pong",
+            ping_pong_with as fn(Config, &[(&str, &str)]) -> _,
+        ),
+        ("ipc-throughput", throughput_with),
+    ] {
+        let workload = Workload::parse(name).unwrap();
+        let start = std::time::Instant::now();
+        let failed = run(config(workload), &[(CHILD_FAIL, "1")]);
+        assert!(failed.is_err(), "{name} succeeded with a failing child");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "{name} took {:?}",
+            start.elapsed()
+        );
+    }
+}

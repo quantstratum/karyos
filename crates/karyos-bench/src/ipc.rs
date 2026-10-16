@@ -14,15 +14,22 @@
 //!
 //! The child learns its part from [`CHILD`], set on its environment; a
 //! binary that runs workloads calls [`child`] first, and a test binary
-//! names the test that does so in [`CHILD_TEST`]. The driver's duty runs
+//! names the test that does so in [`CHILD_TEST`]. Neither side waits on
+//! the other without bound: the parent checks every millisecond of a wait
+//! that its child is still running, and every wait ends with an error
+//! after [`STALL`] without progress. The throughput window ends when the
+//! child reports, on its standard output, that it read every message, so
+//! its process exit is not measured. The driver's duty runs
 //! on its own thread in the parent; the child polls its control path only
 //! to take its grants, and the client liveness timeout is long enough
 //! that it never has to beat during a run.
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,6 +57,16 @@ pub const CHILD: &str = "KARYOS_BENCH_IPC_CHILD";
 /// passes select it, and the benchmark binary ignores them.
 pub const CHILD_TEST: &str = "ipc_child";
 
+/// A test switch: a child whose environment has it fails at once, as one
+/// whose attach is refused would.
+pub const CHILD_FAIL: &str = "KARYOS_BENCH_IPC_CHILD_FAIL";
+
+/// The line a throughput child prints once it read every message.
+const READ_ALL: &str = "karyos-bench-ipc: read all";
+
+/// How long one wait may go without progress.
+pub const STALL: Duration = Duration::from_secs(30);
+
 const PING: StreamKey = StreamKey {
     stream_id: 1,
     session_id: 1,
@@ -61,13 +78,50 @@ const PONG: StreamKey = StreamKey {
 
 type IpcDriver = EmbeddedDriver<SharedTerms>;
 
-/// A child process, killed if the workload ends before it does.
-struct Guard(Option<Child>);
+/// A child process, killed if the workload ends before it does, with its
+/// report lines.
+struct Guard {
+    child: Option<Child>,
+    reports: Receiver<String>,
+}
 
 impl Guard {
+    /// An error if the child exited: it was meant to run until the
+    /// exchange ended.
+    fn alive(&mut self) -> Result<(), BenchError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        match child.try_wait().map_err(|cause| error("child", cause))? {
+            Some(status) => Err(BenchError(format!(
+                "the child process exited early: {status}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Waits at most [`STALL`] for the child's report `line`.
+    fn report(&mut self, line: &str) -> Result<(), BenchError> {
+        let start = Instant::now();
+        loop {
+            match self.reports.recv_timeout(Duration::from_millis(1)) {
+                Ok(report) if report == line => return Ok(()),
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.alive()?;
+                    return Err(BenchError("the child closed its output".into()));
+                }
+            }
+            self.alive()?;
+            if start.elapsed() > STALL {
+                return Err(BenchError(format!("no report {line:?} from the child")));
+            }
+        }
+    }
+
     /// Waits at most `limit` for the child to exit successfully.
     fn finish(mut self, limit: Duration) -> Result<(), BenchError> {
-        let Some(mut child) = self.0.take() else {
+        let Some(mut child) = self.child.take() else {
             return Ok(());
         };
         let start = Instant::now();
@@ -91,7 +145,7 @@ impl Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
+        if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -187,34 +241,57 @@ fn join(handle: thread::JoinHandle<Result<(), BenchError>>) -> Result<(), BenchE
         .map_err(|_| BenchError("the duty thread panicked".into()))?
 }
 
-/// Starts the child of `config` against the driver in `dir`.
-fn spawn(config: &Config, dir: &Path) -> Result<Guard, BenchError> {
+/// Starts the child of `config` against the driver in `dir`, with
+/// `child_env` added to its environment.
+fn spawn(config: &Config, dir: &Path, child_env: &[(&str, &str)]) -> Result<Guard, BenchError> {
     let total = config.warmup + config.iterations;
-    let child = Command::new(std::env::current_exe().map_err(|cause| error("executable", cause))?)
-        .args(["--exact", CHILD_TEST, "--test-threads", "1"])
-        .env(
-            CHILD,
-            format!(
-                "{}:{}:{total}:{}",
-                config.workload.name(),
-                config.message,
-                dir.display()
-            ),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|cause| error("child", cause))?;
-    Ok(Guard(Some(child)))
+    let mut child =
+        Command::new(std::env::current_exe().map_err(|cause| error("executable", cause))?)
+            .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
+            .env(
+                CHILD,
+                format!(
+                    "{}:{}:{total}:{}",
+                    config.workload.name(),
+                    config.message,
+                    dir.display()
+                ),
+            )
+            .envs(child_env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|cause| error("child", cause))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| BenchError("the child has no output".into()))?;
+    let (sender, reports) = channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            // libtest may print `test ipc_child ... ` on the same line.
+            if let Some(at) = line.find(READ_ALL) {
+                let _ = sender.send(line[at..].to_string());
+            }
+        }
+    });
+    Ok(Guard {
+        child: Some(child),
+        reports,
+    })
 }
 
 /// Offers `payload` until it is accepted; a stream with no subscriber yet
-/// (the child still attaching) is retried.
+/// (the child still attaching) is retried. `watch` runs every millisecond
+/// of the wait, and the wait fails after [`STALL`].
 fn offer(
     publication: &mut karyos_client::ClientPublication<SharedTerms>,
     payload: &[u8],
+    watch: &mut dyn FnMut() -> Result<(), BenchError>,
 ) -> Result<(), BenchError> {
+    let start = Instant::now();
+    let mut checked = start;
     loop {
         match publication
             .offer(payload)
@@ -222,13 +299,18 @@ fn offer(
         {
             OfferOutcome::Accepted { .. } => return Ok(()),
             OfferOutcome::Closed => return Err(BenchError("the stream closed".into())),
-            _ => thread::yield_now(),
+            _ => waiting(start, &mut checked, watch)?,
         }
     }
 }
 
-/// Polls until one message arrives.
-fn receive(subscription: &mut ClientSubscription<SharedTerms>) -> Result<(), BenchError> {
+/// Polls until one message arrives, watched as [`offer`].
+fn receive(
+    subscription: &mut ClientSubscription<SharedTerms>,
+    watch: &mut dyn FnMut() -> Result<(), BenchError>,
+) -> Result<(), BenchError> {
+    let start = Instant::now();
+    let mut checked = start;
     loop {
         let summary = subscription
             .poll(|_, _| {}, MessageLimit::new(1))
@@ -239,8 +321,27 @@ fn receive(subscription: &mut ClientSubscription<SharedTerms>) -> Result<(), Ben
         if summary.closed.is_some() {
             return Err(BenchError("the stream closed".into()));
         }
-        thread::yield_now();
+        waiting(start, &mut checked, watch)?;
     }
+}
+
+/// One idle turn of a wait that began at `start`: runs `watch` once a
+/// millisecond has passed since `checked`, and fails after [`STALL`].
+fn waiting(
+    start: Instant,
+    checked: &mut Instant,
+    watch: &mut dyn FnMut() -> Result<(), BenchError>,
+) -> Result<(), BenchError> {
+    let now = Instant::now();
+    if now.duration_since(*checked) >= Duration::from_millis(1) {
+        *checked = now;
+        watch()?;
+        if now.duration_since(start) > STALL {
+            return Err(BenchError("no progress".into()));
+        }
+    }
+    thread::yield_now();
+    Ok(())
 }
 
 /// `ipc-ping-pong`: see the module documentation.
@@ -249,6 +350,18 @@ fn receive(subscription: &mut ClientSubscription<SharedTerms>) -> Result<(), Ben
 ///
 /// Returns the first driver, client or child error.
 pub fn ping_pong(config: Config) -> Result<Measurement, BenchError> {
+    ping_pong_with(config, &[])
+}
+
+/// [`ping_pong`] with `child_env` added to the child's environment.
+///
+/// # Errors
+///
+/// As [`ping_pong`].
+pub fn ping_pong_with(
+    config: Config,
+    child_env: &[(&str, &str)],
+) -> Result<Measurement, BenchError> {
     let resolution = resolution();
     let dir = private_dir()?;
     let mut driver = driver(&dir)?;
@@ -262,7 +375,7 @@ pub fn ping_pong(config: Config) -> Result<Measurement, BenchError> {
         .map_err(|cause| error("subscribe", cause))?;
     let stop = Arc::new(AtomicBool::new(false));
     let duty = duty_thread(driver, Arc::clone(&stop));
-    let child = spawn(&config, &dir)?;
+    let mut child = spawn(&config, &dir, child_env)?;
     let payload = vec![7u8; config.message];
     let mut latencies = histogram()?;
     let mut measured_from = Instant::now();
@@ -272,7 +385,10 @@ pub fn ping_pong(config: Config) -> Result<Measurement, BenchError> {
             measured_from = Instant::now();
         }
         let begin = Instant::now();
-        if let Err(cause) = offer(&mut ping_out, &payload).and_then(|()| receive(&mut pong_in)) {
+        let mut watch = || child.alive();
+        if let Err(cause) = offer(&mut ping_out, &payload, &mut watch)
+            .and_then(|()| receive(&mut pong_in, &mut watch))
+        {
             outcome = Err(cause);
             break;
         }
@@ -281,7 +397,7 @@ pub fn ping_pong(config: Config) -> Result<Measurement, BenchError> {
         }
     }
     let seconds = measured_from.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
-    let finished = outcome.and_then(|()| child.finish(Duration::from_secs(30)));
+    let finished = outcome.and_then(|()| child.finish(STALL));
     stop.store(true, Ordering::Release);
     join(duty)?;
     let _ = std::fs::remove_dir_all(&dir);
@@ -303,6 +419,18 @@ pub fn ping_pong(config: Config) -> Result<Measurement, BenchError> {
 ///
 /// Returns the first driver, client or child error.
 pub fn throughput(config: Config) -> Result<Measurement, BenchError> {
+    throughput_with(config, &[])
+}
+
+/// [`throughput`] with `child_env` added to the child's environment.
+///
+/// # Errors
+///
+/// As [`throughput`].
+pub fn throughput_with(
+    config: Config,
+    child_env: &[(&str, &str)],
+) -> Result<Measurement, BenchError> {
     let resolution = resolution();
     let dir = private_dir()?;
     let mut driver = driver(&dir)?;
@@ -312,11 +440,12 @@ pub fn throughput(config: Config) -> Result<Measurement, BenchError> {
         .map_err(|cause| error("publication", cause))?;
     let stop = Arc::new(AtomicBool::new(false));
     let duty = duty_thread(driver, Arc::clone(&stop));
-    let child = spawn(&config, &dir)?;
+    let mut child = spawn(&config, &dir, child_env)?;
     let payload = vec![7u8; config.message];
     let mut outcome = Ok(());
+    let mut watch = || child.alive();
     for _ in 0..config.warmup {
-        if let Err(cause) = offer(&mut out, &payload) {
+        if let Err(cause) = offer(&mut out, &payload, &mut watch) {
             outcome = Err(cause);
             break;
         }
@@ -324,15 +453,17 @@ pub fn throughput(config: Config) -> Result<Measurement, BenchError> {
     let measured_from = Instant::now();
     if outcome.is_ok() {
         for _ in 0..config.iterations {
-            if let Err(cause) = offer(&mut out, &payload) {
+            if let Err(cause) = offer(&mut out, &payload, &mut watch) {
                 outcome = Err(cause);
                 break;
             }
         }
     }
-    // The child read every message once it exits successfully.
-    let finished = outcome.and_then(|()| child.finish(Duration::from_secs(30)));
+    // The window ends when the child read every message; its exit is
+    // not measured.
+    let outcome = outcome.and_then(|()| child.report(READ_ALL));
     let seconds = measured_from.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    let finished = outcome.and_then(|()| child.finish(STALL));
     stop.store(true, Ordering::Release);
     join(duty)?;
     let _ = std::fs::remove_dir_all(&dir);
@@ -376,6 +507,9 @@ pub fn child() -> Option<Result<(), BenchError>> {
 }
 
 fn run_child(spec: &str) -> Result<(), BenchError> {
+    if std::env::var_os(CHILD_FAIL).is_some() {
+        return Err(BenchError("failing as asked".into()));
+    }
     let mut parts = spec.splitn(4, ':');
     let (Some(workload), Some(message), Some(total), Some(dir)) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -405,22 +539,33 @@ fn run_child(spec: &str) -> Result<(), BenchError> {
                 .take_publication(&fetchable)
                 .map_err(|cause| error("take publication", cause))?;
             let payload = vec![9u8; message];
+            // The parent's exit ends the child's waits after `STALL`.
+            let mut watch = || Ok(());
             for _ in 0..total {
-                receive(&mut ping_in)?;
-                offer(&mut pong_out, &payload)?;
+                receive(&mut ping_in, &mut watch)?;
+                offer(&mut pong_out, &payload, &mut watch)?;
             }
         }
         Workload::IpcThroughput => {
             let mut read = 0u64;
+            let mut progress = Instant::now();
             while read < total {
                 let summary = ping_in
                     .poll(|_, _| {}, MessageLimit::new(64))
                     .map_err(|cause| error("poll", cause))?;
                 read += u64::from(summary.delivered);
-                if summary.delivered == 0 {
+                if summary.delivered > 0 {
+                    progress = Instant::now();
+                } else if progress.elapsed() > STALL {
+                    return Err(BenchError("no message from the parent".into()));
+                } else {
                     thread::yield_now();
                 }
             }
+            // A newline first: libtest may have started a line.
+            let mut stdout = std::io::stdout();
+            writeln!(stdout, "\n{READ_ALL}").map_err(|cause| error("report", cause))?;
+            stdout.flush().map_err(|cause| error("report", cause))?;
         }
         other => return Err(BenchError(format!("{} has no child", other.name()))),
     }
