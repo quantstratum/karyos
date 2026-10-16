@@ -78,6 +78,16 @@
 //! `counters unavailable` counts it once, tools show that position as
 //! unavailable, and later passes retry.
 //!
+//! A conflated stream (`quantstratum-docs: karyos/design/conflation-end-to-end.md`,
+//! Counters) has three event counters of its feeder, keyed by the stream
+//! and its lane (participant kind none): `conflation updates written`
+//! (messages written to the keyed table), `conflation keys rejected` (keys
+//! outside the table) and `conflation values too large` (values longer
+//! than a slot). They are allocated when the stream is added, outside any
+//! sampling pass, and freed when the stream is freed. When no cell is free
+//! one is not allocated, `counters unavailable` counts it, and it is not
+//! retried.
+//!
 //! The cells are allocated once, when the driver is created. A reader
 //! keeps the region alive after the driver is dropped; the driver's
 //! counters then read as pending release with their last values, and
@@ -409,6 +419,16 @@ impl DriverCounters {
         {
             // Overflowing the overflow counter itself leaves it at its last
             // value; nothing further can record it.
+            let _ = overflows.increment(1);
+        }
+    }
+
+    /// Adds `delta` to a keyed event counter, reporting an overflow as
+    /// [`add`](Self::add) does.
+    pub(crate) fn add_to(&self, counter: &Counter, delta: u64) {
+        if counter.increment(delta).is_err()
+            && let Some(overflows) = self.counter(Event::CounterOverflows)
+        {
             let _ = overflows.increment(1);
         }
     }
