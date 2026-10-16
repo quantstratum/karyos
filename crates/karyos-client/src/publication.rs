@@ -632,7 +632,15 @@ impl<T: TermBytes> ClientPublication<T> {
             return Ok(OfferOutcome::RateLimited);
         }
         let appended = match (tx_time, &mut self.schedule) {
-            (Some(time), Some(_)) => self.inner.append_scheduled(payload, options, time)?,
+            (Some(time), Some(binding)) => {
+                let outcome = self.inner.append_scheduled(payload, options, time)?;
+                // Back pressure from a full ring, before anything was
+                // reserved, is counted under its reason.
+                if outcome == AppendOutcome::BackPressured && !self.inner.schedule_has_room()? {
+                    crate::schedule::count(binding.counters.rejected_ring_full.as_ref());
+                }
+                outcome
+            }
             _ => self.inner.append(payload, options)?,
         };
         Ok(match appended {

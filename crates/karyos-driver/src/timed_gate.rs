@@ -46,11 +46,13 @@
 //! ([`LaneGate::left`]). It allocates only in [`TimedGate::new`].
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use core::num::NonZeroU16;
 
 use karyos_io::backend::{Exposure, GateDecision, SenderGate, SenderToken, TxTicket};
 use karyos_io::lanes::{LaneGate, Left, Staged};
+use karyos_sys::counters::Counter;
 use karyos_sys::error::SysError;
 use karyos_sys::log_buffer::{BufferOwner, Conductor, SealReason, SealState};
 
@@ -89,11 +91,72 @@ impl Default for LatePolicy {
     }
 }
 
+/// The lateness histogram's buckets, by upper bound in nanoseconds
+/// (inclusive); a negative lateness (a clock set back) has its own bucket,
+/// the first, and the last bucket has no bound.
+pub const LATENESS_BOUNDS: [u64; 6] = [1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
+/// The labels of the lateness histogram's cells, in bucket order.
+pub const LATENESS_LABELS: [&str; LATENESS_BUCKETS] = [
+    "timed lateness negative",
+    "timed lateness <= 1us",
+    "timed lateness <= 10us",
+    "timed lateness <= 100us",
+    "timed lateness <= 1ms",
+    "timed lateness <= 10ms",
+    "timed lateness <= 100ms",
+    "timed lateness > 100ms",
+];
+
+/// Cells of the lateness histogram.
+pub const LATENESS_BUCKETS: usize = 8;
+
+/// The histogram bucket of a lateness (`None` beyond `i64`, a clock far
+/// past the time: the last bucket).
+#[must_use]
+pub fn lateness_bucket(late: Option<i64>) -> usize {
+    match late {
+        Some(late) if late < 0 => 0,
+        Some(late) => LATENESS_BOUNDS
+            .iter()
+            .position(|bound| late.unsigned_abs() <= *bound)
+            .map_or(LATENESS_BUCKETS - 1, |index| index + 1),
+        None => LATENESS_BUCKETS - 1,
+    }
+}
+
+/// A timed lane's sender counters (`quantstratum-docs:
+/// karyos/design/timed-tx.md`, section 6), cells of the driver's counters
+/// region keyed by the stream and the lane, the clock domain in their
+/// labels. A cell the region had no room for is `None` (counted in
+/// `counters unavailable` at allocation). An increment that would overflow
+/// leaves the value unchanged and counts in the gate's `overflows`.
+#[derive(Debug, Default)]
+pub struct TimedLaneCounters {
+    /// Timed heads submitted beyond the tolerance.
+    pub late_sends: Option<Counter>,
+    /// Deadline aborts of the lane.
+    pub deadline_aborts: Option<Counter>,
+    /// The lateness histogram of submitted timed heads, by
+    /// [`lateness_bucket`].
+    pub lateness: [Option<Counter>; LATENESS_BUCKETS],
+}
+
+/// Adds one to a counter cell, if any; an overflow counts in `overflows`.
+fn count(counter: Option<&Counter>, overflows: &mut u64) {
+    if let Some(counter) = counter
+        && counter.increment(1).is_err()
+    {
+        *overflows = overflows.saturating_add(1);
+    }
+}
+
 /// One lane of the gate.
 #[derive(Debug)]
 struct TimedLane {
     heads: VecDeque<Head>,
     policy: LatePolicy,
+    counters: Option<Arc<TimedLaneCounters>>,
     /// A head missed its deadline under cancel-on-deadline: for good.
     missed: bool,
     /// The lane's buffer was sealed for the miss.
@@ -186,6 +249,7 @@ impl<G: LaneGate> TimedGate<G> {
                 .map(|policy| TimedLane {
                     heads: VecDeque::with_capacity(bound),
                     policy: *policy,
+                    counters: None,
                     missed: false,
                     sealed: false,
                 })
@@ -300,6 +364,15 @@ impl<G: LaneGate> TimedGate<G> {
         }
     }
 
+    /// Counts `lane`'s late sends, deadline aborts and lateness into
+    /// `counters` as well (the cells the driver allocated for the stream's
+    /// lane, `EmbeddedDriver::timed_counters`).
+    pub fn attach_counters(&mut self, lane: usize, counters: Arc<TimedLaneCounters>) {
+        if let Some(state) = self.lanes.get_mut(lane) {
+            state.counters = Some(counters);
+        }
+    }
+
     /// Whether `lane` aborted for a missed deadline.
     #[must_use]
     pub fn deadline_missed(&self, lane: usize) -> bool {
@@ -370,6 +443,13 @@ impl<G: LaneGate> TimedGate<G> {
         if missed {
             state.missed = true;
             bump(&mut self.counts.deadline_aborts, &mut self.counts.overflows);
+            count(
+                state
+                    .counters
+                    .as_ref()
+                    .and_then(|cells| cells.deadline_aborts.as_ref()),
+                &mut self.counts.overflows,
+            );
         }
         !missed
     }
@@ -485,6 +565,7 @@ impl<G: LaneGate> LaneGate for TimedGate<G> {
             return;
         };
         let tolerance = state.policy.tolerance;
+        let cells = state.counters.clone();
         match state.heads.pop_front() {
             None => bump(&mut self.counts.faults, &mut self.counts.overflows),
             // The records diverged: counted, and the inner gate decides.
@@ -502,8 +583,20 @@ impl<G: LaneGate> LaneGate for TimedGate<G> {
                     .is_some_and(|late| late > tolerance)
                 {
                     bump(&mut self.counts.late_sends, &mut self.counts.overflows);
+                    count(
+                        cells.as_ref().and_then(|cells| cells.late_sends.as_ref()),
+                        &mut self.counts.overflows,
+                    );
                 }
-                if let Some(late) = lateness(self.now, time) {
+                let late = lateness(self.now, time);
+                count(
+                    cells
+                        .as_ref()
+                        .and_then(|cells| cells.lateness.get(lateness_bucket(late)))
+                        .and_then(Option::as_ref),
+                    &mut self.counts.overflows,
+                );
+                if let Some(late) = late {
                     self.counts.max_lateness =
                         Some(self.counts.max_lateness.map_or(late, |max| max.max(late)));
                 }
