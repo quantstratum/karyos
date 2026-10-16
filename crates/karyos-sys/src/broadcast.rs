@@ -25,6 +25,7 @@
 //! [`BroadcastWords`] holds the protocol over any atomic words (also checked
 //! with Loom); [`broadcast`] builds the owned, safe API over heap memory.
 
+use crate::load_words::LoadWords;
 use crate::sync::{AtomicU64, Ordering, fence};
 
 /// Message type of a padding record; not available to applications.
@@ -127,7 +128,215 @@ const fn align8(value: u64) -> Option<u64> {
     }
 }
 
+/// The capacity in bytes of a data area of `data_words` words, checked as
+/// [`BroadcastWords::new`] describes.
+fn geometry(
+    data_words: usize,
+    trailer_words: usize,
+    max_extent: u64,
+) -> Result<u64, BroadcastError> {
+    let capacity = u64::try_from(data_words)
+        .ok()
+        .and_then(|words| words.checked_mul(8))
+        .ok_or(BroadcastError::InvalidGeometry)?;
+    let valid = data_words >= 2
+        && capacity.is_power_of_two()
+        && trailer_words >= TRAILER_WORDS
+        && max_extent.is_multiple_of(8)
+        && (16..=capacity / 2).contains(&max_extent);
+    if valid {
+        Ok(capacity)
+    } else {
+        Err(BroadcastError::InvalidGeometry)
+    }
+}
+
+/// The reader side of a broadcast buffer over any words it can load
+/// ([`LoadWords`]): it only loads, so it also reads a buffer mapped without
+/// write access. [`BroadcastWords`] reads through one over its own words.
+#[derive(Debug, Clone, Copy)]
+pub struct BroadcastReader<W> {
+    data: W,
+    trailer: W,
+    capacity: u64,
+    max_extent: u64,
+}
+
+impl<W: LoadWords> BroadcastReader<W> {
+    /// Wraps the data words and the trailer, checked as
+    /// [`BroadcastWords::new`] checks them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::InvalidGeometry`] as [`BroadcastWords::new`].
+    pub fn new(data: W, trailer: W, max_extent: u64) -> Result<Self, BroadcastError> {
+        let capacity = geometry(data.len(), trailer.len(), max_extent)?;
+        Ok(Self {
+            data,
+            trailer,
+            capacity,
+            max_extent,
+        })
+    }
+
+    /// Largest payload in bytes.
+    #[must_use]
+    pub fn max_payload(&self) -> usize {
+        usize::try_from(self.max_extent - u64::from(HEADER_LENGTH)).unwrap_or(0)
+    }
+
+    fn data_at(&self, position: u64) -> Option<u64> {
+        let offset = position & (self.capacity - 1);
+        self.data.load(usize::try_from(offset / 8).ok()?)
+    }
+
+    /// Whether the buffer is closed (Acquire).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.trailer
+            .load_acquire(CLOSED)
+            .is_some_and(|word| word != 0)
+    }
+
+    /// The driver heartbeat (Acquire), as last advanced by the writer.
+    #[must_use]
+    pub fn heartbeat(&self) -> u64 {
+        self.trailer.load_acquire(HEARTBEAT).unwrap_or(0)
+    }
+
+    /// The committed tail (Acquire): where a new reader starts.
+    #[must_use]
+    pub fn tail(&self) -> u64 {
+        self.trailer.load_acquire(TAIL).unwrap_or(0)
+    }
+
+    /// Receives at most one message into `out`, stepping over at most one
+    /// padding record. `cursor` is the reader's private position; it never
+    /// moves backward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::BufferTooShort`] when `out` cannot hold the
+    /// largest payload; the cursor is unchanged.
+    pub fn receive(&self, cursor: &mut u64, out: &mut [u8]) -> Result<Receive, BroadcastError> {
+        if out.len() < self.max_payload() {
+            return Err(BroadcastError::BufferTooShort {
+                available: out.len(),
+                required: self.max_payload(),
+            });
+        }
+        for _ in 0..2 {
+            let tail = self.tail();
+            if tail <= *cursor {
+                return Ok(Receive::Pending);
+            }
+            if tail - *cursor > self.capacity {
+                return Ok(self.rejoin(cursor));
+            }
+            let position = *cursor;
+            let header = self.data_at(position).unwrap_or(0);
+            let length = header & u64::from(u32::MAX);
+            let type_id = u32::try_from(header >> 32).unwrap_or(PAD_TYPE);
+            let to_end = self.capacity - (position & (self.capacity - 1));
+            // Checked before any copy: a lapped header can hold arbitrary
+            // bits. A PAD's length and extent equal the rest of the area; a
+            // record fits both the record limit and the rest of the area.
+            let fits = |extent: u64| {
+                if type_id == PAD_TYPE {
+                    // The writer only generates exact, aligned padding.
+                    extent == to_end && length == to_end
+                } else {
+                    extent <= self.max_extent.min(to_end)
+                }
+            };
+            let extent = align8(length)
+                .filter(|&e| length >= u64::from(HEADER_LENGTH) && fits(e))
+                .filter(|&e| position.checked_add(e).is_some_and(|end| end <= tail));
+            let payload_length = length
+                .checked_sub(u64::from(HEADER_LENGTH))
+                .and_then(|n| usize::try_from(n).ok());
+            let copied = match (extent, payload_length) {
+                (Some(_), Some(n)) if type_id != PAD_TYPE => {
+                    self.copy_payload(position, out.get_mut(..n).unwrap_or(&mut []));
+                    n
+                }
+                _ => 0,
+            };
+            fence(Ordering::Acquire);
+            let intent = self.trailer.load(TAIL_INTENT).unwrap_or(u64::MAX);
+            let overwritten = intent
+                .checked_sub(position)
+                .is_none_or(|distance| distance > self.capacity);
+            let Some(extent) = extent.filter(|_| !overwritten) else {
+                // Overwritten during the copy, or a malformed header: treat
+                // as a lap and rejoin.
+                return Ok(self.rejoin(cursor));
+            };
+            *cursor = position + extent;
+            if type_id != PAD_TYPE {
+                return Ok(Receive::Message {
+                    position,
+                    type_id,
+                    length: copied,
+                });
+            }
+        }
+        Ok(Receive::Pending)
+    }
+
+    fn copy_payload(&self, position: u64, out: &mut [u8]) {
+        for (index, chunk) in out.chunks_mut(8).enumerate() {
+            let offset = (index as u64 + 1) * 8;
+            let word = self.data_at(position + offset).unwrap_or(0);
+            let bytes = word.to_le_bytes();
+            chunk.copy_from_slice(bytes.get(..chunk.len()).unwrap_or(&[]));
+        }
+    }
+
+    /// Moves a lapped reader forward. `latest` (the start of the most
+    /// recently written non-PAD record) is only a candidate: it is used if
+    /// it lies in `[intent - capacity, tail)` for a fresh Acquire load of
+    /// `tail` and a later load of `tail_intent`, so it is committed and not
+    /// yet overwritten. Otherwise, or if the candidate is at or behind the
+    /// cursor (a stale `latest`), the reader moves to that `tail`. This runs
+    /// only after an Acquire load saw `tail > cursor`, and `tail` never
+    /// decreases, so the cursor always moves forward to a record boundary.
+    fn rejoin(&self, cursor: &mut u64) -> Receive {
+        let lost_from = *cursor;
+        let tail = self.tail();
+        let latest = self.trailer.load(LATEST).unwrap_or(tail);
+        let intent = self.trailer.load(TAIL_INTENT).unwrap_or(tail).max(tail);
+        // `latest >= intent - capacity` without saturation (ADR-0007) or
+        // overflow near `u64::MAX`; `intent >= tail > latest` for a valid
+        // candidate, so the subtraction only fails for an invalid one.
+        let not_overwritten = intent
+            .checked_sub(latest)
+            .is_some_and(|distance| distance <= self.capacity);
+        let target = if not_overwritten && latest < tail && latest > *cursor {
+            latest
+        } else {
+            tail
+        };
+        *cursor = target.max(*cursor);
+        Receive::Lapped {
+            lost_from,
+            rejoined_at: *cursor,
+        }
+    }
+}
+
 impl<'a> BroadcastWords<'a> {
+    /// The reader side over these words.
+    #[must_use]
+    pub fn reader(&self) -> BroadcastReader<&'a [AtomicU64]> {
+        BroadcastReader {
+            data: self.data,
+            trailer: self.trailer,
+            capacity: self.capacity,
+            max_extent: self.max_extent,
+        }
+    }
+
     /// Wraps the data words and the trailer. `max_extent` bounds a record's
     /// extent in bytes (header included).
     ///
@@ -144,18 +353,7 @@ impl<'a> BroadcastWords<'a> {
         trailer: &'a [AtomicU64],
         max_extent: u64,
     ) -> Result<Self, BroadcastError> {
-        let capacity = u64::try_from(data.len())
-            .ok()
-            .and_then(|words| words.checked_mul(8))
-            .ok_or(BroadcastError::InvalidGeometry)?;
-        let valid = data.len() >= 2
-            && capacity.is_power_of_two()
-            && trailer.len() >= TRAILER_WORDS
-            && max_extent.is_multiple_of(8)
-            && (16..=capacity / 2).contains(&max_extent);
-        if !valid {
-            return Err(BroadcastError::InvalidGeometry);
-        }
+        let capacity = geometry(data.len(), trailer.len(), max_extent)?;
         Ok(Self {
             data,
             trailer,
@@ -184,8 +382,17 @@ impl<'a> BroadcastWords<'a> {
     /// committed.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.trailer(CLOSED)
-            .is_some_and(|word| word.load(Ordering::Acquire) != 0)
+        self.reader().is_closed()
+    }
+
+    /// Receives at most one message into `out`; see
+    /// [`BroadcastReader::receive`].
+    ///
+    /// # Errors
+    ///
+    /// As [`BroadcastReader::receive`].
+    pub fn receive(&self, cursor: &mut u64, out: &mut [u8]) -> Result<Receive, BroadcastError> {
+        self.reader().receive(cursor, out)
     }
 
     /// Closes the buffer for good (Release). Only the single writer calls
@@ -217,8 +424,7 @@ impl<'a> BroadcastWords<'a> {
     /// The driver heartbeat (Acquire), as last advanced by the writer.
     #[must_use]
     pub fn heartbeat(&self) -> u64 {
-        self.trailer(HEARTBEAT)
-            .map_or(0, |word| word.load(Ordering::Acquire))
+        self.reader().heartbeat()
     }
 
     /// Whether one more record of up to `payload_length` bytes, with any
@@ -242,8 +448,7 @@ impl<'a> BroadcastWords<'a> {
     /// The committed tail (Acquire): where a new reader starts.
     #[must_use]
     pub fn tail(&self) -> u64 {
-        self.trailer(TAIL)
-            .map_or(0, |word| word.load(Ordering::Acquire))
+        self.reader().tail()
     }
 
     /// Writes one message. Only the single writer calls this.
@@ -316,131 +521,6 @@ impl<'a> BroadcastWords<'a> {
         latest.store(start, Ordering::Relaxed);
         tail_word.store(new_tail, Ordering::Release);
         Ok(start)
-    }
-
-    /// Receives at most one message into `out`, stepping over at most one
-    /// padding record. `cursor` is the reader's private position; it never
-    /// moves backward.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BroadcastError::BufferTooShort`] when `out` cannot hold the
-    /// largest payload; the cursor is unchanged.
-    pub fn receive(&self, cursor: &mut u64, out: &mut [u8]) -> Result<Receive, BroadcastError> {
-        if out.len() < self.max_payload() {
-            return Err(BroadcastError::BufferTooShort {
-                available: out.len(),
-                required: self.max_payload(),
-            });
-        }
-        for _ in 0..2 {
-            let tail = self.tail();
-            if tail <= *cursor {
-                return Ok(Receive::Pending);
-            }
-            if tail - *cursor > self.capacity {
-                return Ok(self.rejoin(cursor));
-            }
-            let position = *cursor;
-            let header = self
-                .word_at(position)
-                .map_or(0, |w| w.load(Ordering::Relaxed));
-            let length = header & u64::from(u32::MAX);
-            let type_id = u32::try_from(header >> 32).unwrap_or(PAD_TYPE);
-            let to_end = self.capacity - (position & (self.capacity - 1));
-            // Checked before any copy: a lapped header can hold arbitrary
-            // bits. A PAD's length and extent equal the rest of the area; a
-            // record fits both the record limit and the rest of the area.
-            let fits = |extent: u64| {
-                if type_id == PAD_TYPE {
-                    // The writer only generates exact, aligned padding.
-                    extent == to_end && length == to_end
-                } else {
-                    extent <= self.max_extent.min(to_end)
-                }
-            };
-            let extent = align8(length)
-                .filter(|&e| length >= u64::from(HEADER_LENGTH) && fits(e))
-                .filter(|&e| position.checked_add(e).is_some_and(|end| end <= tail));
-            let payload_length = length
-                .checked_sub(u64::from(HEADER_LENGTH))
-                .and_then(|n| usize::try_from(n).ok());
-            let copied = match (extent, payload_length) {
-                (Some(_), Some(n)) if type_id != PAD_TYPE => {
-                    self.copy_payload(position, out.get_mut(..n).unwrap_or(&mut []));
-                    n
-                }
-                _ => 0,
-            };
-            fence(Ordering::Acquire);
-            let intent = self
-                .trailer(TAIL_INTENT)
-                .map_or(u64::MAX, |word| word.load(Ordering::Relaxed));
-            let overwritten = intent
-                .checked_sub(position)
-                .is_none_or(|distance| distance > self.capacity);
-            let Some(extent) = extent.filter(|_| !overwritten) else {
-                // Overwritten during the copy, or a malformed header: treat
-                // as a lap and rejoin.
-                return Ok(self.rejoin(cursor));
-            };
-            *cursor = position + extent;
-            if type_id != PAD_TYPE {
-                return Ok(Receive::Message {
-                    position,
-                    type_id,
-                    length: copied,
-                });
-            }
-        }
-        Ok(Receive::Pending)
-    }
-
-    fn copy_payload(&self, position: u64, out: &mut [u8]) {
-        for (index, chunk) in out.chunks_mut(8).enumerate() {
-            let offset = (index as u64 + 1) * 8;
-            let word = self
-                .word_at(position + offset)
-                .map_or(0, |w| w.load(Ordering::Relaxed));
-            let bytes = word.to_le_bytes();
-            chunk.copy_from_slice(bytes.get(..chunk.len()).unwrap_or(&[]));
-        }
-    }
-
-    /// Moves a lapped reader forward. `latest` (the start of the most
-    /// recently written non-PAD record) is only a candidate: it is used if
-    /// it lies in `[intent - capacity, tail)` for a fresh Acquire load of
-    /// `tail` and a later load of `tail_intent`, so it is committed and not
-    /// yet overwritten. Otherwise, or if the candidate is at or behind the
-    /// cursor (a stale `latest`), the reader moves to that `tail`. This runs
-    /// only after an Acquire load saw `tail > cursor`, and `tail` never
-    /// decreases, so the cursor always moves forward to a record boundary.
-    fn rejoin(&self, cursor: &mut u64) -> Receive {
-        let lost_from = *cursor;
-        let tail = self.tail();
-        let latest = self
-            .trailer(LATEST)
-            .map_or(tail, |word| word.load(Ordering::Relaxed));
-        let intent = self
-            .trailer(TAIL_INTENT)
-            .map_or(tail, |word| word.load(Ordering::Relaxed))
-            .max(tail);
-        // `latest >= intent - capacity` without saturation (ADR-0007) or
-        // overflow near `u64::MAX`; `intent >= tail > latest` for a valid
-        // candidate, so the subtraction only fails for an invalid one.
-        let not_overwritten = intent
-            .checked_sub(latest)
-            .is_some_and(|distance| distance <= self.capacity);
-        let target = if not_overwritten && latest < tail && latest > *cursor {
-            latest
-        } else {
-            tail
-        };
-        *cursor = target.max(*cursor);
-        Receive::Lapped {
-            lost_from,
-            rejoined_at: *cursor,
-        }
     }
 }
 
