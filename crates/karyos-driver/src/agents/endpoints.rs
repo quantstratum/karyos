@@ -179,6 +179,8 @@ enum State<O: SocketOps> {
 struct Entry<O: SocketOps> {
     id: EndpointId,
     config: SocketsConfig,
+    /// The bound local address of the current epoch.
+    local: std::net::SocketAddr,
     state: State<O>,
 }
 
@@ -246,6 +248,16 @@ impl<O: SocketOps> Endpoints<O> {
             .any(|entry| entry.id == endpoint && matches!(entry.state, State::Active))
     }
 
+    /// The bound local address of `endpoint` in its current epoch (a
+    /// port 0 bind resolved by the kernel).
+    #[must_use]
+    pub fn local_address(&self, endpoint: EndpointId) -> Option<std::net::SocketAddr> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == endpoint)
+            .map(|entry| entry.local)
+    }
+
     fn index(&self, endpoint: EndpointId) -> Result<usize, EndpointError> {
         self.entries
             .iter()
@@ -277,6 +289,7 @@ impl<O: SocketOps> Endpoints<O> {
         let instance = self.next.ok_or(EndpointError::Exhausted)?;
         let endpoint =
             SocketsEndpoint::open(&config, instance, ops).map_err(EndpointError::Open)?;
+        let local = endpoint.capabilities().local;
         // The counter only moves forward: a later failure wastes the id.
         self.next = instance.next().ok();
         // A refused split drops the endpoint, which closes its socket.
@@ -309,6 +322,7 @@ impl<O: SocketOps> Endpoints<O> {
                 self.entries.push(Entry {
                     id,
                     config,
+                    local,
                     state: State::Failing {
                         error: EndpointError::Agent(error.clone()),
                         sender: Fate::Posted,
@@ -318,7 +332,12 @@ impl<O: SocketOps> Endpoints<O> {
                 return Err(EndpointError::Agent(error));
             }
         };
-        self.entries.push(Entry { id, config, state });
+        self.entries.push(Entry {
+            id,
+            config,
+            local,
+            state,
+        });
         Ok(id)
     }
 
@@ -425,7 +444,11 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::Detached {
                 agent, endpoint, ..
             } => (*endpoint, *agent),
-            AgentEvent::Pong { .. } | AgentEvent::Stopped { .. } => return Some(event),
+            AgentEvent::Pong { .. }
+            | AgentEvent::Stopped { .. }
+            | AgentEvent::PublicationAdded { .. }
+            | AgentEvent::PublicationRefused { .. }
+            | AgentEvent::CreateImage { .. } => return Some(event),
         };
         let Ok(index) = self.index(endpoint) else {
             // An answer for an endpoint already gone: dropped (a half in
@@ -618,18 +641,19 @@ impl<O: SocketOps> Endpoints<O> {
                     .and_then(|returned| {
                         endpoint
                             .reopen(&config)
-                            .map(|_| returned)
+                            .map(|snapshot| (returned, snapshot.local))
                             .map_err(EndpointError::Open)
                     })
-                    .and_then(|returned| {
+                    .and_then(|(returned, local)| {
                         endpoint
                             .split()
-                            .map(|halves| (halves, returned))
+                            .map(|halves| (halves, returned, local))
                             .map_err(|error| EndpointError::Split(error.error))
                     });
                 match outcome {
-                    Ok(((tx, rx), returned)) => {
+                    Ok(((tx, rx), returned, local)) => {
                         if let Some(entry) = self.entries.get_mut(index) {
+                            entry.local = local;
                             entry.state = State::Split { tx, rx, returned };
                         }
                     }
