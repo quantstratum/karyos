@@ -478,23 +478,49 @@ mod region {
     use crate::error::SysError;
     use crate::ipc::{ReadOnlyRegion, Region, RegionKind, RegionRecord, SealProfile};
 
+    /// The configuration of the tables these tests create.
+    const CONFIG: ConflationConfig = ConflationConfig {
+        keys: 2,
+        value_capacity: 8,
+        journal_capacity: 1024,
+    };
+
+    fn table() -> ConflationWriter {
+        conflation_in(
+            7,
+            3,
+            CONFIG.keys,
+            CONFIG.value_capacity,
+            CONFIG.journal_capacity,
+        )
+        .unwrap()
+    }
+
     /// Attaches `region` read-only, as a view does with its grant: the
-    /// creator's descriptor reopened read-only, its record and `profile`.
+    /// creator's descriptor reopened read-only, its record, `profile` and
+    /// the granted configuration `expected`.
     fn view_of(
         region: &Region,
         record: RegionRecord,
         profile: SealProfile,
+        expected: ConflationConfig,
     ) -> Result<ConflationReader, SysError> {
-        ConflationReader::attach_read_only(ReadOnlyRegion::attach(
-            region.read_only_descriptor()?,
-            record,
-            profile,
-        )?)
+        ConflationReader::attach_read_only(
+            ReadOnlyRegion::attach(region.read_only_descriptor()?, record, profile)?,
+            expected,
+        )
     }
 
     fn view(writer: &ConflationWriter) -> Result<ConflationReader, SysError> {
+        view_expecting(writer, writer.config())
+    }
+
+    fn view_expecting(
+        writer: &ConflationWriter,
+        expected: ConflationConfig,
+    ) -> Result<ConflationReader, SysError> {
         let region = writer.region().unwrap();
-        view_of(region, region.record(), SealProfile::DriverOnly)
+        view_of(region, region.record(), SealProfile::DriverOnly, expected)
     }
 
     /// A read-only view delivers what the writer wrote, the latest value
@@ -588,10 +614,10 @@ mod region {
     /// profile is refused, and so is a writable attach.
     #[test]
     fn a_table_region_is_driver_only() {
-        let writer = conflation_in(7, 3, 2, 8, 1024).unwrap();
+        let writer = table();
         let region = writer.region().unwrap();
         assert!(matches!(
-            view_of(region, region.record(), SealProfile::Shared),
+            view_of(region, region.record(), SealProfile::Shared, CONFIG),
             Err(SysError::SealMismatch { .. })
         ));
         let fd = region.descriptor().unwrap().try_clone_to_owned().unwrap();
@@ -601,51 +627,132 @@ mod region {
         ));
     }
 
-    /// The attach checks the kind, the layout version and the
-    /// configuration line against the region.
-    #[test]
-    fn attachment_checks_the_kind_and_the_configuration() {
-        // A region of another kind: its header does not match a
-        // conflation table's record, nor does its record pass the reader.
-        let (_manager, counters) = crate::counters::counters_in(7, 4, 2).unwrap();
-        let other = counters.region().unwrap();
-        let mut record = other.record();
-        record.kind = RegionKind::ConflationTable;
-        assert!(matches!(
-            view_of(other, record, SealProfile::DriverOnly),
-            Err(SysError::InvalidRegion { .. })
-        ));
-        assert!(matches!(
-            view_of(other, other.record(), SealProfile::DriverOnly),
-            Err(SysError::InvalidRegion { .. })
-        ));
-        // Another layout version.
-        let writer = conflation_in(7, 3, 2, 8, 1024).unwrap();
-        let mut record = writer.region().unwrap().record();
-        record.layout = LAYOUT_VERSION + 1;
-        let foreign = Region::create_driver_only(record).unwrap();
-        assert!(matches!(
-            view_of(&foreign, record, SealProfile::DriverOnly),
-            Err(SysError::InvalidRegion { .. })
-        ));
-        // Each word of the configuration line is checked: a disagreeing
-        // key count, value capacity, slot words or journal capacity, and a
-        // nonzero unused word.
-        for (index, value) in [(0, 3), (1, 200), (2, 32), (3, 2048), (4, 1), (15, 1)] {
-            let writer = conflation_in(7, 3, 2, 8, 1024).unwrap();
-            let region = writer.region().unwrap();
+    /// A driver-only region whose record is a table's changed by `change`,
+    /// holding a valid configuration line for [`CONFIG`]: only the record
+    /// differs from a table's.
+    fn foreign(change: impl Fn(&mut RegionRecord)) -> (Region, RegionRecord) {
+        let mut record = table().region().unwrap().record();
+        change(&mut record);
+        let region = Region::create_driver_only(record).unwrap();
+        for (index, value) in [2, 8, 16, 1024].into_iter().enumerate() {
             region
                 .structure()
                 .get(index)
                 .unwrap()
                 .store(value, Ordering::Release);
+        }
+        (region, record)
+    }
+
+    /// The attach checks the record: the kind, the layout version and the
+    /// generation, each alone.
+    #[test]
+    fn attachment_checks_the_record() {
+        let (region, record) = foreign(|_| {});
+        assert!(view_of(&region, record, SealProfile::DriverOnly, CONFIG).is_ok());
+        let changes: [fn(&mut RegionRecord); 3] = [
+            |record| record.kind = RegionKind::Counters,
+            |record| record.layout = LAYOUT_VERSION + 1,
+            |record| record.generation = 1,
+        ];
+        for (case, change) in changes.into_iter().enumerate() {
+            let (region, record) = foreign(change);
+            assert!(
+                matches!(
+                    view_of(&region, record, SealProfile::DriverOnly, CONFIG),
+                    Err(SysError::InvalidRegion { .. })
+                ),
+                "record change {case} was accepted"
+            );
+        }
+        // A region of another kind, attached as a table: the header
+        // compare refuses it.
+        let (_manager, counters) = crate::counters::counters_in(7, 4, 2).unwrap();
+        let other = counters.region().unwrap();
+        let mut record = other.record();
+        record.kind = RegionKind::ConflationTable;
+        assert!(matches!(
+            view_of(other, record, SealProfile::DriverOnly, CONFIG),
+            Err(SysError::InvalidRegion { .. })
+        ));
+    }
+
+    /// The attach checks the configuration line: against the granted
+    /// configuration, word by word, and against the region's length in
+    /// both directions.
+    #[test]
+    fn attachment_checks_the_configuration() {
+        assert!(view(&table()).is_ok());
+        // A granted configuration the table does not have, also one with
+        // the same geometry (value capacities 8 and 16 both take 16 slot
+        // words).
+        for expected in [
+            ConflationConfig { keys: 3, ..CONFIG },
+            ConflationConfig {
+                value_capacity: 16,
+                ..CONFIG
+            },
+            ConflationConfig {
+                journal_capacity: 2048,
+                ..CONFIG
+            },
+        ] {
+            assert!(
+                matches!(
+                    view_expecting(&table(), expected),
+                    Err(SysError::InvalidRegion { .. })
+                ),
+                "{expected:?} was accepted"
+            );
+        }
+        // A configuration line that disagrees with the grant, its slot
+        // words or its unused words.
+        for (index, value) in [(1, 200), (2, 32), (4, 1), (15, 1)] {
+            let writer = table();
+            store(&writer, index, value);
             assert!(
                 matches!(view(&writer), Err(SysError::InvalidRegion { .. })),
                 "word {index} = {value} was accepted"
             );
         }
-        // An untouched region attaches.
-        assert!(view(&conflation_in(7, 3, 2, 8, 1024).unwrap()).is_ok());
+        // A line that matches its grant but not the region's length: fewer
+        // keys than the region holds, and more.
+        for keys in [1, 3] {
+            let writer = table();
+            store(&writer, 0, u64::from(keys));
+            assert!(
+                matches!(
+                    view_expecting(&writer, ConflationConfig { keys, ..CONFIG }),
+                    Err(SysError::InvalidRegion { .. })
+                ),
+                "{keys} keys were accepted"
+            );
+        }
+        // So does a larger journal.
+        let writer = table();
+        store(&writer, 3, 2048);
+        assert!(matches!(
+            view_expecting(
+                &writer,
+                ConflationConfig {
+                    journal_capacity: 2048,
+                    ..CONFIG
+                }
+            ),
+            Err(SysError::InvalidRegion { .. })
+        ));
+    }
+
+    /// Stores `value` into word `index` of `writer`'s configuration line,
+    /// through the driver's writable mapping.
+    fn store(writer: &ConflationWriter, index: usize, value: u64) {
+        writer
+            .region()
+            .unwrap()
+            .structure()
+            .get(index)
+            .unwrap()
+            .store(value, Ordering::Release);
     }
 
     /// The creation refuses what `conflation` refuses.

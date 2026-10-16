@@ -386,13 +386,13 @@ mod owned {
         /// The configuration line of a region: keys, value capacity, slot
         /// words and journal capacity; the rest of the stride is zero.
         #[cfg(target_os = "linux")]
-        fn config_line(&self) -> [u64; 4] {
-            [
+        fn config_line(&self) -> Option<[u64; 4]> {
+            Some([
                 u64::from(self.keys),
-                self.value_capacity as u64,
-                self.slot_words as u64,
-                self.journal_capacity as u64,
-            ]
+                u64::try_from(self.value_capacity).ok()?,
+                u64::try_from(self.slot_words).ok()?,
+                u64::try_from(self.journal_capacity).ok()?,
+            ])
         }
     }
 
@@ -648,7 +648,8 @@ mod owned {
             structure_length,
         })?;
         let structure = mapped.structure();
-        for (index, value) in geometry.config_line().into_iter().enumerate() {
+        let line = geometry.config_line().ok_or(invalid)?;
+        for (index, value) in line.into_iter().enumerate() {
             structure
                 .get(index)
                 .ok_or(invalid)?
@@ -875,18 +876,23 @@ mod owned {
         /// A reader of a table in a region mapped read-only (a view's side;
         /// `quantstratum-docs: karyos/design/conflation-end-to-end.md`,
         /// Cross-process views), starting with a full scan. The
-        /// configuration line is read once and must describe a table that
-        /// fills the region exactly; from then on every slot read and
+        /// configuration line is read once: it must equal `expected`, the
+        /// configuration the view was granted, and describe a table that
+        /// fills the region exactly. Both are checked before the reader
+        /// allocates its private state, whose size follows the key count
+        /// and the value capacity, so the region cannot make it allocate
+        /// more than the view accepted. From then on every slot read and
         /// journal record is validated as on the heap, with loads only.
         ///
         /// # Errors
         ///
         /// Returns [`crate::error::SysError::InvalidRegion`] unless the
-        /// region is a conflation table of this layout that matches its
-        /// configuration line.
+        /// region is a conflation table of this layout and generation 0
+        /// whose configuration line is `expected` and matches the region.
         #[cfg(target_os = "linux")]
         pub fn attach_read_only(
             region: crate::ipc::ReadOnlyRegion,
+            expected: ConflationConfig,
         ) -> Result<Self, crate::error::SysError> {
             let record = region.record();
             let invalid = crate::error::SysError::InvalidRegion {
@@ -921,7 +927,9 @@ mod owned {
                     Geometry::new(keys, value_capacity, journal_capacity)
                 })
                 .ok_or(invalid)?;
-            if geometry.config_line() != [keys, value_capacity, slot_words, journal_capacity]
+            if geometry.config() != expected
+                || geometry.config_line()
+                    != Some([keys, value_capacity, slot_words, journal_capacity])
                 || rest.iter().any(|word| *word != 0)
                 || geometry.structure_length() != Some(record.structure_length)
             {
