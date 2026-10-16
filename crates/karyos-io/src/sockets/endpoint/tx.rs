@@ -1187,6 +1187,8 @@ impl Drop for TxCore {
     fn drop(&mut self) {
         let pending = self.pending_total();
         if pending != Some(0) && !std::thread::panicking() {
+            #[cfg(test)]
+            super::note_tx_drop_on_this_thread();
             // `usize` fits `u64` on every supported target. The process
             // counter is checked; the documented choice for overflow is
             // that it keeps its value, as no process discards 2^64 items.

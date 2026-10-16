@@ -64,6 +64,25 @@ pub fn tx_discarded_on_drop() -> u64 {
     TX_DISCARDED_ON_DROP.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Drops counted by [`TX_DISCARDED_ON_DROP`] on this thread, so a test
+    /// observes its own drops and not those of tests running in parallel.
+    static TX_DROPS_ON_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Drops outside unwinding with pending items on the calling thread.
+#[cfg(test)]
+pub(crate) fn tx_drops_on_this_thread() -> u64 {
+    TX_DROPS_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
+/// Records a drop outside unwinding with pending items on this thread.
+#[cfg(test)]
+pub(crate) fn note_tx_drop_on_this_thread() {
+    TX_DROPS_ON_THIS_THREAD.with(|drops| drops.set(drops.get().wrapping_add(1)));
+}
+
 /// The life of an endpoint (7.3 and 7.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
