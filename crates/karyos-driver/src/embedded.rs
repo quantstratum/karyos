@@ -1014,6 +1014,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .conductor
                 .seal_with_reason(SealReason::StreamRemoved)?;
             let key = target.key();
+            let lane = target.config.lane;
             if let Some(mut feeder) = target.feeder.take() {
                 feeder.writer.close();
             }
@@ -1027,6 +1028,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if was_active {
                 self.emit(&DriverEvent::PublicationClosed {
                     stream: key,
+                    lane,
                     reason: CloseReason::StreamRemoved,
                 });
             }
@@ -1207,8 +1209,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             lanes: count,
             profile,
         };
-        // 2 and 3. Build every lane privately. A failure drops the staged
-        // lanes; nothing outside this call can name them.
+        // 2 and 3. Reserve the table, then build every lane privately. A
+        // failure drops the staged lanes; nothing outside this call can
+        // name them, and spare capacity is not state.
+        self.streams.reserve(lanes.len());
         let mut staged: Vec<Stream<T>> = Vec::with_capacity(lanes.len());
         let mut handle = AggregateHandle {
             driver: self.id,
@@ -1236,7 +1240,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
         }
         // 4. Publish in one step that cannot fail.
-        self.streams.reserve(staged.len());
         self.next_stream = next;
         self.streams.extend(staged);
         self.update_stream_gauges();
@@ -1592,7 +1595,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     first_error.get_or_insert(DriverError::from(error));
                 }
                 if was_active && stream.conductor.seal_state() != SealState::Active {
-                    closed.push(stream.key());
+                    closed.push((stream.key(), stream.config.lane));
                 }
             }
             let Some(config) = stream.conflation else {
@@ -1637,8 +1640,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     // A stream already closed for good was reported then.
                     let open = stream.conductor.seal_reason().is_none();
                     lost.push((
-                        stream.aggregate.registration,
-                        stream.key(),
+                        [
+                            stream.aggregate.registration,
+                            u64::from(stream.config.lane.get()),
+                        ],
+                        (stream.key(), stream.config.lane),
                         error.cause.to_string(),
                         open,
                     ));
@@ -1674,15 +1680,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             // Only the seal that moved the stream out of `Active` reports it.
             if was_active && stream.conductor.seal_state() != SealState::Active {
-                closed.push(stream.key());
+                closed.push((stream.key(), stream.config.lane));
             }
             // An end the stream did not reach (no terminal seal: the feeder
             // could not follow a cutover) is a lost feeder, never a silent
             // end of the view.
             if summary.closed.is_some() && stream.conductor.seal_reason().is_none() {
                 lost.push((
-                    stream.id,
-                    stream.key(),
+                    [
+                        stream.aggregate.registration,
+                        u64::from(stream.config.lane.get()),
+                    ],
+                    (stream.key(), stream.config.lane),
                     "the feeder ended before its stream".to_owned(),
                     true,
                 ));
@@ -1701,24 +1710,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
         }
-        for stream in closed {
+        for (stream, lane) in closed {
             self.emit(&DriverEvent::PublicationClosed {
                 stream,
+                lane,
                 reason: CloseReason::ConflationVersionsExhausted,
             });
         }
         // The loss is always logged; only a stream it closes is reported,
         // so a stream closed for good earlier gets no second closing.
-        for (id, stream, cause, open) in lost {
+        // The record names the aggregate's registration and the lane.
+        for (key, (stream, lane), cause, open) in lost {
             self.diagnostics.error(
                 &mut self.counters,
                 crate::diagnostics::ErrorCode::ConflationFeederLost,
-                [id, 0],
+                key,
                 &format!("conflation feeder lost: {cause}"),
             );
             if open {
                 self.emit(&DriverEvent::PublicationClosed {
                     stream,
+                    lane,
                     reason: CloseReason::ConflationFeederLost,
                 });
             }
@@ -2156,6 +2168,7 @@ mod tests {
                     stream_id: 42,
                     session_id: 1,
                 },
+                lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::ConflationVersionsExhausted,
             }]
         );
@@ -2227,6 +2240,7 @@ mod tests {
                     stream_id: 42,
                     session_id: 1,
                 },
+                lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::ConflationFeederLost,
             }]
         );
@@ -2242,7 +2256,11 @@ mod tests {
         assert!(
             records.iter().any(|record| record.code
                 == crate::diagnostics::ErrorCode::ConflationFeederLost as u32
-                && record.key == [driver.streams[0].id, 0]),
+                && record.key
+                    == [
+                        driver.streams[0].aggregate.registration,
+                        u64::from(driver.streams[0].config.lane.get())
+                    ]),
             "{records:?}"
         );
         // The views end.
@@ -2436,6 +2454,7 @@ mod tests {
                     stream_id,
                     session_id: 1,
                 },
+                lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::RequiredParticipantLost,
             });
         }

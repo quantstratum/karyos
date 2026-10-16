@@ -76,6 +76,7 @@ use karyos_protocol::cnc::{
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::counters::{CounterKeys, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER};
+use karyos_sys::frame::Lane;
 use karyos_sys::host_clock::age_ns;
 use karyos_sys::log_buffer::{LossPolicy, PublicationEnd, Revocation, Role, SealState};
 use karyos_sys::record_journal::{JournalDrain, JournalLayout};
@@ -304,6 +305,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let policy = target.policy;
             let publication = target.aggregate.registration;
             let lane = target.config.lane.get();
+            let closed_lane = target.config.lane;
             let key = StreamKey {
                 stream_id: target.stream_id,
                 session_id: target.session_id,
@@ -376,6 +378,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
                 Revocation::Sealed if was_active => self.emit(&DriverEvent::PublicationClosed {
                     stream: key,
+                    lane: closed_lane,
                     reason: CloseReason::RequiredParticipantLost,
                 }),
                 _ => {}
@@ -606,11 +609,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         served
     }
 
-    fn find_stream(&self, stream: StreamKey) -> Option<usize> {
+    /// The lane stream of `stream`'s aggregate on `lane`, or, for `None`,
+    /// the lane that carries the aggregate's registration (lane 0, or the
+    /// only lane of a stream added with `add_stream`).
+    fn find_stream(&self, stream: StreamKey, lane: Option<Lane>) -> Option<usize> {
         // Commands bind by wire key at execution; retiring streams accept
         // nothing new.
         self.streams.iter().position(|s| {
-            !s.retiring && s.stream_id == stream.stream_id && s.session_id == stream.session_id
+            !s.retiring
+                && s.stream_id == stream.stream_id
+                && s.session_id == stream.session_id
+                && lane.map_or(s.id == s.aggregate.registration, |lane| {
+                    s.config.lane == lane
+                })
         })
     }
 
@@ -760,11 +771,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             detail,
         };
         match command {
-            Command::AddPublication { stream, .. }
-            | Command::AddConcurrentPublication { stream, .. }
-            | Command::AddSubscription { stream, .. } => {
+            Command::AddPublication { stream, lane, .. }
+            | Command::AddConcurrentPublication { stream, lane, .. }
+            | Command::AddSubscription { stream, lane, .. } => {
                 let detail = u64::from(stream.stream_id.cast_unsigned());
-                let Some(index) = self.find_stream(stream) else {
+                // A lane the aggregate does not configure is an unknown
+                // stream (quantstratum-docs: karyos/design/aggregate-ownership.md).
+                let Some(index) = self.find_stream(stream, Some(lane)) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
                 let remote = self.ledger(client).map(Ledger::full);
@@ -1018,7 +1031,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let detail = u64::from(stream.stream_id.cast_unsigned());
         let Some(target) = self
-            .find_stream(stream)
+            .find_stream(stream, None)
             .and_then(|index| self.streams.get(index))
         else {
             return refuse(ErrorCode::UnknownStream, detail);
@@ -1717,7 +1730,6 @@ mod tests {
     use karyos_protocol::cnc::{Response, SubscriberRole};
     use karyos_sys::broadcast::Received;
     use karyos_sys::command_ring::RingProducer;
-    use karyos_sys::frame::Lane;
     use karyos_sys::log_buffer::LogBufferConfig;
     use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
     use karyos_sys::term::TermId;
@@ -1837,6 +1849,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Optional,
             },
         );
@@ -1908,6 +1921,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Required,
             },
         );
@@ -1953,6 +1967,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Optional,
             },
         );
@@ -1989,6 +2004,7 @@ mod tests {
                 Command::AddSubscription {
                     sequence,
                     stream: KEY,
+                    lane: Lane::ZERO,
                     role: SubscriberRole::Optional,
                 },
             );
@@ -2021,6 +2037,7 @@ mod tests {
                 Command::AddPublication {
                     sequence,
                     stream: KEY,
+                    lane: Lane::ZERO,
                     allow_unconnected: false,
                 },
             );
@@ -2057,6 +2074,7 @@ mod tests {
                     Command::AddSubscription {
                         sequence,
                         stream: KEY,
+                        lane: Lane::ZERO,
                         role: SubscriberRole::Required,
                     },
                 );
@@ -2122,6 +2140,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Required,
             },
         );
@@ -2205,6 +2224,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Required,
             },
         );
@@ -2296,6 +2316,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Required,
             },
         );
@@ -2377,6 +2398,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Required,
             },
         );
@@ -2434,6 +2456,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Optional,
             },
         );
@@ -2717,6 +2740,7 @@ mod tests {
                     stream_id: 2,
                     session_id: 1,
                 },
+                lane: Lane::ZERO,
                 allow_unconnected: false,
             },
         );
@@ -2767,6 +2791,7 @@ mod tests {
         let add = |sequence| Command::AddSubscription {
             sequence,
             stream: KEY,
+            lane: Lane::ZERO,
             role: SubscriberRole::Required,
         };
         write(&mut local_producer, add(1));
@@ -3035,6 +3060,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Required,
             },
         );
@@ -3110,6 +3136,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Optional,
             },
         );
@@ -3180,6 +3207,7 @@ mod tests {
             Command::AddPublication {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 allow_unconnected: false,
             },
         );
@@ -3641,6 +3669,7 @@ mod tests {
             Command::AddSubscription {
                 sequence: 1,
                 stream: KEY,
+                lane: Lane::ZERO,
                 // Required: the stream's slot credit admits one optional
                 // reader only, and the driver does not check the role.
                 role: SubscriberRole::Required,
@@ -3730,13 +3759,9 @@ mod tests {
         assert_eq!(counter(&driver, "clients faulty"), 0);
     }
 
-    /// A loss report names the aggregate's registration and the lane: a
-    /// subscription on lane 2 is verified when the report names lane 2,
-    /// and a report naming another lane retires the client.
-    #[test]
-    fn a_loss_report_names_the_aggregate_and_the_lane() {
-        let mut driver = EmbeddedDriver::new().unwrap();
-        let aggregate = driver
+    /// A three-lane aggregate on stream 5, session 1.
+    fn three_lanes(driver: &mut EmbeddedDriver) -> crate::embedded::AggregateHandle {
+        driver
             .add_aggregate(crate::embedded::AggregateConfig {
                 stream: StreamConfig {
                     buffer: LogBufferConfig {
@@ -3758,7 +3783,106 @@ mod tests {
                 },
                 quanta: vec![u64::from(DEFAULT_MTU.next_multiple_of(32)); 3],
             })
-            .unwrap();
+            .unwrap()
+    }
+
+    /// The lane word selects the lane stream of the aggregate a command
+    /// names; a lane the aggregate does not configure is an unknown
+    /// stream.
+    #[test]
+    fn a_command_names_one_lane_of_the_aggregate() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let aggregate = three_lanes(&mut driver);
+        let lane = |number| Lane::try_new(number).unwrap();
+        let lane_id = |driver: &EmbeddedDriver, number| {
+            driver
+                .stream_ref(aggregate.lane(lane(number)).unwrap())
+                .unwrap()
+                .id
+        };
+        let (client, mut producer, _link) = raw_client(&mut driver);
+        let mut observer = driver.broadcast.receiver();
+        let key = StreamKey {
+            stream_id: 5,
+            session_id: 1,
+        };
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: key,
+                lane: lane(2),
+                role: SubscriberRole::Optional,
+            },
+        );
+        write(
+            &mut producer,
+            Command::AddPublication {
+                sequence: 2,
+                stream: key,
+                lane: lane(1),
+                allow_unconnected: true,
+            },
+        );
+        write(
+            &mut producer,
+            Command::AddConcurrentPublication {
+                sequence: 3,
+                stream: key,
+                lane: lane(3),
+                allow_unconnected: true,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        let [
+            Response::SubscriptionReady {
+                registration: subscription,
+                ..
+            },
+            Response::PublicationReady {
+                registration: publication,
+                ..
+            },
+            Response::Error {
+                request,
+                code,
+                detail,
+            },
+        ] = answers[..]
+        else {
+            panic!("{answers:?}");
+        };
+        let stream_of = |id| {
+            driver
+                .registrations
+                .iter()
+                .find(|registration| registration.id == id)
+                .unwrap()
+                .stream
+        };
+        assert_eq!(stream_of(subscription), lane_id(&driver, 2));
+        assert_eq!(stream_of(publication), lane_id(&driver, 1));
+        assert_eq!(
+            request,
+            RequestId {
+                client,
+                sequence: 3
+            }
+        );
+        assert_eq!((code, detail), (ErrorCode::UnknownStream, 5));
+    }
+
+    /// A loss report names the aggregate's registration and the lane: a
+    /// subscription on lane 2 is verified when the report names lane 2,
+    /// and a report naming another lane retires the client.
+    #[test]
+    fn a_loss_report_names_the_aggregate_and_the_lane() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let aggregate = three_lanes(&mut driver);
         let lane = |number| Lane::try_new(number).unwrap();
         let registration = driver
             .stream_ref(aggregate.lane(lane(0)).unwrap())
@@ -3896,6 +4020,7 @@ mod tests {
                     Command::AddPublication {
                         sequence: 5,
                         stream: KEY,
+                        lane: Lane::ZERO,
                         allow_unconnected: true,
                     },
                 );

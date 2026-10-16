@@ -191,6 +191,7 @@ fn a_failure_at_any_lane_leaves_nothing() {
 fn removal_seals_every_lane() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let handle = driver.add_aggregate(aggregate(2, 3)).unwrap();
+    let mut observer = driver.connect().unwrap();
     let one = handle.lane(lane(1)).unwrap();
     assert!(matches!(
         driver.remove_stream(one),
@@ -205,11 +206,31 @@ fn removal_seals_every_lane() {
         Err(DriverError::LaneOfAggregate { .. })
     ));
     driver.remove_aggregate(&handle).unwrap();
+    // A retiring aggregate refuses issuance on every lane.
     for number in 0..3 {
         let stream = handle.lane(lane(number)).unwrap();
         assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
         assert!(driver.stream(stream).unwrap().retiring);
+        assert!(driver.publication(stream).is_err(), "lane {number}");
+        assert!(
+            driver.subscribe(stream, Role::Optional).is_err(),
+            "lane {number}"
+        );
     }
+    // Each lane's closing names its lane.
+    let _ = observer.poll(usize::MAX, |_| {});
+    let _ = driver.do_work().unwrap();
+    let _ = observer.poll(usize::MAX, |_| {});
+    let closed: Vec<_> = observer
+        .take_events()
+        .filter_map(|event| match event {
+            karyos_protocol::cnc::Event::PublicationClosed { stream, lane, .. } => {
+                Some((stream.stream_id, lane.get()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, [(2, 0), (2, 1), (2, 2)]);
     // A one-lane stream is removed as before.
     let single = driver.add_stream(stream(9)).unwrap();
     driver.remove_stream(single).unwrap();

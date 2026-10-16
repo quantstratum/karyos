@@ -25,6 +25,12 @@ const KEY: StreamKey = StreamKey {
     stream_id: 2,
     session_id: 1,
 };
+/// The lane of the stream: a one-lane aggregate on lane 1, which a
+/// command names.
+const LANE: Lane = match Lane::try_new(1) {
+    Ok(lane) => lane,
+    Err(_) => panic!("lane 1 exists"),
+};
 
 fn config() -> StreamConfig {
     StreamConfig {
@@ -35,7 +41,7 @@ fn config() -> StreamConfig {
             mtu: DEFAULT_MTU,
             max_reserved: MIN_TERM_LENGTH / 8,
             initial_term_id: TermId::new(7),
-            lane: Lane::try_new(1).unwrap(),
+            lane: LANE,
             session_id: KEY.session_id,
             stream_id: KEY.stream_id,
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
@@ -108,7 +114,7 @@ fn setup_stream(
     let stream = driver.add_stream(stream_config).unwrap();
     let mut client = driver.connect().unwrap();
     let _ = client
-        .add_subscription(KEY, SubscriberRole::Optional)
+        .add_subscription_on_lane(KEY, LANE, SubscriberRole::Optional)
         .unwrap();
     let _ = driver.do_work().unwrap();
     let mut handle = None;
@@ -352,7 +358,7 @@ fn second_subscription(
     policy: RejoinPolicy,
 ) -> ClientSubscription {
     let _ = client
-        .add_subscription(KEY, SubscriberRole::Optional)
+        .add_subscription_on_lane(KEY, LANE, SubscriberRole::Optional)
         .unwrap();
     let _ = driver.do_work().unwrap();
     let mut handle = None;
