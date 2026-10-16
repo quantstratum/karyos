@@ -260,6 +260,61 @@ fn a_long_trace_on_run_takes_bounded_time() {
     );
 }
 
+/// The child part of the wire workloads: the run starts this binary
+/// again with `--exact wire_child`, and the environment names the role.
+#[test]
+fn wire_child() {
+    if let Some(result) = karyos_bench::wire::process::child() {
+        result.unwrap_or_else(|cause| panic!("{cause}"));
+    }
+}
+
+/// Each wire role runs in its own process and both sample files come
+/// back complete (B3c-2).
+#[test]
+fn wire_roles_run_in_their_own_processes() {
+    use karyos_bench::manifest::{MtuRule, Shape};
+    use karyos_bench::samples::MISSING;
+    use karyos_bench::wire::process::run_processes;
+    use karyos_bench::wire::stage::{StageLoad, StageRun};
+    let dir = std::env::temp_dir().join(format!("karyos-wire-{}", std::process::id()));
+    for (shape, load) in [
+        (Shape::W1, StageLoad::Closed),
+        (Shape::W6, StageLoad::Closed),
+        (Shape::W1, StageLoad::Open { rate: 100_000 }),
+    ] {
+        let run = StageRun {
+            shape,
+            e_max: 64,
+            rule: MtuRule::CountsEnvelope,
+            load,
+            messages: 200,
+            warmup: 20,
+        };
+        let samples = run_processes(&run, &dir).unwrap_or_else(|cause| panic!("{shape}: {cause}"));
+        assert_eq!(samples.send.len(), 200);
+        assert_eq!(samples.receive.len(), 200);
+        assert!(
+            samples.send.iter().all(|sample| *sample != MISSING),
+            "{shape}"
+        );
+        if load == StageLoad::Closed {
+            assert!(
+                samples.receive.iter().all(|sample| *sample != MISSING),
+                "{shape}"
+            );
+        }
+        assert_eq!(samples.receive_callback.len(), 200);
+        // Not pinned until B4 (coordinator decision, ACS 15273).
+        assert!(samples.functional_only);
+        assert_eq!(
+            samples.functional_reasons.first().map(String::as_str),
+            Some("not pinned")
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The child part of the IPC workloads: the workload runs this binary
 /// again with `--exact ipc_child`, and the environment says what to do.
 #[cfg(target_os = "linux")]

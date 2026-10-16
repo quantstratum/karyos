@@ -4,10 +4,10 @@
 //! (`quantstratum-docs: karyos/design/measurement-harness.md` §5.3, M-5,
 //! H-5). [`send_role`] drives the TX half of one loopback endpoint and
 //! [`receive_role`] the RX half of another; [`run`] composes them on two
-//! threads of one process. Batch B3c-2 moves each role into its own
-//! process; until then every result of [`run`] is functional only (E4):
-//! eligibility needs one isolated core per process (measurement-harness.md
-//! 4.2), which two threads of one process are not.
+//! threads of one process, and `wire::process` runs each in its own.
+//! Every result of [`run`] is functional only (E4): eligibility needs one
+//! isolated core per process (measurement-harness.md 4.2), which two
+//! threads of one process are not.
 //!
 //! - **Send stage:** from the message's frames ready (stamped from its
 //!   [`Template`]) to the last `TxFrame::commit` of its datagrams; the
@@ -124,9 +124,11 @@ pub struct StageSamples {
     /// Messages each sequence stands for: the frames of a W5 datagram,
     /// one otherwise (M-5b).
     pub messages_per_sample: usize,
-    /// Always `true` for [`run`]: the two roles share a process, so the
-    /// result is functional only (E4) whatever the host.
+    /// Whether the result is functional only (E4): always `true` for
+    /// [`run`], whose two roles share a process, whatever the host.
     pub functional_only: bool,
+    /// Why the result is functional only; empty when it is not.
+    pub functional_reasons: Vec<String>,
     /// The local address of the receiving endpoint.
     pub receiver: SocketAddr,
 }
@@ -856,6 +858,7 @@ pub fn run<P: Protection + Sync>(
         backpressure: sent.backpressure,
         messages_per_sample: prepared.messages_per_sample,
         functional_only: true,
+        functional_reasons: vec!["the roles share one process".to_string()],
         receiver: receiver_address,
     })
 }

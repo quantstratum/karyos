@@ -51,6 +51,7 @@ fn every_shape_runs_closed_loop_over_loopback() {
             "{shape}"
         );
         assert!(samples.functional_only);
+        assert!(!samples.functional_reasons.is_empty());
         assert_eq!(samples.messages_per_sample == 1, shape != Shape::W5);
     }
 }
