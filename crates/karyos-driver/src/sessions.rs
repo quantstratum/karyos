@@ -9,6 +9,7 @@
 //! controls, the binding key and the time, and sends what it returns.
 
 pub mod receive;
+pub mod send;
 
 /// Where random challenge nonces come from (`karyos_sys::random` in the
 /// driver, a counter in tests).
