@@ -8,9 +8,9 @@
 //!
 //! - **Agents (DN-1).** [`SenderAgent`] and [`ReceiverAgent`] are plain
 //!   structs with one duty entry point, `do_work(now) -> work count`. They
-//!   own their state; the conductor reaches them only through their rings.
-//!   This phase gives them no network work: they serve conductor commands
-//!   (a ping, used by tests and by health checks, and `Stop`).
+//!   own their state; the conductor reaches them only through their rings
+//!   and their stop flag. This phase gives them no network work: they serve
+//!   a ping, used by tests and by health checks.
 //! - **Rings (DN-3).** Each agent has a command ring from the conductor and
 //!   an event ring to it ([`ring`]). The conductor reserves the reply's
 //!   event slot when it posts a command, so a reply never finds the ring
@@ -21,23 +21,31 @@
 //!   the conductor. [`AgentRunner`] owns the threads of the other modes:
 //!   one per agent ([`ThreadingMode::Dedicated`]) or one for both
 //!   ([`ThreadingMode::SharedNetwork`]). Whenever both agents share a
-//!   thread the receiver runs first in each iteration.
-//! - **Stop (DN-8).** [`AgentRunner::stop`] posts `Stop` to both agents
-//!   and joins their threads within a timeout; an agent that does not stop
-//!   in time is reported and its thread detached.
+//!   thread the receiver runs first in each iteration. Optional core
+//!   pinning in Dedicated mode (design §2.2) is not here; it comes with the
+//!   standalone driver's runner configuration (phase 8).
+//! - **Stop (DN-8).** Stop cannot be refused: each agent has a stop flag
+//!   ([`AgentLink::request_stop`]) that it checks at the start of every
+//!   cycle, whatever its rings hold. [`AgentRunner::stop`] sets both flags,
+//!   joins the threads within a timeout and hands the agents back; a thread
+//!   that does not stop in time is returned to the conductor
+//!   ([`LateAgent`]), never detached silently.
 //! - **Failure (DN-9).** An agent that returns an error or panics stops its
-//!   thread; the runner reports it, and the conductor treats it as fatal
-//!   for the driver.
+//!   thread; the runner reports it and still hands the agent back, so its
+//!   resources can be released. The conductor treats it as fatal for the
+//!   driver.
 
 pub mod ring;
 
+use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ring::{Reservation, RingReceiver, RingSender};
+use ring::{PostError, Reservation, RingReceiver, RingSender};
 
 /// Which network agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,12 +70,22 @@ pub enum ThreadingMode {
 /// Errors of the network agents and their runner.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AgentError {
+    /// A configuration value is outside its range.
+    #[error("invalid agent configuration: {0}")]
+    InvalidConfig(&'static str),
     /// The command ring or the reply slot of the event ring is full.
     #[error("the {0:?} agent's rings are full")]
     Busy(AgentKind),
     /// The agent's rings are disconnected: it stopped or failed.
     #[error("the {0:?} agent is gone")]
     Gone(AgentKind),
+    /// A ring invariant broke (a held slot found the ring full, or a
+    /// reservation of another ring).
+    #[error("ring invariant broken for the {0:?} agent")]
+    Invariant(AgentKind),
+    /// A work count overflowed.
+    #[error("the {0:?} agent's work count overflowed")]
+    CountOverflow(AgentKind),
     /// The runner could not start a thread.
     #[error("cannot start an agent thread: {0}")]
     Spawn(String),
@@ -78,10 +96,6 @@ pub enum AgentError {
     /// An agent panicked; its thread stopped.
     #[error("the {0:?} agent panicked")]
     Panicked(AgentKind),
-    /// Agents that did not stop within the timeout; their threads were
-    /// detached.
-    #[error("agents did not stop in time: {0:?}")]
-    StopTimeout(Vec<AgentKind>),
 }
 
 /// How an agent thread waits after an iteration without work. The driver
@@ -115,11 +129,11 @@ impl IdleStrategy for YieldThenSleep {
 /// Configuration of the agents and their rings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentConfig {
-    /// Entries of each agent's command ring.
+    /// Entries of each agent's command ring, at least 1.
     pub command_capacity: usize,
-    /// Entries of each agent's event ring.
+    /// Entries of each agent's event ring, at least 1.
     pub event_capacity: usize,
-    /// Commands an agent serves per duty cycle.
+    /// Commands an agent serves per duty cycle, at least 1.
     pub command_budget: u32,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
@@ -139,6 +153,24 @@ impl Default for AgentConfig {
     }
 }
 
+impl AgentConfig {
+    /// The ring capacities, checked.
+    fn validate(&self) -> Result<(NonZeroUsize, NonZeroUsize), AgentError> {
+        let commands = NonZeroUsize::new(self.command_capacity).ok_or(
+            AgentError::InvalidConfig("command_capacity must be at least 1"),
+        )?;
+        let events = NonZeroUsize::new(self.event_capacity).ok_or(AgentError::InvalidConfig(
+            "event_capacity must be at least 1",
+        ))?;
+        if self.command_budget == 0 {
+            return Err(AgentError::InvalidConfig(
+                "command_budget must be at least 1",
+            ));
+        }
+        Ok((commands, events))
+    }
+}
+
 /// A conductor command. Each carries the reservation of its reply.
 #[derive(Debug)]
 pub enum AgentCommand {
@@ -149,17 +181,12 @@ pub enum AgentCommand {
         /// Echoed in the reply.
         token: u64,
     },
-    /// Stop: answer [`AgentEvent::Stopped`] and do no further work.
-    Stop {
-        /// The reply's slot.
-        reply: Reservation,
-    },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
     Panic,
     /// Test only: block the duty cycle until the flag is cleared.
     #[cfg(test)]
-    Block(Arc<std::sync::atomic::AtomicBool>),
+    Block(Arc<AtomicBool>),
 }
 
 /// An agent's event to the conductor.
@@ -172,28 +199,53 @@ pub enum AgentEvent {
         /// The ping's token.
         token: u64,
     },
-    /// The agent stopped.
+    /// The agent saw its stop flag (best effort: posted only when the ring
+    /// has a free slot; the runner's join is the authority).
     Stopped {
         /// The agent.
         agent: AgentKind,
     },
 }
 
-/// What an agent has from the conductor: its rings and its state.
+/// What an agent has from the conductor: its rings, its stop flag and its
+/// state.
 #[derive(Debug)]
 struct AgentCore {
     kind: AgentKind,
     commands: RingReceiver<AgentCommand>,
     events: RingSender<AgentEvent>,
     budget: u32,
+    stop: Arc<AtomicBool>,
     stopped: bool,
+    /// Test only: records each duty cycle's agent, in call order.
+    #[cfg(test)]
+    calls: Option<Arc<std::sync::Mutex<Vec<AgentKind>>>>,
 }
 
 impl AgentCore {
-    /// Serves up to the budget's commands; returns how many.
+    /// One duty cycle: the stop flag first, then up to the budget's
+    /// commands; returns how many were served.
     fn serve_commands(&mut self) -> Result<u32, AgentError> {
+        #[cfg(test)]
+        if let Some(calls) = &self.calls
+            && let Ok(mut calls) = calls.lock()
+        {
+            calls.push(self.kind);
+        }
+        if self.stopped {
+            return Ok(0);
+        }
+        if self.stop.load(Ordering::Acquire) {
+            self.stopped = true;
+            // Informational: the runner's join decides that the agent
+            // stopped.
+            let _ = self
+                .events
+                .try_post(AgentEvent::Stopped { agent: self.kind });
+            return Ok(0);
+        }
         let mut served = 0u32;
-        while served < self.budget && !self.stopped {
+        while served < self.budget {
             let command = match self.commands.try_take() {
                 Ok(Some(command)) => command,
                 Ok(None) => break,
@@ -203,23 +255,27 @@ impl AgentCore {
                     break;
                 }
             };
-            served += 1;
+            served = served
+                .checked_add(1)
+                .ok_or(AgentError::CountOverflow(self.kind))?;
             match command {
                 AgentCommand::Ping { reply, token } => {
                     let event = AgentEvent::Pong {
                         agent: self.kind,
                         token,
                     };
-                    self.events
-                        .post(reply, event)
-                        .map_err(|_| AgentError::Gone(self.kind))?;
-                }
-                AgentCommand::Stop { reply } => {
-                    self.stopped = true;
-                    // The conductor may already be gone at shutdown.
-                    let _ = self
-                        .events
-                        .post(reply, AgentEvent::Stopped { agent: self.kind });
+                    match self.events.post(reply, event) {
+                        Ok(()) => {}
+                        // The conductor dropped its links: stop, nobody
+                        // reads the reply.
+                        Err(PostError::Gone(_)) => {
+                            self.stopped = true;
+                            break;
+                        }
+                        Err(PostError::Full(_) | PostError::Foreign(_)) => {
+                            return Err(AgentError::Invariant(self.kind));
+                        }
+                    }
                 }
                 #[cfg(test)]
                 AgentCommand::Panic => {
@@ -259,13 +315,14 @@ impl SenderAgent {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Gone`] when the conductor's rings are gone.
+    /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         let _ = now;
         self.core.serve_commands()
     }
 
-    /// Whether the agent served `Stop`.
+    /// Whether the agent stopped: its flag was set or its conductor is
+    /// gone.
     #[must_use]
     pub fn is_stopped(&self) -> bool {
         self.core.stopped
@@ -277,13 +334,14 @@ impl ReceiverAgent {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Gone`] when the conductor's rings are gone.
+    /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         let _ = now;
         self.core.serve_commands()
     }
 
-    /// Whether the agent served `Stop`.
+    /// Whether the agent stopped: its flag was set or its conductor is
+    /// gone.
     #[must_use]
     pub fn is_stopped(&self) -> bool {
         self.core.stopped
@@ -310,7 +368,9 @@ impl NetworkAgents {
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         let received = self.receiver.do_work(now)?;
         let sent = self.sender.do_work(now)?;
-        Ok(received.saturating_add(sent))
+        received
+            .checked_add(sent)
+            .ok_or(AgentError::CountOverflow(AgentKind::Sender))
     }
 
     /// Whether both agents stopped.
@@ -318,15 +378,23 @@ impl NetworkAgents {
     pub fn is_stopped(&self) -> bool {
         self.sender.is_stopped() && self.receiver.is_stopped()
     }
+
+    /// Test only: records every duty cycle's agent into `calls`.
+    #[cfg(test)]
+    fn record_calls(&mut self, calls: &Arc<std::sync::Mutex<Vec<AgentKind>>>) {
+        self.sender.core.calls = Some(Arc::clone(calls));
+        self.receiver.core.calls = Some(Arc::clone(calls));
+    }
 }
 
-/// The conductor's end of one agent's rings.
+/// The conductor's end of one agent's rings and its stop flag.
 #[derive(Debug)]
 pub struct AgentLink {
     kind: AgentKind,
     commands: RingSender<AgentCommand>,
     events: RingSender<AgentEvent>,
     received: RingReceiver<AgentEvent>,
+    stop: Arc<AtomicBool>,
 }
 
 impl AgentLink {
@@ -336,14 +404,18 @@ impl AgentLink {
     /// # Errors
     ///
     /// [`AgentError::Busy`] when the command ring or the reply slot is
-    /// full, [`AgentError::Gone`] when the agent is gone.
+    /// full, [`AgentError::Gone`] when the agent is gone,
+    /// [`AgentError::Invariant`] for a broken ring invariant.
     pub fn post(&self, make: impl FnOnce(Reservation) -> AgentCommand) -> Result<(), AgentError> {
         let busy = AgentError::Busy(self.kind);
         let reply = self.events.reserve().ok_or(busy.clone())?;
         let slot = self.commands.reserve().ok_or(busy)?;
         self.commands
             .post(slot, make(reply))
-            .map_err(|_| AgentError::Gone(self.kind))
+            .map_err(|error| match error {
+                PostError::Gone(_) => AgentError::Gone(self.kind),
+                PostError::Full(_) | PostError::Foreign(_) => AgentError::Invariant(self.kind),
+            })
     }
 
     /// Posts a ping carrying `token`.
@@ -353,6 +425,12 @@ impl AgentLink {
     /// As [`AgentLink::post`].
     pub fn ping(&self, token: u64) -> Result<(), AgentError> {
         self.post(|reply| AgentCommand::Ping { reply, token })
+    }
+
+    /// Asks the agent to stop at its next cycle. It cannot be refused: a
+    /// flag, not a command.
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Release);
     }
 
     /// Takes the agent's oldest event.
@@ -379,29 +457,38 @@ pub struct AgentLinks {
 
 /// Creates both agents and the conductor's links to them. Every ring is
 /// allocated here; the duty cycles allocate nothing.
-#[must_use]
-pub fn network_agents(config: AgentConfig) -> (NetworkAgents, AgentLinks) {
+///
+/// # Errors
+///
+/// [`AgentError::InvalidConfig`] for a zero capacity or budget.
+pub fn network_agents(config: AgentConfig) -> Result<(NetworkAgents, AgentLinks), AgentError> {
+    let (command_capacity, event_capacity) = config.validate()?;
     let make = |kind| {
-        let (commands, command_receiver) = ring::ring(config.command_capacity);
-        let (events, event_receiver) = ring::ring(config.event_capacity);
+        let (commands, command_receiver) = ring::ring(command_capacity);
+        let (events, event_receiver) = ring::ring(event_capacity);
+        let stop = Arc::new(AtomicBool::new(false));
         let core = AgentCore {
             kind,
             commands: command_receiver,
             events: events.clone_sender(),
             budget: config.command_budget,
+            stop: Arc::clone(&stop),
             stopped: false,
+            #[cfg(test)]
+            calls: None,
         };
         let link = AgentLink {
             kind,
             commands,
             events,
             received: event_receiver,
+            stop,
         };
         (core, link)
     };
     let (sender_core, sender_link) = make(AgentKind::Sender);
     let (receiver_core, receiver_link) = make(AgentKind::Receiver);
-    (
+    Ok((
         NetworkAgents {
             sender: SenderAgent { core: sender_core },
             receiver: ReceiverAgent {
@@ -412,7 +499,7 @@ pub fn network_agents(config: AgentConfig) -> (NetworkAgents, AgentLinks) {
             sender: sender_link,
             receiver: receiver_link,
         },
-    )
+    ))
 }
 
 /// An agent's state as the runner publishes it.
@@ -420,22 +507,8 @@ const RUNNING: u8 = 0;
 const STOPPED: u8 = 1;
 const FAILED: u8 = 2;
 
-/// One runner thread: the agents it drives and its state cell.
-#[derive(Debug)]
-struct AgentThread {
-    kinds: Vec<AgentKind>,
-    state: Arc<AtomicU8>,
-    handle: JoinHandle<Result<(), AgentError>>,
-}
-
-/// The threads of the Dedicated and Shared network modes (DN-2).
-#[derive(Debug)]
-pub struct AgentRunner {
-    threads: Vec<AgentThread>,
-    stop_timeout: Duration,
-}
-
 /// What a runner thread drives.
+#[derive(Debug)]
 enum Work {
     Sender(SenderAgent),
     Receiver(ReceiverAgent),
@@ -460,7 +533,9 @@ impl Work {
                 // The receiver first, as `NetworkAgents::do_work`.
                 let received = guarded(AgentKind::Receiver, || agents.receiver.do_work(now))?;
                 let sent = guarded(AgentKind::Sender, || agents.sender.do_work(now))?;
-                Ok(received.saturating_add(sent))
+                received
+                    .checked_add(sent)
+                    .ok_or(AgentError::CountOverflow(AgentKind::Sender))
             }
         }
     }
@@ -474,22 +549,148 @@ impl Work {
     }
 }
 
+/// A runner thread's result: its agents and the failure that stopped it,
+/// if any. `None` when the thread was never given work.
+type ThreadResult = Option<(Work, Option<AgentError>)>;
+
+/// One runner thread: the agents it drives and its state cell.
+#[derive(Debug)]
+struct AgentThread {
+    kinds: Vec<AgentKind>,
+    state: Arc<AtomicU8>,
+    handle: JoinHandle<ThreadResult>,
+}
+
+/// The threads of the Dedicated and Shared network modes (DN-2).
+#[derive(Debug)]
+pub struct AgentRunner {
+    threads: Vec<AgentThread>,
+    stops: [Arc<AtomicBool>; 2],
+    stop_timeout: Duration,
+}
+
+/// Why [`AgentRunner::start`] failed. The agents come back, unstarted.
+#[derive(Debug)]
+pub struct StartError {
+    /// What failed.
+    pub error: AgentError,
+    /// The agents, as they were given ([`Stopped::into_agents`]).
+    pub agents: Stopped,
+}
+
+/// What [`AgentRunner::stop`] got back.
+#[derive(Debug, Default)]
+pub struct Stopped {
+    /// The sender agent, unless its thread is late or lost it.
+    pub sender: Option<SenderAgent>,
+    /// The receiver agent, unless its thread is late or lost it.
+    pub receiver: Option<ReceiverAgent>,
+    /// The failures that stopped threads (DN-9).
+    pub failures: Vec<AgentError>,
+    /// Threads still running after the timeout, for the conductor to wait
+    /// on or abandon.
+    pub late: Vec<LateAgent>,
+}
+
+impl Stopped {
+    /// Both agents, when both came back.
+    #[must_use]
+    pub fn into_agents(self) -> Option<NetworkAgents> {
+        Some(NetworkAgents {
+            sender: self.sender?,
+            receiver: self.receiver?,
+        })
+    }
+
+    fn take(&mut self, work: Work) {
+        match work {
+            Work::Sender(agent) => self.sender = Some(agent),
+            Work::Receiver(agent) => self.receiver = Some(agent),
+            Work::Both(agents) => {
+                self.sender = Some(agents.sender);
+                self.receiver = Some(agents.receiver);
+            }
+        }
+    }
+
+    fn absorb(&mut self, thread: AgentThread) {
+        let kind = thread.kinds.first().copied().unwrap_or(AgentKind::Receiver);
+        match thread.handle.join() {
+            Ok(Some((work, failure))) => {
+                self.take(work);
+                self.failures.extend(failure);
+            }
+            Ok(None) => {}
+            // A panic outside a duty cycle: the agent is lost with it.
+            Err(_) => self.failures.push(AgentError::Panicked(kind)),
+        }
+    }
+}
+
+/// A runner thread that did not stop within the timeout.
+#[derive(Debug)]
+pub struct LateAgent {
+    thread: AgentThread,
+}
+
+impl LateAgent {
+    /// The agents it drives.
+    #[must_use]
+    pub fn kinds(&self) -> &[AgentKind] {
+        &self.thread.kinds
+    }
+
+    /// Whether it has stopped since.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.handle.is_finished()
+    }
+
+    /// Waits for it to stop and takes its agents back.
+    #[must_use]
+    pub fn join(self) -> Stopped {
+        let mut stopped = Stopped::default();
+        stopped.absorb(self.thread);
+        stopped
+    }
+}
+
 impl AgentRunner {
     /// Starts the agents' threads in `mode`, each with an idle strategy
-    /// from `idle`. On error nothing is left running.
+    /// from `idle`. Every thread is started before any agent is handed
+    /// over, so a failed start leaves nothing running and returns the
+    /// agents.
     ///
     /// # Errors
     ///
-    /// [`AgentError::SharedMode`] for [`ThreadingMode::Shared`] (the
-    /// caller drives those agents) and [`AgentError::Spawn`].
+    /// [`StartError`] with [`AgentError::SharedMode`] for
+    /// [`ThreadingMode::Shared`] (the caller drives those agents) or
+    /// [`AgentError::Spawn`].
+    #[expect(
+        clippy::result_large_err,
+        reason = "the agents come back by value, as the endpoint halves of SplitError; start is a cold control path call"
+    )]
     pub fn start<I: IdleStrategy + 'static>(
         mode: ThreadingMode,
         agents: NetworkAgents,
         config: AgentConfig,
         idle: impl Fn() -> I,
-    ) -> Result<Self, AgentError> {
+    ) -> Result<Self, StartError> {
+        let stops = [
+            Arc::clone(&agents.sender.core.stop),
+            Arc::clone(&agents.receiver.core.stop),
+        ];
         let work = match mode {
-            ThreadingMode::Shared => return Err(AgentError::SharedMode),
+            ThreadingMode::Shared => {
+                return Err(StartError {
+                    error: AgentError::SharedMode,
+                    agents: Stopped {
+                        sender: Some(agents.sender),
+                        receiver: Some(agents.receiver),
+                        ..Stopped::default()
+                    },
+                });
+            }
             ThreadingMode::Dedicated => vec![
                 (vec![AgentKind::Receiver], Work::Receiver(agents.receiver)),
                 (vec![AgentKind::Sender], Work::Sender(agents.sender)),
@@ -499,32 +700,62 @@ impl AgentRunner {
                 Work::Both(agents),
             )],
         };
-        let mut runner = Self {
-            threads: Vec::with_capacity(work.len()),
-            stop_timeout: config.stop_timeout,
-        };
-        for (kinds, work) in work {
+        let mut threads = Vec::with_capacity(work.len());
+        let mut handoffs = Vec::with_capacity(work.len());
+        let mut failure = None;
+        for (kinds, _) in &work {
             let state = Arc::new(AtomicU8::new(RUNNING));
             let thread_state = Arc::clone(&state);
             let strategy = idle();
+            let (handoff, waiting) = mpsc::channel::<Work>();
             let name = match kinds.as_slice() {
                 [AgentKind::Sender] => "karyos-sender",
                 [AgentKind::Receiver] => "karyos-receiver",
                 _ => "karyos-network",
             };
-            // On error, a thread already started stops once the caller
-            // drops its links: its command ring disconnects.
-            let handle = std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name(name.to_owned())
-                .spawn(move || run(work, strategy, &thread_state))
-                .map_err(|error| AgentError::Spawn(error.to_string()))?;
-            runner.threads.push(AgentThread {
-                kinds,
-                state,
-                handle,
-            });
+                .spawn(move || {
+                    // No work comes when another thread failed to start.
+                    let work = waiting.recv().ok()?;
+                    Some(run(work, strategy, &thread_state))
+                });
+            match spawned {
+                Ok(handle) => {
+                    threads.push(AgentThread {
+                        kinds: kinds.clone(),
+                        state,
+                        handle,
+                    });
+                    handoffs.push(handoff);
+                }
+                Err(error) => {
+                    failure = Some(AgentError::Spawn(error.to_string()));
+                    break;
+                }
+            }
         }
-        Ok(runner)
+        if let Some(error) = failure {
+            // Release the started threads without work, and wait for them.
+            drop(handoffs);
+            for thread in threads {
+                let _ = thread.handle.join();
+            }
+            let mut agents = Stopped::default();
+            for (_, work) in work {
+                agents.take(work);
+            }
+            return Err(StartError { error, agents });
+        }
+        for ((_, work), handoff) in work.into_iter().zip(&handoffs) {
+            // The thread waits on its receiver, so the handoff succeeds.
+            let _ = handoff.send(work);
+        }
+        Ok(Self {
+            threads,
+            stops,
+            stop_timeout: config.stop_timeout,
+        })
     }
 
     /// The agents whose thread failed (an error or a panic) so far.
@@ -537,22 +768,18 @@ impl AgentRunner {
             .collect()
     }
 
-    /// Stops both agents (DN-8): posts `Stop` to each link, then joins the
-    /// threads within the configured timeout.
-    ///
-    /// # Errors
-    ///
-    /// [`AgentError::StopTimeout`] naming the agents still running, whose
-    /// threads are detached; otherwise the first agent failure
-    /// ([`AgentError::Panicked`] or the agent's own error).
-    pub fn stop(self, links: &AgentLinks) -> Result<(), AgentError> {
-        for link in [&links.receiver, &links.sender] {
-            // A failed agent's rings may be gone; its failure is reported
-            // by its join below.
-            let _ = link.post(|reply| AgentCommand::Stop { reply });
+    /// Stops both agents (DN-8): sets their stop flags, which no full ring
+    /// can refuse, waits up to the configured timeout for their threads and
+    /// hands the agents back. A thread still running is returned in
+    /// [`Stopped::late`]; a `stop_timeout` too large for the clock waits
+    /// without a deadline.
+    #[must_use]
+    pub fn stop(self) -> Stopped {
+        for stop in &self.stops {
+            stop.store(true, Ordering::Release);
         }
-        let deadline = Instant::now() + self.stop_timeout;
-        while Instant::now() < deadline
+        let deadline = Instant::now().checked_add(self.stop_timeout);
+        while deadline.is_none_or(|deadline| Instant::now() < deadline)
             && !self
                 .threads
                 .iter()
@@ -560,43 +787,36 @@ impl AgentRunner {
         {
             std::thread::sleep(Duration::from_millis(1));
         }
-        let mut late = Vec::new();
-        let mut failure = None;
+        let mut stopped = Stopped::default();
         for thread in self.threads {
-            if !thread.handle.is_finished() {
-                late.extend(thread.kinds);
-                continue;
-            }
-            let kind = thread.kinds.first().copied().unwrap_or(AgentKind::Receiver);
-            // A panic outside a duty cycle is still the thread's agent's.
-            let result = thread
-                .handle
-                .join()
-                .unwrap_or(Err(AgentError::Panicked(kind)));
-            if let Err(error) = result {
-                failure.get_or_insert(error);
+            if thread.handle.is_finished() {
+                stopped.absorb(thread);
+            } else {
+                stopped.late.push(LateAgent { thread });
             }
         }
-        if !late.is_empty() {
-            return Err(AgentError::StopTimeout(late));
-        }
-        failure.map_or(Ok(()), Err)
+        stopped
     }
 }
 
-/// A runner thread's loop: duty cycles until the agents stop or fail.
-fn run<I: IdleStrategy>(mut work: Work, mut idle: I, state: &AtomicU8) -> Result<(), AgentError> {
+/// A runner thread's loop: duty cycles until the agents stop or fail; the
+/// agents come back with the failure, if any.
+fn run<I: IdleStrategy>(
+    mut work: Work,
+    mut idle: I,
+    state: &AtomicU8,
+) -> (Work, Option<AgentError>) {
     loop {
         let now = karyos_sys::host_clock::host_monotonic_ns();
         match work.do_work(now) {
             Ok(_) if work.is_stopped() => {
                 state.store(STOPPED, Ordering::Release);
-                return Ok(());
+                return (work, None);
             }
             Ok(count) => idle.idle(count),
             Err(error) => {
                 state.store(FAILED, Ordering::Release);
-                return Err(error);
+                return (work, Some(error));
             }
         }
     }

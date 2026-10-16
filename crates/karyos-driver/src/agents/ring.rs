@@ -2,23 +2,31 @@
 
 //! The bounded rings between the conductor and the network agents
 //! (`quantstratum-docs: karyos/design/driver-network-agents.md` §2.3,
-//! DN-3): one producer, one consumer, capacity fixed at creation.
+//! DN-3): capacity fixed at creation, at least one entry.
 //!
 //! A ring is a `std::sync::mpsc::sync_channel` of the ring's capacity (its
 //! buffer is allocated once, at creation) with one shared count of the
 //! slots in use: occupied by a queued item, or reserved for one. A slot is
 //! taken with a compare-and-swap below the capacity, so the channel itself
-//! is never full and a send never blocks. A [`Reservation`] holds a slot
-//! for a later item, possibly posted by another thread: the conductor
-//! reserves the reply slot of a command when it posts the command, so the
-//! agent's reply never finds the ring full. Dropping an unused reservation
-//! frees its slot.
+//! is never full and a send never blocks. The invariant is "queued items
+//! never exceed the count": a producer takes its slot (Acquire) before it
+//! sends, and the consumer frees a slot (Release) only after it has taken
+//! the item, so a producer that sees the freed slot also finds the
+//! channel's room.
+//!
+//! A [`Reservation`] holds a slot of one ring for a later item, possibly
+//! posted by another thread: the conductor reserves the reply slot of a
+//! command when it posts the command, so the agent's reply never finds the
+//! ring full. A reservation is tied to its ring; posting it into another
+//! ring is refused. Dropping an unused reservation frees its slot.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 
-/// A ring's producer.
+/// A ring's producer. A ring may have several producer handles
+/// ([`RingSender::clone_sender`]) sharing its slots.
 #[derive(Debug)]
 pub struct RingSender<T> {
     channel: SyncSender<T>,
@@ -37,17 +45,30 @@ pub struct RingReceiver<T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Disconnected;
 
-/// One slot of a ring, held for one item.
+/// Why [`RingSender::post`] returned its item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostError<T> {
+    /// The consumer is gone.
+    Gone(T),
+    /// The reservation belongs to another ring.
+    Foreign(T),
+    /// No slot was free ([`RingSender::try_post`]), or the channel was full
+    /// although the slot was held ([`RingSender::post`]: a broken
+    /// invariant, never expected).
+    Full(T),
+}
+
+/// One slot of one ring, held for one item.
 #[derive(Debug)]
 pub struct Reservation {
     used: Arc<AtomicUsize>,
     spent: bool,
 }
 
-/// A ring of `capacity` items, at least one.
+/// A ring of `capacity` items.
 #[must_use]
-pub fn ring<T>(capacity: usize) -> (RingSender<T>, RingReceiver<T>) {
-    let capacity = capacity.max(1);
+pub fn ring<T>(capacity: NonZeroUsize) -> (RingSender<T>, RingReceiver<T>) {
+    let capacity = capacity.get();
     let (channel, receiver) = sync_channel(capacity);
     let used = Arc::new(AtomicUsize::new(0));
     (
@@ -67,17 +88,13 @@ impl<T> RingSender<T> {
     /// Holds one slot for a later item; `None` when every slot is used.
     #[must_use]
     pub fn reserve(&self) -> Option<Reservation> {
-        let mut used = self.used.load(Ordering::Relaxed);
+        let mut used = self.used.load(Ordering::Acquire);
         loop {
-            if used >= self.capacity {
-                return None;
-            }
-            match self.used.compare_exchange_weak(
-                used,
-                used + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            let next = used.checked_add(1).filter(|&next| next <= self.capacity)?;
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::Acquire, Ordering::Acquire)
+            {
                 Ok(_) => {
                     return Some(Reservation {
                         used: Arc::clone(&self.used),
@@ -89,36 +106,40 @@ impl<T> RingSender<T> {
         }
     }
 
-    /// Posts `item` into a slot `reservation` holds. Returns the item if
-    /// the consumer is gone.
+    /// Posts `item` into the slot `reservation` holds.
     ///
     /// # Errors
     ///
-    /// The item, when the consumer was dropped.
-    pub fn post(&self, mut reservation: Reservation, item: T) -> Result<(), T> {
-        // The slot moves from reserved to occupied: the count is unchanged.
-        reservation.spent = true;
-        self.channel.try_send(item).map_err(|error| {
-            // Disconnected (never full: the slot was held). The slot is
-            // released, as the consumer will not take it.
-            reservation.used.fetch_sub(1, Ordering::Relaxed);
-            match error {
-                std::sync::mpsc::TrySendError::Full(item)
-                | std::sync::mpsc::TrySendError::Disconnected(item) => item,
+    /// [`PostError::Foreign`] for a reservation of another ring (its slot is
+    /// freed), [`PostError::Gone`] when the consumer was dropped and
+    /// [`PostError::Full`] for a broken invariant; the item comes back.
+    pub fn post(&self, mut reservation: Reservation, item: T) -> Result<(), PostError<T>> {
+        if !Arc::ptr_eq(&reservation.used, &self.used) {
+            return Err(PostError::Foreign(item));
+        }
+        match self.channel.try_send(item) {
+            Ok(()) => {
+                // The slot moves from reserved to occupied: the count is
+                // unchanged.
+                reservation.spent = true;
+                Ok(())
             }
-        })
+            // The reservation's drop frees the slot the item did not take.
+            Err(TrySendError::Disconnected(item)) => Err(PostError::Gone(item)),
+            Err(TrySendError::Full(item)) => Err(PostError::Full(item)),
+        }
     }
 
-    /// Reserves and posts `item`; returns it when no slot is free or the
-    /// consumer is gone.
+    /// Reserves and posts `item`.
     ///
     /// # Errors
     ///
-    /// The item, unposted.
-    pub fn try_post(&self, item: T) -> Result<(), T> {
+    /// [`PostError::Full`] when no slot is free, or as
+    /// [`RingSender::post`]; the item comes back unposted.
+    pub fn try_post(&self, item: T) -> Result<(), PostError<T>> {
         match self.reserve() {
             Some(reservation) => self.post(reservation, item),
-            None => Err(item),
+            None => Err(PostError::Full(item)),
         }
     }
 
@@ -149,7 +170,7 @@ impl<T> RingReceiver<T> {
     pub fn try_take(&self) -> Result<Option<T>, Disconnected> {
         match self.channel.try_recv() {
             Ok(item) => {
-                self.used.fetch_sub(1, Ordering::Relaxed);
+                self.used.fetch_sub(1, Ordering::Release);
                 Ok(Some(item))
             }
             Err(TryRecvError::Empty) => Ok(None),
@@ -161,7 +182,7 @@ impl<T> RingReceiver<T> {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.spent {
-            self.used.fetch_sub(1, Ordering::Relaxed);
+            self.used.fetch_sub(1, Ordering::Release);
         }
     }
 }
