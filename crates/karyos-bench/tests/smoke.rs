@@ -29,13 +29,13 @@ fn every_workload_runs_and_reports() {
         );
         if matches!(
             config.workload,
-            Workload::Throughput | Workload::CleanerThroughput
+            Workload::Throughput | Workload::CleanerThroughput | Workload::IpcThroughput
         ) {
             assert!(measurement.latency.is_none());
         } else {
             assert!(report::field(&line, "p50_ns").is_some(), "{line}");
         }
-        if config.workload == Workload::PingPong {
+        if matches!(config.workload, Workload::PingPong | Workload::IpcPingPong) {
             assert!(text.contains("round trip"), "{text}");
             assert!(text.contains("symmetric paths"), "{text}");
         }
@@ -174,4 +174,14 @@ fn a_long_trace_on_run_takes_bounded_time() {
         "trace-on took {elapsed:?} for {} messages",
         config.iterations
     );
+}
+
+/// The child part of the IPC workloads: the workload runs this binary
+/// again with `--exact ipc_child`, and the environment says what to do.
+#[cfg(target_os = "linux")]
+#[test]
+fn ipc_child() {
+    if let Some(result) = karyos_bench::ipc::child() {
+        result.unwrap_or_else(|cause| panic!("{cause}"));
+    }
 }

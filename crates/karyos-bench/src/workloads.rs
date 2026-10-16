@@ -58,11 +58,17 @@ pub enum Workload {
     TraceOff,
     /// Offer and poll with publication and subscriber trace hooks attached.
     TraceOn,
+    /// A round trip with the echo in another process, over an IPC driver
+    /// (Linux).
+    IpcPingPong,
+    /// One publisher and a subscriber in another process, over an IPC
+    /// driver (Linux).
+    IpcThroughput,
 }
 
 impl Workload {
     /// Every workload.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::OfferPoll,
         Self::Claim,
         Self::PingPong,
@@ -73,6 +79,8 @@ impl Workload {
         Self::ReceiveDuplicate,
         Self::TraceOff,
         Self::TraceOn,
+        Self::IpcPingPong,
+        Self::IpcThroughput,
     ];
 
     /// Its name on the command line and in the history.
@@ -89,6 +97,8 @@ impl Workload {
             Self::ReceiveDuplicate => "receive-duplicate",
             Self::TraceOff => "trace-off",
             Self::TraceOn => "trace-on",
+            Self::IpcPingPong => "ipc-ping-pong",
+            Self::IpcThroughput => "ipc-throughput",
         }
     }
 
@@ -172,12 +182,12 @@ impl fmt::Display for BenchError {
 
 impl std::error::Error for BenchError {}
 
-fn error(context: &str, cause: impl fmt::Display) -> BenchError {
+pub(crate) fn error(context: &str, cause: impl fmt::Display) -> BenchError {
     BenchError(format!("{context}: {cause}"))
 }
 
 /// The smallest positive difference between consecutive clock readings.
-fn resolution() -> u64 {
+pub(crate) fn resolution() -> u64 {
     let mut smallest = u64::MAX;
     for _ in 0..1000 {
         let start = Instant::now();
@@ -191,12 +201,16 @@ fn resolution() -> u64 {
     smallest
 }
 
-fn histogram() -> Result<Histogram, BenchError> {
+pub(crate) fn histogram() -> Result<Histogram, BenchError> {
     // Three significant digits up to one minute, in nanoseconds.
     Histogram::new(3, 60_000_000_000, 1).map_err(|cause| error("histogram", cause))
 }
 
-fn record(histogram: &mut Histogram, nanos: u128, resolution: u64) -> Result<(), BenchError> {
+pub(crate) fn record(
+    histogram: &mut Histogram,
+    nanos: u128,
+    resolution: u64,
+) -> Result<(), BenchError> {
     let min = i64::try_from(nanos).unwrap_or(i64::MAX);
     let max = min.saturating_add(i64::try_from(resolution).unwrap_or(i64::MAX));
     histogram
@@ -266,6 +280,15 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
         Workload::CleanerThroughput => cleaner_throughput(config),
         Workload::Receive => receive_frames(config, false),
         Workload::ReceiveDuplicate => receive_frames(config, true),
+        #[cfg(target_os = "linux")]
+        Workload::IpcPingPong => crate::ipc::ping_pong(config),
+        #[cfg(target_os = "linux")]
+        Workload::IpcThroughput => crate::ipc::throughput(config),
+        #[cfg(not(target_os = "linux"))]
+        Workload::IpcPingPong | Workload::IpcThroughput => Err(BenchError(format!(
+            "{} needs Linux: the driver's IPC mode exists there only",
+            config.workload.name()
+        ))),
     }
 }
 
