@@ -78,7 +78,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 stream_id: target.stream_id,
                 session_id: target.session_id,
             };
-            let (base, generation) = (target.base, target.generation.get());
+            let (base, generation, incarnation) =
+                (target.base, target.generation.get(), target.incarnation);
             match reserved {
                 Some((export, participant, handover)) => {
                     if let Some(ledger) = self.ledger_mut(client) {
@@ -91,6 +92,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             state: GrantState::Held,
                             sent: false,
                             generation,
+                            incarnation,
                             fence_at,
                             fenced: false,
                         });
@@ -227,15 +229,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
             return false;
         };
-        let conductor = if stream.generation.get() == grant.generation {
-            &mut stream.conductor
-        } else if let Some(retained) = stream
-            .retained
-            .iter_mut()
-            .find(|retained| retained.generation.get() == grant.generation)
-        {
-            &mut retained.conductor
-        } else {
+        let Some(conductor) = stream.grant_conductor(grant.incarnation, grant.generation) else {
             return false;
         };
         match grant.participant {

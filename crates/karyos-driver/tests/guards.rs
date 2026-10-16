@@ -319,6 +319,9 @@ fn a_reopen_gives_the_next_handle_a_fresh_incarnation() {
     assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
     let mut fresh = driver.publication(handle).unwrap();
     assert_eq!(driver.trace_identity(handle).unwrap().incarnation, 2);
+    // The replaced incarnation's identity stays readable while it retires.
+    assert_eq!(driver.trace_identity_at(handle, 1).unwrap().incarnation, 1);
+    assert!(driver.trace_identity_at(handle, 3).is_err());
     let mut new_reader = driver.subscribe(handle, Role::Optional).unwrap();
     let OfferOutcome::Accepted { position, .. } = fresh.offer(b"three").unwrap() else {
         panic!("not accepted");

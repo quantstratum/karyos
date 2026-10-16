@@ -62,6 +62,10 @@ pub(crate) struct Grant {
     pub(crate) sent: bool,
     /// The mapping generation of its participant.
     pub(crate) generation: u32,
+    /// The publication incarnation of its stream when it was granted
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, The fresh
+    /// incarnation); 0 for a journal grant, which names no stream.
+    pub(crate) incarnation: u64,
     /// For a successor grant reserved at a cutover: when the driver fences
     /// it if its participant has not adopted it (`quantstratum-docs:
     /// karyos/design/ipc-data-path.md`, Generations across processes).
@@ -230,6 +234,7 @@ mod tests {
 
     fn grant(registration: u64) -> Grant {
         Grant {
+            incarnation: crate::embedded::FIRST_INCARNATION,
             export: registration + 100,
             registration,
             key: registration,

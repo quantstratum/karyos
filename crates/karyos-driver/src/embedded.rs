@@ -461,6 +461,12 @@ pub(crate) struct Stream<T: StreamTerms> {
 pub(crate) struct Replaced<T: StreamTerms> {
     pub(crate) incarnation: u64,
     pub(crate) base: u64,
+    /// The sealed buffer, which remote grants of this incarnation fetch.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) buffer: Arc<LogBuffer<T>>,
     pub(crate) conductor: Conductor<Arc<LogBuffer<T>>>,
     /// The old walker and the old handles' rings: its last pass, up to
     /// the seal, writes there.
@@ -549,6 +555,68 @@ impl<T: StreamTerms> Stream<T> {
             kind,
         });
         (link, self.base)
+    }
+
+    /// The conductor of incarnation `incarnation`: the current one, or a
+    /// replaced incarnation still retiring; `None` once it is gone.
+    pub(crate) fn conductor_of(
+        &mut self,
+        incarnation: u64,
+    ) -> Option<&mut Conductor<Arc<LogBuffer<T>>>> {
+        if incarnation == self.incarnation {
+            return Some(&mut self.conductor);
+        }
+        self.replaced
+            .iter_mut()
+            .find(|replaced| replaced.incarnation == incarnation)
+            .map(|replaced| &mut replaced.conductor)
+    }
+
+    /// The conductor of the mapping a grant names, by incarnation and
+    /// generation: the current mapping or a retained predecessor of the
+    /// current incarnation, or a replaced incarnation (one mapping, as a
+    /// guarded stream takes no cutover).
+    pub(crate) fn grant_conductor(
+        &mut self,
+        incarnation: u64,
+        generation: u32,
+    ) -> Option<&mut Conductor<Arc<LogBuffer<T>>>> {
+        if incarnation != self.incarnation {
+            return self.conductor_of(incarnation);
+        }
+        if self.generation.get() == generation {
+            return Some(&mut self.conductor);
+        }
+        self.retained
+            .iter_mut()
+            .find(|retained| retained.generation.get() == generation)
+            .map(|retained| &mut retained.conductor)
+    }
+
+    /// The buffer of the mapping a grant names, as [`Self::grant_conductor`].
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients are admitted only on Linux")
+    )]
+    pub(crate) fn grant_buffer(
+        &self,
+        incarnation: u64,
+        generation: u32,
+    ) -> Option<&Arc<LogBuffer<T>>> {
+        if incarnation != self.incarnation {
+            return self
+                .replaced
+                .iter()
+                .find(|replaced| replaced.incarnation == incarnation)
+                .map(|replaced| &replaced.buffer);
+        }
+        if self.generation.get() == generation {
+            return Some(&self.buffer);
+        }
+        self.retained
+            .iter()
+            .find(|retained| retained.generation.get() == generation)
+            .map(|retained| &retained.buffer)
     }
 
     /// Refuses issuance while a cutover is pending.
@@ -1725,25 +1793,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             SealState::Positioned { position } | SealState::Retired { position } => position,
             SealState::Active | SealState::Sealed => return Err(sealed),
         };
-        // A registration, a remote grant (export ledger) or a held bound
-        // of a lost participant names the stream: remote incarnations are
-        // G-d2b.
-        let remote = self
-            .registrations
-            .iter()
-            .any(|registration| registration.stream() == found.id)
-            || self.clients.iter().any(|client| {
-                client
-                    .ledger
-                    .as_ref()
-                    .is_some_and(|ledger| ledger.names_stream(found.id))
-            })
-            || self.holding.iter().any(|entry| entry.stream() == found.id);
-        if found.conflation.is_some()
-            || found.cutover.is_some()
-            || !found.retained.is_empty()
-            || remote
-        {
+        // Remote registrations, grants and held bounds stay on the replaced
+        // incarnation, which retires only once none names it (G-d2b).
+        if found.conflation.is_some() || found.cutover.is_some() || !found.retained.is_empty() {
             return Err(sealed);
         }
         let incarnation = found
@@ -1774,6 +1826,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             found.replaced.push(Replaced {
                 incarnation: found.incarnation,
                 base: found.base,
+                buffer: Arc::clone(&found.buffer),
                 conductor: std::mem::replace(&mut found.conductor, conductor),
                 guarded: old,
             });
@@ -2035,6 +2088,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut work = 0u32;
         let mut first_error = None;
         let mut lapped = Vec::new();
+        // The (stream, incarnation) pairs a registration, a remote grant or
+        // a held bound still names: a replaced incarnation they name is
+        // kept, so a remote reader can read it to its seal. A dead remote
+        // client releases them through its liveness timeout or exit proof.
+        let mut pinned: Vec<(u64, u64)> = self
+            .registrations
+            .iter()
+            .map(|registration| (registration.stream(), registration.incarnation()))
+            .chain(
+                self.holding
+                    .iter()
+                    .map(|entry| (entry.stream(), entry.incarnation())),
+            )
+            .collect();
+        for client in &self.clients {
+            if let Some(ledger) = &client.ledger {
+                pinned.extend(
+                    ledger
+                        .grants()
+                        .iter()
+                        .map(|grant| (grant.stream, grant.incarnation)),
+                );
+            }
+        }
         for stream in &mut self.streams {
             let lane = stream.config.lane.get();
             // Replaced incarnations first: their last pass, then their
@@ -2073,9 +2150,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }
                 }
             }
+            let id = stream.id;
             stream.replaced.retain(|replaced| {
                 !(replaced.guarded.ended()
-                    && matches!(replaced.conductor.seal_state(), SealState::Retired { .. }))
+                    && matches!(replaced.conductor.seal_state(), SealState::Retired { .. })
+                    && !pinned.contains(&(id, replaced.incarnation)))
             });
             // Until the publication releases at the guard's seal, a claim
             // admitted after the close's abort ran (its record written,
@@ -2363,6 +2442,37 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             stream_id: found.stream_id,
             session_id: found.session_id,
             incarnation: found.incarnation,
+        })
+    }
+
+    /// The publication identity of incarnation `incarnation` of `stream`:
+    /// the current one, or a replaced one still retiring
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, The fresh
+    /// incarnation). Records of an old handle or reader name it.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::trace_identity`], and
+    /// [`DriverError::UnknownStream`] for an incarnation the stream does
+    /// not hold.
+    pub fn trace_identity_at(
+        &mut self,
+        stream: StreamHandle,
+        incarnation: u64,
+    ) -> Result<PublicationIdentity, DriverError> {
+        let current = self.trace_identity(stream)?;
+        let found = self.stream(stream)?;
+        let held = incarnation == found.incarnation
+            || found
+                .replaced
+                .iter()
+                .any(|replaced| replaced.incarnation == incarnation);
+        if !held {
+            return Err(DriverError::UnknownStream { stream: found.id });
+        }
+        Ok(PublicationIdentity {
+            incarnation,
+            ..current
         })
     }
 
@@ -3004,6 +3114,65 @@ mod tests {
         );
         assert!(driver.holding.is_empty());
         assert!(observed_work(&mut driver, &mut observer).is_empty());
+    }
+
+    /// G-d2b, coordinator ACS 15247 (ii): a client that never leaves does
+    /// not pin a replaced incarnation forever. Its liveness timeout
+    /// releases its registration, and the replaced incarnation retires.
+    #[test]
+    fn a_dead_client_lets_the_replaced_incarnation_retire() {
+        use karyos_protocol::cnc::SubscriberRole;
+        let clock = ManualClock::default();
+        let driver_config = DriverConfig {
+            heartbeat_interval: 10,
+            client_liveness_timeout: 100,
+            ..DriverConfig::default()
+        };
+        let mut driver =
+            EmbeddedDriver::with_clock(driver_config, Box::new(clock.clone())).unwrap();
+        let stream = driver.add_stream(config(2)).unwrap();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let mut observer = driver.connect().unwrap();
+        observer.set_liveness(Duration::ZERO, Duration::from_secs(3600));
+        let mut client = driver.connect().unwrap();
+        let key = StreamKey {
+            stream_id: 2,
+            session_id: 1,
+        };
+        let _ = client
+            .add_subscription(key, SubscriberRole::Required)
+            .unwrap();
+        let mut done = Vec::new();
+        while done.is_empty() {
+            let _ = observed_work(&mut driver, &mut observer);
+            let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        }
+        let publication = driver.publication(stream).unwrap();
+        let _ = driver.close_guard(guard, 2).unwrap();
+        drop(publication);
+        let _ = observed_work(&mut driver, &mut observer);
+        assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+        let _fresh = driver.publication(stream).unwrap();
+        for _ in 0..3 {
+            let _ = observed_work(&mut driver, &mut observer);
+        }
+        // Pinned by the client's registration on incarnation 1.
+        assert_eq!(driver.stream(stream).unwrap().replaced.len(), 1);
+        // The client stops beating: its liveness timeout passes.
+        clock.0.store(100, Ordering::Relaxed);
+        for _ in 0..4 {
+            let _ = observed_work(&mut driver, &mut observer);
+        }
+        drop(done);
+        for _ in 0..4 {
+            let _ = observed_work(&mut driver, &mut observer);
+        }
+        assert!(
+            driver.stream(stream).unwrap().replaced.is_empty(),
+            "the dead client still pins the replaced incarnation"
+        );
     }
 
     #[test]

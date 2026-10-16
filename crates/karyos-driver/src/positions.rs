@@ -33,6 +33,11 @@ use crate::generations::MemberKind;
 /// One attached subscriber cell of one mapping, as sampled.
 #[derive(Debug, Clone, Copy)]
 struct Attached {
+    /// The publication incarnation of the mapping
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, The fresh
+    /// incarnation): a replaced incarnation reuses the generation, so the
+    /// pair names the mapping.
+    incarnation: u64,
     /// The mapping's generation.
     generation: u32,
     /// The registry cell in that mapping.
@@ -47,6 +52,7 @@ struct Attached {
 /// The cells of one subscriber.
 #[derive(Debug)]
 struct SubscriberCells {
+    incarnation: u64,
     generation: u32,
     cell: usize,
     registration: u64,
@@ -253,14 +259,26 @@ fn next_epochs(epoch: u64) -> (u64, u64) {
     (odd, even)
 }
 
-/// The attached subscriber cells of every live mapping of `stream`, oldest
-/// mapping first, skipping the successor cells reserved for subscribers
+/// The attached subscriber cells of every live mapping of `stream`,
+/// replaced incarnations and then the oldest mapping first, skipping the successor cells reserved for subscribers
 /// that have not moved yet (they still read their predecessor cell).
 fn collect_attached<T: StreamTerms>(stream: &Stream<T>, out: &mut Vec<Attached>) {
     out.clear();
+    // Replaced incarnations first: their readers still read to the seal.
+    for replaced in &stream.replaced {
+        let generation = stream.generation.get();
+        out.extend(replaced.conductor.subscribers().map(|cell| Attached {
+            incarnation: replaced.incarnation,
+            generation,
+            cell: cell.cell,
+            registration: cell.registration,
+            position: replaced.base.checked_add(cell.position),
+        }));
+    }
     for retained in &stream.retained {
         let generation = retained.generation.get();
         out.extend(retained.conductor.subscribers().map(|cell| Attached {
+            incarnation: stream.incarnation,
             generation,
             cell: cell.cell,
             registration: cell.registration,
@@ -283,6 +301,7 @@ fn collect_attached<T: StreamTerms>(stream: &Stream<T>, out: &mut Vec<Attached>)
             .subscribers()
             .filter(|cell| !offered(cell.cell))
             .map(|cell| Attached {
+                incarnation: stream.incarnation,
                 generation,
                 cell: cell.cell,
                 registration: cell.registration,
@@ -386,6 +405,7 @@ impl SubscriberCells {
         attached: &Attached,
     ) -> Self {
         let mut cells = Self {
+            incarnation: attached.incarnation,
             generation: attached.generation,
             cell: attached.cell,
             registration: attached.registration,
@@ -405,14 +425,24 @@ impl SubscriberCells {
     }
 
     fn label(&self) -> String {
-        format!(
-            "subscriber position generation {} cell {}",
-            self.generation, self.cell
-        )
+        // The first incarnation keeps the label tools already read; a later
+        // one names itself.
+        if self.incarnation == crate::embedded::FIRST_INCARNATION {
+            format!(
+                "subscriber position generation {} cell {}",
+                self.generation, self.cell
+            )
+        } else {
+            format!(
+                "subscriber position incarnation {} generation {} cell {}",
+                self.incarnation, self.generation, self.cell
+            )
+        }
     }
 
     fn matches(&self, attached: &Attached) -> bool {
-        self.generation == attached.generation
+        self.incarnation == attached.incarnation
+            && self.generation == attached.generation
             && self.cell == attached.cell
             && self.registration == attached.registration
     }
@@ -922,5 +952,45 @@ mod tests {
             EmbeddedDriver::with_config(config),
             Err(DriverError::InvalidConfig)
         ));
+    }
+
+    /// G-d2b: a reader still on a replaced incarnation keeps its sampled
+    /// position, and a reader of the fresh incarnation is told apart by
+    /// its label.
+    #[test]
+    fn readers_of_a_replaced_incarnation_are_sampled() {
+        let mut driver = driver(64);
+        let handle = driver.add_stream(stream_config(2)).unwrap();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(handle, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let _old_reader = driver.subscribe(handle, Role::Required).unwrap();
+        let mut writer = driver.publication(handle).unwrap();
+        let _ = writer.offer(b"one").unwrap();
+        let _ = driver.close_guard(guard, 2).unwrap();
+        drop(writer);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+        let _fresh = driver.publication(handle).unwrap();
+        let _new_reader = driver.subscribe(handle, Role::Required).unwrap();
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        let labels: Vec<String> = subscribers(&driver)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels.len(), 2, "{labels:?}");
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("subscriber position generation")),
+            "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.starts_with("subscriber position incarnation 2")),
+            "{labels:?}"
+        );
     }
 }

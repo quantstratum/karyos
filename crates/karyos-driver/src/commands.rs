@@ -96,6 +96,8 @@ use crate::trace_journals::Observed;
 #[derive(Debug)]
 pub(crate) struct Holding {
     stream: u64,
+    /// The incarnation whose buffer holds the cell.
+    incarnation: u64,
     key: StreamKey,
     cell: usize,
     occupant: u64,
@@ -107,6 +109,11 @@ impl Holding {
     /// The stream id of the holding cell.
     pub(crate) fn stream(&self) -> u64 {
         self.stream
+    }
+
+    /// The incarnation whose buffer holds the cell.
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 }
 
@@ -149,6 +156,11 @@ pub(crate) struct Registration {
     /// cell's position), which a trace journal of it carries
     /// (`quantstratum-docs: karyos/design/trace-journal-region.md`, J3).
     pub(crate) join: Option<u64>,
+    /// The publication incarnation of its stream when it was registered:
+    /// identities, trace and loss records of it name this one
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, The fresh
+    /// incarnation).
+    pub(crate) incarnation: u64,
 }
 
 impl<T: StreamTerms> ClientSlot<T> {
@@ -162,6 +174,11 @@ impl Registration {
     /// The stream id this registration belongs to.
     pub(crate) fn stream(&self) -> u64 {
         self.stream
+    }
+
+    /// The publication incarnation it was registered on.
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 }
 
@@ -295,20 +312,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// each cell is revoked as its occupant, so a cell that changed hands
     /// is left alone.
     fn revoke_client(&mut self, client: u64) {
-        let lost: Vec<(u64, u64, usize, u64, Role)> = self
+        let lost: Vec<(u64, u64, u64, usize, u64, Role)> = self
             .registrations
             .iter()
             .filter(|registration| registration.client == client)
             .filter_map(|registration| {
                 registration.subscriber.map(|(cell, occupant, role)| {
-                    (registration.id, registration.stream, cell, occupant, role)
+                    (
+                        registration.id,
+                        registration.stream,
+                        registration.incarnation,
+                        cell,
+                        occupant,
+                        role,
+                    )
                 })
             })
             .collect();
-        for (registration, stream, cell, occupant, role) in lost {
+        for (registration, stream, incarnation, cell, occupant, role) in lost {
             let Some(target) = self.streams.iter_mut().find(|s| s.id == stream) else {
                 continue;
             };
+            // The cell is in the buffer of the registration's incarnation.
+            let current = incarnation == target.incarnation;
             let policy = target.policy;
             let publication = target.aggregate.registration;
             let lane = target.config.lane.get();
@@ -317,11 +343,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 stream_id: target.stream_id,
                 session_id: target.session_id,
             };
-            let position = target.conductor.cell_position(cell).unwrap_or(0);
+            let Some(conductor) = target.conductor_of(incarnation) else {
+                continue;
+            };
+            let position = conductor.cell_position(cell).unwrap_or(0);
             // Sealing is idempotent: only the revocation that moves the
-            // stream out of `Active` reports its closing.
-            let was_active = target.conductor.seal_state() == SealState::Active;
-            let revocation = target.conductor.revoke_participant(cell, occupant, policy);
+            // stream out of `Active` reports its closing. A replaced
+            // incarnation is already sealed.
+            let was_active = current && conductor.seal_state() == SealState::Active;
+            let revocation = conductor.revoke_participant(cell, occupant, policy);
             let revocation = match revocation {
                 Ok(Revocation::Stale) | Err(_) => continue,
                 Ok(revocation) => revocation,
@@ -339,7 +369,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 instance: u128::from(high) << 64 | u128::from(low),
                 stream_registration: publication,
                 lane,
-                incarnation: crate::embedded::FIRST_INCARNATION,
+                incarnation,
                 stream_id: u64::from(key.stream_id.cast_unsigned()),
                 from: position,
                 to: position,
@@ -370,6 +400,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             match revocation {
                 Revocation::Holding => self.holding.push(Holding {
                     stream,
+                    incarnation,
                     key,
                     cell,
                     occupant,
@@ -398,11 +429,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     pub(crate) fn report_withdrawn_bounds(&mut self) {
         let mut index = 0;
         while let Some(entry) = self.holding.get(index) {
+            let (stream, cell, occupant, incarnation) =
+                (entry.stream, entry.cell, entry.occupant, entry.incarnation);
             let still = self
                 .streams
-                .iter()
-                .find(|s| s.id == entry.stream)
-                .is_some_and(|s| s.conductor.holding(entry.cell, entry.occupant));
+                .iter_mut()
+                .find(|s| s.id == stream)
+                .and_then(|s| s.conductor_of(incarnation))
+                .is_some_and(|conductor| conductor.holding(cell, occupant));
             if still {
                 index += 1;
                 continue;
@@ -683,8 +717,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err("loss report of another driver instance; the client is retired");
         }
         let issued = |id: u64, next: u64| id != 0 && id < next;
+        // An incarnation the lane never had: 0, or above its current one.
+        let never = loss.incarnation == 0
+            || self.streams.iter().any(|s| {
+                s.aggregate.registration == loss.stream_registration
+                    && s.config.lane.get() == loss.lane
+                    && loss.incarnation > s.incarnation
+            });
         if !issued(loss.stream_registration, self.next_stream)
-            || loss.incarnation != crate::embedded::FIRST_INCARNATION
+            || never
             || !issued(loss.subscription, self.next_registration)
         {
             return Err("loss report of an identity never issued; the client is retired");
@@ -696,9 +737,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         {
             // The report names the aggregate's registration and the lane;
             // the subscription's lane stream must be that pair.
+            // A subscription reports the incarnation it was registered on,
+            // the current one or a replaced one it still reads.
             Some(live)
                 if live.client == client
                     && live.kind == Kind::Subscription
+                    && live.incarnation == loss.incarnation
                     && self.streams.iter().any(|s| {
                         s.id == live.stream
                             && s.aggregate.registration == loss.stream_registration
@@ -787,17 +831,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let Some(index) = self.find_stream(stream, Some(lane)) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
-                // Identities and records over the control path name the
-                // first incarnation until remote incarnations exist (G-d2b,
-                // coordinator ACS 15233): a reincarnated stream takes no
-                // CnC registration.
-                if self
-                    .streams
-                    .get(index)
-                    .is_some_and(|found| found.incarnation != crate::embedded::FIRST_INCARNATION)
-                {
-                    return refuse(ErrorCode::ResourcesUnavailable, detail);
-                }
                 // A guarded stream's publications are bound to the guard's
                 // open epoch with an outcome ring; that binding exists only
                 // in process (`EmbeddedDriver::publication`) until its CnC
@@ -923,7 +956,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     registration: target.aggregate.registration,
                     stream_id: target.stream_id,
                     session_id: target.session_id,
-                    incarnation: crate::embedded::FIRST_INCARNATION,
+                    incarnation: target.incarnation,
                 };
                 let end = Arc::new(LeaseEnd::default());
                 let lease = Lease::acquire(&target.leases, &end);
@@ -936,6 +969,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     publication: Some(publication),
                 });
                 let stream_id = target.id;
+                let incarnation = target.incarnation;
                 if let Some(next) = occupant_used {
                     self.next_export = next;
                 }
@@ -947,6 +981,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     end,
                     subscriber,
                     join,
+                    incarnation,
                 });
                 match kind {
                     Kind::Publication => Response::PublicationReady {
@@ -1143,7 +1178,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let (Some(config), Some(feeder)) = (target.conflation, target.feeder.as_ref()) else {
             return refuse(ErrorCode::UnknownStream, detail);
         };
-        let (stream, generation) = (target.id, target.generation.get());
+        let (stream, generation, incarnation) =
+            (target.id, target.generation.get(), target.incarnation);
         let (Ok(value_capacity), Ok(journal_capacity)) = (
             u64::try_from(config.value_capacity),
             u64::try_from(config.journal_capacity),
@@ -1178,6 +1214,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 state: GrantState::Held,
                 sent: false,
                 generation,
+                incarnation,
                 fence_at: None,
                 fenced: false,
             });
@@ -1192,6 +1229,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             end: Arc::new(LeaseEnd::default()),
             subscriber: None,
             join: None,
+            incarnation,
         });
         self.counters.add(Event::GrantsReserved, 1);
         Response::ConflatedReady {
@@ -1271,9 +1309,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             registration,
             stream: publication,
             lane,
-            // One incarnation per stream registration (see
-            // `EmbeddedDriver::trace_identity`).
-            incarnation: crate::embedded::FIRST_INCARNATION,
+            // The incarnation the observed registration was made on.
+            incarnation: live.incarnation,
             join,
             time_namespace: TimeNamespace::Unknown,
             provenance,
@@ -1331,6 +1368,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         state: GrantState::Held,
                         sent: false,
                         generation: 0,
+                        incarnation: 0,
                         fence_at: None,
                         fenced: false,
                     });
@@ -1606,6 +1644,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // Effect: everything below cannot fail.
         let stream = target.id;
         let generation = target.generation.get();
+        let incarnation = target.incarnation;
         self.next_registration = next;
         self.next_export = export + 1;
         if let Some(ledger) = self.ledger_mut(client) {
@@ -1618,6 +1657,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 state: GrantState::Held,
                 sent: false,
                 generation,
+                incarnation,
                 fence_at: None,
                 fenced: false,
             });
@@ -1643,6 +1683,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             end: Arc::new(LeaseEnd::default()),
             subscriber,
             join,
+            incarnation,
         });
         self.counters.add(Event::GrantsReserved, 1);
         match kind {
@@ -1707,17 +1748,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
             return;
         };
-        // The grant's own generation: the current mapping or a retained
-        // predecessor.
-        let conductor = if stream.generation.get() == grant.generation {
-            &mut stream.conductor
-        } else if let Some(retained) = stream
-            .retained
-            .iter_mut()
-            .find(|retained| retained.generation.get() == grant.generation)
-        {
-            &mut retained.conductor
-        } else {
+        // The grant's own mapping: its incarnation and generation.
+        let Some(conductor) = stream.grant_conductor(grant.incarnation, grant.generation) else {
             return;
         };
         let ended = match grant.participant {
@@ -2974,6 +3006,7 @@ mod tests {
         let (stream, generation) = (driver.streams[0].id, driver.streams[0].generation.get());
         let ledger = remote_ledger(driver, client);
         ledger.push(Grant {
+            incarnation: crate::embedded::FIRST_INCARNATION,
             export,
             registration,
             key: registration,
@@ -2989,6 +3022,7 @@ mod tests {
             ledger.mark_sent(export);
         }
         driver.registrations.push(Registration {
+            incarnation: crate::embedded::FIRST_INCARNATION,
             id: registration,
             client,
             stream,
@@ -3997,6 +4031,7 @@ mod tests {
         let subscription = driver.next_registration;
         driver.next_registration += 1;
         driver.registrations.push(Registration {
+            incarnation: crate::embedded::FIRST_INCARNATION,
             id: subscription,
             client,
             stream: lane_two,
@@ -4588,72 +4623,115 @@ mod tests {
         assert_eq!(driver.streams[0].incarnation, 2);
     }
 
-    /// Review of #209 (M6 and P2-3): a stream a remote client holds keeps
-    /// its sealed incarnation (remote incarnations are G-d2b), and a
-    /// reincarnated stream takes no CnC registration.
+    /// G-d2b (guards-and-abort.md, The fresh incarnation; coordinator ACS
+    /// 15247): a remote subscriber of the sealed incarnation keeps its
+    /// registration there, the stream reincarnates anyway, a new CnC
+    /// subscription binds the fresh incarnation, loss reports are checked
+    /// per (registration, incarnation), and grants resolve their own
+    /// incarnation's buffer, never another's.
     #[test]
-    fn remote_holders_and_reincarnated_streams_over_cnc() {
+    fn remote_subscribers_across_a_fresh_incarnation() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
         driver.guard_stream(stream, guard, 4).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         let mut observer = driver.broadcast.receiver();
         let (client, mut producer) = remote_client(&mut driver, 4);
-        write(
-            &mut producer,
-            Command::AddSubscription {
-                sequence: 1,
-                stream: KEY,
-                lane: Lane::ZERO,
-                role: SubscriberRole::Required,
-            },
-        );
+        let subscribe = |producer: &mut RingProducer, sequence| {
+            write(
+                producer,
+                Command::AddSubscription {
+                    sequence,
+                    stream: KEY,
+                    lane: Lane::ZERO,
+                    role: SubscriberRole::Required,
+                },
+            );
+        };
+        subscribe(&mut producer, 1);
         let _ = driver.do_work().unwrap();
-        let first = responses(&mut observer);
-        assert!(
-            first
-                .iter()
-                .any(|answer| matches!(answer, Response::SubscriptionReady { .. })),
-            "{first:?}"
-        );
+        let old = ledger(&driver, client)[0].registration;
+        let _ = responses(&mut observer);
         let publication = driver.publication(stream).unwrap();
         let _ = driver.close_guard(guard, 2).unwrap();
         drop(publication);
         let _ = driver.do_work().unwrap();
         assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
-        let refused = driver.publication(stream).map(|_| ());
+        // The remote holder no longer blocks the fresh incarnation.
+        let _fresh = driver.publication(stream).unwrap();
+        assert_eq!(driver.streams[0].incarnation, 2);
+        let generation = driver.streams[0].generation.get();
+        // Grants resolve their own incarnation: the old one names the
+        // replaced buffer, an incarnation never held names nothing.
+        let old_buffer = Arc::clone(&driver.streams[0].replaced[0].buffer);
+        assert!(Arc::ptr_eq(
+            driver.streams[0].grant_buffer(1, generation).unwrap(),
+            &old_buffer
+        ));
+        assert!(!Arc::ptr_eq(
+            driver.streams[0].grant_buffer(2, generation).unwrap(),
+            &old_buffer
+        ));
+        assert!(driver.streams[0].grant_buffer(3, generation).is_none());
+        assert!(driver.streams[0].grant_conductor(0, generation).is_none());
+        // The old registration pins the replaced incarnation.
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(driver.streams[0].replaced.len(), 1);
         assert!(
-            matches!(refused, Err(DriverError::GuardSealed { .. })),
-            "{refused:?}"
+            driver
+                .registrations
+                .iter()
+                .any(|r| r.id == old && r.incarnation() == 1)
         );
-        assert_eq!(driver.streams[0].incarnation, 1);
-        // Once reincarnated (here by hand, as no remote holder is left in
-        // a real run), CnC registration is refused.
-        driver.streams[0].incarnation = 2;
-        write(
-            &mut producer,
-            Command::AddSubscription {
-                sequence: 2,
-                stream: KEY,
-                lane: Lane::ZERO,
-                role: SubscriberRole::Required,
-            },
-        );
+        // A new subscription binds the fresh incarnation.
+        subscribe(&mut producer, 2);
         let mut answers = Vec::new();
         for _ in 0..3 {
             let _ = driver.do_work().unwrap();
             answers.extend(responses(&mut observer));
         }
+        let Some(Response::SubscriptionReady {
+            registration: fresh,
+            ..
+        }) = answers
+            .iter()
+            .find(|answer| matches!(answer, Response::SubscriptionReady { .. }))
+        else {
+            panic!("{answers:?}");
+        };
         assert!(
-            answers.iter().any(|answer| matches!(
-                answer,
-                Response::Error {
-                    request: RequestId { client: c, sequence: 2 },
-                    code: ErrorCode::ResourcesUnavailable,
-                    ..
-                } if *c == client
-            )),
-            "{answers:?}"
+            driver
+                .registrations
+                .iter()
+                .any(|r| r.id == *fresh && r.incarnation() == 2)
+        );
+        // Loss reports name the registration's own incarnation.
+        let base = reported(&driver, 0);
+        let report = |subscription, incarnation| ReportedLoss {
+            incarnation,
+            subscription,
+            ..base
+        };
+        let old_report = report(old, 1);
+        assert_eq!(driver.report_loss(client, &old_report), Ok(()));
+        let fresh_report = report(*fresh, 2);
+        assert_eq!(driver.report_loss(client, &fresh_report), Ok(()));
+        for (subscription, incarnation) in [(old, 2), (old, 0), (*fresh, 3)] {
+            let wrong = report(subscription, incarnation);
+            assert!(
+                driver.report_loss(client, &wrong).is_err(),
+                "{subscription} at {incarnation}"
+            );
+        }
+        let records = losses(&driver);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.incarnation)
+                .collect::<Vec<_>>(),
+            [1, 2]
         );
     }
 }
