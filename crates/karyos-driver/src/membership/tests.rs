@@ -2,7 +2,9 @@
 
 #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
 
-use karyos_protocol::network::{Alias, LaneStatus, Lanes};
+use std::net::{IpAddr, Ipv4Addr};
+
+use karyos_protocol::network::{LaneStatus, Lanes};
 
 use super::*;
 
@@ -26,6 +28,37 @@ fn receiver(id: u64, boot: u64) -> Receiver {
     }
 }
 
+fn alias() -> Alias {
+    Alias {
+        session_id: 5,
+        stream_id: 6,
+    }
+}
+
+/// `receiver`'s binding through endpoint `path` from its own address.
+fn path(receiver: Receiver, path: u32) -> SmKey {
+    SmKey {
+        endpoint: EndpointId(path),
+        alias: alias(),
+        source: SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(
+                10,
+                0,
+                0,
+                u8::try_from(receiver.receiver_id).unwrap(),
+            )),
+            40_000,
+        ),
+        identity: identity(1),
+        receiver,
+    }
+}
+
+/// Takes `sm` through its receiver's first path.
+fn status(table: &mut Membership, sm: &StatusMessage, now: u64) -> StatusOutcome {
+    table.status(&path(sm.receiver, 1), sm, now)
+}
+
 fn lane(lane: u8) -> Lane {
     Lane::try_new(lane).unwrap()
 }
@@ -44,10 +77,7 @@ fn sm_from(receiver: Receiver, group_tag: u64, lanes: &[(u64, u32)]) -> StatusMe
         })
         .collect();
     StatusMessage {
-        alias: Alias {
-            session_id: 5,
-            stream_id: 6,
-        },
+        alias: alias(),
         identity: identity(1),
         receiver,
         group_tag,
@@ -60,7 +90,7 @@ fn config(lanes: u8) -> MembershipConfig {
 }
 
 fn table(config: MembershipConfig, roles: &Roles<'_>) -> Membership {
-    let mut table = Membership::new(config, identity(1), roles, 0).unwrap();
+    let mut table = Membership::new(config, identity(1), alias(), roles, 0).unwrap();
     for at in 0..config.lane_count {
         assert!(table.advance_sent(lane(at), 1 << 30));
     }
@@ -109,6 +139,20 @@ fn the_configuration_is_validated() {
                 ..base
             },
             MembershipConfigError::Capacity,
+        ),
+        (
+            MembershipConfig {
+                max_paths: 0,
+                ..base
+            },
+            MembershipConfigError::Paths,
+        ),
+        (
+            MembershipConfig {
+                max_paths: MAX_PATHS + 1,
+                ..base
+            },
+            MembershipConfigError::Paths,
         ),
         (
             MembershipConfig {
@@ -181,7 +225,7 @@ fn the_configuration_is_validated() {
         },
     ] {
         assert_eq!(
-            Membership::new(base, identity(1), &roles, 0).err(),
+            Membership::new(base, identity(1), alias(), &roles, 0).err(),
             Some(MembershipConfigError::Roles)
         );
     }
@@ -208,8 +252,8 @@ fn edges_are_checked_sums_and_required_members_bound_every_strategy() {
                 tags: &[],
             },
         );
-        accepted(table.status(&sm(1, &[(100, 100)]), 0));
-        accepted(table.status(&sm(2, &[(150, 10)]), 0));
+        accepted(status(&mut table, &sm(1, &[(100, 100)]), 0));
+        accepted(status(&mut table, &sm(2, &[(150, 10)]), 0));
         assert_eq!(
             table.limit(lane(0), 0),
             Limit::Edge(expected),
@@ -222,8 +266,8 @@ fn edges_are_checked_sums_and_required_members_bound_every_strategy() {
 #[test]
 fn every_lane_has_its_own_edge() {
     let mut table = table(config(2), &Roles::default());
-    accepted(table.status(&sm(1, &[(100, 10), (5, 1000)]), 0));
-    accepted(table.status(&sm(2, &[(50, 20), (7, 10)]), 0));
+    accepted(status(&mut table, &sm(1, &[(100, 10), (5, 1000)]), 0));
+    accepted(status(&mut table, &sm(2, &[(50, 20), (7, 10)]), 0));
     assert_eq!(table.limit(lane(0), 0), Limit::Edge(70));
     assert_eq!(table.limit(lane(1), 0), Limit::Edge(17));
     assert_eq!(table.limit(lane(2), 0), Limit::NoReceiverWindow);
@@ -244,23 +288,31 @@ fn a_tagged_group_never_falls_back() {
             tags: &[(1, 7), (2, 7)],
         },
     );
-    accepted(table.status(&sm(3, &[(0, 100)]), 0));
+    accepted(status(&mut table, &sm(3, &[(0, 100)]), 0));
     assert_eq!(table.limit(lane(0), 0), Limit::NoReceiverWindow);
-    accepted(table.status(&sm_from(receiver(1, 1), 7, &[(100, 100)]), 0));
-    accepted(table.status(&sm_from(receiver(2, 1), 7, &[(100, 50)]), 0));
+    accepted(status(
+        &mut table,
+        &sm_from(receiver(1, 1), 7, &[(100, 100)]),
+        0,
+    ));
+    accepted(status(
+        &mut table,
+        &sm_from(receiver(2, 1), 7, &[(100, 50)]),
+        0,
+    ));
     assert_eq!(
         table.limit(lane(0), 0),
         Limit::Edge(100),
         "required 3 bounds"
     );
-    accepted(table.status(&sm(3, &[(80, 100)]), 20 * MS));
+    accepted(status(&mut table, &sm(3, &[(80, 100)]), 20 * MS));
     assert_eq!(
         table.limit(lane(0), 20 * MS),
         Limit::Edge(150),
         "tag minimum"
     );
     // The tagged members expire; the required one stays live.
-    accepted(table.status(&sm(3, &[(90, 100)]), TIMEOUT));
+    accepted(status(&mut table, &sm(3, &[(90, 100)]), TIMEOUT));
     assert_eq!(table.limit(lane(0), TIMEOUT), Limit::NoReceiverWindow);
     assert!(table.connected(TIMEOUT));
 }
@@ -280,11 +332,19 @@ fn a_declared_tag_cannot_choose_a_group() {
         },
     );
     assert_eq!(
-        rejected(table.status(&sm_from(receiver(2, 1), 7, &[(0, 100)]), 0)),
+        rejected(status(
+            &mut table,
+            &sm_from(receiver(2, 1), 7, &[(0, 100)]),
+            0
+        )),
         StatusRejected::Tag
     );
     assert_eq!(
-        rejected(table.status(&sm_from(receiver(1, 1), 0, &[(0, 100)]), 0)),
+        rejected(status(
+            &mut table,
+            &sm_from(receiver(1, 1), 0, &[(0, 100)]),
+            0
+        )),
         StatusRejected::Tag
     );
     assert_eq!(table.limit(lane(0), 0), Limit::NoReceiverWindow);
@@ -308,26 +368,30 @@ fn an_empty_table_grants_nothing() {
 /// edge rejects the whole SM and refreshes nothing.
 #[test]
 fn credit_violations_reject_the_whole_sm() {
-    let mut table = Membership::new(config(2), identity(1), &Roles::default(), 0).unwrap();
+    let mut table = Membership::new(config(2), identity(1), alias(), &Roles::default(), 0).unwrap();
     assert!(table.advance_sent(lane(0), 1000));
     assert!(table.advance_sent(lane(1), u64::MAX));
     assert_eq!(
-        rejected(table.status(&sm(1, &[(0, 9), (0, 100)]), 0)),
+        rejected(status(&mut table, &sm(1, &[(0, 9), (0, 100)]), 0)),
         StatusRejected::Window
     );
     assert_eq!(
-        rejected(table.status(&sm(1, &[(0, 100), (0, (1 << 20) + 1)]), 0)),
+        rejected(status(
+            &mut table,
+            &sm(1, &[(0, 100), (0, (1 << 20) + 1)]),
+            0
+        )),
         StatusRejected::Window
     );
     assert_eq!(
-        rejected(table.status(&sm(1, &[(1001, 100), (0, 100)]), 0)),
+        rejected(status(&mut table, &sm(1, &[(1001, 100), (0, 100)]), 0)),
         StatusRejected::Beyond
     );
     assert_eq!(
-        rejected(table.status(&sm(1, &[(0, 100), (u64::MAX, 100)]), 0)),
+        rejected(status(&mut table, &sm(1, &[(0, 100), (u64::MAX, 100)]), 0)),
         StatusRejected::Overflow
     );
-    let (member, joined, fresh) = accepted(table.status(&sm(1, &[(500, 100), (5, 100)]), 0));
+    let (member, joined, fresh) = accepted(status(&mut table, &sm(1, &[(500, 100), (5, 100)]), 0));
     assert!(joined && fresh);
     for (bad, reason) in [
         (
@@ -339,12 +403,14 @@ fn credit_violations_reject_the_whole_sm() {
         (sm(1, &[(1001, 100), (6, 100)]), StatusRejected::Beyond),
         (sm(1, &[(600, 100)]), StatusRejected::Lanes),
     ] {
-        assert_eq!(rejected(table.status(&bad, TIMEOUT - 1)), reason);
+        assert_eq!(rejected(status(&mut table, &bad, TIMEOUT - 1)), reason);
     }
     let mut other = sm(1, &[(600, 100), (5, 100)]);
     other.identity = identity(2);
+    let mut key = path(other.receiver, 1);
+    key.identity = other.identity;
     assert_eq!(
-        rejected(table.status(&other, TIMEOUT - 1)),
+        rejected(table.status(&key, &other, TIMEOUT - 1)),
         StatusRejected::Identity
     );
     // Nothing refreshed: the member expires at its join's timeout.
@@ -371,18 +437,18 @@ fn credit_violations_reject_the_whole_sm() {
 /// only until `pause_timeout` after its last fresh SM.
 #[test]
 fn stationary_sms_keep_a_member_only_until_pause_timeout() {
-    let mut table = Membership::new(config(1), identity(1), &Roles::default(), 0).unwrap();
+    let mut table = Membership::new(config(1), identity(1), alias(), &Roles::default(), 0).unwrap();
     assert!(table.advance_sent(lane(0), 100));
-    accepted(table.status(&sm(1, &[(50, 100)]), 0));
-    let (_, _, fresh) = accepted(table.status(&sm(1, &[(60, 100)]), SECOND));
+    accepted(status(&mut table, &sm(1, &[(50, 100)]), 0));
+    let (_, _, fresh) = accepted(status(&mut table, &sm(1, &[(60, 100)]), SECOND));
     assert!(fresh, "advanced");
-    let (_, _, fresh) = accepted(table.status(&sm(1, &[(60, 100)]), 2 * SECOND));
+    let (_, _, fresh) = accepted(status(&mut table, &sm(1, &[(60, 100)]), 2 * SECOND));
     assert!(!fresh, "stationary");
     // Stationary SMs keep it past receiver_timeout from the last fresh one.
     let mut now = 2 * SECOND;
     while now < SECOND + PAUSE - SECOND {
         now += SECOND;
-        let (_, _, fresh) = accepted(table.status(&sm(1, &[(60, 100)]), now));
+        let (_, _, fresh) = accepted(status(&mut table, &sm(1, &[(60, 100)]), now));
         assert!(!fresh);
         assert_eq!(table.limit(lane(0), now), Limit::Edge(160));
     }
@@ -397,13 +463,16 @@ fn stationary_sms_keep_a_member_only_until_pause_timeout() {
 /// lost, and a replayed SM of a caught-up member holds nothing back.
 #[test]
 fn a_caught_up_member_is_fresh() {
-    let mut table = Membership::new(config(2), identity(1), &Roles::default(), 0).unwrap();
+    let mut table = Membership::new(config(2), identity(1), alias(), &Roles::default(), 0).unwrap();
     assert!(table.advance_sent(lane(0), 100));
     assert!(table.advance_sent(lane(1), 7));
-    accepted(table.status(&sm(1, &[(100, 100), (7, 100)]), 0));
+    accepted(status(&mut table, &sm(1, &[(100, 100), (7, 100)]), 0));
     for step in 1..=100 {
-        let (_, joined, fresh) =
-            accepted(table.status(&sm(1, &[(100, 100), (7, 100)]), step * SECOND));
+        let (_, joined, fresh) = accepted(status(
+            &mut table,
+            &sm(1, &[(100, 100), (7, 100)]),
+            step * SECOND,
+        ));
         assert!(fresh && !joined);
     }
     assert!(
@@ -412,7 +481,11 @@ fn a_caught_up_member_is_fresh() {
     );
     // Once the sender moves on, the same SM is stationary.
     assert!(table.advance_sent(lane(1), 8));
-    let (_, _, fresh) = accepted(table.status(&sm(1, &[(100, 100), (7, 100)]), 101 * SECOND));
+    let (_, _, fresh) = accepted(status(
+        &mut table,
+        &sm(1, &[(100, 100), (7, 100)]),
+        101 * SECOND,
+    ));
     assert!(!fresh);
     assert!(!table.advance_sent(lane(1), 7), "sent_high never decreases");
     assert!(!table.advance_sent(lane(2), 7), "outside the publication");
@@ -424,7 +497,7 @@ fn a_caught_up_member_is_fresh() {
 #[test]
 fn expiry_is_exact_and_needs_no_sweep() {
     let mut table = table(config(1), &Roles::default());
-    accepted(table.status(&sm(1, &[(0, 100)]), 10 * SECOND));
+    accepted(status(&mut table, &sm(1, &[(0, 100)]), 10 * SECOND));
     assert!(table.connected(10 * SECOND + TIMEOUT - 1));
     assert!(!table.connected(10 * SECOND + TIMEOUT));
     assert_eq!(
@@ -441,7 +514,7 @@ fn expiry_is_exact_and_needs_no_sweep() {
 #[test]
 fn an_expired_optional_member_rejoins_as_a_new_membership() {
     let mut table = table(config(1), &Roles::default());
-    let (first, _, _) = accepted(table.status(&sm(1, &[(500, 100)]), 0));
+    let (first, _, _) = accepted(status(&mut table, &sm(1, &[(500, 100)]), 0));
     assert_eq!(table.timers(TIMEOUT, 64), 64);
     assert_eq!(table.counters().expired, 1);
     assert!(!table.current(first));
@@ -456,7 +529,7 @@ fn an_expired_optional_member_rejoins_as_a_new_membership() {
         }
     );
     // A lower consumption is a fresh join point, not a stale SM.
-    let (second, joined, _) = accepted(table.status(&sm(1, &[(400, 100)]), TIMEOUT + 1));
+    let (second, joined, _) = accepted(status(&mut table, &sm(1, &[(400, 100)]), TIMEOUT + 1));
     assert!(joined);
     assert_eq!(second.slot, first.slot);
     assert_eq!(second.generation, first.generation + 1);
@@ -474,13 +547,13 @@ fn an_sm_after_the_deadline_cannot_revive_a_member() {
             tags: &[],
         },
     );
-    accepted(table.status(&sm(1, &[(0, 100)]), 0));
-    accepted(table.status(&sm(2, &[(0, 100)]), 0));
+    accepted(status(&mut table, &sm(1, &[(0, 100)]), 0));
+    accepted(status(&mut table, &sm(2, &[(0, 100)]), 0));
     assert_eq!(
-        rejected(table.status(&sm(1, &[(10, 100)]), TIMEOUT)),
+        rejected(status(&mut table, &sm(1, &[(10, 100)]), TIMEOUT)),
         StatusRejected::Lost
     );
-    let (_, joined, _) = accepted(table.status(&sm(2, &[(10, 100)]), TIMEOUT));
+    let (_, joined, _) = accepted(status(&mut table, &sm(2, &[(10, 100)]), TIMEOUT));
     assert!(joined);
     assert_eq!(table.counters().lost_required, 1);
     assert_eq!(table.counters().expired, 1);
@@ -500,21 +573,25 @@ fn a_required_loss_holds_the_incarnation() {
         },
     );
     assert_eq!(table.admission(0), Admission::NotJoined);
-    accepted(table.status(&sm(1, &[(40, 100), (4, 100)]), 0));
+    accepted(status(&mut table, &sm(1, &[(40, 100), (4, 100)]), 0));
     assert_eq!(table.admission(0), Admission::NotJoined);
-    accepted(table.status(&sm(2, &[(30, 100), (9, 100)]), 0));
-    accepted(table.status(&sm(3, &[(10, 100), (1, 100)]), 0));
+    accepted(status(&mut table, &sm(2, &[(30, 100), (9, 100)]), 0));
+    accepted(status(&mut table, &sm(3, &[(10, 100), (1, 100)]), 0));
     assert_eq!(table.admission(0), Admission::Open);
     assert_eq!(table.retention(lane(0)), Some(30));
     assert_eq!(table.retention(lane(1)), Some(4));
     assert_eq!(table.limit(lane(0), 0), Limit::Edge(110));
 
     assert_eq!(
-        rejected(table.status(&sm_from(receiver(1, 2), 0, &[(0, 100), (0, 100)]), SECOND)),
+        rejected(status(
+            &mut table,
+            &sm_from(receiver(1, 2), 0, &[(0, 100), (0, 100)]),
+            SECOND
+        )),
         StatusRejected::BootChanged
     );
-    accepted(table.status(&sm(1, &[(90, 100), (9, 100)]), SECOND));
-    accepted(table.status(&sm(3, &[(90, 100), (9, 100)]), SECOND));
+    accepted(status(&mut table, &sm(1, &[(90, 100), (9, 100)]), SECOND));
+    accepted(status(&mut table, &sm(3, &[(90, 100), (9, 100)]), SECOND));
     // Receiver 2 stops: lost at its deadline, even before the sweep.
     assert_eq!(table.admission(TIMEOUT), Admission::LostRequired);
     assert_eq!(table.limit(lane(0), TIMEOUT), Limit::Held);
@@ -532,15 +609,20 @@ fn a_required_loss_holds_the_incarnation() {
     }));
     // No return within the incarnation, nor through a new boot.
     assert_eq!(
-        rejected(table.status(&sm(2, &[(30, 100), (9, 100)]), TIMEOUT + SECOND)),
+        rejected(status(
+            &mut table,
+            &sm(2, &[(30, 100), (9, 100)]),
+            TIMEOUT + SECOND
+        )),
         StatusRejected::Lost
     );
     assert_eq!(
-        table.expect(receiver(2, 1), TIMEOUT + SECOND),
+        table.expect(&path(receiver(2, 1), 1), TIMEOUT + SECOND),
         Err(StatusRejected::Lost)
     );
     assert_eq!(
-        rejected(table.status(
+        rejected(status(
+            &mut table,
             &sm_from(receiver(2, 3), 0, &[(0, 100), (0, 100)]),
             TIMEOUT + SECOND
         )),
@@ -560,9 +642,9 @@ fn a_required_member_that_never_joins_is_reported_once() {
             tags: &[],
         },
     );
-    let pending = table.expect(receiver(2, 1), 0).unwrap();
+    let pending = table.expect(&path(receiver(2, 1), 1), 0).unwrap();
     assert_eq!(
-        table.expect(receiver(2, 1), SECOND),
+        table.expect(&path(receiver(2, 1), 1), SECOND),
         Ok(pending),
         "no extension"
     );
@@ -597,19 +679,19 @@ fn a_full_table_refuses_without_evicting() {
             tags: &[],
         },
     );
-    table.expect(receiver(1, 1), 0).unwrap();
+    table.expect(&path(receiver(1, 1), 1), 0).unwrap();
     assert_eq!(
-        table.expect(receiver(2, 1), 0),
+        table.expect(&path(receiver(2, 1), 1), 0),
         Err(StatusRejected::PendingFull)
     );
-    accepted(table.status(&sm(2, &[(0, 100)]), 0));
+    accepted(status(&mut table, &sm(2, &[(0, 100)]), 0));
     assert_eq!(
-        rejected(table.status(&sm(3, &[(0, 100)]), 0)),
+        rejected(status(&mut table, &sm(3, &[(0, 100)]), 0)),
         StatusRejected::TableFull,
         "the last slot is reserved for receiver 9"
     );
-    accepted(table.status(&sm(9, &[(0, 100)]), 0));
-    accepted(table.status(&sm(1, &[(0, 100)]), 0));
+    accepted(status(&mut table, &sm(9, &[(0, 100)]), 0));
+    accepted(status(&mut table, &sm(1, &[(0, 100)]), 0));
     assert_eq!(table.counters().table_full, 1);
     assert_eq!(table.counters().pending_full, 1);
 }
@@ -626,7 +708,7 @@ fn an_exhausted_generation_retires_its_slot() {
         &Roles::default(),
     );
     table.entries[0].generation = u64::MAX;
-    let (member, _, _) = accepted(table.status(&sm(1, &[(0, 100)]), 0));
+    let (member, _, _) = accepted(status(&mut table, &sm(1, &[(0, 100)]), 0));
     assert_eq!(
         member,
         MemberRef {
@@ -636,7 +718,7 @@ fn an_exhausted_generation_retires_its_slot() {
     );
     assert_eq!(table.counters().retired_slots, 1);
     assert_eq!(
-        rejected(table.status(&sm(2, &[(0, 100)]), 0)),
+        rejected(status(&mut table, &sm(2, &[(0, 100)]), 0)),
         StatusRejected::TableFull
     );
 }
@@ -645,12 +727,107 @@ fn an_exhausted_generation_retires_its_slot() {
 #[test]
 fn a_duplicate_sm_changes_nothing_more() {
     let mut table = table(config(1), &Roles::default());
-    accepted(table.status(&sm(1, &[(100, 100)]), 0));
-    accepted(table.status(&sm(1, &[(150, 100)]), MS));
-    let (_, joined, fresh) = accepted(table.status(&sm(1, &[(150, 100)]), MS));
+    accepted(status(&mut table, &sm(1, &[(100, 100)]), 0));
+    accepted(status(&mut table, &sm(1, &[(150, 100)]), MS));
+    let (_, joined, fresh) = accepted(status(&mut table, &sm(1, &[(150, 100)]), MS));
     assert!(!joined && !fresh);
     assert_eq!(table.limit(lane(0), MS), Limit::Edge(250));
     assert_eq!(table.retention(lane(0)), None);
+}
+
+/// MC-9 and ACS 15636: one receiver over two paths is one member; a
+/// binding beyond `max_paths` is refused while its SM still applies.
+#[test]
+fn a_receiver_over_several_paths_is_one_member() {
+    let mut table = table(
+        MembershipConfig {
+            max_paths: 2,
+            ..config(1)
+        },
+        &Roles {
+            required: &[1],
+            tags: &[],
+        },
+    );
+    let one = sm(1, &[(100, 100)]);
+    let (first, _, _) = accepted(table.status(&path(one.receiver, 1), &one, 0));
+    let (again, joined, _) = accepted(table.status(&path(one.receiver, 2), &one, 0));
+    assert_eq!(first, again);
+    assert!(!joined);
+    accepted(status(&mut table, &sm(2, &[(50, 100)]), 0));
+    assert_eq!(table.limit(lane(0), 0), Limit::Edge(150));
+    assert_eq!(table.retention(lane(0)), Some(100));
+    let ahead = sm(1, &[(120, 100)]);
+    let (_, _, fresh) = accepted(table.status(&path(ahead.receiver, 3), &ahead, MS));
+    assert!(fresh, "liveness is per member");
+    assert_eq!(table.counters().paths_full, 1);
+    assert_eq!(table.counters().joins, 2);
+    assert_eq!(table.binding_gone(&path(ahead.receiver, 3)), Gone::Unknown);
+}
+
+/// The key must be the SM's own; a mismatch is rejected whole.
+#[test]
+fn a_key_of_another_receiver_is_rejected() {
+    let mut table = table(config(1), &Roles::default());
+    let one = sm(1, &[(0, 100)]);
+    assert_eq!(
+        rejected(table.status(&path(receiver(2, 1), 1), &one, 0)),
+        StatusRejected::Key
+    );
+    let mut other = one;
+    other.alias.session_id = 4;
+    assert_eq!(
+        rejected(table.status(&path(other.receiver, 1), &other, 0)),
+        StatusRejected::Key
+    );
+    let mut both = path(other.receiver, 1);
+    both.alias = other.alias;
+    assert_eq!(
+        rejected(table.status(&both, &other, 0)),
+        StatusRejected::Identity
+    );
+    assert_eq!((table.counters().key, table.counters().identity), (2, 1));
+    assert!(!table.connected(0));
+}
+
+/// ACS 15633 and 15636: a gone binding removes its member only when it was
+/// the last; a required member is then lost, as at its timeout (M5).
+#[test]
+fn only_the_last_gone_binding_removes_a_member() {
+    let mut table = table(
+        config(1),
+        &Roles {
+            required: &[1],
+            tags: &[],
+        },
+    );
+    let one = sm(1, &[(10, 100)]);
+    accepted(table.status(&path(one.receiver, 1), &one, 0));
+    accepted(table.status(&path(one.receiver, 2), &one, 0));
+    let two = sm(2, &[(20, 100)]);
+    let (optional, _, _) = accepted(status(&mut table, &two, 0));
+    assert_eq!(table.admission(0), Admission::Open);
+
+    assert_eq!(table.binding_gone(&path(one.receiver, 1)), Gone::Remaining);
+    assert_eq!(table.admission(0), Admission::Open);
+    assert_eq!(table.binding_gone(&path(one.receiver, 1)), Gone::Unknown);
+    assert_eq!(table.binding_gone(&path(two.receiver, 1)), Gone::Removed);
+    assert!(!table.current(optional));
+    assert_eq!(table.binding_gone(&path(one.receiver, 2)), Gone::Lost);
+    assert_eq!(table.admission(0), Admission::LostRequired);
+    assert_eq!(table.limit(lane(0), 0), Limit::Held);
+    assert_eq!(table.retention(lane(0)), Some(10));
+    let all = events(&mut table);
+    assert!(matches!(all[2], MemberEvent::Expired { member, .. } if member == optional));
+    assert!(
+        matches!(all[3], MemberEvent::LostRequired { receiver, .. } if receiver == one.receiver)
+    );
+    let counts = *table.counters();
+    assert_eq!((counts.bindings_gone, counts.unbound), (3, 2));
+    // An expected entry that loses its only binding is removed.
+    let pending = table.expect(&path(receiver(3, 1), 1), 0).unwrap();
+    assert_eq!(table.binding_gone(&path(receiver(3, 1), 1)), Gone::Removed);
+    assert!(!table.current(pending));
 }
 
 /// The timers stop at their limit and resume from their cursor.
@@ -665,7 +842,7 @@ fn timers_are_bounded_and_fair() {
         &Roles::default(),
     );
     for id in 1..=4 {
-        accepted(table.status(&sm(id, &[(0, 100)]), 0));
+        accepted(status(&mut table, &sm(id, &[(0, 100)]), 0));
     }
     assert_eq!(table.timers(TIMEOUT, 3), 3);
     assert_eq!(table.counters().expired, 3);
@@ -685,11 +862,11 @@ fn a_full_event_queue_is_sticky() {
         &Roles::default(),
     );
     for id in 1..=3 {
-        accepted(table.status(&sm(id, &[(0, 100)]), 0));
+        accepted(status(&mut table, &sm(id, &[(0, 100)]), 0));
     }
     assert_eq!(events(&mut table).len(), 2);
     assert_eq!(table.counters().events_dropped, 1);
-    accepted(table.status(&sm(4, &[(0, 100)]), 0));
+    accepted(status(&mut table, &sm(4, &[(0, 100)]), 0));
     assert_eq!(events(&mut table).len(), 1);
     assert!(table.counters().events_incomplete);
 }
@@ -735,7 +912,7 @@ fn limits_match_the_reference_model() {
             if next(4) == 0 {
                 continue;
             }
-            let status: Vec<(u64, u32)> = (0..lanes)
+            let reported: Vec<(u64, u32)> = (0..lanes)
                 .map(|_| (next(1 << 20), u32::try_from(10 + next(1000)).unwrap()))
                 .collect();
             let tag = tags
@@ -743,8 +920,12 @@ fn limits_match_the_reference_model() {
                 .find(|(t, _)| *t == id)
                 .map_or(0, |(_, tag)| *tag);
             let at = next(2 * TIMEOUT);
-            accepted(table.status(&sm_from(receiver(id, 1), tag, &status), at));
-            let edges = status.iter().map(|&(c, w)| c + u64::from(w)).collect();
+            accepted(status(
+                &mut table,
+                &sm_from(receiver(id, 1), tag, &reported),
+                at,
+            ));
+            let edges = reported.iter().map(|&(c, w)| c + u64::from(w)).collect();
             model.push((id, edges, at));
         }
         let now = TIMEOUT + next(TIMEOUT);

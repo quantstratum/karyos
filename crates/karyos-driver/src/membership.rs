@@ -12,11 +12,19 @@
 //! consumption bounds retention.
 //!
 //! - **Members.** A member is keyed by `receiver_id` and
-//!   `receiver_boot_id` within the table's publication identity; a new
-//!   boot id is a new membership, never a continuation. Each slot has a
+//!   `receiver_boot_id` within the table's publication identity and alias;
+//!   a new boot id is a new membership, never a continuation. Each slot has a
 //!   private checked generation, raised at every reuse; queued work names
 //!   it ([`MemberRef`]) and is rechecked with [`Membership::current`]. A
 //!   slot whose generation is exhausted is retired for the incarnation.
+//! - **Bindings** (MC-9, ACS 15636). Every SM arrives through a session
+//!   binding ([`SmKey`]). A member records the `(endpoint, source)` pairs
+//!   of its accepted SMs, at most `max_paths`, and stays one logical
+//!   receiver whatever path carries its SM: a copy over a second path
+//!   changes nothing more. A binding beyond `max_paths` is refused and
+//!   counted; the SM still applies. [`Membership::binding_gone`] removes a
+//!   binding, and only the removal of a member's last binding removes the
+//!   member: an optional one expires and a required one is lost (M5).
 //! - **Roles and tags** are configured ([`Roles`]): a packet cannot promote
 //!   itself to required or choose its group. An SM whose `group_tag`
 //!   differs from the receiver's configured tag (0 when none) is rejected
@@ -51,12 +59,39 @@
 //! count at its end keeps its value and sets the sticky `overflowed` flag
 //! (SPEC.md section 14).
 
+use std::net::SocketAddr;
+
 use karyos_protocol::frame::Lane;
-use karyos_protocol::network::{Identity, Receiver, StatusMessage};
+use karyos_protocol::network::{Alias, Identity, Receiver, StatusMessage};
 use karyos_sys::host_clock::age_ns;
+
+use crate::agents::EndpointId;
+use crate::paths::MAX_PATHS;
 
 /// The most lanes a publication has.
 pub const MAX_LANES: usize = 4;
+
+/// The session binding an SM arrived through (ACS 15595, 15636): the
+/// sender's key for an accepted SM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SmKey {
+    /// The endpoint it arrived on.
+    pub endpoint: EndpointId,
+    /// The publication's alias and stream.
+    pub alias: Alias,
+    /// Its source, normalized.
+    pub source: SocketAddr,
+    /// The publication incarnation.
+    pub identity: Identity,
+    /// The receiver, boot id included.
+    pub receiver: Receiver,
+}
+
+/// A member's binding: where its SMs may come from.
+type Binding = (EndpointId, SocketAddr);
+
+/// The bindings a member holds.
+const BINDINGS: usize = MAX_PATHS as usize;
 
 /// How the optional contribution to a lane's edge is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +112,8 @@ pub struct MembershipConfig {
     pub max_receivers: u16,
     /// Entries waiting for their first SM (default 16).
     pub max_pending: u16,
+    /// Bindings per member, 1 to [`MAX_PATHS`] (default 4).
+    pub max_paths: u8,
     /// The publication's lane count, 1 to 4.
     pub lane_count: u8,
     /// The strategy.
@@ -109,6 +146,7 @@ impl MembershipConfig {
         Self {
             max_receivers: 64,
             max_pending: 16,
+            max_paths: 4,
             lane_count,
             strategy: Strategy::Min,
             min_window,
@@ -130,6 +168,9 @@ impl MembershipConfig {
         if self.max_receivers == 0 || self.max_pending > self.max_receivers || self.max_events == 0
         {
             return Err(MembershipConfigError::Capacity);
+        }
+        if self.max_paths == 0 || self.max_paths > MAX_PATHS {
+            return Err(MembershipConfigError::Paths);
         }
         if self.lane_count == 0 || usize::from(self.lane_count) > MAX_LANES {
             return Err(MembershipConfigError::Lanes);
@@ -158,6 +199,9 @@ pub enum MembershipConfigError {
     /// No entry or event slot, or more pending entries than entries.
     #[error("no entry or event slot, or more pending entries than entries")]
     Capacity,
+    /// `max_paths` is not 1 to [`MAX_PATHS`].
+    #[error("max_paths is not 1 to {MAX_PATHS}")]
+    Paths,
     /// The lane count is not 1 to 4.
     #[error("the lane count is not 1 to 4")]
     Lanes,
@@ -216,8 +260,10 @@ pub enum StatusOutcome {
 /// Why an SM (or an expected join) was rejected; each reason is counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusRejected {
-    /// Another publication incarnation.
+    /// Another publication incarnation or alias.
     Identity,
+    /// The key's receiver, identity or alias is not the SM's.
+    Key,
     /// Not exactly the publication's lane count.
     Lanes,
     /// The declared tag is not the configured one (MC-2).
@@ -240,6 +286,19 @@ pub enum StatusRejected {
     TableFull,
     /// The pending limit is reached.
     PendingFull,
+}
+
+/// The result of [`Membership::binding_gone`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// No member holds that binding.
+    Unknown,
+    /// The member keeps another binding.
+    Remaining,
+    /// It was the last binding: the pending or optional member is removed.
+    Removed,
+    /// It was a required member's last binding: it is lost (M5).
+    Lost,
 }
 
 /// A lane's submission edge.
@@ -318,8 +377,16 @@ pub struct MembershipCounters {
     /// Stationary SMs accepted while only `pause_timeout` kept the member:
     /// an operator's sign of a long pause.
     pub paused: u64,
-    /// SMs of another incarnation.
+    /// SMs of another incarnation or alias.
     pub identity: u64,
+    /// SMs whose key did not match them.
+    pub key: u64,
+    /// Bindings refused beyond `max_paths`.
+    pub paths_full: u64,
+    /// Bindings removed by [`Membership::binding_gone`].
+    pub bindings_gone: u64,
+    /// Members removed with their last binding.
+    pub unbound: u64,
     /// SMs with another lane count.
     pub lanes: u64,
     /// SMs whose tag was not the configured one.
@@ -392,6 +459,7 @@ struct Entry {
     /// Generation exhausted: never used again.
     retired: bool,
     receiver: Receiver,
+    bindings: [Option<Binding>; BINDINGS],
     required: bool,
     tag: u64,
     /// When a pending entry was expected.
@@ -413,6 +481,7 @@ impl Entry {
             receiver_boot_id: [0, 0],
             receiver_id: 0,
         },
+        bindings: [None; BINDINGS],
         required: false,
         tag: 0,
         since: 0,
@@ -429,6 +498,7 @@ impl Entry {
 pub struct Membership {
     config: MembershipConfig,
     identity: Identity,
+    alias: Alias,
     entries: Vec<Entry>,
     required: Vec<u64>,
     /// Whether each required receiver has joined (parallel to `required`).
@@ -444,7 +514,7 @@ pub struct Membership {
 }
 
 impl Membership {
-    /// A table for `identity`, created at `now`.
+    /// A table for the publication `identity` on `alias`, created at `now`.
     ///
     /// # Errors
     ///
@@ -452,6 +522,7 @@ impl Membership {
     pub fn new(
         config: MembershipConfig,
         identity: Identity,
+        alias: Alias,
         roles: &Roles<'_>,
         now: u64,
     ) -> Result<Self, MembershipConfigError> {
@@ -471,6 +542,7 @@ impl Membership {
         Ok(Self {
             config,
             identity,
+            alias,
             entries: vec![Entry::FREE; table],
             required: roles.required.to_vec(),
             required_joined: vec![false; roles.required.len()],
@@ -511,16 +583,21 @@ impl Membership {
         true
     }
 
-    /// Expects `receiver`'s join, from its session establishment: a pending
-    /// entry, removed at `join_timeout` unless an SM joins it first. An
-    /// existing entry is returned unchanged; a repeated SETUP extends
-    /// nothing.
+    /// Expects the join of `key`'s receiver, from its session
+    /// establishment: a pending entry holding that binding, removed at
+    /// `join_timeout` unless an SM joins it first. An existing entry is
+    /// returned unchanged; a repeated SETUP extends nothing.
     ///
     /// # Errors
     ///
-    /// [`StatusRejected::BootChanged`], [`StatusRejected::Lost`],
-    /// [`StatusRejected::PendingFull`] or [`StatusRejected::TableFull`].
-    pub fn expect(&mut self, receiver: Receiver, now: u64) -> Result<MemberRef, StatusRejected> {
+    /// [`StatusRejected::Identity`], [`StatusRejected::BootChanged`],
+    /// [`StatusRejected::Lost`], [`StatusRejected::PendingFull`] or
+    /// [`StatusRejected::TableFull`].
+    pub fn expect(&mut self, key: &SmKey, now: u64) -> Result<MemberRef, StatusRejected> {
+        if key.identity != self.identity || key.alias != self.alias {
+            return Err(self.reject(StatusRejected::Identity));
+        }
+        let receiver = key.receiver;
         let required = self.is_required(receiver.receiver_id);
         if let Some(slot) = self.find(receiver) {
             if self
@@ -529,6 +606,7 @@ impl Membership {
             {
                 return Err(self.reject(StatusRejected::Lost));
             }
+            self.bind(slot, key);
             return Ok(self.member_ref(slot));
         }
         if required && self.other_boot(receiver).is_some() {
@@ -551,15 +629,66 @@ impl Membership {
             entry.tag = tag;
             entry.since = now;
         }
+        self.bind(slot, key);
         Ok(self.member_ref(slot))
     }
 
-    /// Takes an SM that the session binding has validated, at `now`
-    /// (multicast-flow-control.md, "SM validation and liveness").
-    pub fn status(&mut self, sm: &StatusMessage, now: u64) -> StatusOutcome {
+    /// Takes an SM that the session binding `key` has validated, at `now`
+    /// (multicast-flow-control.md, "SM validation and liveness"). An
+    /// accepted SM adds `key`'s binding to its member.
+    pub fn status(&mut self, key: &SmKey, sm: &StatusMessage, now: u64) -> StatusOutcome {
+        if key.receiver != sm.receiver || key.identity != sm.identity || key.alias != sm.alias {
+            return StatusOutcome::Rejected(self.reject(StatusRejected::Key));
+        }
         match self.try_status(sm, now) {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                if let StatusOutcome::Accepted { member, .. } = outcome {
+                    self.bind(usize::from(member.slot), key);
+                }
+                outcome
+            }
             Err(reason) => StatusOutcome::Rejected(self.reject(reason)),
+        }
+    }
+
+    /// Removes the binding `key` that the sender expired or evicted (ACS
+    /// 15633, 15636). Only a member's last binding removes it: a required
+    /// member is then lost, as at its timeout (M5).
+    pub fn binding_gone(&mut self, key: &SmKey) -> Gone {
+        let Some(slot) = self
+            .find(key.receiver)
+            .filter(|_| key.identity == self.identity && key.alias == self.alias)
+        else {
+            return Gone::Unknown;
+        };
+        let binding = (key.endpoint, key.source);
+        let Some(entry) = self.entries.get_mut(slot) else {
+            return Gone::Unknown;
+        };
+        let Some(held) = entry.bindings.iter_mut().find(|b| **b == Some(binding)) else {
+            return Gone::Unknown;
+        };
+        *held = None;
+        let remaining = entry.bindings.iter().any(Option::is_some);
+        let state = entry.state;
+        self.counters.bump(|c| &mut c.bindings_gone);
+        if state == State::LostRequired {
+            return Gone::Lost;
+        }
+        if remaining {
+            return Gone::Remaining;
+        }
+        self.counters.bump(|c| &mut c.unbound);
+        match state {
+            State::Active => {
+                let required = self.entry(slot).is_some_and(|e| e.required);
+                self.expire(slot);
+                if required { Gone::Lost } else { Gone::Removed }
+            }
+            _ => {
+                self.free(slot);
+                Gone::Removed
+            }
         }
     }
 
@@ -568,7 +697,7 @@ impl Membership {
         sm: &StatusMessage,
         now: u64,
     ) -> Result<StatusOutcome, StatusRejected> {
-        if sm.identity != self.identity {
+        if sm.identity != self.identity || sm.alias != self.alias {
             return Err(StatusRejected::Identity);
         }
         if sm.lanes.count() != self.config.lane_count {
@@ -926,6 +1055,24 @@ impl Membership {
         Err(StatusRejected::TableFull)
     }
 
+    /// Adds `key`'s binding to the entry at `slot`, unless it holds it or
+    /// already holds `max_paths` (refused and counted).
+    fn bind(&mut self, slot: usize, key: &SmKey) {
+        let binding = (key.endpoint, key.source);
+        let limit = usize::from(self.config.max_paths);
+        let Some(entry) = self.entries.get_mut(slot) else {
+            return;
+        };
+        if entry.bindings.contains(&Some(binding)) {
+            return;
+        }
+        let free = entry.bindings.iter_mut().take(limit).find(|b| b.is_none());
+        match free {
+            Some(held) => *held = Some(binding),
+            None => self.counters.bump(|c| &mut c.paths_full),
+        }
+    }
+
     fn free(&mut self, slot: usize) {
         if let Some(entry) = self.entries.get_mut(slot) {
             entry.state = State::Free;
@@ -982,6 +1129,7 @@ impl Membership {
     fn reject(&mut self, reason: StatusRejected) -> StatusRejected {
         self.counters.bump(|c| match reason {
             StatusRejected::Identity => &mut c.identity,
+            StatusRejected::Key => &mut c.key,
             StatusRejected::Lanes => &mut c.lanes,
             StatusRejected::Tag => &mut c.tag,
             StatusRejected::Window => &mut c.window,

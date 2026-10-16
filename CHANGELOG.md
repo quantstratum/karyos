@@ -204,9 +204,12 @@ release may break APIs, wire formats and shared-memory layouts.
   multicast-flow-control.md, MC-1 to MC-9, ACS 15597, 15604 and 15610):
   `karyos_driver::membership::Membership`, one publication incarnation's
   receiver table, owned by its sender agent. It takes SMs the session
-  binding validated and keys members by `receiver_id` and
+  binding validated (`SmKey`) and keys members by `receiver_id` and
   `receiver_boot_id`, with a checked generation per slot (`MemberRef`,
-  `current`) and retired slots at exhaustion. Roles and tags are
+  `current`) and retired slots at exhaustion. A member records up to
+  `max_paths` bindings, so one receiver over several paths stays one
+  member; `binding_gone` removes a binding, and the last one removes the
+  member (a required one is lost, M5; ACS 15636). Roles and tags are
   configured (`Roles`): a mismatched `group_tag` rejects the SM, and a
   required receiver has one membership per incarnation. The join fixes
   each lane's window in `min_window..=max_window`; a changed window, a
