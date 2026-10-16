@@ -68,7 +68,7 @@ fn claim_commit_drop_scripted() {
     // A dropped frame frees its slot and queue charge.
     let frame = h.tx.claim_tx(h.queue, 4).unwrap();
     drop(frame);
-    assert_eq!(h.tx.pending(), 0);
+    assert_eq!(h.tx.pending(), Some(0));
     // Committing a prefix of the claim sends exactly that prefix.
     let mut frame = h.tx.claim_tx(h.queue, 8).unwrap();
     frame.bytes_mut().copy_from_slice(b"01234567");
@@ -160,7 +160,7 @@ fn queue_capacity_and_overcommit() {
     );
     // A full lane never blocks a control queue's claim.
     h.commit_to(control, b"control", 100);
-    assert_eq!(h.tx.pending(), 7);
+    assert_eq!(h.tx.pending(), Some(7));
     h.shutdown();
 }
 
@@ -245,8 +245,13 @@ fn gate_trim_and_gate_error() {
         }
     );
     assert_eq!(h.socket.send_calls(), 0);
-    assert_eq!(entries.len(), 4);
-    assert_eq!(h.tx.pending(), 4);
+    // Every candidate waits at the head as after a denial.
+    assert_eq!(
+        outcomes(&entries),
+        vec![pending(PendingCause::GateDenied); 4]
+    );
+    assert_eq!(tokens(&entries), vec![0, 1, 2, 3]);
+    assert_eq!(h.tx.pending(), Some(4));
     // Permit { count } exposes exactly `count` head items.
     h.socket.push_send(SendResult::Sent {
         sent: 2,
@@ -295,7 +300,7 @@ fn report_not_empty_flush_and_cancel_and_close() {
     );
     assert_eq!(gate.calls, 0);
     assert_eq!(h.socket.send_calls(), 0);
-    assert_eq!(h.tx.pending(), 2, "no state changed");
+    assert_eq!(h.tx.pending(), Some(2), "no state changed");
     assert_eq!(drain(&mut full).len(), 1, "the unread entry is intact");
     // reset and retire: lifecycle::report_not_empty_reset_and_retire.
     h.shutdown();
@@ -427,7 +432,7 @@ fn transient_errors() {
             outcomes(&entries),
             vec![pending(cause), pending(PendingCause::NotAttempted)]
         );
-        assert_eq!(h.tx.pending(), 2);
+        assert_eq!(h.tx.pending(), Some(2));
     }
     // Not faulted: the next flush sends.
     h.socket.push_send(SendResult::Sent {
@@ -571,7 +576,7 @@ fn invariant_checks_short_msg_len() {
     );
     // Unknown items leave the queue and are never retried.
     assert!(!h.tx.is_pending(tickets[1]));
-    assert_eq!(h.tx.pending(), 1);
+    assert_eq!(h.tx.pending(), Some(1));
     let mut gate = Gate::default();
     let (outcome, entries) = h.flush(&mut gate);
     assert_eq!(outcome.stop, FlushStop::Queue(QueueError::NeedsReset));
@@ -741,7 +746,7 @@ fn tx_failed_stops_the_half() {
         // Claims and commits make no system call and keep working; the
         // items wait for the reset.
         h.commit_n(2, 1);
-        assert_eq!(h.tx.pending(), 3);
+        assert_eq!(h.tx.pending(), Some(3));
         assert_eq!((gate.calls, h.socket.send_calls()), (0, 1));
         let (mut endpoint, socket) = h.join();
         assert_eq!(reset_all(&mut endpoint).len(), 3);
@@ -1042,7 +1047,7 @@ fn guards_hold_under_an_injected_fault() {
     let cancelled = h.tx.cancel_pending(h.queue, &mut report).unwrap();
     assert_eq!((cancelled.returned, cancelled.more), (0, true));
     assert!(report.is_empty());
-    assert_eq!(h.tx.pending(), 3);
+    assert_eq!(h.tx.pending(), Some(3));
     // The other queue is untouched.
     h.socket.push_send(SendResult::Sent {
         sent: 1,
@@ -1057,7 +1062,7 @@ fn guards_hold_under_an_injected_fault() {
     assert_eq!((outcome.returned, outcome.more), (0, true));
     assert!(report.is_empty());
     assert!(!endpoint.tx.finish_reset(), "refused while pending");
-    assert_eq!(endpoint.pending(), 2);
+    assert_eq!(endpoint.pending(), Some(2));
     assert_eq!(socket.live_descriptors(), 1, "the socket stays open");
     // Repairing the link lets the reset finish, in FIFO order.
     assert_eq!(
@@ -1091,7 +1096,7 @@ fn gate_panic() {
     assert!(result.is_err());
     assert_eq!(h.socket.send_calls(), 0, "nothing sent");
     assert!(report.is_empty());
-    assert_eq!(h.tx.pending(), 2);
+    assert_eq!(h.tx.pending(), Some(2));
     assert!(tickets.iter().all(|ticket| h.tx.is_pending(*ticket)));
     // The next flush reports normally.
     h.socket.push_send(SendResult::Sent {
@@ -1325,4 +1330,89 @@ fn ipv6_route_overhead_is_48_bytes() {
             route_mtu: 1280
         })
     );
+}
+
+/// An item reported `Unknown` that the flush cannot take off its FIFO
+/// (the head is corrupted after the send call) stays terminal: it is no
+/// longer pending, and the reset that later pops it quarantines it without
+/// a second report, so at most once does not depend on the FIFO.
+#[test]
+fn an_unpoppable_unknown_item_gets_one_terminal_report() {
+    let mut h = Harness::new();
+    let tickets = h.commit_n(0, 2);
+    h.tx.core.inject_head_owner_after_send(h.queue, None);
+    h.socket.push_send(SendResult::Sent {
+        sent: 2,
+        error: None,
+    });
+    let (outcome, entries) = h.flush(&mut Gate::default());
+    assert_eq!(
+        outcome.stop,
+        FlushStop::Failed(BackendFailure::Invariant { operation: "send" })
+    );
+    assert_eq!(outcome.submitted, 0);
+    assert_eq!(
+        outcomes(&entries),
+        vec![TxItemOutcome::Unknown, TxItemOutcome::Unknown]
+    );
+    assert_eq!(tokens(&entries), vec![0, 1]);
+    assert!(tickets.iter().all(|ticket| !h.tx.is_pending(*ticket)));
+    assert_eq!(h.tx.retry_queue(h.queue), Err(QueueError::NeedsReset));
+    // Both stay on the FIFO until the link is repaired.
+    assert_eq!(h.tx.pending(), Some(2));
+    let queue = h.queue;
+    let (mut endpoint, socket) = h.join();
+    assert_eq!(
+        endpoint.tx.inject_head_owner(queue, Some(queue)),
+        Some(tickets[0].id().slot())
+    );
+    endpoint.tx.clear_injection();
+    // The reset pops both and reports neither again.
+    assert!(reset_all(&mut endpoint).is_empty());
+    assert_eq!(endpoint.pending(), Some(0));
+    assert_eq!(socket.live_descriptors(), 0);
+    // The quarantined slots were freed with the reset: the whole pool
+    // can be claimed again.
+    endpoint.reopen(&config()).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let route = tx.add_route(peer()).unwrap();
+    let queue = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: nz(8),
+        })
+        .unwrap();
+    let frames: Vec<_> = (0..8)
+        .map(|_| tx.core.claim(queue, 1).map(|_| ()))
+        .collect();
+    assert!(frames.iter().all(Result::is_ok));
+    let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+    assert!(retire_all(&mut endpoint).is_empty());
+}
+
+/// A claimed frame whose bytes lie outside the pool gets no bytes, faults
+/// its queue as an invariant violation and cannot commit.
+#[test]
+fn a_frame_outside_the_pool_faults_the_queue() {
+    let mut h = Harness::new();
+    let mut frame = h.tx.claim_tx(h.queue, 10).unwrap();
+    frame.inject_capacity(usize::MAX);
+    assert!(frame.bytes_mut().is_empty());
+    let rejected = frame
+        .commit(Commit {
+            len: 10,
+            token: SenderToken::new(0),
+            options: TxOptions::none(),
+        })
+        .unwrap_err();
+    assert_eq!(rejected.error, CommitError::UnknownQueue);
+    drop(rejected);
+    assert_eq!(h.tx.retry_queue(h.queue), Err(QueueError::NeedsReset));
+    assert_eq!(h.tx.pending(), Some(0));
+    assert_eq!(
+        h.flush(&mut Gate::default()).0.stop,
+        FlushStop::Queue(QueueError::NeedsReset)
+    );
+    assert!(h.shutdown().is_empty());
 }

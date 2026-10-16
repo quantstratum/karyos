@@ -13,6 +13,7 @@ use crate::backend::{
     PendingCause, QueueError, Reason, Release, ReturnReason, RouteError, RxStop, TxEvent,
     TxItemOutcome,
 };
+use crate::sockets::endpoint::tx_drops_on_this_thread;
 use crate::sockets::ops::{Errno, RecvResult, SendResult};
 use crate::sockets::scripted::default_probes;
 
@@ -257,7 +258,7 @@ fn reset_returns_items_and_invalidates_handles() {
     let entries = drain(&mut report);
     assert_eq!(endpoint.reopen(&cfg_large), Err(OpenError::ResetIncomplete));
     assert_eq!(endpoint.retire(&mut report), Retired::ResetIncomplete);
-    assert_eq!(endpoint.pending(), 2);
+    assert_eq!(endpoint.pending(), Some(2));
     assert_eq!(socket.live_descriptors(), 1, "the socket stays open");
     let second = endpoint.reset(&mut report);
     assert_eq!((second.returned, second.more), (2, false));
@@ -395,7 +396,7 @@ fn report_not_empty_reset_and_retire() {
     assert!(outcome.report_not_empty && outcome.more);
     assert_eq!(outcome.returned, 0);
     assert_eq!(endpoint.retire(&mut full), Retired::ReportNotEmpty);
-    assert_eq!(endpoint.pending(), 2, "no state changed");
+    assert_eq!(endpoint.pending(), Some(2), "no state changed");
     assert_eq!(socket.live_descriptors(), 1);
     // The endpoint is still active: it splits and flushes.
     let (tx, rx) = endpoint.split().unwrap();
@@ -433,9 +434,9 @@ fn retire_and_drop() {
         Retired::Complete { returned: 0 }
     );
     // A drop with nothing pending is quiet.
-    let before = tx_discarded_on_drop();
+    let before = tx_drops_on_this_thread();
     drop(Harness::new());
-    assert_eq!(tx_discarded_on_drop(), before);
+    assert_eq!(tx_drops_on_this_thread(), before);
 }
 
 #[cfg(debug_assertions)]
@@ -686,14 +687,14 @@ fn split_fails_when_the_descriptor_cannot_be_duplicated() {
         let tickets = h.commit_n(0, 2);
         let queue = h.queue;
         let (endpoint, observer) = h.join();
-        let before = tx_discarded_on_drop();
+        let before = tx_drops_on_this_thread();
         observer.fail_next_clone(errno);
         let SplitError { endpoint, error } = endpoint.split().unwrap_err();
         assert_eq!(error, SplitFailure::Os { errno: errno.raw() });
         assert!(error.to_string().contains("dup"));
-        assert_eq!(endpoint.pending(), 2, "no pending item is lost");
+        assert_eq!(endpoint.pending(), Some(2), "no pending item is lost");
         assert_eq!(observer.live_descriptors(), 1, "the socket stays open");
-        assert_eq!(tx_discarded_on_drop(), before);
+        assert_eq!(tx_drops_on_this_thread(), before);
         // The next split succeeds and the items are still pending in order.
         let (mut tx, rx) = endpoint.split().unwrap();
         assert!(tickets.iter().all(|ticket| tx.is_pending(*ticket)));
@@ -743,7 +744,7 @@ fn split_refuses_closed_and_retired_endpoints() {
     let SplitError { endpoint, error } = endpoint.split().unwrap_err();
     assert_eq!(error, SplitFailure::Retired);
     assert_eq!(error.to_string(), "the endpoint is retired");
-    assert_eq!(endpoint.pending(), 0);
+    assert_eq!(endpoint.pending(), Some(0));
 }
 
 #[test]
@@ -952,7 +953,7 @@ fn guard_race_failed_admission_after_permit() {
     assert_eq!(outcome.stop, FlushStop::GateDenied);
     assert_eq!(h.socket.send_calls(), 1);
     assert_eq!(gate.published, vec![(2, vec![])]);
-    assert_eq!(h.tx.pending(), 2);
+    assert_eq!(h.tx.pending(), Some(2));
     h.shutdown();
 }
 

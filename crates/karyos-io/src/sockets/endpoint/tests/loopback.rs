@@ -1,0 +1,502 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Section 12 rows on a real Linux socket over loopback (section 9,
+//! "Loopback, Linux"): RX oversize, split halves on two threads, the round
+//! trip, the buffer and path MTU probes, an unanswered port and loopback
+//! multicast. Unprivileged; the endpoint runs over [`LinuxSocket`].
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::time::{Duration, Instant};
+
+use super::*;
+use crate::backend::{
+    Capability, CapabilityState, FlushStop, PendingCause, Reason, RxDropReason, RxStop,
+    TxItemOutcome,
+};
+use crate::sockets::linux::LinuxSocket;
+
+/// How long a test waits for loopback traffic that should already be there.
+const PATIENCE: Duration = Duration::from_secs(10);
+
+/// Records a skipped case with its reason (section 9).
+#[expect(
+    clippy::print_stderr,
+    reason = "section 9 records every skip with its reason in the test log"
+)]
+fn skip(reason: &str) {
+    eprintln!("skip: {reason}");
+}
+
+fn loopback_any_port() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
+}
+
+/// [`config`] bound to `local`, without buffer requests.
+fn linux_config(local: SocketAddr) -> SocketsConfig {
+    let mut config = config();
+    config.local = local;
+    config.send_buffer = None;
+    config.recv_buffer = None;
+    config
+}
+
+/// An endpoint over a real socket.
+struct Node {
+    tx: SocketsTx<LinuxSocket>,
+    rx: SocketsRx<LinuxSocket>,
+    local: SocketAddr,
+}
+
+impl Node {
+    fn open(config: &SocketsConfig) -> Self {
+        let endpoint =
+            SocketsEndpoint::open(config, InstanceId::FIRST, LinuxSocket::new()).unwrap();
+        let local = endpoint.capabilities().local;
+        let (tx, rx) = endpoint.split().unwrap();
+        Self { tx, rx, local }
+    }
+
+    fn loopback() -> Self {
+        Self::open(&linux_config(loopback_any_port()))
+    }
+
+    /// A route and a queue of 8 towards `peer`.
+    fn queue_to(&mut self, peer: SocketAddr) -> TxQueueId {
+        let route = self.tx.add_route(peer).unwrap();
+        self.tx
+            .open_queue(TxQueueConfig {
+                authority: Authority::FIRST,
+                route,
+                max_pending: nz(8),
+            })
+            .unwrap()
+    }
+
+    /// Commits and flushes `datagrams` on `queue`; returns the report.
+    fn send(&mut self, queue: TxQueueId, datagrams: &[&[u8]]) -> (FlushOutcome, Vec<TxEntry>) {
+        for (token, bytes) in (0_u64..).zip(datagrams) {
+            let mut frame = self.tx.claim_tx(queue, bytes.len()).unwrap();
+            frame.bytes_mut().copy_from_slice(bytes);
+            frame
+                .commit(Commit {
+                    len: bytes.len(),
+                    token: SenderToken::new(token),
+                    options: TxOptions::none(),
+                })
+                .unwrap();
+        }
+        let mut report = TxReport::new();
+        let outcome = self.tx.flush(
+            FlushRequest {
+                queue,
+                max_datagrams: nz(64),
+                max_bytes: u32::MAX,
+            },
+            &mut Gate::default(),
+            &mut report,
+        );
+        (outcome, drain(&mut report))
+    }
+
+    /// Joins and retires the endpoint.
+    fn shutdown(self) {
+        let mut endpoint = SocketsEndpoint::join(self.tx, self.rx).unwrap();
+        assert!(retire_all(&mut endpoint).is_empty());
+    }
+}
+
+/// Polls `rx` until `handler` holds `datagrams` datagrams and drops, or
+/// [`PATIENCE`] runs out.
+fn receive(rx: &mut SocketsRx<LinuxSocket>, handler: &mut Recorder, datagrams: usize) {
+    let budget = config().rx_budget().unwrap();
+    let start = Instant::now();
+    while handler.datagrams.len() + handler.drops.len() < datagrams && start.elapsed() < PATIENCE {
+        let outcome = rx.poll_rx(budget, handler);
+        match outcome.stop {
+            RxStop::WouldBlock => std::thread::yield_now(),
+            RxStop::Budget => {}
+            other => panic!("unexpected stop {other:?}"),
+        }
+    }
+}
+
+fn all_submitted(entries: &[TxEntry]) -> bool {
+    entries
+        .iter()
+        .all(|entry| matches!(entry.outcome, TxItemOutcome::Submitted { .. }))
+}
+
+/// Section 12, RX oversize: `max_datagram + 1` and 9,000 bytes are dropped
+/// as `Oversize` with the length Linux reports, never delivered short; a
+/// datagram of exactly `max_datagram` is delivered whole.
+#[test]
+fn rx_oversize_on_loopback() {
+    let mut node = Node::loopback();
+    let sender = UdpSocket::bind(loopback_any_port()).unwrap();
+    let source = sender.local_addr().unwrap();
+    for len in [257, 9000, 256] {
+        sender.send_to(&payload(9, len), node.local).unwrap();
+    }
+    let mut handler = Recorder::default();
+    receive(&mut node.rx, &mut handler, 3);
+    let oversize = |received| RxDrop {
+        reason: RxDropReason::Oversize {
+            limit: 256,
+            received: Some(received),
+        },
+        source: Some(source),
+    };
+    assert_eq!(handler.drops, vec![oversize(257), oversize(9000)]);
+    assert_eq!(handler.datagrams, vec![(payload(9, 256), source)]);
+    node.shutdown();
+}
+
+/// Section 12, loopback round trip: unicast both ways; bytes equal and the
+/// source endpoint is the peer's bound address.
+#[test]
+fn loopback_round_trip() {
+    let mut a = Node::loopback();
+    let mut b = Node::loopback();
+    let to_b = a.queue_to(b.local);
+    let to_a = b.queue_to(a.local);
+
+    let (outcome, entries) = a.send(to_b, &[b"ping", b"ping again"]);
+    assert_eq!((outcome.submitted, outcome.stop), (2, FlushStop::Exposed));
+    assert!(all_submitted(&entries));
+    let mut at_b = Recorder::default();
+    receive(&mut b.rx, &mut at_b, 2);
+    assert_eq!(
+        at_b.datagrams,
+        vec![
+            (b"ping".to_vec(), a.local),
+            (b"ping again".to_vec(), a.local)
+        ]
+    );
+
+    let (outcome, _) = b.send(to_a, &[b"pong"]);
+    assert_eq!(outcome.submitted, 1);
+    let mut at_a = Recorder::default();
+    receive(&mut a.rx, &mut at_a, 1);
+    assert_eq!(at_a.datagrams, vec![(b"pong".to_vec(), b.local)]);
+    a.shutdown();
+    b.shutdown();
+}
+
+/// Section 12, split halves: each half on its own thread exchanges traffic
+/// over loopback, and dropping one half leaves the other working.
+#[test]
+fn split_halves_on_two_threads() {
+    const COUNT: usize = 200;
+    let mut a = Node::loopback();
+    let b = Node::loopback();
+    let to_b = a.queue_to(b.local);
+    let a_local = a.local;
+    let Node {
+        tx: b_tx,
+        rx: mut b_rx,
+        local: _,
+    } = b;
+
+    let receiver = std::thread::spawn(move || {
+        let mut handler = Recorder::default();
+        receive(&mut b_rx, &mut handler, COUNT);
+        (b_rx, handler)
+    });
+    let Node {
+        tx: mut a_tx,
+        rx: a_rx,
+        local: _,
+    } = a;
+    let sender = std::thread::spawn(move || {
+        for index in 0..COUNT {
+            let mut frame = a_tx.claim_tx(to_b, 4).unwrap();
+            frame
+                .bytes_mut()
+                .copy_from_slice(&u32::try_from(index).unwrap().to_be_bytes());
+            frame
+                .commit(Commit {
+                    len: 4,
+                    token: SenderToken::new(u64::try_from(index).unwrap()),
+                    options: TxOptions::none(),
+                })
+                .unwrap();
+            let mut report = TxReport::new();
+            let outcome = a_tx.flush(
+                FlushRequest {
+                    queue: to_b,
+                    max_datagrams: nz(64),
+                    max_bytes: u32::MAX,
+                },
+                &mut Gate::default(),
+                &mut report,
+            );
+            assert_eq!(outcome.submitted, 1, "{outcome:?}");
+            drain(&mut report);
+        }
+        a_tx
+    });
+    let mut a_tx = sender.join().unwrap();
+    let (b_rx, handler) = receiver.join().unwrap();
+    // Loopback keeps order and loses nothing below the receive buffer.
+    let expected: Vec<(Vec<u8>, SocketAddr)> = (0..COUNT)
+        .map(|index| {
+            (
+                u32::try_from(index).unwrap().to_be_bytes().to_vec(),
+                a_local,
+            )
+        })
+        .collect();
+    assert_eq!(handler.datagrams, expected);
+
+    // Dropping A's receive half closes only its duplicate: A still sends.
+    drop(a_rx);
+    let mut report = TxReport::new();
+    let mut frame = a_tx.claim_tx(to_b, 5).unwrap();
+    frame.bytes_mut().copy_from_slice(b"after");
+    frame
+        .commit(Commit {
+            len: 5,
+            token: SenderToken::new(0),
+            options: TxOptions::none(),
+        })
+        .unwrap();
+    let outcome = a_tx.flush(
+        FlushRequest {
+            queue: to_b,
+            max_datagrams: nz(64),
+            max_bytes: u32::MAX,
+        },
+        &mut Gate::default(),
+        &mut report,
+    );
+    assert_eq!(outcome.submitted, 1);
+    drain(&mut report);
+    let mut b_rx = b_rx;
+    let mut handler = Recorder::default();
+    receive(&mut b_rx, &mut handler, 1);
+    assert_eq!(handler.datagrams, vec![(b"after".to_vec(), a_local)]);
+
+    // Dropping B's send half leaves its receive half working.
+    drop(b_tx);
+    let sender = UdpSocket::bind(loopback_any_port()).unwrap();
+    let b_local = b_rx.capabilities().local;
+    sender.send_to(b"still", b_local).unwrap();
+    let mut handler = Recorder::default();
+    receive(&mut b_rx, &mut handler, 1);
+    assert_eq!(handler.datagrams.len(), 1);
+    drop(a_tx);
+}
+
+/// The snapshot of a real socket: the probed rows, the `LibraryApi` rows of
+/// decision O-3 and the buffer read backs (section 12, buffer sizes).
+#[test]
+fn snapshot_of_a_linux_socket() {
+    let mut wanted = linux_config(loopback_any_port());
+    wanted.send_buffer = SocketsConfig::new(loopback_any_port()).send_buffer;
+    wanted.recv_buffer = SocketsConfig::new(loopback_any_port()).recv_buffer;
+    let endpoint = SocketsEndpoint::open(&wanted, InstanceId::FIRST, LinuxSocket::new()).unwrap();
+    let snapshot = *endpoint.capabilities();
+    assert_eq!(snapshot.platform, Platform::Linux);
+    assert_ne!(snapshot.local.port(), 0);
+    assert_eq!(snapshot.dont_fragment, CapabilityState::Active);
+    assert_eq!(snapshot.tx_batch, CapabilityState::Active);
+    let library = CapabilityState::Unavailable(Reason::LibraryApi);
+    for state in [
+        snapshot.rx_batch,
+        snapshot.gso,
+        snapshot.gro,
+        snapshot.kernel_stamps,
+        snapshot.hardware_stamps,
+        snapshot.busy_poll,
+    ] {
+        assert_eq!(state, library);
+    }
+    assert!(!snapshot.enobufs_reported);
+    for (buffer, requested) in [
+        (snapshot.send_buffer, wanted.send_buffer),
+        (snapshot.recv_buffer, wanted.recv_buffer),
+    ] {
+        let requested = requested.unwrap();
+        let effective = buffer.effective.unwrap();
+        assert_eq!(buffer.requested, Some(requested));
+        let expected = if effective >= requested.get() {
+            CapabilityState::Active
+        } else {
+            CapabilityState::Fallback(Reason::BelowRequest { effective })
+        };
+        assert_eq!(buffer.state, expected);
+    }
+    // A required buffer below the request fails to open (8.3).
+    let below = [
+        (Capability::SendBuffer, snapshot.send_buffer.state),
+        (Capability::RecvBuffer, snapshot.recv_buffer.state),
+    ];
+    for (capability, state) in below {
+        if state == CapabilityState::Active {
+            continue;
+        }
+        let mut required = wanted;
+        required.require = CapabilitySet::EMPTY.with(capability);
+        assert_eq!(
+            SocketsEndpoint::open(&required, InstanceId::FIRST, LinuxSocket::new()).err(),
+            Some(OpenError::RequiredCapability { capability, state })
+        );
+    }
+    let (tx, rx) = endpoint.split().unwrap();
+    let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+    assert!(retire_all(&mut endpoint).is_empty());
+}
+
+/// Section 12, path MTU on loopback: the loopback route is measured and
+/// `Active`; a route whose measurement fails (the broadcast address, which
+/// the temporary socket cannot connect to without `SO_BROADCAST`) is
+/// `Fallback(Unverified)`, or `PathUnverified` when the path MTU is
+/// required.
+#[test]
+fn path_mtu_on_loopback() {
+    let mut node = Node::loopback();
+    let peer = Node::loopback();
+    let route = node.tx.add_route(peer.local).unwrap();
+    let info = node.tx.route_info(route).unwrap();
+    assert_eq!(info.path_mtu, CapabilityState::Active);
+    assert!(info.route_mtu.unwrap() >= 256 + 8 + 20);
+
+    let broadcast = SocketAddr::from((Ipv4Addr::BROADCAST, 9));
+    let route = node.tx.add_route(broadcast).unwrap();
+    assert_eq!(
+        node.tx.route_info(route).unwrap(),
+        RouteInfo {
+            route_mtu: None,
+            path_mtu: CapabilityState::Fallback(Reason::Unverified),
+        }
+    );
+    node.shutdown();
+
+    let mut required = linux_config(loopback_any_port());
+    required.require = CapabilitySet::EMPTY.with(Capability::PathMtu);
+    let mut node = Node::open(&required);
+    assert_eq!(
+        node.tx.add_route(broadcast),
+        Err(RouteError::PathUnverified)
+    );
+    assert!(node.tx.add_route(peer.local).is_ok());
+    node.shutdown();
+    peer.shutdown();
+}
+
+/// Section 12, `ECONNREFUSED` on send, on a real socket: without
+/// `IP_RECVERR` an unconnected socket gets no ICMP error, so datagrams to a
+/// port nobody listens on are `Submitted` and neither half counts a peer
+/// error. The `PeerError` path of a reported `ECONNREFUSED` is the scripted
+/// test `econnrefused_on_send`.
+#[test]
+fn an_unanswered_port_on_loopback() {
+    let closed = UdpSocket::bind(loopback_any_port())
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let mut node = Node::loopback();
+    let queue = node.queue_to(closed);
+    for _ in 0..3 {
+        let (outcome, entries) = node.send(queue, &[b"anyone?"]);
+        assert_eq!(outcome.submitted, 1);
+        assert!(all_submitted(&entries));
+        assert!(!entries.iter().any(|entry| entry.outcome
+            == TxItemOutcome::Pending {
+                cause: PendingCause::PeerError
+            }));
+    }
+    let outcome = node
+        .rx
+        .poll_rx(config().rx_budget().unwrap(), &mut Recorder::default());
+    assert_eq!(outcome.stop, RxStop::WouldBlock);
+    assert_eq!((node.tx.peer_errors(), node.rx.peer_errors()), (0, 0));
+    node.shutdown();
+}
+
+/// A multicast endpoint on `local` joined to `group` on the default
+/// interface, or `None` when the host cannot join (a recorded skip).
+fn multicast_node(local: SocketAddr, group: Ipv4Addr, loopback: bool) -> Option<Node> {
+    let mut wanted = linux_config(local);
+    let mut multicast = MulticastConfig::new(IpAddr::V4(group), InterfaceSel::Index(0));
+    multicast.loopback = loopback;
+    wanted.multicast = Some(multicast);
+    match SocketsEndpoint::open(&wanted, InstanceId::FIRST, LinuxSocket::new()) {
+        Ok(endpoint) => {
+            let local = endpoint.capabilities().local;
+            let (tx, rx) = endpoint.split().unwrap();
+            Some(Node { tx, rx, local })
+        }
+        Err(error) => {
+            skip(&format!("multicast join on the default interface: {error}"));
+            None
+        }
+    }
+}
+
+/// Section 12, multicast, as far as one network namespace allows: a group
+/// joined on the default interface, the sender's own datagrams looped back
+/// (`IP_MULTICAST_LOOP`), the receiver bound to the group address so a
+/// second group on the same port is not delivered, and loop off honored.
+/// Needs an interface with a multicast route (a container's `eth0`); `lo`
+/// has no multicast flag. Cross host delivery and an explicit interface
+/// stay with the namespace rows (S4).
+#[test]
+fn multicast_loopback_on_the_default_interface() {
+    let group_a = Ipv4Addr::new(239, 255, 77, 1);
+    let group_b = Ipv4Addr::new(239, 255, 77, 2);
+    let any = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+    let Some(mut receiver_a) = multicast_node(SocketAddr::from((group_a, 0)), group_a, true) else {
+        return;
+    };
+    let port = receiver_a.local.port();
+    let destination = SocketAddr::from((group_a, port));
+    let mut receiver_b = multicast_node(SocketAddr::from((group_b, port)), group_b, true).unwrap();
+    let mut looped = multicast_node(any, group_a, true).unwrap();
+    let mut quiet = multicast_node(any, group_a, false).unwrap();
+    let looped_queue = looped.queue_to(destination);
+    let quiet_queue = quiet.queue_to(destination);
+
+    let (outcome, _) = looped.send(looped_queue, &[b"to group a"]);
+    if outcome.submitted != 1 {
+        skip(&format!(
+            "multicast send on the default interface: {outcome:?}"
+        ));
+        return;
+    }
+    let mut at_a = Recorder::default();
+    receive(&mut receiver_a.rx, &mut at_a, 1);
+    if at_a.datagrams.is_empty() {
+        skip("multicast loop delivered nothing on this host");
+        return;
+    }
+    assert_eq!(at_a.datagrams.len(), 1);
+    let (bytes, source) = at_a.datagrams.remove(0);
+    assert_eq!(bytes, b"to group a");
+    assert_eq!(source.port(), looped.local.port());
+    // The group bind of B keeps group A's datagram out.
+    let outcome = receiver_b
+        .rx
+        .poll_rx(config().rx_budget().unwrap(), &mut Recorder::default());
+    assert_eq!((outcome.delivered, outcome.stop), (0, RxStop::WouldBlock));
+
+    // Loop off: the quiet sender's datagram is not delivered on this host.
+    // Loopback delivery is synchronous, so the marker sent after it is the
+    // first and only datagram the receiver sees.
+    let (outcome, _) = quiet.send(quiet_queue, &[b"not looped"]);
+    assert_eq!(outcome.submitted, 1);
+    let (outcome, _) = looped.send(looped_queue, &[b"marker"]);
+    assert_eq!(outcome.submitted, 1);
+    let mut after = Recorder::default();
+    receive(&mut receiver_a.rx, &mut after, 1);
+    let outcome = receiver_a
+        .rx
+        .poll_rx(config().rx_budget().unwrap(), &mut after);
+    assert_eq!(outcome.stop, RxStop::WouldBlock);
+    assert_eq!(after.datagrams.len(), 1);
+    assert_eq!(after.datagrams[0].0, b"marker");
+
+    for node in [receiver_a, receiver_b, looped, quiet] {
+        node.shutdown();
+    }
+}

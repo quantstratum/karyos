@@ -195,9 +195,12 @@ impl QueueTable {
         // An open queue's capacity was taken from `uncommitted` at open;
         // its quarantined part moves to `stranded` instead.
         let quarantined = u32::from(account.quarantined);
-        let freed = u32::from(account.max_pending.get()).saturating_sub(quarantined);
+        // A queue never quarantines more than it holds, so `freed` is
+        // never negative; were it, nothing moves and the debug build
+        // asserts.
+        let freed = u32::from(account.max_pending.get()).checked_sub(quarantined);
         match (
-            self.uncommitted.checked_add(freed),
+            freed.and_then(|freed| self.uncommitted.checked_add(freed)),
             self.stranded.checked_add(quarantined),
         ) {
             (Some(uncommitted), Some(stranded)) => {

@@ -12,18 +12,32 @@ use super::endpoint::{BufferSize, Membership, SocketsConfig};
 use crate::backend::{CapabilityState, OpenError};
 
 /// The destination of a route, stored once at `add_route` so sends never
-/// convert or allocate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// convert or allocate: on Linux it also holds the `rustix` socket address
+/// the send calls take (3.8).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteAddr {
     address: SocketAddr,
+    #[cfg(target_os = "linux")]
+    os: rustix::net::SocketAddrAny,
 }
 
 impl RouteAddr {
-    /// Stores `address`.
+    /// Stores `address`, converted once for the platform's send calls.
     #[inline]
     #[must_use]
-    pub const fn new(address: SocketAddr) -> Self {
-        Self { address }
+    pub fn new(address: SocketAddr) -> Self {
+        Self {
+            address,
+            #[cfg(target_os = "linux")]
+            os: rustix::net::SocketAddrAny::from(address),
+        }
+    }
+
+    /// The destination as the Linux send calls take it.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn os(&self) -> &rustix::net::SocketAddrAny {
+        &self.os
     }
 
     /// The destination.
@@ -271,7 +285,10 @@ pub enum RecvResult {
     Datagram {
         /// Bytes written into the buffer.
         len: usize,
-        /// The true datagram length when the kernel reported truncation.
+        /// The true datagram length, when the datagram filled or exceeded
+        /// the buffer and the call reports it (`MSG_TRUNC` on Linux). A
+        /// full buffer alone is ambiguous: `None` with `len` equal to the
+        /// buffer's length means the length is unknown (macOS).
         truncated: Option<usize>,
         /// The sender, when the call reported one.
         source: Option<SocketAddr>,

@@ -64,6 +64,25 @@ pub fn tx_discarded_on_drop() -> u64 {
     TX_DISCARDED_ON_DROP.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Drops counted by [`TX_DISCARDED_ON_DROP`] on this thread, so a test
+    /// observes its own drops and not those of tests running in parallel.
+    static TX_DROPS_ON_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Drops outside unwinding with pending items on the calling thread.
+#[cfg(test)]
+pub(crate) fn tx_drops_on_this_thread() -> u64 {
+    TX_DROPS_ON_THIS_THREAD.with(std::cell::Cell::get)
+}
+
+/// Records a drop outside unwinding with pending items on this thread.
+#[cfg(test)]
+pub(crate) fn note_tx_drop_on_this_thread() {
+    TX_DROPS_ON_THIS_THREAD.with(|drops| drops.set(drops.get().wrapping_add(1)));
+}
+
 /// The life of an endpoint (7.3 and 7.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -460,9 +479,10 @@ impl<O: SocketOps> SocketsEndpoint<O> {
         }
     }
 
-    /// Pending items over every queue.
+    /// Pending items over every queue; `None` if the total does not fit
+    /// `usize`, which 1024 queues of `u16` counts rule out.
     #[must_use]
-    pub fn pending(&self) -> usize {
+    pub fn pending(&self) -> Option<usize> {
         self.tx.pending_total()
     }
 }
@@ -564,9 +584,10 @@ impl<O: SocketOps> SocketsTx<O> {
         self.core.is_pending(ticket)
     }
 
-    /// Pending items over every queue.
+    /// Pending items over every queue; `None` if the total does not fit
+    /// `usize`, which 1024 queues of `u16` counts rule out.
     #[must_use]
-    pub fn pending(&self) -> usize {
+    pub fn pending(&self) -> Option<usize> {
         self.core.pending_total()
     }
 
@@ -574,6 +595,14 @@ impl<O: SocketOps> SocketsTx<O> {
     #[must_use]
     pub fn peer_errors(&self) -> u64 {
         self.core.peer_errors()
+    }
+
+    /// Increments of this half's counters that would have overflowed and
+    /// were not applied: the `counter overflows` count of the driver's
+    /// counter pattern.
+    #[must_use]
+    pub fn counter_overflows(&self) -> u64 {
+        self.core.counter_overflows()
     }
 
     /// The capability snapshot of the half's epoch.
@@ -644,6 +673,14 @@ impl<O: SocketOps> SocketsRx<O> {
     #[must_use]
     pub fn peer_errors(&self) -> u64 {
         self.core.peer_errors()
+    }
+
+    /// Increments of this half's counters that would have overflowed and
+    /// were not applied: the `counter overflows` count of the driver's
+    /// counter pattern.
+    #[must_use]
+    pub fn counter_overflows(&self) -> u64 {
+        self.core.counter_overflows()
     }
 
     /// The capability snapshot of the half's epoch.

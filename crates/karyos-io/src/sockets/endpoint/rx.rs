@@ -40,6 +40,8 @@ pub(super) struct RxCore {
     clock_epoch: ClockEpoch,
     buffer: Box<[u8]>,
     peer_errors: u64,
+    /// Counter increments that would have overflowed and were not applied.
+    counter_overflows: u64,
     /// The failure that stopped the half (3.10): every later poll returns
     /// it with no system call until `reset` and `reopen`.
     failed: Option<BackendFailure>,
@@ -74,6 +76,7 @@ impl RxCore {
             clock_epoch: config.clock_epoch,
             buffer: vec![0; len].into_boxed_slice(),
             peer_errors: 0,
+            counter_overflows: 0,
             failed: None,
         })
     }
@@ -92,6 +95,11 @@ impl RxCore {
     /// `ECONNREFUSED` results of receive calls (4.7).
     pub(super) fn peer_errors(&self) -> u64 {
         self.peer_errors
+    }
+
+    /// Counter increments that would have overflowed (`count_up`).
+    pub(super) fn counter_overflows(&self) -> u64 {
+        self.counter_overflows
     }
 
     /// Whether the rest of `budget` admits one whole datagram: one op, one
@@ -227,7 +235,7 @@ impl RxCore {
             Errno::INTR => Some(RxStop::Interrupted),
             Errno::NOBUFS | Errno::NOMEM => Some(RxStop::NoBuffers),
             Errno::CONNREFUSED => {
-                count_up(&mut self.peer_errors);
+                count_up(&mut self.peer_errors, &mut self.counter_overflows);
                 None
             }
             _ => Some(RxStop::Failed(BackendFailure::Os {
@@ -238,12 +246,19 @@ impl RxCore {
     }
 }
 
-/// Adds one to a monitoring counter of system call results, checked. The
-/// documented choice for overflow: the counter keeps its value, which can
-/// then only be `u64::MAX`, a count one op per call cannot reach in
-/// practice. Never used for a position, length or budget count.
-pub(super) fn count_up(counter: &mut u64) {
-    if let Some(next) = counter.checked_add(1) {
-        *counter = next;
+/// Adds one to a monitoring counter of system call results, checked, as
+/// the driver's counters do (`karyos-driver` `counters.rs`): an increment
+/// that would overflow leaves the counter unchanged and adds one to
+/// `overflows`, the half's `counter overflows` count, which is how the
+/// overflow is reported. Only an overflow of `overflows` itself is lost.
+/// Never used for a position, length or budget count.
+pub(super) fn count_up(counter: &mut u64, overflows: &mut u64) {
+    match counter.checked_add(1) {
+        Some(next) => *counter = next,
+        None => {
+            if let Some(next) = overflows.checked_add(1) {
+                *overflows = next;
+            }
+        }
     }
 }
