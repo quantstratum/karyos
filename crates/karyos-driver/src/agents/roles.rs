@@ -47,9 +47,11 @@ use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, Endpoi
 use crate::sessions::OsNonces;
 use crate::sessions::rate::{EndpointRates, RateRefused, TotalRate, normalized};
 use crate::sessions::receive::{
-    AnnounceOutcome, AnswerOutcome, BindingKey, ReceiveSessions, SessionConfigError,
+    AnnounceOutcome, AnswerOutcome, BindingKey, ReadyOutcome as ImageOutcome, ReceiveSessions,
+    SessionConfigError, SlotRef,
 };
 use crate::sessions::send::{SendSessionError, SendSessions};
+use karyos_sys::log_buffer::ReceiveOwner;
 
 /// The receiver's counters; checked, sticky on overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -127,6 +129,10 @@ pub struct ReceiverRole {
     max_entries: usize,
     rsp_destinations: EndpointRates,
     rsp_total: TotalRate,
+    /// Installed images and their receive owners, by installed slot (at
+    /// most `max_images`, allocated at creation). DATA admission through
+    /// them is phase 5.
+    images: Vec<(SlotRef, Box<ReceiveOwner>)>,
     counters: ReceiverCounters,
 }
 
@@ -208,6 +214,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             max_entries: config.subscriptions,
             rsp_destinations,
             rsp_total,
+            images: Vec::with_capacity(config.sessions.max_images),
             counters: ReceiverCounters::default(),
         },
     ))
@@ -227,23 +234,14 @@ fn answerable(source: SocketAddr) -> bool {
 }
 
 impl ReceiverRole {
-    /// The counters.
-    #[must_use]
-    pub fn counters(&self) -> ReceiverCounters {
-        self.counters
-    }
-
-    fn count(&mut self, field: fn(&mut ReceiverCounters) -> &mut u64) {
-        let mut overflowed = self.counters.overflowed;
-        bump(field(&mut self.counters), &mut overflowed);
-        self.counters.overflowed = overflowed;
-    }
-
-    /// The receiver's commands: `AddSubscription` and `AddPublishedAlias`;
-    /// the sender's are refused.
+    /// The receiver's commands at `now`: `AddSubscription`,
+    /// `AddPublishedAlias`, and `InstallImage` and `RefuseImage` (the
+    /// conductor's `ImageReady` and `ImageRefused`, S1); the sender's are
+    /// refused.
     pub(super) fn command<O: SocketOps>(
         &mut self,
         command: AgentCommand<O>,
+        now: u64,
     ) -> Option<(Reservation, AgentEvent<O>)> {
         let max = self.max_entries;
         let configured = |accepted| AgentEvent::Configured {
@@ -277,6 +275,24 @@ impl ReceiverRole {
                     });
                 Some((reply, configured(accepted)))
             }
+            AgentCommand::InstallImage { reply, slot, owner } => {
+                let event = match self.sessions.image_ready(slot, now) {
+                    ImageOutcome::Installed(installed) => {
+                        // The table holds a slot for every session, so it
+                        // has room for every installed image.
+                        self.images.push((installed, owner));
+                        AgentEvent::ImageInstalled { slot, installed }
+                    }
+                    // Dropping the owner drops the receiver's hold on the
+                    // image; the conductor frees its storage.
+                    ImageOutcome::Release(_) => AgentEvent::ImageReleased { slot },
+                };
+                Some((reply, event))
+            }
+            AgentCommand::RefuseImage { reply, slot } => {
+                self.sessions.image_refused(slot);
+                Some((reply, AgentEvent::ImageReleased { slot }))
+            }
             AgentCommand::AddPublication {
                 reply, publication, ..
             } => Some((
@@ -289,6 +305,24 @@ impl ReceiverRole {
             )),
             _ => None,
         }
+    }
+
+    /// Whether the image installed at `slot` is held.
+    #[must_use]
+    pub fn has_image(&self, slot: SlotRef) -> bool {
+        self.images.iter().any(|(held, _)| *held == slot)
+    }
+
+    /// The counters.
+    #[must_use]
+    pub fn counters(&self) -> ReceiverCounters {
+        self.counters
+    }
+
+    fn count(&mut self, field: fn(&mut ReceiverCounters) -> &mut u64) {
+        let mut overflowed = self.counters.overflowed;
+        bump(field(&mut self.counters), &mut overflowed);
+        self.counters.overflowed = overflowed;
     }
 
     /// One cycle: the session timers, then every held RX half.
@@ -433,6 +467,7 @@ impl<O: SocketOps> Intake<'_, O> {
                 {
                     let event = AgentEvent::CreateImage {
                         endpoint,
+                        alias: answer.alias,
                         slot: session,
                         identity,
                         term,
@@ -515,7 +550,9 @@ impl SenderRole {
                 joins,
             } => (reply, publication, destination, joins),
             AgentCommand::AddSubscription { reply, .. }
-            | AgentCommand::AddPublishedAlias { reply, .. } => {
+            | AgentCommand::AddPublishedAlias { reply, .. }
+            | AgentCommand::InstallImage { reply, .. }
+            | AgentCommand::RefuseImage { reply, .. } => {
                 return Some((
                     reply,
                     AgentEvent::Unsupported {

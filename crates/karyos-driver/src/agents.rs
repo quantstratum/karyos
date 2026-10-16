@@ -37,6 +37,7 @@
 
 pub mod control;
 pub mod endpoints;
+pub mod images;
 pub mod ring;
 pub mod roles;
 
@@ -310,6 +311,26 @@ pub enum AgentCommand<O: SocketOps> {
         /// The publication's alias.
         alias: karyos_protocol::network::Alias,
     },
+    /// Receiver only: the conductor's `ImageReady` (network-sessions.md
+    /// S1): install the image of the pending `slot`, receive owner
+    /// included. Answer [`AgentEvent::ImageInstalled`] or
+    /// [`AgentEvent::ImageReleased`].
+    InstallImage {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The pending session slot, at its challenge generation.
+        slot: crate::sessions::receive::SlotRef,
+        /// The image's receive owner over its lanes.
+        owner: Box<karyos_sys::log_buffer::ReceiveOwner>,
+    },
+    /// Receiver only: the conductor's `ImageRefused`: the challenge of
+    /// `slot` goes. Answer [`AgentEvent::ImageReleased`].
+    RefuseImage {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The pending session slot.
+        slot: crate::sessions::receive::SlotRef,
+    },
     /// Sender only: start announcing `publication` to `destination` (the
     /// channel route); `joins` are its join points until the sender reads
     /// its log (phase 5). Answer [`AgentEvent::PublicationAdded`] or
@@ -398,6 +419,21 @@ pub enum AgentEvent<O: SocketOps> {
         /// Whether the entry was added (or was already there).
         accepted: bool,
     },
+    /// Receiver: the image of `slot` is installed and bound; its installed
+    /// slot (the new generation) names it from now on (`ImageInstalled`).
+    ImageInstalled {
+        /// The pending slot the conductor's `ImageReady` named.
+        slot: crate::sessions::receive::SlotRef,
+        /// The installed slot.
+        installed: crate::sessions::receive::SlotRef,
+    },
+    /// Receiver: the image of `slot` was not installed (too late,
+    /// quarantined, bound elsewhere, or refused); nothing is bound and the
+    /// conductor frees its storage (`ReleaseImage`).
+    ImageReleased {
+        /// The pending slot.
+        slot: crate::sessions::receive::SlotRef,
+    },
     /// The agent does not serve this command.
     Unsupported {
         /// The agent.
@@ -408,6 +444,8 @@ pub enum AgentEvent<O: SocketOps> {
     CreateImage {
         /// The endpoint it arrived on.
         endpoint: EndpointId,
+        /// Stream and session alias of the binding.
+        alias: karyos_protocol::network::Alias,
         /// The pending session slot, at its challenge generation.
         slot: crate::sessions::receive::SlotRef,
         /// The answering incarnation.
@@ -530,7 +568,9 @@ impl<O: SocketOps> AgentCore<O> {
                 }
                 command @ (AgentCommand::AddPublication { .. }
                 | AgentCommand::AddSubscription { .. }
-                | AgentCommand::AddPublishedAlias { .. }) => {
+                | AgentCommand::AddPublishedAlias { .. }
+                | AgentCommand::InstallImage { .. }
+                | AgentCommand::RefuseImage { .. }) => {
                     if let Some((reply, event)) = role(command)
                         && self.reply(reply, event)?
                     {
@@ -670,7 +710,7 @@ impl<O: SocketOps> ReceiverAgent<O> {
     /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         let Self { core, role } = self;
-        let served = core.serve_commands(&mut |command| role.command(command))?;
+        let served = core.serve_commands(&mut |command| role.command(command, now))?;
         if core.stopped {
             return Ok(served);
         }
