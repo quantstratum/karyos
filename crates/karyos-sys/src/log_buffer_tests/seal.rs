@@ -630,10 +630,10 @@ fn a_seal_reason_reaches_readers_publishers_and_the_conductor() {
     assert_eq!(SealReason::from_code(99), SealReason::Unspecified);
 }
 
-/// A buffer keeps the reason of its first seal; a cutover seal is not
-/// terminal and has none.
+/// The first final seal decides the reason, even with none; a cutover
+/// seal is not terminal and has none.
 #[test]
-fn the_first_seal_keeps_its_reason_and_a_cutover_seal_has_none() {
+fn the_first_final_seal_decides_the_reason_and_a_cutover_seal_has_none() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     conductor
@@ -645,6 +645,17 @@ fn the_first_seal_keeps_its_reason_and_a_cutover_seal_has_none() {
         conductor.seal_reason(),
         Some(SealReason::RequiredParticipantLost)
     );
+
+    // The check is on the seal word: a first seal with no reason leaves
+    // the reason word at 0, and a later reason is not written after a
+    // swap a reader may already have observed.
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.seal().unwrap();
+    conductor
+        .seal_with_reason(SealReason::RequiredParticipantLost)
+        .unwrap();
+    assert_eq!(conductor.seal_reason(), Some(SealReason::Unspecified));
 
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
