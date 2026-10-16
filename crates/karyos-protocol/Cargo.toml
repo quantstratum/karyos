@@ -10,11 +10,18 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Hooks for tests of dependent crates: the `Synthetic` test profile of the
+# protection seam, for the measurement harness self-check. Never enabled
+# in a release build.
+test-hooks = []
+
 [dependencies]
 karyos-sys.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+karyos-sys = { workspace = true, features = ["test-hooks"] }
 proptest.workspace = true
 
 [lints]

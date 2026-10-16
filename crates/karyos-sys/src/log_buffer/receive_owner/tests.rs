@@ -1677,3 +1677,82 @@ fn gaps_and_reader_losses_are_counted() {
         (64, 128, 64)
     );
 }
+
+/// The word-wise `overlaps_real` agrees with a bit-by-bit reference on
+/// pseudo-random maps of three words, for every first unit and several
+/// lengths, including records that start one or two words below.
+#[test]
+fn overlaps_real_matches_a_bitwise_reference() {
+    fn reference(set: &Set, unit: usize, units: usize) -> bool {
+        if bit(&set.covered, unit) {
+            let mut at = unit;
+            loop {
+                if bit(&set.starts, at) {
+                    return true;
+                }
+                if bit(&set.gap_starts, at) {
+                    break;
+                }
+                match at.checked_sub(1) {
+                    Some(below) if bit(&set.covered, below) => at = below,
+                    _ => return true,
+                }
+            }
+        }
+        // No start lies past the map, so stop at its end.
+        let end = unit.saturating_add(units).min(set.starts.len() * WORD_BITS);
+        (unit..end).any(|at| bit(&set.starts, at))
+    }
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for round in 0..400 {
+        // Dense coverage with sparse starts, so runs cross words.
+        let covered: Vec<u64> = (0..3).map(|_| next() | next() | next()).collect();
+        let mut sparse = |value: u64| {
+            let thin = value & next() & next();
+            if round % 2 == 0 { thin } else { thin & next() & next() }
+        };
+        let starts: Vec<u64> = covered.iter().map(|&c| sparse(c)).collect();
+        let gap_starts: Vec<u64> = covered
+            .iter()
+            .zip(&starts)
+            .map(|(&c, &s)| sparse(c) & !s)
+            .collect();
+        let set = Set {
+            term: None,
+            covered,
+            starts,
+            gap_starts,
+            dirty: false,
+            cursor: 0,
+        };
+        for unit in 0..3 * WORD_BITS {
+            for units in [1, 2, 7, 64, 130, usize::MAX] {
+                assert_eq!(
+                    overlaps_real(&set, unit, units),
+                    reference(&set, unit, units),
+                    "round {round} unit {unit} units {units}"
+                );
+            }
+        }
+    }
+}
+
+/// `last_one` finds the highest set bit at or below a position across
+/// words, and `None` when there is none.
+#[test]
+fn last_one_scans_down_whole_words() {
+    let bits = [1u64 << 5, 0, 1u64 << 63];
+    let word = |index: usize| bits.get(index).copied().unwrap_or(0);
+    assert_eq!(last_one(4, word), None);
+    assert_eq!(last_one(5, word), Some(5));
+    assert_eq!(last_one(64 + 63, word), Some(5));
+    assert_eq!(last_one(128 + 62, word), Some(5));
+    assert_eq!(last_one(128 + 63, word), Some(128 + 63));
+    assert_eq!(last_one(1000, word), Some(128 + 63));
+}
