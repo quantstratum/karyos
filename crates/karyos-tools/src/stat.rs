@@ -139,7 +139,9 @@ pub fn report(counters: &CountersReader, client_counters: &CountersReader, now: 
         "sample: {}, {}",
         match (sampled, age) {
             (true, Some(age)) => format!("age {}.{:06} ms", age / 1_000_000, age % 1_000_000),
-            _ => "never sampled".to_owned(),
+            // A completed pass without a timestamp cell.
+            (true, None) => "age unknown".to_owned(),
+            (false, _) => "never sampled".to_owned(),
         },
         if consistent {
             "consistent"
