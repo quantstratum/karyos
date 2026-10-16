@@ -36,7 +36,7 @@ fn corrupt(result: Result<Option<u64>, ScheduleConsumerError>) -> bool {
 fn fragments_carry_the_time_and_the_entry_is_released_when_the_message_left() {
     let ring = ring(2);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring, 2).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
     push(&ring, &mut publisher, 0, 10);
     push(&ring, &mut publisher, 96, 20);
     assert_eq!(publisher.has_room(&ring), Ok(false));
@@ -64,7 +64,7 @@ fn fragments_carry_the_time_and_the_entry_is_released_when_the_message_left() {
 fn a_first_fragment_without_its_entry_is_corrupt() {
     let ring = ring(4);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring, 4).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
     // No entry at all.
     assert!(corrupt(consumer.frame(&ring, data(0, true, true))));
     push(&ring, &mut publisher, 64, 5);
@@ -88,7 +88,7 @@ fn a_first_fragment_without_its_entry_is_corrupt() {
 fn padding_takes_no_entry_and_an_aborted_message_takes_its_own() {
     let ring = ring(4);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring, 4).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
     push(&ring, &mut publisher, 0, 1);
     push(&ring, &mut publisher, 32, 2);
     push(&ring, &mut publisher, 96, 3);
@@ -121,7 +121,7 @@ fn padding_takes_no_entry_and_an_aborted_message_takes_its_own() {
 fn an_aborted_message_with_nothing_ahead_is_released_at_once() {
     let ring = ring(1);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring, 1).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
     push(&ring, &mut publisher, 0, 1);
     assert_eq!(publisher.has_room(&ring), Ok(false));
     assert_eq!(
@@ -137,7 +137,7 @@ fn an_aborted_message_with_nothing_ahead_is_released_at_once() {
 fn the_consumer_follows_the_ring_across_a_wrap() {
     let ring = ring(2);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    let mut consumer = ScheduleConsumer::new(&ring, 2).unwrap();
+    let mut consumer = ScheduleConsumer::new(&ring).unwrap();
     for round in 0..5u64 {
         let position = round * 32;
         push(&ring, &mut publisher, position, round);
@@ -155,7 +155,7 @@ fn the_consumer_follows_the_ring_across_a_wrap() {
 fn a_ring_that_is_not_one_is_refused() {
     let words: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
     assert_eq!(
-        ScheduleConsumer::new(&words, 1).err(),
+        ScheduleConsumer::new(&words).err(),
         Some(ScheduleConsumerError::Ring(ScheduleError::Layout))
     );
 }

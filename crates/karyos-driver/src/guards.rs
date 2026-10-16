@@ -376,12 +376,20 @@ impl Guards {
         outcome: AuditOutcome,
     ) {
         if self.audit_capacity == 0 {
-            self.overwritten = self.overwritten.saturating_add(1);
+            // Checked, never wrapped (SPEC.md section 14): at its end the
+            // count keeps its value.
+            if let Some(next) = self.overwritten.checked_add(1) {
+                self.overwritten = next;
+            }
             return;
         }
         if self.audit.len() >= self.audit_capacity {
             let _ = self.audit.pop_front();
-            self.overwritten = self.overwritten.saturating_add(1);
+            // Checked, never wrapped (SPEC.md section 14): at its end the
+            // count keeps its value.
+            if let Some(next) = self.overwritten.checked_add(1) {
+                self.overwritten = next;
+            }
         }
         self.audit.push_back(AuditRecord {
             time,

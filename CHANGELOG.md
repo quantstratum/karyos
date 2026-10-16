@@ -124,7 +124,14 @@ release may break APIs, wire formats and shared-memory layouts.
   `TimedGate::between_gates` seals its buffer once through
   `timed_gate::seal_deadline_missed` (`SealReason::DeadlineMissed`; a sealed
   buffer keeps its first reason). Otherwise a head submitted beyond the
-  tolerance counts in `late_sends`. The inner gate is not told.
+  tolerance counts in `late_sends`. The inner gate is not told, but a lane
+  it already aborts never misses: karyos-io's `LaneGate` gains
+  `aborting(lane)` (default false; `GuardGate` reports its aborting
+  incarnations), so a guard close that lands first stays the lane's end
+  (G7). `TimedGate::earliest` also wakes for a deadline under cancel,
+  `TimedGate::stage` takes the datagram's ticket and `left` counts a report
+  for another ticket as a fault, and `ScheduleConsumer::new` takes its
+  capacity from the ring (`ScheduleReader::capacity`).
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

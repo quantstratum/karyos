@@ -31,7 +31,14 @@
 //!   The inner gate is not told (ACS 15455): the heads it holds behind the
 //!   miss were never exposed, so never charged, and leave at teardown or a
 //!   reopen; its work in flight, which the close acknowledgement reads, is
-//!   unchanged.
+//!   unchanged. A lane the inner gate already aborts
+//!   ([`LaneGate::aborting`], its guard closed) never misses: the loser of
+//!   a close against a deadline changes nothing (G7).
+//! - **Order between gates.** The driver runs the inner gate's step between
+//!   gates (the guard gate's, which applies a close and publishes the
+//!   applied epoch) before this gate's [`TimedGate::between_gates`], so a
+//!   close observed in that step is the lane's end, and a buffer already
+//!   sealed keeps its first reason ([`seal_deadline_missed`]).
 //!
 //! The gate records each datagram's token and time when it is staged
 //! ([`TimedGate::stage`], which stages the inner gate and sender in the
@@ -42,7 +49,7 @@ use std::collections::VecDeque;
 
 use core::num::NonZeroU16;
 
-use karyos_io::backend::{Exposure, GateDecision, SenderGate, SenderToken};
+use karyos_io::backend::{Exposure, GateDecision, SenderGate, SenderToken, TxTicket};
 use karyos_io::lanes::{LaneGate, Left, Staged};
 use karyos_sys::error::SysError;
 use karyos_sys::log_buffer::{BufferOwner, Conductor, SealReason, SealState};
@@ -51,6 +58,8 @@ use karyos_sys::log_buffer::{BufferOwner, Conductor, SealReason, SealState};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Head {
     token: SenderToken,
+    /// The ticket it was committed with, checked when it leaves.
+    ticket: TxTicket,
     /// Its message's requested time; `None` for a datagram that waits for
     /// nothing (a lane that is not timed, or a control datagram).
     time: Option<u64>,
@@ -133,11 +142,16 @@ pub struct TimedCounts {
 }
 
 /// Adds one to `count`; at its end it keeps its value and `overflows`
-/// counts it (SPEC.md section 14: checked, never wrapped).
+/// counts it, itself kept at its end (SPEC.md section 14: checked, never
+/// wrapped).
 fn bump(count: &mut u64, overflows: &mut u64) {
     match count.checked_add(1) {
         Some(next) => *count = next,
-        None => *overflows = overflows.saturating_add(1),
+        None => {
+            if let Some(next) = overflows.checked_add(1) {
+                *overflows = next;
+            }
+        }
     }
 }
 
@@ -206,22 +220,41 @@ impl<G: LaneGate> TimedGate<G> {
         self.now = now;
     }
 
-    /// The earliest time a lane's head waits for, if any head waits: when
-    /// the sender should next run.
+    /// When the sender should next run, if a lane waits on the clock: the
+    /// earliest head time not yet due and, under cancel-on-deadline, the
+    /// earliest deadline (time plus tolerance) of a head not yet exposed,
+    /// so the idle wait wakes for a miss as for a send. A deadline already
+    /// passed means now; a lane the inner gate aborts waits on nothing.
     #[must_use]
     pub fn earliest(&self) -> Option<u64> {
-        self.lanes
+        let now = self.now;
+        let heads = self
+            .lanes
             .iter()
             .filter(|lane| !lane.missed)
             .filter_map(|lane| lane.heads.front().and_then(|head| head.time))
-            .filter(|time| *time > self.now)
-            .min()
+            .filter(|time| *time > now);
+        let deadlines = self
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(index, lane)| {
+                !lane.missed && lane.policy.cancel_on_deadline && !self.inner.aborting(*index)
+            })
+            .filter_map(|(_, lane)| {
+                lane.heads
+                    .iter()
+                    .filter(|head| !head.exposed)
+                    .find_map(|head| head.time)
+                    .and_then(|time| time.checked_add(lane.policy.tolerance))
+            });
+        heads.chain(deadlines).min()
     }
 
-    /// Records a datagram committed to `lane`'s queue with `token`, for a
-    /// message requested at `time`, after `inner` stages it in the inner
-    /// gate and the sender (`|gate| gate.stage(sender, ...)`, or the
-    /// sender's own `staged` for a gate that keeps no record).
+    /// Records a datagram committed to `lane`'s queue with `token` and
+    /// `ticket`, for a message requested at `time`, after `inner` stages it
+    /// in the inner gate and the sender (`|gate| gate.stage(sender, ...)`,
+    /// or the sender's own `staged` for a gate that keeps no record).
     ///
     /// # Errors
     ///
@@ -231,6 +264,7 @@ impl<G: LaneGate> TimedGate<G> {
         &mut self,
         lane: usize,
         token: SenderToken,
+        ticket: TxTicket,
         time: Option<u64>,
         inner: impl FnOnce(&mut G) -> Result<(), E>,
     ) -> Result<(), TimedStageError<E>> {
@@ -245,6 +279,7 @@ impl<G: LaneGate> TimedGate<G> {
         if let Some(state) = self.lanes.get_mut(lane) {
             state.heads.push_back(Head {
                 token,
+                ticket,
                 time,
                 exposed: false,
             });
@@ -254,6 +289,10 @@ impl<G: LaneGate> TimedGate<G> {
 
     /// Forgets `lane`'s heads after `inner` reopens its queue (the inner
     /// gate's or the sender's `reopen`): the reset returned them unsent.
+    /// The sender stages them again with their original times: their
+    /// schedule entries stay in the ring until their messages leave
+    /// (`crate::schedule::ScheduleConsumer`), so re-staging re-times
+    /// nothing.
     pub fn reopen(&mut self, lane: usize, inner: impl FnOnce(&mut G)) {
         inner(&mut self.inner);
         if let Some(state) = self.lanes.get_mut(lane) {
@@ -313,6 +352,11 @@ impl<G: LaneGate> TimedGate<G> {
             return false;
         }
         if !state.policy.cancel_on_deadline {
+            return true;
+        }
+        // A lane the inner gate already aborts (its guard closed) ends
+        // that way: a deadline that passes afterwards changes nothing.
+        if self.inner.aborting(lane) {
             return true;
         }
         let tolerance = state.policy.tolerance;
@@ -425,6 +469,10 @@ impl<G: LaneGate> LaneGate for TimedGate<G> {
         inner && due
     }
 
+    fn aborting(&self, lane: usize) -> bool {
+        self.deadline_missed(lane) || self.inner.aborting(lane)
+    }
+
     fn flushing(&mut self, lane: usize) {
         self.flushing = Some(lane);
         self.inner.flushing(lane);
@@ -439,6 +487,10 @@ impl<G: LaneGate> LaneGate for TimedGate<G> {
         let tolerance = state.policy.tolerance;
         match state.heads.pop_front() {
             None => bump(&mut self.counts.faults, &mut self.counts.overflows),
+            // The records diverged: counted, and the inner gate decides.
+            Some(head) if head.ticket != staged.ticket => {
+                bump(&mut self.counts.faults, &mut self.counts.overflows);
+            }
             Some(Head {
                 time: Some(time), ..
             }) if how == Left::Submitted => {

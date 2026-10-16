@@ -57,6 +57,8 @@ struct Fixture {
     word: Arc<HeapWords>,
     next_token: u64,
     next_position: Vec<u64>,
+    /// The ticket of the datagram staged last.
+    last_ticket: Option<TxTicket>,
 }
 
 impl Fixture {
@@ -128,6 +130,7 @@ impl Fixture {
             word,
             next_token: 1,
             next_position: vec![0; lanes],
+            last_ticket: None,
         }
     }
 
@@ -157,7 +160,7 @@ impl Fixture {
         self.next_position[lane] = end;
         let sender = &mut self.sender;
         self.gate
-            .stage(lane, token, time, |guard| {
+            .stage(lane, token, ticket, time, |guard| {
                 guard.stage(
                     sender,
                     lane,
@@ -171,6 +174,7 @@ impl Fixture {
                 )
             })
             .unwrap();
+        self.last_ticket = Some(ticket);
         token
     }
 
@@ -370,9 +374,10 @@ fn a_refused_stage_records_nothing() {
     for _ in 0..BOUND {
         f.stage(0, None);
     }
+    let ticket = f.last_ticket.unwrap();
     let mut ran = false;
     assert_eq!(
-        f.gate.stage(0, SenderToken::new(7), None, |_| {
+        f.gate.stage(0, SenderToken::new(7), ticket, None, |_| {
             ran = true;
             Ok::<(), ()>(())
         }),
@@ -380,12 +385,13 @@ fn a_refused_stage_records_nothing() {
     );
     assert_eq!(
         f.gate
-            .stage(5, SenderToken::new(7), None, |_| Ok::<(), ()>(())),
+            .stage(5, SenderToken::new(7), ticket, None, |_| Ok::<(), ()>(())),
         Err(TimedStageError::UnknownLane { lane: 5 })
     );
     assert!(!ran);
     assert_eq!(
-        f.gate.stage(0, SenderToken::new(7), None, |_| Err(())),
+        f.gate
+            .stage(0, SenderToken::new(7), ticket, None, |_| Err(())),
         Err(TimedStageError::Full { lane: 0 })
     );
 }
@@ -393,9 +399,14 @@ fn a_refused_stage_records_nothing() {
 /// The inner gate's refusal leaves the timed record unchanged.
 #[test]
 fn an_inner_refusal_records_nothing() {
+    // A ticket from another endpoint: the refusal never records it.
+    let mut other = Fixture::new(1, None);
+    other.stage(0, None);
+    let ticket = other.last_ticket.unwrap();
     let mut f = Fixture::new(1, None);
     assert_eq!(
-        f.gate.stage(0, SenderToken::new(7), Some(PAST), |_| Err(3)),
+        f.gate
+            .stage(0, SenderToken::new(7), ticket, Some(PAST), |_| Err(3)),
         Err(TimedStageError::Inner(3))
     );
     assert_eq!(f.gate.earliest(), None);
@@ -602,4 +613,93 @@ fn a_seal_keeps_its_first_reason() {
     conductor.seal_with_reason(SealReason::GuardClosed).unwrap();
     seal_deadline_missed(&mut conductor).unwrap();
     assert_eq!(conductor.seal_reason(), Some(SealReason::GuardClosed));
+}
+
+fn close_guard(f: &Fixture) {
+    let _ = guard::close(f.word.words().first().unwrap()).unwrap();
+}
+
+/// G7, close first: the guard closes, then the clock passes the deadline;
+/// the lane ends by its guard, and no miss is declared, counted or sealed
+/// (#240 review, P2).
+#[test]
+fn a_deadline_after_a_close_changes_nothing() {
+    let mut f = Fixture::with_policy(1, None, cancel());
+    let token = f.stage(0, Some(NOW));
+    close_guard(&f);
+    assert!(!f.gate.admits(0));
+    assert!(f.gate.inner().aborting(0));
+    f.gate.set_now(NOW + TOLERANCE + 1);
+    assert!(!f.gate.admits(0));
+    assert_eq!(check(&mut f.gate, 0, &[token]), GateDecision::Deny);
+    assert!(!f.gate.deadline_missed(0));
+    assert_eq!(f.gate.counts().deadline_aborts, 0);
+    let mut sealed = Vec::new();
+    f.gate
+        .between_gates(|lane| {
+            sealed.push(lane);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+    assert!(sealed.is_empty());
+    // The lane is aborting either way.
+    assert!(f.gate.aborting(0));
+}
+
+/// G7, deadline first: the miss is declared, then the guard closes; the
+/// miss stays the lane's end, counted once.
+#[test]
+fn a_close_after_a_miss_keeps_the_miss() {
+    let mut f = Fixture::with_policy(1, None, cancel());
+    f.stage(0, Some(NOW));
+    f.gate.set_now(NOW + TOLERANCE + 1);
+    assert!(!f.gate.admits(0));
+    assert!(f.gate.deadline_missed(0));
+    close_guard(&f);
+    assert!(!f.gate.admits(0));
+    assert!(f.gate.inner().aborting(0));
+    assert!(f.gate.deadline_missed(0));
+    assert_eq!(f.gate.counts().deadline_aborts, 1);
+    assert!(f.gate.aborting(0));
+}
+
+/// The idle wait wakes for a deadline under cancel: a due head not yet
+/// exposed waits on its time plus the tolerance; a lane its inner gate
+/// aborts waits on nothing (#240 review, P3).
+#[test]
+fn earliest_includes_the_deadline_under_cancel() {
+    let mut f = Fixture::with_policy(1, None, cancel());
+    f.stage(0, Some(NOW - 5));
+    assert_eq!(f.gate.earliest(), Some(NOW - 5 + TOLERANCE));
+    // A future head: its own time comes first.
+    let mut g = Fixture::with_policy(1, None, cancel());
+    g.stage(0, Some(FUTURE));
+    assert_eq!(g.gate.earliest(), Some(FUTURE));
+    // Without cancel, a due head waits on nothing.
+    let mut h = Fixture::new(1, None);
+    h.stage(0, Some(NOW - 5));
+    assert_eq!(h.gate.earliest(), None);
+    // A closed guard: nothing to wake for.
+    close_guard(&f);
+    assert!(!f.gate.admits(0));
+    assert_eq!(f.gate.earliest(), None);
+}
+
+/// A head that leaves with another ticket than the one staged is a fault,
+/// counted, and its lateness is not measured (#239 review).
+#[test]
+fn a_report_with_another_ticket_is_a_fault() {
+    let mut f = Fixture::new(1, None);
+    f.stage(0, Some(PAST));
+    // The second head's ticket, reported for the first.
+    f.stage(0, Some(PAST));
+    let staged = Staged {
+        ticket: f.last_ticket.unwrap(),
+        charge: u64::from(FRAME),
+        len: FRAME,
+    };
+    f.gate.left(0, staged, Left::Submitted);
+    assert_eq!(f.gate.counts().faults, 1);
+    assert_eq!(f.gate.counts().sent, 0);
+    assert_eq!(f.gate.counts().max_lateness, None);
 }

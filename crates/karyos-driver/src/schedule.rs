@@ -69,15 +69,17 @@ pub struct ScheduleConsumer {
 }
 
 impl ScheduleConsumer {
-    /// The consumer of the timed lane whose ring is `ring`, of `capacity`
-    /// entries; it allocates only here.
+    /// The consumer of the timed lane whose ring is `ring`, sized by the
+    /// ring's own capacity; it allocates only here.
     ///
     /// # Errors
     ///
     /// [`ScheduleConsumerError::Ring`] for a ring that is not one.
-    pub fn new(ring: &[AtomicU64], capacity: usize) -> Result<Self, ScheduleConsumerError> {
+    pub fn new(ring: &[AtomicU64]) -> Result<Self, ScheduleConsumerError> {
+        let reader = ScheduleReader::attach(ring)?;
+        let capacity = usize::try_from(reader.capacity()).map_err(|_| ScheduleError::Layout)?;
         Ok(Self {
-            reader: ScheduleReader::attach(ring)?,
+            reader,
             current: None,
             outstanding: VecDeque::with_capacity(capacity),
         })
