@@ -6,7 +6,10 @@
 //!
 //! The sender serving a guard publishes, each time its gate observes a
 //! guard epoch above the one it applied, that epoch together with the last
-//! positions it submitted per lane under the previous epoch. The guard's
+//! positions it submitted per lane under the previous epoch, and the
+//! backend work it still has in flight (`quantstratum-docs:
+//! karyos/design/driver-network-agents.md`, DN-7); it publishes again as
+//! that work drains. The guard's
 //! owner reads the pair to build the effective-close acknowledgement: a
 //! sender is applied for close epoch `c` once its applied epoch is at
 //! least `c`, and the positions it reports are those of that same
@@ -34,14 +37,17 @@ use crate::sync::{AtomicU64, Ordering, fence};
 /// Lanes a publication carries.
 const LANES: usize = Lane::COUNT as usize;
 
-/// One applied epoch and the last positions submitted per lane under the
-/// epoch before it.
+/// One applied epoch, the last positions submitted per lane under the
+/// epoch before it, and the work still in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Applied {
     /// The guard epoch the sender applied; 0 before any.
     pub epoch: u64,
     /// The last position submitted per lane under the previous epoch.
     pub positions: [u64; LANES],
+    /// Backend work exposed and not yet settled: items whose exposure is
+    /// unproven (`Unknown`) or submitted and not released.
+    pub in_flight: u64,
 }
 
 /// The cell, in memory the sender writes and the owner reads.
@@ -50,6 +56,7 @@ pub struct AppliedEpoch {
     sequence: AtomicU64,
     epoch: AtomicU64,
     positions: [AtomicU64; LANES],
+    in_flight: AtomicU64,
     /// Loom only: the negative controls' variants of the writer.
     #[cfg(loom)]
     control: WriterControl,
@@ -67,6 +74,9 @@ pub enum WriterControl {
     /// The fields stored before the odd sequence, with no fence: a reader
     /// can see the old sequence with new fields.
     FieldsBeforeSequence,
+    /// The in-flight count stored after the even sequence, outside the
+    /// lock: a reader can pair it with another publication.
+    InFlightOutsideSequence,
 }
 
 impl Default for AppliedEpoch {
@@ -83,6 +93,7 @@ impl AppliedEpoch {
             sequence: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
             positions: core::array::from_fn(|_| AtomicU64::new(0)),
+            in_flight: AtomicU64::new(0),
             #[cfg(loom)]
             control: WriterControl::None,
         }
@@ -126,6 +137,10 @@ impl AppliedEpoch {
             Ordering::Release
         };
         self.sequence.store(sequence.wrapping_add(2), order);
+        #[cfg(loom)]
+        if control == WriterControl::InFlightOutsideSequence {
+            self.in_flight.store(applied.in_flight, Ordering::Relaxed);
+        }
     }
 
     fn store_fields(&self, applied: Applied) {
@@ -133,6 +148,26 @@ impl AppliedEpoch {
             cell.store(position, Ordering::Relaxed);
         }
         self.epoch.store(applied.epoch, Ordering::Relaxed);
+        #[cfg(loom)]
+        let inside = self.control != WriterControl::InFlightOutsideSequence;
+        #[cfg(not(loom))]
+        let inside = true;
+        if inside {
+            self.in_flight.store(applied.in_flight, Ordering::Relaxed);
+        }
+    }
+
+    /// Test hook: leaves the sequence odd, as a writer stopped in the
+    /// middle of a publication, so that readers keep seeing one in
+    /// progress.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn stall_writer(&self) {
+        let sequence = self.sequence.load(Ordering::Relaxed);
+        if sequence.is_multiple_of(2) {
+            self.sequence
+                .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        }
     }
 
     /// The owner: one attempt to read a consistent publication; `None`
@@ -150,9 +185,14 @@ impl AppliedEpoch {
                 .get(lane)
                 .map_or(0, |cell| cell.load(Ordering::Relaxed))
         });
+        let in_flight = self.in_flight.load(Ordering::Relaxed);
         fence(Ordering::Acquire);
         let second = self.sequence.load(Ordering::Relaxed);
-        (first == second).then_some(Applied { epoch, positions })
+        (first == second).then_some(Applied {
+            epoch,
+            positions,
+            in_flight,
+        })
     }
 }
 
@@ -167,7 +207,8 @@ mod tests {
             cell.try_read(),
             Some(Applied {
                 epoch: 0,
-                positions: [0; LANES]
+                positions: [0; LANES],
+                in_flight: 0,
             })
         );
     }
@@ -178,10 +219,12 @@ mod tests {
         let first = Applied {
             epoch: 3,
             positions: [64, 0, 128, 0],
+            in_flight: 2,
         };
         let second = Applied {
             epoch: 5,
             positions: [192, 32, 128, 0],
+            in_flight: 0,
         };
         cell.publish(first);
         assert_eq!(cell.try_read(), Some(first));
@@ -203,6 +246,7 @@ mod tests {
         let applied = Applied {
             epoch: 7,
             positions: [1, 2, 3, 4],
+            in_flight: 9,
         };
         cell.publish(applied);
         assert_eq!(cell.sequence.load(Ordering::Relaxed), 0);

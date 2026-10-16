@@ -709,3 +709,38 @@ fn a_policy_is_validated_against_the_largest_datagram() {
         ))
     );
 }
+
+/// G-e4 (DN-7): the gate counts its work in flight, exposed heads not yet
+/// left and unproven ones until a reopen, publishes it with the applied
+/// epoch, and again from the between gates step as it drains.
+#[test]
+fn the_work_in_flight_is_published_as_it_drains() {
+    let mut f = Fixture::new(1, None);
+    let (token, _, staged) = f.stage(0);
+    let (second, _, second_staged) = f.stage(0);
+    assert_eq!(f.gate.in_flight(), Some(0), "staged is not exposed");
+    assert_eq!(check(&mut f.gate, 0, &[token, second]), permit(2));
+    assert_eq!(f.gate.in_flight(), Some(2));
+    close(&f.word);
+    f.gate.between_gates();
+    let applied = f.cell.try_read().unwrap();
+    assert_eq!((applied.epoch, applied.in_flight), (3, 2));
+    f.gate.left(0, staged, Left::Submitted);
+    f.gate.left(0, second_staged, Left::Unknown);
+    assert_eq!(f.gate.in_flight(), Some(1), "unknown stays in flight");
+    f.gate.between_gates();
+    assert_eq!(f.cell.try_read().unwrap().in_flight, 1);
+    let queue = f.queues[0];
+    let mut report = TxReport::new();
+    while let Ok(outcome) = f.tx.cancel_pending(queue, &mut report) {
+        while report.pop_front().is_some() {}
+        if !outcome.more {
+            break;
+        }
+    }
+    f.gate.reopen(&mut f.sender, 0, queue);
+    f.gate.between_gates();
+    let drained = f.cell.try_read().unwrap();
+    assert_eq!((drained.epoch, drained.in_flight), (3, 0));
+    assert_eq!(f.gate.counts().applied, 1, "one epoch applied, republished");
+}

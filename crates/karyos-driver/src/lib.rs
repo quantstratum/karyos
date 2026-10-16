@@ -20,6 +20,7 @@ pub mod diagnostics;
 pub mod embedded;
 pub mod error;
 mod generations;
+pub mod guard_ack;
 pub mod guard_gate;
 mod guard_streams;
 pub mod guards;

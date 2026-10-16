@@ -100,6 +100,8 @@ struct Entry {
     name: String,
     id: u64,
     word: Arc<HeapWords>,
+    /// The epoch and driver clock time of the guard's latest close.
+    closed: Option<(u64, u64)>,
 }
 
 /// The scope a rate limit applies to (`quantstratum-docs:
@@ -184,6 +186,7 @@ impl Guards {
             name: name.to_owned(),
             id,
             word,
+            closed: None,
         });
         self.next = next;
         Ok(GuardHandle {
@@ -213,6 +216,21 @@ impl Guards {
             driver: self.driver,
             guard: entry.id,
         })
+    }
+
+    /// The driver clock time of the guard's close at `epoch`, or of a later
+    /// close, which happened no earlier; `None` if the guard never closed
+    /// at or after `epoch`.
+    pub(crate) fn closed_since(
+        &self,
+        handle: GuardHandle,
+        epoch: u64,
+    ) -> Result<Option<u64>, DriverError> {
+        let entry = self.check(handle)?;
+        Ok(entry
+            .closed
+            .filter(|&(closed, _)| closed >= epoch)
+            .map(|(_, time)| time))
     }
 
     fn check(&self, handle: GuardHandle) -> Result<&Entry, DriverError> {
@@ -267,6 +285,14 @@ impl Guards {
                 return Err(error);
             }
         };
+        if let Ok(Closed::Now { epoch }) = result
+            && let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == handle.guard)
+        {
+            entry.closed = Some((epoch, time));
+        }
         let outcome = match &result {
             Ok(Closed::Now { .. }) => AuditOutcome::Closed,
             Ok(Closed::Already { .. }) => AuditOutcome::AlreadyClosed,

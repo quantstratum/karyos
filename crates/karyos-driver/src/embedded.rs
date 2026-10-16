@@ -232,6 +232,13 @@ pub struct DriverConfig {
     /// Records of the guard audit ring (G9 interim); a full ring overwrites
     /// its oldest record and counts it. Zero keeps only the count.
     pub guard_audit_records: usize,
+    /// Sender gates registered with their guards' owner at once
+    /// (`EmbeddedDriver::register_guard_sender`).
+    pub max_guard_senders: usize,
+    /// How long, in the driver clock's unit, a sender may take to apply a
+    /// close before the effective-close acknowledgement reports it overdue;
+    /// it is still pending, never closed (guards-and-abort.md). Nonzero.
+    pub guard_ack_timeout: u64,
 }
 
 impl Default for DriverConfig {
@@ -275,6 +282,8 @@ impl Default for DriverConfig {
             max_guards: 16,
             guard_walker_budget: 1024,
             guard_audit_records: 1024,
+            max_guard_senders: 64,
+            guard_ack_timeout: 1_000_000_000,
         }
     }
 }
@@ -695,6 +704,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) trace_journals: crate::trace_journals::TraceJournals,
     /// The guard registry and its audit ring.
     pub(crate) guards: crate::guards::Guards,
+    /// The sender gates registered with their guards (G-e4).
+    pub(crate) guard_senders: crate::guard_ack::GuardSenders,
 }
 
 /// The incarnation of a stream's publication in the embedded driver: one per
@@ -801,7 +812,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             && config.cycles_between_drains > 0
             && config.ring_capacity >= karyos_sys::command_ring::MIN_CAPACITY
             && config.ring_capacity.is_power_of_two()
-            && config.broadcast_capacity >= needed;
+            && config.broadcast_capacity >= needed
+            && config.guard_ack_timeout > 0;
         if !valid {
             return Err(DriverError::InvalidConfig);
         }
@@ -916,6 +928,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 config.trace_drain_budget,
             ),
             guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
+            guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
         })
     }
 
