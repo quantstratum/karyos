@@ -209,7 +209,7 @@ fn a_receiver_stop_ends_an_open_loop_wait() {
             &mut tx,
             peer,
             &SendControl {
-                wait: &|_| true,
+                wait: &|_| Wait::Completed,
                 stopped: &|| stop.load(Ordering::Acquire),
             },
         )
@@ -221,6 +221,38 @@ fn a_receiver_stop_ends_an_open_loop_wait() {
         "{:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn unacknowledged_messages_past_the_drop_budget_end_the_run() {
+    // 1000 messages allow one timeout (M-11): the second ends the run.
+    let run = stage_run(Shape::W1, StageLoad::Closed, 1_000, 0);
+    let prepared = Prepared::new(&run, &Trusted).unwrap();
+    let (mut tx, _tx_rx) = prepared
+        .endpoint()
+        .unwrap()
+        .split()
+        .map_err(|_| "split")
+        .unwrap();
+    let receiving = prepared.endpoint().unwrap();
+    let waits = AtomicU32::new(0);
+    let result = send_role(
+        &run,
+        &prepared,
+        &Trusted,
+        &mut tx,
+        receiving.capabilities().local,
+        &SendControl {
+            wait: &|_| {
+                waits.fetch_add(1, Ordering::Relaxed);
+                Wait::TimedOut
+            },
+            stopped: &|| false,
+        },
+    );
+    let error = result.err().map(|error| error.0).unwrap_or_default();
+    assert!(error.contains("2 messages unacknowledged"), "{error}");
+    assert_eq!(waits.load(Ordering::Relaxed), 2);
 }
 
 #[test]

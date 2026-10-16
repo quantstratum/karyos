@@ -269,29 +269,57 @@ fn wire_child() {
     }
 }
 
+/// A temporary directory removed on drop, whatever the test's outcome.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        Self(std::env::temp_dir().join(format!("karyos-{name}-{}", std::process::id())))
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn wire_run(
+    shape: karyos_bench::manifest::Shape,
+    load: karyos_bench::wire::stage::StageLoad,
+    messages: u64,
+) -> karyos_bench::wire::stage::StageRun {
+    karyos_bench::wire::stage::StageRun {
+        shape,
+        e_max: 64,
+        rule: karyos_bench::manifest::MtuRule::CountsEnvelope,
+        load,
+        messages,
+        warmup: 20,
+    }
+}
+
 /// Each wire role runs in its own process and both sample files come
 /// back complete (B3c-2).
 #[test]
 fn wire_roles_run_in_their_own_processes() {
-    use karyos_bench::manifest::{MtuRule, Shape};
+    use karyos_bench::manifest::Shape;
     use karyos_bench::samples::MISSING;
-    use karyos_bench::wire::process::run_processes;
-    use karyos_bench::wire::stage::{StageLoad, StageRun};
-    let dir = std::env::temp_dir().join(format!("karyos-wire-{}", std::process::id()));
+    use karyos_bench::wire::process::{ProcessOptions, run_processes};
+    use karyos_bench::wire::stage::StageLoad;
+    let dir = TempDir::new("wire");
+    let options = ProcessOptions {
+        run_index: 3,
+        ..ProcessOptions::default()
+    };
     for (shape, load) in [
         (Shape::W1, StageLoad::Closed),
         (Shape::W6, StageLoad::Closed),
         (Shape::W1, StageLoad::Open { rate: 100_000 }),
     ] {
-        let run = StageRun {
-            shape,
-            e_max: 64,
-            rule: MtuRule::CountsEnvelope,
-            load,
-            messages: 200,
-            warmup: 20,
-        };
-        let samples = run_processes(&run, &dir).unwrap_or_else(|cause| panic!("{shape}: {cause}"));
+        let run = wire_run(shape, load, 200);
+        let samples = run_processes(&run, &dir.0, &options)
+            .unwrap_or_else(|cause| panic!("{shape}: {cause}"));
         assert_eq!(samples.send.len(), 200);
         assert_eq!(samples.receive.len(), 200);
         assert!(
@@ -305,6 +333,7 @@ fn wire_roles_run_in_their_own_processes() {
             );
         }
         assert_eq!(samples.receive_callback.len(), 200);
+        assert_eq!(samples.ack_timeouts, 0);
         // Not pinned until B4 (coordinator decision, ACS 15273).
         assert!(samples.functional_only);
         assert_eq!(
@@ -312,7 +341,192 @@ fn wire_roles_run_in_their_own_processes() {
             Some("not pinned")
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs W1 under R1 with `faults`, returning the error and the time the
+/// run took.
+fn faulty_run(
+    name: &str,
+    messages: u64,
+    faults: karyos_bench::wire::process::Faults,
+    deadline: Option<std::time::Duration>,
+) -> (Option<String>, std::time::Duration) {
+    use karyos_bench::manifest::Shape;
+    use karyos_bench::wire::process::{ProcessOptions, run_processes};
+    use karyos_bench::wire::stage::StageLoad;
+    let dir = TempDir::new(name);
+    let started = std::time::Instant::now();
+    let result = run_processes(
+        &wire_run(Shape::W1, StageLoad::Closed, messages),
+        &dir.0,
+        &ProcessOptions {
+            run_index: 0,
+            deadline,
+            faults,
+        },
+    );
+    (result.err().map(|error| error.0), started.elapsed())
+}
+
+/// Lost hellos are repeated: no message waits for an acknowledgement
+/// that cannot come.
+#[test]
+fn lost_hellos_are_repeated() {
+    use karyos_bench::manifest::Shape;
+    use karyos_bench::wire::process::{Faults, ProcessOptions, run_processes};
+    use karyos_bench::wire::stage::StageLoad;
+    let dir = TempDir::new("wire-hello");
+    let started = std::time::Instant::now();
+    let samples = run_processes(
+        &wire_run(Shape::W1, StageLoad::Closed, 200),
+        &dir.0,
+        &ProcessOptions {
+            faults: Faults {
+                drop_hellos: 3,
+                ..Faults::default()
+            },
+            ..ProcessOptions::default()
+        },
+    )
+    .unwrap_or_else(|cause| panic!("{cause}"));
+    assert_eq!(samples.ack_timeouts, 0);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// A sender that crashes ends the run quickly: the parent repeats its
+/// notice to the receiver until the receiver exits.
+#[test]
+fn a_crashed_sender_ends_the_run() {
+    use karyos_bench::wire::process::Faults;
+    let (error, took) = faulty_run(
+        "wire-tx-crash",
+        200,
+        Faults {
+            tx_crash_at: Some(50),
+            drop_dones: 3,
+            ..Faults::default()
+        },
+        Some(std::time::Duration::from_secs(20)),
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("tx child failed"), "{error}");
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+}
+
+/// A receiver that crashes ends the run at once, without waiting for
+/// the sender.
+#[test]
+fn a_crashed_receiver_ends_the_run() {
+    use karyos_bench::wire::process::Faults;
+    let (error, took) = faulty_run(
+        "wire-rx-crash",
+        200,
+        Faults {
+            rx_crash_at: Some(50),
+            ..Faults::default()
+        },
+        None,
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("rx child failed"), "{error}");
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+}
+
+/// A receiver that ends at its deadline while the R1 sender still runs
+/// tells the sender, which stops; without that notice the parent stops a
+/// sender that outlives the receiver.
+#[test]
+fn a_finished_receiver_stops_the_sender() {
+    use karyos_bench::wire::process::Faults;
+    let finish = Faults {
+        rx_deadline_ms: Some(300),
+        ..Faults::default()
+    };
+    // A million R1 messages take far longer than 300 ms.
+    let (error, took) = faulty_run("wire-finish", 1_000_000, finish, None);
+    let error = error.unwrap_or_default();
+    assert!(error.contains("tx child failed"), "{error}");
+    // The sender stops on the notice, not after an acknowledgement
+    // timeout: 300 ms of receiving plus ACK_TIMEOUT is the bound.
+    assert!(took < std::time::Duration::from_millis(1_300), "{took:?}");
+    let (error, took) = faulty_run(
+        "wire-no-stop",
+        1_000_000,
+        Faults {
+            no_stop: true,
+            ..finish
+        },
+        None,
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("outlived"), "{error}");
+    assert!(took < std::time::Duration::from_secs(6), "{took:?}");
+}
+
+/// A sender that stops responding meets the run deadline, and both
+/// children are killed.
+#[test]
+fn a_frozen_sender_meets_the_deadline() {
+    use karyos_bench::wire::process::Faults;
+    let (error, took) = faulty_run(
+        "wire-freeze",
+        200,
+        Faults {
+            tx_freeze_at: Some(50),
+            ..Faults::default()
+        },
+        Some(std::time::Duration::from_secs(3)),
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("deadline"), "{error}");
+    assert!(
+        (std::time::Duration::from_secs(3)..std::time::Duration::from_secs(6)).contains(&took),
+        "{took:?}"
+    );
+}
+
+/// A wire child exits on its own once its parent's end of its standard
+/// input closes, so a parent that dies leaves no orphan.
+#[test]
+fn an_orphaned_wire_child_exits() {
+    use karyos_bench::manifest::Shape;
+    use karyos_bench::wire::process::{
+        CHILD_TEST, INDEX, NONCE, ORPHANED, OUT, ROLE, RUN, encode_run,
+    };
+    use karyos_bench::wire::stage::StageLoad;
+    use std::io::BufRead;
+    let dir = TempDir::new("wire-orphan");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
+        .env(ROLE, "rx")
+        .env(
+            RUN,
+            encode_run(&wire_run(Shape::W1, StageLoad::Closed, 200)),
+        )
+        .env(OUT, dir.0.join("receive.samples"))
+        .env(NONCE, "1")
+        .env(INDEX, "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    assert!(lines.any(|line| line.is_ok_and(|line| line.contains("WIRE_READY"))));
+    drop(child.stdin.take());
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the orphaned child kept running");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(status.code(), Some(ORPHANED));
 }
 
 /// The child part of the IPC workloads: the workload runs this binary

@@ -10,6 +10,12 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Fault injection into the wire process runs (`wire::process::Faults`), for
+# the bench's own tests; never enabled outside dev-dependencies, so a
+# measurement build refuses injected faults (coordinator, ACS 15309).
+test-hooks = []
+
 [dependencies]
 karyos-sys.workspace = true
 karyos-io.workspace = true
@@ -25,6 +31,8 @@ karyos-sim.workspace = true
 karyos.workspace = true
 
 [dev-dependencies]
+# The bench itself with `test-hooks`, for the fault tests of tests/smoke.rs.
+karyos-bench = { path = ".", features = ["test-hooks"] }
 criterion = { version = "=0.7.0", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

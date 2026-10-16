@@ -247,6 +247,7 @@ dependencies = [
  "criterion",
  "karyos",
  "karyos-archive",
+ "karyos-bench",
  "karyos-client",
  "karyos-cluster",
  "karyos-codec",
