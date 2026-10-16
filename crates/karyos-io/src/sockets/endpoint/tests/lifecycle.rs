@@ -13,7 +13,7 @@ use crate::backend::{
     PendingCause, QueueError, Reason, Release, ReturnReason, RouteError, RxStop, TxEvent,
     TxItemOutcome,
 };
-use crate::sockets::endpoint::tx_drops_on_this_thread;
+use crate::sockets::endpoint::{tx_discarded_on_drop, tx_drops_on_this_thread};
 use crate::sockets::ops::{Errno, RecvResult, SendResult};
 use crate::sockets::scripted::default_probes;
 
@@ -105,6 +105,23 @@ fn open_rejects_invalid_configuration_and_protection() {
             value: 4096 * 8192 + 8193,
         },
     );
+    // S3 review P3: a buffer request the C `int` of `SO_SNDBUF` or
+    // `SO_RCVBUF` cannot carry is a configuration error, not an `EINVAL`
+    // from the kernel call.
+    check(
+        |cfg| cfg.send_buffer = std::num::NonZeroU32::new(1 << 31),
+        OpenError::InvalidConfig {
+            field: "send_buffer",
+            value: 1 << 31,
+        },
+    );
+    check(
+        |cfg| cfg.recv_buffer = std::num::NonZeroU32::new(u32::MAX),
+        OpenError::InvalidConfig {
+            field: "recv_buffer",
+            value: u64::from(u32::MAX),
+        },
+    );
     check(
         |cfg| {
             cfg.multicast = Some(MulticastConfig::new(
@@ -121,6 +138,15 @@ fn open_rejects_invalid_configuration_and_protection() {
         |cfg| cfg.protection = Protection::Authenticated,
         OpenError::ProtectionUnavailable,
     );
+}
+
+/// The largest buffer request the socket option can carry is valid.
+#[test]
+fn buffer_requests_up_to_a_c_int_are_valid() {
+    let mut cfg = config();
+    cfg.send_buffer = std::num::NonZeroU32::new(MAX_BUFFER_REQUEST);
+    cfg.recv_buffer = std::num::NonZeroU32::new(MAX_BUFFER_REQUEST);
+    assert_eq!(cfg.validate(), Ok(()));
 }
 
 #[test]
@@ -446,6 +472,26 @@ fn retire_and_drop_non_unwinding_drop_with_pending_items_asserts() {
     let mut h = Harness::new();
     h.commit_n(0, 1);
     drop(h);
+}
+
+/// S3 review P3: a non-unwinding drop with pending items is counted. The
+/// fault injection hook marks the half as carrying an injected fault (its
+/// head owner is rewritten to its own queue, which changes nothing else),
+/// so the debug assertion stands aside and the release build path runs:
+/// this thread's count grows by one drop and the process counter
+/// `tx_discarded_on_drop` by at least the two pending items. Other tests
+/// run in parallel, so the process counter is checked with `>=` only.
+#[test]
+fn retire_and_drop_non_unwinding_drop_with_pending_items_is_counted() {
+    let mut h = Harness::new();
+    h.commit_n(0, 2);
+    let queue = h.queue;
+    assert!(h.tx.core.inject_head_owner(queue, Some(queue)).is_some());
+    let drops = tx_drops_on_this_thread();
+    let discarded = tx_discarded_on_drop();
+    drop(h);
+    assert_eq!(tx_drops_on_this_thread(), drops + 1);
+    assert!(tx_discarded_on_drop() >= discarded + 2);
 }
 
 #[test]

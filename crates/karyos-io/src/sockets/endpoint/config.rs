@@ -47,6 +47,13 @@ pub const MAX_DATAGRAM: u16 = 8192;
 pub const MAX_TX_SLOTS: u16 = 4096;
 /// The largest `max_queues` and `max_routes`.
 pub const MAX_TABLE_ENTRIES: u16 = 1024;
+/// The largest `send_buffer` and `recv_buffer` request: `SO_SNDBUF` and
+/// `SO_RCVBUF` take a C `int` on Linux and macOS, so a larger request
+/// cannot reach the kernel and is refused by [`SocketsConfig::validate`]
+/// rather than set to some other size. Equal to `c_int::MAX`, pinned
+/// below without a cast.
+pub const MAX_BUFFER_REQUEST: u32 = 0x7FFF_FFFF;
+const _: () = assert!(std::ffi::c_int::MAX == 0x7FFF_FFFF);
 
 /// Provisional default `max_datagram` (O-4): the default channel `mtu`.
 pub const DEFAULT_MAX_DATAGRAM: NonZeroU16 = nz16(1408);
@@ -211,9 +218,9 @@ pub struct SocketsConfig {
     /// (`max_datagram + 1`) may take together (4.5); provisional default
     /// [`DEFAULT_MEMORY_CAP`].
     pub memory_cap: NonZeroU64,
-    /// The `SO_SNDBUF` request, if any.
+    /// The `SO_SNDBUF` request, if any, up to [`MAX_BUFFER_REQUEST`].
     pub send_buffer: Option<NonZeroU32>,
-    /// The `SO_RCVBUF` request, if any.
+    /// The `SO_RCVBUF` request, if any, up to [`MAX_BUFFER_REQUEST`].
     pub recv_buffer: Option<NonZeroU32>,
     /// The multicast group, if any.
     pub multicast: Option<MulticastConfig>,
@@ -314,6 +321,21 @@ impl SocketsConfig {
         match self.pool_bytes() {
             Some(bytes) if bytes <= self.memory_cap.get() => {}
             needed => return Err(invalid("memory_cap", needed.unwrap_or(u64::MAX))),
+        }
+        // A request the C `int` of the socket option cannot carry. Section
+        // 8.3 covers an effective size below a request the kernel took;
+        // this request cannot be made at all, so it is a configuration
+        // error, not a `BelowRequest` fallback.
+        let buffers = [
+            ("send_buffer", self.send_buffer),
+            ("recv_buffer", self.recv_buffer),
+        ];
+        for (field, request) in buffers {
+            if let Some(request) = request
+                && request.get() > MAX_BUFFER_REQUEST
+            {
+                return Err(invalid(field, u64::from(request.get())));
+            }
         }
         if let Some(multicast) = self.multicast {
             let same_family = multicast.group.is_ipv4() == self.local.is_ipv4();
