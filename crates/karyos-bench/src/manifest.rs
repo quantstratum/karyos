@@ -23,12 +23,11 @@ pub const VERSION: &str = "2.0";
 
 /// The SHA-256 of the manifest file of [`VERSION`] (manifest 9). The file
 /// cannot contain its own hash, so every result records it. This is the
-/// 2.0 file at quantstratum-docs PR #70 head 345ff84 (coordinator, after
-/// ACS 15075); if the review changes the file, this constant changes with
-/// it. A value that is not 64 lowercase hex digits makes every result not
+/// 2.0 file as merged in quantstratum-docs #70 at 749ae98 (ACS note
+/// `karyos/threat-model-manifest-v2-hash`). A value that is not 64 lowercase hex digits makes every result not
 /// decision grade (`decision::GradeReason::ManifestHashPending`).
 pub const MANIFEST_SHA256: &str =
-    "a0228318c31aabdaf90ab62ed62f7c657557634446793a170c4f935c733114a9";
+    "67855e81f0ae526559f4dde470f6ab8b1dac7d5e939aa870a3e46a386a1c4dea";
 
 /// The SHA-256 of manifest version 1.0 at its freeze (ACS note
 /// `threat-model-manifest-v1-hash`), kept for results that cite 1.0.
@@ -775,7 +774,7 @@ mod tests {
         assert!(is_sha256_hex(MANIFEST_1_0_SHA256));
         assert_eq!(
             MANIFEST_SHA256,
-            "a0228318c31aabdaf90ab62ed62f7c657557634446793a170c4f935c733114a9"
+            "67855e81f0ae526559f4dde470f6ab8b1dac7d5e939aa870a3e46a386a1c4dea"
         );
         assert!(manifest_hash_is_final());
         assert!(!is_sha256_hex("PENDING"));
