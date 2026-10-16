@@ -25,6 +25,7 @@ fn exclusive_plan() -> StreamPlan {
         required: 1,
         optional: 1,
         clients: 0,
+        keys: 0,
     }
 }
 
@@ -35,6 +36,7 @@ fn concurrent_plan() -> StreamPlan {
         required: 1,
         optional: 2,
         clients: 0,
+        keys: 0,
     }
 }
 
@@ -145,6 +147,26 @@ pub fn all() -> Vec<Scenario> {
                     stall: false,
                 },
             )
+        },
+        Scenario {
+            name: "conflated",
+            streams: vec![
+                StreamPlan {
+                    keys: 4,
+                    ..exclusive_plan()
+                },
+                StreamPlan {
+                    keys: 4,
+                    ..concurrent_plan()
+                },
+            ],
+            faults: Faults {
+                pause: true,
+                pause_in_claim: true,
+                ..Faults::default()
+            },
+            on_required_loss: LossPolicy::Hold,
+            steps: 1500,
         },
         stall("stall-hold", LossPolicy::Hold),
         stall("stall-continue", LossPolicy::Continue),

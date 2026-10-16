@@ -13,6 +13,7 @@ use karyos_driver::{
     StreamHandle,
 };
 use karyos_protocol::cnc::{StreamKey, SubscriberRole};
+use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::error::SysError;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
@@ -20,7 +21,7 @@ use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
 use crate::clock::SimClock;
-use crate::oracle::{ReaderView, StreamRecord};
+use crate::oracle::{ConflatedView, ReaderView, StreamRecord, key_of};
 use crate::payload::{Stamp, encode};
 use crate::publisher::{Attempt, Claimed, SimPublisher};
 use crate::rng::Rng;
@@ -79,6 +80,10 @@ pub struct StreamPlan {
     /// connects through a conductor and beats: the readers a stall
     /// fault can make the driver lose.
     pub clients: u8,
+    /// Keys of a conflated stream (SPEC.md §7.1), 0 for a plain one. A
+    /// conflated stream has its driver's feeder and one conflated view
+    /// actor; its publishers key each message from its stamp.
+    pub keys: u32,
 }
 
 /// A scenario: streams, faults and a step budget.
@@ -157,6 +162,11 @@ enum Kind {
     Reader {
         subscription: ClientSubscription,
         view: ReaderView,
+    },
+    /// A conflated view of a keyed stream.
+    Conflated {
+        view: karyos_client::ConflatedSubscription,
+        oracle: ConflatedView,
     },
     /// A required reader whose client beats while it is not paused.
     Client {
@@ -306,7 +316,13 @@ impl<'s> Sim<'s> {
                         term_length: TermLength::try_new(MIN_TERM_LENGTH)
                             .map_err(|error| fail(format!("term: {error}")))?,
                         spare_slots: 6,
-                        max_subscribers: plan.required + plan.optional + plan.clients + 1,
+                        // The feeder of a conflated stream is one more
+                        // required participant.
+                        max_subscribers: plan.required
+                            + plan.optional
+                            + plan.clients
+                            + u8::from(plan.keys > 0)
+                            + 1,
                         mtu: DEFAULT_MTU,
                         max_reserved: MIN_TERM_LENGTH / 8,
                         initial_term_id: TermId::new(7),
@@ -318,7 +334,12 @@ impl<'s> Sim<'s> {
                     },
                     allow_unconnected: true,
                     on_required_loss: scenario.on_required_loss,
-                    conflation: None,
+                    conflation: (plan.keys > 0).then_some(ConflationConfig {
+                        keys: plan.keys,
+                        // Above the largest payload a publisher sends.
+                        value_capacity: 512,
+                        journal_capacity: 1024,
+                    }),
                 })
                 .map_err(|error| fail(format!("stream: {error}")))?;
             let mut add = |kind: Kind| {
@@ -340,6 +361,15 @@ impl<'s> Sim<'s> {
                     .map_err(|error| fail(format!("subscribe: {error}")))?;
                 let view = ReaderView::new(role, subscription.position());
                 add(Kind::Reader { subscription, view });
+            }
+            if plan.keys > 0 {
+                let view = driver
+                    .subscribe_conflated(handle)
+                    .map_err(|error| fail(format!("conflated view: {error}")))?;
+                add(Kind::Conflated {
+                    view,
+                    oracle: ConflatedView::new(plan.keys),
+                });
             }
             for _ in 0..plan.clients {
                 let (conductor, subscription) =
@@ -574,6 +604,9 @@ impl<'s> Sim<'s> {
                 Kind::Reader { subscription, view } => self
                     .read(subscription, view, actor.id, actor.stream)
                     .map(|()| false),
+                Kind::Conflated { view, oracle } => self
+                    .read_conflated(view, oracle, actor.id, actor.stream)
+                    .map(|()| false),
                 Kind::Client {
                     subscription,
                     view,
@@ -635,16 +668,26 @@ impl<'s> Sim<'s> {
             sequence: *sequence,
         };
         *sequence += 1;
+        let keys = self
+            .scenario
+            .streams
+            .get(stream)
+            .map_or(0, |plan| plan.keys);
+        let key = if keys > 0 {
+            i64::from(key_of(stamp, keys))
+        } else {
+            0
+        };
         let attempt = if self.rng.chance(2, 3) {
             let payload = encode(stamp, length);
             let attempt = publication
-                .offer(&payload)
+                .offer(&payload, key)
                 .map_err(|error| self.failure(format!("offer: {error}")))?;
             self.note(format!("actor {id} offer {stamp:?}: {attempt:?}"));
             attempt
         } else {
             let claimed = publication
-                .claim(length as u32)
+                .claim(length as u32, key)
                 .map_err(|error| self.failure(format!("claim: {error}")))?;
             match claimed {
                 Claimed::Outcome(attempt) => {
@@ -762,6 +805,38 @@ impl<'s> Sim<'s> {
         Ok(())
     }
 
+    /// One poll of a conflated view with a small random budget, every
+    /// value checked.
+    fn read_conflated(
+        &mut self,
+        view: &mut karyos_client::ConflatedSubscription,
+        oracle: &mut ConflatedView,
+        id: u32,
+        stream: usize,
+    ) -> Result<(), Failure> {
+        let budget = karyos_sys::conflation::Budget {
+            keys: self.rng.between(1, 4) as u32,
+            retries: 2,
+        };
+        let Some(record) = self.streams.get(stream).map(|s| &s.record) else {
+            return Ok(());
+        };
+        let mut errors = Vec::new();
+        let report = view.poll_changed_with(budget, |key, version, bytes| {
+            if let Err(error) = oracle.value(record, key, version, bytes) {
+                errors.push(error);
+            }
+        });
+        if let Some(error) = errors.into_iter().next() {
+            return Err(self.failure(format!("conflated view {id}: {error}")));
+        }
+        if report.delivered > 0 {
+            self.observed += 1;
+            self.note(format!("conflated view {id} poll: {report:?}"));
+        }
+        Ok(())
+    }
+
     /// One poll of a client's required reader. Under the stall fault the
     /// client may stop while it holds the loan of a delivered message:
     /// the other actors and the driver run, the driver's clock moves past
@@ -868,7 +943,7 @@ impl<'s> Sim<'s> {
                 let is_reader = matches!(
                     self.actors.get(index),
                     Some(Some(Actor {
-                        kind: Kind::Reader { .. } | Kind::Client { .. },
+                        kind: Kind::Reader { .. } | Kind::Client { .. } | Kind::Conflated { .. },
                         ..
                     }))
                 );
@@ -893,6 +968,16 @@ impl<'s> Sim<'s> {
         let mut delivered = 0;
         let mut revoked = 0;
         for actor in self.actors.iter().flatten() {
+            if let Kind::Conflated { oracle, .. } = &actor.kind {
+                delivered += oracle.delivered();
+                let Some(stream) = self.streams.get(actor.stream) else {
+                    continue;
+                };
+                oracle.complete(&stream.record).map_err(|reason| {
+                    self.failure(format!("conflated view {}: {reason}", actor.id))
+                })?;
+                continue;
+            }
             if let Kind::Reader { view, .. } | Kind::Client { view, .. } = &actor.kind {
                 delivered += view.delivered();
                 revoked += usize::from(view.revoked().is_some());

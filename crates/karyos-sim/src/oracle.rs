@@ -64,6 +64,109 @@ impl StreamRecord {
     }
 }
 
+/// The key of `stamp` on a conflated stream of `keys` keys: derived from
+/// the stamp, so the oracle and the publisher agree without sharing state.
+#[must_use]
+pub fn key_of(stamp: Stamp, keys: u32) -> u32 {
+    stamp.publisher.wrapping_add(stamp.sequence) % keys.max(1)
+}
+
+impl StreamRecord {
+    /// The latest accepted stamp of every key, by stream position: what a
+    /// conflated view must hold once the writers are quiescent.
+    #[must_use]
+    pub fn latest_by_key(&self, keys: u32) -> BTreeMap<u32, Stamp> {
+        let mut latest = BTreeMap::new();
+        for stamp in self.accepted.values() {
+            let _ = latest.insert(key_of(*stamp, keys), *stamp);
+        }
+        latest
+    }
+
+    /// Whether `stamp` was accepted.
+    #[must_use]
+    pub fn was_accepted(&self, stamp: Stamp) -> bool {
+        self.accepted.values().any(|accepted| *accepted == stamp)
+    }
+}
+
+/// A conflated view's observations (SPEC.md §7.1): per key, the last
+/// version and value delivered.
+#[derive(Debug, Default)]
+pub struct ConflatedView {
+    keys: u32,
+    seen: BTreeMap<u32, (u64, Stamp)>,
+    delivered: usize,
+}
+
+impl ConflatedView {
+    /// A view of a stream of `keys` keys.
+    #[must_use]
+    pub fn new(keys: u32) -> Self {
+        Self {
+            keys,
+            ..Self::default()
+        }
+    }
+
+    /// Values delivered so far.
+    #[must_use]
+    pub fn delivered(&self) -> usize {
+        self.delivered
+    }
+
+    /// A delivered value of `key` at `version`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when the value is not a valid payload, names
+    /// another key, was never accepted, or its version does not move
+    /// forward.
+    pub fn value(
+        &mut self,
+        record: &StreamRecord,
+        key: u32,
+        version: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let stamp = decode(bytes).map_err(|why| format!("key {key}: {why}"))?;
+        if key_of(stamp, self.keys) != key {
+            return Err(format!("key {key} holds {stamp:?} of another key"));
+        }
+        if !record.was_accepted(stamp) {
+            return Err(format!("key {key} holds {stamp:?}, never accepted"));
+        }
+        if let Some((before, _)) = self.seen.get(&key)
+            && version <= *before
+        {
+            return Err(format!("key {key}: version {version} after {before}"));
+        }
+        let _ = self.seen.insert(key, (version, stamp));
+        self.delivered += 1;
+        Ok(())
+    }
+
+    /// The end-of-run check, with the writers quiescent: every key holds
+    /// its latest accepted value.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first key whose value is not the latest.
+    pub fn complete(&self, record: &StreamRecord) -> Result<(), String> {
+        for (key, stamp) in record.latest_by_key(self.keys) {
+            match self.seen.get(&key) {
+                Some((_, held)) if *held == stamp => {}
+                other => {
+                    return Err(format!(
+                        "key {key} holds {other:?}, the latest accepted is {stamp:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One reader's observations.
 #[derive(Debug)]
 pub struct ReaderView {
@@ -393,5 +496,35 @@ mod tests {
         twice.accepted(0, stamp(0)).unwrap();
         assert!(twice.accepted(0, stamp(1)).is_err());
         assert!(twice.aborted(0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod conflated_tests {
+    use super::*;
+    use crate::payload::encode;
+
+    #[test]
+    fn a_conflated_view_checks_keys_versions_and_the_latest_value() {
+        let stamp = |sequence| Stamp {
+            publisher: 0,
+            sequence,
+        };
+        let mut record = StreamRecord::default();
+        // Keys of 2: sequences 0 and 2 are key 0, 1 is key 1.
+        for (position, sequence) in [(0, 0), (64, 1), (128, 2)] {
+            record.accepted(position, stamp(sequence)).unwrap();
+        }
+        let mut view = ConflatedView::new(2);
+        view.value(&record, 0, 2, &encode(stamp(0), 40)).unwrap();
+        view.value(&record, 1, 2, &encode(stamp(1), 40)).unwrap();
+        // Negative controls: not the latest yet, a version going back, a
+        // value of another key, a value never accepted.
+        assert!(view.complete(&record).is_err());
+        assert!(view.value(&record, 0, 2, &encode(stamp(2), 40)).is_err());
+        assert!(view.value(&record, 0, 4, &encode(stamp(1), 40)).is_err());
+        assert!(view.value(&record, 0, 4, &encode(stamp(4), 40)).is_err());
+        view.value(&record, 0, 4, &encode(stamp(2), 40)).unwrap();
+        view.complete(&record).unwrap();
     }
 }
