@@ -13,7 +13,10 @@ use karyos_client::{
     ClaimOutcome, ClientError, ClientPublication, ClientSubscription, CommitOutcome, MessageLimit,
     OfferOutcome,
 };
-use karyos_driver::{DriverError, EmbeddedDriver, Reconfiguration, StreamConfig, StreamHandle};
+use karyos_driver::{
+    DriverConfig, DriverError, EmbeddedDriver, Reconfiguration, SealState, StreamConfig,
+    StreamHandle,
+};
 use karyos_sys::frame::Lane;
 use karyos_sys::guard::Closed;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
@@ -392,4 +395,101 @@ fn a_writer_abort_keeps_its_reason_across_a_close() {
         [(Kind::Aborted, 6), (Kind::Submitted, 0), (Kind::Ended, 1)],
         "{records:?}"
     );
+}
+
+/// Review of #209 (M4, and the fresh start): nothing is created while the
+/// guard is closed, and the fresh incarnation starts exactly at the seal
+/// position.
+#[test]
+fn the_fresh_incarnation_starts_at_the_seal_and_only_when_open() {
+    let (mut driver, handle, guard) = guarded(4);
+    let mut publication = driver.publication(handle).unwrap();
+    for value in [b"a", b"b"] {
+        assert!(matches!(
+            publication.offer(value).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    drop(publication);
+    let _ = driver.do_work().unwrap();
+    let seal = match driver.seal_state(handle).unwrap() {
+        SealState::Positioned { position } | SealState::Retired { position } => position,
+        other => panic!("not positioned: {other:?}"),
+    };
+    for _ in 0..2 {
+        assert!(matches!(
+            driver.publication(handle),
+            Err(DriverError::GuardNotOpen { .. })
+        ));
+        assert_eq!(driver.trace_identity(handle).unwrap().incarnation, 1);
+    }
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let mut fresh = driver.publication(handle).unwrap();
+    assert_eq!(driver.trace_identity(handle).unwrap().incarnation, 2);
+    let OfferOutcome::Accepted { position, .. } = fresh.offer(b"c").unwrap() else {
+        panic!("not accepted");
+    };
+    assert_eq!(position, seal, "the fresh incarnation starts at the seal");
+}
+
+/// Review of #209 (M5): with a walker budget of one block, the old readers
+/// can pass the seal before the replaced walker reached it; the replaced
+/// incarnation is kept until its walker wrote `Ended`.
+#[test]
+fn a_replaced_incarnation_is_kept_until_its_walker_ended() {
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        guard_walker_budget: 1,
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
+    let guard = driver.add_guard("orders").unwrap();
+    driver.guard_stream(handle, guard, 4).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut publication = driver.publication(handle).unwrap();
+    for value in [b"a", b"b", b"c"] {
+        assert!(matches!(
+            publication.offer(value).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::Gated);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let _fresh = driver.publication(handle).unwrap();
+    // One block per cycle: Submitted three times, then Ended.
+    let mut kinds = Vec::new();
+    for _ in 0..8 {
+        let _ = driver.do_work().unwrap();
+        kinds.extend(outcomes(&mut publication).iter().map(|r| r.kind));
+    }
+    assert_eq!(
+        kinds,
+        [
+            Kind::Submitted,
+            Kind::Submitted,
+            Kind::Submitted,
+            Kind::Ended
+        ]
+    );
+}
+
+/// Review of #209, P2-1: a removed stream creates nothing; it stays at its
+/// incarnation and refuses as a retiring stream.
+#[test]
+fn a_removed_guarded_stream_creates_no_incarnation() {
+    let (mut driver, handle, guard) = guarded(4);
+    let publication = driver.publication(handle).unwrap();
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    drop(publication);
+    let _ = driver.do_work().unwrap();
+    driver.remove_stream(handle).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    assert!(matches!(
+        driver.publication(handle),
+        Err(DriverError::StreamRetiring { .. })
+    ));
+    assert_eq!(driver.trace_identity(handle).unwrap().incarnation, 1);
 }

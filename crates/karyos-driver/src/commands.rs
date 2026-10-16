@@ -103,6 +103,13 @@ pub(crate) struct Holding {
     position: u64,
 }
 
+impl Holding {
+    /// The stream id of the holding cell.
+    pub(crate) fn stream(&self) -> u64 {
+        self.stream
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ClientSlot<T: StreamTerms> {
     id: u64,
@@ -780,6 +787,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let Some(index) = self.find_stream(stream, Some(lane)) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
+                // Identities and records over the control path name the
+                // first incarnation until remote incarnations exist (G-d2b,
+                // coordinator ACS 15233): a reincarnated stream takes no
+                // CnC registration.
+                if self
+                    .streams
+                    .get(index)
+                    .is_some_and(|found| found.incarnation != crate::embedded::FIRST_INCARNATION)
+                {
+                    return refuse(ErrorCode::ResourcesUnavailable, detail);
+                }
                 // A guarded stream's publications are bound to the guard's
                 // open epoch with an outcome ring; that binding exists only
                 // in process (`EmbeddedDriver::publication`) until its CnC
@@ -4568,5 +4586,74 @@ mod tests {
         }
         assert!(driver.streams[0].replaced.is_empty());
         assert_eq!(driver.streams[0].incarnation, 2);
+    }
+
+    /// Review of #209 (M6 and P2-3): a stream a remote client holds keeps
+    /// its sealed incarnation (remote incarnations are G-d2b), and a
+    /// reincarnated stream takes no CnC registration.
+    #[test]
+    fn remote_holders_and_reincarnated_streams_over_cnc() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                lane: Lane::ZERO,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let first = responses(&mut observer);
+        assert!(
+            first
+                .iter()
+                .any(|answer| matches!(answer, Response::SubscriptionReady { .. })),
+            "{first:?}"
+        );
+        let publication = driver.publication(stream).unwrap();
+        let _ = driver.close_guard(guard, 2).unwrap();
+        drop(publication);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+        let refused = driver.publication(stream).map(|_| ());
+        assert!(
+            matches!(refused, Err(DriverError::GuardSealed { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(driver.streams[0].incarnation, 1);
+        // Once reincarnated (here by hand, as no remote holder is left in
+        // a real run), CnC registration is refused.
+        driver.streams[0].incarnation = 2;
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 2,
+                stream: KEY,
+                lane: Lane::ZERO,
+                role: SubscriberRole::Required,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        assert!(
+            answers.iter().any(|answer| matches!(
+                answer,
+                Response::Error {
+                    request: RequestId { client: c, sequence: 2 },
+                    code: ErrorCode::ResourcesUnavailable,
+                    ..
+                } if *c == client
+            )),
+            "{answers:?}"
+        );
     }
 }

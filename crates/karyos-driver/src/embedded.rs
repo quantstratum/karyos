@@ -1256,8 +1256,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// [`Self::seal_guarded`] after a close that took effect: a failure is
-    /// recorded in the error log (`GuardSealFailed`, keyed by the guard)
-    /// and retried by the walker's duty, never reported as a failed close.
+    /// recorded in the error log (`GuardSealFailed`, keyed by the guard),
+    /// never reported as a failed close. The walker's duty repeats only
+    /// the claim abort, and only on a stream whose seal reason is
+    /// `GuardClosed`; a seal that failed to set is not retried.
     pub(crate) fn seal_guarded_reporting(&mut self, guard: GuardHandle) {
         if let Err(error) = self.seal_guarded(guard) {
             self.diagnostics.error(
@@ -1633,10 +1635,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::InvalidPublicationMode`] for a concurrent stream,
     /// [`DriverError::StreamRetiring`] for a removed stream, and
     /// [`DriverError::UnknownStream`] for a foreign handle or a freed stream.
+    /// On a guarded stream also [`DriverError::GuardNotOpen`],
+    /// [`DriverError::GuardSealed`], [`DriverError::IncarnationsExhausted`]
+    /// and [`DriverError::PositionsExhausted`] (see
+    /// `reincarnate_if_reopened`), with nothing created or taken.
     pub fn publication(
         &mut self,
         stream: StreamHandle,
     ) -> Result<ClientPublication<T>, DriverError> {
+        // A foreign, freed or removed stream is refused before anything
+        // else, so nothing is created for it.
+        let _ = self.active_stream(stream)?;
         // After a guard close and reopen, the fresh incarnation first.
         self.reincarnate_if_reopened(stream)?;
         // A guarded handle's binding is prepared first, so a refusal takes
@@ -1703,7 +1712,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(guarded) = &found.guarded else {
             return Ok(());
         };
-        if found.conductor.seal_reason() != Some(SealReason::GuardClosed)
+        // A removed stream is refused by `publication()` itself; nothing is
+        // created for it.
+        if found.retiring
+            || found.conductor.seal_reason() != Some(SealReason::GuardClosed)
             || !self.guards.state(guarded.guard)?.open
         {
             return Ok(());
@@ -1713,10 +1725,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             SealState::Positioned { position } | SealState::Retired { position } => position,
             SealState::Active | SealState::Sealed => return Err(sealed),
         };
+        // A registration, a remote grant (export ledger) or a held bound
+        // of a lost participant names the stream: remote incarnations are
+        // G-d2b.
         let remote = self
             .registrations
             .iter()
-            .any(|registration| registration.stream() == found.id);
+            .any(|registration| registration.stream() == found.id)
+            || self.clients.iter().any(|client| {
+                client
+                    .ledger
+                    .as_ref()
+                    .is_some_and(|ledger| ledger.names_stream(found.id))
+            })
+            || self.holding.iter().any(|entry| entry.stream() == found.id);
         if found.conflation.is_some()
             || found.cutover.is_some()
             || !found.retained.is_empty()
@@ -2034,6 +2056,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             .add(Event::GuardOutcomesWritten, u64::from(walked.written));
                         self.counters
                             .add(Event::GuardOutcomesLost, u64::from(walked.lost));
+                        if walked.budget_exhausted {
+                            self.counters.add(Event::GuardWalkerBudgetExhausted, 1);
+                        }
+                        // A lapped walker abandoned its rings: nothing more
+                        // will be recorded, so the entry is done.
+                        if walked.overrun {
+                            lapped.push(stream.id);
+                            replaced.guarded.finish();
+                        }
                         add_work(&self.counters, &mut work, &mut first_error, walked.written);
                         add_work(&self.counters, &mut work, &mut first_error, walked.lost);
                     }
