@@ -1012,6 +1012,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Command::AddConflatedSubscription { stream, .. } => {
                 self.add_conflated(client, request, stream)
             }
+            // The driver has no guard registry yet (P2.10 G-d): every
+            // guard is unknown, and nothing changes.
+            Command::GuardClose { guard, .. } | Command::GuardReopen { guard, .. } => {
+                refuse(ErrorCode::UnknownGuard, guard)
+            }
         }
     }
 
