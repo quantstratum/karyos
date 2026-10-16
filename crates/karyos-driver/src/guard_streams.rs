@@ -95,6 +95,11 @@ impl<T: TermBytes> GuardedStream<T> {
         }
     }
 
+    /// Whether the walker reached the seal and wrote `Ended`.
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
+
     /// Binds a newly issued handle's ring, for blocks from `from` on.
     pub(crate) fn bind(&mut self, bound: Bound) {
         self.bounds.push_back(bound);

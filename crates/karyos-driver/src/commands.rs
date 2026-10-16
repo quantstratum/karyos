@@ -4453,4 +4453,46 @@ mod tests {
             Some(karyos_sys::log_buffer::SealReason::GuardClosed)
         );
     }
+
+    /// A replaced incarnation retires once its walker ended and its readers
+    /// passed the seal; one with a reader still behind is kept.
+    #[test]
+    fn a_replaced_incarnation_retires() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let mut reader = driver
+            .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+            .unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        assert!(matches!(
+            publication.offer(b"x").unwrap(),
+            karyos_client::OfferOutcome::Accepted { .. }
+        ));
+        let _ = driver.close_guard(guard, 2).unwrap();
+        drop(publication);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+        let _fresh = driver.publication(stream).unwrap();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        // The reader has not read to the seal: the old incarnation stays.
+        assert_eq!(driver.streams[0].replaced.len(), 1);
+        while reader
+            .poll(|_, _| {}, karyos_client::MessageLimit::new(8))
+            .unwrap()
+            .delivered
+            > 0
+        {}
+        let _ = reader
+            .poll(|_, _| {}, karyos_client::MessageLimit::new(8))
+            .unwrap();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert!(driver.streams[0].replaced.is_empty());
+        assert_eq!(driver.streams[0].incarnation, 2);
+    }
 }

@@ -66,10 +66,19 @@ pub enum DriverError {
         /// The guard id.
         guard: u64,
     },
-    /// The stream was sealed by a guard close: that incarnation is final,
-    /// and a reopened guard's fresh incarnation is a later batch (G-d2).
+    /// The stream was sealed by a guard close and the guard is open again,
+    /// but the fresh incarnation could not be created yet: the sealed
+    /// incarnation's publication has not released, or the stream is
+    /// conflated or held by a remote client (remote incarnations: G-d2b).
     #[error("stream {stream} was sealed by a guard close")]
     GuardSealed {
+        /// The stream id.
+        stream: u64,
+    },
+    /// The stream's incarnation numbers are exhausted; they are never
+    /// reused.
+    #[error("stream {stream}'s incarnations are exhausted")]
+    IncarnationsExhausted {
         /// The stream id.
         stream: u64,
     },

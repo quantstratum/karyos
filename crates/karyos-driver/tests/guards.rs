@@ -9,11 +9,15 @@
 // test exemptions (ADR-0007 exempts tests from these lints).
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
-use karyos_client::{ClaimOutcome, ClientError, ClientPublication, CommitOutcome, OfferOutcome};
+use karyos_client::{
+    ClaimOutcome, ClientError, ClientPublication, ClientSubscription, CommitOutcome, MessageLimit,
+    OfferOutcome,
+};
 use karyos_driver::{DriverError, EmbeddedDriver, Reconfiguration, StreamConfig, StreamHandle};
 use karyos_sys::frame::Lane;
 use karyos_sys::guard::Closed;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
+use karyos_sys::log_buffer::{Role, SealReason};
 use karyos_sys::outcome_ring::{Kind, Record};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
@@ -144,14 +148,11 @@ fn a_close_gates_the_handle_and_ends_its_outcomes() {
     assert_eq!(records[1].reason, 1, "AbortReason::GUARD_CLOSED");
     assert_eq!(records[2].reason, 1);
     assert_eq!(publication.guard().unwrap().outstanding(), 0);
-    // The sealed incarnation is final: a new handle is refused, even after
-    // a reopen (the fresh incarnation is G-d2).
+    // The sealed incarnation is final; after a reopen the next handle gets
+    // a fresh one (G-d2).
     drop(publication);
     assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
-    assert!(matches!(
-        driver.publication(handle),
-        Err(DriverError::GuardSealed { .. })
-    ));
+    assert!(driver.publication(handle).is_ok());
 }
 
 #[test]
@@ -266,4 +267,96 @@ fn the_walker_keeps_up_across_many_terms() {
     recorded += outcomes(&mut publication).len();
     assert_eq!(recorded, total, "one final record per message");
     assert_eq!(publication.guard().unwrap().outstanding(), 0);
+}
+
+fn read(subscription: &mut ClientSubscription) -> (Vec<Vec<u8>>, Option<SealReason>) {
+    let mut seen = Vec::new();
+    loop {
+        let summary = subscription
+            .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
+            .unwrap();
+        if summary.delivered == 0 && summary.aborted.is_none() {
+            return (seen, summary.close_reason);
+        }
+    }
+}
+
+/// G-d2 (guards-and-abort.md, The fresh incarnation): after a close and a
+/// reopen, the next handle publishes into a fresh incarnation that starts
+/// at the seal position, with the next incarnation number; the old
+/// subscriber reads to `GuardClosed`, and a new subscription reads only
+/// the fresh incarnation.
+#[test]
+fn a_reopen_gives_the_next_handle_a_fresh_incarnation() {
+    let (mut driver, handle, guard) = guarded(4);
+    let mut old_reader = driver.subscribe(handle, Role::Optional).unwrap();
+    let mut publication = driver.publication(handle).unwrap();
+    let OfferOutcome::Accepted {
+        position: first, ..
+    } = publication.offer(b"one").unwrap()
+    else {
+        panic!("not accepted");
+    };
+    assert_eq!(driver.trace_identity(handle).unwrap().incarnation, 1);
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    assert_eq!(publication.offer(b"two").unwrap(), OfferOutcome::Gated);
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    let old: Vec<Kind> = outcomes(&mut publication).iter().map(|r| r.kind).collect();
+    assert_eq!(old, [Kind::Submitted, Kind::Ended]);
+    let (seen, closed) = read(&mut old_reader);
+    assert_eq!(seen, [b"one".to_vec()]);
+    assert_eq!(closed, Some(SealReason::GuardClosed));
+    // Still closed: no fresh incarnation, nothing created.
+    assert!(matches!(
+        driver.publication(handle),
+        Err(DriverError::GuardNotOpen { .. })
+    ));
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let mut fresh = driver.publication(handle).unwrap();
+    assert_eq!(driver.trace_identity(handle).unwrap().incarnation, 2);
+    let mut new_reader = driver.subscribe(handle, Role::Optional).unwrap();
+    let OfferOutcome::Accepted { position, .. } = fresh.offer(b"three").unwrap() else {
+        panic!("not accepted");
+    };
+    assert!(
+        position > first,
+        "positions continue: {position} after {first}"
+    );
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    let records = outcomes(&mut fresh);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        (records[0].kind, records[0].incarnation),
+        (Kind::Submitted, 2)
+    );
+    assert_eq!(records[0].epoch, 4);
+    assert_eq!(records[0].start, position);
+    let (seen, closed) = read(&mut new_reader);
+    assert_eq!(seen, [b"three".to_vec()]);
+    assert_eq!(closed, None);
+    // The old handle stays gated, the old reader stays at its end.
+    assert_eq!(publication.offer(b"four").unwrap(), OfferOutcome::Gated);
+    assert_eq!(read(&mut old_reader).1, Some(SealReason::GuardClosed));
+}
+
+/// The fresh incarnation waits for the sealed one's publication to
+/// release: before that the seal has no position.
+#[test]
+fn a_fresh_incarnation_waits_for_the_old_handle_to_release() {
+    let (mut driver, handle, guard) = guarded(4);
+    let publication = driver.publication(handle).unwrap();
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let _ = driver.do_work().unwrap();
+    assert!(matches!(
+        driver.publication(handle),
+        Err(DriverError::GuardSealed { .. })
+    ));
+    drop(publication);
+    let _ = driver.do_work().unwrap();
+    assert!(driver.publication(handle).is_ok());
 }
