@@ -10,8 +10,17 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# The scripted `SocketOps` test double for tests of dependent crates; never
+# enabled outside dev-dependencies.
+test-hooks = []
+
 [dependencies]
 karyos-sys.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 # The workspace lint set without `unsafe_code = "forbid"`, plus the unsafe
 # rules of SPEC.md §14. Keep the clippy list in sync with the workspace.
