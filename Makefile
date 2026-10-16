@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test loom loom-full sim sim-arch unsafe-report bench miri build-release deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint doc test loom loom-full sim sim-arch unsafe-report bench measure miri build-release deny deps-inventory deps-check lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -52,6 +52,9 @@ unsafe-report:
 
 bench:
 	$(CARGO) run -p karyos-bench --release --locked -- $(BENCH_ARGS)
+
+measure:
+	scripts/measure.sh $(MEASURE_ARGS)
 
 miri:
 	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-sys --lib --locked

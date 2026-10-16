@@ -27,12 +27,12 @@
 //! A child exits on its own when its standard input closes, so a parent
 //! that dies leaves no orphan.
 //!
-//! Every result is functional only (E4) for now, with the reason "not
-//! pinned": batch B4 pins each child to its own isolated core, reads the
-//! affinity back in the child, and only then clears the flag on a host
-//! that is decision eligible (`env::decision_eligible`: E1 to E3 on its
-//! declared host). The reasons of this host's ineligibility are recorded
-//! too.
+//! **Pinning.** With [`Cores`], each child starts under `taskset -c` on
+//! its own core and reads its affinity back (`Cpus_allowed_list` of
+//! `/proc/self/status`) into its sidecar. A result is functional only
+//! (E4) unless both read-backs show the requested core and this host is
+//! decision eligible (`env::decision_eligible`: E1 to E3 on its declared
+//! host); every reason is recorded (coordinator decision, ACS 15273).
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -45,7 +45,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use karyos_protocol::protection::Trusted;
 
 use crate::env;
-use crate::inventory::{Inventory, Scope};
+use crate::inventory::{Inventory, Scope, parse_cpu_list};
 use crate::manifest::{ExtBase, Fanout, Load, MtuRule, Point, Shape};
 use crate::samples::{self, Header, RunSamples, SATURATED, Stage};
 use crate::wire::stage::{
@@ -240,11 +240,94 @@ impl Faults {
     }
 }
 
+/// The cores of the two roles, one each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cores {
+    /// The receive child's core.
+    pub receiver: usize,
+    /// The send child's core.
+    pub sender: usize,
+}
+
+impl Cores {
+    /// The first two cores of `inventory` that are both isolated and in
+    /// `nohz_full`; `None` with fewer.
+    #[must_use]
+    pub fn of(inventory: &Inventory) -> Option<Self> {
+        let nohz = inventory.nohz_full_cores();
+        let mut quiet = inventory
+            .isolated_cores()
+            .into_iter()
+            .filter(|core| nohz.contains(core));
+        Some(Self {
+            receiver: quiet.next()?,
+            sender: quiet.next()?,
+        })
+    }
+
+    /// This host's cores, when it has two and `taskset` runs; otherwise
+    /// why not.
+    ///
+    /// # Errors
+    ///
+    /// Fewer than two quiet cores, or no `taskset`.
+    pub fn detect() -> Result<Self, String> {
+        let cores = Self::of(&Inventory::detect(Scope::Classification))
+            .ok_or_else(|| "fewer than two isolated nohz_full cores".to_string())?;
+        env::command("taskset", &["--version"])
+            .map(|_| cores)
+            .ok_or_else(|| "taskset unavailable".to_string())
+    }
+}
+
+/// This process's CPU affinity, read back from the kernel.
+///
+/// # Errors
+///
+/// Off Linux, or an unreadable `/proc/self/status`.
+pub fn affinity() -> Result<Vec<usize>, String> {
+    if !cfg!(target_os = "linux") {
+        return Err(format!("unavailable on {}", std::env::consts::OS));
+    }
+    let status = std::fs::read_to_string("/proc/self/status").map_err(|cause| cause.to_string())?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .map(parse_cpu_list)
+        .ok_or_else(|| "no Cpus_allowed_list".to_string())
+}
+
+/// The sidecar line of [`affinity`].
+fn affinity_line() -> String {
+    match affinity() {
+        Ok(cores) => format!(
+            "affinity {}\n",
+            cores
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Err(reason) => format!("affinity unavailable ({reason})\n"),
+    }
+}
+
+/// Why `role`'s read-back affinity `line` does not show `core` pinned.
+fn pin_reason(role: &str, line: &str, core: Option<usize>) -> Option<String> {
+    let Some(core) = core else {
+        return Some(format!("{role} not pinned"));
+    };
+    let expected = core.to_string();
+    (line != expected).then(|| format!("{role} affinity {line}, expected {expected}"))
+}
+
 /// How the parent runs one pair of processes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProcessOptions {
     /// The run index at its point, written into the sample headers.
     pub run_index: u32,
+    /// Each child's core; unpinned without.
+    pub cores: Option<Cores>,
     /// The run deadline; by default [`receive_deadline`] plus 30 s.
     pub deadline: Option<Duration>,
     /// Injected faults; tests only.
@@ -559,7 +642,8 @@ fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), Benc
     std::fs::write(
         context.out.with_extension("rx"),
         format!(
-            "drops {}\nbatches {}\ncallback {}\n",
+            "{}drops {}\nbatches {}\ncallback {}\n",
+            affinity_line(),
             received.drops,
             join(&received.batches),
             join(&received.receive_callback)
@@ -710,8 +794,10 @@ fn send_child(context: &ChildContext, prepared: &Prepared) -> Result<(), BenchEr
     std::fs::write(
         context.out.with_extension("tx"),
         format!(
-            "backpressure {}\nack_timeouts {}\n",
-            sent.backpressure, sent.ack_timeouts
+            "{}backpressure {}\nack_timeouts {}\n",
+            affinity_line(),
+            sent.backpressure,
+            sent.ack_timeouts
         ),
     )
     .map_err(|cause| error("tx sidecar", cause))
@@ -737,9 +823,24 @@ struct Spawn<'a> {
 }
 
 impl Spawn<'_> {
-    fn child(&self, role: &str, out: &Path, peer: Option<&str>) -> Result<Guard, BenchError> {
-        let mut command =
-            Command::new(std::env::current_exe().map_err(|cause| error("executable", cause))?);
+    fn child(
+        &self,
+        role: &str,
+        out: &Path,
+        peer: Option<&str>,
+        core: Option<usize>,
+    ) -> Result<Guard, BenchError> {
+        let executable = std::env::current_exe().map_err(|cause| error("executable", cause))?;
+        // `taskset` execs the child in place: the guard's PID stays the
+        // child's.
+        let mut command = match core {
+            Some(core) => {
+                let mut taskset = Command::new("taskset");
+                taskset.arg("-c").arg(core.to_string()).arg(executable);
+                taskset
+            }
+            None => Command::new(executable),
+        };
         command
             .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
             .env(ROLE, role)
@@ -834,14 +935,15 @@ fn check_samples(
     Ok(())
 }
 
-/// Why a result of this host is functional only: always "not pinned"
-/// until batch B4 pins the children, then every condition
+/// Why a result is functional only: `pinning`, the reasons the children
+/// are not verified on their cores, then every condition
 /// `env::decision_eligible` finds unmet (E1 to E3 on the declared host).
+/// Empty only for a decision-eligible result.
 #[must_use]
-pub fn functional_reasons() -> Vec<String> {
+pub fn functional_reasons(pinning: Vec<String>) -> Vec<String> {
     let inventory = Inventory::detect(Scope::Classification);
     let record = env::host_record(&inventory.host);
-    let mut reasons = vec!["not pinned".to_string()];
+    let mut reasons = pinning;
     if let Err(ineligible) = env::decision_eligible(&inventory, record.as_deref(), Fanout::F1) {
         reasons.extend(ineligible.iter().map(ToString::to_string));
     }
@@ -893,7 +995,7 @@ pub fn run_processes(
         nonce: nonce(),
         options,
     };
-    let mut receiver = spawn.child("rx", &receive_out, None)?;
+    let mut receiver = spawn.child("rx", &receive_out, None, options.cores.map(|c| c.receiver))?;
     let stdout = receiver
         .0
         .stdout
@@ -925,7 +1027,12 @@ pub fn run_processes(
     else {
         return Err(BenchError(format!("bad ready line {line}")));
     };
-    let mut sender_child = spawn.child("tx", &send_out, Some(&peers))?;
+    let mut sender_child = spawn.child(
+        "tx",
+        &send_out,
+        Some(&peers),
+        options.cores.map(|c| c.sender),
+    )?;
     let parent =
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|cause| error("control", cause))?;
     let mut dones_to_drop = options.faults.drop_dones;
@@ -986,8 +1093,8 @@ pub fn run_processes(
         .map_err(|cause| error("rx sidecar", cause))?;
     let tx = std::fs::read_to_string(send_out.with_extension("tx"))
         .map_err(|cause| error("tx sidecar", cause))?;
-    let rx = sidecar(&rx, &["drops", "batches", "callback"])?;
-    let tx = sidecar(&tx, &["backpressure", "ack_timeouts"])?;
+    let rx = sidecar(&rx, &["affinity", "drops", "batches", "callback"])?;
+    let tx = sidecar(&tx, &["affinity", "backpressure", "ack_timeouts"])?;
     let field = |values: &[&str], index: usize| -> Result<u64, BenchError> {
         values
             .get(index)
@@ -995,7 +1102,16 @@ pub fn run_processes(
             .parse()
             .map_err(|cause| error("sidecar number", cause))
     };
-    let receive_callback = numbers(rx.get(2).copied().unwrap_or_default())?;
+    let receive_callback = numbers(rx.get(3).copied().unwrap_or_default())?;
+    let affinity = |values: &[&'_ str]| values.first().copied().unwrap_or_default().to_string();
+    let pinning: Vec<String> = [
+        pin_reason("rx", &affinity(&rx), options.cores.map(|c| c.receiver)),
+        pin_reason("tx", &affinity(&tx), options.cores.map(|c| c.sender)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let functional_reasons = functional_reasons(pinning);
     if receive_callback.len() != expected {
         return Err(BenchError(format!(
             "{} callback samples, {expected} expected",
@@ -1006,13 +1122,13 @@ pub fn run_processes(
         send: send.samples,
         receive: receive.samples,
         receive_callback,
-        batches: numbers(rx.get(1).copied().unwrap_or_default())?,
-        backend_drops: field(&rx, 0)?,
-        backpressure: field(&tx, 0)?,
-        ack_timeouts: field(&tx, 1)?,
+        batches: numbers(rx.get(2).copied().unwrap_or_default())?,
+        backend_drops: field(&rx, 1)?,
+        backpressure: field(&tx, 1)?,
+        ack_timeouts: field(&tx, 2)?,
         messages_per_sample: prepared.messages_per_sample,
-        functional_only: true,
-        functional_reasons: functional_reasons(),
+        functional_only: !functional_reasons.is_empty(),
+        functional_reasons,
         receiver: receiver_address,
     })
 }
@@ -1056,6 +1172,23 @@ mod tests {
         assert_eq!(parse_control(&bytes, 77), Some((ACK, 1_234_567)));
         assert_eq!(parse_control(&bytes, 78), None);
         assert_eq!(parse_control(bytes.get(..16).unwrap_or_default(), 77), None);
+    }
+
+    #[test]
+    fn pinning_needs_the_requested_core_read_back() {
+        assert_eq!(pin_reason("rx", "3", Some(3)), None);
+        assert_eq!(
+            pin_reason("rx", "0,1,2,3", Some(3)).as_deref(),
+            Some("rx affinity 0,1,2,3, expected 3")
+        );
+        assert_eq!(
+            pin_reason("tx", "unavailable (unavailable on macos)", Some(3)).as_deref(),
+            Some("tx affinity unavailable (unavailable on macos), expected 3")
+        );
+        assert_eq!(
+            pin_reason("tx", "3", None).as_deref(),
+            Some("tx not pinned")
+        );
     }
 
     #[test]
