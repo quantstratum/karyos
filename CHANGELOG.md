@@ -68,6 +68,15 @@ release may break APIs, wire formats and shared-memory layouts.
   close is effective at a sender once applied with nothing in flight.
   `karyos_sys::applied_epoch::Applied` carries `in_flight`, published by the
   gate with its applied epoch and again as the work drains.
+- `karyos_sys::schedule_ring` (P2.11 T1, TT-1): the schedule ring of a timed
+  lane, one entry (first-frame position and requested time) per message in a
+  power-of-two ring, written by the exclusive publisher (room checked with the
+  head loaded Acquire before reservation, the entry then the tail with Release
+  before the commit) and read by the sender (the tail with Acquire, the head
+  released with Release); counts never wrap. Modelled with Loom (a read before
+  the commit retries and never takes a stale entry), with negative controls
+  for a commit before its entry, a Relaxed head load and a head released
+  before the read. Not yet mapped into a log buffer's region.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

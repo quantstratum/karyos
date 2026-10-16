@@ -55,6 +55,7 @@ pub mod mmap;
 pub mod publication;
 pub mod random;
 pub mod rate_limit;
+pub mod schedule_ring;
 // Used only by `log_buffer`, which Loom builds leave out.
 #[cfg(not(loom))]
 pub mod receive;
