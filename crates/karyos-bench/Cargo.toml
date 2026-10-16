@@ -15,6 +15,16 @@ publish.workspace = true
 # the bench's own tests; never enabled outside dev-dependencies, so a
 # measurement build refuses injected faults (coordinator, ACS 15309).
 test-hooks = []
+# The allocation build (M-9): the counting allocator of
+# `karyos_sys::alloc_count` as the global allocator, and a count of the
+# allocations inside both measured stages. Never used for timing: its
+# binary refuses `measure`, and `analyze` refuses any result it produced
+# (coordinator, ACS 15372). `scripts/measure.sh` builds it into its own
+# target directory. Any build that enables it, `--all-features` included,
+# is an allocation build and never a timing build; `karyos-bench
+# build-info` says which a binary is, and measure.sh and `make
+# timing-build-check` refuse to time any but `build timing`.
+alloc-count = ["karyos-sys/test-hooks"]
 
 [dependencies]
 karyos-sys.workspace = true
@@ -32,7 +42,7 @@ karyos.workspace = true
 
 [dev-dependencies]
 # The bench itself with `test-hooks`, for the fault tests of tests/smoke.rs.
-karyos-bench = { path = ".", features = ["test-hooks"] }
+karyos-bench = { path = ".", features = ["test-hooks", "alloc-count"] }
 criterion = { version = "=0.7.0", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

@@ -59,6 +59,20 @@ fn every_shape_runs_closed_loop_over_loopback() {
 }
 
 #[test]
+fn the_allocation_build_counts_and_both_stages_allocate_nothing() {
+    // The counting allocator is this test binary's (lib.rs).
+    assert_eq!(BUILD, "alloc-count");
+    let (vector, allocations) = counted(|| vec![1_u8; 16]);
+    assert_eq!(vector.len(), 16);
+    assert!(allocations >= 1, "counting is off");
+    for shape in [Shape::W1, Shape::W5, Shape::W6] {
+        let samples = smoke(shape, StageLoad::Closed);
+        assert_eq!(samples.send_allocations, 0, "{shape}");
+        assert_eq!(samples.receivers[0].allocations, 0, "{shape}");
+    }
+}
+
+#[test]
 fn an_open_loop_run_records_every_message() {
     let samples = smoke(Shape::W1, StageLoad::Open { rate: 20_000 });
     assert_eq!(samples.receivers[0].receive.len(), 200);

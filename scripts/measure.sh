@@ -9,10 +9,12 @@
 #    its class and eligibility against the filed records;
 # 3. runs `karyos-bench measure --plan primary` into the same directory,
 #    each child pinned to an isolated core when the host has two;
+# 4. builds the allocation build (feature alloc-count) into its own
+#    target directory and runs `karyos-bench alloc`, which counts the
+#    allocations of both stages at every point into alloc.json; that
+#    build never measures timing (M-9);
 # 5. runs `karyos-bench analyze`, which writes report.md and
 #    analysis.json, even when runs failed: a failed run is a result.
-#
-# The allocation build (step 4 of 5.5) arrives with batch B3d.
 #
 # Usage: scripts/measure.sh [measure arguments...], for example
 # --plan-only. Environment:
@@ -42,6 +44,12 @@ cargo build -p karyos-bench --release --locked
 # The binary this build made, wherever cargo puts its target directory:
 # a stale one elsewhere must never run under the current commit.
 bin=${CARGO_TARGET_DIR:-$root/target}/release/karyos-bench
+# Only a timing build is timed: a build with alloc-count (an
+# --all-features build included) counts allocations instead (M-9).
+if [ "$("$bin" build-info)" != "build timing" ]; then
+    echo "measure.sh: $bin is not a timing build: $("$bin" build-info)" >&2
+    exit 2
+fi
 export KARYOS_COMMIT=$commit
 
 for arg in "$@"; do
@@ -57,6 +65,13 @@ fi
 "$bin" inventory --out "$out" "${records[@]+"${records[@]}"}"
 status=0
 "$bin" measure --plan primary --out "$out" "$@" || status=$?
+alloc_target=${CARGO_TARGET_DIR:-$root/target}/alloc-count
+cargo build -p karyos-bench --release --locked --features alloc-count --target-dir "$alloc_target"
+if [ "$("$alloc_target/release/karyos-bench" build-info)" != "build alloc-count" ]; then
+    echo "measure.sh: the allocation binary is not an alloc-count build" >&2
+    exit 2
+fi
+"$alloc_target/release/karyos-bench" alloc --out "$out" || status=$?
 "$bin" analyze --out "$out"
 echo "measure: wrote $out"
 exit "$status"

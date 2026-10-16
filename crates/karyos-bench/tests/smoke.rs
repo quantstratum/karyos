@@ -7,6 +7,13 @@ use karyos_bench::env::{Environment, Labels};
 use karyos_bench::inventory;
 use karyos_bench::{Config, Workload, defaults, report, run};
 
+/// The counting allocator, so the wire children of these tests count the
+/// allocations of both stages (the allocation build, M-9).
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
+    karyos_sys::alloc_count::CountingAllocator;
+
 fn smoke(config: Config) -> Config {
     Config {
         iterations: 200,
@@ -335,6 +342,10 @@ fn wire_roles_run_in_their_own_processes() {
             );
         }
         assert_eq!(receiver.receive_callback.len(), 200);
+        // Neither stage allocates (M-9): counted in this allocation build.
+        const { assert!(cfg!(feature = "alloc-count")) };
+        assert_eq!(samples.send_allocations, 0, "{shape} {load:?}");
+        assert_eq!(receiver.allocations, 0, "{shape} {load:?}");
         assert_eq!(samples.ack_timeouts, 0);
         // Unpinned children are never decision eligible (ACS 15273).
         assert!(samples.functional_only);
@@ -738,6 +749,42 @@ fn an_orphaned_wire_child_exits() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     assert_eq!(status.code(), Some(ORPHANED));
+}
+
+/// The allocation build counts both stages of every measurable primary
+/// point and writes alloc.json; it refuses to measure timing (M-9).
+#[test]
+fn the_allocation_build_counts_every_point_and_never_times() {
+    let dir = TempDir::new("alloc");
+    // A test build enables alloc-count, so its binary is an allocation
+    // build; `make timing-build-check` checks the timing one.
+    let info = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-bench"))
+        .arg("build-info")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&info.stdout), "build alloc-count\n");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-bench"))
+        .args(["alloc", "--out"])
+        .arg(&dir.0)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let alloc = std::fs::read_to_string(dir.0.join("alloc.json")).unwrap();
+    assert!(alloc.contains("\"build\":\"alloc-count\""), "{alloc}");
+    assert!(alloc.contains("W1/R1/F1\\u0009send=0 receive=0"), "{alloc}");
+    let measure = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-bench"))
+        .args(["measure", "--out"])
+        .arg(dir.0.join("timing"))
+        .env("KARYOS_MEASURE_SMOKE", "1")
+        .output()
+        .unwrap();
+    assert_eq!(measure.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&measure.stderr).contains("never measures timing"));
 }
 
 /// The bench binary refuses to measure with injected faults requested,

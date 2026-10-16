@@ -27,12 +27,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::env::{self, Ineligible, Labels};
 use crate::inventory::{Inventory, Scope};
-use crate::manifest::{Fanout, MANIFEST_SHA256, VERSION};
-use crate::plan::{self, INSUFFICIENT, Plan, PlannedRun};
+use crate::manifest::{Fanout, ILLUSTRATIVE_E_MAX, MANIFEST_SHA256, MtuRule, VERSION, primary};
+use crate::plan::{self, INSUFFICIENT, Plan, PlanOptions, PlannedRun};
 use crate::preflight;
 use crate::samples::MISSING;
 use crate::wire::process::{Cores, FAULTS, ProcessOptions, faults_requested, run_processes};
-use crate::wire::stage::{ReceiverSamples, StageLoad, StageSamples};
+use crate::wire::stage::{BUILD, ReceiverSamples, StageLoad, StageSamples};
 use crate::workloads::BenchError;
 
 /// `text` as a JSON string literal.
@@ -109,6 +109,7 @@ pub fn result_line(
         format!("\"warmup\":{}", run.warmup),
         format!("\"e_max\":{}", run.e_max),
         format!("\"rule\":{}", json_string(&format!("{:?}", run.rule))),
+        format!("\"build\":{}", json_string(BUILD)),
         format!("\"receivers\":{}", run.receivers),
         // The cores the run used, receivers first; null when unpinned or
         // failed.
@@ -138,6 +139,11 @@ pub fn result_line(
                 format!("\"backend_drops\":[{}]", per_receiver(samples, |r| r.drops)),
                 format!("\"backpressure\":{}", samples.backpressure),
                 format!("\"ack_timeouts\":{}", samples.ack_timeouts),
+                format!("\"send_allocations\":{}", samples.send_allocations),
+                format!(
+                    "\"receive_allocations\":[{}]",
+                    per_receiver(samples, |r| r.allocations)
+                ),
                 format!(
                     "\"batches\":[{}]",
                     per_receiver(samples, |r| r.batches.len())
@@ -203,6 +209,7 @@ pub fn header(
         format!("\"manifest_version\":{}", json_string(VERSION)),
         format!("\"manifest_sha256\":{}", json_string(MANIFEST_SHA256)),
         format!("\"started_unix\":{started}"),
+        format!("\"build\":{}", json_string(BUILD)),
         "\"faults\":\"off\"".to_string(),
         format!("\"host\":{}", json_string(&labels.host)),
         format!("\"os\":{}", json_string(labels.os)),
@@ -254,6 +261,82 @@ pub fn header(
         ),
     ];
     format!("{{{}}}\n", fields.join(","))
+}
+
+/// The allocation run (M-9), in the allocation build only: one short run
+/// of every measurable primary point with the `trusted` profile, each
+/// stage counting its allocations. Writes `alloc.json` into `out`: one
+/// flat object whose `points` are `<point>\t<result>` strings, the result
+/// `send=<n> receive=<n,...>` or `error=<cause>`. Returns how many points
+/// allocate or failed.
+///
+/// # Errors
+///
+/// A timing build, an `out` that already holds `alloc.json`, or one that
+/// cannot be written.
+pub fn run_alloc(out: &Path, log: &mut dyn Write) -> Result<usize, BenchError> {
+    if BUILD != "alloc-count" {
+        return Err(BenchError(
+            "allocation counting needs the alloc-count build".into(),
+        ));
+    }
+    if out.join("alloc.json").exists() {
+        return Err(BenchError(format!(
+            "{} already holds alloc.json",
+            out.display()
+        )));
+    }
+    let plan = plan::expand(
+        &primary(),
+        &PlanOptions::smoke(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope),
+    )?;
+    let mut points = Vec::new();
+    let mut failed = 0_usize;
+    for planned in plan
+        .runs
+        .iter()
+        .filter(|run| run.round == 0 && run.configuration == "trusted")
+    {
+        let dir = out.join("alloc").join(planned.slug());
+        let options = ProcessOptions {
+            profile: planned.configuration.clone(),
+            ..ProcessOptions::default()
+        };
+        let result = match run_processes(&planned.run, &dir, &options) {
+            Ok(samples) => {
+                let receive = per_receiver(&samples, |r| r.allocations);
+                if samples.send_allocations != 0
+                    || samples.receivers.iter().any(|r| r.allocations != 0)
+                {
+                    failed = failed
+                        .checked_add(1)
+                        .ok_or_else(|| BenchError("failure count".into()))?;
+                }
+                format!("send={} receive={receive}", samples.send_allocations)
+            }
+            Err(error) => {
+                failed = failed
+                    .checked_add(1)
+                    .ok_or_else(|| BenchError("failure count".into()))?;
+                format!("error={}", error.0)
+            }
+        };
+        let _ = writeln!(log, "{}: {result}", planned.point);
+        points.push(json_string(&format!("{}\t{result}", planned.point)));
+    }
+    std::fs::create_dir_all(out)
+        .map_err(|cause| BenchError(format!("{}: {cause}", out.display())))?;
+    std::fs::write(
+        out.join("alloc.json"),
+        format!(
+            "{{\"build\":{},\"manifest_sha256\":{},\"points\":[{}]}}\n",
+            json_string(BUILD),
+            json_string(MANIFEST_SHA256),
+            points.join(",")
+        ),
+    )
+    .map_err(|cause| BenchError(format!("alloc.json: {cause}")))?;
+    Ok(failed)
 }
 
 /// Runs every run of `plan` into `out`, printing one line per run to

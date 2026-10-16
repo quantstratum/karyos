@@ -318,6 +318,9 @@ pub struct Analysis {
     pub drift: Vec<String>,
     /// The total runtime of the runs, ms.
     pub runtime_ms: u64,
+    /// The allocation run's `<point>\t<result>` entries, when
+    /// `alloc.json` is present (M-9).
+    pub allocations: Option<Vec<String>>,
 }
 
 impl Analysis {
@@ -480,6 +483,12 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             "measured under manifest {version} ({hash}); this analysis is for {VERSION} ({MANIFEST_SHA256})"
         )));
     }
+    if header.string("build")? != "timing" {
+        return Err(BenchError(format!(
+            "measured by the {} build: only a timing build's runs are analyzed (M-9)",
+            header.string("build")?
+        )));
+    }
     if header.string("faults")? != "off" {
         return Err(BenchError(
             "the runs were not measured with faults off".into(),
@@ -585,6 +594,12 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         runtime_ms = runtime_ms
             .checked_add(line.number("duration_ms")?)
             .ok_or_else(|| BenchError("runtime overflow".into()))?;
+        if line.string("build")? != "timing" {
+            return Err(BenchError(format!(
+                "result {index} comes from the {} build, not a timing build",
+                line.string("build")?
+            )));
+        }
         let planned_dir = format!("runs/{index:04}_{}", planned.slug());
         if line.string("dir")? != planned_dir {
             return Err(BenchError(format!(
@@ -747,6 +762,21 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             .iter()
             .map(|entry| format!("preflight drift: {entry}")),
     );
+    // The allocation run, from its own build (M-9).
+    let allocations = match std::fs::read_to_string(out.join("alloc.json")) {
+        Err(_) => None,
+        Ok(text) => {
+            let alloc = Object(parse_object(&text)?);
+            if alloc.string("build")? != "alloc-count"
+                || alloc.string("manifest_sha256")? != MANIFEST_SHA256
+            {
+                return Err(BenchError(
+                    "alloc.json is not an allocation build's under this manifest".into(),
+                ));
+            }
+            Some(alloc.list("points")?.to_vec())
+        }
+    };
     let outcomes: Vec<(Point, Outcome)> = points
         .iter()
         .map(|point| (point.point, point.outcome.clone()))
@@ -784,6 +814,7 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         blockers,
         drift,
         runtime_ms,
+        allocations,
     })
 }
 
@@ -1026,6 +1057,35 @@ pub fn report(analysis: &Analysis) -> String {
     }
     for blocker in &analysis.blockers {
         let _ = writeln!(out, "- {blocker}");
+    }
+    let _ = writeln!(out, "\n## Allocations (M-9)\n");
+    match &analysis.allocations {
+        None => {
+            let _ = writeln!(
+                out,
+                "Not measured: no alloc.json (the allocation build did not run)."
+            );
+        }
+        Some(points) => {
+            let zero = points.iter().all(|entry| {
+                entry
+                    .split_once('\t')
+                    .and_then(|(_, result)| result.strip_prefix("send=0 receive="))
+                    .is_some_and(|receive| receive.split(',').all(|n| n == "0"))
+            });
+            let _ = writeln!(
+                out,
+                "From the allocation build (feature alloc-count, never timed): {}.",
+                if zero {
+                    "zero allocations on both stages at every point"
+                } else {
+                    "a stage allocates or a run failed; see below"
+                }
+            );
+            for entry in points {
+                let _ = writeln!(out, "- {}", entry.replace('\t', ": "));
+            }
+        }
     }
     let _ = writeln!(out, "\n## Gates (manifest 7)\n");
     for (gate, status) in decision::GateTable::default().rows() {
@@ -1320,7 +1380,7 @@ mod tests {
             out.join("measure.json"),
             format!(
                 "{{\"manifest_version\":\"{VERSION}\",\"manifest_sha256\":\"{hash}\",\
-                 \"faults\":\"off\",\"host\":\"h\",\"profile\":\"release\",\
+                 \"faults\":\"off\",\"build\":\"timing\",\"host\":\"h\",\"profile\":\"release\",\
                  \"commit\":\"c\",\"class\":\"{class}\",\"environment\":\"{class}\",\
                  \"messages\":10,\"warmup\":0,\"rounds\":5,\"e_max\":64,\
                  \"rule\":\"CountsEnvelope\",\"configurations\":[{}],\
@@ -1347,10 +1407,12 @@ mod tests {
                         receive_callback: vec![7; count],
                         batches: vec![1; count],
                         drops: 0,
+                        allocations: 0,
                     })
                     .collect(),
                 backpressure: 0,
                 ack_timeouts: 0,
+                send_allocations: 0,
                 messages_per_sample: usize::try_from(planned.messages_per_sample).unwrap(),
                 functional_only: false,
                 functional_reasons: Vec::new(),
@@ -1412,6 +1474,12 @@ mod tests {
             ));
             results.push('\n');
         }
+        // The fixture stands for a timing build's runs, whatever this test
+        // build is.
+        let results = results.replace(
+            &format!("\"build\":\"{}\"", crate::wire::stage::BUILD),
+            "\"build\":\"timing\"",
+        );
         std::fs::write(out.join("results.jsonl"), results).unwrap();
         out
     }
@@ -1596,6 +1664,40 @@ mod tests {
     fn another_manifest_is_refused() {
         let out = fixture("hash", "E4", &"0".repeat(64), ELIGIBLE, None, &none);
         assert!(error_of(&out).contains("measured under manifest"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn the_allocation_build_never_feeds_timing() {
+        let out = plain("alloc-build");
+        let header = read(&out.join("measure.json")).unwrap();
+        std::fs::write(
+            out.join("measure.json"),
+            header.replace("\"build\":\"timing\"", "\"build\":\"alloc-count\""),
+        )
+        .unwrap();
+        assert!(error_of(&out).contains("only a timing build"));
+        std::fs::write(out.join("measure.json"), &header).unwrap();
+        let results = read(&out.join("results.jsonl")).unwrap();
+        std::fs::write(
+            out.join("results.jsonl"),
+            results.replacen("\"build\":\"timing\"", "\"build\":\"alloc-count\"", 1),
+        )
+        .unwrap();
+        assert!(error_of(&out).contains("not a timing build"));
+        std::fs::write(out.join("results.jsonl"), &results).unwrap();
+        // The allocation run's own file is reported, never decided on.
+        std::fs::write(
+            out.join("alloc.json"),
+            format!(
+                "{{\"build\":\"alloc-count\",\"manifest_sha256\":\"{MANIFEST_SHA256}\",\
+                 \"points\":[\"W1/R1/F1\\tsend=0 receive=0\"]}}\n"
+            ),
+        )
+        .unwrap();
+        write(&out).unwrap();
+        let report = read(&out.join("report.md")).unwrap();
+        assert!(report.contains("zero allocations on both stages at every point"));
         let _ = std::fs::remove_dir_all(&out);
     }
 

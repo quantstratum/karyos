@@ -788,11 +788,12 @@ fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), Benc
     std::fs::write(
         context.out.with_extension("rx"),
         format!(
-            "{}drops {}\nbatches {}\ncallback {}\n",
+            "{}drops {}\nbatches {}\ncallback {}\nallocations {}\n",
             affinity_line(),
             received.drops,
             join(&received.batches),
-            join(&received.receive_callback)
+            join(&received.receive_callback),
+            received.allocations
         ),
     )
     .map_err(|cause| error("rx sidecar", cause))
@@ -994,10 +995,11 @@ fn send_child(context: &ChildContext, prepared: &Prepared) -> Result<(), BenchEr
     std::fs::write(
         context.out.with_extension("tx"),
         format!(
-            "{}backpressure {}\nack_timeouts {}\n",
+            "{}backpressure {}\nack_timeouts {}\nallocations {}\n",
             affinity_line(),
             sent.backpressure,
-            sent.ack_timeouts
+            sent.ack_timeouts,
+            sent.allocations
         ),
     )
     .map_err(|cause| error("tx sidecar", cause))
@@ -1387,7 +1389,10 @@ pub fn run_processes(
     check_samples(&send, run, Stage::Send, options, expected)?;
     let tx = std::fs::read_to_string(send_out.with_extension("tx"))
         .map_err(|cause| error("tx sidecar", cause))?;
-    let tx = sidecar(&tx, &["affinity", "backpressure", "ack_timeouts"])?;
+    let tx = sidecar(
+        &tx,
+        &["affinity", "backpressure", "ack_timeouts", "allocations"],
+    )?;
     let field = |values: &[&str], index: usize| -> Result<u64, BenchError> {
         values
             .get(index)
@@ -1417,7 +1422,10 @@ pub fn run_processes(
         )?;
         let rx = std::fs::read_to_string(out.with_extension("rx"))
             .map_err(|cause| error("rx sidecar", cause))?;
-        let rx = sidecar(&rx, &["affinity", "drops", "batches", "callback"])?;
+        let rx = sidecar(
+            &rx,
+            &["affinity", "drops", "batches", "callback", "allocations"],
+        )?;
         let receive_callback = numbers(rx.get(3).copied().unwrap_or_default())?;
         if receive_callback.len() != expected {
             return Err(BenchError(format!(
@@ -1435,6 +1443,7 @@ pub fn run_processes(
             receive_callback,
             batches: numbers(rx.get(2).copied().unwrap_or_default())?,
             drops: field(&rx, 1)?,
+            allocations: field(&rx, 4)?,
         });
     }
     pinning.extend(pin_reason(
@@ -1456,6 +1465,7 @@ pub fn run_processes(
         receivers: per_receiver,
         backpressure: field(&tx, 1)?,
         ack_timeouts: field(&tx, 2)?,
+        send_allocations: field(&tx, 3)?,
         messages_per_sample: prepared.messages_per_sample,
         functional_only: !functional_reasons.is_empty(),
         functional_reasons,
