@@ -30,8 +30,17 @@ commit=$(git rev-parse --short HEAD)
 utc=$(date -u +%Y%m%dT%H%M%SZ)
 out=${KARYOS_MEASURE_OUT:-$root/target/karyos-measure/$utc-$commit}
 
+for arg in "$@"; do
+    if [ "$arg" = "--out" ]; then
+        echo "measure.sh: set KARYOS_MEASURE_OUT, not --out: the inventory and the runs share one directory" >&2
+        exit 2
+    fi
+done
+
 cargo build -p karyos-bench --release --locked
-bin=$root/target/release/karyos-bench
+# The binary this build made, wherever cargo puts its target directory:
+# a stale one elsewhere must never run under the current commit.
+bin=${CARGO_TARGET_DIR:-$root/target}/release/karyos-bench
 export KARYOS_COMMIT=$commit
 
 for arg in "$@"; do

@@ -193,6 +193,12 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
             other => return Err(format!("unknown argument {other}")),
         }
     }
+    if karyos_bench::wire::process::faults_requested() {
+        return Err(format!(
+            "{} is set: a measurement never runs with injected faults",
+            karyos_bench::wire::process::FAULTS
+        ));
+    }
     let plan = plan::expand(&primary(), &options).map_err(|error| error.0)?;
     if plan_only {
         let _ = write!(out, "{}", plan::render(&plan));

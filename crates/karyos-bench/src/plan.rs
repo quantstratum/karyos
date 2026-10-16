@@ -180,7 +180,7 @@ fn messages_per_sample(shape: Shape, e_max: u32, rule: MtuRule) -> Result<u64, B
 /// # Errors
 ///
 /// Fewer than [`MIN_RUNS`] rounds, no configuration, no `trusted`
-/// configuration, `N` of zero, or a size error.
+/// configuration, `N` or `E_max` of zero, or a size error.
 pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchError> {
     if options.runs < MIN_RUNS {
         return Err(BenchError(format!(
@@ -190,6 +190,9 @@ pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchErro
     }
     if options.messages == 0 {
         return Err(BenchError("N of zero".into()));
+    }
+    if options.e_max == 0 {
+        return Err(BenchError("E_max of zero".into()));
     }
     let count = options.configurations.len();
     if !options
@@ -214,6 +217,9 @@ pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchErro
         };
         let per = messages_per_sample(point.shape, options.e_max, options.rule)?;
         let sequences = options.messages.div_ceil(per);
+        // The warmup counts messages too (manifest 8.1): W5 warms up with
+        // ceil(warmup / k) sequences.
+        let warmup = options.warmup.div_ceil(per);
         let surplus = sequences
             .checked_mul(per)
             .and_then(|expanded| expanded.checked_sub(options.messages))
@@ -236,7 +242,7 @@ pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchErro
                         rule: options.rule,
                         load,
                         messages: sequences,
-                        warmup: options.warmup,
+                        warmup,
                     },
                     messages_per_sample: per,
                     surplus,
@@ -252,23 +258,25 @@ pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchErro
 }
 
 /// The estimated runtime of `plan`: R2 runs at their rate, R1 runs at an
-/// assumed 20 µs per message, plus about a second per process pair.
-/// Computed in `u128` nanoseconds, so it cannot overflow.
+/// assumed 20 µs per message, plus about a second per process pair;
+/// `None` past what a `Duration` of nanoseconds holds.
 #[must_use]
-pub fn estimate(plan: &Plan) -> Duration {
-    let nanos: u128 = plan
-        .runs
-        .iter()
-        .map(|planned| {
-            let messages = u128::from(planned.run.messages) + u128::from(planned.run.warmup);
-            let traffic = match planned.run.load {
-                StageLoad::Open { rate } => messages * 1_000_000_000 / u128::from(rate.max(1)),
-                StageLoad::Closed => messages * R1_ESTIMATE.as_nanos(),
-            };
-            traffic + RUN_OVERHEAD.as_nanos()
-        })
-        .sum();
-    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+pub fn estimate(plan: &Plan) -> Option<Duration> {
+    let mut nanos: u128 = 0;
+    for planned in &plan.runs {
+        let messages =
+            u128::from(planned.run.messages).checked_add(u128::from(planned.run.warmup))?;
+        let traffic = match planned.run.load {
+            StageLoad::Open { rate } => messages
+                .checked_mul(1_000_000_000)?
+                .checked_div(u128::from(rate))?,
+            StageLoad::Closed => messages.checked_mul(R1_ESTIMATE.as_nanos())?,
+        };
+        nanos = nanos
+            .checked_add(traffic)?
+            .checked_add(RUN_OVERHEAD.as_nanos())?;
+    }
+    u64::try_from(nanos).ok().map(Duration::from_nanos)
 }
 
 /// `plan` as text: options, runs per point, skipped points and the
@@ -316,7 +324,10 @@ pub fn render(plan: &Plan) -> String {
         out,
         "{} runs, estimated {} s",
         plan.runs.len(),
-        estimate(plan).as_secs()
+        estimate(plan).map_or_else(
+            || "too long to state".to_string(),
+            |d| d.as_secs().to_string()
+        )
     );
     out
 }
@@ -430,6 +441,8 @@ mod tests {
         assert_eq!(w5.messages_per_sample, 21);
         assert_eq!(w5.run.messages, 47_620);
         assert_eq!(w5.surplus, 20);
+        // The warmup counts messages too: ceil(10^5 / 21) sequences.
+        assert_eq!(w5.run.warmup, 4_762);
         let w1 = plan.runs.first().unwrap();
         assert_eq!((w1.run.messages, w1.surplus), (MESSAGES, 0));
     }

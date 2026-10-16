@@ -570,6 +570,28 @@ fn an_orphaned_wire_child_exits() {
     assert_eq!(status.code(), Some(ORPHANED));
 }
 
+/// The bench binary refuses to measure with injected faults requested,
+/// before it prints a plan or writes a file (ACS 15309).
+#[test]
+fn measure_refuses_injected_faults() {
+    let dir = TempDir::new("measure-faults");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-bench"))
+        .args(["measure", "--out"])
+        .arg(&dir.0)
+        .env("KARYOS_MEASURE_SMOKE", "1")
+        .env(karyos_bench::wire::process::FAULTS, "no_stop=1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("never runs with injected faults"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!dir.0.join("measure.json").exists());
+}
+
 /// The child part of the IPC workloads: the workload runs this binary
 /// again with `--exact ipc_child`, and the environment says what to do.
 #[cfg(target_os = "linux")]

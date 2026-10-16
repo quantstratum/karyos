@@ -254,11 +254,8 @@ impl Cores {
     /// `nohz_full`; `None` with fewer.
     #[must_use]
     pub fn of(inventory: &Inventory) -> Option<Self> {
-        let nohz = inventory.nohz_full_cores();
-        let mut quiet = inventory
-            .isolated_cores()
-            .into_iter()
-            .filter(|core| nohz.contains(core));
+        let mut quiet =
+            quiet_cores(&inventory.isolated_cores(), &inventory.nohz_full_cores()).into_iter();
         Some(Self {
             receiver: quiet.next()?,
             sender: quiet.next()?,
@@ -278,6 +275,15 @@ impl Cores {
             .map(|_| cores)
             .ok_or_else(|| "taskset unavailable".to_string())
     }
+}
+
+/// The cores both `isolated` and in `nohz`, in order.
+fn quiet_cores(isolated: &[usize], nohz: &[usize]) -> Vec<usize> {
+    isolated
+        .iter()
+        .copied()
+        .filter(|core| nohz.contains(core))
+        .collect()
 }
 
 /// This process's CPU affinity, read back from the kernel.
@@ -943,8 +949,18 @@ fn check_samples(
 pub fn functional_reasons(pinning: Vec<String>) -> Vec<String> {
     let inventory = Inventory::detect(Scope::Classification);
     let record = env::host_record(&inventory.host);
+    reasons_for(pinning, &inventory, record.as_deref(), Fanout::F1)
+}
+
+/// [`functional_reasons`] for a given host and record.
+fn reasons_for(
+    pinning: Vec<String>,
+    inventory: &Inventory,
+    record: Option<&str>,
+    fanout: Fanout,
+) -> Vec<String> {
     let mut reasons = pinning;
-    if let Err(ineligible) = env::decision_eligible(&inventory, record.as_deref(), Fanout::F1) {
+    if let Err(ineligible) = env::decision_eligible(inventory, record, fanout) {
         reasons.extend(ineligible.iter().map(ToString::to_string));
     }
     reasons
@@ -1189,6 +1205,37 @@ mod tests {
             pin_reason("tx", "3", None).as_deref(),
             Some("tx not pinned")
         );
+    }
+
+    #[test]
+    fn quiet_cores_are_isolated_and_in_nohz_full() {
+        assert_eq!(quiet_cores(&[2, 3, 4, 5], &[3, 4, 6]), [3, 4]);
+        assert!(quiet_cores(&[2, 3], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_result_is_eligible_only_pinned_on_an_eligible_host() {
+        use crate::inventory::tests::{capture, tuned};
+        let (tree, canned) = tuned();
+        let inventory = capture(&tree, &canned, "linux", "x86_64");
+        let record = crate::inventory::render(
+            &inventory,
+            &env::classify(&inventory),
+            &[] as &[crate::inventory::Eligibility],
+        );
+        // A pinned run on an eligible host has no reason left.
+        assert!(reasons_for(Vec::new(), &inventory, Some(&record), Fanout::F1).is_empty());
+        // Unpinned, or without the host record, it stays functional only.
+        assert_eq!(
+            reasons_for(
+                vec!["rx not pinned".into()],
+                &inventory,
+                Some(&record),
+                Fanout::F1
+            ),
+            ["rx not pinned"]
+        );
+        assert!(!reasons_for(Vec::new(), &inventory, None, Fanout::F1).is_empty());
     }
 
     #[test]

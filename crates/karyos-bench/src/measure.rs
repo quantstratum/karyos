@@ -142,6 +142,10 @@ pub fn header(plan: &Plan, labels: &Labels, cores: &Result<Cores, String>) -> St
         format!("\"warmup\":{}", options.warmup),
         format!("\"rounds\":{}", options.runs),
         format!("\"e_max\":{}", options.e_max),
+        format!(
+            "\"e_max_status\":{}",
+            json_string("provisional E_max (illustrative, manifest 6.1)")
+        ),
         format!("\"rule\":{}", json_string(&format!("{:?}", options.rule))),
         format!("\"configurations\":[{}]", configurations.join(",")),
         format!(
@@ -166,8 +170,8 @@ pub fn header(plan: &Plan, labels: &Labels, cores: &Result<Cores, String>) -> St
 /// # Errors
 ///
 /// [`FAULTS`] set in the environment (a measurement never runs with
-/// injected faults, ACS 15309), or the output directory or
-/// `results.jsonl` cannot be written.
+/// injected faults, ACS 15309), an output directory that already holds a
+/// measurement, or one that cannot be written.
 pub fn run_plan(
     plan: &Plan,
     out: &Path,
@@ -181,6 +185,14 @@ pub fn run_plan(
         )));
     }
     let io = |what: &str, cause: std::io::Error| BenchError(format!("{what}: {cause}"));
+    for name in ["measure.json", "results.jsonl"] {
+        if out.join(name).exists() {
+            return Err(BenchError(format!(
+                "{} already holds {name}: a measurement never overwrites another",
+                out.display()
+            )));
+        }
+    }
     std::fs::create_dir_all(out.join("runs")).map_err(|cause| io("output directory", cause))?;
     std::fs::write(out.join("measure.json"), header(plan, labels, cores))
         .map_err(|cause| io("measure.json", cause))?;
@@ -234,6 +246,47 @@ mod tests {
     use super::*;
     use crate::manifest::{ILLUSTRATIVE_E_MAX, MtuRule, primary};
     use crate::plan::{PlanOptions, expand};
+
+    #[test]
+    fn measure_json_records_faults_off_and_the_provisional_e_max() {
+        let plan = expand(
+            &primary(),
+            &PlanOptions::smoke(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope),
+        )
+        .unwrap();
+        let header = header(&plan, &Labels::detect(), &Err("none".into()));
+        assert!(header.contains("\"faults\":\"off\""), "{header}");
+        assert!(
+            header.contains("\"e_max_status\":\"provisional E_max (illustrative, manifest 6.1)\""),
+            "{header}"
+        );
+        assert!(header.contains("\"unpinned\":\"none\""), "{header}");
+    }
+
+    #[test]
+    fn a_measurement_never_overwrites_another() {
+        let out = std::env::temp_dir().join(format!("karyos-measure-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("results.jsonl"), "").unwrap();
+        let plan = expand(
+            &primary(),
+            &PlanOptions::smoke(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope),
+        )
+        .unwrap();
+        let error = run_plan(
+            &plan,
+            &out,
+            &Labels::detect(),
+            &Err("none".into()),
+            &mut Vec::new(),
+        )
+        .err()
+        .map(|error| error.0)
+        .unwrap_or_default();
+        assert!(error.contains("never overwrites"), "{error}");
+        assert!(!out.join("measure.json").exists());
+        let _ = std::fs::remove_dir_all(&out);
+    }
 
     #[test]
     fn json_strings_escape_what_json_needs() {
