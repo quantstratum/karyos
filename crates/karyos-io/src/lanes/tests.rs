@@ -459,3 +459,298 @@ fn a_cleared_send_fault_retries_the_same_head() {
     assert_eq!(f.sender.pending(0), Some(0));
     assert!(!f.tx.is_pending(head));
 }
+
+/// `EINTR` and `ECONNREFUSED` are not lane conditions: the lane stays
+/// eligible, nothing is forfeited and the retry costs one work unit each.
+#[test]
+fn interrupted_and_peer_errors_keep_the_lane_eligible() {
+    use crate::sockets::ops::Errno;
+    let mut f = Fixture::new(&[100, 100], 100);
+    f.stage(0, 50, 64);
+    f.socket.push_send(SendResult::Error(Errno::INTR));
+    f.socket.push_send(SendResult::Error(Errno::CONNREFUSED));
+    f.accept(1);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report), [64, 0]);
+    assert_eq!(report.drr.lanes[0].failed, 2);
+    // Only the residual once the lane emptied after serving: the retries
+    // forfeited nothing and took no second quantum.
+    assert_eq!(report.drr.lanes[0].forfeited, 100 - 64);
+    assert_eq!(report.drr.lanes[0].credits, 1);
+    assert_eq!(report.failure, None);
+}
+
+/// `ENOBUFS` is backpressure, as `EAGAIN`.
+#[test]
+fn no_buffers_is_backpressure() {
+    let mut f = Fixture::new(&[100, 100], 100);
+    f.stage(0, 50, 64);
+    f.stage(1, 50, 64);
+    f.socket
+        .push_send(SendResult::Error(crate::sockets::ops::Errno::NOBUFS));
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(report.drr.stop, Stop::Backpressure { lane: 0 });
+    assert_eq!(f.socket.send_calls(), 1);
+}
+
+/// An OS failure stops the half: the call halts at once with a backend
+/// failure, no other lane is tried and no deficit is forfeited.
+#[test]
+fn an_os_failure_halts_the_call() {
+    let mut f = Fixture::new(&[100, 100], 100);
+    f.stage(0, 50, 64);
+    f.stage(1, 50, 64);
+    f.socket
+        .push_send(SendResult::Error(crate::sockets::ops::Errno::BADF));
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert!(
+        matches!(
+            report.failure,
+            Some(SenderFailure::Backend {
+                lane: 0,
+                stop: FlushStop::Failed(_)
+            })
+        ),
+        "{:?}",
+        report.failure
+    );
+    assert_eq!(report.drr.stop, Stop::Halted { lane: 0 });
+    assert_eq!(report.drr.lanes[0].forfeited, 0);
+    assert_eq!(f.socket.send_calls(), 1, "no other lane is tried");
+    // The half stays stopped until the reset.
+    f.accept(1);
+    let again = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&again), [0, 0]);
+}
+
+/// A backend that answers a scripted reply per flush, for the rows the
+/// sockets flush never produces (`Returned`) or produces only through
+/// endpoint state (`NotActive`), and for the invariant and caller rows.
+mod fake {
+    use std::collections::VecDeque;
+    use std::num::NonZeroU64;
+
+    use super::super::*;
+    use crate::backend::{
+        BackendEpoch, CancelOutcome, ClaimError, Commit, CommitRejected, CompletionHandler,
+        CompletionOutcome, FlushOutcome, InstanceId, QueueError, ReturnReason, SenderToken, Spent,
+        SubmissionId, TxEntry, TxFrame,
+    };
+
+    pub(super) struct NoFrame;
+
+    impl TxFrame for NoFrame {
+        fn capacity(&self) -> usize {
+            0
+        }
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut []
+        }
+        fn commit(self, _: Commit) -> Result<TxTicket, CommitRejected<Self>> {
+            Err(CommitRejected {
+                frame: self,
+                error: crate::backend::CommitError::NotActive,
+            })
+        }
+    }
+
+    /// One flush's answer: the entry's outcome and ticket, if any, and the
+    /// stop.
+    pub(super) type Reply = (Option<(TxItemOutcome, TxTicket)>, FlushStop);
+
+    #[derive(Default)]
+    pub(super) struct Fake {
+        pub(super) replies: VecDeque<Reply>,
+        pub(super) flushes: u32,
+    }
+
+    pub(super) fn ticket(slot: u32) -> TxTicket {
+        TxTicket::new(SubmissionId::new(
+            InstanceId::FIRST,
+            BackendEpoch::FIRST,
+            slot,
+            NonZeroU64::MIN,
+        ))
+    }
+
+    pub(super) fn queue(index: u16) -> TxQueueId {
+        TxQueueId::new(BackendEpoch::FIRST, index, std::num::NonZeroU32::MIN)
+    }
+
+    impl TxBackend for Fake {
+        type Frame<'a> = NoFrame;
+
+        fn claim_tx(&mut self, _: TxQueueId, _: usize) -> Result<NoFrame, ClaimError> {
+            Err(ClaimError::NotActive)
+        }
+
+        fn flush<G: SenderGate>(
+            &mut self,
+            request: FlushRequest,
+            _: &mut G,
+            report: &mut TxReport,
+        ) -> FlushOutcome {
+            self.flushes += 1;
+            let (entry, stop) = self
+                .replies
+                .pop_front()
+                .unwrap_or((None, FlushStop::QueueEmpty));
+            if let Some((outcome, ticket)) = entry {
+                let mut writer = report.writer().unwrap();
+                writer
+                    .push(TxEntry {
+                        ticket,
+                        token: SenderToken::new(1),
+                        len: u16::try_from(request.max_bytes).unwrap(),
+                        outcome,
+                    })
+                    .unwrap();
+            }
+            FlushOutcome {
+                submitted: 0,
+                bytes: 0,
+                spent: Spent::default(),
+                stop,
+            }
+        }
+
+        fn poll_completions<H: CompletionHandler>(
+            &mut self,
+            _: crate::backend::Budget,
+            _: &mut H,
+        ) -> CompletionOutcome {
+            CompletionOutcome::default()
+        }
+
+        fn cancel_pending(
+            &mut self,
+            _: TxQueueId,
+            _: &mut TxReport,
+        ) -> Result<CancelOutcome, QueueError> {
+            Err(QueueError::NotActive)
+        }
+    }
+
+    pub(super) const RETURNED: TxItemOutcome = TxItemOutcome::Returned {
+        reason: ReturnReason::Cancelled,
+    };
+}
+
+/// A sender of two lanes over the fake backend, one item of charge 64 per
+/// lane, tickets 0 and 1.
+fn faked(replies: Vec<fake::Reply>) -> (LaneSender, fake::Fake) {
+    let mut sender = LaneSender::new(
+        DrrConfig::new(&[100, 100], 100).unwrap(),
+        &[fake::queue(0), fake::queue(1)],
+        4,
+    )
+    .unwrap();
+    for (lane, slot) in [(0, 0), (0, 2), (1, 1)] {
+        sender
+            .staged(
+                lane,
+                Staged {
+                    ticket: fake::ticket(slot),
+                    charge: 64,
+                    len: 50,
+                },
+            )
+            .unwrap();
+    }
+    let backend = fake::Fake {
+        replies: replies.into(),
+        flushes: 0,
+    };
+    (sender, backend)
+}
+
+fn serve_faked(sender: &mut LaneSender, backend: &mut fake::Fake) -> SenderReport {
+    sender.serve(
+        backend,
+        &mut Gate::default(),
+        Budget {
+            work: 16,
+            bytes: 1000,
+        },
+    )
+}
+
+/// A `Returned` head left its queue without exposure: it is not service,
+/// its record goes, and the lane's next head is served.
+#[test]
+fn a_returned_head_is_dropped_and_the_next_one_served() {
+    const SUBMITTED: TxItemOutcome = TxItemOutcome::Submitted {
+        release: crate::backend::Release::AtSubmission,
+    };
+    let (mut sender, mut backend) = faked(vec![
+        (Some((fake::RETURNED, fake::ticket(0))), FlushStop::Exposed),
+        (Some((SUBMITTED, fake::ticket(2))), FlushStop::Exposed),
+    ]);
+    let report = serve_faked(&mut sender, &mut backend);
+    assert_eq!(report.drr.lanes[0].served_bytes, 64);
+    assert_eq!(report.drr.lanes[0].failed, 1);
+    assert_eq!(sender.pending(0), Some(0));
+}
+
+/// An endpoint resetting or retired (`Queue(NotActive)`) stops the call as
+/// backpressure and reports it.
+#[test]
+fn an_inactive_endpoint_stops_the_call() {
+    let (mut sender, mut backend) = faked(vec![(
+        None,
+        FlushStop::Queue(crate::backend::QueueError::NotActive),
+    )]);
+    let report = serve_faked(&mut sender, &mut backend);
+    assert!(report.inactive);
+    assert_eq!(report.drr.stop, Stop::Backpressure { lane: 0 });
+    assert_eq!(backend.flushes, 1, "no other lane is tried");
+}
+
+/// A row's expected failure.
+type Expected = fn(&Option<SenderFailure>) -> bool;
+
+/// Flush stops that contradict the sender's records are invariant
+/// failures, and caller misuse is a sender failure; each halts the call.
+#[test]
+fn invariant_and_sender_rows_halt_the_call() {
+    let rows: [(fake::Reply, Expected); 5] = [
+        ((None, FlushStop::QueueEmpty), |f| {
+            matches!(f, Some(SenderFailure::Invariant { lane: 0, .. }))
+        }),
+        ((None, FlushStop::HeadExceedsBudget { head_len: 50 }), |f| {
+            matches!(f, Some(SenderFailure::Invariant { lane: 0, .. }))
+        }),
+        (
+            (
+                Some((
+                    TxItemOutcome::Submitted {
+                        release: crate::backend::Release::AtSubmission,
+                    },
+                    fake::ticket(9),
+                )),
+                FlushStop::Exposed,
+            ),
+            |f| matches!(f, Some(SenderFailure::Invariant { lane: 0, .. })),
+        ),
+        ((None, FlushStop::ReportNotEmpty), |f| {
+            matches!(f, Some(SenderFailure::Sender { lane: 0, .. }))
+        }),
+        (
+            (
+                None,
+                FlushStop::GateError {
+                    permitted: 2,
+                    offered: 1,
+                },
+            ),
+            |f| matches!(f, Some(SenderFailure::Sender { lane: 0, .. })),
+        ),
+    ];
+    for (reply, expected) in rows {
+        let (mut sender, mut backend) = faked(vec![reply]);
+        let report = serve_faked(&mut sender, &mut backend);
+        assert!(expected(&report.failure), "{reply:?}: {:?}", report.failure);
+        assert_eq!(report.drr.stop, Stop::Halted { lane: 0 }, "{reply:?}");
+        assert_eq!(backend.flushes, 1, "{reply:?}");
+    }
+}

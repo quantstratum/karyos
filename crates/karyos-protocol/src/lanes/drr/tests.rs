@@ -657,3 +657,25 @@ fn backpressure_on_the_last_lane_counts_its_round() {
     assert_eq!(report.rounds, 1);
     assert_eq!(drr.cursor(), 0);
 }
+
+/// A halted source stops the call at once: nothing is debited or
+/// forfeited, the visit is kept and no round is counted.
+#[test]
+fn a_halted_source_keeps_the_visit() {
+    struct Halting;
+    impl LaneSource for Halting {
+        fn probe(&mut self, _lane: usize) -> Probe {
+            Probe::Eligible { charge: 100 }
+        }
+        fn serve(&mut self, _lane: usize) -> Service {
+            Service::Halt
+        }
+    }
+    let mut drr = drr(&[300, 300], 100);
+    let report = drr.run(ALL, &mut Halting);
+    assert_eq!(report.stop, Stop::Halted { lane: 0 });
+    assert_eq!(report.lanes[0].forfeited, 0);
+    assert_eq!(report.rounds, 0);
+    assert_eq!((drr.cursor(), drr.deficit(0)), (0, Some(300)));
+    assert!(drr.in_visit());
+}

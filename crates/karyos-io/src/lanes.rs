@@ -313,10 +313,11 @@ struct Source<'a, B, G> {
 }
 
 impl<B: TxBackend, G: LaneGate> Source<'_, B, G> {
-    /// Stops the call: every lane is ineligible from now on.
+    /// Stops the call with `Stop::Halted`: nothing is forfeited and the
+    /// visit is kept for the control path to resume after it acts.
     fn fail(&mut self, failure: SenderFailure) -> Service {
         self.failure = Some(failure);
-        Service::NotServed
+        Service::Halt
     }
 
     /// `lane` waits for the control path: its queue is faulted, closed or

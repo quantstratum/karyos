@@ -171,6 +171,10 @@ pub enum Service {
     /// so a backend that never has room for one lane's quantum cannot hold
     /// the cursor on it.
     Backpressure,
+    /// The source cannot go on (a broken backend, queue state or caller):
+    /// nothing is debited or forfeited, the visit is kept, and the call
+    /// stops with [`Stop::Halted`] rather than a full ineligible pass.
+    Halt,
 }
 
 /// The lanes a scheduler serves.
@@ -210,6 +214,12 @@ pub enum Stop {
     },
     /// A full pass found no lane eligible.
     Idle,
+    /// The source halted while serving `lane` ([`Service::Halt`]): the
+    /// visit is kept and no deficit was forfeited.
+    Halted {
+        /// The lane under the cursor.
+        lane: usize,
+    },
     /// The backend had no room for `lane`'s head ([`Service::Backpressure`]):
     /// the lane forfeited its deficit and the cursor is on the next lane,
     /// with no extra empty pass (a wrap from the last lane counts a round
@@ -444,6 +454,7 @@ impl Drr {
                             self.advance(report)?;
                             return Ok(Stop::Backpressure { lane });
                         }
+                        Service::Halt => return Ok(Stop::Halted { lane }),
                         Service::Uncertain => {
                             entry.uncertain_bytes =
                                 entry.uncertain_bytes.checked_add(charge).ok_or(overflow)?;
