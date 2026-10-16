@@ -345,17 +345,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             };
             // The loss names an absolute stream position: the
             // incarnation's base plus the cell's buffer position. Both stay
-            // below 2^63, so the sum cannot overflow; the fallback is
-            // unreachable.
+            // below 2^63 (the stream position range), so the checked sum
+            // always exists.
             let Some(base) = target.base_of(incarnation) else {
                 continue;
             };
             let Some(conductor) = target.conductor_of(incarnation) else {
                 continue;
             };
-            let position = base
-                .checked_add(conductor.cell_position(cell).unwrap_or(0))
-                .unwrap_or(u64::MAX);
+            let Some(position) = base.checked_add(conductor.cell_position(cell).unwrap_or(0))
+            else {
+                continue;
+            };
             // Sealing is idempotent: only the revocation that moves the
             // stream out of `Active` reports its closing. A replaced
             // incarnation is already sealed.
