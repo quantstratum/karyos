@@ -225,3 +225,82 @@ fn a_zero_ack_timeout_is_refused() {
         Some(DriverError::InvalidConfig)
     );
 }
+
+/// Review of #227 (P2-1): a sender registered after a close is not
+/// concerned by it; it is by later closes.
+#[test]
+fn a_sender_registered_after_a_close_is_not_listed_for_it() {
+    let (mut driver, guard, _) = driver(DriverConfig::default());
+    let (old, cell) = driver.register_guard_sender(guard).unwrap();
+    assert_eq!(driver.close_guard(guard, 1), Ok(Closed::Now { epoch: 3 }));
+    cell.publish(applied(3, 0));
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let (new, _) = driver.register_guard_sender(guard).unwrap();
+    let ack = driver.close_guard_ack(guard, 3).unwrap();
+    assert_eq!(
+        ack.senders.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![old]
+    );
+    assert_eq!(ack.effective(), Some(true));
+    assert_eq!(driver.close_guard(guard, 4), Ok(Closed::Now { epoch: 5 }));
+    let ack = driver.close_guard_ack(guard, 5).unwrap();
+    assert_eq!(
+        ack.senders.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        vec![old, new]
+    );
+}
+
+/// Overdue for an older close is measured from that close's own time,
+/// while it is in the kept history.
+#[test]
+fn overdue_is_measured_from_the_close_acknowledged() {
+    let config = DriverConfig {
+        guard_ack_timeout: SECOND,
+        ..DriverConfig::default()
+    };
+    let (mut driver, guard, now) = driver(config);
+    let _ = driver.register_guard_sender(guard).unwrap();
+    now.store(10 * SECOND, Ordering::Relaxed);
+    assert_eq!(driver.close_guard(guard, 1), Ok(Closed::Now { epoch: 3 }));
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    now.store(20 * SECOND, Ordering::Relaxed);
+    assert_eq!(driver.close_guard(guard, 4), Ok(Closed::Now { epoch: 5 }));
+    let ack = driver.close_guard_ack(guard, 3).unwrap();
+    assert_eq!(ack.senders[0].1, SenderAck::Pending { overdue: true });
+    let ack = driver.close_guard_ack(guard, 5).unwrap();
+    assert_eq!(ack.senders[0].1, SenderAck::Pending { overdue: false });
+    // A clock read behind the close is never overdue.
+    now.store(5 * SECOND, Ordering::Relaxed);
+    let ack = driver.close_guard_ack(guard, 3).unwrap();
+    assert_eq!(ack.senders[0].1, SenderAck::Pending { overdue: false });
+}
+
+/// Epoch 1 is the guard's creation, not a close.
+#[test]
+fn the_initial_epoch_is_not_a_close() {
+    let (mut driver, guard, _) = driver(DriverConfig::default());
+    assert_eq!(driver.close_guard(guard, 1), Ok(Closed::Now { epoch: 3 }));
+    assert!(matches!(
+        driver.close_guard_ack(guard, 1),
+        Err(DriverError::Guard(GuardError::NotClosedAt {
+            expected: 1,
+            ..
+        }))
+    ));
+}
+
+/// A sender id names its driver: another driver does not know it.
+#[test]
+fn a_sender_id_belongs_to_its_driver() {
+    let (mut driver, guard, _) = driver(DriverConfig::default());
+    let (mut other, other_guard, _) = self::driver(DriverConfig::default());
+    let (id, _) = other.register_guard_sender(other_guard).unwrap();
+    let (mine, _) = driver.register_guard_sender(guard).unwrap();
+    assert_eq!(id.get(), mine.get(), "the same number, two drivers");
+    assert_eq!(
+        driver.deregister_guard_sender(id),
+        Err(DriverError::UnknownGuardSender { sender: id.get() })
+    );
+    driver.deregister_guard_sender(mine).unwrap();
+    other.deregister_guard_sender(id).unwrap();
+}

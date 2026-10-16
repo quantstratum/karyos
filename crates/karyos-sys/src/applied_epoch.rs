@@ -45,8 +45,10 @@ pub struct Applied {
     pub epoch: u64,
     /// The last position submitted per lane under the previous epoch.
     pub positions: [u64; LANES],
-    /// Backend work exposed and not yet settled: items whose exposure is
-    /// unproven (`Unknown`) or submitted and not released.
+    /// Backend work in flight as the gate counts it: items exposed and not
+    /// yet reported, and items whose exposure is unproven (`Unknown`) until
+    /// the control path resolves them (`quantstratum-docs:
+    /// karyos/design/driver-network-agents.md`, DN-7).
     pub in_flight: u64,
 }
 

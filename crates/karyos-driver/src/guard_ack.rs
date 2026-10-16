@@ -33,15 +33,19 @@ use crate::guards::GuardHandle;
 /// reads is not waited for.
 pub const ACK_READ_ATTEMPTS: u32 = 8;
 
-/// Names a registered sender gate of one driver.
+/// Names a registered sender gate of one driver, as a `GuardHandle`
+/// names a guard: another driver's id is unknown here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GuardSenderId(u64);
+pub struct GuardSenderId {
+    driver: u64,
+    id: u64,
+}
 
 impl GuardSenderId {
     /// The id, from 1, never reused within the driver.
     #[must_use]
     pub const fn get(self) -> u64 {
-        self.0
+        self.id
     }
 }
 
@@ -106,6 +110,9 @@ impl CloseAck {
 struct Entry {
     id: GuardSenderId,
     guard: GuardHandle,
+    /// The guard's epoch when the sender registered: a close at or before
+    /// it is none of this sender's concern.
+    registered: u64,
     cell: Arc<AppliedEpoch>,
 }
 
@@ -134,10 +141,13 @@ fn read(cell: &AppliedEpoch) -> Option<Applied> {
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
-    /// Registers a sender gate serving `guard`: the returned cell is the
-    /// gate's, written by it alone, and read by
+    /// Registers a sender gate serving `guard` (phase 7 of
+    /// driver-network-agents.md wires it from `AddSenderSession`): the
+    /// returned cell is the gate's, written by it alone, and read by
     /// [`EmbeddedDriver::close_guard_ack`] until
-    /// [`EmbeddedDriver::deregister_guard_sender`].
+    /// [`EmbeddedDriver::deregister_guard_sender`]. A sender is concerned
+    /// only by closes after its registration: the guard's epoch is recorded
+    /// with it.
     ///
     /// # Errors
     ///
@@ -148,12 +158,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         &mut self,
         guard: GuardHandle,
     ) -> Result<(GuardSenderId, Arc<AppliedEpoch>), DriverError> {
-        let _ = self.guards.state(guard)?;
+        let registered = self.guards.state(guard)?.epoch;
+        let driver = self.id;
         let senders = &mut self.guard_senders;
         if senders.entries.len() >= senders.max {
             return Err(DriverError::TooManyGuardSenders);
         }
-        let id = GuardSenderId(senders.next);
+        let id = GuardSenderId {
+            driver,
+            id: senders.next,
+        };
         senders.next = senders
             .next
             .checked_add(1)
@@ -162,6 +176,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         senders.entries.push(Entry {
             id,
             guard,
+            registered,
             cell: Arc::clone(&cell),
         });
         Ok((id, cell))
@@ -172,26 +187,31 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// # Errors
     ///
-    /// [`DriverError::UnknownGuardSender`] for a sender not registered.
+    /// [`DriverError::UnknownGuardSender`] for a sender not registered
+    /// here (another driver's included).
     pub fn deregister_guard_sender(&mut self, sender: GuardSenderId) -> Result<(), DriverError> {
         let entries = &mut self.guard_senders.entries;
         let index = entries
             .iter()
             .position(|entry| entry.id == sender)
-            .ok_or(DriverError::UnknownGuardSender { sender: sender.0 })?;
+            .ok_or(DriverError::UnknownGuardSender { sender: sender.id })?;
         let _ = entries.remove(index);
         Ok(())
     }
 
     /// The effective-close acknowledgement of `guard`'s close at `epoch`:
-    /// every registered sender, applied (with its positions and in-flight
-    /// work) or pending (overdue past `guard_ack_timeout`, measured from
-    /// the close by the driver clock).
+    /// every sender registered before that close, applied (with its
+    /// positions and in-flight work) or pending (overdue past
+    /// `guard_ack_timeout`, measured from the close by the driver clock).
+    /// A clock read behind the close is never overdue. For a close older
+    /// than the guard's kept history (`guards::CLOSE_HISTORY`), the time of
+    /// a later close is used, so overdue can only come late, never early.
     ///
     /// # Errors
     ///
     /// [`DriverError::UnknownGuard`], and [`DriverError::Guard`] with
-    /// `NotClosedAt` when the guard did not close at `epoch` (or later).
+    /// `NotClosedAt` when `epoch` is not a close of the guard: an even
+    /// (open) epoch, the initial epoch 1, or one the guard never reached.
     pub fn close_guard_ack(
         &mut self,
         guard: GuardHandle,
@@ -201,7 +221,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(closed_at) = self.guards.closed_since(guard, epoch)? else {
             return Err(not_closed(epoch, current));
         };
-        if epoch.is_multiple_of(2) {
+        // Closed epochs are odd; epoch 1 is the guard's creation, no close.
+        if epoch.is_multiple_of(2) || epoch < 3 {
             return Err(not_closed(epoch, current));
         }
         let now = self.clock.now();
@@ -212,7 +233,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .guard_senders
             .entries
             .iter()
-            .filter(|entry| entry.guard == guard)
+            .filter(|entry| entry.guard == guard && entry.registered < epoch)
             .map(|entry| {
                 let ack = match read(&entry.cell) {
                     Some(applied) if applied.epoch >= epoch => SenderAck::Applied {

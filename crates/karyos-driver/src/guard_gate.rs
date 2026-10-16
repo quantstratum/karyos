@@ -398,8 +398,15 @@ impl GuardGate {
     }
 
     /// Backend work in flight: heads exposed and not yet left, and heads
-    /// that left unproven until a reopen resolves them (DN-7). `None` only
-    /// past `u64`, which would take 2^64 unresolved reports.
+    /// that left unproven (or whose report contradicted the record) until a
+    /// reopen resolves them (DN-7). `None` only past `u64`, which would take
+    /// 2^64 unresolved reports.
+    ///
+    /// The count errs high, never low: the matching prefix of a
+    /// contradicted exposure, a permitted head the backend keeps pending,
+    /// and a head marked exposed in a batch cut short all count until they
+    /// leave or a reopen settles them. After those, only a reopen makes a
+    /// close effective.
     #[must_use]
     pub fn in_flight(&self) -> Option<u64> {
         self.lanes.iter().try_fold(0u64, |total, state| {
@@ -595,8 +602,11 @@ impl LaneGate for GuardGate {
             return;
         };
         if entry.ticket != staged.ticket {
-            // The records diverged: the lane cannot be trusted any more.
+            // The records diverged: the lane cannot be trusted any more, and
+            // the item's fate is unknown, so it stays in flight until a
+            // reopen, as an `Unknown` one does.
             refund(&mut self.limiter, &mut entry);
+            bump(&mut state.unknown, &mut self.counts.overflows);
             self.fault(Some(lane));
             return;
         }
