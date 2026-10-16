@@ -16,27 +16,22 @@
 //! - **Writing.** The driver stores a record's fields with Relaxed stores,
 //!   then its sequence with Release. It writes an ordinary record only
 //!   while fewer than `capacity - 1` are unread, so the last slot is always
-//!   free for the one `OutcomesLost` record of a faulted client.
+//!   free for the one `OutcomesLost` record of a faulted client. A record
+//!   that finds no room faults the client (below): the room check and the
+//!   lag fault are one bound, so nothing is ever deferred.
 //! - **The consumed count.** The driver loads the consumed cell with
 //!   Acquire before every write and validates it: monotonic, and at most
 //!   the last sequence written. The client stores it with Release only
 //!   after it has read the records it counts, so a slot is never rewritten
 //!   while its record is being read. An invalid count, or a client so far
 //!   behind that the records produced minus its count would exceed
-//!   `capacity - 1`, faults it: the driver stops writing, counts what it
-//!   could not write, and writes one final `OutcomesLost` record against
-//!   the last count it validated.
-//! - **Deferral.** A record that finds no room is deferred in a
-//!   preallocated queue of `capacity - 1` entries and retried, never
-//!   dropped and never blocking a close, a reopen or the sender. Sequences
-//!   are assigned when a record is produced, and the queue drains first in
-//!   first out, so the ring receives records in sequence order.
+//!   `capacity - 1`, faults it: the driver writes one final `OutcomesLost`
+//!   record against the last count it validated, counting the record that
+//!   faulted it, then stops writing and only counts later records.
 //! - **Reading.** The reader loads a slot's word 0 with Acquire; when it
 //!   is the next expected sequence, the fields are complete. It validates
 //!   them, hands the record to the handler, and only then publishes the
 //!   consumed count, so a panicking handler gets the record again.
-
-use std::collections::VecDeque;
 
 use crate::load_words::LoadWords;
 use crate::sync::{AtomicU64, Ordering};
@@ -259,72 +254,105 @@ fn slot_base(capacity: u64, sequence: u64) -> Option<usize> {
 pub enum Produced {
     /// Written into the ring with this sequence.
     Written(u64),
-    /// Assigned this sequence and deferred until the client consumes.
-    Deferred(u64),
     /// The client is faulted: the record is counted as lost.
     Lost,
 }
 
 /// The driver's writer of one ring.
+///
+/// A record is written at once or the client is faulted; nothing waits.
+/// The room check and the lag fault are the same bound: a record needs
+/// fewer than `capacity - 1` unread records, and a client whose unread
+/// records would exceed `capacity - 1` is faulted. A protocol-following
+/// client's reservations bound its unread records to `C_m + C_r =
+/// capacity - 1`, so it is never faulted, and no record is ever deferred
+/// (the design's deferral queue is unreachable and is not built).
 #[derive(Debug)]
 pub struct OutcomeWriter {
     capacity: u64,
-    /// The last sequence assigned.
-    produced: u64,
     /// The last sequence written into the ring.
     written: u64,
     /// The last consumed count validated.
     consumed: u64,
-    /// Produced records not yet written, oldest first; at most
-    /// `capacity - 1`.
-    deferred: VecDeque<[u64; 7]>,
-    /// Records lost since the client faulted; `None` while not faulted.
+    /// Records lost since the client faulted, the triggering record
+    /// included; `None` while not faulted.
     lost: Option<u64>,
+    /// Loom only: the ordering of the consumed load (Acquire), weakened by
+    /// the negative control.
+    #[cfg(loom)]
+    consumed_load: Ordering,
+    /// Loom only: one witness per slot, see [`OutcomeWriter::with_witness`].
+    #[cfg(loom)]
+    witness: Option<Witness>,
 }
 
+/// Loom only: one ownership witness per slot, shared by the writer and the
+/// reader of one ring.
+#[cfg(loom)]
+pub type Witness = loom::sync::Arc<Vec<loom::cell::UnsafeCell<u64>>>;
+
 impl OutcomeWriter {
-    /// A writer of a ring of `capacity` slots, with its deferral queue
-    /// preallocated.
+    /// A writer of a ring of `capacity` slots.
     ///
     /// # Errors
     ///
     /// [`OutcomeError::Layout`] when `capacity` is below 2.
     pub fn new(capacity: u64) -> Result<Self, OutcomeError> {
-        let queue = capacity
-            .checked_sub(1)
-            .filter(|queue| *queue >= 1)
-            .and_then(|queue| usize::try_from(queue).ok())
-            .ok_or(OutcomeError::Layout)?;
+        if capacity < 2 {
+            return Err(OutcomeError::Layout);
+        }
         Ok(Self {
             capacity,
-            produced: 0,
             written: 0,
             consumed: 0,
-            deferred: VecDeque::with_capacity(queue),
             lost: None,
+            #[cfg(loom)]
+            consumed_load: Ordering::Acquire,
+            #[cfg(loom)]
+            witness: None,
         })
     }
 
-    /// The records lost since the client faulted; `None` while it has not.
+    /// Loom only: the negative control's ordering for the consumed load.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_consumed_load(mut self, order: Ordering) -> Self {
+        self.consumed_load = order;
+        self
+    }
+
+    /// Loom only: attaches one witness per slot. The writer writes a slot's
+    /// witness after it validated the room and before it stores the
+    /// record; the reader reads it before it publishes the consumed count,
+    /// with no other synchronization, so Loom reports a race when the
+    /// consumed handoff is too weak to order a slot's reuse after its read.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_witness(mut self, witness: Witness) -> Self {
+        self.witness = Some(witness);
+        self
+    }
+
+    /// The records lost since the client faulted, the record that faulted
+    /// it included; `None` while it has not.
     #[must_use]
     pub fn faulted(&self) -> Option<u64> {
         self.lost
     }
 
-    /// Records produced and not yet written.
-    #[must_use]
-    pub fn deferred(&self) -> usize {
-        self.deferred.len()
-    }
-
-    /// Produces `record`: assigns it the next sequence and writes it, or
-    /// defers it when the client has not consumed enough. Never blocks.
+    /// Produces `record`: validates the consumed cell, then writes the
+    /// record with the next sequence, or faults the client when its count
+    /// is invalid or it lags so far that the record finds no room. Never
+    /// blocks.
     ///
     /// # Errors
     ///
-    /// [`OutcomeError::Layout`] for a record that breaks the layout (a
-    /// caller bug: nothing is assigned); [`OutcomeError::Exhausted`] when
-    /// sequences would overflow.
+    /// [`OutcomeError::Layout`] for a record that breaks the layout or a
+    /// ring shorter than its capacity (a caller bug: nothing is written);
+    /// [`OutcomeError::Exhausted`] when sequences or the lost count would
+    /// overflow.
     pub fn produce(
         &mut self,
         ring: &[AtomicU64],
@@ -336,49 +364,32 @@ impl OutcomeWriter {
             *lost = lost.checked_add(1).ok_or(OutcomeError::Exhausted)?;
             return Ok(Produced::Lost);
         }
-        let sequence = self
-            .produced
-            .checked_add(1)
-            .ok_or(OutcomeError::Exhausted)?;
-        // A client so far behind that its unread records would exceed the
-        // ordinary room, or whose count is invalid, is faulted rather than
-        // queued past the bound.
-        if sequence - self.consumed > self.capacity - 1
-            && (!self.read_consumed(consumed) || sequence - self.consumed > self.capacity - 1)
-        {
-            self.fault(ring);
-            if let Some(lost) = &mut self.lost {
-                *lost = lost.checked_add(1).ok_or(OutcomeError::Exhausted)?;
-            }
+        let sequence = self.written.checked_add(1).ok_or(OutcomeError::Exhausted)?;
+        // `written - consumed` never underflows: a validated count is at
+        // most `written`. `capacity - 1` never does: `capacity >= 2`.
+        if !self.read_consumed(consumed) || self.written - self.consumed >= self.capacity - 1 {
+            // The record that faults the client is the first one lost.
+            self.fault(ring, 1)?;
             return Ok(Produced::Lost);
         }
-        self.produced = sequence;
-        self.deferred.push_back(fields);
-        self.drain(ring, consumed);
-        // A fault in the drain counted this record with the unwritten ones.
-        Ok(if self.lost.is_some() {
-            Produced::Lost
-        } else if self.written >= sequence {
-            Produced::Written(sequence)
-        } else {
-            Produced::Deferred(sequence)
-        })
-    }
-
-    /// Writes deferred records the client has made room for; returns how
-    /// many it wrote. Called each duty cycle while records are deferred.
-    pub fn retry(&mut self, ring: &[AtomicU64], consumed: &AtomicU64) -> usize {
-        if self.lost.is_some() {
-            return 0;
+        #[cfg(loom)]
+        self.witness_write(sequence);
+        if !write(ring, self.capacity, sequence, fields) {
+            return Err(OutcomeError::Layout);
         }
-        self.drain(ring, consumed)
+        self.written = sequence;
+        Ok(Produced::Written(sequence))
     }
 
     /// Validates the consumed cell (Acquire): monotonic, and at most the
     /// last sequence written. Returns `false` for an invalid count, which
     /// the caller answers with a fault; the last valid count is kept.
     fn read_consumed(&mut self, consumed: &AtomicU64) -> bool {
-        let count = consumed.load(Ordering::Acquire);
+        #[cfg(not(loom))]
+        let order = Ordering::Acquire;
+        #[cfg(loom)]
+        let order = self.consumed_load;
+        let count = consumed.load(order);
         if count < self.consumed || count > self.written {
             return false;
         }
@@ -386,39 +397,17 @@ impl OutcomeWriter {
         true
     }
 
-    fn drain(&mut self, ring: &[AtomicU64], consumed: &AtomicU64) -> usize {
-        let mut wrote = 0;
-        if self.deferred.is_empty() {
-            return wrote;
-        }
-        if !self.read_consumed(consumed) {
-            self.fault(ring);
-            return wrote;
-        }
-        while self.written - self.consumed < self.capacity - 1 {
-            let Some(fields) = self.deferred.pop_front() else {
-                break;
-            };
-            let sequence = self.written + 1;
-            if !write(ring, self.capacity, sequence, fields) {
-                // The layout was checked at init; a short ring is a caller
-                // bug, so the record is kept rather than lost.
-                self.deferred.push_front(fields);
-                break;
-            }
-            self.written = sequence;
-            wrote += 1;
-        }
-        wrote
-    }
-
-    /// Faults the client: counts every unwritten record as lost, and
-    /// writes the one `OutcomesLost` record in the reserved slot, against
-    /// the last validated count.
-    fn fault(&mut self, ring: &[AtomicU64]) {
-        // The queue holds at most `capacity - 1` entries, a `u64` count.
-        let lost = u64::try_from(self.deferred.len()).unwrap_or(u64::MAX);
-        self.deferred.clear();
+    /// Faults the client with `lost` records lost so far, and writes the
+    /// one `OutcomesLost` record carrying that count in the reserved slot,
+    /// against the last validated count: `written - consumed <= capacity -
+    /// 1` always holds, so its slot's record has been read.
+    fn fault(&mut self, ring: &[AtomicU64], lost: u64) -> Result<(), OutcomeError> {
+        self.lost = Some(lost);
+        let sequence = self.written.checked_add(1).ok_or(OutcomeError::Exhausted)?;
+        debug_assert!(
+            self.written - self.consumed < self.capacity,
+            "the reserved slot is free"
+        );
         let record = Record {
             kind: Kind::OutcomesLost,
             lane: 0,
@@ -430,15 +419,35 @@ impl OutcomeWriter {
             reason: 0,
             lost,
         };
-        let sequence = self.written + 1;
-        if let Some(fields) = record.fields()
-            && write(ring, self.capacity, sequence, fields)
-        {
-            self.written = sequence;
-            self.produced = self.produced.max(sequence);
+        let fields = record.fields().ok_or(OutcomeError::Layout)?;
+        #[cfg(loom)]
+        self.witness_write(sequence);
+        if !write(ring, self.capacity, sequence, fields) {
+            return Err(OutcomeError::Layout);
         }
-        self.lost = Some(lost);
+        self.written = sequence;
+        Ok(())
     }
+
+    #[cfg(loom)]
+    fn witness_write(&self, sequence: u64) {
+        if let Some(cell) = witness(self.witness.as_ref(), self.capacity, sequence) {
+            // SAFETY: Loom checks that this write is ordered after the
+            // reader's last read of the slot's witness.
+            cell.with_mut(|value| unsafe { *value = sequence });
+        }
+    }
+}
+
+/// Loom only: the witness of `sequence`'s slot.
+#[cfg(loom)]
+fn witness(
+    witness: Option<&Witness>,
+    capacity: u64,
+    sequence: u64,
+) -> Option<&loom::cell::UnsafeCell<u64>> {
+    let slot = usize::try_from(sequence.checked_sub(1)? % capacity).ok()?;
+    witness?.get(slot)
 }
 
 /// Stores a record: fields Relaxed, then the sequence with Release.
@@ -471,6 +480,13 @@ pub struct OutcomeReader {
     next: u64,
     /// Set once the `OutcomesLost` record was read: nothing follows it.
     ended: bool,
+    /// Loom only: the ordering of the consumed store (Release), weakened by
+    /// the negative control.
+    #[cfg(loom)]
+    consumed_store: Ordering,
+    /// Loom only: the writer's witnesses, see [`OutcomeWriter::with_witness`].
+    #[cfg(loom)]
+    witness: Option<Witness>,
 }
 
 impl OutcomeReader {
@@ -481,7 +497,7 @@ impl OutcomeReader {
     ///
     /// [`OutcomeError::Version`] for another layout version;
     /// [`OutcomeError::Layout`] for a slot count the ring cannot hold.
-    pub fn attach(ring: &impl LoadWords, lanes: u8) -> Result<Self, OutcomeError> {
+    pub fn attach(ring: &(impl LoadWords + ?Sized), lanes: u8) -> Result<Self, OutcomeError> {
         let version = ring.load_acquire(VERSION).ok_or(OutcomeError::Layout)?;
         if version != OUTCOME_LAYOUT_VERSION {
             return Err(OutcomeError::Version(version));
@@ -496,7 +512,29 @@ impl OutcomeReader {
             lanes,
             next: 1,
             ended: false,
+            #[cfg(loom)]
+            consumed_store: Ordering::Release,
+            #[cfg(loom)]
+            witness: None,
         })
+    }
+
+    /// Loom only: the negative control's ordering for the consumed store.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_consumed_store(mut self, order: Ordering) -> Self {
+        self.consumed_store = order;
+        self
+    }
+
+    /// Loom only: the writer's witnesses, read before each consumed store.
+    #[cfg(loom)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_witness(mut self, witness: Witness) -> Self {
+        self.witness = Some(witness);
+        self
     }
 
     /// Delivers up to `limit` records in sequence order. Each is counted
@@ -505,11 +543,13 @@ impl OutcomeReader {
     ///
     /// # Errors
     ///
-    /// [`OutcomeError::Corrupt`] for a record that breaks the layout or a
-    /// slot holding a sequence ahead of the expected one.
+    /// [`OutcomeError::Corrupt`] for a record that breaks the layout, or a
+    /// slot holding anything but the expected sequence or, while pending,
+    /// the record it replaces (`sequence - capacity`, or 0 on the first
+    /// round).
     pub fn poll(
         &mut self,
-        ring: &impl LoadWords,
+        ring: &(impl LoadWords + ?Sized),
         consumed: &AtomicU64,
         limit: usize,
         mut handler: impl FnMut(u64, Record),
@@ -520,20 +560,34 @@ impl OutcomeReader {
             let corrupt = OutcomeError::Corrupt { sequence };
             let base = slot_base(self.capacity, sequence).ok_or(corrupt)?;
             let head = ring.load_acquire(base).ok_or(corrupt)?;
-            if head < sequence {
-                // Not written yet: the slot still holds an older record.
-                break;
-            }
             if head != sequence {
+                // Not written yet: the slot still holds the record it
+                // replaces. Anything else is corrupt.
+                if head == sequence.saturating_sub(self.capacity) {
+                    break;
+                }
                 return Err(corrupt);
             }
             let mut fields = [0u64; 7];
-            for (index, field) in fields.iter_mut().enumerate() {
-                *field = ring.load(base + 1 + index).ok_or(corrupt)?;
+            for (index, field) in (1..).zip(fields.iter_mut()) {
+                let word = base.checked_add(index).ok_or(corrupt)?;
+                *field = ring.load(word).ok_or(corrupt)?;
             }
             let record = Record::decode(fields, self.lanes).ok_or(corrupt)?;
             handler(sequence, record);
-            consumed.store(sequence, Ordering::Release);
+            #[cfg(loom)]
+            if let Some(cell) = witness(self.witness.as_ref(), self.capacity, sequence) {
+                // SAFETY: Loom checks that this read is ordered after the
+                // writer's witness write for this record and before the
+                // slot's reuse.
+                let owner = cell.with(|value| unsafe { *value });
+                assert_eq!(owner, sequence, "torn record: the witness names another");
+            }
+            #[cfg(not(loom))]
+            let order = Ordering::Release;
+            #[cfg(loom)]
+            let order = self.consumed_store;
+            consumed.store(sequence, order);
             self.next = sequence.checked_add(1).ok_or(OutcomeError::Exhausted)?;
             self.ended = record.kind == Kind::OutcomesLost;
             delivered += 1;

@@ -122,7 +122,7 @@ fn the_reserved_slot_is_never_used_by_an_ordinary_record() {
     let seen = read_all(&mut reader, &ring, &consumed);
     assert_eq!(seen.len(), 3);
     assert_eq!(seen[2].1.kind, Kind::OutcomesLost);
-    assert_eq!(seen[2].1.lost, 0, "lost at the fault: nothing deferred");
+    assert_eq!(seen[2].1.lost, 1, "the record that faulted the client");
     assert!(reader.ended());
     // Later records are only counted.
     assert_eq!(
@@ -161,7 +161,43 @@ fn an_invalid_consumed_count_faults_the_client() {
         let seen = read_all(&mut reader, &ring, &consumed);
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[1].1.kind, Kind::OutcomesLost);
+        assert_eq!(seen[1].1.lost, 1);
+        assert_eq!(writer.faulted(), Some(1));
     }
+}
+
+#[test]
+fn a_late_consumed_count_faults_with_the_exact_count() {
+    // Capacity 4: three records fill the room. The client read them but
+    // has not published its count, so the fourth faults it.
+    let ring = ring(4);
+    let consumed = AtomicU64::new(0);
+    let mut writer = OutcomeWriter::new(4).unwrap();
+    for start in [0, 64, 128] {
+        assert!(matches!(
+            writer
+                .produce(&ring, &consumed, message(Kind::Submitted, start))
+                .unwrap(),
+            Produced::Written(_)
+        ));
+    }
+    for start in [192, 256] {
+        assert_eq!(
+            writer
+                .produce(&ring, &consumed, message(Kind::Submitted, start))
+                .unwrap(),
+            Produced::Lost
+        );
+    }
+    assert_eq!(writer.faulted(), Some(2));
+    let mut reader = OutcomeReader::attach(&ring.as_slice(), 2).unwrap();
+    let seen = read_all(&mut reader, &ring, &consumed);
+    assert_eq!(seen.len(), 4);
+    assert_eq!(seen[3].0, 4, "the reserved slot");
+    assert_eq!(seen[3].1.kind, Kind::OutcomesLost);
+    assert_eq!(seen[3].1.lost, 1, "counted when it was written");
+    // Nothing follows it, even once the count is published.
+    assert_eq!(read_all(&mut reader, &ring, &consumed).len(), 0);
 }
 
 #[test]
@@ -276,6 +312,7 @@ fn a_corrupt_record_is_an_error_never_skipped() {
         (1, 1 | (1 << 40)), // reserved bits
         (7, 5),             // a lost count on a message record
         (0, 2),             // a sequence ahead of the expected one
+        (0, u64::MAX),      // a sequence no round can hold
     ] {
         let ring = ring(4);
         let mut writer = OutcomeWriter::new(4).unwrap();
@@ -297,5 +334,32 @@ fn an_unwritten_slot_is_pending() {
     let ring = ring(4);
     let consumed = AtomicU64::new(0);
     let mut reader = OutcomeReader::attach(&ring.as_slice(), 2).unwrap();
+    assert_eq!(read_all(&mut reader, &ring, &consumed).len(), 0);
+}
+
+#[test]
+fn only_the_replaced_record_is_pending() {
+    // Capacity 2: record 2 lives in slot 1, which holds 0 before it is
+    // written; record 3 lives in slot 0, which holds record 1 until then.
+    let ring = ring(2);
+    let consumed = AtomicU64::new(0);
+    let mut writer = OutcomeWriter::new(2).unwrap();
+    let mut reader = OutcomeReader::attach(&ring.as_slice(), 2).unwrap();
+    let _ = writer
+        .produce(&ring, &consumed, message(Kind::Submitted, 0))
+        .unwrap();
+    assert_eq!(read_all(&mut reader, &ring, &consumed).len(), 1);
+    // Slot 1 holding anything but 0 or 2 is corrupt.
+    ring[HEADER_WORDS + RECORD_WORDS].store(1, Ordering::Relaxed);
+    assert_eq!(
+        reader.poll(&ring.as_slice(), &consumed, 1, |_, _| {}),
+        Err(OutcomeError::Corrupt { sequence: 2 })
+    );
+    ring[HEADER_WORDS + RECORD_WORDS].store(0, Ordering::Relaxed);
+    let _ = writer
+        .produce(&ring, &consumed, message(Kind::Submitted, 64))
+        .unwrap();
+    assert_eq!(read_all(&mut reader, &ring, &consumed).len(), 1);
+    // Slot 0 still holds record 1: pending.
     assert_eq!(read_all(&mut reader, &ring, &consumed).len(), 0);
 }

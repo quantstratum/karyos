@@ -6,12 +6,20 @@
 //!
 //! A ring of two slots (one ordinary record of room plus the reserved
 //! slot): the driver writes three records, each only once the client's
-//! reservation allows it (the consumed count shows room), so the ring
-//! wraps twice. A concurrent client polls and publishes its consumed
-//! count. Every record it delivers must be whole (its fields belong to the
-//! sequence it was read as) and in order, and the writer never faults a
-//! protocol-following client. Negative control: a writer that stores the
-//! sequence before the fields lets the client read a torn record.
+//! reservation allows it, so the ring wraps twice. The harness waits for
+//! that reservation with a Relaxed load, so only the writer's own Acquire
+//! load of the consumed count orders a slot's reuse. A concurrent client
+//! polls and publishes its consumed count. Each slot has an ownership
+//! witness (a Loom `UnsafeCell`) that the writer writes after validating
+//! the room and before storing the record, and the reader reads before
+//! publishing its count, with no other synchronization. Every record the
+//! client delivers must be whole and in order, and the writer never faults
+//! a protocol-following client.
+//!
+//! Negative controls, each of which must fail: the sequence stored before
+//! the fields (a torn record); the writer's consumed load weakened to
+//! Relaxed, and the client's consumed store weakened to Relaxed (a race on
+//! the witness: a slot rewritten while its record is read).
 //!
 //! Run with `make loom`.
 
@@ -19,14 +27,16 @@
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
+    clippy::panic,
     reason = "a test model, as ADR-0007 allows in tests"
 )]
 
 use karyos_sys::outcome_ring::{
-    HEADER_WORDS, Kind, OutcomeReader, OutcomeWriter, Produced, RECORD_WORDS, Record, init,
-    ring_words,
+    HEADER_WORDS, Kind, OutcomeReader, OutcomeWriter, Produced, RECORD_WORDS, Record, Witness,
+    init, ring_words,
 };
 use karyos_sys::sync::{AtomicU64, Ordering};
+use loom::cell::UnsafeCell;
 use loom::sync::Arc;
 use loom::thread;
 
@@ -48,10 +58,14 @@ fn record(sequence: u64) -> Record {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Writer {
+enum Variant {
     Production,
     /// Negative control: the sequence is stored before the fields.
     SequenceFirst,
+    /// Negative control: the writer loads the consumed count Relaxed.
+    RelaxedLoad,
+    /// Negative control: the client stores the consumed count Relaxed.
+    RelaxedStore,
 }
 
 /// Writes `record` as `sequence` with the sequence first (the control).
@@ -73,7 +87,7 @@ fn write_sequence_first(ring: &[AtomicU64], sequence: u64, record: Record) {
     }
 }
 
-fn model(writer_kind: Writer) {
+fn model(variant: Variant) {
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(3);
     builder.check(move || {
@@ -81,11 +95,18 @@ fn model(writer_kind: Writer) {
         let ring: Arc<Vec<AtomicU64>> = Arc::new((0..words).map(|_| AtomicU64::new(0)).collect());
         init(&ring, CAPACITY).unwrap();
         let consumed = Arc::new(AtomicU64::new(0));
+        let witness: Witness = Arc::new((0..CAPACITY).map(|_| UnsafeCell::new(0)).collect());
         let client = {
             let ring = Arc::clone(&ring);
             let consumed = Arc::clone(&consumed);
+            let witness = Arc::clone(&witness);
             thread::spawn(move || {
-                let mut reader = OutcomeReader::attach(&ring.as_slice(), 1).unwrap();
+                let mut reader = OutcomeReader::attach(&ring.as_slice(), 1)
+                    .unwrap()
+                    .with_witness(witness);
+                if variant == Variant::RelaxedStore {
+                    reader = reader.with_consumed_store(Ordering::Relaxed);
+                }
                 let mut next = 1;
                 while next <= RECORDS {
                     let _ = reader
@@ -99,19 +120,24 @@ fn model(writer_kind: Writer) {
                 }
             })
         };
-        let mut writer = OutcomeWriter::new(CAPACITY).unwrap();
+        let mut writer = OutcomeWriter::new(CAPACITY).unwrap().with_witness(witness);
+        if variant == Variant::RelaxedLoad {
+            writer = writer.with_consumed_load(Ordering::Relaxed);
+        }
         for sequence in 1..=RECORDS {
-            // The client's reservation: at most `CAPACITY - 1` unread.
-            while consumed.load(Ordering::Acquire) + (CAPACITY - 1) < sequence {
+            // The client's reservation: at most `CAPACITY - 1` unread. A
+            // Relaxed wait, so it orders nothing.
+            while consumed.load(Ordering::Relaxed) + (CAPACITY - 1) < sequence {
                 thread::yield_now();
             }
-            match writer_kind {
-                Writer::Production => assert_eq!(
+            if variant == Variant::SequenceFirst {
+                write_sequence_first(&ring, sequence, record(sequence));
+            } else {
+                assert_eq!(
                     writer.produce(&ring, &consumed, record(sequence)).unwrap(),
                     Produced::Written(sequence),
                     "a protocol-following client was faulted"
-                ),
-                Writer::SequenceFirst => write_sequence_first(&ring, sequence, record(sequence)),
+                );
             }
         }
         client.join().unwrap();
@@ -120,11 +146,23 @@ fn model(writer_kind: Writer) {
 
 #[test]
 fn the_client_reads_whole_records_in_order() {
-    model(Writer::Production);
+    model(Variant::Production);
 }
 
 #[test]
 #[should_panic(expected = "torn record")]
 fn control_the_sequence_stored_before_the_fields() {
-    model(Writer::SequenceFirst);
+    model(Variant::SequenceFirst);
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn control_a_relaxed_consumed_load() {
+    model(Variant::RelaxedLoad);
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn control_a_relaxed_consumed_store() {
+    model(Variant::RelaxedStore);
 }

@@ -12,14 +12,19 @@
 //!   A reopen that would need an epoch above it is refused with
 //!   [`GuardError::Exhausted`], and the guard stays closed for good.
 //! - Only the guard's owner writes the word, on the driver's control path,
-//!   with Release; every reader loads it with Acquire. A word that breaks
-//!   the encoding is a broken invariant: [`load`] reports it and it is
-//!   treated as closed, never used to open.
+//!   with Release; every reader loads it with acquire semantics. A word
+//!   that breaks the encoding is a broken invariant: [`load`] reports it
+//!   and it is treated as closed, never used to open.
 //!
-//! The functions work on any `AtomicU64`: a heap word in process, or a
-//! word of a driver region that clients map read-only for their early
-//! admission check.
+//! The owner's functions ([`close`], [`reopen`], and [`load`] and
+//! [`admits`]) work on a writable `AtomicU64`, a heap word in process or
+//! the driver's own mapping of its guard region. A client that maps the
+//! region read-only uses [`load_in`] and [`admits_in`], which read through
+//! [`LoadWords`]: on `PROT_READ` memory Rust guarantees only Relaxed loads,
+//! so `ReadOnlyWords` gives acquire semantics with a Relaxed load and an
+//! Acquire fence.
 
+use crate::load_words::LoadWords;
 use crate::sync::{AtomicU64, Ordering};
 
 /// The largest epoch; odd, so a `Closed` epoch.
@@ -108,6 +113,25 @@ pub fn admits(word: &AtomicU64, epoch: u64) -> bool {
         .is_some_and(|open| word.load(Ordering::Acquire) == open)
 }
 
+/// [`load`] over word `index` of a view that may be read-only, such as a
+/// client's mapping of the driver's guard region.
+///
+/// # Errors
+///
+/// [`GuardError::Corrupt`] for a word that breaks the encoding, or for a
+/// word past the end of the view (reported as word 0).
+pub fn load_in(words: &(impl LoadWords + ?Sized), index: usize) -> Result<GuardState, GuardError> {
+    decode(words.load_acquire(index).unwrap_or(0))
+}
+
+/// [`admits`] over word `index` of a view that may be read-only: one load
+/// with acquire semantics. A word past the end of the view refuses.
+#[must_use]
+pub fn admits_in(words: &(impl LoadWords + ?Sized), index: usize, epoch: u64) -> bool {
+    encode(GuardState { epoch, open: true })
+        .is_some_and(|open| words.load_acquire(index) == Some(open))
+}
+
 /// The outcome of [`close`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Closed {
@@ -135,8 +159,11 @@ pub fn close(word: &AtomicU64) -> Result<Closed, GuardError> {
     if !state.open {
         return Ok(Closed::Already { epoch: state.epoch });
     }
-    // An open epoch is even and below MAX_EPOCH, which is odd.
-    let epoch = state.epoch + 1;
+    // An open epoch is even and below MAX_EPOCH, which is odd, so this
+    // cannot overflow; checked all the same.
+    let Some(epoch) = state.epoch.checked_add(1) else {
+        return Err(GuardError::Exhausted);
+    };
     word.store(epoch << 1, Ordering::Release);
     Ok(Closed::Now { epoch })
 }

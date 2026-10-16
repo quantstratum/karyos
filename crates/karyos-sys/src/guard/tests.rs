@@ -85,6 +85,23 @@ fn admits_refuses_an_unencodable_epoch() {
     assert!(!admits(&word, 1), "odd epochs are never open");
 }
 
+#[test]
+fn a_read_only_view_loads_and_admits() {
+    let words = [AtomicU64::new(0), AtomicU64::new(created())];
+    let view = words.as_slice();
+    assert_eq!(load_in(&view, 1), Ok(state(1, false)));
+    assert!(!admits_in(&view, 1, 2));
+    assert_eq!(reopen(&words[1], 1), Ok(2));
+    assert_eq!(load_in(&view, 1), Ok(state(2, true)));
+    assert!(admits_in(&view, 1, 2));
+    assert!(!admits_in(&view, 0, 2), "a corrupt word refuses");
+    assert_eq!(load_in(&view, 0), Err(GuardError::Corrupt { word: 0 }));
+    assert!(!admits_in(&view, 2, 2), "past the end refuses");
+    assert!(load_in(&view, 2).is_err());
+    assert_eq!(close(&words[1]), Ok(Closed::Now { epoch: 3 }));
+    assert!(!admits_in(&view, 1, 2));
+}
+
 proptest! {
     // Under Miri: fewer cases and no failure file.
     #![proptest_config(crate::receive::tests_config())]
