@@ -1134,8 +1134,13 @@ fn a_sealed_gap_is_skipped_by_a_reader() {
         poll(&mut subscription),
         PollOutcome::Message { position: 128, .. }
     ));
-    // The record is final: a late copy into it conflicts.
-    assert_eq!(recv(&mut owner, &data(0, 64, 64, 2)), conflict(64, 64));
+    // The record is final: a late copy into it is late after the skip,
+    // counted and not written (GU-7).
+    assert_eq!(
+        recv(&mut owner, &data(0, 64, 64, 2)),
+        Ok(Received::LateAfterSkip)
+    );
+    assert_eq!(owner.counters().frames_late_after_skip, 1);
     // A record's reason is reported as sealed.
     let reason = crate::local_gap::GapReason::RangeUnavailable;
     assert_eq!(
@@ -1537,4 +1542,62 @@ fn a_frame_reader_reports_after_loss_too() {
     }
     assert_eq!(reasons, [LOST, SkipReason::AfterLoss]);
     assert_eq!(reader.subscription().first_loss(), Some(0));
+}
+
+/// GU-7: a late copy is classified in order: an overlap with a committed
+/// real frame is a conflict (or a duplicate), even when it also overlaps a
+/// gap; an overlap with retained gap records alone is `LateAfterSkip`,
+/// counted and not written, so the sealed interval stays sealed; a term no
+/// longer retained is `Late`.
+#[test]
+fn a_late_copy_is_classified_real_overlap_first() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 0, 64, 1)), committed(0, 64));
+    assert_eq!(seal(&mut owner, 64, 128), committed(64, 128));
+    assert_eq!(recv(&mut owner, &data(0, 192, 64, 2)), committed(192, 64));
+    // Inside the gap alone, at its start and in its middle.
+    for offset in [64, 128] {
+        assert_eq!(
+            recv(&mut owner, &data(0, offset, 64, 3)),
+            Ok(Received::LateAfterSkip),
+            "at {offset}"
+        );
+    }
+    // Across the gap and the real frame after it: a conflict.
+    assert_eq!(recv(&mut owner, &data(0, 160, 64, 4)), conflict(160, 64));
+    // Across the real frame before it and the gap: a conflict.
+    assert_eq!(recv(&mut owner, &data(0, 32, 64, 5)), conflict(32, 64));
+    // The real frames still answer as before.
+    assert_eq!(recv(&mut owner, &data(0, 0, 64, 1)), Ok(Received::Duplicate));
+    assert_eq!(owner.counters().frames_late_after_skip, 2);
+    // Nothing was written into the gap: the reader sees it whole.
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Message { position: 0, .. }
+    ));
+    assert_eq!(poll(&mut subscription), skipped(64, 128, LOST));
+}
+
+/// GU-7 in the trailing term: a copy into a retained gap of the term
+/// behind the window is `LateAfterSkip`, one into a real frame of it is a
+/// duplicate or a conflict.
+#[test]
+fn a_late_copy_into_the_trailing_term_is_classified_too() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 0, 64, 1)), committed(0, 64));
+    assert_eq!(seal(&mut owner, 64, 128), committed(64, 128));
+    finish(&mut owner, 0, 192);
+    conductor.duty_cycle().unwrap();
+    assert_eq!(recv(&mut owner, &data(1, 0, 64, 2)), committed(u64::from(TERM), 64));
+    assert_eq!(
+        recv(&mut owner, &data(0, 64, 64, 3)),
+        Ok(Received::LateAfterSkip)
+    );
+    assert_eq!(recv(&mut owner, &data(0, 0, 64, 1)), Ok(Received::Duplicate));
+    assert_eq!(recv(&mut owner, &data(0, 0, 64, 9)), conflict(0, 64));
 }
