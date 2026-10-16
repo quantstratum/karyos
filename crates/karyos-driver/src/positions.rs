@@ -38,8 +38,9 @@ struct Attached {
     cell: usize,
     /// The occupant or export id, 0 for none.
     registration: u64,
-    /// Its stream position: the mapping's base plus the cell position.
-    position: u64,
+    /// Its stream position: the mapping's base plus the cell position;
+    /// `None` if the sum does not fit (checked, SPEC.md §14).
+    position: Option<u64>,
 }
 
 /// The cells of one subscriber.
@@ -167,6 +168,7 @@ impl Positions {
             }
         }
         // Allocations and values.
+        let mut overflowed = false;
         let mut allocator = PassAllocator {
             counters,
             exhausted: false,
@@ -190,16 +192,20 @@ impl Positions {
             };
             cells.admit(&mut allocator, attached);
             for (subscriber, attached) in cells.subscribers.iter().zip(attached) {
-                set(subscriber.position.as_ref(), attached.position);
+                overflowed |= !set_checked(subscriber.position.as_ref(), attached.position);
             }
-            let at = |value: u64| stream.base.saturating_add(value);
-            set(cells.floor.as_ref(), at(stream.conductor.floor()));
+            let at = |value: u64| stream.base.checked_add(value);
+            overflowed |= !set_checked(cells.floor.as_ref(), at(stream.conductor.floor()));
             if let Ok(head) = stream.conductor.head() {
-                set(cells.head.as_ref(), at(head));
+                overflowed |= !set_checked(cells.head.as_ref(), at(head));
             }
-            set(cells.limit.as_ref(), at(stream.conductor.limit()));
+            overflowed |= !set_checked(cells.limit.as_ref(), at(stream.conductor.limit()));
         }
         let counters = allocator.counters;
+        // A pass in which some position did not fit counts one overflow.
+        if overflowed {
+            counters.add(Event::CounterOverflows, 1);
+        }
         counters.set(Event::PositionsSampledAt, now);
         self.epoch = even;
         counters.end_pass(even);
@@ -245,7 +251,7 @@ fn collect_attached<T: StreamTerms>(stream: &Stream<T>, out: &mut Vec<Attached>)
             generation,
             cell: cell.cell,
             registration: cell.registration,
-            position: retained.base.saturating_add(cell.position),
+            position: retained.base.checked_add(cell.position),
         }));
     }
     let generation = stream.generation.get();
@@ -267,7 +273,7 @@ fn collect_attached<T: StreamTerms>(stream: &Stream<T>, out: &mut Vec<Attached>)
                 generation,
                 cell: cell.cell,
                 registration: cell.registration,
-                position: stream.base.saturating_add(cell.position),
+                position: stream.base.checked_add(cell.position),
             }),
     );
 }
@@ -400,6 +406,18 @@ fn set(counter: Option<&Counter>, value: u64) {
     }
 }
 
+/// Sets a position cell to `value`, or leaves it at its last value when
+/// the position did not fit (`None`). Returns whether it fit.
+fn set_checked(counter: Option<&Counter>, value: Option<u64>) -> bool {
+    match value {
+        Some(value) => {
+            set(counter, value);
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use karyos_sys::counters::{CellRead, CounterMetadata};
@@ -484,6 +502,27 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    /// A position that does not fit (checked, SPEC.md §14) leaves its cell
+    /// at its last value, and the pass counts one counter overflow.
+    #[test]
+    fn a_position_that_does_not_fit_keeps_its_cell_and_counts_an_overflow() {
+        let mut driver = driver(64);
+        let handle = driver.add_stream(stream_config(2)).unwrap();
+        let _reader = driver.subscribe(handle, Role::Required).unwrap();
+        let mut writer = driver.publication(handle).unwrap();
+        let _ = writer.offer(b"one").unwrap();
+        let _ = driver.do_work().unwrap();
+        let head = position(&driver, "stream head").unwrap();
+        assert_ne!(head, 0);
+        let overflows = fixed(&driver, "counter overflows");
+        driver.streams[0].base = u64::MAX;
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(fixed(&driver, "positions epoch"), 4);
+        assert_eq!(fixed(&driver, "counter overflows"), overflows + 1);
+        assert_eq!(position(&driver, "stream head"), Some(head));
     }
 
     #[test]
