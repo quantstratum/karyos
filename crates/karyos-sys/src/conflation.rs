@@ -32,6 +32,7 @@
 //! (also checked with Loom); [`conflation`] builds the owned, safe API over
 //! heap memory.
 
+use crate::load_words::LoadWords;
 use crate::sync::{AtomicU64, Ordering, fence};
 
 /// Words per stride: 128 bytes, as for counters.
@@ -226,38 +227,55 @@ impl<'a> SlotWords<'a> {
     /// [`SlotRead::Unstable`] for values that do not fit.
     #[must_use]
     pub fn read(&self, out: &mut [u8]) -> SlotRead {
-        let (Some(version), Some(length)) = (self.word(VERSION), self.word(LENGTH)) else {
-            return SlotRead::Unstable;
-        };
-        let first = version.load(Ordering::Acquire);
-        if first == 0 {
-            return SlotRead::Empty;
-        }
-        if first % 2 == 1 {
-            return SlotRead::Unstable;
-        }
-        let copied = usize::try_from(length.load(Ordering::Relaxed))
-            .ok()
-            .filter(|&length| length <= self.capacity() && length <= out.len());
-        if let Some(target) = copied.and_then(|copied| out.get_mut(..copied)) {
-            for (index, chunk) in target.chunks_mut(WORD_BYTES).enumerate() {
-                if let Some(word) = self.word(VALUE + index) {
-                    let bytes = word.load(Ordering::Relaxed).to_le_bytes();
-                    if let Some(prefix) = bytes.get(..chunk.len()) {
-                        chunk.copy_from_slice(prefix);
-                    }
+        read_slot(&self.words, out)
+    }
+}
+
+/// The slot reader over any words a reader can load ([`LoadWords`]): a
+/// slot's version, length and value words, as [`SlotWords`] lays them out.
+/// It only loads, so it also reads a slot mapped without write access.
+/// See [`SlotWords::read`].
+#[must_use]
+pub fn read_slot<W: LoadWords>(words: &W, out: &mut [u8]) -> SlotRead {
+    let Some(capacity) = words
+        .len()
+        .checked_sub(VALUE)
+        .and_then(|value_words| value_words.checked_mul(WORD_BYTES))
+    else {
+        return SlotRead::Unstable;
+    };
+    // The version first (Acquire), then the length, as the writer orders
+    // them.
+    let (Some(first), Some(length)) = (words.load_acquire(VERSION), words.load(LENGTH)) else {
+        return SlotRead::Unstable;
+    };
+    if first == 0 {
+        return SlotRead::Empty;
+    }
+    if first % 2 == 1 {
+        return SlotRead::Unstable;
+    }
+    let copied = usize::try_from(length)
+        .ok()
+        .filter(|&length| length <= capacity && length <= out.len());
+    if let Some(target) = copied.and_then(|copied| out.get_mut(..copied)) {
+        for (index, chunk) in target.chunks_mut(WORD_BYTES).enumerate() {
+            if let Some(word) = words.load(VALUE + index) {
+                let bytes = word.to_le_bytes();
+                if let Some(prefix) = bytes.get(..chunk.len()) {
+                    chunk.copy_from_slice(prefix);
                 }
             }
         }
-        fence(Ordering::Acquire);
-        let second = version.load(Ordering::Relaxed);
-        match copied {
-            Some(length) if first == second => SlotRead::Value {
-                version: first,
-                length,
-            },
-            _ => SlotRead::Unstable,
-        }
+    }
+    fence(Ordering::Acquire);
+    let second = words.load(VERSION).unwrap_or(0);
+    match copied {
+        Some(length) if first == second => SlotRead::Value {
+            version: first,
+            length,
+        },
+        _ => SlotRead::Unstable,
     }
 }
 
