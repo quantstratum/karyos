@@ -6,16 +6,29 @@
 //! error mapping are tested deterministically, under Miri as well. Test
 //! hook only (feature `test-hooks`).
 //!
+//! A `ScriptedSocket` is a handle to one shared script, like a descriptor
+//! to one socket: [`SocketOps::try_clone`] and [`ScriptedSocket::observer`]
+//! return handles to the same script and counters, so the two halves of a
+//! split endpoint share it and a test inspects it while the endpoint owns
+//! its handles. A handle is a live descriptor from a successful
+//! [`SocketOps::open`] or `try_clone` until [`SocketOps::close`] or its
+//! drop; [`ScriptedSocket::live_descriptors`] counts them.
+//!
 //! Scripts are stored when they are pushed and consumed by a cursor, so
-//! `send` and `recv` neither allocate nor free: a counting allocator test
-//! of the data path can run over this double. A call with no scripted
-//! result left behaves as an idle nonblocking socket, returning `EAGAIN`,
-//! and is counted as unscripted.
+//! `send` and `recv` neither allocate nor free once the shared lock has
+//! been taken on the control path: a counting allocator test of the data
+//! path can run over this double. A call with no scripted result left
+//! behaves as an idle nonblocking socket, returning `EAGAIN`, and is
+//! counted as unscripted. A data call on a handle that is not live returns
+//! `EBADF`.
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::ops::{Errno, RecvResult, RouteAddr, SendResult, SocketOps};
+use super::endpoint::{BufferSize, SocketsConfig};
+use super::ops::{Errno, RecvResult, RouteAddr, SendResult, SocketOps, SocketProbes};
+use crate::backend::{CapabilityState, OpenError};
 
 /// A hook that sees every send call before its scripted result is returned,
 /// for example to check the bytes it is handed or to close a guard between
@@ -40,48 +53,98 @@ enum ScriptedRecv {
     },
 }
 
-/// A [`SocketOps`] that returns scripted results and counts its calls.
-pub struct ScriptedSocket {
+/// The script and counters every handle of one socket shares.
+#[derive(Default)]
+struct Script {
     sends: Vec<SendResult>,
     next_send: usize,
     recvs: Vec<ScriptedRecv>,
     next_recv: usize,
+    opens: Vec<Result<SocketProbes, OpenError>>,
+    next_open: usize,
+    clone_failures: Vec<Errno>,
+    route_mtu: Option<u32>,
     send_calls: u64,
     datagrams_offered: u64,
     unscripted_sends: u64,
     recv_calls: u64,
     unscripted_recvs: u64,
+    open_calls: u64,
+    live: u64,
     send_hook: Option<SendHook>,
 }
 
+/// A [`SocketOps`] that returns scripted results and counts its calls.
+pub struct ScriptedSocket {
+    script: Arc<Mutex<Script>>,
+    live: bool,
+}
+
+/// The probes an unscripted [`SocketOps::open`] returns: the address of
+/// the configuration, every probed capability `Active` and each buffer
+/// request met.
+#[must_use]
+pub fn default_probes(config: &SocketsConfig) -> SocketProbes {
+    let buffer = |requested: Option<std::num::NonZeroU32>| match requested {
+        Some(size) => BufferSize {
+            requested,
+            effective: Some(size.get()),
+            state: CapabilityState::Active,
+        },
+        None => BufferSize::NOT_REQUESTED,
+    };
+    SocketProbes {
+        local: config.local,
+        interface: None,
+        dont_fragment: CapabilityState::Active,
+        tx_batch: CapabilityState::Active,
+        send_buffer: buffer(config.send_buffer),
+        recv_buffer: buffer(config.recv_buffer),
+        multicast: config
+            .multicast
+            .map(|multicast| super::endpoint::Membership {
+                group: multicast.group,
+                interface: multicast.interface,
+            }),
+    }
+}
+
 impl ScriptedSocket {
-    /// A socket with empty scripts.
+    /// A closed socket with empty scripts.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sends: Vec::new(),
-            next_send: 0,
-            recvs: Vec::new(),
-            next_recv: 0,
-            send_calls: 0,
-            datagrams_offered: 0,
-            unscripted_sends: 0,
-            recv_calls: 0,
-            unscripted_recvs: 0,
-            send_hook: None,
+            script: Arc::new(Mutex::new(Script::default())),
+            live: false,
         }
     }
 
+    /// Another handle to the same script and counters that is not a
+    /// descriptor: for a test to push results and read counters while the
+    /// endpoint owns the live handles.
+    #[must_use]
+    pub fn observer(&self) -> Self {
+        Self {
+            script: Arc::clone(&self.script),
+            live: false,
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Script> {
+        // A panicking send hook poisons the lock; the script stays usable.
+        self.script.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Appends the result of a later send call.
-    pub fn push_send(&mut self, result: SendResult) -> &mut Self {
-        self.sends.push(result);
+    pub fn push_send(&self, result: SendResult) -> &Self {
+        self.lock().sends.push(result);
         self
     }
 
     /// Appends a datagram for a later receive call, delivered with Linux
     /// `MSG_TRUNC` semantics.
-    pub fn push_recv_datagram(&mut self, payload: &[u8], source: Option<SocketAddr>) -> &mut Self {
-        self.recvs.push(ScriptedRecv::Datagram {
+    pub fn push_recv_datagram(&self, payload: &[u8], source: Option<SocketAddr>) -> &Self {
+        self.lock().recvs.push(ScriptedRecv::Datagram {
             payload: payload.to_vec(),
             source,
         });
@@ -90,64 +153,106 @@ impl ScriptedSocket {
 
     /// Appends an exact receive result; `payload` is copied into the buffer
     /// first, up to the buffer's length.
-    pub fn push_recv(&mut self, result: RecvResult, payload: &[u8]) -> &mut Self {
-        self.recvs.push(ScriptedRecv::Exact {
+    pub fn push_recv(&self, result: RecvResult, payload: &[u8]) -> &Self {
+        self.lock().recvs.push(ScriptedRecv::Exact {
             result,
             payload: payload.to_vec(),
         });
         self
     }
 
+    /// Appends the result of a later open call; an unscripted open
+    /// succeeds with [`default_probes`].
+    pub fn push_open(&self, result: Result<SocketProbes, OpenError>) -> &Self {
+        self.lock().opens.push(result);
+        self
+    }
+
+    /// Makes the next `try_clone` fail with `errno`.
+    pub fn fail_next_clone(&self, errno: Errno) -> &Self {
+        self.lock().clone_failures.push(errno);
+        self
+    }
+
+    /// Sets the route MTU every later measurement returns; `None`, the
+    /// initial value, is an unmeasured route.
+    pub fn set_route_mtu(&self, route_mtu: Option<u32>) -> &Self {
+        self.lock().route_mtu = route_mtu;
+        self
+    }
+
     /// Installs a hook run at the start of every send call.
-    pub fn set_send_hook(&mut self, hook: SendHook) -> &mut Self {
-        self.send_hook = Some(hook);
+    pub fn set_send_hook(&self, hook: SendHook) -> &Self {
+        self.lock().send_hook = Some(hook);
         self
     }
 
     /// Send calls made.
     #[must_use]
     pub fn send_calls(&self) -> u64 {
-        self.send_calls
+        self.lock().send_calls
     }
 
     /// Datagrams offered over all send calls, accepted or not.
     #[must_use]
     pub fn datagrams_offered(&self) -> u64 {
-        self.datagrams_offered
+        self.lock().datagrams_offered
     }
 
     /// Send calls made with no scripted result left.
     #[must_use]
     pub fn unscripted_sends(&self) -> u64 {
-        self.unscripted_sends
+        self.lock().unscripted_sends
     }
 
     /// Scripted send results not consumed yet.
     #[must_use]
     pub fn remaining_sends(&self) -> usize {
-        self.sends
-            .get(self.next_send..)
+        let script = self.lock();
+        script
+            .sends
+            .get(script.next_send..)
             .map_or(0, <[SendResult]>::len)
     }
 
     /// Receive calls made.
     #[must_use]
     pub fn recv_calls(&self) -> u64 {
-        self.recv_calls
+        self.lock().recv_calls
     }
 
     /// Receive calls made with no scripted result left.
     #[must_use]
     pub fn unscripted_recvs(&self) -> u64 {
-        self.unscripted_recvs
+        self.lock().unscripted_recvs
     }
 
     /// Scripted receive results not consumed yet.
     #[must_use]
     pub fn remaining_recvs(&self) -> usize {
-        self.recvs
-            .get(self.next_recv..)
+        let script = self.lock();
+        script
+            .recvs
+            .get(script.next_recv..)
             .map_or(0, <[ScriptedRecv]>::len)
+    }
+
+    /// Open calls made, failed ones included.
+    #[must_use]
+    pub fn open_calls(&self) -> u64 {
+        self.lock().open_calls
+    }
+
+    /// Live descriptors over every handle of the socket.
+    #[must_use]
+    pub fn live_descriptors(&self) -> u64 {
+        self.lock().live
+    }
+
+    /// Whether this handle is a live descriptor.
+    #[must_use]
+    pub fn is_live(&self) -> bool {
+        self.live
     }
 }
 
@@ -159,22 +264,31 @@ impl Default for ScriptedSocket {
 
 impl fmt::Debug for ScriptedSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let script = self.lock();
         f.debug_struct("ScriptedSocket")
-            .field("sends", &self.sends)
-            .field("next_send", &self.next_send)
-            .field("recvs", &self.recvs)
-            .field("next_recv", &self.next_recv)
-            .field("send_calls", &self.send_calls)
-            .field("datagrams_offered", &self.datagrams_offered)
-            .field("unscripted_sends", &self.unscripted_sends)
-            .field("recv_calls", &self.recv_calls)
-            .field("unscripted_recvs", &self.unscripted_recvs)
-            .field("send_hook", &self.send_hook.is_some())
+            .field("live", &self.live)
+            .field("sends", &script.sends)
+            .field("next_send", &script.next_send)
+            .field("recvs", &script.recvs)
+            .field("next_recv", &script.next_recv)
+            .field("send_calls", &script.send_calls)
+            .field("datagrams_offered", &script.datagrams_offered)
+            .field("unscripted_sends", &script.unscripted_sends)
+            .field("recv_calls", &script.recv_calls)
+            .field("unscripted_recvs", &script.unscripted_recvs)
+            .field("live_descriptors", &script.live)
+            .field("send_hook", &script.send_hook.is_some())
             .finish()
     }
 }
 
-/// Adds one to a call counter; a test cannot make `u64::MAX` calls.
+impl Drop for ScriptedSocket {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// Adds to a call counter; a test cannot make `u64::MAX` calls.
 fn bump(counter: &mut u64, by: u64) {
     if let Some(next) = counter.checked_add(by) {
         *counter = next;
@@ -200,34 +314,46 @@ fn copy_prefix(buffer: &mut [u8], payload: &[u8]) -> usize {
 
 impl SocketOps for ScriptedSocket {
     fn send(&mut self, route: &RouteAddr, datagrams: &[&[u8]]) -> SendResult {
-        bump(&mut self.send_calls, 1);
+        let live = self.live;
+        let mut guard = self.lock();
+        let script = &mut *guard;
+        bump(&mut script.send_calls, 1);
         bump(
-            &mut self.datagrams_offered,
+            &mut script.datagrams_offered,
             u64::try_from(datagrams.len()).unwrap_or(u64::MAX),
         );
-        if let Some(hook) = self.send_hook.as_mut() {
+        if !live {
+            return SendResult::Error(Errno::BADF);
+        }
+        if let Some(hook) = script.send_hook.as_mut() {
             hook(route, datagrams);
         }
-        match self.sends.get(self.next_send) {
+        match script.sends.get(script.next_send) {
             Some(result) => {
-                bump_cursor(&mut self.next_send);
-                *result
+                let result = *result;
+                bump_cursor(&mut script.next_send);
+                result
             }
             None => {
-                bump(&mut self.unscripted_sends, 1);
+                bump(&mut script.unscripted_sends, 1);
                 SendResult::Error(Errno::AGAIN)
             }
         }
     }
 
     fn recv(&mut self, buffer: &mut [u8]) -> RecvResult {
-        bump(&mut self.recv_calls, 1);
-        let Some(script) = self.recvs.get(self.next_recv) else {
-            bump(&mut self.unscripted_recvs, 1);
+        let live = self.live;
+        let mut guard = self.lock();
+        let script = &mut *guard;
+        bump(&mut script.recv_calls, 1);
+        if !live {
+            return RecvResult::Error(Errno::BADF);
+        }
+        let Some(entry) = script.recvs.get(script.next_recv) else {
+            bump(&mut script.unscripted_recvs, 1);
             return RecvResult::Error(Errno::AGAIN);
         };
-        bump_cursor(&mut self.next_recv);
-        match script {
+        let result = match entry {
             ScriptedRecv::Datagram { payload, source } => {
                 let len = copy_prefix(buffer, payload);
                 let truncated = (payload.len() > buffer.len()).then_some(payload.len());
@@ -241,7 +367,59 @@ impl SocketOps for ScriptedSocket {
                 copy_prefix(buffer, payload);
                 *result
             }
+        };
+        bump_cursor(&mut script.next_recv);
+        result
+    }
+
+    fn open(&mut self, config: &SocketsConfig) -> Result<SocketProbes, OpenError> {
+        self.close();
+        let mut script = self.lock();
+        bump(&mut script.open_calls, 1);
+        let result = match script.opens.get(script.next_open) {
+            Some(result) => {
+                let result = *result;
+                bump_cursor(&mut script.next_open);
+                result
+            }
+            None => Ok(default_probes(config)),
+        };
+        if result.is_ok() {
+            bump(&mut script.live, 1);
         }
+        drop(script);
+        self.live = result.is_ok();
+        result
+    }
+
+    fn close(&mut self) {
+        if self.live {
+            self.live = false;
+            let mut script = self.lock();
+            // Every live handle was counted when it became live.
+            if let Some(live) = script.live.checked_sub(1) {
+                script.live = live;
+            }
+        }
+    }
+
+    fn try_clone(&self) -> Result<Self, Errno> {
+        let mut script = self.lock();
+        if !self.live {
+            return Err(Errno::BADF);
+        }
+        if !script.clone_failures.is_empty() {
+            return Err(script.clone_failures.remove(0));
+        }
+        bump(&mut script.live, 1);
+        Ok(Self {
+            script: Arc::clone(&self.script),
+            live: true,
+        })
+    }
+
+    fn route_mtu(&mut self, _route: &RouteAddr) -> Option<u32> {
+        self.lock().route_mtu
     }
 }
 
@@ -257,9 +435,20 @@ mod tests {
         RouteAddr::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)))
     }
 
+    fn live() -> ScriptedSocket {
+        let mut socket = ScriptedSocket::new();
+        socket
+            .open(&SocketsConfig::new(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                0,
+            ))))
+            .unwrap();
+        socket
+    }
+
     #[test]
     fn sends_return_the_script_in_order_then_would_block() {
-        let mut socket = ScriptedSocket::new();
+        let mut socket = live();
         socket
             .push_send(SendResult::Sent {
                 sent: 1,
@@ -290,7 +479,7 @@ mod tests {
     fn the_send_hook_sees_every_call_and_its_bytes() {
         let seen = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&seen);
-        let mut socket = ScriptedSocket::default();
+        let mut socket = live();
         socket.set_send_hook(Box::new(move |route, datagrams| {
             assert_eq!(route.address().port(), 7000);
             assert_eq!(datagrams, [b"xyz".as_slice()]);
@@ -305,7 +494,7 @@ mod tests {
     #[test]
     fn datagrams_report_truncation_like_msg_trunc() {
         let source = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
-        let mut socket = ScriptedSocket::new();
+        let mut socket = live();
         socket
             .push_recv_datagram(b"abc", source)
             .push_recv_datagram(b"abcdef", None)
@@ -354,7 +543,7 @@ mod tests {
 
     #[test]
     fn a_payload_as_long_as_the_buffer_is_not_truncated() {
-        let mut socket = ScriptedSocket::new();
+        let mut socket = live();
         socket.push_recv_datagram(b"abcd", None);
         let mut buffer = [0_u8; 4];
         assert_eq!(
@@ -366,5 +555,54 @@ mod tests {
             }
         );
         assert_eq!(&buffer, b"abcd");
+    }
+
+    #[test]
+    fn handles_share_one_script_and_count_live_descriptors() {
+        let mut socket = ScriptedSocket::new();
+        let observer = socket.observer();
+        let mut buffer = [0_u8; 4];
+        // A closed handle is a bad descriptor.
+        assert_eq!(socket.recv(&mut buffer), RecvResult::Error(Errno::BADF));
+        assert_eq!(socket.try_clone().err(), Some(Errno::BADF));
+        socket
+            .open(&SocketsConfig::new(SocketAddr::from((
+                Ipv4Addr::LOCALHOST,
+                0,
+            ))))
+            .unwrap();
+        observer.fail_next_clone(Errno::NOMEM);
+        assert_eq!(socket.try_clone().err(), Some(Errno::NOMEM));
+        let mut duplicate = socket.try_clone().unwrap();
+        assert_eq!(observer.live_descriptors(), 2);
+        observer.push_recv_datagram(b"x", None);
+        assert!(matches!(
+            duplicate.recv(&mut buffer),
+            RecvResult::Datagram { len: 1, .. }
+        ));
+        drop(duplicate);
+        assert_eq!(observer.live_descriptors(), 1);
+        assert_eq!(observer.recv_calls(), 2);
+        socket.close();
+        socket.close();
+        assert_eq!(observer.live_descriptors(), 0);
+        assert!(!socket.is_live());
+        assert_eq!(observer.open_calls(), 1);
+        assert_eq!(socket.route_mtu(&route()), None);
+        observer.set_route_mtu(Some(1500));
+        assert_eq!(socket.route_mtu(&route()), Some(1500));
+        observer.push_open(Err(OpenError::Os {
+            operation: "bind",
+            errno: Errno::ADDRNOTAVAIL.raw(),
+        }));
+        assert!(
+            socket
+                .open(&SocketsConfig::new(SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    0
+                ))))
+                .is_err()
+        );
+        assert_eq!(observer.live_descriptors(), 0);
     }
 }

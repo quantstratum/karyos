@@ -24,10 +24,6 @@ use super::{Authority, BackendEpoch, ClaimError, QueueError, RouteId, TxQueueCon
 
 /// The accounting of one open queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 pub(crate) struct QueueAccount {
     authority: Authority,
     route: RouteId,
@@ -40,56 +36,32 @@ pub(crate) struct QueueAccount {
 
 impl QueueAccount {
     /// The authority fixed when the queue opened.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn authority(&self) -> Authority {
         self.authority
     }
 
     /// The route fixed when the queue opened.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn route(&self) -> RouteId {
         self.route
     }
 
     /// The queue's capacity.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn max_pending(&self) -> u16 {
         self.max_pending.get()
     }
 
     /// Claimed, pending and quarantined slots charged to the queue.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn charged(&self) -> u16 {
         self.charged
     }
 
     /// Quarantined slots charged to the queue until reset.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn quarantined(&self) -> u16 {
         self.quarantined
     }
 
     /// Whether the queue holds `max_pending` claimed, pending and
     /// quarantined slots.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn is_full(&self) -> bool {
         self.charged >= self.max_pending.get()
     }
@@ -97,10 +69,6 @@ impl QueueAccount {
 
 /// The open queues of one endpoint and the slots committed to them.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 pub(crate) struct QueueTable {
     queues: HandleTable<TxQueueId, QueueAccount>,
     tx_slots: u32,
@@ -115,10 +83,6 @@ pub(crate) struct QueueTable {
 impl QueueTable {
     /// An empty table of `max_queues` entries over a pool of `tx_slots`,
     /// issuing handles in `epoch`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn new(max_queues: NonZeroU16, tx_slots: NonZeroU16, epoch: BackendEpoch) -> Self {
         Self {
             queues: HandleTable::new(max_queues, epoch),
@@ -132,10 +96,6 @@ impl QueueTable {
     /// (`QueueLimit`), the no overcommit rule (`OverCommitted`), then the
     /// generation counter (`IdentityExhausted`). A failed open changes
     /// nothing.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn open(&mut self, config: TxQueueConfig) -> Result<TxQueueId, QueueError> {
         if !self.queues.has_free() {
             return Err(QueueError::QueueLimit);
@@ -161,19 +121,11 @@ impl QueueTable {
     }
 
     /// The account of `queue`, if the handle is live.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn get(&self, queue: TxQueueId) -> Option<&QueueAccount> {
         self.queues.get(queue)
     }
 
     /// Charges one claimed frame to `queue`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn charge(&mut self, queue: TxQueueId) -> Result<(), ClaimError> {
         let account = self.queues.get_mut(queue).ok_or(ClaimError::UnknownQueue)?;
         if account.is_full() {
@@ -193,10 +145,6 @@ impl QueueTable {
     /// Returns one charge of `queue`: its frame was dropped, or its pending
     /// item was submitted or returned. A quarantined charge never returns
     /// here; it leaves only at reset.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn discharge(&mut self, queue: TxQueueId) -> bool {
         match self.queues.get_mut(queue) {
             Some(account) if account.charged > account.quarantined => {
@@ -217,10 +165,6 @@ impl QueueTable {
 
     /// One pending item of `queue` was quarantined: its charge stays, as
     /// its slot stays occupied, and is marked quarantined until reset.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn quarantine(&mut self, queue: TxQueueId) -> bool {
         match self.queues.get_mut(queue) {
             Some(account) if account.charged > account.quarantined => {
@@ -242,10 +186,6 @@ impl QueueTable {
     /// Closes `queue` and frees its committed capacity, except the part its
     /// quarantined slots occupy, which stays committed until reset. The
     /// caller returns its claimed and pending items first.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn close(&mut self, queue: TxQueueId) -> Result<QueueAccount, QueueError> {
         let account = self.queues.remove(queue).ok_or(QueueError::UnknownQueue)?;
         debug_assert_eq!(
@@ -272,10 +212,6 @@ impl QueueTable {
     /// Closes every queue and moves the table to `new_epoch` (reset), so no
     /// earlier handle matches again. Every slot becomes uncommitted, as
     /// reset also frees the quarantined slots. Generations are kept.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn close_all(&mut self, new_epoch: BackendEpoch) {
         self.queues.clear(new_epoch);
         self.uncommitted = self.tx_slots;
@@ -301,10 +237,6 @@ impl QueueTable {
     }
 
     /// The open queues.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (TxQueueId, &QueueAccount)> {
         self.queues.iter()
     }

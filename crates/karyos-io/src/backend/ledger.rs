@@ -26,10 +26,6 @@ use super::{
 
 /// Slots, queues and the datagram limit of one endpoint.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 pub(crate) struct TxLedger {
     pool: SlotPool,
     queues: QueueTable,
@@ -40,10 +36,6 @@ impl TxLedger {
     /// A ledger of `tx_slots` slots and `max_queues` queues for datagrams
     /// of at most `max_datagram` bytes, issuing queue handles in `epoch`.
     /// Allocates on the control path only.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn new(
         tx_slots: NonZeroU16,
         max_queues: NonZeroU16,
@@ -67,38 +59,22 @@ impl TxLedger {
     }
 
     /// The slot pool, mutably.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn pool_mut(&mut self) -> &mut SlotPool {
         &mut self.pool
     }
 
     /// The queue table.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn queues(&self) -> &QueueTable {
         &self.queues
     }
 
     /// Opens a queue in the current epoch; see [`QueueTable::open`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn open_queue(&mut self, config: TxQueueConfig) -> Result<TxQueueId, QueueError> {
         self.queues.open(config)
     }
 
     /// Closes a queue; see [`QueueTable::close`]. Its quarantined slots
     /// stay committed until [`TxLedger::reset`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn close_queue(&mut self, queue: TxQueueId) -> Result<(), QueueError> {
         self.queues.close(queue).map(|_| ())
     }
@@ -106,10 +82,6 @@ impl TxLedger {
     /// Reset step 3 of 7.3, once nothing is claimed or pending: closes
     /// every queue, frees the quarantined slots and moves the queue table
     /// to `new_epoch`. Returns how many quarantined slots were freed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn reset(&mut self, new_epoch: BackendEpoch) -> usize {
         debug_assert!(
             self.queues
@@ -129,10 +101,6 @@ impl TxLedger {
     /// `PoolExhausted` when a reset would free a quarantined slot. Under
     /// the accounting of this module the pool runs dry only after
     /// retirement. A failed claim changes nothing.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn claim(
         &mut self,
         active: bool,
@@ -167,10 +135,6 @@ impl TxLedger {
 
     /// A dropped frame: the slot returns to Free and the charge to the
     /// queue.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn release_claim(&mut self, queue: TxQueueId, slot: u32) -> bool {
         let released = self.pool.release_claim(slot);
         if released {
@@ -183,10 +147,6 @@ impl TxLedger {
     /// Checks a commit in the order of 3.3: the endpoint is Active, the
     /// queue is open with the same epoch and generation, `1 <= len <=
     /// capacity` and the options are supported.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn check_commit(
         &self,
         active: bool,
@@ -215,10 +175,6 @@ impl TxLedger {
 
     /// A pending item left its queue: submitted with release at submission
     /// or returned without exposure. The slot is Free again.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn release_pending(&mut self, queue: TxQueueId, slot: u32) -> bool {
         let released = self.pool.release_pending(slot);
         if released {
@@ -232,10 +188,6 @@ impl TxLedger {
     /// and its slot is quarantined until reset. The slot stays charged to
     /// the queue, so it keeps counting towards the queue's `max_pending`
     /// and never towards another queue's share of the pool.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn quarantine(&mut self, queue: TxQueueId, slot: u32) -> bool {
         let quarantined = self.pool.quarantine(slot);
         if quarantined {

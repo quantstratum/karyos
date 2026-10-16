@@ -20,6 +20,8 @@ karyos-sys.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The counting allocator of the no allocation tests (`alloc_count`).
+karyos-sys = { workspace = true, features = ["test-hooks"] }
 proptest.workspace = true
 
 # The workspace lint set without `unsafe_code = "forbid"`, plus the unsafe

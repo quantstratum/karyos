@@ -16,12 +16,10 @@
 
 #![forbid(unsafe_code)]
 
-// The sockets endpoint (P2.3 batch S2) is the first user of the handle
-// table, the slot pool, the queue table and the ledger; until then only
-// their unit tests use them, and each unused item carries its own
-// `expect(dead_code)`, which S2 removes item by item.
-mod handles;
-mod ledger;
+// The handle table, the slot pool, the queue table and the ledger: the
+// building blocks of the sockets endpoint.
+pub(crate) mod handles;
+pub(crate) mod ledger;
 mod pool;
 mod queues;
 
@@ -192,10 +190,6 @@ impl SubmissionId {
     /// Builds the identity of one claim of `slot`.
     #[inline]
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) const fn new(
         instance: InstanceId,
         epoch: BackendEpoch,
@@ -249,10 +243,6 @@ impl TxTicket {
     /// The ticket of the pending item `id`.
     #[inline]
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) const fn new(id: SubmissionId) -> Self {
         Self(id)
     }
@@ -613,10 +603,6 @@ impl TxReport {
     /// Starts filling the report: `None` when it still holds entries, which
     /// the calling operation turns into its `ReportNotEmpty` result before
     /// it calls a gate or the kernel and before it changes any state.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn writer(&mut self) -> Option<ReportWriter<'_>> {
         if self.is_empty() {
             self.head = 0;
@@ -635,18 +621,10 @@ impl Default for TxReport {
 
 /// Appends entries to a report that was empty when the call started.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 pub(crate) struct ReportWriter<'a> {
     report: &'a mut TxReport,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 impl ReportWriter<'_> {
     /// Entries the report can still take.
     pub(crate) fn remaining(&self) -> usize {
@@ -746,6 +724,18 @@ pub enum PendingCause {
     PeerError,
     /// The queue head failed with this error; the queue is faulted.
     Faulted(SendError),
+    /// The flush stopped with [`FlushStop::Failed`] carrying this failure
+    /// before handing off this item; only a reset returns it.
+    ///
+    /// - [`BackendFailure::Os`]: the send call failed in a way that ends
+    ///   the half (`EBADF`, `ENOTSOCK`, `EFAULT`, `EINVAL`, section 4.7).
+    ///   The half is stopped: every later flush returns the same
+    ///   `Failed` with no gate check and no system call until the control
+    ///   path resets the endpoint (3.10: a failure stops only that half).
+    /// - [`BackendFailure::Invariant`]: the endpoint found its own queue
+    ///   state broken before the exposure; the queue is faulted and needs a
+    ///   reset (6.3, S-16).
+    Failed(BackendFailure),
 }
 
 /// Why an item was returned without exposure.
@@ -777,6 +767,13 @@ pub struct FlushOutcome {
 pub enum FlushStop {
     /// The permitted prefix was submitted; the queue may hold more.
     Exposed,
+    /// `sendmmsg` accepted only the first `submitted` items of the
+    /// permitted prefix and lost the error of the next one, which stays
+    /// [`PendingCause::ErrorLost`] (4.3). The queue is not faulted; the next
+    /// flush attempts that item again after a new gate check. Not in the
+    /// 3.4 list of the design, which names no stop for a lost error:
+    /// `Exposed` would claim the whole prefix was submitted.
+    ErrorLost,
     /// The queue held no pending item.
     QueueEmpty,
     /// The gate denied the exposure.
@@ -1065,6 +1062,10 @@ pub enum BackendFailure {
         /// The operation whose result broke its contract.
         operation: &'static str,
     },
+    /// The endpoint is resetting, reset or retired: the half makes no
+    /// system call until the control path reopens it (section 7.3).
+    #[error("endpoint is not active")]
+    NotActive,
 }
 
 /// Why a queue operation failed.
@@ -1142,6 +1143,9 @@ pub enum RouteError {
     /// Route generations are exhausted for the instance. Terminal.
     #[error("route identities exhausted")]
     IdentityExhausted,
+    /// The endpoint is resetting, reset or retired.
+    #[error("endpoint is not active")]
+    NotActive,
 }
 
 /// Why an endpoint could not open, reopen or retire.
@@ -1183,6 +1187,9 @@ pub enum OpenError {
     /// `reopen` or `retire` while pending items remain unreturned.
     #[error("reset incomplete: pending items remain")]
     ResetIncomplete,
+    /// `reopen` of a retired endpoint: retirement is final.
+    #[error("endpoint is retired")]
+    Retired,
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,10 +1220,6 @@ pub struct RxDatagram<'a> {
 
 impl<'a> RxDatagram<'a> {
     /// Lends `bytes`, received from `source` on `path` in `epoch`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) const fn new(
         bytes: &'a [u8],
         source: SocketAddr,
@@ -1319,7 +1322,9 @@ pub enum RxStop {
     HandlerStopped,
     /// The call was interrupted.
     Interrupted,
-    /// The half cannot continue; the control path must reset it.
+    /// The half cannot continue; the control path must reset it. A sockets
+    /// half is then stopped: every later poll returns the same `Failed`
+    /// with no system call until the reset (3.10).
     Failed(BackendFailure),
 }
 
