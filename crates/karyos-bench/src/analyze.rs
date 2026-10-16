@@ -318,6 +318,11 @@ pub struct Analysis {
     pub drift: Vec<String>,
     /// The total runtime of the runs, ms.
     pub runtime_ms: u64,
+    /// The allocation run's `<point>\t<result>` entries, when
+    /// `alloc.json` is present (M-9).
+    pub allocations: Option<Vec<String>>,
+    /// The build that measured.
+    pub build: String,
 }
 
 impl Analysis {
@@ -480,6 +485,12 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             "measured under manifest {version} ({hash}); this analysis is for {VERSION} ({MANIFEST_SHA256})"
         )));
     }
+    if header.string("build")? != "timing" {
+        return Err(BenchError(format!(
+            "measured by the {} build: only a timing build's runs are analyzed (M-9)",
+            header.string("build")?
+        )));
+    }
     if header.string("faults")? != "off" {
         return Err(BenchError(
             "the runs were not measured with faults off".into(),
@@ -585,6 +596,12 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         runtime_ms = runtime_ms
             .checked_add(line.number("duration_ms")?)
             .ok_or_else(|| BenchError("runtime overflow".into()))?;
+        if line.string("build")? != "timing" {
+            return Err(BenchError(format!(
+                "result {index} comes from the {} build, not a timing build",
+                line.string("build")?
+            )));
+        }
         let planned_dir = format!("runs/{index:04}_{}", planned.slug());
         if line.string("dir")? != planned_dir {
             return Err(BenchError(format!(
@@ -747,6 +764,49 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             .iter()
             .map(|entry| format!("preflight drift: {entry}")),
     );
+    // The allocation run, from its own build (M-9): only an absent file
+    // means not measured; it must cover exactly the measured points, from
+    // the commit that measured.
+    let allocations = match std::fs::read_to_string(out.join("alloc.json")) {
+        Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => None,
+        Err(cause) => return Err(BenchError(format!("alloc.json: {cause}"))),
+        Ok(text) => {
+            let alloc = Object(parse_object(&text)?);
+            if !alloc.string("build")?.starts_with("alloc-count")
+                || alloc.string("manifest_sha256")? != MANIFEST_SHA256
+            {
+                return Err(BenchError(
+                    "alloc.json is not an allocation build's under this manifest".into(),
+                ));
+            }
+            if alloc.string("commit")? != header.string("commit")? {
+                return Err(BenchError(format!(
+                    "alloc.json comes from commit {}, the runs from {}",
+                    alloc.string("commit")?,
+                    header.string("commit")?
+                )));
+            }
+            let entries = alloc.list("points")?.to_vec();
+            let mut covered: Vec<String> = entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .split_once('\t')
+                        .map_or(entry.as_str(), |(point, _)| point)
+                        .to_string()
+                })
+                .collect();
+            let mut measured: Vec<String> = points.iter().map(|p| p.point.to_string()).collect();
+            covered.sort_unstable();
+            measured.sort_unstable();
+            if covered != measured {
+                return Err(BenchError(format!(
+                    "alloc.json covers {covered:?}, the runs measured {measured:?}"
+                )));
+            }
+            Some(entries)
+        }
+    };
     let outcomes: Vec<(Point, Outcome)> = points
         .iter()
         .map(|point| (point.point, point.outcome.clone()))
@@ -784,6 +844,8 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         blockers,
         drift,
         runtime_ms,
+        allocations,
+        build: header.string("build")?.to_string(),
     })
 }
 
@@ -1027,6 +1089,35 @@ pub fn report(analysis: &Analysis) -> String {
     for blocker in &analysis.blockers {
         let _ = writeln!(out, "- {blocker}");
     }
+    let _ = writeln!(out, "\n## Allocations (M-9)\n");
+    match &analysis.allocations {
+        None => {
+            let _ = writeln!(
+                out,
+                "Not measured: no alloc.json (the allocation build did not run)."
+            );
+        }
+        Some(points) => {
+            let zero = points.iter().all(|entry| {
+                entry
+                    .split_once('\t')
+                    .and_then(|(_, result)| result.strip_prefix("send=0 receive="))
+                    .is_some_and(|receive| receive.split(',').all(|n| n == "0"))
+            });
+            let _ = writeln!(
+                out,
+                "From the allocation build (feature alloc-count, never timed): {}.",
+                if zero {
+                    "zero allocations on both stages at every point"
+                } else {
+                    "a stage allocates or a run failed; see below"
+                }
+            );
+            for entry in points {
+                let _ = writeln!(out, "- {}", entry.replace('\t', ": "));
+            }
+        }
+    }
     let _ = writeln!(out, "\n## Gates (manifest 7)\n");
     for (gate, status) in decision::GateTable::default().rows() {
         let _ = writeln!(out, "- {}: {status:?}", gate.name());
@@ -1172,6 +1263,14 @@ pub fn json(analysis: &Analysis) -> String {
             json_string(&seed_text())
         ),
         format!("\"messages\":{}", analysis.options.messages),
+        format!("\"build\":{}", json_string(&analysis.build)),
+        format!(
+            "\"allocations\":{}",
+            analysis
+                .allocations
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |entries| json_list(entries))
+        ),
         format!("\"rounds\":{}", analysis.options.runs),
         format!("\"decision_grade\":{}", analysis.decision_grade()),
         format!("\"grade_reasons\":{}", json_list(&grade)),
@@ -1320,7 +1419,7 @@ mod tests {
             out.join("measure.json"),
             format!(
                 "{{\"manifest_version\":\"{VERSION}\",\"manifest_sha256\":\"{hash}\",\
-                 \"faults\":\"off\",\"host\":\"h\",\"profile\":\"release\",\
+                 \"faults\":\"off\",\"build\":\"timing\",\"host\":\"h\",\"profile\":\"release\",\
                  \"commit\":\"c\",\"class\":\"{class}\",\"environment\":\"{class}\",\
                  \"messages\":10,\"warmup\":0,\"rounds\":5,\"e_max\":64,\
                  \"rule\":\"CountsEnvelope\",\"configurations\":[{}],\
@@ -1347,10 +1446,12 @@ mod tests {
                         receive_callback: vec![7; count],
                         batches: vec![1; count],
                         drops: 0,
+                        allocations: 0,
                     })
                     .collect(),
                 backpressure: 0,
                 ack_timeouts: 0,
+                send_allocations: 0,
                 messages_per_sample: usize::try_from(planned.messages_per_sample).unwrap(),
                 functional_only: false,
                 functional_reasons: Vec::new(),
@@ -1412,6 +1513,12 @@ mod tests {
             ));
             results.push('\n');
         }
+        // The fixture stands for a timing build's runs, whatever this test
+        // build is.
+        let results = results.replace(
+            &format!("\"build\":\"{}\"", crate::wire::stage::BUILD),
+            "\"build\":\"timing\"",
+        );
         std::fs::write(out.join("results.jsonl"), results).unwrap();
         out
     }
@@ -1596,6 +1703,76 @@ mod tests {
     fn another_manifest_is_refused() {
         let out = fixture("hash", "E4", &"0".repeat(64), ELIGIBLE, None, &none);
         assert!(error_of(&out).contains("measured under manifest"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn the_allocation_build_never_feeds_timing() {
+        let out = plain("alloc-build");
+        let header = read(&out.join("measure.json")).unwrap();
+        std::fs::write(
+            out.join("measure.json"),
+            header.replace("\"build\":\"timing\"", "\"build\":\"alloc-count\""),
+        )
+        .unwrap();
+        assert!(error_of(&out).contains("only a timing build"));
+        std::fs::write(out.join("measure.json"), &header).unwrap();
+        let results = read(&out.join("results.jsonl")).unwrap();
+        std::fs::write(
+            out.join("results.jsonl"),
+            results.replacen("\"build\":\"timing\"", "\"build\":\"alloc-count\"", 1),
+        )
+        .unwrap();
+        assert!(error_of(&out).contains("not a timing build"));
+        std::fs::write(out.join("results.jsonl"), &results).unwrap();
+        // The allocation run's own file is reported, never decided on; it
+        // must cover exactly the measured points, from the same commit.
+        let measured: Vec<String> = analyze(&out)
+            .unwrap()
+            .points
+            .iter()
+            .map(|p| p.point.to_string())
+            .collect();
+        let alloc = |commit: &str, points: &[String]| {
+            let entries: Vec<String> = points
+                .iter()
+                .map(|point| format!("\"{point}\\tsend=0 receive=0\""))
+                .collect();
+            std::fs::write(
+                out.join("alloc.json"),
+                format!(
+                    "{{\"build\":\"alloc-count\",\"manifest_sha256\":\"{MANIFEST_SHA256}\",\
+                     \"commit\":\"{commit}\",\"points\":[{}]}}\n",
+                    entries.join(",")
+                ),
+            )
+            .unwrap();
+        };
+        alloc("c", &[]);
+        assert!(error_of(&out).contains("alloc.json covers"));
+        alloc("c", &measured[..1]);
+        assert!(error_of(&out).contains("alloc.json covers"));
+        let mut foreign = measured.clone();
+        foreign[0] = "W2/R1/F1".to_string();
+        alloc("c", &foreign);
+        assert!(error_of(&out).contains("alloc.json covers"));
+        alloc("other", &measured);
+        assert!(error_of(&out).contains("from commit other"));
+        alloc("c", &measured);
+        let analysis = write(&out).unwrap();
+        assert_eq!(
+            analysis.allocations.as_ref().map(Vec::len),
+            Some(measured.len())
+        );
+        let report = read(&out.join("report.md")).unwrap();
+        assert!(report.contains("zero allocations on both stages at every point"));
+        let json = read(&out.join("analysis.json")).unwrap();
+        assert!(json.contains("\"allocations\":[\""), "{json}");
+        // Only an absent file means not measured: an unreadable one is
+        // refused.
+        std::fs::remove_file(out.join("alloc.json")).unwrap();
+        std::fs::create_dir(out.join("alloc.json")).unwrap();
+        assert!(error_of(&out).starts_with("alloc.json:"));
         let _ = std::fs::remove_dir_all(&out);
     }
 

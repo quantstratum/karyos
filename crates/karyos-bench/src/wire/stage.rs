@@ -149,6 +149,10 @@ pub struct ReceiverSamples {
     pub batches: Vec<u32>,
     /// Drops the backend reported.
     pub drops: u64,
+    /// The most allocations one receive poll made, every callback of its
+    /// batch included; counted only by the allocation build ([`BUILD`]), 0
+    /// otherwise.
+    pub allocations: u64,
 }
 
 /// The samples of one run.
@@ -163,6 +167,9 @@ pub struct StageSamples {
     pub backpressure: u64,
     /// R1 messages not acknowledged within [`ACK_TIMEOUT`].
     pub ack_timeouts: u64,
+    /// The most allocations one send stage made; counted only by the
+    /// allocation build ([`BUILD`]), 0 otherwise.
+    pub send_allocations: u64,
     /// Messages each sequence stands for: the frames of a W5 datagram,
     /// one otherwise (M-5b).
     pub messages_per_sample: usize,
@@ -191,6 +198,30 @@ impl SenderGate for Open {
             Some(count) => GateDecision::Permit { count },
             None => GateDecision::Deny,
         }
+    }
+}
+
+/// The build this process is: `alloc-count` counts allocations inside
+/// both stages and is never used for timing (M-9; coordinator, ACS 15372);
+/// `timing` is every other build.
+pub const BUILD: &str = if cfg!(feature = "alloc-count") {
+    "alloc-count"
+} else {
+    "timing"
+};
+
+/// Runs `f` and, in the allocation build, counts this thread's
+/// allocations, reallocations and frees during it
+/// (`karyos_sys::alloc_count`); 0 in a timing build.
+#[inline]
+fn counted<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    #[cfg(feature = "alloc-count")]
+    {
+        karyos_sys::alloc_count::count(f)
+    }
+    #[cfg(not(feature = "alloc-count"))]
+    {
+        (f(), 0)
     }
 }
 
@@ -240,6 +271,8 @@ struct Receiver<'p, P: Protection> {
     batch_len: u32,
     batches: Vec<u32>,
     drops: u64,
+    /// The most allocations one poll made (allocation build only).
+    allocations: u64,
     /// The condition that invalidated the run, if any.
     fault: Option<BenchError>,
 }
@@ -287,6 +320,7 @@ impl<'p, P: Protection> Receiver<'p, P> {
             batch_len: 0,
             batches: Vec::with_capacity(batch_room),
             drops: 0,
+            allocations: 0,
             fault: None,
         })
     }
@@ -567,6 +601,9 @@ pub struct Received {
     pub batches: Vec<u32>,
     /// Drops the backend reported.
     pub drops: u64,
+    /// The most allocations one receive decision made (allocation build
+    /// only).
+    pub allocations: u64,
 }
 
 /// How a receive role learns that the sender is done and reports R1
@@ -615,7 +652,10 @@ pub fn receive_role<P: Protection>(
     loop {
         receiver.batch_start = None;
         receiver.batch_len = 0;
-        let outcome = rx.poll_rx(budget, &mut receiver);
+        // The allocation build counts the whole poll: every callback of a
+        // batch, and the backend between them, all inside the H-5 window.
+        let (outcome, allocations) = counted(|| rx.poll_rx(budget, &mut receiver));
+        receiver.allocations = receiver.allocations.max(allocations);
         if receiver.batch_len > 0 {
             if receiver.batches.len() < receiver.batches.capacity() {
                 receiver.batches.push(receiver.batch_len);
@@ -657,6 +697,7 @@ pub fn receive_role<P: Protection>(
         receive_callback: receiver.receive_callback,
         batches: receiver.batches,
         drops: receiver.drops,
+        allocations: receiver.allocations,
     })
 }
 
@@ -690,6 +731,8 @@ pub struct Sent {
     pub backpressure: u64,
     /// R1 messages not acknowledged within [`ACK_TIMEOUT`].
     pub ack_timeouts: u64,
+    /// The most allocations one send stage made (allocation build only).
+    pub allocations: u64,
 }
 
 fn receiver_stopped() -> BenchError {
@@ -792,6 +835,7 @@ pub fn send_role<P: Protection>(
     let mut report = TxReport::new();
     let mut backpressure = 0_u64;
     let mut ack_timeouts = 0_u64;
+    let mut max_allocations = 0_u64;
     let schedule = match run.load {
         StageLoad::Open { rate } => Some(Schedule::new(Instant::now(), rate)?),
         StageLoad::Closed => None,
@@ -809,44 +853,51 @@ pub fn send_role<P: Protection>(
             }
             None => Duration::ZERO,
         };
-        template.stamp(sequence, &mut message)?;
-        let begin = Instant::now();
-        for index in 0..template.datagrams() {
-            let frames = template
-                .datagram(&message, index)
-                .ok_or_else(|| BenchError("datagram index".into()))?;
-            let room = frames
-                .len()
-                .checked_add(envelope)
-                .ok_or_else(|| BenchError("seal length".into()))?;
-            let slot = buffer
-                .get_mut(..room)
-                .ok_or_else(|| BenchError("seal buffer".into()))?;
-            slot.get_mut(..frames.len())
-                .ok_or_else(|| BenchError("seal buffer".into()))?
-                .copy_from_slice(frames);
-            let length = protection
-                .seal(slot, frames.len())
-                .map_err(|error| BenchError(format!("seal: {error}")))?;
-            let sealed = slot
-                .get(..length)
-                .ok_or_else(|| BenchError("sealed length".into()))?;
-            let mut frame = tx
-                .claim_tx(queue, sealed.len())
-                .map_err(|error| BenchError(format!("claim: {error:?}")))?;
-            frame
-                .bytes_mut()
-                .get_mut(..sealed.len())
-                .ok_or_else(|| BenchError("claim capacity".into()))?
-                .copy_from_slice(sealed);
-            frame
-                .commit(Commit {
-                    len: sealed.len(),
-                    token: SenderToken::new(sequence),
-                    options: TxOptions::none(),
-                })
-                .map_err(|_| BenchError("commit rejected".into()))?;
-        }
+        // The stage, from the stamped frames to the last commit; the
+        // allocation build counts what it allocates (M-9).
+        let (staged, allocations) = counted(|| -> Result<Instant, BenchError> {
+            template.stamp(sequence, &mut message)?;
+            let begin = Instant::now();
+            for index in 0..template.datagrams() {
+                let frames = template
+                    .datagram(&message, index)
+                    .ok_or_else(|| BenchError("datagram index".into()))?;
+                let room = frames
+                    .len()
+                    .checked_add(envelope)
+                    .ok_or_else(|| BenchError("seal length".into()))?;
+                let slot = buffer
+                    .get_mut(..room)
+                    .ok_or_else(|| BenchError("seal buffer".into()))?;
+                slot.get_mut(..frames.len())
+                    .ok_or_else(|| BenchError("seal buffer".into()))?
+                    .copy_from_slice(frames);
+                let length = protection
+                    .seal(slot, frames.len())
+                    .map_err(|error| BenchError(format!("seal: {error}")))?;
+                let sealed = slot
+                    .get(..length)
+                    .ok_or_else(|| BenchError("sealed length".into()))?;
+                let mut frame = tx
+                    .claim_tx(queue, sealed.len())
+                    .map_err(|error| BenchError(format!("claim: {error:?}")))?;
+                frame
+                    .bytes_mut()
+                    .get_mut(..sealed.len())
+                    .ok_or_else(|| BenchError("claim capacity".into()))?
+                    .copy_from_slice(sealed);
+                frame
+                    .commit(Commit {
+                        len: sealed.len(),
+                        token: SenderToken::new(sequence),
+                        options: TxOptions::none(),
+                    })
+                    .map_err(|_| BenchError("commit rejected".into()))?;
+            }
+            Ok(begin)
+        });
+        let begin = staged?;
+        max_allocations = max_allocations.max(allocations);
         let committed = Instant::now();
         if let Some(index) = sequence
             .checked_sub(run.warmup)
@@ -886,6 +937,7 @@ pub fn send_role<P: Protection>(
         send,
         backpressure,
         ack_timeouts,
+        allocations: max_allocations,
     })
 }
 
@@ -995,9 +1047,11 @@ pub fn run<P: Protection + Sync>(
             receive_callback: received.receive_callback,
             batches: received.batches,
             drops: received.drops,
+            allocations: received.allocations,
         }],
         backpressure: sent.backpressure,
         ack_timeouts: sent.ack_timeouts,
+        send_allocations: sent.allocations,
         messages_per_sample: prepared.messages_per_sample,
         functional_only: true,
         functional_reasons: vec!["the roles share one process".to_string()],

@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test loom loom-full sim sim-arch unsafe-report bench measure miri build-release deny deps-inventory deps-check lint-sync pre-push
+.PHONY: fmt fmt-check lint doc test loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release deny deps-inventory deps-check lint-sync pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -56,6 +56,12 @@ bench:
 measure:
 	scripts/measure.sh $(MEASURE_ARGS)
 
+# The bench binary built as measure.sh builds it must be a timing build
+# (no alloc-count; an --all-features build never is one).
+timing-build-check:
+	$(CARGO) build -p karyos-bench --release --locked
+	test "$$($${CARGO_TARGET_DIR:-target}/release/karyos-bench build-info)" = "build timing"
+
 miri:
 	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-sys --lib --locked
 
@@ -74,4 +80,4 @@ deps-check:
 lint-sync:
 	scripts/check-lint-sync.sh
 
-pre-push: fmt-check lint-sync deps-check lint doc test loom build-release
+pre-push: fmt-check lint-sync deps-check lint doc test loom build-release timing-build-check

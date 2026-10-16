@@ -37,6 +37,8 @@
 //!
 //! ```text
 //! karyos-bench analyze --out <dir>
+//! karyos-bench alloc --out <dir>      (the alloc-count build only)
+//! karyos-bench build-info             (prints `build timing` or `build alloc-count`)
 //! ```
 //!
 //! decides every point of a `measure` directory and writes `report.md`
@@ -52,6 +54,13 @@ use karyos_bench::manifest::{ILLUSTRATIVE_E_MAX, MtuRule, primary};
 use karyos_bench::plan::{self, PlanOptions};
 use karyos_bench::wire::process::Cores;
 use karyos_bench::{Workload, analyze, defaults, measure, report, run};
+
+/// The allocation build counts allocations with this allocator; it never
+/// measures timing (`alloc-count`, M-9).
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
+    karyos_sys::alloc_count::CountingAllocator;
 
 struct Options {
     workload: Option<Workload>,
@@ -206,6 +215,12 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
             karyos_bench::wire::process::FAULTS
         ));
     }
+    if cfg!(feature = "alloc-count") {
+        return Err(
+            "this is the allocation build (alloc-count): it never measures timing; use `alloc`"
+                .to_string(),
+        );
+    }
     let plan = plan::expand(&primary(), &options).map_err(|error| error.0)?;
     if plan_only {
         let _ = write!(out, "{}", plan::render(&plan));
@@ -236,6 +251,19 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
         }
     }
     measure::run_plan(&plan, &dir, &Labels::detect(), &cores, &facts, out).map_err(|error| error.0)
+}
+
+fn alloc_command(args: &[String], out: &mut dyn Write) -> Result<usize, String> {
+    let dir = match args {
+        [flag, dir] if flag == "--out" => PathBuf::from(dir),
+        _ => return Err("alloc needs --out <dir>".to_string()),
+    };
+    if !cfg!(feature = "alloc-count") {
+        return Err(
+            "this is a timing build: counting allocations needs the alloc-count build".to_string(),
+        );
+    }
+    measure::run_alloc(&dir, out).map_err(|error| error.0)
 }
 
 fn analyze_command(args: &[String]) -> Result<String, String> {
@@ -289,6 +317,28 @@ fn main() -> ExitCode {
             }
             Err(message) => {
                 let _ = writeln!(err, "karyos-bench inventory: {message}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("build-info") {
+        // Which build this binary is: measure.sh and `make
+        // timing-build-check` refuse to time anything but `timing`.
+        let _ = writeln!(out, "build {}", karyos_bench::wire::stage::BUILD);
+        return ExitCode::SUCCESS;
+    }
+    if args.first().map(String::as_str) == Some("alloc") {
+        return match alloc_command(args.get(1..).unwrap_or_default(), &mut out) {
+            Ok(0) => ExitCode::SUCCESS,
+            Ok(failed) => {
+                let _ = writeln!(
+                    err,
+                    "karyos-bench alloc: {failed} points allocate or failed"
+                );
+                ExitCode::FAILURE
+            }
+            Err(message) => {
+                let _ = writeln!(err, "karyos-bench alloc: {message}");
                 ExitCode::from(2)
             }
         };

@@ -24,6 +24,13 @@
 //! inventory`), environment classification and decision eligibility
 //! ([`mod@env`]).
 
+/// Counts the allocations of this crate's unit tests in the allocation
+/// build (`alloc-count`, M-9), so the zero-allocation stages are tested.
+#[cfg(all(test, feature = "alloc-count"))]
+#[global_allocator]
+static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
+    karyos_sys::alloc_count::CountingAllocator;
+
 pub mod analyze;
 pub mod decision;
 pub mod env;
