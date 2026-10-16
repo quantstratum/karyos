@@ -170,16 +170,24 @@ impl Direction {
 
     /// The size read back, halved: Linux doubles the set value for its
     /// bookkeeping overhead and reports the doubled value (8.2), so half of
-    /// it is in the units of the request.
-    fn effective(self, fd: &OwnedFd) -> Result<u32, OpenError> {
+    /// it is in the units of the request. `None` when the halved value
+    /// does not fit `u32`, which the kernel's `int` sizes cannot reach.
+    fn effective(self, fd: &OwnedFd) -> Result<Option<u32>, OpenError> {
         let read = match self {
             Self::Send => sockopt::socket_send_buffer_size(fd).map_err(os("getsockopt SO_SNDBUF")),
             Self::Recv => sockopt::socket_recv_buffer_size(fd).map_err(os("getsockopt SO_RCVBUF")),
         }?;
         Ok(read
             .checked_div(2)
-            .and_then(|half| u32::try_from(half).ok())
-            .unwrap_or(u32::MAX))
+            .and_then(|half| u32::try_from(half).ok()))
+    }
+
+    /// The configuration field of the request.
+    const fn field(self) -> &'static str {
+        match self {
+            Self::Send => "send_buffer",
+            Self::Recv => "recv_buffer",
+        }
     }
 
     const fn set_name(self) -> &'static str {
@@ -193,7 +201,9 @@ impl Direction {
 /// Sets a buffer size and reads it back (4.1, 8.2). When the read back is
 /// below the request (the `wmem_max` or `rmem_max` limit), the privileged
 /// `_FORCE` form is tried once; its failure is not an error, and the
-/// effective size below the request is recorded as `BelowRequest`.
+/// effective size below the request is recorded as `BelowRequest`. A read
+/// back that cannot be represented is recorded as `ProbeFailed` with no
+/// effective size, never as a made up one.
 fn buffer(
     fd: &OwnedFd,
     requested: Option<NonZeroU32>,
@@ -202,20 +212,26 @@ fn buffer(
     let Some(request) = requested else {
         return Ok(BufferSize::NOT_REQUESTED);
     };
-    let size = usize::try_from(request.get()).unwrap_or(usize::MAX);
+    let Ok(size) = usize::try_from(request.get()) else {
+        return Err(OpenError::InvalidConfig {
+            field: direction.field(),
+            value: u64::from(request.get()),
+        });
+    };
     retry_intr(|| direction.set(fd, size)).map_err(os(direction.set_name()))?;
     let mut effective = direction.effective(fd)?;
-    if effective < request.get() && retry_intr(|| direction.set_force(fd, size)).is_ok() {
+    let below = |effective: Option<u32>| matches!(effective, Some(size) if size < request.get());
+    if below(effective) && retry_intr(|| direction.set_force(fd, size)).is_ok() {
         effective = direction.effective(fd)?;
     }
-    let state = if effective >= request.get() {
-        CapabilityState::Active
-    } else {
-        CapabilityState::Fallback(Reason::BelowRequest { effective })
+    let state = match effective {
+        Some(size) if size >= request.get() => CapabilityState::Active,
+        Some(size) => CapabilityState::Fallback(Reason::BelowRequest { effective: size }),
+        None => CapabilityState::Fallback(MISMATCH),
     };
     Ok(BufferSize {
         requested,
-        effective: Some(effective),
+        effective,
         state,
     })
 }

@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use proptest::prelude::*;
 
 use super::*;
-use crate::backend::{ClaimError, FlushStop, TxItemOutcome};
+use crate::backend::{BackendFailure, ClaimError, FlushStop, TxItemOutcome};
 use crate::sockets::ops::{Errno, SendResult};
 
 /// The pool of [`config`], split evenly over the model's queues.
@@ -60,7 +60,8 @@ enum Op {
     Reset,
 }
 
-const ERRNOS: [Errno; 8] = [
+/// The errnos of the send column of 4.7; the last four stop the half.
+const ERRNOS: [Errno; 12] = [
     Errno::AGAIN,
     Errno::INTR,
     Errno::NOBUFS,
@@ -69,6 +70,10 @@ const ERRNOS: [Errno; 8] = [
     Errno::MSGSIZE,
     Errno::HOSTUNREACH,
     Errno::ADDRNOTAVAIL,
+    Errno::BADF,
+    Errno::NOTSOCK,
+    Errno::FAULT,
+    Errno::INVAL,
 ];
 
 fn errno(index: u8) -> Errno {
@@ -77,8 +82,8 @@ fn errno(index: u8) -> Errno {
 
 fn documented() -> impl Strategy<Value = Script> {
     prop_oneof![
-        (0..8_u8).prop_map(Script::Error),
-        (1..9_u8, proptest::option::of(0..8_u8))
+        (0..12_u8).prop_map(Script::Error),
+        (1..9_u8, proptest::option::of(0..12_u8))
             .prop_map(|(sent, error)| Script::Sent { sent, error }),
     ]
 }
@@ -170,6 +175,8 @@ struct Model {
     /// Terminal reports per token.
     terminal: HashMap<u64, u32>,
     unknown_seen: bool,
+    /// A `Failed(Os)` result stopped the TX half until the next reset.
+    half_failed: bool,
 }
 
 /// Opens `count` queues of `max_pending` on the harness route, after its
@@ -204,6 +211,7 @@ impl Model {
             owner: HashMap::new(),
             terminal: HashMap::new(),
             unknown_seen: false,
+            half_failed: false,
         }
     }
 
@@ -332,7 +340,7 @@ impl Model {
         // does not.
         let tx = &self.h.as_ref().unwrap().tx;
         let pending: usize = self.lanes.iter().map(|lane| lane.fifo.len()).sum();
-        prop_assert_eq!(tx.pending(), pending);
+        prop_assert_eq!(tx.pending(), Some(pending));
         for token in self.lanes.iter().flat_map(|lane| &lane.fifo) {
             prop_assert!(tx.is_pending(self.tickets[token]));
         }
@@ -352,7 +360,9 @@ impl Model {
         let fault = self.lanes[lane].fault;
         let candidates = self.lanes[lane].fifo.len().min(8);
         let permitted = permit.map_or(candidates, |permit| usize::from(permit).min(candidates));
-        if permitted > 0 && fault == Fault::None {
+        let half_failed = self.half_failed;
+        let exposes = permitted > 0 && fault == Fault::None && !half_failed;
+        if exposes {
             self.h().socket.push_send(result(script, permitted));
         }
         let mut gate = match permit {
@@ -371,12 +381,20 @@ impl Model {
             0,
             "the model predicts every exposure"
         );
-        prop_assert_eq!(sent, u64::from(permitted > 0 && fault == Fault::None));
+        prop_assert_eq!(sent, u64::from(exposes));
+        if half_failed {
+            // A stopped half makes no gate check, no call and no report.
+            let stopped = matches!(outcome.stop, FlushStop::Failed(BackendFailure::Os { .. }));
+            prop_assert!(stopped, "a stopped half returns its failure");
+            prop_assert_eq!(gate.calls, 0);
+            prop_assert!(entries.is_empty());
+        }
         match outcome.stop {
             FlushStop::Faulted(_) => {
                 prop_assert!(fault != Fault::Invariant);
                 self.lanes[lane].fault = Fault::Send;
             }
+            FlushStop::Failed(BackendFailure::Os { .. }) => self.half_failed = true,
             FlushStop::Failed(_) => self.lanes[lane].fault = Fault::Invariant,
             _ => {}
         }
@@ -392,6 +410,7 @@ impl Model {
         let entries = reset_all(&mut endpoint);
         self.apply(&entries)?;
         prop_assert!(self.lanes.iter().all(|lane| lane.fifo.is_empty()));
+        self.half_failed = false;
         endpoint
             .reopen(&config())
             .map_err(|error| TestCaseError::fail(format!("{error}")))?;

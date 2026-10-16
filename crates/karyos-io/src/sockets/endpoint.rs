@@ -460,9 +460,10 @@ impl<O: SocketOps> SocketsEndpoint<O> {
         }
     }
 
-    /// Pending items over every queue.
+    /// Pending items over every queue; `None` if the total does not fit
+    /// `usize`, which 1024 queues of `u16` counts rule out.
     #[must_use]
-    pub fn pending(&self) -> usize {
+    pub fn pending(&self) -> Option<usize> {
         self.tx.pending_total()
     }
 }
@@ -564,9 +565,10 @@ impl<O: SocketOps> SocketsTx<O> {
         self.core.is_pending(ticket)
     }
 
-    /// Pending items over every queue.
+    /// Pending items over every queue; `None` if the total does not fit
+    /// `usize`, which 1024 queues of `u16` counts rule out.
     #[must_use]
-    pub fn pending(&self) -> usize {
+    pub fn pending(&self) -> Option<usize> {
         self.core.pending_total()
     }
 
@@ -574,6 +576,14 @@ impl<O: SocketOps> SocketsTx<O> {
     #[must_use]
     pub fn peer_errors(&self) -> u64 {
         self.core.peer_errors()
+    }
+
+    /// Increments of this half's counters that would have overflowed and
+    /// were not applied: the `counter overflows` count of the driver's
+    /// counter pattern.
+    #[must_use]
+    pub fn counter_overflows(&self) -> u64 {
+        self.core.counter_overflows()
     }
 
     /// The capability snapshot of the half's epoch.
@@ -644,6 +654,14 @@ impl<O: SocketOps> SocketsRx<O> {
     #[must_use]
     pub fn peer_errors(&self) -> u64 {
         self.core.peer_errors()
+    }
+
+    /// Increments of this half's counters that would have overflowed and
+    /// were not applied: the `counter overflows` count of the driver's
+    /// counter pattern.
+    #[must_use]
+    pub fn counter_overflows(&self) -> u64 {
+        self.core.counter_overflows()
     }
 
     /// The capability snapshot of the half's epoch.

@@ -138,7 +138,7 @@ fn rx_transient_errors() {
         assert_eq!(outcome.spent.ops, 1, "one op: {errno:?}");
     }
     // The TX half is untouched and nothing was reset.
-    assert_eq!(h.tx.pending(), 1);
+    assert_eq!(h.tx.pending(), Some(1));
     h.socket.push_send(SendResult::Sent {
         sent: 1,
         error: None,
@@ -260,4 +260,23 @@ fn rx_datagram_metadata_and_observation() {
         fn dropped(&mut self, _: RxDrop) {}
     }
     assert_eq!(h.rx.poll_rx(budget(2), &mut Check).delivered, 1);
+}
+
+/// The counter pattern of the driver: an increment that would overflow
+/// leaves the counter unchanged and is counted in `counter overflows`;
+/// only an overflow of that count itself is lost.
+#[test]
+fn a_counter_overflow_is_counted_not_wrapped() {
+    use super::super::rx::count_up;
+    let (mut counter, mut overflows) = (u64::MAX - 1, 0);
+    count_up(&mut counter, &mut overflows);
+    assert_eq!((counter, overflows), (u64::MAX, 0));
+    count_up(&mut counter, &mut overflows);
+    assert_eq!((counter, overflows), (u64::MAX, 1));
+    overflows = u64::MAX;
+    count_up(&mut counter, &mut overflows);
+    assert_eq!((counter, overflows), (u64::MAX, u64::MAX));
+    let h = Harness::new();
+    assert_eq!((h.tx.counter_overflows(), h.rx.counter_overflows()), (0, 0));
+    assert!(h.shutdown().is_empty());
 }
