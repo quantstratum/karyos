@@ -706,10 +706,6 @@ impl<T: TermBytes> LogBuffer<T> {
         &self.control().seal.reason
     }
 
-    /// The reason of a terminal seal, read after an Acquire load of the
-    /// seal word: `None` while the buffer is not sealed, and also for a
-    /// cutover seal, which is not terminal (the stream continues in a
-    /// successor mapping).
     /// The seal line's reason, for a handle that has already observed the
     /// seal with Acquire (so the reason, stored before the seal swap, is
     /// visible); [`SealReason::Unspecified`] when none was recorded.
@@ -717,6 +713,10 @@ impl<T: TermBytes> LogBuffer<T> {
         SealReason::from_code(seal_reason(self.seal_reason_word()))
     }
 
+    /// The reason of a terminal seal, read after an Acquire load of the
+    /// seal word: `None` while the buffer is not sealed, and also for a
+    /// cutover seal, which is not terminal (the stream continues in a
+    /// successor mapping).
     pub(crate) fn terminal_seal_reason(&self) -> Option<SealReason> {
         let raw = self.seal().load(Ordering::Acquire);
         (raw & SEAL_SEALED != 0 && !crate::publication::seal_has_successor(raw))

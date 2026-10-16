@@ -299,6 +299,7 @@ fn offer(
         {
             OfferOutcome::Accepted { .. } => return Ok(()),
             OfferOutcome::Closed => return Err(BenchError("the stream closed".into())),
+            OfferOutcome::Gated => return Err(BenchError("the stream's guard closed".into())),
             _ => waiting(start, &mut checked, watch)?,
         }
     }
