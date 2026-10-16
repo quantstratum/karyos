@@ -35,6 +35,7 @@
 //!   resources can be released. The conductor treats it as fatal for the
 //!   driver.
 
+pub mod endpoints;
 pub mod ring;
 
 use std::num::NonZeroUsize;
@@ -45,6 +46,8 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use karyos_io::sockets::endpoint::{SocketsRx, SocketsTx};
+use karyos_io::sockets::ops::SocketOps;
 use ring::{PostError, Reservation, RingReceiver, RingSender};
 
 /// Which network agent.
@@ -135,6 +138,8 @@ pub struct AgentConfig {
     pub event_capacity: usize,
     /// Commands an agent serves per duty cycle, at least 1.
     pub command_budget: u32,
+    /// Endpoint halves each agent holds at once, at least 1.
+    pub max_endpoints: usize,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -148,6 +153,7 @@ impl Default for AgentConfig {
             command_capacity: 64,
             event_capacity: 64,
             command_budget: 16,
+            max_endpoints: 16,
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -167,19 +173,70 @@ impl AgentConfig {
                 "command_budget must be at least 1",
             ));
         }
+        if self.max_endpoints == 0 {
+            return Err(AgentError::InvalidConfig(
+                "max_endpoints must be at least 1",
+            ));
+        }
         Ok((commands, events))
+    }
+}
+
+/// Names an endpoint of the conductor's table: never reused within a
+/// driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct EndpointId(pub u32);
+
+/// One half of a split endpoint (`quantstratum-docs:
+/// karyos/design/sockets-backend.md` 3.10): the sender agent holds TX
+/// halves, the receiver agent RX halves. Boxed on the control path (open
+/// and reset), so commands and events stay small; agents only move it.
+#[derive(Debug)]
+pub enum Half<O: SocketOps> {
+    /// The TX half.
+    Tx(Box<SocketsTx<O>>),
+    /// The RX half.
+    Rx(Box<SocketsRx<O>>),
+}
+
+impl<O: SocketOps> Half<O> {
+    /// The agent that holds this half.
+    #[must_use]
+    pub fn agent(&self) -> AgentKind {
+        match self {
+            Half::Tx(_) => AgentKind::Sender,
+            Half::Rx(_) => AgentKind::Receiver,
+        }
     }
 }
 
 /// A conductor command. Each carries the reservation of its reply.
 #[derive(Debug)]
-pub enum AgentCommand {
+pub enum AgentCommand<O: SocketOps> {
     /// Answer with [`AgentEvent::Pong`] carrying `token`.
     Ping {
         /// The reply's slot.
         reply: Reservation,
         /// Echoed in the reply.
         token: u64,
+    },
+    /// Hold `half` of `endpoint`: answer [`AgentEvent::Attached`], or
+    /// [`AgentEvent::Refused`] with the half (the wrong agent's half, a
+    /// full table or an endpoint already held).
+    Attach {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its half for this agent.
+        half: Half<O>,
+    },
+    /// Hand back the half of `endpoint`: answer [`AgentEvent::Detached`].
+    Detach {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
     },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
@@ -190,8 +247,8 @@ pub enum AgentCommand {
 }
 
 /// An agent's event to the conductor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentEvent {
+#[derive(Debug)]
+pub enum AgentEvent<O: SocketOps> {
     /// The reply to a ping.
     Pong {
         /// The agent.
@@ -205,24 +262,54 @@ pub enum AgentEvent {
         /// The agent.
         agent: AgentKind,
     },
+    /// The agent holds the endpoint's half.
+    Attached {
+        /// The agent.
+        agent: AgentKind,
+        /// The endpoint.
+        endpoint: EndpointId,
+    },
+    /// The agent refused the half, which comes back.
+    Refused {
+        /// The agent.
+        agent: AgentKind,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The refused half.
+        half: Half<O>,
+    },
+    /// The agent handed back the endpoint's half; `None` if it held none.
+    Detached {
+        /// The agent.
+        agent: AgentKind,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The half.
+        half: Option<Half<O>>,
+    },
 }
 
 /// What an agent has from the conductor: its rings, its stop flag and its
 /// state.
 #[derive(Debug)]
-struct AgentCore {
+struct AgentCore<O: SocketOps> {
     kind: AgentKind,
-    commands: RingReceiver<AgentCommand>,
-    events: RingSender<AgentEvent>,
+    commands: RingReceiver<AgentCommand<O>>,
+    events: RingSender<AgentEvent<O>>,
     budget: u32,
     stop: Arc<AtomicBool>,
     stopped: bool,
+    /// The endpoint halves this agent holds, at most `max_endpoints`
+    /// (allocated at creation).
+    halves: Vec<(EndpointId, Half<O>)>,
+    /// The most halves the agent holds (`AgentConfig::max_endpoints`).
+    max_endpoints: usize,
     /// Test only: records each duty cycle's agent, in call order.
     #[cfg(test)]
     calls: Option<Arc<std::sync::Mutex<Vec<AgentKind>>>>,
 }
 
-impl AgentCore {
+impl<O: SocketOps> AgentCore<O> {
     /// One duty cycle: the stop flag first, then up to the budget's
     /// commands; returns how many were served.
     fn serve_commands(&mut self) -> Result<u32, AgentError> {
@@ -264,17 +351,48 @@ impl AgentCore {
                         agent: self.kind,
                         token,
                     };
-                    match self.events.post(reply, event) {
-                        Ok(()) => {}
-                        // The conductor dropped its links: stop, nobody
-                        // reads the reply.
-                        Err(PostError::Gone(_)) => {
-                            self.stopped = true;
-                            break;
+                    if self.reply(reply, event)? {
+                        break;
+                    }
+                }
+                AgentCommand::Attach {
+                    reply,
+                    endpoint,
+                    half,
+                } => {
+                    let event = if half.agent() != self.kind
+                        || self.halves.len() >= self.max_endpoints
+                        || self.halves.iter().any(|(held, _)| *held == endpoint)
+                    {
+                        AgentEvent::Refused {
+                            agent: self.kind,
+                            endpoint,
+                            half,
                         }
-                        Err(PostError::Full(_) | PostError::Foreign(_)) => {
-                            return Err(AgentError::Invariant(self.kind));
+                    } else {
+                        self.halves.push((endpoint, half));
+                        AgentEvent::Attached {
+                            agent: self.kind,
+                            endpoint,
                         }
+                    };
+                    if self.reply(reply, event)? {
+                        break;
+                    }
+                }
+                AgentCommand::Detach { reply, endpoint } => {
+                    let half = self
+                        .halves
+                        .iter()
+                        .position(|(held, _)| *held == endpoint)
+                        .map(|index| self.halves.swap_remove(index).1);
+                    let event = AgentEvent::Detached {
+                        agent: self.kind,
+                        endpoint,
+                        half,
+                    };
+                    if self.reply(reply, event)? {
+                        break;
                     }
                 }
                 #[cfg(test)]
@@ -294,23 +412,69 @@ impl AgentCore {
         }
         Ok(served)
     }
+
+    /// Posts a reply into its reserved slot. Returns `true` when the
+    /// conductor is gone: the agent stops (a half in the lost reply is
+    /// dropped, which closes its descriptor).
+    fn reply(&mut self, reply: Reservation, event: AgentEvent<O>) -> Result<bool, AgentError> {
+        match self.events.post(reply, event) {
+            Ok(()) => Ok(false),
+            Err(PostError::Gone(_)) => {
+                self.stopped = true;
+                Ok(true)
+            }
+            Err(PostError::Full(_) | PostError::Foreign(_)) => {
+                Err(AgentError::Invariant(self.kind))
+            }
+        }
+    }
+
+    /// Takes the halves of the commands still unread in the command ring:
+    /// after a stop, an `Attach` the agent never served still carries its
+    /// half.
+    fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {
+        let mut halves = Vec::new();
+        while let Ok(Some(command)) = self.commands.try_take() {
+            if let AgentCommand::Attach { endpoint, half, .. } = command {
+                halves.push((endpoint, half));
+            }
+        }
+        halves
+    }
+
+    /// Hands back every half this agent holds.
+    fn take_halves(&mut self) -> impl Iterator<Item = (EndpointId, Half<O>)> + '_ {
+        self.halves.drain(..)
+    }
 }
 
 /// The sender agent (`driver-network-agents.md` §3.1). This phase serves
 /// conductor commands only.
 #[derive(Debug)]
-pub struct SenderAgent {
-    core: AgentCore,
+pub struct SenderAgent<O: SocketOps> {
+    core: AgentCore<O>,
 }
 
 /// The receiver agent (`driver-network-agents.md` §3.2). This phase
 /// serves conductor commands only.
 #[derive(Debug)]
-pub struct ReceiverAgent {
-    core: AgentCore,
+pub struct ReceiverAgent<O: SocketOps> {
+    core: AgentCore<O>,
 }
 
-impl SenderAgent {
+impl<O: SocketOps> SenderAgent<O> {
+    /// After a stop: the halves of `Attach` commands the agent never read
+    /// (DN-8). The conductor reclaims them with the held ones.
+    pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {
+        self.core.take_unread_halves()
+    }
+
+    /// Hands back every endpoint half the agent holds, for the conductor
+    /// to join and retire after a stop (DN-8).
+    pub fn take_halves(&mut self) -> impl Iterator<Item = (EndpointId, Half<O>)> + '_ {
+        self.core.take_halves()
+    }
+
     /// One duty cycle at `now` (driver clock, ns); returns its work count.
     ///
     /// # Errors
@@ -329,7 +493,19 @@ impl SenderAgent {
     }
 }
 
-impl ReceiverAgent {
+impl<O: SocketOps> ReceiverAgent<O> {
+    /// After a stop: the halves of `Attach` commands the agent never read
+    /// (DN-8). The conductor reclaims them with the held ones.
+    pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {
+        self.core.take_unread_halves()
+    }
+
+    /// Hands back every endpoint half the agent holds, for the conductor
+    /// to join and retire after a stop (DN-8).
+    pub fn take_halves(&mut self) -> impl Iterator<Item = (EndpointId, Half<O>)> + '_ {
+        self.core.take_halves()
+    }
+
     /// One duty cycle at `now` (driver clock, ns); returns its work count.
     ///
     /// # Errors
@@ -352,14 +528,14 @@ impl ReceiverAgent {
 /// the Shared network mode's thread. The receiver runs first, so control
 /// it posts leaves in the same iteration.
 #[derive(Debug)]
-pub struct NetworkAgents {
+pub struct NetworkAgents<O: SocketOps> {
     /// The sender agent.
-    pub sender: SenderAgent,
+    pub sender: SenderAgent<O>,
     /// The receiver agent.
-    pub receiver: ReceiverAgent,
+    pub receiver: ReceiverAgent<O>,
 }
 
-impl NetworkAgents {
+impl<O: SocketOps> NetworkAgents<O> {
     /// One iteration: the receiver's duty cycle, then the sender's.
     ///
     /// # Errors
@@ -389,15 +565,48 @@ impl NetworkAgents {
 
 /// The conductor's end of one agent's rings and its stop flag.
 #[derive(Debug)]
-pub struct AgentLink {
+pub struct AgentLink<O: SocketOps> {
     kind: AgentKind,
-    commands: RingSender<AgentCommand>,
-    events: RingSender<AgentEvent>,
-    received: RingReceiver<AgentEvent>,
+    commands: RingSender<AgentCommand<O>>,
+    events: RingSender<AgentEvent<O>>,
+    received: RingReceiver<AgentEvent<O>>,
     stop: Arc<AtomicBool>,
 }
 
-impl AgentLink {
+impl<O: SocketOps> AgentLink<O> {
+    /// Reserves a command slot and its reply slot, so that commands to
+    /// several agents can be committed together or not at all.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Busy`] when either slot is missing.
+    pub fn prepare(&self) -> Result<Prepared, AgentError> {
+        let busy = AgentError::Busy(self.kind);
+        let reply = self.events.reserve().ok_or(busy.clone())?;
+        let slot = self.commands.reserve().ok_or(busy)?;
+        Ok(Prepared { reply, slot })
+    }
+
+    /// Posts the command `make` builds around the reply's reservation into
+    /// the prepared slot.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Gone`] when the agent is gone, [`AgentError::Invariant`]
+    /// for a broken ring invariant.
+    pub fn commit(
+        &self,
+        prepared: Prepared,
+        make: impl FnOnce(Reservation) -> AgentCommand<O>,
+    ) -> Result<(), AgentError> {
+        self.commands
+            .post(prepared.slot, make(prepared.reply))
+            .map_err(|error| match error {
+                PostError::Gone(_) => AgentError::Gone(self.kind),
+                PostError::Full(_) | PostError::Foreign(_) => AgentError::Invariant(self.kind),
+            })
+    }
+
     /// Posts the command `make` builds around its reply's reservation.
     /// Nothing is posted when a slot is missing.
     ///
@@ -406,16 +615,12 @@ impl AgentLink {
     /// [`AgentError::Busy`] when the command ring or the reply slot is
     /// full, [`AgentError::Gone`] when the agent is gone,
     /// [`AgentError::Invariant`] for a broken ring invariant.
-    pub fn post(&self, make: impl FnOnce(Reservation) -> AgentCommand) -> Result<(), AgentError> {
-        let busy = AgentError::Busy(self.kind);
-        let reply = self.events.reserve().ok_or(busy.clone())?;
-        let slot = self.commands.reserve().ok_or(busy)?;
-        self.commands
-            .post(slot, make(reply))
-            .map_err(|error| match error {
-                PostError::Gone(_) => AgentError::Gone(self.kind),
-                PostError::Full(_) | PostError::Foreign(_) => AgentError::Invariant(self.kind),
-            })
+    pub fn post(
+        &self,
+        make: impl FnOnce(Reservation) -> AgentCommand<O>,
+    ) -> Result<(), AgentError> {
+        let prepared = self.prepare()?;
+        self.commit(prepared, make)
     }
 
     /// Posts a ping carrying `token`.
@@ -435,7 +640,7 @@ impl AgentLink {
 
     /// Takes the agent's oldest event.
     #[must_use]
-    pub fn take_event(&self) -> Option<AgentEvent> {
+    pub fn take_event(&self) -> Option<AgentEvent<O>> {
         self.received.try_take().ok().flatten()
     }
 
@@ -446,13 +651,20 @@ impl AgentLink {
     }
 }
 
+/// A command slot and its reply slot, reserved by [`AgentLink::prepare`].
+#[derive(Debug)]
+pub struct Prepared {
+    reply: Reservation,
+    slot: Reservation,
+}
+
 /// The conductor's links to both agents.
 #[derive(Debug)]
-pub struct AgentLinks {
+pub struct AgentLinks<O: SocketOps> {
     /// The sender agent's link.
-    pub sender: AgentLink,
+    pub sender: AgentLink<O>,
     /// The receiver agent's link.
-    pub receiver: AgentLink,
+    pub receiver: AgentLink<O>,
 }
 
 /// Creates both agents and the conductor's links to them. Every ring is
@@ -461,7 +673,9 @@ pub struct AgentLinks {
 /// # Errors
 ///
 /// [`AgentError::InvalidConfig`] for a zero capacity or budget.
-pub fn network_agents(config: AgentConfig) -> Result<(NetworkAgents, AgentLinks), AgentError> {
+pub fn network_agents<O: SocketOps>(
+    config: AgentConfig,
+) -> Result<(NetworkAgents<O>, AgentLinks<O>), AgentError> {
     let (command_capacity, event_capacity) = config.validate()?;
     let make = |kind| {
         let (commands, command_receiver) = ring::ring(command_capacity);
@@ -474,6 +688,8 @@ pub fn network_agents(config: AgentConfig) -> Result<(NetworkAgents, AgentLinks)
             budget: config.command_budget,
             stop: Arc::clone(&stop),
             stopped: false,
+            halves: Vec::with_capacity(config.max_endpoints),
+            max_endpoints: config.max_endpoints,
             #[cfg(test)]
             calls: None,
         };
@@ -509,10 +725,10 @@ const FAILED: u8 = 2;
 
 /// What a runner thread drives.
 #[derive(Debug)]
-enum Work {
-    Sender(SenderAgent),
-    Receiver(ReceiverAgent),
-    Both(NetworkAgents),
+enum Work<O: SocketOps> {
+    Sender(SenderAgent<O>),
+    Receiver(ReceiverAgent<O>),
+    Both(NetworkAgents<O>),
 }
 
 /// Runs one agent's duty cycle, turning a panic into
@@ -524,7 +740,7 @@ fn guarded(
     catch_unwind(AssertUnwindSafe(cycle)).unwrap_or(Err(AgentError::Panicked(kind)))
 }
 
-impl Work {
+impl<O: SocketOps> Work<O> {
     fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         match self {
             Work::Sender(agent) => guarded(AgentKind::Sender, || agent.do_work(now)),
@@ -551,58 +767,69 @@ impl Work {
 
 /// A runner thread's result: its agents and the failure that stopped it,
 /// if any. `None` when the thread was never given work.
-type ThreadResult = Option<(Work, Option<AgentError>)>;
+type ThreadResult<O> = Option<(Work<O>, Option<AgentError>)>;
 
 /// One runner thread: the agents it drives and its state cell.
 #[derive(Debug)]
-struct AgentThread {
+struct AgentThread<O: SocketOps> {
     kinds: Vec<AgentKind>,
     state: Arc<AtomicU8>,
-    handle: JoinHandle<ThreadResult>,
+    handle: JoinHandle<ThreadResult<O>>,
 }
 
 /// The threads of the Dedicated and Shared network modes (DN-2).
 #[derive(Debug)]
-pub struct AgentRunner {
-    threads: Vec<AgentThread>,
+pub struct AgentRunner<O: SocketOps> {
+    threads: Vec<AgentThread<O>>,
     stops: [Arc<AtomicBool>; 2],
     stop_timeout: Duration,
 }
 
 /// Why [`AgentRunner::start`] failed. The agents come back, unstarted.
 #[derive(Debug)]
-pub struct StartError {
+pub struct StartError<O: SocketOps> {
     /// What failed.
     pub error: AgentError,
     /// The agents, as they were given ([`Stopped::into_agents`]).
-    pub agents: Stopped,
+    pub agents: Stopped<O>,
 }
 
 /// What [`AgentRunner::stop`] got back.
-#[derive(Debug, Default)]
-pub struct Stopped {
+#[derive(Debug)]
+pub struct Stopped<O: SocketOps> {
     /// The sender agent, unless its thread is late or lost it.
-    pub sender: Option<SenderAgent>,
+    pub sender: Option<SenderAgent<O>>,
     /// The receiver agent, unless its thread is late or lost it.
-    pub receiver: Option<ReceiverAgent>,
+    pub receiver: Option<ReceiverAgent<O>>,
     /// The failures that stopped threads (DN-9).
     pub failures: Vec<AgentError>,
     /// Threads still running after the timeout, for the conductor to wait
     /// on or abandon.
-    pub late: Vec<LateAgent>,
+    pub late: Vec<LateAgent<O>>,
 }
 
-impl Stopped {
+impl<O: SocketOps> Default for Stopped<O> {
+    fn default() -> Self {
+        Self {
+            sender: None,
+            receiver: None,
+            failures: Vec::new(),
+            late: Vec::new(),
+        }
+    }
+}
+
+impl<O: SocketOps> Stopped<O> {
     /// Both agents, when both came back.
     #[must_use]
-    pub fn into_agents(self) -> Option<NetworkAgents> {
+    pub fn into_agents(self) -> Option<NetworkAgents<O>> {
         Some(NetworkAgents {
             sender: self.sender?,
             receiver: self.receiver?,
         })
     }
 
-    fn take(&mut self, work: Work) {
+    fn take(&mut self, work: Work<O>) {
         match work {
             Work::Sender(agent) => self.sender = Some(agent),
             Work::Receiver(agent) => self.receiver = Some(agent),
@@ -613,7 +840,7 @@ impl Stopped {
         }
     }
 
-    fn absorb(&mut self, thread: AgentThread) {
+    fn absorb(&mut self, thread: AgentThread<O>) {
         let kind = thread.kinds.first().copied().unwrap_or(AgentKind::Receiver);
         match thread.handle.join() {
             Ok(Some((work, failure))) => {
@@ -629,11 +856,11 @@ impl Stopped {
 
 /// A runner thread that did not stop within the timeout.
 #[derive(Debug)]
-pub struct LateAgent {
-    thread: AgentThread,
+pub struct LateAgent<O: SocketOps> {
+    thread: AgentThread<O>,
 }
 
-impl LateAgent {
+impl<O: SocketOps> LateAgent<O> {
     /// The agents it drives.
     #[must_use]
     pub fn kinds(&self) -> &[AgentKind] {
@@ -648,14 +875,14 @@ impl LateAgent {
 
     /// Waits for it to stop and takes its agents back.
     #[must_use]
-    pub fn join(self) -> Stopped {
+    pub fn join(self) -> Stopped<O> {
         let mut stopped = Stopped::default();
         stopped.absorb(self.thread);
         stopped
     }
 }
 
-impl AgentRunner {
+impl<O: SocketOps + Send + 'static> AgentRunner<O> {
     /// Starts the agents' threads in `mode`, each with an idle strategy
     /// from `idle`. Every thread is started before any agent is handed
     /// over, so a failed start leaves nothing running and returns the
@@ -672,10 +899,10 @@ impl AgentRunner {
     )]
     pub fn start<I: IdleStrategy + 'static>(
         mode: ThreadingMode,
-        agents: NetworkAgents,
+        agents: NetworkAgents<O>,
         config: AgentConfig,
         idle: impl Fn() -> I,
-    ) -> Result<Self, StartError> {
+    ) -> Result<Self, StartError<O>> {
         let stops = [
             Arc::clone(&agents.sender.core.stop),
             Arc::clone(&agents.receiver.core.stop),
@@ -707,7 +934,7 @@ impl AgentRunner {
             let state = Arc::new(AtomicU8::new(RUNNING));
             let thread_state = Arc::clone(&state);
             let strategy = idle();
-            let (handoff, waiting) = mpsc::channel::<Work>();
+            let (handoff, waiting) = mpsc::channel::<Work<O>>();
             let name = match kinds.as_slice() {
                 [AgentKind::Sender] => "karyos-sender",
                 [AgentKind::Receiver] => "karyos-receiver",
@@ -774,7 +1001,7 @@ impl AgentRunner {
     /// [`Stopped::late`]; a `stop_timeout` too large for the clock waits
     /// without a deadline.
     #[must_use]
-    pub fn stop(self) -> Stopped {
+    pub fn stop(self) -> Stopped<O> {
         for stop in &self.stops {
             stop.store(true, Ordering::Release);
         }
@@ -801,11 +1028,11 @@ impl AgentRunner {
 
 /// A runner thread's loop: duty cycles until the agents stop or fail; the
 /// agents come back with the failure, if any.
-fn run<I: IdleStrategy>(
-    mut work: Work,
+fn run<O: SocketOps, I: IdleStrategy>(
+    mut work: Work<O>,
     mut idle: I,
     state: &AtomicU8,
-) -> (Work, Option<AgentError>) {
+) -> (Work<O>, Option<AgentError>) {
     loop {
         let now = karyos_sys::host_clock::host_monotonic_ns();
         match work.do_work(now) {
