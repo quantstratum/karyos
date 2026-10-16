@@ -443,6 +443,22 @@ impl ReceiveSessions {
             .is_some_and(|(bound, _)| bound == image)
     }
 
+    /// The binding key and identity of the active image at `slot`: where
+    /// its SMs go and what they report.
+    #[must_use]
+    pub fn binding(&self, slot: SlotRef) -> Option<(BindingKey, Identity)> {
+        match self.get(slot)?.state {
+            State::Active { key, identity } => Some((key, identity)),
+            _ => None,
+        }
+    }
+
+    /// This receiver's boot id, the boot id of its SMs' receiver block.
+    #[must_use]
+    pub fn boot_id(&self) -> [u64; 2] {
+        self.boot_id
+    }
+
     /// Whether `slot` still names an active image (the admission recheck).
     #[must_use]
     pub fn is_active(&self, slot: SlotRef) -> bool {

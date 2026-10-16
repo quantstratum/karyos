@@ -494,6 +494,7 @@ fn a_full_ring_counts_each_kind() {
         endpoint: EndpointId(1),
         destination: source,
         control,
+        guard: None,
     };
     let incoming = |control| super::ControlItem::Incoming {
         endpoint: EndpointId(1),
@@ -516,9 +517,9 @@ fn a_full_ring_counts_each_kind() {
     assert_eq!(counters.ring_full_solicit, 3);
 }
 
-/// P1-1, P1-3 and P2: an SM is dropped and counted; an ANNOUNCE for an
-/// unsubscribed stream is not challenged; a CHALLENGE or SOLICIT for an
-/// alias not published on the endpoint never reaches the ring.
+/// An ANNOUNCE for an unsubscribed stream is not challenged; an SM,
+/// CHALLENGE or SOLICIT for an alias not published on the endpoint never
+/// reaches the ring.
 #[test]
 fn the_receiver_filters_before_the_ring() {
     let (_sender, mut role) = receiver_with(AgentConfig::default());
@@ -558,9 +559,8 @@ fn the_receiver_filters_before_the_ring() {
     intake.control(source, challenge_control());
     intake.control(source, solicit);
     let counters = role.counters();
-    assert_eq!(counters.status_unvalidated, 1);
     assert_eq!(counters.unsubscribed, 1);
-    assert_eq!(counters.not_published, 2);
+    assert_eq!(counters.not_published, 3);
     assert_eq!(counters.forwarded, 0);
 }
 
@@ -652,4 +652,182 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
         ));
     }
     assert_eq!(role.subscriptions, [(EndpointId(1), 6, 512 << 10)]);
+}
+
+/// The sender accepts an SM only from a receiver it answered on that
+/// endpoint (source, receiver boot id), with the answered identity, the
+/// publication's lane count and, after the first, the same receiver id;
+/// consumption never moves back; a new answer to the tuple starts the
+/// binding over.
+#[test]
+fn the_sender_validates_sms_against_its_bindings() {
+    use karyos_protocol::network::{LaneStatus, Receiver, SetupAnswer, StatusMessage};
+
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let endpoint = EndpointId(1);
+    sender.sessions.add(publication(endpoint)).unwrap();
+    let group: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+    sender
+        .publications
+        .push((endpoint, alias(), group, Lanes::new(&[0]).unwrap()));
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    // The answer to the receiver's challenge binds it.
+    let answer = |boot_id| SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(endpoint).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: boot_id,
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    sender.bind(endpoint, receiver, &answer([7, 8]), 0);
+    let status = |boot_id, receiver_id, identity, lanes: &[LaneStatus]| StatusMessage {
+        alias: alias(),
+        identity,
+        receiver: Receiver {
+            receiver_boot_id: boot_id,
+            receiver_id,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(lanes).unwrap(),
+    };
+    let at = |consumption| {
+        [LaneStatus {
+            consumption,
+            window: 32_768,
+        }]
+    };
+    let other = Identity {
+        incarnation: 2,
+        ..identity()
+    };
+    let spoofer: SocketAddr = "10.0.0.66:5000".parse().unwrap();
+    // Another source, another boot id, another endpoint: unbound.
+    sender.status(endpoint, spoofer, &status([7, 8], 1, identity(), &at(0)), 1);
+    sender.status(
+        endpoint,
+        receiver,
+        &status([9, 9], 1, identity(), &at(0)),
+        1,
+    );
+    sender.status(
+        EndpointId(2),
+        receiver,
+        &status([7, 8], 1, identity(), &at(0)),
+        1,
+    );
+    // Bound, but another identity or lane count: mismatch.
+    sender.status(endpoint, receiver, &status([7, 8], 1, other, &at(0)), 1);
+    let two = [at(0)[0]; 2];
+    sender.status(endpoint, receiver, &status([7, 8], 1, identity(), &two), 1);
+    assert_eq!(sender.sessions.counters().established, 0);
+    // The bound receiver, mapped or not: accepted, established.
+    let mapped: SocketAddr = "[::ffff:10.0.0.9]:5000".parse().unwrap();
+    sender.status(
+        endpoint,
+        mapped,
+        &status([7, 8], 1, identity(), &at(4096)),
+        2,
+    );
+    assert_eq!(sender.sessions.counters().established, 1);
+    // A replayed older SM keeps the higher consumption, and is counted.
+    sender.status(
+        endpoint,
+        receiver,
+        &status([7, 8], 1, identity(), &at(1024)),
+        3,
+    );
+    let held = sender.bindings[0].lanes.unwrap();
+    assert_eq!(held.as_slice()[0].consumption, 4096);
+    // Another receiver id: mismatch, until a new answer starts it over (a
+    // reinstalled image).
+    sender.status(
+        endpoint,
+        receiver,
+        &status([7, 8], 2, identity(), &at(4096)),
+        4,
+    );
+    sender.bind(endpoint, receiver, &answer([7, 8]), 5);
+    sender.status(
+        endpoint,
+        receiver,
+        &status([7, 8], 2, identity(), &at(4096)),
+        6,
+    );
+    let counters = sender.counters();
+    assert_eq!(
+        (
+            counters.sm_unbound,
+            counters.sm_mismatch,
+            counters.sm_accepted,
+            counters.sm_stale
+        ),
+        (3, 3, 3, 1)
+    );
+}
+
+/// P1: a flood of answered strangers cannot hold the binding table. An
+/// unconfirmed binding expires after `setup_challenge_timeout` and is the
+/// first evicted when the table is full; a confirmed one stays while its
+/// SMs come, and goes once they stop for `image_liveness_timeout`.
+#[test]
+fn unconfirmed_bindings_never_hold_the_table() {
+    use karyos_protocol::network::{LaneStatus, Receiver, SetupAnswer, StatusMessage};
+
+    let config = AgentConfig::default();
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let endpoint = EndpointId(1);
+    sender.sessions.add(publication(endpoint)).unwrap();
+    let answer = |boot| SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(endpoint).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: [boot, 1],
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    let source = |port| SocketAddr::from(([10, 0, 0, 7], port));
+    // A full table of strangers, answered at once.
+    for boot in 1..=64u64 {
+        let port = u16::try_from(boot).unwrap();
+        sender.bind(endpoint, source(port), &answer(boot), 0);
+    }
+    assert_eq!(sender.bindings.len(), config.receiver_bindings);
+    // The real receiver still binds (the oldest stranger goes) and is
+    // confirmed by its SM.
+    let receiver = SocketAddr::from(([10, 0, 0, 9], 5000));
+    sender.bind(endpoint, receiver, &answer(99), 1);
+    let status = StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [99, 1],
+            receiver_id: 1,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[LaneStatus {
+            consumption: 0,
+            window: 32_768,
+        }])
+        .unwrap(),
+    };
+    sender
+        .publications
+        .push((endpoint, alias(), receiver, Lanes::new(&[0]).unwrap()));
+    sender.status(endpoint, receiver, &status, 2);
+    assert_eq!(sender.sessions.counters().established, 1);
+    assert_eq!(sender.counters().bindings_evicted, 1);
+    // Past the challenge timeout the strangers expire; the confirmed
+    // binding stays while its SMs come.
+    let later = config.sessions.setup_challenge_timeout + 10;
+    sender.status(endpoint, receiver, &status, later);
+    assert_eq!(sender.bindings.len(), 1);
+    assert_eq!(sender.counters().bindings_expired, 63);
+    // Its SMs stop: it goes after the image liveness timeout.
+    sender.expire_bindings(later + config.image_liveness_timeout);
+    assert!(sender.bindings.is_empty());
 }

@@ -133,6 +133,10 @@ impl IdleStrategy for YieldThenSleep {
     }
 }
 
+/// Control ring entries kept for forwarded controls beyond the reserved
+/// RSP_SETUP and SM slots (network-sessions.md S5 `control_queue_floor`).
+const CONTROL_FLOOR: usize = 32;
+
 /// Configuration of the agents and their rings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentConfig {
@@ -172,6 +176,16 @@ pub struct AgentConfig {
     pub rsp_setup_destinations: usize,
     /// `rsp_setup_rate` per driver (default 256 per second).
     pub rsp_setup_rate: u64,
+    /// `sm_interval` in ns: an installed image's SM cadence (default 10 ms,
+    /// multicast-flow-control.md MC-6).
+    pub sm_interval: u64,
+    /// `image_liveness_timeout` in ns: an image with no evidence from its
+    /// binding for this long is retired (default 10 s, network-sessions.md
+    /// S5).
+    pub image_liveness_timeout: u64,
+    /// Receiver bindings the sender tracks (the receivers it answered),
+    /// at least 1 (default 64).
+    pub receiver_bindings: usize,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -198,6 +212,9 @@ impl Default for AgentConfig {
             rsp_setup_per_destination: 20,
             rsp_setup_destinations: 64,
             rsp_setup_rate: 256,
+            sm_interval: 10_000_000,
+            image_liveness_timeout: 10_000_000_000,
+            receiver_bindings: 64,
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -225,6 +242,9 @@ impl AgentConfig {
             || self.rsp_setup_per_destination == 0
             || self.rsp_setup_destinations == 0
             || self.rsp_setup_rate == 0
+            || self.sm_interval == 0
+            || self.image_liveness_timeout == 0
+            || self.receiver_bindings == 0
         {
             return Err(AgentError::InvalidConfig(
                 "a network capacity or budget is zero",
@@ -233,6 +253,20 @@ impl AgentConfig {
         if self.max_endpoints == 0 {
             return Err(AgentError::InvalidConfig(
                 "max_endpoints must be at least 1",
+            ));
+        }
+        // S1: the control ring holds every pending challenge's RSP_SETUP
+        // and one SM slot per image, above a floor for forwarded controls
+        // (one path per image until redundant paths, RP-1).
+        let control = self
+            .sessions
+            .max_images
+            .checked_add(self.sessions.max_pending_challenges)
+            .and_then(|units| units.checked_add(CONTROL_FLOOR))
+            .ok_or(AgentError::InvalidConfig("max_images too large"))?;
+        if self.control_capacity < control {
+            return Err(AgentError::InvalidConfig(
+                "control_capacity below max_pending_challenges + max_images + 32",
             ));
         }
         // S1: three units per image in flight on each session ring.

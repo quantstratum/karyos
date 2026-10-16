@@ -75,6 +75,8 @@ impl Default for Setup {
 }
 
 struct Rig {
+    /// The publishing endpoint A.
+    publisher: EndpointId,
     agents: Agents,
     links: Links,
     endpoints: Endpoints<OsSocket>,
@@ -90,6 +92,7 @@ impl Rig {
         let config = AgentConfig::default();
         let (agents, links) = network_agents::<OsSocket>(config).unwrap();
         let mut rig = Self {
+            publisher: EndpointId(u32::MAX),
             agents,
             links,
             endpoints: Endpoints::new(&config),
@@ -119,6 +122,7 @@ impl Rig {
             }
         }
         assert_eq!(opened, 2);
+        rig.publisher = a;
         let destination = rig.endpoints.local_address(b).unwrap();
         rig.links
             .receiver
@@ -393,4 +397,161 @@ fn partial_credit_drops_the_answer_and_recovers() {
         [ImageEvent::Installed { .. }]
     ));
     assert_eq!(rig.credits(), (FULL - 1, FULL - 1));
+}
+
+/// Establishment (§4.3, network-control-schemas.md §6.2 step 1): the
+/// installed image's first SM reaches the sender from the bound receiver,
+/// is accepted, and the publication's SETUP stops; SMs keep flowing every
+/// `sm_interval`.
+#[test]
+fn the_first_sm_establishes_and_stops_setup() {
+    let (mut rig, _b) = Rig::new(Setup::default());
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established == 1
+    });
+    let announces = rig.agents.sender.role.session_counters().announces;
+    let accepted = rig.agents.sender.role.counters().sm_accepted;
+    // 500 ms more: SMs every 10 ms, no SETUP (its interval is 100 ms).
+    for _ in 0..500 {
+        rig.round(true);
+    }
+    assert_eq!(
+        rig.agents.sender.role.session_counters().announces,
+        announces
+    );
+    let sender = rig.agents.sender.role.counters();
+    assert!(sender.sm_accepted >= accepted + 10, "{sender:?}");
+    assert_eq!((sender.sm_unbound, sender.sm_mismatch), (0, 0));
+    assert!(rig.agents.receiver.counters().sm_sent >= sender.sm_accepted);
+}
+
+/// An SM from a source this sender never answered changes nothing, even
+/// with the publication's alias and identity: it is counted unbound and
+/// SETUP goes on.
+#[test]
+fn a_spoofed_sm_changes_nothing() {
+    use std::net::UdpSocket;
+
+    use karyos_protocol::network::{
+        Control, LaneStatus, MAX_CONTROL_LENGTH, Receiver, StatusMessage,
+    };
+
+    // The subscription accepts no term length: the publication is
+    // announced, never challenged nor answered, so no receiver is bound.
+    let setup = Setup {
+        max_term_length: 0,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup);
+    let target = rig.endpoints.local_address(rig.publisher).unwrap();
+    let status = Control::Status(StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 1,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[
+            LaneStatus {
+                consumption: 0,
+                window: 32_768,
+            },
+            LaneStatus {
+                consumption: 0,
+                window: 32_768,
+            },
+        ])
+        .unwrap(),
+    });
+    let mut bytes = [0u8; MAX_CONTROL_LENGTH];
+    let length = status.encode(&mut bytes).unwrap();
+    let spoofer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    for _ in 0..20 {
+        spoofer.send_to(&bytes[..length], target).unwrap();
+    }
+    rig.until(true, |rig| {
+        rig.agents.sender.role.counters().sm_unbound >= 1
+    });
+    for _ in 0..200 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.sender.role.counters().sm_accepted, 0);
+    assert_eq!(rig.agents.sender.role.session_counters().established, 0);
+    assert!(rig.agents.sender.role.session_counters().announces >= 2);
+}
+
+/// Liveness and retirement (S1): with no evidence from the binding for
+/// `image_liveness_timeout`, the receiver retires the image; a subscriber
+/// still holding a lane keeps the storage; once it lets go the conductor
+/// reclaims it and posts `StorageReclaimed`, and every unit of the chain is
+/// back.
+#[test]
+fn an_idle_image_is_retired_and_reclaimed() {
+    let (mut rig, _b) = Rig::new(Setup::default());
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established == 1
+    });
+    let Some(ImageEvent::Installed { slot, .. }) = rig.events.first().copied() else {
+        panic!("{:?}", rig.events);
+    };
+    // A local subscriber holds a lane.
+    let held = rig.images.installed(slot).unwrap()[0].clone();
+    rig.now += 11_000 * MS;
+    rig.until(true, |rig| {
+        rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Retiring { .. }))
+    });
+    assert_eq!(rig.agents.receiver.counters().images_retired, 1);
+    assert!(!rig.agents.receiver.role.has_image(slot));
+    assert!(rig.images.installed(slot).is_none());
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    assert!(
+        !rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Reclaimed { .. })),
+        "reclaimed while a subscriber holds a lane"
+    );
+    drop(held);
+    rig.until(true, |rig| {
+        rig.events.contains(&ImageEvent::Reclaimed { slot })
+    });
+    rig.round(true);
+    assert_eq!(rig.images.charged(), 0);
+    assert!(rig.images.is_empty());
+    assert_eq!(rig.credits(), (FULL, FULL));
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert_eq!((sessions.retired, sessions.stale_commands), (1, 0));
+}
+
+/// S1's SM slot rule: one slot per image. With the sender stalled, the
+/// image's periodic SMs find their slot still occupied and are skipped and
+/// counted; once the sender runs, exactly the one waiting SM arrives.
+#[test]
+fn a_busy_sm_slot_skips_the_period() {
+    let (mut rig, _b) = Rig::new(Setup::default());
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established == 1
+    });
+    // Drain what is in flight, then stall the sender.
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let accepted = rig.agents.sender.role.counters().sm_accepted;
+    let skipped = rig.agents.receiver.counters().sm_skipped;
+    for _ in 0..100 {
+        rig.now += MS;
+        rig.agents.receiver.do_work(rig.now).unwrap();
+    }
+    assert!(rig.agents.receiver.counters().sm_skipped >= skipped + 5);
+    // One sender cycle sends the one waiting SM; the receiver reads it on
+    // its next cycle and the sender accepts it on the one after.
+    rig.agents.sender.do_work(rig.now).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    rig.agents.receiver.do_work(rig.now).unwrap();
+    rig.agents.sender.do_work(rig.now).unwrap();
+    assert_eq!(rig.agents.sender.role.counters().sm_accepted, accepted + 1);
 }
