@@ -38,23 +38,19 @@
 //! `host_clock::age_ns`, never an addition. Counters are checked and
 //! sticky on overflow.
 
-use std::net::SocketAddr;
-
 use karyos_protocol::network::{Identity, Lanes, TermParams};
 use karyos_sys::host_clock::age_ns;
 
-use super::receive::SlotRef;
-use crate::agents::EndpointId;
+use super::receive::{BindingKey, SlotRef};
 
-/// A path of an image: the local endpoint it arrives on and its source
-/// endpoint. The alias is the image's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PathKey {
-    /// The local endpoint.
-    pub endpoint: EndpointId,
-    /// The source endpoint, from backend metadata.
-    pub source: SocketAddr,
-}
+/// A path of an image: the binding key it completed its challenge from
+/// (the local endpoint, the source endpoint and the alias; one source
+/// endpoint may carry several publications).
+pub type PathKey = BindingKey;
+
+/// The largest `max_paths` (provisional; the owner-side components of
+/// `crate::paths` bound it alike).
+pub const MAX_PATHS: u8 = 16;
 
 /// The table's limits (redundant-paths.md section 5; provisional).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +347,16 @@ impl PathBindings {
             .get(path)?
             .as_ref()
             .map(|binding| binding.joins)
+    }
+
+    /// The identity, term parameters and lane count of the image at
+    /// `slot`, and whether it has a free path.
+    #[must_use]
+    pub fn image(&self, slot: SlotRef) -> Option<(Identity, TermParams, u8, bool)> {
+        let row = self.row(slot)?;
+        let image = row.image?;
+        let free = row.paths.iter().any(Option::is_none);
+        Some((image.identity, image.term, image.lanes, free))
     }
 
     /// Live bindings of the image at `slot`.

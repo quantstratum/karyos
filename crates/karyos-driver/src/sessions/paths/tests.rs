@@ -30,8 +30,12 @@ fn term() -> TermParams {
 
 fn key(endpoint: u32, port: u16) -> PathKey {
     PathKey {
-        endpoint: EndpointId(endpoint),
+        endpoint: crate::agents::EndpointId(endpoint),
         source: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), port)),
+        alias: karyos_protocol::network::Alias {
+            stream_id: 2,
+            session_id: 1,
+        },
     }
 }
 

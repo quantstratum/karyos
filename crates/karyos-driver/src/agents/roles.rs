@@ -93,6 +93,8 @@ pub struct ReceiverCounters {
     pub status_unvalidated: u64,
     /// Images asked of the conductor.
     pub create_image: u64,
+    /// Later paths bound to installed images (RP-1): no image asked.
+    pub paths_bound: u64,
     /// Data and controls this phase does not handle yet.
     pub unhandled: u64,
     /// An increment did not apply.
@@ -576,6 +578,9 @@ impl Intake<'_> {
                     // The conductor gone: the driver is stopping.
                     let _ = sessions.events.post(create, event);
                     self.role.count(|c| &mut c.create_image);
+                }
+                if let AnswerOutcome::PathBound { .. } = outcome {
+                    self.role.count(|c| &mut c.paths_bound);
                 }
             }
             Control::Challenge(_) | Control::Solicit(_) => {

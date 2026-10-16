@@ -25,12 +25,17 @@
 //! - **Bound.** A SETUP for the bound identity is ignored and counted; one
 //!   for another identity is rejected until the image retires; neither
 //!   refreshes liveness.
-//! - **One owner per identity.** An identity active, challenged or answered
-//!   under one key is refused under any other (a second path or a second
-//!   writer) until redundant paths are reviewed (RP-1). The quarantine and
-//!   this uniqueness are checked at the announcement and again at the
-//!   answer and at `ImageReady`, so a challenge created before a retirement
-//!   or before another key bound the identity never installs it.
+//! - **One owner per identity.** An identity challenged or answered under
+//!   one key is refused under any other. An identity active under one key
+//!   may gain a later path under another (`quantstratum-docs:
+//!   karyos/design/redundant-paths.md`, RP-1): with the image's term
+//!   parameters and lane count and a free path, the announcement gets a
+//!   path challenge, whose answer binds the path in [`super::paths`]
+//!   ([`AnswerOutcome::PathBound`]) and creates no image; otherwise it is
+//!   refused. The quarantine and this uniqueness are checked at the
+//!   announcement and again at the answer and at `ImageReady`, so a
+//!   challenge created before a retirement or before another key bound the
+//!   identity never installs it.
 //! - **Retirement.** The binding goes at once; the full identity stays
 //!   quarantined for `alias_quarantine`, and the slot stays charged until
 //!   both the quarantine has passed and the conductor reclaimed the
@@ -42,11 +47,12 @@
 use std::net::SocketAddr;
 
 use karyos_protocol::network::{
-    Alias, ChallengeBlock, Identity, RspChallenge, SetupAnnounce, SetupAnswer, TermParams,
+    Alias, ChallengeBlock, Identity, Lanes, RspChallenge, SetupAnnounce, SetupAnswer, TermParams,
 };
 use karyos_sys::host_clock::age_ns;
 
 use super::NonceSource;
+use super::paths::{PathBindings, PathBindingsConfig};
 use crate::agents::EndpointId;
 
 /// A binding key: the local endpoint, the datagram's source and its alias.
@@ -81,6 +87,13 @@ pub struct SessionConfig {
     /// (`challenge_resend_interval`, network-control-schemas.md §7.4,
     /// default 50 ms).
     pub challenge_resend_interval: u64,
+    /// Paths of one image (`max_paths`, redundant-paths.md section 5,
+    /// default 4), 1 to `super::paths::MAX_PATHS`.
+    pub max_paths: u8,
+    /// A path with no fresh evidence for this long is lost, in ns
+    /// (`path_liveness_timeout`, RP-2; provisional default 10 s, the image
+    /// liveness timeout).
+    pub path_liveness_timeout: u64,
 }
 
 impl Default for SessionConfig {
@@ -93,6 +106,8 @@ impl Default for SessionConfig {
             alias_quarantine: 10_000_000_000,
             timer_actions: 64,
             challenge_resend_interval: 50_000_000,
+            max_paths: 4,
+            path_liveness_timeout: 10_000_000_000,
         }
     }
 }
@@ -121,8 +136,14 @@ impl SessionConfig {
                 "max_pending_per_source above max_pending_challenges",
             ));
         }
-        if self.setup_challenge_timeout == 0 || self.alias_quarantine == 0 {
+        if self.setup_challenge_timeout == 0
+            || self.alias_quarantine == 0
+            || self.path_liveness_timeout == 0
+        {
             return Err(SessionConfigError("a timeout is zero"));
+        }
+        if self.max_paths == 0 || self.max_paths > super::paths::MAX_PATHS {
+            return Err(SessionConfigError("max_paths is not in 1..=MAX_PATHS"));
         }
         Ok(())
     }
@@ -160,6 +181,14 @@ pub enum AnswerOutcome {
         term: TermParams,
         /// Each lane's join position.
         joins: karyos_protocol::network::Lanes<u64>,
+    },
+    /// Accepted as a later path of the active image (RP-1): bound, no
+    /// image created.
+    PathBound {
+        /// The image's installed slot.
+        image: SlotRef,
+        /// The path's index in its bindings.
+        path: usize,
     },
     /// Ignored and counted: the reason.
     Dropped(Ignored),
@@ -204,10 +233,16 @@ pub enum Ignored {
     AlreadyAnswered,
     /// The conductor command chain could not be reserved.
     NoCommandCredit,
-    /// The identity is active, challenged or answered under another key: a
-    /// second path or a second writer (one receive owner per image,
-    /// ADR-0018; redundant paths wait for RP-1).
+    /// The identity is challenged or answered under another key, or active
+    /// under another key with other term parameters or lane count: a second
+    /// writer, or a path that does not match its image (one receive owner
+    /// per image, ADR-0018).
     DuplicateIdentity,
+    /// The identity is active under another key and its image has
+    /// `max_paths` paths.
+    PathsFull,
+    /// A later path's answer was refused by the path bindings (RP-1).
+    PathRefused,
     /// The control's alias differs from the key's.
     AliasMismatch,
     /// The challenge was sent less than `challenge_resend_interval` ago.
@@ -230,6 +265,8 @@ pub struct SessionCounters {
     pub dropped: u64,
     /// Images installed.
     pub installed: u64,
+    /// Later paths bound to installed images (RP-1).
+    pub paths_bound: u64,
     /// Images released at `ImageReady` (too late) or refused.
     pub released: u64,
     /// Images retired.
@@ -269,6 +306,10 @@ enum State {
         /// When this challenge was last handed out for sending.
         last_sent: u64,
         answered: bool,
+        /// A later path's challenge: the image it would add a path to.
+        path_of: Option<SlotRef>,
+        /// The answer's join points, kept for the first path's binding.
+        joins: Option<Lanes<u64>>,
     },
     Active {
         key: BindingKey,
@@ -297,6 +338,8 @@ pub struct ReceiveSessions {
     boot_id: [u64; 2],
     slots: Vec<Slot>,
     counters: SessionCounters,
+    /// The images' path bindings (redundant-paths.md sections 2 and 3).
+    paths: PathBindings,
 }
 
 impl ReceiveSessions {
@@ -312,6 +355,13 @@ impl ReceiveSessions {
         if boot_id == [0, 0] {
             return Err(SessionConfigError("receiver_boot_id is zero"));
         }
+        let paths = PathBindings::new(PathBindingsConfig {
+            max_images: u32::try_from(config.max_images)
+                .map_err(|_| SessionConfigError("max_images above u32"))?,
+            max_paths: config.max_paths,
+            path_liveness_timeout: config.path_liveness_timeout,
+        })
+        .map_err(|_| SessionConfigError("a capacity or budget is zero"))?;
         Ok(Self {
             config,
             boot_id,
@@ -323,7 +373,21 @@ impl ReceiveSessions {
                 config.max_images
             ],
             counters: SessionCounters::default(),
+            paths,
         })
+    }
+
+    /// The images' path bindings: the receive owner refreshes a binding on
+    /// fresh evidence, PATH_HB intake on its datagram, and the timer duty
+    /// removes lost ones (`crate::paths::stats` says what is fresh).
+    #[must_use]
+    pub fn paths(&self) -> &PathBindings {
+        &self.paths
+    }
+
+    /// The images' path bindings, for refresh, PATH_HB and timers.
+    pub fn paths_mut(&mut self) -> &mut PathBindings {
+        &mut self.paths
     }
 
     /// The counters.
@@ -404,6 +468,71 @@ impl ReceiveSessions {
         })
     }
 
+    /// The installed image of `identity` under a key other than `key`.
+    fn active_elsewhere(&self, identity: &Identity, key: &BindingKey) -> Option<SlotRef> {
+        self.slots
+            .iter()
+            .enumerate()
+            .find_map(|(index, slot)| match slot.state {
+                State::Active {
+                    key: other,
+                    identity: held,
+                } if held == *identity && other != *key => Self::slot_ref(index, slot),
+                _ => None,
+            })
+    }
+
+    /// Whether `identity` is challenged or answered under a key other than
+    /// `key`: refused, one challenge at a time.
+    fn pending_elsewhere(&self, identity: &Identity, key: &BindingKey) -> bool {
+        self.slots.iter().any(|slot| match slot.state {
+            State::Challenged {
+                key: other,
+                identity: held,
+                ..
+            } => held == *identity && other != *key,
+            _ => false,
+        })
+    }
+
+    /// What an announcement of `identity` from `key` may become while the
+    /// identity is held under another key (RP-1): nothing held, a later
+    /// path of the active image with its term parameters and lane count
+    /// and a free path, or a refusal.
+    fn path_target(
+        &self,
+        key: &BindingKey,
+        announce: &SetupAnnounce,
+    ) -> Result<Option<SlotRef>, Ignored> {
+        let identity = &announce.identity;
+        if self.pending_elsewhere(identity, key) {
+            return Err(Ignored::DuplicateIdentity);
+        }
+        let Some(image) = self.active_elsewhere(identity, key) else {
+            return Ok(None);
+        };
+        // Every path carries the same session and stream (redundant-paths.md
+        // section 1): another alias for the identity is another writer.
+        let same_alias = self.get(image).is_some_and(
+            |slot| matches!(slot.state, State::Active { key: held, .. } if held.alias == key.alias),
+        );
+        if !same_alias {
+            return Err(Ignored::DuplicateIdentity);
+        }
+        match self.paths.image(image) {
+            Some((held, term, lanes, free))
+                if held == *identity && term == announce.term && lanes == announce.lane_count =>
+            {
+                if free {
+                    Ok(Some(image))
+                } else {
+                    Err(Ignored::PathsFull)
+                }
+            }
+            _ => Err(Ignored::DuplicateIdentity),
+        }
+    }
+
     fn pending(&self, source: Option<SocketAddr>) -> usize {
         self.slots
             .iter()
@@ -473,9 +602,23 @@ impl ReceiveSessions {
         if self.quarantined(&announce.identity, now) {
             return AnnounceOutcome::Dropped(self.ignore(Ignored::Quarantined));
         }
-        if self.elsewhere(&announce.identity, &key) {
-            return AnnounceOutcome::Dropped(self.ignore(Ignored::DuplicateIdentity));
+        // A key bound as a later path is bound: a replayed or late SETUP.
+        if let Some((image, _)) = self.paths.lookup(key) {
+            let same = self
+                .paths
+                .image(image)
+                .is_some_and(|(held, ..)| held == announce.identity);
+            let reason = if same {
+                Ignored::BoundSameIdentity
+            } else {
+                Ignored::BoundOtherIdentity
+            };
+            return AnnounceOutcome::Dropped(self.ignore(reason));
         }
+        let path_of = match self.path_target(&key, announce) {
+            Ok(path_of) => path_of,
+            Err(reason) => return AnnounceOutcome::Dropped(self.ignore(reason)),
+        };
         let timeout = self.config.setup_challenge_timeout;
         let existing = self.slots.iter().position(|slot| match slot.state {
             State::Active { key: bound, .. } | State::Challenged { key: bound, .. } => bound == key,
@@ -541,6 +684,8 @@ impl ReceiveSessions {
                             created_at: now,
                             last_sent: now,
                             answered: false,
+                            path_of,
+                            joins: None,
                         };
                     }
                     self.counters.bump(|c| &mut c.challenges_replaced);
@@ -583,6 +728,8 @@ impl ReceiveSessions {
                 created_at: now,
                 last_sent: now,
                 answered: false,
+                path_of,
+                joins: None,
             };
         }
         self.counters.bump(|c| &mut c.challenges);
@@ -633,6 +780,7 @@ impl ReceiveSessions {
             nonce,
             created_at,
             answered,
+            path_of,
             ..
         } = slot.state
         else {
@@ -660,6 +808,9 @@ impl ReceiveSessions {
         if self.quarantined(&identity, now) {
             return AnswerOutcome::Dropped(self.ignore(Ignored::Quarantined));
         }
+        if let Some(image) = path_of {
+            return self.answer_path(index, image, key, answer, now);
+        }
         if self.elsewhere(&identity, &key) {
             return AnswerOutcome::Dropped(self.ignore(Ignored::DuplicateIdentity));
         }
@@ -670,15 +821,51 @@ impl ReceiveSessions {
             return AnswerOutcome::Dropped(self.ignore(Ignored::TableFull));
         };
         if let Some(entry) = self.slots.get_mut(index)
-            && let State::Challenged { answered, .. } = &mut entry.state
+            && let State::Challenged {
+                answered, joins, ..
+            } = &mut entry.state
         {
             *answered = true;
+            *joins = Some(answer.joins);
         }
         AnswerOutcome::CreateImage {
             slot: slot_ref,
             identity,
             term,
             joins: answer.joins,
+        }
+    }
+
+    /// A later path's checked answer (RP-1): the image must still be
+    /// active under another key; the path is bound with its joins recorded,
+    /// never applied, and no image is created, so no conductor chain is
+    /// reserved. The challenge is consumed either way.
+    fn answer_path(
+        &mut self,
+        index: usize,
+        image: SlotRef,
+        key: BindingKey,
+        answer: &SetupAnswer,
+        now: u64,
+    ) -> AnswerOutcome {
+        if self.active_elsewhere(&answer.identity, &key) != Some(image) {
+            if let Some(entry) = self.slots.get_mut(index) {
+                entry.state = State::Free;
+            }
+            return AnswerOutcome::Dropped(self.ignore(Ignored::DuplicateIdentity));
+        }
+        let bound =
+            self.paths
+                .offer_later(image, key, answer.identity, answer.term, answer.joins, now);
+        if let Some(entry) = self.slots.get_mut(index) {
+            entry.state = State::Free;
+        }
+        match bound {
+            Ok(path) => {
+                self.counters.bump(|c| &mut c.paths_bound);
+                AnswerOutcome::PathBound { image, path }
+            }
+            Err(_) => AnswerOutcome::Dropped(self.ignore(Ignored::PathRefused)),
         }
     }
 
@@ -699,8 +886,10 @@ impl ReceiveSessions {
         let State::Challenged {
             key,
             identity,
+            term,
             created_at,
             answered: true,
+            joins,
             ..
         } = entry.state
         else {
@@ -729,10 +918,18 @@ impl ReceiveSessions {
         entry.generation = generation;
         entry.state = State::Active { key, identity };
         self.counters.bump(|c| &mut c.installed);
-        ReadyOutcome::Installed(SlotRef {
+        let installed = SlotRef {
             slot: slot.slot,
             generation,
-        })
+        };
+        // The first path, at the image's own joins, keyed by the installed
+        // generation.
+        if let Some(joins) = joins {
+            let _ = self
+                .paths
+                .bind_first(installed, identity, term, key, joins, now);
+        }
+        ReadyOutcome::Installed(installed)
     }
 
     /// The conductor's `ImageRefused`: the challenge goes, its token with
@@ -763,6 +960,7 @@ impl ReceiveSessions {
             reclaimed: false,
         };
         self.counters.bump(|c| &mut c.retired);
+        self.paths.image_retired(slot);
         true
     }
 

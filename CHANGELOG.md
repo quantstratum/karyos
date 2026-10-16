@@ -169,6 +169,17 @@ release may break APIs, wire formats and shared-memory layouts.
   whole term of a binding from fresh deliveries only, arrival differences
   from a ring of first arrivals per lane, and freshness per path for path
   liveness, the mark seeded at the path's join and kept across a loss).
+- Redundant path bindings at the receiver (P2.9, redundant-paths.md
+  sections 2 and 3, ACS 15519): `sessions::paths::PathBindings` binds an
+  image's first path at installation and later paths of the same identity,
+  alias, term parameters and lane count through their own challenge (RP-1:
+  their joins are recorded, never applied); a path's liveness takes only
+  fresh evidence and PATH_HB, and a lost path leaves no tombstone. The
+  receive sessions answer a later path with `AnswerOutcome::PathBound`,
+  with no image created and no conductor chain reserved, refuse a full
+  image (`Ignored::PathsFull`), and keep refusing an identity challenged or
+  answered under another key. `SessionConfig` gains `max_paths` and
+  `path_liveness_timeout`.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

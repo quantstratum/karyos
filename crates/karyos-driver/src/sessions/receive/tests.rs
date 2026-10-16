@@ -98,6 +98,7 @@ fn challenged(outcome: AnnounceOutcome) -> RspChallenge {
 fn accepted(outcome: AnswerOutcome) -> SlotRef {
     match outcome {
         AnswerOutcome::CreateImage { slot, .. } => slot,
+        AnswerOutcome::PathBound { .. } => panic!("bound as a path"),
         AnswerOutcome::Dropped(reason) => panic!("dropped: {reason:?}"),
     }
 }
@@ -486,6 +487,8 @@ fn inject(
         created_at: 0,
         last_sent: 0,
         answered,
+        path_of: None,
+        joins: answered.then(|| Lanes::new(&[0, 0]).unwrap()),
     };
     SlotRef {
         slot: u32::try_from(index).unwrap(),
@@ -668,4 +671,151 @@ fn resends_are_held_off() {
         sessions.announce(key(1), &announce(1), 60 * MS, &mut nonces),
         AnnounceOutcome::Dropped(Ignored::ResendHoldoff)
     );
+}
+
+/// RP-1, hooks 2 and 3: a later path of an active image (another source,
+/// the image's alias, term parameters and lane count) gets a path
+/// challenge; its answer binds the path, creates no image and reserves no
+/// conductor chain. The first path was bound at installation, and
+/// retirement clears both.
+#[test]
+fn a_later_path_binds_without_an_image() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let image = install_on_key_one(&mut sessions, &mut nonces);
+    assert_eq!(sessions.paths().live(image), 1);
+    assert_eq!(sessions.paths().lookup(key(1)), Some((image, 0)));
+    let nonce = challenged(sessions.announce(key(2), &announce(1), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    let mut reserved = false;
+    assert_eq!(
+        sessions.answer(key(2), &answer(1, nonce), 3 * MS, || {
+            reserved = true;
+            true
+        }),
+        AnswerOutcome::PathBound { image, path: 1 }
+    );
+    assert!(!reserved, "a path reserves no chain");
+    assert_eq!(sessions.paths().live(image), 2);
+    assert_eq!(sessions.paths().lookup(key(2)), Some((image, 1)));
+    assert_eq!(sessions.counters().installed, 1);
+    assert_eq!(sessions.counters().paths_bound, 1);
+    // The bound path's key announcing again: bound, as for the first path.
+    assert_eq!(
+        sessions.announce(key(2), &announce(1), 4 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::BoundSameIdentity)
+    );
+    assert!(sessions.retire(image, 5 * MS));
+    assert_eq!(sessions.paths().live(image), 0);
+    assert_eq!(sessions.paths().lookup(key(2)), None);
+}
+
+/// Hook 1 keeps every refusal it had (ACS 15540): an identity challenged
+/// or answered under another key is refused as before; so are another
+/// identity on a bound path's key, an active identity with other term
+/// parameters or lane count, and a full image.
+#[test]
+fn a_later_path_keeps_the_refusals() {
+    let mut nonces = Counter::default();
+    // Challenged elsewhere.
+    let mut sessions = table(SessionConfig::default());
+    challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces));
+    assert_eq!(
+        sessions.announce(key(2), &announce(1), 0, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    // Answered elsewhere.
+    let mut sessions = table(SessionConfig::default());
+    inject(&mut sessions, key(1), 1, [90, 0], true);
+    assert_eq!(
+        sessions.announce(key(2), &announce(1), 0, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    // Another identity on a bound path's key.
+    let mut sessions = table(SessionConfig::default());
+    let image = install_on_key_one(&mut sessions, &mut nonces);
+    let nonce = challenged(sessions.announce(key(2), &announce(1), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    assert_eq!(
+        sessions.answer(key(2), &answer(1, nonce), 3 * MS, || true),
+        AnswerOutcome::PathBound { image, path: 1 }
+    );
+    assert_eq!(
+        sessions.announce(key(2), &announce(2), 4 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::BoundOtherIdentity)
+    );
+    // Other term parameters, or another lane count, for the active image.
+    let other_term = SetupAnnounce {
+        term: TermParams {
+            mtu: 1200,
+            ..term()
+        },
+        ..announce(1)
+    };
+    let other_lanes = SetupAnnounce {
+        lane_count: 1,
+        ..announce(1)
+    };
+    for other in [other_term, other_lanes] {
+        assert_eq!(
+            sessions.announce(key(3), &other, 5 * MS, &mut nonces),
+            AnnounceOutcome::Dropped(Ignored::DuplicateIdentity)
+        );
+    }
+    // A full image: `max_paths` 2, both bound.
+    let mut sessions = table(SessionConfig {
+        max_paths: 2,
+        ..SessionConfig::default()
+    });
+    let image = install_on_key_one(&mut sessions, &mut nonces);
+    let nonce = challenged(sessions.announce(key(2), &announce(1), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    assert_eq!(
+        sessions.answer(key(2), &answer(1, nonce), 3 * MS, || true),
+        AnswerOutcome::PathBound { image, path: 1 }
+    );
+    assert_eq!(
+        sessions.announce(key(3), &announce(1), 4 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::PathsFull)
+    );
+    assert_eq!(sessions.counters().installed, 1);
+}
+
+/// A path challenge whose image retired before its answer binds nothing:
+/// the quarantine refuses it, and no image is created.
+#[test]
+fn a_path_answer_after_retirement_binds_nothing() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let image = install_on_key_one(&mut sessions, &mut nonces);
+    let nonce = challenged(sessions.announce(key(2), &announce(1), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    assert!(sessions.retire(image, 3 * MS));
+    assert_eq!(
+        sessions.answer(key(2), &answer(1, nonce), 4 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::Quarantined)
+    );
+    assert_eq!(sessions.paths().lookup(key(2)), None);
+    assert_eq!(sessions.counters().paths_bound, 0);
+}
+
+#[test]
+fn the_path_settings_are_validated() {
+    for (max_paths, timeout) in [(0, 1), (super::super::paths::MAX_PATHS + 1, 1), (4, 0)] {
+        assert!(
+            ReceiveSessions::new(
+                SessionConfig {
+                    max_paths,
+                    path_liveness_timeout: timeout,
+                    ..SessionConfig::default()
+                },
+                BOOT
+            )
+            .is_err()
+        );
+    }
 }
