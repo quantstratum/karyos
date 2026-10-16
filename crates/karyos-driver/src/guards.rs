@@ -102,6 +102,42 @@ struct Entry {
     word: Arc<HeapWords>,
 }
 
+/// The scope a rate limit applies to (`quantstratum-docs:
+/// karyos/design/guards-and-abort.md`, Rate limits). Phase 2 supports the
+/// publication scope only (GC-5); the others are refused at configuration
+/// until their designs exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateScope {
+    /// One publication's messages.
+    Publication,
+    /// A strategy's publications (not supported yet).
+    Strategy,
+    /// An account's publications (not supported yet).
+    Account,
+    /// A destination's traffic (not supported yet).
+    Destination,
+}
+
+impl core::fmt::Display for RateScope {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Publication => "publication",
+            Self::Strategy => "strategy",
+            Self::Account => "account",
+            Self::Destination => "destination",
+        })
+    }
+}
+
+/// A guarded stream's rate limit: its scope and its token buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardRate {
+    /// What the limit applies to.
+    pub scope: RateScope,
+    /// The buckets' rates and bursts.
+    pub policy: karyos_sys::rate_limit::RatePolicy,
+}
+
 /// The guard registry and audit ring of one driver.
 #[derive(Debug)]
 pub(crate) struct Guards {

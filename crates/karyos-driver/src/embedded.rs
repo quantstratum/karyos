@@ -1373,9 +1373,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Guards a stream with `guard` on the control path, before any
     /// publication handle is issued (`quantstratum-docs:
-    /// karyos/design/guards-and-abort.md`, Admission and Local streams).
-    /// Each handle issued later is bound to the guard's open epoch, with an
-    /// outcome ring of `messages` (`C_m`) message records.
+    /// karyos/design/guards-and-abort.md`, Admission, Local streams and
+    /// Rate limits). Each handle issued later is bound to the guard's open
+    /// epoch, with an outcome ring of `messages` (`C_m`) message records
+    /// and, with `rate`, the publication's rate limit: the handle's copy of
+    /// the message bucket returns `RateLimited` early, and the sender
+    /// gate's bucket is authoritative.
     ///
     /// # Errors
     ///
@@ -1388,12 +1391,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::GuardWalkerUnavailable`] when the walker, which holds
     /// one spare-slot credit for the stream's life, finds no credit
     /// ([`WalkerUnavailable::NoSpareCredit`]) or no reader cell
-    /// ([`WalkerUnavailable::NoReaderCell`]).
+    /// ([`WalkerUnavailable::NoReaderCell`]);
+    /// [`DriverError::RateScopeUnsupported`] for a rate scope other than
+    /// the publication (GC-5) and [`DriverError::InvalidRatePolicy`] for a
+    /// policy whose byte burst cannot hold the stream's largest frame, or
+    /// with a zero rate or burst.
     pub fn guard_stream(
         &mut self,
         stream: StreamHandle,
         guard: GuardHandle,
         messages: u64,
+        rate: Option<crate::guards::GuardRate>,
     ) -> Result<(), DriverError> {
         if let Err(error) = self.guards.state(guard) {
             self.report_guard_error(guard.id(), &error);
@@ -1418,6 +1426,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if found.guarded.is_some() || issued || messages == 0 || !fits {
             return Err(DriverError::InvalidConfig);
         }
+        let rate = match rate {
+            None => None,
+            Some(crate::guards::GuardRate {
+                scope: crate::guards::RateScope::Publication,
+                policy,
+            }) => {
+                // Every datagram fits the MTU (aggregate-lanes.md), so a byte
+                // burst that holds the MTU holds whatever a route's sender
+                // gate is validated against.
+                let frame = u64::from(found.config.mtu);
+                policy
+                    .validate(frame)
+                    .map_err(DriverError::InvalidRatePolicy)?;
+                Some(policy)
+            }
+            Some(crate::guards::GuardRate { scope, .. }) => {
+                return Err(DriverError::RateScopeUnsupported { scope });
+            }
+        };
         // The credit is checked first, as admission counts it, so its
         // refusal is told apart from a full cell table.
         let id = found.id;
@@ -1448,7 +1475,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let scratch = usize::try_from(found.buffer.max_message_length())
             .map_err(|_| DriverError::InvalidConfig)?;
         found.guarded = Some(crate::guard_streams::GuardedStream::new(
-            guard, messages, walker, scratch,
+            guard, messages, rate, walker, scratch,
         ));
         Ok(())
     }
@@ -1865,11 +1892,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .base
             .checked_add(position)
             .ok_or(DriverError::PositionsExhausted)?;
-        let (config, generation, guard, messages) = (
+        let (config, generation, guard, messages, rate) = (
             found.config,
             found.generation,
             guarded.guard,
             guarded.messages,
+            guarded.rate,
         );
         let buffer = Arc::new(<T as sealed::Create>::create(self, config, generation)?);
         let mut conductor = buffer
@@ -1880,7 +1908,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             usize::try_from(buffer.max_message_length()).map_err(|_| DriverError::InvalidConfig)?;
         // Every check passed: the swap cannot fail.
         let found = self.stream(handle)?;
-        let fresh = crate::guard_streams::GuardedStream::new(guard, messages, walker, scratch);
+        let fresh =
+            crate::guard_streams::GuardedStream::new(guard, messages, rate, walker, scratch);
         if let Some(old) = found.guarded.replace(fresh) {
             found.replaced.push(Replaced {
                 incarnation: found.incarnation,
@@ -1934,6 +1963,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             found.config.lane.get() + 1,
             guarded.messages,
         )?;
+        // The handle's early copy of the rate limit, read against the host
+        // clock; the sender gate's bucket is authoritative.
+        let client = match guarded.rate {
+            Some(policy) => client.with_rate(policy, karyos_sys::host_clock::host_monotonic_ns),
+            None => client,
+        };
         let bound = crate::guard_streams::Bound {
             from: found.conductor.head()?,
             epoch: state.epoch,
@@ -3191,7 +3226,7 @@ mod tests {
             EmbeddedDriver::with_clock(driver_config, Box::new(clock.clone())).unwrap();
         let stream = driver.add_stream(config(2)).unwrap();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         let mut observer = driver.connect().unwrap();
         observer.set_liveness(Duration::ZERO, Duration::from_secs(3600));

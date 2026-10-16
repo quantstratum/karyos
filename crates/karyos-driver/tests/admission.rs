@@ -1325,7 +1325,7 @@ fn a_remote_subscriber_of_a_fresh_incarnation_reads_absolute_positions() {
     config.buffer.max_subscribers = 8;
     let stream = driver.add_stream(config).unwrap();
     let guard = driver.add_guard("orders").unwrap();
-    driver.guard_stream(stream, guard, 4).unwrap();
+    driver.guard_stream(stream, guard, 4, None).unwrap();
     assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
     let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
     for _ in 0..3 {

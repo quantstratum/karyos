@@ -4514,7 +4514,7 @@ mod tests {
     fn a_client_guard_close_seals_the_guarded_stream() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         let (_client, mut producer) = remote_client(&mut driver, 4);
         write(
@@ -4541,7 +4541,7 @@ mod tests {
     fn a_guarded_stream_refuses_cnc_publications() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         let mut observer = driver.broadcast.receiver();
         let (client, mut producer) = remote_client(&mut driver, 4);
         write(
@@ -4576,7 +4576,7 @@ mod tests {
     fn the_guard_counters_count_the_walker() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         // The stream refuses unconnected offers; the walker does not
         // connect it.
@@ -4602,7 +4602,7 @@ mod tests {
     fn a_replaced_incarnation_retires() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         let mut reader = driver
             .subscribe(stream, karyos_sys::log_buffer::Role::Required)
@@ -4648,7 +4648,7 @@ mod tests {
     fn remote_subscribers_across_a_fresh_incarnation() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         let mut observer = driver.broadcast.receiver();
         let (client, mut producer) = remote_client(&mut driver, 4);
@@ -4763,7 +4763,7 @@ mod tests {
     fn a_replaced_incarnations_grant_carries_its_own_base() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         let mut epoch = driver.reopen_guard(guard, 1, 1).unwrap();
         let mut bases = Vec::new();
         let mut readers = Vec::new();
@@ -4812,7 +4812,7 @@ mod tests {
         stream: StreamHandle,
     ) -> (u64, RingProducer, u64) {
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         let mut observer = driver.broadcast.receiver();
         let (client, mut producer) = remote_client(driver, 4);
@@ -4883,7 +4883,7 @@ mod tests {
     fn a_revocation_names_an_absolute_position() {
         let (mut driver, stream) = driver_with_stream();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(stream, guard, 4).unwrap();
+        driver.guard_stream(stream, guard, 4, None).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         let _reader = driver.subscribe(stream, Role::Required).unwrap();
         let mut publication = driver.publication(stream).unwrap();

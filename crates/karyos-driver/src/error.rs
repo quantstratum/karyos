@@ -98,6 +98,17 @@ pub enum DriverError {
         /// What is missing.
         reason: WalkerUnavailable,
     },
+    /// A rate limit names a scope other than the publication's, which
+    /// Phase 2 does not support (GC-5).
+    #[error("rate limits of scope {scope} are not supported")]
+    RateScopeUnsupported {
+        /// The scope named.
+        scope: crate::guards::RateScope,
+    },
+    /// A rate limit policy was refused: a zero rate or burst, or a byte
+    /// burst below the stream's largest frame.
+    #[error(transparent)]
+    InvalidRatePolicy(karyos_sys::rate_limit::RatePolicyError),
     /// The stream's incarnation numbers are exhausted; they are never
     /// reused.
     #[error("stream {stream}'s incarnations are exhausted")]

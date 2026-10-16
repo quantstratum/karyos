@@ -28,6 +28,7 @@ use std::sync::Arc;
 use karyos_sys::guard;
 use karyos_sys::load_words::LoadWords;
 use karyos_sys::outcome_ring::{Kind, OutcomeError, OutcomeReader, Record};
+use karyos_sys::rate_limit::{RateLimiter, RatePolicy};
 use karyos_sys::sync::AtomicU64;
 
 use crate::error::ClientError;
@@ -107,6 +108,16 @@ pub struct GuardBinding {
     message_capacity: u64,
     reserved: u64,
     released: u64,
+    rate: Option<RateCopy>,
+}
+
+/// The handle's copy of its publication's message bucket: an early
+/// rejection only. The sender gate's bucket is authoritative
+/// (`quantstratum-docs: karyos/design/guards-and-abort.md`, Rate limits).
+#[derive(Debug, Clone, Copy)]
+struct RateCopy {
+    limiter: RateLimiter,
+    clock: fn() -> u64,
 }
 
 impl GuardBinding {
@@ -143,7 +154,78 @@ impl GuardBinding {
             message_capacity,
             reserved: 0,
             released: 0,
+            rate: None,
         })
+    }
+
+    /// Gives the handle a copy of its publication's rate limit, read
+    /// against `clock` (monotonic nanoseconds): `offer` and `try_claim`
+    /// return `RateLimited` while the copy holds no message token, and an
+    /// accepted message takes one; a claim that is never sent (dropped,
+    /// aborted, or aborted by its deadline) gives its token back.
+    ///
+    /// The copy is an early rejection only. It charges a message when it is
+    /// accepted, before the sender gate charges it at its send, so a
+    /// `RateLimited` message is one the gate would hold at that instant; it
+    /// is not a claim that the gate would never have admitted it later.
+    /// `RateLimited` means retry later: nothing is appended or dropped.
+    /// Only the message bucket is copied, since the gate charges bytes per
+    /// datagram, which a whole message cannot be checked against early.
+    ///
+    /// The copy can be stricter than the gate: a message accepted and later
+    /// aborted (by its deadline, or returned or dropped by a reopen at the
+    /// gate) keeps the copy's charge, and so does a claim leaked with
+    /// `mem::forget`, which no drop reaches. A sealed handle reports its
+    /// seal before the copy is asked.
+    #[must_use]
+    pub fn with_rate(mut self, policy: RatePolicy, clock: fn() -> u64) -> Self {
+        let messages = RatePolicy {
+            messages: policy.messages,
+            bytes: None,
+        };
+        self.rate = Some(RateCopy {
+            limiter: RateLimiter::new(messages, clock()),
+            clock,
+        });
+        self
+    }
+
+    /// Whole message tokens the handle's copy holds at its last refill;
+    /// `None` without a rate limit.
+    #[must_use]
+    pub fn rate_tokens(&self) -> Option<u64> {
+        self.rate.as_ref().map(|copy| copy.limiter.message_tokens())
+    }
+
+    /// Whether the rate copy admits one more message now (refilled from the
+    /// clock, charging nothing); always without a rate limit.
+    pub(crate) fn rate_admits(&mut self) -> bool {
+        self.rate.as_mut().is_none_or(|copy| {
+            copy.limiter.refill_at((copy.clock)());
+            copy.limiter.admits(0, true)
+        })
+    }
+
+    /// Whether the handle keeps a rate copy.
+    pub(crate) fn has_rate(&self) -> bool {
+        self.rate.is_some()
+    }
+
+    /// Gives back the token of a claim that will never be sent: aborted,
+    /// dropped, or aborted by its deadline (capped at the burst).
+    pub(crate) fn refund_rate(&mut self) {
+        if let Some(copy) = &mut self.rate {
+            copy.limiter.refund(0, true);
+        }
+    }
+
+    /// Takes one message token for an accepted message; the caller checked
+    /// [`Self::rate_admits`] in the same call, and tokens only grow since.
+    pub(crate) fn charge_rate(&mut self) {
+        if let Some(copy) = &mut self.rate {
+            let charged = copy.limiter.try_admit(0, true);
+            debug_assert!(charged, "a charge the copy did not admit");
+        }
     }
 
     /// The open epoch the handle was admitted under.

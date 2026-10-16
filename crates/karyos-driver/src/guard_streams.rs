@@ -63,6 +63,12 @@ pub(crate) struct GuardedStream<T: TermBytes> {
     pub(crate) guard: GuardHandle,
     /// `C_m`.
     pub(crate) messages: u64,
+    /// The publication's rate limit, validated: every handle's early
+    /// check, and the sender gate's authoritative bucket. Until the network
+    /// agents wire the gate (phase 7 of `quantstratum-docs:
+    /// karyos/design/driver-network-agents.md`), the handles' copies are
+    /// the only limiter in practice.
+    pub(crate) rate: Option<karyos_sys::rate_limit::RatePolicy>,
     walker: Subscription<Arc<LogBuffer<T>>>,
     scratch: Vec<u8>,
     /// Rings of issued handles, oldest first.
@@ -92,12 +98,14 @@ impl<T: TermBytes> GuardedStream<T> {
     pub(crate) fn new(
         guard: GuardHandle,
         messages: u64,
+        rate: Option<karyos_sys::rate_limit::RatePolicy>,
         walker: Subscription<Arc<LogBuffer<T>>>,
         max_message: usize,
     ) -> Self {
         Self {
             guard,
             messages,
+            rate,
             walker,
             scratch: vec![0; max_message],
             bounds: VecDeque::new(),
@@ -318,7 +326,7 @@ mod tests {
             driver: 1,
             guard: 1,
         };
-        let mut guarded = GuardedStream::new(guard, 2, walker, 64);
+        let mut guarded = GuardedStream::new(guard, 2, None, walker, 64);
         let (ring, writer) = new_ring(2).unwrap();
         let consumed = Arc::new(AtomicU64::new(0));
         guarded.bind(Bound {

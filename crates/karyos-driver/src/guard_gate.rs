@@ -214,9 +214,12 @@ impl GuardGate {
     /// A gate over guard word 0 of `word`, writing its applied epoch to
     /// `cell` (this gate's alone), for `lanes` in the DRR lane order of
     /// `sender`, with the publication's `rate` policy, validated against
-    /// the largest datagram the route builds, `max_datagram` bytes. Every
-    /// buffer it will use is allocated here; the bucket starts full at
-    /// clock time `now`.
+    /// the largest datagram the route builds, `max_datagram` bytes: the
+    /// smaller of the route's own bound and the stream's MTU, which no
+    /// datagram exceeds (aggregate-lanes.md). It is never above the MTU
+    /// `guard_stream` validated the policy against, so a policy accepted
+    /// there is accepted here. Every buffer it will use is allocated here;
+    /// the bucket starts full at clock time `now`.
     ///
     /// # Errors
     ///
