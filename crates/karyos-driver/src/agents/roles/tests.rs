@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The establishment control path over real loopback sockets (phase 4b-1):
-//! announce, challenge, answer, `CreateImage`; and a spoofed SOLICIT flood
-//! capped by `setup_answer_rate`.
+//! announce, challenge, answer, `CreateImage`; a spoofed SOLICIT flood
+//! capped by `setup_answer_rate`; the receiver's filters, rates and drop
+//! counters; and the sender's control routes across a reset.
 
 #![allow(
     clippy::unwrap_used,
@@ -110,26 +111,48 @@ fn drive<T>(
     panic!("not reached");
 }
 
-fn add_publication(links: &Links, a: EndpointId, destination: SocketAddr) {
+/// The publication on A announced to B: the sender's publication, A's
+/// published alias and B's subscription.
+fn add_publication(links: &Links, a: EndpointId, b: EndpointId, destination: SocketAddr) {
+    links
+        .receiver
+        .post(|reply| AgentCommand::AddPublishedAlias {
+            reply,
+            endpoint: a,
+            alias: alias(),
+        })
+        .unwrap();
+    links
+        .receiver
+        .post(|reply| AgentCommand::AddSubscription {
+            reply,
+            endpoint: b,
+            stream_id: alias().stream_id,
+        })
+        .unwrap();
     links
         .sender
         .post(|reply| AgentCommand::AddPublication {
             reply,
-            publication: Publication {
-                endpoint: a,
-                alias: alias(),
-                identity: identity(),
-                term: TermParams {
-                    term_length: 65_536,
-                    initial_term_id: 9,
-                    mtu: 1408,
-                },
-                lane_count: 1,
-            },
+            publication: publication(a),
             destination,
             joins: Lanes::new(&[0]).unwrap(),
         })
         .unwrap();
+}
+
+fn publication(endpoint: EndpointId) -> Publication {
+    Publication {
+        endpoint,
+        alias: alias(),
+        identity: identity(),
+        term: TermParams {
+            term_length: 65_536,
+            initial_term_id: 9,
+            mtu: 1408,
+        },
+        lane_count: 1,
+    }
 }
 
 /// The sender announces from A to B; B's receiver challenges A; A's
@@ -139,7 +162,7 @@ fn add_publication(links: &Links, a: EndpointId, destination: SocketAddr) {
 fn a_loopback_setup_reaches_create_image() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, destination);
+    add_publication(&links, a, b, destination);
     let (endpoint, created) = drive(&mut agents, &links, &mut endpoints, |event| match event {
         AgentEvent::CreateImage {
             endpoint,
@@ -165,7 +188,7 @@ fn a_loopback_setup_reaches_create_image() {
 fn a_solicit_flood_is_capped() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, destination);
+    add_publication(&links, a, b, destination);
     drive(&mut agents, &links, &mut endpoints, |event| match event {
         AgentEvent::PublicationAdded { .. } => Some(()),
         _ => None,
@@ -247,6 +270,10 @@ fn only_unicast_sources_are_answerable() {
         ("0.0.0.0:4000", false),
         ("[ff02::1]:4000", false),
         ("[::]:4000", false),
+        ("[::ffff:10.0.0.1]:4000", true),
+        ("[::ffff:239.1.1.1]:4000", false),
+        ("[::ffff:255.255.255.255]:4000", false),
+        ("[::ffff:0.0.0.0]:4000", false),
     ] {
         assert_eq!(
             super::answerable(source.parse().unwrap()),
@@ -323,11 +350,43 @@ fn an_answer_waits_for_its_create_image_slot() {
         ..AgentConfig::default()
     };
     let (mut agents, links, mut endpoints, a, b) = two_endpoints_with(config);
+    let destination = endpoints.local_address(b).unwrap();
+    // One configuration command at a time: one event slot.
+    for command in 0..2 {
+        let post = if command == 0 {
+            links
+                .receiver
+                .post(|reply| AgentCommand::AddPublishedAlias {
+                    reply,
+                    endpoint: a,
+                    alias: alias(),
+                })
+        } else {
+            links.receiver.post(|reply| AgentCommand::AddSubscription {
+                reply,
+                endpoint: b,
+                stream_id: alias().stream_id,
+            })
+        };
+        post.unwrap();
+        agents.receiver.do_work(0).unwrap();
+        assert!(matches!(
+            links.receiver.take_event(),
+            Some(AgentEvent::Configured { accepted: true, .. })
+        ));
+    }
     // The receiver's only event slot is held by an unread pong.
     links.receiver.ping(1).unwrap();
     agents.receiver.do_work(0).unwrap();
-    let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, destination);
+    links
+        .sender
+        .post(|reply| AgentCommand::AddPublication {
+            reply,
+            publication: publication(a),
+            destination,
+            joins: Lanes::new(&[0]).unwrap(),
+        })
+        .unwrap();
     let mut now = 0u64;
     for _ in 0..300 {
         now += 1_000_000;
@@ -345,4 +404,258 @@ fn an_answer_waits_for_its_create_image_slot() {
         _ => None,
     });
     assert_eq!(created, b);
+}
+
+/// A receiver role with `config`.
+fn receiver_with(config: AgentConfig) -> (super::SenderRole, super::ReceiverRole) {
+    super::roles(&config).unwrap()
+}
+
+/// An intake on endpoint 1 at `now`.
+fn intake<'a>(
+    role: &'a mut super::ReceiverRole,
+    events: &'a super::RingSender<AgentEvent<OsSocket>>,
+    now: u64,
+) -> super::Intake<'a, OsSocket> {
+    super::Intake {
+        endpoint: EndpointId(1),
+        now,
+        role,
+        events,
+        work: 0,
+    }
+}
+
+fn event_ring() -> (
+    super::RingSender<AgentEvent<OsSocket>>,
+    super::RingReceiver<AgentEvent<OsSocket>>,
+) {
+    super::ring::ring(std::num::NonZeroUsize::new(4).unwrap())
+}
+
+fn challenge_control() -> Control {
+    Control::Challenge(karyos_protocol::network::RspChallenge {
+        alias: alias(),
+        identity: identity(),
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+    })
+}
+
+/// P1-3, §7.4: one destination gets at most `rsp_setup_rate_per_destination`
+/// (20) challenges per second however many triggers it sends; the rest are
+/// counted.
+#[test]
+fn rsp_setup_is_capped_per_destination() {
+    let (_sender, mut role) = receiver_with(AgentConfig {
+        control_capacity: 512,
+        ..AgentConfig::default()
+    });
+    let (events, _keep) = event_ring();
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let mut intake = intake(&mut role, &events, 1);
+    for _ in 0..200 {
+        intake.challenge(source, challenge_control());
+    }
+    // The IPv4-mapped form is the same destination.
+    let mapped: SocketAddr = "[::ffff:10.0.0.9]:5000".parse().unwrap();
+    intake.challenge(mapped, challenge_control());
+    let counters = role.counters();
+    assert_eq!(counters.forwarded, 20);
+    assert_eq!(counters.rsp_setup_rate_limited, 181);
+}
+
+/// P1-3, §7.4: across destinations, at most `rsp_setup_rate` (256) per
+/// driver per second.
+#[test]
+fn rsp_setup_is_capped_per_driver() {
+    let (_sender, mut role) = receiver_with(AgentConfig {
+        control_capacity: 512,
+        rsp_setup_destinations: 512,
+        ..AgentConfig::default()
+    });
+    let (events, _keep) = event_ring();
+    let mut intake = intake(&mut role, &events, 1);
+    for port in 1..=300u16 {
+        intake.challenge(SocketAddr::from(([10, 0, 0, 9], port)), challenge_control());
+    }
+    let counters = role.counters();
+    assert_eq!(counters.forwarded, 256);
+    assert_eq!(counters.rsp_setup_total_limited, 44);
+}
+
+/// P3, §7.3 wiring: a challenge toward an unanswerable source is neither
+/// forwarded nor charged to a rate; it is counted.
+#[test]
+fn an_unanswerable_source_gets_no_challenge() {
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (events, _keep) = event_ring();
+    let mut intake = intake(&mut role, &events, 1);
+    for source in ["239.1.1.1:4000", "[::ffff:239.1.1.1]:4000", "10.0.0.1:0"] {
+        intake.challenge(source.parse().unwrap(), challenge_control());
+    }
+    let counters = role.counters();
+    assert_eq!(counters.forwarded, 0);
+    assert_eq!(counters.unanswerable_source, 3);
+    assert_eq!(counters.rsp_setup_rate_limited, 0);
+}
+
+/// P2: a full control ring drops each kind under its own counter.
+#[test]
+fn a_full_ring_counts_each_kind() {
+    let (_sender, mut role) = receiver_with(AgentConfig {
+        control_capacity: 1,
+        ..AgentConfig::default()
+    });
+    let (events, _keep) = event_ring();
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let solicit = Control::Solicit(RspSolicit {
+        alias: alias(),
+        challenge: ChallengeBlock::default(),
+    });
+    let outgoing = |control| super::ControlItem::Outgoing {
+        endpoint: EndpointId(1),
+        destination: source,
+        control,
+    };
+    let incoming = |control| super::ControlItem::Incoming {
+        endpoint: EndpointId(1),
+        source,
+        control,
+    };
+    let mut intake = intake(&mut role, &events, 1);
+    // The only slot.
+    intake.forward(outgoing(challenge_control()));
+    intake.forward(outgoing(challenge_control()));
+    intake.forward(incoming(challenge_control()));
+    intake.forward(incoming(challenge_control()));
+    intake.forward(incoming(solicit));
+    intake.forward(incoming(solicit));
+    intake.forward(incoming(solicit));
+    let counters = role.counters();
+    assert_eq!(counters.forwarded, 1);
+    assert_eq!(counters.ring_full_rsp_setup, 1);
+    assert_eq!(counters.ring_full_challenge, 2);
+    assert_eq!(counters.ring_full_solicit, 3);
+}
+
+/// P1-1, P1-3 and P2: an SM is dropped and counted; an ANNOUNCE for an
+/// unsubscribed stream is not challenged; a CHALLENGE or SOLICIT for an
+/// alias not published on the endpoint never reaches the ring.
+#[test]
+fn the_receiver_filters_before_the_ring() {
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (events, _keep) = event_ring();
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let status = Control::Status(karyos_protocol::network::StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: karyos_protocol::network::Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 1,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[karyos_protocol::network::LaneStatus {
+            consumption: 0,
+            window: 65_536,
+        }])
+        .unwrap(),
+    });
+    let announce = Control::SetupAnnounce(karyos_protocol::network::SetupAnnounce {
+        alias: alias(),
+        identity: identity(),
+        term: TermParams {
+            term_length: 65_536,
+            initial_term_id: 9,
+            mtu: 1408,
+        },
+        lane_count: 1,
+    });
+    let solicit = Control::Solicit(RspSolicit {
+        alias: alias(),
+        challenge: ChallengeBlock::default(),
+    });
+    let mut intake = intake(&mut role, &events, 1);
+    intake.control(source, status);
+    intake.control(source, announce);
+    intake.control(source, challenge_control());
+    intake.control(source, solicit);
+    let counters = role.counters();
+    assert_eq!(counters.status_unvalidated, 1);
+    assert_eq!(counters.unsubscribed, 1);
+    assert_eq!(counters.not_published, 2);
+    assert_eq!(counters.forwarded, 0);
+}
+
+/// P3: a full route cache evicts the least recently used destination.
+#[test]
+fn control_routes_evict_the_least_recently_used() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::control::ControlRoutes;
+
+    let socket = ScriptedSocket::new();
+    // The kernel takes each of the four sends.
+    for _ in 0..4 {
+        socket.push_send(karyos_io::sockets::ops::SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (mut tx, _rx) = endpoint.split().unwrap();
+    let mut routes = ControlRoutes::new(2);
+    let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
+    for port in [41_001, 41_002, 41_001, 41_003] {
+        routes
+            .send(&mut tx, at(port), &challenge_control())
+            .unwrap();
+    }
+    assert_eq!(routes.cached(), [at(41_001), at(41_003)]);
+}
+
+/// P1-2: after A is reset, the sender's controls on A go out on the new
+/// epoch's routes; none fails on a stale cached id.
+#[test]
+fn control_routes_survive_a_reset() {
+    let (mut agents, links, mut endpoints, a, b) = two_endpoints();
+    let destination = endpoints.local_address(b).unwrap();
+    add_publication(&links, a, b, destination);
+    drive(&mut agents, &links, &mut endpoints, |event| match event {
+        AgentEvent::CreateImage { .. } => Some(()),
+        _ => None,
+    });
+    endpoints.reset(&links, a).unwrap();
+    let mut now = 10_000_000_000u64;
+    let mut reopened = false;
+    for _ in 0..2000 {
+        now += 1_000_000;
+        agents.do_work(now).unwrap();
+        endpoints.poll(
+            &links,
+            |event| {
+                reopened |=
+                    matches!(event, EndpointEvent::Reopened { endpoint, .. } if endpoint == a);
+            },
+            |_| {},
+        );
+        if reopened {
+            break;
+        }
+    }
+    assert!(reopened);
+    let before = agents.sender.counters();
+    // Announcements keep going every `setup_interval` (100 ms).
+    for _ in 0..400 {
+        now += 1_000_000;
+        agents.do_work(now).unwrap();
+        endpoints.poll(&links, |_| {}, |_| {});
+    }
+    let after = agents.sender.counters();
+    assert!(after.sent >= before.sent + 3, "{before:?} {after:?}");
+    assert_eq!(after.send_failures, before.send_failures);
 }

@@ -6,20 +6,25 @@
 //! - **Items.** The receiver agent owns every RX half. It hands the sender
 //!   agent, which owns every TX half, two kinds of control through one
 //!   bounded ring: controls to send (an RSP_SETUP challenge to a source)
-//!   and controls it received for a sender session (RSP_SETUP CHALLENGE
-//!   and SOLICIT, SM). A full ring drops the item and counts it.
+//!   and controls it received for a local publication (RSP_SETUP CHALLENGE
+//!   and SOLICIT). A full ring drops the item and counts it per kind.
 //! - **Control TX.** The sender sends controls through a small cache of
-//!   routes per endpoint, one control queue per destination, sized at most
-//!   `max_routes` of the endpoint; a full cache reuses the least recently
-//!   used entry. Controls pass an always-permit gate: they are not guarded
-//!   DATA (the guard gate is phase 7, `guards-and-abort.md`).
+//!   routes per endpoint, one control queue per destination, at most
+//!   `control_routes` of them; a full cache reuses the least recently used
+//!   entry. The cache belongs to one backend epoch of the endpoint: a reset
+//!   reopens the endpoint at its next epoch, whose route and queue ids are
+//!   all new, so the cache starts empty again. Any failed send evicts its
+//!   entry. Controls pass an always-permit gate, private to this module:
+//!   only [`ControlRoutes::send`] uses it, and that takes a typed
+//!   [`Control`], so DATA can never pass it (the guard gate is phase 7,
+//!   `guards-and-abort.md`).
 
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
 
 use karyos_io::backend::{
-    Authority, Commit, Exposure, FlushRequest, GateDecision, RouteId, SenderGate, SenderToken,
-    TxBackend, TxFrame, TxItemOutcome, TxOptions, TxQueueConfig, TxQueueId, TxReport,
+    Authority, BackendEpoch, Commit, Exposure, FlushRequest, GateDecision, RouteId, SenderGate,
+    SenderToken, TxBackend, TxFrame, TxItemOutcome, TxOptions, TxQueueConfig, TxQueueId, TxReport,
 };
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
@@ -39,7 +44,8 @@ pub enum ControlItem {
         /// What.
         control: Control,
     },
-    /// `control` arrived on `endpoint` from `source`, for a sender session.
+    /// `control` arrived on `endpoint` from `source`, for a local
+    /// publication.
     Incoming {
         /// The endpoint it arrived on.
         endpoint: EndpointId,
@@ -50,9 +56,7 @@ pub enum ControlItem {
     },
 }
 
-/// The gate of control traffic: every candidate is permitted. Private to
-/// this module: only [`ControlRoutes::send`] uses it, and that takes a
-/// typed [`Control`], so DATA can never pass it.
+/// The gate of control traffic: every candidate is permitted.
 #[derive(Debug, Clone, Copy, Default)]
 struct ControlGate;
 
@@ -77,7 +81,7 @@ pub enum ControlSendError {
     Route,
     /// The queue had no room for it.
     Claim,
-    /// The kernel did not take it (kept pending, then returned).
+    /// The kernel did not take it.
     Unsent,
 }
 
@@ -90,11 +94,13 @@ struct Destination {
     used: u64,
 }
 
-/// The control routes of one endpoint's TX half.
+/// The control routes of one endpoint's TX half, for one backend epoch.
 #[derive(Debug)]
 pub struct ControlRoutes {
     entries: Vec<Destination>,
     max: usize,
+    /// The epoch the cached ids belong to.
+    epoch: Option<BackendEpoch>,
     /// A logical clock for least-recently-used eviction.
     tick: u64,
     report: TxReport,
@@ -104,15 +110,41 @@ pub struct ControlRoutes {
 const CONTROL_QUEUE_DEPTH: u16 = 4;
 
 impl ControlRoutes {
-    /// At most `max` cached destinations (at least 1).
+    /// At most `max` cached destinations (at least 1); allocated here.
     #[must_use]
     pub fn new(max: usize) -> Self {
         let max = max.max(1);
         Self {
             entries: Vec::with_capacity(max),
             max,
+            epoch: None,
             tick: 0,
             report: TxReport::new(),
+        }
+    }
+
+    /// Forgets every cached destination without touching any half: for an
+    /// endpoint handed back, or a half of a new epoch.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.epoch = None;
+    }
+
+    /// The cached destinations, oldest use first (tests).
+    #[cfg(test)]
+    pub(crate) fn cached(&self) -> Vec<SocketAddr> {
+        let mut entries = self.entries.clone();
+        entries.sort_by_key(|entry| entry.used);
+        entries.iter().map(|entry| entry.address).collect()
+    }
+
+    /// Drops the entry of `queue` from `tx` and the cache.
+    fn evict<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, queue: TxQueueId) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.queue == queue) {
+            let old = self.entries.swap_remove(index);
+            let _ = tx.close_queue(old.queue, &mut self.report);
+            while self.report.pop_front().is_some() {}
+            let _ = tx.remove_route(old.route);
         }
     }
 
@@ -123,7 +155,24 @@ impl ControlRoutes {
         tx: &mut SocketsTx<O>,
         address: SocketAddr,
     ) -> Result<TxQueueId, ControlSendError> {
-        self.tick = self.tick.wrapping_add(1);
+        // A reset reopened the endpoint: the cached ids are of the old
+        // epoch, and every one of them is dead.
+        let epoch = tx.capabilities().epoch;
+        if self.epoch != Some(epoch) {
+            self.entries.clear();
+            self.epoch = Some(epoch);
+        }
+        // A u64 use clock does not wrap in practice; if it ever would, the
+        // ages start over.
+        self.tick = match self.tick.checked_add(1) {
+            Some(tick) => tick,
+            None => {
+                for entry in &mut self.entries {
+                    entry.used = 0;
+                }
+                1
+            }
+        };
         let tick = self.tick;
         if let Some(entry) = self
             .entries
@@ -137,14 +186,10 @@ impl ControlRoutes {
             && let Some(oldest) = self
                 .entries
                 .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.used)
-                .map(|(index, _)| index)
+                .min_by_key(|entry| entry.used)
+                .map(|entry| entry.queue)
         {
-            let old = self.entries.swap_remove(oldest);
-            let _ = tx.close_queue(old.queue, &mut self.report);
-            while self.report.pop_front().is_some() {}
-            let _ = tx.remove_route(old.route);
+            self.evict(tx, oldest);
         }
         let route = tx.add_route(address).map_err(|_| ControlSendError::Route)?;
         let queue = tx
@@ -166,11 +211,23 @@ impl ControlRoutes {
         Ok(queue)
     }
 
-    /// Encodes `control` and sends it on `tx` to `address`, now.
+    /// Encodes `control` and sends it on `tx` to `address`, now. It takes
+    /// a typed [`Control`] only, so no DATA can take this path:
+    ///
+    /// ```compile_fail
+    /// # use karyos_driver::agents::control::ControlRoutes;
+    /// # use karyos_io::sockets::{OsSocket, endpoint::SocketsTx};
+    /// fn send_data(routes: &mut ControlRoutes, tx: &mut SocketsTx<OsSocket>, batch: &[u8]) {
+    ///     let to = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+    ///     // A DATA batch is bytes, not a `Control`: this does not compile.
+    ///     let _ = routes.send(tx, to, batch);
+    /// }
+    /// ```
     ///
     /// # Errors
     ///
-    /// The [`ControlSendError`] reason; nothing waits for a later cycle.
+    /// The [`ControlSendError`] reason; nothing waits for a later cycle,
+    /// and the destination's entry is evicted.
     pub fn send<O: SocketOps>(
         &mut self,
         tx: &mut SocketsTx<O>,
@@ -183,21 +240,26 @@ impl ControlRoutes {
             .map_err(|_| ControlSendError::Encode)?;
         let encoded = bytes.get(..length).ok_or(ControlSendError::Encode)?;
         let queue = self.queue(tx, address)?;
-        let mut frame = tx
+        let claimed = tx
             .claim_tx(queue, encoded.len())
-            .map_err(|_| ControlSendError::Claim)?;
-        frame
-            .bytes_mut()
-            .get_mut(..encoded.len())
-            .ok_or(ControlSendError::Claim)?
-            .copy_from_slice(encoded);
-        frame
-            .commit(Commit {
-                len: encoded.len(),
-                token: SenderToken::new(0),
-                options: TxOptions::none(),
-            })
-            .map_err(|_| ControlSendError::Claim)?;
+            .ok()
+            .and_then(|mut frame| {
+                frame
+                    .bytes_mut()
+                    .get_mut(..encoded.len())?
+                    .copy_from_slice(encoded);
+                frame
+                    .commit(Commit {
+                        len: encoded.len(),
+                        token: SenderToken::new(0),
+                        options: TxOptions::none(),
+                    })
+                    .ok()
+            });
+        if claimed.is_none() {
+            self.evict(tx, queue);
+            return Err(ControlSendError::Claim);
+        }
         let _ = tx.flush(
             FlushRequest {
                 queue,
@@ -214,15 +276,19 @@ impl ControlRoutes {
         if sent {
             return Ok(());
         }
-        // Not taken now: a control is not worth a retry, drop it so the
-        // queue never fills with stale ones.
-        let _ = tx.close_queue(queue, &mut self.report);
-        while self.report.pop_front().is_some() {}
-        if let Some(index) = self.entries.iter().position(|entry| entry.queue == queue)
-            && let Some(old) = Some(self.entries.swap_remove(index))
-        {
-            let _ = tx.remove_route(old.route);
-        }
+        // Not taken now: a control is not worth a retry; dropping the
+        // queue drops it, so no stale control waits.
+        self.evict(tx, queue);
         Err(ControlSendError::Unsent)
     }
+}
+
+/// One endpoint's control routes, kept by the sender in a table allocated
+/// at creation (one per endpoint the agent can hold).
+#[derive(Debug)]
+pub struct RouteSlot {
+    /// The endpoint it serves, `None` while free.
+    pub endpoint: Option<EndpointId>,
+    /// Its routes.
+    pub routes: ControlRoutes,
 }

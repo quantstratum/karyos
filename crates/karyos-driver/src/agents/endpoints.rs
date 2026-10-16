@@ -448,7 +448,9 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::Stopped { .. }
             | AgentEvent::PublicationAdded { .. }
             | AgentEvent::PublicationRefused { .. }
-            | AgentEvent::CreateImage { .. } => return Some(event),
+            | AgentEvent::CreateImage { .. }
+            | AgentEvent::Configured { .. }
+            | AgentEvent::Unsupported { .. } => return Some(event),
         };
         let Ok(index) = self.index(endpoint) else {
             // An answer for an endpoint already gone: dropped (a half in

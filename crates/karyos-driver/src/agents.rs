@@ -156,6 +156,16 @@ pub struct AgentConfig {
     pub control_routes: usize,
     /// Datagrams the receiver reads per endpoint and cycle, at least 1.
     pub rx_datagrams: u32,
+    /// Subscribed streams and published aliases the receiver tracks, each
+    /// at least 1.
+    pub subscriptions: usize,
+    /// `rsp_setup_rate_per_destination` (network-control-schemas.md §7.4,
+    /// default 20 per second).
+    pub rsp_setup_per_destination: u64,
+    /// Destinations the per-destination RSP_SETUP rate tracks (default 64).
+    pub rsp_setup_destinations: usize,
+    /// `rsp_setup_rate` per driver (default 256 per second).
+    pub rsp_setup_rate: u64,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -177,6 +187,10 @@ impl Default for AgentConfig {
             control_capacity: 256,
             control_routes: 8,
             rx_datagrams: 64,
+            subscriptions: 64,
+            rsp_setup_per_destination: 20,
+            rsp_setup_destinations: 64,
+            rsp_setup_rate: 256,
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -200,6 +214,10 @@ impl AgentConfig {
             || self.control_capacity == 0
             || self.control_routes == 0
             || self.rx_datagrams == 0
+            || self.subscriptions == 0
+            || self.rsp_setup_per_destination == 0
+            || self.rsp_setup_destinations == 0
+            || self.rsp_setup_rate == 0
         {
             return Err(AgentError::InvalidConfig(
                 "a network capacity or budget is zero",
@@ -269,6 +287,28 @@ pub enum AgentCommand<O: SocketOps> {
         reply: Reservation,
         /// The endpoint.
         endpoint: EndpointId,
+    },
+    /// Receiver only: challenge SETUP for `stream_id` on `endpoint` (a
+    /// stream this driver subscribes to, network-control-schemas.md §6.2
+    /// step 2). Answer [`AgentEvent::Configured`].
+    AddSubscription {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The subscribed stream.
+        stream_id: i32,
+    },
+    /// Receiver only: `alias` on `endpoint` is a local publication, so
+    /// controls for it go to the sender (the pre-filter of DN-4). Answer
+    /// [`AgentEvent::Configured`].
+    AddPublishedAlias {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
     },
     /// Sender only: start announcing `publication` to `destination` (the
     /// channel route); `joins` are its join points until the sender reads
@@ -349,6 +389,19 @@ pub enum AgentEvent<O: SocketOps> {
         endpoint: EndpointId,
         /// Its alias.
         alias: karyos_protocol::network::Alias,
+    },
+    /// The answer to a receiver configuration command: `accepted` is false
+    /// when its table is full.
+    Configured {
+        /// The agent.
+        agent: AgentKind,
+        /// Whether the entry was added (or was already there).
+        accepted: bool,
+    },
+    /// The agent does not serve this command.
+    Unsupported {
+        /// The agent.
+        agent: AgentKind,
     },
     /// Receiver: a SETUP answer was accepted; the conductor creates the
     /// image (network-sessions.md S1; the full command chain is phase 4b-2).
@@ -475,7 +528,9 @@ impl<O: SocketOps> AgentCore<O> {
                         break;
                     }
                 }
-                command @ AgentCommand::AddPublication { .. } => {
+                command @ (AgentCommand::AddPublication { .. }
+                | AgentCommand::AddSubscription { .. }
+                | AgentCommand::AddPublishedAlias { .. }) => {
                     if let Some((reply, event)) = role(command)
                         && self.reply(reply, event)?
                     {
@@ -575,7 +630,7 @@ impl<O: SocketOps> SenderAgent<O> {
         if core.stopped {
             return Ok(served);
         }
-        let work = role.duty(&mut core.halves, now);
+        let work = role.duty(&mut core.halves, now)?;
         served
             .checked_add(work)
             .ok_or(AgentError::CountOverflow(AgentKind::Sender))
@@ -615,23 +670,11 @@ impl<O: SocketOps> ReceiverAgent<O> {
     /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         let Self { core, role } = self;
-        let served = core.serve_commands(&mut |command| match command {
-            AgentCommand::AddPublication {
-                reply, publication, ..
-            } => Some((
-                reply,
-                AgentEvent::PublicationRefused {
-                    agent: AgentKind::Receiver,
-                    endpoint: publication.endpoint,
-                    alias: publication.alias,
-                },
-            )),
-            _ => None,
-        })?;
+        let served = core.serve_commands(&mut |command| role.command(command))?;
         if core.stopped {
             return Ok(served);
         }
-        let work = role.duty(&mut core.halves, &core.events, now);
+        let work = role.duty(&mut core.halves, &core.events, now)?;
         served
             .checked_add(work)
             .ok_or(AgentError::CountOverflow(AgentKind::Receiver))
@@ -858,10 +901,10 @@ const FAILED: u8 = 2;
 /// What a runner thread drives.
 #[derive(Debug)]
 enum Work<O: SocketOps> {
-    Sender(SenderAgent<O>),
-    Receiver(ReceiverAgent<O>),
-    /// Boxed: both agents together are large, and the runner builds this
-    /// once, at start.
+    /// Every variant is boxed: the agents are large, and the runner builds
+    /// this once, at start.
+    Sender(Box<SenderAgent<O>>),
+    Receiver(Box<ReceiverAgent<O>>),
     Both(Box<NetworkAgents<O>>),
 }
 
@@ -965,8 +1008,8 @@ impl<O: SocketOps> Stopped<O> {
 
     fn take(&mut self, work: Work<O>) {
         match work {
-            Work::Sender(agent) => self.sender = Some(agent),
-            Work::Receiver(agent) => self.receiver = Some(agent),
+            Work::Sender(agent) => self.sender = Some(*agent),
+            Work::Receiver(agent) => self.receiver = Some(*agent),
             Work::Both(agents) => {
                 self.sender = Some(agents.sender);
                 self.receiver = Some(agents.receiver);
@@ -1053,8 +1096,14 @@ impl<O: SocketOps + Send + 'static> AgentRunner<O> {
                 });
             }
             ThreadingMode::Dedicated => vec![
-                (vec![AgentKind::Receiver], Work::Receiver(agents.receiver)),
-                (vec![AgentKind::Sender], Work::Sender(agents.sender)),
+                (
+                    vec![AgentKind::Receiver],
+                    Work::Receiver(Box::new(agents.receiver)),
+                ),
+                (
+                    vec![AgentKind::Sender],
+                    Work::Sender(Box::new(agents.sender)),
+                ),
             ],
             ThreadingMode::SharedNetwork => vec![(
                 vec![AgentKind::Receiver, AgentKind::Sender],

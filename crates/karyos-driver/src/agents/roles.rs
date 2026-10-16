@@ -5,34 +5,47 @@
 //! establishment control path. No image is created yet (phase 4b-2).
 //!
 //! - **Receiver.** For each RX half it holds, the receiver reads up to
-//!   `rx_datagrams` datagrams and classifies them. SETUP ANNOUNCE and
-//!   ANSWER go to its session table ([`ReceiveSessions`]); a challenge to
-//!   send, and every control for a sender session (RSP_SETUP CHALLENGE and
-//!   SOLICIT, SM), go to the sender agent through the control ring
-//!   ([`ControlItem`], DN-4). An accepted answer becomes an
-//!   [`AgentEvent::CreateImage`] for the conductor, its slot reserved
-//!   before the session table commits it. DATA waits for phase 5.
+//!   `rx_datagrams` datagrams and classifies them.
+//!   - SETUP ANNOUNCE is challenged only for a stream this driver
+//!     subscribes to on that endpoint (`AddSubscription`,
+//!     network-control-schemas.md §6.2 step 2). The challenge goes only to
+//!     the announcement's validated source (§7.3), within
+//!     `rsp_setup_rate_per_destination` and the per-driver `rsp_setup_rate`
+//!     (§7.4); the session table holds each resend to
+//!     `challenge_resend_interval`.
+//!   - SETUP ANSWER goes to its session table; an accepted one becomes an
+//!     [`AgentEvent::CreateImage`] for the conductor, its slot reserved
+//!     before the session table commits it.
+//!   - RSP_SETUP CHALLENGE and SOLICIT go to the sender ([`ControlItem`],
+//!     DN-4), but only for an alias published on that endpoint
+//!     (`AddPublishedAlias`): controls for anything else never reach the
+//!     ring, so they cannot crowd out the rest.
+//!   - SM is dropped and counted: it can only be validated against an
+//!     installed binding and its receiver (§6.1), which phase 4b-2 brings.
+//!   - DATA waits for phase 5.
 //! - **Sender.** It holds the publications it announces
 //!   ([`SendSessions`]), their channel destinations and join points. Each
 //!   cycle it sends the controls the receiver handed over, answers the
 //!   challenges and solicits for its publications toward the channel
 //!   destination (never a payload's address), and sends the announcements
-//!   due.
+//!   due. Its control routes are kept per endpoint in a table allocated at
+//!   creation and forgotten when the endpoint is handed back.
 //!
 //! Every queue and table is allocated when the agents are created; drops
-//! are counted.
+//! are counted, each under its own counter.
 
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 
 use karyos_io::backend::{Budget, RxBackend, RxDatagram, RxDrop, RxHandler};
 use karyos_io::sockets::ops::SocketOps;
-use karyos_protocol::network::{Alias, Control, Datagram, Lanes, classify};
+use karyos_protocol::network::{Alias, Control, Datagram, Lanes, SetupAnnounce, classify};
 
-use super::control::{ControlItem, ControlRoutes};
+use super::control::{ControlItem, ControlRoutes, RouteSlot};
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
 use crate::sessions::OsNonces;
+use crate::sessions::rate::{EndpointRates, RateRefused, TotalRate, normalized};
 use crate::sessions::receive::{
     AnnounceOutcome, AnswerOutcome, BindingKey, ReceiveSessions, SessionConfigError,
 };
@@ -55,11 +68,21 @@ pub struct ReceiverCounters {
     pub ring_full_challenge: u64,
     /// Received SOLICITs dropped with the control ring full.
     pub ring_full_solicit: u64,
-    /// Received SMs dropped with the control ring full.
-    pub ring_full_status: u64,
-    /// Challenges not sent: the trigger's source is not an answerable
-    /// unicast endpoint (network-control-schemas.md §7.3).
+    /// Challenges not sent: the source is not an answerable unicast
+    /// endpoint (network-control-schemas.md §7.3).
     pub unanswerable_source: u64,
+    /// Challenges not sent: `rsp_setup_rate_per_destination` (§7.4).
+    pub rsp_setup_rate_limited: u64,
+    /// Challenges not sent: the destination rate table is full.
+    pub rsp_setup_destinations_full: u64,
+    /// Challenges not sent: the per-driver `rsp_setup_rate` (§7.4).
+    pub rsp_setup_total_limited: u64,
+    /// Announcements for a stream not subscribed on the endpoint.
+    pub unsubscribed: u64,
+    /// CHALLENGE and SOLICIT for an alias not published on the endpoint.
+    pub not_published: u64,
+    /// SMs dropped: no installed binding validates them yet (phase 4b-2).
+    pub status_unvalidated: u64,
     /// Images asked of the conductor.
     pub create_image: u64,
     /// Data and controls this phase does not handle yet.
@@ -97,6 +120,13 @@ pub struct ReceiverRole {
     nonces: OsNonces,
     to_sender: RingSender<ControlItem>,
     budget: Budget,
+    /// Subscribed streams per endpoint.
+    subscriptions: Vec<(EndpointId, i32)>,
+    /// Aliases published per endpoint.
+    published: Vec<(EndpointId, Alias)>,
+    max_entries: usize,
+    rsp_destinations: EndpointRates,
+    rsp_total: TotalRate,
     counters: ReceiverCounters,
 }
 
@@ -107,12 +137,11 @@ pub struct SenderRole {
     from_receiver: RingReceiver<ControlItem>,
     /// Each publication's channel destination and join points.
     publications: Vec<(EndpointId, Alias, SocketAddr, Lanes<u64>)>,
-    /// Control routes per endpoint.
-    routes: Vec<(EndpointId, ControlRoutes)>,
-    max_routes: usize,
+    /// Control routes, one slot per endpoint the agent can hold.
+    routes: Vec<RouteSlot>,
     budget: u32,
     /// The announcements due this cycle (allocated at creation).
-    due: Vec<(EndpointId, karyos_protocol::network::SetupAnnounce)>,
+    due: Vec<(EndpointId, SetupAnnounce)>,
     counters: SenderCounters,
 }
 
@@ -146,13 +175,25 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
     let ops = datagrams
         .checked_add(1)
         .ok_or(AgentError::InvalidConfig("rx_datagrams too large"))?;
+    let rsp_destinations = EndpointRates::new(
+        config.rsp_setup_per_destination,
+        config.rsp_setup_destinations,
+    )
+    .ok_or(AgentError::InvalidConfig("rsp_setup rate or table is zero"))?;
+    let rsp_total = TotalRate::new(config.rsp_setup_rate, 0)
+        .ok_or(AgentError::InvalidConfig("rsp_setup_rate is zero"))?;
+    let routes = (0..config.max_endpoints)
+        .map(|_| RouteSlot {
+            endpoint: None,
+            routes: ControlRoutes::new(config.control_routes),
+        })
+        .collect();
     Ok((
         SenderRole {
             sessions: send,
             from_receiver,
             publications: Vec::with_capacity(config.publications),
-            routes: Vec::with_capacity(config.max_endpoints),
-            max_routes: config.control_routes,
+            routes,
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
             counters: SenderCounters::default(),
@@ -162,9 +203,27 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             nonces: OsNonces,
             to_sender,
             budget: Budget::new(datagrams, bytes, ops),
+            subscriptions: Vec::with_capacity(config.subscriptions),
+            published: Vec::with_capacity(config.subscriptions),
+            max_entries: config.subscriptions,
+            rsp_destinations,
+            rsp_total,
             counters: ReceiverCounters::default(),
         },
     ))
+}
+
+/// Whether an RSP_SETUP may answer `source` (network-control-schemas.md
+/// §7.3): a unicast address with a nonzero port; never a multicast,
+/// broadcast or unspecified address, an IPv4-mapped one included.
+fn answerable(source: SocketAddr) -> bool {
+    let source = normalized(source);
+    let ip = source.ip();
+    let broadcast = match ip {
+        std::net::IpAddr::V4(v4) => v4.is_broadcast(),
+        std::net::IpAddr::V6(_) => false,
+    };
+    source.port() != 0 && !ip.is_multicast() && !ip.is_unspecified() && !broadcast
 }
 
 impl ReceiverRole {
@@ -174,18 +233,82 @@ impl ReceiverRole {
         self.counters
     }
 
+    fn count(&mut self, field: fn(&mut ReceiverCounters) -> &mut u64) {
+        let mut overflowed = self.counters.overflowed;
+        bump(field(&mut self.counters), &mut overflowed);
+        self.counters.overflowed = overflowed;
+    }
+
+    /// The receiver's commands: `AddSubscription` and `AddPublishedAlias`;
+    /// the sender's are refused.
+    pub(super) fn command<O: SocketOps>(
+        &mut self,
+        command: AgentCommand<O>,
+    ) -> Option<(Reservation, AgentEvent<O>)> {
+        let max = self.max_entries;
+        let configured = |accepted| AgentEvent::Configured {
+            agent: AgentKind::Receiver,
+            accepted,
+        };
+        match command {
+            AgentCommand::AddSubscription {
+                reply,
+                endpoint,
+                stream_id,
+            } => {
+                let entry = (endpoint, stream_id);
+                let accepted = self.subscriptions.contains(&entry)
+                    || (self.subscriptions.len() < max && {
+                        self.subscriptions.push(entry);
+                        true
+                    });
+                Some((reply, configured(accepted)))
+            }
+            AgentCommand::AddPublishedAlias {
+                reply,
+                endpoint,
+                alias,
+            } => {
+                let entry = (endpoint, alias);
+                let accepted = self.published.contains(&entry)
+                    || (self.published.len() < max && {
+                        self.published.push(entry);
+                        true
+                    });
+                Some((reply, configured(accepted)))
+            }
+            AgentCommand::AddPublication {
+                reply, publication, ..
+            } => Some((
+                reply,
+                AgentEvent::PublicationRefused {
+                    agent: AgentKind::Receiver,
+                    endpoint: publication.endpoint,
+                    alias: publication.alias,
+                },
+            )),
+            _ => None,
+        }
+    }
+
     /// One cycle: the session timers, then every held RX half.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
     pub(super) fn duty<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
         events: &RingSender<AgentEvent<O>>,
         now: u64,
-    ) -> u32 {
+    ) -> Result<u32, AgentError> {
+        let overflow = AgentError::CountOverflow(AgentKind::Receiver);
         let mut work = self.sessions.timers(now);
         for (endpoint, half) in halves.iter_mut() {
             let Half::Rx(rx) = half else {
                 continue;
             };
+            let budget = self.budget;
             let mut intake = Intake {
                 endpoint: *endpoint,
                 now,
@@ -193,11 +316,10 @@ impl ReceiverRole {
                 events,
                 work: 0,
             };
-            let budget = intake.role.budget;
             let _ = rx.poll_rx(budget, &mut intake);
-            work += intake.work;
+            work = work.checked_add(intake.work).ok_or(overflow.clone())?;
         }
-        work
+        Ok(work)
     }
 }
 
@@ -207,36 +329,57 @@ struct Intake<'a, O: SocketOps> {
     now: u64,
     role: &'a mut ReceiverRole,
     events: &'a RingSender<AgentEvent<O>>,
+    /// Datagrams read; one poll reads at most its budget's.
     work: u32,
 }
 
 impl<O: SocketOps> Intake<'_, O> {
-    fn count(&mut self, field: fn(&mut ReceiverCounters) -> &mut u64) {
-        let counters = &mut self.role.counters;
-        let mut overflowed = counters.overflowed;
-        bump(field(counters), &mut overflowed);
-        counters.overflowed = overflowed;
-    }
-
     /// Hands `item` to the sender; a full ring drops it, counted per kind
     /// so that a flood of one kind does not hide another.
     fn forward(&mut self, item: ControlItem) {
         let full: fn(&mut ReceiverCounters) -> &mut u64 = match item {
             ControlItem::Outgoing { .. } => |c| &mut c.ring_full_rsp_setup,
             ControlItem::Incoming {
-                control: Control::Challenge(_),
-                ..
-            } => |c| &mut c.ring_full_challenge,
-            ControlItem::Incoming {
                 control: Control::Solicit(_),
                 ..
             } => |c| &mut c.ring_full_solicit,
-            ControlItem::Incoming { .. } => |c| &mut c.ring_full_status,
+            ControlItem::Incoming { .. } => |c| &mut c.ring_full_challenge,
         };
         match self.role.to_sender.try_post(item) {
-            Ok(()) => self.count(|c| &mut c.forwarded),
-            Err(_) => self.count(full),
+            Ok(()) => self.role.count(|c| &mut c.forwarded),
+            Err(_) => self.role.count(full),
         }
+    }
+
+    /// Sends `challenge` toward `source` if §7.3 and §7.4 allow it.
+    fn challenge(&mut self, source: SocketAddr, control: Control) {
+        // §7.3: an RSP_SETUP goes only to the trigger's validated source
+        // endpoint, through the socket it arrived on.
+        if !answerable(source) {
+            self.role.count(|c| &mut c.unanswerable_source);
+            return;
+        }
+        // §7.4: per destination, then per driver.
+        match self.role.rsp_destinations.admit(source, self.now) {
+            Ok(()) => {}
+            Err(RateRefused::Limited) => {
+                self.role.count(|c| &mut c.rsp_setup_rate_limited);
+                return;
+            }
+            Err(RateRefused::TableFull) => {
+                self.role.count(|c| &mut c.rsp_setup_destinations_full);
+                return;
+            }
+        }
+        if !self.role.rsp_total.admit(self.now) {
+            self.role.count(|c| &mut c.rsp_setup_total_limited);
+            return;
+        }
+        self.forward(ControlItem::Outgoing {
+            endpoint: self.endpoint,
+            destination: source,
+            control,
+        });
     }
 
     fn control(&mut self, source: SocketAddr, control: Control) {
@@ -244,27 +387,26 @@ impl<O: SocketOps> Intake<'_, O> {
         let now = self.now;
         match control {
             Control::SetupAnnounce(announce) => {
+                // §6.2 step 2: only a stream subscribed on this endpoint.
+                if !self
+                    .role
+                    .subscriptions
+                    .contains(&(endpoint, announce.alias.stream_id))
+                {
+                    self.role.count(|c| &mut c.unsubscribed);
+                    return;
+                }
                 let key = BindingKey {
                     endpoint,
                     source,
                     alias: announce.alias,
                 };
+                let role = &mut *self.role;
                 if let AnnounceOutcome::Challenge(challenge) =
-                    self.role
-                        .sessions
-                        .announce(key, &announce, now, &mut self.role.nonces)
+                    role.sessions
+                        .announce(key, &announce, now, &mut role.nonces)
                 {
-                    // §7.3: an RSP_SETUP goes only to the trigger's validated
-                    // source endpoint, through the socket it arrived on.
-                    if answerable(source) {
-                        self.forward(ControlItem::Outgoing {
-                            endpoint,
-                            destination: source,
-                            control: Control::Challenge(challenge),
-                        });
-                    } else {
-                        self.count(|c| &mut c.unanswerable_source);
-                    }
+                    self.challenge(source, Control::Challenge(challenge));
                 }
             }
             Control::SetupAnswer(answer) => {
@@ -299,38 +441,50 @@ impl<O: SocketOps> Intake<'_, O> {
                     // The event ring's consumer gone: the driver is
                     // stopping; nothing to undo.
                     let _ = events.post(reservation, event);
-                    self.count(|c| &mut c.create_image);
+                    self.role.count(|c| &mut c.create_image);
                 }
             }
-            Control::Challenge(_) | Control::Solicit(_) | Control::Status(_) => {
+            Control::Challenge(_) | Control::Solicit(_) => {
+                let alias = match control {
+                    Control::Challenge(challenge) => challenge.alias,
+                    Control::Solicit(solicit) => solicit.alias,
+                    _ => return,
+                };
+                // Only for a publication of this endpoint (DN-4 pre-filter).
+                if !self.role.published.contains(&(endpoint, alias)) {
+                    self.role.count(|c| &mut c.not_published);
+                    return;
+                }
                 self.forward(ControlItem::Incoming {
                     endpoint,
                     source,
                     control,
                 });
             }
-            _ => self.count(|c| &mut c.unhandled),
+            Control::Status(_) => self.role.count(|c| &mut c.status_unvalidated),
+            _ => self.role.count(|c| &mut c.unhandled),
         }
     }
 }
 
 impl<O: SocketOps> RxHandler for Intake<'_, O> {
     fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
+        // At most the poll budget's datagrams: no overflow.
         self.work += 1;
-        self.count(|c| &mut c.datagrams);
+        self.role.count(|c| &mut c.datagrams);
         let source = datagram.source();
         match classify(datagram.bytes()) {
             Ok(Datagram::Control(control)) => self.control(source, control),
             Ok(Datagram::DataBatch(_) | Datagram::Heartbeat(_)) => {
-                self.count(|c| &mut c.unhandled);
+                self.role.count(|c| &mut c.unhandled);
             }
-            Err(_) => self.count(|c| &mut c.decode_errors),
+            Err(_) => self.role.count(|c| &mut c.decode_errors),
         }
         ControlFlow::Continue(())
     }
 
     fn dropped(&mut self, _drop: RxDrop) {
-        self.count(|c| &mut c.backend_drops);
+        self.role.count(|c| &mut c.backend_drops);
     }
 }
 
@@ -347,19 +501,29 @@ impl SenderRole {
         self.counters.overflowed = overflowed;
     }
 
-    /// The sender's commands: `AddPublication`.
+    /// The sender's commands: `AddPublication`; the receiver's are
+    /// answered `Unsupported`.
     pub(super) fn command<O: SocketOps>(
         &mut self,
         command: AgentCommand<O>,
     ) -> Option<(Reservation, AgentEvent<O>)> {
-        let AgentCommand::AddPublication {
-            reply,
-            publication,
-            destination,
-            joins,
-        } = command
-        else {
-            return None;
+        let (reply, publication, destination, joins) = match command {
+            AgentCommand::AddPublication {
+                reply,
+                publication,
+                destination,
+                joins,
+            } => (reply, publication, destination, joins),
+            AgentCommand::AddSubscription { reply, .. }
+            | AgentCommand::AddPublishedAlias { reply, .. } => {
+                return Some((
+                    reply,
+                    AgentEvent::Unsupported {
+                        agent: AgentKind::Sender,
+                    },
+                ));
+            }
+            _ => return None,
         };
         let event = match self.sessions.add(publication) {
             Ok(()) => {
@@ -374,14 +538,32 @@ impl SenderRole {
                     alias: publication.alias,
                 }
             }
-            Err(SendSessionError::Full | SendSessionError::DuplicateAlias)
-            | Err(SendSessionError::InvalidConfig) => AgentEvent::PublicationRefused {
+            Err(
+                SendSessionError::Full
+                | SendSessionError::DuplicateAlias
+                | SendSessionError::InvalidConfig,
+            ) => AgentEvent::PublicationRefused {
                 agent: AgentKind::Sender,
                 endpoint: publication.endpoint,
                 alias: publication.alias,
             },
         };
         Some((reply, event))
+    }
+
+    /// Frees the route slots of endpoints the agent no longer holds: their
+    /// cached ids belong to a half that was handed back.
+    fn prune<O: SocketOps>(&mut self, halves: &[(EndpointId, Half<O>)]) {
+        for slot in &mut self.routes {
+            if let Some(endpoint) = slot.endpoint
+                && !halves
+                    .iter()
+                    .any(|(held, half)| *held == endpoint && matches!(half, Half::Tx(_)))
+            {
+                slot.endpoint = None;
+                slot.routes.clear();
+            }
+        }
     }
 
     /// Sends `control` on `endpoint` to `destination`.
@@ -400,18 +582,19 @@ impl SenderRole {
             self.count(|c| &mut c.no_endpoint);
             return;
         };
-        let max = self.max_routes;
-        let routes = match self.routes.iter().position(|(held, _)| *held == endpoint) {
-            Some(index) => index,
-            None => {
-                self.routes.push((endpoint, ControlRoutes::new(max)));
-                self.routes.len() - 1
-            }
-        };
-        let Some((_, routes)) = self.routes.get_mut(routes) else {
+        let index = self
+            .routes
+            .iter()
+            .position(|slot| slot.endpoint == Some(endpoint))
+            .or_else(|| self.routes.iter().position(|slot| slot.endpoint.is_none()));
+        let Some(slot) = index.and_then(|index| self.routes.get_mut(index)) else {
+            // More held halves than slots: the agent holds at most
+            // `max_endpoints`, so this does not happen.
+            self.count(|c| &mut c.no_endpoint);
             return;
         };
-        match routes.send(tx, destination, control) {
+        slot.endpoint = Some(endpoint);
+        match slot.routes.send(tx, destination, control) {
             Ok(()) => self.count(|c| &mut c.sent),
             Err(_) => self.count(|c| &mut c.send_failures),
         }
@@ -427,18 +610,26 @@ impl SenderRole {
 
     /// One cycle: the controls the receiver handed over, then the
     /// announcements due.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
     pub(super) fn duty<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
         now: u64,
-    ) -> u32 {
+    ) -> Result<u32, AgentError> {
+        let overflow = AgentError::CountOverflow(AgentKind::Sender);
+        self.prune(halves);
         let mut work = 0u32;
         for _ in 0..self.budget {
             let Ok(Some(item)) = self.from_receiver.try_take() else {
                 break;
             };
-            work += 1;
+            work = work.checked_add(1).ok_or(overflow.clone())?;
             match item {
+                // §7.3: an RSP_SETUP to the trigger's validated source,
+                // checked by the receiver.
                 ControlItem::Outgoing {
                     endpoint,
                     destination,
@@ -448,7 +639,13 @@ impl SenderRole {
                     endpoint,
                     source,
                     control,
-                } => self.incoming(halves, endpoint, source, now, control),
+                } => {
+                    if let Some((destination, answer)) =
+                        self.answer_for(endpoint, source, now, control)
+                    {
+                        self.send(halves, endpoint, destination, &answer);
+                    }
+                }
             }
         }
         let mut due = std::mem::take(&mut self.due);
@@ -458,7 +655,7 @@ impl SenderRole {
             // An ANNOUNCE goes to the channel's configured destination
             // (§6.2).
             if let Some((destination, _)) = self.route_of(endpoint, announce.alias) {
-                work += 1;
+                work = work.checked_add(1).ok_or(overflow.clone())?;
                 self.send(
                     halves,
                     endpoint,
@@ -469,20 +666,7 @@ impl SenderRole {
         }
         // Its capacity stays for the next cycle.
         self.due = due;
-        work
-    }
-
-    fn incoming<O: SocketOps>(
-        &mut self,
-        halves: &mut [(EndpointId, Half<O>)],
-        endpoint: EndpointId,
-        source: SocketAddr,
-        now: u64,
-        control: Control,
-    ) {
-        if let Some((destination, answer)) = self.answer_for(endpoint, source, now, control) {
-            self.send(halves, endpoint, destination, &answer);
-        }
+        Ok(work)
     }
 
     /// The SETUP ANSWER to a received control, and where it goes: §7.3 and
@@ -496,57 +680,34 @@ impl SenderRole {
         now: u64,
         control: Control,
     ) -> Option<(SocketAddr, Control)> {
-        let (alias, answer) = match control {
+        let alias = match control {
+            Control::Challenge(challenge) => challenge.alias,
+            Control::Solicit(solicit) => solicit.alias,
+            _ => return None,
+        };
+        let Some((destination, joins)) = self.route_of(endpoint, alias) else {
+            self.count(|c| &mut c.refused);
+            return None;
+        };
+        let answer = match control {
             Control::Challenge(challenge) => {
-                let Some((_, joins)) = self.route_of(endpoint, challenge.alias) else {
-                    self.count(|c| &mut c.refused);
-                    return None;
-                };
-                (
-                    challenge.alias,
-                    self.sessions
-                        .challenge(endpoint, source, now, &challenge, |_| joins),
-                )
+                self.sessions
+                    .challenge(endpoint, source, now, &challenge, |_| joins)
             }
             Control::Solicit(solicit) => {
-                let Some((_, joins)) = self.route_of(endpoint, solicit.alias) else {
-                    self.count(|c| &mut c.refused);
-                    return None;
-                };
-                (
-                    solicit.alias,
-                    self.sessions
-                        .solicit(endpoint, source, now, &solicit, |_| joins),
-                )
-            }
-            Control::Status(status) => {
-                self.sessions.status(endpoint, &status);
-                return None;
+                self.sessions
+                    .solicit(endpoint, source, now, &solicit, |_| joins)
             }
             _ => return None,
         };
         match answer {
-            Ok(answer) => self
-                .route_of(endpoint, alias)
-                .map(|(destination, _)| (destination, Control::SetupAnswer(answer))),
+            Ok(answer) => Some((destination, Control::SetupAnswer(answer))),
             Err(_) => {
                 self.count(|c| &mut c.refused);
                 None
             }
         }
     }
-}
-
-/// Whether an RSP_SETUP may answer `source` (network-control-schemas.md
-/// §7.3): a unicast address with a nonzero port; never a multicast,
-/// broadcast or unspecified address.
-fn answerable(source: SocketAddr) -> bool {
-    let ip = source.ip();
-    let broadcast = match ip {
-        std::net::IpAddr::V4(v4) => v4.is_broadcast(),
-        std::net::IpAddr::V6(_) => false,
-    };
-    source.port() != 0 && !ip.is_multicast() && !ip.is_unspecified() && !broadcast
 }
 
 #[cfg(test)]
