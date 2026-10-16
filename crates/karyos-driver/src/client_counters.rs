@@ -118,19 +118,21 @@ impl ClientCounters {
         self.reader.region()
     }
 
-    /// Cells owned by `client`, those awaiting its last handle included.
-    pub(crate) fn owned_by(&self, client: u64) -> usize {
-        let orphaned: usize = self
-            .orphans
-            .iter()
-            .filter(|orphans| orphans.client == client)
-            .map(|orphans| orphans.counters.len())
-            .sum();
-        self.owned
+    /// Cells owned by `client`, those awaiting its last handle included;
+    /// `None` if the count does not fit `usize` (checked, SPEC.md §14),
+    /// which an allocation treats as over the limit.
+    pub(crate) fn owned_by(&self, client: u64) -> Option<usize> {
+        let owned = self
+            .owned
             .iter()
             .filter(|owned| owned.client == client)
-            .count()
-            .saturating_add(orphaned)
+            .count();
+        self.orphans
+            .iter()
+            .filter(|orphans| orphans.client == client)
+            .try_fold(owned, |sum, orphans| {
+                sum.checked_add(orphans.counters.len())
+            })
     }
 
     /// Allocates a cell for `client` with `keys`; returns the cell and the
@@ -142,7 +144,10 @@ impl ClientCounters {
         label: &str,
         keys: CounterKeys,
     ) -> Result<(usize, u64), Refusal> {
-        if self.owned_by(client) >= self.max_per_client {
+        if self
+            .owned_by(client)
+            .is_none_or(|owned| owned >= self.max_per_client)
+        {
             return Err(Refusal::ClientLimit);
         }
         // Clients can write the state words, so the driver's own record of

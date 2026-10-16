@@ -607,8 +607,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         })
     }
 
-    pub(crate) fn held_total(&self) -> usize {
-        self.clients.iter().map(|slot| slot.link.held()).sum()
+    /// Handed-over publications held for every client; `None` if the sum
+    /// does not fit `usize` (checked, SPEC.md §14), which admission treats
+    /// as over the hand-over limit.
+    pub(crate) fn held_total(&self) -> Option<usize> {
+        self.clients
+            .iter()
+            .try_fold(0usize, |sum, slot| sum.checked_add(slot.link.held()))
     }
 
     /// Serves one decoded command: its single response, or, for a
@@ -757,7 +762,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     None => {}
                 }
                 if link.held() >= self.config.max_pending_per_client
-                    || self.held_total() >= self.config.max_hand_over
+                    || self
+                        .held_total()
+                        .is_none_or(|held| held >= self.config.max_hand_over)
                 {
                     return refuse(ErrorCode::ResourcesUnavailable, detail);
                 }
@@ -2647,7 +2654,7 @@ mod tests {
                 }
             );
         }
-        assert_eq!(driver.client_counters.owned_by(client), 3);
+        assert_eq!(driver.client_counters.owned_by(client), Some(3));
     }
 
     #[test]
@@ -2724,7 +2731,7 @@ mod tests {
                 ..
             }]
         ));
-        assert_eq!(driver.client_counters.owned_by(client), 0);
+        assert_eq!(driver.client_counters.owned_by(client), Some(0));
         let reader = driver.client_counters();
         assert!(
             (0..reader.capacity())
@@ -2785,8 +2792,8 @@ mod tests {
             }
         });
         assert_eq!(refused, [[first, 1], [second, 2]]);
-        assert_eq!(driver.client_counters.owned_by(first), 2);
-        assert_eq!(driver.client_counters.owned_by(second), 1);
+        assert_eq!(driver.client_counters.owned_by(first), Some(2));
+        assert_eq!(driver.client_counters.owned_by(second), Some(1));
         // A release makes room for the same client again.
         let (cell, registration) = allocated(&answered[0]);
         write(
@@ -2865,7 +2872,7 @@ mod tests {
                     ..
                 }
             ));
-            assert_eq!(driver.client_counters.owned_by(owner), 1);
+            assert_eq!(driver.client_counters.owned_by(owner), Some(1));
             // The violation is in the error log under the sender.
             let mut violations = Vec::new();
             let _ = driver.error_log().scan(&mut 0, |record| {
@@ -2897,7 +2904,7 @@ mod tests {
         // cell stays charged.
         driver.retire_faulty(index);
         let _ = driver.do_work().unwrap();
-        assert_eq!(driver.client_counters.owned_by(client), 1);
+        assert_eq!(driver.client_counters.owned_by(client), Some(1));
         assert!(matches!(
             client_cell(&driver, cell),
             karyos_sys::counters::CellRead::Allocated { .. }
@@ -2906,7 +2913,7 @@ mod tests {
         driver.clients[index].link.mark_closed();
         let _ = driver.do_work().unwrap();
         assert_eq!(driver.clients(), 0);
-        assert_eq!(driver.client_counters.owned_by(client), 0);
+        assert_eq!(driver.client_counters.owned_by(client), Some(0));
         assert_eq!(
             client_cell(&driver, cell),
             karyos_sys::counters::CellRead::Free
@@ -2978,7 +2985,10 @@ mod tests {
             client_cell(&driver, cell),
             karyos_sys::counters::CellRead::Free
         );
-        assert_eq!(driver.client_counters.owned_by(client.owner().client), 0);
+        assert_eq!(
+            driver.client_counters.owned_by(client.owner().client),
+            Some(0)
+        );
     }
 
     #[test]
@@ -3029,7 +3039,7 @@ mod tests {
         drop(client);
         let _ = driver.do_work().unwrap();
         assert_eq!(driver.clients(), 0);
-        assert_eq!(driver.client_counters.owned_by(id), 2);
+        assert_eq!(driver.client_counters.owned_by(id), Some(2));
         // A new allocation takes another cell; the old writer still writes
         // only its own.
         let mut other = driver.connect().unwrap();
@@ -3043,7 +3053,7 @@ mod tests {
         ));
         drop(kept);
         let _ = driver.do_work().unwrap();
-        assert_eq!(driver.client_counters.owned_by(id), 0);
+        assert_eq!(driver.client_counters.owned_by(id), Some(0));
         for cell in [kept_cell, other_cell] {
             assert_eq!(
                 client_cell(&driver, cell),
