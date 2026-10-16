@@ -55,11 +55,13 @@ pub enum OfferOutcome {
     /// reopen the application takes a new publication
     /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, GC-8).
     Gated,
-    /// The publication's rate limit holds no token for another message;
-    /// nothing was appended, retry later. An early rejection by the
-    /// handle's copy of the limit; the driver's sender gate is
+    /// The publication's rate limit holds no token for another message:
+    /// nothing was appended, and nothing is dropped; retry later. An early
+    /// rejection by the handle's copy of the limit, of a message the
+    /// driver's sender gate would hold at this instant; the gate is
     /// authoritative (`quantstratum-docs:
-    /// karyos/design/guards-and-abort.md`, Rate limits).
+    /// karyos/design/guards-and-abort.md`, Rate limits; see
+    /// [`GuardBinding::with_rate`]).
     RateLimited,
 }
 
@@ -161,6 +163,29 @@ pub struct ClientClaim<'a, T: TermBytes = HeapTerms> {
     base: u64,
     /// The handle's trace and the claim's extension, for a traced claim.
     trace: Option<(&'a mut PublishTrace, TraceExtension)>,
+    /// The rate copy's token the claim took, given back unless its commit
+    /// is accepted.
+    refund: RateRefund<'a>,
+}
+
+/// The rate copy's token of a claim: dropped armed, it is refunded, so an
+/// aborted, dropped or deadline-aborted claim keeps no token (G-e3).
+#[derive(Debug)]
+struct RateRefund<'a>(Option<&'a mut GuardBinding>);
+
+impl RateRefund<'_> {
+    /// The claim was accepted: its token stays spent.
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for RateRefund<'_> {
+    fn drop(&mut self) {
+        if let Some(binding) = self.0.take() {
+            binding.refund_rate();
+        }
+    }
 }
 
 impl<T: TermBytes> ClientClaim<'_, T> {
@@ -188,6 +213,7 @@ impl<T: TermBytes> ClientClaim<'_, T> {
         let (lane, base) = (self.lane, self.base);
         match self.inner.commit() {
             SysCommitOutcome::Committed { position } => {
+                self.refund.keep();
                 let position = base + position;
                 if let Some((trace, extension)) = self.trace {
                     trace.committed(&extension, lane, position);
@@ -637,13 +663,13 @@ impl<T: TermBytes> ClientPublication<T> {
         let lane = self.inner.buffer().lane();
         let base = self.base;
         let link = self.link.as_deref();
-        let guard = self.guard.as_mut();
+        let mut guard = self.guard.as_mut();
         let trace = match (extension, &mut self.trace) {
             (Some(extension), Some(trace)) => Some((trace, extension)),
             _ => None,
         };
         let outcome = self.inner.try_claim(length, options)?;
-        if let Some(binding) = guard
+        if let Some(binding) = guard.as_deref_mut()
             && reserves(&outcome)
         {
             binding.reserve();
@@ -657,6 +683,7 @@ impl<T: TermBytes> ClientPublication<T> {
                 lane,
                 base,
                 trace,
+                refund: RateRefund(guard.filter(|binding| binding.has_rate())),
             }),
             SysClaimOutcome::BackPressured => ClaimOutcome::BackPressured,
             SysClaimOutcome::AdminAction => ClaimOutcome::AdminAction,
@@ -1323,27 +1350,72 @@ mod tests {
             ));
             assert_eq!(driver.conductor.head().unwrap(), before, "nothing appended");
             assert_eq!(publication.guard().unwrap().outstanding(), 1);
-            // A tenth of a second earns one token: a claim takes it.
+            // A tenth of a second earns one token: an offer takes it.
             advance(100_000_000);
+            assert!(accepted(publication.offer(b"y").unwrap()));
+            assert_eq!(binding(&publication), Some(0));
+            // C_m = 2 reservations wait for their records: back pressure
+            // comes first, and a refusal charges nothing.
+            advance(100_000_000);
+            assert_eq!(
+                publication.offer(b"z").unwrap(),
+                OfferOutcome::BackPressured
+            );
+            driver.outcome(Kind::Submitted);
+            driver.outcome(Kind::Submitted);
+            let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+            assert_eq!(publication.guard().unwrap().outstanding(), 0);
+            assert!(accepted(publication.offer(b"z").unwrap()));
+            assert_eq!(binding(&publication), Some(0));
+            assert_eq!(publication.offer(b"w").unwrap(), OfferOutcome::RateLimited);
+        }
+
+        /// G-e3 (ACS 15347): a claim that will never be sent gives its
+        /// token back: dropped, aborted, or aborted by its deadline before
+        /// the commit; an accepted commit keeps it.
+        #[test]
+        fn an_unsent_claim_gives_its_rate_token_back() {
+            let (mut driver, mut publication) = guarded_with(Some(messages_per_second(10, 1)));
+            let tokens =
+                |publication: &ClientPublication| publication.guard().unwrap().rate_tokens();
+            let release = |driver: &mut Driver, publication: &mut ClientPublication| {
+                driver.outcome(Kind::Aborted);
+                let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+            };
+            // Dropped.
             let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
                 panic!("not claimed");
             };
             drop(claim);
-            assert_eq!(binding(&publication), Some(0));
-            // C_m = 2 reservations wait for their records: back pressure
-            // comes first, and a refusal charges nothing.
-            assert_eq!(
-                publication.offer(b"y").unwrap(),
-                OfferOutcome::BackPressured
-            );
-            driver.outcome(Kind::Submitted);
-            driver.outcome(Kind::Aborted);
-            let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
-            assert_eq!(publication.guard().unwrap().outstanding(), 0);
-            assert_eq!(publication.offer(b"y").unwrap(), OfferOutcome::RateLimited);
-            advance(100_000_000);
-            assert!(accepted(publication.offer(b"z").unwrap()));
-            assert_eq!(binding(&publication), Some(0));
+            assert_eq!(tokens(&publication), Some(1));
+            release(&mut driver, &mut publication);
+            // Aborted by the writer.
+            let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
+                panic!("not claimed");
+            };
+            claim.abort();
+            assert_eq!(tokens(&publication), Some(1));
+            release(&mut driver, &mut publication);
+            // Aborted by its deadline (the abort wins the decision word), as
+            // the commit observes.
+            let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
+                panic!("not claimed");
+            };
+            let _ = driver.conductor.abort_admitted_claim().unwrap();
+            assert!(matches!(claim.commit(), CommitOutcome::Aborted { .. }));
+            assert_eq!(tokens(&publication), Some(1));
+            release(&mut driver, &mut publication);
+            // Accepted: the token stays spent.
+            let ClaimOutcome::Claimed(mut claim) = publication.try_claim(8).unwrap() else {
+                panic!("not claimed");
+            };
+            claim.payload().fill(1);
+            assert!(matches!(claim.commit(), CommitOutcome::Accepted { .. }));
+            assert_eq!(tokens(&publication), Some(0));
+            assert!(matches!(
+                publication.try_claim(8).unwrap(),
+                ClaimOutcome::RateLimited
+            ));
         }
 
         #[test]

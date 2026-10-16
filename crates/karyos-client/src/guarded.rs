@@ -161,10 +161,16 @@ impl GuardBinding {
     /// Gives the handle a copy of its publication's rate limit, read
     /// against `clock` (monotonic nanoseconds): `offer` and `try_claim`
     /// return `RateLimited` while the copy holds no message token, and an
-    /// accepted message takes one. Only the message bucket is copied: the
-    /// gate charges bytes per frame, which a whole message cannot be
-    /// checked against early, so the copy never refuses what the gate
-    /// would admit, except after an aborted claim, which keeps its token.
+    /// accepted message takes one; a claim that is never sent (dropped,
+    /// aborted, or aborted by its deadline) gives its token back.
+    ///
+    /// The copy is an early rejection only. It charges a message when it is
+    /// accepted, before the sender gate charges it at its send, so a
+    /// `RateLimited` message is one the gate would hold at that instant; it
+    /// is not a claim that the gate would never have admitted it later.
+    /// `RateLimited` means retry later: nothing is appended or dropped.
+    /// Only the message bucket is copied, since the gate charges bytes per
+    /// frame, which a whole message cannot be checked against early.
     #[must_use]
     pub fn with_rate(mut self, policy: RatePolicy, clock: fn() -> u64) -> Self {
         let messages = RatePolicy {
@@ -192,6 +198,19 @@ impl GuardBinding {
             copy.limiter.refill_at((copy.clock)());
             copy.limiter.admits(0, true)
         })
+    }
+
+    /// Whether the handle keeps a rate copy.
+    pub(crate) fn has_rate(&self) -> bool {
+        self.rate.is_some()
+    }
+
+    /// Gives back the token of a claim that will never be sent: aborted,
+    /// dropped, or aborted by its deadline (capped at the burst).
+    pub(crate) fn refund_rate(&mut self) {
+        if let Some(copy) = &mut self.rate {
+            copy.limiter.refund(0, true);
+        }
     }
 
     /// Takes one message token for an accepted message; the caller checked
