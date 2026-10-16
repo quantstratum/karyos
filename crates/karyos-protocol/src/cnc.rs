@@ -1247,6 +1247,8 @@ pub enum CloseReason {
     ConflationVersionsExhausted,
     /// The stream was removed.
     StreamRemoved,
+    /// The stream's conflation feeder failed and could not go on.
+    ConflationFeederLost,
 }
 
 impl CloseReason {
@@ -1257,6 +1259,7 @@ impl CloseReason {
             Self::RequiredParticipantLost => 1,
             Self::ConflationVersionsExhausted => 2,
             Self::StreamRemoved => 3,
+            Self::ConflationFeederLost => 4,
         }
     }
 
@@ -1265,6 +1268,7 @@ impl CloseReason {
             1 => Some(Self::RequiredParticipantLost),
             2 => Some(Self::ConflationVersionsExhausted),
             3 => Some(Self::StreamRemoved),
+            4 => Some(Self::ConflationFeederLost),
             _ => None,
         }
     }
@@ -1277,6 +1281,7 @@ impl CloseReason {
             SealReason::RequiredParticipantLost => Some(Self::RequiredParticipantLost),
             SealReason::ConflationVersionsExhausted => Some(Self::ConflationVersionsExhausted),
             SealReason::StreamRemoved => Some(Self::StreamRemoved),
+            SealReason::ConflationFeederLost => Some(Self::ConflationFeederLost),
             _ => None,
         }
     }

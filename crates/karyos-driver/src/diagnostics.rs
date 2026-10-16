@@ -34,6 +34,9 @@ pub enum ErrorCode {
     CleanerLag = 6,
     /// Two receive paths conflicted (phase 2).
     ReceiveConflict = 7,
+    /// A stream's conflation feeder failed and the stream was ended with
+    /// `ConflationFeederLost`; the key is the stream registration and 0.
+    ConflationFeederLost = 8,
 }
 
 /// The agent that reported an error.

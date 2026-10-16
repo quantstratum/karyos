@@ -2364,6 +2364,10 @@ pub enum SealReason {
     ConflationVersionsExhausted,
     /// The stream was removed.
     StreamRemoved,
+    /// The stream's conflation feeder failed and could not go on (a
+    /// defect, not a timing case; `quantstratum-docs:
+    /// karyos/design/conflation-end-to-end.md`).
+    ConflationFeederLost,
 }
 
 impl SealReason {
@@ -2375,6 +2379,7 @@ impl SealReason {
             Self::RequiredParticipantLost => 1,
             Self::ConflationVersionsExhausted => 2,
             Self::StreamRemoved => 3,
+            Self::ConflationFeederLost => 4,
         }
     }
 
@@ -2385,6 +2390,7 @@ impl SealReason {
             1 => Self::RequiredParticipantLost,
             2 => Self::ConflationVersionsExhausted,
             3 => Self::StreamRemoved,
+            4 => Self::ConflationFeederLost,
             _ => Self::Unspecified,
         }
     }

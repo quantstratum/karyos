@@ -1291,6 +1291,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut work = 0u32;
         let mut first_error: Option<DriverError> = None;
         let mut closed = Vec::new();
+        let mut lost = Vec::new();
         for stream in &mut self.streams {
             if stream.conflation_terminal.is_some() {
                 if let Some(cutover) = stream.cutover.take() {
@@ -1348,8 +1349,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             let summary = match polled {
                 Ok(summary) => summary,
+                // The feeder cannot read on: the stream ends explicitly.
                 Err(error) => {
-                    first_error.get_or_insert(DriverError::Client(error.cause));
+                    lost.push((stream.id, stream.key(), error.cause.to_string()));
+                    if let Err(error) = lose_feeder(stream) {
+                        first_error.get_or_insert(DriverError::from(error));
+                    }
                     continue;
                 }
             };
@@ -1376,7 +1381,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if was_active && stream.conductor.seal_state() != SealState::Active {
                 closed.push(stream.key());
             }
-            if summary.closed.is_some() {
+            // An end the stream did not reach (no terminal seal: the feeder
+            // could not follow a cutover) is a lost feeder, never a silent
+            // end of the view.
+            if summary.closed.is_some() && stream.conductor.seal_reason().is_none() {
+                lost.push((
+                    stream.id,
+                    stream.key(),
+                    "the feeder ended before its stream".to_owned(),
+                ));
+                if let Err(error) = lose_feeder(stream) {
+                    first_error.get_or_insert(DriverError::from(error));
+                }
+            } else if summary.closed.is_some() {
                 if let Some(mut feeder) = stream.feeder.take() {
                     feeder.writer.close();
                 }
@@ -1392,6 +1409,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.emit(&DriverEvent::PublicationClosed {
                 stream,
                 reason: CloseReason::ConflationVersionsExhausted,
+            });
+        }
+        for (id, stream, cause) in lost {
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::ConflationFeederLost,
+                [id, 0],
+                &format!("conflation feeder lost: {cause}"),
+            );
+            self.emit(&DriverEvent::PublicationClosed {
+                stream,
+                reason: CloseReason::ConflationFeederLost,
             });
         }
         match first_error {
@@ -1532,6 +1561,27 @@ fn heap_mirror(
         config.trace_mirror_records,
     )
     .map_err(|_| DriverError::InvalidConfig)
+}
+
+/// Ends a stream whose conflation feeder failed: its cutover is abandoned,
+/// its table closed (views end with `closed`) and its publication sealed
+/// with `ConflationFeederLost`, so its readers get `Closed`. A current
+/// mapping already sealed (a cutover that had not opened yet) keeps its
+/// seal word, as any later seal does; the event and the error log record
+/// still name the loss.
+fn lose_feeder<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), karyos_sys::error::SysError> {
+    if let Some(cutover) = stream.cutover.take() {
+        cutover.abandon();
+    }
+    if let Some(mut feeder) = stream.feeder.take() {
+        feeder.writer.close();
+    }
+    stream
+        .members
+        .retain(|member| member.kind != MemberKind::Feeder);
+    stream
+        .conductor
+        .seal_with_reason(SealReason::ConflationFeederLost)
 }
 
 fn seal_conflation_terminal<E>(
@@ -1768,6 +1818,96 @@ mod tests {
             Some(SealReason::ConflationVersionsExhausted)
         );
         assert!(observed_work(&mut driver, &mut observer).is_empty());
+    }
+
+    /// conflation-end-to-end.md, Mapping generations: a feeder that cannot
+    /// follow a cutover (its generation link closed: a defect, here forced)
+    /// ends the stream explicitly, sealed with `ConflationFeederLost`,
+    /// reported once and logged, and its views end; never a silent loss.
+    #[test]
+    fn a_feeder_that_cannot_follow_a_cutover_ends_the_stream() {
+        use karyos_client::{ConflatedSubscription, OfferOutcome};
+        use karyos_protocol::cnc::{CloseReason, Event as DriverEvent};
+        use karyos_sys::log_buffer::AppendOptions;
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let mut stream_config = config(42);
+        stream_config.conflation = Some(ConflationConfig {
+            keys: 4,
+            value_capacity: 8,
+            journal_capacity: 1024,
+        });
+        let handle = driver.add_stream(stream_config).unwrap();
+        let mut observer = driver.connect().unwrap();
+        observer.set_liveness(Duration::ZERO, Duration::from_secs(3600));
+        let mut publication = driver.publication(handle).unwrap();
+        let mut conflated: ConflatedSubscription = driver.subscribe_conflated(handle).unwrap();
+        let options = AppendOptions {
+            reserved_value: 1,
+            ..AppendOptions::default()
+        };
+        assert!(matches!(
+            publication.offer_with(b"before", options).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+        assert!(observed_work(&mut driver, &mut observer).is_empty());
+        let _ = driver
+            .reconfigure_stream(
+                handle,
+                crate::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 3,
+                },
+            )
+            .unwrap();
+        // The defect: the feeder's link closes before it moves.
+        let link = driver.streams[0]
+            .feeder
+            .as_ref()
+            .unwrap()
+            .subscription
+            .generation_link()
+            .cloned()
+            .unwrap();
+        let _ = link.close();
+        let mut events = Vec::new();
+        for _ in 0..20 {
+            let _ = publication.offer_with(b"after", options).unwrap();
+            events.extend(observed_work(&mut driver, &mut observer));
+        }
+        assert_eq!(
+            events,
+            [DriverEvent::PublicationClosed {
+                stream: StreamKey {
+                    stream_id: 42,
+                    session_id: 1,
+                },
+                reason: CloseReason::ConflationFeederLost,
+            }]
+        );
+        assert!(driver.streams[0].feeder.is_none());
+        assert_eq!(
+            driver.seal_reason(handle).unwrap(),
+            Some(SealReason::ConflationFeederLost)
+        );
+        let mut records = Vec::new();
+        let _ = driver
+            .error_log()
+            .scan(&mut 0, |record| records.push(record));
+        assert!(
+            records.iter().any(|record| record.code
+                == crate::diagnostics::ErrorCode::ConflationFeederLost as u32
+                && record.key == [driver.streams[0].id, 0]),
+            "{records:?}"
+        );
+        // The views end.
+        let mut report = conflated.poll_changed(|_, _| {});
+        for _ in 0..8 {
+            if report.closed {
+                break;
+            }
+            report = conflated.poll_changed(|_, _| {});
+        }
+        assert!(report.closed, "{report:?}");
     }
 
     #[test]
