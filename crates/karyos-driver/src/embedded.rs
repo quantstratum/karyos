@@ -464,6 +464,10 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// A timed lane's settings (`quantstratum-docs:
     /// karyos/design/timed-tx.md`); the defaults when not set.
     pub(crate) schedule: Option<karyos_client::schedule::ScheduleOptions>,
+    /// A handle of this incarnation's timed lane was issued: its settings
+    /// are fixed from then on, even after the handle is dropped, since its
+    /// entries stay in the ring (#234 P3).
+    pub(crate) schedule_issued: bool,
 }
 
 /// A sealed incarnation a fresh one replaced, retiring like a removed
@@ -1794,6 +1798,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             incarnation: FIRST_INCARNATION,
             replaced: Vec::new(),
             schedule: None,
+            schedule_issued: false,
         })
     }
 
@@ -1861,6 +1866,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         if let Some(schedule) = schedule {
             publication = publication.with_schedule(schedule);
+            stream.schedule_issued = true;
         }
         self.update_stream_gauges();
         Ok(publication)
@@ -1873,14 +1879,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream: StreamHandle,
     ) -> Result<Option<karyos_client::schedule::ScheduleBinding>, DriverError> {
         let found = self.stream_ref(stream)?;
-        let Some(ring) = found.buffer.schedule_ring() else {
+        if found.buffer.schedule_ring().is_none() {
             return Ok(None);
-        };
+        }
         let options = found.schedule.unwrap_or_default();
         let clock = options.domain.clock()?;
         Ok(Some(karyos_client::schedule::ScheduleBinding::new(
-            ring, options, clock,
-        )?))
+            options, clock,
+        )))
     }
 
     /// Sets a timed lane's settings (`quantstratum-docs:
@@ -1893,7 +1899,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// [`DriverError::NotTimed`] for a stream whose buffer has no schedule
     /// ring (`schedule_capacity` 0); [`DriverError::InvalidConfig`] once a
-    /// handle was issued; [`DriverError::Client`] with `InvalidSchedule`
+    /// handle of the incarnation was issued, also if it was dropped since;
+    /// [`DriverError::Client`] with `InvalidSchedule` for a zero horizon and
     /// for the `Tai` domain off Linux; the stream lookup errors.
     pub fn schedule_stream(
         &mut self,
@@ -1901,15 +1908,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         options: karyos_client::schedule::ScheduleOptions,
     ) -> Result<(), DriverError> {
         let _ = options.domain.clock()?;
+        if options.max_horizon == 0 {
+            return Err(DriverError::Client(
+                karyos_client::ClientError::InvalidSchedule {
+                    reason: "a zero horizon",
+                },
+            ));
+        }
         let found = self.active_stream(stream)?;
         if found.buffer.schedule_ring().is_none() {
             return Err(DriverError::NotTimed { stream: found.id });
         }
-        let issued = found
-            .members
-            .iter()
-            .any(|member| matches!(member.kind, MemberKind::Exclusive));
-        if issued {
+        // Once a handle of this incarnation was issued, its entries are in
+        // the ring under the old settings, also after the handle is gone.
+        if found.schedule_issued {
             return Err(DriverError::InvalidConfig);
         }
         found.schedule = Some(options);
@@ -1994,6 +2006,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         found.buffer = buffer;
         found.incarnation = incarnation;
+        // A fresh incarnation has a fresh ring.
+        found.schedule_issued = false;
         found.base = base;
         found.members.clear();
         found.spare = None;

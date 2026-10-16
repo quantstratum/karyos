@@ -180,3 +180,100 @@ fn the_schedule_is_set_before_any_handle() {
         ));
     }
 }
+
+/// A timed lane takes no cutover: its ring belongs to one buffer, and the
+/// handle's publisher would not follow a successor (#234 P1). Nothing
+/// changes on the refusal: the lane keeps its mapping and its offers.
+#[test]
+fn a_timed_lane_refuses_a_cutover() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 4);
+    let mut publication = driver.publication(handle).unwrap();
+    assert!(matches!(
+        publication.offer_at(b"m", 1).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert!(matches!(
+        driver.reconfigure_stream(
+            handle,
+            karyos_driver::Reconfiguration {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                spare_slots: 3,
+            },
+        ),
+        Err(DriverError::TimedCutover { .. })
+    ));
+    assert_eq!(driver.generations(handle).unwrap().len(), 1);
+    assert!(matches!(
+        publication.offer_at(b"m", 2).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    // A lane that is not timed still takes one.
+    let mut other = EmbeddedDriver::new().unwrap();
+    let plain = stream(&mut other, 0);
+    assert!(
+        other
+            .reconfigure_stream(
+                plain,
+                karyos_driver::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 3,
+                },
+            )
+            .is_ok()
+    );
+}
+
+/// A zero horizon is refused: every offer would be checked against the
+/// clock alone (#234 P3).
+#[test]
+fn a_zero_horizon_is_refused() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 4);
+    assert!(matches!(
+        driver.schedule_stream(
+            handle,
+            ScheduleOptions {
+                max_horizon: 0,
+                ..ScheduleOptions::default()
+            },
+        ),
+        Err(DriverError::Client(ClientError::InvalidSchedule { .. }))
+    ));
+}
+
+/// The settings are fixed once a handle of the incarnation was issued,
+/// also after it is dropped: its entries stay in the ring (#234 P3).
+#[test]
+fn the_schedule_stays_fixed_after_a_handle_is_dropped() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 4);
+    let mut publication = driver.publication(handle).unwrap();
+    assert!(matches!(
+        publication.offer_at(b"m", 1).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    drop(publication);
+    let _ = driver.do_work();
+    assert_eq!(
+        driver.schedule_stream(handle, ScheduleOptions::default()),
+        Err(DriverError::InvalidConfig)
+    );
+}
+
+/// A sealed handle reports its seal before a refused time, as every other
+/// refusal does and as sys does (#234 P3).
+#[test]
+fn a_sealed_handle_reports_the_seal_before_a_refused_time() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 4);
+    let mut publication = driver.publication(handle).unwrap();
+    assert!(matches!(
+        publication.offer_at(b"m", 10).unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert!(invalid(publication.offer_at(b"m", 5)));
+    driver.remove_stream(handle).unwrap();
+    assert_eq!(publication.offer_at(b"m", 5).unwrap(), OfferOutcome::Closed);
+    assert_eq!(publication.offer_at(b"m", 5).unwrap(), OfferOutcome::Closed);
+}

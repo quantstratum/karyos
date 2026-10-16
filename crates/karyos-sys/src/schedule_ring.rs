@@ -63,6 +63,10 @@ pub enum ScheduleError {
     /// claim: a timed lane carries timed messages only.
     #[error("not a timed lane, or a timed lane offered without a time")]
     NotScheduled,
+    /// A requested time below the lane's last: times never go backwards
+    /// on a timed lane.
+    #[error("a requested time below the lane's last")]
+    Backwards,
     /// 2^64 entries were pushed on the lane.
     #[error("the schedule ring's entries are exhausted")]
     Exhausted,

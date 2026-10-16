@@ -96,9 +96,16 @@ release may break APIs, wire formats and shared-memory layouts.
   (provisional defaults: 1 s horizon, 1 ms tolerance);
   `EmbeddedDriver::schedule_stream` sets them before any handle
   (`DriverError::NotTimed` for a lane that is not timed), and a CnC
-  publication of a timed lane is refused for now. In karyos-sys,
-  `Publication::append_scheduled` pushes the message's schedule entry after
-  its reservation and before its commit store (`SysError::Schedule`). A
+  publication of a timed lane is refused for now, as is a cutover
+  (`DriverError::TimedCutover`), a zero horizon, and new settings once a
+  handle of the incarnation was issued. A schedule clock that cannot read
+  the time returns `schedule::CLOCK_UNAVAILABLE` and the offer is refused
+  with `ScheduleOverflow`. In karyos-sys, `Publication::append_scheduled`
+  pushes the message's schedule entry after its reservation and before its
+  commit store through the publication's own publisher of its own ring,
+  refuses a time below the last (`ScheduleError::Backwards`) and observes a
+  seal before a full ring's back pressure; `Publication::schedule_has_room`
+  reports the ring's room (`SysError::Schedule`). A
   schedule capacity is a power of two up to `schedule_ring::MAX_CAPACITY`
   (2^20), refused otherwise with `ScheduleError::Capacity`, and attach checks
   the ring's own capacity word against the configuration.

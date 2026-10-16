@@ -1253,8 +1253,22 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
 /// The exclusive publication's initial write loan on term 0, for a fresh
 /// publication taken by this process or adopted from a registration.
 fn first_loan<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Result<Publication<O>, SysError> {
+    let schedule = schedule_publisher(&owner)?;
     take_initial_loan(&owner)?;
-    Ok(initial_publication(owner, staging))
+    Ok(initial_publication(owner, staging, schedule))
+}
+
+/// The publisher of a timed lane's schedule ring, built from the buffer's
+/// own ring, so a publication's entries always go to its own lane's ring;
+/// `None` for a lane that is not timed.
+fn schedule_publisher<T: TermBytes>(
+    buffer: &LogBuffer<T>,
+) -> Result<Option<crate::schedule_ring::SchedulePublisher>, SysError> {
+    buffer
+        .schedule_ring()
+        .map(crate::schedule_ring::SchedulePublisher::attach)
+        .transpose()
+        .map_err(SysError::from)
 }
 
 /// Takes the exclusive publication's write loan on term 0, in slot 0: a
@@ -1278,7 +1292,11 @@ fn take_initial_loan<T: TermBytes>(buffer: &LogBuffer<T>) -> Result<(), SysError
 }
 
 /// The exclusive publication at term 0 under its initial write loan.
-fn initial_publication<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Publication<O> {
+fn initial_publication<O: BufferOwner>(
+    owner: O,
+    staging: Box<[u8]>,
+    schedule: Option<crate::schedule_ring::SchedulePublisher>,
+) -> Publication<O> {
     Publication {
         buffer: owner,
         state: PublicationState::Active {
@@ -1288,6 +1306,8 @@ fn initial_publication<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Publicat
         },
         pending: None,
         staging,
+        schedule,
+        last_time: None,
     }
 }
 
@@ -1414,13 +1434,22 @@ impl<O: BufferOwner> PreparedPublication<O> {
                 prepared: Some(self),
             });
         }
+        let schedule = match schedule_publisher(buffer) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                return Err(ActivateError {
+                    error,
+                    prepared: Some(self),
+                });
+            }
+        };
         if let Err(error) = take_initial_loan(buffer) {
             return Err(ActivateError {
                 error,
                 prepared: Some(self),
             });
         }
-        Ok(initial_publication(self.owner, self.staging))
+        Ok(initial_publication(self.owner, self.staging, schedule))
     }
 }
 
@@ -1687,6 +1716,10 @@ pub struct Publication<O: BufferOwner> {
     pending: Option<PendingClaim>,
     /// Claim payload staging on backings without direct bytes.
     staging: Box<[u8]>,
+    /// A timed lane's publisher of its own schedule ring.
+    schedule: Option<crate::schedule_ring::SchedulePublisher>,
+    /// The last requested time a timed append accepted.
+    last_time: Option<u64>,
 }
 
 impl<O: BufferOwner> Publication<O> {
@@ -1733,51 +1766,104 @@ impl<O: BufferOwner> Publication<O> {
     /// Appends one message of a timed lane with its requested `time`
     /// (`quantstratum-docs: karyos/design/timed-tx.md`, section 2, TT-1):
     /// the schedule ring's room is checked before the message is reserved
-    /// (none is back pressure, and nothing is reserved), and the entry of
-    /// the reserved message's first frame is pushed after the reservation
-    /// and before the block's commit store, so a sender that sees the
-    /// committed frame finds its entry. `publisher` is the lane's publisher
-    /// of the ring, held by the handle across appends.
+    /// (none is back pressure, and nothing is reserved; a sealed buffer is
+    /// observed first, as an append observes it), and the entry of the
+    /// reserved message's first frame is pushed after the reservation and
+    /// before the block's commit store, so a sender that sees the committed
+    /// frame finds its entry. The publication's own publisher of its own
+    /// lane's ring pushes it; times never go backwards on the lane.
     ///
     /// # Errors
     ///
     /// As [`Publication::append`]; [`SysError::Schedule`] with
-    /// `NotScheduled` for a lane that is not timed, `Exhausted` past 2^64
-    /// entries and `Layout` or `Invariant` for a ring that does not match
-    /// the publisher. Nothing is reserved on error.
+    /// `NotScheduled` for a lane that is not timed, `Backwards` for a time
+    /// below the lane's last, `Exhausted` past 2^64 entries and `Invariant`
+    /// for counts a peer broke. Nothing is reserved on error.
     pub fn append_scheduled(
         &mut self,
         payload: &[u8],
         options: AppendOptions,
-        publisher: &mut crate::schedule_ring::SchedulePublisher,
         time: u64,
+    ) -> Result<AppendOutcome, SysError> {
+        self.append_scheduled_with(payload, options, time, &mut || {})
+    }
+
+    /// [`Publication::append_scheduled`] with `pause` called between the
+    /// entry's push and the block's write and commit.
+    #[cfg(test)]
+    fn append_scheduled_pausing(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        time: u64,
+        pause: &mut dyn FnMut(),
+    ) -> Result<AppendOutcome, SysError> {
+        self.append_scheduled_with(payload, options, time, pause)
+    }
+
+    fn append_scheduled_with(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        time: u64,
+        pause: &mut dyn FnMut(),
     ) -> Result<AppendOutcome, SysError> {
         self.resolve_claim();
         if self.state == PublicationState::Closed {
             return Ok(self.ended_append());
         }
-        let buffer = &*self.buffer;
-        let ring = buffer
-            .schedule_ring()
-            .ok_or(crate::schedule_ring::ScheduleError::NotScheduled)?;
-        if !publisher.has_room(ring)? {
+        if self.schedule.is_none() {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
+        }
+        if self.last_time.is_some_and(|last| time < last) {
+            return Err(crate::schedule_ring::ScheduleError::Backwards.into());
+        }
+        if !self.schedule_has_room()? {
+            if self.observe_seal() {
+                return Ok(self.ended_append());
+            }
             return Ok(AppendOutcome::BackPressured);
         }
+        let buffer = &*self.buffer;
+        let (Some(ring), Some(publisher)) = (buffer.schedule_ring(), self.schedule.as_mut()) else {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
+        };
         let outcome = PublicationContext {
             buffer: &self.buffer,
             state: &mut self.state,
         }
         .append(payload, options, &mut |position| {
-            // Room was checked and the count is not exhausted: the push of
-            // a reserved message cannot be refused.
+            // Room was checked on the publication's own ring and the count
+            // is not exhausted: the push of a reserved message cannot be
+            // refused.
             let pushed = publisher.push(ring, crate::schedule_ring::Entry { position, time });
             debug_assert!(pushed.is_ok(), "{pushed:?}");
+            pause();
         })?;
         match outcome {
-            AppendOutcome::Appended { .. } => Ok(outcome),
+            AppendOutcome::Appended { .. } => {
+                self.last_time = Some(time);
+                Ok(outcome)
+            }
             _ if self.observe_seal() => Ok(self.ended_append()),
             _ => Ok(outcome),
         }
+    }
+
+    /// Whether a timed lane's schedule ring has room for one more entry
+    /// (the offer's back pressure, checked before anything is reserved).
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::Schedule`] with `NotScheduled` for a lane that is not
+    /// timed, `Exhausted` past 2^64 entries and `Invariant` for counts a
+    /// peer broke.
+    pub fn schedule_has_room(&mut self) -> Result<bool, SysError> {
+        let buffer = &*self.buffer;
+        let (Some(ring), Some(publisher)) = (buffer.schedule_ring(), self.schedule.as_mut()) else {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
+        };
+        Ok(publisher.has_room(ring)?)
     }
 
     /// Claims one unfragmented block of `length` payload bytes (SPEC.md §4,

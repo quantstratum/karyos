@@ -560,8 +560,10 @@ impl<T: TermBytes> ClientPublication<T> {
         // A forgotten claim is resolved before any early return.
         self.inner.resolve_forgotten_claim();
         // A timed lane takes timed offers only, and only it does; the time
-        // is checked before anything is reserved.
-        match (tx_time, &self.schedule) {
+        // is checked before anything is reserved. A refused time on a sealed
+        // handle reports the seal first and releases, as every other
+        // refusal does (GC-8).
+        let checked = match (tx_time, &self.schedule) {
             (None, Some(_)) => {
                 return Err(ClientError::InvalidSchedule {
                     reason: "a timed lane takes offer_at only",
@@ -572,8 +574,17 @@ impl<T: TermBytes> ClientPublication<T> {
                     reason: "offer_at on a lane that is not timed",
                 });
             }
-            (Some(time), Some(binding)) => binding.check(time)?,
-            (None, None) => {}
+            (Some(time), Some(binding)) => binding.check(time),
+            (None, None) => Ok(()),
+        };
+        if let Err(error) = checked {
+            if let Some(reason) = self.inner.close_if_sealed() {
+                if reason.is_gate() {
+                    return Ok(OfferOutcome::Gated);
+                }
+                return Ok(self.after_end().offer());
+            }
+            return Err(error);
         }
         let admission = self.guard.as_ref().map(GuardBinding::admission);
         if let Some(refused) = admission.filter(|admission| *admission != Admission::Open) {
@@ -621,10 +632,7 @@ impl<T: TermBytes> ClientPublication<T> {
             return Ok(OfferOutcome::RateLimited);
         }
         let appended = match (tx_time, &mut self.schedule) {
-            (Some(time), Some(binding)) => {
-                self.inner
-                    .append_scheduled(payload, options, &mut binding.publisher, time)?
-            }
+            (Some(time), Some(_)) => self.inner.append_scheduled(payload, options, time)?,
             _ => self.inner.append(payload, options)?,
         };
         Ok(match appended {

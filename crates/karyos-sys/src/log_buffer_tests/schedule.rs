@@ -86,24 +86,89 @@ fn a_timed_lane_takes_scheduled_appends_only() {
         ))
     ));
     let plain = new_buffer(config(2, 2)).unwrap();
-    let ring = timed_ring_words();
-    crate::schedule_ring::init(&ring, 4).unwrap();
-    let mut other = crate::schedule_ring::SchedulePublisher::attach(&ring).unwrap();
+    let mut plain_publication = plain.publication().unwrap().unwrap();
     assert_eq!(
-        plain.publication().unwrap().unwrap().append_scheduled(
-            b"a",
-            AppendOptions::default(),
-            &mut other,
-            1
-        ),
+        plain_publication.append_scheduled(b"a", AppendOptions::default(), 1),
         not_scheduled
     );
+    assert_eq!(plain_publication.schedule_has_room(), not_scheduled.map(|_| true));
 }
 
-fn timed_ring_words() -> Vec<AtomicU64> {
-    (0..crate::schedule_ring::ring_words(4).unwrap())
-        .map(|_| AtomicU64::new(0))
-        .collect()
+/// Times never go backwards on a timed lane, also in sys: a time below the
+/// last is refused before anything is reserved; an equal one is accepted.
+#[test]
+fn a_time_below_the_last_is_refused() {
+    let buffer = new_buffer(timed(4)).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    assert!(matches!(
+        publication.append_scheduled(b"a", AppendOptions::default(), 20),
+        Ok(AppendOutcome::Appended { .. })
+    ));
+    let head = buffer.reserved_head().load(Ordering::Acquire);
+    assert_eq!(
+        publication.append_scheduled(b"b", AppendOptions::default(), 19),
+        Err(SysError::Schedule(
+            crate::schedule_ring::ScheduleError::Backwards
+        ))
+    );
+    assert_eq!(buffer.reserved_head().load(Ordering::Acquire), head);
+    assert!(matches!(
+        publication.append_scheduled(b"c", AppendOptions::default(), 20),
+        Ok(AppendOutcome::Appended { .. })
+    ));
+}
+
+/// A sealed timed lane whose ring is full still observes its seal and
+/// releases, as an append does (#234 P2-1).
+#[test]
+fn a_full_schedule_still_observes_the_seal() {
+    let buffer = new_buffer(timed(1)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    assert!(matches!(
+        publication.append_scheduled(b"a", AppendOptions::default(), 1),
+        Ok(AppendOutcome::Appended { .. })
+    ));
+    assert_eq!(
+        publication.append_scheduled(b"b", AppendOptions::default(), 2),
+        Ok(AppendOutcome::BackPressured)
+    );
+    conductor.seal().unwrap();
+    assert_eq!(
+        publication.append_scheduled(b"b", AppendOptions::default(), 2),
+        Ok(AppendOutcome::Closed)
+    );
+    assert_ne!(buffer.exclusive_released().load(Ordering::Acquire), 0);
+}
+
+/// The entry is pushed before the block's commit store: at the pause
+/// between them, the sender already finds the entry while no reader sees
+/// the message (#234 P3, the push-before-commit order).
+#[test]
+fn the_entry_is_visible_before_the_block_is_committed() {
+    let buffer = new_buffer(timed(4)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Required).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let ring = buffer.schedule_ring().unwrap();
+    let reader = crate::schedule_ring::ScheduleReader::attach(ring).unwrap();
+    let mut paused = false;
+    let outcome = publication
+        .append_scheduled_pausing(b"a", AppendOptions::default(), 7, &mut || {
+            paused = true;
+            assert_eq!(reader.peek(ring).unwrap().map(|entry| entry.time), Some(7));
+            assert!(poll_message(&mut subscription).is_none(), "committed early");
+        })
+        .unwrap();
+    assert!(paused);
+    let AppendOutcome::Appended { position } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(
+        reader.peek(ring).unwrap(),
+        Some(crate::schedule_ring::Entry { position, time: 7 })
+    );
+    assert!(poll_message(&mut subscription).is_some());
 }
 
 /// A full ring back pressures before the reservation: nothing is reserved.
@@ -111,12 +176,10 @@ fn timed_ring_words() -> Vec<AtomicU64> {
 fn a_full_schedule_backpressures_before_reserving() {
     let buffer = new_buffer(timed(2)).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
-    let ring = buffer.schedule_ring().unwrap();
-    let mut publisher = crate::schedule_ring::SchedulePublisher::attach(ring).unwrap();
     for time in [10, 20] {
         assert!(matches!(
             publication
-                .append_scheduled(b"a", AppendOptions::default(), &mut publisher, time)
+                .append_scheduled(b"a", AppendOptions::default(), time)
                 .unwrap(),
             AppendOutcome::Appended { .. }
         ));
@@ -124,7 +187,7 @@ fn a_full_schedule_backpressures_before_reserving() {
     let head = buffer.reserved_head().load(Ordering::Acquire);
     assert_eq!(
         publication
-            .append_scheduled(b"b", AppendOptions::default(), &mut publisher, 30)
+            .append_scheduled(b"b", AppendOptions::default(), 30)
             .unwrap(),
         AppendOutcome::BackPressured
     );
@@ -141,7 +204,6 @@ fn scheduled_appends_keep_the_ring_in_step_with_the_log() {
     let mut subscription = conductor.subscribe(Role::Required).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     let ring = buffer.schedule_ring().unwrap();
-    let mut publisher = crate::schedule_ring::SchedulePublisher::attach(ring).unwrap();
     let mut reader = crate::schedule_ring::ScheduleReader::attach(ring).unwrap();
     let mut expected = Vec::new();
     let mut seen = Vec::new();
@@ -160,12 +222,7 @@ fn scheduled_appends_keep_the_ring_in_step_with_the_log() {
         let time = u64::from(sequence) * 3;
         loop {
             match publication
-                .append_scheduled(
-                    &message(sequence),
-                    AppendOptions::default(),
-                    &mut publisher,
-                    time,
-                )
+                .append_scheduled(&message(sequence), AppendOptions::default(), time)
                 .unwrap()
             {
                 AppendOutcome::Appended { position } => {

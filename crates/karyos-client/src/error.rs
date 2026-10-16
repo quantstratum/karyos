@@ -86,6 +86,11 @@ impl From<SysError> for ClientError {
                     reason: "a timed lane takes timed offers only, and only a timed lane does",
                 }
             }
+            SysError::Schedule(karyos_sys::schedule_ring::ScheduleError::Backwards) => {
+                Self::InvalidSchedule {
+                    reason: "a requested time below the lane's last",
+                }
+            }
             other => Self::Sys(other),
         }
     }

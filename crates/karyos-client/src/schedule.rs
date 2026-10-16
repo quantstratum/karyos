@@ -4,13 +4,10 @@
 //! karyos/design/timed-tx.md`, sections 2 and 3; P2.11 T1).
 //!
 //! A timed lane's publication handle holds a [`ScheduleBinding`]: the
-//! lane's schedule ring publisher, the publication's clock domain and its
-//! limits. `offer_at` checks a requested time against them before anything
-//! is reserved, then appends the message with its entry
-//! (`karyos_sys::log_buffer::Publication::append_scheduled`).
-
-use karyos_sys::schedule_ring::SchedulePublisher;
-use karyos_sys::sync::AtomicU64;
+//! publication's clock domain and its limits. `offer_at` checks a requested
+//! time against them before anything is reserved, then appends the message
+//! with its entry (`karyos_sys::log_buffer::Publication::append_scheduled`,
+//! whose publisher is the sys publication's own).
 
 use crate::error::ClientError;
 
@@ -50,12 +47,17 @@ impl ClockDomain {
 }
 
 /// `CLOCK_TAI` once its availability was checked: a later refusal by the
-/// kernel reads as the end of time, so every deadline sum overflows and
-/// the offer is refused (`ScheduleOverflow`), never scheduled on a guess.
+/// kernel reads as [`CLOCK_UNAVAILABLE`], and the offer is refused
+/// (`ScheduleOverflow`), never scheduled on a guess.
 #[cfg(target_os = "linux")]
 fn tai_now() -> u64 {
-    karyos_sys::host_clock::host_tai_ns().unwrap_or(u64::MAX)
+    karyos_sys::host_clock::host_tai_ns().unwrap_or(CLOCK_UNAVAILABLE)
 }
+
+/// What a schedule clock returns when it cannot read the time: an offer
+/// checked against it is refused with `ScheduleOverflow`, whatever the
+/// horizon, never scheduled on a guess.
+pub const CLOCK_UNAVAILABLE: u64 = u64::MAX;
 
 /// The current time in `domain`, so an application reads the clock it
 /// schedules in.
@@ -94,36 +96,26 @@ impl Default for ScheduleOptions {
     }
 }
 
-/// A timed lane's publication side: the ring's publisher, the settings and
-/// the last time accepted.
+/// A timed lane's publication side: the settings, the clock and the last
+/// time accepted. The ring's publisher is the sys publication's own, built
+/// from its own lane's ring, so a handle cannot push to another lane's.
 #[derive(Debug)]
 pub struct ScheduleBinding {
-    pub(crate) publisher: SchedulePublisher,
     options: ScheduleOptions,
     clock: fn() -> u64,
     last: Option<u64>,
 }
 
 impl ScheduleBinding {
-    /// The binding of the timed lane whose schedule ring is `ring`, read
-    /// against `clock` in `options.domain`.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError::Sys`] for a ring that is not one.
-    pub fn new(
-        ring: &[AtomicU64],
-        options: ScheduleOptions,
-        clock: fn() -> u64,
-    ) -> Result<Self, ClientError> {
-        let publisher = SchedulePublisher::attach(ring)
-            .map_err(|error| ClientError::from(karyos_sys::error::SysError::from(error)))?;
-        Ok(Self {
-            publisher,
+    /// The binding of a timed lane, its offers read against `clock` in
+    /// `options.domain`.
+    #[must_use]
+    pub fn new(options: ScheduleOptions, clock: fn() -> u64) -> Self {
+        Self {
             options,
             clock,
             last: None,
-        })
+        }
     }
 
     /// The publication's settings.
@@ -142,7 +134,8 @@ impl ScheduleBinding {
     /// below the lane's last is `InvalidSchedule` (times never go backwards
     /// within a timed lane, or its head-time rule breaks); one beyond
     /// `now + max_horizon` is `ScheduleTooFar`; a deadline that overflows
-    /// is `ScheduleOverflow`. A time already past is accepted.
+    /// is `ScheduleOverflow`, as is a clock that cannot read the time
+    /// ([`CLOCK_UNAVAILABLE`]). A time already past is accepted.
     pub(crate) fn check(&self, tx_time: u64) -> Result<(), ClientError> {
         if self.last.is_some_and(|last| tx_time < last) {
             return Err(ClientError::InvalidSchedule {
@@ -152,7 +145,11 @@ impl ScheduleBinding {
         tx_time
             .checked_add(self.options.lateness_tolerance)
             .ok_or(ClientError::ScheduleOverflow)?;
-        let limit = (self.clock)()
+        let now = (self.clock)();
+        if now == CLOCK_UNAVAILABLE {
+            return Err(ClientError::ScheduleOverflow);
+        }
+        let limit = now
             .checked_add(self.options.max_horizon)
             .ok_or(ClientError::ScheduleOverflow)?;
         if tx_time > limit {
@@ -181,12 +178,31 @@ mod tests {
         NOW.with(core::cell::Cell::get)
     }
 
-    fn binding(options: ScheduleOptions) -> (Vec<AtomicU64>, ScheduleBinding) {
-        let words = karyos_sys::schedule_ring::ring_words(4).unwrap();
-        let ring: Vec<AtomicU64> = (0..words).map(|_| AtomicU64::new(0)).collect();
-        karyos_sys::schedule_ring::init(&ring, 4).unwrap();
-        let binding = ScheduleBinding::new(&ring, options, now_for_tests).unwrap();
-        (ring, binding)
+    fn binding(options: ScheduleOptions) -> ((), ScheduleBinding) {
+        ((), ScheduleBinding::new(options, now_for_tests))
+    }
+
+    fn unavailable() -> u64 {
+        CLOCK_UNAVAILABLE
+    }
+
+    /// A clock that cannot read the time refuses every offer with
+    /// `ScheduleOverflow`, also with a zero horizon, where the sum alone
+    /// would not overflow (#234 P3).
+    #[test]
+    fn an_unavailable_clock_refuses() {
+        for max_horizon in [0, 1, 1_000_000_000] {
+            let binding = ScheduleBinding::new(
+                ScheduleOptions {
+                    max_horizon,
+                    ..ScheduleOptions::default()
+                },
+                unavailable,
+            );
+            for time in [0, 1_000, u64::MAX - 1_000_000_000] {
+                assert_eq!(binding.check(time), Err(ClientError::ScheduleOverflow));
+            }
+        }
     }
 
     /// `ScheduleTooFar` at `max_horizon` plus 1 ns, never at the horizon
