@@ -107,7 +107,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 51] = [
+const LABELS: [(u64, &str); 54] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -159,6 +159,9 @@ const LABELS: [(u64, &str); 51] = [
     (TYPE_EVENTS, "trace mirror overwritten"),
     (TYPE_GAUGE, "trace journals open"),
     (TYPE_EVENTS, "trace journal faults"),
+    (TYPE_EVENTS, "guard outcomes written"),
+    (TYPE_EVENTS, "guard outcomes lost"),
+    (TYPE_EVENTS, "guard walker budget exhausted"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -288,6 +291,13 @@ pub(crate) enum Event {
     TraceJournalsOpen,
     /// Client trace journals no longer drained after a protocol violation.
     TraceJournalFaults,
+    /// Final outcome records the guard walkers wrote into handle rings.
+    GuardOutcomesWritten,
+    /// Outcome records counted as lost (a faulted client, or a block no
+    /// issued handle reserved).
+    GuardOutcomesLost,
+    /// Duty cycles in which a guard walker used its whole budget.
+    GuardWalkerBudgetExhausted,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -531,6 +541,12 @@ mod tests {
             (Event::TraceMirrorOverwritten, "trace mirror overwritten"),
             (Event::TraceJournalsOpen, "trace journals open"),
             (Event::TraceJournalFaults, "trace journal faults"),
+            (Event::GuardOutcomesWritten, "guard outcomes written"),
+            (Event::GuardOutcomesLost, "guard outcomes lost"),
+            (
+                Event::GuardWalkerBudgetExhausted,
+                "guard walker budget exhausted",
+            ),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

@@ -38,6 +38,18 @@ pub enum ErrorCode {
     /// `ConflationFeederLost`; the key is the aggregate registration and the
     /// lane.
     ConflationFeederLost = 8,
+    /// A guard word broke its encoding (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, G2): the guard is treated as
+    /// closed; the key is the guard id and the word.
+    GuardWordCorrupt = 9,
+    /// A guard walker was lapped, a broken invariant (it holds the
+    /// retention floor): the outcome streams of the stream's handles were
+    /// abandoned with an unknown lost count. The key is the stream id.
+    GuardWalkerLapped = 10,
+    /// A guard close took effect but sealing a stream it binds failed (a
+    /// broken invariant); the walker's duty retries the claim abort. The
+    /// key is the guard id.
+    GuardSealFailed = 11,
 }
 
 /// The agent that reported an error.

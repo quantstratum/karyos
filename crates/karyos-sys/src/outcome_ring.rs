@@ -256,6 +256,10 @@ fn slot_base(capacity: u64, sequence: u64) -> Option<usize> {
     slot.checked_mul(RECORD_WORDS)?.checked_add(HEADER_WORDS)
 }
 
+/// The lost count of an `OutcomesLost` record whose lost records cannot
+/// be counted (coordinator, ACS 15161): never read as "nothing lost".
+pub const LOST_UNKNOWN: u64 = u64::MAX;
+
 /// What [`OutcomeWriter::produce`] did with a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Produced {
@@ -368,7 +372,10 @@ impl OutcomeWriter {
     ) -> Result<Produced, OutcomeError> {
         let fields = record.fields().ok_or(OutcomeError::Layout)?;
         if let Some(lost) = &mut self.lost {
-            *lost = lost.checked_add(1).ok_or(OutcomeError::Exhausted)?;
+            // An unknown count stays unknown.
+            if *lost != LOST_UNKNOWN {
+                *lost = lost.checked_add(1).ok_or(OutcomeError::Exhausted)?;
+            }
             return Ok(Produced::Lost);
         }
         let sequence = self.written.checked_add(1).ok_or(OutcomeError::Exhausted)?;
@@ -386,6 +393,22 @@ impl OutcomeWriter {
         }
         self.written = sequence;
         Ok(Produced::Written(sequence))
+    }
+
+    /// Faults the client for a reason outside the ring, such as a source of
+    /// records the driver lost (its walker lapped, a broken invariant):
+    /// writes the final `OutcomesLost` record with `lost`, which is
+    /// [`LOST_UNKNOWN`] when the lost records cannot be counted. A writer
+    /// already faulted changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`OutcomeWriter::produce`].
+    pub fn abandon(&mut self, ring: &[AtomicU64], lost: u64) -> Result<(), OutcomeError> {
+        if self.lost.is_some() {
+            return Ok(());
+        }
+        self.fault(ring, lost)
     }
 
     /// Validates the consumed cell (Acquire): monotonic, and at most the

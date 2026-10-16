@@ -363,3 +363,29 @@ fn only_the_replaced_record_is_pending() {
     // Slot 0 still holds record 1: pending.
     assert_eq!(read_all(&mut reader, &ring, &consumed).len(), 0);
 }
+
+#[test]
+fn an_abandoned_ring_ends_with_an_unknown_count() {
+    let ring = ring(4);
+    let consumed = AtomicU64::new(0);
+    let mut writer = OutcomeWriter::new(4).unwrap();
+    let _ = writer
+        .produce(&ring, &consumed, message(Kind::Submitted, 0))
+        .unwrap();
+    writer.abandon(&ring, LOST_UNKNOWN).unwrap();
+    assert_eq!(writer.faulted(), Some(LOST_UNKNOWN));
+    // Later records stay unknown, and a second abandon changes nothing.
+    assert_eq!(
+        writer
+            .produce(&ring, &consumed, message(Kind::Submitted, 64))
+            .unwrap(),
+        Produced::Lost
+    );
+    writer.abandon(&ring, 3).unwrap();
+    assert_eq!(writer.faulted(), Some(LOST_UNKNOWN));
+    let mut reader = OutcomeReader::attach(&ring.as_slice(), 2).unwrap();
+    let seen = read_all(&mut reader, &ring, &consumed);
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].1.kind, Kind::OutcomesLost);
+    assert_eq!(seen[1].1.lost, LOST_UNKNOWN);
+}

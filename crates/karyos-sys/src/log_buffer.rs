@@ -969,6 +969,33 @@ fn publisher_cells(mode: PublicationMode) -> usize {
 /// trailing term it compares (`L = 3`, owner decision D2).
 const IMAGE_OWNER_CELLS: usize = 3;
 
+/// The commit deadline's verdict for the admitted claim `serial` at
+/// `clock()`, given the conductor's first observation `observed`: `None`
+/// once expired, else why it is not aborted yet.
+fn deadline_state(
+    observed: &mut Option<(u64, u64)>,
+    claim_deadline: u64,
+    serial: u64,
+    clock: &mut dyn FnMut() -> u64,
+) -> Option<ClaimDeadline> {
+    let now = clock();
+    let first_seen = match *observed {
+        Some((seen, first_seen)) if seen == serial => first_seen,
+        _ => {
+            *observed = Some((serial, now));
+            now
+        }
+    };
+    if now < first_seen {
+        *observed = Some((serial, now));
+        return Some(ClaimDeadline::ClockWentBack);
+    }
+    let Some(expiry) = first_seen.checked_add(claim_deadline) else {
+        return Some(ClaimDeadline::Unrepresentable);
+    };
+    (now < expiry).then_some(ClaimDeadline::Waiting)
+}
+
 /// The publication window: `term_length / 2`, less the concurrent
 /// overshoot `(P - 1) × max_reserved` (SPEC.md §4 IPC flow control).
 fn window(config: &LogBufferConfig) -> u64 {
@@ -4205,7 +4232,28 @@ impl<O: BufferOwner> Conductor<O> {
                 reason: "a concurrent buffer's deadlines are served by service_deadlines",
             });
         }
-        self.exclusive_deadline(clock)
+        self.exclusive_deadline(clock, false)
+    }
+
+    /// Aborts an exclusive buffer's admitted claim now, whatever its
+    /// deadline (`quantstratum-docs: karyos/design/guards-and-abort.md`,
+    /// a guard close aborts outstanding claims). The abort is the commit
+    /// deadline's: the same compare-exchange of the block's first word 0
+    /// against the writer's commit, so exactly one wins
+    /// (`Aborted` when the abort did, `Resolved` when the commit or the
+    /// writer's own abort did, `Idle` without an admitted claim).
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::abort_expired_claims`].
+    pub fn abort_admitted_claim(&mut self) -> Result<ClaimDeadline, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if buffer.concurrent() {
+            return Err(SysError::InvalidPublicationMode {
+                reason: "a concurrent buffer's claims are not aborted by a guard close here",
+            });
+        }
+        self.exclusive_deadline(&mut || 0, true)
     }
 
     /// The deadline service (`quantstratum-docs: karyos/design/concurrent-deadline.md`,
@@ -4259,7 +4307,7 @@ impl<O: BufferOwner> Conductor<O> {
                 Err(error) => Err(DeadlineError { report, error }),
             };
         }
-        match self.exclusive_deadline(clock) {
+        match self.exclusive_deadline(clock, false) {
             Ok(ClaimDeadline::Idle) => {}
             Ok(ClaimDeadline::Waiting) => report.waiting = true,
             Ok(ClaimDeadline::ClockWentBack) => report.clock_went_back = 1,
@@ -4275,9 +4323,12 @@ impl<O: BufferOwner> Conductor<O> {
     }
 
     /// The exclusive claim's deadline (`quantstratum-docs: karyos/design/claim-deadline.md`).
+    /// `force`: abort the admitted claim without reading the clock (a
+    /// guard close); otherwise only once its deadline expired.
     fn exclusive_deadline(
         &mut self,
         clock: &mut dyn FnMut() -> u64,
+        force: bool,
     ) -> Result<ClaimDeadline, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         let Some((serial, record)) =
@@ -4308,24 +4359,12 @@ impl<O: BufferOwner> Conductor<O> {
             self.observed = None;
             return Ok(ClaimDeadline::Idle);
         }
-        // Admitted: only now is the time read.
-        let now = clock();
-        let first_seen = match self.observed {
-            Some((seen, first_seen)) if seen == serial => first_seen,
-            _ => {
-                self.observed = Some((serial, now));
-                now
+        // Admitted: only now is the time read; a forced abort reads none.
+        if !force {
+            let deadline = buffer.config.claim_deadline;
+            if let Some(waiting) = deadline_state(&mut self.observed, deadline, serial, clock) {
+                return Ok(waiting);
             }
-        };
-        if now < first_seen {
-            self.observed = Some((serial, now));
-            return Ok(ClaimDeadline::ClockWentBack);
-        }
-        let Some(expiry) = first_seen.checked_add(buffer.config.claim_deadline) else {
-            return Ok(ClaimDeadline::Unrepresentable);
-        };
-        if now < expiry {
-            return Ok(ClaimDeadline::Waiting);
         }
         let lane = buffer.config.lane;
         let aborted = Word0::new(

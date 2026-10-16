@@ -227,6 +227,8 @@ pub struct DriverConfig {
     /// Guards configured at once (`quantstratum-docs:
     /// karyos/design/guards-and-abort.md`).
     pub max_guards: usize,
+    /// Blocks each guard walker reads per duty cycle.
+    pub guard_walker_budget: u32,
     /// Records of the guard audit ring (G9 interim); a full ring overwrites
     /// its oldest record and counts it. Zero keeps only the count.
     pub guard_audit_records: usize,
@@ -271,6 +273,7 @@ impl Default for DriverConfig {
             trace_drain_budget: 1024,
             trace_mirror_records: 4096,
             max_guards: 16,
+            guard_walker_budget: 1024,
             guard_audit_records: 1024,
         }
     }
@@ -437,6 +440,9 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// The feeder's counters, when conflation is configured. They outlive
     /// the feeder and are freed with the stream.
     pub(crate) feeder_counters: Option<FeederCounters>,
+    /// The guard binding and walker of a guarded stream
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`).
+    pub(crate) guarded: Option<crate::guard_streams::GuardedStream<T>>,
 }
 
 /// The conflation feeder's event counters of one stream
@@ -1184,8 +1190,129 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         operation: u64,
     ) -> Result<karyos_sys::guard::Closed, DriverError> {
         let now = self.clock.now();
-        self.guards
-            .close(guard, operation, crate::guards::Requester::InProcess, now)
+        let closed = self
+            .guards
+            .close(guard, operation, crate::guards::Requester::InProcess, now);
+        match &closed {
+            // The close took effect: a failed seal is reported, never
+            // returned as a failed close.
+            Ok(_) => self.seal_guarded_reporting(guard),
+            Err(error) => self.report_guard_error(guard.id(), error),
+        }
+        closed
+    }
+
+    /// Seals every stream guarded by `guard` with `GuardClosed` and aborts
+    /// its outstanding claim (guards-and-abort.md, Local streams); the
+    /// walker's last pass writes the final records. A stream already
+    /// sealed is not sealed again.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Sys`] from a seal (a broken invariant); every stream
+    /// is still tried.
+    pub(crate) fn seal_guarded(&mut self, guard: GuardHandle) -> Result<(), DriverError> {
+        let mut first_error = None;
+        for stream in &mut self.streams {
+            let bound = stream
+                .guarded
+                .as_ref()
+                .is_some_and(|guarded| guarded.guard == guard);
+            if !bound {
+                continue;
+            }
+            if stream.conductor.seal_state() == SealState::Active
+                && let Err(error) = stream.conductor.seal_with_reason(SealReason::GuardClosed)
+            {
+                first_error.get_or_insert(DriverError::from(error));
+            }
+            if let Err(error) = abort_guarded_claim(stream) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// [`Self::seal_guarded`] after a close that took effect: a failure is
+    /// recorded in the error log (`GuardSealFailed`, keyed by the guard)
+    /// and retried by the walker's duty, never reported as a failed close.
+    pub(crate) fn seal_guarded_reporting(&mut self, guard: GuardHandle) {
+        if let Err(error) = self.seal_guarded(guard) {
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::GuardSealFailed,
+                [guard.id(), 0],
+                &error.to_string(),
+            );
+        }
+    }
+
+    /// Guards a stream with `guard` on the control path, before any
+    /// publication handle is issued (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, Admission and Local streams).
+    /// Each handle issued later is bound to the guard's open epoch, with an
+    /// outcome ring of `messages` (`C_m`) message records.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidPublicationMode`] for a concurrent stream
+    /// (GC-7); [`DriverError::InvalidConfig`] for a stream already guarded,
+    /// one with an issued handle, `messages` of 0, or `messages` reserved
+    /// messages that do not fit half a term (the publication window, so
+    /// the walker's retained span never needs more than the rotation and
+    /// spare slots can hold); [`DriverError::UnknownGuard`]; and the
+    /// walker's admission errors (it takes a spare-slot credit).
+    pub fn guard_stream(
+        &mut self,
+        stream: StreamHandle,
+        guard: GuardHandle,
+        messages: u64,
+    ) -> Result<(), DriverError> {
+        if let Err(error) = self.guards.state(guard) {
+            self.report_guard_error(guard.id(), &error);
+            return Err(error);
+        }
+        let found = self.active_stream(stream)?;
+        if !matches!(
+            found.config.publication,
+            karyos_sys::log_buffer::PublicationMode::Exclusive
+        ) {
+            return Err(DriverError::InvalidPublicationMode);
+        }
+        let window = u64::from(found.config.term_length.get() / 2);
+        let fits = messages
+            .checked_mul(u64::from(found.config.max_reserved))
+            .is_some_and(|span| span <= window);
+        // An exclusive handle already issued, not a subscriber, rules it out.
+        let issued = found
+            .members
+            .iter()
+            .any(|member| matches!(member.kind, MemberKind::Exclusive));
+        if found.guarded.is_some() || issued || messages == 0 || !fits {
+            return Err(DriverError::InvalidConfig);
+        }
+        let walker = found
+            .conductor
+            .subscribe(karyos_sys::log_buffer::Role::Walker)?;
+        let scratch = usize::try_from(found.buffer.max_message_length())
+            .map_err(|_| DriverError::InvalidConfig)?;
+        found.guarded = Some(crate::guard_streams::GuardedStream::new(
+            guard, messages, walker, scratch,
+        ));
+        Ok(())
+    }
+
+    /// Reports a corrupt guard word in the error log (G2); other guard
+    /// errors are the caller's to handle.
+    pub(crate) fn report_guard_error(&mut self, guard: u64, error: &DriverError) {
+        if let DriverError::Guard(karyos_sys::guard::GuardError::Corrupt { word }) = error {
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::GuardWordCorrupt,
+                [guard, *word],
+                &error.to_string(),
+            );
+        }
     }
 
     /// Reopens a guard closed at `expected` for the in-process caller (G1),
@@ -1202,13 +1329,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         operation: u64,
     ) -> Result<u64, DriverError> {
         let now = self.clock.now();
-        self.guards.reopen(
+        let reopened = self.guards.reopen(
             guard,
             expected,
             operation,
             crate::guards::Requester::InProcess,
             now,
-        )
+        );
+        if let Err(error) = &reopened {
+            self.report_guard_error(guard.id(), error);
+        }
+        reopened
     }
 
     /// A snapshot of the guard audit ring (G9 interim).
@@ -1465,6 +1596,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             feeder,
             conflation_terminal: None,
             feeder_counters,
+            guarded: None,
         })
     }
 
@@ -1481,6 +1613,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         &mut self,
         stream: StreamHandle,
     ) -> Result<ClientPublication<T>, DriverError> {
+        // A guarded handle's binding is prepared first, so a refusal takes
+        // nothing.
+        let binding = match self.prepare_guard_binding(stream) {
+            Ok(binding) => binding,
+            Err(error) => {
+                let guard = self
+                    .stream_ref(stream)
+                    .ok()
+                    .and_then(|found| found.guarded.as_ref().map(|guarded| guarded.guard.id()));
+                if let Some(guard) = guard {
+                    self.report_guard_error(guard, &error);
+                }
+                return Err(error);
+            }
+        };
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = match stream.spare.take() {
@@ -1498,9 +1645,56 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if let Some(config) = conflation {
             publication = publication.with_conflation(config);
         }
-        let publication = publication.with_generation(link, base)?;
+        let mut publication = publication.with_generation(link, base)?;
+        if let (Some((client, bound)), Some(guarded)) = (binding, stream.guarded.as_mut()) {
+            publication = publication.with_guard(client);
+            guarded.bind(bound);
+        }
         self.update_stream_gauges();
         Ok(publication)
+    }
+
+    /// The guard binding of a handle about to be issued on a guarded
+    /// stream: refused on a stream a guard close sealed (its incarnation is
+    /// final, G-d2 brings the fresh one) and while the guard is not open.
+    fn prepare_guard_binding(
+        &self,
+        stream: StreamHandle,
+    ) -> Result<Option<(karyos_client::GuardBinding, crate::guard_streams::Bound)>, DriverError>
+    {
+        let found = self.stream_ref(stream)?;
+        let Some(guarded) = &found.guarded else {
+            return Ok(None);
+        };
+        if found.conductor.seal_reason() == Some(SealReason::GuardClosed) {
+            return Err(DriverError::GuardSealed { stream: found.id });
+        }
+        let state = self.guards.state(guarded.guard)?;
+        if !state.open {
+            return Err(DriverError::GuardNotOpen {
+                guard: guarded.guard.id(),
+            });
+        }
+        let (ring, writer) =
+            crate::guard_streams::new_ring(guarded.messages).map_err(DriverError::Outcomes)?;
+        let consumed = Arc::new(karyos_sys::sync::AtomicU64::new(0));
+        let client = karyos_client::GuardBinding::new(
+            self.guards.view(guarded.guard)?,
+            0,
+            state.epoch,
+            Arc::clone(&ring) as Arc<dyn karyos_client::SharedWords>,
+            Arc::clone(&consumed) as Arc<dyn karyos_client::ConsumedCell>,
+            found.config.lane.get() + 1,
+            guarded.messages,
+        )?;
+        let bound = crate::guard_streams::Bound {
+            from: found.conductor.head()?,
+            epoch: state.epoch,
+            ring,
+            consumed,
+            writer,
+        };
+        Ok(Some((client, bound)))
     }
 
     /// Issues a concurrent publication handle on one of the stream's `P`
@@ -1673,6 +1867,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !self.holding.is_empty() {
             self.report_withdrawn_bounds();
         }
+        match self.walk_guarded() {
+            Ok(walked) => add_work(&self.counters, &mut work, &mut first_error, walked),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
         match self.feed_conflation() {
             Ok(feeder_work) => add_work(&self.counters, &mut work, &mut first_error, feeder_work),
             Err(error) => {
@@ -1689,6 +1889,61 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Some(error) => Err(error),
             None => Ok(work),
         }
+    }
+
+    /// One walk per guarded stream (guards-and-abort.md, Local streams):
+    /// final outcome records for the blocks committed or aborted since the
+    /// last walk, under the walker budget. A lapped walker, a broken
+    /// invariant, abandons the bound rings and is reported.
+    fn walk_guarded(&mut self) -> Result<u32, DriverError> {
+        let budget = self.config.guard_walker_budget;
+        let mut work = 0u32;
+        let mut first_error = None;
+        let mut lapped = Vec::new();
+        for stream in &mut self.streams {
+            // Until the publication releases at the guard's seal, a claim
+            // admitted after the close's abort ran (its record written,
+            // its head not yet) is aborted here, every duty cycle.
+            if stream.guarded.is_some()
+                && stream.conductor.seal_reason() == Some(SealReason::GuardClosed)
+                && stream.conductor.seal_state() == SealState::Sealed
+                && let Err(error) = abort_guarded_claim(stream)
+            {
+                first_error.get_or_insert(error);
+            }
+            let (base, lane, id) = (stream.base, stream.config.lane.get(), stream.id);
+            let Some(guarded) = &mut stream.guarded else {
+                continue;
+            };
+            match guarded.walk(budget, base, lane, FIRST_INCARNATION) {
+                Ok(walked) => {
+                    self.counters
+                        .add(Event::GuardOutcomesWritten, u64::from(walked.written));
+                    self.counters
+                        .add(Event::GuardOutcomesLost, u64::from(walked.lost));
+                    if walked.budget_exhausted {
+                        self.counters.add(Event::GuardWalkerBudgetExhausted, 1);
+                    }
+                    if walked.overrun {
+                        lapped.push(id);
+                    }
+                    add_work(&self.counters, &mut work, &mut first_error, walked.written);
+                    add_work(&self.counters, &mut work, &mut first_error, walked.lost);
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        for id in lapped {
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::GuardWalkerLapped,
+                [id, 0],
+                "a guard walker was lapped: outcome streams abandoned",
+            );
+        }
+        first_error.map_or(Ok(work), Err)
     }
 
     /// Copies a bounded number of messages into each configured keyed table.
@@ -2026,6 +2281,20 @@ fn seal_conflation_terminal<E>(
     }
     if terminal.is_some() {
         seal()?;
+    }
+    Ok(())
+}
+
+/// Aborts a guarded stream's admitted claim for its guard close and
+/// records the block, so the walker labels it `GUARD_CLOSED`.
+fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), DriverError> {
+    // The outstanding claim: its commit and this abort race on the block's
+    // decision word, and exactly one wins.
+    if let karyos_sys::log_buffer::ClaimDeadline::Aborted { position, .. } =
+        stream.conductor.abort_admitted_claim()?
+        && let Some(guarded) = &mut stream.guarded
+    {
+        guarded.note_guard_abort(position);
     }
     Ok(())
 }

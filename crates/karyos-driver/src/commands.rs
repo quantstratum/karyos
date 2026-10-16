@@ -780,6 +780,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let Some(index) = self.find_stream(stream, Some(lane)) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
+                // A guarded stream's publications are bound to the guard's
+                // open epoch with an outcome ring; that binding exists only
+                // in process (`EmbeddedDriver::publication`) until its CnC
+                // form, so the control path issues none.
+                if matches!(command, Command::AddPublication { .. })
+                    && self
+                        .streams
+                        .get(index)
+                        .is_some_and(|found| found.guarded.is_some())
+                {
+                    return refuse(ErrorCode::InvalidPublicationMode, detail);
+                }
                 let remote = self.ledger(client).map(Ledger::full);
                 match remote {
                     // The export bound refuses before anything is reserved.
@@ -1026,14 +1038,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
-    /// Serves `AddConflatedSubscription` (`quantstratum-docs:
-    /// karyos/design/conflation-end-to-end.md`, Cross-process views): a
-    /// remote client's read-only view of a live conflated stream's table.
-    /// Every check first (the stream, its table, the client's export
-    /// bounds, identities), then the effects, which cannot fail: the grant
-    /// is `Held` under a fresh export and its fetch carries the table's
-    /// region reopened read-only. An in-process client takes its view with
-    /// `subscribe_conflated` instead, so it is refused here.
+    /// Serves `GuardClose` and `GuardReopen` (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`): an admitted client is
+    /// authorized by the uid admission proved (G1). Every command is
+    /// audited, an unknown guard against the id it named.
     fn guard_command(
         &mut self,
         client: u64,
@@ -1044,25 +1052,28 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ) -> Response {
         let requester = crate::guards::Requester::Client(client);
         let now = self.clock.now();
-        // An unknown id is still audited, against a handle no guard has.
+        // An unknown id is still audited, against the id it named.
         let handle = self
             .guards
             .by_id(guard)
             .unwrap_or(crate::guards::GuardHandle {
                 driver: self.id,
-                guard: 0,
+                guard,
             });
         let done = match reopen {
             None => self
                 .guards
                 .close(handle, operation, requester, now)
-                .map(|_| ()),
+                .map(|_| self.seal_guarded_reporting(handle)),
             Some(expected) => self
                 .guards
                 .reopen(handle, expected, operation, requester, now)
                 .map(|_| ()),
         };
         let state = done.and_then(|()| self.guards.state(handle));
+        if let Err(error) = &state {
+            self.report_guard_error(guard, error);
+        }
         match state {
             Ok(state) => Response::GuardState {
                 request,
@@ -1087,6 +1098,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// Serves `AddConflatedSubscription` (`quantstratum-docs:
+    /// karyos/design/conflation-end-to-end.md`, Cross-process views): a
+    /// remote client's read-only view of a live conflated stream's table.
+    /// Every check first (the stream, its table, the client's export
+    /// bounds, identities), then the effects, which cannot fail: the grant
+    /// is `Held` under a fresh export and its fetch carries the table's
+    /// region reopened read-only. An in-process client takes its view with
+    /// `subscribe_conflated` instead, so it is refused here.
     fn add_conflated(&mut self, client: u64, request: RequestId, stream: StreamKey) -> Response {
         let refuse = |code: ErrorCode, detail: u64| Response::Error {
             request,
@@ -4332,5 +4351,180 @@ mod tests {
                 .all(|record| record.requester == crate::guards::Requester::InProcess)
         );
         assert_eq!(other.guard_audit().records.len(), 1);
+    }
+
+    /// A reopen beyond the last epoch is refused with `GuardExhausted`
+    /// over CnC; the guard stays closed, and the refusal is audited.
+    #[test]
+    fn a_guard_at_its_last_epoch_cannot_reopen() {
+        let (mut driver, _stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        let last = karyos_sys::guard::MAX_EPOCH;
+        let word = karyos_sys::guard::encode(karyos_sys::guard::GuardState {
+            epoch: last,
+            open: false,
+        })
+        .unwrap();
+        driver.guards.set_word(guard, word);
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::GuardReopen {
+                sequence: 1,
+                guard: guard.id(),
+                expected: last,
+                operation: 5,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        assert!(
+            answers.contains(&Response::Error {
+                request: RequestId {
+                    client,
+                    sequence: 1
+                },
+                code: ErrorCode::GuardExhausted,
+                detail: guard.id(),
+            }),
+            "{answers:?}"
+        );
+        assert_eq!(
+            driver.guard_state(guard).unwrap(),
+            karyos_sys::guard::GuardState {
+                epoch: last,
+                open: false
+            }
+        );
+        let audit = driver.guard_audit();
+        let record = audit.records.last().unwrap();
+        assert_eq!(
+            (record.guard, record.before, record.after, record.outcome),
+            (
+                guard.id(),
+                word,
+                word,
+                crate::guards::AuditOutcome::Refused(ErrorCode::GuardExhausted)
+            )
+        );
+    }
+
+    /// A corrupt guard word is refused, never opened, and reported in the
+    /// error log (G2).
+    #[test]
+    fn a_corrupt_guard_word_is_reported() {
+        let (mut driver, _stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        // An open bit on an odd epoch.
+        let word = (3 << 1) | 1;
+        driver.guards.set_word(guard, word);
+        assert_eq!(
+            driver.close_guard(guard, 1),
+            Err(DriverError::Guard(karyos_sys::guard::GuardError::Corrupt {
+                word
+            }))
+        );
+        let mut records = Vec::new();
+        let _ = driver
+            .error_log()
+            .scan(&mut 0, |record| records.push(record));
+        assert!(
+            records.iter().any(|record| record.code
+                == crate::diagnostics::ErrorCode::GuardWordCorrupt as u32
+                && record.key == [guard.id(), word]),
+            "{records:?}"
+        );
+    }
+
+    /// A client's `GuardClose` seals the streams the guard binds, as the
+    /// embedded API does.
+    #[test]
+    fn a_client_guard_close_seals_the_guarded_stream() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let (_client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::GuardClose {
+                sequence: 1,
+                guard: guard.id(),
+                operation: 9,
+            },
+        );
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(
+            driver.seal_reason(stream).unwrap(),
+            Some(karyos_sys::log_buffer::SealReason::GuardClosed)
+        );
+    }
+
+    /// Review of #207, P1-1: the control path issues no publication on a
+    /// guarded stream (its binding exists only in process), for an
+    /// in-process client and a remote one alike.
+    #[test]
+    fn a_guarded_stream_refuses_cnc_publications() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddPublication {
+                sequence: 1,
+                stream: KEY,
+                allow_unconnected: true,
+                lane: Lane::ZERO,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        assert!(
+            answers.iter().any(|answer| matches!(
+                answer,
+                Response::Error {
+                    request: RequestId { client: c, sequence: 1 },
+                    code: ErrorCode::InvalidPublicationMode,
+                    ..
+                } if *c == client
+            )),
+            "{answers:?}"
+        );
+    }
+
+    /// The guard counters count what the walker did.
+    #[test]
+    fn the_guard_counters_count_the_walker() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        // The stream refuses unconnected offers; the walker does not
+        // connect it.
+        let _reader = driver
+            .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+            .unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        for value in [b"a", b"b", b"c"] {
+            assert!(matches!(
+                publication.offer(value).unwrap(),
+                karyos_client::OfferOutcome::Accepted { .. }
+            ));
+        }
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.counters.value(Event::GuardOutcomesWritten), 3);
+        assert_eq!(driver.counters.value(Event::GuardOutcomesLost), 0);
+        assert_eq!(driver.counters.value(Event::GuardWalkerBudgetExhausted), 0);
     }
 }
