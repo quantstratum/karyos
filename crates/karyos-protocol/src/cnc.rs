@@ -102,6 +102,7 @@
 //! | `0xC4` | `SuccessorReady` | stream and session | registration | hand-over key of the successor grant | base position | generation |
 //! | `0xC5` | `Fenced` | stream and session | registration | | | |
 
+use karyos_sys::log_buffer::SealReason;
 use thiserror::Error;
 
 /// Longest counter label, in bytes: the label of a counter cell.
@@ -1242,18 +1243,40 @@ impl LossPolicyCode {
 pub enum CloseReason {
     /// A required participant was lost under the `abort` policy.
     RequiredParticipantLost,
+    /// The stream's keyed conflation table exhausted its versions.
+    ConflationVersionsExhausted,
+    /// The stream was removed.
+    StreamRemoved,
 }
 
 impl CloseReason {
+    // The codes are those of `SealReason`, so the event and the seal line
+    // name a closing the same way.
     const fn code(self) -> u64 {
         match self {
             Self::RequiredParticipantLost => 1,
+            Self::ConflationVersionsExhausted => 2,
+            Self::StreamRemoved => 3,
         }
     }
 
     const fn from_code(code: u64) -> Option<Self> {
         match code {
             1 => Some(Self::RequiredParticipantLost),
+            2 => Some(Self::ConflationVersionsExhausted),
+            3 => Some(Self::StreamRemoved),
+            _ => None,
+        }
+    }
+
+    /// The event reason of a seal reason; `None` for an unspecified seal,
+    /// which no event reports.
+    #[must_use]
+    pub const fn from_seal(reason: SealReason) -> Option<Self> {
+        match reason {
+            SealReason::RequiredParticipantLost => Some(Self::RequiredParticipantLost),
+            SealReason::ConflationVersionsExhausted => Some(Self::ConflationVersionsExhausted),
+            SealReason::StreamRemoved => Some(Self::StreamRemoved),
             _ => None,
         }
     }

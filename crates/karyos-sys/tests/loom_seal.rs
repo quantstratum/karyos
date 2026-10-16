@@ -14,13 +14,16 @@
 //! - the exclusive issuance racing the seal: either the issuer is refused,
 //!   or positioning waits for the issued writer's release;
 //! - a seal for a cutover racing an issuer's read and a reader: every load
-//!   that sees the seal sees its successor mark, and positioning keeps it.
+//!   that sees the seal sees its successor mark, and positioning keeps it;
+//! - a seal with a reason racing a reader and the positioning: every load
+//!   that sees the seal, sealed or positioned, then reads the reason.
 //!
 //! Negative controls must fail: a concurrent release stored before the
 //! last `fetch_add`; positioning that loads the slot and the tail Relaxed;
-//! an exclusive release stored before the last `reserved_head` store; and
-//! an issuance whose take and seal read are plain Acquire and Release
-//! accesses instead of read-modify-writes.
+//! an exclusive release stored before the last `reserved_head` store; an
+//! issuance whose take and seal read are plain Acquire and Release
+//! accesses instead of read-modify-writes; and a reason stored after the
+//! seal's swap.
 //!
 //! Exploration: preemption bound 3; at most two granted reservations per
 //! publisher, one conductor.
@@ -33,7 +36,7 @@ use karyos_sys::publication::{
     PUBLISHER_HELD, SEAL_POSITION_MASK, SEAL_POSITIONED, SEAL_SEALED, SEAL_SUCCESSOR,
     issuer_sees_seal, observe_seal, position_seal, publication_released, publication_taken,
     publisher_slot_free, release_publication, release_publisher_slot, seal, seal_for_cutover,
-    seal_has_successor, take_publication,
+    seal_has_successor, seal_reason, seal_with_reason, take_publication,
 };
 use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::sync::Arc;
@@ -411,4 +414,55 @@ fn control_positioning_with_a_plain_swap() {
             "positioning lost the mark"
         );
     });
+}
+
+#[derive(Clone, Copy)]
+enum Reason {
+    /// The production order: the reason, then the seal's swap.
+    BeforeTheSwap,
+    /// Negative control: the swap, then the reason.
+    AfterTheSwap,
+}
+
+/// The conductor seals with reason code 2 and then positions the seal; a
+/// reader polls the seal word by Acquire. Whenever it sees the seal, sealed
+/// or already positioned, it reads the reason.
+fn reason_model(order: Reason) {
+    builder().check(move || {
+        let words = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(1)));
+        let reader = {
+            let words = Arc::clone(&words);
+            thread::spawn(move || {
+                let (seal_word, reason_word, _) = &*words;
+                if seal_word.load(Ordering::Acquire) & SEAL_SEALED != 0 {
+                    assert_eq!(
+                        seal_reason(reason_word),
+                        2,
+                        "the seal was seen without its reason"
+                    );
+                }
+            })
+        };
+        let (seal_word, reason_word, limit) = &*words;
+        match order {
+            Reason::BeforeTheSwap => seal_with_reason(seal_word, reason_word, limit, 2),
+            Reason::AfterTheSwap => {
+                seal(seal_word, limit);
+                reason_word.store(2, Ordering::Relaxed);
+            }
+        }
+        position_seal(seal_word, 64);
+        reader.join().unwrap();
+    });
+}
+
+#[test]
+fn a_seal_is_never_seen_without_its_reason() {
+    reason_model(Reason::BeforeTheSwap);
+}
+
+#[test]
+#[should_panic(expected = "the seal was seen without its reason")]
+fn control_a_reason_stored_after_the_swap() {
+    reason_model(Reason::AfterTheSwap);
 }

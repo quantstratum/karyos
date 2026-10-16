@@ -250,6 +250,13 @@ impl<T: TermBytes> ClientPublication<T> {
         self
     }
 
+    /// Why the stream was sealed, once an attempt returned `Closed`; `None`
+    /// while the handle is open.
+    #[must_use]
+    pub fn seal_reason(&self) -> Option<karyos_sys::log_buffer::SealReason> {
+        self.inner.seal_reason()
+    }
+
     /// Traces this handle's messages through `hook`, which records them for
     /// the publication `identity` (control path).
     #[must_use]

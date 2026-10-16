@@ -19,13 +19,13 @@ use karyos_client::{
     OfferOutcome, Outcome, PollSummary,
 };
 use karyos_driver::{
-    DriverConfig, EmbeddedDriver, LossPolicy, MonotonicClock, SealState, StreamConfig,
+    DriverConfig, EmbeddedDriver, LossPolicy, MonotonicClock, SealReason, SealState, StreamConfig,
 };
 use karyos_protocol::cnc::{CloseReason, Event, LossPolicyCode, StreamKey, SubscriberRole};
 use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::counters::CellRead;
 use karyos_sys::frame::Lane;
-use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
+use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
@@ -582,4 +582,80 @@ fn test_driver_events_abort_reports_one_closing_for_two_lost_participants() {
             .count(),
         2
     );
+}
+
+// ---- #96: the typed seal reason ----
+
+/// Polls `reader` until it reports the end, running the driver between
+/// polls so that it positions the seal.
+fn read_to_end(driver: &mut EmbeddedDriver, reader: &mut ClientSubscription) -> PollSummary {
+    for _ in 0..100 {
+        let summary = poll_once(reader);
+        if summary.closed.is_some() {
+            return summary;
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    panic!("the reader never reached the end");
+}
+
+/// An `abort` seal carries its reason to an in-process reader at the seal
+/// position; a later removal keeps it.
+#[test]
+fn test_seal_reason_abort_reaches_a_reader_and_survives_removal() {
+    let (mut driver, clock) = driver();
+    let stream = driver.add_stream(stream_config(LossPolicy::Abort)).unwrap();
+    let mut reader = driver.subscribe(stream, Role::Optional).unwrap();
+    assert_eq!(driver.seal_reason(stream).unwrap(), None);
+    let (_client, _subscription) = lost_required_subscriber(&mut driver, &clock);
+    assert_eq!(
+        driver.seal_reason(stream).unwrap(),
+        Some(SealReason::RequiredParticipantLost)
+    );
+    let summary = read_to_end(&mut driver, &mut reader);
+    assert_eq!(
+        summary.close_reason,
+        Some(SealReason::RequiredParticipantLost)
+    );
+    driver.remove_stream(stream).unwrap();
+    assert_eq!(
+        driver.seal_reason(stream).unwrap(),
+        Some(SealReason::RequiredParticipantLost)
+    );
+}
+
+/// A removal seals with `StreamRemoved`, which readers and the closed
+/// publisher see, and reports the closing once to every client.
+#[test]
+fn test_seal_reason_removal_reaches_handles_and_is_reported_once() {
+    let (mut driver, _clock) = driver();
+    let stream = driver.add_stream(stream_config(LossPolicy::Hold)).unwrap();
+    let mut observer = beating(&mut driver);
+    assert!(observed_work(&mut driver, &mut observer).is_empty());
+    let mut reader = driver.subscribe(stream, Role::Optional).unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    assert!(matches!(
+        publication.offer(b"last").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    driver.remove_stream(stream).unwrap();
+    driver.remove_stream(stream).unwrap();
+    assert_eq!(
+        observed_work(&mut driver, &mut observer),
+        [Event::PublicationClosed {
+            stream: LOST_STREAM,
+            reason: CloseReason::StreamRemoved,
+        }]
+    );
+    assert_eq!(
+        driver.seal_reason(stream).unwrap(),
+        Some(SealReason::StreamRemoved)
+    );
+    assert_eq!(publication.seal_reason(), None);
+    assert_eq!(publication.offer(b"late").unwrap(), OfferOutcome::Closed);
+    assert_eq!(publication.seal_reason(), Some(SealReason::StreamRemoved));
+    drop(publication);
+    let summary = read_to_end(&mut driver, &mut reader);
+    assert_eq!(summary.close_reason, Some(SealReason::StreamRemoved));
+    assert!(observed_work(&mut driver, &mut observer).is_empty());
 }

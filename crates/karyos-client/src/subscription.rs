@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use karyos_sys::frame::EXTENSION_LENGTH;
-use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SkipReason, Subscription};
+use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SealReason, SkipReason, Subscription};
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 
 use karyos_protocol::frame::TraceExtension;
@@ -302,6 +302,8 @@ pub struct PollSummary {
     /// and no message can follow (`quantstratum-docs: karyos/design/publication-seal.md`).
     /// Every later poll reports it again.
     pub closed: Option<u64>,
+    /// Why the stream was sealed, set together with `closed`.
+    pub close_reason: Option<SealReason>,
     /// The read position, when the subscription was revoked because its
     /// client was lost (quantstratum-docs: `karyos/design/required-participant-loss.md`): the subscription is over, and every later
     /// poll reports it again.
@@ -642,7 +644,7 @@ impl<T: TermBytes> ClientSubscription<T> {
                     });
                     break;
                 }
-                PollOutcome::Closed { position } => match self.after_end() {
+                PollOutcome::Closed { position, reason } => match self.after_end() {
                     // Moved: the successor's first message is next, in the
                     // same poll and budget.
                     Some(true) => {}
@@ -650,6 +652,7 @@ impl<T: TermBytes> ClientSubscription<T> {
                     Some(false) => break,
                     None => {
                         summary.closed = Some(self.base + position);
+                        summary.close_reason = Some(reason);
                         break;
                     }
                 },

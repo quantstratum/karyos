@@ -57,7 +57,7 @@ fn an_exclusive_seal_closes_the_next_attempt_and_positions_at_the_last_block() {
     assert_eq!(buffer.limit().load(Ordering::Acquire), 0, "the limit stays zero");
     assert_eq!(conductor.seal_state(), SealState::Retired { position: end });
     for _ in 0..2 {
-        assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: end });
+        assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: end, reason: SealReason::Unspecified });
     }
     assert!(publication.close_if_sealed());
 }
@@ -82,7 +82,7 @@ fn a_claim_in_hand_at_the_seal_commits_and_delays_the_position() {
         AppendOutcome::Closed
     );
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96 });
+    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96, reason: SealReason::Unspecified });
     assert_eq!(conductor.seal_state(), SealState::Retired { position: 96 });
 }
 
@@ -126,7 +126,7 @@ fn a_claim_in_hand_at_the_seal_loses_to_the_deadline_below_the_position() {
             extent: 96,
         }
     );
-    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96 });
+    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96, reason: SealReason::Unspecified });
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn a_forgotten_claim_is_aborted_before_closed() {
                 extent: 96,
             }
         );
-        assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96 });
+        assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96, reason: SealReason::Unspecified });
     }
 }
 
@@ -166,7 +166,7 @@ fn an_unissued_or_dropped_publication_does_not_delay_the_position() {
     conductor.seal().unwrap();
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Retired { position: 0 });
-    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 0 });
+    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 0, reason: SealReason::Unspecified });
     // Issuance after the seal is refused, and the publication is spent.
     assert!(matches!(buffer.publication(), Err(SysError::Sealed)));
     assert!(buffer.publication().unwrap().is_none());
@@ -257,7 +257,7 @@ fn the_position_after_a_term_crossing_is_the_next_term_start() {
     let _ = conductor.duty_cycle().unwrap();
     let (rest, end) = drain_to_end(&mut subscription);
     assert!(read + rest > 0);
-    assert_eq!(end, PollOutcome::Closed { position: TERM });
+    assert_eq!(end, PollOutcome::Closed { position: TERM, reason: SealReason::Unspecified });
     assert_eq!(conductor.seal_state(), SealState::Retired { position: TERM });
 }
 
@@ -274,7 +274,7 @@ fn retirement_waits_for_attached_subscribers_only() {
     assert!(publication.close_if_sealed());
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Positioned { position: end });
-    assert_eq!(drain_to_end(&mut reader), (1, PollOutcome::Closed { position: end }));
+    assert_eq!(drain_to_end(&mut reader), (1, PollOutcome::Closed { position: end, reason: SealReason::Unspecified }));
     assert_eq!(conductor.seal_state(), SealState::Positioned { position: end });
     drop(lagging);
     assert_eq!(conductor.seal_state(), SealState::Retired { position: end });
@@ -311,7 +311,7 @@ fn a_concurrent_seal_is_positioned_at_once_and_handles_close() {
         ConcurrentClaimOutcome::Closed
     ));
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(drain_to_end(&mut subscription), (2, PollOutcome::Closed { position: end }));
+    assert_eq!(drain_to_end(&mut subscription), (2, PollOutcome::Closed { position: end, reason: SealReason::Unspecified }));
     assert_eq!(conductor.seal_state(), SealState::Retired { position: end });
     // The head stays at the seal position across duty cycles.
     assert_eq!(buffer.head().unwrap(), Some(end));
@@ -347,7 +347,7 @@ fn a_concurrent_forgotten_claim_is_aborted_before_closed() {
             extent: 96,
         }
     );
-    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96 });
+    assert_eq!(poll(&mut subscription), PollOutcome::Closed { position: 96, reason: SealReason::Unspecified });
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn a_concurrent_seal_after_a_crossing_positions_at_the_next_term() {
     let _ = conductor.duty_cycle().unwrap();
     assert_eq!(conductor.seal_state(), SealState::Positioned { position: TERM });
     let (_, end) = drain_to_end(&mut subscription);
-    assert_eq!(end, PollOutcome::Closed { position: TERM });
+    assert_eq!(end, PollOutcome::Closed { position: TERM, reason: SealReason::Unspecified });
 }
 
 #[test]
@@ -420,7 +420,7 @@ fn a_reservation_admitted_before_the_fence_lands_past_the_end_and_closes() {
     assert_eq!(conductor.seal_state(), SealState::Positioned { position: end });
     assert_eq!(buffer.head().unwrap(), Some(end));
     let _ = conductor.duty_cycle().unwrap();
-    assert_eq!(drain_to_end(&mut subscription), (1, PollOutcome::Closed { position: end }));
+    assert_eq!(drain_to_end(&mut subscription), (1, PollOutcome::Closed { position: end, reason: SealReason::Unspecified }));
 }
 
 #[test]
@@ -449,7 +449,7 @@ fn a_reservation_granted_before_the_fence_commits_below_the_position() {
     );
     assert_eq!(
         drain_to_end(&mut subscription),
-        (1, PollOutcome::Closed { position: reserved })
+        (1, PollOutcome::Closed { position: reserved, reason: SealReason::Unspecified })
     );
 }
 
@@ -477,7 +477,7 @@ fn a_paused_zero_span_below_the_position_is_aborted_by_the_deadline() {
                 );
                 assert_eq!(
                     poll(&mut subscription),
-                    PollOutcome::Closed { position: reserved }
+                    PollOutcome::Closed { position: reserved, reason: SealReason::Unspecified }
                 );
             }
         })
@@ -530,7 +530,7 @@ fn a_fenced_buffer_never_rotates() {
         0
     );
     let (_, end) = drain_to_end(&mut subscription);
-    assert_eq!(end, PollOutcome::Closed { position: TERM });
+    assert_eq!(end, PollOutcome::Closed { position: TERM, reason: SealReason::Unspecified });
 }
 
 #[test]
@@ -578,7 +578,7 @@ fn the_fenced_term_is_never_reclaimed_while_it_is_the_active_count() {
     // The required reader reaches the seal at the term end, so the floor
     // is that end; the fenced term is still the active count.
     let (_, end) = drain_to_end(&mut subscription);
-    assert_eq!(end, PollOutcome::Closed { position: TERM });
+    assert_eq!(end, PollOutcome::Closed { position: TERM, reason: SealReason::Unspecified });
     for _ in 0..3 {
         let _ = conductor.duty_cycle().unwrap();
     }
@@ -587,4 +587,82 @@ fn the_fenced_term_is_never_reclaimed_while_it_is_the_active_count() {
     };
     let found = Descriptor::decode(buffer.descriptor(slot).unwrap().load(Ordering::Acquire)).unwrap();
     assert_eq!(found.state(), SlotState::Active);
+}
+
+/// Every reason recorded by `seal_with_reason` reaches the reader at the
+/// seal position, the closed publisher and the conductor.
+#[test]
+fn a_seal_reason_reaches_readers_publishers_and_the_conductor() {
+    for reason in [
+        SealReason::Unspecified,
+        SealReason::RequiredParticipantLost,
+        SealReason::ConflationVersionsExhausted,
+        SealReason::StreamRemoved,
+    ] {
+        let buffer = new_buffer(config(3, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Required).unwrap();
+        let mut publication = buffer.publication().unwrap().unwrap();
+        assert!(matches!(
+            publication.append(&message(0), AppendOptions::default()).unwrap(),
+            AppendOutcome::Appended { .. }
+        ));
+        assert_eq!(conductor.seal_reason(), None);
+        assert_eq!(publication.seal_reason(), None);
+        conductor.seal_with_reason(reason).unwrap();
+        assert_eq!(conductor.seal_reason(), Some(reason));
+        // Open until it observes the seal.
+        assert_eq!(publication.seal_reason(), None);
+        assert_eq!(
+            publication.append(&message(1), AppendOptions::default()).unwrap(),
+            AppendOutcome::Closed
+        );
+        assert_eq!(publication.seal_reason(), Some(reason));
+        let _ = conductor.duty_cycle().unwrap();
+        let end = buffer.reserved_head().load(Ordering::Acquire);
+        assert_eq!(
+            drain_to_end(&mut subscription),
+            (1, PollOutcome::Closed { position: end, reason })
+        );
+        assert_eq!(SealReason::from_code(reason.code()), reason);
+    }
+    // A code this build does not know reads as unspecified.
+    assert_eq!(SealReason::from_code(99), SealReason::Unspecified);
+}
+
+/// The first final seal decides the reason, even with none; a cutover
+/// seal is not terminal and has none.
+#[test]
+fn the_first_final_seal_decides_the_reason_and_a_cutover_seal_has_none() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor
+        .seal_with_reason(SealReason::RequiredParticipantLost)
+        .unwrap();
+    conductor.seal_with_reason(SealReason::StreamRemoved).unwrap();
+    conductor.seal().unwrap();
+    assert_eq!(
+        conductor.seal_reason(),
+        Some(SealReason::RequiredParticipantLost)
+    );
+
+    // The check is on the seal word: a first seal with no reason leaves
+    // the reason word at 0, and a later reason is not written after a
+    // swap a reader may already have observed.
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.seal().unwrap();
+    conductor
+        .seal_with_reason(SealReason::RequiredParticipantLost)
+        .unwrap();
+    assert_eq!(conductor.seal_reason(), Some(SealReason::Unspecified));
+
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.seal_for_cutover().unwrap();
+    assert_eq!(conductor.seal_state(), SealState::Sealed);
+    assert_eq!(conductor.seal_reason(), None);
+    // A later terminal seal does not overwrite the cutover's.
+    conductor.seal_with_reason(SealReason::StreamRemoved).unwrap();
+    assert_eq!(conductor.seal_reason(), None);
 }

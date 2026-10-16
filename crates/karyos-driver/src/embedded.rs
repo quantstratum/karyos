@@ -32,7 +32,7 @@ use karyos_client::{
     ClientConcurrentPublication, ClientPublication, ClientSubscription, ConflatedSubscription,
     GenerationLink, MessageLimit,
 };
-use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
+use karyos_protocol::cnc::{CloseReason, Event as DriverEvent, MAX_RESPONSE_LENGTH, StreamKey};
 use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::conflation::{
@@ -41,7 +41,7 @@ use karyos_sys::conflation::{
 use karyos_sys::counters::{Counter, CounterKeys, KIND_NONE};
 use karyos_sys::log_buffer::{
     Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, LossPolicy, Publication,
-    Role, SealState,
+    Role, SealReason, SealState,
 };
 use karyos_sys::term::Generation;
 #[cfg(target_os = "linux")]
@@ -414,6 +414,14 @@ pub(crate) struct ConflationFeeder<T: StreamTerms> {
 }
 
 impl<T: StreamTerms> Stream<T> {
+    /// The stream's wire key.
+    pub(crate) fn key(&self) -> StreamKey {
+        StreamKey {
+            stream_id: self.stream_id,
+            session_id: self.session_id,
+        }
+    }
+
     /// A new generation link for a handle on the current mapping.
     pub(crate) fn join(&mut self, kind: MemberKind) -> (Arc<GenerationLink<T>>, u64) {
         let link = GenerationLink::new();
@@ -732,6 +740,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         })
     }
 
+    /// Why a stream's buffer was sealed (`quantstratum-docs: karyos/design/publication-seal.md`):
+    /// `None` while it is active or sealed only for a cutover.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DriverError::UnknownStream`] for a foreign handle or a
+    /// freed stream.
+    pub fn seal_reason(&self, stream: StreamHandle) -> Result<Option<SealReason>, DriverError> {
+        self.streams
+            .iter()
+            .find(|s| stream.driver == self.id && s.id == stream.stream)
+            .map(|s| s.conductor.seal_reason())
+            .ok_or(DriverError::UnknownStream {
+                stream: stream.stream,
+            })
+    }
+
     /// The seal state of a stream's buffer (`quantstratum-docs: karyos/design/publication-seal.md`):
     /// `Active` until it is removed, then `Sealed` until every issued
     /// publication has released, `Positioned` at the end of its last
@@ -841,7 +866,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     pub fn remove_stream(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
         let target = self.stream(stream)?;
         if !target.retiring {
-            target.conductor.seal()?;
+            // A stream an earlier seal closed keeps that reason and was
+            // reported then.
+            let was_active = target.conductor.seal_state() == SealState::Active;
+            target
+                .conductor
+                .seal_with_reason(SealReason::StreamRemoved)?;
+            let key = target.key();
             if let Some(mut feeder) = target.feeder.take() {
                 feeder.writer.close();
             }
@@ -852,6 +883,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             target.retiring = true;
             self.counters.add(Event::StreamsRemoved, 1);
+            if was_active {
+                self.emit(&DriverEvent::PublicationClosed {
+                    stream: key,
+                    reason: CloseReason::StreamRemoved,
+                });
+            }
         }
         self.update_stream_gauges();
         Ok(())
@@ -1253,17 +1290,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let budget = self.config.conflation_feeder_budget.get();
         let mut work = 0u32;
         let mut first_error: Option<DriverError> = None;
+        let mut closed = Vec::new();
         for stream in &mut self.streams {
             if stream.conflation_terminal.is_some() {
                 if let Some(cutover) = stream.cutover.take() {
                     cutover.abandon();
                 }
+                // A retry after a failed seal.
+                let was_active = stream.conductor.seal_state() == SealState::Active;
                 if let Err(error) =
                     seal_conflation_terminal(&mut stream.conflation_terminal, None, || {
-                        stream.conductor.seal()
+                        stream
+                            .conductor
+                            .seal_with_reason(SealReason::ConflationVersionsExhausted)
                     })
                 {
                     first_error.get_or_insert(DriverError::from(error));
+                }
+                if was_active && stream.conductor.seal_state() != SealState::Active {
+                    closed.push(stream.key());
                 }
             }
             let Some(config) = stream.conflation else {
@@ -1314,12 +1359,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             {
                 cutover.abandon();
             }
+            // Only a new exhaustion can move the stream out of `Active`
+            // here: the branch above sealed an earlier one.
+            let was_active =
+                terminal.is_some() && stream.conductor.seal_state() == SealState::Active;
             if let Err(error) =
                 seal_conflation_terminal(&mut stream.conflation_terminal, terminal, || {
-                    stream.conductor.seal()
+                    stream
+                        .conductor
+                        .seal_with_reason(SealReason::ConflationVersionsExhausted)
                 })
             {
                 first_error.get_or_insert(DriverError::from(error));
+            }
+            // Only the seal that moved the stream out of `Active` reports it.
+            if was_active && stream.conductor.seal_state() != SealState::Active {
+                closed.push(stream.key());
             }
             if summary.closed.is_some() {
                 if let Some(mut feeder) = stream.feeder.take() {
@@ -1332,6 +1387,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     cutover.abandon();
                 }
             }
+        }
+        for stream in closed {
+            self.emit(&DriverEvent::PublicationClosed {
+                stream,
+                reason: CloseReason::ConflationVersionsExhausted,
+            });
         }
         match first_error {
             Some(error) => Err(error),
@@ -1672,6 +1733,41 @@ mod tests {
         assert_eq!(value(&counters.written), 2);
         assert_eq!(value(&counters.keys_rejected), 2);
         assert_eq!(value(&counters.values_too_large), 1);
+    }
+
+    /// A conflation table that exhausted its versions seals the stream
+    /// with that reason and reports the closing once.
+    #[test]
+    fn conflation_exhaustion_seals_with_its_reason_and_reports_it_once() {
+        use karyos_protocol::cnc::{CloseReason, Event as DriverEvent};
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let mut stream_config = config(42);
+        stream_config.conflation = Some(ConflationConfig {
+            keys: 4,
+            value_capacity: 8,
+            journal_capacity: 1024,
+        });
+        let handle = driver.add_stream(stream_config).unwrap();
+        let mut observer = driver.connect().unwrap();
+        observer.set_liveness(Duration::ZERO, Duration::from_secs(3600));
+        assert!(observed_work(&mut driver, &mut observer).is_empty());
+        driver.streams[0].conflation_terminal =
+            Some(karyos_sys::conflation::ConflationError::VersionsExhausted);
+        assert_eq!(
+            observed_work(&mut driver, &mut observer),
+            [DriverEvent::PublicationClosed {
+                stream: StreamKey {
+                    stream_id: 42,
+                    session_id: 1,
+                },
+                reason: CloseReason::ConflationVersionsExhausted,
+            }]
+        );
+        assert_eq!(
+            driver.seal_reason(handle).unwrap(),
+            Some(SealReason::ConflationVersionsExhausted)
+        );
+        assert!(observed_work(&mut driver, &mut observer).is_empty());
     }
 
     #[test]

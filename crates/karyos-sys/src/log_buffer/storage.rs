@@ -59,6 +59,20 @@ pub(crate) struct Cell {
     _padding: [AtomicU64; LINE_WORDS - 5],
 }
 
+/// The seal word and its reason, alone on a 128-byte stride
+/// (`quantstratum-docs: karyos/design/publication-seal.md`). The reason
+/// word was padding before it had a meaning: a region whose conductor
+/// never wrote it reads 0, `SealReason::Unspecified`.
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct SealLine {
+    /// The seal word.
+    pub(crate) word: AtomicU64,
+    /// The reason code, written before the seal word's swap.
+    pub(crate) reason: AtomicU64,
+    _padding: [AtomicU64; LINE_WORDS - 2],
+}
+
 /// One concurrent publisher slot, alone on its stride.
 #[repr(C)]
 #[derive(Debug)]
@@ -80,7 +94,7 @@ pub(crate) struct Control {
     pub(crate) reserved_head: Line,
     pub(crate) limit: Line,
     pub(crate) floor: Line,
-    pub(crate) seal: Line,
+    pub(crate) seal: SealLine,
     pub(crate) publication_taken: Line,
     pub(crate) exclusive_released: Line,
     pub(crate) publication_registration: Line,
@@ -101,6 +115,10 @@ unsafe impl Overlay for Cell {
     const WORDS: usize = LINE_WORDS;
 }
 // SAFETY: as above.
+unsafe impl Overlay for SealLine {
+    const WORDS: usize = LINE_WORDS;
+}
+// SAFETY: as above.
 unsafe impl Overlay for PublisherSlot {
     const WORDS: usize = LINE_WORDS;
 }
@@ -112,6 +130,11 @@ unsafe impl Overlay for Control {
 const _: () = {
     assert!(size_of::<Line>() == Line::WORDS * WORD_BYTES);
     assert!(size_of::<Cell>() == Cell::WORDS * WORD_BYTES);
+    assert!(size_of::<SealLine>() == SealLine::WORDS * WORD_BYTES);
+    assert!(align_of::<SealLine>() == align_of::<AtomicU64>());
+    assert!(offset_of!(SealLine, word) == 0);
+    assert!(offset_of!(SealLine, reason) == 8);
+    assert!(offset_of!(Control, seal) == 4 * 128);
     assert!(size_of::<Control>() == Control::WORDS * WORD_BYTES);
     assert!(size_of::<PublisherSlot>() == PublisherSlot::WORDS * WORD_BYTES);
     assert!(align_of::<PublisherSlot>() == align_of::<AtomicU64>());

@@ -476,21 +476,29 @@ fn remote_handles_close_at_once_at_a_final_seal() {
         OfferOutcome::Accepted { position: 0, .. }
     ));
     driver.remove_stream(stream).unwrap();
-    // The publication's next attempt sees the final seal and ends.
+    // The publication's next attempt sees the final seal and ends, and
+    // reads its reason from the shared seal line.
     assert_eq!(publication.offer(b"late").unwrap(), OfferOutcome::Closed);
+    assert_eq!(
+        publication.seal_reason(),
+        Some(karyos_driver::SealReason::StreamRemoved)
+    );
     drop(publication);
     // The subscription reads the backlog, then the end, once the driver
     // positions the seal; its client is never polled.
     let mut seen = Vec::new();
     let mut closed = None;
+    let mut reason = None;
     serve_until(&mut driver, |_| {
         let summary = subscription
             .poll(|bytes, _| seen.push(bytes.to_vec()), MessageLimit::new(8))
             .unwrap();
         closed = summary.closed;
+        reason = summary.close_reason;
         closed.is_some()
     });
     assert_eq!(seen, vec![b"last".to_vec()]);
+    assert_eq!(reason, Some(karyos_driver::SealReason::StreamRemoved));
     assert_eq!(
         subscription.generation_link().unwrap().status(),
         LinkStatus::Current
