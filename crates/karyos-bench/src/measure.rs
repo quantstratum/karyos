@@ -32,7 +32,7 @@ use crate::plan::{self, INSUFFICIENT, Plan, PlannedRun};
 use crate::preflight;
 use crate::samples::MISSING;
 use crate::wire::process::{Cores, FAULTS, ProcessOptions, faults_requested, run_processes};
-use crate::wire::stage::{StageLoad, StageSamples};
+use crate::wire::stage::{ReceiverSamples, StageLoad, StageSamples};
 use crate::workloads::BenchError;
 
 /// `text` as a JSON string literal.
@@ -58,6 +58,30 @@ fn count_missing(samples: &[u32]) -> usize {
     samples.iter().filter(|sample| **sample == MISSING).count()
 }
 
+/// One number per receiver, joined by `,`.
+fn per_receiver<T: std::fmt::Display>(
+    samples: &StageSamples,
+    value: impl Fn(&ReceiverSamples) -> T,
+) -> String {
+    samples
+        .receivers
+        .iter()
+        .map(|receiver| value(receiver).to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn core_list(cores: &[usize]) -> String {
+    format!(
+        "[{}]",
+        cores
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
 /// The `results.jsonl` line of one run: `outcome` is its samples or the
 /// error that ended it.
 #[must_use]
@@ -65,7 +89,6 @@ pub fn result_line(
     index: usize,
     planned: &PlannedRun,
     dir: &str,
-    cores: Option<Cores>,
     duration: Duration,
     outcome: &Result<StageSamples, BenchError>,
 ) -> String {
@@ -86,12 +109,15 @@ pub fn result_line(
         format!("\"warmup\":{}", run.warmup),
         format!("\"e_max\":{}", run.e_max),
         format!("\"rule\":{}", json_string(&format!("{:?}", run.rule))),
+        format!("\"receivers\":{}", run.receivers),
+        // The cores the run used, receivers first; null when unpinned or
+        // failed.
         format!(
             "\"cores\":{}",
-            cores.map_or_else(
-                || "null".to_string(),
-                |c| format!("[{},{}]", c.receiver, c.sender)
-            )
+            match outcome {
+                Ok(samples) if !samples.cores.is_empty() => core_list(&samples.cores),
+                _ => "null".to_string(),
+            }
         ),
         format!("\"duration_ms\":{}", duration.as_millis()),
         format!("\"dir\":{}", json_string(dir)),
@@ -105,11 +131,17 @@ pub fn result_line(
                 .collect();
             fields.extend([
                 format!("\"send_missing\":{}", count_missing(&samples.send)),
-                format!("\"receive_missing\":{}", count_missing(&samples.receive)),
-                format!("\"backend_drops\":{}", samples.backend_drops),
+                format!(
+                    "\"receive_missing\":[{}]",
+                    per_receiver(samples, |r| count_missing(&r.receive))
+                ),
+                format!("\"backend_drops\":[{}]", per_receiver(samples, |r| r.drops)),
                 format!("\"backpressure\":{}", samples.backpressure),
                 format!("\"ack_timeouts\":{}", samples.ack_timeouts),
-                format!("\"batches\":{}", samples.batches.len()),
+                format!(
+                    "\"batches\":[{}]",
+                    per_receiver(samples, |r| r.batches.len())
+                ),
                 format!("\"functional_only\":{}", samples.functional_only),
                 format!("\"functional_reasons\":[{}]", reasons.join(",")),
                 "\"error\":null".to_string(),
@@ -190,6 +222,7 @@ pub fn header(
         ),
         format!("\"rule\":{}", json_string(&format!("{:?}", options.rule))),
         format!("\"configurations\":[{}]", configurations.join(",")),
+        format!("\"f2\":{}", options.f2),
         format!(
             "\"label\":{}",
             if options.sufficient() {
@@ -199,7 +232,7 @@ pub fn header(
             }
         ),
         match cores {
-            Ok(c) => format!("\"cores\":[{},{}]", c.receiver, c.sender),
+            Ok(c) => format!("\"cores\":{}", core_list(&c.quiet)),
             Err(reason) => format!("\"cores\":null,\"unpinned\":{}", json_string(reason)),
         },
         format!("\"eligible\":{}", facts.ineligible.is_empty()),
@@ -267,7 +300,7 @@ pub fn run_plan(
         .map_err(|cause| io("preflight-start.txt", cause))?;
     let mut results = std::fs::File::create(out.join("results.jsonl"))
         .map_err(|cause| io("results.jsonl", cause))?;
-    let pinned = cores.as_ref().ok().copied();
+    let pinned = cores.as_ref().ok();
     let total = plan.runs.len();
     let mut failed = 0_usize;
     for (index, planned) in plan.runs.iter().enumerate() {
@@ -280,17 +313,17 @@ pub fn run_plan(
         let options = ProcessOptions {
             profile: planned.configuration.clone(),
             run_index: planned.round,
-            cores: pinned,
+            cores: pinned.cloned(),
             ..ProcessOptions::default()
         };
         let outcome = run_processes(&planned.run, &out.join(&dir), &options);
         let duration = started.elapsed();
-        let line = result_line(index, planned, &dir, pinned, duration, &outcome);
+        let line = result_line(index, planned, &dir, duration, &outcome);
         writeln!(results, "{line}").map_err(|cause| io("results.jsonl", cause))?;
         let summary = match &outcome {
             Ok(samples) => format!(
-                "receive missing {}, backpressure {}",
-                count_missing(&samples.receive),
+                "receive missing [{}], backpressure {}",
+                per_receiver(samples, |r| count_missing(&r.receive)),
                 samples.backpressure
             ),
             Err(error) => {
@@ -388,7 +421,6 @@ mod tests {
             3,
             planned,
             "runs/0003_x",
-            None,
             Duration::from_millis(12),
             &Err(BenchError("orphan sequence 9 (M-11)".into())),
         );

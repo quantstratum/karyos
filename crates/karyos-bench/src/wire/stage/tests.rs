@@ -15,6 +15,7 @@ fn stage_run(shape: Shape, load: StageLoad, messages: u64, warmup: u64) -> Stage
         load,
         messages,
         warmup,
+        receivers: 1,
     }
 }
 
@@ -39,14 +40,15 @@ fn every_shape_runs_closed_loop_over_loopback() {
         let samples = smoke(shape, StageLoad::Closed);
         assert_eq!(samples.send.len(), 200);
         assert!(samples.send.iter().all(|s| *s != MISSING), "{shape}");
-        let lost = samples.receive.iter().filter(|s| **s == MISSING).count();
+        let receiver = &samples.receivers[0];
+        let lost = receiver.receive.iter().filter(|s| **s == MISSING).count();
         assert_eq!(lost, 0, "{shape}: {lost} lost in closed loop");
         // H-5: the batch's first callback is never after the message's own.
         assert!(
-            samples
+            receiver
                 .receive
                 .iter()
-                .zip(&samples.receive_callback)
+                .zip(&receiver.receive_callback)
                 .all(|(batch, own)| batch >= own),
             "{shape}"
         );
@@ -59,8 +61,8 @@ fn every_shape_runs_closed_loop_over_loopback() {
 #[test]
 fn an_open_loop_run_records_every_message() {
     let samples = smoke(Shape::W1, StageLoad::Open { rate: 20_000 });
-    assert_eq!(samples.receive.len(), 200);
-    assert!(!samples.batches.is_empty());
+    assert_eq!(samples.receivers[0].receive.len(), 200);
+    assert!(!samples.receivers[0].batches.is_empty());
 }
 
 #[test]

@@ -296,6 +296,7 @@ fn wire_run(
         load,
         messages,
         warmup: 20,
+        receivers: 1,
     }
 }
 
@@ -321,24 +322,25 @@ fn wire_roles_run_in_their_own_processes() {
         let samples = run_processes(&run, &dir.0, &options)
             .unwrap_or_else(|cause| panic!("{shape}: {cause}"));
         assert_eq!(samples.send.len(), 200);
-        assert_eq!(samples.receive.len(), 200);
+        let receiver = &samples.receivers[0];
+        assert_eq!(receiver.receive.len(), 200);
         assert!(
             samples.send.iter().all(|sample| *sample != MISSING),
             "{shape}"
         );
         if load == StageLoad::Closed {
             assert!(
-                samples.receive.iter().all(|sample| *sample != MISSING),
+                receiver.receive.iter().all(|sample| *sample != MISSING),
                 "{shape}"
             );
         }
-        assert_eq!(samples.receive_callback.len(), 200);
+        assert_eq!(receiver.receive_callback.len(), 200);
         assert_eq!(samples.ack_timeouts, 0);
         // Unpinned children are never decision eligible (ACS 15273).
         assert!(samples.functional_only);
         assert_eq!(
             samples.functional_reasons.get(..2),
-            Some(&["rx not pinned".to_string(), "tx not pinned".to_string()][..])
+            Some(&["rx0 not pinned".to_string(), "tx not pinned".to_string()][..])
         );
     }
 }
@@ -366,6 +368,176 @@ fn faulty_run(
         },
     );
     (result.err().map(|error| error.0), started.elapsed())
+}
+
+/// Under F2 four receive processes join one loopback multicast group and
+/// every one receives every message; a receiver that crashes ends the
+/// run (B3d-1). Off Linux the receivers cannot share the group port, and
+/// the run is refused with that cause.
+#[test]
+fn f2_receivers_share_one_group() {
+    use karyos_bench::manifest::Shape;
+    use karyos_bench::samples::MISSING;
+    use karyos_bench::wire::process::{Faults, ProcessOptions, run_processes};
+    use karyos_bench::wire::stage::StageLoad;
+    let dir = TempDir::new("wire-f2");
+    for load in [StageLoad::Closed, StageLoad::Open { rate: 100_000 }] {
+        let mut run = wire_run(Shape::W1, load, 200);
+        run.receivers = 4;
+        let result = run_processes(&run, &dir.0, &ProcessOptions::default());
+        if !cfg!(target_os = "linux") {
+            let error = result.err().map(|error| error.0).unwrap_or_default();
+            assert!(error.contains("Linux only"), "{error}");
+            return;
+        }
+        let samples = result.unwrap_or_else(|cause| panic!("{load:?}: {cause}"));
+        assert_eq!(samples.receivers.len(), 4);
+        assert!(samples.destination.ip().is_multicast());
+        for receiver in &samples.receivers {
+            assert_eq!(receiver.receive.len(), 200);
+            if load == StageLoad::Closed {
+                assert!(receiver.receive.iter().all(|sample| *sample != MISSING));
+            }
+        }
+        assert_eq!(samples.ack_timeouts, 0);
+        assert!((0..4).all(|i| {
+            samples
+                .functional_reasons
+                .contains(&format!("rx{i} not pinned"))
+        }));
+    }
+    let mut run = wire_run(Shape::W1, StageLoad::Closed, 200);
+    run.receivers = 4;
+    let started = std::time::Instant::now();
+    let error = run_processes(
+        &run,
+        &dir.0,
+        &ProcessOptions {
+            faults: Faults {
+                rx_crash_at: Some(50),
+                ..Faults::default()
+            },
+            ..ProcessOptions::default()
+        },
+    )
+    .err()
+    .map(|error| error.0)
+    .unwrap_or_default();
+    assert!(error.contains("child failed"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+/// Runs W1 under R1 with 4 receivers and `faults`, returning the error
+/// and the time the run took (Linux only: F2 needs the group port shared).
+#[cfg(target_os = "linux")]
+fn faulty_f2(
+    name: &str,
+    messages: u64,
+    faults: karyos_bench::wire::process::Faults,
+) -> (Option<String>, std::time::Duration) {
+    use karyos_bench::manifest::Shape;
+    use karyos_bench::wire::process::{ProcessOptions, run_processes};
+    use karyos_bench::wire::stage::StageLoad;
+    let dir = TempDir::new(name);
+    let mut run = wire_run(Shape::W1, StageLoad::Closed, messages);
+    run.receivers = 4;
+    let started = std::time::Instant::now();
+    let result = run_processes(
+        &run,
+        &dir.0,
+        &ProcessOptions {
+            faults,
+            ..ProcessOptions::default()
+        },
+    );
+    (result.err().map(|error| error.0), started.elapsed())
+}
+
+/// One F2 receiver slow to acknowledge the last message is no stop for
+/// the sender: a receiver that stops after a message has it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_slow_last_ack_at_one_receiver_is_no_stop() {
+    use karyos_bench::wire::process::Faults;
+    let (error, _) = faulty_f2(
+        "f2-slow",
+        200,
+        Faults {
+            only_receiver: Some(3),
+            rx_last_ack_delay_ms: Some(100),
+            ..Faults::default()
+        },
+    );
+    assert_eq!(error, None);
+}
+
+/// One F2 receiver failing alone ends the run, and names that receiver.
+#[cfg(target_os = "linux")]
+#[test]
+fn one_crashed_f2_receiver_ends_the_run() {
+    use karyos_bench::wire::process::Faults;
+    let (error, took) = faulty_f2(
+        "f2-crash",
+        200,
+        Faults {
+            only_receiver: Some(2),
+            rx_crash_at: Some(50),
+            ..Faults::default()
+        },
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("rx2 child failed"), "{error}");
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+}
+
+/// One F2 receiver ending early alone stops the sender through its stop;
+/// without its stop, the parent ends a sender that outlives it.
+#[cfg(target_os = "linux")]
+#[test]
+fn one_early_f2_receiver_stops_the_sender() {
+    use karyos_bench::wire::process::Faults;
+    let early = Faults {
+        only_receiver: Some(1),
+        rx_deadline_ms: Some(300),
+        ..Faults::default()
+    };
+    let (error, took) = faulty_f2("f2-early", 1_000_000, early);
+    let error = error.unwrap_or_default();
+    assert!(error.contains("tx child failed"), "{error}");
+    assert!(took < std::time::Duration::from_millis(2_000), "{took:?}");
+    let (error, took) = faulty_f2(
+        "f2-early-silent",
+        1_000_000,
+        Faults {
+            no_stop: true,
+            ..early
+        },
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("outlived"), "{error}");
+    assert!(took < std::time::Duration::from_secs(8), "{took:?}");
+}
+
+/// A run whose multicast group this host has already joined is refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_already_joined_group_is_refused() {
+    use karyos_bench::wire::process::{Faults, group_of};
+    let nonce = 0x5eed_0000_0000_7a11;
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    socket
+        .join_multicast_v4(&group_of(nonce), &std::net::Ipv4Addr::LOCALHOST)
+        .unwrap();
+    let (error, _) = faulty_f2(
+        "f2-joined",
+        200,
+        Faults {
+            nonce: Some(nonce),
+            ..Faults::default()
+        },
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("already joined"), "{error}");
 }
 
 /// Lost hellos are repeated: no message waits for an acknowledgement
@@ -428,7 +600,7 @@ fn a_crashed_receiver_ends_the_run() {
         None,
     );
     let error = error.unwrap_or_default();
-    assert!(error.contains("rx child failed"), "{error}");
+    assert!(error.contains("rx0 child failed"), "{error}");
     assert!(took < std::time::Duration::from_secs(3), "{took:?}");
 }
 
@@ -508,10 +680,7 @@ fn pinned_wire_children_read_their_core_back() {
         &wire_run(Shape::W1, StageLoad::Closed, 200),
         &dir.0,
         &ProcessOptions {
-            cores: Some(Cores {
-                receiver: 0,
-                sender: 1,
-            }),
+            cores: Some(Cores { quiet: vec![0, 1] }),
             ..ProcessOptions::default()
         },
     )

@@ -35,7 +35,7 @@
 //! each W5 sample that many times. Every other shape has one message per
 //! sequence.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU16;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,7 +48,9 @@ use karyos_io::backend::{
     TxItemOutcome, TxOptions, TxQueueConfig, TxQueueId, TxReport,
 };
 use karyos_io::sockets::OsSocket;
-use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint, SocketsRx, SocketsTx};
+use karyos_io::sockets::endpoint::{
+    InterfaceSel, MulticastConfig, SocketsConfig, SocketsEndpoint, SocketsRx, SocketsTx,
+};
 use karyos_protocol::protection::{Protection, Verdict};
 use karyos_protocol::sizing::TermLength;
 use karyos_sys::receive::{ImageParams, ValidatedDatagram};
@@ -130,13 +132,14 @@ pub struct StageRun {
     pub messages: u64,
     /// Messages sent first and discarded.
     pub warmup: u64,
+    /// Receivers: 1 for F1 (one unicast route), more for F2 (loopback
+    /// multicast, `wire::process` only).
+    pub receivers: u16,
 }
 
-/// The samples of one run.
+/// What one receiver of a run measured.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageSamples {
-    /// Send stage per measured message, ns.
-    pub send: Vec<u32>,
+pub struct ReceiverSamples {
     /// Receive stage per measured message, ns; [`MISSING`] when lost.
     pub receive: Vec<u32>,
     /// The receive stage from the message's own first callback instead of
@@ -145,7 +148,16 @@ pub struct StageSamples {
     /// The size of the receive batches, one entry per poll that delivered.
     pub batches: Vec<u32>,
     /// Drops the backend reported.
-    pub backend_drops: u64,
+    pub drops: u64,
+}
+
+/// The samples of one run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageSamples {
+    /// Send stage per measured message, ns.
+    pub send: Vec<u32>,
+    /// Every receiver's samples, in receiver order.
+    pub receivers: Vec<ReceiverSamples>,
     /// Flushes that stopped for lack of room in the kernel (backpressure,
     /// §5.3).
     pub backpressure: u64,
@@ -159,8 +171,12 @@ pub struct StageSamples {
     pub functional_only: bool,
     /// Why the result is functional only; empty when it is not.
     pub functional_reasons: Vec<String>,
-    /// The local address of the receiving endpoint.
-    pub receiver: SocketAddr,
+    /// Where the sender sent: the receiving endpoint's address under F1,
+    /// the multicast group under F2.
+    pub destination: SocketAddr,
+    /// The cores the run used: each receiver's, then the sender's; empty
+    /// when unpinned.
+    pub cores: Vec<usize>,
 }
 
 /// A gate that permits every candidate: the measured path has no guard.
@@ -402,8 +418,25 @@ impl<P: Protection> RxHandler for Receiver<'_, P> {
     }
 }
 
-fn endpoint(max_datagram: u32) -> Result<SocketsEndpoint<OsSocket>, BenchError> {
-    let mut config = SocketsConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+/// The membership of an F2 endpoint in `group` on the loopback
+/// interface, with its own sends looped back to the host's receivers.
+fn loopback_group(group: Ipv4Addr) -> MulticastConfig {
+    MulticastConfig {
+        loopback: true,
+        ..MulticastConfig::new(
+            IpAddr::V4(group),
+            InterfaceSel::Address(Ipv4Addr::LOCALHOST),
+        )
+    }
+}
+
+fn endpoint(
+    max_datagram: u32,
+    local: SocketAddr,
+    group: Option<Ipv4Addr>,
+) -> Result<SocketsEndpoint<OsSocket>, BenchError> {
+    let mut config = SocketsConfig::new(local);
+    config.multicast = group.map(loopback_group);
     config.max_datagram = u16::try_from(max_datagram)
         .ok()
         .and_then(NonZeroU16::new)
@@ -483,7 +516,43 @@ impl Prepared {
     ///
     /// The endpoint cannot open.
     pub fn endpoint(&self) -> Result<SocketsEndpoint<OsSocket>, BenchError> {
-        endpoint(self.max_datagram)
+        endpoint(
+            self.max_datagram,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            None,
+        )
+    }
+
+    /// The sending endpoint of an F2 run: on loopback, sending to `group`.
+    ///
+    /// # Errors
+    ///
+    /// The endpoint cannot open or join.
+    pub fn group_sender(&self, group: Ipv4Addr) -> Result<SocketsEndpoint<OsSocket>, BenchError> {
+        endpoint(
+            self.max_datagram,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            Some(group),
+        )
+    }
+
+    /// A receiving endpoint of an F2 run: bound to `group` and `port`,
+    /// which every receiver of the run shares (port 0 lets the kernel
+    /// choose it for the first).
+    ///
+    /// # Errors
+    ///
+    /// The endpoint cannot open or join.
+    pub fn group_receiver(
+        &self,
+        group: Ipv4Addr,
+        port: u16,
+    ) -> Result<SocketsEndpoint<OsSocket>, BenchError> {
+        endpoint(
+            self.max_datagram,
+            SocketAddr::from((group, port)),
+            Some(group),
+        )
     }
 }
 
@@ -841,6 +910,12 @@ pub fn run<P: Protection + Sync>(
     run: StageRun,
     protection: &P,
 ) -> Result<StageSamples, BenchError> {
+    if run.receivers != 1 {
+        return Err(BenchError(format!(
+            "{} receivers: the in-process run is F1 only; F2 runs in processes",
+            run.receivers
+        )));
+    }
     let prepared = Prepared::new(&run, protection)?;
     let (mut tx, _tx_rx) = prepared
         .endpoint()?
@@ -915,16 +990,19 @@ pub fn run<P: Protection + Sync>(
     let sent = sent??;
     Ok(StageSamples {
         send: sent.send,
-        receive: received.receive,
-        receive_callback: received.receive_callback,
-        batches: received.batches,
-        backend_drops: received.drops,
+        receivers: vec![ReceiverSamples {
+            receive: received.receive,
+            receive_callback: received.receive_callback,
+            batches: received.batches,
+            drops: received.drops,
+        }],
         backpressure: sent.backpressure,
         ack_timeouts: sent.ack_timeouts,
         messages_per_sample: prepared.messages_per_sample,
         functional_only: true,
         functional_reasons: vec!["the roles share one process".to_string()],
-        receiver: receiver_address,
+        destination: receiver_address,
+        cores: Vec::new(),
     })
 }
 
