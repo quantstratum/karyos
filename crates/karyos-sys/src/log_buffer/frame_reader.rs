@@ -422,17 +422,19 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         let read = self.read_fragment(slot, start, offset, assembly, Some(bytes));
         release_loan(&cell.loan);
         let read = read?;
-        if !matches!(
-            read,
-            Fragment::Pending
-                | Fragment::Skip {
-                    reason: SkipReason::Orphan | SkipReason::JoinedMidMessage,
-                    ..
-                }
-        ) {
+        self.cursor.note(match read {
+            Fragment::Pending => super::Outcome::Pending,
+            Fragment::Skip { extent, reason } => super::Outcome::Skip {
+                position: start,
+                extent,
+                reason,
+            },
             // The cursor reached a BEGIN, ABORTED or PAD frame.
-            self.cursor.joining = false;
-        }
+            Fragment::Pad
+            | Fragment::Aborted { .. }
+            | Fragment::Copied { .. }
+            | Fragment::Complete { .. } => super::Outcome::Boundary,
+        });
         Ok(match read {
             Fragment::Pending => (kept, self.pending_with(assembly)),
             Fragment::Pad => {
