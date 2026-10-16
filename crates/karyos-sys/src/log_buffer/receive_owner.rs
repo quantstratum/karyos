@@ -1151,8 +1151,16 @@ fn overlaps_real(set: &Set, unit: usize, units: usize) -> bool {
         }
     }
     // No start lies past the map: stop the search at its end.
-    let end = unit.saturating_add(units).min(set.starts.len() * WORD_BITS);
-    any_set(&set.starts, unit, end.saturating_sub(unit))
+    let Some(map_end) = set.starts.len().checked_mul(WORD_BITS) else {
+        // A map too large to address: the conservative answer.
+        return true;
+    };
+    let end = unit
+        .checked_add(units)
+        .map_or(map_end, |end| end.min(map_end));
+    // A range starting past the map meets no start.
+    end.checked_sub(unit)
+        .is_some_and(|len| any_set(&set.starts, unit, len))
 }
 
 /// Word `index` of `bits`; zero past its end.
@@ -1167,7 +1175,9 @@ fn last_one(at: usize, word: impl Fn(usize) -> u64) -> Option<usize> {
     let mut value = word(index) & mask(0, at % WORD_BITS + 1);
     loop {
         if value != 0 {
-            return Some(index * WORD_BITS + (WORD_BITS - 1 - value.leading_zeros() as usize));
+            // `value` is non-zero: `ilog2` is its highest set bit, below 64.
+            let bit = usize::try_from(value.ilog2()).ok()?;
+            return index.checked_mul(WORD_BITS)?.checked_add(bit);
         }
         index = index.checked_sub(1)?;
         value = word(index);
