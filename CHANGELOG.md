@@ -135,7 +135,8 @@ release may break APIs, wire formats and shared-memory layouts.
 - Timed counters and an injected schedule clock (P2.11 T1 step 6). Public
   API additions in karyos-client: `schedule::ScheduleClock` (the clock a
   timed lane's offers are checked against, the host clock of the domain by
-  default; it runs on the offer path and must not allocate or block),
+  default; it runs on the offer path and must not allocate or block, and
+  returns `CLOCK_UNAVAILABLE` when it cannot read the time),
   `ScheduleCounters`, `ScheduleBinding::with_counters` and
   `ClockDomain::label`; `ScheduleBinding::new` takes a `ScheduleClock`. In
   karyos-driver, `EmbeddedDriver::schedule_stream_with_clock` and

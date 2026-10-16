@@ -14,7 +14,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use karyos_client::schedule::{ClockDomain, ScheduleClock, ScheduleOptions, now};
+use karyos_client::schedule::{
+    CLOCK_UNAVAILABLE, ClockDomain, ScheduleClock, ScheduleOptions, now,
+};
 use karyos_client::{ClientError, OfferOutcome};
 use karyos_driver::{DriverError, EmbeddedDriver, StreamConfig, StreamHandle};
 use karyos_sys::frame::Lane;
@@ -350,4 +352,34 @@ fn timed_offers_are_counted_against_the_injected_clock() {
     assert_eq!(read("timed late sends"), 0);
     assert_eq!(read("timed deadline aborts"), 0);
     assert_eq!(read("timed lateness <= 1us"), 0);
+}
+
+/// A clock that cannot read the time refuses every offer with
+/// `ScheduleOverflow`, counted, whatever the horizon (ACS 15475; a zero
+/// horizon is refused at `schedule_stream`).
+#[test]
+fn an_unavailable_clock_refuses_the_offer() {
+    for max_horizon in [1, SECOND] {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let handle = stream(&mut driver, 2);
+        driver
+            .schedule_stream_with_clock(
+                handle,
+                ScheduleOptions {
+                    max_horizon,
+                    ..ScheduleOptions::default()
+                },
+                ScheduleClock::new(|| CLOCK_UNAVAILABLE),
+            )
+            .unwrap();
+        let mut publication = driver.publication(handle).unwrap();
+        for time in [0, 1_000, u64::MAX - SECOND] {
+            assert!(matches!(
+                publication.offer_at(b"m", time),
+                Err(ClientError::ScheduleOverflow)
+            ));
+        }
+        assert_eq!(counter(&driver, "timed rejections overflow (monotonic)"), 3);
+        assert_eq!(counter(&driver, "timed scheduled offers (monotonic)"), 0);
+    }
 }
