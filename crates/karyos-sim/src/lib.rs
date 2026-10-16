@@ -6,8 +6,10 @@
 //! (`quantstratum-docs: karyos/design/simulator-and-bench.md`, s1): a seeded, single-threaded
 //! scheduler on virtual time that drives the embedded driver one API call
 //! per step, with suspended actors (also inside a claim), forgotten
-//! claims, dropped handles, stream removal and cutovers, and an oracle that
-//! checks every delivery. Suspensions and drops are logical, inside one
+//! claims, dropped handles, stream removal and cutovers, clients whose
+//! heartbeat stops (also while their reader holds a loan) until the
+//! driver may time them out under the stream's loss policy, and an oracle
+//! that checks every delivery. Suspensions and drops are logical, inside one
 //! process: they are not evidence for real process pause, crash or restart,
 //! which belongs to IPC. The network, the backend ring models, the disk
 //! model, the Archive and the Cluster do not exist yet.

@@ -158,7 +158,7 @@ fn a_lost_cell_is_reused_only_after_its_holder_left() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "the old holder's detach overwrote the new occupant")]
 fn control_reuse_before_the_detach_store() {
     reuse_model(Reuse::BeforeDetach);
 }
@@ -231,7 +231,7 @@ fn a_stale_rescan_leaves_a_local_successor_untouched() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "stale rescan touched occupant 2")]
 fn control_a_stale_rescan_with_a_plain_store() {
     stale_rescan_model(Rescan::PlainStore, LOCAL, REMOTE);
 }
@@ -283,7 +283,7 @@ fn a_detach_racing_the_loss_ends_free_with_no_bound() {
 }
 
 #[test]
-#[should_panic]
+#[should_panic(expected = "the cell did not end free")]
 fn control_a_loss_with_a_plain_store() {
     detach_versus_loss_model(Loss::PlainStore);
 }

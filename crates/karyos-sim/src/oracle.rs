@@ -80,6 +80,8 @@ pub struct ReaderView {
     /// The seal position, once the reader reached an end with no
     /// successor (removal, or a fence at a cutover).
     closed: Option<u64>,
+    /// The read position at which the reader was revoked, its client lost.
+    revoked: Option<u64>,
 }
 
 impl ReaderView {
@@ -94,6 +96,7 @@ impl ReaderView {
             sequences: HashMap::new(),
             lost: Vec::new(),
             closed: None,
+            revoked: None,
         }
     }
 
@@ -115,7 +118,18 @@ impl ReaderView {
         self.closed
     }
 
+    /// The read position at which the reader was revoked, if it was.
+    #[must_use]
+    pub fn revoked(&self) -> Option<u64> {
+        self.revoked
+    }
+
     fn advance(&mut self, position: u64) -> Result<(), String> {
+        if let Some(revoked) = self.revoked {
+            return Err(format!(
+                "{position} observed after the revocation at {revoked}"
+            ));
+        }
         if let Some(closed) = self.closed {
             return Err(format!("{position} observed after the end at {closed}"));
         }
@@ -223,8 +237,34 @@ impl ReaderView {
         Ok(())
     }
 
+    /// The reader was revoked at read position `position`: its client was
+    /// lost (`quantstratum-docs: karyos/design/required-participant-loss.md`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when the position is not past everything
+    /// observed, or moved.
+    pub fn revoked_at(&mut self, position: u64) -> Result<(), String> {
+        if let Some(earlier) = self.revoked {
+            return if earlier == position {
+                Ok(())
+            } else {
+                Err(format!("revocation moved from {earlier} to {position}"))
+            };
+        }
+        if self.last.is_some_and(|last| last >= position) {
+            return Err(format!(
+                "revoked at {position}, at or before {:?}",
+                self.last
+            ));
+        }
+        self.revoked = Some(position);
+        Ok(())
+    }
+
     /// The end-of-run check: a required reader received every message
-    /// accepted from its attach position up to its end.
+    /// accepted from its attach position up to its end, or up to its
+    /// revocation: while it bounded the publisher it missed nothing.
     ///
     /// # Errors
     ///
@@ -233,7 +273,10 @@ impl ReaderView {
         if self.role != Role::Required {
             return Ok(());
         }
-        let end = self.closed.unwrap_or(u64::MAX);
+        let end = self
+            .closed
+            .unwrap_or(u64::MAX)
+            .min(self.revoked.unwrap_or(u64::MAX));
         for (position, stamp) in record.accepted_in(self.attach, end) {
             if !self.delivered.contains(position) {
                 return Err(format!(
@@ -298,6 +341,19 @@ mod tests {
     }
 
     #[test]
+    fn a_revoked_reader_owes_only_what_preceded_its_revocation() {
+        let record = record();
+        let mut reader = ReaderView::new(Role::Required, 0);
+        reader.message(&record, 0, &encode(stamp(0), 40)).unwrap();
+        reader.revoked_at(64).unwrap();
+        reader.complete(&record).unwrap();
+        // Negative control: a gap before the revocation is still missed.
+        let mut gap = ReaderView::new(Role::Required, 0);
+        gap.revoked_at(64).unwrap();
+        assert!(gap.complete(&record).is_err());
+    }
+
+    #[test]
     fn a_reordered_sequence_is_reported() {
         let mut record = StreamRecord::default();
         record.accepted(0, stamp(5)).unwrap();
@@ -323,6 +379,12 @@ mod tests {
         let mut reader = ReaderView::new(Role::Optional, 0);
         assert!(reader.message(&record, 64, &encode(stamp(9), 40)).is_err());
         assert!(reader.aborted(&record, 192).is_err());
+        let mut revoked = ReaderView::new(Role::Required, 0);
+        revoked.message(&record, 64, &encode(stamp(1), 40)).unwrap();
+        assert!(revoked.revoked_at(64).is_err());
+        revoked.revoked_at(128).unwrap();
+        assert!(revoked.revoked_at(192).is_err());
+        assert!(revoked.aborted(&record, 128).is_err());
         let mut ended = ReaderView::new(Role::Required, 0);
         ended.closed_at(256).unwrap();
         assert!(ended.closed_at(320).is_err());

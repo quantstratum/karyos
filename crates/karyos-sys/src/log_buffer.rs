@@ -3305,7 +3305,10 @@ impl<O: BufferOwner> Conductor<O> {
         if !registration::end(&found.registration, export) {
             return false;
         }
-        found.state.store(CELL_FREE, Ordering::Release);
+        // A swap, as in `participant::leave`: every write of the cell's
+        // state is a read-modify-write, so it stays in one release
+        // sequence with the conductor's own transitions.
+        let _ = found.state.swap(CELL_FREE, Ordering::Release);
         true
     }
 
