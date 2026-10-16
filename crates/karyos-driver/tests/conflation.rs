@@ -291,3 +291,196 @@ fn feeder_counters_are_keyed_per_stream_and_freed_with_it() {
         assert_eq!(feeder_counter(&driver, registration, 3, label), None);
     }
 }
+
+// ---- Phase 1 closing audit of #7: the design's remaining tests ----
+
+/// The latest value and version of every key, read until the view has
+/// delivered every change; `seen` holds the versions delivered so far and
+/// checks that none goes backwards.
+fn read_all(
+    conflated: &mut ConflatedSubscription,
+    seen: &mut std::collections::BTreeMap<u32, (u64, Vec<u8>)>,
+) {
+    for _ in 0..64 {
+        let report = conflated.poll_changed_with(
+            Budget {
+                keys: 64,
+                retries: 3,
+            },
+            |key, version, value| {
+                if let Some((before, _)) = seen.get(&key) {
+                    assert!(version > *before, "key {key}: {version} after {before}");
+                }
+                let _ = seen.insert(key, (version, value.to_vec()));
+            },
+        );
+        assert!(!report.closed, "the table closed");
+        if report.pending == 0 && !report.scanning && report.journal_drained {
+            return;
+        }
+    }
+    panic!("the view never caught up");
+}
+
+/// conflation-end-to-end.md, `test_conflation_feeder_latest_value_per_key`:
+/// interleaved updates to several keys; every key ends at its last update,
+/// and versions never go backwards across reads made in between.
+#[test]
+fn test_conflation_feeder_latest_value_per_key() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver
+        .add_stream(config(Some(conflation_config())))
+        .unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    let mut conflated = driver.subscribe_conflated(stream).unwrap();
+    let mut seen = std::collections::BTreeMap::new();
+    let rounds = 50u8;
+    for round in 0..rounds {
+        for key in 0..4u8 {
+            offer_keyed(&mut driver, &mut publication, i64::from(key), &[round, key]);
+        }
+        let _ = driver.do_work().unwrap();
+        if round % 7 == 3 {
+            read_all(&mut conflated, &mut seen);
+        }
+    }
+    let _ = driver.do_work().unwrap();
+    read_all(&mut conflated, &mut seen);
+    for key in 0..4u8 {
+        // Each write advances a key's version by two.
+        assert_eq!(
+            seen.get(&u32::from(key)),
+            Some(&(2 * u64::from(rounds), vec![rounds - 1, key])),
+            "key {key}"
+        );
+    }
+}
+
+/// conflation-end-to-end.md, `test_conflation_feeder_back_pressures_never_loses`:
+/// with the feeder starved of duty cycles the publisher is back pressured;
+/// once the feeder runs, every accepted update is in the version sequence.
+#[test]
+fn test_conflation_feeder_back_pressures_never_loses() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver
+        .add_stream(config(Some(conflation_config())))
+        .unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    let mut conflated = driver.subscribe_conflated(stream).unwrap();
+    let options = AppendOptions {
+        reserved_value: 0,
+        ..AppendOptions::default()
+    };
+    let mut accepted = 0u64;
+    loop {
+        let value = accepted.to_le_bytes();
+        match publication.offer_with(&value, options).unwrap() {
+            OfferOutcome::Accepted { .. } => accepted += 1,
+            OfferOutcome::BackPressured => break,
+            other => panic!("after {accepted}: {other:?}"),
+        }
+        assert!(accepted < 1_000_000, "never back pressured");
+    }
+    assert!(accepted > 1);
+    // The feeder runs: nothing accepted is missing.
+    let mut seen = std::collections::BTreeMap::new();
+    for _ in 0..64 {
+        let _ = driver.do_work().unwrap();
+    }
+    read_all(&mut conflated, &mut seen);
+    assert_eq!(
+        seen.get(&0),
+        Some(&(2 * accepted, (accepted - 1).to_le_bytes().to_vec()))
+    );
+    // The publisher goes on.
+    offer_keyed(&mut driver, &mut publication, 0, b"more");
+    let _ = driver.do_work().unwrap();
+    read_all(&mut conflated, &mut seen);
+    assert_eq!(seen.get(&0), Some(&(2 * accepted + 2, b"more".to_vec())));
+}
+
+/// A manual clock for the paused-driver variant.
+#[derive(Debug, Clone, Default)]
+struct ManualClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl karyos_driver::MonotonicClock for ManualClock {
+    fn now(&mut self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// conflation-end-to-end.md, `test_conflation_view_survives_cutover`, the
+/// slow-feeder and paused-driver variants: updates before, during and after
+/// a cutover, with a feeder that copies one message per duty cycle and is
+/// still on the predecessor when the successor opens, and optionally with
+/// the driver's clock moved past the cutover deadline before its next duty
+/// cycle. The feeder is not fenced, versions continue without reset, no
+/// update is lost and the table stays open.
+#[test]
+fn test_conflation_view_survives_cutover_with_a_slow_feeder_and_a_paused_driver() {
+    for paused in [false, true] {
+        let clock = ManualClock::default();
+        let mut driver = EmbeddedDriver::with_clock(
+            karyos_driver::DriverConfig {
+                conflation_feeder_budget: std::num::NonZeroU32::new(1).unwrap(),
+                cutover_deadline: 1_000,
+                ..karyos_driver::DriverConfig::default()
+            },
+            Box::new(clock.clone()),
+        )
+        .unwrap();
+        let stream = driver
+            .add_stream(config(Some(conflation_config())))
+            .unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        let mut conflated = driver.subscribe_conflated(stream).unwrap();
+        let mut seen = std::collections::BTreeMap::new();
+        let updates = 30u8;
+        for n in 0..updates {
+            offer_keyed(&mut driver, &mut publication, i64::from(n % 2), &[n]);
+        }
+        // The feeder has copied at most one message per duty cycle so far.
+        assert_eq!(
+            driver
+                .reconfigure_stream(
+                    stream,
+                    Reconfiguration {
+                        term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                        spare_slots: 3,
+                    }
+                )
+                .unwrap(),
+            Generation::try_new(1).unwrap(),
+            "paused: {paused}"
+        );
+        if paused {
+            // The driver sleeps through the cutover deadline.
+            clock.0.store(10_000, std::sync::atomic::Ordering::Relaxed);
+        }
+        for n in updates..2 * updates {
+            offer_keyed(&mut driver, &mut publication, i64::from(n % 2), &[n]);
+        }
+        for _ in 0..4 * u32::from(updates) {
+            let _ = driver.do_work().unwrap();
+        }
+        read_all(&mut conflated, &mut seen);
+        for key in 0..2u8 {
+            let last = 2 * updates - 2 + key;
+            assert_eq!(
+                seen.get(&u32::from(key)),
+                Some(&(2 * u64::from(updates), vec![last])),
+                "paused: {paused}, key {key}"
+            );
+        }
+        assert_eq!(
+            driver
+                .generations(stream)
+                .unwrap()
+                .last()
+                .unwrap()
+                .generation,
+            Generation::try_new(1).unwrap(),
+            "paused: {paused}"
+        );
+    }
+}
