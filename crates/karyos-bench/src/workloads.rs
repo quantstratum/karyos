@@ -971,7 +971,7 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
                 ));
             }
             let scheduled = scheduled_instant(schedule_start, index, target_rate)?;
-            if !wait_until(scheduled, &producer_failed) {
+            if !wait_until(scheduled, &|| producer_failed.load(Ordering::Acquire)) {
                 return Err(BenchError(
                     "receiver stopped before the schedule finished".into(),
                 ));
@@ -1099,9 +1099,11 @@ fn scheduled_latency_ns(scheduled: Instant, delivered: Instant) -> u128 {
     delivered.saturating_duration_since(scheduled).as_nanos()
 }
 
-fn wait_until(scheduled: Instant, stop: &AtomicBool) -> bool {
+/// Waits until `scheduled`, sleeping while it is far and spinning in its
+/// last 200 µs; `false` as soon as `stop` holds.
+pub(crate) fn wait_until(scheduled: Instant, stop: &dyn Fn() -> bool) -> bool {
     loop {
-        if stop.load(Ordering::Acquire) {
+        if stop() {
             return false;
         }
         let remaining = scheduled.saturating_duration_since(Instant::now());
