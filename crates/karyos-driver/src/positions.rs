@@ -259,9 +259,10 @@ fn next_epochs(epoch: u64) -> (u64, u64) {
     (odd, even)
 }
 
-/// The attached subscriber cells of every live mapping of `stream`,
-/// replaced incarnations and then the oldest mapping first, skipping the successor cells reserved for subscribers
-/// that have not moved yet (they still read their predecessor cell).
+/// The attached subscriber cells of every live mapping of `stream`:
+/// replaced incarnations first, then the oldest mapping first, skipping
+/// the successor cells reserved for subscribers that have not moved yet
+/// (they still read their predecessor cell).
 fn collect_attached<T: StreamTerms>(stream: &Stream<T>, out: &mut Vec<Attached>) {
     out.clear();
     // Replaced incarnations first: their readers still read to the seal.
@@ -975,22 +976,21 @@ mod tests {
         let _new_reader = driver.subscribe(handle, Role::Required).unwrap();
         driver.positions.force_due();
         let _ = driver.do_work().unwrap();
-        let labels: Vec<String> = subscribers(&driver)
-            .into_iter()
-            .map(|(label, _)| label)
-            .collect();
-        assert_eq!(labels.len(), 2, "{labels:?}");
-        assert!(
-            labels
-                .iter()
-                .any(|label| label.starts_with("subscriber position generation")),
-            "{labels:?}"
-        );
-        assert!(
-            labels
-                .iter()
-                .any(|label| label.starts_with("subscriber position incarnation 2")),
-            "{labels:?}"
-        );
+        let sampled = subscribers(&driver);
+        assert_eq!(sampled.len(), 2, "{sampled:?}");
+        // The old reader, same cell and registration word in its own
+        // incarnation, never read: position 0. The fresh reader starts at
+        // the fresh incarnation's base, the seal position.
+        let base = driver.streams[0].base;
+        assert!(base > 0);
+        let old = sampled
+            .iter()
+            .find(|(label, _)| label.starts_with("subscriber position generation"))
+            .unwrap();
+        let fresh = sampled
+            .iter()
+            .find(|(label, _)| label.starts_with("subscriber position incarnation 2"))
+            .unwrap();
+        assert_eq!((old.1, fresh.1), (0, base), "{sampled:?}");
     }
 }

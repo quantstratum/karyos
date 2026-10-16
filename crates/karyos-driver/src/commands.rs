@@ -717,13 +717,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err("loss report of another driver instance; the client is retired");
         }
         let issued = |id: u64, next: u64| id != 0 && id < next;
-        // An incarnation the lane never had: 0, or above its current one.
-        let never = loss.incarnation == 0
-            || self.streams.iter().any(|s| {
+        // An incarnation the driver cannot verify: 0, above the lane's
+        // current one, or, once the lane's stream is freed, any but the
+        // first (the only one a freed stream is known to have had).
+        let lane_incarnation = self
+            .streams
+            .iter()
+            .find(|s| {
                 s.aggregate.registration == loss.stream_registration
                     && s.config.lane.get() == loss.lane
-                    && loss.incarnation > s.incarnation
-            });
+            })
+            .map_or(crate::embedded::FIRST_INCARNATION, |s| s.incarnation);
+        let never = loss.incarnation == 0 || loss.incarnation > lane_incarnation;
         if !issued(loss.stream_registration, self.next_stream)
             || never
             || !issued(loss.subscription, self.next_registration)
@@ -4685,6 +4690,12 @@ mod tests {
                 .iter()
                 .any(|r| r.id == old && r.incarnation() == 1)
         );
+        // Review of #213, P2-1: a registration on the replaced incarnation
+        // stands Closed, never Current, though it shares the generation.
+        assert_eq!(
+            driver.query_cutover(client, old),
+            Some(karyos_protocol::cnc::CutoverState::Closed)
+        );
         // A new subscription binds the fresh incarnation.
         subscribe(&mut producer, 2);
         let mut answers = Vec::new();
@@ -4733,5 +4744,132 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2]
         );
+    }
+
+    /// A guarded stream with a remote required subscriber on incarnation 1,
+    /// then a fresh incarnation 2.
+    fn reincarnated_with_remote(
+        driver: &mut EmbeddedDriver,
+        stream: StreamHandle,
+    ) -> (u64, RingProducer, u64) {
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                lane: Lane::ZERO,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let _ = responses(&mut observer);
+        let old = ledger(driver, client)[0].registration;
+        let publication = driver.publication(stream).unwrap();
+        let _ = driver.close_guard(guard, 2).unwrap();
+        drop(publication);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+        drop(driver.publication(stream).unwrap());
+        assert_eq!(driver.streams[0].incarnation, 2);
+        (client, producer, old)
+    }
+
+    /// Review of #213 (M5): a client that times out on incarnation 1 is
+    /// revoked in incarnation 1's buffer, though a fresh reader sits in the
+    /// same cell of incarnation 2; the loss names incarnation 1, and the
+    /// fresh reader is untouched.
+    #[test]
+    fn a_lost_client_is_revoked_in_its_own_incarnation() {
+        let (mut driver, stream) = driver_with_stream();
+        let (client, _producer, old) = reincarnated_with_remote(&mut driver, stream);
+        let old_cell = driver
+            .registrations
+            .iter()
+            .find(|r| r.id == old)
+            .and_then(|r| r.subscriber)
+            .unwrap()
+            .0;
+        let _fresh = driver
+            .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+            .unwrap();
+        assert!(
+            driver.streams[0]
+                .conductor
+                .subscribers()
+                .any(|cell| cell.cell == old_cell),
+            "the same cell in both buffers"
+        );
+        driver.revoke_client(client);
+        let records = losses(&driver);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].incarnation, 1);
+        assert!(
+            driver.streams[0]
+                .conductor
+                .cell_position(old_cell)
+                .is_some()
+        );
+    }
+
+    /// Review of #213 (M7): a sent grant pins the replaced incarnation after
+    /// its registration is removed, and releases it at the exit proof.
+    #[test]
+    fn a_sent_grant_pins_the_replaced_incarnation_until_the_exit_proof() {
+        let (mut driver, stream) = driver_with_stream();
+        let (client, mut producer, old) = reincarnated_with_remote(&mut driver, stream);
+        let export = ledger(&driver, client)[0].export;
+        remote_ledger(&mut driver, client).mark_sent(export);
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 2,
+                registration: old,
+            },
+        );
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert!(driver.registrations.iter().all(|r| r.id != old));
+        assert_eq!(
+            driver.streams[0].replaced.len(),
+            1,
+            "the sent grant pins it"
+        );
+        // The exit proof: the client's close flag.
+        if let Some(slot) = driver.clients.iter().find(|slot| slot.id == client) {
+            slot.link.mark_closed();
+        }
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert!(driver.streams[0].replaced.is_empty());
+    }
+
+    /// Review of #213, P3: an incarnation the driver cannot verify (no
+    /// stream holds the named lane, as after a free) is a violation unless
+    /// it is the first; u64::MAX is never recorded.
+    #[test]
+    fn a_loss_on_an_unknown_lane_names_only_the_first_incarnation() {
+        let (mut driver, _stream) = driver_with_stream();
+        let (client, _producer, subscription) = reporting_client(&mut driver);
+        let base = reported(&driver, subscription);
+        let unknown_lane = |incarnation| ReportedLoss {
+            lane: 1,
+            incarnation,
+            ..base
+        };
+        for incarnation in [2, u64::MAX] {
+            let report = unknown_lane(incarnation);
+            assert!(
+                driver.report_loss(client, &report).is_err(),
+                "{incarnation}"
+            );
+        }
+        assert!(losses(&driver).is_empty());
     }
 }

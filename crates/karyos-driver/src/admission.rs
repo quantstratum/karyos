@@ -901,9 +901,10 @@ impl<T: StreamTerms> Admission<T> {
             return refuse(remote, refusal::RESOURCES);
         };
         // The publication identity of the grant, whose driver part is the
-        // instance of `Admitted` (ACS 13555). One incarnation per stream
-        // registration, kept across mapping generations. A journal grant
-        // names no stream: both are zero.
+        // instance of `Admitted` (ACS 13555), and the incarnation the grant
+        // was issued on (a fresh incarnation follows a guard close and
+        // reopen; a mapping cutover keeps it). A journal grant names no
+        // stream: both are zero.
         let (stream_registration, incarnation) = match grant.participant {
             Participant::Journal { .. } => (0, 0),
             // The publication's identity: the aggregate's registration; the

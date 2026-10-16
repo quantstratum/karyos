@@ -1770,9 +1770,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// [`DriverError::GuardSealed`] while the sealed incarnation's
-    /// publication has not released (no seal position yet), for a
-    /// conflated stream, and while a remote client holds a registration or
-    /// export of the stream (remote incarnations are G-d2b);
+    /// publication has not released (no seal position yet), and for a
+    /// conflated stream or one with a cutover or retained mappings (remote
+    /// holders stay on the replaced incarnation, which they pin);
     /// [`DriverError::IncarnationsExhausted`]; [`DriverError::PositionsExhausted`];
     /// and the buffer's allocation errors.
     fn reincarnate_if_reopened(&mut self, handle: StreamHandle) -> Result<(), DriverError> {
