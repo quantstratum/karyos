@@ -709,3 +709,62 @@ fn a_policy_is_validated_against_the_largest_datagram() {
         ))
     );
 }
+
+/// G-e4 (DN-7): the gate counts its work in flight, exposed heads not yet
+/// left and unproven ones until a reopen, publishes it with the applied
+/// epoch, and again from the between gates step as it drains.
+#[test]
+fn the_work_in_flight_is_published_as_it_drains() {
+    let mut f = Fixture::new(1, None);
+    let (token, _, staged) = f.stage(0);
+    let (second, _, second_staged) = f.stage(0);
+    assert_eq!(f.gate.in_flight(), Some(0), "staged is not exposed");
+    assert_eq!(check(&mut f.gate, 0, &[token, second]), permit(2));
+    assert_eq!(f.gate.in_flight(), Some(2));
+    close(&f.word);
+    f.gate.between_gates();
+    let applied = f.cell.try_read().unwrap();
+    assert_eq!((applied.epoch, applied.in_flight), (3, 2));
+    f.gate.left(0, staged, Left::Submitted);
+    f.gate.left(0, second_staged, Left::Unknown);
+    assert_eq!(f.gate.in_flight(), Some(1), "unknown stays in flight");
+    f.gate.between_gates();
+    assert_eq!(f.cell.try_read().unwrap().in_flight, 1);
+    let queue = f.queues[0];
+    let mut report = TxReport::new();
+    while let Ok(outcome) = f.tx.cancel_pending(queue, &mut report) {
+        while report.pop_front().is_some() {}
+        if !outcome.more {
+            break;
+        }
+    }
+    f.gate.reopen(&mut f.sender, 0, queue);
+    f.gate.between_gates();
+    let drained = f.cell.try_read().unwrap();
+    assert_eq!((drained.epoch, drained.in_flight), (3, 0));
+    assert_eq!(f.gate.counts().applied, 1, "one epoch applied, republished");
+}
+
+/// Review of #227 (P2-2): a report that contradicts the gate's head leaves
+/// that item's fate unknown, so it stays in flight until a reopen.
+#[test]
+fn a_contradicted_report_stays_in_flight_until_a_reopen() {
+    let mut f = Fixture::new(2, None);
+    let (token, _, _) = f.stage(0);
+    let (_, _, other) = f.stage(1);
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
+    assert_eq!(f.gate.in_flight(), Some(1));
+    f.gate.left(0, other, Left::Submitted);
+    assert_eq!(f.gate.abort_cause(0), Some(AbortCause::Fault));
+    assert_eq!(f.gate.in_flight(), Some(1), "not counted as settled");
+    let queue = f.queues[0];
+    let mut report = TxReport::new();
+    while let Ok(outcome) = f.tx.cancel_pending(queue, &mut report) {
+        while report.pop_front().is_some() {}
+        if !outcome.more {
+            break;
+        }
+    }
+    f.gate.reopen(&mut f.sender, 0, queue);
+    assert_eq!(f.gate.in_flight(), Some(0));
+}

@@ -109,6 +109,19 @@ pub enum DriverError {
     /// burst below the stream's largest frame.
     #[error(transparent)]
     InvalidRatePolicy(karyos_sys::rate_limit::RatePolicyError),
+    /// Every sender slot of the guards' owner is taken
+    /// (`DriverConfig::max_guard_senders`).
+    #[error("too many guard senders")]
+    TooManyGuardSenders,
+    /// Guard sender ids are exhausted; they are never reused.
+    #[error("guard sender ids exhausted")]
+    GuardSenderIdsExhausted,
+    /// The sender is not registered with this driver (never, or no more).
+    #[error("unknown guard sender {sender}")]
+    UnknownGuardSender {
+        /// The sender id.
+        sender: u64,
+    },
     /// The stream's incarnation numbers are exhausted; they are never
     /// reused.
     #[error("stream {stream}'s incarnations are exhausted")]

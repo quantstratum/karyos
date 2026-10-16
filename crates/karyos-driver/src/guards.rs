@@ -100,7 +100,14 @@ struct Entry {
     name: String,
     id: u64,
     word: Arc<HeapWords>,
+    /// The epoch and driver clock time of the guard's latest closes,
+    /// oldest first, at most [`CLOSE_HISTORY`].
+    closes: VecDeque<(u64, u64)>,
 }
+
+/// Closes whose time a guard keeps for the effective-close
+/// acknowledgement's overdue check.
+pub const CLOSE_HISTORY: usize = 8;
 
 /// The scope a rate limit applies to (`quantstratum-docs:
 /// karyos/design/guards-and-abort.md`, Rate limits). Phase 2 supports the
@@ -184,6 +191,7 @@ impl Guards {
             name: name.to_owned(),
             id,
             word,
+            closes: VecDeque::with_capacity(CLOSE_HISTORY),
         });
         self.next = next;
         Ok(GuardHandle {
@@ -213,6 +221,24 @@ impl Guards {
             driver: self.driver,
             guard: entry.id,
         })
+    }
+
+    /// The driver clock time of the guard's close at `epoch`; for a close
+    /// older than the [`CLOSE_HISTORY`] kept, the time of the oldest kept
+    /// close after it, which happened no earlier (so an overdue check can
+    /// only come late, never early). `None` if the guard never closed at or
+    /// after `epoch`.
+    pub(crate) fn closed_since(
+        &self,
+        handle: GuardHandle,
+        epoch: u64,
+    ) -> Result<Option<u64>, DriverError> {
+        let entry = self.check(handle)?;
+        Ok(entry
+            .closes
+            .iter()
+            .find(|&&(closed, _)| closed >= epoch)
+            .map(|&(_, time)| time))
     }
 
     fn check(&self, handle: GuardHandle) -> Result<&Entry, DriverError> {
@@ -267,6 +293,17 @@ impl Guards {
                 return Err(error);
             }
         };
+        if let Ok(Closed::Now { epoch }) = result
+            && let Some(entry) = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == handle.guard)
+        {
+            if entry.closes.len() >= CLOSE_HISTORY {
+                let _ = entry.closes.pop_front();
+            }
+            entry.closes.push_back((epoch, time));
+        }
         let outcome = match &result {
             Ok(Closed::Now { .. }) => AuditOutcome::Closed,
             Ok(Closed::Already { .. }) => AuditOutcome::AlreadyClosed,

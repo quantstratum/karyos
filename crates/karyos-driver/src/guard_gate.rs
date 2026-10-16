@@ -14,8 +14,10 @@
 //!   than exactly `(e, Open)` denies and puts the lane's incarnation in
 //!   `Aborting` for good; a later reopen cannot resume it. If the observed
 //!   epoch is above the applied epoch, the gate publishes it once, with the
-//!   last positions submitted per lane, through its [`AppliedEpoch`] cell,
-//!   which this gate alone writes.
+//!   last positions submitted per lane and the work in flight, through its
+//!   [`AppliedEpoch`] cell, which this gate alone writes; the between gates
+//!   step publishes again as that work drains, for the effective-close
+//!   acknowledgement (`crate::guard_ack`).
 //! - **Rate.** The authoritative bucket of the publication, one per gate:
 //!   a channel's lanes are one publication (GC-5, ACS 15344). A datagram
 //!   costs one message token per message it starts and its length in byte
@@ -173,6 +175,8 @@ struct Head {
     ticket: TxTicket,
     /// Its tokens are reserved: it was permitted and has not left.
     charged: bool,
+    /// It was permitted: backend work in flight until it leaves.
+    exposed: bool,
 }
 
 #[derive(Debug)]
@@ -182,6 +186,9 @@ struct State {
     heads: VecDeque<Head>,
     bound: usize,
     aborting: Option<AbortCause>,
+    /// Heads that left with an unproven exposure (`Unknown`), in flight
+    /// until the control path resolves them with a reopen.
+    unknown: u64,
 }
 
 fn refund(limiter: &mut Option<RateLimiter>, entry: &mut Head) {
@@ -205,6 +212,8 @@ pub struct GuardGate {
     flushing: Option<usize>,
     /// The epoch last published to the cell.
     applied: u64,
+    /// The in-flight count last published to the cell.
+    published_in_flight: u64,
     /// The last position submitted per publication lane.
     submitted: [u64; Lane::COUNT as usize],
     counts: GateCounts,
@@ -252,6 +261,7 @@ impl GuardGate {
                 heads: VecDeque::with_capacity(lane.bound),
                 bound: lane.bound,
                 aborting: None,
+                unknown: 0,
             })
             .collect();
         Ok(Self {
@@ -261,6 +271,7 @@ impl GuardGate {
             limiter: rate.map(|policy| RateLimiter::new(policy, now)),
             flushing: None,
             applied: 0,
+            published_in_flight: 0,
             submitted: [0; Lane::COUNT as usize],
             counts: GateCounts::default(),
         })
@@ -338,6 +349,7 @@ impl GuardGate {
             head,
             ticket: staged.ticket,
             charged: false,
+            exposed: false,
         });
         Ok(())
     }
@@ -352,6 +364,8 @@ impl GuardGate {
             while let Some(mut entry) = state.heads.pop_front() {
                 refund(&mut self.limiter, &mut entry);
             }
+            // The reset settled every item of the old queue.
+            state.unknown = 0;
         }
     }
 
@@ -378,12 +392,44 @@ impl GuardGate {
             && observed.epoch > self.applied
         {
             self.applied = observed.epoch;
-            self.cell.publish(Applied {
-                epoch: observed.epoch,
-                positions: self.submitted,
-            });
+            self.publish();
             bump(&mut self.counts.applied, &mut self.counts.overflows);
         }
+    }
+
+    /// Backend work in flight: heads exposed and not yet left, and heads
+    /// that left unproven (or whose report contradicted the record) until a
+    /// reopen resolves them (DN-7). `None` only past `u64`, which would take
+    /// 2^64 unresolved reports.
+    ///
+    /// The count errs high, never low: the matching prefix of a
+    /// contradicted exposure, a permitted head the backend keeps pending,
+    /// and a head marked exposed in a batch cut short all count until they
+    /// leave or a reopen settles them. After those, only a reopen makes a
+    /// close effective.
+    #[must_use]
+    pub fn in_flight(&self) -> Option<u64> {
+        self.lanes.iter().try_fold(0u64, |total, state| {
+            let exposed = state.heads.iter().filter(|entry| entry.exposed).count();
+            u64::try_from(exposed)
+                .ok()?
+                .checked_add(state.unknown)?
+                .checked_add(total)
+        })
+    }
+
+    /// Publishes the applied epoch, the submitted positions and the work in
+    /// flight, whole (the cell's sequence lock).
+    fn publish(&mut self) {
+        // An unreachable overflow reports the most work in flight, which
+        // never reads as drained.
+        let in_flight = self.in_flight().unwrap_or(u64::MAX);
+        self.published_in_flight = in_flight;
+        self.cell.publish(Applied {
+            epoch: self.applied,
+            positions: self.submitted,
+            in_flight,
+        });
     }
 
     /// A probe or check found the guard closed for a lane that was not
@@ -422,6 +468,11 @@ impl GuardGate {
             if !open {
                 self.apply_close(index, observed);
             }
+        }
+        // Once a close is applied, the acknowledgement watches its work
+        // drain: a changed in-flight count is published again.
+        if self.applied > 0 && self.in_flight() != Some(self.published_in_flight) {
+            self.publish();
         }
     }
 
@@ -489,6 +540,7 @@ impl SenderGate for GuardGate {
                 }
                 entry.charged = true;
             }
+            entry.exposed = true;
             let Some(next) = permitted.checked_add(1) else {
                 break;
             };
@@ -550,8 +602,11 @@ impl LaneGate for GuardGate {
             return;
         };
         if entry.ticket != staged.ticket {
-            // The records diverged: the lane cannot be trusted any more.
+            // The records diverged: the lane cannot be trusted any more, and
+            // the item's fate is unknown, so it stays in flight until a
+            // reopen, as an `Unknown` one does.
             refund(&mut self.limiter, &mut entry);
+            bump(&mut state.unknown, &mut self.counts.overflows);
             self.fault(Some(lane));
             return;
         }
@@ -561,9 +616,9 @@ impl LaneGate for GuardGate {
                     *slot = (*slot).max(entry.head.end);
                 }
             }
-            // It may have been sent: its charge stays, and its position is
-            // not counted as submitted.
-            Left::Unknown => {}
+            // It may have been sent: its charge stays, its position is not
+            // counted as submitted, and it stays in flight until a reopen.
+            Left::Unknown => bump(&mut state.unknown, &mut self.counts.overflows),
             // It left without exposure: not a send.
             Left::Returned => refund(&mut self.limiter, &mut entry),
         }
