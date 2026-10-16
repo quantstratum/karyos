@@ -37,6 +37,44 @@ pub const CELL_LOST_RESERVED: u64 = 7;
 /// An observer: copies only, never bounds, holds a spare-slot credit
 /// (`quantstratum-docs: karyos/design/observer-role.md`).
 pub const CELL_OBSERVER: u64 = 8;
+/// The driver's walker: an observer that does not keep the publication
+/// connected and is not listed as a subscriber
+/// (`quantstratum-docs: karyos/design/guards-and-abort.md`, "Local
+/// streams"). Everything else is as for [`CELL_OBSERVER`].
+pub const CELL_WALKER: u64 = 9;
+
+/// Whether a cell in `state` is a live reader of any role: it has a
+/// position and reads. Every site that asks about readers goes through
+/// this or one of the predicates below, never a list of states, so a new
+/// state cannot fall into a default arm unnoticed.
+#[must_use]
+pub const fn is_reader(state: u64) -> bool {
+    counts_for_connection(state) || state == CELL_WALKER
+}
+
+/// Whether a reader in `state` keeps the publication connected (SPEC.md
+/// §4): every live reader but the driver's walker.
+#[must_use]
+pub const fn counts_for_connection(state: u64) -> bool {
+    matches!(
+        state,
+        CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_OPTIONAL | CELL_OBSERVER
+    )
+}
+
+/// Whether a reader in `state` is listed among the subscriber cells
+/// (diagnostics, positions): the readers that count for connection.
+#[must_use]
+pub const fn visible_as_subscriber(state: u64) -> bool {
+    counts_for_connection(state)
+}
+
+/// Whether a reader in `state` never bounds, copies its acknowledgement
+/// and is lapped: optional readers, observers and the walker.
+#[must_use]
+pub const fn is_observer_like(state: u64) -> bool {
+    matches!(state, CELL_OPTIONAL | CELL_OBSERVER | CELL_WALKER)
+}
 
 /// Whether a cell in `state` bounds the publication limit.
 #[must_use]
@@ -130,4 +168,38 @@ pub fn admit(
     revoked.store(0, Ordering::Relaxed);
     registration_word.store(occupant, Ordering::Relaxed);
     state.store(admitted, Ordering::Release);
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    /// Every cell state against every reader predicate. A new state must
+    /// be added here, which forces a decision for each predicate.
+    #[test]
+    fn reader_predicates_cover_every_state() {
+        // (state, reader, connects, listed, observer-like, bounds)
+        let table = [
+            (CELL_FREE, false, false, false, false, false),
+            (CELL_REQUIRED, true, true, true, false, true),
+            (CELL_OPTIONAL, true, true, true, true, false),
+            (CELL_PUBLICATION, false, false, false, false, false),
+            (CELL_REQUIRED_RESERVED, true, true, true, false, true),
+            (CELL_LOST_HOLDING, false, false, false, false, true),
+            (CELL_LOST, false, false, false, false, false),
+            (CELL_LOST_RESERVED, false, false, false, false, false),
+            (CELL_OBSERVER, true, true, true, true, false),
+            (CELL_WALKER, true, false, false, true, false),
+        ];
+        for (state, reader, connects, listed, observer, bounding) in table {
+            assert_eq!(is_reader(state), reader, "is_reader({state})");
+            assert_eq!(counts_for_connection(state), connects, "connects({state})");
+            assert_eq!(visible_as_subscriber(state), listed, "listed({state})");
+            assert_eq!(is_observer_like(state), observer, "observer-like({state})");
+            assert_eq!(bounds(state), bounding, "bounds({state})");
+        }
+        // The table is every state there is: the next value is unused.
+        let next = CELL_WALKER + 1;
+        assert!(!is_reader(next) && !bounds(next) && !is_observer_like(next));
+    }
 }
