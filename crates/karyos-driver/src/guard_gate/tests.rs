@@ -11,25 +11,28 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
+use karyos_client::HeapWords;
 use karyos_io::backend::{
     Authority, BackendEpoch, Commit, InstanceId, RouteId, TxBackend, TxFrame, TxOptions,
-    TxQueueConfig, TxQueueId, TxReport,
+    TxQueueConfig, TxReport,
 };
-use karyos_io::lanes::{LaneSender, SenderReport};
+use karyos_io::lanes::SenderReport;
 use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint, SocketsTx};
 use karyos_io::sockets::ops::SendResult;
 use karyos_io::sockets::scripted::ScriptedSocket;
 use karyos_protocol::lanes::drr::{Budget, DrrConfig};
+use karyos_sys::load_words::LoadWords;
 use karyos_sys::rate_limit::Rate;
+use karyos_sys::sync::{AtomicU64, Ordering};
 
 use super::*;
 
 const SECOND: u64 = 1_000_000_000;
 /// Datagrams each lane queue may hold.
 const BOUND: u16 = 4;
-/// A frame here: 64 bytes, charged 64, unless a test stages another size.
+/// A datagram here: 64 bytes, charged 64, unless a test stages another.
 const FRAME: u16 = 64;
-/// The largest frame and DRR charge here.
+/// The largest datagram and DRR charge here: the route's `max_datagram`.
 const MAX_FRAME: u16 = 256;
 
 fn rate(per_second: u64, burst: u64) -> RatePolicy {
@@ -39,17 +42,51 @@ fn rate(per_second: u64, burst: u64) -> RatePolicy {
     }
 }
 
+/// A guard word that counts its Acquire loads.
+#[derive(Debug)]
+struct CountingWords {
+    words: HeapWords,
+    acquires: AtomicU64,
+}
+
+impl CountingWords {
+    fn cell(&self) -> &AtomicU64 {
+        self.words.words().first().unwrap()
+    }
+
+    fn acquires(&self) -> u64 {
+        self.acquires.load(Ordering::Relaxed)
+    }
+}
+
+impl LoadWords for CountingWords {
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    fn load(&self, index: usize) -> Option<u64> {
+        self.words.load(index)
+    }
+
+    fn load_acquire(&self, index: usize) -> Option<u64> {
+        self.acquires.fetch_add(1, Ordering::Relaxed);
+        self.words.load_acquire(index)
+    }
+}
+
 /// A guard word, open at epoch 2.
-fn open_guard() -> Arc<HeapWords> {
-    let word = Arc::new(HeapWords::zeroed(1));
-    let cell = word.words().first().unwrap();
-    cell.store(guard::created(), karyos_sys::sync::Ordering::Release);
-    assert_eq!(guard::reopen(cell, 1), Ok(2));
+fn open_guard() -> Arc<CountingWords> {
+    let word = Arc::new(CountingWords {
+        words: HeapWords::zeroed(1),
+        acquires: AtomicU64::new(0),
+    });
+    word.cell().store(guard::created(), Ordering::Release);
+    assert_eq!(guard::reopen(word.cell(), 1), Ok(2));
     word
 }
 
-fn close(word: &HeapWords) {
-    let _ = guard::close(word.words().first().unwrap()).unwrap();
+fn close(word: &CountingWords) {
+    let _ = guard::close(word.cell()).unwrap();
 }
 
 struct Fixture {
@@ -58,13 +95,21 @@ struct Fixture {
     queues: Vec<TxQueueId>,
     sender: LaneSender,
     gate: GuardGate,
-    word: Arc<HeapWords>,
+    word: Arc<CountingWords>,
     cell: Arc<AppliedEpoch>,
     next_token: u64,
     /// The next stream position per DRR lane.
     next_position: Vec<u64>,
-    /// The sender's record of the last staged frame.
-    last: Option<Staged>,
+}
+
+fn gate_lanes(lanes: usize) -> Vec<GateLane> {
+    (0..lanes)
+        .map(|index| GateLane {
+            lane: Lane::try_new(u8::try_from(index).unwrap()).unwrap(),
+            epoch: 2,
+            bound: usize::from(BOUND),
+        })
+        .collect()
 }
 
 impl Fixture {
@@ -72,7 +117,7 @@ impl Fixture {
     /// epoch 2, sharing the publication's `rate`.
     fn new(lanes: usize, rate: Option<RatePolicy>) -> Self {
         let mut config = SocketsConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)));
-        config.max_datagram = NonZeroU16::new(256).unwrap();
+        config.max_datagram = NonZeroU16::new(MAX_FRAME).unwrap();
         config.tx_slots = NonZeroU16::new(16).unwrap();
         config.max_queues = NonZeroU16::new(4).unwrap();
         config.max_routes = NonZeroU16::new(4).unwrap();
@@ -103,14 +148,16 @@ impl Fixture {
         .unwrap();
         let word = open_guard();
         let cell = Arc::new(AppliedEpoch::new());
-        let gate_lanes: Vec<GateLane> = (0..lanes)
-            .map(|index| GateLane {
-                lane: Lane::try_new(u8::try_from(index).unwrap()).unwrap(),
-                epoch: 2,
-                bound: usize::from(BOUND),
-            })
-            .collect();
-        let gate = GuardGate::new(Arc::clone(&word), Arc::clone(&cell), &gate_lanes, rate, 0);
+        let gate = GuardGate::new(
+            Arc::clone(&word) as Arc<dyn SharedWords>,
+            Arc::clone(&cell),
+            &gate_lanes(lanes),
+            &sender,
+            rate,
+            u64::from(MAX_FRAME),
+            0,
+        )
+        .unwrap();
         Self {
             tx,
             socket: observer,
@@ -121,19 +168,25 @@ impl Fixture {
             cell,
             next_token: 1,
             next_position: vec![0; lanes],
-            last: None,
         }
     }
 
-    /// Commits one first-of-message frame to `lane`, recorded by both the
-    /// sender and the gate; returns its token and end position.
-    fn stage(&mut self, lane: usize) -> (SenderToken, u64) {
-        self.stage_sized(lane, FRAME)
+    /// Commits one datagram starting one message to `lane`, through the
+    /// gate; returns its token, end position and the sender's record.
+    fn stage(&mut self, lane: usize) -> (SenderToken, u64, Staged) {
+        self.stage_with(lane, FRAME, 1, None)
     }
 
-    /// [`Self::stage`] with a frame of `len` bytes.
-    fn stage_sized(&mut self, lane: usize, len: u16) -> (SenderToken, u64) {
-        let token = SenderToken::new(self.next_token);
+    /// [`Self::stage`] with `len` bytes, `messages` messages started and
+    /// an optional token of the test's choosing.
+    fn stage_with(
+        &mut self,
+        lane: usize,
+        len: u16,
+        messages: u64,
+        token: Option<u64>,
+    ) -> (SenderToken, u64, Staged) {
+        let token = SenderToken::new(token.unwrap_or(self.next_token));
         self.next_token += 1;
         let mut frame = self
             .tx
@@ -152,22 +205,22 @@ impl Fixture {
             charge: u64::from(len),
             len,
         };
-        self.sender.staged(lane, staged).unwrap();
-        self.last = Some(staged);
         let end = self.next_position[lane] + u64::from(len);
         self.next_position[lane] = end;
         self.gate
-            .staged(
+            .stage(
+                &mut self.sender,
                 lane,
+                staged,
                 GateHead {
                     token,
                     length: u64::from(len),
-                    first_of_message: true,
+                    messages,
                     end,
                 },
             )
             .unwrap();
-        (token, end)
+        (token, end, staged)
     }
 
     /// The kernel accepts the next `count` single-datagram sends.
@@ -213,18 +266,19 @@ fn served(report: &SenderReport, lane: usize) -> u64 {
     report.drr.lanes[lane].served_bytes
 }
 
-/// An exposure of `tokens` on the fixture's route, for direct checks.
-fn exposure(tokens: &[SenderToken]) -> (Vec<SenderToken>, Vec<u16>) {
-    (tokens.to_vec(), vec![FRAME; tokens.len()])
+fn lane(index: u8) -> Lane {
+    Lane::try_new(index).unwrap()
 }
 
-fn check(gate: &mut GuardGate, tokens: &[SenderToken]) -> GateDecision {
-    let (tokens, lengths) = exposure(tokens);
+/// `lane`'s exposure of `tokens`, checked directly.
+fn check(gate: &mut GuardGate, lane: usize, tokens: &[SenderToken]) -> GateDecision {
+    let lengths = vec![FRAME; tokens.len()];
+    gate.flushing(lane);
     gate.check(&Exposure {
         authority: Authority::FIRST,
         route: RouteId::new(BackendEpoch::FIRST, 0, core::num::NonZeroU32::MIN),
         epoch: BackendEpoch::FIRST,
-        tokens: &tokens,
+        tokens,
         lengths: &lengths,
     })
 }
@@ -239,24 +293,31 @@ fn permit(count: u16) -> GateDecision {
 fn an_open_guard_sends_every_head_and_records_the_positions() {
     let mut f = Fixture::new(2, None);
     f.stage(0);
-    let (_, end0) = f.stage(0);
-    let (_, end1) = f.stage(1);
+    let (_, end0, _) = f.stage(0);
+    let (_, end1, _) = f.stage(1);
     f.accept(3);
     let report = f.serve(0);
     assert_eq!((served(&report, 0), served(&report, 1)), (128, 64));
-    assert_eq!(f.gate.last_submitted(Lane::try_new(0).unwrap()), end0);
-    assert_eq!(f.gate.last_submitted(Lane::try_new(1).unwrap()), end1);
-    assert_eq!(f.gate.counts(), GateCounts::default());
+    assert_eq!(f.gate.last_submitted(lane(0)), end0);
+    assert_eq!(f.gate.last_submitted(lane(1)), end1);
+    assert_eq!(
+        f.gate.counts(),
+        GateCounts {
+            checks: 3,
+            ..GateCounts::default()
+        }
+    );
     assert_eq!(f.cell.try_read().unwrap().epoch, 0, "nothing applied");
 }
 
 /// Design step 3: a close between two gates stops the exposure, the
 /// incarnation aborts for good and the applied epoch is published once,
-/// with the last positions submitted under the old epoch.
+/// with the last positions submitted under the old epoch; the denial is
+/// counted once per incarnation, however often the lane is probed.
 #[test]
 fn a_close_aborts_the_incarnation_and_publishes_the_applied_epoch_once() {
     let mut f = Fixture::new(2, None);
-    let (_, sent) = f.stage(0);
+    let (_, sent, _) = f.stage(0);
     f.accept(1);
     let _ = f.serve(0);
     f.stage(0);
@@ -265,20 +326,20 @@ fn a_close_aborts_the_incarnation_and_publishes_the_applied_epoch_once() {
     let report = f.serve(0);
     assert_eq!((served(&report, 0), served(&report, 1)), (0, 0));
     assert_eq!(f.socket.send_calls(), 1, "nothing exposed after the close");
-    assert_eq!(
-        (f.gate.aborting(0), f.gate.aborting(1)),
-        (Some(true), Some(true))
-    );
+    assert_eq!(f.gate.abort_cause(0), Some(AbortCause::Guard));
+    assert_eq!(f.gate.abort_cause(1), Some(AbortCause::Guard));
     let applied = f.cell.try_read().unwrap();
     assert_eq!(applied.epoch, 3);
     assert_eq!(applied.positions[0], sent);
     assert_eq!(applied.positions[1], 0);
-    // More denials under the same closed epoch publish nothing more.
+    for _ in 0..3 {
+        let _ = f.serve(0);
+    }
     let counts = f.gate.counts();
-    let _ = f.serve(0);
-    assert_eq!(f.gate.counts().applied, 1);
-    assert_eq!(f.gate.counts().aborted, 2, "once per incarnation");
-    assert!(f.gate.counts().guard_denied > counts.guard_denied);
+    assert_eq!(
+        (counts.applied, counts.aborted, counts.guard_denied),
+        (1, 2, 2)
+    );
 }
 
 /// The between gates step makes a close effective with nothing pending:
@@ -287,20 +348,16 @@ fn a_close_aborts_the_incarnation_and_publishes_the_applied_epoch_once() {
 #[test]
 fn the_between_gates_step_applies_a_close_without_traffic() {
     let mut f = Fixture::new(1, None);
-    let (_, sent) = f.stage(0);
+    let (_, sent, _) = f.stage(0);
     f.accept(1);
     let _ = f.serve(0);
     f.gate.between_gates();
-    assert_eq!(
-        f.gate.aborting(0),
-        Some(false),
-        "an open guard changes nothing"
-    );
+    assert_eq!(f.gate.abort_cause(0), None, "an open guard changes nothing");
     assert_eq!(f.cell.try_read().unwrap().epoch, 0);
     close(&f.word);
     f.gate.between_gates();
     f.gate.between_gates();
-    assert_eq!(f.gate.aborting(0), Some(true));
+    assert_eq!(f.gate.abort_cause(0), Some(AbortCause::Guard));
     let applied = f.cell.try_read().unwrap();
     assert_eq!((applied.epoch, applied.positions[0]), (3, sent));
     let counts = f.gate.counts();
@@ -316,15 +373,31 @@ fn the_between_gates_step_applies_a_close_without_traffic() {
 fn a_reopen_to_a_later_epoch_does_not_resume() {
     let mut f = Fixture::new(1, None);
     f.stage(0);
-    let cell = f.word.words().first().unwrap();
     close(&f.word);
-    assert_eq!(guard::reopen(cell, 3), Ok(4));
+    assert_eq!(guard::reopen(f.word.cell(), 3), Ok(4));
     f.accept(1);
     let report = f.serve(0);
     assert_eq!(served(&report, 0), 0);
     assert_eq!(f.socket.send_calls(), 0);
-    assert_eq!(f.gate.aborting(0), Some(true));
+    assert_eq!(f.gate.abort_cause(0), Some(AbortCause::Guard));
     assert_eq!(f.cell.try_read().unwrap().epoch, 4);
+}
+
+/// The single Acquire load per probe and per check, pinned.
+#[test]
+fn each_probe_and_check_loads_the_guard_once() {
+    let mut f = Fixture::new(1, None);
+    let (token, _, _) = f.stage(0);
+    let before = f.word.acquires();
+    assert!(f.gate.admits(0));
+    assert_eq!(f.word.acquires(), before + 1);
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
+    assert_eq!(f.word.acquires(), before + 2);
+    // An aborting lane is refused without a load.
+    close(&f.word);
+    assert!(!f.gate.admits(0));
+    assert!(!f.gate.admits(0));
+    assert_eq!(f.word.acquires(), before + 3);
 }
 
 /// The bucket is the publication's, shared by its lanes (ACS 15344): with
@@ -346,18 +419,19 @@ fn an_empty_bucket_holds_every_lane_in_order() {
             64,
             "one token, one message, at second {second}"
         );
-        for lane in 0..2 {
-            let last = f.gate.last_submitted(Lane::try_new(lane as u8).unwrap());
+        for index in 0..2u8 {
+            let last = f.gate.last_submitted(lane(index));
+            let at = usize::from(index);
             // Each lane's submissions are its heads in order.
-            let count = ends[lane]
+            let count = ends[at]
                 .iter()
                 .position(|&end| end == last)
-                .map_or(0, |at| at + 1);
+                .map_or(0, |found| found + 1);
             assert!(
-                count == sent[lane] || count == sent[lane] + 1,
-                "lane {lane} skipped"
+                count == sent[at] || count == sent[at] + 1,
+                "lane {index} skipped"
             );
-            sent[lane] = count;
+            sent[at] = count;
         }
     }
     assert_eq!(sent, [2, 2]);
@@ -381,98 +455,257 @@ fn a_held_lane_does_not_starve_another() {
         }),
     };
     let mut f = Fixture::new(2, Some(policy));
-    // Lane 0 sends a small frame, which leaves it deficit, then holds a
+    // Lane 0 sends a small datagram, which leaves it deficit, then holds a
     // full-size one the 192 bytes left cannot pay for.
-    let (_, small) = f.stage(0);
-    let (_, held) = f.stage_sized(0, MAX_FRAME);
+    let (_, small, _) = f.stage(0);
+    let (_, held, _) = f.stage_with(0, MAX_FRAME, 1, None);
     f.stage(1);
-    let (_, other) = f.stage(1);
+    let (_, other, _) = f.stage(1);
     f.accept(4);
     let report = f.serve(0);
     assert_eq!((served(&report, 0), served(&report, 1)), (64, 128));
     assert!(report.drr.lanes[0].forfeited > 0, "{report:?}");
-    assert_eq!(f.gate.last_submitted(Lane::try_new(0).unwrap()), small);
-    assert_eq!(f.gate.last_submitted(Lane::try_new(1).unwrap()), other);
+    assert_eq!(f.gate.last_submitted(lane(0)), small);
+    assert_eq!(f.gate.last_submitted(lane(1)), other);
     assert!(f.gate.counts().rate_held > 0);
     // A second refills the bytes: the held head goes.
     let report = f.serve(SECOND);
     assert_eq!(served(&report, 0), u64::from(MAX_FRAME));
-    assert_eq!(f.gate.last_submitted(Lane::try_new(0).unwrap()), held);
+    assert_eq!(f.gate.last_submitted(lane(0)), held);
 }
 
-/// Several frames exposed in one batch against a small bucket: only the
+/// A rate-held lane is ineligible at the probe: it is never flushed.
+#[test]
+fn a_rate_held_lane_is_never_flushed() {
+    let mut f = Fixture::new(1, Some(rate(1, 1)));
+    f.stage(0);
+    f.stage(0);
+    f.accept(2);
+    let _ = f.serve(0);
+    let (checks, sends) = (f.gate.counts().checks, f.socket.send_calls());
+    assert_eq!((checks, sends), (1, 1));
+    for _ in 0..3 {
+        let report = f.serve(0);
+        assert_eq!(served(&report, 0), 0);
+    }
+    assert_eq!(f.gate.counts().checks, checks, "no flush, so no exposure");
+    assert_eq!(f.socket.send_calls(), sends);
+}
+
+/// Review of #221 (P2-1): tokens need not be unique across lanes. With the
+/// same token at two lanes' heads and one message token, one datagram goes,
+/// charged to the lane flushed, and no fault.
+#[test]
+fn the_flushed_lane_places_an_exposure_whatever_its_tokens() {
+    let mut f = Fixture::new(2, Some(rate(1, 1)));
+    f.stage_with(0, FRAME, 1, Some(7));
+    f.stage_with(1, FRAME, 1, Some(7));
+    f.stage_with(1, FRAME, 1, Some(8));
+    f.accept(3);
+    let report = f.serve(0);
+    assert_eq!(served(&report, 0) + served(&report, 1), 64, "{report:?}");
+    assert_eq!(f.socket.send_calls(), 1);
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    assert_eq!(f.gate.counts().faults, 0);
+}
+
+/// Review of #221 (P2-2): a datagram that starts several messages costs a
+/// message token each; it waits until the bucket holds them all.
+#[test]
+fn a_datagram_pays_for_every_message_it_starts() {
+    let mut f = Fixture::new(1, Some(rate(1, 2)));
+    let (token, _, _) = f.stage_with(0, FRAME, 2, None);
+    let (later, _, _) = f.stage_with(0, FRAME, 2, None);
+    assert_eq!(check(&mut f.gate, 0, &[token, later]), permit(1));
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    assert!(f.gate.admits(0), "a charged pending head may go again");
+    // A second earns one token: not enough for a datagram of two.
+    f.gate.set_now(SECOND);
+    assert_eq!(check(&mut f.gate, 0, &[token, later]), permit(1));
+    assert_eq!(f.gate.message_tokens(), Some(1));
+    f.gate.set_now(2 * SECOND);
+    assert_eq!(check(&mut f.gate, 0, &[token, later]), permit(2));
+    assert_eq!(f.gate.message_tokens(), Some(0));
+}
+
+/// Several datagrams exposed in one batch against a small bucket: only the
 /// prefix the bucket pays for is permitted, and a re-exposure of a pending
 /// head is not charged again.
 #[test]
 fn a_batch_is_permitted_only_as_far_as_its_tokens() {
     let mut f = Fixture::new(1, Some(rate(1, 2)));
     let tokens: Vec<SenderToken> = (0..3).map(|_| f.stage(0).0).collect();
-    assert_eq!(check(&mut f.gate, &tokens), permit(2));
+    assert_eq!(check(&mut f.gate, 0, &tokens), permit(2));
     assert_eq!(f.gate.message_tokens(), Some(0));
     assert_eq!(f.gate.counts().rate_held, 1);
     // The backend kept both pending: exposed again, they are not charged
     // twice, and the third still waits.
-    assert_eq!(check(&mut f.gate, &tokens), permit(2));
+    assert_eq!(check(&mut f.gate, 0, &tokens), permit(2));
     assert_eq!(f.gate.message_tokens(), Some(0));
-    assert_eq!(check(&mut f.gate, &tokens[..1]), permit(1));
+    assert_eq!(check(&mut f.gate, 0, &tokens[..1]), permit(1));
 }
 
 /// A head that left without exposure gets its tokens back; a submitted or
 /// unknown one keeps its charge.
 #[test]
-fn a_returned_head_is_refunded_and_regated_without_a_second_charge() {
+fn a_returned_head_is_refunded_and_a_submitted_one_kept() {
     let mut f = Fixture::new(1, Some(rate(1, 2)));
-    let (token, _) = f.stage(0);
-    let (second, _) = f.stage(0);
-    let staged = f.last.unwrap();
-    assert_eq!(check(&mut f.gate, &[token]), permit(1));
+    let (token, _, staged) = f.stage(0);
+    let (second, _, second_staged) = f.stage(0);
+    let (third, end, third_staged) = f.stage(0);
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
     assert_eq!(f.gate.message_tokens(), Some(1));
     f.gate.left(0, staged, Left::Returned);
     assert_eq!(f.gate.message_tokens(), Some(2), "refunded");
-    // The packetizer stages it again: one charge for its one send.
-    f.gate
-        .staged(
-            0,
-            GateHead {
-                token,
-                length: u64::from(FRAME),
-                first_of_message: true,
-                end: 192,
-            },
-        )
-        .unwrap();
-    assert_eq!(check(&mut f.gate, &[second]), permit(1));
-    f.gate.left(0, staged, Left::Unknown);
+    assert_eq!(check(&mut f.gate, 0, &[second]), permit(1));
+    f.gate.left(0, second_staged, Left::Unknown);
     assert_eq!(f.gate.message_tokens(), Some(1), "unknown keeps its charge");
-    assert_eq!(check(&mut f.gate, &[token]), permit(1));
-    f.gate.left(0, staged, Left::Submitted);
+    assert_eq!(check(&mut f.gate, 0, &[third]), permit(1));
+    f.gate.left(0, third_staged, Left::Submitted);
     assert_eq!(f.gate.message_tokens(), Some(0));
-    assert_eq!(f.gate.last_submitted(Lane::try_new(0).unwrap()), 192);
+    assert_eq!(f.gate.last_submitted(lane(0)), end);
+    assert_eq!(f.gate.counts().faults, 0);
 }
 
-/// An exposure that does not start with a lane's head is a sender fault,
-/// denied; an abort and a reopen give reserved tokens back.
+/// Sender faults: an exposure the gate cannot place, or that contradicts
+/// the lane's heads, is denied; a contradiction is terminal for the lane,
+/// counted once, and gives its reserved tokens back.
 #[test]
-fn faults_are_denied_and_dropped_heads_are_refunded() {
-    let mut f = Fixture::new(1, Some(rate(1, 2)));
-    let (token, _) = f.stage(0);
-    let (second, _) = f.stage(0);
-    assert_eq!(check(&mut f.gate, &[second]), GateDecision::Deny);
+fn a_contradicted_exposure_is_terminal_for_its_lane() {
+    let mut f = Fixture::new(2, Some(rate(1, 2)));
+    let (token, _, _) = f.stage(0);
+    let (other, _, _) = f.stage(1);
+    // No flushing lane: unplaced, but no lane to blame.
+    let lengths = [FRAME];
+    let exposure = Exposure {
+        authority: Authority::FIRST,
+        route: RouteId::new(BackendEpoch::FIRST, 0, core::num::NonZeroU32::MIN),
+        epoch: BackendEpoch::FIRST,
+        tokens: &[token],
+        lengths: &lengths,
+    };
+    assert_eq!(f.gate.check(&exposure), GateDecision::Deny);
+    assert_eq!(f.gate.counts().faults, 1);
+    assert_eq!(f.gate.abort_cause(0), None);
+    // Lane 0's head charged, then a candidate that is not its next head.
     assert_eq!(
-        check(&mut f.gate, &[SenderToken::new(99)]),
+        check(&mut f.gate, 0, &[token, SenderToken::new(99)]),
         GateDecision::Deny
     );
-    assert_eq!(
-        check(&mut f.gate, &[token, SenderToken::new(99)]),
-        permit(1)
+    assert_eq!(f.gate.abort_cause(0), Some(AbortCause::Fault));
+    assert_eq!(f.gate.message_tokens(), Some(2), "nothing stays reserved");
+    assert_eq!(f.gate.counts().faults, 2);
+    assert!(!f.gate.admits(0));
+    assert_eq!(check(&mut f.gate, 0, &[token]), GateDecision::Deny);
+    assert_eq!(f.gate.counts().faults, 2, "terminal, not one per cycle");
+    // The other lane goes on.
+    assert_eq!(check(&mut f.gate, 1, &[other]), permit(1));
+}
+
+/// A report that does not match the gate's head is a fault, terminal for
+/// the lane; a report on an empty record is counted.
+#[test]
+fn a_report_out_of_step_is_a_fault() {
+    let mut f = Fixture::new(2, None);
+    let (_, _, staged) = f.stage(0);
+    let (_, _, other) = f.stage(1);
+    f.gate.left(0, other, Left::Submitted);
+    assert_eq!(f.gate.abort_cause(0), Some(AbortCause::Fault));
+    assert_eq!(f.gate.counts().faults, 1);
+    f.gate.left(0, staged, Left::Submitted);
+    assert_eq!(f.gate.counts().faults, 2, "nothing recorded any more");
+    assert_eq!(f.gate.last_submitted(lane(0)), 0);
+}
+
+/// The gate and the sender stay paired: lane counts at construction,
+/// records at each stage, and a reopen of both that refunds.
+#[test]
+fn the_gate_and_its_sender_stay_paired() {
+    let mut f = Fixture::new(2, Some(rate(1, 2)));
+    let other = GuardGate::new(
+        Arc::clone(&f.word) as Arc<dyn SharedWords>,
+        Arc::new(AppliedEpoch::new()),
+        &gate_lanes(3),
+        &f.sender,
+        None,
+        u64::from(MAX_FRAME),
+        0,
     );
-    assert_eq!(f.gate.counts().faults, 3);
+    assert_eq!(other.err(), Some(GateError::LaneCount { gate: 3 }));
+    // A record the gate did not make puts the lane out of step.
+    let mut frame = f.tx.claim_tx(f.queues[0], usize::from(FRAME)).unwrap();
+    frame.bytes_mut().fill(0);
+    let ticket = frame
+        .commit(Commit {
+            len: usize::from(FRAME),
+            token: SenderToken::new(50),
+            options: TxOptions::none(),
+        })
+        .unwrap();
+    let staged = Staged {
+        ticket,
+        charge: u64::from(FRAME),
+        len: FRAME,
+    };
+    f.sender.staged(0, staged).unwrap();
+    let head = GateHead {
+        token: SenderToken::new(51),
+        length: u64::from(FRAME),
+        messages: 1,
+        end: 64,
+    };
+    assert_eq!(
+        f.gate.stage(&mut f.sender, 0, staged, head),
+        Err(GateStageError::OutOfStep { lane: 0 })
+    );
+    // A reopen of both clears both and refunds what was reserved.
+    let (token, _, _) = f.stage(1);
+    assert_eq!(check(&mut f.gate, 1, &[token]), permit(1));
     assert_eq!(f.gate.message_tokens(), Some(1));
-    f.gate.reopen(0);
+    let mut report = TxReport::new();
+    while let Ok(outcome) = f.tx.cancel_pending(f.queues[1], &mut report) {
+        while report.pop_front().is_some() {}
+        if !outcome.more {
+            break;
+        }
+    }
+    let queue = f.queues[1];
+    f.gate.reopen(&mut f.sender, 1, queue);
     assert_eq!(f.gate.message_tokens(), Some(2), "a reopen refunds");
-    let (token, _) = f.stage(0);
-    assert_eq!(check(&mut f.gate, &[token]), permit(1));
-    close(&f.word);
-    assert_eq!(check(&mut f.gate, &[token]), GateDecision::Deny);
-    assert_eq!(f.gate.message_tokens(), Some(2), "an abort refunds");
+    assert_eq!(f.sender.pending(1), Some(0));
+    f.stage(1);
+}
+
+/// The byte burst must hold the route's largest datagram (P2-2).
+#[test]
+fn a_policy_is_validated_against_the_largest_datagram() {
+    let f = Fixture::new(1, None);
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 10,
+            burst: 1,
+        },
+        bytes: Some(Rate {
+            per_second: 1000,
+            burst: u64::from(MAX_FRAME) - 1,
+        }),
+    };
+    let refused = GuardGate::new(
+        Arc::clone(&f.word) as Arc<dyn SharedWords>,
+        Arc::new(AppliedEpoch::new()),
+        &gate_lanes(1),
+        &f.sender,
+        Some(policy),
+        u64::from(MAX_FRAME),
+        0,
+    );
+    assert_eq!(
+        refused.err(),
+        Some(GateError::InvalidRatePolicy(
+            RatePolicyError::BurstBelowFrame {
+                burst: u64::from(MAX_FRAME) - 1,
+                frame: u64::from(MAX_FRAME),
+            }
+        ))
+    );
 }

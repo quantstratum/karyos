@@ -205,7 +205,16 @@ impl RateLimiter {
     /// check before the frame is sent.
     #[must_use]
     pub fn admits(&self, length: u64, first_of_message: bool) -> bool {
-        let message_ok = !first_of_message || self.messages.holds(1);
+        self.admits_datagram(length, u64::from(first_of_message))
+    }
+
+    /// Whether a first-send datagram of `length` bytes that starts
+    /// `messages` messages would be admitted with the tokens held, charging
+    /// nothing. A datagram may carry several frames, each starting a
+    /// message (`quantstratum-docs: karyos/design/aggregate-lanes.md`).
+    #[must_use]
+    pub fn admits_datagram(&self, length: u64, messages: u64) -> bool {
+        let message_ok = messages == 0 || self.messages.holds(messages);
         message_ok && self.bytes.as_ref().is_none_or(|bytes| bytes.holds(length))
     }
 
@@ -224,11 +233,18 @@ impl RateLimiter {
     /// byte bucket every frame costs its length. Either every bucket is
     /// charged or none is; `false` means the frame waits, in order.
     pub fn try_admit(&mut self, length: u64, first_of_message: bool) -> bool {
-        if !self.admits(length, first_of_message) {
+        self.try_admit_datagram(length, u64::from(first_of_message))
+    }
+
+    /// Admits a first-send datagram of `length` bytes that starts
+    /// `messages` messages: `messages` message tokens and, with a byte
+    /// bucket, `length` byte tokens, all or none.
+    pub fn try_admit_datagram(&mut self, length: u64, messages: u64) -> bool {
+        if !self.admits_datagram(length, messages) {
             return false;
         }
-        if first_of_message {
-            self.messages.take(1);
+        if messages > 0 {
+            self.messages.take(messages);
         }
         if let Some(bytes) = &mut self.bytes {
             bytes.take(length);
@@ -240,8 +256,14 @@ impl RateLimiter {
     /// sent after all (a reservation released), each bucket capped at its
     /// burst. The caller refunds only a charge it made.
     pub fn refund(&mut self, length: u64, first_of_message: bool) {
-        if first_of_message {
-            self.messages.give(1);
+        self.refund_datagram(length, u64::from(first_of_message));
+    }
+
+    /// Gives back what [`Self::try_admit_datagram`] charged a datagram that
+    /// was not sent after all, each bucket capped at its burst.
+    pub fn refund_datagram(&mut self, length: u64, messages: u64) {
+        if messages > 0 {
+            self.messages.give(messages);
         }
         if let Some(bytes) = &mut self.bytes {
             bytes.give(length);

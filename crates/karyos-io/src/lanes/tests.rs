@@ -30,6 +30,8 @@ struct Gate {
     /// allocating, and the last one.
     left: [u32; 3],
     last_left: Option<(usize, TxTicket, Left)>,
+    /// Lanes announced as flushed, by lane, without allocating.
+    flushing: [u32; 4],
 }
 
 impl SenderGate for Gate {
@@ -47,6 +49,10 @@ impl SenderGate for Gate {
 impl LaneGate for Gate {
     fn admits(&mut self, lane: usize) -> bool {
         !self.closed[lane]
+    }
+
+    fn flushing(&mut self, lane: usize) {
+        self.flushing[lane] += 1;
     }
 
     fn left(&mut self, lane: usize, staged: Staged, how: Left) {
@@ -715,7 +721,9 @@ fn a_returned_head_is_dropped_and_the_next_one_served() {
     assert_eq!(report.drr.lanes[0].served_bytes, 64);
     assert_eq!(report.drr.lanes[0].failed, 1);
     assert_eq!(sender.pending(0), Some(0));
-    // The gate hears of each head that left, as it left.
+    // The gate hears of each flush before it and of each head that left,
+    // as it left.
+    assert_eq!(gate.flushing, [2, 1, 0, 0]);
     assert_eq!(gate.left, [1, 1, 0]);
     assert_eq!(gate.last_left, Some((0, fake::ticket(2), Left::Submitted)));
 }

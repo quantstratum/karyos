@@ -124,6 +124,34 @@ fn a_refund_gives_back_a_charge_capped_at_the_burst() {
     );
 }
 
+/// A datagram that starts several messages costs one message token each,
+/// all or none, and its refund gives them all back.
+#[test]
+fn a_datagram_charges_every_message_it_starts() {
+    let mut limiter = RateLimiter::new(policy(10, 3, Some((1000, 500))), 0);
+    assert!(limiter.admits_datagram(400, 3));
+    assert!(!limiter.admits_datagram(400, 4));
+    assert!(!limiter.admits_datagram(501, 0));
+    assert!(limiter.try_admit_datagram(400, 2));
+    assert_eq!(
+        (limiter.message_tokens(), limiter.byte_tokens()),
+        (1, Some(100))
+    );
+    assert!(!limiter.try_admit_datagram(50, 2), "all or none");
+    assert_eq!(
+        (limiter.message_tokens(), limiter.byte_tokens()),
+        (1, Some(100))
+    );
+    limiter.refund_datagram(400, 2);
+    assert_eq!(
+        (limiter.message_tokens(), limiter.byte_tokens()),
+        (3, Some(500))
+    );
+    // A continuation datagram starts no message.
+    assert!(limiter.try_admit_datagram(500, 0));
+    assert_eq!(limiter.message_tokens(), 3);
+}
+
 #[test]
 fn a_long_idle_time_caps_at_the_burst() {
     let mut limiter = RateLimiter::new(policy(u64::MAX, 5, Some((u64::MAX, 1 << 40))), 0);

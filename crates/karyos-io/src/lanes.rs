@@ -38,6 +38,13 @@ pub trait LaneGate: SenderGate {
     /// Whether `lane` may send its head now.
     fn admits(&mut self, lane: usize) -> bool;
 
+    /// The sender is about to flush `lane`'s head: the next
+    /// [`SenderGate::check`] is that lane's exposure, so a gate need not
+    /// place it by its tokens, which need not be unique across lanes.
+    fn flushing(&mut self, lane: usize) {
+        let _ = lane;
+    }
+
     /// `lane`'s head left its queue, reported `how`: the gate's own record
     /// of the head moves on with the sender's. A head the backend keeps
     /// pending is not reported; it is exposed again, through the gate.
@@ -411,6 +418,7 @@ impl<B: TxBackend, G: LaneGate> LaneSource for Source<'_, B, G> {
             max_datagrams: NonZeroU16::MIN,
             max_bytes: u32::from(head.len),
         };
+        self.gate.flushing(lane);
         let outcome = self.backend.flush(request, &mut *self.gate, self.report);
         let reported = self.report.pop_front();
         // One datagram offered: at most one entry. Anything left is a
