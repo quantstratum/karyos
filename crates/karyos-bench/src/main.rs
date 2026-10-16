@@ -45,13 +45,6 @@
 //! and `analysis.json` into it (`analyze.rs`).
 
 use std::io::Write;
-
-/// The allocation build counts allocations with this allocator; it never
-/// measures timing (`alloc-count`, M-9).
-#[cfg(feature = "alloc-count")]
-#[global_allocator]
-static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
-    karyos_sys::alloc_count::CountingAllocator;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -61,6 +54,13 @@ use karyos_bench::manifest::{ILLUSTRATIVE_E_MAX, MtuRule, primary};
 use karyos_bench::plan::{self, PlanOptions};
 use karyos_bench::wire::process::Cores;
 use karyos_bench::{Workload, analyze, defaults, measure, report, run};
+
+/// The allocation build counts allocations with this allocator; it never
+/// measures timing (`alloc-count`, M-9).
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
+    karyos_sys::alloc_count::CountingAllocator;
 
 struct Options {
     workload: Option<Workload>,

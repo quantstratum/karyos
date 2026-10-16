@@ -139,11 +139,17 @@ pub fn result_line(
                 format!("\"backend_drops\":[{}]", per_receiver(samples, |r| r.drops)),
                 format!("\"backpressure\":{}", samples.backpressure),
                 format!("\"ack_timeouts\":{}", samples.ack_timeouts),
-                format!("\"send_allocations\":{}", samples.send_allocations),
-                format!(
-                    "\"receive_allocations\":[{}]",
-                    per_receiver(samples, |r| r.allocations)
-                ),
+                // Counted only by the allocation build: null in a timing
+                // build, so no zero reads as a measured one.
+                if cfg!(feature = "alloc-count") {
+                    format!(
+                        "\"send_allocations\":{},\"receive_allocations\":[{}]",
+                        samples.send_allocations,
+                        per_receiver(samples, |r| r.allocations)
+                    )
+                } else {
+                    "\"send_allocations\":null,\"receive_allocations\":null".to_string()
+                },
                 format!(
                     "\"batches\":[{}]",
                     per_receiver(samples, |r| r.batches.len())
@@ -267,8 +273,10 @@ pub fn header(
 /// of every measurable primary point with the `trusted` profile, each
 /// stage counting its allocations. Writes `alloc.json` into `out`: one
 /// flat object whose `points` are `<point>\t<result>` strings, the result
-/// `send=<n> receive=<n,...>` or `error=<cause>`. Returns how many points
-/// allocate or failed.
+/// `send=<n> receive=<n,...>` or `error=<cause>`, with the commit that
+/// built it. Returns how many points allocate or failed. It covers the
+/// `trusted` profile only; it must cover every profile measured once
+/// candidate profiles land (B5).
 ///
 /// # Errors
 ///
@@ -329,9 +337,10 @@ pub fn run_alloc(out: &Path, log: &mut dyn Write) -> Result<usize, BenchError> {
     std::fs::write(
         out.join("alloc.json"),
         format!(
-            "{{\"build\":{},\"manifest_sha256\":{},\"points\":[{}]}}\n",
+            "{{\"build\":{},\"manifest_sha256\":{},\"commit\":{},\"points\":[{}]}}\n",
             json_string(BUILD),
             json_string(MANIFEST_SHA256),
+            json_string(&Labels::detect().commit),
             points.join(",")
         ),
     )

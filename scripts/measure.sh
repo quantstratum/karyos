@@ -65,13 +65,16 @@ fi
 "$bin" inventory --out "$out" "${records[@]+"${records[@]}"}"
 status=0
 "$bin" measure --plan primary --out "$out" "$@" || status=$?
+# Step 4 may fail without stopping step 5: a failed step is a result too.
 alloc_target=${CARGO_TARGET_DIR:-$root/target}/alloc-count
-cargo build -p karyos-bench --release --locked --features alloc-count --target-dir "$alloc_target"
-if [ "$("$alloc_target/release/karyos-bench" build-info)" != "build alloc-count" ]; then
-    echo "measure.sh: the allocation binary is not an alloc-count build" >&2
-    exit 2
+alloc_bin=$alloc_target/release/karyos-bench
+if cargo build -p karyos-bench --release --locked --features alloc-count --target-dir "$alloc_target" \
+    && [ "$("$alloc_bin" build-info)" = "build alloc-count" ]; then
+    "$alloc_bin" alloc --out "$out" || status=$?
+else
+    echo "measure.sh: the allocation step failed: no alloc-count binary" >&2
+    status=1
 fi
-"$alloc_target/release/karyos-bench" alloc --out "$out" || status=$?
 "$bin" analyze --out "$out"
 echo "measure: wrote $out"
 exit "$status"

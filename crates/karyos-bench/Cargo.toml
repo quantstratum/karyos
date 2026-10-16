@@ -23,7 +23,9 @@ test-hooks = []
 # target directory. Any build that enables it, `--all-features` included,
 # is an allocation build and never a timing build; `karyos-bench
 # build-info` says which a binary is, and measure.sh and `make
-# timing-build-check` refuse to time any but `build timing`.
+# timing-build-check` refuse to time any but `build timing`. The bench's
+# self dev-dependency enables it too, so any build of its test or bench
+# targets (`--all-targets`, `cargo test`) is an alloc-count binary.
 alloc-count = ["karyos-sys/test-hooks"]
 
 [dependencies]

@@ -72,6 +72,62 @@ fn the_allocation_build_counts_and_both_stages_allocate_nothing() {
     }
 }
 
+/// A protection that allocates in one seal or one open, the third.
+#[derive(Default)]
+struct AllocatesOnce {
+    seals: AtomicU32,
+    opens: AtomicU32,
+    in_open: bool,
+}
+
+impl Protection for AllocatesOnce {
+    fn envelope_len(&self) -> usize {
+        0
+    }
+
+    fn seal(&self, datagram: &mut [u8], frames: usize) -> Result<usize, SealError> {
+        if !self.in_open && self.seals.fetch_add(1, Ordering::Relaxed) == 2 {
+            std::hint::black_box(vec![0_u8; 8]);
+        }
+        Trusted.seal(datagram, frames)
+    }
+
+    fn open(&self, datagram: &[u8]) -> Verdict {
+        if self.in_open && self.opens.fetch_add(1, Ordering::Relaxed) == 2 {
+            std::hint::black_box(vec![0_u8; 8]);
+        }
+        Trusted.open(datagram)
+    }
+}
+
+#[test]
+fn one_allocating_stage_among_clean_ones_is_counted() {
+    // The most of any stage is reported, not the last one's: the third
+    // message allocates, the 19 after it do not.
+    let samples = run(
+        stage_run(Shape::W1, StageLoad::Closed, 20, 0),
+        &AllocatesOnce::default(),
+    )
+    .unwrap();
+    assert!(
+        samples.send_allocations >= 1,
+        "{}",
+        samples.send_allocations
+    );
+    assert_eq!(samples.receivers[0].allocations, 0);
+    // The receive count covers the whole poll, the decision included.
+    let samples = run(
+        stage_run(Shape::W1, StageLoad::Closed, 20, 0),
+        &AllocatesOnce {
+            in_open: true,
+            ..AllocatesOnce::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(samples.send_allocations, 0);
+    assert!(samples.receivers[0].allocations >= 1);
+}
+
 #[test]
 fn an_open_loop_run_records_every_message() {
     let samples = smoke(Shape::W1, StageLoad::Open { rate: 20_000 });

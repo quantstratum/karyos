@@ -149,8 +149,9 @@ pub struct ReceiverSamples {
     pub batches: Vec<u32>,
     /// Drops the backend reported.
     pub drops: u64,
-    /// The most allocations one receive decision made; counted only by
-    /// the allocation build ([`BUILD`]), 0 otherwise.
+    /// The most allocations one receive poll made, every callback of its
+    /// batch included; counted only by the allocation build ([`BUILD`]), 0
+    /// otherwise.
     pub allocations: u64,
 }
 
@@ -270,7 +271,7 @@ struct Receiver<'p, P: Protection> {
     batch_len: u32,
     batches: Vec<u32>,
     drops: u64,
-    /// The most allocations one decision made (allocation build only).
+    /// The most allocations one poll made (allocation build only).
     allocations: u64,
     /// The condition that invalidated the run, if any.
     fault: Option<BenchError>,
@@ -327,9 +328,7 @@ impl<'p, P: Protection> Receiver<'p, P> {
     /// Decides one datagram that arrived at `callback` in a batch whose
     /// first callback was `batch`, and stops the poll on a fault.
     fn accept(&mut self, bytes: &[u8], batch: Instant, callback: Instant) -> ControlFlow<()> {
-        let (decided, allocations) = counted(|| self.decide(bytes, batch, callback));
-        self.allocations = self.allocations.max(allocations);
-        match decided {
+        match self.decide(bytes, batch, callback) {
             Ok(()) => ControlFlow::Continue(()),
             Err(error) => {
                 self.fault.get_or_insert(error);
@@ -653,7 +652,10 @@ pub fn receive_role<P: Protection>(
     loop {
         receiver.batch_start = None;
         receiver.batch_len = 0;
-        let outcome = rx.poll_rx(budget, &mut receiver);
+        // The allocation build counts the whole poll: every callback of a
+        // batch, and the backend between them, all inside the H-5 window.
+        let (outcome, allocations) = counted(|| rx.poll_rx(budget, &mut receiver));
+        receiver.allocations = receiver.allocations.max(allocations);
         if receiver.batch_len > 0 {
             if receiver.batches.len() < receiver.batches.capacity() {
                 receiver.batches.push(receiver.batch_len);
