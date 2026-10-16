@@ -53,6 +53,7 @@ pub mod log_buffer;
 pub mod mmap;
 pub mod publication;
 pub mod random;
+pub mod rate_limit;
 // Used only by `log_buffer`, which Loom builds leave out.
 #[cfg(not(loom))]
 pub mod receive;
