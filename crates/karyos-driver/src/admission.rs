@@ -243,6 +243,48 @@ fn refuse(socket: &OwnedFd, code: u64) {
     }
 }
 
+/// An admission step's work count, checked (SPEC.md §14): a sum that does
+/// not fit keeps the count and records the first overflow, which the duty
+/// cycle reports as [`DriverError::WorkCountOverflow`] after the step ran
+/// to its end, as `add_work` does for the other terms.
+#[derive(Debug, Default)]
+struct Work {
+    count: u32,
+    overflow: Option<DriverError>,
+}
+
+impl Work {
+    fn add(&mut self, delta: u32) {
+        match self.count.checked_add(delta) {
+            Some(sum) => self.count = sum,
+            None => {
+                self.overflow.get_or_insert(DriverError::WorkCountOverflow {
+                    count: self.count,
+                    delta,
+                });
+            }
+        }
+    }
+
+    /// Adds `delta` items; a count that does not fit `u32` overflows.
+    fn add_items(&mut self, delta: usize) {
+        match u32::try_from(delta) {
+            Ok(delta) => self.add(delta),
+            Err(_) => {
+                self.overflow.get_or_insert(DriverError::WorkCountOverflow {
+                    count: self.count,
+                    delta: u32::MAX,
+                });
+            }
+        }
+    }
+
+    /// The count of the work that fit, and the first overflow if any.
+    fn done(self) -> (u32, Option<DriverError>) {
+        (self.count, self.overflow)
+    }
+}
+
 /// The manifest record of one CnC or diagnostic grant of `region`.
 fn record(region: &Region, export: u64) -> Option<Record> {
     let header = region.record();
@@ -331,8 +373,8 @@ impl<T: StreamTerms> Admission<T> {
     /// One admission step: accepts, reads `Hello`s and client messages,
     /// drains the outbound queues and checks exit proofs. Returns work
     /// done.
-    fn serve(&mut self, driver: &mut EmbeddedDriver<T>) -> u32 {
-        let mut work = 0u32;
+    fn serve(&mut self, driver: &mut EmbeddedDriver<T>) -> (u32, Option<DriverError>) {
+        let mut work = Work::default();
         // Accept up to the pending bound.
         let mut now = None;
         while self.pending.len() < self.config.max_pending_hellos {
@@ -341,7 +383,7 @@ impl<T: StreamTerms> Admission<T> {
             };
             let since = *now.get_or_insert_with(|| driver.clock.now());
             self.pending.push(Pending { socket, since });
-            work = work.saturating_add(1);
+            work.add(1);
         }
         // One datagram per pending connection.
         let mut index = 0;
@@ -352,7 +394,7 @@ impl<T: StreamTerms> Admission<T> {
                     let now = *now.get_or_insert_with(|| driver.clock.now());
                     if now.saturating_sub(pending.since) >= self.config.hello_timeout {
                         drop(self.pending.swap_remove(index));
-                        work = work.saturating_add(1);
+                        work.add(1);
                     } else {
                         index += 1;
                     }
@@ -362,11 +404,11 @@ impl<T: StreamTerms> Admission<T> {
                     let bytes = buffer.get(..received.len).unwrap_or(&[]);
                     let now = *now.get_or_insert_with(|| driver.clock.now());
                     self.hello(driver, pending.socket, bytes, received.fd, now);
-                    work = work.saturating_add(1);
+                    work.add(1);
                 }
                 Ok(Recv::PeerClosed) | Err(_) => {
                     drop(self.pending.swap_remove(index));
-                    work = work.saturating_add(1);
+                    work.add(1);
                 }
             }
         }
@@ -409,7 +451,7 @@ impl<T: StreamTerms> Admission<T> {
                     let remote = self.remotes.swap_remove(index);
                     Self::fail_open(driver, &remote);
                     remote.link.mark_closed();
-                    work = work.saturating_add(1);
+                    work.add(1);
                 }
                 Step::Retire => {
                     let remote = self.remotes.swap_remove(index);
@@ -419,11 +461,11 @@ impl<T: StreamTerms> Admission<T> {
                         pidfd: remote.pidfd,
                         link: remote.link,
                     });
-                    work = work.saturating_add(1);
+                    work.add(1);
                 }
             }
         }
-        work = work.saturating_add(self.serve_tools(driver, &mut now));
+        self.serve_tools(driver, &mut now, &mut work);
         // Exit proofs.
         let before = self.remotes.len() + self.retiring.len();
         self.remotes.retain(|remote| {
@@ -440,8 +482,8 @@ impl<T: StreamTerms> Admission<T> {
             }
             !exited
         });
-        let proofs = before - self.remotes.len() - self.retiring.len();
-        work.saturating_add(u32::try_from(proofs).unwrap_or(u32::MAX))
+        work.add_items(before - self.remotes.len() - self.retiring.len());
+        work.done()
     }
 
     /// Handles the first datagram of a connection: admits the client or
@@ -653,8 +695,12 @@ impl<T: StreamTerms> Admission<T> {
     /// closes the connection; then its bootstrap is drained, and a
     /// bootstrap not drained within `fetch_deadline` closes it too. Returns
     /// work done.
-    fn serve_tools(&mut self, driver: &mut EmbeddedDriver<T>, now: &mut Option<u64>) -> u32 {
-        let mut work = 0u32;
+    fn serve_tools(
+        &mut self,
+        driver: &mut EmbeddedDriver<T>,
+        now: &mut Option<u64>,
+        work: &mut Work,
+    ) {
         let mut index = 0;
         while let Some(tool) = self.tools.get_mut(index) {
             let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
@@ -670,7 +716,7 @@ impl<T: StreamTerms> Admission<T> {
                 ) {
                     Ok(Sent::Sent) => {
                         drop(tool.outbound.pop_front());
-                        work = work.saturating_add(1);
+                        work.add(1);
                     }
                     Ok(Sent::WouldBlock) => break,
                     Err(_) => keep = false,
@@ -696,10 +742,9 @@ impl<T: StreamTerms> Admission<T> {
             } else {
                 // Closes the socket; queued descriptors are closed with it.
                 drop(self.tools.swap_remove(index));
-                work = work.saturating_add(1);
+                work.add(1);
             }
         }
-        work
     }
 
     /// Reads at most one datagram of an admitted client.
@@ -1043,10 +1088,12 @@ fn grant_record(
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
-    /// The admission step of a duty cycle; 0 without IPC.
-    pub(crate) fn serve_admission(&mut self) -> u32 {
+    /// The admission step of a duty cycle: the count of the work that fit
+    /// in `u32`, and [`DriverError::WorkCountOverflow`] if some did not
+    /// (the step ran to its end); 0 without IPC.
+    pub(crate) fn serve_admission(&mut self) -> (u32, Option<DriverError>) {
         let Some(mut admission) = self.admission.take() else {
-            return 0;
+            return (0, None);
         };
         let work = admission.serve(self);
         self.admission = Some(admission);
@@ -1067,5 +1114,47 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     #[must_use]
     pub fn instance(&self) -> Option<u128> {
         self.admission.as_ref().map(Admission::instance)
+    }
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::Work;
+    use crate::error::DriverError;
+
+    /// A work count that does not fit keeps its count and reports its
+    /// first overflow; later additions do not replace it.
+    #[test]
+    fn an_overflowing_work_count_reports_its_first_overflow() {
+        let mut work = Work::default();
+        work.add(2);
+        work.add_items(3);
+        assert_eq!(work.count, 5);
+        assert!(work.overflow.is_none());
+        work.add(u32::MAX);
+        work.add(1);
+        // The work that fit is still counted.
+        assert!(matches!(
+            work.done(),
+            (
+                6,
+                Some(DriverError::WorkCountOverflow {
+                    count: 5,
+                    delta: u32::MAX
+                })
+            )
+        ));
+        let mut work = Work::default();
+        work.add_items(usize::MAX);
+        assert!(matches!(
+            work.done(),
+            (
+                0,
+                Some(DriverError::WorkCountOverflow {
+                    count: 0,
+                    delta: u32::MAX
+                })
+            )
+        ));
     }
 }
