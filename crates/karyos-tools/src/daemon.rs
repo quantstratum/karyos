@@ -14,7 +14,11 @@
 //! and retired streams are freed. The result is [`Shutdown::Clean`] once
 //! every client has left and every stream is freed, and
 //! [`Shutdown::Lingering`] when the linger ends first. A second signal
-//! during the linger changes nothing.
+//! during the linger changes nothing. A driver that enters its terminal
+//! state (`quantstratum-docs: karyos/design/client-commands.md`) serves
+//! nothing more, so the daemon then stops at once with
+//! [`Shutdown::Terminal`], logged as an error, whether or not a stop was
+//! requested, so that a supervisor sees the failure.
 //!
 //! The daemon only emits `tracing` events; installing a subscriber is the
 //! binary's job.
@@ -46,8 +50,11 @@ use crate::idle::BackoffIdle;
 pub const EXIT_CLEAN: u8 = 0;
 /// Exit status of a configuration or startup error.
 pub const EXIT_STARTUP: u8 = 2;
-/// Exit status when clients were still attached at the end of the linger.
-pub const EXIT_CLIENTS_ATTACHED: u8 = 3;
+/// Exit status when the shutdown linger ended first: clients were still
+/// attached or a stream was not yet freed.
+pub const EXIT_LINGERED: u8 = 3;
+/// Exit status when the driver entered its terminal state.
+pub const EXIT_TERMINAL: u8 = 4;
 
 /// A startup failure; its display is the single line `karyosd` prints
 /// before exiting with [`EXIT_STARTUP`].
@@ -98,16 +105,19 @@ pub enum Shutdown {
         /// Streams not yet freed.
         streams: usize,
     },
+    /// The driver entered its terminal state.
+    Terminal,
 }
 
 impl Shutdown {
-    /// The process exit status: [`EXIT_CLEAN`] or
-    /// [`EXIT_CLIENTS_ATTACHED`].
+    /// The process exit status: [`EXIT_CLEAN`], [`EXIT_LINGERED`] or
+    /// [`EXIT_TERMINAL`].
     #[must_use]
     pub fn code(self) -> u8 {
         match self {
             Self::Clean => EXIT_CLEAN,
-            Self::Lingering { .. } => EXIT_CLIENTS_ATTACHED,
+            Self::Lingering { .. } => EXIT_LINGERED,
+            Self::Terminal => EXIT_TERMINAL,
         }
     }
 }
@@ -270,6 +280,9 @@ impl Daemon {
         while !stop.load(Ordering::Acquire) {
             let work = self.cycle();
             clients = self.log_clients(clients);
+            if let Some(terminal) = self.terminal(clients) {
+                return terminal;
+            }
             idle.idle(work);
         }
         tracing::info!(
@@ -289,6 +302,9 @@ impl Daemon {
         loop {
             let work = self.cycle();
             clients = self.log_clients(clients);
+            if let Some(terminal) = self.terminal(clients) {
+                return terminal;
+            }
             let left = self.unfreed();
             if clients == 0 && left == 0 {
                 tracing::info!("shutdown complete");
@@ -298,7 +314,7 @@ impl Daemon {
                 tracing::warn!(
                     clients,
                     streams = left,
-                    "shutdown linger ended with clients attached"
+                    "shutdown linger ended with clients attached or streams not freed"
                 );
                 return Shutdown::Lingering {
                     clients,
@@ -307,6 +323,20 @@ impl Daemon {
             }
             idle.idle(work);
         }
+    }
+
+    /// [`Shutdown::Terminal`], logged as an error, once the driver is in
+    /// its terminal state.
+    fn terminal(&self, clients: usize) -> Option<Shutdown> {
+        if !self.driver.is_terminal() {
+            return None;
+        }
+        tracing::error!(
+            clients,
+            streams = self.unfreed(),
+            "driver entered its terminal state; stopping"
+        );
+        Some(Shutdown::Terminal)
     }
 
     /// One duty cycle; its work, 0 on error. A duty cycle error is logged
@@ -387,6 +417,7 @@ mod tests {
             .code(),
             3
         );
+        assert_eq!(Shutdown::Terminal.code(), 4);
     }
 
     #[cfg(not(target_os = "linux"))]
