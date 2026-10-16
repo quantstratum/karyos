@@ -200,8 +200,16 @@ impl QueueTable {
     pub(crate) fn discharge(&mut self, queue: TxQueueId) -> bool {
         match self.queues.get_mut(queue) {
             Some(account) if account.charged > account.quarantined => {
-                account.charged -= 1;
-                true
+                match account.charged.checked_sub(1) {
+                    Some(charged) => {
+                        account.charged = charged;
+                        true
+                    }
+                    None => {
+                        debug_assert!(false, "charged exceeds quarantined");
+                        false
+                    }
+                }
             }
             _ => false,
         }
@@ -216,8 +224,16 @@ impl QueueTable {
     pub(crate) fn quarantine(&mut self, queue: TxQueueId) -> bool {
         match self.queues.get_mut(queue) {
             Some(account) if account.charged > account.quarantined => {
-                account.quarantined += 1;
-                true
+                match account.quarantined.checked_add(1) {
+                    Some(quarantined) => {
+                        account.quarantined = quarantined;
+                        true
+                    }
+                    None => {
+                        debug_assert!(false, "quarantined is below charged");
+                        false
+                    }
+                }
             }
             _ => false,
         }

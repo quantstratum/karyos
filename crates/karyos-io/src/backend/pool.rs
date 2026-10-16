@@ -442,7 +442,7 @@ mod tests {
         pool.claim().unwrap();
         assert!(pool.release_claim(0));
         assert_eq!(pool.retired_count(), 1);
-        // Quarantine slot 1: a reset would free it, so not terminal.
+        // Quarantine slot 1: a reset would free it, so PoolExhausted.
         pool.claim().unwrap();
         assert!(pool.commit(1));
         assert!(pool.quarantine(1));
@@ -451,7 +451,8 @@ mod tests {
         assert_eq!(pool.release_quarantined(), 1);
         assert_eq!(pool.quarantined_count(), 0);
         pool.claim().unwrap();
-        // Now only retirement keeps the pool dry: terminal.
+        // Now only retirement and a live claim keep the pool dry:
+        // IdentityExhausted until a claimed slot is released.
         assert_eq!(pool.claim(), Err(ClaimError::IdentityExhausted));
     }
 

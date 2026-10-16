@@ -985,7 +985,9 @@ pub enum ClaimError {
     #[error("endpoint is not active")]
     NotActive,
     /// No slot is free, slots were retired for generation overflow and
-    /// none is quarantined, so no reset frees one. Terminal.
+    /// none is quarantined, so no reset frees one. A later release of a
+    /// claimed or pending slot makes claims succeed again; the state is
+    /// terminal only once every slot is retired (design 3.2 and 3.6).
     #[error("tx slot identities exhausted")]
     IdentityExhausted,
 }
