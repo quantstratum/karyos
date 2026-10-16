@@ -133,6 +133,10 @@ impl IdleStrategy for YieldThenSleep {
     }
 }
 
+/// Control ring entries kept for forwarded controls beyond the reserved
+/// RSP_SETUP and SM slots (network-sessions.md S5 `control_queue_floor`).
+const CONTROL_FLOOR: usize = 32;
+
 /// Configuration of the agents and their rings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentConfig {
@@ -249,6 +253,20 @@ impl AgentConfig {
         if self.max_endpoints == 0 {
             return Err(AgentError::InvalidConfig(
                 "max_endpoints must be at least 1",
+            ));
+        }
+        // S1: the control ring holds every pending challenge's RSP_SETUP
+        // and one SM slot per image, above a floor for forwarded controls
+        // (one path per image until redundant paths, RP-1).
+        let control = self
+            .sessions
+            .max_images
+            .checked_add(self.sessions.max_pending_challenges)
+            .and_then(|units| units.checked_add(CONTROL_FLOOR))
+            .ok_or(AgentError::InvalidConfig("max_images too large"))?;
+        if self.control_capacity < control {
+            return Err(AgentError::InvalidConfig(
+                "control_capacity below max_pending_challenges + max_images + 32",
             ));
         }
         // S1: three units per image in flight on each session ring.

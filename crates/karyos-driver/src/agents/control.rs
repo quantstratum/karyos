@@ -32,8 +32,43 @@ use karyos_protocol::network::{Control, MAX_CONTROL_LENGTH};
 
 use super::EndpointId;
 
+/// The SM slot of one image (network-sessions.md S1: an SM slot per
+/// binding): set while its SM waits in the control ring, cleared when the
+/// sender drops the item after sending it.
+#[derive(Debug, Default)]
+pub struct SmSlot(std::sync::atomic::AtomicBool);
+
+impl SmSlot {
+    /// Whether the image's previous SM still waits.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// The guard an SM carries through the ring: its drop frees the slot.
+#[derive(Debug)]
+pub struct SmGuard(std::sync::Arc<SmSlot>);
+
+impl SmGuard {
+    /// Takes `slot` for one SM.
+    #[must_use]
+    pub fn take(slot: &std::sync::Arc<SmSlot>) -> Self {
+        slot.0.store(true, std::sync::atomic::Ordering::Release);
+        Self(std::sync::Arc::clone(slot))
+    }
+}
+
+impl Drop for SmGuard {
+    fn drop(&mut self) {
+        (self.0)
+            .0
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A control handed from the receiver agent to the sender agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ControlItem {
     /// Send `control` on `endpoint` to `destination`.
     Outgoing {
@@ -43,6 +78,8 @@ pub enum ControlItem {
         destination: SocketAddr,
         /// What.
         control: Control,
+        /// An SM's slot guard, dropped once the SM was sent.
+        guard: Option<SmGuard>,
     },
     /// `control` arrived on `endpoint` from `source`, for a local
     /// publication.

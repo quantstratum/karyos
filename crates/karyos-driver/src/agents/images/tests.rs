@@ -526,3 +526,32 @@ fn an_idle_image_is_retired_and_reclaimed() {
     let sessions = rig.agents.receiver.role.session_counters();
     assert_eq!((sessions.retired, sessions.stale_commands), (1, 0));
 }
+
+/// S1's SM slot rule: one slot per image. With the sender stalled, the
+/// image's periodic SMs find their slot still occupied and are skipped and
+/// counted; once the sender runs, exactly the one waiting SM arrives.
+#[test]
+fn a_busy_sm_slot_skips_the_period() {
+    let (mut rig, _b) = Rig::new(Setup::default());
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established == 1
+    });
+    // Drain what is in flight, then stall the sender.
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let accepted = rig.agents.sender.role.counters().sm_accepted;
+    let skipped = rig.agents.receiver.counters().sm_skipped;
+    for _ in 0..100 {
+        rig.now += MS;
+        rig.agents.receiver.do_work(rig.now).unwrap();
+    }
+    assert!(rig.agents.receiver.counters().sm_skipped >= skipped + 5);
+    // One sender cycle sends the one waiting SM; the receiver reads it on
+    // its next cycle and the sender accepts it on the one after.
+    rig.agents.sender.do_work(rig.now).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    rig.agents.receiver.do_work(rig.now).unwrap();
+    rig.agents.sender.do_work(rig.now).unwrap();
+    assert_eq!(rig.agents.sender.role.counters().sm_accepted, accepted + 1);
+}

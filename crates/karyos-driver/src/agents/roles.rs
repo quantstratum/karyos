@@ -38,6 +38,7 @@
 
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
+use std::sync::Arc;
 
 use karyos_io::backend::{Budget, RxBackend, RxDatagram, RxDrop, RxHandler};
 use karyos_io::sockets::ops::SocketOps;
@@ -49,7 +50,7 @@ use karyos_protocol::network::{
 use karyos_sys::host_clock::age_ns;
 
 use super::chain::{ImageChain, SessionCommand, SessionEnd, SessionEvent};
-use super::control::{ControlItem, ControlRoutes, RouteSlot};
+use super::control::{ControlItem, ControlRoutes, RouteSlot, SmGuard, SmSlot};
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
 use crate::sessions::OsNonces;
@@ -101,6 +102,9 @@ pub struct ReceiverCounters {
     pub sm_skipped: u64,
     /// Images retired at their liveness timeout.
     pub images_retired: u64,
+    /// Installed images not kept (no SM slot, or no binding): retired at
+    /// once so their storage is reclaimed.
+    pub images_refused: u64,
     /// An image retired without its `RetireImage` unit, or installed without
     /// its binding: a broken invariant, counted.
     pub chain_invariant: u64,
@@ -133,8 +137,17 @@ pub struct SenderCounters {
     /// SMs from a bound receiver whose identity, lane count or receiver id
     /// does not match, ignored.
     pub sm_mismatch: u64,
-    /// Answered receivers not recorded: the binding table was full.
+    /// Answered receivers not recorded: the binding table was full of
+    /// confirmed bindings.
     pub bindings_full: u64,
+    /// Unconfirmed bindings evicted to make room for a new answer.
+    pub bindings_evicted: u64,
+    /// Bindings expired: unconfirmed past `setup_challenge_timeout`, or
+    /// confirmed with no SM for `image_liveness_timeout`.
+    pub bindings_expired: u64,
+    /// SMs whose consumption is below one already reported (replayed or
+    /// reordered): the higher value is kept.
+    pub sm_stale: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -150,10 +163,14 @@ struct ReceiverBinding {
     boot_id: [u64; 2],
     /// The publication incarnation answered.
     identity: Identity,
-    /// The receiver id of its first SM.
+    /// The receiver id of its first SM since the last answer.
     receiver_id: Option<u64>,
-    /// Its last reported status (consumption and window per lane).
+    /// Its highest reported status per lane (consumption and window).
     lanes: Option<Lanes<LaneStatus>>,
+    /// When it was last answered.
+    answered_at: u64,
+    /// When it last sent an accepted SM: `None` while unconfirmed.
+    last_sm: Option<u64>,
 }
 
 fn bump(value: &mut u64, overflowed: &mut bool) {
@@ -185,6 +202,9 @@ pub struct ReceiverRole {
     /// Installed images (at most `max_images`, allocated at creation).
     /// DATA admission through them is phase 5c.
     images: Vec<Installed>,
+    /// One SM slot flag per image, allocated at creation; an image takes
+    /// one only the pool holds.
+    sm_slots: Vec<Arc<SmSlot>>,
     sm_interval: u64,
     liveness_timeout: u64,
     counters: ReceiverCounters,
@@ -217,10 +237,13 @@ struct Installed {
     window: u32,
     /// When the last SM was due; `None` before the first.
     sm_last: Option<u64>,
-    /// A control ring slot held for the next SM (S1: an SM slot per
-    /// binding).
+    /// The control ring slot of its next SM, while none waits (S1: one SM
+    /// slot per binding).
     sm_slot: Option<Reservation>,
-    /// The last evidence from the binding.
+    /// Whether its previous SM still waits in the ring.
+    sm: Arc<SmSlot>,
+    /// The last fresh evidence from the binding (DATA and heartbeats, phase
+    /// 5c; until then, the install).
     evidence: u64,
 }
 
@@ -240,6 +263,11 @@ pub struct SenderRole {
     /// creation).
     bindings: Vec<ReceiverBinding>,
     max_bindings: usize,
+    /// An unconfirmed binding lives this long (`setup_challenge_timeout`).
+    unconfirmed_timeout: u64,
+    /// A confirmed binding lives this long without an SM
+    /// (`image_liveness_timeout`).
+    confirmed_timeout: u64,
     counters: SenderCounters,
 }
 
@@ -296,6 +324,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             due: Vec::with_capacity(config.publications),
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
+            unconfirmed_timeout: config.sessions.setup_challenge_timeout,
+            confirmed_timeout: config.image_liveness_timeout,
             counters: SenderCounters::default(),
         },
         ReceiverRole {
@@ -310,6 +340,9 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             rsp_total,
             chains: Vec::with_capacity(config.sessions.max_images),
             images: Vec::with_capacity(config.sessions.max_images),
+            sm_slots: (0..config.sessions.max_images)
+                .map(|_| Arc::new(SmSlot::default()))
+                .collect(),
             sm_interval: config.sm_interval,
             liveness_timeout: config.image_liveness_timeout,
             counters: ReceiverCounters::default(),
@@ -448,12 +481,17 @@ impl ReceiverRole {
             served = served
                 .checked_add(1)
                 .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
+            // An installed image the receiver could not keep: retired right
+            // after its `ImageInstalled`, so the conductor reclaims it.
+            let mut refused = None;
             let (reply, event) = match command {
                 SessionCommand::InstallImage { reply, slot, owner } => {
                     let chain = self.take_chain(slot);
                     let event = match self.sessions.image_ready(slot, now) {
                         ImageOutcome::Installed(installed) => {
-                            self.install(installed, owner, chain, now);
+                            if let Err(retire) = self.install(installed, owner, chain, now) {
+                                refused = Some((installed, retire));
+                            }
                             SessionEvent::ImageInstalled { slot, installed }
                         }
                         // Dropping the owner drops the receiver's hold on
@@ -475,6 +513,18 @@ impl ReceiverRole {
             };
             // The conductor gone: the driver is stopping.
             let _ = sessions.events.post(reply, event);
+            if let Some((installed, retire)) = refused {
+                let _ = self.sessions.retire(installed, now);
+                self.count(|c| &mut c.images_refused);
+                match retire {
+                    Some(unit) => {
+                        let _ = sessions
+                            .events
+                            .post(unit, SessionEvent::RetireImage { slot: installed });
+                    }
+                    None => self.count(|c| &mut c.chain_invariant),
+                }
+            }
         }
         Ok(served)
     }
@@ -487,22 +537,39 @@ impl ReceiverRole {
 
     /// Records the image installed at `installed`: its first SM is due at
     /// once (S1 installation step 3).
+    ///
+    /// # Errors
+    ///
+    /// Without its binding, its chain or an SM slot, the image is not kept
+    /// (its owner is dropped); the error holds its `RetireImage` unit, if
+    /// any, for the caller to retire it.
     fn install(
         &mut self,
         installed: SlotRef,
         owner: Box<ReceiveOwner>,
         chain: Option<Chain>,
         now: u64,
-    ) {
-        let (Some((key, identity)), Some(chain)) = (self.sessions.binding(installed), chain) else {
-            // Dropping the owner releases the image; the binding stays
-            // until its liveness timeout retires it.
+    ) -> Result<(), Option<Reservation>> {
+        let Some(chain) = chain else {
             self.count(|c| &mut c.chain_invariant);
-            return;
+            return Err(None);
+        };
+        let Some((key, identity)) = self.sessions.binding(installed) else {
+            self.count(|c| &mut c.chain_invariant);
+            return Err(Some(chain.retire));
+        };
+        // S1: an image whose SM slot cannot be reserved is refused.
+        let (Some(sm_slot), Some(sm)) = (
+            self.to_sender.reserve(),
+            self.sm_slots
+                .iter()
+                .find(|slot| Arc::strong_count(slot) == 1)
+                .cloned(),
+        ) else {
+            return Err(Some(chain.retire));
         };
         // Half a term per SM: aligned, within the wire's window bound.
         let window = (chain.term_length / 2).min(MAX_WINDOW) & !(FRAME_ALIGNMENT - 1);
-        let sm_slot = self.to_sender.reserve();
         // The table holds a slot for every session, so it has room for
         // every installed image.
         self.images.push(Installed {
@@ -514,16 +581,11 @@ impl ReceiverRole {
             lane_count: chain.lane_count,
             window,
             sm_last: None,
-            sm_slot,
+            sm_slot: Some(sm_slot),
+            sm,
             evidence: now,
         });
-    }
-
-    /// Fresh evidence from the binding `key` at `now`.
-    fn evidence(&mut self, key: &BindingKey, now: u64) {
-        if let Some(image) = self.images.iter_mut().find(|image| image.key == *key) {
-            image.evidence = now;
-        }
+        Ok(())
     }
 
     /// The installed images' timers at `now`: retirement at the liveness
@@ -618,21 +680,25 @@ impl ReceiverRole {
             group_tag: 0,
             lanes,
         };
-        let item = ControlItem::Outgoing {
-            endpoint: image.key.endpoint,
-            destination: image.key.source,
-            control: Control::Status(status),
-        };
+        // One slot per image (S1): a period whose previous SM still waits
+        // is skipped, never given a second slot.
+        if image.sm.busy() {
+            self.count(|c| &mut c.sm_skipped);
+            return;
+        }
         let slot = image.sm_slot.take().or_else(|| self.to_sender.reserve());
         let Some(slot) = slot else {
             self.count(|c| &mut c.sm_skipped);
             return;
         };
+        let item = ControlItem::Outgoing {
+            endpoint: image.key.endpoint,
+            destination: image.key.source,
+            control: Control::Status(status),
+            guard: Some(SmGuard::take(&image.sm)),
+        };
         // The sender gone: the driver is stopping.
         let _ = self.to_sender.post(slot, item);
-        if let Some(image) = self.images.get_mut(index) {
-            image.sm_slot = self.to_sender.reserve();
-        }
         self.count(|c| &mut c.sm_sent);
     }
 
@@ -739,6 +805,7 @@ impl Intake<'_> {
             endpoint: self.endpoint,
             destination: source,
             control,
+            guard: None,
         });
     }
 
@@ -771,9 +838,6 @@ impl Intake<'_> {
                     source,
                     alias: announce.alias,
                 };
-                // The bound sender's SETUP is liveness evidence for its
-                // image (DATA and heartbeats join it in phase 5c).
-                self.role.evidence(&key, now);
                 let role = &mut *self.role;
                 if let AnnounceOutcome::Challenge(challenge) =
                     role.sessions
@@ -1023,16 +1087,21 @@ impl SenderRole {
             match item {
                 // §7.3: an RSP_SETUP to the trigger's validated source,
                 // checked by the receiver.
+                // An SM's guard drops after the send, freeing its slot.
                 ControlItem::Outgoing {
                     endpoint,
                     destination,
                     control,
-                } => self.send(halves, endpoint, destination, &control),
+                    guard,
+                } => {
+                    self.send(halves, endpoint, destination, &control);
+                    drop(guard);
+                }
                 ControlItem::Incoming {
                     endpoint,
                     source,
                     control: Control::Status(status),
-                } => self.status(endpoint, source, &status),
+                } => self.status(endpoint, source, &status, now),
                 ControlItem::Incoming {
                     endpoint,
                     source,
@@ -1069,7 +1138,13 @@ impl SenderRole {
 
     /// Records the receiver `answer` goes to: its challenge's `source` on
     /// `endpoint` and its boot id, where its SMs must come from.
-    fn bind(&mut self, endpoint: EndpointId, source: SocketAddr, answer: &SetupAnswer) {
+    ///
+    /// A new answer to a known tuple starts it over: unconfirmed, with no
+    /// receiver id or status, so a reinstalled image binds again. A full
+    /// table evicts its oldest unconfirmed binding first; one full of
+    /// confirmed bindings refuses and counts.
+    fn bind(&mut self, endpoint: EndpointId, source: SocketAddr, answer: &SetupAnswer, now: u64) {
+        self.expire_bindings(now);
         let binding = ReceiverBinding {
             endpoint,
             alias: answer.alias,
@@ -1078,30 +1153,60 @@ impl SenderRole {
             identity: answer.identity,
             receiver_id: None,
             lanes: None,
+            answered_at: now,
+            last_sm: None,
         };
-        let known = self.bindings.iter().any(|held| {
+        let tuple = |held: &ReceiverBinding| {
             (
                 held.endpoint,
                 held.alias,
                 held.source,
                 held.boot_id,
                 held.identity,
-            ) == (
-                binding.endpoint,
-                binding.alias,
-                binding.source,
-                binding.boot_id,
-                binding.identity,
             )
-        });
-        if known {
+        };
+        if let Some(held) = self
+            .bindings
+            .iter_mut()
+            .find(|held| tuple(held) == tuple(&binding))
+        {
+            *held = binding;
             return;
         }
         if self.bindings.len() >= self.max_bindings {
-            self.count(|c| &mut c.bindings_full);
-            return;
+            let oldest = self
+                .bindings
+                .iter()
+                .enumerate()
+                .filter(|(_, held)| held.last_sm.is_none())
+                .min_by_key(|(_, held)| held.answered_at)
+                .map(|(index, _)| index);
+            let Some(index) = oldest else {
+                self.count(|c| &mut c.bindings_full);
+                return;
+            };
+            let _ = self.bindings.swap_remove(index);
+            self.count(|c| &mut c.bindings_evicted);
         }
         self.bindings.push(binding);
+    }
+
+    /// Removes the bindings past their lifetime at `now`: an unconfirmed
+    /// one after `setup_challenge_timeout`, a confirmed one with no SM for
+    /// `image_liveness_timeout` (its image is retired by then).
+    fn expire_bindings(&mut self, now: u64) {
+        let (unconfirmed, confirmed) = (self.unconfirmed_timeout, self.confirmed_timeout);
+        let before = self.bindings.len();
+        self.bindings.retain(|binding| match binding.last_sm {
+            None => age_ns(now, binding.answered_at) < unconfirmed,
+            Some(last) => age_ns(now, last) < confirmed,
+        });
+        // `retain` only removes: no underflow.
+        if let Some(expired) = before.checked_sub(self.bindings.len()) {
+            for _ in 0..expired {
+                self.count(|c| &mut c.bindings_expired);
+            }
+        }
     }
 
     /// An SM from `source` on `endpoint` (network-control-schemas.md §6.1):
@@ -1109,7 +1214,14 @@ impl SenderRole {
     /// answered identity, the publication's lane count and, after the first,
     /// the same receiver id. The first accepted SM establishes the
     /// publication: its SETUP stops.
-    fn status(&mut self, endpoint: EndpointId, source: SocketAddr, status: &StatusMessage) {
+    fn status(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        status: &StatusMessage,
+        now: u64,
+    ) {
+        self.expire_bindings(now);
         let source = normalized(source);
         let lane_count = self
             .publications
@@ -1136,9 +1248,37 @@ impl SenderRole {
             return;
         }
         binding.receiver_id = Some(status.receiver.receiver_id);
-        binding.lanes = Some(status.lanes);
+        binding.last_sm = Some(now);
+        // Consumption only moves forward: a replayed or reordered SM keeps
+        // the higher value per lane, and is counted.
+        let mut stale = false;
+        let lanes = match binding.lanes {
+            None => status.lanes,
+            Some(held) => {
+                let mut kept = [LaneStatus::default(); 4];
+                for ((slot, old), new) in kept
+                    .iter_mut()
+                    .zip(held.as_slice())
+                    .zip(status.lanes.as_slice())
+                {
+                    if new.consumption < old.consumption {
+                        stale = true;
+                        *slot = *old;
+                    } else {
+                        *slot = *new;
+                    }
+                }
+                kept.get(..held.as_slice().len())
+                    .and_then(|kept| Lanes::new(kept).ok())
+                    .unwrap_or(held)
+            }
+        };
+        binding.lanes = Some(lanes);
         let _ = self.sessions.status(endpoint, status);
         self.count(|c| &mut c.sm_accepted);
+        if stale {
+            self.count(|c| &mut c.sm_stale);
+        }
     }
 
     /// The SETUP ANSWER to a received control, and where it goes: §7.3 and
@@ -1174,7 +1314,7 @@ impl SenderRole {
         };
         match answer {
             Ok(answer) => {
-                self.bind(endpoint, source, &answer);
+                self.bind(endpoint, source, &answer, now);
                 Some((destination, Control::SetupAnswer(answer)))
             }
             Err(_) => {
