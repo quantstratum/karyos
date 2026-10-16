@@ -10,6 +10,9 @@
 //!   host, the plan's options and label, and the cores or why there are
 //!   none;
 //! - `plan.txt`: the plan as [`plan::render`] prints it;
+//! - `preflight-start.txt`, and `preflight.txt` in every run directory:
+//!   the preflight snapshots ([`preflight`]), taken before the first run
+//!   and before each run;
 //! - `runs/<index>_<point>_<configuration>_r<round>/`: the raw sample
 //!   files and sidecars of each run;
 //! - `results.jsonl`: one hand-written JSON line per run, in plan order.
@@ -19,12 +22,14 @@
 
 use std::fmt::Write as _;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::env::Labels;
-use crate::manifest::{MANIFEST_SHA256, VERSION};
+use crate::env::{self, Ineligible, Labels};
+use crate::inventory::{Inventory, Scope};
+use crate::manifest::{Fanout, MANIFEST_SHA256, VERSION};
 use crate::plan::{self, INSUFFICIENT, Plan, PlannedRun};
+use crate::preflight;
 use crate::samples::MISSING;
 use crate::wire::process::{Cores, FAULTS, ProcessOptions, faults_requested, run_processes};
 use crate::wire::stage::{StageLoad, StageSamples};
@@ -103,6 +108,7 @@ pub fn result_line(
                 format!("\"receive_missing\":{}", count_missing(&samples.receive)),
                 format!("\"backend_drops\":{}", samples.backend_drops),
                 format!("\"backpressure\":{}", samples.backpressure),
+                format!("\"ack_timeouts\":{}", samples.ack_timeouts),
                 format!("\"batches\":{}", samples.batches.len()),
                 format!("\"functional_only\":{}", samples.functional_only),
                 format!("\"functional_reasons\":[{}]", reasons.join(",")),
@@ -114,9 +120,44 @@ pub fn result_line(
     format!("{{{}}}", fields.join(","))
 }
 
+/// What a measurement records about its host's decision eligibility.
+#[derive(Debug, Clone, Default)]
+pub struct HostFacts {
+    /// The F1 conditions of `env::decision_eligible` the host fails.
+    pub ineligible: Vec<Ineligible>,
+    /// The host record cited: its path and text, if one was found.
+    pub record: Option<(PathBuf, String)>,
+}
+
+impl HostFacts {
+    /// This host's facts: its record from `KARYOS_ENVIRONMENTS`, if any,
+    /// and the F1 eligibility against it.
+    #[must_use]
+    pub fn detect() -> Self {
+        let inventory = Inventory::detect(Scope::Classification);
+        let record = std::env::var_os("KARYOS_ENVIRONMENTS").and_then(|dir| {
+            let path = Path::new(&dir).join(format!("{}.md", inventory.host));
+            std::fs::read_to_string(&path).ok().map(|text| (path, text))
+        });
+        let ineligible = env::decision_eligible(
+            &inventory,
+            record.as_ref().map(|(_, text)| text.as_str()),
+            Fanout::F1,
+        )
+        .err()
+        .unwrap_or_default();
+        Self { ineligible, record }
+    }
+}
+
 /// The `measure.json` of a plan.
 #[must_use]
-pub fn header(plan: &Plan, labels: &Labels, cores: &Result<Cores, String>) -> String {
+pub fn header(
+    plan: &Plan,
+    labels: &Labels,
+    cores: &Result<Cores, String>,
+    facts: &HostFacts,
+) -> String {
     let options = &plan.options;
     let started = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -137,6 +178,7 @@ pub fn header(plan: &Plan, labels: &Labels, cores: &Result<Cores, String>) -> St
         format!("\"cpu\":{}", json_string(&labels.cpu)),
         format!("\"profile\":{}", json_string(labels.profile)),
         format!("\"commit\":{}", json_string(&labels.commit)),
+        format!("\"class\":{}", json_string(&labels.environment.to_string())),
         format!("\"environment\":{}", json_string(&labels.qualification)),
         format!("\"messages\":{}", options.messages),
         format!("\"warmup\":{}", options.warmup),
@@ -160,6 +202,23 @@ pub fn header(plan: &Plan, labels: &Labels, cores: &Result<Cores, String>) -> St
             Ok(c) => format!("\"cores\":[{},{}]", c.receiver, c.sender),
             Err(reason) => format!("\"cores\":null,\"unpinned\":{}", json_string(reason)),
         },
+        format!("\"eligible\":{}", facts.ineligible.is_empty()),
+        format!(
+            "\"ineligible\":[{}]",
+            facts
+                .ineligible
+                .iter()
+                .map(|reason| json_string(&reason.encode()))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        format!(
+            "\"host_record\":{}",
+            facts.record.as_ref().map_or_else(
+                || "null".to_string(),
+                |(path, _)| json_string(&path.display().to_string())
+            )
+        ),
     ];
     format!("{{{}}}\n", fields.join(","))
 }
@@ -177,6 +236,7 @@ pub fn run_plan(
     out: &Path,
     labels: &Labels,
     cores: &Result<Cores, String>,
+    facts: &HostFacts,
     log: &mut dyn Write,
 ) -> Result<usize, BenchError> {
     if faults_requested() {
@@ -194,10 +254,17 @@ pub fn run_plan(
         }
     }
     std::fs::create_dir_all(out.join("runs")).map_err(|cause| io("output directory", cause))?;
-    std::fs::write(out.join("measure.json"), header(plan, labels, cores))
+    std::fs::write(out.join("measure.json"), header(plan, labels, cores, facts))
         .map_err(|cause| io("measure.json", cause))?;
+    if let Some((_, text)) = &facts.record {
+        // The record the eligibility and the preflight checks cite.
+        std::fs::write(out.join("host-record.md"), text)
+            .map_err(|cause| io("host-record.md", cause))?;
+    }
     std::fs::write(out.join("plan.txt"), plan::render(plan))
         .map_err(|cause| io("plan.txt", cause))?;
+    std::fs::write(out.join("preflight-start.txt"), preflight::capture())
+        .map_err(|cause| io("preflight-start.txt", cause))?;
     let mut results = std::fs::File::create(out.join("results.jsonl"))
         .map_err(|cause| io("results.jsonl", cause))?;
     let pinned = cores.as_ref().ok().copied();
@@ -206,7 +273,12 @@ pub fn run_plan(
     for (index, planned) in plan.runs.iter().enumerate() {
         let dir = format!("runs/{index:04}_{}", planned.slug());
         let started = Instant::now();
+        // The preflight snapshot of this run (4.2 condition 4).
+        std::fs::create_dir_all(out.join(&dir)).map_err(|cause| io("run directory", cause))?;
+        std::fs::write(out.join(&dir).join("preflight.txt"), preflight::capture())
+            .map_err(|cause| io("preflight.txt", cause))?;
         let options = ProcessOptions {
+            profile: planned.configuration.clone(),
             run_index: planned.round,
             cores: pinned,
             ..ProcessOptions::default()
@@ -254,7 +326,17 @@ mod tests {
             &PlanOptions::smoke(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope),
         )
         .unwrap();
-        let header = header(&plan, &Labels::detect(), &Err("none".into()));
+        let facts = HostFacts {
+            ineligible: vec![Ineligible::ClockSource("hpet".into())],
+            record: None,
+        };
+        let header = header(&plan, &Labels::detect(), &Err("none".into()), &facts);
+        assert!(header.contains("\"eligible\":false"), "{header}");
+        assert!(
+            header.contains("\"ineligible\":[\"clock_source\\u0009hpet\"]"),
+            "{header}"
+        );
+        assert!(header.contains("\"host_record\":null"), "{header}");
         assert!(header.contains("\"faults\":\"off\""), "{header}");
         assert!(
             header.contains("\"e_max_status\":\"provisional E_max (illustrative, manifest 6.1)\""),
@@ -278,6 +360,7 @@ mod tests {
             &out,
             &Labels::detect(),
             &Err("none".into()),
+            &HostFacts::default(),
             &mut Vec::new(),
         )
         .err()

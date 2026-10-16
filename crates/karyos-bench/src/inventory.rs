@@ -1284,7 +1284,7 @@ pub fn render(
         let _ = writeln!(out, "- {basis}");
     }
     out.push('\n');
-    out.push_str("Decision eligibility (measurement-harness.md 4.2, conditions 1 to 3; condition 4, the preflight snapshot, is deferred to batch B4; the manifest hash, `E_max` and the sample count are checked per run):\n\n");
+    out.push_str("Decision eligibility (measurement-harness.md 4.2, conditions 1 to 3; condition 4, each run's preflight snapshot against the preflight fields below, is checked by the analysis; the manifest hash, `E_max` and the sample count are checked per run):\n\n");
     for (fanout, verdict) in eligibility {
         let what = env::fanout_label(*fanout);
         match verdict {
@@ -1301,6 +1301,7 @@ pub fn render(
     out.push_str(
         "Switch model and topology (E2): not recorded by this capture; an E2 record adds them by hand (batch B5).\n",
     );
+    out.push_str(&crate::preflight::record_block(inventory));
     out
 }
 

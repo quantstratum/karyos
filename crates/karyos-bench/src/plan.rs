@@ -46,8 +46,10 @@ pub const SMOKE_WARMUP: u64 = 200;
 /// The label of a plan whose `N` is below [`MESSAGES`].
 pub const INSUFFICIENT: &str = "insufficient samples";
 
-/// The configurations of the A/A plan: `trusted` against itself.
-pub const AA: [&str; 2] = ["trusted/a", "trusted/b"];
+/// The configurations of the A/A plan, all of the `trusted` profile:
+/// the baseline and the two sides it compares (coordinator, ACS 15349).
+/// Names follow the sample files' profile rule (no `/`).
+pub const AA: [&str; 3] = ["trusted", "trusted-a", "trusted-b"];
 
 /// The assumed cost of one R1 message, for the runtime estimate only.
 const R1_ESTIMATE: Duration = Duration::from_micros(20);
@@ -383,8 +385,8 @@ mod tests {
     #[test]
     fn the_primary_plan_runs_f1_and_lists_the_rest() {
         let plan = decision();
-        // 8 F1 points of R1 and R2, 5 rounds, 2 configurations.
-        assert_eq!(plan.runs.len(), 8 * 5 * 2);
+        // 8 F1 points of R1 and R2, 5 rounds, 3 configurations.
+        assert_eq!(plan.runs.len(), 8 * 5 * 3);
         assert_eq!(plan.skipped.len(), 9);
         assert_eq!(
             plan.skipped
@@ -412,10 +414,10 @@ mod tests {
         assert_eq!(
             first,
             [
-                (0, "trusted/a"),
-                (0, "trusted/b"),
-                (1, "trusted/b"),
-                (1, "trusted/a")
+                (0, "trusted"),
+                (0, "trusted-a"),
+                (0, "trusted-b"),
+                (1, "trusted-a")
             ]
         );
         let mut three = PlanOptions::decision(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope);

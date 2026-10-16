@@ -8,10 +8,11 @@
 # 2. writes this host's inventory into the output directory and prints
 #    its class and eligibility against the filed records;
 # 3. runs `karyos-bench measure --plan primary` into the same directory,
-#    each child pinned to an isolated core when the host has two.
+#    each child pinned to an isolated core when the host has two;
+# 5. runs `karyos-bench analyze`, which writes report.md and
+#    analysis.json, even when runs failed: a failed run is a result.
 #
-# The allocation build (step 4 of 5.5) arrives with batch B3d, and the
-# analysis and report.md (step 5) with batch B4b.
+# The allocation build (step 4 of 5.5) arrives with batch B3d.
 #
 # Usage: scripts/measure.sh [measure arguments...], for example
 # --plan-only. Environment:
@@ -31,7 +32,7 @@ utc=$(date -u +%Y%m%dT%H%M%SZ)
 out=${KARYOS_MEASURE_OUT:-$root/target/karyos-measure/$utc-$commit}
 
 for arg in "$@"; do
-    if [ "$arg" = "--out" ]; then
+    if [ "$arg" = "--out" ] || [ "${arg#--out=}" != "$arg" ]; then
         echo "measure.sh: set KARYOS_MEASURE_OUT, not --out: the inventory and the runs share one directory" >&2
         exit 2
     fi
@@ -54,5 +55,8 @@ if [ -n "${KARYOS_ENVIRONMENTS:-}" ]; then
     records=(--records "$KARYOS_ENVIRONMENTS")
 fi
 "$bin" inventory --out "$out" "${records[@]+"${records[@]}"}"
-"$bin" measure --plan primary --out "$out" "$@"
+status=0
+"$bin" measure --plan primary --out "$out" "$@" || status=$?
+"$bin" analyze --out "$out"
 echo "measure: wrote $out"
+exit "$status"

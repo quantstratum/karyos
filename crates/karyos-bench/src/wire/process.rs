@@ -72,6 +72,10 @@ pub const NONCE: &str = "KARYOS_BENCH_WIRE_NONCE";
 /// The run index at its point, written into the sample headers.
 pub const INDEX: &str = "KARYOS_BENCH_WIRE_INDEX";
 
+/// The configuration name, written into the sample headers as the
+/// profile; it follows the sample files' profile rule.
+pub const PROFILE: &str = "KARYOS_BENCH_WIRE_PROFILE";
+
 /// Injected faults, as [`Faults::encode`] writes them; honoured only by
 /// a build with the feature `test-hooks` (see [`FAULTS_ENABLED`]).
 pub const FAULTS: &str = "KARYOS_BENCH_WIRE_FAULTS";
@@ -328,8 +332,10 @@ fn pin_reason(role: &str, line: &str, core: Option<usize>) -> Option<String> {
 }
 
 /// How the parent runs one pair of processes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessOptions {
+    /// The configuration, written into the sample headers as the profile.
+    pub profile: String,
     /// The run index at its point, written into the sample headers.
     pub run_index: u32,
     /// Each child's core; unpinned without.
@@ -338,6 +344,18 @@ pub struct ProcessOptions {
     pub deadline: Option<Duration>,
     /// Injected faults; tests only.
     pub faults: Faults,
+}
+
+impl Default for ProcessOptions {
+    fn default() -> Self {
+        Self {
+            profile: "trusted".to_string(),
+            run_index: 0,
+            cores: None,
+            deadline: None,
+            faults: Faults::default(),
+        }
+    }
 }
 
 /// The text form of a shape: its display name.
@@ -430,10 +448,11 @@ fn point(run: &StageRun) -> Result<Point, BenchError> {
     })
 }
 
-/// A wire child's environment: its run, sample file, run index, nonce
-/// and faults.
+/// A wire child's environment: its run, sample file, configuration,
+/// run index, nonce and faults.
 struct ChildContext {
     run: StageRun,
+    profile: String,
     out: PathBuf,
     index: u32,
     nonce: u64,
@@ -449,6 +468,7 @@ impl ChildContext {
         Ok(Self {
             run: decode_run(&variable(RUN)?)?,
             out: PathBuf::from(variable(OUT)?),
+            profile: variable(PROFILE)?,
             index: variable(INDEX)?
                 .parse()
                 .map_err(|cause| error(INDEX, cause))?,
@@ -470,7 +490,7 @@ impl ChildContext {
         let saturated = data.iter().filter(|sample| **sample == SATURATED).count();
         let header = Header {
             point: point(&self.run)?,
-            profile: "trusted".to_string(),
+            profile: self.profile.clone(),
             stage,
             run: self.index,
             seed: 0,
@@ -854,6 +874,7 @@ impl Spawn<'_> {
             .env(OUT, out)
             .env(NONCE, self.nonce.to_string())
             .env(INDEX, self.options.run_index.to_string())
+            .env(PROFILE, &self.options.profile)
             // Held open by the parent: its end tells the child to exit.
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -921,14 +942,18 @@ fn check_samples(
     samples: &RunSamples,
     run: &StageRun,
     stage: Stage,
-    index: u32,
+    options: &ProcessOptions,
     expected: usize,
 ) -> Result<(), BenchError> {
     let header = &samples.header;
-    if header.point != point(run)? || header.stage != stage || header.run != index {
+    if header.point != point(run)?
+        || header.stage != stage
+        || header.run != options.run_index
+        || header.profile != options.profile
+    {
         return Err(BenchError(format!(
-            "sample header {} {:?} run {} does not match the run",
-            header.point, header.stage, header.run
+            "sample header {} {:?} {} run {} does not match the run",
+            header.point, header.stage, header.profile, header.run
         )));
     }
     if samples.samples.len() != expected {
@@ -1097,12 +1122,12 @@ pub fn run_processes(
     let send = samples::read_file(&send_out).map_err(|cause| error("send samples", cause))?;
     let receive =
         samples::read_file(&receive_out).map_err(|cause| error("receive samples", cause))?;
-    check_samples(&send, run, Stage::Send, options.run_index, expected)?;
+    check_samples(&send, run, Stage::Send, options, expected)?;
     check_samples(
         &receive,
         run,
         Stage::Receive { receiver: 0 },
-        options.run_index,
+        options,
         expected,
     )?;
     let rx = std::fs::read_to_string(receive_out.with_extension("rx"))

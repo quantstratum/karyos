@@ -532,7 +532,7 @@ fn pinned_wire_children_read_their_core_back() {
 fn an_orphaned_wire_child_exits() {
     use karyos_bench::manifest::Shape;
     use karyos_bench::wire::process::{
-        CHILD_TEST, INDEX, NONCE, ORPHANED, OUT, ROLE, RUN, encode_run,
+        CHILD_TEST, INDEX, NONCE, ORPHANED, OUT, PROFILE, ROLE, RUN, encode_run,
     };
     use karyos_bench::wire::stage::StageLoad;
     use std::io::BufRead;
@@ -547,6 +547,7 @@ fn an_orphaned_wire_child_exits() {
         .env(OUT, dir.0.join("receive.samples"))
         .env(NONCE, "1")
         .env(INDEX, "0")
+        .env(PROFILE, "trusted")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
