@@ -1260,3 +1260,91 @@ fn releasing_more_bytes_than_held_counts_an_overflow() {
     assert_eq!(super::release(2, 3, &driver.counters), 0);
     assert_eq!(counter(&driver, "counter overflows"), overflows + 1);
 }
+
+/// Journals of an aggregate carry their lane in the mirror (entry word 69,
+/// `aggregate-ownership.md`): every lane names the aggregate's
+/// registration, and a subscriber journal that ends notes only the
+/// publisher journals of its own lane.
+#[test]
+fn journals_pair_within_their_lane() {
+    use karyos_protocol::cnc::{StreamKey, SubscriberRole};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+    let mut driver = driver(4, 64, 64);
+    let key = StreamKey {
+        stream_id: 6,
+        session_id: 1,
+    };
+    let aggregate = driver
+        .add_aggregate(crate::embedded::AggregateConfig {
+            stream: crate::StreamConfig {
+                buffer: LogBufferConfig {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 8,
+                    max_subscribers: 4,
+                    mtu: DEFAULT_MTU,
+                    max_reserved: MIN_TERM_LENGTH / 8,
+                    initial_term_id: TermId::new(7),
+                    lane: Lane::ZERO,
+                    session_id: key.session_id,
+                    stream_id: key.stream_id,
+                    claim_deadline: 100,
+                    publication: PublicationMode::Exclusive,
+                },
+                allow_unconnected: true,
+                on_required_loss: LossPolicy::Hold,
+                conflation: None,
+            },
+            quanta: vec![u64::from(DEFAULT_MTU.next_multiple_of(32)); 2],
+        })
+        .unwrap();
+    let lane = |number| Lane::try_new(number).unwrap();
+    let registration = driver
+        .trace_identity(aggregate.lane(lane(0)).unwrap())
+        .unwrap()
+        .registration;
+    let mut conductor = driver.connect().unwrap();
+    let publication_on = |driver: &mut EmbeddedDriver, conductor: &mut ClientConductor, number| {
+        let outcome = complete(driver, conductor, |conductor| {
+            conductor.add_publication_on_lane(key, lane(number), true)
+        });
+        let Outcome::Publication(publication) = outcome else {
+            panic!("expected a publication, got {outcome:?}");
+        };
+        let registration = publication.origin().unwrap().registration();
+        (publication, registration)
+    };
+    let (_zero, publication_zero) = publication_on(&mut driver, &mut conductor, 0);
+    let (_one, publication_one) = publication_on(&mut driver, &mut conductor, 1);
+    let outcome = complete(&mut driver, &mut conductor, |conductor| {
+        conductor.add_subscription_on_lane(key, lane(1), SubscriberRole::Optional)
+    });
+    let Outcome::Subscription(subscription) = outcome else {
+        panic!("expected a subscription, got {outcome:?}");
+    };
+    let subscription_one = subscription.origin().unwrap().registration();
+    let publishing_zero = journal(&mut driver, &mut conductor, publication_zero);
+    let publishing_one = journal(&mut driver, &mut conductor, publication_one);
+    let mut observing = journal(&mut driver, &mut conductor, subscription_one);
+    for (journal, number) in [(&publishing_zero, 0), (&publishing_one, 1), (&observing, 1)] {
+        let found = entry(&driver, journal.journal());
+        assert_eq!((found.stream, found.lane), (registration, lane(number)));
+    }
+    let observed = observing.journal();
+    end(&mut driver, &mut observing);
+    let _ = driver.do_work().unwrap();
+    let notes: Vec<u64> = driver
+        .trace_journals
+        .slots
+        .iter()
+        .flatten()
+        .find(|held| held.entry.journal == observed)
+        .and_then(|held| held.notes.as_ref())
+        .unwrap()
+        .iter()
+        .map(|note| note.journal)
+        .collect();
+    assert_eq!(notes, [publishing_one.journal()]);
+}

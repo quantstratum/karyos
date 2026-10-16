@@ -35,9 +35,10 @@
 //! processes). [`RemoteClient::poll`], the control path, serves the driver's
 //! cutover events: on `SuccessorReady` it fetches the successor grant, checks
 //! it as any fetch, prepares its adoption and offers it to the handle's link;
-//! on `Fenced`, on a `PublicationClosed` of the handle's stream and when the
-//! driver is lost it closes the link. It also drops what a handle left in its
-//! link when it moved, unmapping the predecessor and sending its `Detach`.
+//! on `Fenced`, on a `PublicationClosed` of the handle's stream and lane and
+//! when the driver is lost it closes the link. It also drops what a handle
+//! left in its link when it moved, unmapping the predecessor and sending its
+//! `Detach`.
 //!
 //! Its trace journals (`quantstratum-docs:
 //! karyos/design/trace-journal-region.md`, J2) complete as
@@ -267,12 +268,11 @@ impl Session {
                 Event::Fenced { registration, .. } => {
                     self.close_where(|entry| entry.registration == registration);
                 }
-                // Only the closed lane's links; a conflated view names no
-                // lane and ends with any lane of its stream.
+                // Only the closed lane's links. A conflated view has no
+                // link: it ends with its table's `closed`.
                 Event::PublicationClosed { stream, lane, .. } => {
                     self.close_where(|entry| {
-                        entry.request.stream() == stream
-                            && entry.request.lane().is_none_or(|ours| ours == lane)
+                        entry.request.stream() == stream && entry.request.lane() == Some(lane)
                     });
                 }
                 _ => {}

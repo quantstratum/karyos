@@ -1157,7 +1157,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .streams
             .iter()
             .find(|s| s.id == live.stream)
-            .map(|s| (s.aggregate.registration, s.config.lane.get()))
+            .map(|s| (s.aggregate.registration, s.config.lane))
         else {
             return Response::Error {
                 request,

@@ -218,6 +218,7 @@ impl Driver {
             Some(&RecycledJournal {
                 journal: old.journal,
                 stream: old.stream,
+                lane: old.lane,
                 incarnation: old.incarnation,
                 state: old.state,
                 boundary: old.boundary,
@@ -549,8 +550,8 @@ fn a_subscriber_journal_with_every_record_overwritten_still_counts() {
     assert_eq!(answer(&report, 1), TraceAnswer::Final(Verdict::Incomplete));
 }
 
-/// A journal whose records contradict its entry (another publication, or a
-/// point of the other kind) is malformed: treated as writer lost, its
+/// A journal whose records contradict its entry (another publication,
+/// another lane, or a point of the other kind) is malformed: treated as writer lost, its
 /// traces are Incomplete and it stays in their expected sets. A record that
 /// differs only outside the publication key (the wire ids) still names
 /// the entry's publication, as across a successor mapping, which keeps the
@@ -560,6 +561,13 @@ fn a_contradicting_journal_is_malformed_and_its_traces_incomplete() {
     for (contradiction, malformed) in [
         (observation(OTHER, Point::SubscriberPoll, 0, 1, 15), true),
         (observation(PUBLICATION, Point::Publish, 0, 1, 15), true),
+        (
+            TraceRecord {
+                lane: 1,
+                ..observation(PUBLICATION, Point::SubscriberPoll, 0, 1, 15)
+            },
+            true,
+        ),
         (
             observation(
                 PublicationId {
