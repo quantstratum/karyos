@@ -83,6 +83,15 @@ pub enum SysError {
         /// Length in bytes.
         len: usize,
     },
+    /// A region of the right kind was laid out by another layout version:
+    /// a reader never interprets it (no mixed versions).
+    #[error("region layout version {found}, expected {expected}")]
+    LayoutVersion {
+        /// The region's layout version.
+        found: u64,
+        /// The version this build reads.
+        expected: u64,
+    },
     /// A system call failed.
     #[error("{operation} failed with OS error {errno}")]
     Os {

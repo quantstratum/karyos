@@ -367,6 +367,12 @@ impl<'a> FreshSlotWords<'a> {
     /// Writes `value`, keeping the freshness words. Returns the new value
     /// version.
     ///
+    /// The value version advances by 2, checked, so public versions stay
+    /// the even, nonzero sequence of layout 1 (2, 4, 6, ...): readers keep
+    /// 0 as "never written" and compare delivered versions and journal
+    /// records as before. The seqlock has its own word, so the value
+    /// version is never odd as a lock state.
+    ///
     /// # Errors
     ///
     /// [`ConflationError::ValueTooLarge`] and
@@ -1141,11 +1147,15 @@ mod owned {
                 address: 0,
                 len: record.structure_length,
             };
-            if record.kind != crate::ipc::RegionKind::ConflationTable
-                || record.layout != LAYOUT_VERSION
-                || record.generation != 0
-            {
+            if record.kind != crate::ipc::RegionKind::ConflationTable || record.generation != 0 {
                 return Err(invalid);
+            }
+            // A version-1 table has no freshness words: refused, typed.
+            if record.layout != LAYOUT_VERSION {
+                return Err(crate::error::SysError::LayoutVersion {
+                    found: record.layout,
+                    expected: LAYOUT_VERSION,
+                });
             }
             let structure = region.structure();
             let mut line = [0u64; STRIDE_WORDS];

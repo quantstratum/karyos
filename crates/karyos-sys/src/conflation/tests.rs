@@ -645,14 +645,13 @@ mod region {
     }
 
     /// The attach checks the record: the kind, the layout version and the
-    /// generation, each alone.
+    /// generation, each alone; another layout version is a typed refusal.
     #[test]
     fn attachment_checks_the_record() {
         let (region, record) = foreign(|_| {});
         assert!(view_of(&region, record, SealProfile::DriverOnly, CONFIG).is_ok());
-        let changes: [fn(&mut RegionRecord); 3] = [
+        let changes: [fn(&mut RegionRecord); 2] = [
             |record| record.kind = RegionKind::Counters,
-            |record| record.layout = LAYOUT_VERSION + 1,
             |record| record.generation = 1,
         ];
         for (case, change) in changes.into_iter().enumerate() {
@@ -663,6 +662,20 @@ mod region {
                     Err(SysError::InvalidRegion { .. })
                 ),
                 "record change {case} was accepted"
+            );
+        }
+        // Another layout version, the version-1 table without freshness
+        // words among them, is refused with a typed error.
+        for layout in [1, LAYOUT_VERSION + 1] {
+            let (region, record) = foreign(|record| record.layout = layout);
+            assert_eq!(record.layout, layout);
+            assert!(
+                matches!(
+                    view_of(&region, record, SealProfile::DriverOnly, CONFIG),
+                    Err(SysError::LayoutVersion { found, expected: LAYOUT_VERSION })
+                        if found == layout
+                ),
+                "layout {layout} was accepted"
             );
         }
         // A region of another kind, attached as a table: the header
@@ -845,4 +858,43 @@ fn a_fresh_slot_refuses_what_it_cannot_store() {
     // Mid-write: unstable.
     words[0].store(3, Ordering::Relaxed);
     assert_eq!(slot.read(&mut [0u8; 8]), FreshRead::Unstable);
+}
+
+/// GU-8: a freshness-only write leaves the public version unchanged. A
+/// reader that meets it in progress retries the key and then delivers the
+/// same version once; the freshness write alone is not a new version.
+#[test]
+fn a_freshness_write_is_not_a_new_version_and_is_retried() {
+    use crate::freshness::{STALE, SlotFreshness};
+    let mut writer = conflation(4, 8, 1024).unwrap();
+    let mut reader = writer.reader();
+    let _ = drain(&mut reader, BUDGET);
+    assert_eq!(writer.write(1, b"a").unwrap(), 2);
+    // A freshness write in progress: the sequence is odd.
+    let seq = writer.slot_seq_word(1).unwrap();
+    let even = seq.load(Ordering::Relaxed);
+    seq.store(even + 1, Ordering::Relaxed);
+    let mut seen = Vec::new();
+    let report = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    assert_eq!((report.delivered, report.unstable), (0, 1));
+    // The write completes; the value version stays 2.
+    seq.store(even, Ordering::Relaxed);
+    writer
+        .table_slot(1)
+        .unwrap()
+        .set_freshness(SlotFreshness {
+            loss_applied: 1 | STALE,
+            stale_since: 0,
+        })
+        .unwrap();
+    assert_eq!(seq.load(Ordering::Relaxed), even + 2);
+    assert_eq!(
+        writer.slot_version_word(1).unwrap().load(Ordering::Relaxed),
+        2
+    );
+    let _ = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    assert_eq!(seen, [(1, 2)], "retried, delivered once");
+    let report = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    assert_eq!(report.delivered, 0);
+    assert_eq!(seen, [(1, 2)]);
 }
