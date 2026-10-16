@@ -1052,7 +1052,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             None => self
                 .guards
                 .close(handle, operation, requester, now)
-                .map(|_| ()),
+                .and_then(|_| self.seal_guarded(handle)),
             Some(expected) => self
                 .guards
                 .reopen(handle, expected, operation, requester, now)
@@ -4425,6 +4425,32 @@ mod tests {
                 == crate::diagnostics::ErrorCode::GuardWordCorrupt as u32
                 && record.key == [guard.id(), word]),
             "{records:?}"
+        );
+    }
+
+    /// A client's `GuardClose` seals the streams the guard binds, as the
+    /// embedded API does.
+    #[test]
+    fn a_client_guard_close_seals_the_guarded_stream() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let (_client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::GuardClose {
+                sequence: 1,
+                guard: guard.id(),
+                operation: 9,
+            },
+        );
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(
+            driver.seal_reason(stream).unwrap(),
+            Some(karyos_sys::log_buffer::SealReason::GuardClosed)
         );
     }
 }

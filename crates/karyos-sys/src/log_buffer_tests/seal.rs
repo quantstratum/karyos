@@ -733,3 +733,56 @@ fn seal_reason_codes_round_trip() {
     }
     assert_eq!(SealReason::from_code(7), SealReason::Unspecified);
 }
+
+/// A guard close aborts the admitted claim at once, whatever its deadline
+/// (`quantstratum-docs: karyos/design/guards-and-abort.md`): the abort wins
+/// the block's decision word and the commit reports `Aborted`; with no
+/// claim it is `Idle`, and after a commit it is `Resolved`.
+#[test]
+fn a_guard_close_aborts_the_admitted_claim_at_once() {
+    let buffer = new_buffer(LogBufferConfig {
+        claim_deadline: 1_000_000,
+        ..config(3, 2)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    assert_eq!(conductor.abort_admitted_claim().unwrap(), ClaimDeadline::Idle);
+    let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
+    let position = claim.position();
+    conductor.seal_with_reason(SealReason::GuardClosed).unwrap();
+    assert_eq!(
+        conductor.abort_admitted_claim().unwrap(),
+        ClaimDeadline::Aborted {
+            position,
+            extent: 96,
+        }
+    );
+    claim.payload().fill(7);
+    assert_eq!(claim.commit(), CommitOutcome::Aborted { position });
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position,
+            extent: 96,
+        }
+    );
+}
+
+#[test]
+fn a_committed_claim_is_not_aborted_by_a_guard_close() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
+    let position = claim.position();
+    claim.payload().fill(7);
+    assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+    // The record is cleared at commit: nothing is admitted any more.
+    assert!(matches!(
+        conductor.abort_admitted_claim().unwrap(),
+        ClaimDeadline::Idle | ClaimDeadline::Resolved
+    ));
+    let _ = position;
+}

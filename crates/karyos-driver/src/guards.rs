@@ -186,6 +186,11 @@ impl Guards {
         self.entry(handle.guard).ok_or(DriverError::UnknownGuard)
     }
 
+    /// The shared view of a guard's word, for in-process handles.
+    pub(crate) fn view(&self, handle: GuardHandle) -> Result<Arc<HeapWords>, DriverError> {
+        Ok(Arc::clone(&self.check(handle)?.word))
+    }
+
     /// The guard's state.
     pub(crate) fn state(&self, handle: GuardHandle) -> Result<GuardState, DriverError> {
         let entry = self.check(handle)?;

@@ -42,6 +42,10 @@ pub enum ErrorCode {
     /// karyos/design/guards-and-abort.md`, G2): the guard is treated as
     /// closed; the key is the guard id and the word.
     GuardWordCorrupt = 9,
+    /// A guard walker was lapped, a broken invariant (it holds the
+    /// retention floor): the outcome streams of the stream's handles were
+    /// abandoned with an unknown lost count. The key is the stream id.
+    GuardWalkerLapped = 10,
 }
 
 /// The agent that reported an error.

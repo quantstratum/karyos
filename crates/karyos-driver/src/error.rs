@@ -59,6 +59,23 @@ pub enum DriverError {
     /// Guard ids are exhausted; they are never reused.
     #[error("guard ids exhausted")]
     GuardIdsExhausted,
+    /// The stream's guard is not open: a guarded publication is bound to
+    /// an open epoch when it is issued.
+    #[error("guard {guard} is not open")]
+    GuardNotOpen {
+        /// The guard id.
+        guard: u64,
+    },
+    /// The stream was sealed by a guard close: that incarnation is final,
+    /// and a reopened guard's fresh incarnation is a later batch (G-d2).
+    #[error("stream {stream} was sealed by a guard close")]
+    GuardSealed {
+        /// The stream id.
+        stream: u64,
+    },
+    /// A guarded publication's outcome ring could not be sized or written.
+    #[error(transparent)]
+    Outcomes(karyos_sys::outcome_ring::OutcomeError),
     /// A guard transition was refused (`karyos_sys::guard`).
     #[error(transparent)]
     Guard(#[from] karyos_sys::guard::GuardError),

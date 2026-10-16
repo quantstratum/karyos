@@ -437,7 +437,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         reconfiguration: Reconfiguration,
     ) -> Result<PreparedCutover<T>, DriverError> {
         let max_retained = self.config.max_retained_generations;
-        let id = self.active_stream_mut(stream)?.id;
+        let target = self.active_stream_mut(stream)?;
+        // A guarded stream's walker and rings follow one mapping; cutovers
+        // of guarded streams wait for G-d2.
+        if target.guarded.is_some() {
+            return Err(DriverError::InvalidConfig);
+        }
+        let id = target.id;
         #[cfg(test)]
         if self.fail_at == Some(id) {
             return Err(DriverError::Sys(SysError::ResourcesUnavailable));
