@@ -36,6 +36,12 @@ use crate::guards::GuardHandle;
 
 /// `AbortReason::GUARD_CLOSED` (guards-and-abort.md, G4).
 pub(crate) const REASON_GUARD_CLOSED: u64 = 1;
+/// `AbortReason::DEADLINE_MISSED` (G4).
+pub(crate) const REASON_DEADLINE_MISSED: u64 = 2;
+/// `AbortReason::PUBLICATION_FAULT` (G4).
+pub(crate) const REASON_PUBLICATION_FAULT: u64 = 4;
+/// `AbortReason::DRIVER_SHUTDOWN` (G4).
+pub(crate) const REASON_DRIVER_SHUTDOWN: u64 = 5;
 /// `AbortReason::WRITER_ABORTED` (G4): outcome records only.
 pub(crate) const REASON_WRITER_ABORTED: u64 = 6;
 
@@ -98,6 +104,17 @@ impl<T: TermBytes> GuardedStream<T> {
             ended: false,
             guard_aborted: Vec::new(),
         }
+    }
+
+    /// Whether the walker reached the seal and wrote `Ended`, or was
+    /// lapped and abandoned its rings.
+    pub(crate) fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// Ends the walk: nothing more is recorded (a lapped walker).
+    pub(crate) fn finish(&mut self) {
+        self.ended = true;
     }
 
     /// Records a block the guard close aborted (`ClaimDeadline::Aborted`).
@@ -242,9 +259,9 @@ impl<T: TermBytes> GuardedStream<T> {
 pub(crate) const fn end_reason(seal: SealReason) -> u64 {
     match seal {
         SealReason::GuardClosed => REASON_GUARD_CLOSED,
-        SealReason::DeadlineMissed => 2,
-        SealReason::StreamRemoved => 5,
-        _ => 4,
+        SealReason::DeadlineMissed => REASON_DEADLINE_MISSED,
+        SealReason::StreamRemoved => REASON_DRIVER_SHUTDOWN,
+        _ => REASON_PUBLICATION_FAULT,
     }
 }
 

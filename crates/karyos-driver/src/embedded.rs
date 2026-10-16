@@ -443,6 +443,28 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// The guard binding and walker of a guarded stream
     /// (`quantstratum-docs: karyos/design/guards-and-abort.md`).
     pub(crate) guarded: Option<crate::guard_streams::GuardedStream<T>>,
+    /// The current incarnation of the stream's publication: from
+    /// [`FIRST_INCARNATION`], the next one after each guard close and
+    /// reopen (`quantstratum-docs: karyos/design/guards-and-abort.md`,
+    /// The fresh incarnation), never reused within the registration.
+    pub(crate) incarnation: u64,
+    /// Incarnations a guard close sealed and a fresh incarnation replaced,
+    /// retiring: served until their walker ended and their readers passed
+    /// the seal.
+    pub(crate) replaced: Vec<Replaced<T>>,
+}
+
+/// A sealed incarnation a fresh one replaced, retiring like a removed
+/// stream (`quantstratum-docs: karyos/design/guards-and-abort.md`, The
+/// fresh incarnation).
+#[derive(Debug)]
+pub(crate) struct Replaced<T: StreamTerms> {
+    pub(crate) incarnation: u64,
+    pub(crate) base: u64,
+    pub(crate) conductor: Conductor<Arc<LogBuffer<T>>>,
+    /// The old walker and the old handles' rings: its last pass, up to
+    /// the seal, writes there.
+    pub(crate) guarded: crate::guard_streams::GuardedStream<T>,
 }
 
 /// The conflation feeder's event counters of one stream
@@ -1234,8 +1256,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// [`Self::seal_guarded`] after a close that took effect: a failure is
-    /// recorded in the error log (`GuardSealFailed`, keyed by the guard)
-    /// and retried by the walker's duty, never reported as a failed close.
+    /// recorded in the error log (`GuardSealFailed`, keyed by the guard),
+    /// never reported as a failed close. The walker's duty repeats only
+    /// the claim abort, and only on a stream whose seal reason is
+    /// `GuardClosed`; a seal that failed to set is not retried.
     pub(crate) fn seal_guarded_reporting(&mut self, guard: GuardHandle) {
         if let Err(error) = self.seal_guarded(guard) {
             self.diagnostics.error(
@@ -1597,6 +1621,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             conflation_terminal: None,
             feeder_counters,
             guarded: None,
+            incarnation: FIRST_INCARNATION,
+            replaced: Vec::new(),
         })
     }
 
@@ -1609,10 +1635,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::InvalidPublicationMode`] for a concurrent stream,
     /// [`DriverError::StreamRetiring`] for a removed stream, and
     /// [`DriverError::UnknownStream`] for a foreign handle or a freed stream.
+    /// On a guarded stream also [`DriverError::GuardNotOpen`],
+    /// [`DriverError::GuardSealed`], [`DriverError::IncarnationsExhausted`]
+    /// and [`DriverError::PositionsExhausted`] (see
+    /// `reincarnate_if_reopened`), with nothing created or taken.
     pub fn publication(
         &mut self,
         stream: StreamHandle,
     ) -> Result<ClientPublication<T>, DriverError> {
+        // A foreign, freed or removed stream is refused before anything
+        // else, so nothing is created for it.
+        let _ = self.active_stream(stream)?;
+        // After a guard close and reopen, the fresh incarnation first.
+        self.reincarnate_if_reopened(stream)?;
         // A guarded handle's binding is prepared first, so a refusal takes
         // nothing.
         let binding = match self.prepare_guard_binding(stream) {
@@ -1654,6 +1689,104 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(publication)
     }
 
+    /// Creates the fresh incarnation of a guarded stream a guard close
+    /// sealed, once its guard is open again (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, The fresh incarnation): a new
+    /// log buffer from the stream's configuration starting at the sealed
+    /// one's seal position, the next incarnation number, and a new walker.
+    /// The sealed incarnation retires with its walker and the old handles'
+    /// rings. Every check comes first; nothing changes on refusal. A stream
+    /// that is not guarded, not sealed by a guard close, or whose guard is
+    /// still closed is left as it is.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::GuardSealed`] while the sealed incarnation's
+    /// publication has not released (no seal position yet), for a
+    /// conflated stream, and while a remote client holds a registration or
+    /// export of the stream (remote incarnations are G-d2b);
+    /// [`DriverError::IncarnationsExhausted`]; [`DriverError::PositionsExhausted`];
+    /// and the buffer's allocation errors.
+    fn reincarnate_if_reopened(&mut self, handle: StreamHandle) -> Result<(), DriverError> {
+        let found = self.stream_ref(handle)?;
+        let Some(guarded) = &found.guarded else {
+            return Ok(());
+        };
+        // A removed stream is refused by `publication()` itself; nothing is
+        // created for it.
+        if found.retiring
+            || found.conductor.seal_reason() != Some(SealReason::GuardClosed)
+            || !self.guards.state(guarded.guard)?.open
+        {
+            return Ok(());
+        }
+        let sealed = DriverError::GuardSealed { stream: found.id };
+        let position = match found.conductor.seal_state() {
+            SealState::Positioned { position } | SealState::Retired { position } => position,
+            SealState::Active | SealState::Sealed => return Err(sealed),
+        };
+        // A registration, a remote grant (export ledger) or a held bound
+        // of a lost participant names the stream: remote incarnations are
+        // G-d2b.
+        let remote = self
+            .registrations
+            .iter()
+            .any(|registration| registration.stream() == found.id)
+            || self.clients.iter().any(|client| {
+                client
+                    .ledger
+                    .as_ref()
+                    .is_some_and(|ledger| ledger.names_stream(found.id))
+            })
+            || self.holding.iter().any(|entry| entry.stream() == found.id);
+        if found.conflation.is_some()
+            || found.cutover.is_some()
+            || !found.retained.is_empty()
+            || remote
+        {
+            return Err(sealed);
+        }
+        let incarnation = found
+            .incarnation
+            .checked_add(1)
+            .ok_or(DriverError::IncarnationsExhausted { stream: found.id })?;
+        let base = found
+            .base
+            .checked_add(position)
+            .ok_or(DriverError::PositionsExhausted)?;
+        let (config, generation, guard, messages) = (
+            found.config,
+            found.generation,
+            guarded.guard,
+            guarded.messages,
+        );
+        let buffer = Arc::new(<T as sealed::Create>::create(self, config, generation)?);
+        let mut conductor = buffer
+            .conductor_owned()
+            .ok_or(karyos_sys::error::SysError::ResourcesUnavailable)?;
+        let walker = conductor.subscribe(Role::Walker)?;
+        let scratch =
+            usize::try_from(buffer.max_message_length()).map_err(|_| DriverError::InvalidConfig)?;
+        // Every check passed: the swap cannot fail.
+        let found = self.stream(handle)?;
+        let fresh = crate::guard_streams::GuardedStream::new(guard, messages, walker, scratch);
+        if let Some(old) = found.guarded.replace(fresh) {
+            found.replaced.push(Replaced {
+                incarnation: found.incarnation,
+                base: found.base,
+                conductor: std::mem::replace(&mut found.conductor, conductor),
+                guarded: old,
+            });
+        }
+        found.buffer = buffer;
+        found.incarnation = incarnation;
+        found.base = base;
+        found.members.clear();
+        found.spare = None;
+        found.claim_waiting = false;
+        Ok(())
+    }
+
     /// The guard binding of a handle about to be issued on a guarded
     /// stream: refused on a stream a guard close sealed (its incarnation is
     /// final, G-d2 brings the fresh one) and while the guard is not open.
@@ -1666,14 +1799,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(guarded) = &found.guarded else {
             return Ok(None);
         };
-        if found.conductor.seal_reason() == Some(SealReason::GuardClosed) {
-            return Err(DriverError::GuardSealed { stream: found.id });
-        }
+        // A closed guard first: nothing is issued or created while it is.
         let state = self.guards.state(guarded.guard)?;
         if !state.open {
             return Err(DriverError::GuardNotOpen {
                 guard: guarded.guard.id(),
             });
+        }
+        // Open, yet still the sealed incarnation: it could not be replaced.
+        if found.conductor.seal_reason() == Some(SealReason::GuardClosed) {
+            return Err(DriverError::GuardSealed { stream: found.id });
         }
         let (ring, writer) =
             crate::guard_streams::new_ring(guarded.messages).map_err(DriverError::Outcomes)?;
@@ -1901,6 +2036,47 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut first_error = None;
         let mut lapped = Vec::new();
         for stream in &mut self.streams {
+            let lane = stream.config.lane.get();
+            // Replaced incarnations first: their last pass, then their
+            // retirement once the walker ended and the readers passed the
+            // seal.
+            for replaced in &mut stream.replaced {
+                duty(
+                    &self.counters,
+                    &mut work,
+                    &mut first_error,
+                    &mut replaced.conductor,
+                );
+                match replaced
+                    .guarded
+                    .walk(budget, replaced.base, lane, replaced.incarnation)
+                {
+                    Ok(walked) => {
+                        self.counters
+                            .add(Event::GuardOutcomesWritten, u64::from(walked.written));
+                        self.counters
+                            .add(Event::GuardOutcomesLost, u64::from(walked.lost));
+                        if walked.budget_exhausted {
+                            self.counters.add(Event::GuardWalkerBudgetExhausted, 1);
+                        }
+                        // A lapped walker abandoned its rings: nothing more
+                        // will be recorded, so the entry is done.
+                        if walked.overrun {
+                            lapped.push(stream.id);
+                            replaced.guarded.finish();
+                        }
+                        add_work(&self.counters, &mut work, &mut first_error, walked.written);
+                        add_work(&self.counters, &mut work, &mut first_error, walked.lost);
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            stream.replaced.retain(|replaced| {
+                !(replaced.guarded.ended()
+                    && matches!(replaced.conductor.seal_state(), SealState::Retired { .. }))
+            });
             // Until the publication releases at the guard's seal, a claim
             // admitted after the close's abort ran (its record written,
             // its head not yet) is aborted here, every duty cycle.
@@ -1911,11 +2087,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             {
                 first_error.get_or_insert(error);
             }
-            let (base, lane, id) = (stream.base, stream.config.lane.get(), stream.id);
+            let (base, id, incarnation) = (stream.base, stream.id, stream.incarnation);
             let Some(guarded) = &mut stream.guarded else {
                 continue;
             };
-            match guarded.walk(budget, base, lane, FIRST_INCARNATION) {
+            match guarded.walk(budget, base, lane, incarnation) {
                 Ok(walked) => {
                     self.counters
                         .add(Event::GuardOutcomesWritten, u64::from(walked.written));
@@ -2186,7 +2362,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             registration: found.aggregate.registration,
             stream_id: found.stream_id,
             session_id: found.session_id,
-            incarnation: FIRST_INCARNATION,
+            incarnation: found.incarnation,
         })
     }
 
