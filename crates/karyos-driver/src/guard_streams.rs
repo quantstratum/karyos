@@ -64,7 +64,10 @@ pub(crate) struct GuardedStream<T: TermBytes> {
     /// `C_m`.
     pub(crate) messages: u64,
     /// The publication's rate limit, validated: every handle's early
-    /// check, and the sender gate's authoritative bucket.
+    /// check, and the sender gate's authoritative bucket. Until the network
+    /// agents wire the gate (phase 7 of `quantstratum-docs:
+    /// karyos/design/driver-network-agents.md`), the handles' copies are
+    /// the only limiter in practice.
     pub(crate) rate: Option<karyos_sys::rate_limit::RatePolicy>,
     walker: Subscription<Arc<LogBuffer<T>>>,
     scratch: Vec<u8>,

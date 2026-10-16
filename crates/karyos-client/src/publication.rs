@@ -545,10 +545,17 @@ impl<T: TermBytes> ClientPublication<T> {
             config.validate_publication(options.reserved_value, payload.len())?;
         }
         // The rate copy is asked last, so it refuses only a message that
-        // would otherwise be appended.
+        // would otherwise be appended; a sealed handle reports its seal
+        // and releases first (GC-8), as an append would.
         if let Some(binding) = &mut self.guard
             && !binding.rate_admits()
         {
+            if let Some(reason) = self.inner.close_if_sealed() {
+                if reason.is_gate() {
+                    return Ok(OfferOutcome::Gated);
+                }
+                return Ok(self.after_end().offer());
+            }
             return Ok(OfferOutcome::RateLimited);
         }
         Ok(match self.inner.append(payload, options)? {
@@ -658,6 +665,12 @@ impl<T: TermBytes> ClientPublication<T> {
         if let Some(binding) = &mut self.guard
             && !binding.rate_admits()
         {
+            if let Some(reason) = self.inner.close_if_sealed() {
+                if reason.is_gate() {
+                    return Ok(ClaimOutcome::Gated);
+                }
+                return Ok(self.after_end().claim());
+            }
             return Ok(ClaimOutcome::RateLimited);
         }
         let lane = self.inner.buffer().lane();
@@ -1416,6 +1429,106 @@ mod tests {
                 publication.try_claim(8).unwrap(),
                 ClaimOutcome::RateLimited
             ));
+        }
+
+        /// Review of #223: a sealed handle reports its seal over a spent
+        /// rate copy, and releases; a non-gate seal is `Closed`.
+        #[test]
+        fn a_seal_comes_before_a_spent_rate_copy() {
+            use karyos_sys::log_buffer::SealReason;
+            for (reason, gated) in [
+                (SealReason::GuardClosed, true),
+                (SealReason::DeadlineMissed, true),
+                (SealReason::StreamRemoved, false),
+            ] {
+                let (mut driver, mut publication) = guarded_with(Some(messages_per_second(10, 1)));
+                assert!(accepted(publication.offer(b"a").unwrap()));
+                // The guard word stays open: only the seal tells.
+                driver.conductor.seal_with_reason(reason).unwrap();
+                let _ = driver.conductor.duty_cycle().unwrap();
+                let offered = publication.offer(b"b").unwrap();
+                if gated {
+                    assert_eq!(offered, OfferOutcome::Gated, "{reason:?}");
+                    assert!(
+                        matches!(publication.try_claim(8), Ok(ClaimOutcome::Gated)),
+                        "{reason:?}"
+                    );
+                } else {
+                    assert_eq!(offered, OfferOutcome::Closed, "{reason:?}");
+                    assert!(
+                        matches!(publication.try_claim(8), Ok(ClaimOutcome::Closed)),
+                        "{reason:?}"
+                    );
+                }
+                // Released: the buffer retires.
+                let _ = driver.conductor.duty_cycle().unwrap();
+                assert!(
+                    matches!(
+                        driver.conductor.seal_state(),
+                        karyos_sys::log_buffer::SealState::Retired { .. }
+                    ),
+                    "{reason:?}: {:?}",
+                    driver.conductor.seal_state()
+                );
+            }
+        }
+
+        /// A closed guard is `Gated` before the rate copy is asked.
+        #[test]
+        fn a_closed_guard_comes_before_a_spent_rate_copy() {
+            let (driver, mut publication) = guarded_with(Some(messages_per_second(10, 1)));
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert_eq!(
+                guard::close(&driver.guard.words()[1]),
+                Ok(guard::Closed::Now { epoch: 3 })
+            );
+            assert_eq!(publication.offer(b"b").unwrap(), OfferOutcome::Gated);
+            assert!(matches!(publication.try_claim(8), Ok(ClaimOutcome::Gated)));
+        }
+
+        /// A refund gives back exactly the claim's token, below a burst of
+        /// more than one.
+        #[test]
+        fn a_refund_gives_back_one_token_exactly() {
+            let (_driver, mut publication) = guarded_with(Some(messages_per_second(10, 3)));
+            let tokens =
+                |publication: &ClientPublication| publication.guard().unwrap().rate_tokens();
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert_eq!(tokens(&publication), Some(2));
+            let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
+                panic!("not claimed");
+            };
+            drop(claim);
+            assert_eq!(tokens(&publication), Some(2), "one token back, not two");
+        }
+
+        /// An append the log refuses after the rate copy admitted it
+        /// (rotation or back pressure) charges nothing.
+        #[test]
+        fn an_append_the_log_refuses_charges_nothing() {
+            let (mut driver, mut publication) = guarded_with(Some(messages_per_second(1, 1000)));
+            let tokens =
+                |publication: &ClientPublication| publication.guard().unwrap().rate_tokens();
+            let payload = vec![7u8; 4000];
+            let mut refused = false;
+            for _ in 0..200 {
+                let before = tokens(&publication);
+                match publication.offer(&payload).unwrap() {
+                    OfferOutcome::Accepted { .. } => {
+                        assert_eq!(tokens(&publication), before.map(|t| t - 1));
+                        driver.outcome(Kind::Submitted);
+                        let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+                    }
+                    outcome @ (OfferOutcome::AdminAction | OfferOutcome::BackPressured) => {
+                        assert_eq!(publication.guard().unwrap().outstanding(), 0);
+                        assert_eq!(tokens(&publication), before, "{outcome:?} charged");
+                        refused = true;
+                        break;
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert!(refused, "the log never refused");
         }
 
         #[test]

@@ -54,7 +54,11 @@ release may break APIs, wire formats and shared-memory layouts.
   `ClaimOutcome::RateLimited` while it holds no token, appending nothing
   (retry later; nothing is dropped). A claim that is never sent gives its
   token back. The copy rejects early what the sender gate would hold at that
-  instant; the gate's bucket stays authoritative.
+  instant; the gate's bucket is authoritative, but until the network agents
+  wire it the copy is the only limiter in practice. The copy can be stricter
+  than the gate: a message accepted and later aborted keeps its charge, and so
+  does a claim leaked with `mem::forget`. A sealed handle reports its seal
+  before the copy is asked.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

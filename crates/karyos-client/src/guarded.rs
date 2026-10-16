@@ -170,7 +170,13 @@ impl GuardBinding {
     /// is not a claim that the gate would never have admitted it later.
     /// `RateLimited` means retry later: nothing is appended or dropped.
     /// Only the message bucket is copied, since the gate charges bytes per
-    /// frame, which a whole message cannot be checked against early.
+    /// datagram, which a whole message cannot be checked against early.
+    ///
+    /// The copy can be stricter than the gate: a message accepted and later
+    /// aborted (by its deadline, or returned or dropped by a reopen at the
+    /// gate) keeps the copy's charge, and so does a claim leaked with
+    /// `mem::forget`, which no drop reaches. A sealed handle reports its
+    /// seal before the copy is asked.
     #[must_use]
     pub fn with_rate(mut self, policy: RatePolicy, clock: fn() -> u64) -> Self {
         let messages = RatePolicy {
