@@ -16,6 +16,21 @@ fn fr_loan_released(reader: &FrameReader<&LogBuffer<Terms>>) -> bool {
         == 0
 }
 
+/// Nothing is committed between a peek and the next serve here, so the
+/// peek predicts the step and its charge exactly (aggregate-subscriber.md,
+/// AS-1).
+fn fr_peek_predicts(peeked: Peek, step: FrameStep) {
+    let expected = match step {
+        FrameStep::Copied { charge }
+        | FrameStep::Complete { charge, .. }
+        | FrameStep::Stepped { charge, .. } => Peek::Step { charge },
+        FrameStep::Ready => Peek::Ready,
+        FrameStep::Pending => Peek::Pending,
+        FrameStep::Ended(_) => Peek::Ended,
+    };
+    assert_eq!(peeked, expected, "peek before {step:?}");
+}
+
 /// A message the reader delivered, with the charges of its fragments.
 #[derive(Debug, PartialEq, Eq)]
 struct FrDelivered {
@@ -44,8 +59,11 @@ fn fr_serve(
     out: &mut Vec<FrDelivered>,
 ) {
     for _ in 0..calls {
+        let peeked = reader.peek().unwrap();
+        assert!(fr_loan_released(reader));
         let step = reader.serve_frame().unwrap();
         assert!(fr_loan_released(reader));
+        fr_peek_predicts(peeked, step);
         match step {
             FrameStep::Copied { charge } => *charged += u64::from(charge),
             FrameStep::Complete { charge, info } => {

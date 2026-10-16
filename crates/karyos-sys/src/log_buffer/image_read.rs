@@ -54,7 +54,9 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         };
         let flags = first.word0.flags();
         match first.kind {
-            Kind::LocalGap => return self.local_gap(slot, start, first.reserved),
+            Kind::LocalGap => {
+                return self.local_gap(slot, self.cursor.position, start, first.reserved);
+            }
             Kind::Frame(FrameType::Pad) => {
                 if first.reserved != term_length - start {
                     return Err(corrupt(start, "pad extent"));
@@ -208,11 +210,12 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     pub(super) fn local_gap(
         &self,
         slot: u8,
+        position: u64,
         start: u32,
         extent: u32,
     ) -> Result<Validated, SysError> {
         let buffer = self.buffer;
-        let (count, offset) = buffer.split(self.cursor.position)?;
+        let (count, offset) = buffer.split(position)?;
         if offset != start {
             return Err(corrupt(start, "local gap position"));
         }

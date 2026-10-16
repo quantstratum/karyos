@@ -16,6 +16,7 @@
 static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
     karyos_sys::alloc_count::CountingAllocator;
 
+pub mod aggregate;
 pub mod concurrent;
 pub mod conductor;
 pub mod conflated_subscription;

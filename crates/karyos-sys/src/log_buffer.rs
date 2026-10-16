@@ -76,7 +76,7 @@ mod image_read;
 mod receive_owner;
 
 pub use frame_reader::{
-    FrameEnd, FrameReader, FrameStep, MessageInfo, SKIP_WALK_FRAMES, STEP_CHARGE, Stepped,
+    FrameEnd, FrameReader, FrameStep, MessageInfo, Peek, SKIP_WALK_FRAMES, STEP_CHARGE, Stepped,
 };
 pub use receive_owner::{ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received};
 pub(crate) mod storage;
