@@ -8,8 +8,10 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
+use std::time::{Duration, Instant};
 
 use super::*;
+use crate::sockets::endpoint::MAX_BUFFER_REQUEST;
 
 fn ipv4_any_port() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
@@ -30,16 +32,25 @@ fn open_ipv4() -> (LinuxSocket, SocketAddr) {
     (socket, probes.local)
 }
 
-/// Receives one datagram, retrying `EAGAIN` for a bounded time: loopback
-/// delivery is synchronous, so the first call normally succeeds.
+/// How long [`recv_one`] waits for loopback traffic that should already be
+/// there: a time limit rather than a number of tries, so a loaded host
+/// (parallel tests, an emulated container) does not fail the test.
+const PATIENCE: Duration = Duration::from_secs(10);
+
+/// Receives one datagram, retrying `EAGAIN` until [`PATIENCE`] runs out:
+/// loopback delivery is synchronous, so the first call normally succeeds.
+/// Neither the clock nor the yield allocates, so the no allocation test
+/// uses it too.
 fn recv_one(socket: &mut LinuxSocket, buffer: &mut [u8]) -> RecvResult {
-    for _ in 0..1000 {
+    let start = Instant::now();
+    loop {
         match socket.recv(buffer) {
-            RecvResult::Error(Errno::AGAIN) => std::thread::yield_now(),
+            RecvResult::Error(Errno::AGAIN) if start.elapsed() < PATIENCE => {
+                std::thread::yield_now();
+            }
             result => return result,
         }
     }
-    RecvResult::Error(Errno::AGAIN)
 }
 
 /// Records a skipped case with its reason (section 9).
@@ -169,6 +180,45 @@ fn buffer_sizes_are_read_back() {
     );
 }
 
+/// S3 review P3: a request above `c_int::MAX` never reaches `rustix`,
+/// which would reject it with `EINVAL`; the largest valid request is set
+/// and read back like any other.
+#[test]
+fn a_buffer_request_beyond_a_c_int_is_a_configuration_error() {
+    let (socket, _) = open_ipv4();
+    let fd = socket.fd.as_ref().unwrap();
+    for (request, direction) in [(1_u32 << 31, Direction::Send), (u32::MAX, Direction::Recv)] {
+        assert_eq!(
+            buffer(fd, NonZeroU32::new(request), direction),
+            Err(OpenError::InvalidConfig {
+                field: direction.field(),
+                value: u64::from(request),
+            })
+        );
+    }
+    let largest = NonZeroU32::new(MAX_BUFFER_REQUEST).unwrap();
+    for direction in [Direction::Send, Direction::Recv] {
+        let size = buffer(fd, Some(largest), direction).unwrap();
+        let effective = size.effective.unwrap();
+        assert_eq!(size.requested, Some(largest));
+        if effective >= largest.get() {
+            assert_eq!(size.state, CapabilityState::Active);
+        } else {
+            assert_eq!(
+                size.state,
+                CapabilityState::Fallback(Reason::BelowRequest { effective })
+            );
+        }
+    }
+}
+
+/// `open` on an open socket closes the old descriptor before it binds
+/// again: reopening on the same address succeeds without a `close` call,
+/// which would fail with `EADDRINUSE` if the old descriptor were still
+/// open. The port stays held by this socket until `open` itself closes
+/// it, so a parallel test binding port 0 cannot take it in between (only
+/// the instant inside `open`, between its close and its bind, is open to
+/// that race).
 #[test]
 fn reopen_closes_the_old_descriptor_and_a_failed_open_keeps_none() {
     let (mut socket, local) = open_ipv4();
@@ -183,10 +233,26 @@ fn reopen_closes_the_old_descriptor_and_a_failed_open_keeps_none() {
         })
     );
     assert!(!second.is_open());
-    // Open closes the old descriptor first, so the port is free again.
+    // Reopen without `close`: the old descriptor is closed first.
+    let probes = socket.open(&config(local)).unwrap();
+    assert_eq!(probes.local, local);
+    assert!(socket.is_open());
+    // The reopened socket is the one bound to `local`.
+    let (mut peer, _) = open_ipv4();
+    assert_eq!(
+        peer.send(&RouteAddr::new(local), &[b"reopened"]),
+        SendResult::Sent {
+            sent: 1,
+            error: None
+        }
+    );
+    let mut buffer = [0_u8; 16];
+    assert!(matches!(
+        recv_one(&mut socket, &mut buffer),
+        RecvResult::Datagram { len: 8, .. }
+    ));
     socket.close();
     assert!(!socket.is_open());
-    second.open(&config(local)).unwrap();
 }
 
 #[test]
@@ -473,7 +539,7 @@ fn data_calls_do_not_allocate() {
             ));
             for _ in 0..4 {
                 assert!(matches!(
-                    receiver.recv(&mut buffer),
+                    recv_one(&mut receiver, &mut buffer),
                     RecvResult::Datagram { .. }
                 ));
             }

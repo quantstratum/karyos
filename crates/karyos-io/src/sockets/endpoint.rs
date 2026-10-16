@@ -36,9 +36,9 @@ pub use config::{
     BufferSize, CapabilitySet, CapabilitySnapshot, ClockInfo, CopyMode, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_DATAGRAM, DEFAULT_MAX_QUEUES, DEFAULT_MAX_ROUTES, DEFAULT_MEMORY_CAP,
     DEFAULT_MULTICAST_TTL, DEFAULT_RECV_BUFFER, DEFAULT_RX_BUDGET_DATAGRAMS, DEFAULT_SEND_BUFFER,
-    DEFAULT_TX_SLOTS, InterfaceSel, MAX_DATAGRAM, MAX_TABLE_ENTRIES, MAX_TX_SLOTS, MIN_DATAGRAM,
-    Membership, MulticastConfig, ObservationPoints, Platform, Protection, QueueAssignment,
-    SOCKETS_MAX_BATCH, SocketsConfig,
+    DEFAULT_TX_SLOTS, InterfaceSel, MAX_BUFFER_REQUEST, MAX_DATAGRAM, MAX_TABLE_ENTRIES,
+    MAX_TX_SLOTS, MIN_DATAGRAM, Membership, MulticastConfig, ObservationPoints, Platform,
+    Protection, QueueAssignment, SOCKETS_MAX_BATCH, SocketsConfig,
 };
 pub use tx::{RouteInfo, SocketsFrame};
 

@@ -212,7 +212,15 @@ fn buffer(
     let Some(request) = requested else {
         return Ok(BufferSize::NOT_REQUESTED);
     };
-    let Ok(size) = usize::try_from(request.get()) else {
+    // `SO_SNDBUF` and `SO_RCVBUF` take a C `int`, and `rustix` rejects a
+    // larger value with `EINVAL`. `SocketsConfig::validate` already refuses
+    // such a request (`MAX_BUFFER_REQUEST`); this guard keeps a caller that
+    // skipped it from reaching the kernel. The `usize` is the type `rustix`
+    // takes; a nonnegative `c_int` always fits it.
+    let (Ok(_), Ok(size)) = (
+        std::ffi::c_int::try_from(request.get()),
+        usize::try_from(request.get()),
+    ) else {
         return Err(OpenError::InvalidConfig {
             field: direction.field(),
             value: u64::from(request.get()),

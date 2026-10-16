@@ -6,12 +6,14 @@
 //! multicast. Unprivileged; the endpoint runs over [`LinuxSocket`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
 use crate::backend::{
-    Capability, CapabilityState, FlushStop, PendingCause, Reason, RxDropReason, RxStop,
-    TxItemOutcome,
+    Capability, CapabilityState, ClaimError, FlushStop, PendingCause, Reason, ReturnReason,
+    RxDropReason, RxStop, TxItemOutcome,
 };
 use crate::sockets::linux::LinuxSocket;
 
@@ -184,9 +186,17 @@ fn loopback_round_trip() {
 
 /// Section 12, split halves: each half on its own thread exchanges traffic
 /// over loopback, and dropping one half leaves the other working.
+///
+/// The sender keeps at most [`WINDOW`] datagrams ahead of what the receiver
+/// has taken, so the receive buffer (the OS default; no request) never
+/// overflows on a loaded host, where the receiving thread may not run for
+/// a while.
 #[test]
 fn split_halves_on_two_threads() {
     const COUNT: usize = 200;
+    /// Datagrams in flight at most: far below what any default receive
+    /// buffer holds.
+    const WINDOW: usize = 16;
     let mut a = Node::loopback();
     let b = Node::loopback();
     let to_b = a.queue_to(b.local);
@@ -197,9 +207,21 @@ fn split_halves_on_two_threads() {
         local: _,
     } = b;
 
+    let taken = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::clone(&taken);
     let receiver = std::thread::spawn(move || {
         let mut handler = Recorder::default();
-        receive(&mut b_rx, &mut handler, COUNT);
+        let budget = config().rx_budget().unwrap();
+        let start = Instant::now();
+        while handler.datagrams.len() < COUNT && start.elapsed() < PATIENCE {
+            let outcome = b_rx.poll_rx(budget, &mut handler);
+            progress.store(handler.datagrams.len(), Ordering::Release);
+            match outcome.stop {
+                RxStop::WouldBlock => std::thread::yield_now(),
+                RxStop::Budget => {}
+                other => panic!("unexpected stop {other:?}"),
+            }
+        }
         (b_rx, handler)
     });
     let Node {
@@ -208,7 +230,11 @@ fn split_halves_on_two_threads() {
         local: _,
     } = a;
     let sender = std::thread::spawn(move || {
+        let start = Instant::now();
         for index in 0..COUNT {
+            while index >= taken.load(Ordering::Acquire) + WINDOW && start.elapsed() < PATIENCE {
+                std::thread::yield_now();
+            }
             let mut frame = a_tx.claim_tx(to_b, 4).unwrap();
             frame
                 .bytes_mut()
@@ -285,6 +311,65 @@ fn split_halves_on_two_threads() {
     receive(&mut b_rx, &mut handler, 1);
     assert_eq!(handler.datagrams.len(), 1);
     drop(a_tx);
+}
+
+/// Section 12, reset, on a real socket (section 9, "Loopback, Linux"):
+/// pending items return with `Reset`; the finished reset closes the
+/// socket, which `reopen` proves by binding the same address again (an
+/// open descriptor would fail it with `EADDRINUSE`); `reopen` probes again
+/// and publishes the snapshot of the next epoch; old queue handles and
+/// tickets are inert; traffic flows in the new epoch. Only the few
+/// statements between the reset and the rebind leave the port free for a
+/// parallel test's `bind(0)`, a race of negligible likelihood.
+#[test]
+fn reset_on_loopback() {
+    let mut a = Node::loopback();
+    let mut b = Node::loopback();
+    let local = a.local;
+    let queue = a.queue_to(b.local);
+    let tickets: Vec<TxTicket> = (0_u64..3)
+        .map(|token| {
+            let mut frame = a.tx.claim_tx(queue, 4).unwrap();
+            frame.bytes_mut().copy_from_slice(b"held");
+            frame
+                .commit(Commit {
+                    len: 4,
+                    token: SenderToken::new(token),
+                    options: TxOptions::none(),
+                })
+                .unwrap()
+        })
+        .collect();
+    let first = *a.tx.capabilities();
+    let mut endpoint = SocketsEndpoint::join(a.tx, a.rx).unwrap();
+    let entries = reset_all(&mut endpoint);
+    assert_eq!(entries.len(), 3);
+    assert!(entries.iter().all(|entry| entry.outcome
+        == TxItemOutcome::Returned {
+            reason: ReturnReason::Reset
+        }));
+
+    let snapshot = *endpoint.reopen(&linux_config(local)).unwrap();
+    assert_eq!(snapshot.local, local, "the closed socket freed its port");
+    assert_eq!(snapshot.epoch.get().get(), 2);
+    assert_eq!(
+        (snapshot.dont_fragment, snapshot.tx_batch),
+        (first.dont_fragment, first.tx_batch),
+        "probed again with the same results"
+    );
+    let (mut tx, rx) = endpoint.split().unwrap();
+    assert!(tickets.iter().all(|ticket| !tx.is_pending(*ticket)));
+    assert_eq!(tx.claim_tx(queue, 4).err(), Some(ClaimError::UnknownQueue));
+    let mut a = Node { tx, rx, local };
+    let queue = a.queue_to(b.local);
+    let (outcome, entries) = a.send(queue, &[b"after reset"]);
+    assert_eq!(outcome.submitted, 1);
+    assert!(all_submitted(&entries));
+    let mut at_b = Recorder::default();
+    receive(&mut b.rx, &mut at_b, 1);
+    assert_eq!(at_b.datagrams, vec![(b"after reset".to_vec(), local)]);
+    a.shutdown();
+    b.shutdown();
 }
 
 /// The snapshot of a real socket: the probed rows, the `LibraryApi` rows of

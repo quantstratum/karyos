@@ -27,9 +27,9 @@ use crate::sockets::scripted::ScriptedSocket;
 /// Rows of section 12 that need a real socket, kernel or driver beyond
 /// Linux loopback, and the batch that covers them. Kept as data so the
 /// coverage claim is reviewed with the code. On Linux, `loopback` covers RX
-/// oversize, split halves, the round trip, the buffer read back, the
-/// unverified path MTU, the unanswered port and multicast loop within one
-/// namespace.
+/// oversize, split halves, the round trip, reset and reopen, the buffer
+/// read back, the unverified path MTU, the unanswered port and multicast
+/// loop within one namespace.
 const DEFERRED_ROWS: &[(&str, &str)] = &[
     (
         "RX oversize, split halves and loopback round trip on macOS",
@@ -46,6 +46,16 @@ const DEFERRED_ROWS: &[(&str, &str)] = &[
     (
         "Path MTU (1280 byte namespace link, MTU shrink)",
         "S4: network namespace",
+    ),
+    (
+        "Small SO_SNDBUF on loopback: a real EAGAIN under a burst (section 9 \
+         environment); the exact EAGAIN cases are the scripted \
+         tx::transient_errors",
+        "Linux namespace gate: not reproducible on loopback, which releases \
+         each datagram's send buffer charge at transmit (200,000 sends of \
+         1,400 bytes at the minimum SO_SNDBUF of 4,608 gave no EAGAIN in \
+         the rust:1.99 container); needs a rate limited egress, a veth \
+         with a tc qdisc, so CAP_NET_ADMIN; decision O-7",
     ),
     (
         "Repair authority: partly covered here by \
@@ -73,7 +83,7 @@ const DEFERRED_ROWS: &[(&str, &str)] = &[
 /// The deferred rows are named, each with its batch.
 #[test]
 fn deferred_rows_name_their_batch() {
-    assert_eq!(DEFERRED_ROWS.len(), 6);
+    assert_eq!(DEFERRED_ROWS.len(), 7);
     assert!(
         DEFERRED_ROWS
             .iter()
@@ -291,7 +301,7 @@ pub(super) fn retire_all<O: SocketOps>(endpoint: &mut SocketsEndpoint<O>) -> Vec
 }
 
 /// Resets `endpoint` to completion, emptying the report after each call.
-pub(super) fn reset_all(endpoint: &mut SocketsEndpoint<ScriptedSocket>) -> Vec<TxEntry> {
+pub(super) fn reset_all<O: SocketOps>(endpoint: &mut SocketsEndpoint<O>) -> Vec<TxEntry> {
     let mut report = TxReport::new();
     let mut entries = Vec::new();
     loop {
