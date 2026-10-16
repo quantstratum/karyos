@@ -29,7 +29,10 @@
 //! the value. Properties:
 //!
 //! - after observing a committed gap, the affected old value is never
-//!   Fresh;
+//!   Fresh: a gap makes every value below its end stale (GU-9), so the
+//!   value read lies before the first gap;
+//! - a value stale through a record is stale since the first gap's start,
+//!   never a later gap's;
 //! - a reader that sees a record retired sees the slot metadata that
 //!   replaced it, in every slot;
 //! - an accepted combination never pairs a slot with a barrier older than
@@ -40,7 +43,8 @@
 //! Negative controls, each removing one rule, must fail: the marker
 //! committed before the barrier, the record retired before the slots were
 //! reconciled, the record retired after the first slot only, the second
-//! loss overwriting the unretired first record, the final barrier
+//! loss overwriting the unretired first record (the reader then dates the
+//! loss from the later gap), the final barrier
 //! validation skipped, and the terminal cell published before its body.
 //!
 //! The retirement needs no ordering of its own here: with one writer, the
@@ -64,14 +68,15 @@ use loom::thread;
 
 /// Bit 63 of the reconciled sequence: the slot is stale.
 const STALE: u64 = 1 << 63;
-/// The first gap `[GAP_START, GAP_END)`: both values lie inside it.
+/// The first gap `[GAP_START, GAP_END)`: both values lie below its end.
 const GAP_START: u64 = 8;
 const GAP_END: u64 = 16;
-/// The second gap, which covers neither value.
+/// The second gap, above both values.
 const SECOND_START: u64 = 24;
 const SECOND_END: u64 = 32;
-/// The values' stream positions, one per slot.
-const POSITIONS: [u64; 2] = [10, 12];
+/// The values' stream positions, one per slot: the first inside the first
+/// gap, the second (the one read) before it.
+const POSITIONS: [u64; 2] = [10, 2];
 
 /// Which rule a control removes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -231,7 +236,10 @@ fn reader(table: &Table, fault: Fault) {
     } else if loss_seq > applied {
         if retired_through >= loss_seq || rec_seq != loss_seq {
             Freshness::Retry
-        } else if (rec_start..rec_end).contains(&position) {
+        } else if position < rec_end {
+            // Stale since the record's start: the earliest gap only if the
+            // records the slot needs were all retained.
+            assert_eq!(rec_start, GAP_START, "stale since a later gap");
             Freshness::Stale
         } else {
             Freshness::Fresh
@@ -314,8 +322,8 @@ fn control_a_record_retired_after_the_first_slot_hides_the_second() {
 }
 
 #[test]
-#[should_panic(expected = "fresh after a committed gap")]
-fn control_overwriting_an_unretired_record_shows_a_lost_value_fresh() {
+#[should_panic(expected = "stale since a later gap")]
+fn control_overwriting_an_unretired_record_loses_the_earlier_gap() {
     model(Fault::OverwriteUnretired);
 }
 
