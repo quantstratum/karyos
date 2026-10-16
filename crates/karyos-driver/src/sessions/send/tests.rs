@@ -8,6 +8,8 @@
     reason = "test helpers, as ADR-0007 allows in tests"
 )]
 
+use std::net::SocketAddr;
+
 use karyos_protocol::network::{ChallengeBlock, LaneStatus, Receiver};
 
 use super::*;
@@ -44,6 +46,10 @@ fn publication(session_id: i32) -> Publication {
     }
 }
 
+fn source(host: u8) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, host], 40_000))
+}
+
 fn joins(_: &Publication) -> Lanes<u64> {
     Lanes::new(&[64, 128]).unwrap()
 }
@@ -78,7 +84,7 @@ fn due(sessions: &mut SendSessions, now: u64) -> Vec<(EndpointId, SetupAnnounce)
 /// first SM for its identity (an SM for another identity does not count).
 #[test]
 fn announcements_repeat_until_the_first_sm() {
-    let mut sessions = SendSessions::new(4, INTERVAL).unwrap();
+    let mut sessions = SendSessions::new(4, INTERVAL, AnswerRate::default()).unwrap();
     sessions.add(publication(5)).unwrap();
     let first = due(&mut sessions, 0);
     assert_eq!(first.len(), 1);
@@ -109,7 +115,7 @@ fn announcements_repeat_until_the_first_sm() {
 /// and the current joins; another identity, alias or endpoint is dropped.
 #[test]
 fn a_challenge_is_answered_only_for_our_identity() {
-    let mut sessions = SendSessions::new(4, INTERVAL).unwrap();
+    let mut sessions = SendSessions::new(4, INTERVAL, AnswerRate::default()).unwrap();
     sessions.add(publication(5)).unwrap();
     let challenge = RspChallenge {
         alias: alias(5),
@@ -117,7 +123,7 @@ fn a_challenge_is_answered_only_for_our_identity() {
         challenge: block(),
     };
     let answer = sessions
-        .challenge(EndpointId(1), &challenge, joins)
+        .challenge(EndpointId(1), source(1), 0, &challenge, joins)
         .unwrap();
     assert_eq!(answer.challenge, block());
     assert_eq!(answer.identity, identity(1));
@@ -127,7 +133,7 @@ fn a_challenge_is_answered_only_for_our_identity() {
         ..challenge
     };
     assert_eq!(
-        sessions.challenge(EndpointId(1), &stale, joins),
+        sessions.challenge(EndpointId(1), source(1), 0, &stale, joins),
         Err(SendIgnored::WrongIdentity)
     );
     let other = RspChallenge {
@@ -135,11 +141,11 @@ fn a_challenge_is_answered_only_for_our_identity() {
         ..challenge
     };
     assert_eq!(
-        sessions.challenge(EndpointId(1), &other, joins),
+        sessions.challenge(EndpointId(1), source(1), 0, &other, joins),
         Err(SendIgnored::UnknownAlias)
     );
     assert_eq!(
-        sessions.challenge(EndpointId(2), &challenge, joins),
+        sessions.challenge(EndpointId(2), source(1), 0, &challenge, joins),
         Err(SendIgnored::UnknownAlias),
         "another channel"
     );
@@ -151,18 +157,22 @@ fn a_challenge_is_answered_only_for_our_identity() {
 /// (a late multicast receiver or a restarted unicast one).
 #[test]
 fn a_solicit_is_answered_by_alias() {
-    let mut sessions = SendSessions::new(4, INTERVAL).unwrap();
+    let mut sessions = SendSessions::new(4, INTERVAL, AnswerRate::default()).unwrap();
     sessions.add(publication(5)).unwrap();
     sessions.status(EndpointId(1), &sm(5, 1));
     let solicit = RspSolicit {
         alias: alias(5),
         challenge: block(),
     };
-    let answer = sessions.solicit(EndpointId(1), &solicit, joins).unwrap();
+    let answer = sessions
+        .solicit(EndpointId(1), source(1), 0, &solicit, joins)
+        .unwrap();
     assert_eq!(answer.identity, identity(1));
     assert_eq!(
         sessions.solicit(
             EndpointId(1),
+            source(1),
+            0,
             &RspSolicit {
                 alias: alias(6),
                 ..solicit
@@ -173,7 +183,8 @@ fn a_solicit_is_answered_by_alias() {
     );
     // Joins that do not cover the lanes are never sent.
     assert_eq!(
-        sessions.solicit(EndpointId(1), &solicit, |_| Lanes::new(&[0]).unwrap()),
+        sessions.solicit(EndpointId(1), source(1), 0, &solicit, |_| Lanes::new(&[0])
+            .unwrap()),
         Err(SendIgnored::Joins)
     );
 }
@@ -183,14 +194,14 @@ fn a_solicit_is_answered_by_alias() {
 #[test]
 fn the_table_is_bounded_and_aliases_unique() {
     assert_eq!(
-        SendSessions::new(0, INTERVAL).unwrap_err(),
+        SendSessions::new(0, INTERVAL, AnswerRate::default()).unwrap_err(),
         SendSessionError::InvalidConfig
     );
     assert_eq!(
-        SendSessions::new(1, 0).unwrap_err(),
+        SendSessions::new(1, 0, AnswerRate::default()).unwrap_err(),
         SendSessionError::InvalidConfig
     );
-    let mut sessions = SendSessions::new(1, INTERVAL).unwrap();
+    let mut sessions = SendSessions::new(1, INTERVAL, AnswerRate::default()).unwrap();
     sessions.add(publication(5)).unwrap();
     assert_eq!(
         sessions.add(publication(5)),
@@ -207,8 +218,99 @@ fn the_table_is_bounded_and_aliases_unique() {
         challenge: block(),
     };
     assert_eq!(
-        sessions.solicit(EndpointId(1), &solicit, joins),
+        sessions.solicit(EndpointId(1), source(1), 0, &solicit, joins),
         Err(SendIgnored::UnknownAlias)
     );
     sessions.add(publication(6)).unwrap();
+}
+
+/// Review P2: `setup_answer_rate` caps the answers to one source endpoint
+/// (a spoofed SOLICIT flood) at its rate, counted, while another source is
+/// still answered; the bucket refills with time; an IPv4-mapped source
+/// shares its IPv4 bucket.
+#[test]
+fn answers_are_rate_limited_per_source() {
+    let mut sessions = SendSessions::new(4, INTERVAL, AnswerRate::default()).unwrap();
+    sessions.add(publication(5)).unwrap();
+    let solicit = RspSolicit {
+        alias: alias(5),
+        challenge: block(),
+    };
+    let flood = (0..100)
+        .filter(|_| {
+            sessions
+                .solicit(EndpointId(1), source(1), 0, &solicit, joins)
+                .is_ok()
+        })
+        .count();
+    assert_eq!(flood, 20, "the burst, then nothing");
+    assert_eq!(sessions.counters().rate_limited, 80);
+    assert!(
+        sessions
+            .solicit(EndpointId(1), source(2), 0, &solicit, joins)
+            .is_ok()
+    );
+    let mapped: SocketAddr = "[::ffff:10.0.0.1]:40000".parse().unwrap();
+    assert_eq!(
+        sessions.solicit(EndpointId(1), mapped, 0, &solicit, joins),
+        Err(SendIgnored::RateLimited)
+    );
+    // 50 ms earn one answer at 20 per second.
+    assert!(
+        sessions
+            .solicit(EndpointId(1), source(1), 50 * MS, &solicit, joins)
+            .is_ok()
+    );
+    assert_eq!(
+        sessions.solicit(EndpointId(1), source(1), 50 * MS, &solicit, joins),
+        Err(SendIgnored::RateLimited)
+    );
+}
+
+/// The per-source table is bounded: a new source is refused while every
+/// entry was active within the last second, and takes an idle entry after.
+#[test]
+fn the_rate_table_is_bounded() {
+    let rate = AnswerRate {
+        per_second: 20,
+        sources: 2,
+    };
+    let mut sessions = SendSessions::new(4, INTERVAL, rate).unwrap();
+    sessions.add(publication(5)).unwrap();
+    let solicit = RspSolicit {
+        alias: alias(5),
+        challenge: block(),
+    };
+    assert!(
+        sessions
+            .solicit(EndpointId(1), source(1), 0, &solicit, joins)
+            .is_ok()
+    );
+    assert!(
+        sessions
+            .solicit(EndpointId(1), source(2), 0, &solicit, joins)
+            .is_ok()
+    );
+    assert_eq!(
+        sessions.solicit(EndpointId(1), source(3), 500 * MS, &solicit, joins),
+        Err(SendIgnored::RateSources)
+    );
+    assert_eq!(sessions.counters().rate_sources_full, 1);
+    assert!(
+        sessions
+            .solicit(EndpointId(1), source(3), 1000 * MS, &solicit, joins)
+            .is_ok()
+    );
+    assert_eq!(
+        SendSessions::new(
+            4,
+            INTERVAL,
+            AnswerRate {
+                per_second: 0,
+                sources: 2
+            }
+        )
+        .unwrap_err(),
+        SendSessionError::InvalidConfig
+    );
 }

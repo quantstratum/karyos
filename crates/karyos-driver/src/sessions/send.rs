@@ -15,9 +15,21 @@
 //!   it only if `(stream_id, session_id)` names a publication it sends on
 //!   that endpoint.
 //!
+//! - **Answer rate.** Answers are limited per source endpoint
+//!   (`setup_answer_rate`, 20 per second, network-control-schemas.md 7.4):
+//!   a spoofed 56-byte SOLICIT must not make the sender emit unbounded
+//!   answers toward the spoofed address. Each source endpoint has a
+//!   message bucket ([`karyos_sys::rate_limit::RateLimiter`]) in a bounded
+//!   table; an entry idle for a second is full again and may be reused, and
+//!   with no reusable entry the control is dropped. IPv4-mapped IPv6
+//!   sources count as their IPv4 endpoint. Each drop is counted under its
+//!   own reason.
+//!
 //! A state machine with no I/O: the caller decodes the controls, supplies
 //! the join points and sends what it returns, through the channel route,
 //! never to an address taken from a payload.
+
+use std::net::SocketAddr;
 
 use karyos_protocol::frame::Lane;
 use karyos_protocol::network::{
@@ -25,6 +37,7 @@ use karyos_protocol::network::{
     TermParams,
 };
 use karyos_sys::host_clock::age_ns;
+use karyos_sys::rate_limit::{Rate, RateLimiter, RatePolicy};
 
 use crate::agents::EndpointId;
 
@@ -52,6 +65,11 @@ pub enum SendIgnored {
     WrongIdentity,
     /// The join points do not cover the publication's lanes.
     Joins,
+    /// The source endpoint exceeded `setup_answer_rate`.
+    RateLimited,
+    /// The per-source rate table is full of sources active within the last
+    /// second.
+    RateSources,
 }
 
 /// Counters of the sender's SETUP side; checked, sticky on overflow.
@@ -61,8 +79,13 @@ pub struct SendCounters {
     pub announces: u64,
     /// Answers to challenges and solicits.
     pub answers: u64,
-    /// Challenges and solicits dropped.
+    /// Challenges and solicits dropped for their content (alias, identity,
+    /// joins).
     pub dropped: u64,
+    /// Challenges and solicits dropped by `setup_answer_rate`.
+    pub rate_limited: u64,
+    /// Challenges and solicits dropped with the rate table full.
+    pub rate_sources_full: u64,
     /// Incarnations established by their first SM.
     pub established: u64,
     /// An increment did not apply.
@@ -79,6 +102,36 @@ impl SendCounters {
     }
 }
 
+/// `setup_answer_rate` and the size of its per-source table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnswerRate {
+    /// Answers per second per source endpoint, also the burst (default 20).
+    pub per_second: u64,
+    /// Source endpoints tracked at once (default 64).
+    pub sources: usize,
+}
+
+impl Default for AnswerRate {
+    fn default() -> Self {
+        Self {
+            per_second: 20,
+            sources: 64,
+        }
+    }
+}
+
+/// One source endpoint's bucket.
+#[derive(Debug, Clone, Copy)]
+struct RateSource {
+    source: SocketAddr,
+    limiter: RateLimiter,
+    last: u64,
+}
+
+/// A second in ns: a bucket idle this long is full again (its burst is its
+/// rate per second).
+const SECOND: u64 = 1_000_000_000;
+
 #[derive(Debug, Clone, Copy)]
 struct Session {
     publication: Publication,
@@ -93,6 +146,8 @@ pub struct SendSessions {
     sessions: Vec<Session>,
     capacity: usize,
     setup_interval: u64,
+    rate: AnswerRate,
+    rates: Vec<RateSource>,
     counters: SendCounters,
 }
 
@@ -112,19 +167,27 @@ pub enum SendSessionError {
 
 impl SendSessions {
     /// A table of at most `capacity` sessions announcing every
-    /// `setup_interval` ns (default 100 ms).
+    /// `setup_interval` ns (default 100 ms), answering at most `rate` per
+    /// source endpoint.
     ///
     /// # Errors
     ///
-    /// [`SendSessionError::InvalidConfig`] for a zero capacity or interval.
-    pub fn new(capacity: usize, setup_interval: u64) -> Result<Self, SendSessionError> {
-        if capacity == 0 || setup_interval == 0 {
+    /// [`SendSessionError::InvalidConfig`] for a zero capacity, interval,
+    /// rate or rate table.
+    pub fn new(
+        capacity: usize,
+        setup_interval: u64,
+        rate: AnswerRate,
+    ) -> Result<Self, SendSessionError> {
+        if capacity == 0 || setup_interval == 0 || rate.per_second == 0 || rate.sources == 0 {
             return Err(SendSessionError::InvalidConfig);
         }
         Ok(Self {
             sessions: Vec::with_capacity(capacity),
             capacity,
             setup_interval,
+            rate,
+            rates: Vec::with_capacity(rate.sources),
             counters: SendCounters::default(),
         })
     }
@@ -163,6 +226,7 @@ impl SendSessions {
     }
 
     /// Stops a publication's SETUP side. Returns whether it was present.
+    /// The table keeps no order (`swap_remove`).
     pub fn remove(&mut self, endpoint: EndpointId, alias: Alias) -> bool {
         let found = self.sessions.iter().position(|session| {
             session.publication.endpoint == endpoint && session.publication.alias == alias
@@ -222,9 +286,9 @@ impl SendSessions {
         }
     }
 
-    /// An RSP_SETUP CHALLENGE that arrived on `endpoint`. `joins` gives
-    /// the publication's current join point of each lane. Returns the
-    /// answer to send, or why it was dropped.
+    /// An RSP_SETUP CHALLENGE that arrived on `endpoint` from `source` at
+    /// `now`. `joins` gives the publication's current join point of each
+    /// lane. Returns the answer to send, or why it was dropped.
     ///
     /// # Errors
     ///
@@ -232,6 +296,8 @@ impl SendSessions {
     pub fn challenge(
         &mut self,
         endpoint: EndpointId,
+        source: SocketAddr,
+        now: u64,
         challenge: &RspChallenge,
         joins: impl FnOnce(&Publication) -> Lanes<u64>,
     ) -> Result<SetupAnswer, SendIgnored> {
@@ -242,11 +308,17 @@ impl SendSessions {
             return Err(self.ignore(SendIgnored::WrongIdentity));
         }
         let publication = session.publication;
-        self.answer(&publication, challenge.challenge, joins(&publication))
+        self.answer(
+            &publication,
+            source,
+            now,
+            challenge.challenge,
+            joins(&publication),
+        )
     }
 
-    /// An RSP_SETUP SOLICIT that arrived on `endpoint`: answered by alias,
-    /// as [`SendSessions::challenge`].
+    /// An RSP_SETUP SOLICIT that arrived on `endpoint` from `source` at
+    /// `now`: answered by alias, as [`SendSessions::challenge`].
     ///
     /// # Errors
     ///
@@ -254,6 +326,8 @@ impl SendSessions {
     pub fn solicit(
         &mut self,
         endpoint: EndpointId,
+        source: SocketAddr,
+        now: u64,
         solicit: &RspSolicit,
         joins: impl FnOnce(&Publication) -> Lanes<u64>,
     ) -> Result<SetupAnswer, SendIgnored> {
@@ -261,18 +335,27 @@ impl SendSessions {
             return Err(self.ignore(SendIgnored::UnknownAlias));
         };
         let publication = session.publication;
-        self.answer(&publication, solicit.challenge, joins(&publication))
+        self.answer(
+            &publication,
+            source,
+            now,
+            solicit.challenge,
+            joins(&publication),
+        )
     }
 
     fn answer(
         &mut self,
         publication: &Publication,
+        source: SocketAddr,
+        now: u64,
         challenge: karyos_protocol::network::ChallengeBlock,
         joins: Lanes<u64>,
     ) -> Result<SetupAnswer, SendIgnored> {
         if joins.count() != publication.lane_count {
             return Err(self.ignore(SendIgnored::Joins));
         }
+        self.admit(source, now)?;
         self.counters.bump(|c| &mut c.answers);
         Ok(SetupAnswer {
             alias: publication.alias,
@@ -284,8 +367,10 @@ impl SendSessions {
     }
 
     /// An SM that arrived on `endpoint`, already validated for its
-    /// binding: the first one for the publication's identity ends its
-    /// announcements. Returns whether it established the publication now.
+    /// binding: the first one for the publication's exact identity and
+    /// alias ends its announcements. A receiver that joins later binds
+    /// through SOLICIT ([`SendSessions::solicit`]). Returns whether it
+    /// established the publication now.
     pub fn status(&mut self, endpoint: EndpointId, status: &StatusMessage) -> bool {
         let Some(session) = self.find_mut(endpoint, status.alias) else {
             return false;
@@ -298,9 +383,71 @@ impl SendSessions {
         true
     }
 
+    /// Charges one answer to `source`'s bucket at `now`.
+    fn admit(&mut self, source: SocketAddr, now: u64) -> Result<(), SendIgnored> {
+        let source = normalized(source);
+        let index = match self.rates.iter().position(|entry| entry.source == source) {
+            Some(index) => index,
+            None => {
+                let policy = RatePolicy {
+                    messages: Rate {
+                        per_second: self.rate.per_second,
+                        burst: self.rate.per_second,
+                    },
+                    bytes: None,
+                };
+                let entry = RateSource {
+                    source,
+                    limiter: RateLimiter::new(policy, now),
+                    last: now,
+                };
+                if self.rates.len() < self.rate.sources {
+                    self.rates.push(entry);
+                    self.rates.len() - 1
+                } else if let Some(index) = self
+                    .rates
+                    .iter()
+                    .position(|entry| age_ns(now, entry.last) >= SECOND)
+                {
+                    // Idle a second: its bucket is full again, so reusing it
+                    // for another source grants nothing early.
+                    if let Some(slot) = self.rates.get_mut(index) {
+                        *slot = entry;
+                    }
+                    index
+                } else {
+                    self.counters.bump(|c| &mut c.rate_sources_full);
+                    return Err(SendIgnored::RateSources);
+                }
+            }
+        };
+        let Some(entry) = self.rates.get_mut(index) else {
+            return Err(SendIgnored::RateSources);
+        };
+        entry.last = now;
+        if entry.limiter.admit_frame(now, 0, true) {
+            Ok(())
+        } else {
+            self.counters.bump(|c| &mut c.rate_limited);
+            Err(SendIgnored::RateLimited)
+        }
+    }
+
     fn ignore(&mut self, reason: SendIgnored) -> SendIgnored {
         self.counters.bump(|c| &mut c.dropped);
         reason
+    }
+}
+
+/// A source endpoint as its bucket is keyed: an IPv4-mapped IPv6 endpoint
+/// is its IPv4 endpoint.
+fn normalized(source: SocketAddr) -> SocketAddr {
+    match source {
+        SocketAddr::V6(v6) => v6
+            .ip()
+            .to_ipv4_mapped()
+            .map_or(source, |v4| SocketAddr::from((v4, v6.port()))),
+        SocketAddr::V4(_) => source,
     }
 }
 
