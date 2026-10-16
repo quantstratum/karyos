@@ -33,6 +33,7 @@ pub mod manifest;
 pub mod report;
 pub mod samples;
 pub mod stats;
+pub mod wire;
 pub mod workloads;
 
 pub use workloads::{BenchError, Config, Measurement, Workload, run};

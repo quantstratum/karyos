@@ -131,6 +131,27 @@ pub struct SkipReport {
     /// A close the caller must carry out; the policy seals nothing more on
     /// that lane once it reported one.
     pub close: Option<Close>,
+    /// A seal whose record was published before a later step failed
+    /// (GU-11, [`ReceiveError::GapCommitted`]): it is counted in `sealed`,
+    /// the caller never seals that interval again, and the call stopped
+    /// there.
+    pub committed_failure: Option<ReceiveError>,
+}
+
+impl SkipReport {
+    /// Counts one seal of `extent` bytes. One call seals at most
+    /// `SEALS_PER_DUTY` holes on each of at most `Lane::COUNT` lanes, each
+    /// within one term, so neither sum can overflow; the increments are
+    /// checked and apply together.
+    fn count(&mut self, extent: u32) {
+        if let (Some(sealed), Some(bytes)) = (
+            self.sealed.checked_add(1),
+            self.sealed_bytes.checked_add(u64::from(extent)),
+        ) {
+            self.sealed = sealed;
+            self.sealed_bytes = bytes;
+        }
+    }
 }
 
 /// Why a [`SkipPolicy`] could not be built.
@@ -141,13 +162,17 @@ pub enum SkipConfigError {
     ReorderTimeout(u64),
 }
 
-/// Closes a policy reported (GU-11).
+/// One lane's closes the policy reported (GU-11). Increments are checked:
+/// one that would overflow keeps its value and sets `overflowed`, which
+/// stays set.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SkipCounters {
-    /// Lanes closed because a position could not be resumed.
+    /// Closes because a position could not be resumed.
     pub gap_cannot_resume: u64,
-    /// Lanes closed on an unrecoverable reliable range.
+    /// Closes on an unrecoverable reliable range.
     pub unrecoverable: u64,
+    /// An increment did not apply because it would have overflowed.
+    pub overflowed: bool,
 }
 
 impl SkipCounters {
@@ -156,10 +181,9 @@ impl SkipCounters {
             CloseCause::GapCannotResume => &mut self.gap_cannot_resume,
             CloseCause::Unrecoverable => &mut self.unrecoverable,
         };
-        // A lane closes once; an increment that would overflow keeps the
-        // value, never wraps.
-        if let Some(next) = value.checked_add(1) {
-            *value = next;
+        match value.checked_add(1) {
+            Some(next) => *value = next,
+            None => self.overflowed = true,
         }
     }
 }
@@ -177,6 +201,8 @@ struct LaneState {
     ahead: Option<(u64, u64)>,
     /// The lane was reported closed.
     closed: bool,
+    /// The closes reported on the lane.
+    counters: SkipCounters,
 }
 
 /// The skip policy of one image: one state per lane.
@@ -184,7 +210,6 @@ struct LaneState {
 pub struct SkipPolicy {
     config: SkipConfig,
     lanes: Vec<LaneState>,
-    counters: SkipCounters,
 }
 
 impl SkipPolicy {
@@ -200,7 +225,6 @@ impl SkipPolicy {
         Ok(Self {
             config,
             lanes: vec![LaneState::default(); lanes],
-            counters: SkipCounters::default(),
         })
     }
 
@@ -210,10 +234,11 @@ impl SkipPolicy {
         &self.config
     }
 
-    /// The closes reported so far.
+    /// The closes reported on `lane` so far; `None` for a lane the policy
+    /// does not have.
     #[must_use]
-    pub fn counters(&self) -> SkipCounters {
-        self.counters
+    pub fn counters(&self, lane: Lane) -> Option<SkipCounters> {
+        self.lanes.get(usize::from(lane.get())).map(|l| l.counters)
     }
 
     /// Records an arrival's outcome on `lane` at `now`, the frame at
@@ -258,11 +283,11 @@ impl SkipPolicy {
                 continue;
             };
             self.seal_due(owner, lane, now, &mut report)?;
+            if report.committed_failure.is_some() {
+                break;
+            }
             if report.close.is_none() {
                 report.close = self.far_window(owner, lane, now)?;
-                if let Some(close) = report.close {
-                    self.counters.count(close.cause);
-                }
             }
         }
         Ok(report)
@@ -282,8 +307,8 @@ impl SkipPolicy {
     /// # Errors
     ///
     /// [`ReceiveError::Foreign`] for a lane the image does not have,
-    /// [`ReceiveError::Sys`] for a corrupt owner state or a floor outside
-    /// the incarnation.
+    /// [`ReceiveError::Sys`] for a corrupt owner state. A floor outside the
+    /// incarnation is beyond the window.
     pub fn range_unavailable<T: TermBytes>(
         &mut self,
         owner: &mut ReceiveOwner<T>,
@@ -307,7 +332,7 @@ impl SkipPolicy {
                 from: prefix,
                 to: floor,
             });
-            self.counters.count(CloseCause::GapCannotResume);
+            state.counters.count(CloseCause::GapCannotResume);
             return Ok(report);
         }
         match self.config.on_unrecoverable {
@@ -319,7 +344,7 @@ impl SkipPolicy {
                     from: prefix,
                     to: floor,
                 });
-                self.counters.count(CloseCause::Unrecoverable);
+                state.counters.count(CloseCause::Unrecoverable);
             }
             Unrecoverable::Skip => {
                 state.unrecoverable_to = state.unrecoverable_to.max(floor);
@@ -372,13 +397,18 @@ impl SkipPolicy {
             } else {
                 return Ok(());
             };
-            match owner.seal_gap(lane, position, extent, reason)? {
-                Received::Committed { extent, .. } => {
-                    report.sealed = report.sealed.saturating_add(1);
-                    report.sealed_bytes = report.sealed_bytes.saturating_add(u64::from(extent));
+            match owner.seal_gap(lane, position, extent, reason) {
+                Ok(Received::Committed { extent, .. }) => report.count(extent),
+                // Published, then a later step failed: count it, report it
+                // and stop.
+                Err(failure @ ReceiveError::GapCommitted { extent, .. }) => {
+                    report.count(extent);
+                    report.committed_failure = Some(failure);
+                    return Ok(());
                 }
+                Err(error) => return Err(error),
                 // The term is not prepared yet: the hole stays due.
-                _ => return Ok(()),
+                Ok(_) => return Ok(()),
             }
         }
         Ok(())
@@ -407,6 +437,7 @@ impl SkipPolicy {
             return Ok(None);
         }
         state.closed = true;
+        state.counters.count(CloseCause::GapCannotResume);
         let prefix = owner.rebuild_position(lane).ok_or(ReceiveError::Foreign)?;
         Ok(Some(Close {
             lane,

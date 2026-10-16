@@ -59,14 +59,15 @@ pub const HEADER: u32 = 32;
 /// The frame alignment (SPEC §4).
 pub const ALIGNMENT: u32 = 32;
 
-/// The largest `E_max` for which the manifest states that W6 takes exactly
-/// 5 datagrams (manifest 6.1, W6).
+/// The largest `E_max` for which manifest 2.0 defines W6 (6.1, W6).
 pub const W6_E_MAX_LIMIT: u32 = 176;
 
 /// The W6 message length (manifest 6.1, W6).
 pub const W6_LENGTH: u32 = 6000;
 
-/// The W6 datagram count (manifest 6.1, W6).
+/// The W6 datagram count when `mtu` does not count the envelope, or the
+/// envelope is at most 160 bytes; one more for 161 to 176 when it does
+/// (manifest 2.0 6.1, W6).
 pub const W6_DATAGRAMS: u32 = 5;
 
 /// The illustrative `E_max` of the manifest examples (manifest 6.1).
@@ -109,8 +110,9 @@ pub enum ManifestError {
         /// The MTU it was applied to.
         mtu: u32,
     },
-    /// W6 does not take exactly 5 datagrams under this `E_max` and rule
-    /// with the fragment plan of SPEC §4 (see [`w6_datagrams`]).
+    /// W6 takes a count that manifest 2.0 6.1 does not state for this
+    /// `E_max` and rule, with the fragment plan of SPEC §4 (see
+    /// [`w6_datagrams`]); in practice an `E_max` above 176.
     W6DatagramCount {
         /// The envelope budget.
         e_max: u32,
@@ -136,7 +138,7 @@ impl fmt::Display for ManifestError {
                 datagrams,
             } => write!(
                 f,
-                "W6 takes {datagrams} datagrams at E_max {e_max} ({rule}), not {W6_DATAGRAMS}"
+                "W6 takes {datagrams} datagrams at E_max {e_max} ({rule}), outside manifest 2.0 6.1"
             ),
             Self::NoSizeFormula(shape) => write!(f, "{shape} has no size formula in this model"),
         }
@@ -256,7 +258,8 @@ pub enum Shape {
     W4,
     /// W5: `floor((1408 - E_max) / 64)` frames of `L` = 32 in one datagram.
     W5,
-    /// W6: `L` = 6000 in exactly 5 datagrams.
+    /// W6: `L` = 6000 in 5 datagrams, or 6 for an envelope of 161 to 176
+    /// bytes when `mtu` counts it (manifest 2.0 6.1).
     W6,
     /// W7: MTU 8192 and the largest single frame it holds.
     W7,
@@ -304,8 +307,9 @@ impl Shape {
     /// # Errors
     ///
     /// [`ManifestError::EnvelopeTooLarge`] when `e_max` leaves no frame
-    /// room, [`ManifestError::W6DatagramCount`] when W6 does not take 5
-    /// datagrams, [`ManifestError::NoSizeFormula`] for W8.
+    /// room, [`ManifestError::W6DatagramCount`] when W6 takes a count other
+    /// than manifest 2.0 6.1 states (5, or 6 for E from 161 to 176 when
+    /// `mtu` counts the envelope), [`ManifestError::NoSizeFormula`] for W8.
     pub fn size(self, e_max: u32, rule: MtuRule) -> Result<Size, ManifestError> {
         let single = |payload: u32, ext: bool, mtu: u32| Size {
             payload,
@@ -329,8 +333,13 @@ impl Shape {
                 mtu: MTU,
             }),
             Self::W6 => {
+                // Manifest 2.0 6.1: the fragment plan's count, 5 datagrams,
+                // or 6 for E from 161 to 176 when `mtu` counts the envelope.
                 let datagrams = w6_datagrams(e_max, rule)?;
-                if datagrams == W6_DATAGRAMS {
+                // W6 is defined only up to E_max 176, under either rule.
+                if e_max <= W6_E_MAX_LIMIT
+                    && (datagrams == W6_DATAGRAMS || datagrams == W6_DATAGRAMS + 1)
+                {
                     Ok(Size {
                         payload: W6_LENGTH,
                         frames_per_datagram: 1,
@@ -421,12 +430,11 @@ pub fn w6_fragment_payload(e_max: u32, rule: MtuRule) -> Result<u32, ManifestErr
 /// The datagrams of one W6 message (`L` = 6000) under `rule`, with the
 /// fragment plan of SPEC §4.
 ///
-/// The manifest (6.1, W6) states 5 datagrams for any `E_max` up to 176
-/// with `c` between 1200 and 1376, which is `c = 1376 - E_max` without
-/// frame alignment. The fragment plan aligns the budget down to 32 bytes
-/// (`FragmentPlan::new`), so under [`MtuRule::CountsEnvelope`] an `E_max`
-/// in `161..=176` gives `c` = 1184 and 6 datagrams. This function returns
-/// the count of the code; [`Shape::size`] refuses W6 where it is not 5.
+/// The fragment plan aligns the frame budget down to 32 bytes
+/// (`FragmentPlan::new`), so under [`MtuRule::CountsEnvelope`] an envelope
+/// of 161 to 176 bytes gives `c` = 1184 and 6 datagrams, and any smaller
+/// one 5, as manifest 2.0 6.1 states; without the envelope in the MTU it
+/// is always 5. [`Shape::size`] refuses W6 above `E_max` 176.
 ///
 /// # Errors
 ///
@@ -674,7 +682,7 @@ mod tests {
         // Exhaustive over 0..=176 and both rules. The aligned fragment
         // plan of SPEC §4 agrees with the manifest up to E_max = 160; under
         // CountsEnvelope, 161..=176 align the budget to 1216 and c to 1184,
-        // so W6 takes 6 datagrams there and the model refuses it.
+        // so W6 takes 6 datagrams there, as manifest 2.0 6.1 states.
         for e_max in 0..=W6_E_MAX_LIMIT {
             for rule in MtuRule::ALL {
                 let datagrams = w6_datagrams(e_max, rule).unwrap();
@@ -689,14 +697,9 @@ mod tests {
                     assert_eq!(size.datagrams_per_message, 5);
                 } else {
                     assert_eq!((datagrams, c), (6, 1184), "E_max {e_max}");
-                    assert_eq!(
-                        Shape::W6.size(e_max, rule),
-                        Err(ManifestError::W6DatagramCount {
-                            e_max,
-                            rule,
-                            datagrams: 6
-                        })
-                    );
+                    // Manifest 2.0 6.1 states this count.
+                    let size = Shape::W6.size(e_max, rule).unwrap();
+                    assert_eq!(size.datagrams_per_message, 6);
                 }
             }
         }
