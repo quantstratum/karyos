@@ -79,10 +79,13 @@ mod skip_policy;
 pub use frame_reader::{
     FrameEnd, FrameReader, FrameStep, MessageInfo, Peek, SKIP_WALK_FRAMES, STEP_CHARGE, Stepped,
 };
-pub use receive_owner::{ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received};
+pub use receive_owner::{
+    GapCounters, ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received,
+};
 pub use skip_policy::{
     Close, CloseCause, DEFAULT_FAR_WINDOW_TIMEOUT_NS, DEFAULT_REORDER_TIMEOUT_NS,
-    MAX_REORDER_TIMEOUT_NS, SkipConfig, SkipConfigError, SkipPolicy, SkipReport, Unrecoverable,
+    MAX_REORDER_TIMEOUT_NS, SkipConfig, SkipConfigError, SkipCounters, SkipPolicy, SkipReport,
+    Unrecoverable,
 };
 pub(crate) mod storage;
 
@@ -1442,6 +1445,7 @@ impl<O: BufferOwner> PreparedSubscription<O> {
                 resync,
                 first_loss: None,
                 interrupted: None,
+                loss: ReaderLoss::default(),
             },
         })
     }
@@ -2623,6 +2627,34 @@ struct Cursor {
     /// The last outcome was an `Interrupted` skip of `[start, end)`; a
     /// local gap at `end` makes `start` the loss position.
     interrupted: Option<(u64, u64)>,
+    /// Loss counters of this reader (GU-11).
+    loss: ReaderLoss,
+}
+
+/// A reader's loss counters (`quantstratum-docs:
+/// karyos/design/gaps-and-unreliable-delivery.md`, GU-11). Increments are
+/// checked: one that would overflow keeps its value and sets `overflowed`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReaderLoss {
+    /// Bytes of partial messages discarded: `Interrupted`,
+    /// `MessageTooLarge` and `MissingEnd` skips.
+    pub discarded_partial_bytes: u64,
+    /// Bytes of runs without BEGIN after a local gap (`AfterLoss`).
+    pub after_loss_bytes: u64,
+    /// Bytes of local gap records stepped over.
+    pub gap_bytes: u64,
+    /// An increment did not apply because it would have overflowed.
+    pub overflowed: bool,
+}
+
+impl ReaderLoss {
+    fn add(&mut self, field: fn(&mut Self) -> &mut u64, by: u32) {
+        let value = field(self);
+        match value.checked_add(u64::from(by)) {
+            Some(next) => *value = next,
+            None => self.overflowed = true,
+        }
+    }
 }
 
 /// An image reader's resynchronization state (GU-3): which reason a run of
@@ -2688,6 +2720,7 @@ impl Cursor {
                 reason,
             } => match reason {
                 SkipReason::LocalGap(_) => {
+                    self.loss.add(|l| &mut l.gap_bytes, extent);
                     // A gap ending an interrupted message makes the
                     // interrupted range the loss.
                     let first = match interrupted {
@@ -2697,14 +2730,19 @@ impl Cursor {
                     self.lost(first);
                     self.resync = Resync::AfterLoss;
                 }
-                SkipReason::AfterLoss => self.lost(position),
+                SkipReason::AfterLoss => {
+                    self.loss.add(|l| &mut l.after_loss_bytes, extent);
+                    self.lost(position);
+                }
                 SkipReason::Orphan | SkipReason::JoinedMidMessage => {}
                 SkipReason::Interrupted => {
+                    self.loss.add(|l| &mut l.discarded_partial_bytes, extent);
                     // The reader had reached the message's BEGIN.
                     self.resync = Resync::Synchronized;
                     self.interrupted = Some((position, position + u64::from(extent)));
                 }
                 SkipReason::MessageTooLarge | SkipReason::MissingEnd => {
+                    self.loss.add(|l| &mut l.discarded_partial_bytes, extent);
                     self.resync = Resync::Synchronized;
                 }
             },
@@ -2764,6 +2802,13 @@ impl<O: BufferOwner> Subscription<O> {
     #[must_use]
     pub fn first_loss(&self) -> Option<u64> {
         self.cursor.first_loss
+    }
+
+    /// This reader's loss counters (GU-11).
+    #[inline]
+    #[must_use]
+    pub fn loss_counters(&self) -> ReaderLoss {
+        self.cursor.loss
     }
 
     /// The registry cell of this subscriber, for its conductor's
@@ -4391,6 +4436,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             resync: Resync::at_join(buffer.image()),
             first_loss: None,
             interrupted: None,
+            loss: ReaderLoss::default(),
         })
     }
 

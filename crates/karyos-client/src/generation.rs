@@ -279,6 +279,10 @@ impl<T: TermBytes> GenerationLink<T> {
     ///
     /// Returns the successor when the link cannot take it, or when its
     /// mapping starting at `base` is not [`representable`].
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error gives the successor back by value, with its ownership; boxing it would allocate on the cutover path"
+    )]
     pub fn offer(&self, base: u64, successor: Successor<T>) -> Result<(), Successor<T>> {
         if !representable(base, successor.buffer()) {
             return Err(successor);

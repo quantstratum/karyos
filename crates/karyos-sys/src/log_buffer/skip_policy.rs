@@ -141,6 +141,29 @@ pub enum SkipConfigError {
     ReorderTimeout(u64),
 }
 
+/// Closes a policy reported (GU-11).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkipCounters {
+    /// Lanes closed because a position could not be resumed.
+    pub gap_cannot_resume: u64,
+    /// Lanes closed on an unrecoverable reliable range.
+    pub unrecoverable: u64,
+}
+
+impl SkipCounters {
+    fn count(&mut self, cause: CloseCause) {
+        let value = match cause {
+            CloseCause::GapCannotResume => &mut self.gap_cannot_resume,
+            CloseCause::Unrecoverable => &mut self.unrecoverable,
+        };
+        // A lane closes once; an increment that would overflow keeps the
+        // value, never wraps.
+        if let Some(next) = value.checked_add(1) {
+            *value = next;
+        }
+    }
+}
+
 /// One lane's hole and far-window state.
 #[derive(Debug, Clone, Copy, Default)]
 struct LaneState {
@@ -161,6 +184,7 @@ struct LaneState {
 pub struct SkipPolicy {
     config: SkipConfig,
     lanes: Vec<LaneState>,
+    counters: SkipCounters,
 }
 
 impl SkipPolicy {
@@ -176,6 +200,7 @@ impl SkipPolicy {
         Ok(Self {
             config,
             lanes: vec![LaneState::default(); lanes],
+            counters: SkipCounters::default(),
         })
     }
 
@@ -183,6 +208,12 @@ impl SkipPolicy {
     #[must_use]
     pub fn config(&self) -> &SkipConfig {
         &self.config
+    }
+
+    /// The closes reported so far.
+    #[must_use]
+    pub fn counters(&self) -> SkipCounters {
+        self.counters
     }
 
     /// Records an arrival's outcome on `lane` at `now`, the frame at
@@ -229,6 +260,9 @@ impl SkipPolicy {
             self.seal_due(owner, lane, now, &mut report)?;
             if report.close.is_none() {
                 report.close = self.far_window(owner, lane, now)?;
+                if let Some(close) = report.close {
+                    self.counters.count(close.cause);
+                }
             }
         }
         Ok(report)
@@ -273,6 +307,7 @@ impl SkipPolicy {
                 from: prefix,
                 to: floor,
             });
+            self.counters.count(CloseCause::GapCannotResume);
             return Ok(report);
         }
         match self.config.on_unrecoverable {
@@ -284,6 +319,7 @@ impl SkipPolicy {
                     from: prefix,
                     to: floor,
                 });
+                self.counters.count(CloseCause::Unrecoverable);
             }
             Unrecoverable::Skip => {
                 state.unrecoverable_to = state.unrecoverable_to.max(floor);

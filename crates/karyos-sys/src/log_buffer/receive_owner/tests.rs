@@ -1601,3 +1601,43 @@ fn a_late_copy_into_the_trailing_term_is_classified_too() {
     assert_eq!(recv(&mut owner, &data(0, 0, 64, 1)), Ok(Received::Duplicate));
     assert_eq!(recv(&mut owner, &data(0, 0, 64, 9)), conflict(0, 64));
 }
+
+/// GU-11: the owner counts its sealed gaps per lane, by reason, and the
+/// late copies it dropped; a reader counts the bytes it lost by kind.
+#[test]
+fn gaps_and_reader_losses_are_counted() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &fragment(0, 0, 32, true, false, 1)).unwrap();
+    assert_eq!(seal(&mut owner, 64, 64), committed(64, 64));
+    recv(&mut owner, &fragment(0, 128, 32, false, true, 2)).unwrap();
+    let range = crate::local_gap::GapReason::RangeUnavailable;
+    assert_eq!(owner.seal_gap(Lane::ZERO, 192, 64, range), committed(192, 64));
+    assert_eq!(
+        recv(&mut owner, &data(0, 64, 64, 3)),
+        Ok(Received::LateAfterSkip)
+    );
+    let counters = owner.gap_counters(Lane::ZERO).unwrap();
+    assert_eq!(
+        (
+            counters.gaps_sealed,
+            counters.gap_bytes,
+            counters.reorder_expired,
+            counters.range_unavailable_skips,
+            counters.late_after_skip,
+            counters.overflowed,
+        ),
+        (2, 128, 1, 1, 1, false)
+    );
+    // Interrupted [0, 64), gap [64, 128), after loss [128, 192), gap.
+    for _ in 0..4 {
+        let _ = poll(&mut subscription);
+    }
+    let loss = subscription.loss_counters();
+    assert_eq!(
+        (loss.discarded_partial_bytes, loss.gap_bytes, loss.after_loss_bytes),
+        (64, 128, 64)
+    );
+}
