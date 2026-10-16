@@ -331,6 +331,10 @@ impl<T: TermBytes> LaneState<T> {
 pub struct AggregateSubscription<T: TermBytes = HeapTerms> {
     lanes: Vec<LaneState<T>>,
     drr: Drr,
+    /// Run at the start of each DRR serve step: tests reproduce a race
+    /// between a probe's peek and the serve there.
+    #[cfg(test)]
+    between: Option<Box<dyn FnMut()>>,
 }
 
 impl<T: TermBytes> core::fmt::Debug for AggregateSubscription<T> {
@@ -360,12 +364,22 @@ impl<T: TermBytes> AggregateSubscription<T> {
                 reason: "one subscription per configured lane",
             }));
         }
+        // A subscription its rejoin policy already closed has no cell, so
+        // its lane could never report a terminal.
+        if lanes
+            .iter()
+            .any(|(_, subscription)| subscription.is_closed_by_overrun())
+        {
+            return Err(ClientError::ClosedByOverrun);
+        }
         Ok(Self {
             lanes: lanes
                 .into_iter()
                 .map(|(lane, subscription)| LaneState::new(lane, subscription))
                 .collect(),
             drr: Drr::new(config),
+            #[cfg(test)]
+            between: None,
         })
     }
 
@@ -404,6 +418,8 @@ impl<T: TermBytes> AggregateSubscription<T> {
                 lanes: &mut self.lanes,
                 handler: &mut handler,
                 max_charge,
+                #[cfg(test)]
+                between: self.between.as_mut(),
             },
         );
         let lanes: Vec<LanePoll> = self
@@ -433,6 +449,8 @@ impl<T: TermBytes> AggregateSubscription<T> {
 
 /// The DRR's view of the lanes for one poll.
 struct Source<'a, T: TermBytes, H> {
+    #[cfg(test)]
+    between: Option<&'a mut Box<dyn FnMut()>>,
     lanes: &'a mut [LaneState<T>],
     handler: &'a mut H,
     max_charge: u64,
@@ -459,8 +477,23 @@ where
                     // service, and the probe looks at the interrupting
                     // frame.
                     match reader.serve_frame() {
-                        Ok(FrameStep::Stepped { kind, .. }) => state.stepped(kind),
-                        Ok(_) => return Probe::Ineligible,
+                        Ok(FrameStep::Stepped { charge: 0, kind }) => state.stepped(kind),
+                        // The reader ended between the peek and the serve:
+                        // an overrun was consumed by `serve_frame`, so its
+                        // loss and rejoin policy are applied now.
+                        Ok(FrameStep::Ended(end)) => {
+                            state.ended(end);
+                            return Probe::Ineligible;
+                        }
+                        // Nothing was read: a floor or a slot moved first.
+                        Ok(FrameStep::Pending) => return Probe::Ineligible,
+                        // A copy or a charged step where the peek saw a
+                        // zero-charge one: committed frames are immutable,
+                        // so the term is corrupt, and nothing is served.
+                        Ok(_) => {
+                            state.finish(LaneEnd::Failed(corrupt("a zero-charge step changed")));
+                            return Probe::Ineligible;
+                        }
                         Err(error) => {
                             state.finish(LaneEnd::Failed(ClientError::from(error)));
                             return Probe::Ineligible;
@@ -489,6 +522,10 @@ where
     }
 
     fn serve(&mut self, lane: usize) -> Service {
+        #[cfg(test)]
+        if let Some(between) = self.between.as_mut() {
+            between();
+        }
         let Some(state) = self.lanes.get_mut(lane) else {
             return Service::NotServed;
         };

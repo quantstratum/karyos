@@ -282,8 +282,9 @@ impl<O: BufferOwner> FrameReader<O> {
     ///
     /// # Errors
     ///
-    /// The errors the next `serve_frame` would return; the reader is not
-    /// ended by a peek.
+    /// The errors the next `serve_frame` would return, except that a
+    /// required reader's lap answers `Ok(Peek::Ended)`: `serve_frame` then
+    /// returns `RequiredSubscriberLapped`. A peek never ends the reader.
     pub fn peek(&mut self) -> Result<Peek, SysError> {
         let assembly = match self.state {
             State::Idle => None,

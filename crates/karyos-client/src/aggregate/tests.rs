@@ -133,3 +133,130 @@ fn an_interrupted_skip_is_applied_by_the_probe() {
     assert_eq!(lane.first_loss, Some(0));
     assert!(lane.end.is_none());
 }
+
+/// A publication-mode buffer of 3 spare slots for optional readers.
+fn publication_buffer() -> Arc<LogBuffer> {
+    Arc::new(
+        LogBuffer::new(LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 3,
+            max_subscribers: 2,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(INITIAL),
+            lane: Lane::ZERO,
+            session_id: SESSION,
+            stream_id: STREAM,
+            claim_deadline: DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Exclusive,
+        })
+        .unwrap(),
+    )
+}
+
+/// An overrun that `serve_frame` finds between the probe's peek and the
+/// serve is consumed by it: the lane source applies it there, so the loss,
+/// the rejoin policy and the first loss are not lost.
+#[test]
+fn an_overrun_between_peek_and_serve_is_applied() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
+    let buffer = publication_buffer();
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let subscription = ClientSubscription::new(conductor.subscribe(Role::Optional).unwrap());
+    let mut publication = buffer.publication_owned().unwrap().unwrap();
+    assert!(matches!(
+        publication
+            .append(&[7; 100], AppendOptions::default())
+            .unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+    let frame = 1408;
+    let mut aggregate = AggregateSubscription::new(
+        DrrConfig::new(&[frame], frame).unwrap(),
+        vec![(Lane::ZERO, subscription)],
+    )
+    .unwrap();
+    // Between the peek and the serve, the publisher laps the reader.
+    aggregate.between = Some(Box::new(move || {
+        for _ in 0..300 {
+            // Back pressure or an admin action only delays the lap.
+            let _ = publication.append(&[1; 3000], AppendOptions::default());
+            let _ = conductor.duty_cycle().unwrap();
+        }
+    }));
+    let mut delivered = 0;
+    let report = aggregate.poll(
+        |_, _, _| delivered += 1,
+        Budget {
+            work: 4,
+            bytes: frame,
+        },
+    );
+    assert_eq!(delivered, 0, "the lapped message is never delivered");
+    let lane = report.lanes[0];
+    let (overrun, _) = lane.overrun.expect("the overrun is reported");
+    assert_eq!(overrun.from, 0);
+    assert_eq!(lane.first_loss, Some(0));
+    assert_eq!(report.drr.lanes[0].served_bytes, 0);
+}
+
+/// A peeked charge above every frame of the geometry (`F_max`) ends the
+/// lane as a corrupt term, with nothing charged.
+#[test]
+fn a_charge_above_f_max_ends_the_lane() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
+    let buffer = publication_buffer();
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let subscription = ClientSubscription::new(conductor.subscribe(Role::Optional).unwrap());
+    let mut publication = buffer.publication_owned().unwrap().unwrap();
+    assert!(matches!(
+        publication
+            .append(&[7; 1000], AppendOptions::default())
+            .unwrap(),
+        AppendOutcome::Appended { .. }
+    ));
+    // A profile whose largest charge is below the frame just committed.
+    let mut aggregate = AggregateSubscription::new(
+        DrrConfig::new(&[256], 256).unwrap(),
+        vec![(Lane::ZERO, subscription)],
+    )
+    .unwrap();
+    let report = aggregate.poll(
+        |_, _, _| panic!("nothing is delivered"),
+        Budget {
+            work: 8,
+            bytes: 4096,
+        },
+    );
+    assert!(matches!(
+        report.lanes[0].end,
+        Some(LaneEnd::Failed(ClientError::Sys(
+            SysError::CorruptTerm { .. }
+        )))
+    ));
+    assert_eq!(report.drr.lanes[0].served_bytes, 0);
+    assert_eq!(report.terminal, Some(Terminal { clean: false }));
+}
+
+/// A subscription its rejoin policy already closed cannot become a lane.
+#[test]
+fn a_closed_subscription_is_refused() {
+    let buffer = publication_buffer();
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let mut subscription = ClientSubscription::new(conductor.subscribe(Role::Optional).unwrap())
+        .with_rejoin(RejoinPolicy::Close);
+    let mut publication = buffer.publication_owned().unwrap().unwrap();
+    for _ in 0..300 {
+        let _ = publication.append(&[1; 3000], karyos_sys::log_buffer::AppendOptions::default());
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    let _ = subscription.poll(|_, _| {}, crate::subscription::MessageLimit::new(1));
+    assert!(subscription.is_closed_by_overrun());
+    assert!(matches!(
+        AggregateSubscription::new(
+            DrrConfig::new(&[1408], 1408).unwrap(),
+            vec![(Lane::ZERO, subscription)],
+        ),
+        Err(ClientError::ClosedByOverrun)
+    ));
+}
