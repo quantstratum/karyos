@@ -1488,16 +1488,21 @@ fn data_groups() {
     for (name, bytes, expected) in refused {
         assert_eq!(classify(&bytes), Err(expected), "{name}");
     }
-    // A later record of another version is refused by its own first word.
-    let later = [first.clone(), mutate(&data(1, 0x03, ALIAS, false), 4, &[2])].concat();
-    assert_eq!(
-        classify(&later),
-        Err(ControlError::UnsupportedVersion {
-            version: 2,
-            frame_type: 1,
-            frame_length: 33,
-        })
-    );
+    // A later record of another version is a grouping violation of the
+    // version 1 datagram (sections 7.1 and 7.5), so no ERR UNBOUND can
+    // quote a nested record.
+    for version in [0u8, 2] {
+        let later = [
+            first.clone(),
+            mutate(&data(1, 0x03, ALIAS, false), 4, &[version]),
+        ]
+        .concat();
+        assert_eq!(
+            classify(&later),
+            Err(ControlError::InvalidGrouping),
+            "{version}"
+        );
+    }
     // A batch the dispatcher groups is one the receive scanner can then
     // validate against the image: DATA at term offsets 0 and 64, then an
     // ABORTED extent of 64 at 128.

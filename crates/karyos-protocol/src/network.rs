@@ -152,7 +152,8 @@ pub enum ControlError {
     #[error("invalid frame length")]
     InvalidLength,
     /// The datagram mixes groups, holds more than one control or
-    /// heartbeat, or holds bytes after its record.
+    /// heartbeat, holds bytes after its record, or holds a later batch
+    /// record whose version is not the datagram's.
     #[error("invalid datagram grouping")]
     InvalidGrouping,
     /// A nonzero reserved byte or flag bit.
@@ -1267,7 +1268,16 @@ fn scan_data(bytes: &[u8]) -> Result<Datagram<'_>, ControlError> {
         let r = Reader(record);
         let frame_length = r.i32(0)?;
         let code = r.u16(6)?;
-        check_version(r.u8(4)?, code, frame_length)?;
+        let version = r.u8(4)?;
+        if offset == 0 {
+            check_version(version, code, frame_length)?;
+        } else if version != PROTOCOL_VERSION {
+            // Section 7.5 classifies by the datagram's first word only. A
+            // later record of another version is a version 1 grouping
+            // violation (section 7.1: no reply), never an unsupported
+            // version that could be answered with a nested record's word.
+            return Err(ControlError::InvalidGrouping);
+        }
         let frame_type = match FrameType::try_from_code(code) {
             Ok(t @ (FrameType::Data | FrameType::Pad | FrameType::Aborted)) => t,
             // Only a later record can get here: the first selected this scan.
