@@ -35,7 +35,8 @@ pub enum ErrorCode {
     /// Two receive paths conflicted (phase 2).
     ReceiveConflict = 7,
     /// A stream's conflation feeder failed and the stream was ended with
-    /// `ConflationFeederLost`; the key is the stream registration and 0.
+    /// `ConflationFeederLost`; the key is the aggregate registration and the
+    /// lane.
     ConflationFeederLost = 8,
 }
 

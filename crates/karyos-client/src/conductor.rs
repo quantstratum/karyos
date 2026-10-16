@@ -48,6 +48,7 @@ use karyos_protocol::cnc::{CutoverState, ErrorCode};
 use karyos_sys::broadcast::{BroadcastReceiver, Received};
 use karyos_sys::command_ring::{RingError, RingProducer};
 use karyos_sys::counters::ClientCells;
+use karyos_sys::frame::Lane;
 use karyos_sys::record_journal::JournalLayout;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 use thiserror::Error;
@@ -156,6 +157,8 @@ pub enum Request {
     Publication {
         /// The stream.
         stream: StreamKey,
+        /// The lane of the stream's aggregate.
+        lane: Lane,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
     },
@@ -163,6 +166,8 @@ pub enum Request {
     ConcurrentPublication {
         /// The stream.
         stream: StreamKey,
+        /// The lane of the stream's aggregate.
+        lane: Lane,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
     },
@@ -170,6 +175,8 @@ pub enum Request {
     Subscription {
         /// The stream.
         stream: StreamKey,
+        /// The lane of the stream's aggregate.
+        lane: Lane,
         /// Its role.
         role: SubscriberRole,
     },
@@ -189,6 +196,17 @@ impl Request {
             | Self::ConcurrentPublication { stream, .. }
             | Self::Subscription { stream, .. }
             | Self::ConflatedSubscription { stream } => stream,
+        }
+    }
+
+    /// The lane requested; a conflated view names none.
+    #[must_use]
+    pub fn lane(&self) -> Option<Lane> {
+        match *self {
+            Self::Publication { lane, .. }
+            | Self::ConcurrentPublication { lane, .. }
+            | Self::Subscription { lane, .. } => Some(lane),
+            Self::ConflatedSubscription { .. } => None,
         }
     }
 }
@@ -541,8 +559,8 @@ impl<T: TermBytes> ClientConductor<T> {
         self.pending.len() + self.unknown.len()
     }
 
-    /// Requests the stream's exclusive publication; returns the request
-    /// sequence.
+    /// Requests the stream's exclusive publication on lane 0; returns the
+    /// request sequence.
     ///
     /// # Errors
     ///
@@ -552,14 +570,32 @@ impl<T: TermBytes> ClientConductor<T> {
         stream: StreamKey,
         allow_unconnected: bool,
     ) -> Result<u64, ConductorError> {
+        self.add_publication_on_lane(stream, Lane::ZERO, allow_unconnected)
+    }
+
+    /// Requests the exclusive publication of one lane of the stream's
+    /// aggregate; returns the request sequence. The driver refuses a lane
+    /// the aggregate does not configure with `UnknownStream`.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    pub fn add_publication_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: Lane,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
         let request = Request::Publication {
             stream,
+            lane,
             allow_unconnected,
         };
         self.submit(Kind::AddPublication, Some(request), |sequence| {
             Command::AddPublication {
                 sequence,
                 stream,
+                lane,
                 allow_unconnected,
             }
         })
@@ -578,20 +614,40 @@ impl<T: TermBytes> ClientConductor<T> {
         stream: StreamKey,
         allow_unconnected: bool,
     ) -> Result<u64, ConductorError> {
+        self.add_concurrent_publication_on_lane(stream, Lane::ZERO, allow_unconnected)
+    }
+
+    /// Requests a concurrent publication handle on one lane of the
+    /// stream's aggregate, as
+    /// [`add_concurrent_publication`](Self::add_concurrent_publication)
+    /// does on lane 0.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    pub fn add_concurrent_publication_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: Lane,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
         let request = Request::ConcurrentPublication {
             stream,
+            lane,
             allow_unconnected,
         };
         self.submit(Kind::AddConcurrentPublication, Some(request), |sequence| {
             Command::AddConcurrentPublication {
                 sequence,
                 stream,
+                lane,
                 allow_unconnected,
             }
         })
     }
 
-    /// Requests a subscription to the stream; returns the request sequence.
+    /// Requests a subscription to the stream on lane 0; returns the
+    /// request sequence.
     ///
     /// # Errors
     ///
@@ -601,11 +657,27 @@ impl<T: TermBytes> ClientConductor<T> {
         stream: StreamKey,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
-        let request = Request::Subscription { stream, role };
+        self.add_subscription_on_lane(stream, Lane::ZERO, role)
+    }
+
+    /// Requests a subscription to one lane of the stream's aggregate;
+    /// returns the request sequence.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    pub fn add_subscription_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: Lane,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        let request = Request::Subscription { stream, lane, role };
         self.submit(Kind::AddSubscription, Some(request), |sequence| {
             Command::AddSubscription {
                 sequence,
                 stream,
+                lane,
                 role,
             }
         })

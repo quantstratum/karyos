@@ -509,6 +509,7 @@ fn test_driver_events_abort_reports_the_loss_and_the_closed_publication() {
         events[1],
         Event::PublicationClosed {
             stream: LOST_STREAM,
+            lane: Lane::ZERO,
             reason: CloseReason::RequiredParticipantLost,
         }
     );
@@ -644,6 +645,7 @@ fn test_seal_reason_removal_reaches_handles_and_is_reported_once() {
         observed_work(&mut driver, &mut observer),
         [Event::PublicationClosed {
             stream: LOST_STREAM,
+            lane: Lane::ZERO,
             reason: CloseReason::StreamRemoved,
         }]
     );

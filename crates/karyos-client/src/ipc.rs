@@ -72,6 +72,7 @@ use karyos_sys::command_ring::RingProducer;
 use karyos_sys::conflation::{Budget, ConflationConfig, ConflationReader};
 use karyos_sys::counters::{CellRead, ClientCells, CountersReader};
 use karyos_sys::error::SysError;
+use karyos_sys::frame::Lane;
 use karyos_sys::ipc::{self, PidFd, ReadOnlyRegion, Recv, Region, RegionRecord, SealProfile, Sent};
 use karyos_sys::log_buffer::{
     ConcurrentPublication, LogBuffer, PreparedConcurrentPublication, PreparedPublication,
@@ -266,8 +267,13 @@ impl Session {
                 Event::Fenced { registration, .. } => {
                     self.close_where(|entry| entry.registration == registration);
                 }
-                Event::PublicationClosed { stream, .. } => {
-                    self.close_where(|entry| entry.request.stream() == stream);
+                // Only the closed lane's links; a conflated view names no
+                // lane and ends with any lane of its stream.
+                Event::PublicationClosed { stream, lane, .. } => {
+                    self.close_where(|entry| {
+                        entry.request.stream() == stream
+                            && entry.request.lane().is_none_or(|ours| ours == lane)
+                    });
                 }
                 _ => {}
             }
@@ -715,6 +721,52 @@ impl RemoteClient {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?.add_subscription(stream, role)
+    }
+
+    /// Requests a publication on one lane of `stream`'s aggregate.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_publication_on_lane`].
+    pub fn add_publication_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: Lane,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_publication_on_lane(stream, lane, allow_unconnected)
+    }
+
+    /// Requests a concurrent publication handle on one lane of `stream`'s
+    /// aggregate.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_concurrent_publication_on_lane`].
+    pub fn add_concurrent_publication_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: Lane,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_concurrent_publication_on_lane(stream, lane, allow_unconnected)
+    }
+
+    /// Requests a subscription to one lane of `stream`'s aggregate.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_subscription_on_lane`].
+    pub fn add_subscription_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: Lane,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_subscription_on_lane(stream, lane, role)
     }
 
     /// Requests a read-only view of a conflated stream's table, as
@@ -1442,7 +1494,8 @@ fn check(fetched: &Fetched, request: &Request) -> Result<(), AttachError> {
         && record.session_id == stream.session_id
         && config.stream_id == stream.stream_id
         && config.session_id == stream.session_id
-        && record.lane == config.lane.get();
+        && record.lane == config.lane.get()
+        && request.lane().is_none_or(|lane| lane == config.lane);
     if matches {
         Ok(())
     } else {
@@ -1511,6 +1564,7 @@ mod tests {
             1,
             Request::Subscription {
                 stream: STREAM,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Required,
             },
         );
@@ -1519,6 +1573,7 @@ mod tests {
             2,
             Request::Publication {
                 stream: OTHER,
+                lane: Lane::ZERO,
                 allow_unconnected: false,
             },
         );
@@ -1532,8 +1587,9 @@ mod tests {
         assert!(matches!(first.next(true), crate::generation::Next::End));
     }
 
-    /// `PublicationClosed` closes the links of its stream, publication and
-    /// subscription alike, and no other; `Fenced` closes its registration's.
+    /// `PublicationClosed` closes the links of its stream and lane,
+    /// publication and subscription alike, and no other; `Fenced` closes
+    /// its registration's.
     #[test]
     fn publication_closed_and_fenced_close_only_their_links() {
         let (session, _peer) = session();
@@ -1542,6 +1598,7 @@ mod tests {
             1,
             Request::Subscription {
                 stream: STREAM,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Optional,
             },
         );
@@ -1550,6 +1607,7 @@ mod tests {
             2,
             Request::Publication {
                 stream: STREAM,
+                lane: Lane::ZERO,
                 allow_unconnected: true,
             },
         );
@@ -1558,6 +1616,7 @@ mod tests {
             3,
             Request::ConcurrentPublication {
                 stream: OTHER,
+                lane: Lane::ZERO,
                 allow_unconnected: true,
             },
         );
@@ -1566,18 +1625,30 @@ mod tests {
             4,
             Request::Subscription {
                 stream: OTHER,
+                lane: Lane::ZERO,
                 role: SubscriberRole::Required,
+            },
+        );
+        let other_lane = register(
+            &session,
+            5,
+            Request::Subscription {
+                stream: STREAM,
+                lane: Lane::try_new(1).unwrap(),
+                role: SubscriberRole::Optional,
             },
         );
         session.serve_cutovers(
             vec![Event::PublicationClosed {
                 stream: STREAM,
+                lane: Lane::ZERO,
                 reason: karyos_protocol::cnc::CloseReason::RequiredParticipantLost,
             }],
             false,
         );
         assert_eq!(subscription.status(), LinkStatus::Closed);
         assert_eq!(publication.status(), LinkStatus::Closed);
+        assert_eq!(other_lane.status(), LinkStatus::Current);
         assert_eq!(other.status(), LinkStatus::Current);
         assert_eq!(fenced.status(), LinkStatus::Current);
         session.serve_cutovers(
@@ -1600,6 +1671,7 @@ mod tests {
             1,
             Request::Publication {
                 stream: STREAM,
+                lane: Lane::ZERO,
                 allow_unconnected: true,
             },
         );

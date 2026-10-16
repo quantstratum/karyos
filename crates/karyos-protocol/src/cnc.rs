@@ -16,11 +16,11 @@
 //!
 //! | Type | Message | Word 0 | Word 1 | Word 2 | Word 3 |
 //! | --- | --- | --- | --- | --- | --- |
-//! | `0x01` | `AddPublication` | sequence | stream id (low 32) and session id (high 32) | flags: bit 0 allow unconnected, others zero | |
-//! | `0x02` | `AddSubscription` | sequence | stream and session as above | role: 0 required, 1 optional | |
+//! | `0x01` | `AddPublication` | sequence | stream id (low 32) and session id (high 32) | flags: bit 0 allow unconnected, others zero | lane: below 4 |
+//! | `0x02` | `AddSubscription` | sequence | stream and session as above | role: 0 required, 1 optional | lane as `AddPublication` |
 //! | `0x03` | `RemovePublication` | sequence | registration | | |
 //! | `0x04` | `RemoveSubscription` | sequence | registration | | |
-//! | `0x05` | `AddConcurrentPublication` | sequence | stream and session as above | flags as `AddPublication` | |
+//! | `0x05` | `AddConcurrentPublication` | sequence | stream and session as above | flags as `AddPublication` | lane as `AddPublication` |
 //! | `0x06` | `AllocateCounter` | sequence | type id | stream registration or 0 | participant registration or 0 |
 //! | `0x07` | `ReleaseCounter` | sequence | cell | registration | |
 //! | `0x08` | `ReportLoss` | sequence | driver instance id, high word | driver instance id, low word | stream registration |
@@ -36,6 +36,11 @@
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
 //! | `0x88` | `ConflatedReady` | client | sequence | registration | hand-over key |
+//!
+//! The lane word of `AddPublication`, `AddConcurrentPublication` and
+//! `AddSubscription` (`quantstratum-docs: karyos/design/aggregate-ownership.md`,
+//! The API) selects one lane of the stream's aggregate; a lane the stream
+//! does not configure is refused with `Error` and `UnknownStream`.
 //!
 //! `AddConflatedSubscription` and `ConflatedReady` (`quantstratum-docs:
 //! karyos/design/conflation-end-to-end.md`, Cross-process views): a view
@@ -110,10 +115,11 @@
 //! | --- | --- | --- | --- | --- | --- | --- |
 //! | `0xC1` | `ParticipantLost` | stream and session | registration | client | policy: 1 hold, 2 continue, 3 abort | position |
 //! | `0xC2` | `RequiredBoundWithdrawn` | stream and session | registration | position | | |
-//! | `0xC3` | `PublicationClosed` | stream and session | reason: 1 required participant lost | | | |
+//! | `0xC3` | `PublicationClosed` | stream and session | reason: 1 required participant lost | lane: below 4 | | |
 //! | `0xC4` | `SuccessorReady` | stream and session | registration | hand-over key of the successor grant | base position | generation |
 //! | `0xC5` | `Fenced` | stream and session | registration | | | |
 
+use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::SealReason;
 use thiserror::Error;
 
@@ -468,6 +474,8 @@ pub enum Command {
         sequence: u64,
         /// The stream.
         stream: StreamKey,
+        /// The lane of the stream's aggregate.
+        lane: Lane,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
     },
@@ -477,6 +485,8 @@ pub enum Command {
         sequence: u64,
         /// The stream.
         stream: StreamKey,
+        /// The lane of the stream's aggregate.
+        lane: Lane,
         /// The subscriber's role.
         role: SubscriberRole,
     },
@@ -487,6 +497,8 @@ pub enum Command {
         sequence: u64,
         /// The stream.
         stream: StreamKey,
+        /// The lane of the stream's aggregate.
+        lane: Lane,
         /// Accept offers with no subscriber attached.
         allow_unconnected: bool,
     },
@@ -792,6 +804,15 @@ fn read_words<const N: usize>(type_id: u32, bytes: &[u8]) -> Result<[u64; N], Cn
     Ok(words)
 }
 
+/// The lane of a command's lane word: a value below 4, the other bits
+/// zero.
+fn lane_from(type_id: u32, word: u64) -> Result<Lane, CncError> {
+    u8::try_from(word)
+        .ok()
+        .and_then(|lane| Lane::try_new(lane).ok())
+        .ok_or(CncError::Reserved { type_id })
+}
+
 impl Command {
     /// The record type of this command.
     #[must_use]
@@ -841,19 +862,27 @@ impl Command {
             Self::AddPublication {
                 sequence,
                 stream,
+                lane,
                 allow_unconnected,
             }
             | Self::AddConcurrentPublication {
                 sequence,
                 stream,
+                lane,
                 allow_unconnected,
             } => write_words(
-                &[sequence, stream_word(stream), u64::from(allow_unconnected)],
+                &[
+                    sequence,
+                    stream_word(stream),
+                    u64::from(allow_unconnected),
+                    u64::from(lane.get()),
+                ],
                 out,
             ),
             Self::AddSubscription {
                 sequence,
                 stream,
+                lane,
                 role,
             } => {
                 let role = match role {
@@ -861,7 +890,10 @@ impl Command {
                     SubscriberRole::Optional => 1,
                     SubscriberRole::Observer => 2,
                 };
-                write_words(&[sequence, stream_word(stream), role], out)
+                write_words(
+                    &[sequence, stream_word(stream), role, u64::from(lane.get())],
+                    out,
+                )
             }
             Self::RemovePublication {
                 sequence,
@@ -953,28 +985,31 @@ impl Command {
     pub fn decode(type_id: u32, bytes: &[u8]) -> Result<Self, CncError> {
         match type_id {
             ADD_PUBLICATION | ADD_CONCURRENT_PUBLICATION => {
-                let [sequence, stream, flags] = read_words::<3>(type_id, bytes)?;
+                let [sequence, stream, flags, lane] = read_words::<4>(type_id, bytes)?;
                 if flags & !ALLOW_UNCONNECTED != 0 {
                     return Err(CncError::Reserved { type_id });
                 }
+                let lane = lane_from(type_id, lane)?;
                 let stream = stream_from(stream);
                 let allow_unconnected = flags == ALLOW_UNCONNECTED;
                 Ok(if type_id == ADD_PUBLICATION {
                     Self::AddPublication {
                         sequence,
                         stream,
+                        lane,
                         allow_unconnected,
                     }
                 } else {
                     Self::AddConcurrentPublication {
                         sequence,
                         stream,
+                        lane,
                         allow_unconnected,
                     }
                 })
             }
             ADD_SUBSCRIPTION => {
-                let [sequence, stream, role] = read_words::<3>(type_id, bytes)?;
+                let [sequence, stream, role, lane] = read_words::<4>(type_id, bytes)?;
                 let role = match role {
                     0 => SubscriberRole::Required,
                     1 => SubscriberRole::Optional,
@@ -984,6 +1019,7 @@ impl Command {
                 Ok(Self::AddSubscription {
                     sequence,
                     stream: stream_from(stream),
+                    lane: lane_from(type_id, lane)?,
                     role,
                 })
             }
@@ -1409,10 +1445,14 @@ pub enum Event {
         /// Its last published position.
         position: u64,
     },
-    /// The stream's publication was closed for `reason`.
+    /// The publication of one lane of the stream's aggregate was closed
+    /// for `reason`.
     PublicationClosed {
         /// The stream.
         stream: StreamKey,
+        /// The lane closed; removing an aggregate closes each of its
+        /// lanes.
+        lane: Lane,
         /// Why.
         reason: CloseReason,
     },
@@ -1491,9 +1531,14 @@ impl Event {
                 registration,
                 position,
             } => write_words(&[stream_word(stream), registration, position], out),
-            Self::PublicationClosed { stream, reason } => {
-                write_words(&[stream_word(stream), reason.code()], out)
-            }
+            Self::PublicationClosed {
+                stream,
+                lane,
+                reason,
+            } => write_words(
+                &[stream_word(stream), reason.code(), u64::from(lane.get())],
+                out,
+            ),
             Self::SuccessorReady {
                 stream,
                 registration,
@@ -1540,9 +1585,10 @@ impl Event {
                 })
             }
             PUBLICATION_CLOSED => {
-                let [stream, reason] = read_words::<2>(type_id, bytes)?;
+                let [stream, reason, lane] = read_words::<3>(type_id, bytes)?;
                 Ok(Self::PublicationClosed {
                     stream: stream_from(stream),
+                    lane: lane_from(type_id, lane)?,
                     reason: CloseReason::from_code(reason).ok_or(CncError::Reserved { type_id })?,
                 })
             }
@@ -1601,21 +1647,25 @@ mod tests {
             Command::AddPublication {
                 sequence: 1,
                 stream: stream(),
+                lane: Lane::ZERO,
                 allow_unconnected: true,
             },
             Command::AddSubscription {
                 sequence: u64::MAX,
                 stream: stream(),
+                lane: Lane::try_new(3).unwrap(),
                 role: SubscriberRole::Optional,
             },
             Command::AddSubscription {
                 sequence: 5,
                 stream: stream(),
+                lane: Lane::ZERO,
                 role: SubscriberRole::Observer,
             },
             Command::AddConcurrentPublication {
                 sequence: 2,
                 stream: stream(),
+                lane: Lane::try_new(2).unwrap(),
                 allow_unconnected: false,
             },
             Command::RemovePublication {
@@ -1807,6 +1857,7 @@ mod tests {
                 stream_id: -2,
                 session_id: 7,
             },
+            lane: Lane::try_new(1).unwrap(),
             allow_unconnected: true,
         }
         .encode(&mut out)
@@ -1817,6 +1868,7 @@ mod tests {
                 0x02, 0x01, 0, 0, 0, 0, 0, 0, // sequence
                 0xfe, 0xff, 0xff, 0xff, 7, 0, 0, 0, // stream -2, session 7
                 1, 0, 0, 0, 0, 0, 0, 0, // allow unconnected
+                1, 0, 0, 0, 0, 0, 0, 0, // lane 1
             ]
         );
         let mut out = [0u8; MAX_RESPONSE_LENGTH];
@@ -1846,6 +1898,7 @@ mod tests {
                     stream_id: 0,
                     session_id: 0
                 },
+                lane: Lane::ZERO,
                 role: SubscriberRole::Optional
             }
             .type_id(),
@@ -1868,6 +1921,7 @@ mod tests {
                 stream_id: -2,
                 session_id: 7,
             },
+            lane: Lane::try_new(3).unwrap(),
             allow_unconnected: false,
         }
         .encode(&mut out)
@@ -1878,6 +1932,28 @@ mod tests {
                 0x02, 0x01, 0, 0, 0, 0, 0, 0, // sequence
                 0xfe, 0xff, 0xff, 0xff, 7, 0, 0, 0, // stream -2, session 7
                 0, 0, 0, 0, 0, 0, 0, 0, // flags
+                3, 0, 0, 0, 0, 0, 0, 0, // lane 3
+            ]
+        );
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = Command::AddSubscription {
+            sequence: 0x0102,
+            stream: StreamKey {
+                stream_id: -2,
+                session_id: 7,
+            },
+            lane: Lane::try_new(2).unwrap(),
+            role: SubscriberRole::Observer,
+        }
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(
+            &out[..length],
+            &[
+                0x02, 0x01, 0, 0, 0, 0, 0, 0, // sequence
+                0xfe, 0xff, 0xff, 0xff, 7, 0, 0, 0, // stream -2, session 7
+                2, 0, 0, 0, 0, 0, 0, 0, // role: observer
+                2, 0, 0, 0, 0, 0, 0, 0, // lane 2
             ]
         );
         assert_eq!(ErrorCode::InvalidPublicationMode.code(), 6);
@@ -1898,6 +1974,7 @@ mod tests {
         let command = Command::AddSubscription {
             sequence: 1,
             stream: stream(),
+            lane: Lane::ZERO,
             role: SubscriberRole::Required,
         };
         let length = command.encode(&mut out).unwrap();
@@ -1928,6 +2005,20 @@ mod tests {
             Command::decode(0x0D, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
+        // A lane word of 4 or more, or with any bit above the lane, is
+        // reserved in all three commands.
+        out[16] = 0;
+        for type_id in [0x01, 0x02, 0x05] {
+            assert!(Command::decode(type_id, &out[..length]).is_ok());
+            for lane in [4u64, 0xFF, 1 << 8, 1 << 63] {
+                out[24..32].copy_from_slice(&lane.to_le_bytes());
+                assert!(matches!(
+                    Command::decode(type_id, &out[..length]),
+                    Err(CncError::Reserved { .. })
+                ));
+            }
+            out[24..32].fill(0);
+        }
         let mut response = [0u8; 4 * 8];
         response[16] = 99;
         assert!(matches!(
@@ -2249,6 +2340,7 @@ mod tests {
             },
             Event::PublicationClosed {
                 stream: stream(),
+                lane: Lane::try_new(2).unwrap(),
                 reason: CloseReason::RequiredParticipantLost,
             },
             Event::SuccessorReady {
@@ -2287,10 +2379,22 @@ mod tests {
         let mut out = [0u8; 64];
         let length = Event::PublicationClosed {
             stream: stream(),
+            lane: Lane::try_new(3).unwrap(),
             reason: CloseReason::RequiredParticipantLost,
         }
         .encode(&mut out)
         .unwrap();
+        assert_eq!(
+            &out[8..length],
+            &[
+                1, 0, 0, 0, 0, 0, 0, 0, // reason: required participant lost
+                3, 0, 0, 0, 0, 0, 0, 0, // lane 3
+            ]
+        );
+        // A lane of 4 or more is refused.
+        out[16] = 4;
+        assert!(Event::decode(PUBLICATION_CLOSED, &out[..length]).is_err());
+        out[16] = 3;
         out[8] = 9;
         assert!(Event::decode(PUBLICATION_CLOSED, &out[..length]).is_err());
     }
@@ -2718,6 +2822,10 @@ mod properties {
             )
     }
 
+    fn lane() -> impl Strategy<Value = Lane> {
+        (0..Lane::COUNT).prop_map(|lane| Lane::try_new(lane).unwrap())
+    }
+
     fn command() -> impl Strategy<Value = Command> {
         let role = prop::sample::select(
             &[
@@ -2727,24 +2835,29 @@ mod properties {
             ][..],
         );
         prop_oneof![
-            (any::<u64>(), stream(), any::<bool>()).prop_map(
-                |(sequence, stream, allow_unconnected)| Command::AddPublication {
+            (any::<u64>(), stream(), lane(), any::<bool>()).prop_map(
+                |(sequence, stream, lane, allow_unconnected)| Command::AddPublication {
                     sequence,
                     stream,
+                    lane,
                     allow_unconnected,
                 }
             ),
-            (any::<u64>(), stream(), any::<bool>()).prop_map(
-                |(sequence, stream, allow_unconnected)| Command::AddConcurrentPublication {
-                    sequence,
-                    stream,
-                    allow_unconnected,
+            (any::<u64>(), stream(), lane(), any::<bool>()).prop_map(
+                |(sequence, stream, lane, allow_unconnected)| {
+                    Command::AddConcurrentPublication {
+                        sequence,
+                        stream,
+                        lane,
+                        allow_unconnected,
+                    }
                 }
             ),
-            (any::<u64>(), stream(), role).prop_map(|(sequence, stream, role)| {
+            (any::<u64>(), stream(), lane(), role).prop_map(|(sequence, stream, lane, role)| {
                 Command::AddSubscription {
                     sequence,
                     stream,
+                    lane,
                     role,
                 }
             }),
@@ -2922,8 +3035,9 @@ mod properties {
                     position,
                 }
             }),
-            stream().prop_map(|stream| Event::PublicationClosed {
+            (stream(), lane()).prop_map(|(stream, lane)| Event::PublicationClosed {
                 stream,
+                lane,
                 reason: CloseReason::RequiredParticipantLost,
             }),
             (stream(), any::<[u64; 4]>()).prop_map(
@@ -2949,11 +3063,11 @@ mod properties {
                 COMMANDS.types,
                 MAX_COMMAND_LENGTH,
                 &[
-                    (ADD_PUBLICATION, 3),
-                    (ADD_SUBSCRIPTION, 3),
+                    (ADD_PUBLICATION, 4),
+                    (ADD_SUBSCRIPTION, 4),
                     (REMOVE_PUBLICATION, 2),
                     (REMOVE_SUBSCRIPTION, 2),
-                    (ADD_CONCURRENT_PUBLICATION, 3),
+                    (ADD_CONCURRENT_PUBLICATION, 4),
                     (ALLOCATE_COUNTER, ALLOCATE_COUNTER_WORDS),
                     (RELEASE_COUNTER, 3),
                     (REPORT_LOSS, REPORT_LOSS_WORDS),
@@ -2995,7 +3109,7 @@ mod properties {
                 &[
                     (PARTICIPANT_LOST, 5),
                     (REQUIRED_BOUND_WITHDRAWN, 3),
-                    (PUBLICATION_CLOSED, 2),
+                    (PUBLICATION_CLOSED, 3),
                     (SUCCESSOR_READY, 5),
                     (FENCED, 2),
                 ],
