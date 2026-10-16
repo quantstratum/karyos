@@ -122,6 +122,9 @@ pub mod refusal {
     pub const RESOURCES: u64 = 4;
     /// The fetch names no hand-over entry held for this client.
     pub const UNKNOWN_KEY: u64 = 5;
+    /// The driver is shutting down and admits no new client; retrying
+    /// against this instance cannot succeed.
+    pub const SHUTTING_DOWN: u64 = 6;
 }
 
 /// The protocol version of a `Hello` datagram of any version: its type and

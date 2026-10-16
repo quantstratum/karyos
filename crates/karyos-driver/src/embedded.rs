@@ -824,7 +824,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// (`quantstratum-docs: karyos/design/observability-and-tools.md`,
     /// Binaries): [`EmbeddedDriver::connect`] then returns
     /// [`DriverError::NotAdmitting`], and in IPC mode a client `Hello` is
-    /// refused with `LIMIT`. Clients already admitted are served as
+    /// refused with `SHUTTING_DOWN`, so that a client does not retry as it
+    /// would after `LIMIT`. Clients already admitted are served as
     /// before, and tools are still admitted, so that diagnostics stay
     /// readable. It cannot be undone; calling it again has no effect.
     pub fn stop_admitting(&mut self) {

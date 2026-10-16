@@ -468,14 +468,11 @@ impl<T: StreamTerms> Admission<T> {
         if !proven || pidfd.exited().unwrap_or(true) {
             return reject(driver, &socket, refusal::PROFILE, "peer not proven");
         }
-        if driver.terminal || !driver.admitting || driver.clients.len() >= driver.config.max_clients
-        {
-            return reject(
-                driver,
-                &socket,
-                refusal::LIMIT,
-                "client limit, terminal or not admitting",
-            );
+        if !driver.admitting {
+            return reject(driver, &socket, refusal::SHUTTING_DOWN, "not admitting");
+        }
+        if driver.terminal || driver.clients.len() >= driver.config.max_clients {
+            return reject(driver, &socket, refusal::LIMIT, "client limit or terminal");
         }
         match self.bootstrap(driver) {
             Some((client, link, outbound)) => self.remotes.push(Remote {

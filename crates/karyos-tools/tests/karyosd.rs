@@ -160,7 +160,14 @@ fn karyosd_refuses_new_clients_once_shutting_down() {
     let start = Instant::now();
     loop {
         match attach(&dir, Duration::from_secs(5), 16) {
-            Err(karyos_client::ipc::AttachError::Refused { .. }) => break,
+            Err(karyos_client::ipc::AttachError::Refused { code }) => {
+                assert_eq!(
+                    code,
+                    karyos_protocol::admission::refusal::SHUTTING_DOWN,
+                    "refused for another reason"
+                );
+                break;
+            }
             Ok(late) => drop(late),
             Err(error) => panic!("{error:?}"),
         }

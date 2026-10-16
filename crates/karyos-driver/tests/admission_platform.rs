@@ -396,10 +396,10 @@ fn test_admission_stopped_driver_refuses_clients_and_admits_tools() {
     let client = attach_serving(&mut driver, &dir).unwrap();
     assert_eq!(driver.clients(), 1);
     driver.stop_admitting();
-    // A new client is refused with LIMIT; the admitted one stays.
+    // A new client is refused with SHUTTING_DOWN; the admitted one stays.
     let refused = attach_serving(&mut driver, &dir);
     assert!(
-        matches!(refused, Err(AttachError::Refused { code }) if code == refusal::LIMIT),
+        matches!(refused, Err(AttachError::Refused { code }) if code == refusal::SHUTTING_DOWN),
         "{refused:?}"
     );
     assert_eq!(driver.clients(), 1);
