@@ -38,6 +38,11 @@
 //! needs and revalidates the version: a changed barrier, a slot reconciled
 //! past the snapshot or a missing record yields [`Freshness::Retry`], never
 //! Fresh.
+//!
+//! A value at `position` is stale after a gap `[start, end)` whenever
+//! `position < end` (GU-9): the lost range may have held a newer update of
+//! its key, and only a replacement that begins at or after `end` restores
+//! it. A gap above the value's position does not touch it.
 
 use crate::load_words::LoadWords;
 use crate::sync::{AtomicU64, Ordering, fence};
@@ -72,9 +77,14 @@ pub enum FreshnessError {
         /// The ring size.
         ring: usize,
     },
-    /// The loss sequence or the barrier version would overflow.
+    /// The loss sequence would reach [`STALE`] (bit 63, which a slot's
+    /// applied sequence uses as its stale flag) or the barrier version
+    /// would overflow.
     #[error("loss barrier sequence exhausted")]
     Exhausted,
+    /// A barrier write is in progress: take the snapshot again.
+    #[error("loss barrier write in progress")]
+    Busy,
     /// An empty or reversed interval.
     #[error("invalid loss interval [{start}, {end})")]
     InvalidInterval {
@@ -218,12 +228,19 @@ impl<'a> BarrierWords<'a> {
         if u64::try_from(self.ring).is_ok_and(|ring| unretired >= ring) {
             return Err(FreshnessError::RingFull { ring: self.ring });
         }
-        let seq = newest.checked_add(1).ok_or(FreshnessError::Exhausted)?;
+        // The sequence stays below the slots' stale flag.
+        let seq = newest
+            .checked_add(1)
+            .filter(|&seq| seq < STALE)
+            .ok_or(FreshnessError::Exhausted)?;
         let record = self.record_index(seq)?;
+        let (Some(start_at), Some(end_at)) = (record.checked_add(1), record.checked_add(2)) else {
+            return Err(FreshnessError::InvalidLayout);
+        };
         self.write(&[
             (record, seq),
-            (record + 1, start),
-            (record + 2, end),
+            (start_at, start),
+            (end_at, end),
             (LOSS_SEQ, seq),
         ])?;
         Ok(seq)
@@ -284,7 +301,10 @@ impl<'a> BarrierWords<'a> {
 /// The first word of the record of loss `seq` in a ring of `ring` records.
 fn record_index(seq: u64, ring: usize) -> Result<usize, FreshnessError> {
     let ring_words = u64::try_from(ring).map_err(|_| FreshnessError::InvalidLayout)?;
-    let slot = usize::try_from(seq % ring_words).map_err(|_| FreshnessError::InvalidLayout)?;
+    let slot = seq
+        .checked_rem(ring_words)
+        .and_then(|slot| usize::try_from(slot).ok())
+        .ok_or(FreshnessError::InvalidLayout)?;
     slot.checked_mul(RECORD_WORDS)
         .and_then(|offset| offset.checked_add(HEADER_WORDS))
         .ok_or(FreshnessError::InvalidLayout)
@@ -297,22 +317,41 @@ pub struct BarrierSnapshot {
     version: u64,
     loss_seq: u64,
     retired_through: u64,
+    ring: usize,
 }
 
 impl BarrierSnapshot {
-    /// Takes the snapshot (an Acquire load of the version, then the header
-    /// words). `None` while the writer is mid-write: retry.
-    #[must_use]
-    pub fn take<W: LoadWords>(words: &W) -> Option<Self> {
-        let version = words.load_acquire(VERSION)?;
-        if version % 2 == 1 {
-            return None;
+    /// Takes the snapshot of a barrier of `ring` records (an Acquire load
+    /// of the version, then the header words).
+    ///
+    /// # Errors
+    ///
+    /// [`FreshnessError::InvalidLayout`] unless `words` holds exactly
+    /// [`barrier_words`]`(ring)` words; [`FreshnessError::Busy`] while the
+    /// writer is mid-write (take it again).
+    pub fn take<W: LoadWords>(words: &W, ring: usize) -> Result<Self, FreshnessError> {
+        if barrier_words(ring) != Some(words.len()) {
+            return Err(FreshnessError::InvalidLayout);
         }
-        Some(Self {
+        let header = |index| words.load(index).ok_or(FreshnessError::InvalidLayout);
+        let version = words
+            .load_acquire(VERSION)
+            .ok_or(FreshnessError::InvalidLayout)?;
+        if version % 2 == 1 {
+            return Err(FreshnessError::Busy);
+        }
+        Ok(Self {
             version,
-            loss_seq: words.load(LOSS_SEQ)?,
-            retired_through: words.load(RETIRED)?,
+            loss_seq: header(LOSS_SEQ)?,
+            retired_through: header(RETIRED)?,
+            ring,
         })
+    }
+
+    /// The barrier version the snapshot was taken at.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// The newest loss sequence seen.
@@ -321,19 +360,24 @@ impl BarrierSnapshot {
         self.loss_seq
     }
 
+    /// The sequence retired through, as seen.
+    #[must_use]
+    pub fn retired_through(&self) -> u64 {
+        self.retired_through
+    }
+
     /// Classifies the value at `position` whose slot freshness words
     /// `slot` were copied after [`BarrierSnapshot::take`]: reads the
     /// records the slot has not applied, then revalidates the barrier
-    /// version. `ring` is the barrier's `G`.
+    /// version. `words` are the barrier the snapshot was taken from.
     #[must_use]
     pub fn classify<W: LoadWords>(
         &self,
         words: &W,
-        ring: usize,
         slot: SlotFreshness,
         position: u64,
     ) -> Freshness {
-        let classified = self.classify_unchecked(words, ring, slot, position);
+        let classified = self.classify_unchecked(words, slot, position);
         fence(Ordering::Acquire);
         if words.load(VERSION) != Some(self.version) {
             // The barrier changed while the slot or the records were read.
@@ -345,7 +389,6 @@ impl BarrierSnapshot {
     fn classify_unchecked<W: LoadWords>(
         &self,
         words: &W,
-        ring: usize,
         slot: SlotFreshness,
         position: u64,
     ) -> Freshness {
@@ -355,23 +398,23 @@ impl BarrierSnapshot {
         if applied > self.loss_seq || applied < self.retired_through {
             return Freshness::Retry;
         }
-        if slot.is_stale() {
-            return Freshness::Stale {
-                since: slot.stale_since,
-            };
-        }
-        // The records `applied + 1 ..= loss_seq`, oldest first: the first
-        // that covers `position` makes it stale.
+        // The slot's own stale start, then the records `applied + 1 ..=
+        // loss_seq`: the value is stale since the lowest start among them
+        // and the unapplied gaps that end above it.
+        let mut since = slot.is_stale().then_some(slot.stale_since);
         let mut seq = applied;
         while seq < self.loss_seq {
-            seq += 1;
-            let Ok(record) = record_index(seq, ring) else {
+            let Some(next) = seq.checked_add(1) else {
+                return Freshness::Retry;
+            };
+            seq = next;
+            let Ok(record) = record_index(seq, self.ring) else {
                 return Freshness::Retry;
             };
             let (Some(found), Some(start), Some(end)) = (
                 words.load(record),
-                words.load(record + 1),
-                words.load(record + 2),
+                record.checked_add(1).and_then(|at| words.load(at)),
+                record.checked_add(2).and_then(|at| words.load(at)),
             ) else {
                 return Freshness::Retry;
             };
@@ -379,11 +422,14 @@ impl BarrierSnapshot {
                 // Overwritten: the history this slot needs is gone.
                 return Freshness::Retry;
             }
-            if (start..end).contains(&position) {
-                return Freshness::Stale { since: start };
+            if position < end {
+                since = Some(since.map_or(start, |since| since.min(start)));
             }
         }
-        Freshness::Fresh
+        match since {
+            Some(since) => Freshness::Stale { since },
+            None => Freshness::Fresh,
+        }
     }
 }
 
@@ -391,7 +437,8 @@ impl BarrierSnapshot {
 /// once, after its body, when a full ring or an exhausted sequence leaves
 /// no other way to mark retained values stale.
 ///
-/// Words: `[published, start, end, reason]`.
+/// Words: `[state, start, end, reason]`; the state is 0 (empty), 1
+/// (claimed, body being written) or 2 (published).
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalCell<'a> {
     words: &'a [AtomicU64],
@@ -399,6 +446,10 @@ pub struct TerminalCell<'a> {
 
 /// Words of a [`TerminalCell`].
 pub const TERMINAL_WORDS: usize = 4;
+/// A terminal cell's states.
+const EMPTY: u64 = 0;
+const CLAIMED: u64 = 1;
+const PUBLISHED: u64 = 2;
 
 /// A published terminal invalidation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,30 +475,33 @@ impl<'a> TerminalCell<'a> {
         Ok(Self { words })
     }
 
-    /// Publishes the terminal invalidation: the body (Relaxed), then the
-    /// publication word (Release). Returns `false`, storing nothing, if it
-    /// was already published: the cell is one-shot.
+    /// Publishes the terminal invalidation: claims the cell (0 to 1), stores
+    /// the body (Relaxed), then publishes it (2, Release). Returns `false`,
+    /// storing nothing, if the cell was already claimed: it is one-shot,
+    /// even against a second publisher.
     #[must_use]
     pub fn publish(&self, terminal: Terminal) -> bool {
-        let [published, start, end, reason] = self.words else {
+        let [state, start, end, reason] = self.words else {
             return false;
         };
-        // Only the writer stores the cell.
-        if published.load(Ordering::Relaxed) != 0 {
+        if state
+            .compare_exchange(EMPTY, CLAIMED, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
             return false;
         }
         start.store(terminal.start, Ordering::Relaxed);
         end.store(terminal.end, Ordering::Relaxed);
         reason.store(terminal.reason, Ordering::Relaxed);
-        published.store(1, Ordering::Release);
+        state.store(PUBLISHED, Ordering::Release);
         true
     }
 
     /// The published invalidation, read only after the publication's
-    /// Acquire; `None` while unpublished.
+    /// Acquire; `None` while empty or claimed.
     #[must_use]
     pub fn read<W: LoadWords>(words: &W) -> Option<Terminal> {
-        if words.load_acquire(0)? == 0 {
+        if words.load_acquire(0)? != PUBLISHED {
             return None;
         }
         Some(Terminal {

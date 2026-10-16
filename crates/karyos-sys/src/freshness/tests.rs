@@ -2,7 +2,7 @@
 
 //! The loss barrier, single-threaded: layout, the ring-full rule,
 //! retirement bounds, classification and the terminal cell. The ordering
-//! is checked by `tests/loom_freshness.rs`.
+//! is checked by `tests/loom_barrier.rs`.
 
 #![allow(
     clippy::unwrap_used,
@@ -19,8 +19,8 @@ fn words(ring: usize) -> Vec<AtomicU64> {
 }
 
 fn classify(words: &[AtomicU64], ring: usize, slot: SlotFreshness, position: u64) -> Freshness {
-    let snapshot = BarrierSnapshot::take(&words).unwrap();
-    snapshot.classify(&words, ring, slot, position)
+    let snapshot = BarrierSnapshot::take(&words, ring).unwrap();
+    snapshot.classify(&words, slot, position)
 }
 
 fn fresh_through(applied: u64) -> SlotFreshness {
@@ -35,6 +35,7 @@ fn the_layout_is_a_header_and_three_words_per_record() {
     assert_eq!(barrier_words(MIN_RING), Some(3 + 3 * MIN_RING));
     assert_eq!(barrier_words(DEFAULT_RING), Some(3 + 3 * 16));
     assert_eq!(barrier_words(1), None);
+    assert_eq!(barrier_words(0), None);
     assert_eq!(barrier_words(usize::MAX), None);
     let w = words(4);
     assert!(BarrierWords::new(&w, 4).is_ok());
@@ -44,30 +45,55 @@ fn the_layout_is_a_header_and_three_words_per_record() {
     );
 }
 
-/// An unreconciled slot is Stale from the first record that covers it,
-/// and Fresh when no record does.
+/// GU-9: a value is stale after a gap whenever it lies below the gap's
+/// end, inside the gap or before it (the lost range may have held a newer
+/// update of its key); a gap wholly above it does not touch it.
 #[test]
-fn a_committed_gap_makes_an_unreconciled_value_stale() {
+fn a_committed_gap_makes_every_older_value_stale() {
     let w = words(4);
     let barrier = BarrierWords::new(&w, 4).unwrap();
-    assert_eq!(classify(&w, 4, fresh_through(0), 10), Freshness::Fresh);
+    assert_eq!(classify(&w, 4, fresh_through(0), 2), Freshness::Fresh);
     assert_eq!(barrier.append_loss(8, 16), Ok(1));
-    assert_eq!(barrier.append_loss(4, 12), Ok(2));
+    assert_eq!(
+        classify(&w, 4, fresh_through(0), 2),
+        Freshness::Stale { since: 8 },
+        "a value before the gap"
+    );
     assert_eq!(
         classify(&w, 4, fresh_through(0), 10),
         Freshness::Stale { since: 8 },
-        "the oldest covering record"
-    );
-    assert_eq!(
-        classify(&w, 4, fresh_through(1), 10),
-        Freshness::Stale { since: 4 }
+        "a value inside the gap"
     );
     assert_eq!(
         classify(&w, 4, fresh_through(0), 16),
         Freshness::Fresh,
-        "half-open"
+        "a replacement at the end restores (half-open)"
     );
-    assert_eq!(classify(&w, 4, fresh_through(2), 10), Freshness::Fresh);
+}
+
+/// `since` is the lowest start among the unapplied gaps that end above the
+/// value, whatever order they were committed in.
+#[test]
+fn stale_since_is_the_lowest_covering_start() {
+    let w = words(4);
+    let barrier = BarrierWords::new(&w, 4).unwrap();
+    assert_eq!(barrier.append_loss(24, 32), Ok(1));
+    assert_eq!(barrier.append_loss(8, 16), Ok(2));
+    assert_eq!(
+        classify(&w, 4, fresh_through(0), 2),
+        Freshness::Stale { since: 8 }
+    );
+    assert_eq!(
+        classify(&w, 4, fresh_through(0), 20),
+        Freshness::Stale { since: 24 },
+        "only the gap ending above it"
+    );
+    assert_eq!(
+        classify(&w, 4, fresh_through(1), 20),
+        Freshness::Fresh,
+        "the applied gap is the slot's business"
+    );
+    assert_eq!(classify(&w, 4, fresh_through(2), 2), Freshness::Fresh);
 }
 
 /// A stale slot reports its own start, whatever the records say.
@@ -81,6 +107,13 @@ fn a_stale_slot_reports_its_start() {
         stale_since: 8,
     };
     assert_eq!(classify(&w, 4, stale, 100), Freshness::Stale { since: 8 });
+    // An unapplied gap starting lower lowers it.
+    barrier.append_loss(2, 4).unwrap();
+    let later = SlotFreshness {
+        loss_applied: 1 | STALE,
+        stale_since: 8,
+    };
+    assert_eq!(classify(&w, 4, later, 3), Freshness::Stale { since: 2 });
 }
 
 /// The ring-full rule: no record is overwritten before it retires.
@@ -121,32 +154,40 @@ fn an_overwritten_record_is_retried() {
     let w = words(2);
     let barrier = BarrierWords::new(&w, 2).unwrap();
     barrier.append_loss(8, 16).unwrap();
-    let snapshot = BarrierSnapshot::take(&w.as_slice()).unwrap();
+    let snapshot = BarrierSnapshot::take(&w.as_slice(), 2).unwrap();
     // Record 1 (index 1) rewritten as loss 3, outside the protocol.
     w[3 + 3].store(3, Ordering::Relaxed);
-    let slot = &w.as_slice();
     // The version is unchanged, so only the sequence check catches it.
     assert_eq!(
-        snapshot.classify(slot, 2, fresh_through(0), 10),
+        snapshot.classify(&w.as_slice(), fresh_through(0), 10),
         Freshness::Retry
     );
 }
 
 /// A barrier write between the snapshot and the classification is seen by
-/// the revalidation.
+/// the revalidation; a write in progress and a malformed view are typed.
 #[test]
-fn a_barrier_change_after_the_snapshot_is_retried() {
+fn a_snapshot_is_revalidated_and_its_failures_are_typed() {
     let w = words(4);
     let barrier = BarrierWords::new(&w, 4).unwrap();
-    let snapshot = BarrierSnapshot::take(&w.as_slice()).unwrap();
+    let snapshot = BarrierSnapshot::take(&w.as_slice(), 4).unwrap();
     barrier.append_loss(8, 16).unwrap();
     assert_eq!(
-        snapshot.classify(&w.as_slice(), 4, fresh_through(0), 100),
+        snapshot.classify(&w.as_slice(), fresh_through(0), 100),
         Freshness::Retry
     );
-    // Mid-write (odd version): no snapshot.
     w[0].store(5, Ordering::Relaxed);
-    assert_eq!(BarrierSnapshot::take(&w.as_slice()), None);
+    assert_eq!(
+        BarrierSnapshot::take(&w.as_slice(), 4),
+        Err(FreshnessError::Busy)
+    );
+    for ring in [0, 1, 3] {
+        assert_eq!(
+            BarrierSnapshot::take(&w.as_slice(), ring),
+            Err(FreshnessError::InvalidLayout),
+            "ring {ring}"
+        );
+    }
 }
 
 #[test]
@@ -182,7 +223,7 @@ fn retirement_stays_within_the_appended_losses() {
 }
 
 #[test]
-fn an_empty_interval_and_an_exhausted_version_are_refused() {
+fn an_empty_interval_and_an_exhausted_sequence_are_refused() {
     let w = words(4);
     let barrier = BarrierWords::new(&w, 4).unwrap();
     assert_eq!(
@@ -192,6 +233,12 @@ fn an_empty_interval_and_an_exhausted_version_are_refused() {
     w[0].store(u64::MAX - 1, Ordering::Relaxed);
     assert_eq!(barrier.append_loss(8, 16), Err(FreshnessError::Exhausted));
     assert_eq!(barrier.loss_seq(), 0, "nothing stored");
+    // The sequence never reaches the slots' stale flag.
+    w[0].store(0, Ordering::Relaxed);
+    w[1].store(STALE - 1, Ordering::Relaxed);
+    w[2].store(STALE - 1, Ordering::Relaxed);
+    assert_eq!(barrier.append_loss(8, 16), Err(FreshnessError::Exhausted));
+    assert_eq!(barrier.loss_seq(), STALE - 1);
 }
 
 #[test]
@@ -213,4 +260,11 @@ fn the_terminal_cell_is_one_shot() {
     }));
     assert_eq!(TerminalCell::read(&w.as_slice()), Some(terminal));
     assert!(TerminalCell::new(&w[..3]).is_err());
+    // A claimed cell (a publisher mid-body) reads as unpublished and
+    // refuses a second publisher.
+    let w: Vec<AtomicU64> = (0..TERMINAL_WORDS).map(|_| AtomicU64::new(0)).collect();
+    w[0].store(1, Ordering::Relaxed);
+    let cell = TerminalCell::new(&w).unwrap();
+    assert_eq!(TerminalCell::read(&w.as_slice()), None);
+    assert!(!cell.publish(terminal));
 }
