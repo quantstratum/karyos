@@ -1462,7 +1462,7 @@ fn data_groups() {
         (
             "short trailer",
             [first.clone(), vec![0; 7]].concat(),
-            ControlError::Truncated,
+            ControlError::InvalidGrouping,
         ),
         (
             "short record",
@@ -1505,7 +1505,7 @@ fn data_groups() {
     }
     // A batch the dispatcher groups is one the receive scanner can then
     // validate against the image: DATA at term offsets 0 and 64, then an
-    // ABORTED extent of 64 at 128.
+    // ABORTED extent of 64 at 160.
     let mut first_data = data(5, 0x03, ALIAS, true);
     let mut second_data = data(40, 0x03, ALIAS, true);
     second_data[8..12].copy_from_slice(&64i32.to_le_bytes());
