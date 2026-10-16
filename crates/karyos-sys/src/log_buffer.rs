@@ -423,9 +423,12 @@ impl LogBuffer<SharedTerms> {
     ///
     /// # Errors
     ///
-    /// Returns [`SysError::InvalidRegion`] for a region that is not a log
-    /// buffer region, a configuration block that is not valid or does not
-    /// match the region, and the validation errors of [`LogBuffer::new`].
+    /// Returns [`SysError::LayoutVersion`] for a region or configuration
+    /// block of another layout version, [`SysError::InvalidRegion`] for a
+    /// region that is not a log buffer region, a configuration block that
+    /// is not valid or does not match the region, or a schedule ring whose
+    /// own capacity is not the configuration's, and the validation errors
+    /// of [`LogBuffer::new`].
     pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
         let record = region.record();
         let invalid = SysError::InvalidRegion {
@@ -457,8 +460,7 @@ impl LogBuffer<SharedTerms> {
         let (config, generation, max_message_length) = parse_config(&words).ok_or(invalid)?;
         let (layout, slots, expected_max) = Self::plan(&config)?;
         let structure_length = layout.total.checked_mul(crate::atomic_view::WORD_BYTES);
-        if record.layout != LAYOUT_VERSION
-            || record.generation != u64::from(generation.get())
+        if record.generation != u64::from(generation.get())
             || structure_length != Some(record.structure_length)
             || max_message_length != expected_max
         {
@@ -473,6 +475,15 @@ impl LogBuffer<SharedTerms> {
             slots,
             max_message_length,
         )?;
+        // Capacities whose rings round to the same region length (1 and
+        // 2) would attach on a rewritten configuration word: the ring's own
+        // capacity word, written at creation, must agree.
+        if let Some(ring) = buffer.schedule_ring() {
+            let declared = ring.first().map(|word| word.load(Ordering::Acquire));
+            if declared != Some(u64::from(buffer.config.schedule_capacity)) {
+                return Err(invalid);
+            }
+        }
         buffer.conductor_taken.store(true, Ordering::Relaxed);
         Ok(buffer)
     }
@@ -616,7 +627,11 @@ impl<T: TermBytes> LogBuffer<T> {
         self.active_count()
             .store(u64::from(start.get()), Ordering::Relaxed);
         if let Some(ring) = self.schedule_ring() {
-            // `plan` checked the capacity and `Layout` sized the words.
+            // `plan` checked that the capacity is a power of two and
+            // `Layout` sized the words with `ring_words` of that capacity,
+            // which are exactly what `init` checks; so `init` cannot fail
+            // here, in release as in debug, and the assertion only guards
+            // a future change to either.
             let initialised =
                 crate::schedule_ring::init(ring, u64::from(self.config.schedule_capacity));
             debug_assert!(initialised.is_ok(), "{initialised:?}");
@@ -1238,8 +1253,22 @@ fn issue_publication<O: BufferOwner>(owner: O) -> Result<Option<Publication<O>>,
 /// The exclusive publication's initial write loan on term 0, for a fresh
 /// publication taken by this process or adopted from a registration.
 fn first_loan<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Result<Publication<O>, SysError> {
+    let schedule = schedule_publisher(&owner)?;
     take_initial_loan(&owner)?;
-    Ok(initial_publication(owner, staging))
+    Ok(initial_publication(owner, staging, schedule))
+}
+
+/// The publisher of a timed lane's schedule ring, built from the buffer's
+/// own ring, so a publication's entries always go to its own lane's ring;
+/// `None` for a lane that is not timed.
+fn schedule_publisher<T: TermBytes>(
+    buffer: &LogBuffer<T>,
+) -> Result<Option<crate::schedule_ring::SchedulePublisher>, SysError> {
+    buffer
+        .schedule_ring()
+        .map(crate::schedule_ring::SchedulePublisher::attach)
+        .transpose()
+        .map_err(SysError::from)
 }
 
 /// Takes the exclusive publication's write loan on term 0, in slot 0: a
@@ -1263,7 +1292,11 @@ fn take_initial_loan<T: TermBytes>(buffer: &LogBuffer<T>) -> Result<(), SysError
 }
 
 /// The exclusive publication at term 0 under its initial write loan.
-fn initial_publication<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Publication<O> {
+fn initial_publication<O: BufferOwner>(
+    owner: O,
+    staging: Box<[u8]>,
+    schedule: Option<crate::schedule_ring::SchedulePublisher>,
+) -> Publication<O> {
     Publication {
         buffer: owner,
         state: PublicationState::Active {
@@ -1273,6 +1306,8 @@ fn initial_publication<O: BufferOwner>(owner: O, staging: Box<[u8]>) -> Publicat
         },
         pending: None,
         staging,
+        schedule,
+        last_time: None,
     }
 }
 
@@ -1399,13 +1434,22 @@ impl<O: BufferOwner> PreparedPublication<O> {
                 prepared: Some(self),
             });
         }
+        let schedule = match schedule_publisher(buffer) {
+            Ok(schedule) => schedule,
+            Err(error) => {
+                return Err(ActivateError {
+                    error,
+                    prepared: Some(self),
+                });
+            }
+        };
         if let Err(error) = take_initial_loan(buffer) {
             return Err(ActivateError {
                 error,
                 prepared: Some(self),
             });
         }
-        Ok(initial_publication(self.owner, self.staging))
+        Ok(initial_publication(self.owner, self.staging, schedule))
     }
 }
 
@@ -1672,6 +1716,10 @@ pub struct Publication<O: BufferOwner> {
     pending: Option<PendingClaim>,
     /// Claim payload staging on backings without direct bytes.
     staging: Box<[u8]>,
+    /// A timed lane's publisher of its own schedule ring.
+    schedule: Option<crate::schedule_ring::SchedulePublisher>,
+    /// The last requested time a timed append accepted.
+    last_time: Option<u64>,
 }
 
 impl<O: BufferOwner> Publication<O> {
@@ -1699,16 +1747,123 @@ impl<O: BufferOwner> Publication<O> {
         if self.state == PublicationState::Closed {
             return Ok(self.ended_append());
         }
+        // A timed lane carries timed messages only (timed-tx.md, TT-1).
+        if self.buffer.schedule_ring().is_some() {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
+        }
         let outcome = PublicationContext {
             buffer: &self.buffer,
             state: &mut self.state,
         }
-        .append(payload, options)?;
+        .append(payload, options, &mut |_| {})?;
         match outcome {
             AppendOutcome::Appended { .. } => Ok(outcome),
             _ if self.observe_seal() => Ok(self.ended_append()),
             _ => Ok(outcome),
         }
+    }
+
+    /// Appends one message of a timed lane with its requested `time`
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`, section 2, TT-1):
+    /// the schedule ring's room is checked before the message is reserved
+    /// (none is back pressure, and nothing is reserved; a sealed buffer is
+    /// observed first, as an append observes it), and the entry of the
+    /// reserved message's first frame is pushed after the reservation and
+    /// before the block's commit store, so a sender that sees the committed
+    /// frame finds its entry. The publication's own publisher of its own
+    /// lane's ring pushes it; times never go backwards on the lane.
+    ///
+    /// # Errors
+    ///
+    /// As [`Publication::append`]; [`SysError::Schedule`] with
+    /// `NotScheduled` for a lane that is not timed, `Backwards` for a time
+    /// below the lane's last, `Exhausted` past 2^64 entries and `Invariant`
+    /// for counts a peer broke. Nothing is reserved on error.
+    pub fn append_scheduled(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        time: u64,
+    ) -> Result<AppendOutcome, SysError> {
+        self.append_scheduled_with(payload, options, time, &mut || {})
+    }
+
+    /// [`Publication::append_scheduled`] with `pause` called between the
+    /// entry's push and the block's write and commit.
+    #[cfg(test)]
+    fn append_scheduled_pausing(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        time: u64,
+        pause: &mut dyn FnMut(),
+    ) -> Result<AppendOutcome, SysError> {
+        self.append_scheduled_with(payload, options, time, pause)
+    }
+
+    fn append_scheduled_with(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        time: u64,
+        pause: &mut dyn FnMut(),
+    ) -> Result<AppendOutcome, SysError> {
+        self.resolve_claim();
+        if self.state == PublicationState::Closed {
+            return Ok(self.ended_append());
+        }
+        if self.schedule.is_none() {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
+        }
+        if self.last_time.is_some_and(|last| time < last) {
+            return Err(crate::schedule_ring::ScheduleError::Backwards.into());
+        }
+        if !self.schedule_has_room()? {
+            if self.observe_seal() {
+                return Ok(self.ended_append());
+            }
+            return Ok(AppendOutcome::BackPressured);
+        }
+        let buffer = &*self.buffer;
+        let (Some(ring), Some(publisher)) = (buffer.schedule_ring(), self.schedule.as_mut()) else {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
+        };
+        let outcome = PublicationContext {
+            buffer: &self.buffer,
+            state: &mut self.state,
+        }
+        .append(payload, options, &mut |position| {
+            // Room was checked on the publication's own ring and the count
+            // is not exhausted: the push of a reserved message cannot be
+            // refused.
+            let pushed = publisher.push(ring, crate::schedule_ring::Entry { position, time });
+            debug_assert!(pushed.is_ok(), "{pushed:?}");
+            pause();
+        })?;
+        match outcome {
+            AppendOutcome::Appended { .. } => {
+                self.last_time = Some(time);
+                Ok(outcome)
+            }
+            _ if self.observe_seal() => Ok(self.ended_append()),
+            _ => Ok(outcome),
+        }
+    }
+
+    /// Whether a timed lane's schedule ring has room for one more entry
+    /// (the offer's back pressure, checked before anything is reserved).
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::Schedule`] with `NotScheduled` for a lane that is not
+    /// timed, `Exhausted` past 2^64 entries and `Invariant` for counts a
+    /// peer broke.
+    pub fn schedule_has_room(&mut self) -> Result<bool, SysError> {
+        let buffer = &*self.buffer;
+        let (Some(ring), Some(publisher)) = (buffer.schedule_ring(), self.schedule.as_mut()) else {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
+        };
+        Ok(publisher.has_room(ring)?)
     }
 
     /// Claims one unfragmented block of `length` payload bytes (SPEC.md §4,
@@ -1752,6 +1907,10 @@ impl<O: BufferOwner> Publication<O> {
         self.resolve_claim();
         if self.state == PublicationState::Closed {
             return Ok(self.ended_claim());
+        }
+        // A timed lane carries timed messages only (timed-tx.md, TT-1).
+        if self.buffer.schedule_ring().is_some() {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
         }
         let step = PublicationContext {
             buffer: &self.buffer,
@@ -2082,10 +2241,14 @@ struct PublicationContext<'a, T: TermBytes> {
 }
 
 impl<T: TermBytes> PublicationContext<'_, T> {
+    /// Reserves and writes one message; `reserved` sees the first frame's
+    /// position after the reservation and before the block is written and
+    /// committed (a timed lane's schedule entry).
     fn append(
         &mut self,
         payload: &[u8],
         options: AppendOptions,
+        reserved_at: &mut dyn FnMut(u64),
     ) -> Result<AppendOutcome, SysError> {
         if payload.is_empty() {
             return Err(SysError::EmptyMessage);
@@ -2116,6 +2279,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
             } => {
                 #[cfg(feature = "test-hooks")]
                 crate::test_pause::reached(crate::test_pause::PausePoint::ExclusiveReserved);
+                reserved_at(position);
                 self.write_block(slot, count, tail, payload, &plan, options);
                 Ok(AppendOutcome::Appended { position })
             }
@@ -4777,14 +4941,17 @@ fn corrupt(offset: u32, reason: &'static str) -> SysError {
 
 /// The log buffer tests run on both backings.
 /// A timed lane's schedule (`quantstratum-docs: karyos/design/timed-tx.md`,
-/// TT-1 and GC-7): a capacity of 0 (not timed) or a power of two, on an
-/// exclusive publication only.
+/// TT-1 and GC-7): a capacity of 0 (not timed) or a power of two up to
+/// [`crate::schedule_ring::MAX_CAPACITY`], on an exclusive publication
+/// only.
 fn check_schedule(config: &LogBufferConfig) -> Result<(), SysError> {
     match config.schedule_capacity {
         0 => Ok(()),
-        capacity if !capacity.is_power_of_two() => Err(SysError::InvalidPublicationMode {
-            reason: "a schedule capacity is a power of two",
-        }),
+        capacity
+            if !capacity.is_power_of_two() || capacity > crate::schedule_ring::MAX_CAPACITY =>
+        {
+            Err(crate::schedule_ring::ScheduleError::Capacity { capacity }.into())
+        }
         _ if config.publication != PublicationMode::Exclusive => {
             Err(SysError::InvalidPublicationMode {
                 reason: "a timed lane needs an exclusive publication (GC-7)",
@@ -5348,6 +5515,46 @@ mod region_tests {
         let seen = attached.schedule_ring().unwrap();
         let reader = crate::schedule_ring::ScheduleReader::attach(seen).unwrap();
         assert_eq!(reader.peek(seen), Ok(Some(entry)));
+    }
+
+    /// Rings of capacity 1 and 2 round to the same region length, so a
+    /// configuration word rewritten from 2 to 1 still lays out; the ring's
+    /// own capacity word refuses it at attach.
+    #[test]
+    fn attach_checks_the_ring_capacity_against_the_configuration() {
+        let creator = LogBuffer::create_in(
+            1,
+            9,
+            LogBufferConfig {
+                schedule_capacity: 2,
+                ..config(PublicationMode::Exclusive)
+            },
+            generation(),
+        )
+        .unwrap();
+        let one = LogBuffer::create_in(
+            1,
+            10,
+            LogBufferConfig {
+                schedule_capacity: 1,
+                ..config(PublicationMode::Exclusive)
+            },
+            generation(),
+        )
+        .unwrap();
+        assert_eq!(
+            one.region().unwrap().record().structure_length,
+            creator.region().unwrap().record().structure_length
+        );
+        assert!(attach(&creator).is_ok());
+        let word = creator.region().unwrap().structure().get(18).unwrap();
+        word.store(1, Ordering::Release);
+        assert!(matches!(
+            attach(&creator),
+            Err(SysError::InvalidRegion { .. })
+        ));
+        word.store(2, Ordering::Release);
+        assert!(attach(&creator).is_ok());
     }
 
     /// A region of an older layout version, 1 (shipped in v0.1.0-alpha.1,

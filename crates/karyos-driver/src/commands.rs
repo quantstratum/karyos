@@ -850,11 +850,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // open epoch with an outcome ring; that binding exists only
                 // in process (`EmbeddedDriver::publication`) until its CnC
                 // form, so the control path issues none.
+                // A timed lane's handle needs its schedule binding, in
+                // process only for now (timed-tx.md, T1).
                 if matches!(command, Command::AddPublication { .. })
-                    && self
-                        .streams
-                        .get(index)
-                        .is_some_and(|found| found.guarded.is_some())
+                    && self.streams.get(index).is_some_and(|found| {
+                        found.guarded.is_some() || found.buffer.schedule_ring().is_some()
+                    })
                 {
                     return refuse(ErrorCode::InvalidPublicationMode, detail);
                 }
@@ -1907,6 +1908,33 @@ mod tests {
                     claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
                     publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
                     schedule_capacity: 0,
+                },
+                allow_unconnected: false,
+                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: None,
+            })
+            .unwrap();
+        (driver, stream)
+    }
+
+    /// As [`driver_with_stream`], on a timed lane.
+    fn driver_with_timed_stream() -> (EmbeddedDriver, StreamHandle) {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let stream = driver
+            .add_stream(StreamConfig {
+                buffer: LogBufferConfig {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 3,
+                    max_subscribers: 4,
+                    mtu: DEFAULT_MTU,
+                    max_reserved: MIN_TERM_LENGTH / 8,
+                    initial_term_id: TermId::new(7),
+                    lane: Lane::ZERO,
+                    session_id: 1,
+                    stream_id: 2,
+                    claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                    publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                    schedule_capacity: 4,
                 },
                 allow_unconnected: false,
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
@@ -4542,6 +4570,77 @@ mod tests {
     /// Review of #207, P1-1: the control path issues no publication on a
     /// guarded stream (its binding exists only in process), for an
     /// in-process client and a remote one alike.
+    /// Every message a timed lane's handle accepts leaves its entry in the
+    /// lane's schedule ring, in order: the position of its first frame and
+    /// its requested time; a full ring back pressures until the sender
+    /// releases a slot (timed-tx.md section 2).
+    #[test]
+    fn timed_offers_leave_their_entries_in_the_ring() {
+        let (mut driver, stream) = driver_with_timed_stream();
+        let _reader = driver.subscribe(stream, Role::Required).unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        let mut accepted = Vec::new();
+        for time in [5, 9, 9, 40] {
+            let karyos_client::OfferOutcome::Accepted { position, .. } =
+                publication.offer_at(b"timed", time).unwrap()
+            else {
+                panic!("not accepted");
+            };
+            accepted.push((position, time));
+        }
+        assert_eq!(
+            publication.offer_at(b"timed", 41).unwrap(),
+            karyos_client::OfferOutcome::BackPressured,
+            "four entries fill a ring of four"
+        );
+        let ring = driver.streams[0].buffer.schedule_ring().unwrap();
+        let mut sender = karyos_sys::schedule_ring::ScheduleReader::attach(ring).unwrap();
+        for (position, time) in accepted {
+            let entry = sender.peek(ring).unwrap().unwrap();
+            assert_eq!((entry.position, entry.time), (position, time));
+            sender.release(ring).unwrap();
+        }
+        assert_eq!(sender.peek(ring).unwrap(), None);
+        assert!(matches!(
+            publication.offer_at(b"timed", 41).unwrap(),
+            karyos_client::OfferOutcome::Accepted { .. }
+        ));
+    }
+
+    /// A timed lane's handle needs its schedule binding, issued in process
+    /// only for now (timed-tx.md, T1): a CnC publication is refused.
+    #[test]
+    fn a_timed_stream_refuses_cnc_publications() {
+        let (mut driver, _stream) = driver_with_timed_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddPublication {
+                sequence: 1,
+                stream: KEY,
+                allow_unconnected: true,
+                lane: Lane::ZERO,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        assert!(
+            answers.iter().any(|answer| matches!(
+                answer,
+                Response::Error {
+                    request: RequestId { client: c, sequence: 1 },
+                    code: ErrorCode::InvalidPublicationMode,
+                    ..
+                } if *c == client
+            )),
+            "{answers:?}"
+        );
+    }
+
     #[test]
     fn a_guarded_stream_refuses_cnc_publications() {
         let (mut driver, stream) = driver_with_stream();

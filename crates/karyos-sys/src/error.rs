@@ -117,6 +117,10 @@ pub enum SysError {
     /// A frame layout or sizing rule failed.
     #[error(transparent)]
     Layout(#[from] LayoutError),
+    /// A timed lane's schedule was misused or its ring refused an entry
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`, TT-1).
+    #[error(transparent)]
+    Schedule(#[from] crate::schedule_ring::ScheduleError),
     /// A fixed capacity (slots, registry cells or loan credits) is exhausted.
     #[error("resources unavailable")]
     ResourcesUnavailable,

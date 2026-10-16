@@ -30,6 +30,7 @@ pub mod journal;
 pub mod link;
 pub mod loss;
 pub mod publication;
+pub mod schedule;
 pub mod subscription;
 #[cfg(target_os = "linux")]
 pub mod tool;

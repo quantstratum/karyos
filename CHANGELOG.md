@@ -84,6 +84,31 @@ release may break APIs, wire formats and shared-memory layouts.
   terms, initialised at creation and read through `LogBuffer::schedule_ring`.
   The region layout version is 3; regions of versions 1 and 2 are refused at
   attach with `SysError::LayoutVersion`.
+- Timed offers (P2.11 T1, TT-2, TT-3): `ClientPublication::offer_at` sends a
+  message of a timed lane with its requested not-before time, after checks
+  made before anything is reserved (a time below the lane's last is
+  `ClientError::InvalidSchedule`, one beyond the horizon `ScheduleTooFar`, an
+  overflowing deadline `ScheduleOverflow`, a full schedule ring
+  `BackPressured`); plain `offer` and `try_claim` are refused on a timed lane,
+  and `offer_at` on another. `karyos_client::schedule` holds `ClockDomain`
+  (`Monotonic`, and `Tai` on Linux through the new
+  `karyos_sys::host_clock::host_tai_ns`), `now(domain)` and `ScheduleOptions`
+  (provisional defaults: 1 s horizon, 1 ms tolerance);
+  `EmbeddedDriver::schedule_stream` sets them before any handle
+  (`DriverError::NotTimed` for a lane that is not timed), and a CnC
+  publication of a timed lane is refused for now, as is a cutover
+  (`DriverError::TimedCutover`), a zero horizon, and new settings once a
+  handle of the incarnation was issued. A schedule clock that cannot read
+  the time returns `schedule::CLOCK_UNAVAILABLE` and the offer is refused
+  with `ScheduleOverflow`. In karyos-sys, `Publication::append_scheduled`
+  pushes the message's schedule entry after its reservation and before its
+  commit store through the publication's own publisher of its own ring,
+  refuses a time below the last (`ScheduleError::Backwards`) and observes a
+  seal before a full ring's back pressure; `Publication::schedule_has_room`
+  reports the ring's room (`SysError::Schedule`). A
+  schedule capacity is a power of two up to `schedule_ring::MAX_CAPACITY`
+  (2^20), refused otherwise with `ScheduleError::Capacity`, and attach checks
+  the ring's own capacity word against the configuration.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

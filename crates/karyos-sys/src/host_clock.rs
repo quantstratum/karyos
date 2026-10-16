@@ -21,6 +21,22 @@ pub fn host_monotonic_ns() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Nanoseconds of the host's `CLOCK_TAI`, the clock domain of timed
+/// transmission's `Tai` schedules (`quantstratum-docs:
+/// karyos/design/timed-tx.md`, TT-2; Linux only), through the same
+/// `rustix` `time` feature (its dynamic clock id, which needs no further
+/// feature); `None` when the kernel refuses the clock.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn host_tai_ns() -> Option<u64> {
+    let now = rustix::time::clock_gettime_dynamic(rustix::time::DynamicClockId::Tai).ok()?;
+    let seconds = u64::try_from(now.tv_sec).ok()?;
+    let nanos = u64::try_from(now.tv_nsec).ok()?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|ns| ns.checked_add(nanos))
+}
+
 /// Nanoseconds of this process's monotonic clock: on a host without
 /// cross-process IPC, one process is the whole scale. The scale starts at
 /// 1 ns, not 0: the first reading of a process is taken at its origin, and

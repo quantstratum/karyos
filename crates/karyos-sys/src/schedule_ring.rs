@@ -59,10 +59,29 @@ pub enum ScheduleError {
     /// contradict each other: a broken invariant.
     #[error("the schedule ring's counts are inconsistent")]
     Invariant,
+    /// The lane is not timed, or a timed lane was given a plain offer or
+    /// claim: a timed lane carries timed messages only.
+    #[error("not a timed lane, or a timed lane offered without a time")]
+    NotScheduled,
+    /// A requested time below the lane's last: times never go backwards
+    /// on a timed lane.
+    #[error("a requested time below the lane's last")]
+    Backwards,
     /// 2^64 entries were pushed on the lane.
     #[error("the schedule ring's entries are exhausted")]
     Exhausted,
+    /// A lane's schedule capacity is not a power of two up to
+    /// [`MAX_CAPACITY`].
+    #[error("schedule capacity {capacity} is not a power of two in 1..={max}", max = MAX_CAPACITY)]
+    Capacity {
+        /// The capacity given.
+        capacity: u32,
+    },
 }
+
+/// The largest schedule capacity a lane takes: 2^20 entries (16 MiB of
+/// ring), a second of timed messages at a million a second.
+pub const MAX_CAPACITY: u32 = 1 << 20;
 
 /// One message's schedule: the position of its first frame and its
 /// requested time in the publication's clock domain.
@@ -215,6 +234,10 @@ impl SchedulePublisher {
         let order = self.head_load;
         #[cfg(not(loom))]
         let order = Ordering::Acquire;
+        // 2^64 entries are refused before the reservation, not after it.
+        if self.tail == u64::MAX {
+            return Err(ScheduleError::Exhausted);
+        }
         let head = word(ring, HEAD)?.load(order);
         let waiting = self
             .tail

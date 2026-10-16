@@ -122,6 +122,22 @@ pub enum DriverError {
         /// The sender id.
         sender: u64,
     },
+    /// The stream is not a timed lane: its buffer has no schedule ring
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`).
+    #[error("stream {stream} is not a timed lane")]
+    NotTimed {
+        /// The stream id.
+        stream: u64,
+    },
+    /// A cutover of a timed lane: its schedule ring belongs to one
+    /// incarnation's buffer and is never carried to a successor
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`, section 2 step 5),
+    /// so timed lanes take no cutover until a design covers it.
+    #[error("stream {stream} is a timed lane, which takes no cutover yet")]
+    TimedCutover {
+        /// The stream id.
+        stream: u64,
+    },
     /// The stream's incarnation numbers are exhausted; they are never
     /// reused.
     #[error("stream {stream}'s incarnations are exhausted")]

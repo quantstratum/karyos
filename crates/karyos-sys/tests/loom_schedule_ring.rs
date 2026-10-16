@@ -25,6 +25,13 @@
 //! sender reads it); and the sender storing the head before it has read the
 //! entry, so the publisher can overwrite it mid-read (the same race).
 //!
+//! A second model joins the ring to the block publication of the append
+//! path (`karyos_sys::publication::publish_block` and `observe_block`, the
+//! production commit store and its observation): the entry is pushed after
+//! the reservation and before the block's first word is published, so a
+//! sender that observes the committed block finds its entry (review of the
+//! T1 step 3b design, ACS 15421). Its control publishes the block first.
+//!
 //! Run with `make loom`.
 
 #![cfg(loom)]
@@ -35,6 +42,8 @@
     reason = "a test model, as ADR-0007 allows in tests"
 )]
 
+use karyos_sys::frame::{Flags, FrameType, Lane, Word0};
+use karyos_sys::publication::{observe_block, publish_block};
 use karyos_sys::schedule_ring::{
     Entry, SchedulePublisher, ScheduleReader, Witness, init, ring_words,
 };
@@ -152,4 +161,57 @@ fn control_a_relaxed_head_load() {
 #[should_panic(expected = "Causality violation")]
 fn control_the_head_released_before_the_read() {
     model(Variant::ReleaseFirst);
+}
+
+fn first_word() -> Word0 {
+    Word0::new(
+        48,
+        Flags::new(true, true, false, false, Lane::ZERO),
+        FrameType::Data,
+    )
+}
+
+/// The append path's order: entry, then the block's commit store.
+fn commit_model(block_first: bool) {
+    loom::model(move || {
+        let words = ring_words(usize::try_from(CAPACITY).unwrap()).unwrap();
+        let ring: Arc<Vec<AtomicU64>> = Arc::new((0..words).map(|_| AtomicU64::new(0)).collect());
+        init(&ring, CAPACITY).unwrap();
+        let block = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let ring = Arc::clone(&ring);
+            let block = Arc::clone(&block);
+            thread::spawn(move || {
+                let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+                assert!(publisher.has_room(&ring).unwrap());
+                if block_first {
+                    publish_block(&block, first_word());
+                    publisher.push(&ring, entry(0)).unwrap();
+                } else {
+                    publisher.push(&ring, entry(0)).unwrap();
+                    publish_block(&block, first_word());
+                }
+            })
+        };
+        let reader = ScheduleReader::attach(&ring).unwrap();
+        if observe_block(&block) != 0 {
+            let read = reader
+                .peek(&ring)
+                .unwrap()
+                .unwrap_or_else(|| panic!("entry missing for a committed block"));
+            assert_eq!(read, entry(0));
+        }
+        writer.join().unwrap();
+    });
+}
+
+#[test]
+fn a_committed_block_finds_its_entry() {
+    commit_model(false);
+}
+
+#[test]
+#[should_panic(expected = "entry missing")]
+fn control_the_block_committed_before_its_entry() {
+    commit_model(true);
 }

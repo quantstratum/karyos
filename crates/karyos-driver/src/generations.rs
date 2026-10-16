@@ -443,6 +443,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if target.guarded.is_some() {
             return Err(DriverError::InvalidConfig);
         }
+        // A timed lane's schedule ring belongs to its buffer; the handle's
+        // publisher would not follow a successor (#234 P1).
+        if target.buffer.schedule_ring().is_some() {
+            return Err(DriverError::TimedCutover { stream: target.id });
+        }
         let id = target.id;
         #[cfg(test)]
         if self.fail_at == Some(id) {
