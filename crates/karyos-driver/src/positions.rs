@@ -231,6 +231,13 @@ impl Positions {
 
 /// The odd and the even epoch of the pass after `epoch`. The even one is
 /// never 0, which only the region's initial state shows (no pass yet).
+///
+/// The epoch is a seqlock sequence, not a position, length or counter: it
+/// wraps by design, and this is its modelled rollover (SPEC.md §14, "term
+/// rollover is modelled explicitly"; coordinator decision, ACS 14545,
+/// quantstratum/karyos#157 group 7). A reader compares two epochs for
+/// equality only, never for order, so a wrap cannot make it accept a torn
+/// pass; the one value it must not see again, 0, is skipped explicitly.
 fn next_epochs(epoch: u64) -> (u64, u64) {
     let odd = epoch.wrapping_add(1) | 1;
     let even = match odd.wrapping_add(1) {
@@ -835,6 +842,8 @@ mod tests {
         assert_eq!(next_epochs(0), (1, 2));
         assert_eq!(next_epochs(2), (3, 4));
         assert_eq!(next_epochs(u64::MAX - 1), (u64::MAX, 2));
+        // An odd epoch is never stored, but the wrap from it skips 0 too.
+        assert_eq!(next_epochs(u64::MAX), (1, 2));
         let mut driver = driver(64);
         driver.positions.set_epoch(u64::MAX - 1);
         let _ = driver.do_work().unwrap();
