@@ -31,7 +31,7 @@ pub const COMPOSED_LABEL: &str = "composed sender path";
 
 /// The term the templates are composed in: 64 KiB, the smallest term,
 /// whose eighth (8 KiB) holds the largest message of every shape (W7).
-const TERM: u32 = 64 * 1024;
+pub const TERM: u32 = 64 * 1024;
 
 /// The fixed identity of the composed frames (`static binding`).
 pub const IDENTITY: TermIdentity = TermIdentity {
@@ -43,6 +43,11 @@ pub const IDENTITY: TermIdentity = TermIdentity {
 
 /// The byte offset of `reserved_value` in a frame header.
 const RESERVED_VALUE: usize = 24;
+
+/// A `u32` length as `usize`, checked (SPEC §14: no `as` conversions).
+fn to_usize(value: u32) -> Result<usize, BenchError> {
+    usize::try_from(value).map_err(|_| BenchError(format!("length {value} exceeds usize")))
+}
 
 /// The frame length of a header-only DATA frame (W2): the 32-byte header.
 const HEARTBEAT_LENGTH: i32 = 32;
@@ -59,6 +64,10 @@ pub struct Template {
     bytes: Vec<u8>,
     /// Each datagram's range in `bytes`.
     datagrams: Vec<Range<usize>>,
+    /// The term offset of each datagram's first frame.
+    starts: Vec<i32>,
+    /// The bytes of frames one datagram may carry.
+    budget: u32,
     /// The offset of each frame header in `bytes`, to stamp.
     headers: Vec<usize>,
 }
@@ -85,9 +94,14 @@ impl Template {
         let size = shape
             .size(e_max, rule)
             .map_err(|error| BenchError(format!("{shape}: {error}")))?;
-        let mut term = vec![0_u8; TERM as usize];
+        let mut term = vec![0_u8; to_usize(TERM)?];
         let term_length =
             TermLength::try_new(TERM).map_err(|error| BenchError(format!("term: {error}")))?;
+        // The frames fill the budget the rule leaves for them: under
+        // `CountsEnvelope` the envelope comes out of the MTU.
+        let budget = rule
+            .frame_budget(size.mtu, envelope)
+            .map_err(|error| BenchError(format!("{shape}: {error}")))?;
         let mut blocks: Vec<Range<usize>> = Vec::new();
         if shape == Shape::W2 {
             // A header-only DATA frame: a heartbeat, not a message.
@@ -107,15 +121,10 @@ impl Template {
                 .encode(&mut term)
                 .map_err(|error| BenchError(format!("heartbeat: {error}")))?;
         } else {
-            // The frames fill the budget the rule leaves for them: under
-            // `CountsEnvelope` the envelope comes out of the MTU.
-            let budget = rule
-                .frame_budget(size.mtu, envelope)
-                .map_err(|error| BenchError(format!("{shape}: {error}")))?;
             let mut appender =
                 TermAppender::new(&mut term, term_length, IDENTITY, budget, TERM / 8)
                     .map_err(|error| BenchError(format!("appender: {error}")))?;
-            let payload = vec![0x5a_u8; size.payload as usize];
+            let payload = vec![0x5a_u8; to_usize(size.payload)?];
             let options = AppendOptions {
                 extension: size.ext.then(TraceExtension::default),
                 ..AppendOptions::default()
@@ -135,16 +144,16 @@ impl Template {
         loop {
             match scanner.next_item() {
                 Ok(ScanItem::Message(block)) => {
-                    let start = block.offset() as usize;
+                    let start = to_usize(block.offset())?;
                     let end = start
-                        .checked_add(block.reserved() as usize)
+                        .checked_add(to_usize(block.reserved())?)
                         .ok_or_else(|| BenchError(format!("{shape}: block end overflow")))?;
                     blocks.push(start..end);
                 }
                 Ok(ScanItem::Heartbeat { offset }) => {
-                    let start = offset as usize;
+                    let start = to_usize(offset)?;
                     let end = start
-                        .checked_add(HEADER_LENGTH as usize)
+                        .checked_add(to_usize(HEADER_LENGTH)?)
                         .ok_or_else(|| BenchError(format!("{shape}: heartbeat end overflow")))?;
                     blocks.push(start..end);
                 }
@@ -169,9 +178,9 @@ impl Template {
                     })?;
                 let length = u32::try_from(header.word0.frame_length())
                     .map_err(|_| BenchError(format!("{shape}: negative frame length")))?;
-                let reserved = align_frame(length)
-                    .map_err(|error| BenchError(format!("{shape}: {error}")))?
-                    as usize;
+                let reserved = to_usize(
+                    align_frame(length).map_err(|error| BenchError(format!("{shape}: {error}")))?,
+                )?;
                 let next = at
                     .checked_add(reserved)
                     .filter(|next| *next > at)
@@ -190,8 +199,15 @@ impl Template {
         let mut bytes = Vec::new();
         let mut datagrams = Vec::new();
         let mut headers = Vec::new();
+        let mut starts = Vec::new();
         for group in groups {
             let start = bytes.len();
+            if let Some(first) = group.first() {
+                starts.push(
+                    i32::try_from(first.start)
+                        .map_err(|_| BenchError(format!("{shape}: term offset")))?,
+                );
+            }
             for frame in group {
                 headers.push(bytes.len());
                 let slice = term
@@ -203,10 +219,12 @@ impl Template {
         }
         // W6 takes the count of the profile's envelope (manifest 2.0 6.1).
         let expected = if shape == Shape::W6 {
-            w6_datagrams(envelope, rule).map_err(|error| BenchError(format!("{shape}: {error}")))?
-                as usize
+            to_usize(
+                w6_datagrams(envelope, rule)
+                    .map_err(|error| BenchError(format!("{shape}: {error}")))?,
+            )?
         } else {
-            size.datagrams_per_message as usize
+            to_usize(size.datagrams_per_message)?
         };
         if datagrams.len() != expected {
             return Err(BenchError(format!(
@@ -219,8 +237,26 @@ impl Template {
             size,
             bytes,
             datagrams,
+            starts,
+            budget,
             headers,
         })
+    }
+
+    /// The bytes of frames one datagram may carry under the template's
+    /// rule and envelope: the receiver's per-datagram limit.
+    #[must_use]
+    pub fn frame_budget(&self) -> u32 {
+        self.budget
+    }
+
+    /// The index in its message of the received datagram whose frames
+    /// are `frames`, from its first frame's term offset; `None` for a
+    /// datagram the template does not have.
+    #[must_use]
+    pub fn datagram_index(&self, frames: &[u8]) -> Option<usize> {
+        let offset = FrameHeader::decode(frames).ok()?.term_offset;
+        self.starts.iter().position(|start| *start == offset)
     }
 
     /// The number of datagrams of one message.
