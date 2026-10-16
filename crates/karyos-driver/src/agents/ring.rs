@@ -159,6 +159,14 @@ impl<T> RingSender<T> {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Slots neither occupied nor reserved (tests); `None` would be a
+    /// count above the capacity.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn available(&self) -> Option<usize> {
+        self.capacity.checked_sub(self.used.load(Ordering::Acquire))
+    }
 }
 
 impl<T> RingReceiver<T> {

@@ -113,12 +113,17 @@ fn reservations_keep_room_for_replies() {
     assert_eq!(receiver.try_take(), Err(ring::Disconnected));
 }
 
-/// Zero capacities and a zero budget are refused at creation.
+/// Zero capacities and a zero budget are refused at creation, and so are
+/// session rings below three units per image (S1).
 #[test]
 fn the_configuration_is_checked() {
     for config in [
         AgentConfig {
             command_capacity: 0,
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            session_command_capacity: 3 * AgentConfig::default().sessions.max_images - 1,
             ..AgentConfig::default()
         },
         AgentConfig {

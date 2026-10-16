@@ -448,7 +448,6 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::Stopped { .. }
             | AgentEvent::PublicationAdded { .. }
             | AgentEvent::PublicationRefused { .. }
-            | AgentEvent::CreateImage { .. }
             | AgentEvent::Configured { .. }
             | AgentEvent::Unsupported { .. } => return Some(event),
         };
