@@ -22,7 +22,9 @@ pub fn host_monotonic_ns() -> u64 {
 }
 
 /// Nanoseconds of this process's monotonic clock: on a host without
-/// cross-process IPC, one process is the whole scale.
+/// cross-process IPC, one process is the whole scale. The scale starts at
+/// 1 ns, not 0: the first reading of a process is taken at its origin, and
+/// a timestamp of 0 would read as unset (karyos #197).
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn host_monotonic_ns() -> u64 {
@@ -31,7 +33,10 @@ pub fn host_monotonic_ns() -> u64 {
 
     static ORIGIN: OnceLock<Instant> = OnceLock::new();
     let origin = *ORIGIN.get_or_init(Instant::now);
-    u64::try_from(origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    u64::try_from(origin.elapsed().as_nanos())
+        .ok()
+        .and_then(|ns| ns.checked_add(1))
+        .unwrap_or(u64::MAX)
 }
 
 /// The age of a stored timestamp at `now`: `now - stored`, or zero when
@@ -54,6 +59,13 @@ mod tests {
         let first = host_monotonic_ns();
         let second = host_monotonic_ns();
         assert!(second >= first);
+    }
+
+    /// A reading is never 0, which a stored timestamp would read as unset
+    /// (karyos #197): not even the first reading of a process.
+    #[test]
+    fn a_reading_is_never_zero() {
+        assert!(host_monotonic_ns() > 0);
     }
 
     #[test]
