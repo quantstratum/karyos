@@ -170,6 +170,60 @@ fn a_duplicate_datagram_invalidates_the_run() {
 }
 
 #[test]
+fn a_duplicate_warmup_datagram_invalidates_the_run() {
+    let (run, prepared) = w6();
+    let mut receiver = Receiver::new(&run, &prepared, &Trusted).unwrap();
+    let warmup = datagrams(&prepared, 1);
+    let now = Instant::now();
+    assert!(receiver.accept(&warmup[2], now, now).is_continue());
+    let fault = fault_of(&mut receiver, &warmup[2]);
+    assert!(fault.contains("sequence 1: duplicate"), "{fault}");
+    assert_eq!(receiver.completed, 0);
+}
+
+#[test]
+fn a_receiver_stop_ends_an_open_loop_wait() {
+    // At one message per second, message 1 is due 1 s after message 0;
+    // the receiver stops after 50 ms, inside that wait.
+    let run = stage_run(Shape::W1, StageLoad::Open { rate: 1 }, 5, 0);
+    let prepared = Prepared::new(&run, &Trusted).unwrap();
+    let (mut tx, _tx_rx) = prepared
+        .endpoint()
+        .unwrap()
+        .split()
+        .map_err(|_| "split")
+        .unwrap();
+    let receiving = prepared.endpoint().unwrap();
+    let peer = receiving.capabilities().local;
+    let stop = AtomicBool::new(false);
+    let started = Instant::now();
+    let result = thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(50));
+            stop.store(true, Ordering::Release);
+        });
+        send_role(
+            &run,
+            &prepared,
+            &Trusted,
+            &mut tx,
+            peer,
+            &SendControl {
+                wait: &|_| true,
+                stopped: &|| stop.load(Ordering::Acquire),
+            },
+        )
+    });
+    let error = result.err().map(|error| error.0).unwrap_or_default();
+    assert!(error.contains("receiver stopped"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn a_sequence_never_sent_is_an_orphan() {
     let (run, prepared) = w6();
     let mut receiver = Receiver::new(&run, &prepared, &Trusted).unwrap();

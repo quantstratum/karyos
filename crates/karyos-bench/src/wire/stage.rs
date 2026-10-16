@@ -218,7 +218,9 @@ impl<'p, P: Protection> Receiver<'p, P> {
                 u32::try_from(prepared.template.datagrams())
                     .map_err(|_| BenchError("datagram count".into()))?,
             )
-            .map_or(u64::MAX, |bit| bit.wrapping_sub(1));
+            // 64 datagrams shift out of range: every bit is set.
+            .map_or(Some(u64::MAX), |bit| bit.checked_sub(1))
+            .ok_or_else(|| BenchError("datagram mask".into()))?;
         // Every batch delivers at least one datagram, so this bounds them.
         let batch_room = usize::try_from(prepared.total)
             .ok()
