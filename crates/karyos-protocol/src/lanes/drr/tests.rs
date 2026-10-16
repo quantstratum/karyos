@@ -121,19 +121,17 @@ fn configuration_is_checked() {
 fn zero_and_too_small_budgets_make_no_progress() {
     let mut drr = drr(&[100, 100], 100);
     let mut model = Model::with(&[&[60, 60], &[60]]);
-    let report = drr
-        .run(
-            Budget {
-                work: 0,
-                bytes: 1_000,
-            },
-            &mut model,
-        )
-        .unwrap();
+    let report = drr.run(
+        Budget {
+            work: 0,
+            bytes: 1_000,
+        },
+        &mut model,
+    );
     assert_eq!(report.stop, Stop::WorkExhausted);
     assert_eq!(report.lanes, [LaneReport::default(); MAX_LANES]);
     for _ in 0..10 {
-        let report = drr.run(Budget { work: 5, bytes: 59 }, &mut model).unwrap();
+        let report = drr.run(Budget { work: 5, bytes: 59 }, &mut model);
         assert_eq!(
             report.stop,
             Stop::BytesLimited {
@@ -150,6 +148,47 @@ fn zero_and_too_small_budgets_make_no_progress() {
     assert!(model.log.is_empty());
 }
 
+/// A budget with work but no bytes suspends before any probe: even with
+/// only ineligible lanes, nothing is forfeited, the cursor stays and no
+/// round is counted.
+#[test]
+fn a_zero_byte_budget_changes_nothing() {
+    let mut drr = drr_with_residual();
+    let mut model = Model {
+        closed: [true; MAX_LANES],
+        ..Model::default()
+    };
+    let report = drr.run(Budget { work: 5, bytes: 0 }, &mut model);
+    assert_eq!(report.stop, Stop::BytesExhausted);
+    assert_eq!(report.rounds, 0);
+    assert_eq!(report.lanes, [LaneReport::default(); MAX_LANES]);
+    assert_eq!(
+        (drr.cursor(), drr.in_visit(), drr.deficit(0)),
+        (1, false, Some(400))
+    );
+}
+
+/// A failed step keeps the report of the steps before it: the frame
+/// lane 0 served is counted when lane 1's head turns out invalid.
+#[test]
+fn a_failed_step_keeps_the_report_of_earlier_steps() {
+    let mut drr = drr(&[100, 100], 100);
+    let mut model = Model::with(&[&[80], &[0]]);
+    let report = drr.run(ALL, &mut model);
+    assert_eq!(
+        report.stop,
+        Stop::Failed(DrrError::InvalidCharge {
+            lane: 1,
+            charge: 0,
+            max: 100
+        })
+    );
+    assert_eq!(report.lanes[0].served_bytes, 80);
+    assert_eq!(report.lanes[0].served_frames, 1);
+    assert_eq!(report.lanes[1], LaneReport::default());
+    assert_eq!(model.log, vec![(0, 80)]);
+}
+
 /// A head charged zero or above the maximum is a typed error, with no
 /// credit given for it.
 #[test]
@@ -158,8 +197,8 @@ fn an_invalid_charge_is_a_typed_error() {
         let mut drr = drr(&[100], 100);
         let mut model = Model::with(&[&[charge]]);
         assert_eq!(
-            drr.run(ALL, &mut model),
-            Err(DrrError::InvalidCharge {
+            drr.run(ALL, &mut model).stop,
+            Stop::Failed(DrrError::InvalidCharge {
                 lane: 0,
                 charge,
                 max: 100
@@ -176,7 +215,7 @@ fn an_invalid_charge_is_a_typed_error() {
 fn a_residual_carries_and_ineligibility_forfeits_it() {
     let mut drr = drr(&[1_000, 1_000], 1_000);
     let mut model = Model::with(&[&[600, 600, 600], &[]]);
-    let report = drr.run(ALL, &mut model).unwrap();
+    let report = drr.run(ALL, &mut model);
     // Visit 1: 1000 credited, one 600 served, 400 left < 600: carried.
     // Lane 1 is empty. Visit 2: 400 + 1000, two served, 200 left; then
     // nothing eligible anywhere.
@@ -191,15 +230,13 @@ fn a_residual_carries_and_ineligibility_forfeits_it() {
     let mut model = Model::with(&[&[600], &[]]);
     model.closed[0] = true;
     // Lane 1 (empty) first, then lane 0, closed: its 400 are forfeited.
-    let report = drr
-        .run(
-            Budget {
-                work: 2,
-                bytes: u64::MAX,
-            },
-            &mut model,
-        )
-        .unwrap();
+    let report = drr.run(
+        Budget {
+            work: 2,
+            bytes: u64::MAX,
+        },
+        &mut model,
+    );
     assert_eq!(report.lanes[0].forfeited, 400);
     assert_eq!(drr.deficit(0), Some(0));
 }
@@ -208,15 +245,13 @@ fn a_residual_carries_and_ineligibility_forfeits_it() {
 fn drr_with_residual() -> Drr {
     let mut drr = drr(&[1_000, 1_000], 1_000);
     let mut model = Model::with(&[&[600, 600], &[]]);
-    let _ = drr
-        .run(
-            Budget {
-                work: 2,
-                bytes: u64::MAX,
-            },
-            &mut model,
-        )
-        .unwrap();
+    let _ = drr.run(
+        Budget {
+            work: 2,
+            bytes: u64::MAX,
+        },
+        &mut model,
+    );
     assert_eq!((drr.deficit(0), drr.cursor()), (Some(400), 1));
     drr
 }
@@ -228,11 +263,11 @@ fn a_failed_attempt_is_not_debited() {
     let mut drr = drr(&[100], 100);
     let mut model = Model::with(&[&[80]]);
     model.failures[0] = 2;
-    let report = drr.run(Budget { work: 2, bytes: 80 }, &mut model).unwrap();
+    let report = drr.run(Budget { work: 2, bytes: 80 }, &mut model);
     assert_eq!(report.lanes[0].failed, 2);
     assert_eq!(report.lanes[0].served_bytes, 0);
     assert_eq!(drr.deficit(0), Some(100));
-    let report = drr.run(Budget { work: 1, bytes: 80 }, &mut model).unwrap();
+    let report = drr.run(Budget { work: 1, bytes: 80 }, &mut model);
     assert_eq!(report.lanes[0].served_bytes, 80);
     // Resumed: no second quantum.
     assert_eq!(report.lanes[0].credits, 0);
@@ -257,7 +292,7 @@ fn serve_split(budgets: &[Budget], faults: Faults) -> Vec<(usize, u64)> {
     drr.faults = faults;
     let mut model = split_scenario();
     for budget in budgets.iter().cycle().take(10_000) {
-        if drr.run(*budget, &mut model).unwrap().stop == Stop::Idle {
+        if drr.run(*budget, &mut model).stop == Stop::Idle {
             break;
         }
     }
@@ -364,7 +399,7 @@ fn lane_three_keeps_its_share(faults: Faults) -> (bool, u64) {
     ];
     let mut totals = Totals::default();
     for budget in budgets.iter().cycle().take(4_000) {
-        let report = drr.run(*budget, &mut model).unwrap();
+        let report = drr.run(*budget, &mut model);
         totals.add(&report);
         let between_visits = drr.cursor() != 3 || !drr.in_visit();
         if between_visits {
@@ -402,57 +437,45 @@ fn a_blocked_lane_gains_nothing_and_restarts_from_zero() {
     model.saturate[0] = Some(600);
     model.saturate[1] = Some(100);
     let mut totals = Totals::default();
-    totals.add(
-        &drr.run(
-            Budget {
-                work: 4,
-                bytes: u64::MAX,
-            },
-            &mut model,
-        )
-        .unwrap(),
-    );
+    totals.add(&drr.run(
+        Budget {
+            work: 4,
+            bytes: u64::MAX,
+        },
+        &mut model,
+    ));
     // Lane 0 served 600, carried 400; lane 1 is mid-visit.
     model.closed[0] = true;
     let before = totals.credits[0];
     for _ in 0..20 {
-        totals.add(
-            &drr.run(
-                Budget {
-                    work: 7,
-                    bytes: u64::MAX,
-                },
-                &mut model,
-            )
-            .unwrap(),
-        );
+        totals.add(&drr.run(
+            Budget {
+                work: 7,
+                bytes: u64::MAX,
+            },
+            &mut model,
+        ));
     }
     assert_eq!(totals.credits[0], before);
     assert_eq!(totals.forfeited[0], 400);
     assert_eq!(drr.deficit(0), Some(0));
     model.closed[0] = false;
     while drr.cursor() != 0 {
-        totals.add(
-            &drr.run(
-                Budget {
-                    work: 1,
-                    bytes: u64::MAX,
-                },
-                &mut model,
-            )
-            .unwrap(),
-        );
-    }
-    totals.add(
-        &drr.run(
+        totals.add(&drr.run(
             Budget {
                 work: 1,
                 bytes: u64::MAX,
             },
             &mut model,
-        )
-        .unwrap(),
-    );
+        ));
+    }
+    totals.add(&drr.run(
+        Budget {
+            work: 1,
+            bytes: u64::MAX,
+        },
+        &mut model,
+    ));
     assert_eq!(drr.deficit(0), Some(400));
     assert!(conserved(&drr, &totals));
 }
@@ -494,7 +517,7 @@ proptest! {
                 Step::Push(lane, charge) => model.queues[lane].push_back(charge),
                 Step::Run(budget) => {
                     let before = (drr.cursor(), drr.in_visit(), drr.deficit);
-                    let report = drr.run(budget, &mut model).unwrap();
+                    let report = drr.run(budget, &mut model);
                     let served: u64 = report.lanes.iter().map(|lane| lane.served_bytes).sum();
                     prop_assert!(served <= budget.bytes);
                     if budget.work == 0 {

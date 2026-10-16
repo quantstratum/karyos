@@ -13,7 +13,8 @@
 //!
 //! One visit follows the design's seven steps:
 //!
-//! 1. With no work budget left the call suspends; the round is untouched.
+//! 1. With no work or no bytes left the call suspends before any probe;
+//!    the round is untouched.
 //! 2. The lane is probed (one unit of work). A head whose charge does not
 //!    fit the remaining byte budget suspends the call as budget limited,
 //!    before any credit (owner decision P3: budget exhaustion suspends the
@@ -181,6 +182,9 @@ pub struct Budget {
 pub enum Stop {
     /// The work budget ran out; the visit under the cursor is kept.
     WorkExhausted,
+    /// The byte budget ran out (or was zero); the visit under the cursor is
+    /// kept.
+    BytesExhausted,
     /// The head of `lane` is charged more than the remaining byte budget;
     /// the visit is kept, uncredited if it was not credited yet.
     BytesLimited {
@@ -191,6 +195,9 @@ pub enum Stop {
     },
     /// A full pass found no lane eligible.
     Idle,
+    /// A step failed (see [`DrrError`]): nothing was credited or served
+    /// for it, and the report still counts the steps before it.
+    Failed(DrrError),
 }
 
 /// What one call did for one lane.
@@ -284,19 +291,15 @@ impl Drr {
     }
 
     /// Serves `source` within `budget`, resuming the round where the last
-    /// call stopped. A zero budget changes nothing.
+    /// call stopped. A budget with no work or no bytes left suspends before
+    /// any probe, so a zero budget changes nothing.
     ///
-    /// # Errors
-    ///
-    /// Returns [`DrrError::InvalidCharge`] for a head charged zero or above
-    /// the maximum, and [`DrrError::Overflow`] if a deficit or a report
-    /// count would not fit `u64`. Nothing is credited or served for the
-    /// step that failed; earlier steps of the call stand.
-    pub fn run(
-        &mut self,
-        budget: Budget,
-        source: &mut impl LaneSource,
-    ) -> Result<Report, DrrError> {
+    /// The report's [`Report::stop`] is [`Stop::Failed`] with
+    /// [`DrrError::InvalidCharge`] for a head charged zero or above the
+    /// maximum, or [`DrrError::Overflow`] if a deficit or a report count
+    /// would not fit `u64`. Nothing is credited or served for the step that
+    /// failed; the report counts the steps before it, whose service stands.
+    pub fn run(&mut self, budget: Budget, source: &mut impl LaneSource) -> Report {
         #[cfg(test)]
         self.inject_call_faults();
         let mut report = Report {
@@ -304,17 +307,36 @@ impl Drr {
             lanes: [LaneReport::default(); MAX_LANES],
             rounds: 0,
         };
+        report.stop = match self.serve(budget, source, &mut report) {
+            Ok(stop) => stop,
+            Err(error) => Stop::Failed(error),
+        };
+        report
+    }
+
+    /// The steps of [`Drr::run`]; returns why they stopped.
+    fn serve(
+        &mut self,
+        budget: Budget,
+        source: &mut impl LaneSource,
+        report: &mut Report,
+    ) -> Result<Stop, DrrError> {
         let (mut work, mut bytes) = (budget.work, budget.bytes);
         // Consecutive lanes found with nothing eligible: a full pass of
         // them ends the call.
         let mut ineligible = 0;
         loop {
+            // No budget left: suspend before any probe (step 1).
             let Some(left) = work.checked_sub(1) else {
                 #[cfg(test)]
                 self.inject_budget_fault();
-                report.stop = Stop::WorkExhausted;
-                return Ok(report);
+                return Ok(Stop::WorkExhausted);
             };
+            if bytes == 0 {
+                #[cfg(test)]
+                self.inject_budget_fault();
+                return Ok(Stop::BytesExhausted);
+            }
             work = left;
             let lane = self.cursor;
             let overflow = DrrError::Overflow { lane };
@@ -326,11 +348,10 @@ impl Drr {
                     if let Some(deficit) = self.deficit.get_mut(lane) {
                         *deficit = 0;
                     }
-                    self.advance(&mut report)?;
+                    self.advance(report)?;
                     ineligible += 1;
                     if ineligible >= self.config.lanes {
-                        report.stop = Stop::Idle;
-                        return Ok(report);
+                        return Ok(Stop::Idle);
                     }
                 }
                 Probe::Eligible { charge } => {
@@ -345,8 +366,7 @@ impl Drr {
                     if charge > bytes {
                         #[cfg(test)]
                         self.inject_budget_fault();
-                        report.stop = Stop::BytesLimited { lane, charge };
-                        return Ok(report);
+                        return Ok(Stop::BytesLimited { lane, charge });
                     }
                     let deficit = self.deficit.get(lane).copied().unwrap_or(0);
                     let deficit = if self.credited {
@@ -365,7 +385,7 @@ impl Drr {
                     let Some(residual) = deficit.checked_sub(charge) else {
                         // The head exceeds the residual: the visit ends and
                         // the residual carries into the next one.
-                        self.advance(&mut report)?;
+                        self.advance(report)?;
                         continue;
                     };
                     let entry = report.lanes.get_mut(lane).ok_or(overflow)?;
@@ -395,16 +415,17 @@ impl Drr {
     /// Ends the visit under the cursor and moves to the next lane;
     /// wrapping completes a round.
     fn advance(&mut self, report: &mut Report) -> Result<(), DrrError> {
+        let lane = self.cursor;
         self.credited = false;
-        let next = self.cursor + 1;
-        if next >= self.config.lanes {
-            self.cursor = 0;
-            report.rounds = report
-                .rounds
-                .checked_add(1)
-                .ok_or(DrrError::Overflow { lane: self.cursor })?;
-        } else {
-            self.cursor = next;
+        match lane.checked_add(1).filter(|next| *next < self.config.lanes) {
+            Some(next) => self.cursor = next,
+            None => {
+                report.rounds = report
+                    .rounds
+                    .checked_add(1)
+                    .ok_or(DrrError::Overflow { lane })?;
+                self.cursor = 0;
+            }
         }
         Ok(())
     }
