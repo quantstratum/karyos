@@ -139,10 +139,14 @@ impl Tracked {
         }
     }
 
-    /// The publication the entry names.
+    /// The publication the entry names: a network journal names its
+    /// sender's driver, the others this driver.
     fn publication(&self, driver: [u64; 2]) -> PublicationKey {
         PublicationKey {
-            driver,
+            driver: self
+                .entry
+                .network
+                .map_or(driver, |facts| facts.sender_driver),
             registration: self.entry.stream,
             incarnation: self.entry.incarnation,
         }
@@ -156,6 +160,8 @@ impl Tracked {
             || match self.entry.kind {
                 JournalKind::Subscriber => record.point == Point::Publish,
                 JournalKind::Publisher => record.point == Point::SubscriberPoll,
+                JournalKind::NetworkSender => record.point != Point::SenderPickup,
+                JournalKind::NetworkReceiver => record.point != Point::ReceiverCommit,
             }
     }
 
@@ -628,6 +634,12 @@ impl MirrorTool {
                     // is taken as expected from the stream's start.
                     let join = tracked.entry.join.unwrap_or(0);
                     report.add_subscriber_source(source, clock, publication, join)?;
+                }
+                // Network journals are not read yet (P2.12 N1c): their
+                // publication's traces are out of scope, so a missing
+                // network observation never yields a false `Complete`.
+                JournalKind::NetworkSender | JournalKind::NetworkReceiver => {
+                    report.out_of_scope(publication, None);
                 }
             }
         }
