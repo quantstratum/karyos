@@ -780,6 +780,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let Some(index) = self.find_stream(stream, Some(lane)) else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
+                // A guarded stream's publications are bound to the guard's
+                // open epoch with an outcome ring; that binding exists only
+                // in process (`EmbeddedDriver::publication`) until its CnC
+                // form, so the control path issues none.
+                if matches!(command, Command::AddPublication { .. })
+                    && self
+                        .streams
+                        .get(index)
+                        .is_some_and(|found| found.guarded.is_some())
+                {
+                    return refuse(ErrorCode::InvalidPublicationMode, detail);
+                }
                 let remote = self.ledger(client).map(Ledger::full);
                 match remote {
                     // The export bound refuses before anything is reserved.
@@ -1052,7 +1064,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             None => self
                 .guards
                 .close(handle, operation, requester, now)
-                .and_then(|_| self.seal_guarded(handle)),
+                .map(|_| self.seal_guarded_reporting(handle)),
             Some(expected) => self
                 .guards
                 .reopen(handle, expected, operation, requester, now)
@@ -4452,6 +4464,68 @@ mod tests {
             driver.seal_reason(stream).unwrap(),
             Some(karyos_sys::log_buffer::SealReason::GuardClosed)
         );
+    }
+
+    /// Review of #207, P1-1: the control path issues no publication on a
+    /// guarded stream (its binding exists only in process), for an
+    /// in-process client and a remote one alike.
+    #[test]
+    fn a_guarded_stream_refuses_cnc_publications() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddPublication {
+                sequence: 1,
+                stream: KEY,
+                allow_unconnected: true,
+                lane: Lane::ZERO,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        assert!(
+            answers.iter().any(|answer| matches!(
+                answer,
+                Response::Error {
+                    request: RequestId { client: c, sequence: 1 },
+                    code: ErrorCode::InvalidPublicationMode,
+                    ..
+                } if *c == client
+            )),
+            "{answers:?}"
+        );
+    }
+
+    /// The guard counters count what the walker did.
+    #[test]
+    fn the_guard_counters_count_the_walker() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        // The stream refuses unconnected offers; the walker does not
+        // connect it.
+        let _reader = driver
+            .subscribe(stream, karyos_sys::log_buffer::Role::Required)
+            .unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        for value in [b"a", b"b", b"c"] {
+            assert!(matches!(
+                publication.offer(value).unwrap(),
+                karyos_client::OfferOutcome::Accepted { .. }
+            ));
+        }
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.counters.value(Event::GuardOutcomesWritten), 3);
+        assert_eq!(driver.counters.value(Event::GuardOutcomesLost), 0);
+        assert_eq!(driver.counters.value(Event::GuardWalkerBudgetExhausted), 0);
     }
 
     /// A replaced incarnation retires once its walker ended and its readers

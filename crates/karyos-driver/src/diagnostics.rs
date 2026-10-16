@@ -46,6 +46,10 @@ pub enum ErrorCode {
     /// retention floor): the outcome streams of the stream's handles were
     /// abandoned with an unknown lost count. The key is the stream id.
     GuardWalkerLapped = 10,
+    /// A guard close took effect but sealing a stream it binds failed (a
+    /// broken invariant); the walker's duty retries the claim abort. The
+    /// key is the guard id.
+    GuardSealFailed = 11,
 }
 
 /// The agent that reported an error.

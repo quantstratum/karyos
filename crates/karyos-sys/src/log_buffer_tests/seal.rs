@@ -786,3 +786,36 @@ fn a_committed_claim_is_not_aborted_by_a_guard_close() {
     ));
     let _ = position;
 }
+
+/// Review of karyos#207, P1-2: a guard close that seals and aborts while a
+/// claim is between its record and its reserved head finds nothing
+/// admitted (`Idle`); the driver therefore repeats the abort every duty
+/// cycle until the publication releases at the seal, and the repeat wins.
+#[test]
+fn a_claim_admitted_after_the_close_is_aborted_by_the_repeat() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut first = None;
+    let outcome = publication
+        .try_claim_pausing(64, AppendOptions::default(), &mut |point| {
+            if point == ClaimPause::BeforeHead {
+                conductor.seal_with_reason(SealReason::GuardClosed).unwrap();
+                first = Some(conductor.abort_admitted_claim().unwrap());
+            }
+        });
+    assert_eq!(first, Some(ClaimDeadline::Idle), "not admitted yet");
+    let mut claim = claimed(outcome);
+    let position = claim.position();
+    assert_eq!(conductor.seal_state(), SealState::Sealed);
+    // The driver's repeat on its next duty cycle.
+    assert_eq!(
+        conductor.abort_admitted_claim().unwrap(),
+        ClaimDeadline::Aborted {
+            position,
+            extent: 96,
+        }
+    );
+    claim.payload().fill(7);
+    assert_eq!(claim.commit(), CommitOutcome::Aborted { position });
+}

@@ -360,3 +360,36 @@ fn a_fresh_incarnation_waits_for_the_old_handle_to_release() {
     let _ = driver.do_work().unwrap();
     assert!(driver.publication(handle).is_ok());
 }
+
+/// Review of #207, P2: a block its writer aborted is `WRITER_ABORTED` (6)
+/// even when the guard closes before the walker reaches it; only the
+/// blocks the close aborted are `GUARD_CLOSED` (1).
+#[test]
+fn a_writer_abort_keeps_its_reason_across_a_close() {
+    let (mut driver, handle, guard) = guarded(4);
+    let mut publication = driver.publication(handle).unwrap();
+    let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
+        panic!("not claimed");
+    };
+    // The writer drops its claim: its own abort.
+    drop(claim);
+    assert!(matches!(
+        publication.offer(b"after").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::Gated);
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    let records = outcomes(&mut publication);
+    let kinds: Vec<(Kind, u64)> = records.iter().map(|r| (r.kind, r.reason)).collect();
+    assert_eq!(
+        kinds,
+        [(Kind::Aborted, 6), (Kind::Submitted, 0), (Kind::Ended, 1)],
+        "{records:?}"
+    );
+}
