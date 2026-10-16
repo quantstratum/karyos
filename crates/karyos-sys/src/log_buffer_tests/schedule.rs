@@ -215,6 +215,7 @@ fn scheduled_appends_keep_the_ring_in_step_with_the_log() {
         while poll_message(subscription).is_some() {}
         while let Some(entry) = reader.peek(ring).unwrap() {
             seen.push((entry.position, entry.time));
+            reader.advance(ring).unwrap();
             reader.release(ring).unwrap();
         }
     };
