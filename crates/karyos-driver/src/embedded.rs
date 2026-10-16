@@ -1697,11 +1697,6 @@ fn account_deadlines(
     report.waiting
 }
 
-/// Adds `delta` to a duty cycle's work count with a checked sum
-/// (ADR-0007). An overflow leaves the count unchanged, is recorded in
-/// `counter overflows` and becomes [`DriverError::WorkCountOverflow`]
-/// unless an earlier error is already recorded; the rest of the cycle
-/// still runs.
 /// Adds a step's own checked count to a duty cycle's work count, as
 /// [`add_work`]: the work that fit is added, and an overflow inside the
 /// step counts one `counter overflows` and becomes the cycle's error
@@ -1719,6 +1714,11 @@ fn add_step(
     }
 }
 
+/// Adds `delta` to a duty cycle's work count with a checked sum
+/// (ADR-0007). An overflow leaves the count unchanged, is recorded in
+/// `counter overflows` and becomes [`DriverError::WorkCountOverflow`]
+/// unless an earlier error is already recorded; the rest of the cycle
+/// still runs.
 fn add_work(
     counters: &DriverCounters,
     work: &mut u32,
