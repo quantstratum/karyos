@@ -27,8 +27,10 @@ use super::*;
 const SECOND: u64 = 1_000_000_000;
 /// Datagrams each lane queue may hold.
 const BOUND: u16 = 4;
-/// Every frame here: 64 bytes, charged 64.
+/// A frame here: 64 bytes, charged 64, unless a test stages another size.
 const FRAME: u16 = 64;
+/// The largest frame and DRR charge here.
+const MAX_FRAME: u16 = 256;
 
 fn rate(per_second: u64, burst: u64) -> RatePolicy {
     RatePolicy {
@@ -66,9 +68,9 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Lanes of quantum 128, publication lanes 0, 1, ..., bound to epoch 2,
-    /// with `rates[i]` for DRR lane `i`.
-    fn new(rates: &[Option<RatePolicy>]) -> Self {
+    /// `lanes` lanes of quantum 256, publication lanes 0, 1, ..., bound to
+    /// epoch 2, sharing the publication's `rate`.
+    fn new(lanes: usize, rate: Option<RatePolicy>) -> Self {
         let mut config = SocketsConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)));
         config.max_datagram = NonZeroU16::new(256).unwrap();
         config.tx_slots = NonZeroU16::new(16).unwrap();
@@ -82,8 +84,7 @@ impl Fixture {
         let route = tx
             .add_route(SocketAddr::from((Ipv4Addr::LOCALHOST, 7001)))
             .unwrap();
-        let queues: Vec<TxQueueId> = rates
-            .iter()
+        let queues: Vec<TxQueueId> = (0..lanes)
             .map(|_| {
                 tx.open_queue(TxQueueConfig {
                     authority: Authority::FIRST,
@@ -93,26 +94,23 @@ impl Fixture {
                 .unwrap()
             })
             .collect();
-        let quanta = vec![128; rates.len()];
+        let quanta = vec![u64::from(MAX_FRAME); lanes];
         let sender = LaneSender::new(
-            DrrConfig::new(&quanta, u64::from(FRAME)).unwrap(),
+            DrrConfig::new(&quanta, u64::from(MAX_FRAME)).unwrap(),
             &queues,
             usize::from(BOUND),
         )
         .unwrap();
         let word = open_guard();
         let cell = Arc::new(AppliedEpoch::new());
-        let lanes: Vec<GateLane> = rates
-            .iter()
-            .enumerate()
-            .map(|(index, rate)| GateLane {
+        let gate_lanes: Vec<GateLane> = (0..lanes)
+            .map(|index| GateLane {
                 lane: Lane::try_new(u8::try_from(index).unwrap()).unwrap(),
                 epoch: 2,
-                rate: *rate,
                 bound: usize::from(BOUND),
             })
             .collect();
-        let gate = GuardGate::new(Arc::clone(&word), Arc::clone(&cell), &lanes, 0);
+        let gate = GuardGate::new(Arc::clone(&word), Arc::clone(&cell), &gate_lanes, rate, 0);
         Self {
             tx,
             socket: observer,
@@ -122,7 +120,7 @@ impl Fixture {
             word,
             cell,
             next_token: 1,
-            next_position: vec![0; rates.len()],
+            next_position: vec![0; lanes],
             last: None,
         }
     }
@@ -130,35 +128,40 @@ impl Fixture {
     /// Commits one first-of-message frame to `lane`, recorded by both the
     /// sender and the gate; returns its token and end position.
     fn stage(&mut self, lane: usize) -> (SenderToken, u64) {
+        self.stage_sized(lane, FRAME)
+    }
+
+    /// [`Self::stage`] with a frame of `len` bytes.
+    fn stage_sized(&mut self, lane: usize, len: u16) -> (SenderToken, u64) {
         let token = SenderToken::new(self.next_token);
         self.next_token += 1;
         let mut frame = self
             .tx
-            .claim_tx(self.queues[lane], usize::from(FRAME))
+            .claim_tx(self.queues[lane], usize::from(len))
             .unwrap();
         frame.bytes_mut().fill(u8::try_from(lane).unwrap());
         let ticket = frame
             .commit(Commit {
-                len: usize::from(FRAME),
+                len: usize::from(len),
                 token,
                 options: TxOptions::none(),
             })
             .unwrap();
         let staged = Staged {
             ticket,
-            charge: u64::from(FRAME),
-            len: FRAME,
+            charge: u64::from(len),
+            len,
         };
         self.sender.staged(lane, staged).unwrap();
         self.last = Some(staged);
-        let end = self.next_position[lane] + u64::from(FRAME);
+        let end = self.next_position[lane] + u64::from(len);
         self.next_position[lane] = end;
         self.gate
             .staged(
                 lane,
                 GateHead {
                     token,
-                    length: u64::from(FRAME),
+                    length: u64::from(len),
                     first_of_message: true,
                     end,
                 },
@@ -234,7 +237,7 @@ fn permit(count: u16) -> GateDecision {
 
 #[test]
 fn an_open_guard_sends_every_head_and_records_the_positions() {
-    let mut f = Fixture::new(&[None, None]);
+    let mut f = Fixture::new(2, None);
     f.stage(0);
     let (_, end0) = f.stage(0);
     let (_, end1) = f.stage(1);
@@ -252,7 +255,7 @@ fn an_open_guard_sends_every_head_and_records_the_positions() {
 /// with the last positions submitted under the old epoch.
 #[test]
 fn a_close_aborts_the_incarnation_and_publishes_the_applied_epoch_once() {
-    let mut f = Fixture::new(&[None, None]);
+    let mut f = Fixture::new(2, None);
     let (_, sent) = f.stage(0);
     f.accept(1);
     let _ = f.serve(0);
@@ -283,7 +286,7 @@ fn a_close_aborts_the_incarnation_and_publishes_the_applied_epoch_once() {
 /// nothing exposed and no denial counted.
 #[test]
 fn the_between_gates_step_applies_a_close_without_traffic() {
-    let mut f = Fixture::new(&[None]);
+    let mut f = Fixture::new(1, None);
     let (_, sent) = f.stage(0);
     f.accept(1);
     let _ = f.serve(0);
@@ -311,7 +314,7 @@ fn the_between_gates_step_applies_a_close_without_traffic() {
 /// 2 can never be current again.
 #[test]
 fn a_reopen_to_a_later_epoch_does_not_resume() {
-    let mut f = Fixture::new(&[None]);
+    let mut f = Fixture::new(1, None);
     f.stage(0);
     let cell = f.word.words().first().unwrap();
     close(&f.word);
@@ -324,32 +327,77 @@ fn a_reopen_to_a_later_epoch_does_not_resume() {
     assert_eq!(f.cell.try_read().unwrap().epoch, 4);
 }
 
-/// Rate limits: an empty bucket holds its lane's head in order, the lane
-/// forfeits its deficit, the other lane is served, and after a refill the
-/// held head goes first.
+/// The bucket is the publication's, shared by its lanes (ACS 15344): with
+/// it empty every lane is held in order, each refill lets one message
+/// through, and no lane ever skips its own head.
 #[test]
-fn a_rate_held_lane_neither_starves_the_others_nor_skips_its_head() {
-    let mut f = Fixture::new(&[Some(rate(1, 1)), None]);
-    let (_, first) = f.stage(0);
-    let (_, held) = f.stage(0);
-    f.stage(0);
-    for _ in 0..3 {
-        f.stage(1);
+fn an_empty_bucket_holds_every_lane_in_order() {
+    let mut f = Fixture::new(2, Some(rate(1, 1)));
+    let mut ends = [Vec::new(), Vec::new()];
+    for lane in [0, 1, 0, 1] {
+        ends[lane].push(f.stage(lane).1);
     }
     f.accept(4);
-    let report = f.serve(0);
-    assert_eq!(served(&report, 0), 64, "one token: one message");
-    assert_eq!(served(&report, 1), 192, "the other lane is served");
-    assert!(report.drr.lanes[0].forfeited > 0, "{report:?}");
+    let mut sent = [0usize; 2];
+    for second in 0..4 {
+        let report = f.serve(second * SECOND);
+        assert_eq!(
+            served(&report, 0) + served(&report, 1),
+            64,
+            "one token, one message, at second {second}"
+        );
+        for lane in 0..2 {
+            let last = f.gate.last_submitted(Lane::try_new(lane as u8).unwrap());
+            // Each lane's submissions are its heads in order.
+            let count = ends[lane]
+                .iter()
+                .position(|&end| end == last)
+                .map_or(0, |at| at + 1);
+            assert!(
+                count == sent[lane] || count == sent[lane] + 1,
+                "lane {lane} skipped"
+            );
+            sent[lane] = count;
+        }
+    }
+    assert_eq!(sent, [2, 2]);
     assert!(f.gate.counts().rate_held > 0);
     assert_eq!(f.gate.counts().faults, 0, "a held head is not a fault");
-    assert_eq!(f.gate.last_submitted(Lane::try_new(0).unwrap()), first);
-    // A second earns one token: the held head, not the one after it.
-    f.accept(1);
+}
+
+/// A head the bucket cannot pay for holds its lane, which forfeits its
+/// deficit, while another lane whose head fits is served; after a refill
+/// the held head goes first.
+#[test]
+fn a_held_lane_does_not_starve_another() {
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 1000,
+            burst: 1000,
+        },
+        bytes: Some(Rate {
+            per_second: u64::from(MAX_FRAME),
+            burst: u64::from(MAX_FRAME),
+        }),
+    };
+    let mut f = Fixture::new(2, Some(policy));
+    // Lane 0 sends a small frame, which leaves it deficit, then holds a
+    // full-size one the 192 bytes left cannot pay for.
+    let (_, small) = f.stage(0);
+    let (_, held) = f.stage_sized(0, MAX_FRAME);
+    f.stage(1);
+    let (_, other) = f.stage(1);
+    f.accept(4);
+    let report = f.serve(0);
+    assert_eq!((served(&report, 0), served(&report, 1)), (64, 128));
+    assert!(report.drr.lanes[0].forfeited > 0, "{report:?}");
+    assert_eq!(f.gate.last_submitted(Lane::try_new(0).unwrap()), small);
+    assert_eq!(f.gate.last_submitted(Lane::try_new(1).unwrap()), other);
+    assert!(f.gate.counts().rate_held > 0);
+    // A second refills the bytes: the held head goes.
     let report = f.serve(SECOND);
-    assert_eq!(served(&report, 0), 64);
+    assert_eq!(served(&report, 0), u64::from(MAX_FRAME));
     assert_eq!(f.gate.last_submitted(Lane::try_new(0).unwrap()), held);
-    assert_eq!(f.sender.pending(0), Some(1));
 }
 
 /// Several frames exposed in one batch against a small bucket: only the
@@ -357,15 +405,15 @@ fn a_rate_held_lane_neither_starves_the_others_nor_skips_its_head() {
 /// head is not charged again.
 #[test]
 fn a_batch_is_permitted_only_as_far_as_its_tokens() {
-    let mut f = Fixture::new(&[Some(rate(1, 2))]);
+    let mut f = Fixture::new(1, Some(rate(1, 2)));
     let tokens: Vec<SenderToken> = (0..3).map(|_| f.stage(0).0).collect();
     assert_eq!(check(&mut f.gate, &tokens), permit(2));
-    assert_eq!(f.gate.message_tokens(0), Some(0));
+    assert_eq!(f.gate.message_tokens(), Some(0));
     assert_eq!(f.gate.counts().rate_held, 1);
     // The backend kept both pending: exposed again, they are not charged
     // twice, and the third still waits.
     assert_eq!(check(&mut f.gate, &tokens), permit(2));
-    assert_eq!(f.gate.message_tokens(0), Some(0));
+    assert_eq!(f.gate.message_tokens(), Some(0));
     assert_eq!(check(&mut f.gate, &tokens[..1]), permit(1));
 }
 
@@ -373,14 +421,14 @@ fn a_batch_is_permitted_only_as_far_as_its_tokens() {
 /// unknown one keeps its charge.
 #[test]
 fn a_returned_head_is_refunded_and_regated_without_a_second_charge() {
-    let mut f = Fixture::new(&[Some(rate(1, 2))]);
+    let mut f = Fixture::new(1, Some(rate(1, 2)));
     let (token, _) = f.stage(0);
     let (second, _) = f.stage(0);
     let staged = f.last.unwrap();
     assert_eq!(check(&mut f.gate, &[token]), permit(1));
-    assert_eq!(f.gate.message_tokens(0), Some(1));
+    assert_eq!(f.gate.message_tokens(), Some(1));
     f.gate.left(0, staged, Left::Returned);
-    assert_eq!(f.gate.message_tokens(0), Some(2), "refunded");
+    assert_eq!(f.gate.message_tokens(), Some(2), "refunded");
     // The packetizer stages it again: one charge for its one send.
     f.gate
         .staged(
@@ -395,14 +443,10 @@ fn a_returned_head_is_refunded_and_regated_without_a_second_charge() {
         .unwrap();
     assert_eq!(check(&mut f.gate, &[second]), permit(1));
     f.gate.left(0, staged, Left::Unknown);
-    assert_eq!(
-        f.gate.message_tokens(0),
-        Some(1),
-        "unknown keeps its charge"
-    );
+    assert_eq!(f.gate.message_tokens(), Some(1), "unknown keeps its charge");
     assert_eq!(check(&mut f.gate, &[token]), permit(1));
     f.gate.left(0, staged, Left::Submitted);
-    assert_eq!(f.gate.message_tokens(0), Some(0));
+    assert_eq!(f.gate.message_tokens(), Some(0));
     assert_eq!(f.gate.last_submitted(Lane::try_new(0).unwrap()), 192);
 }
 
@@ -410,7 +454,7 @@ fn a_returned_head_is_refunded_and_regated_without_a_second_charge() {
 /// denied; an abort and a reopen give reserved tokens back.
 #[test]
 fn faults_are_denied_and_dropped_heads_are_refunded() {
-    let mut f = Fixture::new(&[Some(rate(1, 2))]);
+    let mut f = Fixture::new(1, Some(rate(1, 2)));
     let (token, _) = f.stage(0);
     let (second, _) = f.stage(0);
     assert_eq!(check(&mut f.gate, &[second]), GateDecision::Deny);
@@ -423,12 +467,12 @@ fn faults_are_denied_and_dropped_heads_are_refunded() {
         permit(1)
     );
     assert_eq!(f.gate.counts().faults, 3);
-    assert_eq!(f.gate.message_tokens(0), Some(1));
+    assert_eq!(f.gate.message_tokens(), Some(1));
     f.gate.reopen(0);
-    assert_eq!(f.gate.message_tokens(0), Some(2), "a reopen refunds");
+    assert_eq!(f.gate.message_tokens(), Some(2), "a reopen refunds");
     let (token, _) = f.stage(0);
     assert_eq!(check(&mut f.gate, &[token]), permit(1));
     close(&f.word);
     assert_eq!(check(&mut f.gate, &[token]), GateDecision::Deny);
-    assert_eq!(f.gate.message_tokens(0), Some(2), "an abort refunds");
+    assert_eq!(f.gate.message_tokens(), Some(2), "an abort refunds");
 }

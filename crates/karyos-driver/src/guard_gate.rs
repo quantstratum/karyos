@@ -16,10 +16,11 @@
 //!   If the observed epoch is above the applied epoch, the gate publishes
 //!   it once, with the last positions submitted per lane, through the
 //!   [`AppliedEpoch`] cell.
-//! - **Rate.** The authoritative bucket of the lane's publication. A head
-//!   the bucket cannot pay for is held in order, never skipped; the lane is
+//! - **Rate.** The authoritative bucket of the publication, one per gate:
+//!   a channel's lanes are one publication (GC-5, ACS 15344). A head the
+//!   bucket cannot pay for is held in order, never skipped; its lane is
 //!   ineligible, so it forfeits its DRR deficit as any lane its gate
-//!   closed. Tokens are reserved when an exposure is permitted and kept
+//!   closed, and with the bucket empty every lane is held. Tokens are reserved when an exposure is permitted and kept
 //!   once the head is reported submitted (or unknown, which may have left).
 //!   A head exposed again while pending is not charged twice; a head that
 //!   left without exposure, or that an abort or a reopen drops, gets its
@@ -53,8 +54,6 @@ pub struct GateLane {
     pub lane: Lane,
     /// The open epoch the incarnation was admitted under.
     pub epoch: u64,
-    /// The publication's validated rate policy, if any.
-    pub rate: Option<RatePolicy>,
     /// Heads the lane may record: its queue's bound.
     pub bound: usize,
 }
@@ -134,19 +133,9 @@ struct Head {
 struct State {
     lane: Lane,
     epoch: u64,
-    limiter: Option<RateLimiter>,
     heads: VecDeque<Head>,
     bound: usize,
     aborting: bool,
-}
-
-impl State {
-    /// Gives back every reserved charge of the heads it drops.
-    fn drop_heads(&mut self) {
-        while let Some(entry) = self.heads.pop_front() {
-            refund(&mut self.limiter, &entry);
-        }
-    }
 }
 
 fn refund(limiter: &mut Option<RateLimiter>, entry: &Head) {
@@ -163,6 +152,8 @@ pub struct GuardGate {
     word: Arc<HeapWords>,
     cell: Arc<AppliedEpoch>,
     lanes: Vec<State>,
+    /// The publication's bucket, shared by its lanes.
+    limiter: Option<RateLimiter>,
     /// The epoch last published to the cell.
     applied: u64,
     /// The last position submitted per publication lane.
@@ -172,14 +163,15 @@ pub struct GuardGate {
 
 impl GuardGate {
     /// A gate over the guard `word` (word 0 of the guard's view), writing
-    /// its applied epoch to `cell`, for `lanes` in DRR lane order. Every
-    /// buffer it will use is allocated here; the rate limiters start full
-    /// at clock time `now`.
+    /// its applied epoch to `cell`, for `lanes` in DRR lane order, with the
+    /// publication's validated `rate` policy. Every buffer it will use is
+    /// allocated here; the bucket starts full at clock time `now`.
     #[must_use]
     pub fn new(
         word: Arc<HeapWords>,
         cell: Arc<AppliedEpoch>,
         lanes: &[GateLane],
+        rate: Option<RatePolicy>,
         now: u64,
     ) -> Self {
         let lanes = lanes
@@ -187,7 +179,6 @@ impl GuardGate {
             .map(|lane| State {
                 lane: lane.lane,
                 epoch: lane.epoch,
-                limiter: lane.rate.map(|policy| RateLimiter::new(policy, now)),
                 heads: VecDeque::with_capacity(lane.bound),
                 bound: lane.bound,
                 aborting: false,
@@ -197,6 +188,7 @@ impl GuardGate {
             word,
             cell,
             lanes,
+            limiter: rate.map(|policy| RateLimiter::new(policy, now)),
             applied: 0,
             submitted: [0; Lane::COUNT as usize],
             counts: GateCounts::default(),
@@ -224,22 +216,23 @@ impl GuardGate {
             .unwrap_or(0)
     }
 
-    /// Whole message tokens `lane`'s bucket holds; `None` without a rate.
+    /// Whole message tokens the bucket holds; `None` without a rate.
     #[must_use]
-    pub fn message_tokens(&self, lane: usize) -> Option<u64> {
-        self.lanes
-            .get(lane)
-            .and_then(|state| state.limiter.as_ref())
-            .map(RateLimiter::message_tokens)
+    pub fn message_tokens(&self) -> Option<u64> {
+        self.limiter.as_ref().map(RateLimiter::message_tokens)
     }
 
-    /// Refills every bucket from the clock time `now`, before a serve call.
+    /// Whole byte tokens the bucket holds; `None` without a byte rate.
+    #[must_use]
+    pub fn byte_tokens(&self) -> Option<u64> {
+        self.limiter.as_ref().and_then(RateLimiter::byte_tokens)
+    }
+
+    /// Refills the bucket from the clock time `now`, before a serve call.
     /// A backward step earns nothing.
     pub fn set_now(&mut self, now: u64) {
-        for state in &mut self.lanes {
-            if let Some(limiter) = &mut state.limiter {
-                limiter.refill_at(now);
-            }
+        if let Some(limiter) = &mut self.limiter {
+            limiter.refill_at(now);
         }
     }
 
@@ -270,7 +263,9 @@ impl GuardGate {
     /// unsent.
     pub fn reopen(&mut self, lane: usize) {
         if let Some(state) = self.lanes.get_mut(lane) {
-            state.drop_heads();
+            while let Some(entry) = state.heads.pop_front() {
+                refund(&mut self.limiter, &entry);
+            }
         }
     }
 
@@ -291,7 +286,7 @@ impl GuardGate {
             state.aborting = true;
             // Reserved tokens of heads that will never be sent come back.
             for entry in &mut state.heads {
-                refund(&mut state.limiter, entry);
+                refund(&mut self.limiter, entry);
                 entry.charged = false;
             }
             bump(&mut self.counts.aborted, &mut self.counts.overflows);
@@ -380,6 +375,7 @@ impl SenderGate for GuardGate {
         }
         // Each candidate must be the lane's next head, in order; the
         // prefix whose tokens are reserved is permitted.
+        let limiter = &mut self.limiter;
         let Some(state) = self.lanes.get_mut(index) else {
             return self.fault();
         };
@@ -395,7 +391,7 @@ impl SenderGate for GuardGate {
                 break;
             }
             if !entry.charged {
-                let paid = state.limiter.as_mut().is_none_or(|limiter| {
+                let paid = limiter.as_mut().is_none_or(|limiter| {
                     limiter.try_admit(entry.head.length, entry.head.first_of_message)
                 });
                 if !paid {
@@ -441,7 +437,7 @@ impl LaneGate for GuardGate {
             return true;
         };
         let affordable = entry.charged
-            || state.limiter.as_ref().is_none_or(|limiter| {
+            || self.limiter.as_ref().is_none_or(|limiter| {
                 limiter.admits(entry.head.length, entry.head.first_of_message)
             });
         if !affordable {
@@ -467,7 +463,7 @@ impl LaneGate for GuardGate {
             // not counted as submitted.
             Left::Unknown => {}
             // It left without exposure: not a send.
-            Left::Returned => refund(&mut state.limiter, &entry),
+            Left::Returned => refund(&mut self.limiter, &entry),
         }
     }
 }

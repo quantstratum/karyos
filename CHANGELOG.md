@@ -32,9 +32,10 @@ release may break APIs, wire formats and shared-memory layouts.
 - `karyos_driver::guard_gate::GuardGate`, the sender gate of a guarded
   publication's lanes (G-e2): one Acquire load of the guard word per
   check, `Aborting` and the applied epoch published once per incarnation,
-  a between gates step, and the authoritative token bucket, whose tokens
-  are reserved at exposure, refunded for a head that left unsent and held
-  in order (`GateCounts::rate_held`, not a fault).
+  a between gates step, and the publication's authoritative token bucket,
+  shared by its lanes, whose tokens are reserved at exposure and refunded
+  for a head that left unsent; a head it cannot pay for is held in order
+  (`GateCounts::rate_held`, not a fault).
 - `karyos_io::lanes::LaneGate::left` (default no-op) and `Left`: the
   sender reports each head that left its queue to its gate.
 - `karyos_sys::rate_limit::RateLimiter::admits` (a check that charges
