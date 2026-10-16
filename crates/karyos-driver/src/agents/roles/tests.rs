@@ -111,6 +111,32 @@ fn drive<T>(
     panic!("not reached");
 }
 
+/// Drives the agents until the receiver posts `CreateImage` on the session
+/// ring: (endpoint, identity, joins).
+fn created(
+    agents: &mut Agents,
+    links: &Links,
+    endpoints: &mut Endpoints<OsSocket>,
+) -> (EndpointId, Identity, Lanes<u64>) {
+    let mut now = 0u64;
+    for _ in 0..2000 {
+        now += 1_000_000;
+        agents.do_work(now).unwrap();
+        endpoints.poll(links, |_| {}, |_| {});
+        if let Some(super::super::chain::SessionEvent::CreateImage {
+            endpoint,
+            identity,
+            joins,
+            ..
+        }) = links.sessions.take_event()
+        {
+            return (endpoint, identity, joins);
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    panic!("no CreateImage");
+}
+
 /// The publication on A announced to B: the sender's publication, A's
 /// published alias and B's subscription.
 fn add_publication(links: &Links, a: EndpointId, b: EndpointId, destination: SocketAddr) {
@@ -128,6 +154,7 @@ fn add_publication(links: &Links, a: EndpointId, b: EndpointId, destination: Soc
             reply,
             endpoint: b,
             stream_id: alias().stream_id,
+            max_term_length: super::super::images::DEFAULT_MAX_IMAGE_TERM_LENGTH,
         })
         .unwrap();
     links
@@ -163,17 +190,8 @@ fn a_loopback_setup_reaches_create_image() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
     add_publication(&links, a, b, destination);
-    let (endpoint, created) = drive(&mut agents, &links, &mut endpoints, |event| match event {
-        AgentEvent::CreateImage {
-            endpoint,
-            identity,
-            joins,
-            ..
-        } => Some((endpoint, (identity, joins))),
-        _ => None,
-    });
-    assert_eq!(endpoint, b);
-    assert_eq!(created, (identity(), Lanes::new(&[0]).unwrap()));
+    let created = created(&mut agents, &links, &mut endpoints);
+    assert_eq!(created, (b, identity(), Lanes::new(&[0]).unwrap()));
     assert_eq!(agents.receiver.counters().create_image, 1);
     assert!(
         agents.sender.counters().sent >= 3,
@@ -339,71 +357,31 @@ fn the_control_path_emits_only_controls() {
     }
 }
 
-/// Condition (4): the `CreateImage` reply slot is reserved before the
-/// ANSWER is consumed. With the receiver's event ring full, an answer
-/// leaves the challenge pending (`NoCommandCredit`); once there is room,
-/// the next answer installs it.
+/// Condition (4) and S1: the whole command chain is reserved before the
+/// ANSWER is consumed. With every unit of the session event ring held, an
+/// answer leaves the challenge pending (`NoCommandCredit`); once there is
+/// room, the next answer creates the image.
 #[test]
-fn an_answer_waits_for_its_create_image_slot() {
-    let config = AgentConfig {
-        event_capacity: 1,
-        ..AgentConfig::default()
-    };
-    let (mut agents, links, mut endpoints, a, b) = two_endpoints_with(config);
+fn an_answer_waits_for_its_chain_credit() {
+    let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    // One configuration command at a time: one event slot.
-    for command in 0..2 {
-        let post = if command == 0 {
-            links
-                .receiver
-                .post(|reply| AgentCommand::AddPublishedAlias {
-                    reply,
-                    endpoint: a,
-                    alias: alias(),
-                })
-        } else {
-            links.receiver.post(|reply| AgentCommand::AddSubscription {
-                reply,
-                endpoint: b,
-                stream_id: alias().stream_id,
-            })
-        };
-        post.unwrap();
-        agents.receiver.do_work(0).unwrap();
-        assert!(matches!(
-            links.receiver.take_event(),
-            Some(AgentEvent::Configured { accepted: true, .. })
-        ));
-    }
-    // The receiver's only event slot is held by an unread pong.
-    links.receiver.ping(1).unwrap();
-    agents.receiver.do_work(0).unwrap();
-    links
-        .sender
-        .post(|reply| AgentCommand::AddPublication {
-            reply,
-            publication: publication(a),
-            destination,
-            joins: Lanes::new(&[0]).unwrap(),
-        })
-        .unwrap();
+    add_publication(&links, a, b, destination);
+    let held: Vec<_> = std::iter::from_fn(|| agents.receiver.sessions.events.reserve()).collect();
+    assert_eq!(held.len(), AgentConfig::default().session_capacity);
     let mut now = 0u64;
     for _ in 0..300 {
         now += 1_000_000;
         agents.do_work(now).unwrap();
-        // The sender's events only: the receiver's pong stays unread.
-        while links.sender.take_event().is_some() {}
+        endpoints.poll(&links, |_| {}, |_| {});
         std::thread::sleep(Duration::from_micros(200));
     }
     assert_eq!(agents.receiver.counters().create_image, 0);
     assert!(agents.receiver.role.sessions.counters().dropped >= 1);
+    assert!(links.sessions.take_event().is_none());
     // Room again: the challenge, still pending, is answered again.
-    assert!(links.receiver.take_event().is_some());
-    let created = drive(&mut agents, &links, &mut endpoints, |event| match event {
-        AgentEvent::CreateImage { endpoint, .. } => Some(endpoint),
-        _ => None,
-    });
-    assert_eq!(created, b);
+    drop(held);
+    let (endpoint, ..) = created(&mut agents, &links, &mut endpoints);
+    assert_eq!(endpoint, b);
 }
 
 /// A receiver role with `config`.
@@ -414,23 +392,20 @@ fn receiver_with(config: AgentConfig) -> (super::SenderRole, super::ReceiverRole
 /// An intake on endpoint 1 at `now`.
 fn intake<'a>(
     role: &'a mut super::ReceiverRole,
-    events: &'a super::RingSender<AgentEvent<OsSocket>>,
+    sessions: &'a super::SessionEnd,
     now: u64,
-) -> super::Intake<'a, OsSocket> {
+) -> super::Intake<'a> {
     super::Intake {
         endpoint: EndpointId(1),
         now,
         role,
-        events,
+        sessions,
         work: 0,
     }
 }
 
-fn event_ring() -> (
-    super::RingSender<AgentEvent<OsSocket>>,
-    super::RingReceiver<AgentEvent<OsSocket>>,
-) {
-    super::ring::ring(std::num::NonZeroUsize::new(4).unwrap())
+fn event_ring() -> (super::SessionEnd, super::super::chain::SessionLink) {
+    super::super::chain::session_rings(std::num::NonZeroUsize::new(4).unwrap())
 }
 
 fn challenge_control() -> Control {
@@ -625,10 +600,7 @@ fn control_routes_survive_a_reset() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
     add_publication(&links, a, b, destination);
-    drive(&mut agents, &links, &mut endpoints, |event| match event {
-        AgentEvent::CreateImage { .. } => Some(()),
-        _ => None,
-    });
+    created(&mut agents, &links, &mut endpoints);
     endpoints.reset(&links, a).unwrap();
     let mut now = 10_000_000_000u64;
     let mut reopened = false;

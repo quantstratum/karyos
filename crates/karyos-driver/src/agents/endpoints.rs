@@ -448,10 +448,7 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::Stopped { .. }
             | AgentEvent::PublicationAdded { .. }
             | AgentEvent::PublicationRefused { .. }
-            | AgentEvent::CreateImage { .. }
             | AgentEvent::Configured { .. }
-            | AgentEvent::ImageInstalled { .. }
-            | AgentEvent::ImageReleased { .. }
             | AgentEvent::Unsupported { .. } => return Some(event),
         };
         let Ok(index) = self.index(endpoint) else {

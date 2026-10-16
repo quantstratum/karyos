@@ -13,9 +13,11 @@
 //!     `rsp_setup_rate_per_destination` and the per-driver `rsp_setup_rate`
 //!     (§7.4); the session table holds each resend to
 //!     `challenge_resend_interval`.
-//!   - SETUP ANSWER goes to its session table; an accepted one becomes an
-//!     [`AgentEvent::CreateImage`] for the conductor, its slot reserved
-//!     before the session table commits it.
+//!   - SETUP ANSWER goes to its session table; an accepted one becomes a
+//!     [`SessionEvent::CreateImage`] for the conductor, its whole command
+//!     chain reserved before the session table commits it (S1). An
+//!     announcement above the subscription's `max_image_term_length` is
+//!     never challenged.
 //!   - RSP_SETUP CHALLENGE and SOLICIT go to the sender ([`ControlItem`],
 //!     DN-4), but only for an alias published on that endpoint
 //!     (`AddPublishedAlias`): controls for anything else never reach the
@@ -41,6 +43,7 @@ use karyos_io::backend::{Budget, RxBackend, RxDatagram, RxDrop, RxHandler};
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::network::{Alias, Control, Datagram, Lanes, SetupAnnounce, classify};
 
+use super::chain::{ImageChain, SessionCommand, SessionEnd, SessionEvent};
 use super::control::{ControlItem, ControlRoutes, RouteSlot};
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
@@ -81,9 +84,12 @@ pub struct ReceiverCounters {
     pub rsp_setup_total_limited: u64,
     /// Announcements for a stream not subscribed on the endpoint.
     pub unsubscribed: u64,
+    /// Announcements whose term length is above the subscription's
+    /// `max_image_term_length`.
+    pub term_too_large: u64,
     /// CHALLENGE and SOLICIT for an alias not published on the endpoint.
     pub not_published: u64,
-    /// SMs dropped: no installed binding validates them yet (phase 4b-2).
+    /// SMs dropped: no installed binding validates them yet (phase 5c).
     pub status_unvalidated: u64,
     /// Images asked of the conductor.
     pub create_image: u64,
@@ -122,17 +128,21 @@ pub struct ReceiverRole {
     nonces: OsNonces,
     to_sender: RingSender<ControlItem>,
     budget: Budget,
-    /// Subscribed streams per endpoint.
-    subscriptions: Vec<(EndpointId, i32)>,
+    /// Subscribed streams per endpoint, with their largest accepted image
+    /// term length.
+    subscriptions: Vec<(EndpointId, i32, u32)>,
     /// Aliases published per endpoint.
     published: Vec<(EndpointId, Alias)>,
     max_entries: usize,
     rsp_destinations: EndpointRates,
     rsp_total: TotalRate,
-    /// Installed images and their receive owners, by installed slot (at
-    /// most `max_images`, allocated at creation). DATA admission through
-    /// them is phase 5.
-    images: Vec<(SlotRef, Box<ReceiveOwner>)>,
+    /// The `RetireImage` unit of each answered challenge, by pending slot,
+    /// until the conductor's reply (S1; at most `max_images`).
+    chains: Vec<(SlotRef, Reservation)>,
+    /// Installed images, their receive owners and `RetireImage` units, by
+    /// installed slot (at most `max_images`, allocated at creation). DATA
+    /// admission through them and retirement are phase 5.
+    images: Vec<(SlotRef, Box<ReceiveOwner>, Option<Reservation>)>,
     counters: ReceiverCounters,
 }
 
@@ -214,8 +224,29 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             max_entries: config.subscriptions,
             rsp_destinations,
             rsp_total,
+            chains: Vec::with_capacity(config.sessions.max_images),
             images: Vec::with_capacity(config.sessions.max_images),
             counters: ReceiverCounters::default(),
+        },
+    ))
+}
+
+/// Reserves an image's whole command chain (S1): `CreateImage`, the
+/// receiver's `RetireImage` and the conductor's units. `None`, with
+/// nothing held, when a ring has no credit.
+fn reserve_chain(sessions: &SessionEnd) -> Option<(Reservation, Reservation, ImageChain)> {
+    let create = sessions.events.reserve()?;
+    let reply = sessions.events.reserve()?;
+    let retire = sessions.events.reserve()?;
+    let command = sessions.credit.reserve()?;
+    let reclaimed = sessions.credit.reserve()?;
+    Some((
+        create,
+        retire,
+        ImageChain {
+            command,
+            reply,
+            reclaimed,
         },
     ))
 }
@@ -234,14 +265,11 @@ fn answerable(source: SocketAddr) -> bool {
 }
 
 impl ReceiverRole {
-    /// The receiver's commands at `now`: `AddSubscription`,
-    /// `AddPublishedAlias`, and `InstallImage` and `RefuseImage` (the
-    /// conductor's `ImageReady` and `ImageRefused`, S1); the sender's are
-    /// refused.
+    /// The receiver's commands: `AddSubscription` and `AddPublishedAlias`;
+    /// the sender's are refused.
     pub(super) fn command<O: SocketOps>(
         &mut self,
         command: AgentCommand<O>,
-        now: u64,
     ) -> Option<(Reservation, AgentEvent<O>)> {
         let max = self.max_entries;
         let configured = |accepted| AgentEvent::Configured {
@@ -253,13 +281,25 @@ impl ReceiverRole {
                 reply,
                 endpoint,
                 stream_id,
+                max_term_length,
             } => {
-                let entry = (endpoint, stream_id);
-                let accepted = self.subscriptions.contains(&entry)
-                    || (self.subscriptions.len() < max && {
-                        self.subscriptions.push(entry);
+                let held = self
+                    .subscriptions
+                    .iter()
+                    .position(|(held, stream, _)| (*held, *stream) == (endpoint, stream_id));
+                let full = self.subscriptions.len() >= max;
+                let accepted = match held.and_then(|index| self.subscriptions.get_mut(index)) {
+                    Some(entry) => {
+                        entry.2 = max_term_length;
                         true
-                    });
+                    }
+                    None if !full => {
+                        self.subscriptions
+                            .push((endpoint, stream_id, max_term_length));
+                        true
+                    }
+                    None => false,
+                };
                 Some((reply, configured(accepted)))
             }
             AgentCommand::AddPublishedAlias {
@@ -275,24 +315,6 @@ impl ReceiverRole {
                     });
                 Some((reply, configured(accepted)))
             }
-            AgentCommand::InstallImage { reply, slot, owner } => {
-                let event = match self.sessions.image_ready(slot, now) {
-                    ImageOutcome::Installed(installed) => {
-                        // The table holds a slot for every session, so it
-                        // has room for every installed image.
-                        self.images.push((installed, owner));
-                        AgentEvent::ImageInstalled { slot, installed }
-                    }
-                    // Dropping the owner drops the receiver's hold on the
-                    // image; the conductor frees its storage.
-                    ImageOutcome::Release(_) => AgentEvent::ImageReleased { slot },
-                };
-                Some((reply, event))
-            }
-            AgentCommand::RefuseImage { reply, slot } => {
-                self.sessions.image_refused(slot);
-                Some((reply, AgentEvent::ImageReleased { slot }))
-            }
             AgentCommand::AddPublication {
                 reply, publication, ..
             } => Some((
@@ -307,10 +329,70 @@ impl ReceiverRole {
         }
     }
 
+    /// The session table's counters.
+    #[must_use]
+    pub fn session_counters(&self) -> crate::sessions::receive::SessionCounters {
+        self.sessions.counters()
+    }
+
     /// Whether the image installed at `slot` is held.
     #[must_use]
     pub fn has_image(&self, slot: SlotRef) -> bool {
-        self.images.iter().any(|(held, _)| *held == slot)
+        self.images.iter().any(|(held, ..)| *held == slot)
+    }
+
+    /// Serves the conductor's session commands at `now` (S1), before any
+    /// other command or datagram; at most one ring's worth per cycle.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
+    pub(super) fn serve_sessions(
+        &mut self,
+        sessions: &SessionEnd,
+        now: u64,
+    ) -> Result<u32, AgentError> {
+        let mut served = 0u32;
+        for _ in 0..sessions.events.capacity() {
+            let Ok(Some(command)) = sessions.commands.try_take() else {
+                break;
+            };
+            served = served
+                .checked_add(1)
+                .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
+            let (reply, event) = match command {
+                SessionCommand::InstallImage { reply, slot, owner } => {
+                    let retire = self.take_chain(slot);
+                    let event = match self.sessions.image_ready(slot, now) {
+                        ImageOutcome::Installed(installed) => {
+                            // The table holds a slot for every session, so
+                            // it has room for every installed image.
+                            self.images.push((installed, owner, retire));
+                            SessionEvent::ImageInstalled { slot, installed }
+                        }
+                        // Dropping the owner drops the receiver's hold on
+                        // the image, and `retire` frees its unit; the
+                        // conductor frees the storage.
+                        ImageOutcome::Release(_) => SessionEvent::ImageReleased { slot },
+                    };
+                    (reply, event)
+                }
+                SessionCommand::RefuseImage { reply, slot } => {
+                    self.sessions.image_refused(slot);
+                    drop(self.take_chain(slot));
+                    (reply, SessionEvent::ImageReleased { slot })
+                }
+            };
+            // The conductor gone: the driver is stopping.
+            let _ = sessions.events.post(reply, event);
+        }
+        Ok(served)
+    }
+
+    /// The held `RetireImage` unit of the answered challenge at `slot`.
+    fn take_chain(&mut self, slot: SlotRef) -> Option<Reservation> {
+        let index = self.chains.iter().position(|(held, _)| *held == slot)?;
+        Some(self.chains.swap_remove(index).1)
     }
 
     /// The counters.
@@ -333,7 +415,7 @@ impl ReceiverRole {
     pub(super) fn duty<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
-        events: &RingSender<AgentEvent<O>>,
+        sessions: &SessionEnd,
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
@@ -347,7 +429,7 @@ impl ReceiverRole {
                 endpoint: *endpoint,
                 now,
                 role: self,
-                events,
+                sessions,
                 work: 0,
             };
             let _ = rx.poll_rx(budget, &mut intake);
@@ -358,16 +440,16 @@ impl ReceiverRole {
 }
 
 /// The receiver's handler of one endpoint's datagrams.
-struct Intake<'a, O: SocketOps> {
+struct Intake<'a> {
     endpoint: EndpointId,
     now: u64,
     role: &'a mut ReceiverRole,
-    events: &'a RingSender<AgentEvent<O>>,
+    sessions: &'a SessionEnd,
     /// Datagrams read; one poll reads at most its budget's.
     work: u32,
 }
 
-impl<O: SocketOps> Intake<'_, O> {
+impl Intake<'_> {
     /// Hands `item` to the sender; a full ring drops it, counted per kind
     /// so that a flood of one kind does not hide another.
     fn forward(&mut self, item: ControlItem) {
@@ -422,12 +504,22 @@ impl<O: SocketOps> Intake<'_, O> {
         match control {
             Control::SetupAnnounce(announce) => {
                 // §6.2 step 2: only a stream subscribed on this endpoint.
-                if !self
+                let Some(max_term_length) = self
                     .role
                     .subscriptions
-                    .contains(&(endpoint, announce.alias.stream_id))
-                {
+                    .iter()
+                    .find(|(held, stream, _)| {
+                        (*held, *stream) == (endpoint, announce.alias.stream_id)
+                    })
+                    .map(|(.., max)| *max)
+                else {
                     self.role.count(|c| &mut c.unsubscribed);
+                    return;
+                };
+                // An image larger than the subscription accepts is never
+                // challenged, so never allocated (S1 storage budget).
+                if announce.term.term_length > max_term_length {
+                    self.role.count(|c| &mut c.term_too_large);
                     return;
                 }
                 let key = BindingKey {
@@ -449,33 +541,38 @@ impl<O: SocketOps> Intake<'_, O> {
                     source,
                     alias: answer.alias,
                 };
-                let mut slot: Option<Reservation> = None;
-                let events = self.events;
+                // S1: the whole chain is reserved before the challenge is
+                // marked answered; without it the answer is dropped and the
+                // challenge stays pending.
+                let mut reserved = None;
+                let sessions = self.sessions;
                 let outcome = self.role.sessions.answer(key, &answer, now, || {
-                    slot = events.reserve();
-                    slot.is_some()
+                    reserved = reserve_chain(sessions);
+                    reserved.is_some()
                 });
                 if let (
                     AnswerOutcome::CreateImage {
-                        slot: session,
+                        slot,
                         identity,
                         term,
                         joins,
                     },
-                    Some(reservation),
-                ) = (outcome, slot)
+                    Some((create, retire, chain)),
+                ) = (outcome, reserved)
                 {
-                    let event = AgentEvent::CreateImage {
+                    let event = SessionEvent::CreateImage {
                         endpoint,
                         alias: answer.alias,
-                        slot: session,
+                        slot,
                         identity,
                         term,
                         joins,
+                        chain,
                     };
-                    // The event ring's consumer gone: the driver is
-                    // stopping; nothing to undo.
-                    let _ = events.post(reservation, event);
+                    // At most one per session slot, so within `max_images`.
+                    self.role.chains.push((slot, retire));
+                    // The conductor gone: the driver is stopping.
+                    let _ = sessions.events.post(create, event);
                     self.role.count(|c| &mut c.create_image);
                 }
             }
@@ -502,7 +599,7 @@ impl<O: SocketOps> Intake<'_, O> {
     }
 }
 
-impl<O: SocketOps> RxHandler for Intake<'_, O> {
+impl RxHandler for Intake<'_> {
     fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
         // At most the poll budget's datagrams: no overflow.
         self.work += 1;
@@ -550,9 +647,7 @@ impl SenderRole {
                 joins,
             } => (reply, publication, destination, joins),
             AgentCommand::AddSubscription { reply, .. }
-            | AgentCommand::AddPublishedAlias { reply, .. }
-            | AgentCommand::InstallImage { reply, .. }
-            | AgentCommand::RefuseImage { reply, .. } => {
+            | AgentCommand::AddPublishedAlias { reply, .. } => {
                 return Some((
                     reply,
                     AgentEvent::Unsupported {

@@ -2,33 +2,38 @@
 
 //! The conductor's image table (`quantstratum-docs:
 //! karyos/design/network-sessions.md` S1 "installation", SN-2; phase
-//! 4b-2): it serves the receiver's `CreateImage`, allocates one image log
+//! 4b-2): it serves the receiver's `CreateImage` from the session ring
+//! ([`super::chain`]), charges the storage budget, allocates one image log
 //! buffer per lane with the answer's join points, and hands the image's
 //! receive owner to the receiver (`InstallImage`, the S1 `ImageReady`). The
 //! receiver installs it if its challenge still allows (`ImageInstalled`) or
 //! releases it (`ImageReleased`), and the conductor then frees the storage.
 //!
-//! - **Geometry.** The term length, MTU and lane count come from the
-//!   accepted answer; one that the log buffer refuses is answered
-//!   `RefuseImage` (S1 `ImageRefused`), and the receiver removes the
-//!   challenge.
-//! - **Credit.** A command whose rings have no room now stays pending in
-//!   the table and is posted on a later poll; the receiver's challenge keeps
-//!   its timeout, so a late `ImageReady` is released, never installed.
-//!   (S1 reserves the whole chain at the answer; the agents' rings reserve
-//!   each reply when its command is posted, so a pending command waits for
-//!   room instead.)
+//! - **Size (S1 step 2).** The receiver challenges only an announcement
+//!   whose term length is within its subscription's
+//!   `max_image_term_length` ([`DEFAULT_MAX_IMAGE_TERM_LENGTH`] unless the
+//!   channel sets one). The conductor then charges the image's term bytes,
+//!   `term_length * (3 + spare_slots) * lanes` (checked), against the
+//!   driver's `image_storage_budget` ([`DEFAULT_IMAGE_STORAGE_BUDGET`])
+//!   before it allocates anything; an image over the budget, a full table
+//!   or a geometry the log buffer refuses is answered `RefuseImage` (S1
+//!   `ImageRefused`) and counted, and the receiver removes the challenge.
+//!   The charge is released when the image's storage is freed.
+//! - **Credit.** Every command of the chain posts into a unit the receiver
+//!   reserved at the answer, so no post waits for room.
 //! - **Attachment.** Local subscribers may attach to an image only once the
 //!   receiver reported it installed ([`ImageTable::installed`]). Retirement,
-//!   `StorageReclaimed` and the image's first SM come with liveness and DATA
-//!   (phase 5).
+//!   `StorageReclaimed` and the image's first SM come with phase 5.
+//! - **Shutdown.** On a stop the conductor drops the table with the agents.
+//!   An image whose `InstallImage` was posted but not answered shares its
+//!   lanes between the table and the unread command; both are freed when
+//!   dropped, and nothing outlives them.
 //!
 //! Images are heap-backed in this phase (one process); shared-memory
 //! images for subscribers of other processes follow the IPC mapping work.
 
 use std::sync::Arc;
 
-use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::frame::Lane;
 use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
 use karyos_sys::log_buffer::{
@@ -38,8 +43,19 @@ use karyos_sys::receive::ImageParams;
 use karyos_sys::sizing::TermLength;
 use karyos_sys::term::TermId;
 
-use super::{AgentCommand, AgentEvent, AgentLinks, EndpointId};
+use super::EndpointId;
+use super::chain::{ImageChain, SessionCommand, SessionEvent, SessionLink};
+use super::ring::Reservation;
 use crate::sessions::receive::SlotRef;
+
+/// The driver default of a subscription's `max_image_term_length`: 64 MiB.
+pub const DEFAULT_MAX_IMAGE_TERM_LENGTH: u32 = 64 << 20;
+
+/// The default `image_storage_budget` of a driver: 2 GiB of image terms.
+pub const DEFAULT_IMAGE_STORAGE_BUDGET: u64 = 2 << 30;
+
+/// Rotation slots of every log buffer, before its spares.
+const ROTATION_SLOTS: u64 = 3;
 
 /// The image log buffer parameters the answer does not carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +67,8 @@ pub struct ImageTemplate {
     /// Whether the receive owner may seal local gaps (default true:
     /// gaps-and-unreliable-delivery.md).
     pub local_gaps: bool,
+    /// Term bytes of every image together (`image_storage_budget`).
+    pub storage_budget: u64,
 }
 
 impl Default for ImageTemplate {
@@ -59,6 +77,7 @@ impl Default for ImageTemplate {
             spare_slots: 5,
             max_subscribers: 8,
             local_gaps: true,
+            storage_budget: DEFAULT_IMAGE_STORAGE_BUDGET,
         }
     }
 }
@@ -80,25 +99,54 @@ pub enum ImageEvent {
         /// The pending slot.
         slot: SlotRef,
     },
-    /// The answer's geometry was refused; the challenge is removed.
+    /// The image was refused (budget, table or geometry); the receiver
+    /// removed the challenge.
     Refused {
         /// The pending slot.
         slot: SlotRef,
     },
 }
 
+/// The table's counters; checked, sticky on overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImageCounters {
+    /// Images allocated and offered.
+    pub offered: u64,
+    /// Images the receiver installed.
+    pub installed: u64,
+    /// Images the receiver released.
+    pub released: u64,
+    /// Refused: the storage budget would be exceeded.
+    pub refused_budget: u64,
+    /// Refused: the table is full.
+    pub refused_full: u64,
+    /// Refused: the log buffer refused the geometry.
+    pub refused_geometry: u64,
+    /// Replies for no image, or for an image in another state; ignored.
+    pub stale_replies: u64,
+    /// An increment did not apply.
+    pub overflowed: bool,
+}
+
+impl ImageCounters {
+    fn bump(&mut self, field: fn(&mut Self) -> &mut u64) {
+        let value = field(self);
+        match value.checked_add(1) {
+            Some(next) => *value = next,
+            None => self.overflowed = true,
+        }
+    }
+}
+
 /// One image's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// Allocated; `InstallImage` waiting for ring room.
-    Pending(Box<ReceiveOwner>),
     /// `InstallImage` posted.
     Offered,
     /// Installed under this slot.
     Installed(SlotRef),
-    /// `RefuseImage` waiting for ring room.
-    Refusing,
     /// `RefuseImage` posted.
-    RefuseOffered,
+    Refused,
 }
 
 struct Image {
@@ -107,6 +155,10 @@ struct Image {
     endpoint: EndpointId,
     identity: Identity,
     lanes: Vec<Arc<LogBuffer>>,
+    /// Term bytes charged to the budget.
+    charge: u64,
+    /// The `StorageReclaimed` unit, held until phase 5 posts it.
+    _reclaimed: Reservation,
     state: State,
 }
 
@@ -115,6 +167,9 @@ pub struct ImageTable {
     images: Vec<Image>,
     max: usize,
     template: ImageTemplate,
+    /// Term bytes charged.
+    charged: u64,
+    counters: ImageCounters,
 }
 
 impl std::fmt::Debug for ImageTable {
@@ -122,13 +177,18 @@ impl std::fmt::Debug for ImageTable {
         f.debug_struct("ImageTable")
             .field("images", &self.images.len())
             .field("max", &self.max)
+            .field("charged", &self.charged)
             .finish_non_exhaustive()
     }
 }
 
-/// Why an answer's geometry was refused.
+/// Why an image was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Refused;
+enum Refusal {
+    Budget,
+    Full,
+    Geometry,
+}
 
 impl ImageTable {
     /// A table of at most `max` images (the receiver's `max_images`).
@@ -138,10 +198,13 @@ impl ImageTable {
             images: Vec::with_capacity(max),
             max,
             template,
+            charged: 0,
+            counters: ImageCounters::default(),
         }
     }
 
-    /// The images held, installed or not.
+    /// The images held, installed or not, refusals awaiting their reply
+    /// included.
     #[must_use]
     pub fn len(&self) -> usize {
         self.images.len()
@@ -151,6 +214,18 @@ impl ImageTable {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.images.is_empty()
+    }
+
+    /// Term bytes charged to the storage budget.
+    #[must_use]
+    pub fn charged(&self) -> u64 {
+        self.charged
+    }
+
+    /// The counters.
+    #[must_use]
+    pub fn counters(&self) -> ImageCounters {
+        self.counters
     }
 
     /// The lanes of the image installed at `slot`, for subscribers to
@@ -163,20 +238,183 @@ impl ImageTable {
         })
     }
 
+    /// Serves every session event the receiver posted, reporting image
+    /// events to `on_event`; returns how many it served.
+    pub fn poll(&mut self, link: &SessionLink, mut on_event: impl FnMut(ImageEvent)) -> u32 {
+        let mut served = 0u32;
+        while let Some(event) = link.take_event() {
+            self.handle(link, event, &mut on_event);
+            match served.checked_add(1) {
+                Some(next) => served = next,
+                None => break,
+            }
+        }
+        served
+    }
+
+    /// Serves one session event.
+    pub fn handle(
+        &mut self,
+        link: &SessionLink,
+        event: SessionEvent,
+        mut on_event: impl FnMut(ImageEvent),
+    ) {
+        match event {
+            SessionEvent::CreateImage {
+                endpoint,
+                alias,
+                slot,
+                identity,
+                term,
+                joins,
+                chain,
+            } => {
+                if let Some(event) =
+                    self.create(link, endpoint, alias, slot, identity, term, &joins, chain)
+                {
+                    on_event(event);
+                }
+            }
+            SessionEvent::ImageInstalled { slot, installed } => {
+                match self.images.iter_mut().find(|image| image.slot == slot) {
+                    Some(image) if image.state == State::Offered => {
+                        image.state = State::Installed(installed);
+                        self.counters.bump(|c| &mut c.installed);
+                        on_event(ImageEvent::Installed {
+                            slot: installed,
+                            endpoint: image.endpoint,
+                            identity: image.identity,
+                        });
+                    }
+                    _ => self.counters.bump(|c| &mut c.stale_replies),
+                }
+            }
+            SessionEvent::ImageReleased { slot } => {
+                let found = self.images.iter().position(|image| {
+                    image.slot == slot && matches!(image.state, State::Offered | State::Refused)
+                });
+                let Some(index) = found else {
+                    self.counters.bump(|c| &mut c.stale_replies);
+                    return;
+                };
+                let image = self.images.swap_remove(index);
+                // Charged by `create`, so never below it.
+                match self.charged.checked_sub(image.charge) {
+                    Some(charged) => self.charged = charged,
+                    None => self.counters.overflowed = true,
+                }
+                on_event(match image.state {
+                    State::Refused => ImageEvent::Refused { slot },
+                    State::Offered | State::Installed(_) => {
+                        self.counters.bump(|c| &mut c.released);
+                        ImageEvent::Released { slot }
+                    }
+                });
+            }
+        }
+    }
+
+    /// Serves `CreateImage`: capacity, budget, then allocation, each
+    /// refusal answered `RefuseImage` before anything is allocated.
+    /// Returns an event only for a refusal that keeps no entry.
+    #[allow(clippy::too_many_arguments, reason = "the fields of one CreateImage")]
+    fn create(
+        &mut self,
+        link: &SessionLink,
+        endpoint: EndpointId,
+        alias: Alias,
+        slot: SlotRef,
+        identity: Identity,
+        term: TermParams,
+        joins: &Lanes<u64>,
+        chain: ImageChain,
+    ) -> Option<ImageEvent> {
+        let ImageChain {
+            command,
+            reply,
+            reclaimed,
+        } = chain;
+        let refuse = |table: &mut Self, refusal: Refusal, command, reply| {
+            table.counters.bump(match refusal {
+                Refusal::Budget => |c| &mut c.refused_budget,
+                Refusal::Full => |c| &mut c.refused_full,
+                Refusal::Geometry => |c| &mut c.refused_geometry,
+            });
+            // The receiver gone: the driver is stopping.
+            let _ = link.post(command, SessionCommand::RefuseImage { reply, slot });
+        };
+        // Capacity first: a full table allocates nothing. It has no entry
+        // to wait for the reply, which is then counted stale.
+        if self.images.len() >= self.max {
+            refuse(self, Refusal::Full, command, reply);
+            return Some(ImageEvent::Refused { slot });
+        }
+        let image = |state, lanes, charge, reclaimed| Image {
+            slot,
+            endpoint,
+            identity,
+            lanes,
+            charge,
+            _reclaimed: reclaimed,
+            state,
+        };
+        // Then the budget, before any allocation.
+        let Some((charge, total)) = self.charge(term, joins).and_then(|charge| {
+            self.charged
+                .checked_add(charge)
+                .filter(|total| *total <= self.template.storage_budget)
+                .map(|total| (charge, total))
+        }) else {
+            refuse(self, Refusal::Budget, command, reply);
+            self.images
+                .push(image(State::Refused, Vec::new(), 0, reclaimed));
+            return None;
+        };
+        let Ok((lanes, owner)) = self.allocate(alias, term, joins) else {
+            refuse(self, Refusal::Geometry, command, reply);
+            self.images
+                .push(image(State::Refused, Vec::new(), 0, reclaimed));
+            return None;
+        };
+        self.charged = total;
+        self.counters.bump(|c| &mut c.offered);
+        self.images
+            .push(image(State::Offered, lanes, charge, reclaimed));
+        let _ = link.post(
+            command,
+            SessionCommand::InstallImage {
+                reply,
+                slot,
+                owner: Box::new(owner),
+            },
+        );
+        None
+    }
+
+    /// The image's term bytes, `term_length * (3 + spare_slots) * lanes`;
+    /// `None` on overflow.
+    fn charge(&self, term: TermParams, joins: &Lanes<u64>) -> Option<u64> {
+        let slots = ROTATION_SLOTS.checked_add(u64::from(self.template.spare_slots))?;
+        let lanes = u64::try_from(joins.as_slice().len()).ok()?;
+        u64::from(term.term_length)
+            .checked_mul(slots)?
+            .checked_mul(lanes)
+    }
+
     /// Builds the lanes and the receive owner of an accepted answer.
     fn allocate(
         &self,
         alias: Alias,
         term: TermParams,
         joins: &Lanes<u64>,
-    ) -> Result<(Vec<Arc<LogBuffer>>, ReceiveOwner), Refused> {
-        let term_length = TermLength::try_new(term.term_length).map_err(|_| Refused)?;
+    ) -> Result<(Vec<Arc<LogBuffer>>, ReceiveOwner), Refusal> {
+        let term_length = TermLength::try_new(term.term_length).map_err(|_| Refusal::Geometry)?;
         let mut lanes = Vec::with_capacity(joins.as_slice().len());
         for (index, &join) in joins.as_slice().iter().enumerate() {
             let lane = u8::try_from(index)
                 .ok()
                 .and_then(|lane| Lane::try_new(lane).ok())
-                .ok_or(Refused)?;
+                .ok_or(Refusal::Geometry)?;
             let config = LogBufferConfig {
                 term_length,
                 spare_slots: self.template.spare_slots,
@@ -194,7 +432,9 @@ impl ImageTable {
                 claim_deadline: DEFAULT_CLAIM_DEADLINE,
                 schedule_capacity: 0,
             };
-            lanes.push(Arc::new(LogBuffer::new(config).map_err(|_| Refused)?));
+            lanes.push(Arc::new(
+                LogBuffer::new(config).map_err(|_| Refusal::Geometry)?,
+            ));
         }
         let params = ImageParams::new(
             alias.session_id,
@@ -203,110 +443,9 @@ impl ImageTable {
             term_length,
             term.mtu,
         )
-        .map_err(|_| Refused)?;
-        let owner = ReceiveOwner::new(params, lanes.clone()).map_err(|_| Refused)?;
+        .map_err(|_| Refusal::Geometry)?;
+        let owner = ReceiveOwner::new(params, lanes.clone()).map_err(|_| Refusal::Geometry)?;
         Ok((lanes, owner))
-    }
-
-    /// Applies one of the receiver's agent events: an image event is
-    /// served and reported to `on_event`; any other comes back, for the
-    /// caller's other consumers (the endpoint table).
-    pub fn handle<O: SocketOps>(
-        &mut self,
-        event: AgentEvent<O>,
-        mut on_event: impl FnMut(ImageEvent),
-    ) -> Option<AgentEvent<O>> {
-        match event {
-            AgentEvent::CreateImage {
-                endpoint,
-                alias,
-                slot,
-                identity,
-                term,
-                joins,
-            } => self.create(endpoint, alias, slot, identity, term, &joins),
-            AgentEvent::ImageInstalled { slot, installed } => {
-                if let Some(image) = self.images.iter_mut().find(|image| image.slot == slot) {
-                    image.state = State::Installed(installed);
-                    on_event(ImageEvent::Installed {
-                        slot: installed,
-                        endpoint: image.endpoint,
-                        identity: image.identity,
-                    });
-                }
-            }
-            AgentEvent::ImageReleased { slot } => {
-                if let Some(index) = self.images.iter().position(|image| image.slot == slot) {
-                    let image = self.images.swap_remove(index);
-                    on_event(match image.state {
-                        State::RefuseOffered => ImageEvent::Refused { slot },
-                        _ => ImageEvent::Released { slot },
-                    });
-                }
-            }
-            other => return Some(other),
-        }
-        None
-    }
-
-    fn create(
-        &mut self,
-        endpoint: EndpointId,
-        alias: Alias,
-        slot: SlotRef,
-        identity: Identity,
-        term: TermParams,
-        joins: &Lanes<u64>,
-    ) {
-        // The table is sized like the receiver's session table, which holds
-        // a slot for every image it asks for.
-        let (lanes, state) = match self.allocate(alias, term, joins) {
-            Ok((lanes, owner)) if self.images.len() < self.max => {
-                (lanes, State::Pending(Box::new(owner)))
-            }
-            _ => (Vec::new(), State::Refusing),
-        };
-        self.images.push(Image {
-            slot,
-            endpoint,
-            identity,
-            lanes,
-            state,
-        });
-    }
-
-    /// Posts every pending `InstallImage` and `RefuseImage` that has ring
-    /// room now; the others wait for a later call.
-    pub fn post<O: SocketOps>(&mut self, links: &AgentLinks<O>) {
-        for image in &mut self.images {
-            let ready = matches!(image.state, State::Pending(_) | State::Refusing);
-            if !ready {
-                continue;
-            }
-            let Ok(prepared) = links.receiver.prepare() else {
-                return;
-            };
-            let slot = image.slot;
-            match std::mem::replace(&mut image.state, State::Offered) {
-                State::Pending(owner) => {
-                    // The agent gone: the driver is stopping.
-                    let _ = links
-                        .receiver
-                        .commit(prepared, |reply| AgentCommand::InstallImage {
-                            reply,
-                            slot,
-                            owner,
-                        });
-                }
-                State::Refusing => {
-                    image.state = State::RefuseOffered;
-                    let _ = links
-                        .receiver
-                        .commit(prepared, |reply| AgentCommand::RefuseImage { reply, slot });
-                }
-                state => image.state = state,
-            }
-        }
     }
 }
 
