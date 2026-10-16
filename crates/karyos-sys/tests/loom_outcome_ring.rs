@@ -28,6 +28,7 @@
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::panic,
+    unsafe_code,
     reason = "a test model, as ADR-0007 allows in tests"
 )]
 
@@ -69,8 +70,20 @@ enum Variant {
 }
 
 /// Writes `record` as `sequence` with the sequence first (the control).
-fn write_sequence_first(ring: &[AtomicU64], sequence: u64, record: Record) {
+/// The control writes the slot's witness as `produce` does, after an
+/// Acquire load of the consumed count, so only the store order differs
+/// from production and only a torn record can fail it.
+fn write_sequence_first(
+    ring: &[AtomicU64],
+    consumed: &AtomicU64,
+    witness: &Witness,
+    sequence: u64,
+    record: Record,
+) {
+    let _ = consumed.load(Ordering::Acquire);
     let slot = usize::try_from((sequence - 1) % CAPACITY).unwrap();
+    // SAFETY: as the writer's witness write; Loom checks the order.
+    witness[slot].with_mut(|value| unsafe { *value = sequence });
     let base = HEADER_WORDS + slot * RECORD_WORDS;
     ring[base].store(sequence, Ordering::Release);
     let fields = [
@@ -120,7 +133,9 @@ fn model(variant: Variant) {
                 }
             })
         };
-        let mut writer = OutcomeWriter::new(CAPACITY).unwrap().with_witness(witness);
+        let mut writer = OutcomeWriter::new(CAPACITY)
+            .unwrap()
+            .with_witness(Arc::clone(&witness));
         if variant == Variant::RelaxedLoad {
             writer = writer.with_consumed_load(Ordering::Relaxed);
         }
@@ -131,7 +146,7 @@ fn model(variant: Variant) {
                 thread::yield_now();
             }
             if variant == Variant::SequenceFirst {
-                write_sequence_first(&ring, sequence, record(sequence));
+                write_sequence_first(&ring, &consumed, &witness, sequence, record(sequence));
             } else {
                 assert_eq!(
                     writer.produce(&ring, &consumed, record(sequence)).unwrap(),

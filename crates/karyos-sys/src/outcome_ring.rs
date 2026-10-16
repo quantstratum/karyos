@@ -36,6 +36,13 @@
 use crate::load_words::LoadWords;
 use crate::sync::{AtomicU64, Ordering};
 
+/// The writer's load of the consumed count: Acquire, so a slot is reused
+/// only after the client's reads of it. One constant for every build, so
+/// the Loom controls weaken exactly the ordering production uses.
+const CONSUMED_LOAD: Ordering = Ordering::Acquire;
+/// The client's store of the consumed count: Release, after its reads.
+const CONSUMED_STORE: Ordering = Ordering::Release;
+
 /// The outcome ring's layout version.
 pub const OUTCOME_LAYOUT_VERSION: u64 = 1;
 /// Words of the header stride.
@@ -307,7 +314,7 @@ impl OutcomeWriter {
             consumed: 0,
             lost: None,
             #[cfg(loom)]
-            consumed_load: Ordering::Acquire,
+            consumed_load: CONSUMED_LOAD,
             #[cfg(loom)]
             witness: None,
         })
@@ -386,7 +393,7 @@ impl OutcomeWriter {
     /// the caller answers with a fault; the last valid count is kept.
     fn read_consumed(&mut self, consumed: &AtomicU64) -> bool {
         #[cfg(not(loom))]
-        let order = Ordering::Acquire;
+        let order = CONSUMED_LOAD;
         #[cfg(loom)]
         let order = self.consumed_load;
         let count = consumed.load(order);
@@ -513,7 +520,7 @@ impl OutcomeReader {
             next: 1,
             ended: false,
             #[cfg(loom)]
-            consumed_store: Ordering::Release,
+            consumed_store: CONSUMED_STORE,
             #[cfg(loom)]
             witness: None,
         })
@@ -563,7 +570,13 @@ impl OutcomeReader {
             if head != sequence {
                 // Not written yet: the slot still holds the record it
                 // replaces. Anything else is corrupt.
-                if head == sequence.saturating_sub(self.capacity) {
+                // A later round's slot holds the record it replaces; a
+                // first-round slot holds 0.
+                let pending = match sequence.checked_sub(self.capacity) {
+                    Some(previous) => head == previous,
+                    None => head == 0,
+                };
+                if pending {
                     break;
                 }
                 return Err(corrupt);
@@ -581,10 +594,10 @@ impl OutcomeReader {
                 // writer's witness write for this record and before the
                 // slot's reuse.
                 let owner = cell.with(|value| unsafe { *value });
-                assert_eq!(owner, sequence, "torn record: the witness names another");
+                assert_eq!(owner, sequence, "the slot's witness names another record");
             }
             #[cfg(not(loom))]
-            let order = Ordering::Release;
+            let order = CONSUMED_STORE;
             #[cfg(loom)]
             let order = self.consumed_store;
             consumed.store(sequence, order);
