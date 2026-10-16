@@ -53,19 +53,27 @@
 //! when it recorded the report, and nothing for a protocol violation.
 //!
 //! `TraceJournal` continues after its four words with word 4, the
-//! registration of the observed subscription (0 for a publisher-side
-//! journal).
+//! observed registration (nonzero), and word 5, the clock provenance
+//! word. The two words were added in place under admission `VERSION` 2,
+//! which no release has used (`quantstratum-docs:
+//! karyos/design/trace-tool.md`, T2 and T4): the five word layout before
+//! them has another length, so strict decoding refuses it.
 //!
 //! `TraceJournal` and `CloseJournal` (`quantstratum-docs:
 //! karyos/design/trace-journal-region.md`, J2 and J3): a client asks the
 //! driver for a trace journal of its sizes, which the driver creates and
-//! drains, naming the subscription the journal observes (a live
-//! subscription of the client, whose stream and join position the driver
-//! takes from its own record, or `Error` with `UnknownRegistration`) or 0
-//! for a publisher-side journal; the answer `JournalReady` carries the journal number the driver
-//! assigned and the hand-over key under which the client takes it, or
-//! `Error` with `TraceJournalsExhausted` when the driver's journal table has
-//! no free entry. `CloseJournal` gives the journal's final delivery
+//! drains, naming the registration the journal observes: a live
+//! subscription of the client (a subscriber journal, whose stream and join
+//! position the driver takes from its own record) or a live publication of
+//! the client (a publisher journal, which has no join position). One
+//! counter issues every registration, so the driver derives the kind from
+//! what the registration names; anything else is refused with `Error` and
+//! `UnknownRegistration`. The provenance word is opaque to the driver,
+//! which records it in the journal's table entry for tools; its values are
+//! defined by the trace crate. The answer `JournalReady` carries the
+//! journal number the driver assigned and the hand-over key under which
+//! the client takes it, or `Error` with `TraceJournalsExhausted` when the
+//! driver's journal table has no free entry. `CloseJournal` gives the journal's final delivery
 //! boundary before the client closes it; the driver answers
 //! `OperationSucceeded`, or `Error` with `UnknownRegistration` for a
 //! journal that is not an open journal of the client without a boundary.
@@ -508,9 +516,14 @@ pub enum Command {
         payload_words: u64,
         /// Drop-range entries, nonzero.
         drop_ranges: u64,
-        /// The registration of the subscription the journal observes; 0
-        /// for a publisher-side journal, which has no join position.
-        subscription: u64,
+        /// The registration the journal observes (nonzero): one of the
+        /// client's live subscriptions (a subscriber journal) or live
+        /// publications (a publisher journal, which has no join position).
+        registration: u64,
+        /// The clock provenance of the journal's observer: a raw word the
+        /// driver records in the journal's table entry without
+        /// interpreting it (the trace crate defines its values).
+        provenance: u64,
     },
     /// The final delivery boundary of one of the client's journals, sent
     /// before the client closes it.
@@ -789,9 +802,17 @@ impl Command {
                 capacity,
                 payload_words,
                 drop_ranges,
-                subscription,
+                registration,
+                provenance,
             } => write_words(
-                &[sequence, capacity, payload_words, drop_ranges, subscription],
+                &[
+                    sequence,
+                    capacity,
+                    payload_words,
+                    drop_ranges,
+                    registration,
+                    provenance,
+                ],
                 out,
             ),
             Self::CloseJournal {
@@ -913,9 +934,19 @@ impl Command {
                 })
             }
             TRACE_JOURNAL => {
-                let [sequence, capacity, payload_words, drop_ranges, subscription] =
-                    read_words::<5>(type_id, bytes)?;
-                if !capacity.is_power_of_two() || payload_words == 0 || drop_ranges == 0 {
+                let [
+                    sequence,
+                    capacity,
+                    payload_words,
+                    drop_ranges,
+                    registration,
+                    provenance,
+                ] = read_words::<6>(type_id, bytes)?;
+                if !capacity.is_power_of_two()
+                    || payload_words == 0
+                    || drop_ranges == 0
+                    || registration == 0
+                {
                     return Err(CncError::Reserved { type_id });
                 }
                 Ok(Self::TraceJournal {
@@ -923,7 +954,8 @@ impl Command {
                     capacity,
                     payload_words,
                     drop_ranges,
-                    subscription,
+                    registration,
+                    provenance,
                 })
             }
             CLOSE_JOURNAL => {
@@ -1988,22 +2020,25 @@ mod journal_tests {
             capacity: 64,
             payload_words: 25,
             drop_ranges: 8,
-            subscription: 11,
+            registration: 11,
+            provenance: 2,
         };
         let length = open.encode(&mut out).unwrap();
         assert_eq!(open.type_id(), 0x09);
-        assert_eq!(words_of(&out[..length]), [3, 64, 25, 8, 11]);
+        assert_eq!(words_of(&out[..length]), [3, 64, 25, 8, 11, 2]);
         assert_eq!(Command::decode(0x09, &out[..length]), Ok(open));
-        let publisher = Command::TraceJournal {
+        // The provenance is a raw word: any value round trips.
+        let raw = Command::TraceJournal {
             sequence: 3,
             capacity: 64,
             payload_words: 25,
             drop_ranges: 8,
-            subscription: 0,
+            registration: 12,
+            provenance: u64::MAX,
         };
-        let length = publisher.encode(&mut out).unwrap();
-        assert_eq!(words_of(&out[..length]), [3, 64, 25, 8, 0]);
-        assert_eq!(Command::decode(0x09, &out[..length]), Ok(publisher));
+        let length = raw.encode(&mut out).unwrap();
+        assert_eq!(words_of(&out[..length]), [3, 64, 25, 8, 12, u64::MAX]);
+        assert_eq!(Command::decode(0x09, &out[..length]), Ok(raw));
         let length = open.encode(&mut out).unwrap();
         assert_eq!(Command::decode(0x09, &out[..length]), Ok(open));
         let close = Command::CloseJournal {
@@ -2042,12 +2077,14 @@ mod journal_tests {
     #[test]
     fn journal_commands_are_decoded_strictly() {
         // A capacity that is zero or not a power of two, no payload or no
-        // drop range, and journal 0.
+        // drop range, registration 0 (the publisher journal of the layout
+        // before T4), and journal 0.
         for words in [
-            [1u64, 0, 25, 8, 0],
-            [1, 3, 25, 8, 0],
-            [1, 4, 0, 8, 0],
-            [1, 4, 25, 0, 5],
+            [1u64, 0, 25, 8, 3, 0],
+            [1, 3, 25, 8, 3, 0],
+            [1, 4, 0, 8, 3, 0],
+            [1, 4, 25, 0, 5, 0],
+            [1, 4, 25, 8, 0, 1],
         ] {
             assert_eq!(
                 Command::decode(TRACE_JOURNAL, &bytes_of(&words)),
@@ -2067,11 +2104,21 @@ mod journal_tests {
             Command::decode(CLOSE_JOURNAL, &bytes_of(&[1, 2, 3, 4])),
             Err(CncError::WrongLength { .. })
         ));
-        // The layout before the subscription word is refused by length.
-        assert!(matches!(
-            Command::decode(TRACE_JOURNAL, &bytes_of(&[1, 4, 25, 8])),
-            Err(CncError::WrongLength { .. })
-        ));
+        // The layouts before the subscription word and before the
+        // provenance word (T2) are refused by length, as is a longer one.
+        for words in [
+            &[1u64, 4, 25, 8][..],
+            &[1, 4, 25, 8, 3],
+            &[1, 4, 25, 8, 3, 0, 0],
+        ] {
+            assert!(
+                matches!(
+                    Command::decode(TRACE_JOURNAL, &bytes_of(words)),
+                    Err(CncError::WrongLength { .. })
+                ),
+                "{words:?}"
+            );
+        }
         assert!(matches!(
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
@@ -2418,16 +2465,18 @@ mod properties {
                 0u32..64,
                 1..=u64::MAX,
                 1..=u64::MAX,
-                prop_oneof![Just(0u64), any::<u64>()],
+                1..=u64::MAX,
+                any::<u64>(),
             )
                 .prop_map(
-                    |(sequence, shift, payload_words, drop_ranges, subscription)| {
+                    |(sequence, shift, payload_words, drop_ranges, registration, provenance)| {
                         Command::TraceJournal {
                             sequence,
                             capacity: 1 << shift,
                             payload_words,
                             drop_ranges,
-                            subscription,
+                            registration,
+                            provenance,
                         }
                     }
                 ),

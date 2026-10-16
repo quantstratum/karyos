@@ -665,26 +665,29 @@ impl<T: TermBytes> ClientConductor<T> {
     }
 
     /// Requests a trace journal of `layout` (`quantstratum-docs:
-    /// karyos/design/trace-journal-region.md`) observing `subscription`,
-    /// the registration of one of this client's live subscriptions, or
-    /// `None` for a publisher-side journal; returns the request sequence.
-    /// It completes as [`Outcome::Journal`] (in process) or
-    /// [`Outcome::FetchableJournal`] (remote), or is refused with
-    /// `UnknownRegistration` (a subscription that is not a live one of this
+    /// karyos/design/trace-journal-region.md`) observing `registration`:
+    /// one of this client's live subscriptions (a subscriber journal) or
+    /// live publications (a publisher journal). `provenance` is the clock
+    /// provenance word of the journal's observer, which the driver records
+    /// in the journal's table entry without interpreting it. Returns the
+    /// request sequence. It completes as [`Outcome::Journal`] (in process)
+    /// or [`Outcome::FetchableJournal`] (remote), or is refused with
+    /// `UnknownRegistration` (a registration that is not a live one of this
     /// client), `TraceJournalsExhausted` or `ResourcesUnavailable`. The
-    /// driver takes the subscription's join position from its own record.
+    /// driver takes a subscription's join position from its own record.
     ///
     /// # Errors
     ///
     /// Returns [`ConductorError::InvalidJournal`] for sizes the driver
-    /// would refuse to decode or `Some(0)`, and the other
+    /// would refuse to decode or registration 0, and the other
     /// [`ConductorError`]s; nothing is submitted on error.
     pub fn trace_journal(
         &mut self,
         layout: JournalLayout,
-        subscription: Option<u64>,
+        registration: u64,
+        provenance: u64,
     ) -> Result<u64, ConductorError> {
-        if layout.validate().is_err() || subscription == Some(0) {
+        if layout.validate().is_err() || registration == 0 {
             return Err(ConductorError::InvalidJournal);
         }
         let words = |value: usize| u64::try_from(value).map_err(|_| ConductorError::InvalidJournal);
@@ -699,7 +702,8 @@ impl<T: TermBytes> ClientConductor<T> {
                 capacity,
                 payload_words,
                 drop_ranges,
-                subscription: subscription.unwrap_or(0),
+                registration,
+                provenance,
             }
         })
     }

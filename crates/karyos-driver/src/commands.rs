@@ -44,14 +44,24 @@
 //! buffer, bound by `max_exports_per_client` and the fetch bounds), and
 //! answers `JournalReady` with the journal number (a trace number) and a
 //! hand-over key taken from the registration counter, so it never names
-//! another grant. A journal that names a subscription must name a live
-//! subscription of the sender; otherwise it is refused with
-//! `UnknownRegistration` before anything is created. The table entry then
-//! carries the subscription, its stream and its join position, which the
-//! driver recorded when it registered the subscription (the mapping's base
-//! plus the cell's position); a publisher-side journal (subscription 0) has
-//! none. `CloseJournal` records the boundary of the client's own open
-//! journal, once.
+//! another grant. The journal names the registration it observes, and one
+//! counter issues every registration, so the driver derives its kind from
+//! what that registration is (`quantstratum-docs:
+//! karyos/design/trace-tool.md`, T4): a live subscription of the sender
+//! gives a subscriber journal, a live publication of the sender a publisher
+//! journal; anything else (another client's registration, an ended one, a
+//! registration never issued) is refused with `UnknownRegistration` before
+//! anything is created. The table entry then carries the kind, the
+//! registration, its stream and the publication's incarnation, and for a
+//! subscriber journal the join position the driver recorded when it
+//! registered the subscription (the mapping's base plus the cell's
+//! position); a publisher journal has none. It also carries the client's
+//! clock provenance word as sent, and the time namespace word (T2): an
+//! in-process client shares the driver's namespace on Linux; for a remote
+//! client the driver compares the namespace of its pidfd-proven process
+//! with its own when it serves the command, never on the data path; off
+//! Linux the word is unknown. `CloseJournal` records the boundary of the
+//! client's own open journal, once.
 
 use std::sync::Arc;
 
@@ -69,6 +79,7 @@ use karyos_sys::counters::{CounterKeys, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBS
 use karyos_sys::log_buffer::{LossPolicy, PublicationEnd, Revocation, Role, SealState};
 use karyos_sys::record_journal::{JournalDrain, JournalLayout};
 use karyos_sys::registration;
+use karyos_sys::trace_mirror::{JournalKind, TimeNamespace};
 
 use crate::client_counters::Refusal;
 use crate::counters::Event;
@@ -76,6 +87,7 @@ use crate::embedded::{EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::generations::MemberKind;
 use crate::ledger::{Grant, GrantState, Ledger, Participant};
+use crate::trace_journals::Observed;
 
 /// A client's registration in the driver.
 /// A lost `hold` participant whose bound has not been withdrawn yet.
@@ -918,7 +930,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 capacity,
                 payload_words,
                 drop_ranges,
-                subscription,
+                registration,
+                provenance,
                 ..
             } => self.trace_journal(
                 client,
@@ -928,7 +941,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     capacity,
                     payload_words,
                     drop_ranges,
-                    subscription,
+                    registration,
+                    provenance,
                 },
             ),
             Command::CloseJournal {
@@ -944,7 +958,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Serves `TraceJournal` (see the module documentation): every check
-    /// first (the observed subscription, sizes, bytes budget, a free table
+    /// first (the observed registration, sizes, bytes budget, a free table
     /// entry, identities, the export bounds and the region of a remote
     /// client), then the effects, which cannot fail.
     fn trace_journal(
@@ -963,29 +977,38 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             capacity,
             payload_words,
             drop_ranges,
-            subscription,
+            registration,
+            provenance,
         } = asked;
-        // A nonzero subscription must be a live subscription of the
-        // sender; its stream and join position are the driver's record.
-        let observed = if subscription == 0 {
-            None
-        } else {
-            let live = self.registrations.iter().find(|registration| {
-                registration.id == subscription
-                    && registration.client == client
-                    && registration.kind == Kind::Subscription
-                    && registration.end.state() == LeaseState::Alive
-            });
-            match live {
-                Some(registration) => Some((subscription, registration.stream, registration.join)),
-                None => {
-                    return Response::Error {
-                        request,
-                        code: ErrorCode::UnknownRegistration,
-                        detail: subscription,
-                    };
-                }
-            }
+        // The registration must be a live subscription or publication of
+        // the sender; its kind, stream and join position are the driver's
+        // record.
+        let live = self.registrations.iter().find(|live| {
+            live.id == registration
+                && live.client == client
+                && live.end.state() == LeaseState::Alive
+        });
+        let Some(live) = live else {
+            return Response::Error {
+                request,
+                code: ErrorCode::UnknownRegistration,
+                detail: registration,
+            };
+        };
+        let (kind, join) = match live.kind {
+            Kind::Subscription => (JournalKind::Subscriber, live.join),
+            Kind::Publication => (JournalKind::Publisher, None),
+        };
+        let mut observed = Observed {
+            kind,
+            registration,
+            stream: live.stream,
+            // One incarnation per stream registration (see
+            // `EmbeddedDriver::trace_identity`).
+            incarnation: crate::embedded::FIRST_INCARNATION,
+            join,
+            time_namespace: TimeNamespace::Unknown,
+            provenance,
         };
         let (Ok(capacity), Ok(payload_words), Ok(drop_ranges)) = (
             usize::try_from(capacity),
@@ -999,7 +1022,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             payload_words,
             drop_ranges,
         };
-        let (index, bytes) = match self.trace_journals.preflight(&layout) {
+        let reserved = match self.trace_journals.preflight(&layout) {
             Ok(found) => found,
             Err(crate::trace_journals::Refusal::Exhausted) => {
                 return refuse(ErrorCode::TraceJournalsExhausted);
@@ -1014,6 +1037,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         else {
             return refuse(ErrorCode::IdentitiesExhausted);
         };
+        let bytes = reserved.bytes();
         let drain = match self
             .ledger(client)
             .map(|ledger| (ledger.full(), ledger.fetchable(1, bytes)))
@@ -1059,13 +1083,35 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         self.next_registration = next_key;
         self.next_trace_number = next_journal;
+        observed.time_namespace = self.time_namespace(client);
         self.trace_journals
-            .insert(index, journal, client, observed, drain, bytes);
+            .insert(reserved, journal, client, observed, drain);
         Response::JournalReady {
             request,
             journal,
             key,
         }
+    }
+
+    /// The time namespace of `client` against the driver's (T2): the same
+    /// for an in-process client, compared through the pidfd-proven process
+    /// for a remote one.
+    #[cfg(target_os = "linux")]
+    fn time_namespace(&self, client: u64) -> TimeNamespace {
+        if self.ledger(client).is_none() {
+            return TimeNamespace::Same;
+        }
+        self.admission
+            .as_ref()
+            .and_then(|admission| admission.time_namespace(client))
+            .unwrap_or(TimeNamespace::Unknown)
+    }
+
+    /// Off Linux the driver cannot tell.
+    #[cfg(not(target_os = "linux"))]
+    fn time_namespace(&self, client: u64) -> TimeNamespace {
+        let _ = client;
+        TimeNamespace::Unknown
     }
 
     /// A journal region for a remote client; `None` when it cannot be
@@ -1398,8 +1444,10 @@ struct JournalRequest {
     capacity: u64,
     payload_words: u64,
     drop_ranges: u64,
-    /// The observed subscription's registration, 0 for none.
-    subscription: u64,
+    /// The observed registration: a subscription or a publication.
+    registration: u64,
+    /// The clock provenance word, recorded as sent.
+    provenance: u64,
 }
 
 /// The bytes a fetch of `buffer` carries: its whole region, header

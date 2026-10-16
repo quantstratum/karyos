@@ -200,9 +200,17 @@ pub struct DriverConfig {
     /// Entries of the trace mirror's journal table (`quantstratum-docs:
     /// karyos/design/trace-journal-region.md`): the open client trace
     /// journals plus the ended ones whose records the mirror's ring still
-    /// retains. A `TraceJournal` that finds no free entry is refused with
-    /// `TraceJournalsExhausted`.
+    /// retains, or that are still needed and cannot be logged (see
+    /// `trace_recycle_log_entries`). A `TraceJournal` that finds no free
+    /// entry is refused with `TraceJournalsExhausted`.
     pub max_trace_journals: usize,
+    /// Entries of the trace mirror's recycle log (`quantstratum-docs:
+    /// karyos/design/trace-tool.md`, T5): one per recycled subscriber
+    /// journal that a pending or retained `Publish` record may still need.
+    /// With the log full, such an entry is not reused until no record
+    /// needs it, so a `TraceJournal` may be refused with
+    /// `TraceJournalsExhausted`.
+    pub trace_recycle_log_entries: usize,
     /// Bytes of every client trace journal the driver holds at once, each
     /// counted as its whole region (header included); a `TraceJournal`
     /// beyond it is refused with `ResourcesUnavailable`.
@@ -245,6 +253,7 @@ impl Default for DriverConfig {
             client_counters_capacity: 1024,
             max_counters_per_client: 64,
             max_trace_journals: 64,
+            trace_recycle_log_entries: 64,
             // Provisional until the trace overhead numbers of P11.
             max_trace_journal_bytes: 64 * 1024 * 1024,
             trace_drain_budget: 1024,
@@ -498,6 +507,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             && config.client_counters_capacity > 0
             && config.max_counters_per_client > 0
             && config.max_trace_journals > 0
+            && config.trace_recycle_log_entries > 0
             && config.max_trace_journal_bytes > 0
             && config.trace_drain_budget > 0
             && config.trace_mirror_records > 0
@@ -550,6 +560,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     instance,
                     region,
                     config.max_trace_journals,
+                    config.trace_recycle_log_entries,
                     config.trace_mirror_records,
                 )
                 .map_err(|_| DriverError::InvalidConfig)?;
@@ -1371,8 +1382,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 fn heap_mirror(
     config: &DriverConfig,
 ) -> Result<karyos_sys::trace_mirror::TraceMirror, DriverError> {
-    karyos_sys::trace_mirror::trace_mirror(config.max_trace_journals, config.trace_mirror_records)
-        .map_err(|_| DriverError::InvalidConfig)
+    karyos_sys::trace_mirror::trace_mirror(
+        config.max_trace_journals,
+        config.trace_recycle_log_entries,
+        config.trace_mirror_records,
+    )
+    .map_err(|_| DriverError::InvalidConfig)
 }
 
 fn seal_conflation_terminal<E>(

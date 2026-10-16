@@ -20,9 +20,13 @@ use karyos_client::{ClientConductor, ClientJournal, ConductorError, Outcome};
 use karyos_protocol::cnc::ErrorCode;
 use karyos_sys::counters::CellRead;
 use karyos_sys::record_journal::{Append, JournalLayout, Stamp};
-use karyos_sys::trace_mirror::{EntryRead, JournalEntry, JournalState};
+use karyos_sys::trace_mirror::{
+    EntryRead, JournalEntry, JournalKind, JournalState, LogRead, MAX_RECYCLE_PAIRS, NotedPublisher,
+    RecycledJournal, TimeNamespace,
+};
 
 use super::journal_bytes;
+use crate::embedded::FIRST_INCARNATION;
 use crate::{DriverConfig, DriverError, EmbeddedDriver};
 
 const LAYOUT: JournalLayout = JournalLayout {
@@ -65,22 +69,59 @@ fn complete(
     outcome.unwrap()
 }
 
+/// The provenance word the tests send: opaque to the driver.
+const PROVENANCE: u64 = 0xC10C;
+
 fn request(
     driver: &mut EmbeddedDriver,
     conductor: &mut ClientConductor,
     layout: JournalLayout,
-    subscription: Option<u64>,
+    registration: u64,
 ) -> Outcome {
     complete(driver, conductor, |conductor| {
-        conductor.trace_journal(layout, subscription)
+        conductor.trace_journal(layout, registration, PROVENANCE)
     })
 }
 
-fn journal(driver: &mut EmbeddedDriver, conductor: &mut ClientConductor) -> ClientJournal {
-    match request(driver, conductor, LAYOUT, None) {
+/// A journal observing `registration`, a live registration of
+/// `conductor`'s client.
+fn journal(
+    driver: &mut EmbeddedDriver,
+    conductor: &mut ClientConductor,
+    registration: u64,
+) -> ClientJournal {
+    match request(driver, conductor, LAYOUT, registration) {
         Outcome::Journal(journal) => journal,
         other => panic!("expected a journal, got {other:?}"),
     }
+}
+
+/// A client with a live publication on a new test stream, whose
+/// registration its publisher journals name: (conductor, publication
+/// handle, registration).
+fn publisher(
+    driver: &mut EmbeddedDriver,
+) -> (ClientConductor, karyos_client::ClientPublication, u64) {
+    let _ = stream(driver);
+    let mut conductor = driver.connect().unwrap();
+    let (publication, registration) = publish(driver, &mut conductor);
+    (conductor, publication, registration)
+}
+
+/// The exclusive publication of the test stream for `conductor`'s client,
+/// with its registration.
+fn publish(
+    driver: &mut EmbeddedDriver,
+    conductor: &mut ClientConductor,
+) -> (karyos_client::ClientPublication, u64) {
+    let outcome = complete(driver, conductor, |conductor| {
+        conductor.add_publication(KEY, true)
+    });
+    let Outcome::Publication(publication) = outcome else {
+        panic!("expected a publication, got {outcome:?}");
+    };
+    let registration = publication.origin().unwrap().registration();
+    (publication, registration)
 }
 
 fn refused(outcome: &Outcome) -> ErrorCode {
@@ -155,9 +196,9 @@ fn counter(driver: &EmbeddedDriver, label: &str) -> u64 {
 #[test]
 fn a_journal_is_drained_into_the_mirror_with_its_drops() {
     let mut driver = driver(4, 64, 64);
-    let mut conductor = driver.connect().unwrap();
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
     let client = conductor.owner().client;
-    let mut journal = journal(&mut driver, &mut conductor);
+    let mut journal = journal(&mut driver, &mut conductor, publication);
     let number = journal.journal();
     assert_eq!(number, 1, "the first trace number");
     let opened = entry(&driver, number);
@@ -230,8 +271,8 @@ fn a_journal_is_drained_into_the_mirror_with_its_drops() {
 #[test]
 fn a_mirror_overwrite_is_mirror_loss_never_journal_loss() {
     let mut driver = driver(2, 2, 64);
-    let mut conductor = driver.connect().unwrap();
-    let mut journal = journal(&mut driver, &mut conductor);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let mut journal = journal(&mut driver, &mut conductor, publication);
     append(&mut journal, 0..4);
     let _ = driver.do_work().unwrap();
     let (overwritten, seen) = scan(&driver, &mut 0);
@@ -253,9 +294,9 @@ fn a_mirror_overwrite_is_mirror_loss_never_journal_loss() {
 #[test]
 fn a_reader_after_the_ring_wrapped_sees_every_journal() {
     let mut driver = driver(4, 2, 64);
-    let mut conductor = driver.connect().unwrap();
-    let mut first = journal(&mut driver, &mut conductor);
-    let mut second = journal(&mut driver, &mut conductor);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let mut first = journal(&mut driver, &mut conductor, publication);
+    let mut second = journal(&mut driver, &mut conductor, publication);
     append(&mut first, 0..2);
     let _ = driver.do_work().unwrap();
     append(&mut second, 0..3);
@@ -282,7 +323,7 @@ fn a_reader_after_the_ring_wrapped_sees_every_journal() {
 #[test]
 fn ended_journals_churn_through_a_small_table() {
     let mut driver = driver(2, 4, 64);
-    let mut conductor = driver.connect().unwrap();
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
     let mut cursor = 0;
     // The reader's check: each scanned record still retained has its
     // journal in the table it reads after the scan.
@@ -294,10 +335,10 @@ fn ended_journals_churn_through_a_small_table() {
             assert!(table.contains(&record.1), "{record:?} without its entry");
         }
     };
-    let mut a = journal(&mut driver, &mut conductor);
-    let mut b = journal(&mut driver, &mut conductor);
+    let mut a = journal(&mut driver, &mut conductor, publication);
+    let mut b = journal(&mut driver, &mut conductor, publication);
     assert_eq!(
-        refused(&request(&mut driver, &mut conductor, LAYOUT, None)),
+        refused(&request(&mut driver, &mut conductor, LAYOUT, publication)),
         ErrorCode::TraceJournalsExhausted
     );
     append(&mut a, [1]);
@@ -309,7 +350,7 @@ fn ended_journals_churn_through_a_small_table() {
     let _ = driver.do_work().unwrap();
     assert_eq!(entry(&driver, a_number).state, JournalState::Closed);
     assert_eq!(
-        refused(&request(&mut driver, &mut conductor, LAYOUT, None)),
+        refused(&request(&mut driver, &mut conductor, LAYOUT, publication)),
         ErrorCode::TraceJournalsExhausted
     );
     check(&driver, &mut cursor);
@@ -317,7 +358,7 @@ fn ended_journals_churn_through_a_small_table() {
     append(&mut b, 0..4);
     let _ = driver.do_work().unwrap();
     check(&driver, &mut cursor);
-    let mut c = journal(&mut driver, &mut conductor);
+    let mut c = journal(&mut driver, &mut conductor, publication);
     // Refusals assigned no trace number.
     assert_eq!(c.journal(), 3);
     let table: Vec<u64> = entries(&driver).iter().map(|entry| entry.journal).collect();
@@ -336,14 +377,14 @@ fn ended_journals_churn_through_a_small_table() {
 #[test]
 fn a_hostile_journal_faults_its_client_without_a_panic() {
     let mut driver = driver(8, 64, 64);
-    let mut conductor = driver.connect().unwrap();
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
     let client = conductor.owner().client;
-    let mut good = journal(&mut driver, &mut conductor);
+    let mut good = journal(&mut driver, &mut conductor, publication);
     // Words of the block: geometry 0..16, head at 16; records at 96, three
     // words each, the sequence first.
     let corruptions: [(usize, u64); 3] = [(16, 99), (96, u64::MAX), (2, 5)];
     for (case, (index, value)) in corruptions.into_iter().enumerate() {
-        let mut bad = journal(&mut driver, &mut conductor);
+        let mut bad = journal(&mut driver, &mut conductor, publication);
         append(&mut bad, [1, 2]);
         let words = driver
             .trace_journals
@@ -381,9 +422,9 @@ fn a_hostile_journal_faults_its_client_without_a_panic() {
 #[test]
 fn the_drain_budget_bounds_each_cycle_and_rotates() {
     let mut driver = driver(3, 64, 4);
-    let mut conductor = driver.connect().unwrap();
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
     let mut journals: Vec<ClientJournal> = (0..3)
-        .map(|_| journal(&mut driver, &mut conductor))
+        .map(|_| journal(&mut driver, &mut conductor, publication))
         .collect();
     for journal in &mut journals {
         append(journal, 0..4);
@@ -420,8 +461,8 @@ fn the_budget_and_the_sizes_refuse_without_creating() {
         ..DriverConfig::default()
     })
     .unwrap();
-    let mut conductor = driver.connect().unwrap();
-    let held = journal(&mut driver, &mut conductor);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let held = journal(&mut driver, &mut conductor, publication);
     for layout in [
         LAYOUT,
         JournalLayout {
@@ -434,7 +475,7 @@ fn the_budget_and_the_sizes_refuse_without_creating() {
         },
     ] {
         assert_eq!(
-            refused(&request(&mut driver, &mut conductor, layout, None)),
+            refused(&request(&mut driver, &mut conductor, layout, publication)),
             ErrorCode::ResourcesUnavailable,
             "{layout:?}"
         );
@@ -443,7 +484,7 @@ fn the_budget_and_the_sizes_refuse_without_creating() {
     // The bytes come back once the journal ended.
     drop(held);
     let _ = driver.do_work().unwrap();
-    let next = journal(&mut driver, &mut conductor);
+    let next = journal(&mut driver, &mut conductor, publication);
     assert_eq!(next.journal(), 2);
     // Sizes the driver would refuse to decode are not even sent.
     assert_eq!(
@@ -452,7 +493,8 @@ fn the_budget_and_the_sizes_refuse_without_creating() {
                 capacity: 3,
                 ..LAYOUT
             },
-            None
+            publication,
+            0
         ),
         Err(ConductorError::InvalidJournal)
     );
@@ -477,6 +519,10 @@ fn the_budget_and_the_sizes_refuse_without_creating() {
             trace_mirror_records: 0,
             ..DriverConfig::default()
         },
+        DriverConfig {
+            trace_recycle_log_entries: 0,
+            ..DriverConfig::default()
+        },
     ] {
         assert!(matches!(
             EmbeddedDriver::with_config(config),
@@ -491,9 +537,9 @@ fn the_budget_and_the_sizes_refuse_without_creating() {
 #[test]
 fn close_journal_sets_the_boundary_of_its_own_journal_once() {
     let mut driver = driver(4, 64, 64);
-    let mut owner = driver.connect().unwrap();
+    let (mut owner, _publication, publication) = publisher(&mut driver);
     let mut other = driver.connect().unwrap();
-    let journal = journal(&mut driver, &mut owner);
+    let journal = journal(&mut driver, &mut owner, publication);
     let number = journal.journal();
     let close = |driver: &mut EmbeddedDriver,
                  conductor: &mut ClientConductor,
@@ -528,9 +574,9 @@ fn close_journal_sets_the_boundary_of_its_own_journal_once() {
 #[test]
 fn a_gone_writer_is_drained_and_marked_writer_lost() {
     let mut driver = driver(4, 64, 64);
-    let mut conductor = driver.connect().unwrap();
-    let mut open = journal(&mut driver, &mut conductor);
-    let mut closed = journal(&mut driver, &mut conductor);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let mut open = journal(&mut driver, &mut conductor, publication);
+    let mut closed = journal(&mut driver, &mut conductor, publication);
     append(&mut open, 0..3);
     append(&mut closed, 0..2);
     closed.writer().close();
@@ -574,9 +620,9 @@ fn a_drop_after_the_last_read_reaches_the_entry() {
             .store(3, std::sync::atomic::Ordering::Release);
     }
     let mut driver = driver(4, 64, 64);
-    let mut conductor = driver.connect().unwrap();
-    let mut idle = journal(&mut driver, &mut conductor);
-    let mut gone = journal(&mut driver, &mut conductor);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let mut idle = journal(&mut driver, &mut conductor, publication);
+    let mut gone = journal(&mut driver, &mut conductor, publication);
     append(&mut idle, 0..2);
     append(&mut gone, 0..2);
     let _ = driver.do_work().unwrap();
@@ -604,8 +650,8 @@ fn a_drop_after_the_last_read_reaches_the_entry() {
 #[test]
 fn an_untaken_journal_ends_with_its_client() {
     let mut driver = driver(4, 64, 64);
-    let mut conductor = driver.connect().unwrap();
-    let _ = conductor.trace_journal(LAYOUT, None).unwrap();
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let _ = conductor.trace_journal(LAYOUT, publication, 0).unwrap();
     let _ = driver.do_work().unwrap();
     assert_eq!(entries(&driver)[0].state, JournalState::Open);
     drop(conductor);
@@ -665,98 +711,353 @@ fn subscribe(
     (subscription, registration)
 }
 
-/// A journal that observes the sender's live subscription carries the
-/// subscription, its stream and the join position the driver recorded
-/// when it registered the subscription (here past messages published
-/// before it joined); a publisher-side journal carries none, which a
-/// reader tells apart from a join at 0.
+/// The time namespace word of an in-process client: the driver's own on
+/// Linux, unknown elsewhere (T2).
+fn own_namespace() -> TimeNamespace {
+    if cfg!(target_os = "linux") {
+        TimeNamespace::Same
+    } else {
+        TimeNamespace::Unknown
+    }
+}
+
+/// T4: a journal derives its kind from the registration it names. One
+/// naming the sender's live subscription is a subscriber journal with the
+/// subscription, its stream, the incarnation and the join position the
+/// driver recorded when it registered the subscription (here past
+/// messages published before it joined); one naming the sender's live
+/// publication is a publisher journal of the same publication without a
+/// join, which a reader tells apart from a join at 0. Both carry the
+/// provenance word as sent and the time namespace word.
 #[test]
-fn a_journal_of_a_subscription_carries_the_driver_recorded_join() {
+fn a_journal_derives_its_kind_from_the_named_registration() {
     let mut driver = driver(4, 64, 64);
     let handle = stream(&mut driver);
     let stream_registration = driver.trace_identity(handle).unwrap().registration;
-    let mut publication = driver.publication(handle).unwrap();
+    let mut conductor = driver.connect().unwrap();
+    let (mut publication, publication_registration) = publish(&mut driver, &mut conductor);
     for _ in 0..3 {
         assert!(matches!(
             publication.offer(b"before the join").unwrap(),
             karyos_client::OfferOutcome::Accepted { .. }
         ));
     }
-    let mut conductor = driver.connect().unwrap();
     let (subscription, registration) = subscribe(&mut driver, &mut conductor);
     let joined = subscription.position();
     assert!(joined > 0, "the subscription joined after three messages");
     // Messages after the join do not move the recorded join.
     let _ = publication.offer(b"after the join").unwrap();
-    let observing = match request(&mut driver, &mut conductor, LAYOUT, Some(registration)) {
-        Outcome::Journal(journal) => journal,
-        other => panic!("expected a journal, got {other:?}"),
-    };
+    let observing = journal(&mut driver, &mut conductor, registration);
     let observed = entry(&driver, observing.journal());
     assert_eq!(
-        (observed.subscription, observed.stream, observed.join),
-        (registration, stream_registration, Some(joined))
+        (
+            observed.kind,
+            observed.registration,
+            observed.stream,
+            observed.incarnation,
+            observed.join
+        ),
+        (
+            JournalKind::Subscriber,
+            registration,
+            stream_registration,
+            FIRST_INCARNATION,
+            Some(joined)
+        )
     );
-    let publisher = journal(&mut driver, &mut conductor);
-    let unobserved = entry(&driver, publisher.journal());
     assert_eq!(
-        (unobserved.subscription, unobserved.stream, unobserved.join),
-        (0, 0, None)
+        (observed.provenance, observed.time_namespace),
+        (PROVENANCE, own_namespace())
     );
-    // `Some(0)` would name no subscription: refused before it is sent.
+    let publishing = journal(&mut driver, &mut conductor, publication_registration);
+    let publisher = entry(&driver, publishing.journal());
     assert_eq!(
-        conductor.trace_journal(LAYOUT, Some(0)),
+        (
+            publisher.kind,
+            publisher.registration,
+            publisher.stream,
+            publisher.incarnation,
+            publisher.join
+        ),
+        (
+            JournalKind::Publisher,
+            publication_registration,
+            stream_registration,
+            FIRST_INCARNATION,
+            None
+        )
+    );
+    assert_eq!(
+        (publisher.provenance, publisher.time_namespace),
+        (PROVENANCE, own_namespace())
+    );
+    // Registration 0 names nothing: refused before it is sent.
+    assert_eq!(
+        conductor.trace_journal(LAYOUT, 0, PROVENANCE),
         Err(ConductorError::InvalidJournal)
     );
 }
 
-/// A journal naming another client's subscription, an ended subscription,
-/// a publication or a registration that never existed is refused with
-/// `UnknownRegistration`, and nothing is created: no table entry, no
-/// bytes charged, no trace number, no hand-over writer.
+/// A journal naming another client's subscription or publication, an
+/// ended subscription or publication, or a registration that never existed
+/// is refused with `UnknownRegistration`, and nothing is created: no table
+/// entry, no bytes charged, no trace number, no hand-over writer.
 #[test]
-fn a_journal_of_a_subscription_that_is_not_the_senders_live_one_creates_nothing() {
-    let mut driver = driver(4, 64, 64);
-    let handle = stream(&mut driver);
-    let mut owner = driver.connect().unwrap();
-    let mut other = driver.connect().unwrap();
-    let _ = handle;
-    // The publication first: subscribers are admitted once the stream has
-    // its publication.
-    let publication = complete(&mut driver, &mut other, |conductor| {
-        conductor.add_publication(KEY, true)
-    });
-    let Outcome::Publication(publication) = publication else {
-        panic!("expected a publication, got {publication:?}");
-    };
-    let publication_registration = publication.origin().unwrap().registration();
-    let (_kept, foreign) = subscribe(&mut driver, &mut owner);
-    let (ended, ended_registration) = subscribe(&mut driver, &mut other);
-    drop(ended);
-    let _ = driver.do_work().unwrap();
-    for (case, subscription) in [
-        ("another client's subscription", foreign),
-        ("an ended subscription", ended_registration),
-        ("a publication", publication_registration),
-        ("a registration never issued", 999),
-    ] {
-        let outcome = request(&mut driver, &mut other, LAYOUT, Some(subscription));
-        match outcome {
+fn a_journal_of_a_registration_that_is_not_the_senders_live_one_creates_nothing() {
+    fn refused_unknown(
+        driver: &mut EmbeddedDriver,
+        requester: &mut ClientConductor,
+        case: &str,
+        registration: u64,
+    ) {
+        match request(driver, requester, LAYOUT, registration) {
             Outcome::Refused { code, detail } => {
                 assert_eq!(
                     (code, detail),
-                    (ErrorCode::UnknownRegistration, subscription),
+                    (ErrorCode::UnknownRegistration, registration),
                     "{case}"
                 );
             }
             other => panic!("{case}: expected a refusal, got {other:?}"),
         }
-        assert!(entries(&driver).is_empty(), "{case}");
+        assert!(entries(driver).is_empty(), "{case}");
         assert_eq!(driver.trace_journals.bytes, 0, "{case}");
         assert_eq!(driver.next_trace_number, 1, "{case}");
     }
+    let mut driver = driver(4, 64, 64);
+    let _ = stream(&mut driver);
+    let mut owner = driver.connect().unwrap();
+    let mut other = driver.connect().unwrap();
+    // The publication first: subscribers are admitted once the stream has
+    // its publication.
+    let (publication, publication_registration) = publish(&mut driver, &mut other);
+    let (_kept, foreign) = subscribe(&mut driver, &mut owner);
+    let (ended, ended_registration) = subscribe(&mut driver, &mut other);
+    drop(ended);
+    let _ = driver.do_work().unwrap();
+    for (case, by_owner, registration) in [
+        ("another client's subscription", false, foreign),
+        ("an ended subscription", false, ended_registration),
+        (
+            "another client's publication",
+            true,
+            publication_registration,
+        ),
+        ("a registration never issued", false, 999),
+    ] {
+        let requester = if by_owner { &mut owner } else { &mut other };
+        refused_unknown(&mut driver, requester, case, registration);
+    }
+    drop(publication);
+    let _ = driver.do_work().unwrap();
+    refused_unknown(
+        &mut driver,
+        &mut other,
+        "an ended publication",
+        publication_registration,
+    );
     // The next journal is the first one created.
-    let created = journal(&mut driver, &mut other);
+    let created = journal(&mut driver, &mut owner, foreign);
     assert_eq!(created.journal(), 1);
     assert_eq!(entries(&driver).len(), 1);
+}
+
+fn driver_with_log(entries: usize, records: usize, log: usize) -> EmbeddedDriver {
+    EmbeddedDriver::with_config(DriverConfig {
+        max_trace_journals: entries,
+        trace_mirror_records: records,
+        trace_recycle_log_entries: log,
+        ..DriverConfig::default()
+    })
+    .unwrap()
+}
+
+/// The recycle log as a tool reads it.
+fn logged(driver: &EmbeddedDriver) -> Vec<RecycledJournal> {
+    let reader = driver.trace_mirror();
+    (0..reader.log_entries())
+        .filter_map(|index| match reader.log_entry(index) {
+            LogRead::Entry(entry) => Some(entry),
+            LogRead::Free => None,
+            LogRead::Busy => panic!("log entry {index} busy"),
+        })
+        .collect()
+}
+
+/// Ends `journal` closed as a gone writer does, before the next drain.
+fn end(driver: &mut EmbeddedDriver, journal: &mut ClientJournal) {
+    journal.writer().close();
+    driver.trace_journals.writer_gone(
+        journal.journal(),
+        &mut driver.diagnostics,
+        &mut driver.counters,
+    );
+}
+
+/// T5: a subscriber journal mirrored before a `Publish` it could be
+/// expected for, ended while that `Publish` was still in its journal and
+/// recycled while it is retained, leaves a recycle log entry with its
+/// publication, boundary and the noted publisher journal; a publisher
+/// journal created after it ended is not noted; the log entry is dropped
+/// only once the ring no longer retains the noted journal's records below
+/// its noted attempted count.
+#[test]
+fn recycling_a_subscriber_entry_logs_it_until_covered() {
+    let mut driver = driver(3, 4, 64);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let (_subscription, subscription) = subscribe(&mut driver, &mut conductor);
+    let mut publishing = journal(&mut driver, &mut conductor, publication);
+    let mut observing = journal(&mut driver, &mut conductor, subscription);
+    let observed = observing.journal();
+    // Its record is mirrored first (ring 0), then its boundary is given.
+    append(&mut observing, [1]);
+    let _ = driver.do_work().unwrap();
+    let closed = complete(&mut driver, &mut conductor, |conductor| {
+        conductor.close_journal(observed, 4096)
+    });
+    assert!(matches!(closed, Outcome::Succeeded));
+    // Two `Publish` records are attempted before it ends, and drained only
+    // after it ended.
+    append(&mut publishing, [10, 11]);
+    end(&mut driver, &mut observing);
+    assert_eq!(entry(&driver, observed).state, JournalState::Closed);
+    // A publisher journal of the publication created after it ended.
+    let mut late = journal(&mut driver, &mut conductor, publication);
+    // The two `Publish` records reach ring 1 and 2; two later records push
+    // the subscriber journal's own record out of the ring.
+    let _ = driver.do_work().unwrap();
+    append(&mut publishing, [12, 13]);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 1);
+    assert!(logged(&driver).is_empty(), "nothing recycled yet");
+    // The table is full: its entry is reused, and logged first.
+    let _next = journal(&mut driver, &mut conductor, publication);
+    assert!(
+        entries(&driver)
+            .iter()
+            .all(|entry| entry.journal != observed)
+    );
+    let stream = entry(&driver, publishing.journal()).stream;
+    let log = logged(&driver);
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        (
+            log[0].journal,
+            log[0].stream,
+            log[0].incarnation,
+            log[0].state,
+            log[0].boundary
+        ),
+        (
+            observed,
+            stream,
+            FIRST_INCARNATION,
+            JournalState::Closed,
+            Some(4096)
+        )
+    );
+    assert_eq!(
+        log[0].pairs(),
+        [NotedPublisher {
+            journal: publishing.journal(),
+            attempted: 2
+        }],
+        "the later publisher journal is not noted"
+    );
+    // Ring 2, the last noted `Publish`, is still retained: kept.
+    append(&mut late, [20]);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 2);
+    assert_eq!(logged(&driver).len(), 1);
+    // Once it is gone the entry is covered: dropped.
+    append(&mut late, [21]);
+    let _ = driver.do_work().unwrap();
+    assert!(logged(&driver).is_empty());
+}
+
+/// Ends subscriber journals with two `Publish` records of `publishing`
+/// still undrained, then pushes their own records out of a ring of four
+/// while the noted `Publish` records stay retained.
+fn end_before_publish(
+    driver: &mut EmbeddedDriver,
+    publishing: &mut ClientJournal,
+    observing: &mut [ClientJournal],
+) {
+    for journal in observing.iter_mut() {
+        append(journal, [1]);
+    }
+    let _ = driver.do_work().unwrap();
+    append(publishing, [10, 11]);
+    for journal in observing.iter_mut() {
+        end(driver, journal);
+    }
+    let _ = driver.do_work().unwrap();
+    append(publishing, [12, 13]);
+    let _ = driver.do_work().unwrap();
+}
+
+/// T5: with the recycle log full, an entry that needs a log entry is not
+/// reused, and a `TraceJournal` that finds no other free entry is refused
+/// with `TraceJournalsExhausted` and creates nothing; once the logged
+/// entry is covered the log entry is dropped and recycling resumes.
+#[test]
+fn a_full_recycle_log_stops_recycling() {
+    let mut driver = driver_with_log(4, 4, 1);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let (_subscription, subscription) = subscribe(&mut driver, &mut conductor);
+    let mut publishing = journal(&mut driver, &mut conductor, publication);
+    let mut observing: Vec<ClientJournal> = (0..3)
+        .map(|_| journal(&mut driver, &mut conductor, subscription))
+        .collect();
+    end_before_publish(&mut driver, &mut publishing, &mut observing);
+    // Ring 3 and 4 hold the noted `Publish` records; ring 0 to 2, the
+    // subscriber journals' records, are gone.
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 3);
+    let _first = journal(&mut driver, &mut conductor, publication);
+    assert_eq!(logged(&driver).len(), 1);
+    let number = driver.next_trace_number;
+    assert_eq!(
+        refused(&request(&mut driver, &mut conductor, LAYOUT, publication)),
+        ErrorCode::TraceJournalsExhausted
+    );
+    assert_eq!(driver.next_trace_number, number, "nothing created");
+    assert_eq!(entries(&driver).len(), 4);
+    assert_eq!(logged(&driver).len(), 1);
+    // The noted records leave the ring: every ended entry is covered.
+    append(&mut publishing, [14, 15]);
+    let _ = driver.do_work().unwrap();
+    assert!(logged(&driver).is_empty());
+    let _second = journal(&mut driver, &mut conductor, publication);
+    assert!(logged(&driver).is_empty(), "a covered entry needs no log");
+}
+
+/// T5: a subscriber journal whose publication had more publisher journals
+/// in the table than a log entry holds is never logged: its entry is not
+/// reused until it is covered, even with the log empty.
+#[test]
+fn too_many_noted_journals_wait_until_covered() {
+    let mut driver = driver(MAX_RECYCLE_PAIRS + 2, 4, 64);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let (_subscription, subscription) = subscribe(&mut driver, &mut conductor);
+    let mut publishers: Vec<ClientJournal> = (0..=MAX_RECYCLE_PAIRS)
+        .map(|_| journal(&mut driver, &mut conductor, publication))
+        .collect();
+    let mut observing = [journal(&mut driver, &mut conductor, subscription)];
+    end_before_publish(&mut driver, &mut publishers[0], &mut observing);
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 1);
+    assert_eq!(
+        refused(&request(&mut driver, &mut conductor, LAYOUT, publication)),
+        ErrorCode::TraceJournalsExhausted
+    );
+    assert!(logged(&driver).is_empty());
+    // Ring 2, the last noted `Publish`, leaves the ring: covered.
+    append(&mut publishers[0], [14, 15]);
+    let _ = driver.do_work().unwrap();
+    let _reused = journal(&mut driver, &mut conductor, publication);
+    assert!(
+        entries(&driver)
+            .iter()
+            .all(|entry| entry.journal != observing[0].journal())
+    );
+    assert!(logged(&driver).is_empty());
 }
