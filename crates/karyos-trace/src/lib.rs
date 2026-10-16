@@ -39,9 +39,9 @@ pub use journal::{
     Collected, ObserverId, TraceCollector, TraceWriter, trace_journal, trace_writer,
 };
 pub use record::{
-    MAX_LANE, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId, RECORD_VERSION,
-    RECORD_VERSION_1, RECORD_WORDS, SubscriberId, TraceIds, TraceRecord, decode_record,
-    encode_record,
+    MAX_LANE, NetworkPath, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId,
+    RECORD_VERSION, RECORD_VERSION_1, RECORD_VERSION_2, RECORD_WORDS, SubscriberId, TraceIds,
+    TraceRecord, decode_record, encode_record,
 };
 pub use report::{
     HeldMessage, HistogramConfig, JournalClock, JournalId, PublicationKey, PublicationSummary,

@@ -72,6 +72,7 @@ fn observation(
             incarnation: 1,
         }),
         packet: None,
+        network: None,
         // Every Publish of these tests starts its own trace.
         root: point == Point::Publish,
     }

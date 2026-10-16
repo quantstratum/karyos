@@ -8,8 +8,14 @@
 //! The data-path callbacks are called outside reservations, never block
 //! and never allocate in the implementations Karyos provides;
 //! [`TraceHook::maintain`] is the only control-path entry point.
+//!
+//! [`NetworkTraceHook`] is its network counterpart (`quantstratum-docs:
+//! karyos/design/trace-network.md`, NT-1): the sender and receiver agents
+//! of a driver call it per traced frame, and `karyos-trace` implements it,
+//! so the driver gains no trace dependency either.
 
 use crate::frame::{Lane, TraceExtension};
+use crate::journal::JournalWriter;
 
 /// The publication an observation belongs to: the driver instance, the
 /// registration, the wire stream and session, and the incarnation.
@@ -96,4 +102,225 @@ pub trait TraceHook: Send {
     /// Called by the application from the handle's thread, never from the
     /// data-path callbacks.
     fn maintain(&mut self) {}
+}
+
+/// A traced frame copied into backend TX storage, before submission, for
+/// a first send or a retransmission (`SenderPickup`, NT-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetPickup {
+    /// The publication.
+    pub publication: PublicationIdentity,
+    /// The lane.
+    pub lane: Lane,
+    /// Stream position of the frame in its lane.
+    pub position: u64,
+    /// The send path, a reusable identity.
+    pub path: u32,
+    /// 0 for the first send; the repair count for a retransmission.
+    pub attempt: u32,
+}
+
+/// A traced frame committed into an image by its receive owner
+/// (`ReceiverCommit`, NT-2). A receiver cannot know the attempt: DATA
+/// carries none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetCommit {
+    /// The publication.
+    pub publication: PublicationIdentity,
+    /// The lane.
+    pub lane: Lane,
+    /// Stream position of the frame in its lane.
+    pub position: u64,
+    /// The path whose copy of the frame was committed.
+    pub path: u32,
+}
+
+/// Where a packet stamp was taken (batch N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StampPoint {
+    /// Kernel software transmit stamp.
+    KernelTx,
+    /// Kernel software receive stamp.
+    KernelRx,
+    /// NIC hardware transmit stamp.
+    HardwareTx,
+    /// NIC hardware receive stamp.
+    HardwareRx,
+}
+
+/// A kernel or hardware stamp of one packet (batch N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PacketStamp {
+    /// Where it was taken.
+    pub point: StampPoint,
+    /// Time in the clock's unit.
+    pub time: u64,
+    /// Clock domain.
+    pub clock: u64,
+    /// Calibration epoch.
+    pub epoch: u64,
+    /// Half-width of the uncertainty interval, same unit as `time`.
+    pub uncertainty: u64,
+}
+
+/// The side of a network journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetSide {
+    /// The sender agent's journal of one lane of a publication incarnation.
+    Sender,
+    /// The receiver agent's journal of one lane of an image.
+    Receiver,
+}
+
+/// A network journal the driver created for an agent (NT-3): the driver
+/// owns its storage, charges it to `max_network_journal_bytes` and drains
+/// it into the trace mirror; the agent writes it.
+#[derive(Debug)]
+pub struct NetJournal {
+    /// Its side.
+    pub side: NetSide,
+    /// The publication it observes.
+    pub publication: PublicationIdentity,
+    /// The lane it observes.
+    pub lane: Lane,
+    /// The driver's journal number, never reused.
+    pub number: u64,
+    /// Its only writer.
+    pub writer: JournalWriter,
+}
+
+/// Records the network observations of one driver agent (NT-1, completed
+/// in ACS 15608). The driver holds one per agent, set on the control path;
+/// with none, the data path pays one branch per frame.
+///
+/// - **Journals (control path).** The driver hands the hook each network
+///   journal it creates ([`NetworkTraceHook::open_journal`]) and tells it
+///   when one closes ([`NetworkTraceHook::close_journal`]), never from a
+///   duty cycle. A refused journal never reaches the hook.
+/// - **Observations (data path).** Each call records one frame of a
+///   traced message, every fragment included (NT-2). A call whose
+///   publication and lane have no open journal on that side, as for a
+///   refused journal, is counted and dropped; a full journal drops the
+///   record; a call never waits.
+pub trait NetworkTraceHook: Send {
+    /// Control path: writes `journal` from now on.
+    fn open_journal(&mut self, journal: NetJournal);
+
+    /// Control path: the journal of `side`, `publication` and `lane`
+    /// closes, since its publication closed or its image retired. The hook
+    /// expires its pending stamps (N2) and closes the writer; the driver
+    /// then drains the journal to its end.
+    fn close_journal(&mut self, side: NetSide, publication: &PublicationIdentity, lane: Lane);
+
+    /// Records the `SenderPickup` of a traced frame, once per path and
+    /// attempt.
+    fn on_sender_pickup(&mut self, ext: &TraceExtension, at: &NetPickup);
+
+    /// Records the `ReceiverCommit` of a traced frame, once per frame;
+    /// duplicates and repairs of a committed frame record nothing.
+    fn on_receiver_commit(&mut self, ext: &TraceExtension, at: &NetCommit);
+
+    /// Records a kernel or hardware stamp of the packet `token` (batch N2,
+    /// gated on owner decision O-3): no producer calls it yet.
+    fn on_packet_stamp(&mut self, _token: u64, _stamp: &PacketStamp) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Counts its calls and holds its journals.
+    #[derive(Default)]
+    struct Counting {
+        journals: Vec<NetJournal>,
+        pickups: Vec<NetPickup>,
+        commits: Vec<NetCommit>,
+    }
+
+    impl NetworkTraceHook for Counting {
+        fn open_journal(&mut self, journal: NetJournal) {
+            self.journals.push(journal);
+        }
+
+        fn close_journal(&mut self, side: NetSide, publication: &PublicationIdentity, lane: Lane) {
+            self.journals.retain(|journal| {
+                (journal.side, journal.publication, journal.lane) != (side, *publication, lane)
+            });
+        }
+
+        fn on_sender_pickup(&mut self, _ext: &TraceExtension, at: &NetPickup) {
+            self.pickups.push(*at);
+        }
+
+        fn on_receiver_commit(&mut self, _ext: &TraceExtension, at: &NetCommit) {
+            self.commits.push(*at);
+        }
+    }
+
+    #[test]
+    fn a_network_hook_is_held_as_an_object() {
+        let mut counting = Counting::default();
+        let hook: &mut dyn NetworkTraceHook = &mut counting;
+        let (writer, mut consumer) = crate::journal::record_journal(4, 1, 1).unwrap();
+        hook.open_journal(NetJournal {
+            side: NetSide::Sender,
+            publication: PublicationIdentity::default(),
+            lane: Lane::default(),
+            number: 1,
+            writer,
+        });
+        let ext = TraceExtension::default();
+        let pickup = NetPickup {
+            publication: PublicationIdentity::default(),
+            lane: Lane::default(),
+            position: 64,
+            path: 1,
+            attempt: 2,
+        };
+        hook.on_sender_pickup(&ext, &pickup);
+        hook.on_receiver_commit(
+            &ext,
+            &NetCommit {
+                publication: PublicationIdentity::default(),
+                lane: Lane::default(),
+                position: 64,
+                path: 1,
+            },
+        );
+        // N2 has no producer: the default stamp call records nothing.
+        hook.on_packet_stamp(
+            1,
+            &PacketStamp {
+                point: StampPoint::KernelTx,
+                time: 1,
+                clock: 0,
+                epoch: 0,
+                uncertainty: 0,
+            },
+        );
+        assert_eq!(counting.pickups, [pickup]);
+        assert_eq!(counting.commits.len(), 1);
+        // The hook writes the journal the driver handed it, and closing it
+        // ends the journal for the driver's drain.
+        counting.journals[0]
+            .writer
+            .append(
+                &[42],
+                crate::journal::Stamp {
+                    time: 1,
+                    clock: 0,
+                    epoch: 0,
+                },
+            )
+            .unwrap();
+        let hook: &mut dyn NetworkTraceHook = &mut counting;
+        hook.close_journal(
+            NetSide::Sender,
+            &PublicationIdentity::default(),
+            Lane::default(),
+        );
+        assert!(counting.journals.is_empty());
+        assert!(matches!(consumer.take(), crate::journal::Taken::Record(_)));
+        assert!(matches!(consumer.take(), crate::journal::Taken::Closed));
+    }
 }

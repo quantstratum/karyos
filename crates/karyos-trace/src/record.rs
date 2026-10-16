@@ -16,10 +16,15 @@ pub const OBSERVATION_WORDS: usize = 22;
 /// Words of a journal record: the observation and the collection stamp
 /// (time, clock, epoch) in words 22 to 24.
 pub const RECORD_WORDS: usize = OBSERVATION_WORDS + 3;
-/// Layout version written in word 0: version 2 adds the `root` flag (bit
-/// 56) to version 1's layout of the same width (`quantstratum-docs:
-/// karyos/design/trace-records.md`, "Root flag", ACS 13936).
-pub const RECORD_VERSION: u8 = 2;
+/// Layout version written in word 0: version 3 carries `path` and
+/// `attempt` in word 21 on `SenderPickup` and `path` on `ReceiverCommit`
+/// (`quantstratum-docs: karyos/design/trace-network.md`, NT-2), in the
+/// same width; every other rule is version 2's.
+pub const RECORD_VERSION: u8 = 3;
+/// Layout version 2, still decoded: it adds the `root` flag (bit 56) to
+/// version 1 (`quantstratum-docs: karyos/design/trace-records.md`, "Root
+/// flag", ACS 13936). Its network points carry no path.
+pub const RECORD_VERSION_2: u8 = 2;
 /// The oldest layout version still decoded: version 1, whose bit 56 was
 /// reserved, decodes with `root` false.
 pub const RECORD_VERSION_1: u8 = 1;
@@ -98,6 +103,14 @@ impl Point {
             Self::KernelTx | Self::KernelRx | Self::HardwareTx | Self::HardwareRx
         )
     }
+
+    /// Whether a driver agent records the observation per frame and path,
+    /// so a layout version 3 record must carry its path (and only such
+    /// records may).
+    #[must_use]
+    pub const fn is_network_level(self) -> bool {
+        matches!(self, Self::SenderPickup | Self::ReceiverCommit)
+    }
 }
 
 /// The publication an observation belongs to. Position alone is not
@@ -173,6 +186,17 @@ pub struct PacketId {
     pub attempt: u32,
 }
 
+/// The path of a network observation (layout version 3): one record per
+/// path and attempt on `SenderPickup`, and the winning path on
+/// `ReceiverCommit`, whose attempt is zero (DATA carries none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetworkPath {
+    /// Send path, a reusable identity; 0 is a valid path.
+    pub path: u32,
+    /// 0 for the first send; the repair count for a retransmission.
+    pub attempt: u32,
+}
+
 /// One observation of one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TraceRecord {
@@ -192,6 +216,9 @@ pub struct TraceRecord {
     pub subscriber: Option<SubscriberId>,
     /// Present exactly for packet-level points.
     pub packet: Option<PacketId>,
+    /// Present exactly for network-level points in layout version 3; a
+    /// version 1 or 2 record decodes with none.
+    pub network: Option<NetworkPath>,
     /// The `Publish` of a message that started a fresh trace (no incoming
     /// context); never set on a parentless join or on another point. A
     /// version 1 record decodes with `root` false.
@@ -209,13 +236,20 @@ const fn join(low: u32, high: u32) -> u64 {
 }
 
 impl TraceRecord {
-    /// Checks the rules shared by encoding and decoding.
+    /// Checks the rules shared by encoding and decoding, for the layout
+    /// version the encoder writes.
     ///
     /// # Errors
     ///
     /// [`TraceError::Lane`], [`TraceError::Subscriber`],
-    /// [`TraceError::Packet`] and [`TraceError::Root`].
+    /// [`TraceError::Packet`], [`TraceError::NetworkPath`] and
+    /// [`TraceError::Root`].
     pub fn validate(&self) -> Result<(), TraceError> {
+        self.validate_as(RECORD_VERSION)
+    }
+
+    /// As [`TraceRecord::validate`], for a record of layout `version`.
+    fn validate_as(&self, version: u8) -> Result<(), TraceError> {
         if self.lane > MAX_LANE {
             return Err(TraceError::Lane { lane: self.lane });
         }
@@ -237,6 +271,16 @@ impl TraceRecord {
         if !packet_valid {
             return Err(TraceError::Packet);
         }
+        let carries_path = version >= RECORD_VERSION && self.point.is_network_level();
+        let network_valid = match self.network {
+            Some(network) => {
+                carries_path && (self.point == Point::SenderPickup || network.attempt == 0)
+            }
+            None => !carries_path,
+        };
+        if !network_valid {
+            return Err(TraceError::NetworkPath);
+        }
         Ok(())
     }
 
@@ -250,9 +294,13 @@ impl TraceRecord {
         let subscriber = self.subscriber.map_or(([0, 0], 0, 0), |s| {
             (s.driver, s.registration, s.incarnation)
         });
-        let packet = self
-            .packet
-            .map_or((0, 0), |p| (p.packet, join(p.path, p.attempt)));
+        // Validation keeps the two apart: packet context only on packet
+        // points, a network path only on network points.
+        let packet = match (self.packet, self.network) {
+            (Some(p), _) => (p.packet, join(p.path, p.attempt)),
+            (None, Some(n)) => (0, join(n.path, n.attempt)),
+            (None, None) => (0, 0),
+        };
         Ok([
             u64::from(RECORD_VERSION)
                 | (u64::from(self.point.code()) << 8)
@@ -285,8 +333,9 @@ impl TraceRecord {
         ])
     }
 
-    /// Decodes and checks a record of layout version 2 or 1 (whose `root`
-    /// is false).
+    /// Decodes and checks a record of layout version 3, 2 (whose network
+    /// points carry no path) or 1 (whose `root` is also false), each
+    /// under its own rule.
     ///
     /// # Errors
     ///
@@ -319,7 +368,7 @@ impl TraceRecord {
             path_attempt,
         ] = *words;
         let version = head as u8;
-        if version != RECORD_VERSION && version != RECORD_VERSION_1 {
+        if !(RECORD_VERSION_1..=RECORD_VERSION).contains(&version) {
             return Err(TraceError::Version { version });
         }
         let root = head & ROOT_BIT != 0;
@@ -343,14 +392,24 @@ impl TraceRecord {
                 registration: subscriber,
                 incarnation: subscriber_incarnation,
             });
-        let packet = (packet != 0 || path_attempt != 0).then(|| {
-            let (path, attempt) = halves(path_attempt);
-            PacketId {
-                packet,
-                path,
-                attempt,
+        let (packet, network) = if version >= RECORD_VERSION && point.is_network_level() {
+            // Version 3: word 21 is the path, and the packet word is zero.
+            if packet != 0 {
+                return Err(TraceError::NetworkPath);
             }
-        });
+            let (path, attempt) = halves(path_attempt);
+            (None, Some(NetworkPath { path, attempt }))
+        } else {
+            let packet = (packet != 0 || path_attempt != 0).then(|| {
+                let (path, attempt) = halves(path_attempt);
+                PacketId {
+                    packet,
+                    path,
+                    attempt,
+                }
+            });
+            (packet, None)
+        };
         let record = Self {
             point,
             publication: PublicationId {
@@ -376,9 +435,10 @@ impl TraceRecord {
             },
             subscriber,
             packet,
+            network,
             root,
         };
-        record.validate()?;
+        record.validate_as(version)?;
         Ok(record)
     }
 }
@@ -471,6 +531,10 @@ mod tests {
                 path: u32::MAX,
                 attempt: 2,
             }),
+            network: point.is_network_level().then_some(NetworkPath {
+                path: u32::MAX,
+                attempt: if point == Point::SenderPickup { 7 } else { 0 },
+            }),
             root: point == Point::Publish,
         }
     }
@@ -548,10 +612,10 @@ mod tests {
     fn decoding_checks_every_word_rule() {
         let good = sample(Point::KernelRx).encode().unwrap();
         let mut version = good;
-        version[0] = (version[0] & !0xFF) | 3;
+        version[0] = (version[0] & !0xFF) | 4;
         assert_eq!(
             TraceRecord::decode(&version),
-            Err(TraceError::Version { version: 3 })
+            Err(TraceError::Version { version: 4 })
         );
         let mut reserved = good;
         reserved[0] |= 1 << 40;
@@ -627,10 +691,11 @@ mod tests {
                 incarnation: 0x14,
             }),
             packet: None,
+            network: None,
             root: false,
         };
         let golden: [u64; OBSERVATION_WORDS] = [
-            0x0002_0402, // version 2, point 4 (SubscriberPoll), lane 2
+            0x0002_0403, // version 3, point 4 (SubscriberPoll), lane 2
             0x0101,
             0x0202,
             0x03,
@@ -666,10 +731,12 @@ mod tests {
         assert_eq!(full[..OBSERVATION_WORDS], golden);
         assert_eq!(full[OBSERVATION_WORDS..], [0x15, 0x16, 0x17]);
         assert_eq!(decode_record(&full), Ok((record, collected)));
-        // Version 1 of the same layout decodes to the same record.
-        let mut v1 = golden;
-        v1[0] = 0x0002_0401;
-        assert_eq!(TraceRecord::decode(&v1), Ok(record));
+        // Versions 1 and 2 of the same layout decode to the same record.
+        for version in [RECORD_VERSION_1, RECORD_VERSION_2] {
+            let mut old = golden;
+            old[0] = 0x0002_0400 | u64::from(version);
+            assert_eq!(TraceRecord::decode(&old), Ok(record));
+        }
     }
 
     /// Layout version 2's root flag: bit 56 of word 0 on a `Publish`.
@@ -678,7 +745,7 @@ mod tests {
         let root = sample(Point::Publish);
         assert!(root.root);
         let words = root.encode().unwrap();
-        assert_eq!(words[0] & 0xFF, 2, "the encoder writes version 2");
+        assert_eq!(words[0] & 0xFF, 3, "the encoder writes version 3");
         assert_eq!(words[0] >> 56, 1);
         assert_eq!(TraceRecord::decode(&words), Ok(root));
         let plain = TraceRecord {
@@ -722,5 +789,112 @@ mod tests {
             TraceRecord::decode(&reserved),
             Err(TraceError::ReservedBits)
         );
+    }
+
+    /// Layout version 3 (NT-2): path and attempt in word 21 on
+    /// `SenderPickup`, the path on `ReceiverCommit`, packet word zero.
+    #[test]
+    fn version_3_records_carry_the_network_path() {
+        let pickup = sample(Point::SenderPickup);
+        let words = pickup.encode().unwrap();
+        assert_eq!(words[20], 0);
+        assert_eq!(words[21], u64::from(u32::MAX) | (7 << 32));
+        // Two pickups of one frame on two paths, or two attempts, differ.
+        let other_path = TraceRecord {
+            network: Some(NetworkPath {
+                path: 0,
+                attempt: 7,
+            }),
+            ..pickup
+        };
+        let other_attempt = TraceRecord {
+            network: Some(NetworkPath {
+                path: u32::MAX,
+                attempt: 0,
+            }),
+            ..pickup
+        };
+        let encoded = [
+            words,
+            other_path.encode().unwrap(),
+            other_attempt.encode().unwrap(),
+        ];
+        assert!(encoded[0] != encoded[1] && encoded[0] != encoded[2]);
+        assert!(encoded[1] != encoded[2]);
+        for (record, words) in [pickup, other_path, other_attempt].iter().zip(encoded) {
+            assert_eq!(TraceRecord::decode(&words), Ok(*record));
+        }
+        // Path 0, attempt 0 is a valid path, not an absent one.
+        let commit = TraceRecord {
+            network: Some(NetworkPath {
+                path: 0,
+                attempt: 0,
+            }),
+            ..sample(Point::ReceiverCommit)
+        };
+        let words = commit.encode().unwrap();
+        assert_eq!((words[20], words[21]), (0, 0));
+        assert_eq!(TraceRecord::decode(&words), Ok(commit));
+    }
+
+    /// The network path rules, refused alike on both sides.
+    #[test]
+    fn the_network_path_is_validated_on_both_sides() {
+        for point in [Point::SenderPickup, Point::ReceiverCommit] {
+            let missing = TraceRecord {
+                network: None,
+                ..sample(point)
+            };
+            assert_eq!(missing.encode(), Err(TraceError::NetworkPath), "{point:?}");
+            // A packet token beside the path.
+            let mut token = sample(point).encode().unwrap();
+            token[20] = 1;
+            assert_eq!(TraceRecord::decode(&token), Err(TraceError::NetworkPath));
+        }
+        let attempt = TraceRecord {
+            network: Some(NetworkPath {
+                path: 1,
+                attempt: 1,
+            }),
+            ..sample(Point::ReceiverCommit)
+        };
+        assert_eq!(attempt.encode(), Err(TraceError::NetworkPath));
+        let mut words = sample(Point::ReceiverCommit).encode().unwrap();
+        words[21] |= 1 << 32;
+        assert_eq!(TraceRecord::decode(&words), Err(TraceError::NetworkPath));
+        for point in POINTS.iter().copied().filter(|p| !p.is_network_level()) {
+            let stray = TraceRecord {
+                network: Some(NetworkPath {
+                    path: 1,
+                    attempt: 0,
+                }),
+                ..sample(point)
+            };
+            assert_eq!(stray.encode(), Err(TraceError::NetworkPath), "{point:?}");
+        }
+    }
+
+    /// Versions 1 and 2 keep their rule on the network points: no path,
+    /// and words 20 and 21 zero.
+    #[test]
+    fn older_network_records_keep_their_rule() {
+        for version in [RECORD_VERSION_1, RECORD_VERSION_2] {
+            for point in [Point::SenderPickup, Point::ReceiverCommit] {
+                let mut words = sample(point).encode().unwrap();
+                words[0] = (words[0] & !0xFF) | u64::from(version);
+                // The version 3 path word is a stray packet word here.
+                assert_eq!(TraceRecord::decode(&words), Err(TraceError::Packet));
+                words[21] = 0;
+                let decoded = TraceRecord::decode(&words).unwrap();
+                assert_eq!(decoded.network, None);
+                assert_eq!(
+                    decoded,
+                    TraceRecord {
+                        network: None,
+                        ..sample(point)
+                    }
+                );
+            }
+        }
     }
 }

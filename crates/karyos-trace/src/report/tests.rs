@@ -534,6 +534,7 @@ fn observation(point: Point, position: u64, trace: u64, time: u64) -> crate::rec
             incarnation: 1,
         }),
         packet: None,
+        network: None,
         root: point == Point::Publish,
     }
 }

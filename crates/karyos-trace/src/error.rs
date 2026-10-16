@@ -37,6 +37,12 @@ pub enum TraceError {
     /// or is present on a point that is not packet level.
     #[error("packet identity does not match the observation point")]
     Packet,
+    /// Network path context is missing on `SenderPickup` or
+    /// `ReceiverCommit` in layout version 3, carries an attempt on
+    /// `ReceiverCommit`, comes with a packet token, or is present on
+    /// another point or in an older version.
+    #[error("network path does not match the observation point")]
+    NetworkPath,
     /// The `root` flag is set on a point other than `Publish`.
     #[error("the root flag is set on a point other than Publish")]
     Root,
