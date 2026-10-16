@@ -415,13 +415,32 @@ impl ReceiveSessions {
     /// immediately before the receive owner call.
     #[must_use]
     pub fn lookup(&self, key: &BindingKey) -> Option<SlotRef> {
-        self.slots
-            .iter()
-            .enumerate()
-            .find_map(|(index, slot)| match slot.state {
-                State::Active { key: bound, .. } if bound == *key => Self::slot_ref(index, slot),
-                _ => None,
-            })
+        self.slots.iter().enumerate().find_map(|(index, slot)| {
+            self.bound_here(index, slot, key)
+                .then(|| Self::slot_ref(index, slot))
+                .flatten()
+        })
+    }
+
+    /// Whether `key` is a live path of the active image in `slot` (the
+    /// path rows are the truth for admission, redundant-paths.md section
+    /// 3): a first path lost at its liveness timeout is no longer bound
+    /// and returns only through a fresh challenge, as a later path. An
+    /// image with no row (its first binding failed, counted) keeps its
+    /// installing key.
+    fn bound_here(&self, index: usize, slot: &Slot, key: &BindingKey) -> bool {
+        let State::Active { key: founding, .. } = slot.state else {
+            return false;
+        };
+        let Some(image) = Self::slot_ref(index, slot) else {
+            return false;
+        };
+        if self.paths.image(image).is_none() {
+            return founding == *key;
+        }
+        self.paths
+            .lookup(*key)
+            .is_some_and(|(bound, _)| bound == image)
     }
 
     /// Whether `slot` still names an active image (the admission recheck).
@@ -457,18 +476,20 @@ impl ReceiveSessions {
     /// Whether `identity` is active, challenged or answered under a key
     /// other than `key`.
     fn elsewhere(&self, identity: &Identity, key: &BindingKey) -> bool {
-        self.slots.iter().any(|slot| match slot.state {
-            State::Active {
-                key: other,
-                identity: held,
-            }
-            | State::Challenged {
-                key: other,
-                identity: held,
-                ..
-            } => held == *identity && other != *key,
-            _ => false,
-        })
+        self.slots
+            .iter()
+            .enumerate()
+            .any(|(index, slot)| match slot.state {
+                State::Active { identity: held, .. } => {
+                    held == *identity && !self.bound_here(index, slot, key)
+                }
+                State::Challenged {
+                    key: other,
+                    identity: held,
+                    ..
+                } => held == *identity && other != *key,
+                _ => false,
+            })
     }
 
     /// The installed image of `identity` under a key other than `key`.
@@ -477,10 +498,11 @@ impl ReceiveSessions {
             .iter()
             .enumerate()
             .find_map(|(index, slot)| match slot.state {
-                State::Active {
-                    key: other,
-                    identity: held,
-                } if held == *identity && other != *key => Self::slot_ref(index, slot),
+                State::Active { identity: held, .. }
+                    if held == *identity && !self.bound_here(index, slot, key) =>
+                {
+                    Self::slot_ref(index, slot)
+                }
                 _ => None,
             })
     }
@@ -579,16 +601,28 @@ impl ReceiveSessions {
             };
             if free {
                 slot.state = State::Free;
-                freed += 1;
+                // Bounded by `limit`, a u32: it cannot overflow.
+                freed = freed.checked_add(1).unwrap_or(freed);
             }
         }
         freed
     }
 
-    /// Timer duty: frees expired entries, up to the configured
-    /// `timer_actions`. Returns how many were freed.
+    /// Timer duty, up to the configured `timer_actions` in all: frees
+    /// expired entries, then removes path bindings with no fresh evidence
+    /// for `path_liveness_timeout` (RP-2; an image keeps its other paths,
+    /// and with none left its own liveness decides). Returns how many
+    /// actions were taken.
     pub fn timers(&mut self, now: u64) -> u32 {
-        self.sweep(now, self.config.timer_actions)
+        let budget = self.config.timer_actions;
+        let freed = self.sweep(now, budget);
+        // The sweep frees at most `budget`; whatever is left goes to the
+        // paths.
+        let lost = match budget.checked_sub(freed) {
+            Some(left) if left > 0 => self.paths.timers(now, left, |_, _, _| {}),
+            _ => 0,
+        };
+        freed.checked_add(lost).unwrap_or(budget)
     }
 
     /// A SETUP ANNOUNCE from `key` at `now`.
@@ -623,10 +657,15 @@ impl ReceiveSessions {
             Err(reason) => return AnnounceOutcome::Dropped(self.ignore(reason)),
         };
         let timeout = self.config.setup_challenge_timeout;
-        let existing = self.slots.iter().position(|slot| match slot.state {
-            State::Active { key: bound, .. } | State::Challenged { key: bound, .. } => bound == key,
-            _ => false,
-        });
+        let existing = self
+            .slots
+            .iter()
+            .enumerate()
+            .position(|(index, slot)| match slot.state {
+                State::Active { .. } => self.bound_here(index, slot, &key),
+                State::Challenged { key: bound, .. } => bound == key,
+                _ => false,
+            });
         if let Some(index) = existing
             && let Some(slot) = self.slots.get(index)
         {

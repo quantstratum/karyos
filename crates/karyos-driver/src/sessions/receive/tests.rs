@@ -842,3 +842,97 @@ fn a_failed_first_binding_is_counted() {
     assert_eq!(sessions.paths().live(image), 0);
     assert_eq!(sessions.counters().path_bind_failed, 1);
 }
+
+/// #247 review P2a: a first path lost at its liveness timeout no longer
+/// admits, and returns only through a fresh challenge, as a later path;
+/// the image keeps its live path.
+#[test]
+fn a_lost_first_path_returns_through_a_path_challenge() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let image = install_on_key_one(&mut sessions, &mut nonces);
+    let nonce = challenged(sessions.announce(key(2), &announce(1), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    assert_eq!(
+        sessions.answer(key(2), &answer(1, nonce), 3 * MS, || true),
+        AnswerOutcome::PathBound { image, path: 1 }
+    );
+    // Only path 1 keeps fresh evidence; path 0 (key 1) is lost.
+    let late = 10 * SECOND + MS;
+    assert!(sessions.paths_mut().refresh(image, 1, late - 1));
+    assert_eq!(sessions.timers(late), 1);
+    assert_eq!(sessions.lookup(&key(1)), None, "key 1 no longer admits");
+    assert_eq!(sessions.lookup(&key(2)), Some(image));
+    assert!(sessions.is_active(image));
+    // Key 1's SETUP gets a fresh challenge, for a later path.
+    let nonce = challenged(sessions.announce(key(1), &announce(1), late, &mut nonces))
+        .challenge
+        .nonce;
+    let mut reserved = false;
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, nonce), late + MS, || {
+            reserved = true;
+            true
+        }),
+        AnswerOutcome::PathBound { image, path: 0 }
+    );
+    assert!(!reserved);
+    assert_eq!(sessions.lookup(&key(1)), Some(image));
+    assert_eq!(sessions.counters().installed, 1);
+}
+
+/// #247 review P2b: the receive timers drive the path timers within
+/// `timer_actions` in all.
+#[test]
+fn path_timers_are_bounded_by_timer_actions() {
+    let mut sessions = table(SessionConfig {
+        timer_actions: 1,
+        ..SessionConfig::default()
+    });
+    let mut nonces = Counter::default();
+    let image = install_on_key_one(&mut sessions, &mut nonces);
+    let nonce = challenged(sessions.announce(key(2), &announce(1), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    sessions.answer(key(2), &answer(1, nonce), 3 * MS, || true);
+    assert_eq!(sessions.paths().live(image), 2);
+    let late = 11 * SECOND;
+    assert_eq!(sessions.timers(late), 1);
+    assert_eq!(sessions.paths().live(image), 1);
+    assert_eq!(sessions.timers(late), 1);
+    assert_eq!(sessions.paths().live(image), 0);
+    // Every path lost: the image's own liveness decides; it stays.
+    assert!(sessions.is_active(image));
+    assert_eq!(sessions.paths().counters().lost, 2);
+}
+
+/// #247 review P3: a path answer whose image is no longer active (retired,
+/// its quarantine already passed) is refused by the image recheck, as
+/// `DuplicateIdentity`, before the path bindings are asked. Reinstalling
+/// the identity meanwhile is refused while the path challenge is pending.
+#[test]
+fn a_path_answer_for_a_gone_image_is_refused_by_the_recheck() {
+    let mut sessions = table(SessionConfig {
+        alias_quarantine: 1,
+        setup_challenge_timeout: 100 * SECOND,
+        ..SessionConfig::default()
+    });
+    let mut nonces = Counter::default();
+    let image = install_on_key_one(&mut sessions, &mut nonces);
+    let nonce = challenged(sessions.announce(key(2), &announce(1), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    assert!(sessions.retire(image, 3 * MS));
+    assert_eq!(
+        sessions.announce(key(3), &announce(1), 4 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::DuplicateIdentity),
+        "pending path challenge"
+    );
+    assert_eq!(
+        sessions.answer(key(2), &answer(1, nonce), 5 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    assert_eq!(sessions.paths().lookup(key(2)), None);
+    assert_eq!(sessions.counters().paths_bound, 0);
+}
