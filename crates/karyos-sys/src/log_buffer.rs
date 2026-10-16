@@ -57,7 +57,8 @@ use crate::publication::{
     fence_rotation, fence_tail, invalidate_claim_record, issuer_sees_seal, load_interior,
     mark_block, observe_block, observe_seal, position_seal, publication_released,
     publication_taken, publish_block, read_claim_record, release_publication,
-    release_publisher_slot, seal, store_interior, take_publication, write_claim_record,
+    release_publisher_slot, seal_reason, seal_with_reason, store_interior, take_publication,
+    write_claim_record,
 };
 use crate::registration::{self, claim, valid_export};
 use crate::sizing::{FragmentPlan, TermLength, align_frame};
@@ -679,6 +680,20 @@ impl<T: TermBytes> LogBuffer<T> {
 
     fn seal(&self) -> &AtomicU64 {
         &self.control().seal.word
+    }
+
+    fn seal_reason_word(&self) -> &AtomicU64 {
+        &self.control().seal.reason
+    }
+
+    /// The reason of a terminal seal, read after an Acquire load of the
+    /// seal word: `None` while the buffer is not sealed, and also for a
+    /// cutover seal, which is not terminal (the stream continues in a
+    /// successor mapping).
+    pub(crate) fn terminal_seal_reason(&self) -> Option<SealReason> {
+        let raw = self.seal().load(Ordering::Acquire);
+        (raw & SEAL_SEALED != 0 && !crate::publication::seal_has_successor(raw))
+            .then(|| SealReason::from_code(seal_reason(self.seal_reason_word())))
     }
 
     fn publication_taken(&self) -> &AtomicU64 {
@@ -1651,6 +1666,17 @@ impl<O: BufferOwner> Publication<O> {
         self.state == PublicationState::Closed
     }
 
+    /// The reason of the buffer's terminal seal, once the handle is closed
+    /// (`None` before, and for a cutover seal, which is not terminal).
+    #[must_use]
+    pub fn seal_reason(&self) -> Option<SealReason> {
+        if !self.is_closed() {
+            return None;
+        }
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer.terminal_seal_reason()
+    }
+
     /// After an attempt that was not granted: if the buffer is sealed,
     /// releases the publication (its loan, then `exclusive_released` after
     /// its last `reserved_head` store) and returns `true`; every later call
@@ -2321,6 +2347,49 @@ pub enum SealState {
     },
 }
 
+/// Why a buffer was sealed (`quantstratum-docs: karyos/design/publication-seal.md`),
+/// stored in the seal line before the seal word: a reader that observes
+/// the seal reads it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SealReason {
+    /// No reason was recorded: a region whose conductor never wrote one,
+    /// a code this build does not know, or a seal with no specific cause.
+    Unspecified,
+    /// A required participant was lost under the `abort` policy
+    /// (`quantstratum-docs: karyos/design/required-participant-loss.md`).
+    RequiredParticipantLost,
+    /// The stream's keyed conflation table exhausted its versions
+    /// (`quantstratum-docs: karyos/design/conflation-end-to-end.md`).
+    ConflationVersionsExhausted,
+    /// The stream was removed.
+    StreamRemoved,
+}
+
+impl SealReason {
+    /// Its code in the seal line's reason word.
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Unspecified => 0,
+            Self::RequiredParticipantLost => 1,
+            Self::ConflationVersionsExhausted => 2,
+            Self::StreamRemoved => 3,
+        }
+    }
+
+    /// The reason a code names; an unknown code is `Unspecified`.
+    #[must_use]
+    pub const fn from_code(code: u64) -> Self {
+        match code {
+            1 => Self::RequiredParticipantLost,
+            2 => Self::ConflationVersionsExhausted,
+            3 => Self::StreamRemoved,
+            _ => Self::Unspecified,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SealWord {
     Active,
@@ -2371,6 +2440,8 @@ pub enum PollOutcome {
     Closed {
         /// The seal position.
         position: u64,
+        /// Why the buffer was sealed.
+        reason: SealReason,
     },
     /// An aborted block was skipped: only its word 0 was read. Its extent
     /// carries no message and needs no acknowledgement.
@@ -2516,7 +2587,10 @@ impl<O: BufferOwner> Subscription<O> {
         // read everything (`quantstratum-docs: karyos/design/publication-seal.md`).
         match decode_seal(self.buffer.seal().load(Ordering::Acquire)) {
             SealWord::Positioned(position) if self.cursor.position >= position => {
-                Ok(PollOutcome::Closed { position })
+                // The Acquire load above observed the seal: the reason
+                // stored before its swap is visible.
+                let reason = SealReason::from_code(seal_reason(self.buffer.seal_reason_word()));
+                Ok(PollOutcome::Closed { position, reason })
             }
             _ => Ok(outcome),
         }
@@ -3516,7 +3590,7 @@ impl<O: BufferOwner> Conductor<O> {
             }
             CELL_LOST_HOLDING => Ok(Revocation::Holding),
             CELL_LOST => {
-                self.seal()?;
+                self.seal_with_reason(SealReason::RequiredParticipantLost)?;
                 Ok(Revocation::Sealed)
             }
             _ => Ok(Revocation::Withdrawn),
@@ -3642,7 +3716,26 @@ impl<O: BufferOwner> Conductor<O> {
     /// Returns errors from the descriptor protocol, which indicate a broken
     /// invariant.
     pub fn seal(&mut self) -> Result<(), SysError> {
-        self.seal_with(false)
+        self.seal_with(false, SealReason::Unspecified)
+    }
+
+    /// Seals the buffer as [`Conductor::seal`], recording `reason` in the
+    /// seal line before the seal word, so every reader that observes the
+    /// seal reads it. A buffer already sealed keeps its first reason.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conductor::seal`].
+    pub fn seal_with_reason(&mut self, reason: SealReason) -> Result<(), SysError> {
+        self.seal_with(false, reason)
+    }
+
+    /// The reason of the buffer's terminal seal; `None` while it is not
+    /// sealed, or sealed for a cutover.
+    #[must_use]
+    pub fn seal_reason(&self) -> Option<SealReason> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer.terminal_seal_reason()
     }
 
     /// Seals the buffer for a mapping-generation cutover, as
@@ -3653,10 +3746,10 @@ impl<O: BufferOwner> Conductor<O> {
     ///
     /// As [`Conductor::seal`].
     pub fn seal_for_cutover(&mut self) -> Result<(), SysError> {
-        self.seal_with(true)
+        self.seal_with(true, SealReason::Unspecified)
     }
 
-    fn seal_with(&mut self, successor: bool) -> Result<(), SysError> {
+    fn seal_with(&mut self, successor: bool, reason: SealReason) -> Result<(), SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         if buffer.seal().load(Ordering::Relaxed) != 0 {
             return Ok(());
@@ -3665,7 +3758,12 @@ impl<O: BufferOwner> Conductor<O> {
         if successor {
             crate::publication::seal_for_cutover(buffer.seal(), buffer.limit());
         } else {
-            seal(buffer.seal(), buffer.limit());
+            seal_with_reason(
+                buffer.seal(),
+                buffer.seal_reason_word(),
+                buffer.limit(),
+                reason.code(),
+            );
         }
         if buffer.concurrent() {
             self.context().fence()?;

@@ -332,6 +332,29 @@ pub fn seal(seal: &AtomicU64, limit: &AtomicU64) {
     limit.store(0, Ordering::Release);
 }
 
+/// Seals (conductor) as [`seal`], first storing `reason` in the seal
+/// line's reason word. The store is sequenced before the seal's swap, so a
+/// load that observes the seal by Acquire, or any later write to the seal
+/// word (each a read-modify-write in the swap's release sequence), is
+/// followed by a [`seal_reason`] that reads it.
+#[inline]
+pub fn seal_with_reason(
+    seal_word: &AtomicU64,
+    reason_word: &AtomicU64,
+    limit: &AtomicU64,
+    reason: u64,
+) {
+    reason_word.store(reason, Ordering::Relaxed);
+    seal(seal_word, limit);
+}
+
+/// The reason code of a seal, read after an Acquire load of the seal word
+/// observed the seal; 0 when no reason was written.
+#[inline]
+pub fn seal_reason(reason_word: &AtomicU64) -> u64 {
+    reason_word.load(Ordering::Relaxed)
+}
+
 /// Seals for a cutover (conductor), as [`seal`], with [`SEAL_SUCCESSOR`]
 /// in the same swap.
 #[inline]

@@ -984,6 +984,10 @@ fn test_log_buffer_required_set_limits_never_decrease_across_hold_continue_abort
             LossPolicy::Abort => {
                 assert_eq!(revocation, Revocation::Sealed);
                 assert!(sealed && !open, "abort did not seal");
+                assert_eq!(
+                    conductor.seal_reason(),
+                    Some(SealReason::RequiredParticipantLost)
+                );
                 // Until the seal the limit never decreased.
                 let until = limits
                     .iter()

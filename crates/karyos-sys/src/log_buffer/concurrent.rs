@@ -806,6 +806,17 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         self.state == HandleState::Closed
     }
 
+    /// The reason of the buffer's terminal seal, once the handle is closed
+    /// (`None` before, and for a cutover seal, which is not terminal).
+    #[must_use]
+    pub fn seal_reason(&self) -> Option<super::SealReason> {
+        if !self.is_closed() {
+            return None;
+        }
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        buffer.terminal_seal_reason()
+    }
+
     /// After an attempt that was not granted: if the buffer is sealed,
     /// releases the handle and returns `true`; every later call returns
     /// `Closed` at once (`quantstratum-docs: karyos/design/publication-seal.md`). The caller

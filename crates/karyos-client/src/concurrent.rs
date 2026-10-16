@@ -239,6 +239,13 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         self
     }
 
+    /// Why the stream was sealed, once an attempt returned `Closed`; `None`
+    /// while the handle is open.
+    #[must_use]
+    pub fn seal_reason(&self) -> Option<karyos_sys::log_buffer::SealReason> {
+        self.inner.seal_reason()
+    }
+
     /// Attaches the generation link the driver keeps for this handle, and
     /// the base of the mapping it uses.
     ///
