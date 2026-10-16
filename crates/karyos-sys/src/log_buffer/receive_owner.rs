@@ -68,6 +68,11 @@ pub enum Received {
     /// Its term is not prepared yet, or no clean bitmap set is free for
     /// it: dropped, to be repaired like a loss.
     NotReady,
+    /// It overlaps a local gap record still retained and no committed real
+    /// frame (`quantstratum-docs: karyos/design/gaps-and-unreliable-delivery.md`,
+    /// GU-7): it arrived after its range was sealed as lost, is counted and
+    /// is not written. A sealed interval is never reopened.
+    LateAfterSkip,
 }
 
 /// A frame the owner refused because it breaks a protocol rule, or an
@@ -129,6 +134,8 @@ pub enum ReceiveCounter {
     FramesConflicting,
     /// [`ReceiveCounters::cleaner_lag`].
     CleanerLag,
+    /// [`ReceiveCounters::frames_late_after_skip`].
+    FramesLateAfterSkip,
 }
 
 /// Lifetime counters of a receive owner, over all lanes. Increments are
@@ -154,6 +161,9 @@ pub struct ReceiveCounters {
     pub frames_conflicting: u64,
     /// Times the next term was not prepared by the conductor.
     pub cleaner_lag: u64,
+    /// Frames dropped because they arrived after their range was sealed as
+    /// a local gap (GU-7).
+    pub frames_late_after_skip: u64,
     /// The first counter whose increment was not applied because it would
     /// have overflowed; it stays set.
     pub overflowed: Option<ReceiveCounter>,
@@ -170,6 +180,7 @@ impl ReceiveCounters {
             ReceiveCounter::FramesNotReady => &mut self.frames_not_ready,
             ReceiveCounter::FramesConflicting => &mut self.frames_conflicting,
             ReceiveCounter::CleanerLag => &mut self.cleaner_lag,
+            ReceiveCounter::FramesLateAfterSkip => &mut self.frames_late_after_skip,
         };
         match value.checked_add(by) {
             Some(next) => *value = next,
@@ -265,6 +276,9 @@ impl<T: TermBytes> ReceiveOwner<T> {
             Ok(Received::Late) => counters.bump(ReceiveCounter::FramesLate, 1),
             Ok(Received::Ahead) => counters.bump(ReceiveCounter::FramesAhead, 1),
             Ok(Received::NotReady) => counters.bump(ReceiveCounter::FramesNotReady, 1),
+            Ok(Received::LateAfterSkip) => {
+                counters.bump(ReceiveCounter::FramesLateAfterSkip, 1);
+            }
             Err(ReceiveError::Conflict { .. }) => {
                 counters.bump(ReceiveCounter::FramesConflicting, 1);
             }
@@ -476,6 +490,11 @@ impl<T: TermBytes> LaneOwner<T> {
             // reclaimed term is late whatever it would have been.
             return match self.compare_trailing(count, frame, starts)? {
                 Some(true) => Ok(Received::Duplicate),
+                // Every unit of the trailing term is covered: a copy that
+                // meets no real frame lies in gaps alone (GU-7).
+                Some(false) if !overlaps_real(self.set(index)?, unit, units) => {
+                    Ok(Received::LateAfterSkip)
+                }
                 Some(false) => Err(conflict()),
                 None => Ok(Received::Late),
             };
@@ -502,7 +521,13 @@ impl<T: TermBytes> LaneOwner<T> {
             };
         }
         if any_set(&self.set(index)?.covered, unit, units) {
-            return Err(conflict());
+            // A real overlap is classified first, as a conflict; an overlap
+            // with retained gap records alone is late after the skip (GU-7).
+            return if overlaps_real(self.set(index)?, unit, units) {
+                Err(conflict())
+            } else {
+                Ok(Received::LateAfterSkip)
+            };
         }
         let Some(slot) = self.write_loan(count)? else {
             return Ok(Received::NotReady);
@@ -940,6 +965,35 @@ fn words_of(start: usize, len: usize, mut each: impl FnMut(usize, u64) -> bool) 
 }
 
 /// Whether any bit of `[start, start + len)` is set.
+/// Whether `[unit, unit + units)` meets a committed real frame of `set`. A
+/// covered unit belongs to the record that starts at the nearest start bit
+/// at or below it, a real frame (`starts`) or a local gap (`gap_starts`):
+/// the range meets a real frame if the record covering its first unit is
+/// one, or if a real frame starts inside it.
+fn overlaps_real(set: &Set, unit: usize, units: usize) -> bool {
+    if bit(&set.covered, unit) {
+        // The record covering `unit`: scan down to its start, within the
+        // covered run.
+        let mut at = unit;
+        loop {
+            if bit(&set.starts, at) {
+                return true;
+            }
+            if bit(&set.gap_starts, at) {
+                break;
+            }
+            match at.checked_sub(1) {
+                Some(below) if bit(&set.covered, below) => at = below,
+                // A covered unit with no start below it in its run: a broken
+                // map; treat it as real, the conservative answer.
+                _ => return true,
+            }
+        }
+    }
+    let end = unit.saturating_add(units);
+    (unit..end).any(|at| bit(&set.starts, at))
+}
+
 fn any_set(bits: &[u64], start: usize, len: usize) -> bool {
     words_of(start, len, |word, mask| {
         bits.get(word).is_some_and(|value| value & mask != 0)
