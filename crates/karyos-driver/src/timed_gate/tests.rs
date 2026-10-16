@@ -61,8 +61,15 @@ struct Fixture {
 
 impl Fixture {
     /// `lanes` lanes of quantum 256 over a guard gate open at epoch 2,
-    /// with the publication's `rate`; both clocks at [`NOW`].
+    /// with the publication's `rate` and the default late policy; both
+    /// clocks at [`NOW`].
     fn new(lanes: usize, rate: Option<RatePolicy>) -> Self {
+        Self::with_policy(lanes, rate, LatePolicy::default())
+    }
+
+    /// [`Self::new`] with `policy` on every lane.
+    fn with_policy(lanes: usize, rate: Option<RatePolicy>, policy: LatePolicy) -> Self {
+        let policies = vec![policy; lanes];
         let mut config = SocketsConfig::new(SocketAddr::from((Ipv4Addr::LOCALHOST, 7000)));
         config.max_datagram = NonZeroU16::new(MAX_FRAME).unwrap();
         config.tx_slots = NonZeroU16::new(16).unwrap();
@@ -117,7 +124,7 @@ impl Fixture {
             socket: observer,
             queues,
             sender,
-            gate: TimedGate::new(guard, lanes, usize::from(BOUND), NOW),
+            gate: TimedGate::new(guard, &policies, usize::from(BOUND), NOW),
             word,
             next_token: 1,
             next_position: vec![0; lanes],
@@ -405,4 +412,194 @@ fn lateness_is_signed_and_checked() {
     assert_eq!(lateness(3, 10), Some(-7));
     assert_eq!(lateness(u64::MAX, 0), None);
     assert_eq!(lateness(0, u64::MAX), None);
+}
+
+const TOLERANCE: u64 = 10;
+
+fn cancel() -> LatePolicy {
+    LatePolicy {
+        tolerance: TOLERANCE,
+        cancel_on_deadline: true,
+    }
+}
+
+/// G7: under cancel-on-deadline, a head not exposed by its time plus the
+/// tolerance aborts the lane for good, counted once; nothing behind it is
+/// exposed, and the one already sent stays sent.
+#[test]
+fn a_missed_deadline_aborts_the_lane_for_good() {
+    let mut f = Fixture::with_policy(1, None, cancel());
+    f.stage(0, Some(NOW));
+    f.accept(1);
+    let report = f.serve(NOW);
+    assert_eq!(served(&report, 0), 64);
+    let late = f.stage(0, Some(FUTURE));
+    let behind = f.stage(0, Some(FUTURE + 1));
+    f.accept(2);
+    // Past FUTURE + TOLERANCE without exposure: the lane aborts.
+    let report = f.serve(FUTURE + TOLERANCE + 1);
+    assert_eq!(served(&report, 0), 0);
+    assert!(f.gate.deadline_missed(0));
+    assert_eq!(f.gate.counts().deadline_aborts, 1);
+    assert_eq!(f.gate.counts().sent, 1);
+    // For good: probes and exposures stay denied and are not recounted.
+    assert!(!f.gate.admits(0));
+    assert_eq!(check(&mut f.gate, 0, &[late, behind]), GateDecision::Deny);
+    let report = f.serve(FUTURE + 1_000);
+    assert_eq!(served(&report, 0), 0);
+    assert_eq!(f.gate.counts().deadline_aborts, 1);
+    assert_eq!(f.gate.earliest(), None);
+}
+
+/// At the boundary, time plus tolerance, a head is neither missed nor
+/// late; one nanosecond later it is missed (under cancel) or late (sent).
+#[test]
+fn the_deadline_boundary_is_not_late() {
+    let mut f = Fixture::with_policy(1, None, cancel());
+    f.stage(0, Some(NOW));
+    f.accept(1);
+    let report = f.serve(NOW + TOLERANCE);
+    assert_eq!(served(&report, 0), 64);
+    assert!(!f.gate.deadline_missed(0));
+    assert_eq!(f.gate.counts().late_sends, 0);
+    let mut g = Fixture::with_policy(1, None, cancel());
+    g.stage(0, Some(NOW));
+    g.accept(1);
+    let report = g.serve(NOW + TOLERANCE + 1);
+    assert_eq!(served(&report, 0), 0);
+    assert!(g.gate.deadline_missed(0));
+}
+
+/// Without cancel-on-deadline nothing aborts: a head past its tolerance
+/// is sent and counted late; one at the boundary is not.
+#[test]
+fn without_cancel_late_heads_are_sent_and_counted() {
+    let policy = LatePolicy {
+        tolerance: TOLERANCE,
+        cancel_on_deadline: false,
+    };
+    let mut f = Fixture::with_policy(1, None, policy);
+    f.stage(0, Some(NOW));
+    f.stage(0, Some(NOW - TOLERANCE));
+    f.stage(0, Some(NOW - TOLERANCE - 1));
+    f.accept(3);
+    let report = f.serve(NOW);
+    assert_eq!(served(&report, 0), 192);
+    assert!(!f.gate.deadline_missed(0));
+    assert_eq!(f.gate.counts().deadline_aborts, 0);
+    assert_eq!(f.gate.counts().late_sends, 1);
+    assert_eq!(f.gate.counts().sent, 3);
+}
+
+/// A head already exposed (the backend keeps it pending) never misses its
+/// deadline: it may have been sent.
+#[test]
+fn an_exposed_head_never_misses() {
+    let mut f = Fixture::with_policy(1, None, cancel());
+    let token = f.stage(0, Some(NOW));
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
+    f.gate.set_now(NOW + TOLERANCE + 100);
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
+    assert!(!f.gate.deadline_missed(0));
+}
+
+/// ACS 15455: the inner guard gate is not told of a deadline abort; its
+/// work in flight, which the close acknowledgement reads, is unchanged.
+#[test]
+fn a_deadline_abort_leaves_the_inner_work_in_flight() {
+    let mut f = Fixture::with_policy(1, None, cancel());
+    let sent = f.stage(0, Some(NOW));
+    assert_eq!(check(&mut f.gate, 0, &[sent]), permit(1));
+    f.stage(0, Some(NOW + 1));
+    let before = f.gate.inner().in_flight();
+    assert_eq!(before, Some(1));
+    f.gate.set_now(NOW + 1 + TOLERANCE + 1);
+    assert!(!f.gate.admits(0));
+    assert!(f.gate.deadline_missed(0));
+    assert_eq!(f.gate.inner().in_flight(), before);
+    assert_eq!(f.gate.inner().counts().aborted, 0);
+}
+
+/// The step between gates seals a missed lane once, with
+/// `DeadlineMissed`; a second step neither reseals nor recounts, and a
+/// failed seal is tried again.
+#[test]
+fn between_gates_seals_a_missed_lane_once() {
+    use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    let buffer = LogBuffer::new(LogBufferConfig {
+        term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+        spare_slots: 3,
+        max_subscribers: 4,
+        mtu: DEFAULT_MTU,
+        max_reserved: MIN_TERM_LENGTH / 8,
+        initial_term_id: TermId::new(7),
+        lane: Lane::ZERO,
+        session_id: 1,
+        stream_id: 2,
+        claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+        publication: PublicationMode::Exclusive,
+        schedule_capacity: 4,
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut f = Fixture::with_policy(2, None, cancel());
+    f.stage(1, Some(NOW));
+    let mut calls = Vec::new();
+    // Nothing missed yet: nothing sealed.
+    f.gate
+        .between_gates(|lane| {
+            calls.push(lane);
+            Ok::<(), SysError>(())
+        })
+        .unwrap();
+    assert!(calls.is_empty());
+    f.gate.set_now(NOW + TOLERANCE + 1);
+    assert!(!f.gate.admits(1));
+    // A failed seal is retried at the next step.
+    assert_eq!(f.gate.between_gates(|_| Err(7)), Err(7));
+    for _ in 0..2 {
+        f.gate
+            .between_gates(|lane| {
+                calls.push(lane);
+                seal_deadline_missed(&mut conductor)
+            })
+            .unwrap();
+    }
+    assert_eq!(calls, vec![1]);
+    assert_eq!(conductor.seal_reason(), Some(SealReason::DeadlineMissed));
+    assert_eq!(f.gate.counts().deadline_aborts, 1);
+    // A buffer already sealed keeps its first reason.
+    seal_deadline_missed(&mut conductor).unwrap();
+    assert_eq!(conductor.seal_reason(), Some(SealReason::DeadlineMissed));
+}
+
+/// A buffer sealed for another reason keeps it.
+#[test]
+fn a_seal_keeps_its_first_reason() {
+    use karyos_sys::log_buffer::{LogBuffer, LogBufferConfig, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    let buffer = LogBuffer::new(LogBufferConfig {
+        term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+        spare_slots: 3,
+        max_subscribers: 4,
+        mtu: DEFAULT_MTU,
+        max_reserved: MIN_TERM_LENGTH / 8,
+        initial_term_id: TermId::new(7),
+        lane: Lane::ZERO,
+        session_id: 1,
+        stream_id: 2,
+        claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+        publication: PublicationMode::Exclusive,
+        schedule_capacity: 4,
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    conductor.seal_with_reason(SealReason::GuardClosed).unwrap();
+    seal_deadline_missed(&mut conductor).unwrap();
+    assert_eq!(conductor.seal_reason(), Some(SealReason::GuardClosed));
 }

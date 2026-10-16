@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The timed gate of a lane sender (`quantstratum-docs:
-//! karyos/design/timed-tx.md`, section 2 step 4 and section 4; P2.11 T1,
-//! step 4, ACS 15436).
+//! karyos/design/timed-tx.md`, section 2 step 4, sections 3 and 4; P2.11
+//! T1, steps 4 and 5, ACS 15436 and 15455).
 //!
 //! A [`TimedGate`] wraps another [`LaneGate`] (the guard gate, or any gate
 //! of the sender) and holds a timed lane's head until its requested time:
@@ -19,6 +19,19 @@
 //! - **Faults.** An exposure that is not the lane's next heads, in order,
 //!   is denied and counted; the inner gate decides what it means for the
 //!   lane.
+//! - **Lateness.** A timed head submitted more than its lane's tolerance
+//!   after its time is a late send, counted. Under cancel-on-deadline
+//!   (guards-and-abort.md, G7), a timed head not yet exposed whose time
+//!   plus the tolerance has passed aborts the lane for good: it is denied
+//!   from then on, counted once, and [`TimedGate::between_gates`] seals its
+//!   buffer once with `SealReason::DeadlineMissed`
+//!   ([`seal_deadline_missed`]), so every message behind gets the final
+//!   record `Aborted` and every one submitted keeps `Submitted`. Nothing
+//!   is skipped, and no `SESSION_ABORT` is sent on sockets (O-11, GC-6).
+//!   The inner gate is not told (ACS 15455): the heads it holds behind the
+//!   miss were never exposed, so never charged, and leave at teardown or a
+//!   reopen; its work in flight, which the close acknowledgement reads, is
+//!   unchanged.
 //!
 //! The gate records each datagram's token and time when it is staged
 //! ([`TimedGate::stage`], which stages the inner gate and sender in the
@@ -31,6 +44,8 @@ use core::num::NonZeroU16;
 
 use karyos_io::backend::{Exposure, GateDecision, SenderGate, SenderToken};
 use karyos_io::lanes::{LaneGate, Left, Staged};
+use karyos_sys::error::SysError;
+use karyos_sys::log_buffer::{BufferOwner, Conductor, SealReason, SealState};
 
 /// A staged datagram, as the timed gate holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +54,41 @@ struct Head {
     /// Its message's requested time; `None` for a datagram that waits for
     /// nothing (a lane that is not timed, or a control datagram).
     time: Option<u64>,
+    /// Permitted at an exposure: from then on it may have been sent, so
+    /// it never misses its deadline.
+    exposed: bool,
+}
+
+/// A lane's late policy (timed-tx.md, TT-3, and G7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatePolicy {
+    /// How far past its time a head may be submitted and not be late, in
+    /// the clock's units.
+    pub tolerance: u64,
+    /// Abort the lane when a head misses its time plus the tolerance,
+    /// instead of sending it late.
+    pub cancel_on_deadline: bool,
+}
+
+impl Default for LatePolicy {
+    /// The provisional defaults (TT-3): 1 ms of tolerance, sent late.
+    fn default() -> Self {
+        Self {
+            tolerance: 1_000_000,
+            cancel_on_deadline: false,
+        }
+    }
+}
+
+/// One lane of the gate.
+#[derive(Debug)]
+struct TimedLane {
+    heads: VecDeque<Head>,
+    policy: LatePolicy,
+    /// A head missed its deadline under cancel-on-deadline: for good.
+    missed: bool,
+    /// The lane's buffer was sealed for the miss.
+    sealed: bool,
 }
 
 /// Why [`TimedGate::stage`] refused a head; nothing is recorded on error.
@@ -70,6 +120,10 @@ pub struct TimedCounts {
     pub faults: u64,
     /// Timed heads submitted.
     pub sent: u64,
+    /// Timed heads submitted beyond their lane's tolerance.
+    pub late_sends: u64,
+    /// Lanes aborted for a missed deadline, once each.
+    pub deadline_aborts: u64,
     /// The largest lateness of a submitted timed head, in the clock's
     /// units: its submission time less its requested time (signed: a clock
     /// set back makes it negative). `None` before the first.
@@ -98,7 +152,7 @@ pub fn lateness(now: u64, time: u64) -> Option<i64> {
 #[derive(Debug)]
 pub struct TimedGate<G> {
     inner: G,
-    lanes: Vec<VecDeque<Head>>,
+    lanes: Vec<TimedLane>,
     bound: usize,
     now: u64,
     flushing: Option<usize>,
@@ -106,13 +160,22 @@ pub struct TimedGate<G> {
 }
 
 impl<G: LaneGate> TimedGate<G> {
-    /// A gate of `lanes` lanes, each recording up to `bound` heads (its
-    /// queue's bound), over `inner`; the clock starts at `now`.
+    /// A gate of one lane per entry of `policies`, each recording up to
+    /// `bound` heads (its queue's bound), over `inner`; the clock starts at
+    /// `now`.
     #[must_use]
-    pub fn new(inner: G, lanes: usize, bound: usize, now: u64) -> Self {
+    pub fn new(inner: G, policies: &[LatePolicy], bound: usize, now: u64) -> Self {
         Self {
             inner,
-            lanes: (0..lanes).map(|_| VecDeque::with_capacity(bound)).collect(),
+            lanes: policies
+                .iter()
+                .map(|policy| TimedLane {
+                    heads: VecDeque::with_capacity(bound),
+                    policy: *policy,
+                    missed: false,
+                    sealed: false,
+                })
+                .collect(),
             bound,
             now,
             flushing: None,
@@ -149,7 +212,8 @@ impl<G: LaneGate> TimedGate<G> {
     pub fn earliest(&self) -> Option<u64> {
         self.lanes
             .iter()
-            .filter_map(|heads| heads.front().and_then(|head| head.time))
+            .filter(|lane| !lane.missed)
+            .filter_map(|lane| lane.heads.front().and_then(|head| head.time))
             .filter(|time| *time > self.now)
             .min()
     }
@@ -170,16 +234,20 @@ impl<G: LaneGate> TimedGate<G> {
         time: Option<u64>,
         inner: impl FnOnce(&mut G) -> Result<(), E>,
     ) -> Result<(), TimedStageError<E>> {
-        let heads = self
+        let state = self
             .lanes
             .get(lane)
             .ok_or(TimedStageError::UnknownLane { lane })?;
-        if heads.len() >= self.bound {
+        if state.heads.len() >= self.bound {
             return Err(TimedStageError::Full { lane });
         }
         inner(&mut self.inner).map_err(TimedStageError::Inner)?;
-        if let Some(heads) = self.lanes.get_mut(lane) {
-            heads.push_back(Head { token, time });
+        if let Some(state) = self.lanes.get_mut(lane) {
+            state.heads.push_back(Head {
+                token,
+                time,
+                exposed: false,
+            });
         }
         Ok(())
     }
@@ -188,20 +256,104 @@ impl<G: LaneGate> TimedGate<G> {
     /// gate's or the sender's `reopen`): the reset returned them unsent.
     pub fn reopen(&mut self, lane: usize, inner: impl FnOnce(&mut G)) {
         inner(&mut self.inner);
-        if let Some(heads) = self.lanes.get_mut(lane) {
-            heads.clear();
+        if let Some(state) = self.lanes.get_mut(lane) {
+            state.heads.clear();
         }
+    }
+
+    /// Whether `lane` aborted for a missed deadline.
+    #[must_use]
+    pub fn deadline_missed(&self, lane: usize) -> bool {
+        self.lanes.get(lane).is_some_and(|state| state.missed)
+    }
+
+    /// The step between gates: seals, through `seal`, the buffer of every
+    /// lane that missed a deadline and is not sealed yet
+    /// ([`seal_deadline_missed`] on the lane's conductor). A lane is
+    /// sealed once; a second call neither reseals nor recounts.
+    ///
+    /// # Errors
+    ///
+    /// The first error of `seal`; every lane is still tried, and a lane
+    /// whose seal failed is tried again at the next call.
+    pub fn between_gates<E>(
+        &mut self,
+        mut seal: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut first_error = None;
+        for (index, state) in self.lanes.iter_mut().enumerate() {
+            if !state.missed || state.sealed {
+                continue;
+            }
+            match seal(index) {
+                Ok(()) => state.sealed = true,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn due(&self, head: &Head) -> bool {
         head.time.is_none_or(|time| time <= self.now)
     }
+
+    /// Whether `lane` may go on: under cancel-on-deadline, its first timed
+    /// head not yet exposed must not be past its time plus the tolerance
+    /// (`now > time + tolerance`; at the boundary it is not late). A miss
+    /// aborts the lane for good, counted once. A deadline that overflows
+    /// was refused at offer (`ScheduleOverflow`), so it never misses here.
+    fn live(&mut self, lane: usize) -> bool {
+        let now = self.now;
+        let Some(state) = self.lanes.get_mut(lane) else {
+            return false;
+        };
+        if state.missed {
+            return false;
+        }
+        if !state.policy.cancel_on_deadline {
+            return true;
+        }
+        let tolerance = state.policy.tolerance;
+        let missed = state
+            .heads
+            .iter()
+            .filter(|head| !head.exposed)
+            .find_map(|head| head.time)
+            .and_then(|time| time.checked_add(tolerance))
+            .is_some_and(|deadline| now > deadline);
+        if missed {
+            state.missed = true;
+            bump(&mut self.counts.deadline_aborts, &mut self.counts.overflows);
+        }
+        !missed
+    }
+}
+
+/// Seals a lane's buffer for a missed deadline (G7): `DeadlineMissed`,
+/// unless it is already sealed, which keeps its first reason.
+///
+/// # Errors
+///
+/// As [`Conductor::seal_with_reason`]: a broken invariant.
+pub fn seal_deadline_missed<O: BufferOwner>(conductor: &mut Conductor<O>) -> Result<(), SysError> {
+    if conductor.seal_state() == SealState::Active {
+        conductor.seal_with_reason(SealReason::DeadlineMissed)?;
+    }
+    Ok(())
 }
 
 impl<G: LaneGate> SenderGate for TimedGate<G> {
     fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
-        let Some(heads) = self.flushing.take().and_then(|lane| self.lanes.get(lane)) else {
+        let Some(lane) = self.flushing.take().filter(|lane| *lane < self.lanes.len()) else {
             bump(&mut self.counts.faults, &mut self.counts.overflows);
+            return GateDecision::Deny;
+        };
+        if !self.live(lane) {
+            return GateDecision::Deny;
+        }
+        let Some(heads) = self.lanes.get(lane).map(|state| &state.heads) else {
             return GateDecision::Deny;
         };
         // Each candidate must be the lane's next head, in order.
@@ -241,6 +393,11 @@ impl<G: LaneGate> SenderGate for TimedGate<G> {
         match inner {
             GateDecision::Permit { count } => {
                 let permitted = usize::from(count.get()).min(due);
+                if let Some(state) = self.lanes.get_mut(lane) {
+                    for head in state.heads.iter_mut().take(permitted) {
+                        head.exposed = true;
+                    }
+                }
                 u16::try_from(permitted)
                     .ok()
                     .and_then(NonZeroU16::new)
@@ -255,10 +412,13 @@ impl<G: LaneGate> LaneGate for TimedGate<G> {
     fn admits(&mut self, lane: usize) -> bool {
         // The inner gate first: it observes its guard on every probe.
         let inner = self.inner.admits(lane);
+        if !self.live(lane) {
+            return false;
+        }
         let due = self
             .lanes
             .get(lane)
-            .is_some_and(|heads| heads.front().is_none_or(|head| self.due(head)));
+            .is_some_and(|state| state.heads.front().is_none_or(|head| self.due(head)));
         if inner && !due {
             bump(&mut self.counts.held, &mut self.counts.overflows);
         }
@@ -271,13 +431,26 @@ impl<G: LaneGate> LaneGate for TimedGate<G> {
     }
 
     fn left(&mut self, lane: usize, staged: Staged, how: Left) {
-        let head = self.lanes.get_mut(lane).and_then(VecDeque::pop_front);
-        match head {
+        let Some(state) = self.lanes.get_mut(lane) else {
+            bump(&mut self.counts.faults, &mut self.counts.overflows);
+            self.inner.left(lane, staged, how);
+            return;
+        };
+        let tolerance = state.policy.tolerance;
+        match state.heads.pop_front() {
             None => bump(&mut self.counts.faults, &mut self.counts.overflows),
             Some(Head {
                 time: Some(time), ..
             }) if how == Left::Submitted => {
                 bump(&mut self.counts.sent, &mut self.counts.overflows);
+                // Late beyond the tolerance: at the boundary it is not.
+                if self
+                    .now
+                    .checked_sub(time)
+                    .is_some_and(|late| late > tolerance)
+                {
+                    bump(&mut self.counts.late_sends, &mut self.counts.overflows);
+                }
                 if let Some(late) = lateness(self.now, time) {
                     self.counts.max_lateness =
                         Some(self.counts.max_lateness.map_or(late, |max| max.max(late)));
