@@ -1063,6 +1063,7 @@ fn test_conflated_a_view_in_another_process_reads_the_latest_values() {
     };
     assert!(value(cells[1], karyos_client::CONFLATION_BUDGETS_EXHAUSTED) > 0);
     let _ = value(cells[0], karyos_client::CONFLATION_SKIPS);
+    release(&mut child.0);
     serve_until(&mut driver, |driver| driver.clients() == 0);
     release(&mut child.0);
     assert!(child.0.wait().unwrap().success());
@@ -1151,6 +1152,9 @@ fn conflated_view(dir: &Path, timeout: Duration) {
         std::thread::yield_now();
     }
     report("closed");
+    // The parent reads the counter cells before the drops below release
+    // them.
+    wait_for_go();
     drop(view);
     drop(client);
     wait_for_go();
