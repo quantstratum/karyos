@@ -14,8 +14,10 @@
 //!   than exactly `(e, Open)` denies and puts the lane's incarnation in
 //!   `Aborting` for good; a later reopen cannot resume it. If the observed
 //!   epoch is above the applied epoch, the gate publishes it once, with the
-//!   last positions submitted per lane, through its [`AppliedEpoch`] cell,
-//!   which this gate alone writes.
+//!   last positions submitted per lane and the work in flight, through its
+//!   [`AppliedEpoch`] cell, which this gate alone writes; the between gates
+//!   step publishes again as that work drains, for the effective-close
+//!   acknowledgement (`crate::guard_ack`).
 //! - **Rate.** The authoritative bucket of the publication, one per gate:
 //!   a channel's lanes are one publication (GC-5, ACS 15344). A datagram
 //!   costs one message token per message it starts and its length in byte

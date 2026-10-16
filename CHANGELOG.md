@@ -59,6 +59,15 @@ release may break APIs, wire formats and shared-memory layouts.
   than the gate: a message accepted and later aborted keeps its charge, and so
   does a claim leaked with `mem::forget`. A sealed handle reports its seal
   before the copy is asked.
+- The effective-close acknowledgement (G-e4):
+  `EmbeddedDriver::register_guard_sender` and `deregister_guard_sender` keep a
+  bounded registry of sender gates (`DriverConfig::max_guard_senders`,
+  `DriverError::TooManyGuardSenders`), and `EmbeddedDriver::close_guard_ack`
+  reports each one `Applied` (positions and work in flight) or `Pending`,
+  overdue past `DriverConfig::guard_ack_timeout` and never reported closed; a
+  close is effective at a sender once applied with nothing in flight.
+  `karyos_sys::applied_epoch::Applied` carries `in_flight`, published by the
+  gate with its applied epoch and again as the work drains.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 
