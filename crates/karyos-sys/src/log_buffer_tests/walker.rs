@@ -8,15 +8,77 @@
 // whose `publish_running_duty` it uses, and `seal.rs` (`drain_to_end`).
 
 #[test]
-fn test_walker_never_bounds_the_limit() {
+fn test_walker_does_not_bound_the_limit() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
+    let _walker = conductor.subscribe(Role::Walker).unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let window = u64::from(buffer.term_length() / 2);
+    for sequence in 0..4 {
+        assert!(matches!(
+            publication
+                .append(&message(sequence), AppendOptions::default())
+                .unwrap(),
+            AppendOutcome::Appended { .. }
+        ));
+    }
+    let _ = conductor.duty_cycle().unwrap();
+    let head = conductor.head().unwrap();
+    assert!(head > 0);
+    // The limit follows the head, as with no reader at all; the stalled
+    // walker at position 0 holds only the floor.
+    assert_eq!(buffer.limit().load(Ordering::Acquire), head + window);
+    assert_eq!(buffer.floor().load(Ordering::Acquire), 0);
+}
+
+/// Coordinator, ACS 15161: a fast required reader moves the limit and
+/// would move the floor past a slow observer; the walker holds the floor,
+/// so it is never lapped. The publisher stalls on reclamation instead.
+#[test]
+fn test_walker_is_never_lapped_behind_a_fast_required_reader() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut required = conductor.subscribe(Role::Required).unwrap();
     let mut walker = conductor.subscribe(Role::Walker).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
     let data = vec![3u8; 7000];
-    let back_pressured = publish_running_duty(&mut publication, &mut conductor, &data, 60);
-    assert_eq!(back_pressured, 0, "the walker bounded the publisher");
-    assert!(matches!(poll(&mut walker), PollOutcome::Overrun { from: 0, .. }));
+    let mut appended = 0u32;
+    // Bounded: the stalled walker eventually stops the publisher.
+    for _ in 0..400 {
+        if matches!(
+            publication.append(&data, AppendOptions::default()).unwrap(),
+            AppendOutcome::Appended { .. }
+        ) {
+            appended += 1;
+        }
+        while poll_message(&mut required).is_some() {}
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    assert!(appended > 4, "the publisher never moved: {appended}");
+    // The walker reads every message from the start: no overrun.
+    let mut out = vec![0u8; 8192];
+    for _ in 0..appended {
+        match walker.poll(&mut out).unwrap() {
+            PollOutcome::Message { length, .. } => assert_eq!(length, 7000),
+            other => panic!("the walker was lapped or stalled: {other:?}"),
+        }
+    }
+    // Once it has passed them, reclamation proceeds and the publisher runs.
+    let _ = conductor.duty_cycle().unwrap();
+    let _ = conductor.duty_cycle().unwrap();
+    let mut resumed = false;
+    for _ in 0..20 {
+        if matches!(
+            publication.append(&data, AppendOptions::default()).unwrap(),
+            AppendOutcome::Appended { .. }
+        ) {
+            resumed = true;
+            break;
+        }
+        while poll_message(&mut required).is_some() {}
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    assert!(resumed, "reclamation did not proceed after the walker passed");
 }
 
 #[test]
