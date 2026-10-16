@@ -4670,11 +4670,11 @@ mod tests {
         // replaced buffer, an incarnation never held names nothing.
         let old_buffer = Arc::clone(&driver.streams[0].replaced[0].buffer);
         assert!(Arc::ptr_eq(
-            driver.streams[0].grant_buffer(1, generation).unwrap(),
+            driver.streams[0].grant_buffer(1, generation).unwrap().0,
             &old_buffer
         ));
         assert!(!Arc::ptr_eq(
-            driver.streams[0].grant_buffer(2, generation).unwrap(),
+            driver.streams[0].grant_buffer(2, generation).unwrap().0,
             &old_buffer
         ));
         assert!(driver.streams[0].grant_buffer(3, generation).is_none());
@@ -4743,6 +4743,55 @@ mod tests {
                 .map(|record| record.incarnation)
                 .collect::<Vec<_>>(),
             [1, 2]
+        );
+    }
+
+    /// Review of #218 (L4): a grant of a replaced incarnation fetches its
+    /// own base, the seal of the incarnation before it, never the current
+    /// incarnation's. Incarnation 2 is replaced by 3, so neither base is 0.
+    #[test]
+    fn a_replaced_incarnations_grant_carries_its_own_base() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        let mut epoch = driver.reopen_guard(guard, 1, 1).unwrap();
+        let mut bases = Vec::new();
+        let mut readers = Vec::new();
+        for value in [b"a", b"b"] {
+            let mut publication = driver.publication(stream).unwrap();
+            bases.push(driver.streams[0].base);
+            readers.push(driver.subscribe(stream, Role::Required).unwrap());
+            assert!(matches!(
+                publication.offer(value).unwrap(),
+                karyos_client::OfferOutcome::Accepted { .. }
+            ));
+            let closed = driver.close_guard(guard, epoch).unwrap();
+            let karyos_sys::guard::Closed::Now { epoch: at } = closed else {
+                panic!("{closed:?}");
+            };
+            drop(publication);
+            let _ = driver.do_work().unwrap();
+            epoch = driver.reopen_guard(guard, at, at).unwrap();
+        }
+        let _fresh = driver.publication(stream).unwrap();
+        assert_eq!(driver.streams[0].incarnation, 3);
+        let current = driver.streams[0].base;
+        let [first, second] = bases[..] else {
+            panic!("{bases:?}");
+        };
+        // Each incarnation starts where the one before it was sealed.
+        assert!(
+            first == 0 && 0 < second && second < current,
+            "{bases:?} {current}"
+        );
+        let generation = driver.streams[0].generation.get();
+        assert_eq!(
+            driver.streams[0].grant_buffer(2, generation).unwrap().1,
+            second
+        );
+        assert_eq!(
+            driver.streams[0].grant_buffer(3, generation).unwrap().1,
+            current
         );
     }
 

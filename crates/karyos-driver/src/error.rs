@@ -7,6 +7,18 @@ use karyos_sys::conflation::ConflationError;
 use karyos_sys::error::SysError;
 use thiserror::Error;
 
+/// Why `guard_stream` could not admit a stream's walker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum WalkerUnavailable {
+    /// Every spare-slot credit the stream's `spare_slots` allows is in
+    /// use: size `spare_slots` for the readers plus one.
+    #[error("no spare-slot credit")]
+    NoSpareCredit,
+    /// Every reader cell of the stream is taken.
+    #[error("no reader cell")]
+    NoReaderCell,
+}
+
 /// Errors returned by the embedded driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum DriverError {
@@ -74,6 +86,17 @@ pub enum DriverError {
     GuardSealed {
         /// The stream id.
         stream: u64,
+    },
+    /// `guard_stream` could not admit the stream's walker, a reader that
+    /// holds one spare-slot credit for the stream's life
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, The
+    /// walker's credit).
+    #[error("stream {stream}'s guard walker is unavailable: {reason}")]
+    GuardWalkerUnavailable {
+        /// The stream id.
+        stream: u64,
+        /// What is missing.
+        reason: WalkerUnavailable,
     },
     /// The stream's incarnation numbers are exhausted; they are never
     /// reused.

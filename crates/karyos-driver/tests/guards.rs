@@ -15,7 +15,7 @@ use karyos_client::{
 };
 use karyos_driver::{
     DriverConfig, DriverError, EmbeddedDriver, Reconfiguration, SealState, StreamConfig,
-    StreamHandle,
+    StreamHandle, WalkerUnavailable,
 };
 use karyos_sys::frame::Lane;
 use karyos_sys::guard::Closed;
@@ -495,4 +495,59 @@ fn a_removed_guarded_stream_creates_no_incarnation() {
         Err(DriverError::StreamRetiring { .. })
     ));
     assert_eq!(driver.trace_identity(handle).unwrap().incarnation, 1);
+}
+
+/// ACS 15298: the walker holds one spare-slot credit for the stream's life,
+/// and `guard_stream` names what it lacks. With 6 spare slots, 5 credits
+/// are allowed: the exclusive publication's and 4 optional readers' use
+/// them all, so the walker gets none; once a reader leaves, it does.
+#[test]
+fn guard_stream_names_the_walkers_missing_credit() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
+    let guard = driver.add_guard("orders").unwrap();
+    let mut readers: Vec<_> = (0..4)
+        .map(|_| driver.subscribe(handle, Role::Optional).unwrap())
+        .collect();
+    let stream_id = match driver.guard_stream(handle, guard, 4) {
+        Err(DriverError::GuardWalkerUnavailable {
+            stream,
+            reason: WalkerUnavailable::NoSpareCredit,
+        }) => stream,
+        other => panic!("expected no spare credit, got {other:?}"),
+    };
+    assert_eq!(
+        DriverError::GuardWalkerUnavailable {
+            stream: stream_id,
+            reason: WalkerUnavailable::NoSpareCredit,
+        }
+        .to_string(),
+        format!("stream {stream_id}'s guard walker is unavailable: no spare-slot credit")
+    );
+    drop(readers.pop());
+    let _ = driver.do_work().unwrap();
+    driver.guard_stream(handle, guard, 4).unwrap();
+}
+
+/// A full cell table is told apart from a missing credit: required readers
+/// take cells but no credit.
+#[test]
+fn guard_stream_names_the_walkers_missing_cell() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
+    let guard = driver.add_guard("orders").unwrap();
+    let _readers: Vec<_> = (0..4)
+        .map(|_| driver.subscribe(handle, Role::Required).unwrap())
+        .collect();
+    assert!(matches!(
+        driver.guard_stream(handle, guard, 4),
+        Err(DriverError::GuardWalkerUnavailable {
+            reason: WalkerUnavailable::NoReaderCell,
+            ..
+        })
+    ));
+    assert_eq!(
+        WalkerUnavailable::NoReaderCell.to_string(),
+        "no reader cell"
+    );
 }

@@ -818,7 +818,7 @@ impl<T: StreamTerms> Admission<T> {
             let Some((record, fd)) = found else {
                 return refuse(remote, refusal::RESOURCES);
             };
-            return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, fd);
+            return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, 0, fd);
         }
         if grant.participant == Participant::Conflation {
             // The table's region, reopened read-only (A1): the view never
@@ -841,16 +841,22 @@ impl<T: StreamTerms> Admission<T> {
             let Some((record, fd)) = found else {
                 return refuse(remote, refusal::RESOURCES);
             };
-            return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, fd);
+            return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, 0, fd);
         }
         let Some(stream) = driver.streams.iter().find(|s| s.id == grant.stream) else {
             return refuse(remote, refusal::RESOURCES);
         };
         // The mapping of the grant's own incarnation and generation: never
-        // another incarnation's buffer; a retired one is refused.
-        let buffer = stream.grant_buffer(grant.incarnation, grant.generation);
-        let Some(region) =
-            buffer.and_then(|buffer| <T as crate::embedded::sealed::Create>::region(buffer))
+        // another incarnation's buffer; a retired one is refused. Its base
+        // goes in the manifest, so the client's positions are absolute.
+        let Some((region, base)) = stream
+            .grant_buffer(grant.incarnation, grant.generation)
+            .and_then(|(buffer, base)| {
+                Some((
+                    <T as crate::embedded::sealed::Create>::region(buffer)?,
+                    base,
+                ))
+            })
         else {
             return refuse(remote, refusal::RESOURCES);
         };
@@ -864,11 +870,13 @@ impl<T: StreamTerms> Admission<T> {
             return refuse(remote, refusal::RESOURCES);
         };
         let fd = descriptor(region);
-        Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, fd)
+        Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, base, fd)
     }
 
     /// Queues the `Manifest` and the one `Region` of a grant's fetch, after
     /// the fetch bounds; the grant is spent before anything is queued.
+    /// `base` is the stream position where a log buffer grant's mapping
+    /// starts; zero for any other region.
     #[allow(
         clippy::too_many_arguments,
         reason = "one fetch's whole context; a struct would only rename it"
@@ -881,6 +889,7 @@ impl<T: StreamTerms> Admission<T> {
         key: u64,
         grant: &Grant,
         record: Record,
+        base: u64,
         fd: Option<OwnedFd>,
     ) -> Step {
         let bound = config.max_outbound_per_client;
@@ -925,6 +934,7 @@ impl<T: StreamTerms> Admission<T> {
                 registration: grant.registration,
                 stream_registration,
                 incarnation,
+                base,
                 records: vec![record],
             }),
             encode(&Message::Region { fetch, index: 0 }),

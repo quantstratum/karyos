@@ -33,7 +33,7 @@ pub use embedded::{
     AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, FIRST_INCARNATION,
     StreamConfig, StreamHandle, StreamState,
 };
-pub use error::DriverError;
+pub use error::{DriverError, WalkerUnavailable};
 pub use generations::{GenerationInfo, Reconfiguration};
 pub use guards::{Audit, AuditOutcome, AuditRecord, GuardHandle, Requester};
 pub use karyos_client::ConflatedSubscription;

@@ -328,6 +328,7 @@ impl Session {
         let prepared = check(&fetched, &request)
             .and_then(|()| {
                 (fetched.record.generation == generation
+                    && fetched.base == base
                     && (fetched.stream_registration, fetched.incarnation) == publication)
                     .then_some(())
                     .ok_or(AttachError::Protocol)
@@ -404,12 +405,14 @@ impl Drop for Detach {
 }
 
 /// A fetched log buffer: its record, the attached buffer, and the stream
-/// registration and incarnation its manifest named.
+/// registration, incarnation and base its manifest named.
 struct Fetched {
     record: Record,
     buffer: Arc<LogBuffer<SharedTerms>>,
     stream_registration: u64,
     incarnation: u64,
+    /// The stream position where the buffer starts (G-d2c).
+    base: u64,
 }
 
 /// One received message, with its descriptor.
@@ -1098,19 +1101,22 @@ impl RemoteClient {
         let export = fetched.record.export;
         let generation = fetched.record.generation;
         let publication = (fetched.stream_registration, fetched.incarnation);
+        let base = fetched.base;
         let built = check(&fetched, &fetchable.request).and_then(|()| adopt(&fetched, export));
         match built {
             Ok(handle) => {
                 drop(fetched);
                 let link = GenerationLink::new_remote();
-                // The first mapping starts at position 0. A refusal drops the
-                // handle, which unmaps and detaches.
+                // The mapping starts at the manifest's base, so positions
+                // are absolute stream positions: zero for a stream's first
+                // incarnation, the seal for a later one (G-d2c). A refusal
+                // drops the handle, which unmaps and detaches.
                 let handle = handle
                     .with_export(Export::new(Detach {
                         session: Arc::clone(session),
                         export,
                     }))
-                    .with_link(Arc::clone(&link))
+                    .with_link(Arc::clone(&link), base)
                     .map_err(|_| AttachError::Protocol)?;
                 session.links().push(RemoteLink {
                     registration: fetchable.registration,
@@ -1155,7 +1161,11 @@ impl Drop for RemoteClient {
 /// its remote generation link.
 trait WithExport: Sized {
     fn with_export(self, export: Export) -> Self;
-    fn with_link(self, link: Arc<GenerationLink<SharedTerms>>) -> Result<Self, ClientError>;
+    fn with_link(
+        self,
+        link: Arc<GenerationLink<SharedTerms>>,
+        base: u64,
+    ) -> Result<Self, ClientError>;
 }
 
 impl WithExport for ClientPublication<SharedTerms> {
@@ -1163,8 +1173,12 @@ impl WithExport for ClientPublication<SharedTerms> {
         ClientPublication::with_export(self, export)
     }
 
-    fn with_link(self, link: Arc<GenerationLink<SharedTerms>>) -> Result<Self, ClientError> {
-        self.with_generation(link, 0)
+    fn with_link(
+        self,
+        link: Arc<GenerationLink<SharedTerms>>,
+        base: u64,
+    ) -> Result<Self, ClientError> {
+        self.with_generation(link, base)
     }
 }
 
@@ -1173,8 +1187,12 @@ impl WithExport for ClientConcurrentPublication<SharedTerms> {
         ClientConcurrentPublication::with_export(self, export)
     }
 
-    fn with_link(self, link: Arc<GenerationLink<SharedTerms>>) -> Result<Self, ClientError> {
-        self.with_generation(link, 0)
+    fn with_link(
+        self,
+        link: Arc<GenerationLink<SharedTerms>>,
+        base: u64,
+    ) -> Result<Self, ClientError> {
+        self.with_generation(link, base)
     }
 }
 
@@ -1183,8 +1201,12 @@ impl WithExport for ClientSubscription<SharedTerms> {
         ClientSubscription::with_export(self, export)
     }
 
-    fn with_link(self, link: Arc<GenerationLink<SharedTerms>>) -> Result<Self, ClientError> {
-        self.with_generation(link, 0)
+    fn with_link(
+        self,
+        link: Arc<GenerationLink<SharedTerms>>,
+        base: u64,
+    ) -> Result<Self, ClientError> {
+        self.with_generation(link, base)
     }
 }
 
@@ -1301,6 +1323,7 @@ fn fetch(session: &Session, fetchable: &Fetchable) -> Result<Fetched, AttachErro
             buffer: Arc::new(buffer),
             stream_registration: fetched.stream_registration,
             incarnation: fetched.incarnation,
+            base: fetched.base,
         }),
         Err(error) => {
             session.detach(export);
@@ -1316,6 +1339,7 @@ struct FetchedRegion {
     region: Region,
     stream_registration: u64,
     incarnation: u64,
+    base: u64,
 }
 
 /// [`fetch_descriptor`], then the region attached writable against the
@@ -1337,6 +1361,7 @@ fn fetch_region(
             region,
             stream_registration: fetched.stream_registration,
             incarnation: fetched.incarnation,
+            base: fetched.base,
         }),
         Err(error) => {
             session.detach(record.export);
@@ -1352,6 +1377,7 @@ struct FetchedDescriptor {
     fd: OwnedFd,
     stream_registration: u64,
     incarnation: u64,
+    base: u64,
 }
 
 /// Sends `Fetch { key }` and receives its `Manifest` and its one `Region`:
@@ -1378,7 +1404,7 @@ fn fetch_descriptor(
         fetch
     };
     send(&session.socket, &Message::Fetch { fetch, key }, None)?;
-    let (record, stream_registration, incarnation) = match receive(&session.socket)? {
+    let (record, stream_registration, incarnation, base) = match receive(&session.socket)? {
         (Message::Refused { fetch: got, code }, None) if got == fetch => {
             return Err(AttachError::Refused { code });
         }
@@ -1389,6 +1415,7 @@ fn fetch_descriptor(
                 registration: got_registration,
                 stream_registration,
                 incarnation,
+                base,
                 records,
             },
             None,
@@ -1396,7 +1423,7 @@ fn fetch_descriptor(
             let expected = got_key == key && got_registration == registration;
             match records[..] {
                 [record] if expected && record.kind == kind => {
-                    (record, stream_registration, incarnation)
+                    (record, stream_registration, incarnation, base)
                 }
                 // Not the grant requested: the fetch is aborted, but its
                 // regions still follow; each descriptor is closed and its
@@ -1437,6 +1464,7 @@ fn fetch_descriptor(
         fd,
         stream_registration,
         incarnation,
+        base,
     })
 }
 

@@ -7,6 +7,21 @@ All notable changes to Karyos are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html); before 1.0 any
 release may break APIs, wire formats and shared-memory layouts.
 
+## [Unreleased]
+
+### Changed
+
+- The admission `Manifest` carries the stream position where the fetched
+  mapping starts (its base), within admission protocol version 2. A remote
+  client maps a grant at that base, so its positions, loss reports and
+  trace records are absolute stream positions after a guard close and
+  reopen, as an in-process handle's are.
+- `EmbeddedDriver::guard_stream` refuses with
+  `DriverError::GuardWalkerUnavailable { stream, reason }` when the stream's
+  walker, which holds one spare-slot credit for the stream's life, finds no
+  credit (`WalkerUnavailable::NoSpareCredit`) or no reader cell
+  (`WalkerUnavailable::NoReaderCell`).
+
 ## [0.1.0-alpha.1]: 2026-10-15
 
 First alpha: the embedded driver on every supported platform and the

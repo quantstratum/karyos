@@ -54,7 +54,7 @@ use crate::client_counters::ClientCounters;
 use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
 use crate::counters::{DriverCounters, Event, TYPE_EVENTS};
-use crate::error::DriverError;
+use crate::error::{DriverError, WalkerUnavailable};
 use crate::generations::{Cutover, Member, MemberKind, Retained};
 use crate::guards::GuardHandle;
 
@@ -593,7 +593,9 @@ impl<T: StreamTerms> Stream<T> {
             .map(|retained| &mut retained.conductor)
     }
 
-    /// The buffer of the mapping a grant names, as [`Self::grant_conductor`].
+    /// The buffer of the mapping a grant names, as [`Self::grant_conductor`],
+    /// and the stream position where that mapping starts: the base a remote
+    /// client maps it at (G-d2c).
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "remote clients are admitted only on Linux")
@@ -602,21 +604,21 @@ impl<T: StreamTerms> Stream<T> {
         &self,
         incarnation: u64,
         generation: u32,
-    ) -> Option<&Arc<LogBuffer<T>>> {
+    ) -> Option<(&Arc<LogBuffer<T>>, u64)> {
         if incarnation != self.incarnation {
             return self
                 .replaced
                 .iter()
                 .find(|replaced| replaced.incarnation == incarnation)
-                .map(|replaced| &replaced.buffer);
+                .map(|replaced| (&replaced.buffer, replaced.base));
         }
         if self.generation.get() == generation {
-            return Some(&self.buffer);
+            return Some((&self.buffer, self.base));
         }
         self.retained
             .iter()
             .find(|retained| retained.generation.get() == generation)
-            .map(|retained| &retained.buffer)
+            .map(|retained| (&retained.buffer, retained.base))
     }
 
     /// Refuses issuance while a cutover is pending.
@@ -1352,8 +1354,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// one with an issued handle, `messages` of 0, or `messages` reserved
     /// messages that do not fit half a term (the publication window, so
     /// the walker's retained span never needs more than the rotation and
-    /// spare slots can hold); [`DriverError::UnknownGuard`]; and the
-    /// walker's admission errors (it takes a spare-slot credit).
+    /// spare slots can hold); [`DriverError::UnknownGuard`]; and
+    /// [`DriverError::GuardWalkerUnavailable`] when the walker, which holds
+    /// one spare-slot credit for the stream's life, finds no credit
+    /// ([`WalkerUnavailable::NoSpareCredit`]) or no reader cell
+    /// ([`WalkerUnavailable::NoReaderCell`]).
     pub fn guard_stream(
         &mut self,
         stream: StreamHandle,
@@ -1383,9 +1388,33 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if found.guarded.is_some() || issued || messages == 0 || !fits {
             return Err(DriverError::InvalidConfig);
         }
+        // The credit is checked first, as admission counts it, so its
+        // refusal is told apart from a full cell table.
+        let id = found.id;
+        let unavailable = |reason| DriverError::GuardWalkerUnavailable { stream: id, reason };
+        // A stream whose spare slots are all cleaning headroom can host no
+        // walker.
+        let allowed = found
+            .config
+            .spare_slots
+            .checked_sub(karyos_sys::log_buffer::CLEANING_HEADROOM)
+            .map(usize::from);
+        let credits = found.conductor.spare_credits().checked_add(1);
+        if allowed
+            .zip(credits)
+            .is_none_or(|(allowed, credits)| credits > allowed)
+        {
+            return Err(unavailable(WalkerUnavailable::NoSpareCredit));
+        }
         let walker = found
             .conductor
-            .subscribe(karyos_sys::log_buffer::Role::Walker)?;
+            .subscribe(karyos_sys::log_buffer::Role::Walker)
+            .map_err(|error| match error {
+                karyos_sys::error::SysError::ResourcesUnavailable => {
+                    unavailable(WalkerUnavailable::NoReaderCell)
+                }
+                other => DriverError::Sys(other),
+            })?;
         let scratch = usize::try_from(found.buffer.max_message_length())
             .map_err(|_| DriverError::InvalidConfig)?;
         found.guarded = Some(crate::guard_streams::GuardedStream::new(
