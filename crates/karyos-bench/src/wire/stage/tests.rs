@@ -129,6 +129,48 @@ fn one_allocating_stage_among_clean_ones_is_counted() {
 }
 
 #[test]
+fn a_stop_after_the_last_ack_is_no_stop() {
+    // The receiver acks message 0 and stops between the sender's two
+    // reads (#236 flake): the count read after the stop has the ack.
+    let count = std::cell::Cell::new(0_u64);
+    let done = || {
+        count.set(1);
+        true
+    };
+    assert_eq!(wait_for_ack(|| count.get(), done, 0), Wait::Completed);
+    // A receiver that stopped short of the message is a stop.
+    assert_eq!(wait_for_ack(|| 1, || true, 1), Wait::Stopped);
+    assert_eq!(wait_for_ack(|| 2, || true, 1), Wait::Completed);
+}
+
+#[test]
+#[ignore = "stress: holds every core for seconds; run with --ignored"]
+fn a_receiver_done_with_every_message_never_stops_the_sender() {
+    // The receiver acks the last message and stops at once; under load the
+    // sender may see the stop before the last ack. Stressors hold every
+    // core so the threads are preempted between the two. The regression
+    // gate is a_stop_after_the_last_ack_is_no_stop, which forces the
+    // interleaving.
+    let quit = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let stressors = thread::available_parallelism().map_or(4, usize::from);
+        for _ in 0..stressors {
+            scope.spawn(|| {
+                while !quit.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+            });
+        }
+        let _quit = SetOnDrop(&quit);
+        for iteration in 0..200 {
+            if let Err(error) = run(stage_run(Shape::W1, StageLoad::Closed, 20, 0), &Trusted) {
+                panic!("iteration {iteration}: {error}");
+            }
+        }
+    });
+}
+
+#[test]
 fn an_open_loop_run_records_every_message() {
     let samples = smoke(Shape::W1, StageLoad::Open { rate: 20_000 });
     assert_eq!(samples.receivers[0].receive.len(), 200);

@@ -941,6 +941,30 @@ pub fn send_role<P: Protection>(
     })
 }
 
+/// Waits until message `sequence` completes, for at most [`ACK_TIMEOUT`],
+/// given the receiver's completed count and whether it has stopped.
+///
+/// The receiver publishes its last count before it stops, so a stop is
+/// read first and the count after it: a receiver that completed the
+/// message and then stopped is no stop for it (the in-process form of
+/// the process STOP that carries its count).
+fn wait_for_ack(completed: impl Fn() -> u64, done: impl Fn() -> bool, sequence: u64) -> Wait {
+    let start = Instant::now();
+    loop {
+        let stopped = done();
+        if completed() > sequence {
+            return Wait::Completed;
+        }
+        if stopped {
+            return Wait::Stopped;
+        }
+        if start.elapsed() >= ACK_TIMEOUT {
+            return Wait::TimedOut;
+        }
+        std::hint::spin_loop();
+    }
+}
+
 /// Sets its flag when dropped, so a role that returns, fails or panics
 /// always tells the other one.
 struct SetOnDrop<'a>(&'a AtomicBool);
@@ -1000,21 +1024,18 @@ pub fn run<P: Protection + Sync>(
         });
         let sending = scope.spawn(|| {
             let _done = SetOnDrop(&sender_done);
-            let stopped = || receiver_done.load(Ordering::Acquire);
+            // A receiver that stopped after the run's last message is no
+            // stop: its count is read after its stop.
+            let stopped = || {
+                receiver_done.load(Ordering::Acquire)
+                    && completed.load(Ordering::Acquire) < prepared.total
+            };
             let wait = |sequence: u64| {
-                let start = Instant::now();
-                loop {
-                    if completed.load(Ordering::Acquire) > sequence {
-                        return Wait::Completed;
-                    }
-                    if stopped() {
-                        return Wait::Stopped;
-                    }
-                    if start.elapsed() >= ACK_TIMEOUT {
-                        return Wait::TimedOut;
-                    }
-                    std::hint::spin_loop();
-                }
+                wait_for_ack(
+                    || completed.load(Ordering::Acquire),
+                    || receiver_done.load(Ordering::Acquire),
+                    sequence,
+                )
             };
             send_role(
                 &run,
