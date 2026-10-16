@@ -1226,3 +1226,37 @@ fn mirror_sequences_are_dense_over_created_journals() {
     );
     assert_eq!(driver.trace_mirror().assigned_sequence(), 3);
 }
+
+/// The journal sequence is checked (SPEC.md §14): when the next one would
+/// not fit, the journal is refused and nothing is created; the last
+/// sequence is still handed out.
+#[test]
+fn an_exhausted_journal_sequence_refuses_without_creating() {
+    let mut driver = driver(4, 64, 64);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    driver.trace_journals.next_sequence = u64::MAX;
+    assert_eq!(
+        refused(&request(&mut driver, &mut conductor, LAYOUT, publication)),
+        ErrorCode::TraceJournalsExhausted
+    );
+    assert!(entries(&driver).is_empty());
+    assert_eq!(driver.trace_journals.next_sequence, u64::MAX);
+    assert_eq!(driver.trace_journals.bytes, 0);
+    driver.trace_journals.next_sequence = u64::MAX - 1;
+    let _journal = journal(&mut driver, &mut conductor, publication);
+    assert_eq!(entries(&driver)[0].sequence, u64::MAX - 1);
+    assert_eq!(driver.trace_journals.next_sequence, u64::MAX);
+    assert_eq!(driver.trace_journals.bytes, journal_bytes(&LAYOUT).unwrap());
+}
+
+/// Releasing a journal's bytes is checked: a charge larger than what is
+/// held goes to zero explicitly and counts one counter overflow.
+#[test]
+fn releasing_more_bytes_than_held_counts_an_overflow() {
+    let driver = driver(4, 64, 64);
+    let overflows = counter(&driver, "counter overflows");
+    assert_eq!(super::release(5, 3, &driver.counters), 2);
+    assert_eq!(counter(&driver, "counter overflows"), overflows);
+    assert_eq!(super::release(2, 3, &driver.counters), 0);
+    assert_eq!(counter(&driver, "counter overflows"), overflows + 1);
+}

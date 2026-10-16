@@ -1247,7 +1247,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         #[cfg(target_os = "linux")]
         let admitted = self.serve_admission();
         #[cfg(not(target_os = "linux"))]
-        let admitted = 0;
+        let admitted: (u32, Option<DriverError>) = (0, None);
         // Retire before sampling liveness: an orderly close at the
         // deadline is a retirement, not a time-out.
         self.retire_closed_clients();
@@ -1256,7 +1256,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.free_retired_streams();
         let mut work = self.serve_commands();
         let mut first_error = None;
-        add_work(&self.counters, &mut work, &mut first_error, admitted);
+        add_step(&self.counters, &mut work, &mut first_error, admitted);
         add_work(&self.counters, &mut work, &mut first_error, alive);
         let charged = self.charged_generations();
         let mut opened = Vec::new();
@@ -1719,6 +1719,23 @@ fn account_deadlines(
         first_error.get_or_insert(DriverError::from(error));
     }
     report.waiting
+}
+
+/// Adds a step's own checked count to a duty cycle's work count, as
+/// [`add_work`]: the work that fit is added, and an overflow inside the
+/// step counts one `counter overflows` and becomes the cycle's error
+/// unless an earlier one is recorded.
+fn add_step(
+    counters: &DriverCounters,
+    work: &mut u32,
+    first_error: &mut Option<DriverError>,
+    (count, overflow): (u32, Option<DriverError>),
+) {
+    add_work(counters, work, first_error, count);
+    if let Some(error) = overflow {
+        counters.add(Event::CounterOverflows, 1);
+        first_error.get_or_insert(error);
+    }
 }
 
 /// Adds `delta` to a duty cycle's work count with a checked sum
@@ -2240,6 +2257,32 @@ mod tests {
         assert!(matches!(
             error,
             Some(DriverError::WorkCountOverflow { delta: 2, .. })
+        ));
+        assert_eq!(counters.value(Event::CounterOverflows), 2);
+    }
+
+    /// A step that overflowed inside adds the work that fit, counts one
+    /// overflow and sets the cycle's error; an earlier error is kept.
+    #[test]
+    fn a_step_overflow_adds_what_fit_and_is_a_typed_error() {
+        let counters = DriverCounters::new().unwrap();
+        let mut work = 3;
+        let mut error = None;
+        add_step(&counters, &mut work, &mut error, (4, None));
+        assert_eq!((work, error.is_none()), (7, true));
+        let overflow = DriverError::WorkCountOverflow { count: 5, delta: 9 };
+        add_step(&counters, &mut work, &mut error, (5, Some(overflow)));
+        assert_eq!(work, 12);
+        assert!(matches!(
+            error,
+            Some(DriverError::WorkCountOverflow { count: 5, delta: 9 })
+        ));
+        assert_eq!(counters.value(Event::CounterOverflows), 1);
+        let later = DriverError::WorkCountOverflow { count: 1, delta: 1 };
+        add_step(&counters, &mut work, &mut error, (0, Some(later)));
+        assert!(matches!(
+            error,
+            Some(DriverError::WorkCountOverflow { count: 5, .. })
         ));
         assert_eq!(counters.value(Event::CounterOverflows), 2);
     }

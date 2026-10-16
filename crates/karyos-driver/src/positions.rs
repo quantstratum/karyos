@@ -24,6 +24,7 @@
 
 use karyos_client::LinkStatus;
 use karyos_sys::counters::{Counter, CounterKeys, KIND_NONE, KIND_SUBSCRIBER};
+use karyos_sys::host_clock::age_ns;
 
 use crate::counters::{DriverCounters, Event, TYPE_POSITION};
 use crate::embedded::{Stream, StreamTerms};
@@ -115,8 +116,7 @@ impl Positions {
     /// Whether a pass is due at host time `now`, `interval` nanoseconds
     /// after the last one.
     pub(crate) fn due(&self, now: u64, interval: u64) -> bool {
-        self.last
-            .is_none_or(|last| now.saturating_sub(last) >= interval)
+        self.last.is_none_or(|last| age_ns(now, last) >= interval)
     }
 
     /// Makes the next duty cycle run a pass.
@@ -523,6 +523,19 @@ mod tests {
         assert_eq!(fixed(&driver, "positions epoch"), 4);
         assert_eq!(fixed(&driver, "counter overflows"), overflows + 1);
         assert_eq!(position(&driver, "stream head"), Some(head));
+    }
+
+    /// A clock that stepped back gives an age of zero (`age_ns`): no pass
+    /// is due until it reaches the interval again.
+    #[test]
+    fn a_clock_that_steps_back_makes_no_pass_due() {
+        let positions = Positions {
+            last: Some(1_000),
+            ..Positions::default()
+        };
+        assert!(!positions.due(500, 100));
+        assert!(!positions.due(1_099, 100));
+        assert!(positions.due(1_100, 100));
     }
 
     #[test]
