@@ -27,6 +27,7 @@
 //! | `0x09` | `TraceJournal` | sequence | capacity in records (a power of two) | payload words (nonzero) | drop ranges (nonzero) |
 //! | `0x0A` | `CloseJournal` | sequence | journal number (nonzero) | final delivery boundary | |
 //! | `0x0B` | `QueryCutover` | sequence | registration | | |
+//! | `0x0C` | `AddConflatedSubscription` | sequence | stream and session as above | | |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
@@ -34,6 +35,17 @@
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
+//! | `0x88` | `ConflatedReady` | client | sequence | registration | hand-over key |
+//!
+//! `AddConflatedSubscription` and `ConflatedReady` (`quantstratum-docs:
+//! karyos/design/conflation-end-to-end.md`, Cross-process views): a view
+//! of a conflated stream's table, which the grant's fetch carries as one
+//! `ConflationTable` region reopened read-only. `ConflatedReady` continues
+//! after its four words with the table's configuration, which the view
+//! checks against its own limits before it maps anything and then requires
+//! of the region: word 4 is the key count (it fits 32 bits), word 5 the
+//! value capacity and word 6 the journal capacity, in bytes. A stream that
+//! is not conflated is refused with `Error` and `UnknownStream`.
 //!
 //! `QueryCutover` and `CutoverState` (`quantstratum-docs:
 //! karyos/design/ipc-data-path.md`, "Resync after a lap"; coordinator
@@ -116,8 +128,10 @@ const ALLOCATE_COUNTER_WORDS: usize = 5 + LABEL_WORDS;
 const REPORT_LOSS_WORDS: usize = 9;
 /// Largest encoded command, in bytes: `AllocateCounter`.
 pub const MAX_COMMAND_LENGTH: usize = ALLOCATE_COUNTER_WORDS * 8;
-/// Largest encoded response, in bytes.
-pub const MAX_RESPONSE_LENGTH: usize = 4 * 8;
+/// Words of an encoded `ConflatedReady`: four, and the configuration.
+const CONFLATED_READY_WORDS: usize = 7;
+/// Largest encoded response, in bytes: `ConflatedReady`.
+pub const MAX_RESPONSE_LENGTH: usize = CONFLATED_READY_WORDS * 8;
 /// Largest encoded driver event, in bytes.
 pub const MAX_EVENT_LENGTH: usize = 5 * 8;
 
@@ -132,6 +146,7 @@ const REPORT_LOSS: u32 = 0x08;
 const TRACE_JOURNAL: u32 = 0x09;
 const CLOSE_JOURNAL: u32 = 0x0A;
 const QUERY_CUTOVER: u32 = 0x0B;
+const ADD_CONFLATED_SUBSCRIPTION: u32 = 0x0C;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -139,6 +154,7 @@ const ERROR: u32 = 0x84;
 const COUNTER_ALLOCATED: u32 = 0x85;
 const JOURNAL_READY: u32 = 0x86;
 const CUTOVER_STATE: u32 = 0x87;
+const CONFLATED_READY: u32 = 0x88;
 const PARTICIPANT_LOST: u32 = 0xC1;
 const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
 const PUBLICATION_CLOSED: u32 = 0xC3;
@@ -561,6 +577,13 @@ pub enum Command {
         /// The registration.
         registration: u64,
     },
+    /// Ask for a read-only view of a conflated stream's table.
+    AddConflatedSubscription {
+        /// Request sequence.
+        sequence: u64,
+        /// The stream.
+        stream: StreamKey,
+    },
 }
 
 /// Why the driver refused a command.
@@ -674,6 +697,21 @@ pub enum Response {
         /// Its state.
         state: CutoverState,
     },
+    /// The view of a conflated stream's table is ready for hand-over.
+    ConflatedReady {
+        /// The request.
+        request: RequestId,
+        /// The new registration.
+        registration: u64,
+        /// The hand-over key.
+        key: u64,
+        /// The table's key count.
+        keys: u32,
+        /// The table's value capacity in bytes.
+        value_capacity: u64,
+        /// The table's journal capacity in bytes.
+        journal_capacity: u64,
+    },
 }
 
 /// Where a remote registration stands in its stream's cutovers, as
@@ -770,6 +808,7 @@ impl Command {
             Self::TraceJournal { .. } => TRACE_JOURNAL,
             Self::CloseJournal { .. } => CLOSE_JOURNAL,
             Self::QueryCutover { .. } => QUERY_CUTOVER,
+            Self::AddConflatedSubscription { .. } => ADD_CONFLATED_SUBSCRIPTION,
         }
     }
 
@@ -787,7 +826,8 @@ impl Command {
             | Self::ReportLoss { sequence, .. }
             | Self::TraceJournal { sequence, .. }
             | Self::CloseJournal { sequence, .. }
-            | Self::QueryCutover { sequence, .. } => sequence,
+            | Self::QueryCutover { sequence, .. }
+            | Self::AddConflatedSubscription { sequence, .. } => sequence,
         }
     }
 
@@ -898,6 +938,9 @@ impl Command {
                 sequence,
                 registration,
             } => write_words(&[sequence, registration], out),
+            Self::AddConflatedSubscription { sequence, stream } => {
+                write_words(&[sequence, stream_word(stream)], out)
+            }
         }
     }
 
@@ -1054,6 +1097,13 @@ impl Command {
                     registration,
                 })
             }
+            ADD_CONFLATED_SUBSCRIPTION => {
+                let [sequence, stream] = read_words::<2>(type_id, bytes)?;
+                Ok(Self::AddConflatedSubscription {
+                    sequence,
+                    stream: stream_from(stream),
+                })
+            }
             _ => Err(CncError::UnknownType { type_id }),
         }
     }
@@ -1071,6 +1121,7 @@ impl Response {
             Self::CounterAllocated { .. } => COUNTER_ALLOCATED,
             Self::JournalReady { .. } => JOURNAL_READY,
             Self::CutoverState { .. } => CUTOVER_STATE,
+            Self::ConflatedReady { .. } => CONFLATED_READY,
         }
     }
 
@@ -1084,7 +1135,8 @@ impl Response {
             | Self::Error { request, .. }
             | Self::CounterAllocated { request, .. }
             | Self::JournalReady { request, .. }
-            | Self::CutoverState { request, .. } => request,
+            | Self::CutoverState { request, .. }
+            | Self::ConflatedReady { request, .. } => request,
         }
     }
 
@@ -1132,6 +1184,25 @@ impl Response {
                 state,
             } => write_words(
                 &[request.client, request.sequence, registration, state.code()],
+                out,
+            ),
+            Self::ConflatedReady {
+                request,
+                registration,
+                key,
+                keys,
+                value_capacity,
+                journal_capacity,
+            } => write_words(
+                &[
+                    request.client,
+                    request.sequence,
+                    registration,
+                    key,
+                    u64::from(keys),
+                    value_capacity,
+                    journal_capacity,
+                ],
                 out,
             ),
         }
@@ -1200,6 +1271,26 @@ impl Response {
                     request: RequestId { client, sequence },
                     registration,
                     state,
+                })
+            }
+            CONFLATED_READY => {
+                let [
+                    client,
+                    sequence,
+                    registration,
+                    key,
+                    keys,
+                    value_capacity,
+                    journal_capacity,
+                ] = read_words::<CONFLATED_READY_WORDS>(type_id, bytes)?;
+                let keys = u32::try_from(keys).map_err(|_| CncError::Reserved { type_id })?;
+                Ok(Self::ConflatedReady {
+                    request: RequestId { client, sequence },
+                    registration,
+                    key,
+                    keys,
+                    value_capacity,
+                    journal_capacity,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -1578,6 +1669,13 @@ mod tests {
                     ..loss()
                 },
             },
+            Command::AddConflatedSubscription {
+                sequence: 11,
+                stream: StreamKey {
+                    stream_id: -3,
+                    session_id: i32::MIN,
+                },
+            },
         ];
         for command in commands {
             let mut out = [0u8; MAX_COMMAND_LENGTH];
@@ -1622,6 +1720,14 @@ mod tests {
                 cell: 7,
                 registration: 8,
             },
+            Response::ConflatedReady {
+                request,
+                registration: 9,
+                key: 10,
+                keys: u32::MAX,
+                value_capacity: 64,
+                journal_capacity: 1 << 20,
+            },
         ];
         for response in responses {
             let mut out = [0u8; MAX_RESPONSE_LENGTH];
@@ -1632,6 +1738,62 @@ mod tests {
             );
             assert_eq!(response.request(), request);
         }
+    }
+
+    /// The conflated view's messages, in literal bytes; a key count that
+    /// does not fit 32 bits is refused.
+    #[test]
+    fn conflated_view_golden_bytes() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let command = Command::AddConflatedSubscription {
+            sequence: 0x0102,
+            stream: StreamKey {
+                stream_id: -2,
+                session_id: 7,
+            },
+        };
+        let length = command.encode(&mut out).unwrap();
+        assert_eq!(command.type_id(), 0x0C);
+        assert_eq!(
+            &out[..length],
+            &[
+                0x02, 0x01, 0, 0, 0, 0, 0, 0, // sequence
+                0xfe, 0xff, 0xff, 0xff, 7, 0, 0, 0, // stream -2, session 7
+            ]
+        );
+        let mut out = [0u8; MAX_RESPONSE_LENGTH];
+        let response = Response::ConflatedReady {
+            request: RequestId {
+                client: 3,
+                sequence: 4,
+            },
+            registration: 5,
+            key: 6,
+            keys: 7,
+            value_capacity: 8,
+            journal_capacity: 0x0400,
+        };
+        let length = response.encode(&mut out).unwrap();
+        assert_eq!(response.type_id(), 0x88);
+        assert_eq!(length, MAX_RESPONSE_LENGTH);
+        assert_eq!(
+            &out[..length],
+            &[
+                3, 0, 0, 0, 0, 0, 0, 0, // client
+                4, 0, 0, 0, 0, 0, 0, 0, // sequence
+                5, 0, 0, 0, 0, 0, 0, 0, // registration
+                6, 0, 0, 0, 0, 0, 0, 0, // key
+                7, 0, 0, 0, 0, 0, 0, 0, // keys
+                8, 0, 0, 0, 0, 0, 0, 0, // value capacity
+                0, 4, 0, 0, 0, 0, 0, 0, // journal capacity
+            ]
+        );
+        let mut wide = out;
+        wide[32..40].copy_from_slice(&(u64::from(u32::MAX) + 1).to_le_bytes());
+        assert_eq!(
+            Response::decode(0x88, &wide),
+            Err(CncError::Reserved { type_id: 0x88 })
+        );
     }
 
     /// Literal bytes, so a layout change cannot hide behind a matching
@@ -1719,7 +1881,7 @@ mod tests {
             ]
         );
         assert_eq!(ErrorCode::InvalidPublicationMode.code(), 6);
-        let mut response = [0u8; MAX_RESPONSE_LENGTH];
+        let mut response = [0u8; 4 * 8];
         response[16] = 6;
         assert!(matches!(
             Response::decode(0x84, &response),
@@ -1763,10 +1925,10 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x0C, &out[..length]),
+            Command::decode(0x0D, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
-        let mut response = [0u8; MAX_RESPONSE_LENGTH];
+        let mut response = [0u8; 4 * 8];
         response[16] = 99;
         assert!(matches!(
             Response::decode(0x84, &response),
@@ -1862,7 +2024,7 @@ mod tests {
         };
         assert_eq!(response.type_id(), 0x85);
         let mut out = [0u8; MAX_RESPONSE_LENGTH];
-        assert_eq!(response.encode(&mut out), Ok(MAX_RESPONSE_LENGTH));
+        assert_eq!(response.encode(&mut out), Ok(4 * 8));
     }
 
     #[test]
@@ -2115,6 +2277,9 @@ mod tests {
             OPERATION_SUCCEEDED,
             ERROR,
             COUNTER_ALLOCATED,
+            JOURNAL_READY,
+            CUTOVER_STATE,
+            CONFLATED_READY,
         ] {
             assert!(!Event::is_event_type(response_type));
         }
@@ -2317,6 +2482,7 @@ mod properties {
             TRACE_JOURNAL,
             CLOSE_JOURNAL,
             QUERY_CUTOVER,
+            ADD_CONFLATED_SUBSCRIPTION,
         ],
     };
 
@@ -2333,6 +2499,7 @@ mod properties {
             COUNTER_ALLOCATED,
             JOURNAL_READY,
             CUTOVER_STATE,
+            CONFLATED_READY,
         ],
     };
 
@@ -2642,6 +2809,9 @@ mod properties {
                 sequence,
                 registration,
             }),
+            (any::<u64>(), stream()).prop_map(|(sequence, stream)| {
+                Command::AddConflatedSubscription { sequence, stream }
+            }),
         ]
     }
 
@@ -2699,6 +2869,18 @@ mod properties {
                     request,
                     registration,
                     state,
+                }
+            ),
+            (request(), any::<(u64, u64, u32, u64, u64)>()).prop_map(
+                |(request, (registration, key, keys, value_capacity, journal_capacity))| {
+                    Response::ConflatedReady {
+                        request,
+                        registration,
+                        key,
+                        keys,
+                        value_capacity,
+                        journal_capacity,
+                    }
                 }
             ),
         ]
@@ -2778,6 +2960,7 @@ mod properties {
                     (TRACE_JOURNAL, 6),
                     (CLOSE_JOURNAL, 3),
                     (QUERY_CUTOVER, 2),
+                    (ADD_CONFLATED_SUBSCRIPTION, 2),
                 ],
             ),
         ) {
@@ -2797,6 +2980,7 @@ mod properties {
                     (COUNTER_ALLOCATED, 4),
                     (JOURNAL_READY, 4),
                     (CUTOVER_STATE, 4),
+                    (CONFLATED_READY, CONFLATED_READY_WORDS),
                 ],
             ),
         ) {

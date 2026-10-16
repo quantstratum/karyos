@@ -1000,6 +1000,32 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         added
     }
 
+    /// The table of a conflated stream: in a driver-only region when this
+    /// driver admits remote clients, so views in other processes map it
+    /// read-only (`quantstratum-docs: karyos/design/conflation-end-to-end.md`,
+    /// Cross-process views); on the heap otherwise.
+    fn conflation_table(
+        &mut self,
+        config: ConflationConfig,
+    ) -> Result<ConflationWriter, DriverError> {
+        #[cfg(target_os = "linux")]
+        if let Some(admission) = self.admission.as_mut() {
+            let (instance, region) = admission.next_region()?;
+            return Ok(karyos_sys::conflation::conflation_in(
+                instance,
+                region,
+                config.keys,
+                config.value_capacity,
+                config.journal_capacity,
+            )?);
+        }
+        Ok(conflation(
+            config.keys,
+            config.value_capacity,
+            config.journal_capacity,
+        )?)
+    }
+
     fn add_stream_checked(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
         // A key in use (active or retiring) is reported before the quota.
         let key = (config.buffer.stream_id, config.buffer.session_id);
@@ -1028,11 +1054,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .ok_or(karyos_sys::error::SysError::ResourcesUnavailable)?;
         let (feeder, members) = match config.conflation {
             Some(conflation_config) => {
-                let writer = conflation(
-                    conflation_config.keys,
-                    conflation_config.value_capacity,
-                    conflation_config.journal_capacity,
-                )?;
+                let writer = self.conflation_table(conflation_config)?;
                 let inner = conductor.subscribe(Role::Required)?;
                 let link = GenerationLink::new();
                 let subscription =

@@ -36,6 +36,12 @@ pub(crate) enum Participant {
     /// No stream participant: a client trace journal (`quantstratum-docs:
     /// karyos/design/trace-journal-region.md`), whose grant has stream 0.
     Journal { journal: u64 },
+    /// No log buffer participant: a read-only view of the stream's
+    /// conflation table (`quantstratum-docs:
+    /// karyos/design/conflation-end-to-end.md`, Cross-process views). The
+    /// table outlives mapping generations, so a cutover neither moves nor
+    /// fences the grant, and it charges no generation.
+    Conflation,
 }
 
 /// One grant.

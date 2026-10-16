@@ -778,6 +778,29 @@ impl<T: StreamTerms> Admission<T> {
             };
             return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, fd);
         }
+        if grant.participant == Participant::Conflation {
+            // The table's region, reopened read-only (A1): the view never
+            // gets the driver's writable descriptor. Gone with the feeder
+            // (stream removed, feeder lost or ended), it is refused.
+            let found = driver
+                .streams
+                .iter()
+                .find(|s| s.id == grant.stream)
+                .and_then(|stream| {
+                    let region = stream.feeder.as_ref()?.writer.region()?;
+                    let record = Record {
+                        stream_id: stream.stream_id,
+                        session_id: stream.session_id,
+                        lane: stream.config.lane.get(),
+                        ..record(region, grant.export)?
+                    };
+                    Some((record, region.read_only_descriptor().ok()))
+                });
+            let Some((record, fd)) = found else {
+                return refuse(remote, refusal::RESOURCES);
+            };
+            return Self::queue_fetch(remote, driver, config, fetch, key, &grant, record, fd);
+        }
         let Some(stream) = driver.streams.iter().find(|s| s.id == grant.stream) else {
             return refuse(remote, refusal::RESOURCES);
         };
@@ -1036,8 +1059,8 @@ fn grant_record(
             } => Capability::ObserverSubscriber {
                 cell: u64::try_from(cell).ok()?,
             },
-            // A journal grant has no log buffer record.
-            Participant::Journal { .. } => return None,
+            // A journal or conflation grant has no log buffer record.
+            Participant::Journal { .. } | Participant::Conflation => return None,
         },
     })
 }

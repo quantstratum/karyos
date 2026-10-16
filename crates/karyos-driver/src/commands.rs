@@ -978,6 +978,97 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     None => refuse(ErrorCode::UnknownRegistration, registration),
                 }
             }
+            Command::AddConflatedSubscription { stream, .. } => {
+                self.add_conflated(client, request, stream)
+            }
+        }
+    }
+
+    /// Serves `AddConflatedSubscription` (`quantstratum-docs:
+    /// karyos/design/conflation-end-to-end.md`, Cross-process views): a
+    /// remote client's read-only view of a live conflated stream's table.
+    /// Every check first (the stream, its table, the client's export
+    /// bounds, identities), then the effects, which cannot fail: the grant
+    /// is `Held` under a fresh export and its fetch carries the table's
+    /// region reopened read-only. An in-process client takes its view with
+    /// `subscribe_conflated` instead, so it is refused here.
+    fn add_conflated(&mut self, client: u64, request: RequestId, stream: StreamKey) -> Response {
+        let refuse = |code: ErrorCode, detail: u64| Response::Error {
+            request,
+            code,
+            detail,
+        };
+        let detail = u64::from(stream.stream_id.cast_unsigned());
+        let Some(target) = self
+            .find_stream(stream)
+            .and_then(|index| self.streams.get(index))
+        else {
+            return refuse(ErrorCode::UnknownStream, detail);
+        };
+        // A stream that is not conflated has no table, as for
+        // `subscribe_conflated`; one whose feeder is gone (lost or ended)
+        // no longer has one.
+        let (Some(config), Some(feeder)) = (target.conflation, target.feeder.as_ref()) else {
+            return refuse(ErrorCode::UnknownStream, detail);
+        };
+        let (stream, generation) = (target.id, target.generation.get());
+        let (Ok(value_capacity), Ok(journal_capacity)) = (
+            u64::try_from(config.value_capacity),
+            u64::try_from(config.journal_capacity),
+        ) else {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        };
+        let bytes = conflation_bytes(&feeder.writer);
+        let admitted = self
+            .ledger(client)
+            .map(|ledger| !ledger.full() && bytes.is_some_and(|bytes| ledger.fetchable(1, bytes)));
+        if admitted != Some(true) {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        }
+        let registration = self.next_registration;
+        let Some(next) = registration.checked_add(1) else {
+            return refuse(ErrorCode::IdentitiesExhausted, 0);
+        };
+        let export = self.next_export;
+        if !registration::valid_export(export) {
+            return refuse(ErrorCode::IdentitiesExhausted, 0);
+        }
+        // Effect: everything below cannot fail.
+        self.next_registration = next;
+        self.next_export = export + 1;
+        if let Some(ledger) = self.ledger_mut(client) {
+            ledger.push(Grant {
+                export,
+                registration,
+                key: registration,
+                stream,
+                participant: Participant::Conflation,
+                state: GrantState::Held,
+                sent: false,
+                generation,
+                fence_at: None,
+                fenced: false,
+            });
+        }
+        self.registrations.push(Registration {
+            id: registration,
+            client,
+            stream,
+            kind: Kind::Subscription,
+            // A remote registration has no in-process lease: it ends with
+            // its grant.
+            end: Arc::new(LeaseEnd::default()),
+            subscriber: None,
+            join: None,
+        });
+        self.counters.add(Event::GrantsReserved, 1);
+        Response::ConflatedReady {
+            request,
+            registration,
+            key: registration,
+            keys: config.keys,
+            value_capacity,
+            journal_capacity,
         }
     }
 
@@ -1373,6 +1464,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Exclusive
             | Participant::Concurrent { .. }
             | Participant::Journal { .. } => (Kind::Publication, None),
+            // Never built here either: `AddConflatedSubscription` builds it.
+            Participant::Conflation => (Kind::Subscription, None),
         };
         self.registrations.push(Registration {
             id: registration,
@@ -1439,6 +1532,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.counters.add(Event::GrantsEnded, 1);
             return;
         }
+        // A view of a conflation table holds nothing in the log buffer: the
+        // table only reads as closed or open to it.
+        if grant.participant == Participant::Conflation {
+            self.counters.add(Event::GrantsEnded, 1);
+            return;
+        }
         let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
             return;
         };
@@ -1463,7 +1562,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Concurrent { slot } => conductor
                 .end_concurrent_publication(slot, grant.export)
                 .unwrap_or(false),
-            Participant::Journal { .. } => false,
+            Participant::Journal { .. } | Participant::Conflation => false,
         };
         if ended {
             self.counters.add(Event::GrantsEnded, 1);
@@ -1504,6 +1603,27 @@ pub(crate) fn fetch_bytes<T: StreamTerms>(buffer: &karyos_sys::log_buffer::LogBu
     {
         let _ = buffer;
         0
+    }
+}
+
+/// Bytes a fetch of a conflation table's region carries: its header stride
+/// and its structure; `None` for a table on the heap, which no remote
+/// client can map.
+fn conflation_bytes(writer: &karyos_sys::conflation::ConflationWriter) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let bytes = writer
+            .region()?
+            .record()
+            .structure_length
+            .checked_add(karyos_sys::ipc::HEADER_STRIDE)
+            .and_then(|bytes| u64::try_from(bytes).ok());
+        Some(bytes.unwrap_or(u64::MAX))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = writer;
+        None
     }
 }
 
