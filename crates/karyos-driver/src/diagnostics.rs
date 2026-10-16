@@ -38,6 +38,10 @@ pub enum ErrorCode {
     /// `ConflationFeederLost`; the key is the aggregate registration and the
     /// lane.
     ConflationFeederLost = 8,
+    /// A guard word broke its encoding (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, G2): the guard is treated as
+    /// closed; the key is the guard id and the word.
+    GuardWordCorrupt = 9,
 }
 
 /// The agent that reported an error.

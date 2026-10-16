@@ -72,7 +72,7 @@ pub enum AuditOutcome {
 pub struct AuditRecord {
     /// The driver's monotonic clock at the transition.
     pub time: u64,
-    /// The guard id; 0 for an unknown guard.
+    /// The guard id the requester named, known or not.
     pub guard: u64,
     /// The guard word before; 0 for an unknown guard.
     pub before: u64,
@@ -221,7 +221,8 @@ impl Guards {
         let (before, after, result) = match checked {
             Ok(found) => found,
             Err(error) => {
-                self.record(time, 0, 0, 0, operation, requester, refused(&error));
+                let id = handle.guard;
+                self.record(time, id, 0, 0, operation, requester, refused(&error));
                 return Err(error);
             }
         };
@@ -264,7 +265,8 @@ impl Guards {
         let (before, after, result) = match checked {
             Ok(found) => found,
             Err(error) => {
-                self.record(time, 0, 0, 0, operation, requester, refused(&error));
+                let id = handle.guard;
+                self.record(time, id, 0, 0, operation, requester, refused(&error));
                 return Err(error);
             }
         };
@@ -312,6 +314,17 @@ impl Guards {
             requester,
             outcome,
         });
+    }
+
+    /// Tests: overwrites a guard's word, to reach states such as the last
+    /// epoch or a corrupt word.
+    #[cfg(test)]
+    pub(crate) fn set_word(&self, handle: GuardHandle, word: u64) {
+        if let Ok(entry) = self.check(handle)
+            && let Some(cell) = entry.word.words().first()
+        {
+            cell.store(word, karyos_sys::sync::Ordering::Release);
+        }
     }
 
     /// A snapshot of the audit ring.
@@ -412,7 +425,7 @@ mod tests {
                 },
                 AuditRecord {
                     time: 103,
-                    guard: 0,
+                    guard: 1,
                     before: 0,
                     after: 0,
                     operation: 13,

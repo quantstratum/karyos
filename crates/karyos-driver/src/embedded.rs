@@ -1184,8 +1184,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         operation: u64,
     ) -> Result<karyos_sys::guard::Closed, DriverError> {
         let now = self.clock.now();
-        self.guards
-            .close(guard, operation, crate::guards::Requester::InProcess, now)
+        let closed = self
+            .guards
+            .close(guard, operation, crate::guards::Requester::InProcess, now);
+        if let Err(error) = &closed {
+            self.report_guard_error(guard.id(), error);
+        }
+        closed
+    }
+
+    /// Reports a corrupt guard word in the error log (G2); other guard
+    /// errors are the caller's to handle.
+    pub(crate) fn report_guard_error(&mut self, guard: u64, error: &DriverError) {
+        if let DriverError::Guard(karyos_sys::guard::GuardError::Corrupt { word }) = error {
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::GuardWordCorrupt,
+                [guard, *word],
+                &error.to_string(),
+            );
+        }
     }
 
     /// Reopens a guard closed at `expected` for the in-process caller (G1),
@@ -1202,13 +1220,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         operation: u64,
     ) -> Result<u64, DriverError> {
         let now = self.clock.now();
-        self.guards.reopen(
+        let reopened = self.guards.reopen(
             guard,
             expected,
             operation,
             crate::guards::Requester::InProcess,
             now,
-        )
+        );
+        if let Err(error) = &reopened {
+            self.report_guard_error(guard.id(), error);
+        }
+        reopened
     }
 
     /// A snapshot of the guard audit ring (G9 interim).
