@@ -1265,6 +1265,11 @@ fn scan_data(bytes: &[u8]) -> Result<Datagram<'_>, ControlError> {
     let mut group: Option<(Alias, Lane)> = None;
     loop {
         let record = bytes.get(offset..).ok_or(ControlError::Truncated)?;
+        if offset != 0 && record.len() < 8 {
+            // Bytes that cannot hold a first word are a trailer, not a
+            // truncated record: the cursor must end exactly at the end.
+            return Err(ControlError::InvalidGrouping);
+        }
         let r = Reader(record);
         let frame_length = r.i32(0)?;
         let code = r.u16(6)?;
