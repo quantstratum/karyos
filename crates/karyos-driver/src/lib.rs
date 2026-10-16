@@ -28,7 +28,8 @@ mod trace_journals;
 pub use admission::{DEFAULT_MAX_TOOLS, IpcConfig};
 pub use clock::{MonotonicClock, SystemClock};
 pub use embedded::{
-    DriverConfig, EmbeddedDriver, FIRST_INCARNATION, StreamConfig, StreamHandle, StreamState,
+    AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, FIRST_INCARNATION,
+    StreamConfig, StreamHandle, StreamState,
 };
 pub use error::DriverError;
 pub use generations::{GenerationInfo, Reconfiguration};

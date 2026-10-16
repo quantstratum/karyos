@@ -29,6 +29,13 @@ pub enum DriverError {
     /// Stream identities are exhausted.
     #[error("stream identities exhausted")]
     StreamIdsExhausted,
+    /// The stream is one lane of an aggregate of several: it is removed or
+    /// reconfigured with its aggregate.
+    #[error("stream {stream} is a lane of an aggregate; act on the aggregate")]
+    LaneOfAggregate {
+        /// The stream.
+        stream: u64,
+    },
     /// A stream with the same wire stream id and session already exists.
     #[error("stream {stream_id} session {session_id} already exists")]
     DuplicateStream {

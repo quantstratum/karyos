@@ -33,12 +33,14 @@ use karyos_client::{
     GenerationLink, MessageLimit,
 };
 use karyos_protocol::cnc::{CloseReason, Event as DriverEvent, MAX_RESPONSE_LENGTH, StreamKey};
+use karyos_protocol::lanes::drr::{DrrConfig, MAX_LANES};
 use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::conflation::{
     Budget as ConflationBudget, ConflationConfig, ConflationError, ConflationWriter, conflation,
 };
 use karyos_sys::counters::{Counter, CounterKeys, KIND_NONE};
+use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, LossPolicy, Publication,
     Role, SealReason, SealState,
@@ -294,6 +296,74 @@ pub struct StreamHandle {
     stream: u64,
 }
 
+/// The configuration of an aggregate publication of one to four lanes
+/// (SPEC.md §7.4; `quantstratum-docs: karyos/design/aggregate-ownership.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateConfig {
+    /// The configuration every lane shares; lane `l` is lane `l`, whatever
+    /// `stream.buffer.lane` says.
+    pub stream: StreamConfig,
+    /// One deficit round robin quantum per lane, lane 0 first: their count,
+    /// 1 to 4, is the number of lanes. Each must be at least the largest
+    /// charged frame (the MTU aligned to 32 bytes).
+    pub quanta: Vec<u64>,
+}
+
+/// Names an aggregate publication and its lanes. Each lane is a stream with
+/// its own [`StreamHandle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AggregateHandle {
+    driver: u64,
+    /// Lane 0's stream id, the aggregate's registration.
+    registration: u64,
+    /// The stream id of each configured lane, by lane number.
+    lanes: [Option<u64>; MAX_LANES],
+}
+
+impl AggregateHandle {
+    /// The number of lanes.
+    #[must_use]
+    pub fn lanes(&self) -> u8 {
+        self.lanes
+            .iter()
+            .filter(|lane| lane.is_some())
+            .count()
+            .try_into()
+            .unwrap_or(0)
+    }
+
+    /// The stream of `lane`; `None` for a lane this aggregate does not have.
+    #[must_use]
+    pub fn lane(&self, lane: Lane) -> Option<StreamHandle> {
+        let stream = (*self.lanes.get(usize::from(lane.get()))?)?;
+        Some(StreamHandle {
+            driver: self.driver,
+            stream,
+        })
+    }
+
+    /// The streams of every lane, lane 0 first.
+    pub(crate) fn streams(&self) -> impl Iterator<Item = StreamHandle> + '_ {
+        self.lanes.iter().flatten().map(|stream| StreamHandle {
+            driver: self.driver,
+            stream: *stream,
+        })
+    }
+}
+
+/// What the lanes of one aggregate share, kept by each lane stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Aggregate {
+    /// The aggregate's registration: lane 0's stream id, or the only lane's
+    /// for a stream added with [`EmbeddedDriver::add_stream`]. Every field
+    /// that names the publication carries it with the lane.
+    pub(crate) registration: u64,
+    /// The number of lanes.
+    pub(crate) lanes: u8,
+    /// The validated scheduling profile.
+    pub(crate) profile: DrrConfig,
+}
+
 /// The lifecycle state of a stream (quantstratum-docs: karyos/design/stream-lifecycle.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamState {
@@ -306,12 +376,22 @@ pub enum StreamState {
     Freed,
 }
 
+/// The largest charged frame of a lane of `config` (aggregate-lanes.md,
+/// charged bytes): a frame never exceeds the MTU, aligned to 32 bytes.
+fn largest_charge(config: &StreamConfig) -> Result<u64, DriverError> {
+    karyos_sys::sizing::align_frame(config.buffer.mtu)
+        .map(u64::from)
+        .map_err(|_| DriverError::InvalidConfig)
+}
+
 /// Source of driver identities within the process.
 static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub(crate) struct Stream<T: StreamTerms> {
     pub(crate) id: u64,
+    /// The aggregate this lane belongs to.
+    pub(crate) aggregate: Aggregate,
     pub(crate) retiring: bool,
     pub(crate) buffer: Arc<LogBuffer<T>>,
     pub(crate) conductor: Conductor<Arc<LogBuffer<T>>>,
@@ -461,6 +541,10 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) registrations: Vec<crate::commands::Registration>,
     pub(crate) next_client: u64,
     pub(crate) next_stream: u64,
+    /// Tests: the stream id at which staging a lane fails, and the cutover
+    /// preparation of that stream.
+    #[cfg(test)]
+    pub(crate) fail_at: Option<u64>,
     pub(crate) next_registration: u64,
     pub(crate) scan_cursor: usize,
     pub(crate) terminal: bool,
@@ -691,6 +775,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             registrations: Vec::new(),
             next_client: 1,
             next_stream: 1,
+            #[cfg(test)]
+            fail_at: None,
             next_registration: 1,
             scan_cursor: 0,
             terminal: false,
@@ -889,6 +975,37 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// indicates a broken invariant.
     pub fn remove_stream(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
         let target = self.stream(stream)?;
+        if target.aggregate.lanes > 1 {
+            return Err(DriverError::LaneOfAggregate { stream: target.id });
+        }
+        self.retire_lane(stream)?;
+        self.update_stream_gauges();
+        Ok(())
+    }
+
+    /// Removes an aggregate: every lane is sealed as
+    /// [`EmbeddedDriver::remove_stream`] seals a stream, in one control
+    /// step. The seals are separate stores, one per lane, each with its own
+    /// seal position; no order across lanes is promised (SPEC.md §7.4).
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::remove_stream`].
+    pub fn remove_aggregate(&mut self, aggregate: &AggregateHandle) -> Result<(), DriverError> {
+        // Every lane is found before any is sealed.
+        for stream in aggregate.streams() {
+            self.stream(stream)?;
+        }
+        for stream in aggregate.streams() {
+            self.retire_lane(stream)?;
+        }
+        self.update_stream_gauges();
+        Ok(())
+    }
+
+    /// Seals one lane stream and marks it retiring, once.
+    fn retire_lane(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+        let target = self.stream(stream)?;
         if !target.retiring {
             // A stream an earlier seal closed keeps that reason and was
             // reported then.
@@ -914,7 +1031,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 });
             }
         }
-        self.update_stream_gauges();
         Ok(())
     }
 
@@ -990,7 +1106,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             u64::from(config.buffer.stream_id.cast_unsigned()),
             u64::from(config.buffer.session_id.cast_unsigned()),
         ];
-        let added = self.add_stream_checked(config);
+        // One lane, the configured one, with a quantum of the largest frame:
+        // exactly today's stream.
+        let lane = config.buffer.lane;
+        let added = largest_charge(&config)
+            .and_then(|charge| self.add_aggregate_checked(config, &[lane], &[charge]))
+            .and_then(|aggregate| aggregate.lane(lane).ok_or(DriverError::InvalidConfig));
         if let Err(error) = &added {
             self.diagnostics.error(
                 &mut self.counters,
@@ -1000,6 +1121,126 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             );
         }
         added
+    }
+
+    /// Creates an aggregate publication of one to four lanes, `0` to
+    /// `count - 1` (SPEC.md §7.4; `quantstratum-docs:
+    /// karyos/design/aggregate-ownership.md`), on the control path: every
+    /// lane is validated, sized and built first, privately, and only then
+    /// are they all added in one step that cannot fail. Each lane is a
+    /// stream; every lane reports the aggregate's registration.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_stream`], and [`DriverError::InvalidConfig`]
+    /// for no lane, more than four, or a quantum below the largest charged
+    /// frame. No lane is added on error.
+    pub fn add_aggregate(
+        &mut self,
+        config: AggregateConfig,
+    ) -> Result<AggregateHandle, DriverError> {
+        let key = [
+            u64::from(config.stream.buffer.stream_id.cast_unsigned()),
+            u64::from(config.stream.buffer.session_id.cast_unsigned()),
+        ];
+        let lanes: Vec<Lane> = (0..config.quanta.len())
+            .map_while(|lane| {
+                u8::try_from(lane)
+                    .ok()
+                    .and_then(|lane| Lane::try_new(lane).ok())
+            })
+            .collect();
+        let added = if lanes.len() == config.quanta.len() {
+            self.add_aggregate_checked(config.stream, &lanes, &config.quanta)
+        } else {
+            Err(DriverError::InvalidConfig)
+        };
+        if let Err(error) = &added {
+            self.diagnostics.error(
+                &mut self.counters,
+                crate::diagnostics::ErrorCode::StreamConfigRejected,
+                key,
+                &error.to_string(),
+            );
+        }
+        added
+    }
+
+    /// Validates, stages and publishes the lanes `lanes` of an aggregate
+    /// with `quanta`, all or nothing.
+    fn add_aggregate_checked(
+        &mut self,
+        config: StreamConfig,
+        lanes: &[Lane],
+        quanta: &[u64],
+    ) -> Result<AggregateHandle, DriverError> {
+        // 1. Validate: the lane count and the profile, the key, the quota.
+        let count = u8::try_from(lanes.len()).map_err(|_| DriverError::InvalidConfig)?;
+        let profile = DrrConfig::new(quanta, largest_charge(&config)?)
+            .map_err(|_| DriverError::InvalidConfig)?;
+        // A key in use (active or retiring) is reported before the quota.
+        let key = (config.buffer.stream_id, config.buffer.session_id);
+        if self
+            .streams
+            .iter()
+            .any(|s| (s.stream_id, s.session_id) == key)
+        {
+            return Err(DriverError::DuplicateStream {
+                stream_id: key.0,
+                session_id: key.1,
+            });
+        }
+        if self
+            .streams
+            .len()
+            .checked_add(lanes.len())
+            .is_none_or(|total| total > self.config.max_streams)
+        {
+            return Err(DriverError::TooManyStreams);
+        }
+        let registration = self.next_stream;
+        let next = registration
+            .checked_add(u64::from(count))
+            .ok_or(DriverError::StreamIdsExhausted)?;
+        let aggregate = Aggregate {
+            registration,
+            lanes: count,
+            profile,
+        };
+        // 2 and 3. Build every lane privately. A failure drops the staged
+        // lanes; nothing outside this call can name them.
+        let mut staged: Vec<Stream<T>> = Vec::with_capacity(lanes.len());
+        let mut handle = AggregateHandle {
+            driver: self.id,
+            registration,
+            lanes: [None; MAX_LANES],
+        };
+        for (id, lane) in (registration..next).zip(lanes) {
+            let buffer = LogBufferConfig {
+                lane: *lane,
+                ..config.buffer
+            };
+            match self.stage_lane(config, buffer, id, aggregate) {
+                Ok(stream) => staged.push(stream),
+                Err(error) => {
+                    for stream in staged {
+                        if let Some(counters) = stream.feeder_counters {
+                            counters.free(&mut self.counters);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+            if let Some(slot) = handle.lanes.get_mut(usize::from(lane.get())) {
+                *slot = Some(id);
+            }
+        }
+        // 4. Publish in one step that cannot fail.
+        self.streams.reserve(staged.len());
+        self.next_stream = next;
+        self.streams.extend(staged);
+        self.update_stream_gauges();
+        Ok(handle)
     }
 
     /// The table of a conflated stream: in a driver-only region when this
@@ -1028,27 +1269,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         )?)
     }
 
-    fn add_stream_checked(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
-        // A key in use (active or retiring) is reported before the quota.
+    /// Builds one lane stream of an aggregate, not yet added: its buffer,
+    /// conductor, conflation feeder and counters.
+    fn stage_lane(
+        &mut self,
+        config: StreamConfig,
+        buffer_config: LogBufferConfig,
+        id: u64,
+        aggregate: Aggregate,
+    ) -> Result<Stream<T>, DriverError> {
+        #[cfg(test)]
+        if self.fail_at == Some(id) {
+            return Err(DriverError::Sys(
+                karyos_sys::error::SysError::ResourcesUnavailable,
+            ));
+        }
         let key = (config.buffer.stream_id, config.buffer.session_id);
-        if self
-            .streams
-            .iter()
-            .any(|s| (s.stream_id, s.session_id) == key)
-        {
-            return Err(DriverError::DuplicateStream {
-                stream_id: key.0,
-                session_id: key.1,
-            });
-        }
-        if self.streams.len() >= self.config.max_streams {
-            return Err(DriverError::TooManyStreams);
-        }
-        let id = self.next_stream;
-        let next = id.checked_add(1).ok_or(DriverError::StreamIdsExhausted)?;
         let buffer = Arc::new(<T as sealed::Create>::create(
             self,
-            config.buffer,
+            buffer_config,
             Generation::default(),
         )?);
         let mut conductor = buffer
@@ -1073,12 +1312,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             None => (None, Vec::new()),
         };
-        let feeder_counters = feeder
-            .is_some()
-            .then(|| FeederCounters::allocate(&mut self.counters, id, config.buffer.lane.get()));
-        self.next_stream = next;
-        self.streams.push(Stream {
+        let feeder_counters = feeder.is_some().then(|| {
+            FeederCounters::allocate(
+                &mut self.counters,
+                aggregate.registration,
+                buffer_config.lane.get(),
+            )
+        });
+        Ok(Stream {
             id,
+            aggregate,
             retiring: false,
             buffer,
             conductor,
@@ -1088,7 +1331,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             stream_id: key.0,
             session_id: key.1,
             claim_waiting: false,
-            config: config.buffer,
+            config: buffer_config,
             conflation: config.conflation,
             generation: Generation::default(),
             base: 0,
@@ -1099,11 +1342,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             feeder,
             conflation_terminal: None,
             feeder_counters,
-        });
-        self.update_stream_gauges();
-        Ok(StreamHandle {
-            driver: self.id,
-            stream: id,
         })
     }
 
@@ -1398,7 +1636,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 Err(error) => {
                     // A stream already closed for good was reported then.
                     let open = stream.conductor.seal_reason().is_none();
-                    lost.push((stream.id, stream.key(), error.cause.to_string(), open));
+                    lost.push((
+                        stream.aggregate.registration,
+                        stream.key(),
+                        error.cause.to_string(),
+                        open,
+                    ));
                     if let Err(error) = lose_feeder(stream) {
                         first_error.get_or_insert(DriverError::from(error));
                     }
@@ -1553,7 +1796,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let found = self.stream(stream)?;
         Ok(PublicationIdentity {
             driver,
-            registration: found.id,
+            registration: found.aggregate.registration,
             stream_id: found.stream_id,
             session_id: found.session_id,
             incarnation: FIRST_INCARNATION,
@@ -2383,3 +2626,6 @@ mod tests {
         assert_eq!(counters.value(Event::CounterOverflows), 1);
     }
 }
+
+#[cfg(test)]
+mod aggregate_tests;

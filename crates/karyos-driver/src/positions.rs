@@ -59,6 +59,8 @@ struct SubscriberCells {
 struct StreamCells {
     /// The stream's id.
     stream: u64,
+    /// Its aggregate's registration: the stream key of its cells.
+    registration: u64,
     /// The stream's lane.
     lane: u8,
     limit: Option<Counter>,
@@ -182,8 +184,12 @@ impl Positions {
                 Some(index) => index,
                 None => {
                     let lane = stream.config.lane.get();
-                    self.streams
-                        .push(StreamCells::allocate(&mut allocator, stream.id, lane));
+                    self.streams.push(StreamCells::allocate(
+                        &mut allocator,
+                        stream.id,
+                        stream.aggregate.registration,
+                        lane,
+                    ));
                     self.streams.len() - 1
                 }
             };
@@ -295,10 +301,16 @@ impl StreamCells {
         }
     }
 
-    fn allocate(allocator: &mut PassAllocator<'_>, stream: u64, lane: u8) -> Self {
-        let keys = Self::keys(stream, lane);
+    fn allocate(
+        allocator: &mut PassAllocator<'_>,
+        stream: u64,
+        registration: u64,
+        lane: u8,
+    ) -> Self {
+        let keys = Self::keys(registration, lane);
         Self {
             stream,
+            registration,
             lane,
             limit: allocator.new_cell("stream limit", keys),
             head: allocator.new_cell("stream head", keys),
@@ -323,7 +335,7 @@ impl StreamCells {
     /// of subscribers still attached, allocates for new ones, and retries
     /// cells refused in an earlier pass (counted once, when first refused).
     fn admit(&mut self, allocator: &mut PassAllocator<'_>, attached: &[Attached]) {
-        let stream = self.stream;
+        let stream = self.registration;
         let lane = self.lane;
         let keys = Self::keys(stream, lane);
         for (counter, label) in [
