@@ -22,6 +22,7 @@
 
 #[cfg(feature = "test-hooks")]
 pub mod alloc_count;
+pub mod applied_epoch;
 pub mod atomic_view;
 pub mod broadcast;
 #[cfg(not(loom))]
