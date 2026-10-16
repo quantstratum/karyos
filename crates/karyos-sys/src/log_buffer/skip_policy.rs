@@ -7,7 +7,9 @@
 //!
 //! - **Unreliable.** A hole is sealed once `gap_reorder_timeout` (or the
 //!   redundant-path skew window, if larger; never their sum) has passed
-//!   since its first detection. A duplicate never restarts the deadline. At
+//!   since its first detection. A hole is detected by the first `duty` call
+//!   that finds it, not at the arrival that revealed it, so the caller runs
+//!   `duty` after its arrivals. A duplicate never restarts the deadline. At
 //!   expiry the extent maps are read again and only what is still uncovered
 //!   is sealed, up to the start of the next committed extent. No NAK is
 //!   sent.
@@ -27,6 +29,7 @@
 
 use super::receive_owner::{ReceiveError, ReceiveOwner, Received};
 use crate::frame::Lane;
+use crate::host_clock::age_ns;
 use crate::local_gap::GapReason;
 use crate::term_bytes::TermBytes;
 
@@ -231,20 +234,27 @@ impl SkipPolicy {
         Ok(report)
     }
 
-    /// A correlated `RANGE_UNAVAILABLE` for `[start, end)` of `lane` on a
-    /// reliable channel (GU-5, GU-6): a start beyond the window closes with
-    /// `GapCannotResume`; otherwise `close` closes with the interval and
-    /// `skip` seals the whole hole.
+    /// A correlated `RANGE_UNAVAILABLE` on a reliable channel (GU-5, GU-6),
+    /// reporting `floor`, the sender's lowest retained position of `lane`:
+    /// everything below it is unrecoverable.
+    ///
+    /// - A floor beyond the window `{r, r + 1}` closes the lane with
+    ///   `GapCannotResume` under every policy: there is no far-window
+    ///   catch-up, so nothing is sealed.
+    /// - Otherwise `close` closes the lane with `[prefix, floor)`, and
+    ///   `skip` seals every hole that starts below the floor, each whole
+    ///   (a hole straddling the floor is unrecoverable in full, RC-9).
     ///
     /// # Errors
     ///
-    /// [`ReceiveError::Sys`] for a corrupt owner state.
+    /// [`ReceiveError::Foreign`] for a lane the image does not have,
+    /// [`ReceiveError::Sys`] for a corrupt owner state or a floor outside
+    /// the incarnation.
     pub fn range_unavailable<T: TermBytes>(
         &mut self,
         owner: &mut ReceiveOwner<T>,
         lane: Lane,
-        start: u64,
-        end: u64,
+        floor: u64,
         now: u64,
     ) -> Result<SkipReport, ReceiveError> {
         let mut report = SkipReport::default();
@@ -255,13 +265,13 @@ impl SkipPolicy {
             return Ok(report);
         }
         let prefix = owner.rebuild_position(lane).ok_or(ReceiveError::Foreign)?;
-        if !owner.within_window(lane, start)? {
+        if !owner.within_window(lane, floor)? {
             state.closed = true;
             report.close = Some(Close {
                 lane,
                 cause: CloseCause::GapCannotResume,
                 from: prefix,
-                to: start,
+                to: floor,
             });
             return Ok(report);
         }
@@ -271,12 +281,12 @@ impl SkipPolicy {
                 report.close = Some(Close {
                     lane,
                     cause: CloseCause::Unrecoverable,
-                    from: prefix.min(start),
-                    to: end,
+                    from: prefix,
+                    to: floor,
                 });
             }
             Unrecoverable::Skip => {
-                state.unrecoverable_to = state.unrecoverable_to.max(end);
+                state.unrecoverable_to = state.unrecoverable_to.max(floor);
                 self.seal_due(owner, lane, now, &mut report)?;
             }
         }
@@ -321,7 +331,7 @@ impl SkipPolicy {
                 } else {
                     return Ok(());
                 }
-            } else if now.saturating_sub(detected) >= config.deadline_ns() {
+            } else if age_ns(now, detected) >= config.deadline_ns() {
                 GapReason::ReorderExpired
             } else {
                 return Ok(());
@@ -357,7 +367,7 @@ impl SkipPolicy {
         let Some((since, earliest)) = state.ahead else {
             return Ok(None);
         };
-        if now.saturating_sub(since) < config.far_window_timeout_ns {
+        if age_ns(now, since) < config.far_window_timeout_ns {
             return Ok(None);
         }
         state.closed = true;

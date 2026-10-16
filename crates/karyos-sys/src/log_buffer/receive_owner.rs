@@ -689,10 +689,6 @@ impl<T: TermBytes> LaneOwner<T> {
         Ok(Received::Committed { position, extent })
     }
 
-    /// [`LogBuffer::split`], except that the end of the incarnation's last
-    /// term, which no term count names, is the end of that term: once the
-    /// last term is complete the window stays on it, every later copy is
-    /// compared there, and nothing new is ever written.
     /// The first hole above the resolved prefix: from it to the start of
     /// the next covered extent, within its term (`quantstratum-docs:
     /// karyos/design/gaps-and-unreliable-delivery.md`, GU-4). `None` while
@@ -720,6 +716,10 @@ impl<T: TermBytes> LaneOwner<T> {
         Ok(Some((self.rebuild, end_offset - offset)))
     }
 
+    /// [`LogBuffer::split`], except that the end of the incarnation's last
+    /// term, which no term count names, is the end of that term: once the
+    /// last term is complete the window stays on it, every later copy is
+    /// compared there, and nothing new is ever written.
     fn split_end(&self, position: u64) -> Result<(TermCount, u32), SysError> {
         let term_length = self.buffer.term_length;
         if position == u64::from(TERM_COUNT_LIMIT) * u64::from(term_length) {

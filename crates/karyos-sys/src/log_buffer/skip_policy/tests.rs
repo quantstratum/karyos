@@ -83,7 +83,7 @@ fn receive(owner: &mut ReceiveOwner, bytes: &[u8]) -> Result<Received, ReceiveEr
     owner.receive(&frame)
 }
 
-fn policy(config: SkipConfig) -> SkipPolicy {
+fn policy_of(config: SkipConfig) -> SkipPolicy {
     SkipPolicy::new(config, 1).unwrap()
 }
 
@@ -99,7 +99,7 @@ fn with_hole() -> (Arc<LogBuffer>, ReceiveOwner) {
 #[test]
 fn an_unreliable_hole_is_sealed_at_the_reorder_deadline() {
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig::unreliable());
+    let mut skip = policy_of(SkipConfig::unreliable());
     assert_eq!(skip.duty(&mut owner, 0).unwrap().sealed, 0, "detected at 0");
     assert_eq!(skip.duty(&mut owner, MS - 1).unwrap().sealed, 0);
     let report = skip.duty(&mut owner, MS).unwrap();
@@ -113,7 +113,7 @@ fn an_unreliable_hole_is_sealed_at_the_reorder_deadline() {
 #[test]
 fn the_deadline_is_the_larger_of_reorder_and_skew() {
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig {
+    let mut skip = policy_of(SkipConfig {
         skew_window_ns: 3 * MS,
         ..SkipConfig::unreliable()
     });
@@ -130,7 +130,7 @@ fn the_deadline_is_the_larger_of_reorder_and_skew() {
 #[test]
 fn a_duplicate_does_not_restart_and_a_repair_wins() {
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig::unreliable());
+    let mut skip = policy_of(SkipConfig::unreliable());
     let _ = skip.duty(&mut owner, 0).unwrap();
     let duplicate = receive(&mut owner, &data(0, 128, 2));
     assert_eq!(duplicate, Ok(Received::Duplicate));
@@ -138,7 +138,7 @@ fn a_duplicate_does_not_restart_and_a_repair_wins() {
     assert_eq!(skip.duty(&mut owner, MS).unwrap().sealed, 1);
 
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig::unreliable());
+    let mut skip = policy_of(SkipConfig::unreliable());
     let _ = skip.duty(&mut owner, 0).unwrap();
     let repaired = receive(&mut owner, &data(0, 64, 3));
     skip.arrived(Lane::ZERO, &repaired, 64, MS / 2);
@@ -151,7 +151,7 @@ fn a_duplicate_does_not_restart_and_a_repair_wins() {
 #[test]
 fn a_zero_interval_seals_at_once() {
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig {
+    let mut skip = policy_of(SkipConfig {
         reorder_timeout_ns: 0,
         ..SkipConfig::unreliable()
     });
@@ -163,7 +163,7 @@ fn a_zero_interval_seals_at_once() {
 #[test]
 fn a_later_hole_is_a_new_detection() {
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig::unreliable());
+    let mut skip = policy_of(SkipConfig::unreliable());
     let _ = skip.duty(&mut owner, 0).unwrap();
     // A frame far above reveals a second hole [192, 320) at 0.5 ms.
     receive(&mut owner, &data(0, 320, 4)).unwrap();
@@ -179,10 +179,10 @@ fn a_later_hole_is_a_new_detection() {
 #[test]
 fn a_reliable_hole_closes_or_is_skipped_only_when_unrecoverable() {
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig::reliable());
+    let mut skip = policy_of(SkipConfig::reliable());
     assert_eq!(skip.duty(&mut owner, 10_000 * MS).unwrap().sealed, 0);
     let report = skip
-        .range_unavailable(&mut owner, Lane::ZERO, 64, 128, 10_000 * MS)
+        .range_unavailable(&mut owner, Lane::ZERO, 128, 10_000 * MS)
         .unwrap();
     assert_eq!(
         report.close,
@@ -200,12 +200,12 @@ fn a_reliable_hole_closes_or_is_skipped_only_when_unrecoverable() {
     );
 
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig {
+    let mut skip = policy_of(SkipConfig {
         on_unrecoverable: Unrecoverable::Skip,
         ..SkipConfig::reliable()
     });
     let report = skip
-        .range_unavailable(&mut owner, Lane::ZERO, 64, 96, 0)
+        .range_unavailable(&mut owner, Lane::ZERO, 96, 0)
         .unwrap();
     assert_eq!(
         (report.sealed, report.sealed_bytes),
@@ -221,13 +221,13 @@ fn a_reliable_hole_closes_or_is_skipped_only_when_unrecoverable() {
 #[test]
 fn a_range_beyond_the_window_cannot_resume() {
     let (_buffer, mut owner) = with_hole();
-    let mut skip = policy(SkipConfig {
+    let mut skip = policy_of(SkipConfig {
         on_unrecoverable: Unrecoverable::Skip,
         ..SkipConfig::reliable()
     });
     let far = 3 * TERM;
     let report = skip
-        .range_unavailable(&mut owner, Lane::ZERO, far, far + 64, 0)
+        .range_unavailable(&mut owner, Lane::ZERO, far, 0)
         .unwrap();
     assert_eq!(
         report
@@ -243,7 +243,7 @@ fn a_range_beyond_the_window_cannot_resume() {
 fn arrivals_all_ahead_close_an_unreliable_lane() {
     let (_buffer, mut owner) = image();
     receive(&mut owner, &data(0, 0, 1)).unwrap();
-    let mut skip = policy(SkipConfig::unreliable());
+    let mut skip = policy_of(SkipConfig::unreliable());
     let ahead = Ok(Received::Ahead);
     skip.arrived(Lane::ZERO, &ahead, 5 * TERM, 0);
     skip.arrived(Lane::ZERO, &ahead, 4 * TERM, 500 * MS);
@@ -284,4 +284,48 @@ fn a_reorder_interval_above_one_second_is_refused() {
         .err(),
         Some(SkipConfigError::ReorderTimeout(MAX_REORDER_TIMEOUT_NS + 1))
     );
+}
+
+/// GU-6 and RC-9 against a floor beyond the window: no far-window catch-up
+/// under either policy. The lane closes with `GapCannotResume` and nothing
+/// is sealed, not the near hole and not the rest of its term.
+#[test]
+fn a_floor_beyond_the_window_seals_nothing() {
+    for policy in [Unrecoverable::Skip, Unrecoverable::Close] {
+        let (_buffer, mut owner) = with_hole();
+        let mut skip = policy_of(SkipConfig {
+            on_unrecoverable: policy,
+            ..SkipConfig::reliable()
+        });
+        let report = skip
+            .range_unavailable(&mut owner, Lane::ZERO, 3 * TERM, 0)
+            .unwrap();
+        assert_eq!((report.sealed, report.sealed_bytes), (0, 0));
+        assert_eq!(
+            report
+                .close
+                .map(|close| (close.cause, close.from, close.to)),
+            Some((CloseCause::GapCannotResume, 64, 3 * TERM))
+        );
+        assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), Some((64, 64)));
+        assert_eq!(owner.first_loss(Lane::ZERO), Some(None));
+    }
+}
+
+/// Under `skip`, only holes that start below the floor are sealed, each
+/// whole; a hole above the floor stays due.
+#[test]
+fn skip_seals_only_the_holes_below_the_floor() {
+    let (_buffer, mut owner) = with_hole();
+    // A second hole [192, 320) above a floor of 160.
+    receive(&mut owner, &data(0, 320, 3)).unwrap();
+    let mut skip = policy_of(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    let report = skip
+        .range_unavailable(&mut owner, Lane::ZERO, 160, 0)
+        .unwrap();
+    assert_eq!((report.sealed, report.sealed_bytes), (1, 64));
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), Some((192, 128)));
 }
