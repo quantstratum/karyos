@@ -218,8 +218,8 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
         Ok(cores) => {
             let _ = writeln!(
                 out,
-                "pinned: rx core {}, tx core {}",
-                cores.receiver, cores.sender
+                "pinned: quiet cores {:?}; receivers first, then the sender",
+                cores.quiet
             );
         }
         Err(reason) => {

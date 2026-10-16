@@ -18,8 +18,11 @@
 //!   only. `N` is the manifest's `N` for every shape, so points stay
 //!   comparable; [`PlannedRun::surplus`] records what was dropped.
 //!
-//! F2 waits for batch B3d and R5 for the key epochs of a profile; both
-//! are listed as skipped with their cause, never left out.
+//! F2 runs DATA-only over loopback multicast with one process per
+//! receiver, where the backend lets the receivers share the group port
+//! (Linux, [`PlanOptions::f2`]); elsewhere it is skipped with that cause.
+//! R5 waits for the key epochs of a profile. Every skipped point is
+//! listed with its cause, never left out.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -72,6 +75,9 @@ pub struct PlanOptions {
     pub rule: MtuRule,
     /// The configurations, in round 0 order.
     pub configurations: Vec<String>,
+    /// Whether F2 points run: the receivers of an F2 run share the group
+    /// port, which needs `SO_REUSEADDR`, set only by the Linux backend.
+    pub f2: bool,
 }
 
 impl PlanOptions {
@@ -85,6 +91,7 @@ impl PlanOptions {
             e_max,
             rule,
             configurations: AA.iter().map(ToString::to_string).collect(),
+            f2: cfg!(target_os = "linux"),
         }
     }
 
@@ -154,9 +161,9 @@ pub struct Plan {
 }
 
 /// Why `point` cannot run yet; `None` when it can.
-fn skip_reason(point: &Point) -> Option<&'static str> {
-    if matches!(point.fanout, Fanout::F2 { .. }) {
-        return Some("F2 pending batch B3d");
+fn skip_reason(point: &Point, f2: bool) -> Option<&'static str> {
+    if matches!(point.fanout, Fanout::F2 { .. }) && !f2 {
+        return Some("F2 needs receivers sharing the group port (SO_REUSEADDR), Linux only");
     }
     match point.load {
         Load::R1 | Load::R2 { .. } => None,
@@ -207,7 +214,7 @@ pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchErro
     let mut runs = Vec::new();
     let mut skipped = Vec::new();
     for point in points {
-        if let Some(reason) = skip_reason(point) {
+        if let Some(reason) = skip_reason(point, options.f2) {
             skipped.push((*point, reason.to_string()));
             continue;
         }
@@ -245,6 +252,10 @@ pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchErro
                         load,
                         messages: sequences,
                         warmup,
+                        receivers: match point.fanout {
+                            Fanout::F1 => 1,
+                            Fanout::F2 { receivers } => u16::from(receivers),
+                        },
                     },
                     messages_per_sample: per,
                     surplus,
@@ -383,18 +394,34 @@ mod tests {
     }
 
     #[test]
-    fn the_primary_plan_runs_f1_and_lists_the_rest() {
-        let plan = decision();
-        // 8 F1 points of R1 and R2, 5 rounds, 3 configurations.
+    fn the_primary_plan_runs_f2_where_receivers_share_a_port() {
+        let mut options = PlanOptions::decision(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope);
+        options.f2 = true;
+        let plan = expand(&primary(), &options).unwrap();
+        // 16 F1 and F2 points of R1 and R2, 5 rounds, 3 configurations.
+        assert_eq!(plan.runs.len(), 16 * 5 * 3);
+        assert_eq!(plan.skipped.len(), 1);
+        assert!(
+            plan.runs.iter().all(
+                |run| (run.run.receivers == 4) == matches!(run.point.fanout, Fanout::F2 { .. })
+            )
+        );
+        options.f2 = false;
+        let plan = expand(&primary(), &options).unwrap();
         assert_eq!(plan.runs.len(), 8 * 5 * 3);
-        assert_eq!(plan.skipped.len(), 9);
         assert_eq!(
             plan.skipped
                 .iter()
-                .filter(|(_, reason)| reason.contains("B3d"))
+                .filter(|(_, reason)| reason.contains("SO_REUSEADDR"))
                 .count(),
             8
         );
+    }
+
+    #[test]
+    fn the_primary_plan_lists_what_it_skips() {
+        let plan = decision();
+        assert_eq!(plan.skipped.len(), if plan.options.f2 { 1 } else { 9 });
         assert!(plan.skipped.iter().any(|(point, reason)| {
             matches!(point.load, Load::R5 { .. }) && reason.contains("deferred")
         }));

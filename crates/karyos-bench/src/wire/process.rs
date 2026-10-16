@@ -7,36 +7,45 @@
 //! child times only its own stage and writes its own sample file in the
 //! format of `samples.rs`.
 //!
-//! The receive child starts first and prints `WIRE_READY <data> <control>`:
-//! the address of its endpoint and of a plain UDP control socket. The send
-//! child says hello to the control socket, so the receiver learns where to
-//! answer, and runs. Control traffic is outside both timed stages, and
-//! every control datagram carries the run's nonce ([`NONCE`]); one with
-//! another nonce is ignored. A control datagram can be lost, so every one
-//! that matters is repeated:
+//! Under F1 one receive child starts first and prints
+//! `WIRE_READY <data> <control>`: the address of its endpoint and of a
+//! plain UDP control socket. Under F2 (`StageRun::receivers` above 1) every
+//! receive child joins one loopback multicast group: the first binds the
+//! group with port 0 and reports the port, the others bind that port
+//! too, which needs `SO_REUSEADDR` (the Linux backend). The group comes
+//! from the run's nonce inside `239.255.0.0/16`, and a group the host has
+//! already joined is refused. The send child then says hello to every
+//! control socket, so each receiver learns where to answer, and runs.
+//! Control traffic is outside both timed stages, and every control
+//! datagram carries the run's nonce ([`NONCE`]); one with another nonce is
+//! ignored. A control datagram can be lost, so every one that matters is
+//! repeated:
 //!
-//! - the sender repeats its hello until it hears from the receiver, which
-//!   answers each hello with its acknowledgement count;
-//! - the receiver acknowledges the messages completed so far (R1) and,
-//!   when it stops for any reason, tells the sender, three times;
-//! - the parent tells the receiver at every poll, once the send child has
-//!   exited however it ended, so the receiver drains and ends.
+//! - the sender repeats its hello to each receiver until it hears from
+//!   it; each answers every hello with its acknowledgement count;
+//! - each receiver acknowledges the messages completed so far (R1) and,
+//!   when it stops for any reason, tells the sender, three times; under
+//!   R1 the sender waits for the smallest count, and a stop from any
+//!   receiver stops it;
+//! - the parent tells every receiver at every poll, once the send child
+//!   has exited however it ended, so the receivers drain and end.
 //!
-//! The parent bounds the whole run by a deadline and kills both children
-//! when it passes, or when the sender outlives a receiver that finished.
-//! A child exits on its own when its standard input closes, so a parent
-//! that dies leaves no orphan.
+//! The parent bounds the whole run by a deadline and kills every child
+//! when it passes, when a receiver fails, or when the sender outlives
+//! the receivers. A child exits on its own when its standard input
+//! closes, so a parent that dies leaves no orphan.
 //!
 //! **Pinning.** With [`Cores`], each child starts under `taskset -c` on
 //! its own core and reads its affinity back (`Cpus_allowed_list` of
 //! `/proc/self/status`) into its sidecar. A result is functional only
-//! (E4) unless both read-backs show the requested core and this host is
-//! decision eligible (`env::decision_eligible`: E1 to E3 on its declared
-//! host); every reason is recorded (coordinator decision, ACS 15273).
+//! (E4) unless every read-back shows the requested core and this host is
+//! decision eligible for the run's fan-out (`env::decision_eligible`: E1
+//! to E3 on its declared host); every reason is recorded (coordinator
+//! decision, ACS 15273).
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,8 +58,8 @@ use crate::inventory::{Inventory, Scope, parse_cpu_list};
 use crate::manifest::{ExtBase, Fanout, Load, MtuRule, Point, Shape};
 use crate::samples::{self, Header, RunSamples, SATURATED, Stage};
 use crate::wire::stage::{
-    ACK_TIMEOUT, Prepared, ReceiveControl, SendControl, StageLoad, StageRun, StageSamples, Wait,
-    receive_deadline, receive_role, send_role,
+    ACK_TIMEOUT, Prepared, ReceiveControl, ReceiverSamples, SendControl, StageLoad, StageRun,
+    StageSamples, Wait, receive_deadline, receive_role, send_role,
 };
 use crate::workloads::{self, BenchError};
 
@@ -75,6 +84,13 @@ pub const INDEX: &str = "KARYOS_BENCH_WIRE_INDEX";
 /// The configuration name, written into the sample headers as the
 /// profile; it follows the sample files' profile rule.
 pub const PROFILE: &str = "KARYOS_BENCH_WIRE_PROFILE";
+
+/// The multicast group and port of an F2 receive child, `<group>:<port>`;
+/// port 0 for the first receiver.
+pub const GROUP: &str = "KARYOS_BENCH_WIRE_GROUP";
+
+/// The index of a receive child, from 0.
+pub const RECEIVER: &str = "KARYOS_BENCH_WIRE_RECEIVER";
 
 /// Injected faults, as [`Faults::encode`] writes them; honoured only by
 /// a build with the feature `test-hooks` (see [`FAULTS_ENABLED`]).
@@ -244,30 +260,26 @@ impl Faults {
     }
 }
 
-/// The cores of the two roles, one each.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The quiet cores of this host: isolated and in `nohz_full`. A run with
+/// `k` receivers takes the first `k` for its receivers and the next for
+/// its sender; two processes never share one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cores {
-    /// The receive child's core.
-    pub receiver: usize,
-    /// The send child's core.
-    pub sender: usize,
+    /// The quiet cores, ascending.
+    pub quiet: Vec<usize>,
 }
 
 impl Cores {
-    /// The first two cores of `inventory` that are both isolated and in
-    /// `nohz_full`; `None` with fewer.
+    /// The quiet cores of `inventory`; `None` with fewer than two, the
+    /// fewest any run needs.
     #[must_use]
     pub fn of(inventory: &Inventory) -> Option<Self> {
-        let mut quiet =
-            quiet_cores(&inventory.isolated_cores(), &inventory.nohz_full_cores()).into_iter();
-        Some(Self {
-            receiver: quiet.next()?,
-            sender: quiet.next()?,
-        })
+        let quiet = quiet_cores(&inventory.isolated_cores(), &inventory.nohz_full_cores());
+        (quiet.len() >= 2).then_some(Self { quiet })
     }
 
-    /// This host's cores, when it has two and `taskset` runs; otherwise
-    /// why not.
+    /// This host's cores, when it has two quiet ones and `taskset` runs;
+    /// otherwise why not.
     ///
     /// # Errors
     ///
@@ -278,6 +290,14 @@ impl Cores {
         env::command("taskset", &["--version"])
             .map(|_| cores)
             .ok_or_else(|| "taskset unavailable".to_string())
+    }
+
+    /// The receivers' cores and the sender's for `receivers` receivers;
+    /// `None` when there are too few.
+    #[must_use]
+    pub fn assign(&self, receivers: usize) -> Option<(Vec<usize>, usize)> {
+        let sender = *self.quiet.get(receivers)?;
+        Some((self.quiet.get(..receivers)?.to_vec(), sender))
     }
 }
 
@@ -374,8 +394,8 @@ fn parse_shape(text: &str) -> Option<Shape> {
     })
 }
 
-/// `shape,e_max,rule,load,messages,warmup`: the rule is `counts` or
-/// `excludes`, the load `closed` or `open:<rate>`.
+/// `shape,e_max,rule,load,messages,warmup,receivers`: the rule is
+/// `counts` or `excludes`, the load `closed` or `open:<rate>`.
 #[must_use]
 pub fn encode_run(run: &StageRun) -> String {
     let rule = match run.rule {
@@ -387,8 +407,8 @@ pub fn encode_run(run: &StageRun) -> String {
         StageLoad::Open { rate } => format!("open:{rate}"),
     };
     format!(
-        "{},{},{rule},{load},{},{}",
-        run.shape, run.e_max, run.messages, run.warmup
+        "{},{},{rule},{load},{},{},{}",
+        run.shape, run.e_max, run.messages, run.warmup, run.receivers
     )
 }
 
@@ -420,6 +440,11 @@ pub fn decode_run(text: &str) -> Result<StageRun, BenchError> {
     };
     let messages = next()?.parse().map_err(|_| bad())?;
     let warmup = next()?.parse().map_err(|_| bad())?;
+    let receivers = next()?
+        .parse()
+        .ok()
+        .filter(|receivers| *receivers > 0)
+        .ok_or_else(bad)?;
     if parts.next().is_some() {
         return Err(bad());
     }
@@ -430,6 +455,7 @@ pub fn decode_run(text: &str) -> Result<StageRun, BenchError> {
         load,
         messages,
         warmup,
+        receivers,
     })
 }
 
@@ -444,14 +470,54 @@ fn point(run: &StageRun) -> Result<Point, BenchError> {
                     .map_err(|_| BenchError(format!("R2 rate {rate} outside the manifest")))?,
             },
         },
-        fanout: Fanout::F1,
+        fanout: fanout(run)?,
     })
+}
+
+/// The fan-out of a run: F1 with one receiver, F2 with more.
+fn fanout(run: &StageRun) -> Result<Fanout, BenchError> {
+    Ok(match run.receivers {
+        1 => Fanout::F1,
+        receivers => Fanout::F2 {
+            receivers: u8::try_from(receivers)
+                .map_err(|_| BenchError(format!("{receivers} receivers")))?,
+        },
+    })
+}
+
+/// The multicast group of the run with `nonce`, inside
+/// `239.255.0.0/16`: the administratively scoped block of the
+/// organisation-local scope.
+#[must_use]
+pub fn group_of(nonce: u64) -> Ipv4Addr {
+    let [low, high, ..] = nonce.to_le_bytes();
+    Ipv4Addr::new(239, 255, high, low)
+}
+
+/// Whether this host has joined `group` on any interface already: the
+/// group's entry in `/proc/net/igmp` (Linux), whose groups are the
+/// address bytes in reverse order, in hex.
+fn joined(group: Ipv4Addr) -> Result<bool, BenchError> {
+    let table = std::fs::read_to_string("/proc/net/igmp")
+        .map_err(|cause| error("/proc/net/igmp", cause))?;
+    Ok(listed(&table, group))
+}
+
+/// Whether the `/proc/net/igmp` text `table` lists `group`.
+fn listed(table: &str, group: Ipv4Addr) -> bool {
+    let [a, b, c, d] = group.octets();
+    let entry = format!("{d:02X}{c:02X}{b:02X}{a:02X}");
+    table
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(entry.as_str()))
 }
 
 /// A wire child's environment: its run, sample file, configuration,
 /// run index, nonce and faults.
 struct ChildContext {
     run: StageRun,
+    receiver: u16,
+    group: Option<SocketAddrV4>,
     profile: String,
     out: PathBuf,
     index: u32,
@@ -467,6 +533,14 @@ impl ChildContext {
     fn from_env() -> Result<Self, BenchError> {
         Ok(Self {
             run: decode_run(&variable(RUN)?)?,
+            receiver: match std::env::var(RECEIVER) {
+                Ok(index) => index.parse().map_err(|cause| error(RECEIVER, cause))?,
+                Err(_) => 0,
+            },
+            group: match std::env::var(GROUP) {
+                Ok(group) => Some(group.parse().map_err(|cause| error(GROUP, cause))?),
+                Err(_) => None,
+            },
             out: PathBuf::from(variable(OUT)?),
             profile: variable(PROFILE)?,
             index: variable(INDEX)?
@@ -608,7 +682,13 @@ impl Drop for ReceiverControl {
 
 fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), BenchError> {
     let run = &context.run;
-    let endpoint = prepared.endpoint()?;
+    let endpoint = match (run.receivers, context.group) {
+        (1, None) => prepared.endpoint()?,
+        (_, Some(group)) => prepared.group_receiver(*group.ip(), group.port())?,
+        (receivers, None) => {
+            return Err(BenchError(format!("{receivers} receivers without a group")));
+        }
+    };
     let local = endpoint.capabilities().local;
     let (_tx, mut rx) = endpoint
         .split()
@@ -662,7 +742,9 @@ fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), Benc
     )?;
     context.write_samples(
         &context.out,
-        Stage::Receive { receiver: 0 },
+        Stage::Receive {
+            receiver: context.receiver,
+        },
         received.receive,
     )?;
     std::fs::write(
@@ -678,34 +760,42 @@ fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), Benc
     .map_err(|cause| error("rx sidecar", cause))
 }
 
-/// The send child's control socket, connected to the receiver's.
+/// The send child's control socket, talking to every receiver's.
 struct SenderControl {
     socket: UdpSocket,
     nonce: u64,
-    completed: Cell<u64>,
+    /// Each receiver's control address.
+    peers: Vec<SocketAddr>,
+    /// Each receiver's cumulative acknowledgement.
+    completed: Vec<Cell<u64>>,
+    /// Whether each receiver has been heard from.
+    heard: Vec<Cell<bool>>,
     stopped: Cell<bool>,
-    /// Whether any datagram of the receiver has arrived.
-    heard: Cell<bool>,
     last_hello: Cell<Option<Instant>>,
     hellos_to_drop: Cell<u32>,
 }
 
 impl SenderControl {
+    /// Says hello to every receiver not heard from yet.
     fn hello(&self) {
         self.last_hello.set(Some(Instant::now()));
-        match self.hellos_to_drop.get().checked_sub(1) {
-            Some(left) => self.hellos_to_drop.set(left),
-            None => {
-                let _ = self.socket.send(&control(HELLO, self.nonce, 0));
+        for (peer, heard) in self.peers.iter().zip(&self.heard) {
+            if heard.get() {
+                continue;
+            }
+            match self.hellos_to_drop.get().checked_sub(1) {
+                Some(left) => self.hellos_to_drop.set(left),
+                None => {
+                    let _ = self.socket.send_to(&control(HELLO, self.nonce, 0), peer);
+                }
             }
         }
     }
 
-    /// Repeats the hello until the receiver is heard, then reads every
-    /// pending control datagram of this run; an error other than an empty
-    /// socket means the receiver is gone.
+    /// Repeats the hellos until every receiver is heard, then reads every
+    /// pending control datagram of this run from a known receiver.
     fn pump(&self) {
-        if !self.heard.get()
+        if self.heard.iter().any(|heard| !heard.get())
             && self
                 .last_hello
                 .get()
@@ -715,21 +805,31 @@ impl SenderControl {
         }
         let mut buffer = [0_u8; CONTROL_LEN];
         loop {
-            match self.socket.recv(&mut buffer) {
-                Ok(length) => match buffer
-                    .get(..length)
-                    .and_then(|bytes| parse_control(bytes, self.nonce))
-                {
-                    Some((ACK, count)) => {
-                        self.heard.set(true);
-                        self.completed.set(self.completed.get().max(count));
+            match self.socket.recv_from(&mut buffer) {
+                Ok((length, from)) => {
+                    let Some(index) = self.peers.iter().position(|peer| *peer == from) else {
+                        continue;
+                    };
+                    let (Some(heard), Some(completed)) =
+                        (self.heard.get(index), self.completed.get(index))
+                    else {
+                        continue;
+                    };
+                    match buffer
+                        .get(..length)
+                        .and_then(|bytes| parse_control(bytes, self.nonce))
+                    {
+                        Some((ACK, count)) => {
+                            heard.set(true);
+                            completed.set(completed.get().max(count));
+                        }
+                        Some((STOP, _)) => {
+                            heard.set(true);
+                            self.stopped.set(true);
+                        }
+                        _ => {}
                     }
-                    Some((STOP, _)) => {
-                        self.heard.set(true);
-                        self.stopped.set(true);
-                    }
-                    _ => {}
-                },
+                }
                 Err(cause) if cause.kind() == ErrorKind::WouldBlock => return,
                 Err(_) => {
                     self.stopped.set(true);
@@ -739,11 +839,16 @@ impl SenderControl {
         }
     }
 
+    /// The messages every receiver has completed.
+    fn completed(&self) -> u64 {
+        self.completed.iter().map(Cell::get).min().unwrap_or(0)
+    }
+
     fn wait(&self, sequence: u64) -> Wait {
         let start = Instant::now();
         loop {
             self.pump();
-            if self.completed.get() > sequence {
+            if self.completed() > sequence {
                 return Wait::Completed;
             }
             if self.stopped.get() {
@@ -765,33 +870,42 @@ impl SenderControl {
 fn send_child(context: &ChildContext, prepared: &Prepared) -> Result<(), BenchError> {
     let peers = variable(PEER)?;
     let mut parts = peers.split_whitespace();
-    let (Some(data), Some(control_peer), None) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(BenchError(format!("bad peers {peers}")));
-    };
-    let data: SocketAddr = data.parse().map_err(|cause| error("peer", cause))?;
-    let control_peer: SocketAddr = control_peer
+    let data: SocketAddr = parts
+        .next()
+        .ok_or_else(|| BenchError(format!("bad peers {peers}")))?
         .parse()
-        .map_err(|cause| error("control peer", cause))?;
+        .map_err(|cause| error("peer", cause))?;
+    let controls: Vec<SocketAddr> = parts
+        .map(|peer| peer.parse().map_err(|cause| error("control peer", cause)))
+        .collect::<Result<_, _>>()?;
+    if controls.len() != usize::from(context.run.receivers) {
+        return Err(BenchError(format!(
+            "{} control peers for {} receivers",
+            controls.len(),
+            context.run.receivers
+        )));
+    }
     let socket =
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|cause| error("control", cause))?;
-    socket
-        .connect(control_peer)
-        .map_err(|cause| error("control", cause))?;
     socket
         .set_nonblocking(true)
         .map_err(|cause| error("control", cause))?;
     let control = SenderControl {
         socket,
         nonce: context.nonce,
-        completed: Cell::new(0),
+        completed: controls.iter().map(|_| Cell::new(0)).collect(),
+        heard: controls.iter().map(|_| Cell::new(false)).collect(),
+        peers: controls,
         stopped: Cell::new(false),
-        heard: Cell::new(false),
         last_hello: Cell::new(None),
         hellos_to_drop: Cell::new(context.faults.drop_hellos),
     };
     control.hello();
-    let (mut tx, _rx) = prepared
-        .endpoint()?
+    let endpoint = match data {
+        SocketAddr::V4(group) if group.ip().is_multicast() => prepared.group_sender(*group.ip())?,
+        _ => prepared.endpoint()?,
+    };
+    let (mut tx, _rx) = endpoint
         .split()
         .map_err(|_| BenchError("split sender".into()))?;
     let faults = context.faults;
@@ -855,6 +969,7 @@ impl Spawn<'_> {
         out: &Path,
         peer: Option<&str>,
         core: Option<usize>,
+        extra: &[(&str, String)],
     ) -> Result<Guard, BenchError> {
         let executable = std::env::current_exe().map_err(|cause| error("executable", cause))?;
         // `taskset` execs the child in place: the guard's PID stays the
@@ -881,6 +996,9 @@ impl Spawn<'_> {
             .stderr(Stdio::inherit());
         if let Some(peer) = peer {
             command.env(PEER, peer);
+        }
+        for (name, value) in extra {
+            command.env(name, value);
         }
         if self.options.faults == Faults::default() {
             command.env_remove(FAULTS);
@@ -971,10 +1089,10 @@ fn check_samples(
 /// `env::decision_eligible` finds unmet (E1 to E3 on the declared host).
 /// Empty only for a decision-eligible result.
 #[must_use]
-pub fn functional_reasons(pinning: Vec<String>) -> Vec<String> {
+pub fn functional_reasons(pinning: Vec<String>, fanout: Fanout) -> Vec<String> {
     let inventory = Inventory::detect(Scope::Classification);
     let record = env::host_record(&inventory.host);
-    reasons_for(pinning, &inventory, record.as_deref(), Fanout::F1)
+    reasons_for(pinning, &inventory, record.as_deref(), fanout)
 }
 
 /// [`functional_reasons`] for a given host and record.
@@ -1003,13 +1121,62 @@ fn nonce() -> u64 {
         ^ COUNTER.fetch_add(1, Ordering::Relaxed).rotate_left(48)
 }
 
+/// A receive child that has said it is ready.
+struct Receiver {
+    guard: Guard,
+    /// Where its endpoint receives: its own address, or the group.
+    data: SocketAddr,
+    /// Its control socket.
+    control: SocketAddr,
+    /// Its exit, once it has exited.
+    status: Option<ExitStatus>,
+}
+
+/// Waits for `child`'s ready line, until `deadline`.
+fn ready(child: &mut Guard, deadline: Instant) -> Result<(SocketAddr, SocketAddr), BenchError> {
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| BenchError("the receive child has no output".into()))?;
+    let (sender, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Read to the end: closing the pipe early would fail the child's
+        // later output.
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(at) = line.find(READY) {
+                let _ = sender.send(line.get(at..).unwrap_or_default().to_string());
+            }
+        }
+    });
+    let line = lines
+        .recv_timeout(READY_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())))
+        .map_err(|_| BenchError("a receive child never got ready".into()))?;
+    let mut addresses = line
+        .strip_prefix(READY)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|address| address.parse::<SocketAddr>().ok());
+    match (addresses.next(), addresses.next(), addresses.next()) {
+        (Some(Some(data)), Some(Some(control)), None) => Ok((data, control)),
+        _ => Err(BenchError(format!("bad ready line {line}"))),
+    }
+}
+
+/// The name of receiver `index`'s sample file.
+fn receive_file(index: u16) -> String {
+    format!("receive-{index}.samples")
+}
+
 /// Runs one wire run with each role in its own process, writing the
-/// sample files into `dir` (`send.samples`, `receive.samples`).
+/// sample files into `dir` (`send.samples` and `receive-<i>.samples`).
+/// Under F2 every receiver joins one loopback multicast group.
 ///
 /// # Errors
 ///
-/// A child that fails, never gets ready, outlives the deadline or the
-/// receiver, or writes samples that do not match the run.
+/// F2 off Linux, a group already joined on the host, a child that fails,
+/// never gets ready, outlives the deadline or the receivers, or writes
+/// samples that do not match the run.
 pub fn run_processes(
     run: &StageRun,
     dir: &Path,
@@ -1019,6 +1186,8 @@ pub fn run_processes(
     let prepared = Prepared::new(run, &Trusted)?;
     let expected =
         usize::try_from(run.messages).map_err(|_| BenchError("too many messages".into()))?;
+    let count = usize::from(run.receivers);
+    let fanout = fanout(run)?;
     let budget = match options.deadline {
         Some(deadline) => deadline,
         None => receive_deadline(run)?
@@ -1029,85 +1198,104 @@ pub fn run_processes(
         .checked_add(budget)
         .ok_or_else(|| BenchError("run deadline overflow".into()))?;
     std::fs::create_dir_all(dir).map_err(|cause| error("sample directory", cause))?;
-    let send_out = dir.join("send.samples");
-    let receive_out = dir.join("receive.samples");
     let spawn = Spawn {
         run,
         nonce: nonce(),
         options,
     };
-    let mut receiver = spawn.child("rx", &receive_out, None, options.cores.map(|c| c.receiver))?;
-    let stdout = receiver
-        .0
-        .stdout
-        .take()
-        .ok_or_else(|| BenchError("the receive child has no output".into()))?;
-    let (sender, ready) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // Read to the end: closing the pipe early would fail the child's
-        // later output.
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(at) = line.find(READY) {
-                let _ = sender.send(line.get(at..).unwrap_or_default().to_string());
-            }
+    let group = if count > 1 {
+        if !cfg!(target_os = "linux") {
+            return Err(BenchError(
+                "F2 needs receivers sharing the group port (SO_REUSEADDR), Linux only".into(),
+            ));
         }
-    });
-    let line = ready
-        .recv_timeout(READY_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())))
-        .map_err(|_| BenchError("the receive child never got ready".into()))?;
-    let peers = line
-        .strip_prefix(READY)
-        .map(str::trim)
-        .ok_or_else(|| BenchError(format!("bad ready line {line}")))?
-        .to_string();
-    let mut addresses = peers
-        .split_whitespace()
-        .map(|address| address.parse::<SocketAddr>().ok());
-    let (Some(Some(receiver_address)), Some(Some(control_address)), None) =
-        (addresses.next(), addresses.next(), addresses.next())
-    else {
-        return Err(BenchError(format!("bad ready line {line}")));
+        let group = group_of(spawn.nonce);
+        if joined(group)? {
+            return Err(BenchError(format!(
+                "multicast group {group} is already joined on this host"
+            )));
+        }
+        Some(group)
+    } else {
+        None
     };
-    let mut sender_child = spawn.child(
-        "tx",
-        &send_out,
-        Some(&peers),
-        options.cores.map(|c| c.sender),
-    )?;
+    let assigned = options.cores.as_ref().map(|cores| cores.assign(count));
+    let core_of =
+        |index: usize| -> Option<usize> { assigned.as_ref()?.as_ref()?.0.get(index).copied() };
+    let sender_core = assigned.as_ref().and_then(|a| a.as_ref().map(|(_, s)| *s));
+    // The first receiver binds the group with port 0; the others bind the
+    // port it reports.
+    let mut receivers: Vec<Receiver> = Vec::with_capacity(count);
+    for index in 0..run.receivers {
+        let out = dir.join(receive_file(index));
+        let mut extra = vec![(RECEIVER, index.to_string())];
+        if let Some(group) = group {
+            let port = receivers.first().map_or(0, |first| first.data.port());
+            extra.push((GROUP, SocketAddrV4::new(group, port).to_string()));
+        }
+        let mut guard = spawn.child("rx", &out, None, core_of(usize::from(index)), &extra)?;
+        let (data, control) = ready(&mut guard, deadline)?;
+        receivers.push(Receiver {
+            guard,
+            data,
+            control,
+            status: None,
+        });
+    }
+    let destination = receivers
+        .first()
+        .map(|first| first.data)
+        .ok_or_else(|| BenchError("no receiver".into()))?;
+    let mut peers = destination.to_string();
+    for receiver in &receivers {
+        peers.push(' ');
+        peers.push_str(&receiver.control.to_string());
+    }
+    let send_out = dir.join("send.samples");
+    let mut sender_child = spawn.child("tx", &send_out, Some(&peers), sender_core, &[])?;
     let parent =
         UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|cause| error("control", cause))?;
     let mut dones_to_drop = options.faults.drop_dones;
     let mut sent: Option<ExitStatus> = None;
-    let mut received: Option<ExitStatus> = None;
-    let mut receiver_ended: Option<Instant> = None;
-    // Both children are polled until both have exited. On any early
-    // return, the guards kill and reap what is still running.
-    while sent.is_none() || received.is_none() {
+    let mut receivers_ended: Option<Instant> = None;
+    // Every child is polled until all have exited. On any early return,
+    // the guards kill and reap what is still running.
+    while sent.is_none() || receivers.iter().any(|r| r.status.is_none()) {
         if sent.is_none() {
             sent = sender_child
                 .0
                 .try_wait()
                 .map_err(|cause| error("tx", cause))?;
         }
-        if received.is_none() {
-            received = receiver.0.try_wait().map_err(|cause| error("rx", cause))?;
+        for (index, receiver) in receivers.iter_mut().enumerate() {
+            if receiver.status.is_none() {
+                receiver.status = receiver
+                    .guard
+                    .0
+                    .try_wait()
+                    .map_err(|cause| error("rx", cause))?;
+                // A receiver that failed ends the run at once.
+                if let Some(status) = receiver.status {
+                    check(status, &format!("rx{index}"))?;
+                }
+            }
         }
-        if let Some(status) = received {
-            // A receiver that failed ends the run at once.
-            check(status, "rx")?;
-            let ended = *receiver_ended.get_or_insert_with(Instant::now);
+        if receivers.iter().all(|r| r.status.is_some()) {
+            let ended = *receivers_ended.get_or_insert_with(Instant::now);
             if sent.is_none() && ended.elapsed() >= OUTLIVE {
                 return Err(BenchError(format!(
-                    "the sender outlived the receiver by {OUTLIVE:?}"
+                    "the sender outlived the receivers by {OUTLIVE:?}"
                 )));
             }
         }
-        if sent.is_some() && received.is_none() {
-            // Repeated until the receiver exits: one notice can be lost.
-            match dones_to_drop.checked_sub(1) {
-                Some(left) => dones_to_drop = left,
-                None => {
-                    let _ = parent.send_to(&control(DONE, spawn.nonce, 0), control_address);
+        if sent.is_some() {
+            // Repeated until each receiver exits: one notice can be lost.
+            for receiver in receivers.iter().filter(|r| r.status.is_none()) {
+                match dones_to_drop.checked_sub(1) {
+                    Some(left) => dones_to_drop = left,
+                    None => {
+                        let _ = parent.send_to(&control(DONE, spawn.nonce, 0), receiver.control);
+                    }
                 }
             }
         }
@@ -1120,21 +1308,9 @@ pub fn run_processes(
         check(status, "tx")?;
     }
     let send = samples::read_file(&send_out).map_err(|cause| error("send samples", cause))?;
-    let receive =
-        samples::read_file(&receive_out).map_err(|cause| error("receive samples", cause))?;
     check_samples(&send, run, Stage::Send, options, expected)?;
-    check_samples(
-        &receive,
-        run,
-        Stage::Receive { receiver: 0 },
-        options,
-        expected,
-    )?;
-    let rx = std::fs::read_to_string(receive_out.with_extension("rx"))
-        .map_err(|cause| error("rx sidecar", cause))?;
     let tx = std::fs::read_to_string(send_out.with_extension("tx"))
         .map_err(|cause| error("tx sidecar", cause))?;
-    let rx = sidecar(&rx, &["affinity", "drops", "batches", "callback"])?;
     let tx = sidecar(&tx, &["affinity", "backpressure", "ack_timeouts"])?;
     let field = |values: &[&str], index: usize| -> Result<u64, BenchError> {
         values
@@ -1143,34 +1319,63 @@ pub fn run_processes(
             .parse()
             .map_err(|cause| error("sidecar number", cause))
     };
-    let receive_callback = numbers(rx.get(3).copied().unwrap_or_default())?;
-    let affinity = |values: &[&'_ str]| values.first().copied().unwrap_or_default().to_string();
-    let pinning: Vec<String> = [
-        pin_reason("rx", &affinity(&rx), options.cores.map(|c| c.receiver)),
-        pin_reason("tx", &affinity(&tx), options.cores.map(|c| c.sender)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    let functional_reasons = functional_reasons(pinning);
-    if receive_callback.len() != expected {
-        return Err(BenchError(format!(
-            "{} callback samples, {expected} expected",
-            receive_callback.len()
-        )));
+    let mut pinning: Vec<String> = Vec::new();
+    if assigned.as_ref().is_some_and(Option::is_none) {
+        pinning.push(format!(
+            "{} receivers and a sender need {} quiet cores; the host has {}",
+            count,
+            count.saturating_add(1),
+            options.cores.as_ref().map_or(0, |cores| cores.quiet.len())
+        ));
     }
+    let mut per_receiver = Vec::with_capacity(count);
+    for index in 0..run.receivers {
+        let out = dir.join(receive_file(index));
+        let receive = samples::read_file(&out).map_err(|cause| error("receive samples", cause))?;
+        check_samples(
+            &receive,
+            run,
+            Stage::Receive { receiver: index },
+            options,
+            expected,
+        )?;
+        let rx = std::fs::read_to_string(out.with_extension("rx"))
+            .map_err(|cause| error("rx sidecar", cause))?;
+        let rx = sidecar(&rx, &["affinity", "drops", "batches", "callback"])?;
+        let receive_callback = numbers(rx.get(3).copied().unwrap_or_default())?;
+        if receive_callback.len() != expected {
+            return Err(BenchError(format!(
+                "rx{index}: {} callback samples, {expected} expected",
+                receive_callback.len()
+            )));
+        }
+        pinning.extend(pin_reason(
+            &format!("rx{index}"),
+            rx.first().copied().unwrap_or_default(),
+            core_of(usize::from(index)),
+        ));
+        per_receiver.push(ReceiverSamples {
+            receive: receive.samples,
+            receive_callback,
+            batches: numbers(rx.get(2).copied().unwrap_or_default())?,
+            drops: field(&rx, 1)?,
+        });
+    }
+    pinning.extend(pin_reason(
+        "tx",
+        tx.first().copied().unwrap_or_default(),
+        sender_core,
+    ));
+    let functional_reasons = functional_reasons(pinning, fanout);
     Ok(StageSamples {
         send: send.samples,
-        receive: receive.samples,
-        receive_callback,
-        batches: numbers(rx.get(2).copied().unwrap_or_default())?,
-        backend_drops: field(&rx, 1)?,
+        receivers: per_receiver,
         backpressure: field(&tx, 1)?,
         ack_timeouts: field(&tx, 2)?,
         messages_per_sample: prepared.messages_per_sample,
         functional_only: !functional_reasons.is_empty(),
         functional_reasons,
-        receiver: receiver_address,
+        destination,
     })
 }
 
@@ -1190,6 +1395,7 @@ mod tests {
                         load,
                         messages: 1_000_000,
                         warmup: 100_000,
+                        receivers: 4,
                     };
                     assert_eq!(decode_run(&encode_run(&run)).ok(), Some(run));
                 }
@@ -1200,11 +1406,41 @@ mod tests {
             "W1",
             "W8.0,64,counts,closed,1,1",
             "W1,64,both,closed,1,1",
-            "W1,64,counts,open:0,1,1",
-            "W1,64,counts,closed,1,1,9",
+            "W1,64,counts,open:0,1,1,1",
+            "W1,64,counts,closed,1,1",
+            "W1,64,counts,closed,1,1,0",
+            "W1,64,counts,closed,1,1,1,9",
         ] {
             assert!(decode_run(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn groups_are_organisation_local_and_follow_the_nonce() {
+        assert_eq!(group_of(0x1234), Ipv4Addr::new(239, 255, 0x12, 0x34));
+        assert!(group_of(u64::MAX).is_multicast());
+        assert_ne!(group_of(1), group_of(2));
+    }
+
+    #[test]
+    fn a_joined_group_is_found_in_the_igmp_table() {
+        let table = "Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n\
+                     1\tlo        :     2      V3\n\
+                     \t\t\t\t3412FFEF     1 0:00000000\t\t0\n\
+                     \t\t\t\t010000E0     1 0:00000000\t\t0\n";
+        assert!(listed(table, Ipv4Addr::new(239, 255, 0x12, 0x34)));
+        assert!(listed(table, Ipv4Addr::new(224, 0, 0, 1)));
+        assert!(!listed(table, Ipv4Addr::new(239, 255, 0x34, 0x12)));
+    }
+
+    #[test]
+    fn cores_go_to_the_receivers_then_the_sender() {
+        let cores = Cores {
+            quiet: vec![2, 3, 4, 5, 6],
+        };
+        assert_eq!(cores.assign(1), Some((vec![2], 3)));
+        assert_eq!(cores.assign(4), Some((vec![2, 3, 4, 5], 6)));
+        assert_eq!(cores.assign(5), None);
     }
 
     #[test]

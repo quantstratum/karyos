@@ -27,7 +27,7 @@ use crate::decision::{
     Outcome, Overall, PointInput, PointResult, Side, TieBreak, TieBreakInput, Verdict,
 };
 use crate::env::Ineligible;
-use crate::manifest::{EMax, MANIFEST_SHA256, MtuRule, Point, VERSION, primary};
+use crate::manifest::{EMax, Fanout, MANIFEST_SHA256, MtuRule, Point, VERSION, primary};
 use crate::plan::{self, INSUFFICIENT, Plan, PlanOptions, PlannedRun};
 use crate::preflight;
 use crate::samples::{self, MISSING, Stage};
@@ -254,6 +254,9 @@ pub struct RunSummary {
     /// The p99.9 of receiver 0's stage from each message's own first
     /// callback (H-5, reported alongside), ns; `None` when infinite.
     pub callback_p999: Option<u32>,
+    /// Each receiver's own p99.9 of its receive stage, ns; `None` when
+    /// infinite. One entry under F1.
+    pub receivers: Vec<Option<u32>>,
     /// Kernel pushbacks of the sender.
     pub backpressure: u64,
     /// R1 messages not acknowledged in time.
@@ -349,14 +352,18 @@ struct RunData {
     kept: Vec<u32>,
     /// Saturated decision samples (design 2.3), counted once.
     saturated: u64,
-    /// Missing messages in the send and the receive stage files.
-    missing: (u64, u64),
-    /// The p99.9 of the H-5 callback stage.
+    /// Missing messages in the send file and in each receive file.
+    missing: (u64, Vec<u64>),
+    /// The p99.9 of receiver 0's H-5 callback stage.
     callback_p999: Option<u32>,
+    /// Each receiver's own p99.9 of its receive stage.
+    receivers: Vec<Option<u32>>,
 }
 
-/// Reads and checks one run's files: both sample headers must name the
-/// planned point, configuration, stage and round.
+/// Reads and checks one run's files: every sample header must name the
+/// planned point, configuration, stage and round. The decision sample is
+/// the per-message sum of the send stage and, under F2, the slowest
+/// receiver's receive stage (M-5a, H-3).
 fn run_data(dir: &Path, planned: &PlannedRun, n: u64) -> Result<RunData, BenchError> {
     let file = |name: &str, stage: Stage| -> Result<Vec<u32>, BenchError> {
         let path = dir.join(name);
@@ -380,10 +387,18 @@ fn run_data(dir: &Path, planned: &PlannedRun, n: u64) -> Result<RunData, BenchEr
         Ok(read.samples)
     };
     let send = file("send.samples", Stage::Send)?;
-    let receive = file("receive.samples", Stage::Receive { receiver: 0 })?;
-    let (combined, saturated) = samples::combine(&send, &[&receive])
+    let receives = (0..planned.run.receivers)
+        .map(|receiver| {
+            file(
+                &format!("receive-{receiver}.samples"),
+                Stage::Receive { receiver },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let stages: Vec<&[u32]> = receives.iter().map(Vec::as_slice).collect();
+    let (combined, saturated) = samples::combine(&send, &stages)
         .map_err(|cause| BenchError(format!("{}: {cause}", dir.display())))?;
-    let sidecar = read(&dir.join("receive.rx"))?;
+    let sidecar = read(&dir.join("receive-0.rx"))?;
     let callback = sidecar
         .lines()
         .find_map(|line| line.strip_prefix("callback "))
@@ -403,9 +418,24 @@ fn run_data(dir: &Path, planned: &PlannedRun, n: u64) -> Result<RunData, BenchEr
     Ok(RunData {
         kept: plan::keep_n(&combined, planned.messages_per_sample, n)?,
         saturated,
-        missing: (samples::missing(&send), samples::missing(&receive)),
+        missing: (
+            samples::missing(&send),
+            receives.iter().map(|r| samples::missing(r)).collect(),
+        ),
         callback_p999: stats::p999(&callback).filter(|v| *v != MISSING),
+        receivers: receives
+            .iter()
+            .map(|r| stats::p999(r).filter(|v| *v != MISSING))
+            .collect(),
     })
+}
+
+/// The effective quantile of one receiver that the p99.9 of the
+/// per-message maximum over `receivers` independent receivers reads:
+/// `q` with `q^k = 0.999` (M-5c; about p99.975 for 4).
+#[must_use]
+pub fn effective_quantile(receivers: u16) -> f64 {
+    0.999_f64.powf(1.0 / f64::from(receivers.max(1)))
 }
 
 /// The runs of configuration `name` among one point's runs.
@@ -457,6 +487,11 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         e_max: u32::try_from(header.number("e_max")?).map_err(|_| BenchError("e_max".into()))?,
         rule: parse_rule(header.string("rule")?)?,
         configurations: header.list("configurations")?.to_vec(),
+        f2: match header.get("f2")? {
+            Json::Raw(raw) if raw == "true" => true,
+            Json::Raw(raw) if raw == "false" => false,
+            _ => return Err(BenchError("f2 is not a boolean".into())),
+        },
     };
     let plan: Plan = plan::expand(&primary(), &options)?;
     let (a, b) = match options.configurations.as_slice() {
@@ -598,6 +633,7 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             saturated: 0,
             quantiles: [None; 3],
             callback_p999: None,
+            receivers: Vec::new(),
             backpressure: 0,
             ack_timeouts: 0,
             functional_reasons: Vec::new(),
@@ -623,11 +659,16 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
                 }
             }
             let data = run_data(&dir, planned, options.messages)?;
-            if (
-                line.number("send_missing")?,
-                line.number("receive_missing")?,
-            ) != data.missing
-            {
+            let receive_missing = line
+                .list("receive_missing")?
+                .iter()
+                .map(|count| {
+                    count
+                        .parse::<u64>()
+                        .map_err(|_| BenchError(format!("result {index}: receive_missing")))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if (line.number("send_missing")?, receive_missing) != data.missing {
                 return Err(BenchError(format!(
                     "result {index}: missing counts differ from the sample files {:?}",
                     data.missing
@@ -635,6 +676,7 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             }
             let (kept, saturated) = (data.kept, data.saturated);
             summary.callback_p999 = data.callback_p999;
+            summary.receivers = data.receivers;
             let finite = |value: Option<u32>| value.filter(|v| *v != MISSING);
             summary.n = u64::try_from(kept.len()).map_err(|_| BenchError("n".into()))?;
             summary.missing = samples::missing(&kept);
@@ -827,6 +869,24 @@ pub fn report(analysis: &Analysis) -> String {
             point.point,
             outcome_text(&point.outcome)
         );
+        if let Fanout::F2 { receivers } = point.point.fanout {
+            let _ = writeln!(
+                out,
+                "- partial: no SM/NAK (P2.7); reported only (M-6). Reading: slowest \
+                 receiver, the per-message maximum of the receive stage over {receivers} \
+                 receivers (H-3), effective quantile p{:.3} of one receiver (M-5c).",
+                effective_quantile(u16::from(receivers)) * 100.0
+            );
+            for run in &point.runs {
+                let own: Vec<String> = run.receivers.iter().map(|v| ns(*v)).collect();
+                let _ = writeln!(
+                    out,
+                    "- run {} receivers' own p99.9: [{}] ns",
+                    run.index,
+                    own.join(", ")
+                );
+            }
+        }
         if let Some(result) = &point.result {
             for (name, per_run, cv) in &result.spread {
                 let per_run: Vec<String> = per_run
@@ -1181,7 +1241,7 @@ mod tests {
     use crate::manifest::{ILLUSTRATIVE_E_MAX, Shape};
     use crate::measure::result_line;
     use crate::samples::{Header, RunSamples};
-    use crate::wire::stage::StageSamples;
+    use crate::wire::stage::{ReceiverSamples, StageSamples};
 
     /// The `measure.json` fields of an eligible host without a record,
     /// E_max provisional.
@@ -1205,12 +1265,27 @@ mod tests {
         record: Option<&str>,
         edit: &Edit,
     ) -> std::path::PathBuf {
+        fixture_with(name, class, hash, facts, record, false, edit)
+    }
+
+    /// [`fixture`] with F2 on or off. Under F2, receiver `i` of a run is
+    /// `10 * i` ns slower than receiver 0, so the slowest is the last.
+    fn fixture_with(
+        name: &str,
+        class: &str,
+        hash: &str,
+        facts: &str,
+        record: Option<&str>,
+        f2: bool,
+        edit: &Edit,
+    ) -> std::path::PathBuf {
         let out =
             std::env::temp_dir().join(format!("karyos-analyze-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out);
         let mut options = PlanOptions::smoke(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope);
         options.messages = 10;
         options.warmup = 0;
+        options.f2 = f2;
         let plan = plan::expand(&primary(), &options).unwrap();
         let configurations: Vec<String> = options
             .configurations
@@ -1233,7 +1308,7 @@ mod tests {
                  \"commit\":\"c\",\"class\":\"{class}\",\"environment\":\"{class}\",\
                  \"messages\":10,\"warmup\":0,\"rounds\":5,\"e_max\":64,\
                  \"rule\":\"CountsEnvelope\",\"configurations\":[{}],\
-                 \"cores\":null,\"unpinned\":\"none\",{facts}}}\n",
+                 \"cores\":null,\"unpinned\":\"none\",\"f2\":{f2},{facts}}}\n",
                 configurations.join(",")
             ),
         )
@@ -1250,29 +1325,35 @@ mod tests {
                 .collect();
             let mut outcome = Ok(StageSamples {
                 send: data.clone(),
-                receive: data,
-                receive_callback: vec![7; count],
-                batches: vec![1; count],
-                backend_drops: 0,
+                receivers: (0..planned.run.receivers)
+                    .map(|receiver| ReceiverSamples {
+                        receive: data.iter().map(|v| v + u32::from(receiver) * 10).collect(),
+                        receive_callback: vec![7; count],
+                        batches: vec![1; count],
+                        drops: 0,
+                    })
+                    .collect(),
                 backpressure: 0,
                 ack_timeouts: 0,
                 messages_per_sample: usize::try_from(planned.messages_per_sample).unwrap(),
                 functional_only: false,
                 functional_reasons: Vec::new(),
-                receiver: "127.0.0.1:1".parse().unwrap(),
+                destination: "127.0.0.1:1".parse().unwrap(),
             });
             let mut preflight = "clocksource tsc\n".to_string();
             edit(planned, index, &mut outcome, &mut preflight);
             std::fs::write(out.join(&dir).join("preflight.txt"), &preflight).unwrap();
             if let Ok(samples) = &outcome {
-                for (file, stage, values) in [
-                    ("send.samples", Stage::Send, &samples.send),
-                    (
-                        "receive.samples",
-                        Stage::Receive { receiver: 0 },
-                        &samples.receive,
-                    ),
-                ] {
+                let files =
+                    std::iter::once(("send.samples".to_string(), Stage::Send, &samples.send))
+                        .chain(samples.receivers.iter().zip(0_u16..).map(|(r, receiver)| {
+                            (
+                                format!("receive-{receiver}.samples"),
+                                Stage::Receive { receiver },
+                                &r.receive,
+                            )
+                        }));
+                for (file, stage, values) in files {
                     let header = Header {
                         point: planned.point,
                         profile: planned.configuration.clone(),
@@ -1284,7 +1365,7 @@ mod tests {
                         saturated: 0,
                     };
                     samples::write_file(
-                        &out.join(&dir).join(file),
+                        &out.join(&dir).join(&file),
                         &RunSamples {
                             header,
                             samples: values.clone(),
@@ -1292,19 +1373,18 @@ mod tests {
                     )
                     .unwrap();
                 }
-                let callback: Vec<String> = samples
-                    .receive_callback
-                    .iter()
-                    .map(u32::to_string)
-                    .collect();
-                std::fs::write(
-                    out.join(&dir).join("receive.rx"),
-                    format!(
-                        "affinity 0\ndrops 0\nbatches 1\ncallback {}\n",
-                        callback.join(",")
-                    ),
-                )
-                .unwrap();
+                for (receiver, r) in samples.receivers.iter().enumerate() {
+                    let callback: Vec<String> =
+                        r.receive_callback.iter().map(u32::to_string).collect();
+                    std::fs::write(
+                        out.join(&dir).join(format!("receive-{receiver}.rx")),
+                        format!(
+                            "affinity 0\ndrops 0\nbatches 1\ncallback {}\n",
+                            callback.join(",")
+                        ),
+                    )
+                    .unwrap();
+                }
             }
             results.push_str(&result_line(
                 index,
@@ -1428,7 +1508,12 @@ mod tests {
             None,
             &|planned, _, outcome, _| {
                 if let (true, Ok(samples)) = (planned.configuration == "trusted-b", outcome) {
-                    for value in samples.send.iter_mut().chain(samples.receive.iter_mut()) {
+                    for value in samples.send.iter_mut().chain(
+                        samples
+                            .receivers
+                            .iter_mut()
+                            .flat_map(|r| r.receive.iter_mut()),
+                    ) {
                         *value *= 2;
                     }
                 }
@@ -1447,6 +1532,39 @@ mod tests {
                 .map(|p| &p.outcome)
                 .collect::<Vec<_>>()
         );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn an_f2_point_is_decided_on_its_slowest_receiver() {
+        let out = fixture_with("f2", "E1", MANIFEST_SHA256, ELIGIBLE, None, true, &none);
+        let analysis = write(&out).unwrap();
+        assert_eq!(analysis.points.len(), 16);
+        let f2 = analysis
+            .points
+            .iter()
+            .find(|p| matches!(p.point.fanout, Fanout::F2 { receivers: 4 }))
+            .unwrap();
+        let f1 = analysis
+            .points
+            .iter()
+            .find(|p| {
+                p.point.shape == f2.point.shape
+                    && p.point.load == f2.point.load
+                    && p.point.fanout == Fanout::F1
+            })
+            .unwrap();
+        // The slowest of 4 receivers is 30 ns slower than receiver 0.
+        assert_eq!(
+            f2.runs[0].quantiles[2].unwrap(),
+            f1.runs[0].quantiles[2].unwrap() + 30
+        );
+        assert_eq!(f2.runs[0].receivers.len(), 4);
+        let report = read(&out.join("report.md")).unwrap();
+        assert!(report.contains("partial: no SM/NAK (P2.7)"));
+        assert!(report.contains("effective quantile p99.975"));
+        // F2 stays reported only (M-6): the overall excludes it.
+        assert!(analysis.overall.reported_only.contains(&f2.point));
         let _ = std::fs::remove_dir_all(&out);
     }
 
@@ -1609,8 +1727,8 @@ mod tests {
         let out = plain("files");
         let run = out.join(&first);
         std::fs::rename(run.join("send.samples"), run.join("tmp")).unwrap();
-        std::fs::rename(run.join("receive.samples"), run.join("send.samples")).unwrap();
-        std::fs::rename(run.join("tmp"), run.join("receive.samples")).unwrap();
+        std::fs::rename(run.join("receive-0.samples"), run.join("send.samples")).unwrap();
+        std::fs::rename(run.join("tmp"), run.join("receive-0.samples")).unwrap();
         assert!(error_of(&out).contains("is not the planned run"));
         let _ = std::fs::remove_dir_all(&out);
     }
