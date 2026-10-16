@@ -35,6 +35,7 @@ fn config(publication: PublicationMode) -> LogBufferConfig {
         stream_id: 2,
         claim_deadline: DEFAULT_CLAIM_DEADLINE,
         publication,
+        schedule_capacity: 0,
     }
 }
 

@@ -2833,6 +2833,7 @@ mod tests {
                 stream_id,
                 claim_deadline: 100,
                 publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                schedule_capacity: 0,
             },
             allow_unconnected: false,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,

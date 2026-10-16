@@ -62,6 +62,7 @@ fn stream(
                 stream_id,
                 claim_deadline: DEADLINE,
                 publication,
+                schedule_capacity: 0,
             },
             allow_unconnected: false,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,

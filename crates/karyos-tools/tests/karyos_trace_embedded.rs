@@ -127,6 +127,7 @@ fn trace_numbers_drawn_between_journals_are_not_missed_journals() {
                 stream_id: KEY.stream_id,
                 claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
                 publication: PublicationMode::Exclusive,
+                schedule_capacity: 0,
             },
             allow_unconnected: true,
             on_required_loss: LossPolicy::Hold,

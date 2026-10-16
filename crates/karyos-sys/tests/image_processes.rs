@@ -86,6 +86,7 @@ fn config() -> LogBufferConfig {
             join: 0,
             local_gaps: false,
         },
+        schedule_capacity: 0,
     }
 }
 

@@ -62,6 +62,7 @@ fn fixture(stream_id: i32, quanta: &[u64], max_subscribers: u8) -> Fixture {
                     stream_id,
                     claim_deadline: 100,
                     publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                    schedule_capacity: 0,
                 },
                 allow_unconnected: true,
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,

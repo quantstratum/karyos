@@ -240,6 +240,7 @@ fn stream(
                 stream_id,
                 claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
                 publication,
+                schedule_capacity: 0,
             },
             allow_unconnected: false,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
@@ -319,6 +320,7 @@ fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchE
                 join: 0,
                 local_gaps: false,
             },
+            schedule_capacity: 0,
         })
         .map_err(|cause| error("image", cause))?,
     );
@@ -807,6 +809,7 @@ fn cleaner_throughput(config: Config) -> Result<Measurement, BenchError> {
                 publishers,
                 allow_non_lse: true,
             },
+            schedule_capacity: 0,
         })
         .map_err(|cause| error("log buffer", cause))?,
     );

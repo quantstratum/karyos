@@ -21,6 +21,7 @@ fn config(spare_slots: u8, max_subscribers: u8) -> LogBufferConfig {
         stream_id: 4,
         claim_deadline: DEFAULT_CLAIM_DEADLINE,
         publication: PublicationMode::Exclusive,
+        schedule_capacity: 0,
     }
 }
 

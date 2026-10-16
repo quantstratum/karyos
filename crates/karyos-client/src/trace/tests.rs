@@ -48,6 +48,7 @@ fn buffer(publication: PublicationMode) -> Arc<LogBuffer> {
             stream_id: 2,
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
             publication,
+            schedule_capacity: 0,
         })
         .unwrap(),
     )

@@ -720,6 +720,7 @@ mod tests {
                     publishers: 1,
                     allow_non_lse: true,
                 },
+                schedule_capacity: 0,
             })
             .unwrap(),
         );
@@ -790,6 +791,7 @@ mod tests {
                     publishers: 2,
                     allow_non_lse: true,
                 },
+                schedule_capacity: 0,
             })
             .unwrap(),
         )

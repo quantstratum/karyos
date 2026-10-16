@@ -58,6 +58,7 @@ fn image() -> Arc<LogBuffer> {
                 join: 0,
                 local_gaps: false,
             },
+            schedule_capacity: 0,
         })
         .unwrap(),
     )
@@ -149,6 +150,7 @@ fn publication_buffer() -> Arc<LogBuffer> {
             stream_id: STREAM,
             claim_deadline: DEFAULT_CLAIM_DEADLINE,
             publication: PublicationMode::Exclusive,
+            schedule_capacity: 0,
         })
         .unwrap(),
     )

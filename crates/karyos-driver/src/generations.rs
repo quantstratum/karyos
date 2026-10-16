@@ -615,6 +615,7 @@ mod tests {
                         publishers: 1,
                         allow_non_lse: true,
                     },
+                    schedule_capacity: 0,
                 },
                 allow_unconnected: true,
                 on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
