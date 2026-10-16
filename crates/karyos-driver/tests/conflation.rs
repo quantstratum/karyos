@@ -9,6 +9,7 @@ use karyos_driver::{
     ConflatedSubscription, DriverError, EmbeddedDriver, Reconfiguration, StreamConfig,
 };
 use karyos_sys::conflation::{Budget, ConflationConfig};
+use karyos_sys::counters::{CellRead, KIND_NONE};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{AppendOptions, LogBufferConfig, Role};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
@@ -218,4 +219,75 @@ fn feeder_and_table_survive_a_mapping_cutover() {
         values,
         [(1, 2, b"before".to_vec()), (2, 2, b"after".to_vec())]
     );
+}
+
+/// The value of the feeder counter `label` keyed to stream `stream`, after
+/// checking its type and keys; `None` when no such cell is allocated.
+fn feeder_counter(driver: &EmbeddedDriver, stream: u64, lane: u8, label: &str) -> Option<u64> {
+    let reader = driver.counters();
+    (0..reader.capacity()).find_map(|index| match reader.read(index) {
+        CellRead::Allocated {
+            metadata, value, ..
+        } if metadata.label() == label.as_bytes() && metadata.keys.stream == stream => {
+            assert_eq!(
+                metadata.type_id,
+                karyos_driver::counters::TYPE_EVENTS,
+                "{label}"
+            );
+            assert_eq!(metadata.keys.lane, lane, "{label}");
+            assert_eq!(metadata.keys.kind, KIND_NONE, "{label}");
+            assert_eq!(metadata.keys.participant, 0, "{label}");
+            Some(value)
+        }
+        _ => None,
+    })
+}
+
+const FEEDER_COUNTERS: [&str; 3] = [
+    "conflation updates written",
+    "conflation keys rejected",
+    "conflation values too large",
+];
+
+/// conflation-end-to-end.md, Counters: the feeder's counters are allocated
+/// per conflated stream, keyed by the stream and its lane, count the
+/// table writes, and are freed with the stream.
+#[test]
+fn feeder_counters_are_keyed_per_stream_and_freed_with_it() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut keyed = config(Some(conflation_config()));
+    keyed.buffer.lane = Lane::try_new(3).unwrap();
+    let stream = driver.add_stream(keyed).unwrap();
+    let mut other = config(None);
+    other.buffer.stream_id = 5;
+    let plain = driver.add_stream(other).unwrap();
+    let registration = driver.trace_identity(stream).unwrap().registration;
+    let plain_registration = driver.trace_identity(plain).unwrap().registration;
+    for label in FEEDER_COUNTERS {
+        assert_eq!(feeder_counter(&driver, registration, 3, label), Some(0));
+        // A stream without conflation has no feeder and no counters.
+        assert_eq!(feeder_counter(&driver, plain_registration, 0, label), None);
+    }
+
+    let mut publication = driver.publication(stream).unwrap();
+    let _conflated = driver.subscribe_conflated(stream).unwrap();
+    for value in [b"one".as_slice(), b"two", b"three"] {
+        offer_keyed(&mut driver, &mut publication, 2, value);
+    }
+    let _ = driver.do_work().unwrap();
+    assert_eq!(
+        feeder_counter(&driver, registration, 3, FEEDER_COUNTERS[0]),
+        Some(3)
+    );
+    assert_eq!(
+        feeder_counter(&driver, registration, 3, FEEDER_COUNTERS[1]),
+        Some(0)
+    );
+
+    drop(publication);
+    driver.remove_stream(stream).unwrap();
+    let _ = driver.do_work().unwrap();
+    for label in FEEDER_COUNTERS {
+        assert_eq!(feeder_counter(&driver, registration, 3, label), None);
+    }
 }

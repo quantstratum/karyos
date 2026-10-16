@@ -36,8 +36,9 @@ use karyos_protocol::cnc::MAX_RESPONSE_LENGTH;
 use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::{BroadcastTransmitter, HEADER_LENGTH, broadcast};
 use karyos_sys::conflation::{
-    Budget as ConflationBudget, ConflationConfig, ConflationWriter, conflation,
+    Budget as ConflationBudget, ConflationConfig, ConflationError, ConflationWriter, conflation,
 };
+use karyos_sys::counters::{Counter, CounterKeys, KIND_NONE};
 use karyos_sys::log_buffer::{
     Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, LossPolicy, Publication,
     Role, SealState,
@@ -50,7 +51,7 @@ use karyos_sys::term_bytes::{HeapTerms, TermBytes};
 use crate::client_counters::ClientCounters;
 use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
-use crate::counters::{DriverCounters, Event};
+use crate::counters::{DriverCounters, Event, TYPE_EVENTS};
 use crate::error::DriverError;
 use crate::generations::{Cutover, Member, MemberKind, Retained};
 
@@ -333,6 +334,68 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// Terminal table failure that sealed this stream. Kept for internal
     /// lifecycle state until the public seal reason is designed.
     pub(crate) conflation_terminal: Option<karyos_sys::conflation::ConflationError>,
+    /// The feeder's counters, when conflation is configured. They outlive
+    /// the feeder and are freed with the stream.
+    pub(crate) feeder_counters: Option<FeederCounters>,
+}
+
+/// The conflation feeder's event counters of one stream
+/// (`quantstratum-docs: karyos/design/conflation-end-to-end.md`,
+/// Counters), keyed by the stream and its lane. A counter is `None` when
+/// no cell was free, which `counters unavailable` counted.
+#[derive(Debug)]
+pub(crate) struct FeederCounters {
+    written: Option<Counter>,
+    keys_rejected: Option<Counter>,
+    values_too_large: Option<Counter>,
+}
+
+/// What one feeder poll did with its messages.
+#[derive(Debug, Default, Clone, Copy)]
+struct Fed {
+    written: u64,
+    keys_rejected: u64,
+    values_too_large: u64,
+}
+
+impl FeederCounters {
+    fn allocate(counters: &mut DriverCounters, stream: u64, lane: u8) -> Self {
+        let keys = CounterKeys {
+            stream,
+            lane,
+            kind: KIND_NONE,
+            participant: 0,
+        };
+        let mut allocate = |label| counters.allocate_keyed(TYPE_EVENTS, label, keys);
+        Self {
+            written: allocate("conflation updates written"),
+            keys_rejected: allocate("conflation keys rejected"),
+            values_too_large: allocate("conflation values too large"),
+        }
+    }
+
+    fn add(&self, counters: &DriverCounters, fed: Fed) {
+        for (counter, delta) in [
+            (&self.written, fed.written),
+            (&self.keys_rejected, fed.keys_rejected),
+            (&self.values_too_large, fed.values_too_large),
+        ] {
+            if let Some(counter) = counter
+                && delta > 0
+            {
+                counters.add_to(counter, delta);
+            }
+        }
+    }
+
+    fn free(self, counters: &mut DriverCounters) {
+        for counter in [self.written, self.keys_rejected, self.values_too_large]
+            .into_iter()
+            .flatten()
+        {
+            counters.free(counter);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -781,30 +844,35 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Frees retiring streams with no live lease and no registration.
     pub(crate) fn free_retired_streams(&mut self) {
-        let before = self.streams.len();
         let registrations = &self.registrations;
         let clients = &self.clients;
         // A remote grant keeps its stream until it ends, even after its
         // registration was removed.
-        self.streams.retain(|stream| {
-            !(stream.retiring
-                && stream.leases.live() == 0
-                && !registrations
-                    .iter()
-                    .any(|registration| registration.stream() == stream.id)
-                && !clients.iter().any(|client| {
-                    client
-                        .ledger
-                        .as_ref()
-                        .is_some_and(|ledger| ledger.names_stream(stream.id))
-                }))
-        });
-        let freed = before - self.streams.len();
-        if freed > 0 {
-            self.counters.add(
-                Event::StreamsFreed,
-                u64::try_from(freed).unwrap_or(u64::MAX),
-            );
+        let freed: Vec<Stream<T>> = self
+            .streams
+            .extract_if(.., |stream| {
+                stream.retiring
+                    && stream.leases.live() == 0
+                    && !registrations
+                        .iter()
+                        .any(|registration| registration.stream() == stream.id)
+                    && !clients.iter().any(|client| {
+                        client
+                            .ledger
+                            .as_ref()
+                            .is_some_and(|ledger| ledger.names_stream(stream.id))
+                    })
+            })
+            .collect();
+        if !freed.is_empty() {
+            let count = u64::try_from(freed.len()).unwrap_or(u64::MAX);
+            // The feeder counters go with their stream.
+            for stream in freed {
+                if let Some(counters) = stream.feeder_counters {
+                    counters.free(&mut self.counters);
+                }
+            }
+            self.counters.add(Event::StreamsFreed, count);
             self.update_stream_gauges();
         }
     }
@@ -888,6 +956,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             None => (None, Vec::new()),
         };
+        let feeder_counters = feeder
+            .is_some()
+            .then(|| FeederCounters::allocate(&mut self.counters, id, config.buffer.lane.get()));
         self.next_stream = next;
         self.streams.push(Stream {
             id,
@@ -910,6 +981,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             spare: None,
             feeder,
             conflation_terminal: None,
+            feeder_counters,
         });
         self.update_stream_gauges();
         Ok(StreamHandle {
@@ -1171,20 +1243,31 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 writer,
             } = feeder;
             let mut terminal = None;
-            let summary = match subscription.poll(
-                |value, info| {
-                    if config
-                        .validate_publication(info.reserved_value, value.len())
-                        .is_ok()
-                        && let Ok(key) = u32::try_from(info.reserved_value)
-                        && let Err(error) = writer.write(key, value)
-                        && error == karyos_sys::conflation::ConflationError::VersionsExhausted
-                    {
-                        terminal = Some(error);
+            let mut fed = Fed::default();
+            let polled = subscription.poll(
+                |value, info| match config.validate_publication(info.reserved_value, value.len()) {
+                    Err(ConflationError::KeyOutOfRange { .. }) => fed.keys_rejected += 1,
+                    Err(ConflationError::ValueTooLarge { .. }) => fed.values_too_large += 1,
+                    Err(_) => {}
+                    Ok(()) => {
+                        if let Ok(key) = u32::try_from(info.reserved_value) {
+                            match writer.write(key, value) {
+                                Ok(_) => fed.written += 1,
+                                Err(error @ ConflationError::VersionsExhausted) => {
+                                    terminal = Some(error);
+                                }
+                                Err(_) => {}
+                            }
+                        }
                     }
                 },
                 MessageLimit::new(budget),
-            ) {
+            );
+            // A failed poll still reports what it handled before the failure.
+            if let Some(counters) = &stream.feeder_counters {
+                counters.add(&self.counters, fed);
+            }
+            let summary = match polled {
                 Ok(summary) => summary,
                 Err(error) => {
                     first_error.get_or_insert(DriverError::Client(error.cause));
@@ -1495,6 +1578,62 @@ mod tests {
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
             conflation: None,
         }
+    }
+
+    /// conflation-end-to-end.md, Counters: the feeder counts the messages
+    /// it writes and those it rejects, by cause. A driver-issued
+    /// publication refuses bad keys and oversized values before reserving,
+    /// so the rejected ones come through a raw publication without those
+    /// checks, as a misbehaving process could write them.
+    #[test]
+    fn the_feeder_counts_writes_and_rejections_by_cause() {
+        use karyos_client::{ClientPublication, OfferOutcome};
+        use karyos_sys::counters::CellRead;
+        use karyos_sys::log_buffer::AppendOptions;
+
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let mut stream_config = config(42);
+        stream_config.conflation = Some(ConflationConfig {
+            keys: 4,
+            value_capacity: 8,
+            journal_capacity: 1024,
+        });
+        let handle = driver.add_stream(stream_config).unwrap();
+        let inner = driver
+            .stream(handle)
+            .unwrap()
+            .buffer
+            .publication_owned()
+            .unwrap()
+            .unwrap();
+        let mut publication = ClientPublication::new(inner, false);
+        for (key, value) in [
+            (1, b"ok".as_slice()),
+            (99, b"bad-key"),
+            (-1, b"negative"),
+            (2, b"too-long-value"),
+            (3, b"fine"),
+        ] {
+            let options = AppendOptions {
+                reserved_value: key,
+                ..AppendOptions::default()
+            };
+            assert!(matches!(
+                publication.offer_with(value, options).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ));
+        }
+        let _ = driver.do_work().unwrap();
+        let reader = driver.counters();
+        let value = |counter: &Option<Counter>| match reader.read(counter.as_ref().unwrap().index())
+        {
+            CellRead::Allocated { value, .. } => value,
+            other => panic!("unexpected {other:?}"),
+        };
+        let counters = driver.streams[0].feeder_counters.as_ref().unwrap();
+        assert_eq!(value(&counters.written), 2);
+        assert_eq!(value(&counters.keys_rejected), 2);
+        assert_eq!(value(&counters.values_too_large), 1);
     }
 
     #[test]
