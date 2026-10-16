@@ -40,6 +40,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             && grant.generation == predecessor
                             && grant.sent
                             && !grant.fenced
+                            && grant.participant != Participant::Conflation
                     })
                     .map(move |grant| (client, *grant))
             })
@@ -148,8 +149,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     .ok()?;
                 Participant::Subscriber { cell, role }
             }
-            // A journal grant names no stream, so no cutover moves it.
-            Participant::Journal { .. } => return None,
+            // A journal grant names no stream, and a conflation table
+            // outlives generations: no cutover moves either.
+            Participant::Journal { .. } | Participant::Conflation => return None,
         };
         self.next_export = next_export;
         self.next_registration = next_handover;
@@ -242,7 +244,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Concurrent { slot } => {
                 conductor.fence_concurrent_publication(slot, grant.export)
             }
-            Participant::Journal { .. } => false,
+            Participant::Journal { .. } | Participant::Conflation => false,
         }
     }
 
@@ -259,7 +261,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .ledger(client)?
             .grants()
             .iter()
-            .filter(|grant| grant.registration == registration && grant.stream != 0)
+            .filter(|grant| {
+                grant.registration == registration
+                    && grant.stream != 0
+                    && grant.participant != Participant::Conflation
+            })
             .max_by_key(|grant| grant.generation)
             .copied()?;
         let target = self.streams.iter().find(|s| s.id == newest.stream)?;
@@ -302,7 +308,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .clients
             .iter()
             .filter_map(|slot| slot.ledger.as_ref())
-            .flat_map(|ledger| ledger.grants().iter().map(|g| (g.stream, g.generation)))
+            // A conflation view holds the table, which outlives
+            // generations, never a mapping.
+            .flat_map(|ledger| {
+                ledger
+                    .grants()
+                    .iter()
+                    .filter(|g| g.participant != Participant::Conflation)
+                    .map(|g| (g.stream, g.generation))
+            })
             .collect();
         charged.sort_unstable();
         charged.dedup();

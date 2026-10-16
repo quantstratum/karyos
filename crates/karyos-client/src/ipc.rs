@@ -486,7 +486,8 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
             | WireKind::Journal
             | WireKind::ErrorLog
             | WireKind::LossReport
-            | WireKind::TraceMirror => {
+            | WireKind::TraceMirror
+            | WireKind::ConflationTable => {
                 return Err(AttachError::Protocol);
             }
         };
@@ -662,6 +663,17 @@ impl RemoteClient {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?.add_subscription(stream, role)
+    }
+
+    /// Requests a read-only view of a conflated stream's table, as
+    /// `ClientConductor::add_conflated_subscription`; it completes as
+    /// [`Outcome::FetchableConflated`](crate::Outcome::FetchableConflated).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_subscription`].
+    pub fn add_conflated_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
+        self.conductor_mut()?.add_conflated_subscription(stream)
     }
 
     /// Requests a client counter, as [`ClientConductor::allocate_counter`];

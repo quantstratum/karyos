@@ -232,7 +232,9 @@ impl Default for DriverConfig {
             command_budget: 64,
             cycles_between_drains: 2,
             ring_capacity: 1024,
-            broadcast_capacity: 16 * 1024,
+            // Room for two cycles of `command_budget` responses of the
+            // largest extent (`ConflatedReady`), with headroom.
+            broadcast_capacity: 32 * 1024,
             max_streams: 64,
             max_retained_generations: 2,
             cutover_deadline: 1_000_000_000,
@@ -1000,6 +1002,32 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         added
     }
 
+    /// The table of a conflated stream: in a driver-only region when this
+    /// driver admits remote clients, so views in other processes map it
+    /// read-only (`quantstratum-docs: karyos/design/conflation-end-to-end.md`,
+    /// Cross-process views); on the heap otherwise.
+    fn conflation_table(
+        &mut self,
+        config: ConflationConfig,
+    ) -> Result<ConflationWriter, DriverError> {
+        #[cfg(target_os = "linux")]
+        if let Some(admission) = self.admission.as_mut() {
+            let (instance, region) = admission.next_region()?;
+            return Ok(karyos_sys::conflation::conflation_in(
+                instance,
+                region,
+                config.keys,
+                config.value_capacity,
+                config.journal_capacity,
+            )?);
+        }
+        Ok(conflation(
+            config.keys,
+            config.value_capacity,
+            config.journal_capacity,
+        )?)
+    }
+
     fn add_stream_checked(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
         // A key in use (active or retiring) is reported before the quota.
         let key = (config.buffer.stream_id, config.buffer.session_id);
@@ -1028,11 +1056,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .ok_or(karyos_sys::error::SysError::ResourcesUnavailable)?;
         let (feeder, members) = match config.conflation {
             Some(conflation_config) => {
-                let writer = conflation(
-                    conflation_config.keys,
-                    conflation_config.value_capacity,
-                    conflation_config.journal_capacity,
-                )?;
+                let writer = self.conflation_table(conflation_config)?;
                 let inner = conductor.subscribe(Role::Required)?;
                 let link = GenerationLink::new();
                 let subscription =
@@ -1777,6 +1801,35 @@ mod tests {
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
             conflation: None,
         }
+    }
+
+    /// The default broadcast capacity keeps a margin over the largest
+    /// response extent, which `ConflatedReady` raised to 64 bytes: the
+    /// default needs half of it, and every command budget that built with
+    /// 40-byte extents at 16 KiB (up to 102) still builds.
+    #[test]
+    fn the_default_broadcast_capacity_keeps_a_margin() {
+        assert_eq!(RESPONSE_EXTENT, 64);
+        let config = DriverConfig::default();
+        let needed = RESPONSE_EXTENT * 2 * config.command_budget * config.cycles_between_drains;
+        assert!(2 * needed <= config.broadcast_capacity);
+        for command_budget in [64, 102, 128] {
+            assert!(
+                EmbeddedDriver::with_config(DriverConfig {
+                    command_budget,
+                    ..DriverConfig::default()
+                })
+                .is_ok(),
+                "{command_budget}"
+            );
+        }
+        assert!(matches!(
+            EmbeddedDriver::with_config(DriverConfig {
+                command_budget: 129,
+                ..DriverConfig::default()
+            }),
+            Err(DriverError::InvalidConfig)
+        ));
     }
 
     /// conflation-end-to-end.md, Counters: the feeder counts the messages

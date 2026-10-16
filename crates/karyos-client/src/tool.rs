@@ -91,7 +91,8 @@ impl Staged {
             WireKind::CommandRing
             | WireKind::Broadcast
             | WireKind::LogBuffer
-            | WireKind::Journal => None,
+            | WireKind::Journal
+            | WireKind::ConflationTable => None,
         }
     }
 }

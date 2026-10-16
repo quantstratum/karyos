@@ -121,6 +121,9 @@ pub(crate) struct ClientSlot<T: StreamTerms> {
 enum Kind {
     Publication,
     Subscription,
+    /// A remote client's read-only view of a conflated stream's table: no
+    /// log buffer participant, so no loss report, no trace journal.
+    ConflatedView,
 }
 
 /// A publication or subscription registration.
@@ -899,7 +902,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         registration,
                         key: registration,
                     },
-                    Kind::Subscription => Response::SubscriptionReady {
+                    // A view is never built here: `add_conflated` builds it.
+                    Kind::Subscription | Kind::ConflatedView => Response::SubscriptionReady {
                         request,
                         registration,
                         key: registration,
@@ -913,10 +917,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 } else {
                     Kind::Subscription
                 };
+                // A conflated view is removed as a subscription.
+                let removes = |found: Kind| {
+                    found == kind || (kind == Kind::Subscription && found == Kind::ConflatedView)
+                };
                 let Some(index) = self
                     .registrations
                     .iter()
-                    .position(|r| r.id == registration && r.client == client && r.kind == kind)
+                    .position(|r| r.id == registration && r.client == client && removes(r.kind))
                 else {
                     return refuse(ErrorCode::UnknownRegistration, registration);
                 };
@@ -979,6 +987,97 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     None => refuse(ErrorCode::UnknownRegistration, registration),
                 }
             }
+            Command::AddConflatedSubscription { stream, .. } => {
+                self.add_conflated(client, request, stream)
+            }
+        }
+    }
+
+    /// Serves `AddConflatedSubscription` (`quantstratum-docs:
+    /// karyos/design/conflation-end-to-end.md`, Cross-process views): a
+    /// remote client's read-only view of a live conflated stream's table.
+    /// Every check first (the stream, its table, the client's export
+    /// bounds, identities), then the effects, which cannot fail: the grant
+    /// is `Held` under a fresh export and its fetch carries the table's
+    /// region reopened read-only. An in-process client takes its view with
+    /// `subscribe_conflated` instead, so it is refused here.
+    fn add_conflated(&mut self, client: u64, request: RequestId, stream: StreamKey) -> Response {
+        let refuse = |code: ErrorCode, detail: u64| Response::Error {
+            request,
+            code,
+            detail,
+        };
+        let detail = u64::from(stream.stream_id.cast_unsigned());
+        let Some(target) = self
+            .find_stream(stream)
+            .and_then(|index| self.streams.get(index))
+        else {
+            return refuse(ErrorCode::UnknownStream, detail);
+        };
+        // A stream that is not conflated has no table, as for
+        // `subscribe_conflated`; one whose feeder is gone (lost or ended)
+        // no longer has one.
+        let (Some(config), Some(feeder)) = (target.conflation, target.feeder.as_ref()) else {
+            return refuse(ErrorCode::UnknownStream, detail);
+        };
+        let (stream, generation) = (target.id, target.generation.get());
+        let (Ok(value_capacity), Ok(journal_capacity)) = (
+            u64::try_from(config.value_capacity),
+            u64::try_from(config.journal_capacity),
+        ) else {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        };
+        let bytes = conflation_bytes(&feeder.writer);
+        let admitted = self
+            .ledger(client)
+            .map(|ledger| !ledger.full() && bytes.is_some_and(|bytes| ledger.fetchable(1, bytes)));
+        if admitted != Some(true) {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        }
+        let registration = self.next_registration;
+        let Some(next) = registration.checked_add(1) else {
+            return refuse(ErrorCode::IdentitiesExhausted, 0);
+        };
+        let export = self.next_export;
+        if !registration::valid_export(export) {
+            return refuse(ErrorCode::IdentitiesExhausted, 0);
+        }
+        // Effect: everything below cannot fail.
+        self.next_registration = next;
+        self.next_export = export + 1;
+        if let Some(ledger) = self.ledger_mut(client) {
+            ledger.push(Grant {
+                export,
+                registration,
+                key: registration,
+                stream,
+                participant: Participant::Conflation,
+                state: GrantState::Held,
+                sent: false,
+                generation,
+                fence_at: None,
+                fenced: false,
+            });
+        }
+        self.registrations.push(Registration {
+            id: registration,
+            client,
+            stream,
+            kind: Kind::ConflatedView,
+            // A remote registration has no in-process lease: it ends with
+            // its grant.
+            end: Arc::new(LeaseEnd::default()),
+            subscriber: None,
+            join: None,
+        });
+        self.counters.add(Event::GrantsReserved, 1);
+        Response::ConflatedReady {
+            request,
+            registration,
+            key: registration,
+            keys: config.keys,
+            value_capacity,
+            journal_capacity,
         }
     }
 
@@ -1023,6 +1122,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let (kind, join) = match live.kind {
             Kind::Subscription => (JournalKind::Subscriber, live.join),
             Kind::Publication => (JournalKind::Publisher, None),
+            // A view delivers no log messages: nothing to journal.
+            Kind::ConflatedView => {
+                return Response::Error {
+                    request,
+                    code: ErrorCode::UnknownRegistration,
+                    detail: registration,
+                };
+            }
         };
         let mut observed = Observed {
             kind,
@@ -1207,7 +1314,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 stream,
                 lane,
                 kind: match found.kind {
-                    Kind::Subscription => KIND_SUBSCRIBER,
+                    // A view is a reader of the stream too.
+                    Kind::Subscription | Kind::ConflatedView => KIND_SUBSCRIBER,
                     Kind::Publication => KIND_PUBLICATION,
                 },
                 participant,
@@ -1374,6 +1482,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Exclusive
             | Participant::Concurrent { .. }
             | Participant::Journal { .. } => (Kind::Publication, None),
+            // Never built here either: `AddConflatedSubscription` builds it.
+            Participant::Conflation => (Kind::ConflatedView, None),
         };
         self.registrations.push(Registration {
             id: registration,
@@ -1393,7 +1503,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 registration,
                 key: registration,
             },
-            Kind::Subscription => Response::SubscriptionReady {
+            Kind::Subscription | Kind::ConflatedView => Response::SubscriptionReady {
                 request,
                 registration,
                 key: registration,
@@ -1440,6 +1550,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.counters.add(Event::GrantsEnded, 1);
             return;
         }
+        // A view of a conflation table holds nothing in the log buffer: the
+        // table only reads as closed or open to it.
+        if grant.participant == Participant::Conflation {
+            self.counters.add(Event::GrantsEnded, 1);
+            return;
+        }
         let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
             return;
         };
@@ -1464,7 +1580,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Participant::Concurrent { slot } => conductor
                 .end_concurrent_publication(slot, grant.export)
                 .unwrap_or(false),
-            Participant::Journal { .. } => false,
+            Participant::Journal { .. } | Participant::Conflation => false,
         };
         if ended {
             self.counters.add(Event::GrantsEnded, 1);
@@ -1505,6 +1621,27 @@ pub(crate) fn fetch_bytes<T: StreamTerms>(buffer: &karyos_sys::log_buffer::LogBu
     {
         let _ = buffer;
         0
+    }
+}
+
+/// Bytes a fetch of a conflation table's region carries: its header stride
+/// and its structure; `None` for a table on the heap, which no remote
+/// client can map.
+fn conflation_bytes(writer: &karyos_sys::conflation::ConflationWriter) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let bytes = writer
+            .region()?
+            .record()
+            .structure_length
+            .checked_add(karyos_sys::ipc::HEADER_STRIDE)
+            .and_then(|bytes| u64::try_from(bytes).ok());
+        Some(bytes.unwrap_or(u64::MAX))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = writer;
+        None
     }
 }
 
@@ -2635,6 +2772,219 @@ mod tests {
         );
         assert_eq!(link.held(), 1);
         assert_eq!(ledger(&driver, remote).len(), 1);
+    }
+
+    /// A heap driver with stream 2 conflated.
+    fn driver_with_conflated_stream() -> (EmbeddedDriver, StreamHandle) {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let stream = driver
+            .add_stream(StreamConfig {
+                buffer: LogBufferConfig {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 3,
+                    max_subscribers: 4,
+                    mtu: DEFAULT_MTU,
+                    max_reserved: MIN_TERM_LENGTH / 8,
+                    initial_term_id: TermId::new(7),
+                    lane: Lane::ZERO,
+                    session_id: 1,
+                    stream_id: 2,
+                    claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                    publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                },
+                allow_unconnected: false,
+                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: Some(karyos_sys::conflation::ConflationConfig {
+                    keys: 4,
+                    value_capacity: 8,
+                    journal_capacity: 1024,
+                }),
+            })
+            .unwrap();
+        (driver, stream)
+    }
+
+    /// Records a view of stream 0's table for remote client `client`, as
+    /// `add_conflated` does (a heap driver has no table region to grant);
+    /// `sent` as if its descriptor left. Returns its registration.
+    fn push_view(driver: &mut EmbeddedDriver, client: u64, sent: bool) -> u64 {
+        let (registration, export) = (driver.next_registration, driver.next_export);
+        driver.next_registration += 1;
+        driver.next_export += 1;
+        let (stream, generation) = (driver.streams[0].id, driver.streams[0].generation.get());
+        let ledger = remote_ledger(driver, client);
+        ledger.push(Grant {
+            export,
+            registration,
+            key: registration,
+            stream,
+            participant: Participant::Conflation,
+            state: GrantState::Held,
+            sent: false,
+            generation,
+            fence_at: None,
+            fenced: false,
+        });
+        if sent {
+            ledger.mark_sent(export);
+        }
+        driver.registrations.push(Registration {
+            id: registration,
+            client,
+            stream,
+            kind: Kind::ConflatedView,
+            end: Arc::new(LeaseEnd::default()),
+            subscriber: None,
+            join: None,
+        });
+        registration
+    }
+
+    /// A view is a remote grant: an in-process client is refused (its view
+    /// comes from `subscribe_conflated`), and so is a remote client of a
+    /// heap driver, whose table has no region; a stream that is not
+    /// conflated is unknown to the command.
+    #[test]
+    fn a_view_needs_a_remote_client_and_a_region() {
+        let (mut driver, _stream) = driver_with_conflated_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (local, mut local_producer, _link) = raw_client(&mut driver);
+        let (remote, mut remote_producer) = remote_client(&mut driver, 4);
+        let add = |sequence, stream_id| Command::AddConflatedSubscription {
+            sequence,
+            stream: StreamKey {
+                stream_id,
+                session_id: 1,
+            },
+        };
+        write(&mut local_producer, add(1, 2));
+        write(&mut remote_producer, add(2, 2));
+        write(&mut remote_producer, add(3, 3));
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        for (client, sequence, code, detail) in [
+            (local, 1, ErrorCode::ResourcesUnavailable, 2),
+            (remote, 2, ErrorCode::ResourcesUnavailable, 2),
+            (remote, 3, ErrorCode::UnknownStream, 3),
+        ] {
+            assert!(
+                answers.contains(&Response::Error {
+                    request: RequestId { client, sequence },
+                    code,
+                    detail,
+                }),
+                "{answers:?}"
+            );
+        }
+        assert!(driver.registrations.is_empty());
+        assert!(ledger(&driver, remote).is_empty());
+    }
+
+    /// `QueryCutover` answers about log buffer registrations only: a view
+    /// is unknown to it.
+    #[test]
+    fn query_cutover_ignores_a_view() {
+        let (mut driver, _stream) = driver_with_conflated_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let registration = push_view(&mut driver, client, true);
+        write(
+            &mut producer,
+            Command::QueryCutover {
+                sequence: 1,
+                registration,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            responses(&mut observer),
+            vec![Response::Error {
+                request: RequestId {
+                    client,
+                    sequence: 1
+                },
+                code: ErrorCode::UnknownRegistration,
+                detail: registration,
+            }]
+        );
+    }
+
+    /// A cutover neither moves nor fences a sent view: no successor is
+    /// reserved for it and no event names it.
+    #[test]
+    fn a_cutover_neither_moves_nor_fences_a_view() {
+        let (mut driver, stream) = driver_with_conflated_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, _producer) = remote_client(&mut driver, 4);
+        let registration = push_view(&mut driver, client, true);
+        let _ = driver
+            .reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 5,
+                },
+            )
+            .unwrap();
+        for _ in 0..8 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(driver.streams[0].generation.get(), 1);
+        let grants = ledger(&driver, client);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert!(!grants[0].fenced && grants[0].fence_at.is_none());
+        let mut events = Vec::new();
+        while let Received::Message {
+            type_id, payload, ..
+        } = observer.receive()
+        {
+            if let Ok(event) = karyos_protocol::cnc::Event::decode(type_id, payload) {
+                events.push(event);
+            }
+        }
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                karyos_protocol::cnc::Event::SuccessorReady { registration: r, .. }
+                | karyos_protocol::cnc::Event::Fenced { registration: r, .. }
+                    if *r == registration
+            )),
+            "{events:?}"
+        );
+    }
+
+    /// `RemoveSubscription` removes a view whose descriptor never left and
+    /// ends its grant.
+    #[test]
+    fn removing_an_unsent_view_ends_its_grant() {
+        let (mut driver, _stream) = driver_with_conflated_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let registration = push_view(&mut driver, client, false);
+        let ended = counter(&driver, "grants ended");
+        write(
+            &mut producer,
+            Command::RemoveSubscription {
+                sequence: 1,
+                registration,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            responses(&mut observer),
+            vec![Response::OperationSucceeded {
+                request: RequestId {
+                    client,
+                    sequence: 1
+                },
+            }]
+        );
+        assert!(ledger(&driver, client).is_empty());
+        assert!(driver.registrations.is_empty());
+        assert_eq!(counter(&driver, "grants ended"), ended + 1);
     }
 
     /// A fence deadline that cannot be represented (`now` plus the

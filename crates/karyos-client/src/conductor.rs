@@ -110,6 +110,11 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     /// A remote client's trace journal, answered with its hand-over key:
     /// the client takes it with `RemoteClient::take_journal`.
     FetchableJournal(FetchableJournal),
+    /// A remote client's view of a conflated stream's table, answered with
+    /// its hand-over key and the table's configuration
+    /// (`quantstratum-docs: karyos/design/conflation-end-to-end.md`,
+    /// Cross-process views).
+    FetchableConflated(FetchableConflated),
     /// The command succeeded.
     Succeeded,
     /// The driver refused the command; it had no effect.
@@ -193,6 +198,23 @@ pub struct Fetchable {
     pub request: Request,
 }
 
+/// A remote client's view of a conflated stream's table, ready to fetch.
+/// The configuration is the driver's answer: a view checks it against its
+/// own limits before it maps anything, then requires it of the region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchableConflated {
+    /// The hand-over key of the response, which the fetch names.
+    pub key: u64,
+    /// The registration the response answered.
+    pub registration: u64,
+    /// The table's key count.
+    pub keys: u32,
+    /// The table's value capacity in bytes.
+    pub value_capacity: u64,
+    /// The table's journal capacity in bytes.
+    pub journal_capacity: u64,
+}
+
 /// A completed request.
 #[derive(Debug)]
 pub struct Completion<T: TermBytes = HeapTerms> {
@@ -217,6 +239,12 @@ enum Kind {
     AddPublication,
     AddConcurrentPublication,
     AddSubscription,
+    /// A remote client's view of a conflated stream's table.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    AddConflatedSubscription,
     Remove,
     AllocateCounter,
     /// The conductor's own `ReleaseCounter`: never reported.
@@ -572,6 +600,29 @@ impl<T: TermBytes> ClientConductor<T> {
                 stream,
                 role,
             }
+        })
+    }
+
+    /// Requests a view of a conflated stream's table (a remote client;
+    /// `quantstratum-docs: karyos/design/conflation-end-to-end.md`,
+    /// Cross-process views); returns the request sequence. It completes as
+    /// [`Outcome::FetchableConflated`]; an in-process client's view comes
+    /// from the driver's `subscribe_conflated` instead, and the driver
+    /// refuses the command.
+    ///
+    /// # Errors
+    ///
+    /// See [`ConductorError`]; nothing is submitted on error.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn add_conflated_subscription(
+        &mut self,
+        stream: StreamKey,
+    ) -> Result<u64, ConductorError> {
+        self.submit(Kind::AddConflatedSubscription, None, |sequence| {
+            Command::AddConflatedSubscription { sequence, stream }
         })
     }
 
@@ -1138,6 +1189,26 @@ impl<T: TermBytes> ClientConductor<T> {
                     });
                 }
                 _ => {}
+            }
+            if let (
+                Kind::AddConflatedSubscription,
+                Response::ConflatedReady {
+                    registration,
+                    key,
+                    keys,
+                    value_capacity,
+                    journal_capacity,
+                    ..
+                },
+            ) = (kind, response)
+            {
+                return Outcome::FetchableConflated(FetchableConflated {
+                    key,
+                    registration,
+                    keys,
+                    value_capacity,
+                    journal_capacity,
+                });
             }
             if let (Kind::TraceJournal, Some(layout), Response::JournalReady { journal, key, .. }) =
                 (kind, pending.journal, response)
