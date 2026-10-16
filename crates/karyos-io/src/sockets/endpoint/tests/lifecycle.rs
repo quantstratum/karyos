@@ -84,6 +84,26 @@ fn open_rejects_invalid_configuration_and_protection() {
             value: 65,
         },
     );
+    // Review P3-7: the pools against the memory cap (4.5). 8 slots of 256
+    // bytes and a 257 byte RX buffer need 2,305 bytes.
+    check(
+        |cfg| cfg.memory_cap = std::num::NonZeroU64::new(2304).unwrap(),
+        OpenError::InvalidConfig {
+            field: "memory_cap",
+            value: 2305,
+        },
+    );
+    // The largest pool (32 MiB) exceeds the provisional default cap.
+    check(
+        |cfg| {
+            cfg.tx_slots = nz(MAX_TX_SLOTS);
+            cfg.max_datagram = nz(MAX_DATAGRAM);
+        },
+        OpenError::InvalidConfig {
+            field: "memory_cap",
+            value: 4096 * 8192 + 8193,
+        },
+    );
     check(
         |cfg| {
             cfg.multicast = Some(MulticastConfig::new(
@@ -103,6 +123,21 @@ fn open_rejects_invalid_configuration_and_protection() {
 }
 
 #[test]
+fn memory_cap_admits_pools_at_the_cap() {
+    let mut cfg = config();
+    cfg.memory_cap = std::num::NonZeroU64::new(2305).unwrap();
+    assert_eq!(cfg.validate(), Ok(()), "the cap is inclusive");
+    cfg.tx_slots = nz(MAX_TX_SLOTS);
+    cfg.max_datagram = nz(MAX_DATAGRAM);
+    cfg.memory_cap = std::num::NonZeroU64::new(64 << 20).unwrap();
+    assert_eq!(
+        cfg.validate(),
+        Ok(()),
+        "a raised cap admits the largest pool"
+    );
+}
+
+#[test]
 fn defaults_are_the_provisional_values() {
     let cfg = SocketsConfig::new(local());
     assert_eq!(cfg.max_datagram.get(), 1408);
@@ -111,7 +146,9 @@ fn defaults_are_the_provisional_values() {
     assert_eq!(cfg.max_batch.get(), 32);
     assert_eq!(cfg.send_buffer, Some(DEFAULT_SEND_BUFFER));
     assert_eq!(cfg.recv_buffer.unwrap().get(), 4 << 20);
-    assert_eq!(cfg.rx_budget(), Budget::new(64, 64 * 1408, 64));
+    assert_eq!(cfg.rx_budget(), Some(Budget::new(64, 64 * 1408, 64)));
+    assert_eq!(cfg.memory_cap, DEFAULT_MEMORY_CAP);
+    assert_eq!(DEFAULT_MEMORY_CAP.get(), 16 << 20);
     assert_eq!(cfg.protection, Protection::Trusted);
     assert_eq!(
         MulticastConfig::new(Ipv4Addr::new(239, 1, 1, 1).into(), InterfaceSel::Index(1)).ttl,
@@ -144,6 +181,14 @@ fn snapshot_records_the_baseline() {
     assert_eq!(snapshot.user_observations, CapabilityState::Active);
     assert!(!snapshot.enobufs_reported);
     assert_eq!(snapshot.clock.granularity_ns, 1);
+    // Review P3-5: no TX path produces a SendReturn observation.
+    assert_eq!(
+        snapshot.observation_points,
+        ObservationPoints {
+            send_return: false,
+            recv_return: true
+        }
+    );
     let (tx, rx) = endpoint.split().unwrap();
     assert_eq!(*tx.capabilities(), snapshot);
     assert_eq!(*rx.capabilities(), snapshot);
@@ -435,14 +480,90 @@ fn reopen_requires_a_finished_reset_and_fixed_pool_sizes() {
     retire_all(&mut endpoint);
 }
 
+/// Review P3-9: reopen with an exhausted epoch fails before any socket is
+/// created and leaves the endpoint closed in its last epoch; it can still
+/// retire.
 #[test]
 fn reopen_fails_when_the_epoch_cannot_advance() {
-    // The endpoint does not expose its epoch counter; BackendEpoch::next
-    // is the checked step reopen takes (backend tests cover its overflow).
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let mut endpoint = SocketsEndpoint::open(&config(), InstanceId::FIRST, socket).unwrap();
+    let last = BackendEpoch::new(std::num::NonZeroU32::MAX);
+    endpoint.tx.epoch = last;
+    endpoint.rx.epoch = last;
+    reset_all(&mut endpoint);
+    assert_eq!(endpoint.reopen(&config()), Err(OpenError::EpochExhausted));
+    assert_eq!(observer.open_calls(), 1, "no socket for the next epoch");
+    assert_eq!(observer.live_descriptors(), 0);
     assert_eq!(
-        BackendEpoch::new(std::num::NonZeroU32::MAX).next(),
-        Err(OpenError::EpochExhausted)
+        endpoint.split().unwrap_err().error,
+        SplitFailure::Closed,
+        "still closed"
     );
+    let mut endpoint =
+        SocketsEndpoint::open(&config(), InstanceId::FIRST, ScriptedSocket::new()).unwrap();
+    endpoint.tx.epoch = last;
+    endpoint.rx.epoch = last;
+    reset_all(&mut endpoint);
+    assert_eq!(endpoint.reopen(&config()), Err(OpenError::EpochExhausted));
+    assert_eq!(
+        endpoint.retire(&mut TxReport::new()),
+        Retired::Complete { returned: 0 }
+    );
+    assert_eq!(endpoint.reopen(&config()), Err(OpenError::Retired));
+}
+
+/// Review P3-9: a reset called during a retirement returns items under the
+/// retirement and ends retired, never closed: no reopen, no split.
+#[test]
+fn reset_during_a_retire_keeps_the_retirement() {
+    let mut h = large();
+    for index in 0..66_u8 {
+        h.commit_to(h.queue, &[index], u64::from(index));
+    }
+    let queue = h.queue;
+    let (mut endpoint, socket) = h.join();
+    let mut report = TxReport::new();
+    assert_eq!(endpoint.retire(&mut report), Retired::More { returned: 64 });
+    let first = drain(&mut report);
+    // A split during the retirement hands back halves that make no call.
+    let (mut tx, rx) = endpoint.split().unwrap();
+    assert_eq!(
+        tx.flush(
+            FlushRequest {
+                queue,
+                max_datagrams: nz(1),
+                max_bytes: u32::MAX,
+            },
+            &mut Gate::default(),
+            &mut report,
+        )
+        .stop,
+        FlushStop::Queue(QueueError::NotActive)
+    );
+    let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+    let outcome = endpoint.reset(&mut report);
+    assert_eq!((outcome.returned, outcome.more), (2, false));
+    let rest = drain(&mut report);
+    assert!(
+        first
+            .iter()
+            .chain(&rest)
+            .all(|entry| entry.outcome == RESET)
+    );
+    assert_eq!(socket.live_descriptors(), 0);
+    assert_eq!(endpoint.reopen(&config()), Err(OpenError::Retired));
+    let SplitError {
+        mut endpoint,
+        error,
+    } = endpoint.split().unwrap_err();
+    assert_eq!(error, SplitFailure::Retired);
+    assert_eq!(
+        endpoint.retire(&mut report),
+        Retired::Complete { returned: 0 }
+    );
+    let outcome = endpoint.reset(&mut report);
+    assert_eq!((outcome.returned, outcome.more), (0, false));
 }
 
 #[test]
@@ -555,20 +676,74 @@ fn split_halves_join_refuses_mismatched_halves() {
     SocketsEndpoint::join(tx, new_rx).unwrap();
 }
 
+/// Review P2-1: a failed duplication returns the endpoint with its
+/// pending items and its socket; nothing is discarded and no drop assertion
+/// trips.
 #[test]
 fn split_fails_when_the_descriptor_cannot_be_duplicated() {
+    for errno in [Errno::NOMEM, Errno::from_raw(24)] {
+        let mut h = Harness::new();
+        let tickets = h.commit_n(0, 2);
+        let queue = h.queue;
+        let (endpoint, observer) = h.join();
+        let before = tx_discarded_on_drop();
+        observer.fail_next_clone(errno);
+        let SplitError { endpoint, error } = endpoint.split().unwrap_err();
+        assert_eq!(error, SplitFailure::Os { errno: errno.raw() });
+        assert!(error.to_string().contains("dup"));
+        assert_eq!(endpoint.pending(), 2, "no pending item is lost");
+        assert_eq!(observer.live_descriptors(), 1, "the socket stays open");
+        assert_eq!(tx_discarded_on_drop(), before);
+        // The next split succeeds and the items are still pending in order.
+        let (mut tx, rx) = endpoint.split().unwrap();
+        assert!(tickets.iter().all(|ticket| tx.is_pending(*ticket)));
+        observer.push_send(SendResult::Sent {
+            sent: 2,
+            error: None,
+        });
+        let mut report = TxReport::new();
+        let outcome = tx.flush(
+            FlushRequest {
+                queue,
+                max_datagrams: nz(8),
+                max_bytes: u32::MAX,
+            },
+            &mut Gate::default(),
+            &mut report,
+        );
+        assert_eq!(outcome.submitted, 2);
+        let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+        assert!(retire_all(&mut endpoint).is_empty());
+    }
+}
+
+/// Review P2-1: a closed or retired endpoint is refused before any system
+/// call and comes back unchanged.
+#[test]
+fn split_refuses_closed_and_retired_endpoints() {
     let socket = ScriptedSocket::new();
     let observer = socket.observer();
-    let endpoint = SocketsEndpoint::open(&config(), InstanceId::FIRST, socket).unwrap();
-    observer.fail_next_clone(Errno::NOMEM);
-    assert_eq!(
-        endpoint.split().unwrap_err(),
-        OpenError::Os {
-            operation: "dup",
-            errno: Errno::NOMEM.raw()
-        }
-    );
-    assert_eq!(observer.live_descriptors(), 0, "the endpoint was dropped");
+    let mut endpoint = SocketsEndpoint::open(&config(), InstanceId::FIRST, socket).unwrap();
+    reset_all(&mut endpoint);
+    assert_eq!(observer.live_descriptors(), 0);
+    // Before the fix this reached `try_clone` on the closed descriptor,
+    // failed with EBADF and dropped the instance.
+    let SplitError { endpoint, error } = endpoint.split().unwrap_err();
+    assert_eq!(error, SplitFailure::Closed);
+    let error = endpoint.split().unwrap_err();
+    assert!(format!("{error:?}").contains("Closed"));
+    assert!(error.to_string().contains("reopen"));
+    // The instance survives: it reopens and splits.
+    let SplitError { mut endpoint, .. } = error;
+    endpoint.reopen(&config()).unwrap();
+    assert_eq!(observer.live_descriptors(), 1);
+    let (tx, rx) = endpoint.split().unwrap();
+    let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+    retire_all(&mut endpoint);
+    let SplitError { endpoint, error } = endpoint.split().unwrap_err();
+    assert_eq!(error, SplitFailure::Retired);
+    assert_eq!(error.to_string(), "the endpoint is retired");
+    assert_eq!(endpoint.pending(), 0);
 }
 
 #[test]

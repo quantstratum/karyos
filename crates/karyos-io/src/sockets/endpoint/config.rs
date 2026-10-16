@@ -9,7 +9,7 @@
 //! configurable, so every one is a field of [`SocketsConfig`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::{NonZeroU16, NonZeroU32};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use crate::backend::{
     BackendEpoch, Budget, Capability, CapabilityState, ClockDomain, ClockEpoch, InstanceId,
@@ -34,6 +34,11 @@ const fn nz32(value: u32) -> NonZeroU32 {
 
 /// The largest `max_batch`: the length of the stack arrays of one flush.
 pub const SOCKETS_MAX_BATCH: u16 = 64;
+/// [`SOCKETS_MAX_BATCH`] as an array length. A `const` cannot call
+/// `usize::from`, and SPEC §14 rules out an `as` cast, so both literals are
+/// pinned to the same value at compile time below.
+pub(crate) const SOCKETS_MAX_BATCH_LEN: usize = 64;
+const _: () = assert!(SOCKETS_MAX_BATCH == 64 && SOCKETS_MAX_BATCH_LEN == 64);
 /// The smallest `max_datagram`: the syntax floor of the channel `mtu`.
 pub const MIN_DATAGRAM: u16 = 256;
 /// The largest `max_datagram`: the jumbo channel `mtu`.
@@ -61,6 +66,16 @@ pub const DEFAULT_RECV_BUFFER: NonZeroU32 = nz32(4 << 20);
 pub const DEFAULT_RX_BUDGET_DATAGRAMS: u32 = 64;
 /// Provisional default multicast TTL or hop limit (O-4).
 pub const DEFAULT_MULTICAST_TTL: u8 = 1;
+/// Provisional default memory cap of the endpoint's pools, 16 MiB. Section
+/// 4.5 checks the pools against "the configured memory cap" but 5.1 gives
+/// no default, so this value is a proposal like the O-4 defaults: it holds
+/// the default pool (360,448 bytes) and a jumbo pool of 256 slots (2 MiB)
+/// with room to spare, and makes the largest pool (4096 slots of 8192
+/// bytes, 32 MiB) an explicit choice.
+pub const DEFAULT_MEMORY_CAP: NonZeroU64 = match NonZeroU64::new(16 << 20) {
+    Some(value) => value,
+    None => NonZeroU64::MIN,
+};
 
 /// The protection profile of the endpoint's datagrams (5.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -192,6 +207,10 @@ pub struct SocketsConfig {
     pub max_routes: NonZeroU16,
     /// Datagrams of one exposure, 1..=[`SOCKETS_MAX_BATCH`].
     pub max_batch: NonZeroU16,
+    /// Bytes the TX pool (`tx_slots * max_datagram`) and the RX buffer
+    /// (`max_datagram + 1`) may take together (4.5); provisional default
+    /// [`DEFAULT_MEMORY_CAP`].
+    pub memory_cap: NonZeroU64,
     /// The `SO_SNDBUF` request, if any.
     pub send_buffer: Option<NonZeroU32>,
     /// The `SO_RCVBUF` request, if any.
@@ -224,6 +243,7 @@ impl SocketsConfig {
             max_queues: DEFAULT_MAX_QUEUES,
             max_routes: DEFAULT_MAX_ROUTES,
             max_batch: DEFAULT_MAX_BATCH,
+            memory_cap: DEFAULT_MEMORY_CAP,
             send_buffer: Some(DEFAULT_SEND_BUFFER),
             recv_buffer: Some(DEFAULT_RECV_BUFFER),
             multicast: None,
@@ -236,21 +256,38 @@ impl SocketsConfig {
     }
 
     /// One `poll_rx` budget: `rx_budget_datagrams` datagrams, as many ops
-    /// and room for that many datagrams of `max_datagram` bytes.
+    /// and room for that many datagrams of `max_datagram` bytes. The byte
+    /// count is a checked product; `None` when it does not fit `u64`, which
+    /// a `u32` count of `u16` sized datagrams (below 2^48) never reaches.
     #[must_use]
-    pub fn rx_budget(&self) -> Budget {
+    pub fn rx_budget(&self) -> Option<Budget> {
         let bytes =
-            u64::from(self.rx_budget_datagrams).saturating_mul(u64::from(self.max_datagram.get()));
-        Budget::new(self.rx_budget_datagrams, bytes, self.rx_budget_datagrams)
+            u64::from(self.rx_budget_datagrams).checked_mul(u64::from(self.max_datagram.get()))?;
+        Some(Budget::new(
+            self.rx_budget_datagrams,
+            bytes,
+            self.rx_budget_datagrams,
+        ))
+    }
+
+    /// Bytes of the TX pool and the RX buffer, checked (4.5, 5.1).
+    fn pool_bytes(&self) -> Option<u64> {
+        let datagram = u64::from(self.max_datagram.get());
+        let tx = u64::from(self.tx_slots.get()).checked_mul(datagram)?;
+        let rx = datagram.checked_add(1)?;
+        tx.checked_add(rx)
     }
 
     /// Checks every bound of 5.1 and the protection profile (5.2), in
-    /// field order, then the protection.
+    /// field order, then the protection. The pools are checked against
+    /// `memory_cap` with checked arithmetic (4.5).
     ///
     /// # Errors
     ///
     /// Returns [`OpenError::InvalidConfig`] with the first field out of
-    /// range, or [`OpenError::ProtectionUnavailable`].
+    /// range, or [`OpenError::ProtectionUnavailable`]. For `memory_cap`
+    /// the value is the bytes the pools need, which exceed the cap
+    /// (`u64::MAX` if that sum overflows, which `u16` sizes cannot reach).
     pub fn validate(&self) -> Result<(), OpenError> {
         let invalid = |field: &'static str, value: u64| OpenError::InvalidConfig { field, value };
         let max_datagram = self.max_datagram.get();
@@ -273,6 +310,10 @@ impl SocketsConfig {
         let pool = usize::from(self.tx_slots.get()).checked_mul(usize::from(max_datagram));
         if pool.is_none() {
             return Err(invalid("tx_slots", u64::from(self.tx_slots.get())));
+        }
+        match self.pool_bytes() {
+            Some(bytes) if bytes <= self.memory_cap.get() => {}
+            needed => return Err(invalid("memory_cap", needed.unwrap_or(u64::MAX))),
         }
         if let Some(multicast) = self.multicast {
             let same_family = multicast.group.is_ipv4() == self.local.is_ipv4();
@@ -325,7 +366,8 @@ pub enum QueueAssignment {
 /// The observation points an endpoint supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationPoints {
-    /// Userspace, after a send call returned.
+    /// Userspace, after a send call returned. `false` for sockets: no TX
+    /// path produces a `SendReturn` observation yet.
     pub send_return: bool,
     /// Userspace, after a receive call returned.
     pub recv_return: bool,
@@ -339,7 +381,7 @@ pub struct ClockInfo {
     /// The clock epoch the driver recorded.
     pub epoch: ClockEpoch,
     /// The reading granularity in ns, at least 1; the `uncertainty_ns` of
-    /// every observation.
+    /// every observation. A placeholder of 1 until S3 probes the clock.
     pub granularity_ns: u64,
 }
 
@@ -392,7 +434,8 @@ pub struct CapabilitySnapshot {
     pub queue_assignment: QueueAssignment,
     /// The datagram limit in bytes.
     pub max_datagram: u16,
-    /// `SendReturn` and `RecvReturn` in the baseline.
+    /// The points the endpoint observes: `RecvReturn` only in the
+    /// baseline (see [`ObservationPoints`]).
     pub observation_points: ObservationPoints,
     /// Domain, epoch and reading granularity of the observation clock.
     pub clock: ClockInfo,
@@ -445,13 +488,19 @@ impl CapabilitySnapshot {
             interface: probes.interface,
             queue_assignment: QueueAssignment::KernelSelected,
             max_datagram: config.max_datagram.get(),
+            // No TX path of the baseline reads the clock around a send, so
+            // no `SendReturn` observation exists; `RecvReturn` is read when
+            // `rx_observation` is set (4.4).
             observation_points: ObservationPoints {
-                send_return: true,
+                send_return: false,
                 recv_return: true,
             },
             clock: ClockInfo {
                 domain: ClockDomain::HostMonotonic,
                 epoch: config.clock_epoch,
+                // Placeholder: 1 ns until S3 probes the host clock's
+                // reading granularity; RX observations carry the same
+                // value as `uncertainty_ns`.
                 granularity_ns: 1,
             },
             dont_fragment: probes.dont_fragment,

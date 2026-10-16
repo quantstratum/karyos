@@ -396,7 +396,10 @@ impl SocketOps for ScriptedSocket {
         if self.live {
             self.live = false;
             let mut script = self.lock();
-            script.live = script.live.saturating_sub(1);
+            // Every live handle was counted when it became live.
+            if let Some(live) = script.live.checked_sub(1) {
+                script.live = live;
+            }
         }
     }
 

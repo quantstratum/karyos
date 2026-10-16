@@ -324,6 +324,8 @@ fn partial_sendmmsg() {
     let (outcome, entries) = h.flush(&mut gate);
     assert_eq!(outcome.submitted, 2);
     assert_eq!(outcome.spent.ops, 1);
+    // Review P3-3: the stop names the lost error, not `Exposed`.
+    assert_eq!(outcome.stop, FlushStop::ErrorLost);
     assert_eq!(
         outcomes(&entries),
         vec![
@@ -676,8 +678,395 @@ fn identity_old_generation_resolves_to_nothing() {
     ));
     assert!(!h.tx.is_pending(other_instance));
     // An old epoch: lifecycle::reset_returns_items_and_invalidates_handles.
-    // Generation overflow retires the slot: backend::pool and ledger tests.
+    // Generation overflow: identity_generation_overflow_retires_the_slot.
     h.shutdown();
+}
+
+/// Section 12 "Identity": generation overflow retires the slot, at the
+/// endpoint (the pool and ledger tests of S1 cover the counter itself).
+#[test]
+fn identity_generation_overflow_retires_the_slot() {
+    let mut cfg = config();
+    cfg.tx_slots = nz(1);
+    let mut h = Harness::open(cfg, 1);
+    let ticket = h.commit_n(0, 1)[0];
+    let slot = ticket.id().slot();
+    h.tx.core.set_slot_generation(slot, u64::MAX);
+    h.socket.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    assert_eq!(h.flush(&mut Gate::default()).0.submitted, 1);
+    // The release retired the slot: no generation is ever reused.
+    assert!(!h.tx.is_pending(ticket));
+    assert_eq!(
+        h.tx.claim_tx(h.queue, 1).err(),
+        Some(ClaimError::IdentityExhausted)
+    );
+    assert!(h.shutdown().is_empty());
+}
+
+/// Review P3-2: `Failed(Os)` stops the TX half (3.10). Later flushes return
+/// the same failure with no gate check and no system call, `add_route`
+/// (a system call) is `NotActive`, and only reset and reopen clear it.
+#[test]
+fn tx_failed_stops_the_half() {
+    for errno in [Errno::BADF, Errno::NOTSOCK, Errno::FAULT, Errno::INVAL] {
+        let mut h = Harness::new();
+        let failure = BackendFailure::Os {
+            operation: "send",
+            errno: errno.raw(),
+        };
+        h.commit_n(0, 2);
+        h.socket.push_send(SendResult::Error(errno));
+        let (outcome, entries) = h.flush(&mut Gate::default());
+        assert_eq!(outcome.stop, FlushStop::Failed(failure));
+        assert_eq!(
+            outcomes(&entries),
+            vec![
+                pending(PendingCause::Failed(failure)),
+                pending(PendingCause::NotAttempted)
+            ]
+        );
+        let mut gate = Gate::default();
+        let (outcome, entries) = h.flush(&mut gate);
+        assert_eq!(outcome.stop, FlushStop::Failed(failure), "{errno:?}");
+        assert_eq!(outcome.spent, Spent::default());
+        assert!(entries.is_empty());
+        assert_eq!((gate.calls, h.socket.send_calls()), (0, 1), "{errno:?}");
+        assert_eq!(h.tx.add_route(peer()), Err(RouteError::NotActive));
+        // retry_queue clears queue faults only; the half stays stopped.
+        assert_eq!(h.tx.retry_queue(h.queue), Ok(()));
+        assert_eq!(h.flush(&mut gate).0.stop, FlushStop::Failed(failure));
+        // Claims and commits make no system call and keep working; the
+        // items wait for the reset.
+        h.commit_n(2, 1);
+        assert_eq!(h.tx.pending(), 3);
+        assert_eq!((gate.calls, h.socket.send_calls()), (0, 1));
+        let (mut endpoint, socket) = h.join();
+        assert_eq!(reset_all(&mut endpoint).len(), 3);
+        endpoint.reopen(&config()).unwrap();
+        let (mut tx, rx) = endpoint.split().unwrap();
+        let route = tx.add_route(peer()).unwrap();
+        let queue = tx
+            .open_queue(TxQueueConfig {
+                authority: Authority::FIRST,
+                route,
+                max_pending: nz(8),
+            })
+            .unwrap();
+        let mut frame = tx.claim_tx(queue, 1).unwrap();
+        frame.bytes_mut()[0] = 1;
+        frame
+            .commit(Commit {
+                len: 1,
+                token: SenderToken::new(7),
+                options: TxOptions::none(),
+            })
+            .unwrap();
+        socket.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+        let mut report = TxReport::new();
+        let outcome = tx.flush(
+            FlushRequest {
+                queue,
+                max_datagrams: nz(8),
+                max_bytes: u32::MAX,
+            },
+            &mut gate,
+            &mut report,
+        );
+        assert_eq!(outcome.submitted, 1, "the reset cleared the failure");
+        assert_eq!(socket.send_calls(), 2);
+        drain(&mut report);
+        let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+        retire_all(&mut endpoint);
+    }
+}
+
+/// Review P3-1: without batching each single send is one op, and the
+/// sends stop at the first error (4.3, 5.3).
+#[test]
+fn spent_ops_count_single_sends() {
+    let cases = [
+        (
+            SendResult::Sent {
+                sent: 4,
+                error: None,
+            },
+            4,
+        ),
+        (
+            SendResult::Sent {
+                sent: 1,
+                error: Some(Errno::AGAIN),
+            },
+            2,
+        ),
+        (SendResult::Error(Errno::INTR), 1),
+        (SendResult::OutOfAbi { proven: 1 }, 2),
+        // Counts the single send path cannot give count the whole request.
+        (
+            SendResult::Sent {
+                sent: 9,
+                error: None,
+            },
+            4,
+        ),
+        (
+            SendResult::Sent {
+                sent: 0,
+                error: None,
+            },
+            4,
+        ),
+    ];
+    for (result, ops) in cases {
+        let socket = ScriptedSocket::new();
+        let observer = socket.observer();
+        let mut probes = crate::sockets::scripted::default_probes(&config());
+        probes.tx_batch = CapabilityState::Unavailable(Reason::LibraryApi);
+        observer.push_open(Ok(probes));
+        let endpoint = SocketsEndpoint::open(&config(), InstanceId::FIRST, socket).unwrap();
+        let (mut tx, rx) = endpoint.split().unwrap();
+        let route = tx.add_route(peer()).unwrap();
+        let queue = tx
+            .open_queue(TxQueueConfig {
+                authority: Authority::FIRST,
+                route,
+                max_pending: nz(8),
+            })
+            .unwrap();
+        let mut h = Harness {
+            tx,
+            rx,
+            socket: observer,
+            route,
+            queue,
+        };
+        h.commit_n(0, 4);
+        h.socket.push_send(result);
+        let (outcome, _) = h.flush(&mut Gate::default());
+        assert_eq!(outcome.spent.ops, ops, "{result:?}");
+        assert_eq!(outcome.spent.datagrams, 4);
+        h.shutdown();
+    }
+    // With batching, one sendmmsg is one op whatever it returns.
+    let mut h = Harness::new();
+    h.commit_n(0, 4);
+    h.socket.push_send(SendResult::Sent {
+        sent: 1,
+        error: Some(Errno::AGAIN),
+    });
+    assert_eq!(h.flush(&mut Gate::default()).0.spent.ops, 1);
+    h.shutdown();
+}
+
+/// Review P3-9: `Spent` under a gate trim counts the exposed prefix only.
+#[test]
+fn budget_spent_under_a_gate_trim() {
+    let mut h = Harness::new();
+    h.commit_n(0, 4);
+    h.socket.push_send(SendResult::Sent {
+        sent: 2,
+        error: None,
+    });
+    let (outcome, entries) = h.flush(&mut Gate::permit(2));
+    assert_eq!(
+        outcome.spent,
+        Spent {
+            datagrams: 2,
+            bytes: 20,
+            ops: 1
+        }
+    );
+    assert_eq!((outcome.submitted, outcome.bytes), (2, 20));
+    assert_eq!(entries.len(), 4);
+    // A trim to one item after a partial result: only the exposed item.
+    h.socket.push_send(SendResult::Error(Errno::AGAIN));
+    let (outcome, _) = h.flush(&mut Gate::permit(1));
+    assert_eq!(
+        outcome.spent,
+        Spent {
+            datagrams: 1,
+            bytes: 10,
+            ops: 1
+        }
+    );
+    assert_eq!((outcome.submitted, outcome.bytes), (0, 0));
+    h.shutdown();
+}
+
+/// Review P3-9: `max_bytes` is inclusive.
+#[test]
+fn budget_max_bytes_boundary_is_inclusive() {
+    let mut h = Harness::new();
+    h.commit_n(0, 3);
+    let mut report = TxReport::new();
+    let mut flush = |h: &mut Harness, max_bytes: u32| {
+        let mut gate = Gate::deny();
+        let outcome = h.tx.flush(
+            FlushRequest {
+                queue: h.queue,
+                max_datagrams: nz(8),
+                max_bytes,
+            },
+            &mut gate,
+            &mut report,
+        );
+        drain(&mut report);
+        (outcome.stop, gate.seen.first().map(|seen| seen.1.len()))
+    };
+    // Exactly two items fit 20 bytes; 19 holds one.
+    assert_eq!(flush(&mut h, 20), (FlushStop::GateDenied, Some(2)));
+    assert_eq!(flush(&mut h, 19), (FlushStop::GateDenied, Some(1)));
+    // A head of exactly `max_bytes` is offered; one byte less is not.
+    assert_eq!(flush(&mut h, 10), (FlushStop::GateDenied, Some(1)));
+    assert_eq!(
+        flush(&mut h, 9),
+        (FlushStop::HeadExceedsBudget { head_len: 10 }, None)
+    );
+    h.shutdown();
+}
+
+/// Review P3-9: a request longer than `max_batch` is clamped to it, and to
+/// `SOCKETS_MAX_BATCH` (the stack arrays and the report capacity).
+#[test]
+fn budget_flush_longer_than_max_batch() {
+    let mut h = Harness::new();
+    h.commit_n(0, 8);
+    let mut cfg = config();
+    cfg.max_batch = nz(3);
+    let (mut endpoint, socket) = h.join();
+    reset_all(&mut endpoint);
+    endpoint.reopen(&cfg).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let route = tx.add_route(peer()).unwrap();
+    let queue = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: nz(8),
+        })
+        .unwrap();
+    let mut h = Harness {
+        tx,
+        rx,
+        socket,
+        route,
+        queue,
+    };
+    h.commit_n(0, 5);
+    h.socket.push_send(SendResult::Sent {
+        sent: 3,
+        error: None,
+    });
+    let mut gate = Gate::default();
+    let (outcome, entries) = h.flush(&mut gate);
+    assert_eq!(gate.seen[0].1, vec![0, 1, 2], "max_batch of 3 clamps 64");
+    assert_eq!((outcome.submitted, entries.len()), (3, 3));
+    h.shutdown();
+    // The largest max_batch: a request of 64 offers 64 of 66 items, which
+    // fill the report exactly.
+    let mut cfg = config();
+    cfg.tx_slots = nz(70);
+    cfg.max_batch = nz(SOCKETS_MAX_BATCH);
+    let mut h = Harness::open(cfg, 70);
+    for index in 0..66_u8 {
+        h.commit_to(h.queue, &[index], u64::from(index));
+    }
+    let mut gate = Gate::deny();
+    let (outcome, entries) = h.flush(&mut gate);
+    assert_eq!(outcome.stop, FlushStop::GateDenied);
+    assert_eq!(gate.seen[0].1.len(), usize::from(SOCKETS_MAX_BATCH));
+    assert_eq!(entries.len(), 64);
+    assert_eq!(h.shutdown().len(), 66);
+}
+
+/// Review P3-9: `retry_queue` on a queue that `close_queue` is closing is
+/// `UnknownQueue`, and the closing continues.
+#[test]
+fn retry_queue_on_a_closing_queue() {
+    let mut cfg = config();
+    cfg.tx_slots = nz(70);
+    let mut h = Harness::open(cfg, 70);
+    for index in 0..65_u8 {
+        h.commit_to(h.queue, &[index], u64::from(index));
+    }
+    let mut report = TxReport::new();
+    let closing = h.tx.close_queue(h.queue, &mut report).unwrap();
+    assert!(closing.more);
+    drain(&mut report);
+    assert_eq!(h.tx.retry_queue(h.queue), Err(QueueError::UnknownQueue));
+    let closed = h.tx.close_queue(h.queue, &mut report).unwrap();
+    assert_eq!((closed.returned, closed.more), (1, false));
+    drain(&mut report);
+    assert_eq!(h.tx.retry_queue(h.queue), Err(QueueError::UnknownQueue));
+}
+
+/// Review N3 and P3-10: the release build guards, exercised by a test-only
+/// fault injection. A FIFO head whose metadata names another queue faults
+/// the queue before the gate (`Failed(Invariant)`, then `NeedsReset`); no
+/// return path pops it; `finish_reset` refuses while it is pending. Other
+/// queues keep working.
+#[test]
+fn guards_hold_under_an_injected_fault() {
+    let mut h = Harness::open(config(), 4);
+    let other =
+        h.tx.open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route: h.route,
+            max_pending: nz(4),
+        })
+        .unwrap();
+    h.commit_n(0, 2);
+    h.commit_to(other, b"other", 10);
+    let head = h.tx.core.inject_head_owner(h.queue, Some(other)).unwrap();
+    let mut gate = Gate::default();
+    let (outcome, entries) = h.flush(&mut gate);
+    assert_eq!(
+        outcome.stop,
+        FlushStop::Failed(BackendFailure::Invariant { operation: "flush" })
+    );
+    assert!(entries.is_empty());
+    assert_eq!((gate.calls, h.socket.send_calls()), (0, 0));
+    assert_eq!(h.tx.retry_queue(h.queue), Err(QueueError::NeedsReset));
+    assert_eq!(
+        h.flush(&mut gate).0.stop,
+        FlushStop::Queue(QueueError::NeedsReset)
+    );
+    // The pop guard: a cancellation returns nothing and changes nothing.
+    let mut report = TxReport::new();
+    let cancelled = h.tx.cancel_pending(h.queue, &mut report).unwrap();
+    assert_eq!((cancelled.returned, cancelled.more), (0, true));
+    assert!(report.is_empty());
+    assert_eq!(h.tx.pending(), 3);
+    // The other queue is untouched.
+    h.socket.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let (outcome, entries) = h.flush_queue(other, &mut gate);
+    assert_eq!((outcome.submitted, tokens(&entries)), (1, vec![10]));
+    // The reset guard: nothing is freed while an item is pending.
+    let queue = h.queue;
+    let (mut endpoint, socket) = h.join();
+    let outcome = endpoint.reset(&mut report);
+    assert_eq!((outcome.returned, outcome.more), (0, true));
+    assert!(report.is_empty());
+    assert!(!endpoint.tx.finish_reset(), "refused while pending");
+    assert_eq!(endpoint.pending(), 2);
+    assert_eq!(socket.live_descriptors(), 1, "the socket stays open");
+    // Repairing the link lets the reset finish, in FIFO order.
+    assert_eq!(
+        endpoint.tx.inject_head_owner(queue, Some(queue)),
+        Some(head)
+    );
+    endpoint.tx.clear_injection();
+    assert_eq!(tokens(&reset_all(&mut endpoint)), vec![0, 1]);
+    assert_eq!(socket.live_descriptors(), 0);
 }
 
 #[test]

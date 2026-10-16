@@ -44,14 +44,27 @@ const DEFERRED_ROWS: &[(&str, &str)] = &[
         "S4: network namespace",
     ),
     (
-        "Repair authority (control class misuse)",
+        "Repair authority: partly covered here by \
+         tx::repair_authority_exposure_carries_the_queue_authority (every \
+         exposure carries its queue's authority to the gate); the control \
+         class misuse and the incarnation's gate are deferred",
         "driver: the endpoint only carries the queue authority",
     ),
     (
-        "Lane order (with aggregate lanes)",
-        "driver: the backend half runs in model::lane_order",
+        "Lane order (with aggregate lanes): the backend half is covered \
+         here for one queue and for two interleaved queues sharing the pool \
+         (model::state_machine_model_and_lane_order, \
+         model::two_queue_model_and_lane_order); the aggregate lanes half \
+         is deferred",
+        "driver: aggregate lanes over several queues",
     ),
 ];
+
+// "Identity: generation overflow retires the slot" is covered, not
+// deferred: tx::identity_generation_overflow_retires_the_slot at the
+// endpoint, and the S1 pool and ledger tests
+// (backend::pool::identity_generation_overflow_retires_the_slot,
+// backend::ledger::claim_error_order_identity_exhausted_only_after_retirement).
 
 /// The deferred rows are named, each with its batch.
 #[test]

@@ -30,23 +30,26 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use thiserror::Error;
+
 pub use config::{
     BufferSize, CapabilitySet, CapabilitySnapshot, ClockInfo, CopyMode, DEFAULT_MAX_BATCH,
-    DEFAULT_MAX_DATAGRAM, DEFAULT_MAX_QUEUES, DEFAULT_MAX_ROUTES, DEFAULT_MULTICAST_TTL,
-    DEFAULT_RECV_BUFFER, DEFAULT_RX_BUDGET_DATAGRAMS, DEFAULT_SEND_BUFFER, DEFAULT_TX_SLOTS,
-    InterfaceSel, MAX_DATAGRAM, MAX_TABLE_ENTRIES, MAX_TX_SLOTS, MIN_DATAGRAM, Membership,
-    MulticastConfig, ObservationPoints, Platform, Protection, QueueAssignment, SOCKETS_MAX_BATCH,
-    SocketsConfig,
+    DEFAULT_MAX_DATAGRAM, DEFAULT_MAX_QUEUES, DEFAULT_MAX_ROUTES, DEFAULT_MEMORY_CAP,
+    DEFAULT_MULTICAST_TTL, DEFAULT_RECV_BUFFER, DEFAULT_RX_BUDGET_DATAGRAMS, DEFAULT_SEND_BUFFER,
+    DEFAULT_TX_SLOTS, InterfaceSel, MAX_DATAGRAM, MAX_TABLE_ENTRIES, MAX_TX_SLOTS, MIN_DATAGRAM,
+    Membership, MulticastConfig, ObservationPoints, Platform, Protection, QueueAssignment,
+    SOCKETS_MAX_BATCH, SocketsConfig,
 };
 pub use tx::{RouteInfo, SocketsFrame};
 
 use self::rx::RxCore;
 use self::tx::TxCore;
-use super::ops::SocketOps;
+use super::ops::{SocketOps, SocketProbes};
 use crate::backend::{
-    BackendEpoch, Budget, CancelOutcome, ClaimError, CompletionHandler, CompletionOutcome,
-    FlushOutcome, FlushRequest, InstanceId, OpenError, QueueError, RouteError, RouteId, RxBackend,
-    RxHandler, RxOutcome, SenderGate, TxBackend, TxQueueConfig, TxQueueId, TxReport, TxTicket,
+    BackendEpoch, Budget, CancelOutcome, CapabilityState, ClaimError, CompletionHandler,
+    CompletionOutcome, FlushOutcome, FlushRequest, InstanceId, OpenError, QueueError, RouteError,
+    RouteId, RxBackend, RxHandler, RxOutcome, SenderGate, TxBackend, TxQueueConfig, TxQueueId,
+    TxReport, TxTicket,
 };
 
 /// Pending items discarded by a TX half dropped outside unwinding
@@ -135,6 +138,59 @@ impl<O: SocketOps> fmt::Display for JoinError<O> {
 
 impl<O: SocketOps> std::error::Error for JoinError<O> {}
 
+/// Why [`SocketsEndpoint::split`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SplitFailure {
+    /// A reset finished and the socket is closed: `reopen` first.
+    #[error("the endpoint is closed; reopen it before splitting")]
+    Closed,
+    /// The endpoint is retired.
+    #[error("the endpoint is retired")]
+    Retired,
+    /// The descriptor could not be duplicated (`EMFILE`, `ENOMEM`, ...).
+    #[error("dup failed with os error {errno}")]
+    Os {
+        /// Raw OS error number.
+        errno: i32,
+    },
+}
+
+/// `split` refused; the endpoint comes back unchanged, pending items and
+/// socket included, mirroring [`JoinError`].
+pub struct SplitError<O: SocketOps> {
+    /// The endpoint, unchanged.
+    pub endpoint: SocketsEndpoint<O>,
+    /// Why the split was refused.
+    pub error: SplitFailure,
+}
+
+impl<O: SocketOps> fmt::Debug for SplitError<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SplitError")
+            .field("endpoint", &self.endpoint)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl<O: SocketOps> fmt::Display for SplitError<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl<O: SocketOps> std::error::Error for SplitError<O> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Whether the sends of an epoch are one `sendmmsg` each (4.3): the rule
+/// [`SocketOps::send`] documents and `Spent::ops` counts by.
+fn batched(probes: &SocketProbes) -> bool {
+    probes.tx_batch == CapabilityState::Active
+}
+
 /// The joined endpoint, held by the control path (3.8, 3.10).
 pub struct SocketsEndpoint<O: SocketOps> {
     tx: TxCore,
@@ -175,9 +231,10 @@ impl<O: SocketOps> SocketsEndpoint<O> {
             ops.close();
             return Err(error);
         }
+        // A failure here drops `ops`, which closes the socket (SocketOps).
         Ok(Self {
-            tx: TxCore::new(config, instance, epoch),
-            rx: RxCore::new(config, instance, epoch),
+            tx: TxCore::new(config, instance, epoch, batched(&probes))?,
+            rx: RxCore::new(config, instance, epoch)?,
             ops,
             snapshot,
         })
@@ -196,17 +253,41 @@ impl<O: SocketOps> SocketsEndpoint<O> {
 
     /// Duplicates the descriptor and splits the endpoint into its TX and
     /// RX halves (3.10). Each half keeps its state and the snapshot of its
-    /// epoch.
+    /// epoch. An endpoint still resetting or retiring splits, so its
+    /// halves can be handed back; their data calls return `NotActive`.
     ///
     /// # Errors
     ///
-    /// Returns [`OpenError::Os`] when the descriptor cannot be duplicated;
-    /// the endpoint is dropped, which closes its socket.
-    pub fn split(self) -> Result<(SocketsTx<O>, SocketsRx<O>), OpenError> {
-        let duplicate = self.ops.try_clone().map_err(|errno| OpenError::Os {
-            operation: "dup",
-            errno: errno.raw(),
-        })?;
+    /// Returns [`SplitError`] with the endpoint, unchanged: with
+    /// [`SplitFailure::Closed`] after a finished reset and
+    /// [`SplitFailure::Retired`] after retirement, both before any system
+    /// call, or [`SplitFailure::Os`] when the descriptor cannot be
+    /// duplicated. No pending item is lost and the socket stays open.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the endpoint comes back by value, like the halves of JoinError; split is a cold control path call"
+    )]
+    pub fn split(self) -> Result<(SocketsTx<O>, SocketsRx<O>), SplitError<O>> {
+        let refused = match self.tx.state {
+            State::Closed => Some(SplitFailure::Closed),
+            State::Retired => Some(SplitFailure::Retired),
+            State::Active | State::Resetting | State::Retiring => None,
+        };
+        if let Some(error) = refused {
+            return Err(SplitError {
+                endpoint: self,
+                error,
+            });
+        }
+        let duplicate = match self.ops.try_clone() {
+            Ok(duplicate) => duplicate,
+            Err(errno) => {
+                return Err(SplitError {
+                    endpoint: self,
+                    error: SplitFailure::Os { errno: errno.raw() },
+                });
+            }
+        };
         let tx = SocketsTx {
             core: self.tx,
             ops: self.ops,
@@ -299,6 +380,13 @@ impl<O: SocketOps> SocketsEndpoint<O> {
     /// (7.3). The pool sizes are fixed for the instance; the other fields
     /// of `config` may change.
     ///
+    /// **Deviation from 5.1**, which says storage is allocated by `open`
+    /// "or `reopen`": this `reopen` allocates nothing. It requires a
+    /// finished reset (state `Closed`), and it requires `max_datagram`,
+    /// `tx_slots`, `max_queues` and `max_routes` equal to those of `open`,
+    /// so the pools, tables and buffers of the instance are reused as they
+    /// are. A different size needs a new endpoint.
+    ///
     /// # Errors
     ///
     /// Returns [`OpenError::ResetIncomplete`] unless a reset finished,
@@ -338,7 +426,7 @@ impl<O: SocketOps> SocketsEndpoint<O> {
             self.ops.close();
             return Err(error);
         }
-        self.tx.reopen(config, epoch);
+        self.tx.reopen(config, epoch, batched(&probes));
         self.rx.reopen(config, epoch);
         self.snapshot = snapshot;
         Ok(&self.snapshot)

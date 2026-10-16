@@ -724,10 +724,17 @@ pub enum PendingCause {
     PeerError,
     /// The queue head failed with this error; the queue is faulted.
     Faulted(SendError),
-    /// The call failed in a way that ends the half (`EBADF`, `ENOTSOCK`,
-    /// `EFAULT`, `EINVAL`, section 4.7) before handing off this item; the
-    /// flush stopped with [`FlushStop::Failed`] and the control path must
-    /// reset the endpoint, which returns the item.
+    /// The flush stopped with [`FlushStop::Failed`] carrying this failure
+    /// before handing off this item; only a reset returns it.
+    ///
+    /// - [`BackendFailure::Os`]: the send call failed in a way that ends
+    ///   the half (`EBADF`, `ENOTSOCK`, `EFAULT`, `EINVAL`, section 4.7).
+    ///   The half is stopped: every later flush returns the same
+    ///   `Failed` with no gate check and no system call until the control
+    ///   path resets the endpoint (3.10: a failure stops only that half).
+    /// - [`BackendFailure::Invariant`]: the endpoint found its own queue
+    ///   state broken before the exposure; the queue is faulted and needs a
+    ///   reset (6.3, S-16).
     Failed(BackendFailure),
 }
 
@@ -760,6 +767,13 @@ pub struct FlushOutcome {
 pub enum FlushStop {
     /// The permitted prefix was submitted; the queue may hold more.
     Exposed,
+    /// `sendmmsg` accepted only the first `submitted` items of the
+    /// permitted prefix and lost the error of the next one, which stays
+    /// [`PendingCause::ErrorLost`] (4.3). The queue is not faulted; the next
+    /// flush attempts that item again after a new gate check. Not in the
+    /// 3.4 list of the design, which names no stop for a lost error:
+    /// `Exposed` would claim the whole prefix was submitted.
+    ErrorLost,
     /// The queue held no pending item.
     QueueEmpty,
     /// The gate denied the exposure.
@@ -1308,7 +1322,9 @@ pub enum RxStop {
     HandlerStopped,
     /// The call was interrupted.
     Interrupted,
-    /// The half cannot continue; the control path must reset it.
+    /// The half cannot continue; the control path must reset it. A sockets
+    /// half is then stopped: every later poll returns the same `Failed`
+    /// with no system call until the reset (3.10).
     Failed(BackendFailure),
 }
 

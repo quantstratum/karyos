@@ -152,18 +152,65 @@ fn rx_transient_errors() {
     assert_eq!(outcome.delivered, 1);
     assert_eq!(outcome.spent.ops, 3);
     assert_eq!(h.rx.peer_errors(), 1);
-    // EBADF, EPERM and the rest fail the half.
+    // EBADF, EPERM and the rest fail the half: rx_failed_stops_the_half.
+    h.shutdown();
+}
+
+/// Review P3-2: a `Failed` result stops the RX half (3.10). Later polls
+/// return the same failure with no system call until reset and reopen;
+/// the TX half keeps working.
+#[test]
+fn rx_failed_stops_the_half() {
     for errno in [Errno::BADF, Errno::PERM, Errno::ACCES, Errno::INVAL] {
+        let mut h = Harness::new();
+        let failed = RxStop::Failed(BackendFailure::Os {
+            operation: "recv",
+            errno: errno.raw(),
+        });
+        let mut handler = Recorder::default();
         h.socket.push_recv(RecvResult::Error(errno), &[]);
+        h.socket.push_recv_datagram(b"later", Some(peer()));
         let outcome = h.rx.poll_rx(budget(8), &mut handler);
-        assert_eq!(
-            outcome.stop,
-            RxStop::Failed(BackendFailure::Os {
-                operation: "recv",
-                errno: errno.raw()
-            })
-        );
+        assert_eq!(outcome.stop, failed, "{errno:?}");
+        assert_eq!(outcome.spent.ops, 1);
+        let outcome = h.rx.poll_rx(budget(8), &mut handler);
+        assert_eq!(outcome.stop, failed, "stopped: {errno:?}");
+        assert_eq!(outcome.spent, Spent::default());
+        assert_eq!(h.socket.recv_calls(), 1, "no system call after Failed");
+        assert!(handler.datagrams.is_empty());
+        // The TX half is not stopped.
+        h.commit_n(0, 1);
+        h.socket.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+        assert_eq!(h.flush(&mut Gate::default()).0.submitted, 1);
+        // Reset and reopen clear the failure.
+        let (mut endpoint, socket) = h.join();
+        reset_all(&mut endpoint);
+        endpoint.reopen(&config()).unwrap();
+        let (tx, mut rx) = endpoint.split().unwrap();
+        let outcome = rx.poll_rx(budget(8), &mut handler);
+        assert_eq!(outcome.delivered, 1, "{errno:?}");
+        assert_eq!(socket.recv_calls(), 3, "the datagram, then EAGAIN");
+        let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+        retire_all(&mut endpoint);
     }
+    // An invariant fault stops the half as well.
+    let mut h = Harness::new();
+    h.socket.push_recv(
+        RecvResult::Datagram {
+            len: 9000,
+            truncated: None,
+            source: Some(peer()),
+        },
+        &[],
+    );
+    let invariant = RxStop::Failed(BackendFailure::Invariant { operation: "recv" });
+    let mut handler = Recorder::default();
+    assert_eq!(h.rx.poll_rx(budget(8), &mut handler).stop, invariant);
+    assert_eq!(h.rx.poll_rx(budget(8), &mut handler).stop, invariant);
+    assert_eq!(h.socket.recv_calls(), 1);
 }
 
 #[test]

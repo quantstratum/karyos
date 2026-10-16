@@ -15,13 +15,18 @@ use super::State;
 use super::config::SocketsConfig;
 use crate::backend::{
     BackendEpoch, BackendFailure, Budget, ClockDomain, ClockEpoch, InstanceId, Observation,
-    ObservationPoint, PathId, RxDatagram, RxDrop, RxDropReason, RxHandler, RxOutcome, RxStop,
-    Spent,
+    ObservationPoint, OpenError, PathId, RxDatagram, RxDrop, RxDropReason, RxHandler, RxOutcome,
+    RxStop, Spent,
 };
 use crate::sockets::ops::{Errno, RecvResult, SocketOps};
 
 /// The operation named in receive failures.
 const RECV: &str = "recv";
+
+/// The `uncertainty_ns` of every `RecvReturn` observation: a placeholder of
+/// 1 ns, equal to the snapshot's `clock.granularity_ns`, until S3 probes
+/// the host clock's reading granularity.
+const OBSERVATION_UNCERTAINTY_NS: u64 = 1;
 
 /// The RX half's state; `SocketsRx` adds the duplicated socket.
 #[derive(Debug)]
@@ -35,13 +40,31 @@ pub(super) struct RxCore {
     clock_epoch: ClockEpoch,
     buffer: Box<[u8]>,
     peer_errors: u64,
+    /// The failure that stopped the half (3.10): every later poll returns
+    /// it with no system call until `reset` and `reopen`.
+    failed: Option<BackendFailure>,
 }
 
 impl RxCore {
     /// Allocates the receive buffer for a validated configuration.
-    pub(super) fn new(config: &SocketsConfig, instance: InstanceId, epoch: BackendEpoch) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` for `max_datagram` when the buffer length
+    /// does not fit `usize`, which a validated configuration never gives.
+    pub(super) fn new(
+        config: &SocketsConfig,
+        instance: InstanceId,
+        epoch: BackendEpoch,
+    ) -> Result<Self, OpenError> {
         let max_datagram = config.max_datagram.get();
-        Self {
+        let len = usize::from(max_datagram)
+            .checked_add(1)
+            .ok_or(OpenError::InvalidConfig {
+                field: "max_datagram",
+                value: u64::from(max_datagram),
+            })?;
+        Ok(Self {
             instance,
             epoch,
             state: State::Active,
@@ -49,18 +72,21 @@ impl RxCore {
             path: config.path,
             observe: config.rx_observation,
             clock_epoch: config.clock_epoch,
-            buffer: vec![0; usize::from(max_datagram).saturating_add(1)].into_boxed_slice(),
+            buffer: vec![0; len].into_boxed_slice(),
             peer_errors: 0,
-        }
+            failed: None,
+        })
     }
 
-    /// Moves to the new epoch of `reopen`; `max_datagram` is unchanged.
+    /// Moves to the new epoch of `reopen`; `max_datagram` is unchanged and
+    /// a failure that stopped the half is cleared.
     pub(super) fn reopen(&mut self, config: &SocketsConfig, epoch: BackendEpoch) {
         self.epoch = epoch;
         self.state = State::Active;
         self.path = config.path;
         self.observe = config.rx_observation;
         self.clock_epoch = config.clock_epoch;
+        self.failed = None;
     }
 
     /// `ECONNREFUSED` results of receive calls (4.7).
@@ -73,10 +99,25 @@ impl RxCore {
     fn admits(&self, budget: Budget, spent: Spent) -> bool {
         spent.ops < budget.ops()
             && spent.datagrams < budget.datagrams()
-            && budget.bytes().saturating_sub(spent.bytes) >= u64::from(self.max_datagram)
+            && budget
+                .bytes()
+                .checked_sub(spent.bytes)
+                .is_some_and(|rest| rest >= u64::from(self.max_datagram))
+    }
+
+    /// Stops the half with `failure` (3.10) and returns `outcome` with it.
+    fn fail(&mut self, mut outcome: RxOutcome, failure: BackendFailure) -> RxOutcome {
+        self.failed = Some(failure);
+        outcome.stop = RxStop::Failed(failure);
+        outcome
     }
 
     /// Receives within `budget`, lending each datagram to `handler`.
+    ///
+    /// Every count is checked. The op and datagram counts of a call are
+    /// computed before it, so a budget that cannot take them stops with
+    /// `Budget` and no call; a count that cannot grow after a call is an
+    /// invariant fault, which stops the half like any `Failed`.
     pub(super) fn poll_rx<O: SocketOps, H: RxHandler>(
         &mut self,
         ops: &mut O,
@@ -93,14 +134,25 @@ impl RxCore {
             outcome.stop = RxStop::Failed(BackendFailure::NotActive);
             return outcome;
         }
+        if let Some(failure) = self.failed {
+            outcome.stop = RxStop::Failed(failure);
+            return outcome;
+        }
+        let invariant = BackendFailure::Invariant { operation: RECV };
         loop {
-            if !self.admits(budget, outcome.spent) {
+            let next = (
+                outcome.spent.ops.checked_add(1),
+                outcome.spent.datagrams.checked_add(1),
+            );
+            let (true, (Some(next_ops), Some(next_datagrams))) =
+                (self.admits(budget, outcome.spent), next)
+            else {
                 outcome.stop = RxStop::Budget;
                 return outcome;
-            }
+            };
             let result = ops.recv(&mut self.buffer);
             let time_ns = self.observe.then(host_monotonic_ns);
-            outcome.spent.ops = outcome.spent.ops.saturating_add(1);
+            outcome.spent.ops = next_ops;
             let (len, truncated, source) = match result {
                 RecvResult::Datagram {
                     len,
@@ -108,6 +160,7 @@ impl RxCore {
                     source,
                 } => (len, truncated, source),
                 RecvResult::Error(errno) => match self.classify(errno) {
+                    Some(RxStop::Failed(failure)) => return self.fail(outcome, failure),
                     Some(stop) => {
                         outcome.stop = stop;
                         return outcome;
@@ -116,10 +169,9 @@ impl RxCore {
                 },
             };
             if len > self.buffer.len() {
-                outcome.stop = RxStop::Failed(BackendFailure::Invariant { operation: RECV });
-                return outcome;
+                return self.fail(outcome, invariant);
             }
-            outcome.spent.datagrams = outcome.spent.datagrams.saturating_add(1);
+            outcome.spent.datagrams = next_datagrams;
             let reason = if truncated.is_some() || len > usize::from(self.max_datagram) {
                 Some(RxDropReason::Oversize {
                     limit: self.max_datagram,
@@ -131,27 +183,36 @@ impl RxCore {
                 None
             };
             let (None, Some(source)) = (reason, source) else {
-                outcome.dropped = outcome.dropped.saturating_add(1);
+                let Some(dropped) = outcome.dropped.checked_add(1) else {
+                    return self.fail(outcome, invariant);
+                };
+                outcome.dropped = dropped;
                 handler.dropped(RxDrop {
                     reason: reason.unwrap_or(RxDropReason::UnsupportedSource),
                     source,
                 });
                 continue;
             };
-            outcome.spent.bytes = outcome
-                .spent
-                .bytes
-                .saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
-            outcome.delivered = outcome.delivered.saturating_add(1);
+            let bytes = u64::try_from(len)
+                .ok()
+                .and_then(|len| outcome.spent.bytes.checked_add(len));
+            let (Some(bytes), Some(delivered), Some(datagram)) = (
+                bytes,
+                outcome.delivered.checked_add(1),
+                self.buffer.get(..len),
+            ) else {
+                return self.fail(outcome, invariant);
+            };
+            outcome.spent.bytes = bytes;
+            outcome.delivered = delivered;
             let observation = time_ns.map(|time_ns| Observation {
                 point: ObservationPoint::RecvReturn,
                 domain: ClockDomain::HostMonotonic,
                 epoch: self.clock_epoch,
                 time_ns,
-                uncertainty_ns: 1,
+                uncertainty_ns: OBSERVATION_UNCERTAINTY_NS,
             });
-            let bytes = self.buffer.get(..len).unwrap_or_default();
-            let datagram = RxDatagram::new(bytes, source, self.path, self.epoch, observation);
+            let datagram = RxDatagram::new(datagram, source, self.path, self.epoch, observation);
             if handler.datagram(datagram).is_break() {
                 outcome.stop = RxStop::HandlerStopped;
                 return outcome;
@@ -166,7 +227,7 @@ impl RxCore {
             Errno::INTR => Some(RxStop::Interrupted),
             Errno::NOBUFS | Errno::NOMEM => Some(RxStop::NoBuffers),
             Errno::CONNREFUSED => {
-                self.peer_errors = self.peer_errors.saturating_add(1);
+                count_up(&mut self.peer_errors);
                 None
             }
             _ => Some(RxStop::Failed(BackendFailure::Os {
@@ -174,5 +235,15 @@ impl RxCore {
                 errno: errno.raw(),
             })),
         }
+    }
+}
+
+/// Adds one to a monitoring counter of system call results, checked. The
+/// documented choice for overflow: the counter keeps its value, which can
+/// then only be `u64::MAX`, a count one op per call cannot reach in
+/// practice. Never used for a position, length or budget count.
+pub(super) fn count_up(counter: &mut u64) {
+    if let Some(next) = counter.checked_add(1) {
+        *counter = next;
     }
 }

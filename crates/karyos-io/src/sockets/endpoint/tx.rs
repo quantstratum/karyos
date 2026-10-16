@@ -8,35 +8,48 @@
 //! Pending queues are intrusive lists threaded through slot metadata
 //! indices, so no queue allocates (5.1). Every allocation happens in
 //! [`TxCore::new`], on the control path.
+//!
+//! Positions, lengths and counts are checked (SPEC §14). Where the
+//! endpoint finds its own state broken (a FIFO link to a slot of another
+//! queue, a pending slot without a generation, a count that cannot move)
+//! it never fabricates a value: the queue faults with an invariant
+//! violation, which only a reset clears (6.3, S-16).
 
 use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
 
-use super::config::{SOCKETS_MAX_BATCH, SocketsConfig};
+use super::config::{SOCKETS_MAX_BATCH, SOCKETS_MAX_BATCH_LEN, SocketsConfig};
+use super::rx::count_up;
 use super::{State, TX_DISCARDED_ON_DROP};
 use crate::backend::handles::{HandleTable, IssueError};
 use crate::backend::ledger::TxLedger;
 use crate::backend::{
     BackendEpoch, BackendFailure, CancelOutcome, CapabilityState, ClaimError, Commit, CommitError,
     CommitRejected, Exposure, FlushOutcome, FlushRequest, FlushStop, GateDecision, InstanceId,
-    PendingCause, QueueError, Reason, Release, ReportWriter, ReturnReason, RouteError, RouteId,
-    SendError, SenderGate, SenderToken, Spent, SubmissionId, TX_REPORT_CAPACITY, TxEntry, TxFrame,
-    TxItemOutcome, TxQueueConfig, TxQueueId, TxReport, TxTicket,
+    OpenError, PendingCause, QueueError, Reason, Release, ReportWriter, ReturnReason, RouteError,
+    RouteId, SendError, SenderGate, SenderToken, Spent, SubmissionId, TX_REPORT_CAPACITY, TxEntry,
+    TxFrame, TxItemOutcome, TxQueueConfig, TxQueueId, TxReport, TxTicket,
 };
 use crate::sockets::ops::{Errno, RouteAddr, SendResult, SocketOps};
 
 /// The end of a pending list.
 const NO_SLOT: u32 = u32::MAX;
 /// The stack arrays of one flush: at most this many candidates.
-const BATCH: usize = SOCKETS_MAX_BATCH as usize;
+const BATCH: usize = SOCKETS_MAX_BATCH_LEN;
+// Every candidate of one flush has a report entry.
+const _: () = assert!(BATCH <= TX_REPORT_CAPACITY);
 /// The operation named in send failures.
 const SEND: &str = "send";
+/// The operation named in invariant faults the endpoint finds in its own
+/// queue state during a flush, before any exposure.
+const FLUSH: &str = "flush";
 /// UDP header bytes (4.5).
 const UDP_HEADER: u16 = 8;
-/// IPv4 header bytes without options (4.5).
-const IPV4_HEADER: u16 = 20;
-/// IPv6 header bytes without extension headers (4.5).
-const IPV6_HEADER: u16 = 40;
+/// UDP and IPv4 header bytes without options (4.5); a constant sum, so an
+/// overflow fails the build.
+const IPV4_OVERHEAD: u16 = UDP_HEADER + 20;
+/// UDP and IPv6 header bytes without extension headers (4.5).
+const IPV6_OVERHEAD: u16 = UDP_HEADER + 40;
 
 /// The result of `add_route`'s measurement, per route (3.8 and 4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,12 +86,35 @@ const EMPTY_META: SlotMeta = SlotMeta {
     next: NO_SLOT,
 };
 
+/// One pending item as a flush or a return reports it: everything its
+/// report entry needs, read from the slot metadata once, so no entry is
+/// built from a default.
+#[derive(Debug, Clone, Copy)]
+struct Item {
+    slot: u32,
+    ticket: TxTicket,
+    token: SenderToken,
+    len: u16,
+}
+
+impl Item {
+    fn entry(self, outcome: TxItemOutcome) -> TxEntry {
+        TxEntry {
+            ticket: self.ticket,
+            token: self.token,
+            len: self.len,
+            outcome,
+        }
+    }
+}
+
 /// Why a queue is faulted (6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
     /// The head failed with a send error; `retry_queue` clears it.
     Send(SendError),
-    /// A result outside the ABI; only a reset clears it (S-16).
+    /// A result outside the ABI, or the endpoint's own queue state found
+    /// broken; only a reset clears it (S-16).
     Invariant,
 }
 
@@ -132,15 +168,41 @@ pub(super) struct TxCore {
     ledger: TxLedger,
     routes: HandleTable<RouteId, RouteEntry>,
     peer_errors: u64,
+    /// Whether each send of the epoch is one `sendmmsg` (4.3); `Spent::ops`
+    /// counts by it.
+    batched: bool,
+    /// The failure that stopped the half (3.10): every later flush returns
+    /// it with no gate check and no system call until `reset` and
+    /// `reopen`.
+    failed: Option<BackendFailure>,
+    /// A test broke an invariant on purpose; the debug assertions of the
+    /// release build guards stay quiet so the guards themselves run.
+    #[cfg(test)]
+    injected: bool,
 }
 
 impl TxCore {
     /// Allocates the pool, its metadata and the tables for a validated
     /// configuration.
-    pub(super) fn new(config: &SocketsConfig, instance: InstanceId, epoch: BackendEpoch) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` for `tx_slots` when the pool size does not
+    /// fit `usize`, which `validate` already rules out.
+    pub(super) fn new(
+        config: &SocketsConfig,
+        instance: InstanceId,
+        epoch: BackendEpoch,
+        batched: bool,
+    ) -> Result<Self, OpenError> {
         let slots = usize::from(config.tx_slots.get());
-        let pool_bytes = slots.saturating_mul(usize::from(config.max_datagram.get()));
-        Self {
+        let pool_bytes = slots
+            .checked_mul(usize::from(config.max_datagram.get()))
+            .ok_or(OpenError::InvalidConfig {
+                field: "tx_slots",
+                value: u64::from(config.tx_slots.get()),
+            })?;
+        Ok(Self {
             instance,
             epoch,
             state: State::Active,
@@ -156,14 +218,21 @@ impl TxCore {
             ),
             routes: HandleTable::new(config.max_routes, epoch),
             peer_errors: 0,
-        }
+            batched,
+            failed: None,
+            #[cfg(test)]
+            injected: false,
+        })
     }
 
-    /// Moves to the new epoch of `reopen`; the sizes are unchanged.
-    pub(super) fn reopen(&mut self, config: &SocketsConfig, epoch: BackendEpoch) {
+    /// Moves to the new epoch of `reopen`; the sizes are unchanged and a
+    /// failure that stopped the half is cleared.
+    pub(super) fn reopen(&mut self, config: &SocketsConfig, epoch: BackendEpoch, batched: bool) {
         self.epoch = epoch;
         self.config = *config;
         self.state = State::Active;
+        self.batched = batched;
+        self.failed = None;
     }
 
     fn active(&self) -> bool {
@@ -174,14 +243,39 @@ impl TxCore {
         self.config.max_datagram.get()
     }
 
+    /// A release build guard found a broken invariant: debug builds assert,
+    /// unless a test injected the fault to exercise the guard. The caller
+    /// takes its typed path either way.
+    fn broken(&self, invariant: &str) {
+        debug_assert!(self.injected(), "broken invariant: {invariant}");
+    }
+
+    #[cfg(test)]
+    fn injected(&self) -> bool {
+        self.injected
+    }
+
+    #[cfg(not(test))]
+    fn injected(&self) -> bool {
+        false
+    }
+
     /// `ECONNREFUSED` results of send calls (4.7).
     pub(super) fn peer_errors(&self) -> u64 {
         self.peer_errors
     }
 
-    /// Pending items over every open queue.
+    /// Pending items over every open queue. At most 1024 queues of `u16`
+    /// counts, so the checked sum fits any `usize` of 32 bits or more; were
+    /// it not to, the result reads as everything pending, which keeps
+    /// `reset` and the drop check conservative.
     pub(super) fn pending_total(&self) -> usize {
-        self.runs.iter().map(|run| usize::from(run.len)).sum()
+        self.runs
+            .iter()
+            .try_fold(0_usize, |total, run| {
+                total.checked_add(usize::from(run.len))
+            })
+            .unwrap_or(usize::MAX)
     }
 
     /// Whether `ticket` names an item that is pending now: same instance,
@@ -221,6 +315,13 @@ impl TxCore {
         self.run(queue).is_some_and(|run| run.closing)
     }
 
+    /// Faults `queue` with an invariant violation (6.3, S-16).
+    fn fault_invariant(&mut self, queue: TxQueueId) {
+        if let Some(run) = self.run_mut(queue) {
+            run.fault = Some(Fault::Invariant);
+        }
+    }
+
     /// The byte range of `slot` in the pool, `len` bytes long.
     fn range(&self, slot: u32, len: usize) -> Option<std::ops::Range<usize>> {
         let start = usize::try_from(slot)
@@ -229,12 +330,16 @@ impl TxCore {
         Some(start..start.checked_add(len)?)
     }
 
-    fn slot_bytes(&self, slot: u32, len: usize) -> &[u8] {
+    /// The bytes of a pending slot; `None` when the slot or length lies
+    /// outside the pool, an invariant violation the caller faults on.
+    fn slot_bytes(&self, slot: u32, len: usize) -> Option<&[u8]> {
         self.range(slot, len)
             .and_then(|range| self.bytes.get(range))
-            .unwrap_or_default()
     }
 
+    /// The writable bytes of a claimed slot. The ledger bounded the slot
+    /// and the length at claim, so the range always lies in the pool; the
+    /// empty fallback only satisfies the `TxFrame` signature.
     fn slot_bytes_mut(&mut self, slot: u32, len: usize) -> &mut [u8] {
         match self.range(slot, len) {
             Some(range) => self.bytes.get_mut(range).unwrap_or_default(),
@@ -242,33 +347,42 @@ impl TxCore {
         }
     }
 
-    fn ticket(&self, slot: u32) -> TxTicket {
-        let generation = self
-            .meta(slot)
-            .and_then(|meta| meta.generation)
-            .unwrap_or(NonZeroU64::MIN);
-        TxTicket::new(SubmissionId::new(
+    /// The pending item at `slot` of `queue` and the next slot of the
+    /// FIFO; `None` when the slot is not a pending slot of that queue with
+    /// a generation.
+    fn item(&self, queue: TxQueueId, slot: u32) -> Option<(Item, u32)> {
+        let meta = self.meta(slot).filter(|meta| meta.queue == Some(queue))?;
+        let generation = meta.generation?;
+        let ticket = TxTicket::new(SubmissionId::new(
             self.instance,
             self.epoch,
             slot,
             generation,
-        ))
+        ));
+        let item = Item {
+            slot,
+            ticket,
+            token: meta.token,
+            len: meta.len,
+        };
+        Some((item, meta.next))
     }
 
     // -----------------------------------------------------------------
     // Routes (3.8, 4.5)
     // -----------------------------------------------------------------
 
-    /// Adds a route to `destination`, checked in this order: `NotActive`,
-    /// `Unsupported`, `FamilyMismatch`, `RouteLimit`; then the route MTU,
-    /// which gives `PathTooSmall` or `PathUnverified`; then the generation
-    /// counter (`IdentityExhausted`).
+    /// Adds a route to `destination`, checked in this order: `NotActive`
+    /// (also for a half stopped by a failure, as the measurement is a
+    /// system call), `Unsupported`, `FamilyMismatch`, `RouteLimit`; then
+    /// the route MTU, which gives `PathTooSmall` or `PathUnverified`; then
+    /// the generation counter (`IdentityExhausted`).
     pub(super) fn add_route<O: SocketOps>(
         &mut self,
         ops: &mut O,
         destination: std::net::SocketAddr,
     ) -> Result<RouteId, RouteError> {
-        if !self.active() {
+        if !self.active() || self.failed.is_some() {
             return Err(RouteError::NotActive);
         }
         if destination.ip().is_unspecified() || destination.port() == 0 {
@@ -283,15 +397,16 @@ impl TxCore {
         let address = RouteAddr::new(destination);
         let info = match ops.route_mtu(&address) {
             Some(route_mtu) => {
-                let ip_header = if destination.is_ipv4() {
-                    IPV4_HEADER
+                let overhead = if destination.is_ipv4() {
+                    IPV4_OVERHEAD
                 } else {
-                    IPV6_HEADER
+                    IPV6_OVERHEAD
                 };
-                let overhead = UDP_HEADER.saturating_add(ip_header);
                 let datagram = self.max_datagram();
-                let needed = u32::from(datagram).saturating_add(u32::from(overhead));
-                if needed > route_mtu {
+                // Two `u16` values always sum within `u32`; an overflow
+                // would mean the datagram cannot fit any path.
+                let needed = u32::from(datagram).checked_add(u32::from(overhead));
+                if needed.is_none_or(|needed| needed > route_mtu) {
                     return Err(RouteError::PathTooSmall {
                         datagram,
                         overhead,
@@ -375,7 +490,9 @@ impl TxCore {
         Ok(queue)
     }
 
-    /// Clears a send fault; an invariant fault gives `NeedsReset`.
+    /// Clears a send fault; an invariant fault gives `NeedsReset`. A queue
+    /// that `close_queue` is closing is `UnknownQueue`. It does not clear a
+    /// failure that stopped the half; only a reset does.
     pub(super) fn retry_queue(&mut self, queue: TxQueueId) -> Result<(), QueueError> {
         if !self.active() {
             return Err(QueueError::NotActive);
@@ -421,7 +538,8 @@ impl TxCore {
         let Some(mut writer) = report.writer() else {
             return Err(QueueError::ReportNotEmpty);
         };
-        let returned = self.drain(queue, &mut writer, ReturnReason::Cancelled);
+        let mut returned: u16 = 0;
+        self.drain(queue, &mut writer, ReturnReason::Cancelled, &mut returned);
         let more = self.run(queue).is_some_and(|run| run.len > 0);
         Ok(CancelOutcome { returned, more })
     }
@@ -441,7 +559,8 @@ impl TxCore {
         if let Some(run) = self.run_mut(queue) {
             run.closing = true;
         }
-        let returned = self.drain(queue, &mut writer, ReturnReason::QueueClosed);
+        let mut returned: u16 = 0;
+        self.drain(queue, &mut writer, ReturnReason::QueueClosed, &mut returned);
         let more = self.run(queue).is_some_and(|run| run.len > 0);
         if !more {
             self.ledger.close_queue(queue)?;
@@ -452,51 +571,72 @@ impl TxCore {
         Ok(CancelOutcome { returned, more })
     }
 
-    /// Pops the head of `queue`'s FIFO and returns its slot.
+    /// Pops the head of `queue`'s FIFO and returns it; `None` for an empty
+    /// queue.
     ///
-    /// The slot's metadata names the queue that owns it; a head owned by
-    /// another queue is never popped, so no ledger call can release,
-    /// quarantine or discharge a slot on the wrong queue, in release builds
-    /// as well (S1 review N3).
-    fn pop_head(&mut self, queue: TxQueueId) -> Option<u32> {
-        let head = self.run(queue)?.head;
-        let meta = self.meta_mut(head)?;
-        if meta.queue != Some(queue) {
-            debug_assert!(false, "a queue's head is owned by that queue");
+    /// Release build guard (S1 review N3): the head's metadata must name
+    /// `queue`, carry a generation, and the queue must count it. Otherwise
+    /// nothing changes and `None` comes back, so no ledger call can
+    /// release, quarantine or discharge a slot on the wrong queue. Every
+    /// check runs before the first change.
+    fn pop_head(&mut self, queue: TxQueueId) -> Option<Item> {
+        let run = *self.run(queue)?;
+        if run.head == NO_SLOT {
             return None;
         }
-        let next = meta.next;
-        meta.queue = None;
-        meta.next = NO_SLOT;
-        let run = self.run_mut(queue)?;
-        run.head = next;
-        if next == NO_SLOT {
-            run.tail = NO_SLOT;
+        let (Some((item, next)), Some(len)) = (self.item(queue, run.head), run.len.checked_sub(1))
+        else {
+            self.broken("a queue's head is a pending slot of that queue, counted by it");
+            return None;
+        };
+        if let Some(meta) = self.meta_mut(item.slot) {
+            meta.queue = None;
+            meta.next = NO_SLOT;
         }
-        run.len = run.len.saturating_sub(1);
-        Some(head)
+        if let Some(run) = self.run_mut(queue) {
+            run.head = next;
+            if next == NO_SLOT {
+                run.tail = NO_SLOT;
+            }
+            run.len = len;
+        }
+        Some(item)
+    }
+
+    /// Pops `slot`, which must be the head of `queue`; `false` changes
+    /// nothing.
+    fn pop_expected(&mut self, queue: TxQueueId, slot: u32) -> bool {
+        if self.run(queue).is_none_or(|run| run.head != slot) {
+            self.broken("a flush candidate is still its queue's head");
+            return false;
+        }
+        self.pop_head(queue).is_some()
     }
 
     /// Returns head items of `queue` with `reason` while the report has
-    /// room; the slots are Free again.
+    /// room, adding to `returned`; the slots are Free again. The count is
+    /// checked before each pop, so an item is never returned uncounted.
     fn drain(
         &mut self,
         queue: TxQueueId,
         writer: &mut ReportWriter<'_>,
         reason: ReturnReason,
-    ) -> u16 {
-        let mut returned: u16 = 0;
+        returned: &mut u16,
+    ) {
         while writer.remaining() > 0 {
-            let Some(slot) = self.pop_head(queue) else {
+            // At most `TX_REPORT_CAPACITY` entries per call, so the count
+            // fits; on `None` the item simply stays pending.
+            let Some(count) = returned.checked_add(1) else {
                 break;
             };
-            let entry = self.entry(slot, TxItemOutcome::Returned { reason });
-            let released = self.ledger.release_pending(queue, slot);
+            let Some(item) = self.pop_head(queue) else {
+                break;
+            };
+            let released = self.ledger.release_pending(queue, item.slot);
             debug_assert!(released, "a returned item was pending");
-            push(writer, entry);
-            returned = returned.saturating_add(1);
+            push(writer, item.entry(TxItemOutcome::Returned { reason }));
+            *returned = count;
         }
-        returned
     }
 
     /// Returns pending items of every queue, in queue index order, with
@@ -507,7 +647,7 @@ impl TxCore {
             let Some(queue) = self.runs.get(index).and_then(|run| run.id) else {
                 continue;
             };
-            returned = returned.saturating_add(self.drain(queue, writer, ReturnReason::Reset));
+            self.drain(queue, writer, ReturnReason::Reset, &mut returned);
         }
         (returned, self.pending_total() > 0)
     }
@@ -516,11 +656,15 @@ impl TxCore {
     /// invalidates every route and frees quarantined slots. Queue and
     /// route handles issued afterwards carry the epoch `reopen` moves to;
     /// when the epoch cannot advance, `reopen` fails and no handle is
-    /// issued again. Refuses, changing nothing and returning `false`, while
-    /// any item is pending, so the ledger never frees occupied capacity.
+    /// issued again.
+    ///
+    /// Release build guard (S1 review N3): refuses, changing nothing and
+    /// returning `false`, while any item is pending, so the ledger never
+    /// frees occupied capacity. Under the invariants `drain_all` empties
+    /// every queue first, so only an injected fault reaches it.
     pub(super) fn finish_reset(&mut self) -> bool {
         if self.pending_total() > 0 {
-            debug_assert!(false, "a reset returns every item first");
+            self.broken("a reset returns every item first");
             return false;
         }
         let next = self.epoch.next().unwrap_or(self.epoch);
@@ -528,18 +672,6 @@ impl TxCore {
         self.routes.clear(next);
         self.runs.iter_mut().for_each(|run| *run = IDLE_RUN);
         true
-    }
-
-    fn entry(&self, slot: u32, outcome: TxItemOutcome) -> TxEntry {
-        let (token, len) = self
-            .meta(slot)
-            .map_or((SenderToken::new(0), 0), |meta| (meta.token, meta.len));
-        TxEntry {
-            ticket: self.ticket(slot),
-            token,
-            len,
-            outcome,
-        }
     }
 
     // -----------------------------------------------------------------
@@ -587,11 +719,17 @@ impl TxCore {
         if !self.active() {
             return stopped(FlushStop::Queue(QueueError::NotActive));
         }
-        let Some(account) = self.ledger.queues().get(request.queue) else {
+        // A half stopped by a failure makes no gate check and no system
+        // call until the reset (3.10).
+        if let Some(failure) = self.failed {
+            return stopped(FlushStop::Failed(failure));
+        }
+        let queue = request.queue;
+        let Some(account) = self.ledger.queues().get(queue) else {
             return stopped(FlushStop::Queue(QueueError::UnknownQueue));
         };
         let (authority, route) = (account.authority(), account.route());
-        let Some(run) = self.run(request.queue).copied() else {
+        let Some(run) = self.run(queue).copied() else {
             return stopped(FlushStop::Queue(QueueError::UnknownQueue));
         };
         if run.closing {
@@ -608,46 +746,69 @@ impl TxCore {
         if run.head == NO_SLOT {
             return stopped(FlushStop::QueueEmpty);
         }
-        let limit = usize::from(request.max_datagrams.get())
-            .min(usize::from(self.config.max_batch.get()))
-            .min(TX_REPORT_CAPACITY)
-            .min(BATCH);
-        let mut slots = [NO_SLOT; BATCH];
+        // Clamped to `max_batch` and the stack arrays; `BATCH` is at most
+        // `TX_REPORT_CAPACITY`, so every candidate has a report entry.
+        let limit = request
+            .max_datagrams
+            .get()
+            .min(self.config.max_batch.get())
+            .min(SOCKETS_MAX_BATCH);
+        let mut items: [Option<Item>; BATCH] = [None; BATCH];
         let mut tokens = [SenderToken::new(0); BATCH];
         let mut lengths = [0_u16; BATCH];
-        let mut offered = 0_usize;
-        let mut offered_bytes = 0_u32;
+        let mut offered: u16 = 0;
+        let mut offered_bytes: u32 = 0;
         let mut cursor = run.head;
-        while offered < limit {
-            let Some(meta) = self
-                .meta(cursor)
-                .filter(|meta| meta.queue == Some(request.queue))
-            else {
-                break;
+        while offered < limit && cursor != NO_SLOT {
+            // Release build guard (S1 review N3): the FIFO links only
+            // pending slots of this queue. Nothing has changed yet, so a
+            // broken link faults the queue before the gate is called.
+            let Some((item, next)) = self.item(queue, cursor) else {
+                self.broken("a queue's FIFO links only its own pending slots");
+                self.fault_invariant(queue);
+                return stopped(FlushStop::Failed(BackendFailure::Invariant {
+                    operation: FLUSH,
+                }));
             };
+            // `max_bytes` is inclusive: a prefix of exactly `max_bytes`
+            // bytes is offered.
             let Some(bytes) = offered_bytes
-                .checked_add(u32::from(meta.len))
+                .checked_add(u32::from(item.len))
                 .filter(|bytes| *bytes <= request.max_bytes)
             else {
                 if offered == 0 {
-                    return stopped(FlushStop::HeadExceedsBudget { head_len: meta.len });
+                    return stopped(FlushStop::HeadExceedsBudget { head_len: item.len });
                 }
                 break;
             };
-            if let (Some(slot), Some(token), Some(len)) = (
-                slots.get_mut(offered),
-                tokens.get_mut(offered),
-                lengths.get_mut(offered),
-            ) {
-                *slot = cursor;
-                *token = meta.token;
-                *len = meta.len;
-            }
-            offered = offered.saturating_add(1);
+            let at = usize::from(offered);
+            let (Some(next_offered), Some(slot), Some(token), Some(len)) = (
+                offered.checked_add(1),
+                items.get_mut(at),
+                tokens.get_mut(at),
+                lengths.get_mut(at),
+            ) else {
+                // Unreachable: `offered < limit <= BATCH`.
+                break;
+            };
+            *slot = Some(item);
+            *token = item.token;
+            *len = item.len;
+            offered = next_offered;
             offered_bytes = bytes;
-            cursor = meta.next;
+            cursor = next;
         }
-        let offered16 = u16::try_from(offered).unwrap_or(u16::MAX);
+        let offered_at = usize::from(offered);
+        let (Some(offered_tokens), Some(offered_lengths)) =
+            (tokens.get(..offered_at), lengths.get(..offered_at))
+        else {
+            // Unreachable: `offered <= BATCH`. Nothing has changed.
+            self.broken("the offered prefix fits the stack arrays");
+            self.fault_invariant(queue);
+            return stopped(FlushStop::Failed(BackendFailure::Invariant {
+                operation: FLUSH,
+            }));
+        };
 
         // Step 2: the gate. Nothing has changed yet, so a panic here leaves
         // the endpoint as it was.
@@ -655,111 +816,147 @@ impl TxCore {
             authority,
             route,
             epoch: self.epoch,
-            tokens: tokens.get(..offered).unwrap_or_default(),
-            lengths: lengths.get(..offered).unwrap_or_default(),
+            tokens: offered_tokens,
+            lengths: offered_lengths,
         });
         let Some(mut writer) = report.writer() else {
             return stopped(FlushStop::ReportNotEmpty);
         };
         let permitted = match decision {
             GateDecision::Deny => {
-                self.report_pending(&mut writer, &slots, 0, offered, PendingCause::GateDenied);
+                report_pending(&mut writer, &items, 0, offered_at, PendingCause::GateDenied);
                 return stopped(FlushStop::GateDenied);
             }
-            GateDecision::Permit { count } if usize::from(count.get()) > offered => {
-                self.report_pending(&mut writer, &slots, 0, offered, PendingCause::GateDenied);
+            // A broken gate: nothing is exposed (6.1). Every candidate is
+            // reported `Pending { GateDenied }`: no exposure was permitted
+            // in a form the backend can act on, so the items wait at the
+            // head as after a denial, and the stop names the gate error.
+            GateDecision::Permit { count } if count.get() > offered => {
+                report_pending(&mut writer, &items, 0, offered_at, PendingCause::GateDenied);
                 return stopped(FlushStop::GateError {
                     permitted: count.get(),
-                    offered: offered16,
+                    offered,
                 });
             }
-            GateDecision::Permit { count } => usize::from(count.get()),
+            GateDecision::Permit { count } => count.get(),
         };
+        let permitted_at = usize::from(permitted);
 
-        // Step 3: one exposure of the permitted prefix.
-        let mut exposed_bytes = 0_u32;
-        let result = {
-            let mut datagrams: [&[u8]; BATCH] = [&[]; BATCH];
-            for (at, datagram) in datagrams.iter_mut().enumerate().take(permitted) {
-                let (slot, len) = (
-                    slots.get(at).copied().unwrap_or(NO_SLOT),
-                    lengths.get(at).copied().unwrap_or(0),
-                );
-                *datagram = self.slot_bytes(slot, usize::from(len));
-                exposed_bytes = exposed_bytes.saturating_add(u32::from(len));
-            }
-            ops.send(&address, datagrams.get(..permitted).unwrap_or_default())
+        // Step 3: one exposure of the permitted prefix. The bytes are
+        // checked before the call; a slot outside the pool or a byte count
+        // that cannot be summed is an invariant fault with nothing sent.
+        let exposed = items
+            .get(..permitted_at)
+            .and_then(|prefix| {
+                prefix
+                    .iter()
+                    .try_fold(0_u32, |sum, item| sum.checked_add(u32::from((*item)?.len)))
+            })
+            .map(|bytes| {
+                let mut datagrams: [&[u8]; BATCH] = [&[]; BATCH];
+                for (datagram, item) in datagrams
+                    .iter_mut()
+                    .zip(items.iter().copied())
+                    .take(permitted_at)
+                {
+                    match item.and_then(|item| self.slot_bytes(item.slot, usize::from(item.len))) {
+                        Some(slot_bytes) => *datagram = slot_bytes,
+                        None => return None,
+                    }
+                }
+                let prefix = datagrams.get(..permitted_at)?;
+                Some((bytes, ops.send(&address, prefix)))
+            });
+        let Some(Some((exposed_bytes, result))) = exposed else {
+            self.broken("the permitted prefix lies in the pool");
+            self.fault_invariant(queue);
+            let failure = BackendFailure::Invariant { operation: FLUSH };
+            report_pending(
+                &mut writer,
+                &items,
+                0,
+                offered_at,
+                PendingCause::Failed(failure),
+            );
+            return stopped(FlushStop::Failed(failure));
         };
         let spent = Spent {
-            datagrams: u32::try_from(permitted).unwrap_or(u32::MAX),
+            datagrams: u32::from(permitted),
             bytes: u64::from(exposed_bytes),
-            ops: 1,
+            ops: self.send_ops(result, permitted),
         };
 
         // Steps 4 and 5: slot states, the queue head, then the report.
-        let (accepted, next) = self.classify(result, permitted);
+        let (mut accepted, mut next) = self.classify(result, permitted_at);
         let mut submitted: u16 = 0;
         let mut submitted_bytes: u32 = 0;
-        for _ in 0..accepted {
-            let Some(slot) = self.pop_head(request.queue) else {
+        for (at, item) in items.iter().copied().take(accepted).enumerate() {
+            let counts = submitted
+                .checked_add(1)
+                .zip(item.and_then(|item| submitted_bytes.checked_add(u32::from(item.len))));
+            // An accepted item that cannot be popped or counted would stay
+            // pending and be sent again: it and every later candidate of
+            // the exposure become `Unknown` instead (6.3).
+            let (Some(item), Some((count, bytes))) = (item, counts) else {
+                self.broken("an accepted item is counted");
+                (accepted, next) = (at, Next::Unknown);
                 break;
             };
-            let entry = self.entry(
-                slot,
-                TxItemOutcome::Submitted {
-                    release: Release::AtSubmission,
-                },
-            );
-            let released = self.ledger.release_pending(request.queue, slot);
+            if !self.pop_expected(queue, item.slot) {
+                (accepted, next) = (at, Next::Unknown);
+                break;
+            }
+            let released = self.ledger.release_pending(queue, item.slot);
             debug_assert!(released, "a submitted item was pending");
-            submitted = submitted.saturating_add(1);
-            submitted_bytes = submitted_bytes.saturating_add(u32::from(entry.len));
-            push(&mut writer, entry);
+            submitted = count;
+            submitted_bytes = bytes;
+            push(
+                &mut writer,
+                item.entry(TxItemOutcome::Submitted {
+                    release: Release::AtSubmission,
+                }),
+            );
         }
         let stop = match next {
             Next::Done => FlushStop::Exposed,
             Next::Pending { cause, stop, fault } => {
-                self.report_pending(
-                    &mut writer,
-                    &slots,
-                    accepted,
-                    accepted.saturating_add(1),
-                    cause,
-                );
-                self.report_pending(
-                    &mut writer,
-                    &slots,
-                    accepted.saturating_add(1),
-                    permitted,
-                    PendingCause::NotAttempted,
-                );
-                if let (Some(fault), Some(run)) = (fault, self.run_mut(request.queue)) {
+                // The first unaccepted item carries the cause; the items
+                // behind it were not attempted.
+                let unaccepted = items.get(accepted..permitted_at).unwrap_or_default();
+                for (at, item) in unaccepted.iter().flatten().enumerate() {
+                    let cause = if at == 0 {
+                        cause
+                    } else {
+                        PendingCause::NotAttempted
+                    };
+                    push(&mut writer, item.entry(TxItemOutcome::Pending { cause }));
+                }
+                if let (Some(fault), Some(run)) = (fault, self.run_mut(queue)) {
                     run.fault = Some(fault);
                 }
                 stop
             }
             Next::Unknown => {
-                for _ in accepted..permitted {
-                    let Some(slot) = self.pop_head(request.queue) else {
-                        break;
-                    };
-                    let entry = self.entry(slot, TxItemOutcome::Unknown);
-                    let quarantined = self.ledger.quarantine(request.queue, slot);
-                    debug_assert!(quarantined, "an unknown item was pending");
-                    push(&mut writer, entry);
+                let unproven = items.get(accepted..permitted_at).unwrap_or_default();
+                for item in unproven.iter().flatten() {
+                    // A slot that cannot be popped stays where it is; its
+                    // queue is faulted below, so it is never exposed again.
+                    if self.pop_expected(queue, item.slot) {
+                        let quarantined = self.ledger.quarantine(queue, item.slot);
+                        debug_assert!(quarantined, "an unknown item was pending");
+                    }
+                    push(&mut writer, item.entry(TxItemOutcome::Unknown));
                 }
-                if let Some(run) = self.run_mut(request.queue) {
-                    run.fault = Some(Fault::Invariant);
-                }
+                self.fault_invariant(queue);
                 FlushStop::Failed(BackendFailure::Invariant { operation: SEND })
             }
         };
         // Candidates the gate trimmed stay pending behind the exposure.
-        self.report_pending(
+        report_pending(
             &mut writer,
-            &slots,
-            permitted,
-            offered,
+            &items,
+            permitted_at,
+            offered_at,
             PendingCause::GateDenied,
         );
         FlushOutcome {
@@ -770,18 +967,33 @@ impl TxCore {
         }
     }
 
-    /// Reports `slots[from..to]` as still pending with `cause`.
-    fn report_pending(
-        &self,
-        writer: &mut ReportWriter<'_>,
-        slots: &[u32; BATCH],
-        from: usize,
-        to: usize,
-        cause: PendingCause,
-    ) {
-        for slot in slots.get(from..to).unwrap_or_default() {
-            push(writer, self.entry(*slot, TxItemOutcome::Pending { cause }));
+    /// Backend operations of one exposure (4.3, 5.3), counted by the
+    /// endpoint from the send path of the epoch, which
+    /// [`SocketOps::send`] documents: one `sendmmsg` when batching is
+    /// active; otherwise single sends, one call per accepted datagram plus
+    /// the call that failed, as they stop at the first error. A count the
+    /// single send path cannot give (zero, above the request, or a result
+    /// outside the ABI past the request) counts as `permitted` calls, the
+    /// most that path makes for one exposure.
+    fn send_ops(&self, result: SendResult, permitted: u16) -> u32 {
+        if self.batched {
+            return 1;
         }
+        let after = |count: usize| u16::try_from(count).ok()?.checked_add(1);
+        let calls = match result {
+            SendResult::Sent { sent, error: None } => u16::try_from(sent).ok(),
+            SendResult::Sent {
+                sent,
+                error: Some(_),
+            } => after(sent),
+            SendResult::Error(_) => Some(1),
+            SendResult::OutOfAbi { proven } => after(proven),
+        };
+        u32::from(
+            calls
+                .filter(|calls| (1..=permitted).contains(calls))
+                .unwrap_or(permitted),
+        )
     }
 
     /// Maps a send result over `permitted` items to the accepted prefix and
@@ -801,11 +1013,14 @@ impl TxCore {
                 sent,
                 error: Some(_),
             } if sent == permitted => (sent, Next::Unknown),
+            // A partial `sendmmsg` that lost the error of item `sent`: the
+            // stop names the lost error rather than `Exposed`, which would
+            // claim the whole permitted prefix (3.4, 4.3).
             SendResult::Sent { sent, error: None } => (
                 sent,
                 Next::Pending {
                     cause: PendingCause::ErrorLost,
-                    stop: FlushStop::Exposed,
+                    stop: FlushStop::ErrorLost,
                     fault: None,
                 },
             ),
@@ -818,7 +1033,8 @@ impl TxCore {
         }
     }
 
-    /// The send column of 4.7 for the first unaccepted item.
+    /// The send column of 4.7 for the first unaccepted item. A `Failed`
+    /// result stops the half (3.10).
     fn classify_errno(&mut self, errno: Errno) -> Next {
         let raw = errno.raw();
         let pending = |cause: PendingCause, stop: FlushStop| Next::Pending {
@@ -836,7 +1052,7 @@ impl TxCore {
             Errno::INTR => pending(PendingCause::Interrupted, FlushStop::Interrupted),
             Errno::NOBUFS | Errno::NOMEM => pending(PendingCause::NoBuffers, FlushStop::NoBuffers),
             Errno::CONNREFUSED => {
-                self.peer_errors = self.peer_errors.saturating_add(1);
+                count_up(&mut self.peer_errors);
                 pending(PendingCause::PeerError, FlushStop::PeerError)
             }
             Errno::MSGSIZE => faulted(SendError::MessageTooLarge),
@@ -850,10 +1066,44 @@ impl TxCore {
                     operation: SEND,
                     errno: raw,
                 };
+                self.failed = Some(failure);
                 pending(PendingCause::Failed(failure), FlushStop::Failed(failure))
             }
             _ => faulted(SendError::Other { errno: raw }),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Test-only fault injection (S1 review N3)
+    // -----------------------------------------------------------------
+
+    /// Rewrites the owner recorded in the metadata of `queue`'s head to
+    /// `owner`, as a corrupted FIFO link would, and marks the core as
+    /// carrying an injected fault so the release build guards run without
+    /// their debug assertions. Returns the head slot.
+    #[cfg(test)]
+    pub(super) fn inject_head_owner(
+        &mut self,
+        queue: TxQueueId,
+        owner: Option<TxQueueId>,
+    ) -> Option<u32> {
+        self.injected = true;
+        let head = self.run(queue)?.head;
+        self.meta_mut(head)?.queue = owner;
+        Some(head)
+    }
+
+    /// Clears the injection mark of [`Self::inject_head_owner`].
+    #[cfg(test)]
+    pub(super) fn clear_injection(&mut self) {
+        self.injected = false;
+    }
+
+    /// Sets the last generation of `slot`, so its next claim overflows the
+    /// generation counter and retires the slot (3.2 Identity).
+    #[cfg(test)]
+    pub(super) fn set_slot_generation(&mut self, slot: u32, generation: u64) {
+        self.ledger.pool_mut().set_last_generation(slot, generation);
     }
 }
 
@@ -864,12 +1114,24 @@ impl Drop for TxCore {
     fn drop(&mut self) {
         let pending = self.pending_total();
         if pending > 0 && !std::thread::panicking() {
-            TX_DISCARDED_ON_DROP.fetch_add(
-                u64::try_from(pending).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+            // `usize` fits `u64` on every supported target. The process
+            // counter is checked; the documented choice for overflow is
+            // that it keeps its value, as no process discards 2^64 items.
+            let discarded = u64::try_from(pending).unwrap_or(u64::MAX);
+            let mut current = TX_DISCARDED_ON_DROP.load(Ordering::Relaxed);
+            while let Some(total) = current.checked_add(discarded) {
+                match TX_DISCARDED_ON_DROP.compare_exchange_weak(
+                    current,
+                    total,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
             debug_assert!(
-                pending == 0,
+                pending == 0 || self.injected(),
                 "a sockets TX half dropped with {pending} pending items; use reset or retire"
             );
         }
@@ -887,6 +1149,19 @@ const fn stopped(stop: FlushStop) -> FlushOutcome {
             ops: 0,
         },
         stop,
+    }
+}
+
+/// Reports the candidates `items[from..to]` as still pending with `cause`.
+fn report_pending(
+    writer: &mut ReportWriter<'_>,
+    items: &[Option<Item>; BATCH],
+    from: usize,
+    to: usize,
+    cause: PendingCause,
+) {
+    for item in items.get(from..to).unwrap_or_default().iter().flatten() {
+        push(writer, item.entry(TxItemOutcome::Pending { cause }));
     }
 }
 
@@ -926,31 +1201,47 @@ impl TxFrame for SocketsFrame<'_> {
         self.core.slot_bytes_mut(self.slot, self.capacity)
     }
 
+    /// Commits the frame to the tail of its queue's FIFO.
+    ///
+    /// The new FIFO length is checked before any change. The ledger bounds
+    /// it by `max_pending`, so a queue without a FIFO entry or a length
+    /// that cannot grow is an invariant violation: the queue is faulted
+    /// (`NeedsReset`) and the commit is rejected with `UnknownQueue`,
+    /// returning the frame.
     fn commit(mut self, commit: Commit) -> Result<TxTicket, CommitRejected<Self>> {
         let core = &mut *self.core;
+        let (queue, slot) = (self.queue, self.slot);
         let checked = core.ledger.check_commit(
             core.active(),
-            self.queue,
+            queue,
             commit.len,
             self.capacity,
             commit.options,
         );
         let checked = match checked {
             Err(CommitError::NotActive) => Err(CommitError::NotActive),
-            _ if core.closing(self.queue) => Err(CommitError::UnknownQueue),
+            _ if core.closing(queue) => Err(CommitError::UnknownQueue),
             other => other,
         };
+        let run_len = core.run(queue).and_then(|run| run.len.checked_add(1));
+        let checked = match (checked, run_len) {
+            (Ok(()), None) => {
+                core.broken("an open queue's FIFO length can grow");
+                core.fault_invariant(queue);
+                Err(CommitError::UnknownQueue)
+            }
+            (checked, _) => checked,
+        };
         let len = u16::try_from(commit.len);
-        let (Ok(()), Ok(len)) = (checked, len) else {
+        let (Ok(()), Ok(len), Some(run_len)) = (checked, len, run_len) else {
             let error = checked.err().unwrap_or(CommitError::LengthExceedsClaim {
                 len: commit.len,
                 capacity: self.capacity,
             });
             return Err(CommitRejected { frame: self, error });
         };
-        let committed = core.ledger.pool_mut().commit(self.slot);
+        let committed = core.ledger.pool_mut().commit(slot);
         debug_assert!(committed, "a claimed slot commits");
-        let (queue, slot) = (self.queue, self.slot);
         if let Some(meta) = core.meta_mut(slot) {
             *meta = SlotMeta {
                 queue: Some(queue),
@@ -969,10 +1260,16 @@ impl TxFrame for SocketsFrame<'_> {
                 run.head = slot;
             }
             run.tail = slot;
-            run.len = run.len.saturating_add(1);
+            run.len = run_len;
         }
+        let ticket = TxTicket::new(SubmissionId::new(
+            core.instance,
+            core.epoch,
+            slot,
+            self.generation,
+        ));
         self.done = true;
-        Ok(self.core.ticket(slot))
+        Ok(ticket)
     }
 }
 

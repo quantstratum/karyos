@@ -168,9 +168,19 @@ mod codes {
 /// it ([`close`](Self::close)), `split` duplicates its descriptor
 /// ([`try_clone`](Self::try_clone)) and `add_route` measures the route MTU
 /// ([`route_mtu`](Self::route_mtu)), sections 3.8, 3.10, 4.1 and 4.5.
+///
+/// **Dropping a value closes its descriptor**, as [`close`](Self::close)
+/// does. The endpoint relies on it: a failed `open` or `reopen` and a
+/// failed `split` drop the handles they hold, and `join` drops the RX
+/// half's duplicate, without any other cleanup call (7.4).
 pub trait SocketOps: Sized {
-    /// Sends `datagrams`, in order, to `route`: one `sendmmsg`, or single
-    /// sends stopping at the first error.
+    /// Sends `datagrams`, in order, to `route`. When the probes of the
+    /// last [`open`](Self::open) reported
+    /// [`SocketProbes::tx_batch`] `Active`, this is exactly one
+    /// `sendmmsg`; otherwise it is single sends, one per datagram, stopping
+    /// at the first error (4.3). The endpoint counts `Spent::ops` from this
+    /// rule (5.3), so an implementation must not batch without an `Active`
+    /// probe or split a batch into several calls when it is `Active`.
     fn send(&mut self, route: &RouteAddr, datagrams: &[&[u8]]) -> SendResult;
 
     /// Receives one datagram into `buffer`.
@@ -217,7 +227,8 @@ pub struct SocketProbes {
     pub interface: Option<u32>,
     /// `IP_MTU_DISCOVER` set to `Do` and read back.
     pub dont_fragment: CapabilityState,
-    /// The `sendmmsg` probe.
+    /// The `sendmmsg` probe. `Active` means every
+    /// [`SocketOps::send`] of the epoch is one `sendmmsg` call.
     pub tx_batch: CapabilityState,
     /// The send buffer request and its read back.
     pub send_buffer: BufferSize,
