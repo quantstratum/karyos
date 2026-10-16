@@ -145,6 +145,15 @@ release may break APIs, wire formats and shared-memory layouts.
   far, overflow and ring full, `timed late sends`, `timed deadline aborts`
   and an 8 cell lateness histogram (`timed_gate::LATENESS_LABELS`), which a
   `TimedGate` counts into once given them (`attach_counters`).
+- Timed simulator scenarios (P2.11 T1 step 6): `timed-send-late` and
+  `timed-cancel` in karyos-sim's `tests/timed.rs`, 40 seeds each, drive a
+  timed stream on virtual time through `ScheduleConsumer` and `TimedGate`
+  over the scripted sockets, with an immediate lane beside it. They check
+  that nothing is submitted before its time, that order holds, that the
+  immediate lane is never held, and that a miss under cancel seals
+  `DeadlineMissed` with nothing submitted after it. karyos-sim takes
+  karyos-io (with its test hooks) as a dev-dependency. In karyos-driver,
+  `EmbeddedDriver::schedule_ring` and `seal_deadline_missed`.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

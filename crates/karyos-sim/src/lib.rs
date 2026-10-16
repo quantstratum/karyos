@@ -10,7 +10,9 @@
 //! heartbeat stops (also while their reader holds a loan) until the
 //! driver may time them out under the stream's loss policy, conflated
 //! streams read through their keyed view, and an oracle that checks every
-//! delivery. Suspensions and drops are logical, inside one
+//! delivery. Timed transmission on virtual time (P2.11 T1) runs in
+//! `tests/timed.rs`, over the scripted sockets of karyos-io's test hooks.
+//! Suspensions and drops are logical, inside one
 //! process: they are not evidence for real process pause, crash or restart,
 //! which belongs to IPC. The network, the backend ring models, the disk
 //! model, the Archive and the Cluster do not exist yet.

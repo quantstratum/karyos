@@ -1985,6 +1985,36 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map(|counters| Arc::clone(&counters.sender)))
     }
 
+    /// The words of a timed lane's schedule ring, for its sender's
+    /// [`crate::schedule::ScheduleConsumer`]; `None` for a lane that is
+    /// not timed.
+    ///
+    /// # Errors
+    ///
+    /// The stream lookup errors.
+    pub fn schedule_ring(
+        &self,
+        stream: StreamHandle,
+    ) -> Result<Option<&[karyos_sys::sync::AtomicU64]>, DriverError> {
+        Ok(self.stream_ref(stream)?.buffer.schedule_ring())
+    }
+
+    /// Seals a timed lane whose sender's [`crate::timed_gate::TimedGate`]
+    /// found a missed deadline under cancel-on-deadline (G7), with
+    /// `SealReason::DeadlineMissed`: the step between gates
+    /// ([`crate::timed_gate::TimedGate::between_gates`]). A stream already
+    /// sealed keeps its first reason.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Sys`] from the seal (a broken invariant); the stream
+    /// lookup errors.
+    pub fn seal_deadline_missed(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+        let found = self.active_stream(stream)?;
+        crate::timed_gate::seal_deadline_missed(&mut found.conductor)?;
+        Ok(())
+    }
+
     /// [`Self::schedule_stream`] with the lane's offers checked against
     /// `clock` instead of the host's clock of `options.domain`: a
     /// simulator's virtual time, or a driver's own clock. `clock` runs on

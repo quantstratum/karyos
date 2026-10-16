@@ -18,5 +18,9 @@ karyos-driver.workspace = true
 karyos-archive.workspace = true
 karyos-cluster.workspace = true
 
+[dev-dependencies]
+# The scripted sockets of the timed scenarios (tests/timed.rs).
+karyos-io = { workspace = true, features = ["test-hooks"] }
+
 [lints]
 workspace = true
