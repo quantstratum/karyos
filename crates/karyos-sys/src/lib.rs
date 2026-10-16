@@ -35,10 +35,12 @@ pub mod diag;
 pub mod diag_ring;
 pub mod error;
 pub mod frame;
+pub mod guard;
 pub mod host_clock;
 pub mod load_words;
 pub mod loan;
 pub mod local_gap;
+pub mod outcome_ring;
 pub mod participant;
 // Real memory with std atomics, like `term_memory`.
 #[cfg(not(loom))]
