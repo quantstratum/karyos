@@ -293,21 +293,27 @@ fn a_reorder_interval_above_one_second_is_refused() {
 /// is sealed, not the near hole and not the rest of its term.
 #[test]
 fn a_floor_beyond_the_window_seals_nothing() {
-    for policy in [Unrecoverable::Skip, Unrecoverable::Close] {
+    // Past the window, and outside the incarnation (a peer-reported floor).
+    for (policy, floor) in [
+        (Unrecoverable::Skip, 3 * TERM),
+        (Unrecoverable::Close, 3 * TERM),
+        (Unrecoverable::Skip, u64::MAX),
+        (Unrecoverable::Close, u64::MAX),
+    ] {
         let (_buffer, mut owner) = with_hole();
         let mut skip = policy_of(SkipConfig {
             on_unrecoverable: policy,
             ..SkipConfig::reliable()
         });
         let report = skip
-            .range_unavailable(&mut owner, Lane::ZERO, 3 * TERM, 0)
+            .range_unavailable(&mut owner, Lane::ZERO, floor, 0)
             .unwrap();
         assert_eq!((report.sealed, report.sealed_bytes), (0, 0));
         assert_eq!(
             report
                 .close
                 .map(|close| (close.cause, close.from, close.to)),
-            Some((CloseCause::GapCannotResume, 64, 3 * TERM))
+            Some((CloseCause::GapCannotResume, 64, floor))
         );
         assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), Some((64, 64)));
         assert_eq!(owner.first_loss(Lane::ZERO), Some(None));

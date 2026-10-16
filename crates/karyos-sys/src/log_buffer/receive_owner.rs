@@ -431,19 +431,21 @@ impl<T: TermBytes> ReceiveOwner<T> {
 
     /// Whether `position` of `lane` lies in the window `{r, r + 1}` of
     /// terms, `r` the term of the resolved prefix (GU-6: a position beyond
-    /// it cannot be resumed).
+    /// it cannot be resumed). A position outside the incarnation, which a
+    /// peer may report, is outside the window.
     ///
     /// # Errors
     ///
-    /// [`ReceiveError::Foreign`] for a lane the image does not have,
-    /// [`ReceiveError::Sys`] for a position outside the incarnation.
+    /// [`ReceiveError::Foreign`] for a lane the image does not have.
     pub fn within_window(&self, lane: Lane, position: u64) -> Result<bool, ReceiveError> {
         let owner = self
             .lanes
             .get(usize::from(lane.get()))
             .ok_or(ReceiveError::Foreign)?;
         let (r, _) = owner.split_end(owner.rebuild)?;
-        let (count, _) = owner.buffer.split(position)?;
+        let Ok((count, _)) = owner.buffer.split(position) else {
+            return Ok(false);
+        };
         Ok(count.get() <= r.get().saturating_add(1))
     }
 
