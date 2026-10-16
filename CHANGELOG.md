@@ -180,6 +180,16 @@ release may break APIs, wire formats and shared-memory layouts.
   image (`Ignored::PathsFull`), and keep refusing an identity challenged or
   answered under another key. `SessionConfig` gains `max_paths` and
   `path_liveness_timeout`.
+- RTT observations (P2.7 B, reliable-transport.md, RC-1, ACS 15597):
+  `karyos_driver::rtt::RttProbes` probes each path of an image with at most
+  one outstanding RTTM REQUEST (checked ids from 1, never wrapped),
+  samples only submitted probes from the time read before the submitting
+  call to the validated reply, never subtracts `service_delay_ns`, raises a
+  sample below `rtt_floor` to it, refuses a zero sample, keeps the largest
+  of the last `rtt_sample_window` samples as the path's estimate
+  (`rtt_initial` before any or after a rebinding) and gives NAK timing the
+  largest estimate over the live paths (`snapshot`). `RttReplies` limits a
+  sender's replies to `rttm_reply_rate` per receiver per second.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 
