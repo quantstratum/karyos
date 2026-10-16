@@ -4243,7 +4243,7 @@ mod tests {
         let request = |sequence| RequestId { client, sequence };
         let state = |epoch: u64| karyos_sys::guard::GuardState {
             epoch,
-            open: epoch % 2 == 0,
+            open: epoch.is_multiple_of(2),
         };
         assert!(
             answers.contains(&Response::GuardState {
