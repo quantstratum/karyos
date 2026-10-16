@@ -8,8 +8,8 @@
 
 use karyos_protocol::journal::{Append, DropRange, Stamp, Taken, record_journal};
 use karyos_sys::trace_mirror::{
-    JournalEntry, JournalKind, JournalState, MAX_RECYCLE_PAIRS, NotedPublisher, RecycledJournal,
-    TimeNamespace, TraceMirror, trace_mirror,
+    JournalEntry, JournalKind, JournalState, MAX_RECYCLE_PAIRS, NetworkFacts, NotedPublisher,
+    RecycledJournal, TimeNamespace, TraceMirror, trace_mirror,
 };
 use karyos_trace::{
     AttributionConfig, ClockProvenance, HostMonotonicClock, ObservedTime, Point, PublicationId,
@@ -411,6 +411,59 @@ fn the_mirror_report_is_complete_without_loss() {
     let latencies = report.latencies().unwrap();
     assert_eq!(latencies[0].1.available(), 1);
     assert_eq!((tool.overwritten(), tool.mirror_lost()), (0, 0));
+}
+
+/// Until P2.12 N1c reads network journals (kinds 3 and 4), a network
+/// entry puts its publication's traces out of scope, so a missing network
+/// observation never yields a false `Complete`; a record of the other
+/// side's point in it is a contradiction.
+#[test]
+fn a_network_journal_puts_its_publication_out_of_scope_until_read() {
+    for kind in [JournalKind::NetworkSender, JournalKind::NetworkReceiver] {
+        let mut driver = Driver::new(4, 2, 64);
+        driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+        driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+        let mut network = JournalEntry::open(3, 0, kind, RECORD_WORDS as u64, 8);
+        network.registration = PUBLICATION.registration;
+        network.stream = PUBLICATION.registration;
+        network.incarnation = PUBLICATION.incarnation;
+        network.time_namespace = TimeNamespace::Same;
+        network.provenance = ClockProvenance::HostMonotonic.word();
+        network.network = Some(NetworkFacts {
+            sender_driver: PUBLICATION.driver,
+            start: Some(0),
+            boundary: None,
+            first_gap: None,
+        });
+        network.sequence = driver.assign();
+        driver.entries[2] = Some(network);
+        driver.write(2);
+        driver.store(0, &publish(0, 1, 1_000));
+        driver.store(1, &poll(0, 1, 1_400));
+        driver.end(0, JournalState::Closed, None);
+        driver.end(1, JournalState::Closed, Some(1));
+        let mut tool = MirrorTool::new(INSTANCE);
+        let _ = driver.scan(&mut tool);
+        let report = tool.report().unwrap();
+        assert_eq!(answer(&report, 1), TraceAnswer::OutOfScope, "{kind:?}");
+        // A record of its own point fits; a client point contradicts it.
+        let tracked = &tool.journals[&3];
+        assert!(!tracked.contradicts(
+            &observation(
+                PUBLICATION,
+                if kind == JournalKind::NetworkSender {
+                    Point::SenderPickup
+                } else {
+                    Point::ReceiverCommit
+                },
+                0,
+                1,
+                1_000
+            ),
+            [1, 2]
+        ));
+        assert!(tracked.contradicts(&publish(0, 1, 1_000), [1, 2]));
+    }
 }
 
 /// Batch C of #121 at unit level: the report reads the drop ranges and

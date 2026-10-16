@@ -35,7 +35,8 @@
 //!
 //! Layout (structure words): a header stride (table entries, words per
 //! entry, words per ring record, ring capacity, log entries, words per log
-//! entry, and in word 6 the highest mirror sequence assigned so far, T7),
+//! entry, in word 6 the highest mirror sequence assigned so far, T7, and in
+//! word 7 the count of network journals refused, `trace-network.md` §5),
 //! then the log entries of [`LOG_ENTRY_WORDS`] words, then the
 //! table entries of [`ENTRY_WORDS`] words, then the ring (its own header
 //! stride and records of [`MIRROR_RECORD_WORDS`] words).
@@ -51,15 +52,24 @@
 //! | 7, 8 | Payload words and capacity of the journal |
 //! | 9, 10, 11 | Attempted horizon, stored count, records mirrored |
 //! | 12, 13 | Watermark (`lost_before`), unstable loss entries |
-//! | 14, 15 | Observed registration (the subscription of a subscriber journal, the publication of a publisher journal) and its stream's registration |
-//! | 16 | Kind: 1 subscriber, 2 publisher |
+//! | 14, 15 | Observed registration (the subscription of a subscriber journal, the publication of a publisher journal, the publication of a network sender journal, the image of a network receiver journal) and its stream's registration (for a network journal, on the sender's driver) |
+//! | 16 | Kind: 1 subscriber, 2 publisher, 3 network sender, 4 network receiver |
 //! | 17 | Incarnation of the publication |
 //! | 18 | Time namespace: 0 unknown, 1 the driver's, 2 another |
 //! | 19 | Clock provenance, as the client sent it (opaque to the driver) |
 //! | 20 to 67 | Drop ranges: first, last, first time, last time, clock, epoch |
 //! | 68 | Mirror sequence: the journal's place among the journals the driver created, from 1, dense (T7) |
 //! | 69 | Lane of the observed registration, below 4: with word 15 it names the aggregate lane (`aggregate-ownership.md`) |
-//! | 70 to 79 | Reserved, zero |
+//! | 70, 71 | Network journals: the sender's `driver_id`, low and high; zero for kinds 1 and 2 |
+//! | 72 | Kind 3: pickup start; kind 4: image join |
+//! | 73 | Kind 3: pickup boundary; kind 4: commit boundary |
+//! | 74 | Kind 4: start of the image's first sealed gap |
+//! | 75 | Network flags: bit 0 word 72, bit 1 word 73, bit 2 word 74 valid |
+//! | 76 to 79 | Reserved, zero |
+//!
+//! A network journal (kinds 3 and 4, `trace-network.md` §5) is written by
+//! the driver itself: its client word is zero, and its join and boundary
+//! live in words 72 and 73, with words 4 and 5 and their flags clear.
 //!
 //! | Log entry word | Field |
 //! | --- | --- |
@@ -114,12 +124,24 @@ const HEADER_LOG_ENTRIES: usize = 4;
 const HEADER_LOG_WORDS: usize = 5;
 /// Header word of the highest mirror sequence assigned so far (T7).
 const HEADER_SEQUENCE: usize = 6;
+/// Header word of the count of network journals refused
+/// (`trace-network.md` §5).
+const HEADER_NETWORK_REFUSED: usize = 7;
 /// Entry word of the drop ranges.
 const RANGES: usize = 20;
 /// Entry word of the mirror sequence.
 const ENTRY_SEQUENCE: usize = 68;
 /// Entry word of the observed lane.
 const ENTRY_LANE: usize = 69;
+/// Entry words of a network journal's facts: the sender's `driver_id`
+/// (two words), start, boundary, first gap, and their flags.
+const ENTRY_NET_DRIVER: usize = 70;
+const ENTRY_NET_START: usize = 72;
+const ENTRY_NET_BOUNDARY: usize = 73;
+const ENTRY_NET_GAP: usize = 74;
+const ENTRY_NET_FLAGS: usize = 75;
+/// The first reserved entry word.
+const ENTRY_RESERVED: usize = 76;
 /// Log entry word of the mirror sequence.
 const LOG_SEQUENCE: usize = 6;
 /// Log entry word of the publication's lane.
@@ -135,12 +157,18 @@ const HAS_JOIN: u64 = 1;
 const HAS_BOUNDARY: u64 = 2;
 const HAS_LAST: u64 = 4;
 const HAS_WATERMARK: u64 = 8;
+/// Network fact flags (entry word 75).
+const NET_START: u64 = 1;
+const NET_BOUNDARY: u64 = 2;
+const NET_GAP: u64 = 4;
 
 // The ranges fit an entry, and the pairs a log entry.
 const _: () = assert!(RANGES + MIRROR_RANGES * RANGE_FIELDS <= ENTRY_WORDS);
 const _: () = assert!(PAIRS + MAX_RECYCLE_PAIRS * 2 <= LOG_ENTRY_WORDS);
 const _: () = assert!(ENTRY_SEQUENCE >= RANGES + MIRROR_RANGES * RANGE_FIELDS);
 const _: () = assert!(ENTRY_SEQUENCE < ENTRY_WORDS && LOG_SEQUENCE < PAIRS);
+const _: () = assert!(ENTRY_LANE < ENTRY_NET_DRIVER && ENTRY_RESERVED < ENTRY_WORDS);
+const _: () = assert!(HEADER_NETWORK_REFUSED < STRIDE_WORDS);
 
 /// The state of a journal in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -184,6 +212,13 @@ pub enum JournalKind {
     /// A publisher journal: it observes one of its client's publications
     /// and records that publication's `Publish` observations.
     Publisher,
+    /// A network sender journal (`trace-network.md`, NT-3): the driver's
+    /// sender agent records its `SenderPickup` observations of one lane of
+    /// a publication incarnation.
+    NetworkSender,
+    /// A network receiver journal: the driver's receiver agent records its
+    /// `ReceiverCommit` observations of one lane of an image.
+    NetworkReceiver,
 }
 
 impl JournalKind {
@@ -191,6 +226,8 @@ impl JournalKind {
         match self {
             Self::Subscriber => 1,
             Self::Publisher => 2,
+            Self::NetworkSender => 3,
+            Self::NetworkReceiver => 4,
         }
     }
 
@@ -198,9 +235,32 @@ impl JournalKind {
         match code {
             1 => Some(Self::Subscriber),
             2 => Some(Self::Publisher),
+            3 => Some(Self::NetworkSender),
+            4 => Some(Self::NetworkReceiver),
             _ => None,
         }
     }
+
+    /// Whether the driver writes the journal itself (kinds 3 and 4).
+    #[must_use]
+    pub const fn is_network(self) -> bool {
+        matches!(self, Self::NetworkSender | Self::NetworkReceiver)
+    }
+}
+
+/// The membership facts of a network journal (`trace-network.md` §5,
+/// NT-4), in entry words 70 to 75.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NetworkFacts {
+    /// The sender's `driver_id`, low and high, in the order of the trace
+    /// record's words 1 and 2: this driver's for a sender journal.
+    pub sender_driver: [u64; 2],
+    /// Sender: the pickup start; receiver: the image join.
+    pub start: Option<u64>,
+    /// Sender: the pickup boundary; receiver: the commit boundary.
+    pub boundary: Option<u64>,
+    /// Receiver only: the start of the image's first sealed gap.
+    pub first_gap: Option<u64>,
 }
 
 /// How a journal's client stands to the driver's time namespace (T2):
@@ -307,6 +367,8 @@ pub struct JournalEntry {
     /// space. A tool detects a journal it never saw from a gap in it. 0
     /// until set.
     pub sequence: u64,
+    /// The facts of a network journal: present exactly for kinds 3 and 4.
+    pub network: Option<NetworkFacts>,
 }
 
 impl JournalEntry {
@@ -345,6 +407,25 @@ impl JournalEntry {
             ranges: [DropRange::default(); MIRROR_RANGES],
             range_count: 0,
             sequence: 0,
+            network: None,
+        }
+    }
+
+    /// Whether the entry keeps the rules of its kind, which both the
+    /// writer and the reader check: a client journal has no network facts;
+    /// a network journal has them, no client, no join or boundary in words
+    /// 4 and 5, and a first gap only on the receiver side.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        match (self.kind.is_network(), self.network) {
+            (false, None) => true,
+            (true, Some(facts)) => {
+                self.client == 0
+                    && self.join.is_none()
+                    && self.boundary.is_none()
+                    && (self.kind == JournalKind::NetworkReceiver || facts.first_gap.is_none())
+            }
+            _ => false,
         }
     }
 
@@ -413,6 +494,27 @@ impl JournalEntry {
         if let Some(word) = words.get_mut(ENTRY_LANE) {
             *word = u64::from(self.lane.get());
         }
+        if let Some(facts) = self.network {
+            let flags = flag(facts.start.is_some(), NET_START)
+                | flag(facts.boundary.is_some(), NET_BOUNDARY)
+                | flag(facts.first_gap.is_some(), NET_GAP);
+            let values = [
+                facts.sender_driver[0],
+                facts.sender_driver[1],
+                facts.start.unwrap_or(0),
+                facts.boundary.unwrap_or(0),
+                facts.first_gap.unwrap_or(0),
+                flags,
+            ];
+            for (word, value) in words
+                .get_mut(ENTRY_NET_DRIVER..ENTRY_RESERVED)
+                .unwrap_or(&mut [])
+                .iter_mut()
+                .zip(values)
+            {
+                *word = value;
+            }
+        }
         words
     }
 
@@ -434,6 +536,33 @@ impl JournalEntry {
             .ok()
             .filter(|count| *count <= MIRROR_RANGES)?;
         let when = |bit: u64, value: u64| (flags & bit != 0).then_some(value);
+        // Words no driver writes: the reserved words, and network facts
+        // with an unknown flag.
+        let reserved = words.get(ENTRY_RESERVED..).unwrap_or(&[]);
+        let net_flags = word(ENTRY_NET_FLAGS);
+        if reserved.iter().any(|word| *word != 0)
+            || net_flags & !(NET_START | NET_BOUNDARY | NET_GAP) != 0
+        {
+            return None;
+        }
+        let net_words = words.get(ENTRY_NET_DRIVER..ENTRY_RESERVED).unwrap_or(&[]);
+        let network = if kind.is_network() {
+            let net = |bit: u64, index: usize| (net_flags & bit != 0).then_some(word(index));
+            Some(NetworkFacts {
+                sender_driver: [word(ENTRY_NET_DRIVER), word(ENTRY_NET_DRIVER + 1)],
+                start: net(NET_START, ENTRY_NET_START),
+                boundary: net(NET_BOUNDARY, ENTRY_NET_BOUNDARY),
+                first_gap: net(NET_GAP, ENTRY_NET_GAP),
+            })
+        } else if net_words.iter().any(|word| *word != 0) {
+            return None;
+        } else {
+            None
+        };
+        // A network entry keeps words 4 and 5 zero with their flags clear.
+        if kind.is_network() && (word(4) != 0 || word(5) != 0) {
+            return None;
+        }
         let mut ranges = [DropRange::default(); MIRROR_RANGES];
         for (range, chunk) in ranges
             .iter_mut()
@@ -480,7 +609,9 @@ impl JournalEntry {
             ranges,
             range_count,
             sequence: word(ENTRY_SEQUENCE),
+            network,
         })
+        .filter(Self::is_valid)
     }
 }
 
@@ -767,9 +898,29 @@ impl TraceMirror {
         }
     }
 
+    /// Counts one refused network journal in header word 7, with Release
+    /// (`trace-network.md` §4): a tool that sees it rise puts its held
+    /// messages that are not final out of scope. The driver is the only
+    /// writer. `false`, and nothing written, if the count would overflow.
+    pub fn refuse_network_journal(&mut self) -> bool {
+        let Some(word) = self.store.words().get(HEADER_NETWORK_REFUSED) else {
+            return false;
+        };
+        let Some(next) = word.load(Ordering::Relaxed).checked_add(1) else {
+            return false;
+        };
+        word.store(next, Ordering::Release);
+        true
+    }
+
     /// Writes table entry `index` under its seqlock: `entry`, or a free
-    /// entry for `None`. `false` for an index out of range.
+    /// entry for `None`. `false` for an index out of range, or for an
+    /// entry that breaks the rules of its kind
+    /// ([`JournalEntry::is_valid`]), which writes nothing.
     pub fn write_entry(&mut self, index: usize, entry: Option<&JournalEntry>) -> bool {
+        if entry.is_some_and(|entry| !entry.is_valid()) {
+            return false;
+        }
         let Some(words) = slot_start(self.geometry.table, index, self.entries, ENTRY_WORDS)
             .and_then(|start| {
                 self.store
@@ -1001,6 +1152,15 @@ impl TraceMirrorReader {
         value
     }
 
+    /// The count of network journals the driver refused (header word 7,
+    /// `trace-network.md` §5), loaded with Acquire.
+    #[must_use]
+    pub fn network_journals_refused(&self) -> u64 {
+        let value = self.store.load(HEADER_NETWORK_REFUSED).unwrap_or(0);
+        fence(Ordering::Acquire);
+        value
+    }
+
     /// Reads table entry `index` under its seqlock, with a bounded number
     /// of attempts. An index out of range reads as free.
     #[must_use]
@@ -1225,7 +1385,7 @@ mod tests {
     /// The mirror sequence (T7) sits in entry word 68 and log entry word 6,
     /// and the lane in entry word 69 and log entry word 31; the noted pairs
     /// fill words 7 to 30, twelve of them, and entry words 70 to 79 stay
-    /// zero.
+    /// zero for a client journal.
     #[test]
     fn the_mirror_sequence_has_its_own_words() {
         assert_eq!(MAX_RECYCLE_PAIRS, 12);
@@ -1262,13 +1422,155 @@ mod tests {
         assert_eq!(words[5].load(Ordering::Relaxed), LOG_ENTRY_WORDS as u64);
     }
 
+    fn network(journal: u64, kind: JournalKind) -> JournalEntry {
+        let mut entry = JournalEntry::open(journal, 0, kind, 22, 4096);
+        entry.registration = 12;
+        entry.stream = 3;
+        entry.lane = Lane::try_new(1).unwrap();
+        entry.incarnation = 2;
+        entry.time_namespace = TimeNamespace::Same;
+        entry.sequence = 9;
+        entry.network = Some(NetworkFacts {
+            sender_driver: [u64::MAX, 0x1D],
+            start: Some(0),
+            boundary: None,
+            first_gap: None,
+        });
+        entry
+    }
+
+    /// Network journals (kinds 3 and 4) keep their facts in words 70 to
+    /// 75 and leave 76 to 79 zero; a start at 0 is told apart from none
+    /// by its flag (`trace-network.md` §5).
+    #[test]
+    fn network_entries_round_trip_with_their_facts() {
+        let mut mirror = trace_mirror(2, 1, 4).unwrap();
+        let reader = mirror.reader();
+        let sender = network(5, JournalKind::NetworkSender);
+        assert!(mirror.write_entry(0, Some(&sender)));
+        assert_eq!(reader.entry(0), EntryRead::Entry(sender));
+        let mut receiver = network(6, JournalKind::NetworkReceiver);
+        receiver.network = Some(NetworkFacts {
+            sender_driver: [4, 5],
+            start: Some(64),
+            boundary: Some(4096),
+            first_gap: Some(1024),
+        });
+        receiver.state = JournalState::Closed;
+        assert!(mirror.write_entry(1, Some(&receiver)));
+        assert_eq!(reader.entry(1), EntryRead::Entry(receiver));
+        let words = mirror.store.words();
+        let table = mirror.geometry.table;
+        let load = |index: usize| words[index].load(Ordering::Relaxed);
+        assert_eq!(load(table + 16), 3);
+        assert_eq!(
+            (70..76).map(|word| load(table + word)).collect::<Vec<_>>(),
+            [u64::MAX, 0x1D, 0, 0, 0, 1]
+        );
+        let second = table + ENTRY_WORDS;
+        assert_eq!(load(second + 16), 4);
+        assert_eq!(
+            (70..76).map(|word| load(second + word)).collect::<Vec<_>>(),
+            [4, 5, 64, 4096, 1024, 7]
+        );
+        for start in [table, second] {
+            // No client, no join or boundary in words 4 and 5.
+            assert_eq!(
+                (load(start + 2), load(start + 4), load(start + 5)),
+                (0, 0, 0)
+            );
+            assert!((76..ENTRY_WORDS).all(|word| load(start + word) == 0));
+        }
+    }
+
+    /// An entry that breaks the rules of its kind is refused by the writer
+    /// and read as free by the reader.
+    #[test]
+    fn entries_that_break_their_kind_are_refused_on_both_sides() {
+        let mut mirror = trace_mirror(1, 1, 4).unwrap();
+        let reader = mirror.reader();
+        let mut facts = entry(1);
+        facts.network = network(1, JournalKind::NetworkSender).network;
+        let mut bare = network(1, JournalKind::NetworkSender);
+        bare.network = None;
+        let mut client = network(1, JournalKind::NetworkSender);
+        client.client = 7;
+        let mut join = network(1, JournalKind::NetworkReceiver);
+        join.join = Some(0);
+        let mut boundary = network(1, JournalKind::NetworkReceiver);
+        boundary.boundary = Some(8);
+        let mut gap = network(1, JournalKind::NetworkSender);
+        gap.network = Some(NetworkFacts {
+            first_gap: Some(0),
+            ..gap.network.unwrap()
+        });
+        for wrong in [facts, bare, client, join, boundary, gap] {
+            assert!(!wrong.is_valid(), "{wrong:?}");
+            assert!(!mirror.write_entry(0, Some(&wrong)), "{wrong:?}");
+            assert_eq!(reader.entry(0), EntryRead::Free);
+        }
+        let table = mirror.geometry.table;
+        let poke = |mirror: &mut TraceMirror, written: &JournalEntry, word: usize, value: u64| {
+            assert!(mirror.write_entry(0, Some(written)));
+            mirror.store.words()[table + word].store(value, Ordering::Relaxed);
+            mirror.reader().entry(0)
+        };
+        // A client journal with network words, and any reserved word.
+        for word in [70, 71, 72, 75, 76, 79] {
+            assert_eq!(
+                poke(&mut mirror, &entry(1), word, 1),
+                EntryRead::Free,
+                "{word}"
+            );
+        }
+        let sender = network(1, JournalKind::NetworkSender);
+        // A network journal with a client, words 4 or 5, a join or
+        // boundary flag, an unknown network flag, or a reserved word.
+        for (word, value) in [
+            (2, 7),
+            (4, 1),
+            (5, 1),
+            (3, 1 | HAS_JOIN << 8),
+            (3, 1 | HAS_BOUNDARY << 8),
+            (75, 8),
+            (77, 1),
+        ] {
+            assert_eq!(
+                poke(&mut mirror, &sender, word, value),
+                EntryRead::Free,
+                "{word}"
+            );
+        }
+        // A first gap on the sender side.
+        assert_eq!(poke(&mut mirror, &sender, 75, NET_GAP), EntryRead::Free);
+    }
+
+    /// Header word 7 counts refused network journals; the count never
+    /// wraps.
+    #[test]
+    fn refused_network_journals_are_counted_in_header_word_7() {
+        let mut mirror = trace_mirror(1, 1, 4).unwrap();
+        let reader = mirror.reader();
+        assert_eq!(reader.network_journals_refused(), 0);
+        for _ in 0..3 {
+            assert!(mirror.refuse_network_journal());
+        }
+        assert_eq!(reader.network_journals_refused(), 3);
+        let words = mirror.store.words();
+        assert_eq!(words[HEADER_NETWORK_REFUSED].load(Ordering::Relaxed), 3);
+        assert_eq!(words[HEADER_SEQUENCE].load(Ordering::Relaxed), 0);
+        words[HEADER_NETWORK_REFUSED].store(u64::MAX, Ordering::Relaxed);
+        assert!(!mirror.refuse_network_journal());
+        assert_eq!(reader.network_journals_refused(), u64::MAX);
+    }
+
     /// Words no driver writes (an unknown kind or time namespace code, a
     /// lane of 4 or more) read as free, never as a value.
     #[test]
     fn unknown_codes_read_free() {
         let mut mirror = trace_mirror(1, 1, 4).unwrap();
         let table = mirror.geometry.table;
-        for (word, value) in [(16, 3), (16, 0), (18, 3), (69, 4), (69, 1 << 8)] {
+        for (word, value) in [(16, 5), (16, 0), (18, 3), (69, 4), (69, 1 << 8)] {
             mirror.write_entry(0, Some(&entry(1)));
             mirror.store.words()[table + word].store(value, Ordering::Relaxed);
             assert_eq!(mirror.reader().entry(0), EntryRead::Free, "word {word}");
