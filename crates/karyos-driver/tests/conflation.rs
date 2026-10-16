@@ -453,6 +453,21 @@ fn test_conflation_view_survives_cutover_with_a_slow_feeder_and_a_paused_driver(
             Generation::try_new(1).unwrap(),
             "paused: {paused}"
         );
+        // The precondition: the feeder is behind on the predecessor when
+        // the cutover starts, so it is still there when the successor
+        // opens.
+        let mut behind = 0u32;
+        let _ = conflated.poll_changed_with(
+            Budget {
+                keys: 64,
+                retries: 3,
+            },
+            |_, version, _| {
+                assert!(version < 2 * u64::from(updates) / 2, "the feeder caught up");
+                behind += 1;
+            },
+        );
+        assert!(behind <= 2, "paused: {paused}");
         if paused {
             // The driver sleeps through the cutover deadline.
             clock.0.store(10_000, std::sync::atomic::Ordering::Relaxed);

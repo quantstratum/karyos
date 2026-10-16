@@ -90,8 +90,22 @@ fn setup_with(
     ClientConductor,
     ClientSubscription,
 ) {
+    setup_stream(policy, driver_config, config())
+}
+
+fn setup_stream(
+    policy: RejoinPolicy,
+    driver_config: DriverConfig,
+    stream_config: StreamConfig,
+) -> (
+    EmbeddedDriver,
+    StreamHandle,
+    ClientPublication,
+    ClientConductor,
+    ClientSubscription,
+) {
     let mut driver = EmbeddedDriver::with_config(driver_config).unwrap();
-    let stream = driver.add_stream(config()).unwrap();
+    let stream = driver.add_stream(stream_config).unwrap();
     let mut client = driver.connect().unwrap();
     let _ = client
         .add_subscription(KEY, SubscriberRole::Optional)
@@ -327,4 +341,141 @@ fn test_a_refused_dropped_counter_keeps_the_count_local() {
         counter(&driver, "overruns rejoin at head"),
         2 * LOSS_REPORT_QUEUE as u64
     );
+}
+
+// ---- Phase 1 closing audit of #9: the design's remaining loss report tests ----
+
+/// A second optional subscription of `client` to the stream.
+fn second_subscription(
+    driver: &mut EmbeddedDriver,
+    client: &mut ClientConductor,
+    policy: RejoinPolicy,
+) -> ClientSubscription {
+    let _ = client
+        .add_subscription(KEY, SubscriberRole::Optional)
+        .unwrap();
+    let _ = driver.do_work().unwrap();
+    let mut handle = None;
+    let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+        Outcome::Subscription(subscription) => handle = Some(subscription),
+        other => panic!("unexpected {other:?}"),
+    });
+    handle.unwrap().with_rejoin(policy)
+}
+
+/// observability-and-tools.md, Tests, "Loss reports": two subscriptions of
+/// one client report separately, each with its own registration.
+#[test]
+fn test_two_subscriptions_of_one_client_report_separately() {
+    // Two optional readers take a spare-slot credit each.
+    let mut stream_config = config();
+    stream_config.buffer.spare_slots = 5;
+    let (mut driver, _stream, mut publication, mut client, mut first) = setup_stream(
+        RejoinPolicy::RejoinAtHead,
+        DriverConfig::default(),
+        stream_config,
+    );
+    let mut second = second_subscription(&mut driver, &mut client, RejoinPolicy::RejoinAtHead);
+    lap(&mut driver, &mut publication);
+    let lost = [&mut first, &mut second].map(|subscription| {
+        let summary = subscription.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+        (
+            subscription.origin().unwrap().registration(),
+            summary.overrun.unwrap(),
+        )
+    });
+    assert_ne!(lost[0].0, lost[1].0);
+    settle(&mut driver, &mut client);
+    let records = losses(&driver);
+    assert_eq!(records.len(), 2, "{records:?}");
+    for (registration, overrun) in lost {
+        let record = records
+            .iter()
+            .find(|record| record.participant == registration)
+            .unwrap_or_else(|| panic!("no record of {registration}: {records:?}"));
+        assert_eq!((record.from, record.to), (overrun.from, overrun.lost_to));
+        assert_eq!(record.client, client.owner().client);
+        assert_eq!(record.flags, 0, "verified");
+    }
+}
+
+/// observability-and-tools.md, Tests, "Loss reports": a report queued
+/// across the removal and the re-adding of its stream names the old
+/// incarnation, and is recorded unverified since its subscription ended.
+#[test]
+fn test_a_report_queued_across_a_stream_re_add_names_the_old_incarnation() {
+    let (mut driver, stream, mut publication, mut client, mut subscription) =
+        setup(RejoinPolicy::RejoinAtHead);
+    let old = driver.trace_identity(stream).unwrap();
+    let (lost, _) = overrun(&mut driver, &mut publication, &mut subscription);
+    // The report waits in the client; the subscription ends and the
+    // stream is removed, freed and added again under the same key.
+    assert_eq!(client.loss_reports_queued(), 1);
+    drop(subscription);
+    drop(publication);
+    driver.remove_stream(stream).unwrap();
+    for _ in 0..10 {
+        let _ = driver.do_work().unwrap();
+    }
+    let again = driver.add_stream(config()).unwrap();
+    let new = driver.trace_identity(again).unwrap();
+    assert_ne!(
+        (new.registration, new.incarnation),
+        (old.registration, old.incarnation)
+    );
+    settle(&mut driver, &mut client);
+    let records = losses(&driver);
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = records[0];
+    assert_eq!(
+        (record.stream_registration, record.incarnation),
+        (old.registration, old.incarnation)
+    );
+    assert_eq!((record.from, record.to), (lost.from, lost.lost_to));
+    assert_eq!(record.flags & 1, 1, "recorded unverified");
+}
+
+/// observability-and-tools.md, Tests, "Loss reports": a full command ring
+/// delays a report without losing it.
+#[test]
+fn test_a_full_command_ring_delays_a_report_without_losing_it() {
+    let (mut driver, _stream, mut publication, mut client, mut subscription) = setup_with(
+        RejoinPolicy::RejoinAtHead,
+        DriverConfig {
+            max_pending_per_client: 256,
+            ..DriverConfig::default()
+        },
+    );
+    let (lost, _) = overrun(&mut driver, &mut publication, &mut subscription);
+    // Fill the ring with requests the driver has not served yet.
+    let unknown = StreamKey {
+        stream_id: 99,
+        session_id: 1,
+    };
+    let mut filled = 0;
+    while client
+        .add_subscription(unknown, SubscriberRole::Optional)
+        .is_ok()
+    {
+        filled += 1;
+        assert!(filled < 1000, "the ring never filled");
+    }
+    // The report cannot be sent: it stays queued, nothing is dropped.
+    let _ = client.poll(usize::MAX, |_| {});
+    assert_eq!(client.loss_reports_queued(), 1);
+    assert_eq!(client.loss_reports_dropped(), 0);
+    assert!(losses(&driver).is_empty());
+    // The driver drains the ring; the report follows and is recorded.
+    for _ in 0..1000 {
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |_| {});
+        if client.loss_reports_queued() == 0 && client.pending() == 0 {
+            break;
+        }
+    }
+    assert_eq!(client.loss_reports_queued(), 0);
+    let records = losses(&driver);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!((records[0].from, records[0].to), (lost.from, lost.lost_to));
+    assert_eq!(client.loss_reports_dropped(), 0);
 }
