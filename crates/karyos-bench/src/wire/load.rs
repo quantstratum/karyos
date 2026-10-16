@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::workloads::BenchError;
+use crate::workloads::{BenchError, scheduled_instant};
 
 /// The open-loop schedule of R2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,14 +44,8 @@ impl Schedule {
     ///
     /// An instant past what the clock represents.
     pub fn instant(&self, index: u64) -> Result<Instant, BenchError> {
-        let offset = u128::from(index)
-            .checked_mul(1_000_000_000)
-            .map(|nanos| nanos / u128::from(self.rate))
-            .and_then(|nanos| u64::try_from(nanos).ok())
-            .ok_or_else(|| BenchError("R2 schedule offset overflow".into()))?;
-        self.start
-            .checked_add(Duration::from_nanos(offset))
-            .ok_or_else(|| BenchError("R2 scheduled instant overflow".into()))
+        // The open-loop schedule of `workloads.rs`, shared.
+        scheduled_instant(self.start, index, self.rate)
     }
 
     /// How late a send that started at `actual` was against message
@@ -63,7 +57,9 @@ impl Schedule {
     ///
     /// As [`Self::instant`].
     pub fn lateness(&self, index: u64, actual: Instant) -> Result<Duration, BenchError> {
-        Ok(actual.saturating_duration_since(self.instant(index)?))
+        Ok(actual
+            .checked_duration_since(self.instant(index)?)
+            .unwrap_or(Duration::ZERO))
     }
 }
 
@@ -145,6 +141,37 @@ mod tests {
         assert_eq!(schedule.lateness(3, late).ok(), Some(Duration::ZERO));
         assert!(Schedule::new(start, 0).is_err());
         assert!(schedule.instant(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn lateness_beyond_one_period_is_kept_whole() {
+        let start = Instant::now();
+        let schedule = Schedule::new(start, 100_000).unwrap();
+        // Message 1 was due at 10 µs and started at 95 µs: 85 µs late,
+        // more than eight periods, all kept.
+        let late = start.checked_add(Duration::from_nanos(95_000)).unwrap();
+        assert_eq!(
+            schedule.lateness(1, late).ok(),
+            Some(Duration::from_nanos(85_000))
+        );
+    }
+
+    #[test]
+    fn a_rate_that_does_not_divide_a_second_rounds_down_exactly() {
+        let start = Instant::now();
+        let schedule = Schedule::new(start, 3).unwrap();
+        assert_eq!(
+            schedule.instant(1).ok(),
+            start.checked_add(Duration::from_nanos(333_333_333))
+        );
+        assert_eq!(
+            schedule.instant(2).ok(),
+            start.checked_add(Duration::from_nanos(666_666_666))
+        );
+        assert_eq!(
+            schedule.instant(3).ok(),
+            start.checked_add(Duration::from_secs(1))
+        );
     }
 
     #[test]

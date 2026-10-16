@@ -23,7 +23,7 @@ use karyos_protocol::term::{
     AppendOptions, AppendOutcome, ScanItem, TermAppender, TermIdentity, TermScanner,
 };
 
-use crate::manifest::{MtuRule, Shape, Size};
+use crate::manifest::{MtuRule, Shape, Size, w6_datagrams};
 use crate::workloads::BenchError;
 
 /// The label every result composed this way carries.
@@ -44,6 +44,9 @@ pub const IDENTITY: TermIdentity = TermIdentity {
 /// The byte offset of `reserved_value` in a frame header.
 const RESERVED_VALUE: usize = 24;
 
+/// The frame length of a header-only DATA frame (W2): the 32-byte header.
+const HEARTBEAT_LENGTH: i32 = 32;
+
 /// The datagrams of one message of a shape, built once and stamped per
 /// message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,13 +64,24 @@ pub struct Template {
 }
 
 impl Template {
-    /// Composes the template of `shape` at `e_max` under `rule`.
+    /// Composes the template of `shape` for a profile whose DATA envelope
+    /// is `envelope` bytes, at the point's `e_max` under `rule`. The
+    /// payload `L` follows `e_max` for every profile (manifest 2.0 6.1),
+    /// while the frame budget, and so the W6 datagram count, follows the
+    /// profile's own envelope: `trusted` (0) composes W6 in 5 datagrams
+    /// even where a larger envelope needs 6.
     ///
     /// # Errors
     ///
-    /// The size errors of the manifest model, W8 (no size formula here),
-    /// and any encoding error, which would be a defect.
-    pub fn new(shape: Shape, e_max: u32, rule: MtuRule) -> Result<Self, BenchError> {
+    /// An envelope above `e_max`, the size errors of the manifest model,
+    /// W8 (no size formula here), and any encoding error, which would be
+    /// a defect.
+    pub fn new(shape: Shape, e_max: u32, envelope: u32, rule: MtuRule) -> Result<Self, BenchError> {
+        if envelope > e_max {
+            return Err(BenchError(format!(
+                "envelope {envelope} above E_max {e_max}"
+            )));
+        }
         let size = shape
             .size(e_max, rule)
             .map_err(|error| BenchError(format!("{shape}: {error}")))?;
@@ -79,7 +93,7 @@ impl Template {
             // A header-only DATA frame: a heartbeat, not a message.
             let heartbeat = FrameHeader {
                 word0: Word0::new(
-                    i32::try_from(HEADER_LENGTH).unwrap_or(32),
+                    HEARTBEAT_LENGTH,
                     Flags::new(true, true, false, false, Lane::ZERO),
                     FrameType::Data,
                 ),
@@ -96,7 +110,7 @@ impl Template {
             // The frames fill the budget the rule leaves for them: under
             // `CountsEnvelope` the envelope comes out of the MTU.
             let budget = rule
-                .frame_budget(size.mtu, e_max)
+                .frame_budget(size.mtu, envelope)
                 .map_err(|error| BenchError(format!("{shape}: {error}")))?;
             let mut appender =
                 TermAppender::new(&mut term, term_length, IDENTITY, budget, TERM / 8)
@@ -122,12 +136,17 @@ impl Template {
             match scanner.next_item() {
                 Ok(ScanItem::Message(block)) => {
                     let start = block.offset() as usize;
-                    let end = start + block.reserved() as usize;
+                    let end = start
+                        .checked_add(block.reserved() as usize)
+                        .ok_or_else(|| BenchError(format!("{shape}: block end overflow")))?;
                     blocks.push(start..end);
                 }
                 Ok(ScanItem::Heartbeat { offset }) => {
                     let start = offset as usize;
-                    blocks.push(start..start + HEADER_LENGTH as usize);
+                    let end = start
+                        .checked_add(HEADER_LENGTH as usize)
+                        .ok_or_else(|| BenchError(format!("{shape}: heartbeat end overflow")))?;
+                    blocks.push(start..end);
                 }
                 Ok(ScanItem::End | ScanItem::Pending) => break,
                 Ok(ScanItem::Aborted { .. }) => {
@@ -153,8 +172,12 @@ impl Template {
                 let reserved = align_frame(length)
                     .map_err(|error| BenchError(format!("{shape}: {error}")))?
                     as usize;
-                frames.push(at..at + reserved);
-                at += reserved;
+                let next = at
+                    .checked_add(reserved)
+                    .filter(|next| *next > at)
+                    .ok_or_else(|| BenchError(format!("{shape}: frame end overflow")))?;
+                frames.push(at..next);
+                at = next;
             }
         }
         // Datagrams: W5 packs every frame into one; W6 sends each fragment
@@ -178,7 +201,13 @@ impl Template {
             }
             datagrams.push(start..bytes.len());
         }
-        let expected = size.datagrams_per_message as usize;
+        // W6 takes the count of the profile's envelope (manifest 2.0 6.1).
+        let expected = if shape == Shape::W6 {
+            w6_datagrams(envelope, rule).map_err(|error| BenchError(format!("{shape}: {error}")))?
+                as usize
+        } else {
+            size.datagrams_per_message as usize
+        };
         if datagrams.len() != expected {
             return Err(BenchError(format!(
                 "{shape}: {} datagrams composed, {expected} expected",
@@ -236,9 +265,11 @@ impl Template {
         out.copy_from_slice(&self.bytes);
         let value = sequence.to_le_bytes();
         for &header in &self.headers {
-            if let Some(field) = out.get_mut(header + RESERVED_VALUE..header + RESERVED_VALUE + 8) {
-                field.copy_from_slice(&value);
-            }
+            let field = header
+                .checked_add(RESERVED_VALUE)
+                .and_then(|start| out.get_mut(start..start.checked_add(8)?))
+                .ok_or_else(|| BenchError("frame header outside the message".into()))?;
+            field.copy_from_slice(&value);
         }
         Ok(())
     }
@@ -253,7 +284,7 @@ impl Template {
 /// The sequence number a received frame carries in `reserved_value`.
 #[must_use]
 pub fn sequence_of(frame: &[u8]) -> Option<u64> {
-    let field = frame.get(RESERVED_VALUE..RESERVED_VALUE + 8)?;
+    let field = frame.get(RESERVED_VALUE..RESERVED_VALUE.checked_add(8)?)?;
     let mut value = [0_u8; 8];
     value.copy_from_slice(field);
     Some(u64::from_le_bytes(value))

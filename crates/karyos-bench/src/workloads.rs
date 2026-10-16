@@ -1082,7 +1082,11 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
     })
 }
 
-fn scheduled_instant(start: Instant, index: u64, target_rate: u64) -> Result<Instant, BenchError> {
+pub(crate) fn scheduled_instant(
+    start: Instant,
+    index: u64,
+    target_rate: u64,
+) -> Result<Instant, BenchError> {
     let offset = (u128::from(index) * 1_000_000_000) / u128::from(target_rate);
     let offset = u64::try_from(offset)
         .map_err(|_| BenchError("open-loop schedule duration overflow".into()))?;
