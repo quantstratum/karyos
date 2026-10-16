@@ -9,7 +9,9 @@
 //! in a byte slice; and the client command and driver response messages of
 //! the CnC structures (`cnc`); and re-exports of the bounded record journal
 //! (`journal`) and the host clock (`host_clock`) of `karyos-sys`; and the
-//! data-path tracing hook that `karyos-trace` implements (`trace_hook`).
+//! data-path tracing hook that `karyos-trace` implements (`trace_hook`); and
+//! the trusted network control codecs and the datagram dispatcher
+//! (`network`, `quantstratum-docs: karyos/design/network-control-schemas.md`).
 //! Concurrent shared-memory access and URI parsing do not exist yet.
 
 pub mod admission;
@@ -18,6 +20,7 @@ pub mod error;
 pub mod frame;
 pub mod host_clock;
 pub mod journal;
+pub mod network;
 pub mod sizing;
 pub mod term;
 pub mod trace_hook;
