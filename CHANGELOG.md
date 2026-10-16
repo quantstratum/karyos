@@ -158,6 +158,16 @@ release may break APIs, wire formats and shared-memory layouts.
   `DeadlineMissed` with nothing submitted after it. karyos-sim takes
   karyos-io (with its test hooks) as a dev-dependency. In karyos-driver,
   `EmbeddedDriver::schedule_ring` and `seal_deadline_missed`.
+- Redundant paths at the receive owner (P2.9, redundant-paths.md sections
+  4 and 5, ACS 15519): `karyos_driver::paths` with `PathConfig`
+  (`max_paths`, `path_queue_datagrams`, `skew_sample_frames`,
+  `path_skew_window` validated in 0 to 1 s), `skew::SkewDeadline` (fixed at
+  detection, no window below two live paths, the larger of reorder and skew
+  on unreliable channels), `queues::PathQueues` (bounded per path, drops
+  counted per path, served round robin) and `stats::PathStats` (wins,
+  duplicates, conflicts, per-path `Late`, missing bytes per term from fresh
+  deliveries only, arrival differences from a ring of first arrivals per
+  lane, and freshness per path for path liveness).
 
 ## [0.1.0-alpha.1]: 2026-10-15
 
