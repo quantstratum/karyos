@@ -76,6 +76,37 @@ pub const fn is_observer_like(state: u64) -> bool {
     matches!(state, CELL_OPTIONAL | CELL_OBSERVER | CELL_WALKER)
 }
 
+/// Whether a cell in `state` holds the retention floor: the cells that
+/// bound the limit, and the driver's walker, which must never be lapped
+/// (coordinator, ACS 15161) yet never bounds the limit.
+#[must_use]
+pub const fn holds_floor(state: u64) -> bool {
+    bounds(state) || state == CELL_WALKER
+}
+
+/// The minimum position of the reader cells that bound the limit, and of
+/// those that hold the retention floor, over `(state, position)` pairs,
+/// each loaded with Acquire. A cell's position only grows, so a stale
+/// load gives a lower minimum: never a floor above a reader that holds it.
+pub fn reader_minima<'a>(
+    cells: impl IntoIterator<Item = (&'a AtomicU64, &'a AtomicU64)>,
+) -> (Option<u64>, Option<u64>) {
+    let mut bound = None::<u64>;
+    let mut held = None::<u64>;
+    for (state, position) in cells {
+        let state = state.load(Ordering::Acquire);
+        if !holds_floor(state) {
+            continue;
+        }
+        let position = position.load(Ordering::Acquire);
+        held = Some(held.map_or(position, |min| min.min(position)));
+        if bounds(state) {
+            bound = Some(bound.map_or(position, |min| min.min(position)));
+        }
+    }
+    (bound, held)
+}
+
 /// Whether a cell in `state` bounds the publication limit.
 #[must_use]
 pub const fn bounds(state: u64) -> bool {
@@ -178,20 +209,22 @@ mod tests {
     /// be added here, which forces a decision for each predicate.
     #[test]
     fn reader_predicates_cover_every_state() {
-        // (state, reader, connects, listed, observer-like, bounds)
+        // (state, reader, connects, listed, observer-like, bounds, holds
+        // the floor)
         let table = [
-            (CELL_FREE, false, false, false, false, false),
-            (CELL_REQUIRED, true, true, true, false, true),
-            (CELL_OPTIONAL, true, true, true, true, false),
-            (CELL_PUBLICATION, false, false, false, false, false),
-            (CELL_REQUIRED_RESERVED, true, true, true, false, true),
-            (CELL_LOST_HOLDING, false, false, false, false, true),
-            (CELL_LOST, false, false, false, false, false),
-            (CELL_LOST_RESERVED, false, false, false, false, false),
-            (CELL_OBSERVER, true, true, true, true, false),
-            (CELL_WALKER, true, false, false, true, false),
+            (CELL_FREE, false, false, false, false, false, false),
+            (CELL_REQUIRED, true, true, true, false, true, true),
+            (CELL_OPTIONAL, true, true, true, true, false, false),
+            (CELL_PUBLICATION, false, false, false, false, false, false),
+            (CELL_REQUIRED_RESERVED, true, true, true, false, true, true),
+            (CELL_LOST_HOLDING, false, false, false, false, true, true),
+            (CELL_LOST, false, false, false, false, false, false),
+            (CELL_LOST_RESERVED, false, false, false, false, false, false),
+            (CELL_OBSERVER, true, true, true, true, false, false),
+            (CELL_WALKER, true, false, false, true, false, true),
         ];
-        for (state, reader, connects, listed, observer, bounding) in table {
+        for (state, reader, connects, listed, observer, bounding, floor) in table {
+            assert_eq!(holds_floor(state), floor, "holds_floor({state})");
             assert_eq!(is_reader(state), reader, "is_reader({state})");
             assert_eq!(counts_for_connection(state), connects, "connects({state})");
             assert_eq!(visible_as_subscriber(state), listed, "listed({state})");
@@ -201,5 +234,23 @@ mod tests {
         // The table is every state there is: the next value is unused.
         let next = CELL_WALKER + 1;
         assert!(!is_reader(next) && !bounds(next) && !is_observer_like(next));
+        assert!(!holds_floor(next));
+    }
+
+    #[test]
+    fn reader_minima_keep_the_walker_out_of_the_limit() {
+        let cell = |state: u64, position: u64| (AtomicU64::new(state), AtomicU64::new(position));
+        let cells = [
+            cell(CELL_REQUIRED, 900),
+            cell(CELL_WALKER, 300),
+            cell(CELL_OBSERVER, 100),
+            cell(CELL_LOST_HOLDING, 950),
+        ];
+        let pairs = cells.iter().map(|(state, position)| (state, position));
+        // The limit's bound ignores the walker; the floor holds it.
+        assert_eq!(reader_minima(pairs), (Some(900), Some(300)));
+        let alone = [cell(CELL_WALKER, 40), cell(CELL_OPTIONAL, 10)];
+        let pairs = alone.iter().map(|(state, position)| (state, position));
+        assert_eq!(reader_minima(pairs), (None, Some(40)));
     }
 }

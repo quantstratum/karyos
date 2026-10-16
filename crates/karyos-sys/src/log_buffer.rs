@@ -4473,13 +4473,16 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         let buffer = self.buffer;
         let window = window(&buffer.config);
         let head = buffer.conductor_head()?;
-        let mut bound = None::<u64>;
-        for cell in buffer.cells().iter().skip(buffer.first_subscriber_cell()) {
-            if bounds(cell.state.load(Ordering::Acquire)) {
-                let position = cell.position.load(Ordering::Acquire);
-                bound = Some(bound.map_or(position, |b| b.min(position)));
-            }
-        }
+        // `bound` drives the limit; `held` (bounding cells and the
+        // driver's walker) holds the floor, so the walker is never lapped
+        // yet never bounds the publisher (coordinator, ACS 15161).
+        let (bound, held) = participant::reader_minima(
+            buffer
+                .cells()
+                .iter()
+                .skip(buffer.first_subscriber_cell())
+                .map(|cell| (&cell.state, &cell.position)),
+        );
         // SPEC.md §4 retention floor: the minimum required position, or,
         // without required participants, `head_snapshot - window` bounded
         // below by position 0 through an explicit comparison.
@@ -4501,6 +4504,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             // wrapping or saturating arithmetic.
             None => (head.max(window) - window, head),
         };
+        let floor = held.map_or(floor, |held| floor.min(held));
         // Neither the floor nor the limit ever decreases.
         let floor = floor.max(buffer.floor().load(Ordering::Relaxed));
         let limit = (base + window).max(buffer.limit().load(Ordering::Relaxed));
