@@ -593,7 +593,9 @@ impl<T: StreamTerms> Stream<T> {
             .map(|retained| &mut retained.conductor)
     }
 
-    /// The buffer of the mapping a grant names, as [`Self::grant_conductor`].
+    /// The buffer of the mapping a grant names, as [`Self::grant_conductor`],
+    /// and the stream position where that mapping starts: the base a remote
+    /// client maps it at (G-d2c).
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "remote clients are admitted only on Linux")
@@ -602,21 +604,21 @@ impl<T: StreamTerms> Stream<T> {
         &self,
         incarnation: u64,
         generation: u32,
-    ) -> Option<&Arc<LogBuffer<T>>> {
+    ) -> Option<(&Arc<LogBuffer<T>>, u64)> {
         if incarnation != self.incarnation {
             return self
                 .replaced
                 .iter()
                 .find(|replaced| replaced.incarnation == incarnation)
-                .map(|replaced| &replaced.buffer);
+                .map(|replaced| (&replaced.buffer, replaced.base));
         }
         if self.generation.get() == generation {
-            return Some(&self.buffer);
+            return Some((&self.buffer, self.base));
         }
         self.retained
             .iter()
             .find(|retained| retained.generation.get() == generation)
-            .map(|retained| &retained.buffer)
+            .map(|retained| (&retained.buffer, retained.base))
     }
 
     /// Refuses issuance while a cutover is pending.

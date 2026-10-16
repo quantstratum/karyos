@@ -23,7 +23,7 @@ use karyos_client::{
 };
 use karyos_driver::{
     DriverConfig, EmbeddedDriver, IpcConfig, LossPolicy, MonotonicClock, Reconfiguration,
-    StreamConfig, SystemClock,
+    SealState, StreamConfig, SystemClock,
 };
 use karyos_protocol::admission::{MAX_MESSAGE_LENGTH, Message, VERSION, refusal};
 use karyos_protocol::cnc::{ErrorCode, StreamKey, SubscriberRole};
@@ -595,12 +595,14 @@ fn a_fetched_subscription_reads_what_an_in_process_publisher_writes() {
         registration: 1,
         stream_registration,
         incarnation,
+        base: 0,
         records,
     } = manifest
     else {
         panic!("expected the manifest of fetch 1, got {manifest:?}");
     };
-    // The grant names its stream's publication identity.
+    // The grant names its stream's publication identity; a first
+    // incarnation's mapping starts at position 0.
     let identity = driver.trace_identity(stream).unwrap();
     assert_eq!(
         (stream_registration, incarnation),
@@ -1297,6 +1299,104 @@ fn an_overrun_remote_subscriber_records_one_verified_loss() {
     assert_eq!(counter(&driver, "clients faulty"), 0);
     assert_eq!(client.loss_reports_queued(), 0);
     assert_eq!(client.loss_reports_dropped(), 0);
+    drop(publication);
+    serve_while(&mut driver, move || {
+        drop(subscription);
+        drop(client);
+    });
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+}
+
+/// G-d2c: a remote subscriber of a fresh incarnation maps its buffer at the
+/// manifest's base, the seal of the replaced incarnation, so its positions
+/// and the loss it reports are absolute stream positions, which the driver
+/// verifies against the incarnation the manifest named.
+#[test]
+fn a_remote_subscriber_of_a_fresh_incarnation_reads_absolute_positions() {
+    let dir = dir("fresh-base");
+    let mut driver = system_driver(&dir);
+    let mut config = StreamConfig {
+        allow_unconnected: true,
+        ..shared_stream_config()
+    };
+    // The walker takes a spare-slot credit; the optional reader needs one
+    // more.
+    config.buffer.spare_slots = 8;
+    config.buffer.max_subscribers = 8;
+    let stream = driver.add_stream(config).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    driver.guard_stream(stream, guard, 4).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            publication.offer(&[1u8; 512]).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    assert!(driver.close_guard(guard, 2).is_ok());
+    drop(publication);
+    let _ = driver.do_work().unwrap();
+    let seal = match driver.seal_state(stream).unwrap() {
+        SealState::Positioned { position } | SealState::Retired { position } => position,
+        other => panic!("not positioned: {other:?}"),
+    };
+    assert!(seal > 0);
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
+    assert_eq!(driver.trace_identity(stream).unwrap().incarnation, 2);
+    let (mut client, subscription, registration) =
+        remote_subscriber_as(&mut driver, &dir, SubscriberRole::Optional);
+    let mut subscription = subscription.with_rejoin(karyos_client::RejoinPolicy::RejoinAtHead);
+    assert_eq!(
+        subscription.position(),
+        seal,
+        "the mapping starts at the seal"
+    );
+    // Lap the subscriber that never reads.
+    for _ in 0..300 {
+        let start = Instant::now();
+        while !matches!(
+            publication.offer(&[7u8; 512]).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ) {
+            assert!(start.elapsed() < Duration::from_secs(5), "never accepted");
+            let _ = driver.do_work().unwrap();
+            // A guarded handle's outcome ring is drained by its owner.
+            let _ = publication.poll_outcomes(64, |_, _| {}).unwrap();
+        }
+        let _ = driver.do_work().unwrap();
+        let _ = publication.poll_outcomes(64, |_, _| {}).unwrap();
+    }
+    let summary = subscription.poll(|_, _| {}, MessageLimit::new(1)).unwrap();
+    let lost = summary.overrun.unwrap();
+    assert!(seal <= lost.from && lost.from < lost.lost_to);
+    let mut records = Vec::new();
+    let start = Instant::now();
+    while records.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no loss record");
+        let _ = client.poll(usize::MAX, |completion| {
+            panic!("unexpected completion {completion:?}");
+        });
+        let _ = driver.do_work().unwrap();
+        let _ = driver
+            .loss_report()
+            .scan(&mut 0, |_, record| records.push(record));
+    }
+    let [record] = records[..] else {
+        panic!("expected exactly one loss record");
+    };
+    assert_eq!(
+        (
+            record.incarnation,
+            record.from,
+            record.to,
+            record.participant
+        ),
+        (2, lost.from, lost.lost_to, registration)
+    );
+    assert_eq!(counter(&driver, "loss reports unverified"), 0);
+    assert_eq!(counter(&driver, "clients faulty"), 0);
     drop(publication);
     serve_while(&mut driver, move || {
         drop(subscription);

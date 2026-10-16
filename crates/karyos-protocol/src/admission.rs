@@ -22,7 +22,7 @@
 //! | `0x04` | `Leave` | none |
 //! | `0x05` | `ToolHello` | version |
 //! | `0x81` | `Admitted` | instance (low, high); protocol version; client id; record count; records |
-//! | `0x82` | `Manifest` | fetch id; hand-over key; registration; stream registration; incarnation; record count; records |
+//! | `0x82` | `Manifest` | fetch id; hand-over key; registration; stream registration; incarnation; base; record count; records |
 //! | `0x83` | `Region` | fetch id; record index |
 //! | `0x84` | `Refused` | fetch id or 0; code (nonzero) |
 //! | `0x85` | `ToolAdmitted` | instance (low, high); protocol version; record count; records (capability none) |
@@ -47,8 +47,9 @@
 //! J2). A trace journal grant is fetched as a log buffer grant: one
 //! `Manifest` with one `Journal` record, then its `Region`. A journal
 //! belongs to no stream, so a manifest whose records are journals carries
-//! the journal number as its registration and zero stream registration and
-//! incarnation; every other manifest carries both nonzero, and a manifest
+//! the journal number as its registration and zero stream registration,
+//! incarnation and base; every other manifest carries a nonzero stream
+//! registration and incarnation, and a manifest
 //! never mixes journal records with others. The `Journal` kind (8) is new,
 //! so an older decoder refuses such a manifest.
 //!
@@ -71,7 +72,18 @@
 //! [`VERSION`] instead (review of #124). The stream registration and
 //! incarnation words of `Manifest` follow that rule (coordinator decision,
 //! ACS 13555: they carry the publication identity of the grant, whose
-//! driver part is the instance of `Admitted`).
+//! driver part is the instance of `Admitted`), and so does its base word
+//! (G-d2c, ACS 15268): one word more makes every manifest length `8 + 8n`
+//! words against `7 + 8n` before, never equal.
+//!
+//! **Base.** A manifest's base is the stream position at which the grant's
+//! log buffer starts: zero for a stream's first incarnation, the seal
+//! position of its predecessor for a later one (`quantstratum-docs:
+//! karyos/design/guards-and-abort.md`, Fresh incarnation, On the
+//! network). A remote client maps the buffer at that base, so the
+//! positions it reports (a loss report, a trace) are absolute stream
+//! positions. A position stays below 2^63, so a base with the top bit set
+//! is refused.
 //!
 //! **Version 2** (coordinator decision, ACS 13677). The trace journal
 //! region adds the `Journal` and `TraceMirror` kinds and a fifth
@@ -112,8 +124,8 @@ pub const MAX_RECORDS: usize = 16;
 /// Words of one record.
 pub const RECORD_WORDS: usize = 8;
 /// Largest encoded message, in bytes: `Manifest` with [`MAX_RECORDS`]
-/// (seven words before its records; `Admitted` has six).
-pub const MAX_MESSAGE_LENGTH: usize = (7 + MAX_RECORDS * RECORD_WORDS) * 8;
+/// (eight words before its records; `Admitted` has six).
+pub const MAX_MESSAGE_LENGTH: usize = (8 + MAX_RECORDS * RECORD_WORDS) * 8;
 
 /// Refusal codes of `Refused` (nonzero). A client treats a code it does not
 /// know as a refusal without a reason.
@@ -498,6 +510,9 @@ pub enum Message {
         /// The publication incarnation of the grant's stream (nonzero; zero
         /// for a journal grant).
         incarnation: u64,
+        /// The stream position at which the grant's log buffer starts (below
+        /// 2^63; zero for a journal grant).
+        base: u64,
         /// The regions.
         records: Vec<Record>,
     },
@@ -564,12 +579,14 @@ fn records_from(header: usize, words: &[u64]) -> Result<Vec<Record>, AdmissionEr
 }
 
 /// The identity rule of a manifest: records that are all journals carry a
-/// zero stream registration and incarnation; any other manifest carries
-/// both nonzero; journal records never share a manifest with others.
+/// zero stream registration, incarnation and base; any other manifest
+/// carries a nonzero stream registration and incarnation; journal records
+/// never share a manifest with others; a base is below 2^63.
 fn check_manifest_identity(
     records: &[Record],
     stream_registration: u64,
     incarnation: u64,
+    base: u64,
 ) -> Result<(), AdmissionError> {
     let journals = records
         .iter()
@@ -578,9 +595,9 @@ fn check_manifest_identity(
     let valid = if journals == 0 {
         stream_registration != 0 && incarnation != 0
     } else {
-        journals == records.len() && stream_registration == 0 && incarnation == 0
+        journals == records.len() && stream_registration == 0 && incarnation == 0 && base == 0
     };
-    if valid {
+    if valid && base >> 63 == 0 {
         Ok(())
     } else {
         Err(AdmissionError::Reserved)
@@ -622,6 +639,7 @@ impl Message {
                 registration,
                 stream_registration,
                 incarnation,
+                base,
                 records,
             } => {
                 words.extend([
@@ -631,6 +649,7 @@ impl Message {
                     *registration,
                     *stream_registration,
                     *incarnation,
+                    *base,
                 ]);
                 records_words(records, &mut words)?;
             }
@@ -664,10 +683,11 @@ impl Message {
             Self::Manifest {
                 stream_registration,
                 incarnation,
+                base,
                 records,
                 ..
             } => {
-                check_manifest_identity(records, *stream_registration, *incarnation)?;
+                check_manifest_identity(records, *stream_registration, *incarnation, *base)?;
                 records.as_slice()
             }
             Self::Admitted { records, .. } => records.as_slice(),
@@ -788,14 +808,15 @@ impl Message {
                 if word(1) == 0 {
                     return Err(AdmissionError::Reserved);
                 }
-                let records = records_from(6, &words)?;
-                check_manifest_identity(&records, word(4), word(5))?;
+                let records = records_from(7, &words)?;
+                check_manifest_identity(&records, word(4), word(5), word(6))?;
                 Ok(Self::Manifest {
                     fetch: word(1),
                     key: word(2),
                     registration: word(3),
                     stream_registration: word(4),
                     incarnation: word(5),
+                    base: word(6),
                     records,
                 })
             }
@@ -905,6 +926,7 @@ mod tests {
             registration: 7,
             stream_registration: 8,
             incarnation: 1,
+            base: 0,
             records,
         });
         round_trip(&Message::Manifest {
@@ -913,6 +935,7 @@ mod tests {
             registration: 7,
             stream_registration: 8,
             incarnation: 1,
+            base: 0,
             records: vec![record(1, Capability::None); MAX_RECORDS],
         });
     }
@@ -936,10 +959,12 @@ mod tests {
             vec![FETCH, 0, 1],
             vec![DETACH, 0],
             vec![REFUSED, 1, 0],
-            vec![MANIFEST, 0, 1, 2, 3, 1, 0],
+            vec![MANIFEST, 0, 1, 2, 3, 1, 0, 0],
             // A zero stream registration or incarnation.
-            vec![MANIFEST, 1, 1, 2, 0, 1, 0],
-            vec![MANIFEST, 1, 1, 2, 3, 0, 0],
+            vec![MANIFEST, 1, 1, 2, 0, 1, 0, 0],
+            vec![MANIFEST, 1, 1, 2, 3, 0, 0, 0],
+            // A base with the top bit set.
+            vec![MANIFEST, 1, 1, 2, 3, 1, 1 << 63, 0],
         ] {
             assert_eq!(
                 Message::decode(&raw(&words)),
@@ -966,27 +991,29 @@ mod tests {
             registration: 3,
             stream_registration: 8,
             incarnation: 1,
+            base: 0,
             records: vec![record(1, Capability::None); 2],
         });
-        manifest[48] = 3;
+        manifest[56] = 3;
         assert!(matches!(
             Message::decode(&manifest),
             Err(AdmissionError::WrongLength { .. })
         ));
-        manifest[48] = 200;
+        manifest[56] = 200;
         assert!(matches!(
             Message::decode(&manifest),
             Err(AdmissionError::TooManyRecords { .. })
         ));
         // A record with export 0, an unknown kind, an unknown capability or
         // an index on a capability without one.
-        for (offset, value) in [(64, 0u8), (72, 11), (105, 7), (112, 1)] {
+        for (offset, value) in [(72, 0u8), (80, 11), (113, 7), (120, 1)] {
             let mut bad = encode(&Message::Manifest {
                 fetch: 1,
                 key: 2,
                 registration: 3,
                 stream_registration: 8,
                 incarnation: 1,
+                base: 0,
                 records: vec![record(1, Capability::None)],
             });
             bad[offset] = value;
@@ -1005,6 +1032,7 @@ mod tests {
                 registration: 3,
                 stream_registration: 8,
                 incarnation: 1,
+                base: 0,
                 records: vec![record(1, Capability::None); MAX_RECORDS + 1],
             }
             .encode(&mut out),
@@ -1029,6 +1057,7 @@ mod tests {
                 registration: 2,
                 stream_registration: 8,
                 incarnation: 1,
+                base: 0,
                 records: Vec::new(),
             },
             Message::Manifest {
@@ -1037,6 +1066,7 @@ mod tests {
                 registration: 2,
                 stream_registration: 8,
                 incarnation: 1,
+                base: 0,
                 records: vec![record(0, Capability::None)],
             },
             Message::Admitted {
@@ -1051,6 +1081,7 @@ mod tests {
                 registration: 2,
                 stream_registration: 0,
                 incarnation: 1,
+                base: 0,
                 records: Vec::new(),
             },
             Message::Manifest {
@@ -1059,6 +1090,16 @@ mod tests {
                 registration: 2,
                 stream_registration: 3,
                 incarnation: 0,
+                base: 0,
+                records: Vec::new(),
+            },
+            Message::Manifest {
+                fetch: 1,
+                key: 1,
+                registration: 2,
+                stream_registration: 3,
+                incarnation: 1,
+                base: 1 << 63,
                 records: Vec::new(),
             },
         ] {
@@ -1097,6 +1138,7 @@ mod tests {
             registration: 3,
             stream_registration: 4,
             incarnation: 1,
+            base: 0,
             records: records.clone(),
         };
         assert_eq!(manifest.encode(&mut out), Ok(MAX_MESSAGE_LENGTH));
@@ -1106,7 +1148,7 @@ mod tests {
             client: 2,
             records,
         };
-        assert_eq!(admitted.encode(&mut out), Ok(MAX_MESSAGE_LENGTH - 8));
+        assert_eq!(admitted.encode(&mut out), Ok(MAX_MESSAGE_LENGTH - 16));
     }
 
     /// Every wire kind and every sys kind appears in the table exactly
@@ -1135,8 +1177,9 @@ mod tests {
         assert_eq!(words_of(&out[..length]), [HELLO, 2, PROFILE_FLAGS]);
     }
 
-    /// The manifest's words, literally: the stream registration and the
-    /// incarnation follow the registration, before the record count.
+    /// The manifest's words, literally: the stream registration, the
+    /// incarnation and the base follow the registration, before the record
+    /// count.
     #[test]
     fn a_manifest_carries_the_publication_identity_of_its_grant() {
         let message = Message::Manifest {
@@ -1145,24 +1188,33 @@ mod tests {
             registration: 7,
             stream_registration: 0x0102_0304,
             incarnation: 9,
+            base: 0x4000,
             records: vec![record(1, Capability::OptionalSubscriber { cell: 2 })],
         };
         let mut out = [0u8; MAX_MESSAGE_LENGTH];
         let length = message.encode(&mut out).unwrap();
-        assert_eq!(length, (7 + RECORD_WORDS) * 8);
+        assert_eq!(length, (8 + RECORD_WORDS) * 8);
         let words: Vec<u64> = out[..length]
             .as_chunks::<8>()
             .0
             .iter()
             .map(|chunk| u64::from_le_bytes(*chunk))
             .collect();
-        assert_eq!(words[..7], [MANIFEST, 5, 6, 7, 0x0102_0304, 9, 1]);
+        assert_eq!(words[..8], [MANIFEST, 5, 6, 7, 0x0102_0304, 9, 0x4000, 1]);
         assert_eq!(Message::decode(&out[..length]).unwrap(), message);
         // The layout without these words (the record count after the
-        // registration) is refused: its record words are read as the count
-        // and come out two words short.
+        // registration) is refused: a record word is read as the count,
+        // here too large.
         let mut short = words.clone();
-        short.drain(4..6);
+        short.drain(4..7);
+        let bytes: Vec<u8> = short.iter().flat_map(|word| word.to_le_bytes()).collect();
+        assert!(matches!(
+            Message::decode(&bytes),
+            Err(AdmissionError::TooManyRecords { .. })
+        ));
+        // Nor is the layout without the base alone (G-d2c): one word short.
+        let mut short = words.clone();
+        short.remove(6);
         let bytes: Vec<u8> = short.iter().flat_map(|word| word.to_le_bytes()).collect();
         assert!(matches!(
             Message::decode(&bytes),
@@ -1196,6 +1248,7 @@ mod tests {
             registration: 9,
             stream_registration,
             incarnation,
+            base: 0,
             records,
         };
         let valid = manifest(vec![journal], 0, 0);
@@ -1203,9 +1256,9 @@ mod tests {
         let mut out = [0u8; MAX_MESSAGE_LENGTH];
         let length = valid.encode(&mut out).unwrap();
         let words = words_of(&out[..length]);
-        assert_eq!(words[..7], [MANIFEST, 1, 2, 9, 0, 0, 1]);
+        assert_eq!(words[..8], [MANIFEST, 1, 2, 9, 0, 0, 0, 1]);
         // The journal kind is 8 on the wire, the trace mirror 9.
-        assert_eq!(words[7 + 2] & 0xFF, 8);
+        assert_eq!(words[8 + 2] & 0xFF, 8);
         for refused in [
             manifest(vec![journal], 3, 0),
             manifest(vec![journal], 0, 1),
@@ -1213,6 +1266,15 @@ mod tests {
             manifest(vec![journal, record(5, Capability::None)], 3, 1),
             manifest(vec![record(5, Capability::None)], 0, 0),
             manifest(Vec::new(), 0, 0),
+            Message::Manifest {
+                fetch: 1,
+                key: 2,
+                registration: 9,
+                stream_registration: 0,
+                incarnation: 0,
+                base: 4096,
+                records: vec![journal],
+            },
         ] {
             assert_eq!(
                 refused.encode(&mut out),
@@ -1228,7 +1290,7 @@ mod tests {
             Err(AdmissionError::Reserved)
         );
         let mut raw = words;
-        raw[7 + 2] = RegionKind::TraceMirror.code() | 1 << 8;
+        raw[8 + 2] = RegionKind::TraceMirror.code() | 1 << 8;
         assert_eq!(
             Message::decode(&bytes_of(&raw)),
             Err(AdmissionError::Reserved),
@@ -1594,13 +1656,13 @@ mod properties {
                 }),
             4 => (
                 prop::sample::select(&[ADMITTED, MANIFEST, TOOL_ADMITTED][..]),
-                prop::collection::vec(prop_oneof![3 => 1u64..=8, 1 => 0u64..=0], 5),
+                prop::collection::vec(prop_oneof![3 => 1u64..=8, 1 => 0u64..=0], 6),
                 prop::collection::vec(record_words(), 0..=MAX_RECORDS),
             )
                 .prop_map(|(kind, header, records)| {
                     let header = &header[..match kind {
                         ADMITTED => 4,
-                        MANIFEST => 5,
+                        MANIFEST => 6,
                         _ => 3,
                     }];
                     to_bytes(
@@ -1712,7 +1774,8 @@ mod properties {
                 id(),
                 id(),
                 records(),
-                any::<bool>()
+                any::<bool>(),
+                any::<u64>()
             )
                 .prop_map(
                     move |(
@@ -1722,13 +1785,15 @@ mod properties {
                         incarnation,
                         mut records,
                         journal,
+                        base,
                     )| {
-                        let (stream_registration, incarnation) =
+                        let base = if valid { base >> 1 } else { base };
+                        let (stream_registration, incarnation, base) =
                             if valid && journal && !records.is_empty() {
                                 for record in &mut records {
                                     record.kind = RegionKind::Journal;
                                 }
-                                (0, 0)
+                                (0, 0, 0)
                             } else {
                                 if valid {
                                     for record in &mut records {
@@ -1737,7 +1802,7 @@ mod properties {
                                         }
                                     }
                                 }
-                                (stream_registration, incarnation)
+                                (stream_registration, incarnation, base)
                             };
                         Message::Manifest {
                             fetch,
@@ -1745,6 +1810,7 @@ mod properties {
                             registration,
                             stream_registration,
                             incarnation,
+                            base,
                             records,
                         }
                     }

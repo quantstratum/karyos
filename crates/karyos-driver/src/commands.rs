@@ -4670,11 +4670,11 @@ mod tests {
         // replaced buffer, an incarnation never held names nothing.
         let old_buffer = Arc::clone(&driver.streams[0].replaced[0].buffer);
         assert!(Arc::ptr_eq(
-            driver.streams[0].grant_buffer(1, generation).unwrap(),
+            driver.streams[0].grant_buffer(1, generation).unwrap().0,
             &old_buffer
         ));
         assert!(!Arc::ptr_eq(
-            driver.streams[0].grant_buffer(2, generation).unwrap(),
+            driver.streams[0].grant_buffer(2, generation).unwrap().0,
             &old_buffer
         ));
         assert!(driver.streams[0].grant_buffer(3, generation).is_none());
