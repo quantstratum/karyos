@@ -11,7 +11,12 @@
 //! the region as a participant does, adopts the cell and reads while the
 //! parent's receive owner writes the fragments, in order, twice each, or
 //! reversed within each message. Every message must arrive once, complete
-//! and byte for byte as sent.
+//! and byte for byte as sent. A fourth scenario writes four terms in order,
+//! each closed by a PAD: the image's window is two terms, so the owner can
+//! write a third only after the reader in the other process left the first
+//! and the conductor rotated; until then its frames are refused as `Ahead`
+//! and sent again, so the writer and the reader run concurrently across
+//! rotations and reclamation.
 
 #![cfg(target_os = "linux")]
 // Test helpers outside #[test] functions are not covered by clippy.toml's
@@ -43,9 +48,14 @@ use karyos_sys::term_bytes::SharedTerms;
 const SCENARIO: &str = "KARYOS_IMAGE_SCENARIO";
 const DIR: &str = "KARYOS_IMAGE_DIR";
 const RECORD: &str = "KARYOS_IMAGE_RECORD";
+const COUNT: &str = "KARYOS_IMAGE_MESSAGES";
 
 /// Messages of three 64-byte fragments, 192 bytes each, all in term 0.
 const MESSAGES: u32 = 150;
+/// Messages per term: 341 of 192 bytes, then a 64-byte PAD.
+const PER_TERM: u32 = MIN_TERM_LENGTH / 192;
+/// Terms of the rotation scenario.
+const TERMS: u32 = 4;
 /// The reader's export id.
 const EXPORT: u64 = 41;
 const INSTANCE: u128 = 1;
@@ -78,10 +88,11 @@ fn params() -> ImageParams {
     .unwrap()
 }
 
-/// Datagram of fragment `f` of message `m`.
+/// Datagram of fragment `f` of message `m`: [`PER_TERM`] messages fill
+/// each term up to its PAD.
 fn fragment(m: u32, f: u32) -> Vec<u8> {
-    let count = TermCount::try_new(m * 192 / MIN_TERM_LENGTH).unwrap();
-    let offset = m * 192 % MIN_TERM_LENGTH + f * 64;
+    let count = TermCount::try_new(m / PER_TERM).unwrap();
+    let offset = m % PER_TERM * 192 + f * 64;
     let flags = Flags::new(f == 0, f == 2, false, false, Lane::ZERO);
     let mut out = Vec::new();
     out.extend_from_slice(&Word0::new(57, flags, FrameType::Data).pack().to_le_bytes());
@@ -91,6 +102,22 @@ fn fragment(m: u32, f: u32) -> Vec<u8> {
     out.extend_from_slice(&TermId::new(7).advanced_by(count).get().to_le_bytes());
     out.extend_from_slice(&0i64.to_le_bytes());
     out.extend((0..25).map(|i| (m * 3 + f) as u8 ^ i));
+    out
+}
+
+/// The PAD that closes term `term` after its [`PER_TERM`] messages.
+fn pad(term: u32) -> Vec<u8> {
+    let offset = PER_TERM * 192;
+    let extent = MIN_TERM_LENGTH - offset;
+    let count = TermCount::try_new(term).unwrap();
+    let flags = Flags::new(false, false, false, false, Lane::ZERO);
+    let mut out = Vec::new();
+    out.extend_from_slice(&Word0::new(32, flags, FrameType::Pad).pack().to_le_bytes());
+    out.extend_from_slice(&offset.cast_signed().to_le_bytes());
+    out.extend_from_slice(&1i32.to_le_bytes());
+    out.extend_from_slice(&2i32.to_le_bytes());
+    out.extend_from_slice(&TermId::new(7).advanced_by(count).get().to_le_bytes());
+    out.extend_from_slice(&i64::from(extent).to_le_bytes());
     out
 }
 
@@ -105,6 +132,7 @@ fn arrivals(scenario: &str) -> &'static [u32] {
         "in-order" => &[0, 1, 2],
         "duplicates" => &[0, 0, 1, 1, 2, 2],
         "reversed" => &[2, 1, 0],
+        "rotations" => &[0, 1, 2],
         other => panic!("no scenario {other}"),
     }
 }
@@ -136,9 +164,19 @@ fn record_text(cell: usize, record: RegionRecord) -> String {
     )
 }
 
+/// How many messages `scenario` sends.
+fn messages(scenario: &str) -> u32 {
+    if scenario == "rotations" {
+        TERMS * PER_TERM
+    } else {
+        MESSAGES
+    }
+}
+
 /// Runs `scenario` with the reader in a child: returns once the child
 /// reported every message read and exited successfully.
 fn run(scenario: &str) {
+    let total = messages(scenario);
     let dir = private_dir(scenario);
     let listener = listen(&dir, 1).unwrap();
     let creator = Arc::new(
@@ -160,6 +198,7 @@ fn run(scenario: &str) {
         .env(SCENARIO, scenario)
         .env(DIR, &dir)
         .env(RECORD, record_text(cell, region.record()))
+        .env(COUNT, total.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -187,14 +226,33 @@ fn run(scenario: &str) {
 
     let params = params();
     let mut owner = ReceiveOwner::new(params, vec![Arc::clone(&creator)]).unwrap();
-    for m in 0..MESSAGES {
+    // Receives `bytes`; a frame beyond the window waits, with duty cycles,
+    // for the reader to free a term.
+    let receive = |owner: &mut ReceiveOwner<_>, conductor: &mut _, bytes: &[u8]| {
+        let datagram = ValidatedDatagram::parse(bytes, &params).unwrap();
+        let Some(Item::Frame(frame)) = datagram.items().next() else {
+            panic!("no frame");
+        };
+        let start = Instant::now();
+        loop {
+            match owner.receive(&frame).unwrap() {
+                Received::Ahead => {
+                    assert!(start.elapsed() < Duration::from_secs(20), "never rotated");
+                    let conductor: &mut karyos_sys::log_buffer::Conductor<
+                        Arc<LogBuffer<SharedTerms>>,
+                    > = conductor;
+                    let _ = conductor.duty_cycle().unwrap();
+                    while owner.duty() {}
+                    std::thread::yield_now();
+                }
+                other => return other,
+            }
+        }
+    };
+    let mut pads = 0u32;
+    for m in 0..total {
         for (index, f) in arrivals(scenario).iter().enumerate() {
-            let bytes = fragment(m, *f);
-            let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
-            let Some(Item::Frame(frame)) = datagram.items().next() else {
-                panic!("no frame");
-            };
-            let received = owner.receive(&frame).unwrap();
+            let received = receive(&mut owner, &mut conductor, &fragment(m, *f));
             // A repeated arrival is compared and dropped.
             let repeat = scenario == "duplicates" && index % 2 == 1;
             match received {
@@ -203,9 +261,18 @@ fn run(scenario: &str) {
                 other => panic!("{m}/{f}: {other:?}"),
             }
         }
+        if (m + 1) % PER_TERM == 0 {
+            let closed = receive(&mut owner, &mut conductor, &pad(m / PER_TERM));
+            assert!(matches!(closed, Received::Committed { .. }), "{closed:?}");
+            pads += 1;
+        }
         let _ = conductor.duty_cycle().unwrap();
+        while owner.duty() {}
     }
-    wait_for(&reports, &mut conductor, &format!("read {MESSAGES}"));
+    if scenario == "rotations" {
+        assert_eq!(pads, TERMS, "every term closed by its PAD");
+    }
+    wait_for(&reports, &mut conductor, &format!("read {total}"));
     let status = guard.0.wait().unwrap();
     assert!(status.success(), "{status:?}");
     drop(socket);
@@ -263,6 +330,11 @@ fn reversed_fragments_reach_a_reader_in_another_process_complete() {
     run("reversed");
 }
 
+#[test]
+fn a_reader_in_another_process_bounds_rotation_across_four_terms() {
+    run("rotations");
+}
+
 fn report(line: &str) {
     // A newline first: libtest may have started a line without ending it.
     let mut stdout = std::io::stdout();
@@ -274,13 +346,15 @@ fn report(line: &str) {
 /// and reads every message. Does nothing unless run by a test above.
 #[test]
 fn child() {
-    let (Some(_scenario), Some(dir), Some(record)) = (
+    let (Some(_scenario), Some(dir), Some(record), Some(total)) = (
         std::env::var_os(SCENARIO),
         std::env::var_os(DIR),
         std::env::var(RECORD).ok(),
+        std::env::var(COUNT).ok(),
     ) else {
         return;
     };
+    let total: u32 = total.parse().unwrap();
     let fields: Vec<u64> = record
         .split(':')
         .map(|field| field.parse().unwrap())
@@ -317,7 +391,7 @@ fn child() {
     let mut out = vec![0u8; 256];
     let mut seen = 0u32;
     let start = Instant::now();
-    while seen < MESSAGES {
+    while seen < total {
         if start.elapsed() > Duration::from_secs(15) {
             report(&format!("stuck at {seen}"));
             std::process::exit(1);
