@@ -143,7 +143,10 @@ pub struct ConflatedLimits {
 }
 
 impl Default for ConflatedLimits {
-    /// 2^20 keys, 64 KiB values and a 64 MiB journal.
+    /// 2^20 keys, 64 KiB values and a 64 MiB journal: provisional
+    /// defaults, to be calibrated before the release (coordinator
+    /// decision, ACS 14545); a view passes its own limits to
+    /// [`RemoteClient::take_conflated`].
     fn default() -> Self {
         Self {
             max_keys: 1 << 20,
