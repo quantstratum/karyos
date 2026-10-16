@@ -12,6 +12,8 @@
 //! data-path tracing hook that `karyos-trace` implements (`trace_hook`); and
 //! the trusted network control codecs and the datagram dispatcher
 //! (`network`, `quantstratum-docs: karyos/design/network-control-schemas.md`);
+//! and the protection seam of the wire data path (`protection`,
+//! `quantstratum-docs: karyos/design/measurement-harness.md` §5.2);
 //! and the persistent deficit round robin of priority lanes (`lanes`,
 //! `quantstratum-docs: karyos/design/aggregate-lanes.md`).
 //! Concurrent shared-memory access and URI parsing do not exist yet.
@@ -24,8 +26,16 @@ pub mod host_clock;
 pub mod journal;
 pub mod lanes;
 pub mod network;
+pub mod protection;
 pub mod sizing;
 pub mod term;
 pub mod trace_hook;
 
 pub use error::{LayoutError, ProtocolError};
+
+/// The counting allocator, so tests can prove a call allocates nothing
+/// (`karyos_sys::alloc_count`).
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
+    karyos_sys::alloc_count::CountingAllocator;
