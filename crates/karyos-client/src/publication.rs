@@ -255,8 +255,9 @@ pub struct ClientPublication<T: TermBytes = HeapTerms> {
     /// karyos/design/guards-and-abort.md`).
     guard: Option<GuardBinding>,
     /// The schedule of a timed lane's handle (`quantstratum-docs:
-    /// karyos/design/timed-tx.md`).
-    schedule: Option<crate::schedule::ScheduleBinding>,
+    /// karyos/design/timed-tx.md`), boxed: a handle that is not timed
+    /// carries one pointer.
+    schedule: Option<Box<crate::schedule::ScheduleBinding>>,
     /// The export of a handle adopted from another process's grant. Last:
     /// it is dropped after the mapping, and its drop sends `Detach`.
     _export: Option<Export>,
@@ -298,14 +299,14 @@ impl<T: TermBytes> ClientPublication<T> {
     /// obtain handles from the driver.
     #[must_use]
     pub fn with_schedule(mut self, binding: crate::schedule::ScheduleBinding) -> Self {
-        self.schedule = Some(binding);
+        self.schedule = Some(Box::new(binding));
         self
     }
 
     /// The schedule of a timed lane's handle, if any.
     #[must_use]
     pub fn schedule(&self) -> Option<&crate::schedule::ScheduleBinding> {
-        self.schedule.as_ref()
+        self.schedule.as_deref()
     }
 
     /// Offers one message of a timed lane with its requested not-before
