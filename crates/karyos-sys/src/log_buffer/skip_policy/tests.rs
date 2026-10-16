@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use super::*;
+use crate::SysError;
 use crate::frame::{Flags, FrameType, Word0};
 use crate::log_buffer::{DEFAULT_CLAIM_DEADLINE, LogBuffer, LogBufferConfig, PublicationMode};
 use crate::receive::{ImageParams, Item, ValidatedDatagram};
@@ -198,7 +199,7 @@ fn a_reliable_hole_closes_or_is_skipped_only_when_unrecoverable() {
         Some((64, 64)),
         "no record"
     );
-    assert_eq!(skip.counters().unrecoverable, 1);
+    assert_eq!(skip.counters(Lane::ZERO).unwrap().unrecoverable, 1);
 
     let (_buffer, mut owner) = with_hole();
     let mut skip = policy_of(SkipConfig {
@@ -270,7 +271,7 @@ fn arrivals_all_ahead_close_an_unreliable_lane() {
         skip.duty(&mut owner, 3000 * MS).unwrap(),
         SkipReport::default()
     );
-    assert_eq!(skip.counters().gap_cannot_resume, 1);
+    assert_eq!(skip.counters(Lane::ZERO).unwrap().gap_cannot_resume, 1);
 }
 
 #[test]
@@ -336,4 +337,52 @@ fn skip_seals_only_the_holes_below_the_floor() {
         .unwrap();
     assert_eq!((report.sealed, report.sealed_bytes), (1, 64));
     assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), Some((192, 128)));
+}
+
+/// GU-11: a seal published before a later step failed is counted and
+/// reported as `GapCommitted`, never as a plain failure, and the duty stops
+/// there: the second hole is not sealed in that call.
+#[test]
+fn a_seal_committed_before_a_failure_is_reported_with_the_duty() {
+    let (_buffer, mut owner) = with_hole();
+    // A second hole [192, 320).
+    receive(&mut owner, &data(0, 320, 3)).unwrap();
+    let mut skip = policy_of(SkipConfig {
+        reorder_timeout_ns: 0,
+        ..SkipConfig::unreliable()
+    });
+    owner.fail_next_advance(Lane::ZERO, SysError::ResourcesUnavailable);
+    let report = skip.duty(&mut owner, 5).unwrap();
+    assert_eq!((report.sealed, report.sealed_bytes), (1, 64));
+    assert_eq!(
+        report.committed_failure,
+        Some(ReceiveError::GapCommitted {
+            lane: Lane::ZERO,
+            position: 64,
+            extent: 64,
+            error: SysError::ResourcesUnavailable,
+        })
+    );
+    assert_eq!(owner.gap_counters(Lane::ZERO).unwrap().gaps_sealed, 1);
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)));
+}
+
+/// GU-11: close counters are per lane, and an increment that would
+/// overflow keeps the value and sets the sticky flag.
+#[test]
+fn close_counters_are_per_lane_and_never_wrap() {
+    let skip = policy_of(SkipConfig::unreliable());
+    assert_eq!(skip.counters(Lane::ZERO), Some(SkipCounters::default()));
+    assert_eq!(skip.counters(Lane::try_new(1).unwrap()), None);
+
+    let mut counters = SkipCounters {
+        gap_cannot_resume: u64::MAX,
+        ..SkipCounters::default()
+    };
+    counters.count(CloseCause::GapCannotResume);
+    assert_eq!(counters.gap_cannot_resume, u64::MAX);
+    assert!(counters.overflowed);
+    counters.count(CloseCause::Unrecoverable);
+    assert_eq!(counters.unrecoverable, 1);
+    assert!(counters.overflowed, "sticky");
 }

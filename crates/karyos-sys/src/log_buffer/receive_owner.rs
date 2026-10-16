@@ -457,6 +457,15 @@ impl<T: TermBytes> ReceiveOwner<T> {
         self.lanes.get(usize::from(lane.get())).map(|l| l.received)
     }
 
+    /// Makes the next advance of `lane`'s resolved prefix fail with
+    /// `error`.
+    #[cfg(test)]
+    pub(crate) fn fail_next_advance(&mut self, lane: Lane, error: SysError) {
+        if let Some(owner) = self.lanes.get_mut(usize::from(lane.get())) {
+            owner.fail_advance = Some(error);
+        }
+    }
+
     /// The local gap counters of `lane` (GU-11).
     #[must_use]
     pub fn gap_counters(&self, lane: Lane) -> Option<GapCounters> {
@@ -527,6 +536,10 @@ struct LaneOwner<T: TermBytes> {
     loans: [Option<(TermCount, u8)>; 2],
     /// Set when the last receive found the next term unprepared.
     lagged: bool,
+    /// Returned by the next `advance`: tests reproduce a failure after a
+    /// gap record was published.
+    #[cfg(test)]
+    fail_advance: Option<SysError>,
 }
 
 impl<T: TermBytes> LaneOwner<T> {
@@ -554,6 +567,8 @@ impl<T: TermBytes> LaneOwner<T> {
             sets: [set(), set(), set(), set()],
             loans: [None, None],
             lagged: false,
+            #[cfg(test)]
+            fail_advance: None,
         }
     }
 
@@ -731,6 +746,9 @@ impl<T: TermBytes> LaneOwner<T> {
             session_id: buffer.config.session_id,
             stream_id: buffer.config.stream_id,
         };
+        // Borrowed before the publication: nothing after it may fail before
+        // the record is in the owner's maps.
+        let set = self.set_mut(index)?;
         // SAFETY: the owner holds the write loan on `slot`'s current term;
         // the 24 bytes start 8 bytes into the record, a multiple of 8, and
         // lie inside its extent (at least 32), which the owner's record
@@ -745,7 +763,6 @@ impl<T: TermBytes> LaneOwner<T> {
         // SAFETY: write loan held; `offset` is the start of this record.
         let first = unsafe { buffer.regions.word0(slot, offset) };
         publish_block(first, word0);
-        let set = self.set_mut(index)?;
         set_bit(&mut set.gap_starts, unit);
         set_range(&mut set.covered, unit, units);
         self.high = self.high.max(end);
@@ -944,6 +961,10 @@ impl<T: TermBytes> LaneOwner<T> {
     /// Advances the rebuild position over every covered unit from it,
     /// publishes it, and moves the window when it crosses a term end.
     fn advance(&mut self) -> Result<(), SysError> {
+        #[cfg(test)]
+        if let Some(error) = self.fail_advance.take() {
+            return Err(error);
+        }
         let buffer = Arc::clone(&self.buffer);
         // At most the two window terms can be crossed in one advance.
         for _ in 0..3 {
