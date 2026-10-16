@@ -4,7 +4,7 @@
 //! (`quantstratum-docs: karyos/design/network-sessions.md` S1, "commands
 //! between receiver and conductor"; driver-network-agents.md §3.2 step 1).
 //!
-//! One ring per direction, `session_capacity` entries each, carries only
+//! One ring per direction, `session_command_capacity` entries each, carries only
 //! the commands of image chains, apart from the agents' general rings. The
 //! whole chain of one image is reserved at the answer, before the
 //! challenge is marked answered:
@@ -22,7 +22,7 @@
 //! ([`ImageChain`]), so no later step of the chain can find a ring full.
 //! A unit returns to its ring when the consumer takes the command, so each
 //! ring holds at most three units per image in flight, and configuration
-//! validates `session_capacity >= 3 * max_images`. If the credit were ever
+//! validates `session_command_capacity >= 3 * max_images`. If the credit were ever
 //! missing, the answer is dropped and counted and the challenge stays
 //! pending until its expiry. `RetireImage` and `StorageReclaimed` are
 //! posted by phase 5; until then their units are held, and released with

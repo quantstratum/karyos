@@ -367,7 +367,7 @@ fn an_answer_waits_for_its_chain_credit() {
     let destination = endpoints.local_address(b).unwrap();
     add_publication(&links, a, b, destination);
     let held: Vec<_> = std::iter::from_fn(|| agents.receiver.sessions.events.reserve()).collect();
-    assert_eq!(held.len(), AgentConfig::default().session_capacity);
+    assert_eq!(held.len(), AgentConfig::default().session_command_capacity);
     let mut now = 0u64;
     for _ in 0..300 {
         now += 1_000_000;
@@ -630,4 +630,26 @@ fn control_routes_survive_a_reset() {
     let after = agents.sender.counters();
     assert!(after.sent >= before.sent + 3, "{before:?} {after:?}");
     assert_eq!(after.send_failures, before.send_failures);
+}
+
+/// Two subscriptions of one stream on one endpoint: the stricter
+/// `max_image_term_length` holds, whatever their order.
+#[test]
+fn a_duplicate_subscription_keeps_the_smaller_limit() {
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    for max_term_length in [1 << 20, 2 << 20, 512 << 10] {
+        let command = AgentCommand::<OsSocket>::AddSubscription {
+            reply: replies.reserve().unwrap(),
+            endpoint: EndpointId(1),
+            stream_id: 6,
+            max_term_length,
+        };
+        assert!(matches!(
+            role.command(command),
+            Some((_, AgentEvent::Configured { accepted: true, .. }))
+        ));
+    }
+    assert_eq!(role.subscriptions, [(EndpointId(1), 6, 512 << 10)]);
 }

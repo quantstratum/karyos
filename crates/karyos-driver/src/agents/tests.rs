@@ -123,7 +123,7 @@ fn the_configuration_is_checked() {
             ..AgentConfig::default()
         },
         AgentConfig {
-            session_capacity: 3 * AgentConfig::default().sessions.max_images - 1,
+            session_command_capacity: 3 * AgentConfig::default().sessions.max_images - 1,
             ..AgentConfig::default()
         },
         AgentConfig {

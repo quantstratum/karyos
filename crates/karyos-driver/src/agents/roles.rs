@@ -289,8 +289,10 @@ impl ReceiverRole {
                     .position(|(held, stream, _)| (*held, *stream) == (endpoint, stream_id));
                 let full = self.subscriptions.len() >= max;
                 let accepted = match held.and_then(|index| self.subscriptions.get_mut(index)) {
+                    // Two subscribers of one stream on one endpoint: the
+                    // stricter limit holds for both.
                     Some(entry) => {
-                        entry.2 = max_term_length;
+                        entry.2 = entry.2.min(max_term_length);
                         true
                     }
                     None if !full => {

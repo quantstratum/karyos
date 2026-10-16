@@ -28,6 +28,9 @@ type Links = AgentLinks<OsSocket>;
 
 const MS: u64 = 1_000_000;
 
+/// Units of each session ring (the default `session_command_capacity`).
+const FULL: usize = 192;
+
 fn alias() -> Alias {
     Alias {
         session_id: 5,
@@ -166,6 +169,16 @@ impl Rig {
         std::thread::sleep(Duration::from_micros(200));
     }
 
+    /// Free units of the session rings: (receiver to conductor, conductor
+    /// to receiver).
+    fn credits(&self) -> (usize, usize) {
+        let sessions = &self.agents.receiver.sessions;
+        (
+            sessions.events.available().unwrap(),
+            sessions.credit.available().unwrap(),
+        )
+    }
+
     fn until(&mut self, serve: bool, done: impl Fn(&Self) -> bool) {
         for _ in 0..2000 {
             self.round(serve);
@@ -207,6 +220,9 @@ fn an_accepted_answer_installs_an_image() {
     assert!(rig.agents.receiver.role.has_image(*slot));
     // 64 KiB terms, 3 + 5 slots, two lanes.
     assert_eq!(rig.images.charged(), 65_536 * 8 * 2);
+    assert_eq!(rig.images.allocations, 1);
+    // The installed image holds its RetireImage and StorageReclaimed units.
+    assert_eq!(rig.credits(), (FULL - 1, FULL - 1));
 }
 
 /// A conductor slower than the challenge: `ImageReady` after the timeout
@@ -226,6 +242,8 @@ fn a_late_image_ready_is_released() {
     ));
     assert!(rig.images.is_empty());
     assert_eq!(rig.images.charged(), 0);
+    assert_eq!(rig.images.allocations, 1);
+    assert_eq!(rig.credits(), (FULL, FULL));
 }
 
 /// A reachable refusal: an image over the storage budget is answered
@@ -252,6 +270,8 @@ fn a_budget_refusal_removes_the_challenge() {
     assert_eq!(rig.images.charged(), 0);
     let sessions = rig.agents.receiver.role.session_counters();
     assert_eq!((sessions.released, sessions.installed), (1, 0));
+    assert_eq!(rig.images.allocations, 0);
+    assert_eq!(rig.credits(), (FULL, FULL));
 }
 
 /// A 1 GiB term the subscription accepts: 16 GiB of image terms against
@@ -272,6 +292,8 @@ fn a_1_gib_request_is_refused_without_allocating() {
     assert_eq!(rig.images.counters().refused_budget, 1);
     assert_eq!(rig.images.counters().offered, 0);
     assert_eq!(rig.images.charged(), 0);
+    // Nothing was allocated, not even lazily: `allocate` never ran.
+    assert_eq!(rig.images.allocations, 0);
 }
 
 /// An announcement above the subscription's `max_image_term_length` is
@@ -307,6 +329,8 @@ fn a_full_table_refuses_without_allocating() {
     let counters = rig.images.counters();
     assert_eq!((counters.refused_full, counters.offered), (1, 0));
     assert_eq!(rig.images.charged(), 0);
+    assert_eq!(rig.images.allocations, 0);
+    assert_eq!(rig.credits(), (FULL, FULL));
     let sessions = rig.agents.receiver.role.session_counters();
     assert_eq!((sessions.released, sessions.installed), (1, 0));
 }
@@ -345,4 +369,28 @@ fn stale_replies_are_counted() {
     assert!(events.is_empty());
     assert_eq!(rig.images.counters().stale_replies, 3);
     assert!(rig.images.installed(installed).is_some());
+}
+
+/// Partial credit: with only two receiver-to-conductor units free, the
+/// chain (three on that ring) cannot be reserved; the answer is dropped and
+/// the two units come back, none leaked. Once the held units return, the
+/// image installs and holds exactly one unit per ring.
+#[test]
+fn partial_credit_drops_the_answer_and_recovers() {
+    let (mut rig, _b) = Rig::new(Setup::default());
+    let events = &rig.agents.receiver.sessions.events;
+    let held: Vec<_> = (0..FULL - 2).map(|_| events.reserve().unwrap()).collect();
+    for _ in 0..300 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.counters().create_image, 0);
+    assert!(rig.agents.receiver.role.session_counters().dropped >= 1);
+    assert_eq!(rig.credits(), (2, FULL));
+    drop(held);
+    rig.until(true, |rig| !rig.events.is_empty());
+    assert!(matches!(
+        rig.events.as_slice(),
+        [ImageEvent::Installed { .. }]
+    ));
+    assert_eq!(rig.credits(), (FULL - 1, FULL - 1));
 }

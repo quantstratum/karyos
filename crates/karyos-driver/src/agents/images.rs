@@ -170,6 +170,9 @@ pub struct ImageTable {
     /// Term bytes charged.
     charged: u64,
     counters: ImageCounters,
+    /// Calls of `allocate` (tests: no refusal allocates).
+    #[cfg(test)]
+    allocations: usize,
 }
 
 impl std::fmt::Debug for ImageTable {
@@ -200,6 +203,8 @@ impl ImageTable {
             template,
             charged: 0,
             counters: ImageCounters::default(),
+            #[cfg(test)]
+            allocations: 0,
         }
     }
 
@@ -370,6 +375,10 @@ impl ImageTable {
                 .push(image(State::Refused, Vec::new(), 0, reclaimed));
             return None;
         };
+        #[cfg(test)]
+        if let Some(allocations) = self.allocations.checked_add(1) {
+            self.allocations = allocations;
+        }
         let Ok((lanes, owner)) = self.allocate(alias, term, joins) else {
             refuse(self, Refusal::Geometry, command, reply);
             self.images

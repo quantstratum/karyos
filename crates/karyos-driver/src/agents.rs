@@ -143,7 +143,7 @@ pub struct AgentConfig {
     /// Entries of each session ring between the receiver and the conductor
     /// ([`chain`]), at least `3 * sessions.max_images` (network-sessions.md
     /// S1; default 192).
-    pub session_capacity: usize,
+    pub session_command_capacity: usize,
     /// Commands an agent serves per duty cycle, at least 1.
     pub command_budget: u32,
     /// Endpoint halves each agent holds at once, at least 1.
@@ -184,7 +184,7 @@ impl Default for AgentConfig {
         Self {
             command_capacity: 64,
             event_capacity: 64,
-            session_capacity: 192,
+            session_command_capacity: 192,
             command_budget: 16,
             max_endpoints: 16,
             sessions: crate::sessions::receive::SessionConfig::default(),
@@ -241,10 +241,10 @@ impl AgentConfig {
             .max_images
             .checked_mul(3)
             .ok_or(AgentError::InvalidConfig("max_images too large"))?;
-        let sessions = NonZeroUsize::new(self.session_capacity)
+        let sessions = NonZeroUsize::new(self.session_command_capacity)
             .filter(|capacity| capacity.get() >= chains)
             .ok_or(AgentError::InvalidConfig(
-                "session_capacity must be at least 3 * max_images",
+                "session_command_capacity must be at least 3 * max_images",
             ))?;
         Ok((commands, events, sessions))
     }
@@ -319,7 +319,9 @@ pub enum AgentCommand<O: SocketOps> {
         /// The largest image term length this subscription accepts: an
         /// ANNOUNCE above it is refused before any challenge (the channel's
         /// `max_image_term_length`, or the driver default
-        /// [`images::DEFAULT_MAX_IMAGE_TERM_LENGTH`]).
+        /// [`images::DEFAULT_MAX_IMAGE_TERM_LENGTH`]). A second
+        /// subscription of the same stream on the same endpoint keeps the
+        /// smaller of the two limits.
         max_term_length: u32,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
@@ -869,7 +871,7 @@ pub struct AgentLinks<O: SocketOps> {
 pub fn network_agents<O: SocketOps>(
     config: AgentConfig,
 ) -> Result<(NetworkAgents<O>, AgentLinks<O>), AgentError> {
-    let (command_capacity, event_capacity, session_capacity) = config.validate()?;
+    let (command_capacity, event_capacity, session_command_capacity) = config.validate()?;
     let make = |kind| {
         let (commands, command_receiver) = ring::ring(command_capacity);
         let (events, event_receiver) = ring::ring(event_capacity);
@@ -898,7 +900,7 @@ pub fn network_agents<O: SocketOps>(
     let (sender_core, sender_link) = make(AgentKind::Sender);
     let (receiver_core, receiver_link) = make(AgentKind::Receiver);
     let (sender_role, receiver_role) = roles::roles(&config)?;
-    let (session_end, session_link) = chain::session_rings(session_capacity);
+    let (session_end, session_link) = chain::session_rings(session_command_capacity);
     Ok((
         NetworkAgents {
             sender: SenderAgent {
