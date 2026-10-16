@@ -102,8 +102,9 @@ struct Note {
     journal: u64,
     /// Its attempted count at that moment.
     attempted: u64,
-    /// Its stored count read with that attempted count: once the drain has
-    /// released this many records, every record below `attempted` was
+    /// Its stored count read after that attempted count (`losses` reads
+    /// the attempted count, then the head, both Acquire): once the drain
+    /// has released this many records, every record below `attempted` was
     /// consumed. `u64::MAX` when its accounting could not be read (the
     /// journal then faults and the drain condition waits for its end).
     stored: u64,

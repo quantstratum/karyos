@@ -477,9 +477,10 @@ pub struct NotedPublisher {
 /// One recycle log entry: a subscriber journal whose table entry was
 /// reused while a `Publish` that could need it may still be pending or
 /// retained. A tool treats the messages of its publication at positions at
-/// or below its boundary as out of scope (`trace-tool.md`, T5); an entry
-/// without a boundary (writer lost) carries no position, and how a tool
-/// scopes it is the tool's decision.
+/// or below its boundary as out of scope (`trace-tool.md`, T5); for an
+/// entry without a boundary (writer lost), every message of its
+/// publication is out of scope while the log entry stays
+/// (`trace-journal-region.md`, "Recycling").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecycledJournal {
     /// The recycled subscriber journal's number (nonzero).

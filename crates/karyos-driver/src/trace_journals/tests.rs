@@ -1061,3 +1061,99 @@ fn too_many_noted_journals_wait_until_covered() {
     );
     assert!(logged(&driver).is_empty());
 }
+
+/// T5: a noted publisher journal whose `Publish` records are still
+/// undrained at the cycles after the subscriber journal ended (a drain
+/// budget of one record) does not count as drained: the recycle log entry
+/// stays until the drain released the noted stored count and the ring
+/// dropped those records, and only then is dropped.
+#[test]
+fn an_undrained_noted_journal_keeps_the_log_entry() {
+    let mut driver = driver(2, 2, 1);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let (_subscription, subscription) = subscribe(&mut driver, &mut conductor);
+    let mut publishing = journal(&mut driver, &mut conductor, publication);
+    let mut observing = journal(&mut driver, &mut conductor, subscription);
+    let observed = observing.journal();
+    append(&mut observing, [1]);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(entry(&driver, observed).last_record, Some(0));
+    // Four `Publish` records are stored when it ends, none drained.
+    append(&mut publishing, 10..14);
+    end(&mut driver, &mut observing);
+    // One record per cycle: ring 1 and 2, which push out ring 0.
+    for _ in 0..2 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(entry(&driver, publishing.journal()).mirrored, 2);
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 1);
+    // Its entry is reused and logged; the cycle of the request drains
+    // ring 3, and two noted records are still in the journal or retained.
+    let mut late = journal(&mut driver, &mut conductor, publication);
+    assert!(
+        entries(&driver)
+            .iter()
+            .all(|entry| entry.journal != observed)
+    );
+    assert_eq!(entry(&driver, publishing.journal()).mirrored, 3);
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 2);
+    assert_eq!(logged(&driver).len(), 1, "a noted record is undrained");
+    // The last noted record reaches ring 4: drained, but retained.
+    let _ = driver.do_work().unwrap();
+    assert_eq!(entry(&driver, publishing.journal()).mirrored, 4);
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 3);
+    assert_eq!(logged(&driver).len(), 1, "ring 4 is retained");
+    append(&mut late, [20]);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 4);
+    assert_eq!(logged(&driver).len(), 1, "ring 4 is retained");
+    // Once ring 4 is gone the entry is covered: dropped.
+    append(&mut late, [21]);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 5);
+    assert!(logged(&driver).is_empty());
+}
+
+/// T5 refinement: a noted publisher journal that dropped records below
+/// its noted attempted count (its journal full) counts as drained once the
+/// drain released its noted stored count, while it stays open: the
+/// subscriber journal becomes covered and its log entry is dropped.
+#[test]
+fn a_noted_journal_that_dropped_records_still_drains() {
+    let mut driver = driver(2, 2, 64);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let (_subscription, subscription) = subscribe(&mut driver, &mut conductor);
+    let mut publishing = journal(&mut driver, &mut conductor, publication);
+    let mut observing = journal(&mut driver, &mut conductor, subscription);
+    let observed = observing.journal();
+    append(&mut observing, [1]);
+    let _ = driver.do_work().unwrap();
+    // Four fit; two are dropped: attempted 6, stored 4 when it ends.
+    let appended = append(&mut publishing, 10..16);
+    assert!(matches!(appended[4], Append::Dropped { .. }));
+    end(&mut driver, &mut observing);
+    // Ring 1 to 4; ring 3 and 4 retained.
+    let _ = driver.do_work().unwrap();
+    let noted = entry(&driver, publishing.journal());
+    assert_eq!((noted.attempted, noted.stored, noted.mirrored), (6, 4, 4));
+    assert_eq!(noted.state, JournalState::Open);
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 3);
+    // Its entry is reused while ring 4 is retained: logged.
+    let mut late = journal(&mut driver, &mut conductor, publication);
+    assert!(
+        entries(&driver)
+            .iter()
+            .all(|entry| entry.journal != observed)
+    );
+    assert_eq!(logged(&driver).len(), 1);
+    // A later publisher journal, not noted, pushes ring 4 out; the noted
+    // journal stays open and never reaches its attempted count.
+    append(&mut late, [20, 21]);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.trace_mirror().bounds().unwrap().first, 5);
+    assert_eq!(entry(&driver, publishing.journal()).mirrored, 4);
+    assert!(
+        logged(&driver).is_empty(),
+        "covered once the stored count is released"
+    );
+}
