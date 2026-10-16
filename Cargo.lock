@@ -304,6 +304,7 @@ dependencies = [
 name = "karyos-io"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "karyos-protocol",
  "karyos-sys",
  "proptest",
  "rustix",

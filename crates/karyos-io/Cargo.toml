@@ -16,6 +16,9 @@ publish.workspace = true
 test-hooks = []
 
 [dependencies]
+# The DRR of priority lanes (P2.4 l2); an internal edge the coordinator
+# approved (ACS 14599 and 14655).
+karyos-protocol.workspace = true
 karyos-sys.workspace = true
 thiserror.workspace = true
 
