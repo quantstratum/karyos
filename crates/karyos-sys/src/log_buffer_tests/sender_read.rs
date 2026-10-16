@@ -11,12 +11,16 @@ fn sr_out() -> Vec<u8> {
     vec![0u8; DEFAULT_MTU as usize]
 }
 
-/// The read capability over a new `role` subscriber of `conductor`.
+/// The read capability over a new reserved required subscriber of
+/// `conductor` (S2 2.1).
 fn sr_reader<'a>(
     conductor: &mut Conductor<&'a LogBuffer<Terms>>,
-    role: Role,
 ) -> SenderRead<&'a LogBuffer<Terms>> {
-    SenderRead::new(conductor.subscribe(role).unwrap(), DEFAULT_CORRUPT_RETRIES).unwrap()
+    SenderRead::new(
+        conductor.subscribe_as(Role::Required, true, 1).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+    )
+    .unwrap()
 }
 
 /// Whether the reader's loan word is empty: every return released it.
@@ -75,7 +79,7 @@ fn sr_parse(bytes: &[u8]) -> (Vec<Vec<u8>>, Vec<FrameKind>) {
 fn sender_read_copies_whole_frames_at_strides() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let messages: Vec<Vec<u8>> = (0..3).map(|i| sized_message(i, 100 + i as usize)).collect();
     for message in &messages {
@@ -105,7 +109,7 @@ fn sender_read_copies_whole_frames_at_strides() {
 fn sender_read_resumes_inside_a_block() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let message = sized_message(7, 3000);
     let _ = publication.append(&message, AppendOptions::default()).unwrap();
@@ -131,7 +135,7 @@ fn sender_read_resumes_inside_a_block() {
 fn sender_read_stops_at_a_block_boundary() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     // Three fragments each, the last of 280 bytes.
     let messages = [sized_message(1, 3000), sized_message(2, 3000)];
@@ -155,7 +159,7 @@ fn sender_read_stops_at_a_block_boundary() {
 fn sender_read_reports_a_small_buffer() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication
         .append(&sized_message(1, 200), AppendOptions::default())
@@ -184,7 +188,7 @@ fn sender_read_reports_a_small_buffer() {
 fn sender_read_turns_padding_into_its_canonical_record() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Required);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     // Each 7000-byte message reserves 7200 bytes: nine fill 64800 of the
     // 65536-byte term, and the tenth pads the last 736.
@@ -220,7 +224,7 @@ fn sender_read_turns_padding_into_its_canonical_record() {
 fn sender_read_needs_32_bytes_for_a_record() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let claim = claimed(publication.try_claim(100, AppendOptions::default()));
     claim.abort();
@@ -239,7 +243,7 @@ fn sender_read_needs_32_bytes_for_a_record() {
 fn sender_read_never_reads_a_live_or_aborted_claim() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let mut claim = claimed(publication.try_claim(100, AppendOptions::default()));
     claim.payload().fill(0xAB);
@@ -270,7 +274,7 @@ fn sender_read_never_reads_a_live_or_aborted_claim() {
 fn sender_read_copies_extensions_whole() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let extension = [0x5Au8; 64];
     let options = AppendOptions {
@@ -296,7 +300,7 @@ fn sender_read_copies_extensions_whole() {
 fn sender_read_respects_the_retention_floor() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication
         .append(&sized_message(1, 100), AppendOptions::default())
@@ -315,31 +319,12 @@ fn sender_read_respects_the_retention_floor() {
     assert_eq!(reader.counters().unavailable, 1);
 }
 
-/// A reclaimed term is `Unavailable`, never read.
-#[test]
-fn sender_read_refuses_a_reclaimed_term() {
-    let buffer = new_buffer(config(3, 2)).unwrap();
-    let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
-    let mut publication = buffer.publication().unwrap().unwrap();
-    let data = vec![5u8; 7000];
-    for _ in 0..60 {
-        let _ = publication.append(&data, AppendOptions::default()).unwrap();
-        let _ = conductor.duty_cycle().unwrap();
-    }
-    let mut out = sr_out();
-    assert!(matches!(
-        sr_read(&mut reader, &mut out),
-        Err(ReadError::Unavailable { lowest }) if lowest > 0
-    ));
-}
-
 /// A revoked participant gets `Revoked`, with no loan taken.
 #[test]
 fn sender_read_is_revoked() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let subscription = conductor.subscribe_as(Role::Observer, false, 7).unwrap();
+    let subscription = conductor.subscribe_as(Role::Required, true, 7).unwrap();
     let cell = subscription.cell();
     let mut reader = SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
@@ -348,7 +333,7 @@ fn sender_read_is_revoked() {
         .unwrap();
     assert_ne!(
         conductor
-            .revoke_participant(cell, 7, LossPolicy::Hold)
+            .revoke_participant(cell, 7, LossPolicy::Continue)
             .unwrap(),
         Revocation::Stale
     );
@@ -362,7 +347,7 @@ fn sender_read_is_revoked() {
 fn sender_read_refuses_positions_other_than_its_cursor() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication
         .append(&sized_message(1, 100), AppendOptions::default())
@@ -383,7 +368,7 @@ fn sender_read_refuses_positions_other_than_its_cursor() {
 fn sender_read_faults_after_corrupt_retries() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication
         .append(&sized_message(1, 3000), AppendOptions::default())
@@ -422,7 +407,7 @@ fn sender_read_faults_after_corrupt_retries() {
 fn sender_read_corrupt_count_resets_when_the_cursor_advances() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Observer);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let _ = publication
         .append(&sized_message(1, 3000), AppendOptions::default())
@@ -471,7 +456,7 @@ fn sender_read_corrupt_count_resets_when_the_cursor_advances() {
 fn sender_read_sent_position_bounds_the_publisher() {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let mut reader = sr_reader(&mut conductor, Role::Required);
+    let mut reader = sr_reader(&mut conductor);
     let mut publication = buffer.publication().unwrap().unwrap();
     let data = sized_message(1, 992);
     let mut appended = 0u64;
@@ -499,14 +484,522 @@ fn sender_read_sent_position_bounds_the_publisher() {
     assert_eq!(reader.sent_position(), reader.subscription().acknowledged_position());
 }
 
-/// Only publication buffers, and only required or observer participants.
+/// Only publication buffers, and only a required participant with its
+/// `L_send` reservation: an optional, an observer or an unreserved
+/// required cell is refused.
 #[test]
 fn sender_read_admission_is_checked() {
+    for role in [Role::Optional, Role::Observer, Role::Required] {
+        let buffer = new_buffer(config(3, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let subscription = conductor.subscribe(role).unwrap();
+        assert!(matches!(
+            SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES),
+            Err(SysError::InvalidPublicationMode { .. })
+        ));
+    }
+}
+
+// Randomized and boundary probes of the coordinator's review of #244.
+
+struct ProbeLcg(u64);
+impl ProbeLcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn range(&mut self, lo: u64, hi: u64) -> u64 {
+        lo + self.next() % (hi - lo + 1)
+    }
+}
+
+#[derive(Default)]
+struct ProbeSink {
+    messages: Vec<Vec<u8>>,
+    partial: Option<Vec<u8>>,
+    aborted: u32,
+    pads: u32,
+    datagrams: u32,
+}
+
+impl ProbeSink {
+    fn datagram(&mut self, bytes: &[u8]) {
+        if bytes.len() <= DEFAULT_MTU as usize {
+            ValidatedDatagram::parse(bytes, &sr_params()).unwrap();
+        }
+        self.datagrams += 1;
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let raw = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            let word = Word0::unpack(raw).unwrap();
+            assert_eq!(word.frame_type_code(), FrameType::Data.code());
+            let flags = word.flags();
+            let length = word.frame_length() as usize;
+            let payload = &bytes[offset + flags.header_length() as usize..offset + length];
+            if flags.begin() {
+                assert!(self.partial.is_none(), "BEGIN inside a message");
+                self.partial = Some(Vec::new());
+            }
+            self.partial.as_mut().expect("fragment without BEGIN").extend_from_slice(payload);
+            if flags.end() {
+                self.messages.push(self.partial.take().unwrap());
+            }
+            offset += length.div_ceil(32) * 32;
+        }
+    }
+}
+
+fn probe_drain(
+    reader: &mut SenderRead<&LogBuffer<Terms>>,
+    rng: &mut ProbeLcg,
+    sink: &mut ProbeSink,
+) {
+    loop {
+        let size = match rng.range(0, 3) {
+            0 => 32,
+            1 => rng.range(32, 1500) as usize,
+            2 => DEFAULT_MTU as usize,
+            _ => rng.range(1400, 9000) as usize,
+        };
+        let mut out = vec![0u8; size];
+        let before = reader.position();
+        match sr_read(reader, &mut out) {
+            Ok(ReadOutcome::Copied { len, next }) => {
+                assert!(next > before);
+                assert_eq!((next - 1) / TERM, before / TERM, "crossed a term: {before} -> {next}");
+                sink.datagram(&out[..len]);
+            }
+            Ok(ReadOutcome::Canonical { record, next }) => {
+                assert!(sink.partial.is_none(), "record inside a message");
+                let (_, kinds) = sr_parse(&out[..32]);
+                match record {
+                    CanonicalKind::Pad => {
+                        assert_eq!(kinds, [FrameKind::Pad]);
+                        assert_eq!(next % TERM, 0);
+                        sink.pads += 1;
+                    }
+                    CanonicalKind::Aborted => {
+                        assert_eq!(kinds, [FrameKind::Aborted]);
+                        sink.aborted += 1;
+                    }
+                }
+            }
+            Ok(ReadOutcome::Pending) => break,
+            Err(ReadError::TooSmall { needed }) => {
+                assert!(needed > size, "TooSmall {needed} with {size}");
+            }
+            Err(error) => panic!("{error:?} at {before}"),
+        }
+        reader.sent(reader.position()).unwrap();
+    }
+}
+
+fn probe_run(seed: u64, steps: usize) {
     let buffer = new_buffer(config(3, 2)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
-    let optional = conductor.subscribe(Role::Optional).unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut rng = ProbeLcg(seed);
+    let mut sink = ProbeSink::default();
+    let mut expected: Vec<Vec<u8>> = Vec::new();
+    let mut aborts = 0u32;
+    for step in 0..steps {
+        let kind = rng.range(0, 9);
+        if kind < 7 {
+            let len = match rng.range(0, 2) {
+                0 => rng.range(1, 200),
+                1 => rng.range(1, 1400),
+                _ => rng.range(1, 6000),
+            } as usize;
+            let data = sized_message(step as u32, len.max(4));
+            loop {
+                match publication.append(&data, AppendOptions::default()).unwrap() {
+                    AppendOutcome::Appended { .. } => break,
+                    AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
+                        probe_drain(&mut reader, &mut rng, &mut sink);
+                        let _ = conductor.duty_cycle().unwrap();
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            expected.push(data);
+        } else {
+            let len = rng.range(1, 1300) as u32;
+            let commit = kind == 9;
+            loop {
+                match publication.try_claim(len, AppendOptions::default()).unwrap() {
+                    ClaimOutcome::Claimed(mut claim) => {
+                        let fill = step as u8;
+                        claim.payload().fill(fill);
+                        if commit {
+                            assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+                            expected.push(vec![fill; len as usize]);
+                        } else {
+                            claim.abort();
+                            aborts += 1;
+                        }
+                        break;
+                    }
+                    ClaimOutcome::BackPressured | ClaimOutcome::AdminAction => {
+                        probe_drain(&mut reader, &mut rng, &mut sink);
+                        let _ = conductor.duty_cycle().unwrap();
+                    }
+                    _ => panic!("claim"),
+                }
+            }
+        }
+        if rng.range(0, 3) == 0 {
+            probe_drain(&mut reader, &mut rng, &mut sink);
+        }
+        if rng.range(0, 5) == 0 {
+            let _ = conductor.duty_cycle().unwrap();
+        }
+    }
+    probe_drain(&mut reader, &mut rng, &mut sink);
+    assert!(sink.partial.is_none());
+    assert_eq!(sink.messages.len(), expected.len(), "seed {seed}");
+    assert!(sink.messages == expected, "seed {seed}: payload mismatch");
+    assert_eq!(sink.aborted, aborts, "seed {seed}");
+    assert_eq!(reader.position(), buffer.reserved_head().load(Ordering::Acquire));
+    assert!(sink.pads > 0 || steps < 50, "seed {seed}: no pad exercised");
+}
+
+#[test]
+fn sender_read_probe_random_sequences() {
+    let seeds: u64 = if cfg!(miri) { 1 } else { 40 };
+    let steps = if cfg!(miri) { 30 } else { 400 };
+    for seed in 1..=seeds {
+        probe_run(seed, steps);
+    }
+}
+
+/// Messages that fill a term exactly (no PAD): copies end exactly at the
+/// term end, with partial copies and fragmented messages.
+#[test]
+fn sender_read_probe_exact_term_end() {
+    for (size, out_len) in [(992usize, 4096usize), (992, 1100), (992, 32 * 40), (4000, 1408), (4000, 3000), (4000, 2816)] {
+        let buffer = new_buffer(config(3, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let mut reader = sr_reader(&mut conductor);
+        let mut publication = buffer.publication().unwrap().unwrap();
+        let mut sink = ProbeSink::default();
+        let mut expected = Vec::new();
+        let mut i = 0u32;
+        let mut ends = Vec::new();
+        while buffer.reserved_head().load(Ordering::Acquire) < TERM + 4096 {
+            let data = sized_message(i, size);
+            i += 1;
+            let _ = append_retrying(&mut publication, &mut conductor, &data, || {});
+            expected.push(data);
+            loop {
+                let mut out = vec![0u8; out_len];
+                match sr_read(&mut reader, &mut out) {
+                    Ok(ReadOutcome::Copied { len, next }) => {
+                        ends.push(next);
+                        sink.datagram(&out[..len]);
+                    }
+                    Ok(ReadOutcome::Pending) => break,
+                    other => panic!("{other:?} size {size}"),
+                }
+                reader.sent(reader.position()).unwrap();
+            }
+        }
+        assert!(ends.contains(&TERM), "size {size} out {out_len}: no copy ended at the term end");
+        assert_eq!(sink.messages, expected);
+    }
+}
+
+/// Concurrent publication: random offers, required sender read.
+#[test]
+fn sender_read_probe_concurrent() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut handles: Vec<_> = (0..2)
+        .map(|_| conductor.concurrent_publication().unwrap().unwrap())
+        .collect();
+    let mut rng = ProbeLcg(77);
+    let mut sink = ProbeSink::default();
+    let mut expected = Vec::new();
+    let total = if cfg!(miri) { 30 } else { 600 };
+    for sequence in 0..total {
+        let len = rng.range(4, 5000) as usize;
+        let data = sized_message(sequence, len);
+        let handle = &mut handles[(sequence % 2) as usize];
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            assert!(tries < 1000);
+            match handle.offer(&data, AppendOptions::default()).unwrap() {
+                ConcurrentOfferOutcome::Appended { .. } => break,
+                ConcurrentOfferOutcome::BackPressured | ConcurrentOfferOutcome::AdminAction => {
+                    probe_drain(&mut reader, &mut rng, &mut sink);
+                    let _ = conductor.duty_cycle().unwrap();
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        expected.push(data);
+        if rng.range(0, 2) == 0 {
+            probe_drain(&mut reader, &mut rng, &mut sink);
+        }
+    }
+    for _ in 0..10 {
+        probe_drain(&mut reader, &mut rng, &mut sink);
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    assert_eq!(sink.messages.len(), expected.len());
+    assert!(sink.messages == expected);
+    assert!(sink.pads > 0);
+}
+
+/// A zero-payload DATA frame (written by a faulty peer) is `CorruptTerm`
+/// under C-9: it would leave as a heartbeat.
+#[test]
+fn sender_read_refuses_a_zero_payload_frame() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 100), AppendOptions::default())
+        .unwrap();
+    let frames = frames(&buffer);
+    let (offset, word) = frames[0];
+    word0_of_term0(&buffer, offset).store(
+        Word0::new(32, word.flags(), FrameType::Data).pack().to_le(),
+        Ordering::Relaxed,
+    );
+    let mut out = sr_out();
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Err(ReadError::CorruptTerm { failures: 1 })
+    );
+    assert_eq!(reader.position(), 0);
+}
+
+/// An interior word 0 that changes between its two loads (a peer storing
+/// while the frame is copied) is `CorruptTerm`: the copy is not sent.
+#[test]
+fn sender_read_rechecks_an_interior_word0_after_the_copy() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 3000), AppendOptions::default())
+        .unwrap();
+    let frames = frames(&buffer);
+    let mut out = sr_out();
+    // The first fragment, alone in its datagram.
     assert!(matches!(
-        SenderRead::new(optional, DEFAULT_CORRUPT_RETRIES),
-        Err(SysError::InvalidPublicationMode { .. })
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Copied { .. })
     ));
+    let (offset, word) = frames[1];
+    let changed = Word0::new(word.frame_length() - 1, word.flags(), FrameType::Data).pack();
+    reader.inject(super::sender_read::TestHook::Word0BetweenLoads {
+        offset,
+        raw: changed,
+    });
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Err(ReadError::CorruptTerm { failures: 1 })
+    );
+    assert_eq!(reader.position(), u64::from(offset));
+}
+
+/// The floor raised between the first check and the loan (a pause): the
+/// check after the loan refuses, releasing the loan; one frame above the
+/// floor reads.
+#[test]
+fn sender_read_rechecks_the_floor_after_the_loan() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for i in 0..2 {
+        let _ = publication
+            .append(&sized_message(i, 100), AppendOptions::default())
+            .unwrap();
+    }
+    let mut out = vec![0u8; 200];
+    reader.inject(super::sender_read::TestHook::FloorBeforeLoan(32));
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Err(ReadError::Unavailable { lowest: 32 })
+    );
+    buffer.floor().store(0, Ordering::Release);
+    let Ok(ReadOutcome::Copied { next, .. }) = sr_read(&mut reader, &mut out) else {
+        panic!("not copied");
+    };
+    // One frame above the floor: the next read is served.
+    buffer.floor().store(next - 32, Ordering::Release);
+    assert!(matches!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Copied { .. })
+    ));
+}
+
+/// The descriptor changing before the loan: a term not active yet is
+/// `Retry`, a term reclaimed (`Overrun`) is `Unavailable`; both release the
+/// loan word and move nothing.
+#[test]
+fn sender_read_retries_and_refuses_at_the_loan() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 100), AppendOptions::default())
+        .unwrap();
+    let active = Descriptor::decode(buffer.descriptor(0).unwrap().load(Ordering::Acquire)).unwrap();
+    let mut out = sr_out();
+    reader.inject(super::sender_read::TestHook::DescriptorBeforeLoan(
+        active.with_state(SlotState::Ready).encode(),
+    ));
+    assert_eq!(sr_read(&mut reader, &mut out), Err(ReadError::Retry));
+    let later = Descriptor::new(
+        active.term_id().advanced_by(TermCount::try_new(3).unwrap()),
+        active.generation(),
+        SlotState::Active,
+    );
+    reader.inject(super::sender_read::TestHook::DescriptorBeforeLoan(
+        later.encode(),
+    ));
+    assert!(matches!(
+        sr_read(&mut reader, &mut out),
+        Err(ReadError::Unavailable { .. })
+    ));
+    buffer
+        .descriptor(0)
+        .unwrap()
+        .store(active.encode(), Ordering::Release);
+    assert!(matches!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Copied { .. })
+    ));
+    assert_eq!(reader.counters().retry, 1);
+}
+
+fn probe_to_end(reader: &mut SenderRead<&LogBuffer<Terms>>) -> Vec<Result<ReadOutcome, ReadError>> {
+    let mut seen = Vec::new();
+    for _ in 0..1000 {
+        let mut out = sr_out();
+        let r = sr_read(reader, &mut out);
+        seen.push(r);
+        if !matches!(r, Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. })) {
+            break;
+        }
+        reader.sent(reader.position()).unwrap();
+    }
+    seen
+}
+
+#[test]
+fn sender_read_probe_seal_exclusive_claim_in_hand() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut claim = claimed(publication.try_claim(64, AppendOptions::default()));
+    claim.payload().fill(7);
+    conductor.seal().unwrap();
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(probe_to_end(&mut reader).last(), Some(&Ok(ReadOutcome::Pending)));
+    assert!(matches!(claim.commit(), CommitOutcome::Committed { .. }));
+    let _ = conductor.duty_cycle().unwrap();
+    let _ = publication.append(&message(1), AppendOptions::default()).unwrap();
+    let _ = conductor.duty_cycle().unwrap();
+    let seen = probe_to_end(&mut reader);
+    assert_eq!(seen.last(), Some(&Ok(ReadOutcome::Pending)), "{seen:?}");
+    assert_eq!(reader.seal_position(), Some(96));
+    assert_eq!(reader.position(), 96);
+}
+
+#[test]
+fn sender_read_probe_seal_concurrent_after_crossing() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let data = sized_message(1, 3000);
+    loop {
+        match handle.offer(&data, AppendOptions::default()).unwrap() {
+            ConcurrentOfferOutcome::Appended { .. } => {}
+            ConcurrentOfferOutcome::AdminAction => break,
+            ConcurrentOfferOutcome::BackPressured => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        let _ = probe_to_end(&mut reader);
+        let _ = conductor.duty_cycle().unwrap();
+    }
+    conductor.seal().unwrap();
+    let _ = conductor.duty_cycle().unwrap();
+    let seen = probe_to_end(&mut reader);
+    assert_eq!(seen.last(), Some(&Ok(ReadOutcome::Pending)), "{seen:?}");
+    assert_eq!(reader.seal_position(), Some(TERM));
+    assert_eq!(reader.position(), TERM);
+}
+
+/// S2 2.7 under threads: the real reader on one thread, the publisher and
+/// its conductor (rotation, reclamation, floor) on another, every message
+/// reassembled in order from the copied datagrams, with every read's loan
+/// released. Under Miri, any read of a term the conductor recycles races.
+#[test]
+fn sender_read_runs_beside_a_publisher_and_its_conductor() {
+    use core::sync::atomic::AtomicBool;
+
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let total: u32 = if cfg!(miri) { 40 } else { 2000 };
+    let expected: Vec<Vec<u8>> = (0..total)
+        .map(|i| sized_message(i, 24 + (i as usize * 523) % 3000))
+        .collect();
+    let done = AtomicBool::new(false);
+    let mut sink = ProbeSink::default();
+    std::thread::scope(|scope| {
+        let messages = &expected;
+        let done = &done;
+        scope.spawn(move || {
+            for message in messages {
+                loop {
+                    match publication.append(message, AppendOptions::default()).unwrap() {
+                        AppendOutcome::Appended { .. } => break,
+                        AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
+                            let _ = conductor.duty_cycle().unwrap();
+                            std::thread::yield_now();
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+            while !done.load(Ordering::Acquire) {
+                let _ = conductor.duty_cycle().unwrap();
+                std::thread::yield_now();
+            }
+        });
+        let mut out = sr_out();
+        let mut spins = 0u64;
+        while sink.messages.len() < messages.len() {
+            match sr_read(&mut reader, &mut out) {
+                Ok(ReadOutcome::Copied { len, .. }) => sink.datagram(&out[..len]),
+                Ok(ReadOutcome::Canonical { record, .. }) => {
+                    assert_eq!(record, CanonicalKind::Pad);
+                    sink.pads += 1;
+                }
+                Ok(ReadOutcome::Pending) | Err(ReadError::Retry) => {
+                    spins += 1;
+                    assert!(spins < 50_000_000, "no progress");
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("{error:?} at {}", reader.position()),
+            }
+            reader.sent(reader.position()).unwrap();
+        }
+        done.store(true, Ordering::Release);
+    });
+    assert_eq!(sink.messages, expected);
 }

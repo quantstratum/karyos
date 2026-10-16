@@ -5,10 +5,12 @@
 //! phase 5a).
 //!
 //! [`SenderRead`] owns one subscriber cell of one lane's log buffer: a SPEC
-//! §4 participant with its own loan word and revoked flag. It is admitted
-//! as [`Role::Required`] on a reliable channel, so its registered position
-//! bounds the publisher and the retention floor, or as [`Role::Observer`]
-//! on an unreliable one. Each [`SenderRead::read_committed`] call takes one
+//! §4 participant with its own loan word and revoked flag. It is a
+//! required participant on every channel (SPEC §4: the sender's position
+//! bounds the publisher; on an unreliable channel it is the sent
+//! position), admitted with its `L_send` slot credit reserved against
+//! `S - C` (S2 2.1, `Conductor::subscribe_as` with `reserve`). Each
+//! [`SenderRead::read_committed`] call takes one
 //! loan on the exact `(generation, term)` of its position, copies whole
 //! committed frames into the caller's TX storage and releases the loan
 //! before it returns, on every path. A loan never spans a backend
@@ -19,8 +21,12 @@
 //!   frame's word 0 is written from the value the read loaded and
 //!   validated, and loaded again after the copy (a change is
 //!   `CorruptTerm`). An ABORTED or PAD block yields its canonical 32-byte
-//!   record, alone; no byte of its extent is read. One call never crosses
-//!   a term end or the seal (C-2).
+//!   record, alone; no byte of its extent is read. A committed DATA frame
+//!   with no payload breaks the log's rules (an application message has at
+//!   least one byte) and is `CorruptTerm`. One call never crosses a term
+//!   end or the seal (C-2).
+//! - **Seal.** At the seal position a read is `Pending`, as for a frontier;
+//!   the sender tells the two apart with [`SenderRead::seal_position`].
 //! - **Sent position.** Reading never moves the registered position; only
 //!   [`SenderRead::sent`], called on the backend's submission, does.
 //! - **Corruption (C-9).** `CorruptTerm` at the cursor is retried on later
@@ -32,8 +38,9 @@
 //! Limits of this phase: the only origin is the sender's own cursor
 //! ([`ReadOrigin::Cursor`]); NAK reads (S2 2.3, `BadRequest` and the
 //! checkpoint arrays) and reads of a draining generation (2.4) come with
-//! repair in phase 6. A reader covers one lane; the incarnation's lanes
-//! are the sender agent's.
+//! repair in phase 6, and so does the retention floor at `sent -
+//! retransmit_window`: until then the registered position bounds it. A
+//! reader covers one lane; the incarnation's lanes are the sender agent's.
 //!
 //! Safety (ADR-0034): every term byte is read under a loan taken with the
 //! SPEC §4 acquisition (`take_loan`: loan word `SeqCst`, then the slot
@@ -43,8 +50,11 @@
 //! 0 is loaded with `Acquire` and its whole geometry validated before any
 //! of its bytes is read; interior word 0s are read after that `Acquire`,
 //! in this call or, for a block resumed at an interior frame, in an
-//! earlier call under a loan of the same term, so the block is the one
-//! observed. Only committed DATA bytes are read; an aborted extent is
+//! earlier call under a loan of the same term incarnation, so the block is
+//! the one observed. Interior loads are `Relaxed`, where S2 2.3 says
+//! `Acquire`: a block is published by one `Release` of its first word 0,
+//! whose `Acquire` already orders every interior frame (as `FrameReader`
+//! reads them). Only committed DATA bytes are read; an aborted extent is
 //! never read past its word 0.
 
 use core::sync::atomic::Ordering;
@@ -55,6 +65,7 @@ use super::{
 use crate::error::SysError;
 use crate::frame::{Flags, FrameType, HEADER_LENGTH, Word0};
 use crate::loan::{LoanOutcome, release_loan, take_loan};
+use crate::participant::CELL_REQUIRED_RESERVED;
 use crate::publication::load_interior;
 use crate::sizing::align_frame;
 use crate::term::TermCount;
@@ -217,27 +228,50 @@ pub struct SenderRead<O: BufferOwner> {
     corrupt_retries: u32,
     faulted: Option<u64>,
     counters: SenderReadCounters,
+    /// An interleaving injected by tests.
+    #[cfg(test)]
+    hook: Option<TestHook>,
+}
+
+/// An interleaving a test injects into the next read: what another party
+/// does at that point of the read.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TestHook {
+    /// The conductor raises the floor after the first floor check, before
+    /// the loan.
+    FloorBeforeLoan(u64),
+    /// The slot descriptor becomes this raw value before the loan.
+    DescriptorBeforeLoan(u64),
+    /// A peer stores this raw word 0 at this term offset after the copy,
+    /// before the second load.
+    Word0BetweenLoads { offset: u32, raw: u64 },
 }
 
 impl<O: BufferOwner> SenderRead<O> {
-    /// The read capability over `subscription`, a cell admitted by the
-    /// conductor as [`Role::Required`] (reliable channel) or
-    /// [`Role::Observer`] (unreliable). Its cursor and its registered
-    /// position start at the subscription's acknowledged position.
+    /// The read capability over `subscription`, a cell the conductor
+    /// admitted as [`Role::Required`] with its slot credit reserved
+    /// (`Conductor::subscribe_as(Role::Required, true, occupant)`). Its
+    /// cursor and its registered position start at the subscription's
+    /// acknowledged position.
     ///
     /// # Errors
     ///
-    /// [`SysError::InvalidPublicationMode`] for an image, or for a
-    /// subscription of another role.
+    /// [`SysError::InvalidPublicationMode`] for an image, or for any other
+    /// cell (another role, or a required cell without its reservation).
     pub fn new(mut subscription: Subscription<O>, corrupt_retries: u32) -> Result<Self, SysError> {
         if subscription.buffer.image() {
             return Err(SysError::InvalidPublicationMode {
                 reason: "a sender read of an image",
             });
         }
-        if !matches!(subscription.cursor.role, Role::Required | Role::Observer) {
+        let reserved = subscription
+            .buffer
+            .cell(subscription.cursor.cell)
+            .is_ok_and(|cell| cell.state.load(Ordering::Acquire) == CELL_REQUIRED_RESERVED);
+        if subscription.cursor.role != Role::Required || !reserved {
             return Err(SysError::InvalidPublicationMode {
-                reason: "a sender read is a required or observer participant",
+                reason: "a sender read is a required participant with its L_send reservation",
             });
         }
         if subscription.cursor.pending.take().is_some() {
@@ -250,7 +284,15 @@ impl<O: BufferOwner> SenderRead<O> {
             corrupt_retries,
             faulted: None,
             counters: SenderReadCounters::default(),
+            #[cfg(test)]
+            hook: None,
         })
+    }
+
+    /// Injects `hook` into the next read (tests).
+    #[cfg(test)]
+    pub(crate) fn inject(&mut self, hook: TestHook) {
+        self.hook = Some(hook);
     }
 
     /// The buffer it reads.
@@ -288,16 +330,21 @@ impl<O: BufferOwner> SenderRead<O> {
     }
 
     /// Records the backend's submission up to `position`: the registered
-    /// position, which on a reliable channel bounds the publisher and the
-    /// retention floor, moves there.
+    /// position, which bounds the publisher and the retention floor, moves
+    /// there. The caller passes the `next` of a read it submitted (a frame
+    /// boundary); a position off the 32-byte grid is refused, any other
+    /// one in range is taken as given.
     ///
     /// # Errors
     ///
-    /// [`ReadError::Invariant`] for a position behind the registered one or
-    /// past the cursor; nothing moves.
+    /// [`ReadError::Invariant`] for a position behind the registered one,
+    /// past the cursor, or not 32-byte aligned; nothing moves.
     pub fn sent(&mut self, position: u64) -> Result<(), ReadError> {
         let cursor = &mut self.subscription.cursor;
-        if position < cursor.acknowledged || position > cursor.position {
+        if position < cursor.acknowledged
+            || position > cursor.position
+            || !position.is_multiple_of(u64::from(crate::frame::FRAME_ALIGNMENT))
+        {
             self.counters.bump(|c| &mut c.invariant, 1);
             return Err(ReadError::Invariant);
         }
@@ -409,6 +456,18 @@ impl<O: BufferOwner> SenderRead<O> {
             .cell(self.subscription.cursor.cell)
             .map_err(invariant)?;
         let descriptor = buffer.descriptor(slot).map_err(invariant)?;
+        #[cfg(test)]
+        match self.hook {
+            Some(TestHook::FloorBeforeLoan(floor)) => {
+                self.hook = None;
+                buffer.floor().store(floor, Ordering::Release);
+            }
+            Some(TestHook::DescriptorBeforeLoan(raw)) => {
+                self.hook = None;
+                descriptor.store(raw, Ordering::Release);
+            }
+            _ => {}
+        }
         let target = buffer.target(slot, count).map_err(invariant)?;
         match take_loan(&cell.loan, &cell.revoked, descriptor, target) {
             Ok(LoanOutcome::Granted) => {}
@@ -514,7 +573,9 @@ impl<O: BufferOwner> SenderRead<O> {
                 let open = (!begin).then_some(block_end);
                 // SAFETY: loan held on this slot's term; `at` is a frame
                 // start inside a block whose first word 0 was observed with
-                // Acquire and whose frames were validated.
+                // Acquire and whose frames were validated, in this call or,
+                // for a resumed block, in an earlier call on the same term
+                // incarnation (the loan's exact term proves it).
                 let word = unsafe { buffer.regions.word0(slot, at) };
                 let raw = load_interior(word);
                 let frame = match check_frame(raw, at, block_end, begin, lane) {
@@ -522,10 +583,6 @@ impl<O: BufferOwner> SenderRead<O> {
                     None if len > 0 => return Ok(Copy::Frames { len, end: at, open }),
                     None => return Err(CopyError::Corrupt),
                 };
-                // A frame with no payload goes alone.
-                if frame.payload == 0 && len > 0 {
-                    return Ok(Copy::Frames { len, end: at, open });
-                }
                 let length = usize::try_from(frame.length).map_err(|_| CopyError::Invariant)?;
                 let reserved = usize::try_from(frame.reserved).map_err(|_| CopyError::Invariant)?;
                 let frame_end = stride.checked_add(length).ok_or(CopyError::Invariant)?;
@@ -542,6 +599,13 @@ impl<O: BufferOwner> SenderRead<O> {
                 // SAFETY: loan held; the frame's bytes after word 0 lie
                 // inside the validated block (`check_frame`).
                 unsafe { buffer.regions.read_bytes(slot, body_at, body) };
+                #[cfg(test)]
+                if let Some(TestHook::Word0BetweenLoads { offset, raw }) = self.hook
+                    && offset == at
+                {
+                    self.hook = None;
+                    word.store(raw.to_le(), Ordering::Relaxed);
+                }
                 // The second load: a changed word 0 means the copy may mix
                 // two values; it is not sent.
                 if load_interior(word) != raw {
@@ -557,10 +621,6 @@ impl<O: BufferOwner> SenderRead<O> {
                 stride = padded;
                 at = frame.next;
                 begin = false;
-                if frame.payload == 0 {
-                    let open = (at < block_end).then_some(block_end);
-                    return Ok(Copy::Frames { len, end: at, open });
-                }
             }
             open = None;
         }
@@ -622,8 +682,6 @@ struct Frame {
     length: u32,
     /// Its aligned extent.
     reserved: u32,
-    /// Payload bytes.
-    payload: u32,
     /// The next frame's offset.
     next: u32,
 }
@@ -649,7 +707,11 @@ fn check_frame(
         return None;
     }
     let length = u32::try_from(word.frame_length()).ok()?;
-    let payload = length.checked_sub(flags.header_length())?;
+    // A log frame carries at least one payload byte: a header-only DATA
+    // frame would leave as a heartbeat.
+    length
+        .checked_sub(flags.header_length())
+        .filter(|payload| *payload > 0)?;
     let reserved = align_frame(length).ok()?;
     let next = at.checked_add(reserved).filter(|next| *next <= block_end)?;
     if flags.end() != (next == block_end) {
@@ -658,7 +720,6 @@ fn check_frame(
     Some(Frame {
         length,
         reserved,
-        payload,
         next,
     })
 }
