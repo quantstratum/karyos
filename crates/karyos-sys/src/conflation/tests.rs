@@ -466,3 +466,306 @@ fn a_zero_budget_does_nothing() {
     assert_eq!(report.delivered, 0);
     assert!(report.scanning);
 }
+
+/// Tables in shared regions (Linux; `quantstratum-docs:
+/// karyos/design/conflation-end-to-end.md`, Cross-process views).
+#[cfg(target_os = "linux")]
+// Test helpers outside #[test] functions are not covered by clippy.toml's
+// test exemptions (ADR-0007 exempts tests from these lints).
+#[allow(clippy::unwrap_used)]
+mod region {
+    use super::*;
+    use crate::error::SysError;
+    use crate::ipc::{ReadOnlyRegion, Region, RegionKind, RegionRecord, SealProfile};
+
+    /// The configuration of the tables these tests create.
+    const CONFIG: ConflationConfig = ConflationConfig {
+        keys: 2,
+        value_capacity: 8,
+        journal_capacity: 1024,
+    };
+
+    fn table() -> ConflationWriter {
+        conflation_in(
+            7,
+            3,
+            CONFIG.keys,
+            CONFIG.value_capacity,
+            CONFIG.journal_capacity,
+        )
+        .unwrap()
+    }
+
+    /// Attaches `region` read-only, as a view does with its grant: the
+    /// creator's descriptor reopened read-only, its record, `profile` and
+    /// the granted configuration `expected`.
+    fn view_of(
+        region: &Region,
+        record: RegionRecord,
+        profile: SealProfile,
+        expected: ConflationConfig,
+    ) -> Result<ConflationReader, SysError> {
+        ConflationReader::attach_read_only(
+            ReadOnlyRegion::attach(region.read_only_descriptor()?, record, profile)?,
+            expected,
+        )
+    }
+
+    fn view(writer: &ConflationWriter) -> Result<ConflationReader, SysError> {
+        view_expecting(writer, writer.config())
+    }
+
+    fn view_expecting(
+        writer: &ConflationWriter,
+        expected: ConflationConfig,
+    ) -> Result<ConflationReader, SysError> {
+        let region = writer.region().unwrap();
+        view_of(region, region.record(), SealProfile::DriverOnly, expected)
+    }
+
+    /// A read-only view delivers what the writer wrote, the latest value
+    /// of each key with versions never going backwards, and sees the close.
+    #[test]
+    fn a_read_only_view_reads_a_table_in_a_region() {
+        let mut writer = conflation_in(7, 3, 5, 20, 1024).unwrap();
+        let record = writer.region().unwrap().record();
+        assert_eq!(record.kind, RegionKind::ConflationTable);
+        assert_eq!(record.layout, LAYOUT_VERSION);
+        assert!(writer.reader().config() == writer.config());
+        writer.write(1, b"before the view").unwrap();
+        let mut reader = view(&writer).unwrap();
+        assert_eq!(reader.config(), writer.config());
+        assert_eq!(
+            reader.config(),
+            ConflationConfig {
+                keys: 5,
+                value_capacity: 20,
+                journal_capacity: 1024
+            }
+        );
+        // The first scan delivers what was written before the attach.
+        let seen = drain(&mut reader, BUDGET);
+        assert_eq!(seen, vec![(1, 2, b"before the view".to_vec())]);
+        let mut latest = vec![(0u64, Vec::new()); 5];
+        let mut delivered = vec![(0u64, Vec::new()); 5];
+        delivered[1] = (2, b"before the view".to_vec());
+        for round in 0..200u32 {
+            let key = round * 3 % 5;
+            let value = value(key, round, (round % 20) as usize + 1);
+            let version = writer.write(key, &value).unwrap();
+            latest[key as usize] = (version, value);
+            if round % 37 == 0 || round == 199 {
+                for (key, version, value) in drain(&mut reader, BUDGET) {
+                    assert!(version > delivered[key as usize].0);
+                    delivered[key as usize] = (version, value);
+                }
+            }
+        }
+        assert_eq!(delivered, latest);
+        // The values delivered last are the latest ones.
+        writer.write(4, b"last").unwrap();
+        let seen = drain(&mut reader, BUDGET);
+        assert_eq!(
+            seen.last().map(|(key, _, value)| (*key, value.as_slice())),
+            Some((4, &b"last"[..]))
+        );
+        writer.close();
+        let report = reader.poll_changed(BUDGET, |_, _, _| {});
+        assert!(report.closed);
+        let report = reader.poll_changed(BUDGET, |_, _, _| unreachable!());
+        assert!(report.finished);
+    }
+
+    /// A view whose journal laps it scans the slots and still converges on
+    /// the latest values.
+    #[test]
+    fn a_lapped_view_scans_and_converges() {
+        let mut writer = conflation_in(7, 3, 8, 8, 1024).unwrap();
+        let mut reader = view(&writer).unwrap();
+        drain(&mut reader, BUDGET);
+        let mut lapped = false;
+        for round in 0..200u32 {
+            writer.write(round % 8, &round.to_le_bytes()).unwrap();
+        }
+        let mut seen = Vec::new();
+        for _ in 0..1000 {
+            let report = reader.poll_changed(BUDGET, |key, _, value| {
+                seen.push((key, value.to_vec()));
+            });
+            lapped |= report.lapped;
+            if report.journal_drained && report.pending == 0 && !report.scanning {
+                break;
+            }
+        }
+        assert!(lapped);
+        for key in 0..8u32 {
+            let last = 192 + key;
+            assert_eq!(
+                seen.iter()
+                    .rev()
+                    .find(|(seen, _)| *seen == key)
+                    .map(|(_, v)| v.clone()),
+                Some(last.to_le_bytes().to_vec())
+            );
+        }
+    }
+
+    /// The region is driver only (A2): a view that expects the shared seal
+    /// profile is refused, and so is a writable attach.
+    #[test]
+    fn a_table_region_is_driver_only() {
+        let writer = table();
+        let region = writer.region().unwrap();
+        assert!(matches!(
+            view_of(region, region.record(), SealProfile::Shared, CONFIG),
+            Err(SysError::SealMismatch { .. })
+        ));
+        let fd = region.descriptor().unwrap().try_clone_to_owned().unwrap();
+        assert!(matches!(
+            Region::attach(fd, region.record()),
+            Err(SysError::SealMismatch { .. })
+        ));
+    }
+
+    /// A driver-only region whose record is a table's changed by `change`,
+    /// holding a valid configuration line for [`CONFIG`]: only the record
+    /// differs from a table's.
+    fn foreign(change: impl Fn(&mut RegionRecord)) -> (Region, RegionRecord) {
+        let mut record = table().region().unwrap().record();
+        change(&mut record);
+        let region = Region::create_driver_only(record).unwrap();
+        for (index, value) in [2, 8, 16, 1024].into_iter().enumerate() {
+            region
+                .structure()
+                .get(index)
+                .unwrap()
+                .store(value, Ordering::Release);
+        }
+        (region, record)
+    }
+
+    /// The attach checks the record: the kind, the layout version and the
+    /// generation, each alone.
+    #[test]
+    fn attachment_checks_the_record() {
+        let (region, record) = foreign(|_| {});
+        assert!(view_of(&region, record, SealProfile::DriverOnly, CONFIG).is_ok());
+        let changes: [fn(&mut RegionRecord); 3] = [
+            |record| record.kind = RegionKind::Counters,
+            |record| record.layout = LAYOUT_VERSION + 1,
+            |record| record.generation = 1,
+        ];
+        for (case, change) in changes.into_iter().enumerate() {
+            let (region, record) = foreign(change);
+            assert!(
+                matches!(
+                    view_of(&region, record, SealProfile::DriverOnly, CONFIG),
+                    Err(SysError::InvalidRegion { .. })
+                ),
+                "record change {case} was accepted"
+            );
+        }
+        // A region of another kind, attached as a table: the header
+        // compare refuses it.
+        let (_manager, counters) = crate::counters::counters_in(7, 4, 2).unwrap();
+        let other = counters.region().unwrap();
+        let mut record = other.record();
+        record.kind = RegionKind::ConflationTable;
+        assert!(matches!(
+            view_of(other, record, SealProfile::DriverOnly, CONFIG),
+            Err(SysError::InvalidRegion { .. })
+        ));
+    }
+
+    /// The attach checks the configuration line: against the granted
+    /// configuration, word by word, and against the region's length in
+    /// both directions.
+    #[test]
+    fn attachment_checks_the_configuration() {
+        assert!(view(&table()).is_ok());
+        // A granted configuration the table does not have, also one with
+        // the same geometry (value capacities 8 and 16 both take 16 slot
+        // words).
+        for expected in [
+            ConflationConfig { keys: 3, ..CONFIG },
+            ConflationConfig {
+                value_capacity: 16,
+                ..CONFIG
+            },
+            ConflationConfig {
+                journal_capacity: 2048,
+                ..CONFIG
+            },
+        ] {
+            assert!(
+                matches!(
+                    view_expecting(&table(), expected),
+                    Err(SysError::InvalidRegion { .. })
+                ),
+                "{expected:?} was accepted"
+            );
+        }
+        // A configuration line that disagrees with the grant, its slot
+        // words or its unused words.
+        for (index, value) in [(1, 200), (2, 32), (4, 1), (15, 1)] {
+            let writer = table();
+            store(&writer, index, value);
+            assert!(
+                matches!(view(&writer), Err(SysError::InvalidRegion { .. })),
+                "word {index} = {value} was accepted"
+            );
+        }
+        // A line that matches its grant but not the region's length: fewer
+        // keys than the region holds, and more.
+        for keys in [1, 3] {
+            let writer = table();
+            store(&writer, 0, u64::from(keys));
+            assert!(
+                matches!(
+                    view_expecting(&writer, ConflationConfig { keys, ..CONFIG }),
+                    Err(SysError::InvalidRegion { .. })
+                ),
+                "{keys} keys were accepted"
+            );
+        }
+        // So does a larger journal.
+        let writer = table();
+        store(&writer, 3, 2048);
+        assert!(matches!(
+            view_expecting(
+                &writer,
+                ConflationConfig {
+                    journal_capacity: 2048,
+                    ..CONFIG
+                }
+            ),
+            Err(SysError::InvalidRegion { .. })
+        ));
+    }
+
+    /// Stores `value` into word `index` of `writer`'s configuration line,
+    /// through the driver's writable mapping.
+    fn store(writer: &ConflationWriter, index: usize, value: u64) {
+        writer
+            .region()
+            .unwrap()
+            .structure()
+            .get(index)
+            .unwrap()
+            .store(value, Ordering::Release);
+    }
+
+    /// The creation refuses what `conflation` refuses.
+    #[test]
+    fn creation_checks_the_geometry() {
+        for (keys, value_capacity, journal_capacity) in
+            [(0, 8, 1024), (2, 0, 1024), (2, 8, 512), (2, 8, 1536)]
+        {
+            assert!(matches!(
+                conflation_in(7, 3, keys, value_capacity, journal_capacity),
+                Err(SysError::InvalidRegion { .. })
+            ));
+            assert!(conflation(keys, value_capacity, journal_capacity).is_err());
+        }
+    }
+}
