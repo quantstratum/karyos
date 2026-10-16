@@ -22,8 +22,15 @@
 //! Negative controls, each of which must fail: the frame committed before
 //! its entry is pushed ("entry missing" or a torn entry); the publisher's
 //! head loaded Relaxed (a race on the witness: a slot rewritten while the
-//! sender reads it); and the sender storing the head before it has read the
-//! entry, so the publisher can overwrite it mid-read (the same race).
+//! sender reads it); and the sender releasing past its read cursor, so the
+//! publisher can overwrite an entry before or while it is read (the same
+//! race).
+//!
+//! A third model has the sender read ahead of what it releases, as it does
+//! when it stages a message's first frame and frees its entry only after
+//! the last fragment left (timed-tx.md section 2 step 4): it reads two
+//! entries ahead, releases them in order across a wrap, and every entry it
+//! reads is whole.
 //!
 //! A second model joins the ring to the block publication of the append
 //! path (`karyos_sys::publication::publish_block` and `observe_block`, the
@@ -69,7 +76,8 @@ enum Variant {
     CommitFirst,
     /// Negative control: the publisher loads the head Relaxed.
     RelaxedHead,
-    /// Negative control: the sender stores the head before reading.
+    /// Negative control: the sender releases past its read cursor, freeing
+    /// a slot before reading its entry.
     ReleaseFirst,
 }
 
@@ -89,7 +97,7 @@ fn model(variant: Variant) {
             thread::spawn(move || {
                 let mut reader = ScheduleReader::attach(&ring).unwrap().with_witness(witness);
                 if variant == Variant::ReleaseFirst {
-                    reader = reader.with_release_first();
+                    reader = reader.with_unchecked_release();
                 }
                 let mut next = 0;
                 while next < MESSAGES {
@@ -104,13 +112,19 @@ fn model(variant: Variant) {
                         assert_eq!(early, entry(next), "stale entry");
                     }
                     if committed.load(Ordering::Acquire) > next {
+                        if variant == Variant::ReleaseFirst {
+                            reader.release(&ring).unwrap();
+                        }
                         // Retried after the commit, never consumed early.
                         let read = reader
                             .peek(&ring)
                             .unwrap()
                             .unwrap_or_else(|| panic!("entry missing for message {next}"));
                         assert_eq!(read, entry(next), "torn entry");
-                        reader.release(&ring).unwrap();
+                        reader.advance(&ring).unwrap();
+                        if variant != Variant::ReleaseFirst {
+                            reader.release(&ring).unwrap();
+                        }
                         next += 1;
                     }
                     thread::yield_now();
@@ -159,7 +173,7 @@ fn control_a_relaxed_head_load() {
 
 #[test]
 #[should_panic(expected = "Causality violation")]
-fn control_the_head_released_before_the_read() {
+fn control_a_release_past_the_read_cursor() {
     model(Variant::ReleaseFirst);
 }
 
@@ -214,4 +228,66 @@ fn a_committed_block_finds_its_entry() {
 #[should_panic(expected = "entry missing")]
 fn control_the_block_committed_before_its_entry() {
     commit_model(true);
+}
+
+/// The sender reads up to two entries ahead and releases in order; four
+/// messages wrap a ring of two. With `past_cursor`, the negative control
+/// releases one entry beyond what it read.
+fn read_ahead_model(past_cursor: bool) {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(move || {
+        const AHEAD: u64 = 4;
+        let words = ring_words(usize::try_from(CAPACITY).unwrap()).unwrap();
+        let ring: Arc<Vec<AtomicU64>> = Arc::new((0..words).map(|_| AtomicU64::new(0)).collect());
+        init(&ring, CAPACITY).unwrap();
+        let witness: Witness = Arc::new((0..CAPACITY).map(|_| UnsafeCell::new(0)).collect());
+        let sender = {
+            let ring = Arc::clone(&ring);
+            let witness = Arc::clone(&witness);
+            thread::spawn(move || {
+                let mut reader = ScheduleReader::attach(&ring).unwrap().with_witness(witness);
+                if past_cursor {
+                    reader = reader.with_unchecked_release();
+                }
+                let mut read = 0;
+                while reader.released() < AHEAD {
+                    // Read ahead while entries are there.
+                    while let Some(found) = reader.peek(&ring).unwrap() {
+                        assert_eq!(found, entry(read), "torn entry");
+                        reader.advance(&ring).unwrap();
+                        read += 1;
+                    }
+                    // Free the oldest read entry, never past the cursor; the
+                    // control frees one more.
+                    let limit = reader.read() + u64::from(past_cursor);
+                    if reader.released() < limit && reader.released() < AHEAD {
+                        reader.release(&ring).unwrap();
+                    }
+                    thread::yield_now();
+                }
+            })
+        };
+        let mut publisher = SchedulePublisher::attach(&ring)
+            .unwrap()
+            .with_witness(Arc::clone(&witness));
+        for n in 0..AHEAD {
+            while !publisher.has_room(&ring).unwrap() {
+                thread::yield_now();
+            }
+            publisher.push(&ring, entry(n)).unwrap();
+        }
+        sender.join().unwrap();
+    });
+}
+
+#[test]
+fn reading_ahead_releases_in_order_across_a_wrap() {
+    read_ahead_model(false);
+}
+
+#[test]
+#[should_panic(expected = "Causality violation")]
+fn control_reading_ahead_with_a_release_past_the_cursor() {
+    read_ahead_model(true);
 }

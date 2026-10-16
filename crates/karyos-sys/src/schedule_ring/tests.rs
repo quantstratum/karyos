@@ -65,13 +65,16 @@ fn entries_pass_in_order_and_a_full_ring_backpressures() {
     );
     for n in 2..7 {
         assert_eq!(reader.peek(&ring), Ok(Some(entry(n - 2))));
+        reader.advance(&ring).unwrap();
         reader.release(&ring).unwrap();
         assert_eq!(publisher.has_room(&ring), Ok(true));
         publisher.push(&ring, entry(n)).unwrap();
     }
     assert_eq!(reader.peek(&ring), Ok(Some(entry(5))));
+    reader.advance(&ring).unwrap();
     reader.release(&ring).unwrap();
     assert_eq!(reader.peek(&ring), Ok(Some(entry(6))));
+    reader.advance(&ring).unwrap();
     reader.release(&ring).unwrap();
     assert_eq!(reader.peek(&ring), Ok(None));
     assert_eq!(reader.release(&ring), Err(ScheduleError::Invariant));
@@ -118,4 +121,34 @@ fn inconsistent_counts_are_refused() {
         publisher.push(&ring, entry(0)),
         Err(ScheduleError::Invariant)
     );
+}
+
+/// The reader reads ahead of what it frees: releases go in order and never
+/// pass the read cursor, and the publisher sees only the released count.
+#[test]
+fn the_reader_reads_ahead_and_releases_in_order() {
+    let ring = ring(2);
+    let mut publisher = SchedulePublisher::attach(&ring).unwrap();
+    let mut reader = ScheduleReader::attach(&ring).unwrap();
+    assert_eq!(reader.release(&ring), Err(ScheduleError::Invariant));
+    assert_eq!(reader.advance(&ring), Err(ScheduleError::Invariant));
+    for n in 0..2 {
+        assert_eq!(publisher.has_room(&ring), Ok(true));
+        publisher.push(&ring, entry(n)).unwrap();
+    }
+    // Read both ahead: the ring is still full for the publisher.
+    for n in 0..2 {
+        assert_eq!(reader.peek(&ring), Ok(Some(entry(n))));
+        reader.advance(&ring).unwrap();
+    }
+    assert_eq!(reader.peek(&ring), Ok(None));
+    assert_eq!(reader.read(), 2);
+    assert_eq!(publisher.has_room(&ring), Ok(false));
+    reader.release(&ring).unwrap();
+    assert_eq!(publisher.has_room(&ring), Ok(true));
+    publisher.push(&ring, entry(2)).unwrap();
+    reader.release(&ring).unwrap();
+    // Nothing read is left to free: the third entry was not read yet.
+    assert_eq!(reader.release(&ring), Err(ScheduleError::Invariant));
+    assert_eq!(reader.peek(&ring), Ok(Some(entry(2))));
 }

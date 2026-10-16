@@ -109,6 +109,14 @@ release may break APIs, wire formats and shared-memory layouts.
   schedule capacity is a power of two up to `schedule_ring::MAX_CAPACITY`
   (2^20), refused otherwise with `ScheduleError::Capacity`, and attach checks
   the ring's own capacity word against the configuration.
+- Timed head eligibility (P2.11 T1 step 4): `ScheduleReader` reads ahead
+  with a private cursor (`peek`, `advance`) and `release` frees entries in
+  order, never past it (`ScheduleError::Invariant`). In karyos-driver,
+  `schedule::ScheduleConsumer` gives each frame of a timed lane its
+  message's requested time and releases the entry once the message left;
+  `timed_gate::TimedGate` wraps a lane gate, holds a head until its time and
+  passes only the due prefix of an exposure to the inner gate, its permit
+  the minimum of the two.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

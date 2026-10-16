@@ -4598,6 +4598,7 @@ mod tests {
         for (position, time) in accepted {
             let entry = sender.peek(ring).unwrap().unwrap();
             assert_eq!((entry.position, entry.time), (position, time));
+            sender.advance(ring).unwrap();
             sender.release(ring).unwrap();
         }
         assert_eq!(sender.peek(ring).unwrap(), None);

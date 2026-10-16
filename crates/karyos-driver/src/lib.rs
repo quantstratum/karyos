@@ -27,7 +27,9 @@ pub mod guards;
 mod ledger;
 mod positions;
 mod remote_generations;
+pub mod schedule;
 pub mod sessions;
+pub mod timed_gate;
 mod trace_journals;
 
 #[cfg(target_os = "linux")]

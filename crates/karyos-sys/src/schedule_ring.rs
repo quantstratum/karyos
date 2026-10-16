@@ -283,18 +283,26 @@ impl SchedulePublisher {
     }
 }
 
-/// The sender's side of one ring.
+/// The sender's side of one ring. It reads entries ahead of the ones it
+/// releases: `next`, private to the reader, is the next entry to read, and
+/// `head`, the only count the publisher sees, is the next one to free. An
+/// entry is read when its message's first frame is staged and freed only
+/// once every path submitted the message's last fragment (timed-tx.md,
+/// section 2 step 4), so the ring's capacity bounds the timed messages
+/// outstanding, which is the publisher's back pressure.
 #[derive(Debug)]
 pub struct ScheduleReader {
     capacity: u64,
     /// Entries released: the `head` this side alone writes.
     head: u64,
+    /// Entries read; never behind `head`. Private to the reader.
+    next: u64,
     #[cfg(loom)]
     witness: Option<Witness>,
-    /// Loom only: the negative control that stores the head before the
-    /// entry is read, so the publisher may overwrite it mid-read.
+    /// Loom only: the negative control whose release does not check the
+    /// read cursor, so a slot can be freed before its entry is read.
     #[cfg(loom)]
-    release_first: bool,
+    unchecked_release: bool,
 }
 
 impl ScheduleReader {
@@ -309,20 +317,21 @@ impl ScheduleReader {
         Ok(Self {
             capacity,
             head,
+            next: head,
             #[cfg(loom)]
             witness: None,
             #[cfg(loom)]
-            release_first: false,
+            unchecked_release: false,
         })
     }
 
-    /// Loom only: the negative control that releases the head before the
-    /// entry's words are read.
+    /// Loom only: the negative control whose `release` may pass the read
+    /// cursor.
     #[cfg(loom)]
     #[doc(hidden)]
     #[must_use]
-    pub fn with_release_first(mut self) -> Self {
-        self.release_first = true;
+    pub fn with_unchecked_release(mut self) -> Self {
+        self.unchecked_release = true;
         self
     }
 
@@ -335,35 +344,36 @@ impl ScheduleReader {
         self
     }
 
-    /// The entry at the head, if the publisher pushed one: `tail` with
-    /// Acquire, then the entry's words.
-    ///
-    /// # Errors
-    ///
-    /// [`ScheduleError::Layout`] and [`ScheduleError::Invariant`] for a
-    /// tail behind the head or more than the capacity ahead.
-    pub fn peek(&self, ring: &[AtomicU64]) -> Result<Option<Entry>, ScheduleError> {
+    /// The tail with Acquire, checked against the reader's counts.
+    fn tail(&self, ring: &[AtomicU64]) -> Result<u64, ScheduleError> {
         let tail = word(ring, TAIL)?.load(Ordering::Acquire);
         let waiting = tail
             .checked_sub(self.head)
             .ok_or(ScheduleError::Invariant)?;
-        if waiting > self.capacity {
+        if waiting > self.capacity || tail < self.next {
             return Err(ScheduleError::Invariant);
         }
-        if waiting == 0 {
+        Ok(tail)
+    }
+
+    /// The next entry to read, if the publisher pushed it: `tail` with
+    /// Acquire, then the entry's words. Reading it does not consume it;
+    /// [`Self::advance`] does.
+    ///
+    /// # Errors
+    ///
+    /// [`ScheduleError::Layout`] and [`ScheduleError::Invariant`] for a
+    /// tail behind the reader's counts or more than the capacity ahead.
+    pub fn peek(&self, ring: &[AtomicU64]) -> Result<Option<Entry>, ScheduleError> {
+        if self.tail(ring)? == self.next {
             return Ok(None);
         }
-        let base = slot_base(self.capacity, self.head).ok_or(ScheduleError::Layout)?;
-        #[cfg(loom)]
-        if self.release_first {
-            let next = self.head.checked_add(1).ok_or(ScheduleError::Invariant)?;
-            word(ring, HEAD)?.store(next, Ordering::Release);
-        }
+        let base = slot_base(self.capacity, self.next).ok_or(ScheduleError::Layout)?;
         let position = word(ring, base)?.load(Ordering::Relaxed);
         let time =
             word(ring, base.checked_add(1).ok_or(ScheduleError::Layout)?)?.load(Ordering::Relaxed);
         #[cfg(loom)]
-        if let Some(cell) = witness(self.witness.as_ref(), self.capacity, self.head) {
+        if let Some(cell) = witness(self.witness.as_ref(), self.capacity, self.next) {
             // SAFETY: Loom checks that this read is ordered before the
             // publisher's next write of the slot's witness.
             let _ = cell.with(|value| unsafe { *value });
@@ -371,28 +381,44 @@ impl ScheduleReader {
         Ok(Some(Entry { position, time }))
     }
 
-    /// Frees the head's slot once every path submitted its message:
-    /// `head + 1` with Release.
+    /// Moves the read cursor past the entry [`Self::peek`] returned.
     ///
     /// # Errors
     ///
-    /// [`ScheduleError::Invariant`] with no entry at the head, and
-    /// [`ScheduleError::Layout`].
-    pub fn release(&mut self, ring: &[AtomicU64]) -> Result<(), ScheduleError> {
-        let tail = word(ring, TAIL)?.load(Ordering::Acquire);
-        if tail == self.head {
+    /// [`ScheduleError::Invariant`] with no entry to read.
+    pub fn advance(&mut self, ring: &[AtomicU64]) -> Result<(), ScheduleError> {
+        if self.tail(ring)? == self.next {
             return Err(ScheduleError::Invariant);
         }
-        let next = self.head.checked_add(1).ok_or(ScheduleError::Invariant)?;
-        #[cfg(loom)]
-        let stored = self.release_first;
-        #[cfg(not(loom))]
-        let stored = false;
-        if !stored {
-            word(ring, HEAD)?.store(next, Ordering::Release);
-        }
-        self.head = next;
+        self.next = self.next.checked_add(1).ok_or(ScheduleError::Invariant)?;
         Ok(())
+    }
+
+    /// Frees the oldest read entry's slot once every path submitted its
+    /// message: `head + 1` with Release. It never passes the read cursor.
+    ///
+    /// # Errors
+    ///
+    /// [`ScheduleError::Invariant`] with no read entry left to free, and
+    /// [`ScheduleError::Layout`].
+    pub fn release(&mut self, ring: &[AtomicU64]) -> Result<(), ScheduleError> {
+        #[cfg(loom)]
+        let checked = !self.unchecked_release;
+        #[cfg(not(loom))]
+        let checked = true;
+        if checked && self.head == self.next {
+            return Err(ScheduleError::Invariant);
+        }
+        let head = self.head.checked_add(1).ok_or(ScheduleError::Invariant)?;
+        word(ring, HEAD)?.store(head, Ordering::Release);
+        self.head = head;
+        Ok(())
+    }
+
+    /// Entries read so far.
+    #[must_use]
+    pub fn read(&self) -> u64 {
+        self.next
     }
 
     /// Entries released so far.
