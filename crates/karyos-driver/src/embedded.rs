@@ -54,7 +54,7 @@ use crate::client_counters::ClientCounters;
 use crate::clock::{MonotonicClock, SystemClock};
 use crate::commands::ClientSlot;
 use crate::counters::{DriverCounters, Event, TYPE_EVENTS};
-use crate::error::DriverError;
+use crate::error::{DriverError, WalkerUnavailable};
 use crate::generations::{Cutover, Member, MemberKind, Retained};
 use crate::guards::GuardHandle;
 
@@ -1354,8 +1354,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// one with an issued handle, `messages` of 0, or `messages` reserved
     /// messages that do not fit half a term (the publication window, so
     /// the walker's retained span never needs more than the rotation and
-    /// spare slots can hold); [`DriverError::UnknownGuard`]; and the
-    /// walker's admission errors (it takes a spare-slot credit).
+    /// spare slots can hold); [`DriverError::UnknownGuard`]; and
+    /// [`DriverError::GuardWalkerUnavailable`] when the walker, which holds
+    /// one spare-slot credit for the stream's life, finds no credit
+    /// ([`WalkerUnavailable::NoSpareCredit`]) or no reader cell
+    /// ([`WalkerUnavailable::NoReaderCell`]).
     pub fn guard_stream(
         &mut self,
         stream: StreamHandle,
@@ -1385,9 +1388,33 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if found.guarded.is_some() || issued || messages == 0 || !fits {
             return Err(DriverError::InvalidConfig);
         }
+        // The credit is checked first, as admission counts it, so its
+        // refusal is told apart from a full cell table.
+        let id = found.id;
+        let unavailable = |reason| DriverError::GuardWalkerUnavailable { stream: id, reason };
+        let allowed = usize::from(
+            found
+                .config
+                .spare_slots
+                .saturating_sub(karyos_sys::log_buffer::CLEANING_HEADROOM),
+        );
+        if found
+            .conductor
+            .spare_credits()
+            .checked_add(1)
+            .is_none_or(|credits| credits > allowed)
+        {
+            return Err(unavailable(WalkerUnavailable::NoSpareCredit));
+        }
         let walker = found
             .conductor
-            .subscribe(karyos_sys::log_buffer::Role::Walker)?;
+            .subscribe(karyos_sys::log_buffer::Role::Walker)
+            .map_err(|error| match error {
+                karyos_sys::error::SysError::ResourcesUnavailable => {
+                    unavailable(WalkerUnavailable::NoReaderCell)
+                }
+                other => DriverError::Sys(other),
+            })?;
         let scratch = usize::try_from(found.buffer.max_message_length())
             .map_err(|_| DriverError::InvalidConfig)?;
         found.guarded = Some(crate::guard_streams::GuardedStream::new(
