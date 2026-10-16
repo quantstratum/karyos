@@ -14,39 +14,47 @@
 //! value, as +∞ (coordinator, ACS 14828); a quantile that lands on it is
 //! [`MISSING`].
 //!
-//! # Point estimate
+//! # Point estimate (H-1 revised, ACS 15031)
 //!
-//! The p99.9 of a configuration at a point is taken over the pooled
-//! samples of its runs, every run contributing the same count (H-1, ACS
-//! 14817). The added latency of a profile is its p99.9 minus the p99.9 of
-//! `trusted` (manifest 6.2), never a quantile of per-message differences.
+//! The p99.9 of a configuration at a point is the **run-mean p99.9**: the
+//! mean over its runs of each run's p99.9, every run contributing the
+//! same sample count. The added latency of a profile is its run-mean
+//! p99.9 minus the run-mean p99.9 of `trusted` (manifest 6.2), never a
+//! quantile of per-message differences. A difference of run means is
+//! `(Σ p_X - Σ p_Y) / k`, rounded half away from zero to whole
+//! nanoseconds. The p99.9 over the pooled samples of the runs (the
+//! earlier H-1, ACS 14817) is still computed and reported
+//! ([`PointBootstrap::pooled_p999`]); it does not decide.
 //!
-//! # Bootstrap (manifest 8.3)
+//! # Interval (manifest 2.0 §8.3) and bootstrap
 //!
 //! One resample redraws every configuration of the point, `trusted`
-//! included, and computes each pooled p99.9, the added latencies and their
-//! difference. The interval is the percentile interval of the resampled
+//! included, and computes the same statistic as the point estimate: each
+//! run-mean p99.9, the added latencies and their difference, so that the
+//! point and its interval always describe the same quantity (H-1 revised,
+//! ACS 15031). The interval is the percentile interval of the resampled
 //! statistics: the values at nearest ranks 2.5% and 97.5% of the sorted
 //! resamples (ranks 250 and 9750 of 10 000). The stage that redraws a
 //! configuration is a [`Resampling`]:
 //!
-//! - [`Resampling::StratifiedBlocks`], the default (coordinator, ACS 14828
-//!   and 14831): the runs are fixed strata, as manifest 8.3 says, and each
-//!   run is redrawn as whole non-overlapping blocks of `block_len`
-//!   consecutive messages, with replacement, so that messages of one
-//!   datagram (W5) or a burst stay together.
+//! - [`Resampling::RunWelchT`], the interval method of manifest 2.0 §8.3
+//!   and the only decision-grade one (`decision::DECISION_METHOD`; owner
+//!   approval, ACS 15075): no resampling, Welch's t interval on the
+//!   per-run p99.9 values.
+//! - [`Resampling::StratifiedBlocks`], the method of manifest 1.0 §8.3:
+//!   the runs are fixed strata and each run is redrawn as whole
+//!   non-overlapping blocks of `block_len` consecutive messages (M-10),
+//!   so that messages of one datagram (W5) or a burst stay together.
+//!   **Limitation (M-10):** fixed strata cannot carry the between-run
+//!   variance, so at the design CV of about 8% an A/A interval excludes
+//!   zero in 96.1% of trials (86.0% for the pooled statistic). It is
+//!   report-only under manifest 2.0.
 //! - [`Resampling::TwoStage`]: the runs are first drawn with replacement,
 //!   then each drawn run is redrawn by blocks. It carries the between-run
-//!   variance; it is pending the owner as a manifest 1.1 change and is
-//!   never the default.
+//!   variance but undercovers with 5 runs (10.9%). Report-only.
 //! - [`Resampling::Iid`]: single messages within fixed runs, the
-//!   stratified scheme with a block of one. Never decision grade (M-10:
-//!   whole units, never single messages).
-//! - [`Resampling::RunWelchT`]: no resampling. The interval is Welch's
-//!   t interval on the per-run p99.9 values (see
-//!   [`Resampling::RunWelchT`]). It is the remedy measured for the
-//!   undercoverage of [`Resampling::TwoStage`] with 5 runs (review of
-//!   #186, ACS 14914) and, like it, awaits the owner (manifest 1.1).
+//!   stratified scheme with a block of one. Report-only, and it breaks
+//!   M-10 (whole units, never single messages).
 //!
 //! # Undefined resamples
 //!
@@ -72,12 +80,13 @@
 //! matters for p99.9, so the bootstrap draws only the blocks that reach
 //! into the pooled upper tail, exactly:
 //!
-//! 1. Once per configuration, every message gets its global rank in the
-//!    pooled samples (0 = largest; ties broken by position), in `O(N log
-//!    N)`. Nested tail regions `T_0 < T_1 < … = N` are fixed, with `T_0 =
-//!    max(4 m, 256)` where `m = N - k + 1` is the rank of p99.9 from the
-//!    top, and `T_{l+1} = 4 T_l`. A block belongs to band `l` when its
-//!    best rank is in `[T_{l-1}, T_l)`.
+//! 1. Once per run, every message gets its rank in the run (0 = largest;
+//!    ties broken by position), in `O(n log n)`. Nested tail regions
+//!    `T_0 < T_1 < … = n` are fixed, with `T_0 = max(4 m, 256)` where
+//!    `m = n - k + 1` is the rank of p99.9 from the top, and
+//!    `T_{l+1} = 4 T_l`. A block belongs to band `l` when its best rank
+//!    is in `[T_{l-1}, T_l)`. (The model also serves pooled runs; the
+//!    decision path builds one per run.)
 //! 2. A resample redraws a run's `B` blocks as `B` independent uniform
 //!    draws. The draws that land in band 0 are `Binomial(B, k_0 / B)`
 //!    (geometric waiting times, `O(hits)`), each a uniform block of the
@@ -91,9 +100,9 @@
 //!    naive draw would give in distribution, not a redraw conditioned on
 //!    failure.
 //!
-//! A resample costs `O(T_0 + hits)` ≈ `O(m)` per configuration while band
-//! 0 suffices, which is nearly always under stratified resampling; two
-//! stage resampling extends more often when runs differ. Resamples run on
+//! A resample costs `O(T_0 + hits)` ≈ `O(m)` per run while band 0
+//! suffices, which is nearly always. Two stage resampling first draws the
+//! runs with replacement, then resamples each drawn run. Resamples run on
 //! scoped threads. Resample `i` uses its own generator, derived from the
 //! seed and `i`, so the interval does not depend on the thread count. The
 //! generator is `karyos_sim::Rng` (SplitMix64); no new dependency.
@@ -308,12 +317,13 @@ pub fn block_len(shape: Shape, e_max: u32) -> Result<usize, ManifestError> {
 /// The measured samples per run for a block length: the manifest minimum
 /// of 10^6 (8.1) rounded up to whole blocks, so that W5 runs end on a
 /// datagram boundary (21 × 47 620 = 1 000 020 at `E_max` = 64).
+/// `None` when the block length is 0 or the product overflows.
 #[must_use]
-pub fn samples_per_run(block_len: usize) -> u64 {
-    let block = u64::try_from(block_len.max(1)).unwrap_or(u64::MAX);
+pub fn samples_per_run(block_len: usize) -> Option<u64> {
+    let block = u64::try_from(block_len).ok().filter(|&b| b > 0)?;
     section8::MIN_SAMPLES_PER_RUN
         .div_ceil(block)
-        .saturating_mul(block)
+        .checked_mul(block)
 }
 
 /// The warmup messages discarded per run for a block length: the
@@ -321,12 +331,11 @@ pub fn samples_per_run(block_len: usize) -> u64 {
 /// messages start on a block boundary. For W5 at `E_max` = 64 the warmup
 /// is 21 × 4762 = 100 002 messages, so every block of 21 measured messages
 /// is one datagram (review of #186, P3).
+/// `None` when the block length is 0 or the product overflows.
 #[must_use]
-pub fn warmup_per_run(block_len: usize) -> u64 {
-    let block = u64::try_from(block_len.max(1)).unwrap_or(u64::MAX);
-    section8::WARMUP_PER_RUN
-        .div_ceil(block)
-        .saturating_mul(block)
+pub fn warmup_per_run(block_len: usize) -> Option<u64> {
+    let block = u64::try_from(block_len).ok().filter(|&b| b > 0)?;
+    section8::WARMUP_PER_RUN.div_ceil(block).checked_mul(block)
 }
 
 /// How one configuration is redrawn in a bootstrap resample (see the
@@ -335,15 +344,22 @@ pub fn warmup_per_run(block_len: usize) -> u64 {
 pub enum Resampling {
     /// Single messages within fixed runs.
     Iid,
-    /// Fixed runs (manifest 8.3), whole blocks of `block_len` messages
-    /// within each: the default (ACS 14831). A datagram group is a block
-    /// of the messages per datagram (21 for W5 at `E_max` = 64).
+    /// Fixed runs (manifest 1.0 §8.3), whole blocks of `block_len`
+    /// messages within each (M-10). A datagram group is a block of the
+    /// messages per datagram (21 for W5 at `E_max` = 64).
+    ///
+    /// **Limitation (M-10; ACS 15068):** with the runs fixed, a resample
+    /// varies only within runs and never between them, so the interval
+    /// omits the between-run variance. At the design CV of about 8% an A/A
+    /// interval excludes zero in 96.1% of trials for the run-mean p99.9
+    /// (86.0% for the pooled p99.9). Report-only under manifest 2.0.
     StratifiedBlocks {
         /// Messages per block; divides the samples per run.
         block_len: usize,
     },
     /// Runs drawn with replacement, then blocks within each drawn run.
-    /// Pending the owner (manifest 1.1); never the default.
+    /// Report-only under manifest 2.0: with 5 runs its percentile interval
+    /// undercovers (10.9% A/A at the design CV).
     TwoStage {
         /// Messages per block; divides the samples per run.
         block_len: usize,
@@ -367,19 +383,21 @@ pub enum Resampling {
     /// 34 (1947) 28-35; Satterthwaite, Biometrics Bulletin 2 (1946)
     /// 110-114).
     ///
-    /// The interval is centred on the difference of the run means, while
-    /// the point estimate stays the pooled p99.9 (H-1); a point estimate
-    /// on the other side of an interval that excludes zero is Not
-    /// demonstrated (`decision::classify`). At the design CV of about 8%
-    /// the A/A rate of an interval excluding zero is 4.8% ± 0.9% with 5
+    /// The interval is centred on the difference of the run means, which is
+    /// the decision point estimate of every method (H-1 revised, ACS
+    /// 15031). This is the interval method of manifest 2.0 §8.3 (owner
+    /// approval, ACS 15075; `decision::DECISION_METHOD`). At the design CV
+    /// of about 8% the A/A rate of an interval excluding zero is 4.8% ± 0.9% with 5
     /// runs of 10^6 messages (2000 replications), where two stage
-    /// resampling gives 14.7% and a delete-a-group jackknife of the pooled
-    /// p99.9 gives 8.3% (see the test `calibration_at_design_cv`).
+    /// resampling of the run-mean p99.9 gives 10.9%, stratified blocks
+    /// 96.1%, and a delete-a-group jackknife of the pooled p99.9 8.3% (see
+    /// the test `calibration_at_design_cv`).
     RunWelchT,
 }
 
 impl Resampling {
-    /// The default: [`Resampling::StratifiedBlocks`] with `block_len`.
+    /// [`Resampling::StratifiedBlocks`] with `block_len`: the fixed-strata
+    /// block bootstrap of manifest 1.0, report only under manifest 2.0.
     #[must_use]
     pub const fn default_with(block_len: usize) -> Self {
         Self::StratifiedBlocks { block_len }
@@ -417,7 +435,8 @@ impl fmt::Display for Resampling {
 pub struct BootstrapSpec {
     /// The resampling stage.
     pub resampling: Resampling,
-    /// Resamples: 10 000 for a decision (manifest 8.3).
+    /// Resamples for a bootstrap method: 10 000 (manifest 1.0 §8.3). Unused
+    /// by [`Resampling::RunWelchT`], the manifest 2.0 §8.3 method.
     pub resamples: u32,
     /// The seed, recorded with the result.
     pub seed: u64,
@@ -457,6 +476,25 @@ pub enum Value {
 }
 
 impl Value {
+    /// `(x - y) / k` of two sums of `k` per-run p99.9 values, a difference
+    /// of run means (H-1 revised, ACS 15031), rounded half away from zero;
+    /// [`INFINITE_SUM`] is +∞.
+    #[must_use]
+    pub fn contrast_means(x: u64, y: u64, k: usize) -> Self {
+        match (x == INFINITE_SUM, y == INFINITE_SUM) {
+            (false, false) => {
+                let k = i128::try_from(k.max(1)).unwrap_or(i128::MAX);
+                let n = i128::from(x) - i128::from(y);
+                let (q, r) = (n / k, n % k);
+                let rounded = if 2 * r.abs() >= k { q + n.signum() } else { q };
+                i64::try_from(rounded).map_or(Self::Undefined, Self::Finite)
+            }
+            (true, false) => Self::PosInf,
+            (false, true) => Self::NegInf,
+            (true, true) => Self::Undefined,
+        }
+    }
+
     /// `x - y` of two p99.9 values, [`MISSING`] being +∞.
     #[must_use]
     pub fn contrast(x: u32, y: u32) -> Self {
@@ -526,6 +564,10 @@ pub struct Interval {
     pub undefined: u32,
     /// All resamples (0 for the run-level t interval).
     pub resamples: u32,
+    /// Runs with an infinite p99.9 (run-level t interval only). The
+    /// interval is then `(-∞, +∞)` and the point is Not demonstrated, as on
+    /// the bootstrap path (ACS 15055).
+    pub infinite_runs: u32,
 }
 
 impl Interval {
@@ -558,7 +600,8 @@ impl Interval {
 /// A point estimate with its interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Estimate {
-    /// The point estimate from the pooled p99.9 values.
+    /// The point estimate: a difference of run-mean p99.9 values (H-1
+    /// revised, ACS 15031).
     pub point: Value,
     /// The bootstrap interval.
     pub interval: Interval,
@@ -566,16 +609,21 @@ pub struct Estimate {
 
 /// The bootstrap of one point comparing profiles `a` and `b` against
 /// `trusted`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PointBootstrap {
-    /// Pooled p99.9 of `a`, `b` and `trusted` (`MISSING` when infinite).
-    pub p999: [u32; 3],
-    /// Added latency of `a`: p99.9(a) - p99.9(trusted).
+    /// Run-mean p99.9 of `a`, `b` and `trusted` in nanoseconds, `None`
+    /// when a run's p99.9 is infinite: the decision statistic (H-1
+    /// revised, ACS 15031).
+    pub run_mean_p999: [Option<f64>; 3],
+    /// Pooled p99.9 of `a`, `b` and `trusted` (`MISSING` when infinite):
+    /// reported, never deciding.
+    pub pooled_p999: [u32; 3],
+    /// Added latency of `a`: run-mean p99.9(a) - run-mean p99.9(trusted).
     pub added_a: Estimate,
     /// Added latency of `b`.
     pub added_b: Estimate,
     /// The difference of added latencies, `added_a - added_b` (manifest
-    /// 8.3). It is computed as `p99.9(a) - p99.9(b)` of the resample, in
+    /// 8.3). It is computed as `p99.9(a) - p99.9(b)` of the run means, in
     /// which the shared `trusted` term cancels; this also keeps a resample
     /// with an infinite `trusted` p99.9 defined.
     pub difference: Estimate,
@@ -612,6 +660,7 @@ pub fn interval(values: &[Value]) -> Interval {
         infinite,
         undefined,
         resamples: u32::try_from(values.len()).unwrap_or(u32::MAX),
+        infinite_runs: 0,
     }
 }
 
@@ -666,7 +715,8 @@ impl Model {
         for run in runs {
             for &value in *run {
                 keys.push((u64::from(value) << 32) | u64::from(u32::MAX - position));
-                position = position.saturating_add(1);
+                // `total` fits in u32 (checked above), so this cannot fail.
+                position = position.checked_add(1).ok_or(StatsError::TooLarge)?;
             }
         }
         keys.sort_unstable_by(|a, b| b.cmp(a));
@@ -683,14 +733,15 @@ impl Model {
 
         let mut levels = Vec::new();
         let mut level = first_level
-            .unwrap_or_else(|| from_top.saturating_mul(4).max(256))
+            .map_or_else(|| from_top.checked_mul(4).map(|l| l.max(256)), Some)
+            .ok_or(StatsError::TooLarge)?
             .clamp(from_top, total);
         loop {
             levels.push(level);
             if level >= total {
                 break;
             }
-            level = level.saturating_mul(4).min(total);
+            level = level.checked_mul(4).ok_or(StatsError::TooLarge)?.min(total);
         }
 
         let blocks = per_run / block_len;
@@ -721,12 +772,12 @@ impl Model {
                     .iter()
                     .map(|band| {
                         let before = sum;
-                        sum = sum.saturating_add(band.len());
-                        before
+                        sum = sum.checked_add(band.len()).ok_or(StatsError::TooLarge)?;
+                        Ok(before)
                     })
-                    .collect()
+                    .collect::<Result<Vec<usize>, StatsError>>()
             })
-            .collect();
+            .collect::<Result<Vec<Vec<usize>>, StatsError>>()?;
         Ok(Self {
             runs: runs.len(),
             per_run,
@@ -895,14 +946,49 @@ fn resample_rng(seed: u64, index: u32) -> Rng {
     Rng::new(root.next_u64())
 }
 
-/// Resampled quantiles of every model, `resamples × models`, row-major.
-fn run_bootstrap(models: &[Model], spec: &BootstrapSpec) -> Result<Vec<u32>, StatsError> {
+/// The sum of `k` per-run p99.9 values of a configuration with an
+/// infinite run p99.9.
+pub const INFINITE_SUM: u64 = u64::MAX;
+
+/// The per-run tail models of one configuration.
+#[derive(Debug)]
+struct RunModels {
+    runs: Vec<Model>,
+}
+
+/// One resample of a configuration: the sum of its resampled per-run
+/// p99.9 values, [`INFINITE_SUM`] if one is infinite. Two stage
+/// resampling draws the runs with replacement first.
+fn resample_sum(config: &RunModels, two_stage: bool, rng: &mut Rng, scratch: &mut Scratch) -> u64 {
+    let k = config.runs.len();
+    let width = u64::try_from(k).unwrap_or(u64::MAX);
+    let mut sum = 0u64;
+    for slot in 0..k {
+        let run = if two_stage {
+            usize::try_from(rng.below(width)).unwrap_or(0)
+        } else {
+            slot
+        };
+        let Some(model) = config.runs.get(run) else {
+            return INFINITE_SUM;
+        };
+        match resample(model, false, rng, scratch) {
+            MISSING => return INFINITE_SUM,
+            value => sum = sum.saturating_add(u64::from(value)),
+        }
+    }
+    sum
+}
+
+/// Resampled run-mean sums of every configuration, `resamples × configs`,
+/// row-major.
+fn run_bootstrap(configs: &[RunModels], spec: &BootstrapSpec) -> Result<Vec<u64>, StatsError> {
     if spec.resamples == 0 {
         return Err(StatsError::NoResamples);
     }
-    let width = models.len();
+    let width = configs.len();
     let resamples = usize::try_from(spec.resamples).map_err(|_| StatsError::TooLarge)?;
-    let mut out = vec![0u32; resamples.checked_mul(width).ok_or(StatsError::TooLarge)?];
+    let mut out = vec![0u64; resamples.checked_mul(width).ok_or(StatsError::TooLarge)?];
     let threads = spec
         .threads
         .or_else(|| thread::available_parallelism().ok())
@@ -919,8 +1005,8 @@ fn run_bootstrap(models: &[Model], spec: &BootstrapSpec) -> Result<Vec<u32>, Sta
                 for (offset, row) in chunk.chunks_mut(width).enumerate() {
                     let index = u32::try_from(first.saturating_add(offset)).unwrap_or(u32::MAX);
                     let mut rng = resample_rng(spec.seed, index);
-                    for (cell, model) in row.iter_mut().zip(models) {
-                        *cell = resample(model, two_stage, &mut rng, &mut scratch);
+                    for (cell, config) in row.iter_mut().zip(configs) {
+                        *cell = resample_sum(config, two_stage, &mut rng, &mut scratch);
                     }
                 }
             });
@@ -944,16 +1030,53 @@ fn check_configs(configs: &[&[&[u32]]]) -> Result<(usize, usize), StatsError> {
     shape.ok_or(StatsError::Empty)
 }
 
-fn models(
-    configs: &[&[&[u32]]],
-    block_len: usize,
-    first_level: Option<usize>,
-) -> Result<Vec<Model>, StatsError> {
+/// The per-run tail models of every configuration.
+fn run_models(configs: &[&[&[u32]]], block_len: usize) -> Result<Vec<RunModels>, StatsError> {
     let (num, den) = section8::DECISION_QUANTILE;
     configs
         .iter()
-        .map(|runs| Model::new(runs, block_len, num, den, first_level))
+        .map(|runs| {
+            let runs = runs
+                .iter()
+                .map(|run| Model::new(&[run], block_len, num, den, None))
+                .collect::<Result<Vec<Model>, StatsError>>()?;
+            Ok(RunModels { runs })
+        })
         .collect()
+}
+
+/// The sum of the per-run p99.9 values, [`INFINITE_SUM`] if one is
+/// infinite: `k` times the run-mean p99.9.
+///
+/// # Errors
+///
+/// [`StatsError::TooLarge`] when the sum overflows.
+fn run_p999_sum(runs: &[&[u32]]) -> Result<u64, StatsError> {
+    let mut sum = 0u64;
+    for value in per_run_p999(runs) {
+        match value {
+            Some(value) if value != MISSING => {
+                sum = sum
+                    .checked_add(u64::from(value))
+                    .filter(|&sum| sum != INFINITE_SUM)
+                    .ok_or(StatsError::TooLarge)?;
+            }
+            _ => return Ok(INFINITE_SUM),
+        }
+    }
+    Ok(sum)
+}
+
+/// The run-mean p99.9 of a configuration (H-1 revised, ACS 15031): the
+/// mean over runs of each run's p99.9; `None` when a run's p99.9 is
+/// infinite or there is no run.
+#[must_use]
+pub fn run_mean_p999(runs: &[&[u32]]) -> Option<f64> {
+    let sum = run_p999_sum(runs).ok()?;
+    let k = u32::try_from(runs.len()).ok().filter(|&k| k > 0)?;
+    #[allow(clippy::cast_precision_loss)]
+    let mean = (sum != INFINITE_SUM).then(|| sum as f64 / f64::from(k));
+    mean
 }
 
 /// Two-sided 97.5% quantiles of Student's t for 1 to 30 degrees of
@@ -976,20 +1099,28 @@ fn t_975(df: usize) -> f64 {
     }
 }
 
-/// Welch's t interval of `p99.9(X) - p99.9(Y)` on the per-run p99.9
-/// values (see [`Resampling::RunWelchT`]). An infinite per-run p99.9
-/// makes the sign unknown: the interval is `(-∞, +∞)`.
+/// Welch's t interval of the run-mean `p99.9(X) - p99.9(Y)` on the
+/// per-run p99.9 values (see [`Resampling::RunWelchT`]). An infinite
+/// per-run p99.9 makes the sign unknown: the interval is `(-∞, +∞)` and
+/// [`Interval::infinite_runs`] counts those runs, so that
+/// `decision::classify` reports Not demonstrated (ACS 15055).
 fn run_welch_interval(x: &[&[u32]], y: &[&[u32]]) -> Result<Interval, StatsError> {
+    let k = x.len();
+    if k < 2 || y.len() != k {
+        return Err(StatsError::TooFewRuns);
+    }
+    let infinite_runs = per_run_p999(x)
+        .into_iter()
+        .chain(per_run_p999(y))
+        .filter(|value| value.is_none_or(|v| v == MISSING))
+        .count();
     let unknown = Interval {
         ends: Some((Value::NegInf, Value::PosInf)),
         infinite: 0,
         undefined: 0,
         resamples: 0,
+        infinite_runs: u32::try_from(infinite_runs).unwrap_or(u32::MAX),
     };
-    let k = x.len();
-    if k < 2 || y.len() != k {
-        return Err(StatsError::TooFewRuns);
-    }
     let moments = |runs: &[&[u32]]| -> Option<(f64, f64)> {
         let values = per_run_p999(runs)
             .into_iter()
@@ -1026,7 +1157,8 @@ fn run_welch_interval(x: &[&[u32]], y: &[&[u32]]) -> Result<Interval, StatsError
 }
 
 /// The bootstrap of one point: profiles `a` and `b` against `trusted`
-/// (manifest 6.2 and 8.3).
+/// (manifest 6.2 and 8.3), on run-mean p99.9 values (H-1 revised, ACS
+/// 15031).
 ///
 /// # Errors
 ///
@@ -1038,56 +1170,61 @@ pub fn bootstrap_point(
     trusted: &[&[u32]],
     spec: &BootstrapSpec,
 ) -> Result<PointBootstrap, StatsError> {
-    check_configs(&[a, b, trusted])?;
-    let p999 = [pooled_p999(a)?, pooled_p999(b)?, pooled_p999(trusted)?];
-    let Some(block_len) = spec.resampling.block_len() else {
-        let [pa, pb, pt] = p999;
-        return Ok(PointBootstrap {
-            p999,
-            added_a: Estimate {
-                point: Value::contrast(pa, pt),
-                interval: run_welch_interval(a, trusted)?,
-            },
-            added_b: Estimate {
-                point: Value::contrast(pb, pt),
-                interval: run_welch_interval(b, trusted)?,
-            },
-            difference: Estimate {
-                point: Value::contrast(pa, pb),
-                interval: run_welch_interval(a, b)?,
-            },
-        });
+    let (k, _) = check_configs(&[a, b, trusted])?;
+    let pooled = [pooled_p999(a)?, pooled_p999(b)?, pooled_p999(trusted)?];
+    let [sa, sb, st] = [run_p999_sum(a)?, run_p999_sum(b)?, run_p999_sum(trusted)?];
+    let run_mean = [run_mean_p999(a), run_mean_p999(b), run_mean_p999(trusted)];
+    let points = [
+        Value::contrast_means(sa, st, k),
+        Value::contrast_means(sb, st, k),
+        Value::contrast_means(sa, sb, k),
+    ];
+    let intervals = match spec.resampling.block_len() {
+        None => [
+            run_welch_interval(a, trusted)?,
+            run_welch_interval(b, trusted)?,
+            run_welch_interval(a, b)?,
+        ],
+        Some(block_len) => {
+            let models = run_models(&[a, b, trusted], block_len)?;
+            let table = run_bootstrap(&models, spec)?;
+            let mut added_a = Vec::with_capacity(table.len() / 3);
+            let mut added_b = Vec::with_capacity(table.len() / 3);
+            let mut difference = Vec::with_capacity(table.len() / 3);
+            for &[qa, qb, qt] in table.as_chunks::<3>().0 {
+                added_a.push(Value::contrast_means(qa, qt, k));
+                added_b.push(Value::contrast_means(qb, qt, k));
+                difference.push(Value::contrast_means(qa, qb, k));
+            }
+            [
+                interval(&added_a),
+                interval(&added_b),
+                interval(&difference),
+            ]
+        }
     };
-    let models = models(&[a, b, trusted], block_len, None)?;
-    let table = run_bootstrap(&models, spec)?;
-    let mut added_a = Vec::with_capacity(table.len() / 3);
-    let mut added_b = Vec::with_capacity(table.len() / 3);
-    let mut difference = Vec::with_capacity(table.len() / 3);
-    for &[qa, qb, qt] in table.as_chunks::<3>().0 {
-        added_a.push(Value::contrast(qa, qt));
-        added_b.push(Value::contrast(qb, qt));
-        difference.push(Value::contrast(qa, qb));
-    }
-    let [pa, pb, pt] = p999;
+    let [pa, pb, pd] = points;
+    let [ia, ib, id] = intervals;
     Ok(PointBootstrap {
-        p999,
+        run_mean_p999: run_mean,
+        pooled_p999: pooled,
         added_a: Estimate {
-            point: Value::contrast(pa, pt),
-            interval: interval(&added_a),
+            point: pa,
+            interval: ia,
         },
         added_b: Estimate {
-            point: Value::contrast(pb, pt),
-            interval: interval(&added_b),
+            point: pb,
+            interval: ib,
         },
         difference: Estimate {
-            point: Value::contrast(pa, pb),
-            interval: interval(&difference),
+            point: pd,
+            interval: id,
         },
     })
 }
 
-/// The bootstrap of `p999(x) - p999(y)`, such as one profile's added
-/// latency over `trusted`.
+/// The bootstrap of `p999(x) - p999(y)` of the run means, such as one
+/// profile's added latency over `trusted` (H-1 revised, ACS 15031).
 ///
 /// # Errors
 ///
@@ -1097,26 +1234,23 @@ pub fn bootstrap_difference(
     y: &[&[u32]],
     spec: &BootstrapSpec,
 ) -> Result<Estimate, StatsError> {
-    check_configs(&[x, y])?;
-    let point = Value::contrast(pooled_p999(x)?, pooled_p999(y)?);
-    let Some(block_len) = spec.resampling.block_len() else {
-        return Ok(Estimate {
-            point,
-            interval: run_welch_interval(x, y)?,
-        });
+    let (k, _) = check_configs(&[x, y])?;
+    let point = Value::contrast_means(run_p999_sum(x)?, run_p999_sum(y)?, k);
+    let interval = match spec.resampling.block_len() {
+        None => run_welch_interval(x, y)?,
+        Some(block_len) => {
+            let models = run_models(&[x, y], block_len)?;
+            let table = run_bootstrap(&models, spec)?;
+            let values: Vec<Value> = table
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[qx, qy]| Value::contrast_means(qx, qy, k))
+                .collect();
+            interval(&values)
+        }
     };
-    let models = models(&[x, y], block_len, None)?;
-    let table = run_bootstrap(&models, spec)?;
-    let values: Vec<Value> = table
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&[qx, qy]| Value::contrast(qx, qy))
-        .collect();
-    Ok(Estimate {
-        point,
-        interval: interval(&values),
-    })
+    Ok(Estimate { point, interval })
 }
 
 #[cfg(test)]
@@ -1167,6 +1301,7 @@ mod tests {
             infinite: 0,
             undefined: 0,
             resamples: 0,
+            infinite_runs: 0,
         };
         let (Value::Finite(point), [Some(vx), Some(vy)]) = (point, variances) else {
             return unknown;
@@ -1354,8 +1489,9 @@ mod tests {
         let y: Vec<Vec<u32>> = vec![vec![100u32; 1000]; 5];
         let welch = spec(Resampling::RunWelchT, 1, 0);
         let estimate = bootstrap_difference(&refs(&x), &refs(&y), &welch).unwrap();
-        // The point estimate stays the pooled p99.9 (H-1): 140 - 100.
-        assert_eq!(estimate.point, Value::Finite(40));
+        // The point estimate is the run-mean difference, the interval's
+        // centre (H-1 revised, ACS 15031): 120 - 100, not the pooled 40.
+        assert_eq!(estimate.point, Value::Finite(20));
         assert_eq!(
             estimate.interval.ends,
             Some((Value::Finite(0), Value::Finite(40)))
@@ -1379,6 +1515,7 @@ mod tests {
         }
         let estimate = bootstrap_difference(&refs(&x), &refs(&dropped), &welch).unwrap();
         assert_eq!(estimate.interval.ends, Some((Value::NegInf, Value::PosInf)));
+        assert_eq!(estimate.interval.infinite_runs, 5);
         // The three intervals of a point.
         let point = bootstrap_point(&refs(&x), &refs(&z), &refs(&y), &welch).unwrap();
         assert_eq!(
@@ -1389,6 +1526,66 @@ mod tests {
         assert_eq!(t_975(4), 2.7764);
         assert_eq!(t_975(100), 2.0423);
         assert!(t_975(0).is_infinite());
+    }
+
+    #[test]
+    fn the_point_estimate_is_the_run_mean_difference() {
+        // H-1 revised (ACS 15031). Constant runs 100..=140 by 10 against
+        // runs of 100: run means 120 and 100, pooled p99.9 140 and 100.
+        let x: Vec<Vec<u32>> = [100u32, 110, 120, 130, 140]
+            .iter()
+            .map(|&v| vec![v; 1000])
+            .collect();
+        let y: Vec<Vec<u32>> = vec![vec![100u32; 1000]; 5];
+        assert_eq!(run_mean_p999(&refs(&x)), Some(120.0));
+        assert_eq!(pooled_p999(&refs(&x)), Ok(140));
+        for resampling in [
+            Resampling::StratifiedBlocks { block_len: 8 },
+            Resampling::TwoStage { block_len: 8 },
+            Resampling::RunWelchT,
+        ] {
+            let found = bootstrap_point(&refs(&x), &refs(&y), &refs(&y), &spec(resampling, 200, 3))
+                .unwrap();
+            assert_eq!(found.added_a.point, Value::Finite(20), "{resampling}");
+            assert_eq!(found.difference.point, Value::Finite(20));
+            assert_eq!(found.added_b.point, Value::Finite(0));
+            assert_eq!(found.run_mean_p999, [Some(120.0), Some(100.0), Some(100.0)]);
+            assert_eq!(found.pooled_p999, [140, 100, 100]);
+        }
+        // Stratified resampling of constant runs is exact: the interval is
+        // the point itself.
+        let found = bootstrap_difference(
+            &refs(&x),
+            &refs(&y),
+            &spec(Resampling::StratifiedBlocks { block_len: 8 }, 200, 3),
+        )
+        .unwrap();
+        assert_eq!(
+            found.interval.ends,
+            Some((Value::Finite(20), Value::Finite(20)))
+        );
+        // A run with an infinite p99.9 makes the run mean infinite.
+        let mut dropped = y.clone();
+        dropped[2][..2].fill(MISSING);
+        assert_eq!(run_mean_p999(&refs(&dropped)), None);
+        let found = bootstrap_difference(&refs(&x), &refs(&dropped), &spec(Resampling::Iid, 50, 1))
+            .unwrap();
+        assert_eq!(found.point, Value::NegInf);
+    }
+
+    #[test]
+    fn run_mean_contrasts_round_half_away_from_zero() {
+        assert_eq!(Value::contrast_means(10, 0, 4), Value::Finite(3)); // 2.5
+        assert_eq!(Value::contrast_means(0, 10, 4), Value::Finite(-3)); // -2.5
+        assert_eq!(Value::contrast_means(9, 0, 4), Value::Finite(2)); // 2.25
+        assert_eq!(Value::contrast_means(0, 9, 4), Value::Finite(-2));
+        assert_eq!(Value::contrast_means(1, 0, 5), Value::Finite(0)); // 0.2
+        assert_eq!(Value::contrast_means(INFINITE_SUM, 3, 5), Value::PosInf);
+        assert_eq!(Value::contrast_means(3, INFINITE_SUM, 5), Value::NegInf);
+        assert_eq!(
+            Value::contrast_means(INFINITE_SUM, INFINITE_SUM, 5),
+            Value::Undefined
+        );
     }
 
     #[test]
@@ -1409,10 +1606,11 @@ mod tests {
 
     #[test]
     fn warmup_ends_on_a_block_boundary() {
-        assert_eq!(warmup_per_run(21), 100_002);
-        assert_eq!(warmup_per_run(21) % 21, 0);
-        assert_eq!(warmup_per_run(64), 100_032);
-        assert_eq!(warmup_per_run(1), 100_000);
+        assert_eq!(warmup_per_run(21), Some(100_002));
+        assert_eq!(warmup_per_run(21).map(|w| w % 21), Some(0));
+        assert_eq!(warmup_per_run(64), Some(100_032));
+        assert_eq!(warmup_per_run(1), Some(100_000));
+        assert_eq!(warmup_per_run(0), None);
     }
 
     /// The naive resampler: every block drawn explicitly.
@@ -1603,9 +1801,10 @@ mod tests {
     fn block_lengths() {
         assert_eq!(block_len(Shape::W5, 64), Ok(21));
         assert_eq!(block_len(Shape::W1, 64), Ok(DEFAULT_BLOCK_LEN));
-        assert_eq!(samples_per_run(21), 1_000_020);
-        assert_eq!(samples_per_run(64), 1_000_000);
-        assert_eq!(samples_per_run(1), 1_000_000);
+        assert_eq!(samples_per_run(21), Some(1_000_020));
+        assert_eq!(samples_per_run(64), Some(1_000_000));
+        assert_eq!(samples_per_run(1), Some(1_000_000));
+        assert_eq!(samples_per_run(0), None);
     }
 
     /// Messages per burst in the calibration data, and the block length of
@@ -1651,7 +1850,7 @@ mod tests {
     /// The methods compared, in the order of a result row.
     const METHODS: [&str; 7] = [
         "iid",
-        "stratified blocks of 50 (default)",
+        "stratified blocks of 50 (manifest 1.0)",
         "two stage, blocks of 50",
         "run jackknife of pooled p99.9, t(k - 1)",
         "run jackknife of pooled p99.9, t(Welch df)",
@@ -1695,12 +1894,14 @@ mod tests {
             Resampling::StratifiedBlocks { block_len: BURST },
             Resampling::TwoStage { block_len: BURST },
         ];
-        let mut built: Option<(usize, Vec<Model>)> = None;
+        // The production statistic: the run-mean p99.9 (H-1 revised, ACS
+        // 15031), resampled through the per-run tail models.
+        let mut built: Option<(usize, Vec<RunModels>)> = None;
         for (slot, resampling) in excluded.iter_mut().zip(methods) {
             let block_len = resampling.block_len().unwrap();
             if built.as_ref().map(|(len, _)| *len) != Some(block_len) {
                 drop(built.take());
-                built = Some((block_len, models(&[&ra, &rb], block_len, None).unwrap()));
+                built = Some((block_len, run_models(&[&ra, &rb], block_len).unwrap()));
             }
             let spec = BootstrapSpec {
                 resampling,
@@ -1713,7 +1914,7 @@ mod tests {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|&[x, y]| Value::contrast(x, y))
+                .map(|&[x, y]| Value::contrast_means(x, y, case.runs))
                 .collect();
             *slot = !interval(&values).contains_zero();
         }
@@ -1742,14 +1943,9 @@ mod tests {
         let k = case.runs as f64;
         let pooled = (sa + sb) / 2.0;
         excluded[5] = t_excludes(ma - mb, (pooled * 2.0 / k).sqrt(), 2 * case.runs - 2);
-        let (ea, eb) = (sa / k, sb / k);
-        let nu = (ea + eb).powi(2) / (ea * ea / each + eb * eb / each);
-        let df = if nu.is_finite() {
-            nu.floor() as usize
-        } else {
-            case.runs - 1
-        };
-        excluded[6] = t_excludes(ma - mb, (ea + eb).sqrt(), df);
+        // Welch: the production path (ACS 15068).
+        let welch = bootstrap_difference(&ra, &rb, &spec(Resampling::RunWelchT, 1, 0)).unwrap();
+        excluded[6] = !welch.interval.contains_zero();
         (excluded, cvs)
     }
 
@@ -1827,19 +2023,23 @@ mod tests {
     ///
     /// Measured on 2026-10-16 (Apple M5 Max, release, 2000 replications,
     /// 1000 resamples; mean per-run p99.9 CV 7.98% at 10^6 and 8.21% at
-    /// 5 × 10^4 messages per run), A/A rate of an interval excluding zero
-    /// at 10^6 (and 5 × 10^4) messages per run, ± 95% binomial half-width
-    /// of about 1%:
+    /// 5 × 10^4 messages per run), A/A rate of an interval excluding zero,
+    /// ± 95% binomial half-width of about 1%. The bootstrap rows resample
+    /// the decision statistic, the run-mean p99.9 (H-1 revised, ACS
+    /// 15031); the jackknife rows are of the pooled p99.9, as evidence:
     ///
     /// | Method | 10^6 | 5 × 10^4 |
     /// | --- | --- | --- |
-    /// | iid | 97.2% | 90.1% |
-    /// | stratified blocks of 50 (default) | 86.0% | 52.6% |
-    /// | two stage, blocks of 50 | 14.7% | 11.7% |
+    /// | iid | 99.2% | 93.8% |
+    /// | stratified blocks of 50 (manifest 1.0 §8.3) | 96.1% | 77.0% |
+    /// | two stage, blocks of 50 | 10.9% | 11.7% |
     /// | run jackknife of pooled p99.9, t(k - 1) | 8.3% | 7.8% |
     /// | run jackknife of pooled p99.9, t(Welch df) | 10.2% | 9.1% |
     /// | run-level Student t, t(2k - 2) | 5.9% | 5.9% |
-    /// | run-level Welch t (`RunWelchT`) | 4.8% | 4.9% |
+    /// | run-level Welch t (`RunWelchT`, manifest 2.0 §8.3) | 4.8% | 4.9% |
+    ///
+    /// With the pooled p99.9 as the bootstrap statistic (ae382be, before
+    /// H-1 revised) the bootstrap rows were 97.2%, 86.0% and 14.7% at 10^6.
     ///
     /// Fewer messages per run add within-run noise that hides part of the
     /// between-run variance, so 5 × 10^4 understates the undercoverage of
@@ -1871,12 +2071,16 @@ mod tests {
     /// k = 5, 10 and 20 runs of 10^6 messages, 500 replications each
     /// (± about 2%).
     ///
-    /// Measured on 2026-10-16 (mean per-run p99.9 CV 7.98%, 8.13%, 8.23%):
+    /// Measured on 2026-10-16 at ae382be (mean per-run p99.9 CV 7.98%,
+    /// 8.13%, 8.23%), when the bootstrap statistic was the pooled p99.9;
+    /// the iid, stratified and two stage rows are of that statistic and
+    /// were not re-run for the run-mean p99.9 (the run-level t rows do not
+    /// depend on it):
     ///
     /// | Method | k = 5 | k = 10 | k = 20 |
     /// | --- | --- | --- | --- |
     /// | iid | 97.0% | 98.2% | 97.4% |
-    /// | stratified blocks of 50 (default) | 84.8% | 89.6% | 86.4% |
+    /// | stratified blocks of 50 (manifest 1.0) | 84.8% | 89.6% | 86.4% |
     /// | two stage, blocks of 50 | 12.4% | 9.0% | 6.2% |
     /// | run jackknife of pooled p99.9, t(k - 1) | 8.2% | 6.6% | 4.0% |
     /// | run jackknife of pooled p99.9, t(Welch df) | 9.4% | 7.0% | 4.8% |

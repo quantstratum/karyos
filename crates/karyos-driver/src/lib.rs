@@ -19,6 +19,7 @@ pub mod diagnostics;
 pub mod embedded;
 pub mod error;
 mod generations;
+pub mod guards;
 mod ledger;
 mod positions;
 mod remote_generations;
@@ -33,5 +34,6 @@ pub use embedded::{
 };
 pub use error::DriverError;
 pub use generations::{GenerationInfo, Reconfiguration};
+pub use guards::{Audit, AuditOutcome, AuditRecord, GuardHandle, Requester};
 pub use karyos_client::ConflatedSubscription;
 pub use karyos_sys::log_buffer::{LossPolicy, SealReason, SealState};

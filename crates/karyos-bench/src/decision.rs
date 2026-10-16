@@ -116,6 +116,12 @@ pub enum Cause {
     /// The interval excludes zero on one side while the point estimate is
     /// on the other side or at zero (review of #186, P3).
     Inconsistent,
+    /// Runs with an infinite p99.9 under the run-level t interval: the
+    /// sign is unknown (ACS 15055).
+    InfiniteRuns {
+        /// Runs with an infinite p99.9.
+        runs: u32,
+    },
     /// The point is not part of the results.
     NotMeasured,
     /// Another cause, such as `F2 before P2.7` or `profile not
@@ -161,6 +167,9 @@ impl fmt::Display for Cause {
                 f,
                 "{undefined} of {resamples} resamples undefined (both p99.9 infinite)"
             ),
+            Self::InfiniteRuns { runs } => {
+                write!(f, "{runs} runs with an infinite p99.9 (drops)")
+            }
             Self::Inconsistent => {
                 f.write_str("point estimate on the other side of zero from the interval")
             }
@@ -192,17 +201,25 @@ pub enum Outcome {
 ///   it contains zero (ACS 14838). The 2% rule applies only when the
 ///   difference and both added latencies are finite.
 /// - More than 2.5% undefined resamples make the point Not demonstrated
-///   (review of #186, P3): their sign is unknown.
-/// - A percentile interval need not contain its point estimate. When the
-///   interval excludes zero but the point estimate is zero or on the
-///   other side, the evidence contradicts itself and the point is Not
-///   demonstrated (review of #186, P3).
+///   (review of #186, P3): their sign is unknown. So does a run-level t
+///   interval with a run whose p99.9 is infinite (ACS 15055).
+/// - The point estimate is the difference of run-mean p99.9 values, the
+///   same statistic the interval is built on, for every resampling (H-1
+///   revised, ACS 15031). A percentile interval still need not contain
+///   its point estimate. When the interval excludes zero but the point
+///   estimate is on the other side, the evidence contradicts itself and
+///   the point is Not demonstrated (review of #186, P3).
 #[must_use]
 pub fn classify(difference: &Estimate, added_a: Value, added_b: Value) -> Outcome {
     let interval = &difference.interval;
     let Some((low, _)) = interval.ends else {
         return Outcome::NotDemonstrated(Cause::NoInterval);
     };
+    if interval.infinite_runs > 0 {
+        return Outcome::NotDemonstrated(Cause::InfiniteRuns {
+            runs: interval.infinite_runs,
+        });
+    }
     if interval.too_many_undefined() {
         return Outcome::NotDemonstrated(Cause::UndefinedResamples {
             undefined: interval.undefined,
@@ -319,7 +336,7 @@ pub fn drops_exceed(missing: u64, total: u64) -> bool {
 pub struct Config<'a> {
     /// The profile name.
     pub profile: &'a str,
-    /// Each run's samples, all of equal length (H-1).
+    /// Each run's samples, all of equal length (H-1 revised, ACS 15031).
     pub runs: Vec<&'a [u32]>,
     /// Saturated samples over all runs.
     pub saturated: u64,
@@ -372,9 +389,19 @@ pub struct PointInput<'a> {
 pub struct PointResult {
     /// The point.
     pub point: Point,
+    /// Where it was measured.
+    pub environment: Environment,
+    /// The interval method, block length, resamples and seed actually
+    /// used (ACS 15068).
+    pub method: BootstrapSpec,
+    /// Runs per configuration (the smallest, if they differ).
+    pub runs: u32,
+    /// Samples per run (the smallest).
+    pub samples_per_run: u64,
     /// The outcome.
     pub outcome: Outcome,
-    /// Per configuration: name, per-run p99.9, CV (reported, H-1).
+    /// Per configuration: name, per-run p99.9 (their mean decides, H-1
+    /// revised, ACS 15031), CV (8.4).
     pub spread: Vec<(String, Vec<u32>, Option<f64>)>,
     /// Per run of every configuration: missing and total messages
     /// (M-11).
@@ -385,7 +412,8 @@ pub struct PointResult {
 
 /// Evaluates one point: the environment (8.8), drops per run (M-11),
 /// saturation,
-/// the CV gate per configuration (8.4), then the bootstrap (8.3) and the
+/// the CV gate per configuration (8.4), then the interval (manifest 2.0
+/// §8.3 for a decision) and the
 /// classification (8.5).
 ///
 /// # Errors
@@ -411,9 +439,25 @@ pub fn evaluate_point(input: &PointInput<'_>) -> Result<PointResult, StatsError>
             });
         }
     }
+    let runs = configs
+        .iter()
+        .map(|config| config.runs.len())
+        .min()
+        .unwrap_or(0);
+    let samples_per_run = configs
+        .iter()
+        .flat_map(|config| config.runs.iter().map(|run| run.len()))
+        .min()
+        .unwrap_or(0);
+    let runs = u32::try_from(runs).unwrap_or(u32::MAX);
+    let samples_per_run = u64::try_from(samples_per_run).unwrap_or(u64::MAX);
     let done = |outcome: Outcome, spread, drops| {
         Ok(PointResult {
             point: input.point,
+            environment: input.environment,
+            method: input.spec,
+            runs,
+            samples_per_run,
             outcome,
             spread,
             drops,
@@ -479,6 +523,10 @@ pub fn evaluate_point(input: &PointInput<'_>) -> Result<PointResult, StatsError>
     );
     Ok(PointResult {
         point: input.point,
+        environment: input.environment,
+        method: input.spec,
+        runs,
+        samples_per_run,
         outcome,
         spread,
         drops,
@@ -811,6 +859,19 @@ impl GateTable {
 pub const AARCH64_ROW: &str =
     "aarch64 (E3): Not demonstrated (manifest 6.3 and 8.8, owner decision Q-5)";
 
+/// The decision-grade interval method: manifest 2.0 §8.3, the run-level
+/// Welch t interval on per-run p99.9 values (owner approval, ACS 15075).
+///
+/// This is the single place the method choice lives. Every other
+/// [`Resampling`] is report-only: [`grade`] refuses it with
+/// [`GradeReason::ReportOnly`]. Under manifest 1.0 the only admitted
+/// method was [`Resampling::StratifiedBlocks`], which the calibration at
+/// the design CV shows invalid (an A/A interval excludes zero in 96.1% of
+/// trials for the run-mean p99.9, 86.0% for the pooled p99.9; see
+/// `stats::tests::calibration_at_design_cv`); while the owner decided, a
+/// fail-safe refused every decision grade (ACS 15055, 15072).
+pub const DECISION_METHOD: Resampling = Resampling::RunWelchT;
+
 /// Why a result is not decision grade.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GradeReason {
@@ -824,15 +885,17 @@ pub enum GradeReason {
     Warmup(u64),
     /// Fewer runs than 8.2 requires.
     Runs(u32),
-    /// Fewer resamples than 8.3 requires.
+    /// Fewer resamples than 8.3 requires (bootstrap methods only).
     Resamples(u32),
-    /// The resampling is not stratified by run in whole blocks (8.3,
-    /// M-10): message-level [`Resampling::Iid`] never is, and the two
-    /// stage and run jackknife variants await the owner (manifest 1.1).
-    Resampling(Resampling),
-    /// Stratified blocks of the wrong length for the shape: M-10 resamples
-    /// whole units, a datagram for W5 and [`stats::DEFAULT_BLOCK_LEN`]
-    /// otherwise (see [`stats::block_len`]).
+    /// Report-only under manifest 2.0: the point used a method other than
+    /// [`DECISION_METHOD`], the run-level Welch t interval of manifest 2.0
+    /// §8.3. Stratified blocks undercover at the design CV (96.1% A/A
+    /// non-tie), two stage resampling too (10.9%), and message-level
+    /// [`Resampling::Iid`] also breaks M-10 (whole units only).
+    ReportOnly(Resampling),
+    /// Blocks of the wrong length for the shape, when the decision method
+    /// resamples blocks: M-10 resamples whole units, a datagram for W5 and
+    /// [`stats::DEFAULT_BLOCK_LEN`] otherwise (see [`stats::block_len`]).
     BlockLength {
         /// The shape.
         shape: Shape,
@@ -844,6 +907,36 @@ pub enum GradeReason {
     },
     /// The overall result is incomplete (H-4).
     Incomplete,
+    /// No point result was given, so the method cannot be checked.
+    NoPoints,
+    /// The manifest hash of the version in force is not recorded yet
+    /// (manifest 9: every result cites it); see
+    /// [`crate::manifest::MANIFEST_SHA256`].
+    ManifestHashPending,
+}
+
+impl fmt::Display for GradeReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProvisionalEMax => f.write_str("provisional E_max"),
+            Self::Environment(environment) => write!(f, "environment {environment}"),
+            Self::Samples(n) => write!(f, "{n} samples per run, below 10^6"),
+            Self::Warmup(n) => write!(f, "warmup {n}, below 10^5"),
+            Self::Runs(n) => write!(f, "{n} runs, below 5"),
+            Self::Resamples(n) => write!(f, "{n} resamples, below 10 000"),
+            Self::ReportOnly(resampling) => {
+                write!(f, "{resampling}: report-only under manifest 2.0")
+            }
+            Self::BlockLength {
+                shape,
+                used,
+                required,
+            } => write!(f, "{shape}: blocks of {used}, required {required:?}"),
+            Self::Incomplete => f.write_str("incomplete overall result"),
+            Self::NoPoints => f.write_str("no point results"),
+            Self::ManifestHashPending => f.write_str("manifest hash pending"),
+        }
+    }
 }
 
 /// Whether a comparison is decision grade.
@@ -856,75 +949,90 @@ pub enum Grade {
     NotDecisionGrade(Vec<GradeReason>),
 }
 
-/// The facts a decision grade depends on.
+/// The facts a decision grade depends on. The method, run count, sample
+/// count and environment come from what [`evaluate_point`] actually ran
+/// (ACS 15068), not from a list the caller declares.
 #[derive(Debug, Clone)]
 pub struct GradeInputs<'a> {
     /// The envelope budget.
     pub e_max: EMax,
-    /// The environment of every run.
-    pub environments: &'a [Environment],
-    /// The smallest measured count of any run.
-    pub min_samples: u64,
-    /// The smallest warmup of any run.
+    /// The smallest warmup of any run (discarded before the samples, so
+    /// not in the results).
     pub min_warmup: u64,
-    /// The smallest run count of any configuration at any point.
-    pub min_runs: u32,
-    /// The bootstrap resamples used (the smallest at any point).
-    pub resamples: u32,
-    /// The shape and resampling of every point of the comparison.
-    pub points: &'a [(Shape, Resampling)],
+    /// Every evaluated point of the comparison.
+    pub results: &'a [PointResult],
     /// The overall result.
     pub overall: &'a Overall,
 }
 
-/// The decision grade: refused for a provisional `E_max` (M-7), an
-/// environment that does not decide (6.3), too few samples, warmup, runs
-/// or resamples (8.1 to 8.3), a resampling other than stratified whole
-/// blocks of the shape's length (M-10; review of #186), or an incomplete
-/// overall result (H-4).
+/// The decision grade, with [`DECISION_METHOD`] as the only decision
+/// method: refused for a provisional `E_max` (M-7), a pending manifest
+/// hash (manifest 9), an environment that does not decide (6.3), too few
+/// samples, warmup or runs (8.1, 8.2), too few resamples for a bootstrap
+/// method (8.3), no point results, a point evaluated with another method
+/// (report-only) or with blocks of the wrong length for its shape (M-10),
+/// and an incomplete overall result (H-4).
 #[must_use]
 pub fn grade(inputs: &GradeInputs<'_>) -> Grade {
+    grade_with(inputs, DECISION_METHOD)
+}
+
+/// [`grade`] with `method` as the decision method. Crate-private so
+/// that no caller can grade with a method other than [`DECISION_METHOD`]
+/// (coordinator review of #200); the tests use it to cover the block
+/// length rule of a block decision method.
+#[must_use]
+pub(crate) fn grade_with(inputs: &GradeInputs<'_>, method: Resampling) -> Grade {
     let mut reasons = Vec::new();
-    if !inputs.e_max.is_decided() {
-        reasons.push(GradeReason::ProvisionalEMax);
-    }
-    let mut seen: Vec<Environment> = Vec::new();
-    for environment in inputs.environments {
-        if !environment.decides() && !seen.contains(environment) {
-            seen.push(*environment);
-            reasons.push(GradeReason::Environment(*environment));
+    let mut push = |reason: GradeReason| {
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
         }
+    };
+    if !inputs.e_max.is_decided() {
+        push(GradeReason::ProvisionalEMax);
     }
-    if inputs.min_samples < section8::MIN_SAMPLES_PER_RUN {
-        reasons.push(GradeReason::Samples(inputs.min_samples));
+    if !crate::manifest::manifest_hash_is_final() {
+        push(GradeReason::ManifestHashPending);
     }
-    if inputs.min_warmup < section8::WARMUP_PER_RUN {
-        reasons.push(GradeReason::Warmup(inputs.min_warmup));
+    if inputs.results.is_empty() {
+        push(GradeReason::NoPoints);
     }
-    if inputs.min_runs < section8::MIN_RUNS {
-        reasons.push(GradeReason::Runs(inputs.min_runs));
-    }
-    if inputs.resamples < section8::BOOTSTRAP_RESAMPLES {
-        reasons.push(GradeReason::Resamples(inputs.resamples));
-    }
-    for &(shape, resampling) in inputs.points {
-        let reason = match resampling {
-            Resampling::StratifiedBlocks { block_len } => {
-                let required = stats::block_len(shape, inputs.e_max.bytes()).ok();
-                (required != Some(block_len)).then_some(GradeReason::BlockLength {
+    for result in inputs.results {
+        if !result.environment.decides() {
+            push(GradeReason::Environment(result.environment));
+        }
+        if result.samples_per_run < section8::MIN_SAMPLES_PER_RUN {
+            push(GradeReason::Samples(result.samples_per_run));
+        }
+        if result.runs < section8::MIN_RUNS {
+            push(GradeReason::Runs(result.runs));
+        }
+        let used = result.method.resampling;
+        if std::mem::discriminant(&used) != std::mem::discriminant(&method) {
+            push(GradeReason::ReportOnly(used));
+            continue;
+        }
+        if let Some(block_len) = used.block_len() {
+            if result.method.resamples < section8::BOOTSTRAP_RESAMPLES {
+                push(GradeReason::Resamples(result.method.resamples));
+            }
+            let shape = result.point.shape;
+            let required = stats::block_len(shape, inputs.e_max.bytes()).ok();
+            if required != Some(block_len) {
+                push(GradeReason::BlockLength {
                     shape,
                     used: block_len,
                     required,
-                })
+                });
             }
-            other => Some(GradeReason::Resampling(other)),
-        };
-        if let Some(reason) = reason.filter(|reason| !reasons.contains(reason)) {
-            reasons.push(reason);
         }
     }
+    if inputs.min_warmup < section8::WARMUP_PER_RUN {
+        push(GradeReason::Warmup(inputs.min_warmup));
+    }
     if !inputs.overall.is_complete() {
-        reasons.push(GradeReason::Incomplete);
+        push(GradeReason::Incomplete);
     }
     if reasons.is_empty() {
         Grade::Decision
@@ -948,6 +1056,7 @@ mod tests {
                 infinite: 0,
                 undefined: 0,
                 resamples: 10_000,
+                infinite_runs: 0,
             },
         }
     }
@@ -1006,6 +1115,7 @@ mod tests {
                 infinite: 3,
                 undefined: 1,
                 resamples: 1000,
+                infinite_runs: 0,
             },
         };
         assert_eq!(
@@ -1039,6 +1149,7 @@ mod tests {
                 infinite: 0,
                 undefined: 0,
                 resamples: 0,
+                infinite_runs: 0,
             },
         };
         assert_eq!(
@@ -1080,9 +1191,12 @@ mod tests {
 
     #[test]
     fn the_point_estimate_must_agree_with_the_interval() {
-        // The interval is above zero but the point estimate is below it:
-        // contradictory evidence. Added latencies of 100 and 50 put the 2%
-        // band at 2 ns, so a point of -5 is outside it.
+        // The gate stays under H-1 revised (ACS 15031): the run-mean point
+        // and its percentile interval come from the same statistic, but a
+        // percentile interval need not contain its point. Here the
+        // interval is above zero and the point below it: contradictory
+        // evidence. Added latencies of 100 and 50 put the 2% band at 2 ns,
+        // so a point of -5 is outside it.
         let difference = estimate(-5, 10, 60);
         assert_eq!(
             classify(&difference, Value::Finite(100), Value::Finite(50)),
@@ -1256,82 +1370,135 @@ mod tests {
         assert_eq!(found.label(), "incomplete");
         assert_eq!(found.missing.len(), 2);
         assert!(found.missing.contains(&(r5, Cause::NotMeasured)));
-        let grade = grade(&GradeInputs {
-            e_max: EMax::Decided(64),
-            environments: &[Environment::E1],
-            min_samples: 1_000_000,
-            min_warmup: 100_000,
-            min_runs: 5,
-            resamples: 10_000,
-            points: &[(Shape::W1, Resampling::default_with(64))],
-            overall: &found,
-        });
+        let results = [result(Shape::W1, Resampling::RunWelchT)];
         assert_eq!(
-            grade,
+            grade(&grade_inputs(&results, &found)),
             Grade::NotDecisionGrade(vec![GradeReason::Incomplete])
         );
+    }
+
+    /// A point result as `evaluate_point` records it, with a decision
+    /// grade sample: E1, 5 runs of 1 000 020 samples, 10 000 resamples.
+    fn result(shape: Shape, resampling: Resampling) -> PointResult {
+        PointResult {
+            point: Point {
+                shape,
+                load: Load::R1,
+                fanout: Fanout::F1,
+            },
+            environment: Environment::E1,
+            method: BootstrapSpec::manifest(resampling, 7),
+            runs: 5,
+            samples_per_run: 1_000_020,
+            outcome: Outcome::Tie,
+            spread: Vec::new(),
+            drops: Vec::new(),
+            bootstrap: None,
+        }
+    }
+
+    fn grade_inputs<'a>(results: &'a [PointResult], overall: &'a Overall) -> GradeInputs<'a> {
+        GradeInputs {
+            e_max: EMax::Decided(64),
+            min_warmup: 100_002,
+            results,
+            overall,
+        }
     }
 
     #[test]
     fn decision_grade_conditions() {
         let complete = overall(&all(&Outcome::Tie), DecisionSet::default());
         let good = [
-            (Shape::W1, Resampling::default_with(64)),
-            (Shape::W5, Resampling::default_with(21)),
+            result(Shape::W1, Resampling::RunWelchT),
+            result(Shape::W5, Resampling::RunWelchT),
         ];
-        let mut inputs = GradeInputs {
-            e_max: EMax::Decided(64),
-            environments: &[Environment::E1, Environment::E1],
-            min_samples: 1_000_020,
-            min_warmup: 100_002,
-            min_runs: 5,
-            resamples: 10_000,
-            points: &good,
-            overall: &complete,
-        };
+        let mut inputs = grade_inputs(&good, &complete);
         assert_eq!(grade(&inputs), Grade::Decision);
+        // Everything that fails is listed, derived from the results.
+        let mut bad = result(Shape::W1, Resampling::RunWelchT);
+        bad.environment = Environment::E4;
+        bad.samples_per_run = 999_999;
+        bad.runs = 4;
+        let mut aarch64 = result(Shape::W3, Resampling::RunWelchT);
+        aarch64.environment = Environment::E3;
+        let bad = [bad, aarch64];
         inputs.e_max = EMax::Provisional(64);
-        inputs.environments = &[Environment::E4, Environment::E3, Environment::E4];
-        inputs.min_samples = 999_999;
-        inputs.resamples = 1000;
-        let two_stage = [(Shape::W1, Resampling::TwoStage { block_len: 64 })];
-        inputs.points = &two_stage;
+        inputs.min_warmup = 99_999;
+        inputs.results = &bad;
         assert_eq!(
             grade(&inputs),
             Grade::NotDecisionGrade(vec![
                 GradeReason::ProvisionalEMax,
                 GradeReason::Environment(Environment::E4),
-                GradeReason::Environment(Environment::E3),
                 GradeReason::Samples(999_999),
-                GradeReason::Resamples(1000),
-                GradeReason::Resampling(Resampling::TwoStage { block_len: 64 }),
+                GradeReason::Runs(4),
+                GradeReason::Environment(Environment::E3),
+                GradeReason::Warmup(99_999),
             ])
         );
     }
 
     #[test]
-    fn decision_grade_needs_whole_units() {
-        // M-10: whole units, never single messages (review of #186, P2).
+    fn only_the_manifest_2_method_is_decision_grade() {
+        // Manifest 2.0 §8.3 (ACS 15075): the run-level Welch t interval is
+        // the decision method, one constant; every other method is
+        // report-only.
+        assert_eq!(DECISION_METHOD, Resampling::RunWelchT);
         let complete = overall(&all(&Outcome::Tie), DecisionSet::default());
-        let check = |points: &[(Shape, Resampling)]| {
-            grade(&GradeInputs {
-                e_max: EMax::Decided(64),
-                environments: &[Environment::E1],
-                min_samples: 1_000_020,
-                min_warmup: 100_002,
-                min_runs: 5,
-                resamples: 10_000,
-                points,
-                overall: &complete,
-            })
-        };
+        for other in [
+            Resampling::default_with(64),
+            Resampling::TwoStage { block_len: 64 },
+            Resampling::Iid,
+        ] {
+            let results = [result(Shape::W1, other)];
+            let found = grade(&grade_inputs(&results, &complete));
+            assert_eq!(
+                found,
+                Grade::NotDecisionGrade(vec![GradeReason::ReportOnly(other)])
+            );
+            assert!(
+                GradeReason::ReportOnly(other)
+                    .to_string()
+                    .contains("report-only under manifest 2.0")
+            );
+        }
+        // One report-only point among decision-grade ones refuses the
+        // whole comparison.
+        let mixed = [
+            result(Shape::W1, Resampling::RunWelchT),
+            result(Shape::W3, Resampling::default_with(64)),
+        ];
+        assert_eq!(
+            grade(&grade_inputs(&mixed, &complete)),
+            Grade::NotDecisionGrade(vec![GradeReason::ReportOnly(Resampling::default_with(64))])
+        );
+        // The run-level Welch t needs no resamples.
+        let mut welch = result(Shape::W1, Resampling::RunWelchT);
+        welch.method.resamples = 0;
+        assert_eq!(grade(&grade_inputs(&[welch], &complete)), Grade::Decision);
+    }
+
+    #[test]
+    fn an_empty_result_list_is_refused() {
+        let complete = overall(&all(&Outcome::Tie), DecisionSet::default());
+        assert_eq!(
+            grade(&grade_inputs(&[], &complete)),
+            Grade::NotDecisionGrade(vec![GradeReason::NoPoints])
+        );
+    }
+
+    #[test]
+    fn a_block_decision_method_needs_whole_units_of_the_shape() {
+        // M-10, for a decision method that resamples blocks (manifest 1.0
+        // §8.3 had one): the block must be the shape's unit.
+        let complete = overall(&all(&Outcome::Tie), DecisionSet::default());
+        let stratified = Resampling::default_with(64);
+        let check =
+            |results: &[PointResult]| grade_with(&grade_inputs(results, &complete), stratified);
         let refused = |reason: GradeReason| Grade::NotDecisionGrade(vec![reason]);
         assert_eq!(
-            check(&[(Shape::W1, Resampling::Iid)]),
-            refused(GradeReason::Resampling(Resampling::Iid))
-        );
-        assert_eq!(
-            check(&[(Shape::W1, Resampling::default_with(1))]),
+            check(&[result(Shape::W1, Resampling::default_with(1))]),
             refused(GradeReason::BlockLength {
                 shape: Shape::W1,
                 used: 1,
@@ -1340,7 +1507,7 @@ mod tests {
         );
         // W5 blocks must be its datagrams (21 at E_max 64), not 64.
         assert_eq!(
-            check(&[(Shape::W5, Resampling::default_with(64))]),
+            check(&[result(Shape::W5, Resampling::default_with(64))]),
             refused(GradeReason::BlockLength {
                 shape: Shape::W5,
                 used: 64,
@@ -1348,12 +1515,58 @@ mod tests {
             })
         );
         assert_eq!(
-            check(&[(Shape::W3, Resampling::RunWelchT)]),
-            refused(GradeReason::Resampling(Resampling::RunWelchT))
-        );
-        assert_eq!(
-            check(&[(Shape::W5, Resampling::default_with(21))]),
+            check(&[result(Shape::W5, Resampling::default_with(21))]),
             Grade::Decision
+        );
+        let mut few = result(Shape::W1, stratified);
+        few.method.resamples = 1000;
+        assert_eq!(check(&[few]), refused(GradeReason::Resamples(1000)));
+        assert_eq!(
+            check(&[result(Shape::W1, Resampling::Iid)]),
+            refused(GradeReason::ReportOnly(Resampling::Iid))
+        );
+    }
+
+    #[test]
+    fn evaluate_point_records_what_it_ran() {
+        // ACS 15068: grade() reads the method from the results.
+        let mut rng = Rng::new(4);
+        let t = runs(&mut rng, 10_000, 5, 4_000);
+        let a = runs(&mut rng, 11_000, 5, 4_000);
+        let mut input = input(config("a", &a), config("a2", &a), config("trusted", &t));
+        input.spec = BootstrapSpec {
+            resampling: Resampling::RunWelchT,
+            resamples: 0,
+            seed: 99,
+            threads: None,
+        };
+        let found = evaluate_point(&input).unwrap();
+        assert_eq!(found.method, input.spec);
+        assert_eq!((found.runs, found.samples_per_run), (5, 4000));
+        assert_eq!(found.environment, Environment::E1);
+        let complete = overall(&all(&Outcome::Tie), DecisionSet::default());
+        assert_eq!(
+            grade(&grade_inputs(&[found], &complete)),
+            Grade::NotDecisionGrade(vec![GradeReason::Samples(4000)])
+        );
+    }
+
+    #[test]
+    fn a_run_level_interval_with_an_infinite_run_is_not_demonstrated() {
+        // ACS 15055: the run-level t interval of a configuration with a
+        // run whose p99.9 is infinite is (-inf, +inf). It is Not
+        // demonstrated, as on the bootstrap path, never a tie.
+        let x: Vec<Vec<u32>> = vec![vec![100u32; 1000]; 5];
+        let mut y = x.clone();
+        y[3][..2].fill(samples::MISSING);
+        let rx: Vec<&[u32]> = x.iter().map(Vec::as_slice).collect();
+        let ry: Vec<&[u32]> = y.iter().map(Vec::as_slice).collect();
+        let spec = BootstrapSpec::manifest(Resampling::RunWelchT, 1);
+        let difference = stats::bootstrap_difference(&rx, &ry, &spec).unwrap();
+        assert_eq!(difference.interval.infinite_runs, 1);
+        assert_eq!(
+            classify(&difference, Value::Finite(10), Value::Finite(20)),
+            Outcome::NotDemonstrated(Cause::InfiniteRuns { runs: 1 })
         );
     }
 
@@ -1470,35 +1683,63 @@ mod tests {
 
     #[test]
     fn a_a_is_a_tie_and_a_five_percent_shift_wins() {
-        // Base 10 000 + U(0, 1000): p99.9 ≈ 10 999. Trusted at offset 0,
-        // profiles at +1000 added latency.
+        // Base 10 000 + U(0, 1000): each run's p99.9 is about 10 999.
+        // Trusted at offset 0, profiles at +1000 added latency. The point
+        // is the run-mean difference under every resampling (H-1 revised,
+        // ACS 15031), so it always agrees with its interval.
         let mut rng = Rng::new(1);
         let t = runs(&mut rng, 10_000, 5, 32_000);
         let a = runs(&mut rng, 11_000, 5, 32_000);
         let b = runs(&mut rng, 11_000, 5, 32_000);
-        let result = evaluate_point(&input(
-            config("a", &a),
-            config("b", &b),
-            config("trusted", &t),
-        ))
-        .unwrap();
-        assert_eq!(result.outcome, Outcome::Tie, "{result:?}");
         // b adds 5% more: 1050 instead of 1000.
-        let b = runs(&mut rng, 11_050, 5, 32_000);
-        let result = evaluate_point(&input(
-            config("a", &a),
-            config("b", &b),
-            config("trusted", &t),
-        ))
-        .unwrap();
-        assert_eq!(result.outcome, Outcome::Win(Side::A), "{result:?}");
-        let swapped = evaluate_point(&input(
-            config("b", &b),
-            config("a", &a),
-            config("trusted", &t),
-        ))
-        .unwrap();
-        assert_eq!(swapped.outcome, Outcome::Win(Side::B));
+        let b5 = runs(&mut rng, 11_050, 5, 32_000);
+        let run_mean_difference = |x: &[Vec<u32>], y: &[Vec<u32>]| {
+            let x: Vec<&[u32]> = x.iter().map(Vec::as_slice).collect();
+            let y: Vec<&[u32]> = y.iter().map(Vec::as_slice).collect();
+            stats::run_mean_p999(&x).unwrap() - stats::run_mean_p999(&y).unwrap()
+        };
+        for resampling in [
+            Resampling::default_with(16),
+            Resampling::TwoStage { block_len: 16 },
+            Resampling::RunWelchT,
+        ] {
+            let with = |mut input: PointInput<'_>| {
+                input.spec.resampling = resampling;
+                evaluate_point(&input).unwrap()
+            };
+            let result = with(input(
+                config("a", &a),
+                config("b", &b),
+                config("trusted", &t),
+            ));
+            assert_eq!(result.outcome, Outcome::Tie, "{resampling}: {result:?}");
+            let result = with(input(
+                config("a", &a),
+                config("b", &b5),
+                config("trusted", &t),
+            ));
+            assert_eq!(
+                result.outcome,
+                Outcome::Win(Side::A),
+                "{resampling}: {result:?}"
+            );
+            let boot = result.bootstrap.unwrap();
+            let expected = run_mean_difference(&a, &b5);
+            let Value::Finite(point) = boot.difference.point else {
+                panic!("{boot:?}");
+            };
+            assert!(
+                (point as f64 - expected).abs() <= 0.5,
+                "{point} vs {expected}"
+            );
+            assert!((-60..=-40).contains(&point), "{point}");
+            let swapped = with(input(
+                config("b", &b5),
+                config("a", &a),
+                config("trusted", &t),
+            ));
+            assert_eq!(swapped.outcome, Outcome::Win(Side::B), "{resampling}");
+        }
     }
 
     #[test]

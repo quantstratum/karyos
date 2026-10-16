@@ -1012,11 +1012,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Command::AddConflatedSubscription { stream, .. } => {
                 self.add_conflated(client, request, stream)
             }
-            // The driver has no guard registry yet (P2.10 G-d): every
-            // guard is unknown, and nothing changes.
-            Command::GuardClose { guard, .. } | Command::GuardReopen { guard, .. } => {
-                refuse(ErrorCode::UnknownGuard, guard)
-            }
+            // Local guard control (G1): an admitted client's uid was
+            // proved equal to the driver's at admission.
+            Command::GuardClose {
+                guard, operation, ..
+            } => self.guard_command(client, request, guard, operation, None),
+            Command::GuardReopen {
+                guard,
+                expected,
+                operation,
+                ..
+            } => self.guard_command(client, request, guard, operation, Some(expected)),
         }
     }
 
@@ -1028,6 +1034,59 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// is `Held` under a fresh export and its fetch carries the table's
     /// region reopened read-only. An in-process client takes its view with
     /// `subscribe_conflated` instead, so it is refused here.
+    fn guard_command(
+        &mut self,
+        client: u64,
+        request: RequestId,
+        guard: u64,
+        operation: u64,
+        reopen: Option<u64>,
+    ) -> Response {
+        let requester = crate::guards::Requester::Client(client);
+        let now = self.clock.now();
+        // An unknown id is still audited, against a handle no guard has.
+        let handle = self
+            .guards
+            .by_id(guard)
+            .unwrap_or(crate::guards::GuardHandle {
+                driver: self.id,
+                guard: 0,
+            });
+        let done = match reopen {
+            None => self
+                .guards
+                .close(handle, operation, requester, now)
+                .map(|_| ()),
+            Some(expected) => self
+                .guards
+                .reopen(handle, expected, operation, requester, now)
+                .map(|_| ()),
+        };
+        let state = done.and_then(|()| self.guards.state(handle));
+        match state {
+            Ok(state) => Response::GuardState {
+                request,
+                guard,
+                state,
+            },
+            Err(error) => {
+                let detail = match &error {
+                    // The current guard word, as the protocol documents.
+                    DriverError::Guard(karyos_sys::guard::GuardError::NotClosedAt {
+                        current,
+                        ..
+                    }) => karyos_sys::guard::encode(*current).unwrap_or(0),
+                    _ => guard,
+                };
+                Response::Error {
+                    request,
+                    code: crate::guards::error_code(&error),
+                    detail,
+                }
+            }
+        }
+    }
+
     fn add_conflated(&mut self, client: u64, request: RequestId, stream: StreamKey) -> Response {
         let refuse = |code: ErrorCode, detail: u64| Response::Error {
             request,
@@ -4137,5 +4196,141 @@ mod tests {
                 (4, 4, 1)
             ]
         );
+    }
+
+    /// `GuardClose` and `GuardReopen` from an admitted client (G1): the
+    /// answer carries the guard's word, a stale reopen carries the current
+    /// word, an unknown guard is refused, and every command is audited
+    /// with the client as requester.
+    #[test]
+    fn guard_commands_transition_and_audit() {
+        let (mut driver, _stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let id = guard.id();
+        for command in [
+            Command::GuardReopen {
+                sequence: 1,
+                guard: id,
+                expected: 1,
+                operation: 70,
+            },
+            Command::GuardReopen {
+                sequence: 2,
+                guard: id,
+                expected: 1,
+                operation: 71,
+            },
+            Command::GuardClose {
+                sequence: 3,
+                guard: id,
+                operation: 72,
+            },
+            Command::GuardClose {
+                sequence: 4,
+                guard: 99,
+                operation: 73,
+            },
+        ] {
+            write(&mut producer, command);
+        }
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        let request = |sequence| RequestId { client, sequence };
+        let state = |epoch: u64| karyos_sys::guard::GuardState {
+            epoch,
+            open: epoch.is_multiple_of(2),
+        };
+        assert!(
+            answers.contains(&Response::GuardState {
+                request: request(1),
+                guard: id,
+                state: state(2),
+            }),
+            "{answers:?}"
+        );
+        assert!(
+            answers.contains(&Response::Error {
+                request: request(2),
+                code: ErrorCode::GuardNotClosedAt,
+                detail: 5,
+            }),
+            "{answers:?}"
+        );
+        assert!(
+            answers.contains(&Response::GuardState {
+                request: request(3),
+                guard: id,
+                state: state(3),
+            }),
+            "{answers:?}"
+        );
+        assert!(
+            answers.contains(&Response::Error {
+                request: request(4),
+                code: ErrorCode::UnknownGuard,
+                detail: 99,
+            }),
+            "{answers:?}"
+        );
+        assert_eq!(driver.guard_state(guard).unwrap(), state(3));
+        let audit = driver.guard_audit();
+        assert_eq!(audit.overwritten, 0);
+        let operations: Vec<_> = audit
+            .records
+            .iter()
+            .map(|record| (record.operation, record.requester, record.outcome))
+            .collect();
+        let by = crate::guards::Requester::Client(client);
+        assert_eq!(
+            operations,
+            [
+                (70, by, crate::guards::AuditOutcome::Reopened),
+                (
+                    71,
+                    by,
+                    crate::guards::AuditOutcome::Refused(ErrorCode::GuardNotClosedAt)
+                ),
+                (72, by, crate::guards::AuditOutcome::Closed),
+                (
+                    73,
+                    by,
+                    crate::guards::AuditOutcome::Refused(ErrorCode::UnknownGuard)
+                ),
+            ]
+        );
+    }
+
+    /// The embedded API (G1, in process): the same transitions and audit.
+    #[test]
+    fn guard_api_transitions_and_audit() {
+        let (mut driver, _stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        assert_eq!(driver.guard("orders"), Some(guard));
+        assert_eq!(driver.guard("quotes"), None);
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        assert_eq!(
+            driver.close_guard(guard, 2),
+            Ok(karyos_sys::guard::Closed::Now { epoch: 3 })
+        );
+        assert_eq!(
+            driver.close_guard(guard, 3),
+            Ok(karyos_sys::guard::Closed::Already { epoch: 3 })
+        );
+        let (mut other, _) = driver_with_stream();
+        assert_eq!(other.close_guard(guard, 4), Err(DriverError::UnknownGuard));
+        let audit = driver.guard_audit();
+        assert_eq!(audit.records.len(), 3);
+        assert!(
+            audit
+                .records
+                .iter()
+                .all(|record| record.requester == crate::guards::Requester::InProcess)
+        );
+        assert_eq!(other.guard_audit().records.len(), 1);
     }
 }

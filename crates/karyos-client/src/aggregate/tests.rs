@@ -260,3 +260,79 @@ fn a_closed_subscription_is_refused() {
         Err(ClientError::ClosedByOverrun)
     ));
 }
+
+/// A 64-byte DATA frame of term `term` at `offset`, BEGIN and END.
+fn whole(term: u32, offset: u32) -> Vec<u8> {
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    let mut out = wire(Word0::new(64, flags, FrameType::Data), offset, 0, 32);
+    out[20..24].copy_from_slice(&INITIAL.wrapping_add(term).to_le_bytes());
+    out
+}
+
+/// The PAD that fills term `term` from `offset`.
+fn pad(term: u32, offset: u32) -> Vec<u8> {
+    let extent = MIN_TERM_LENGTH - offset;
+    let mut out = wire(
+        Word0::new(32, Flags::NONE, FrameType::Pad),
+        offset,
+        i64::from(extent),
+        0,
+    );
+    out[20..24].copy_from_slice(&INITIAL.wrapping_add(term).to_le_bytes());
+    out
+}
+
+/// An overrun that the probe's zero-charge serve finds is consumed by
+/// `serve_frame`: the probe applies it (rejoin policy, loss report, first
+/// loss) instead of dropping it.
+#[test]
+fn an_overrun_at_the_probes_zero_charge_serve_is_applied() {
+    let buffer = image();
+    let mut conductor = buffer.conductor_owned().unwrap();
+    let subscription = ClientSubscription::new(conductor.subscribe(Role::Optional).unwrap());
+    let mut owner = ReceiveOwner::new(params(), vec![Arc::clone(&buffer)]).unwrap();
+    // A BEGIN without its END, then an ABORTED record: the probe peeks an
+    // Interrupted skip, a zero-charge step.
+    receive(&mut owner, &fragment(0, true, false));
+    receive(
+        &mut owner,
+        &wire(Word0::new(32, Flags::NONE, FrameType::Aborted), 64, 64, 0),
+    );
+    let frame = 1408;
+    let mut aggregate = AggregateSubscription::new(
+        DrrConfig::new(&[frame], frame).unwrap(),
+        vec![(Lane::ZERO, subscription)],
+    )
+    .unwrap();
+    // The first poll copies the BEGIN.
+    let _ = aggregate.poll(
+        |_, _, _| panic!("nothing complete"),
+        Budget {
+            work: 1,
+            bytes: frame,
+        },
+    );
+    // Before the zero-charge serve, the image moves on by whole terms and
+    // its slot of term 0 is reclaimed: the serve finds an overrun.
+    aggregate.before_zero_charge = Some(Box::new(move || {
+        receive(&mut owner, &pad(0, 128));
+        for term in 1..8u32 {
+            receive(&mut owner, &whole(term, 0));
+            receive(&mut owner, &pad(term, 64));
+            let _ = conductor.duty_cycle().unwrap();
+            while owner.duty() {}
+        }
+    }));
+    let report = aggregate.poll(
+        |_, _, _| {},
+        Budget {
+            work: 4,
+            bytes: frame,
+        },
+    );
+    let lane = report.lanes[0];
+    let (overrun, _) = lane.overrun.expect("the probe applied the overrun");
+    assert_eq!(overrun.from, 0);
+    assert_eq!(lane.first_loss, Some(0));
+    assert!(lane.end.is_none(), "rejoined at the head");
+}

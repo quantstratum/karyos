@@ -1461,6 +1461,42 @@ fn a_gap_moves_the_resolved_prefix_not_the_received_high_water() {
     assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)), "never cleared");
 }
 
+/// GU-1: a gap sealed above an earlier one leaves the first loss at the
+/// lower start (the minimum, not the latest seal).
+#[test]
+fn a_higher_gap_sealed_later_keeps_the_lower_first_loss() {
+    let buffer = gap_image(0);
+    let mut owner = owner(&buffer);
+    assert_eq!(seal(&mut owner, 64, 64), committed(64, 64));
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)));
+    assert_eq!(seal(&mut owner, 192, 64), committed(192, 64));
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)), "the lowest gap");
+}
+
+/// GU-1: the cursor's first loss is kept since the join; an overrun
+/// rejoin does not clear it.
+#[test]
+fn a_rejoin_after_an_overrun_keeps_the_cursor_first_loss() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(seal(&mut owner, 0, 64), committed(0, 64));
+    assert_eq!(poll(&mut subscription), skipped(0, 64, LOST));
+    assert_eq!(subscription.first_loss(), Some(0));
+    // The rebuild position moves more than half a term past the reader.
+    recv(&mut owner, &record(FrameType::Aborted, 0, 64, TERM / 2)).unwrap();
+    let begin = 64 + TERM / 2;
+    recv(&mut owner, &data(0, begin, 64, 1)).unwrap();
+    recv(&mut owner, &data(0, begin + 64, 64, 2)).unwrap();
+    conductor.duty_cycle().unwrap();
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Overrun { .. }
+    ));
+    assert_eq!(subscription.first_loss(), Some(0), "kept across the rejoin");
+}
+
 /// GU-3: fragments without BEGIN after a reported gap are `AfterLoss`,
 /// never `Orphan`; the reader resynchronizes at the next BEGIN, and a later
 /// run without BEGIN and without a gap is an `Orphan` again. The cursor's
@@ -1600,4 +1636,44 @@ fn a_late_copy_into_the_trailing_term_is_classified_too() {
     );
     assert_eq!(recv(&mut owner, &data(0, 0, 64, 1)), Ok(Received::Duplicate));
     assert_eq!(recv(&mut owner, &data(0, 0, 64, 9)), conflict(0, 64));
+}
+
+/// GU-11: the owner counts its sealed gaps per lane, by reason, and the
+/// late copies it dropped; a reader counts the bytes it lost by kind.
+#[test]
+fn gaps_and_reader_losses_are_counted() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &fragment(0, 0, 32, true, false, 1)).unwrap();
+    assert_eq!(seal(&mut owner, 64, 64), committed(64, 64));
+    recv(&mut owner, &fragment(0, 128, 32, false, true, 2)).unwrap();
+    let range = crate::local_gap::GapReason::RangeUnavailable;
+    assert_eq!(owner.seal_gap(Lane::ZERO, 192, 64, range), committed(192, 64));
+    assert_eq!(
+        recv(&mut owner, &data(0, 64, 64, 3)),
+        Ok(Received::LateAfterSkip)
+    );
+    let counters = owner.gap_counters(Lane::ZERO).unwrap();
+    assert_eq!(
+        (
+            counters.gaps_sealed,
+            counters.gap_bytes,
+            counters.reorder_expired,
+            counters.range_unavailable_skips,
+            counters.late_after_skip,
+            counters.overflowed,
+        ),
+        (2, 128, 1, 1, 1, false)
+    );
+    // Interrupted [0, 64), gap [64, 128), after loss [128, 192), gap.
+    for _ in 0..4 {
+        let _ = poll(&mut subscription);
+    }
+    let loss = subscription.loss_counters();
+    assert_eq!(
+        (loss.discarded_partial_bytes, loss.gap_bytes, loss.after_loss_bytes),
+        (64, 128, 64)
+    );
 }

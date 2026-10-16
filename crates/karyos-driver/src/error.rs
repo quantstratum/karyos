@@ -47,6 +47,21 @@ pub enum DriverError {
     /// A control-channel limit or size is invalid.
     #[error("invalid driver configuration")]
     InvalidConfig,
+    /// No such guard: a foreign handle or an unknown id.
+    #[error("unknown guard")]
+    UnknownGuard,
+    /// A guard of that name already exists.
+    #[error("a guard of that name already exists")]
+    DuplicateGuard,
+    /// `max_guards` guards exist.
+    #[error("too many guards")]
+    TooManyGuards,
+    /// Guard ids are exhausted; they are never reused.
+    #[error("guard ids exhausted")]
+    GuardIdsExhausted,
+    /// A guard transition was refused (`karyos_sys::guard`).
+    #[error(transparent)]
+    Guard(#[from] karyos_sys::guard::GuardError),
 
     /// A cutover of the stream is in progress
     /// (`quantstratum-docs: karyos/design/mapping-generations.md`): new handles wait for the

@@ -335,6 +335,10 @@ pub struct AggregateSubscription<T: TermBytes = HeapTerms> {
     /// between a probe's peek and the serve there.
     #[cfg(test)]
     between: Option<Box<dyn FnMut()>>,
+    /// Run just before the probe applies a zero-charge step: tests
+    /// reproduce a race between the probe's peek and that serve there.
+    #[cfg(test)]
+    before_zero_charge: Option<Box<dyn FnMut()>>,
 }
 
 impl<T: TermBytes> core::fmt::Debug for AggregateSubscription<T> {
@@ -380,6 +384,8 @@ impl<T: TermBytes> AggregateSubscription<T> {
             drr: Drr::new(config),
             #[cfg(test)]
             between: None,
+            #[cfg(test)]
+            before_zero_charge: None,
         })
     }
 
@@ -420,6 +426,8 @@ impl<T: TermBytes> AggregateSubscription<T> {
                 max_charge,
                 #[cfg(test)]
                 between: self.between.as_mut(),
+                #[cfg(test)]
+                before_zero_charge: self.before_zero_charge.as_mut(),
             },
         );
         let lanes: Vec<LanePoll> = self
@@ -451,6 +459,8 @@ impl<T: TermBytes> AggregateSubscription<T> {
 struct Source<'a, T: TermBytes, H> {
     #[cfg(test)]
     between: Option<&'a mut Box<dyn FnMut()>>,
+    #[cfg(test)]
+    before_zero_charge: Option<&'a mut Box<dyn FnMut()>>,
     lanes: &'a mut [LaneState<T>],
     handler: &'a mut H,
     max_charge: u64,
@@ -476,6 +486,10 @@ where
                     // An Interrupted skip: applied here, outside DRR
                     // service, and the probe looks at the interrupting
                     // frame.
+                    #[cfg(test)]
+                    if let Some(hook) = self.before_zero_charge.as_mut() {
+                        hook();
+                    }
                     match reader.serve_frame() {
                         Ok(FrameStep::Stepped { charge: 0, kind }) => state.stepped(kind),
                         // The reader ended between the peek and the serve:
