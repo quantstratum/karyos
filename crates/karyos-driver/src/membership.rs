@@ -24,7 +24,12 @@
 //!   changes nothing more. A binding beyond `max_paths` is refused and
 //!   counted; the SM still applies. [`Membership::binding_gone`] removes a
 //!   binding, and only the removal of a member's last binding removes the
-//!   member: an optional one expires and a required one is lost (M5).
+//!   member: an optional one expires and a required one is lost (M5). The
+//!   sender calls it synchronously when its binding row is removed or
+//!   reset, never from a queue, and before a reset that changes the
+//!   receiver or its boot id (ACS 15647). A binding refused for
+//!   `max_paths` is not recorded: the member can be removed while still
+//!   reachable on it, until that path's next accepted SM.
 //! - **Roles and tags** are configured ([`Roles`]): a packet cannot promote
 //!   itself to required or choose its group. An SM whose `group_tag`
 //!   differs from the receiver's configured tag (0 when none) is rejected
@@ -51,8 +56,17 @@
 //! - **Admission and loss** (owner decision M5). Admission opens once every
 //!   configured required receiver has joined; a lost required member stops
 //!   it for the incarnation and keeps its last consumption in the
-//!   retention bound. An expired optional member is removed; it can join
-//!   again as a new membership with a new generation and join point.
+//!   retention bound. An expired optional member leaves a tombstone: its
+//!   receiver, boot id and last consumption (ACS 15647). While the
+//!   tombstone exists, an SM of that receiver rejoins only when it is fresh
+//!   against it (it advances a lane with none lower, or it is caught up on
+//!   every lane) or after a new [`Membership::expect`]; any other SM is
+//!   rejected (`Expired`) and counted, so stationary SMs of a paused member
+//!   cannot defeat `pause_timeout` by rejoining, and a delayed old SM
+//!   cannot rejoin at a lower point. The tombstone is cleared after
+//!   `receiver_timeout` without any SM of it, or when its slot is needed
+//!   for another receiver; a rejoin is a new membership with a new
+//!   generation and join point.
 //!
 //! The table, the role lists and the event queue are sized at
 //! construction; the data calls do not allocate. Counters never wrap: a
@@ -62,14 +76,11 @@
 use std::net::SocketAddr;
 
 use karyos_protocol::frame::Lane;
-use karyos_protocol::network::{Alias, Identity, Receiver, StatusMessage};
+use karyos_protocol::network::{Alias, Identity, MAX_LANES, Receiver, StatusMessage};
 use karyos_sys::host_clock::age_ns;
 
 use crate::agents::EndpointId;
 use crate::paths::MAX_PATHS;
-
-/// The most lanes a publication has.
-pub const MAX_LANES: usize = 4;
 
 /// The session binding an SM arrived through (ACS 15595, 15636): the
 /// sender's key for an accepted SM.
@@ -90,8 +101,10 @@ pub struct SmKey {
 /// A member's binding: where its SMs may come from.
 type Binding = (EndpointId, SocketAddr);
 
-/// The bindings a member holds.
-const BINDINGS: usize = MAX_PATHS as usize;
+/// The bindings a member holds: [`MAX_PATHS`].
+const BINDINGS: usize = 16;
+
+const _: () = assert!(MAX_PATHS == 16, "BINDINGS is MAX_PATHS");
 
 /// How the optional contribution to a lane's edge is chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,7 +263,9 @@ pub enum StatusOutcome {
         member: MemberRef,
         /// Whether it was the membership's join.
         joined: bool,
-        /// Whether it refreshed liveness against `receiver_timeout`.
+        /// Whether it was fresh. Every accepted SM resets the
+        /// `receiver_timeout` clock; a fresh one also resets the
+        /// `pause_timeout` clock, which stationary SMs do not.
         fresh: bool,
     },
     /// The SM was rejected whole; it changed and refreshed nothing.
@@ -282,6 +297,9 @@ pub enum StatusRejected {
     BootChanged,
     /// A required member that is lost; its return needs a new incarnation.
     Lost,
+    /// An SM of an expired optional member that is not fresh against its
+    /// tombstone: stationary, or older.
+    Expired,
     /// No slot left for a newcomer: nothing is evicted.
     TableFull,
     /// The pending limit is reached.
@@ -295,7 +313,8 @@ pub enum Gone {
     Unknown,
     /// The member keeps another binding.
     Remaining,
-    /// It was the last binding: the pending or optional member is removed.
+    /// It was the last binding: a pending entry is removed, and an optional
+    /// member leaves a tombstone.
     Removed,
     /// It was a required member's last binding: it is lost (M5).
     Lost,
@@ -338,7 +357,7 @@ pub enum MemberEvent {
         /// The join points, lane 0 first.
         joins: [u64; MAX_LANES],
     },
-    /// An optional member expired and was removed.
+    /// An optional member expired, leaving a tombstone.
     Expired {
         /// The membership.
         member: MemberRef,
@@ -405,6 +424,11 @@ pub struct MembershipCounters {
     pub boot_changed: u64,
     /// SMs of a lost required member.
     pub lost_rejected: u64,
+    /// SMs of an expired optional member refused by its tombstone.
+    pub expired_rejected: u64,
+    /// Tombstones cleared after `receiver_timeout` of silence or for their
+    /// slot.
+    pub tombstones_cleared: u64,
     /// Newcomers refused for a full table.
     pub table_full: u64,
     /// Expected joins refused for the pending limit.
@@ -449,6 +473,9 @@ enum State {
     Active,
     /// A required member that expired: kept until the incarnation ends.
     LostRequired,
+    /// An optional member that expired: its receiver and last consumption;
+    /// `last_accepted` is when the last SM of it was seen.
+    Tombstone,
 }
 
 /// One table entry.
@@ -600,14 +627,15 @@ impl Membership {
         let receiver = key.receiver;
         let required = self.is_required(receiver.receiver_id);
         if let Some(slot) = self.find(receiver) {
-            if self
-                .entry(slot)
-                .is_some_and(|e| e.state == State::LostRequired)
-            {
-                return Err(self.reject(StatusRejected::Lost));
+            match self.entry(slot).map(|e| e.state) {
+                Some(State::LostRequired) => return Err(self.reject(StatusRejected::Lost)),
+                // A new establishment lifts the tombstone: the next SM joins.
+                Some(State::Tombstone) => self.free(slot),
+                _ => {
+                    self.bind(slot, key);
+                    return Ok(self.member_ref(slot));
+                }
             }
-            self.bind(slot, key);
-            return Ok(self.member_ref(slot));
         }
         if required && self.other_boot(receiver).is_some() {
             return Err(self.reject(StatusRejected::BootChanged));
@@ -653,8 +681,12 @@ impl Membership {
 
     /// Removes the binding `key` that the sender expired or evicted (ACS
     /// 15633, 15636). Only a member's last binding removes it: a required
-    /// member is then lost, as at its timeout (M5).
-    pub fn binding_gone(&mut self, key: &SmKey) -> Gone {
+    /// member is then lost, as at its timeout (M5), and an optional one
+    /// leaves a tombstone. The binding names no generation, so the sender
+    /// must call this synchronously when its binding row is removed or
+    /// reset, never from a queue, and before a reset that changes the
+    /// receiver or its boot id (ACS 15647).
+    pub fn binding_gone(&mut self, key: &SmKey, now: u64) -> Gone {
         let Some(slot) = self
             .find(key.receiver)
             .filter(|_| key.identity == self.identity && key.alias == self.alias)
@@ -682,7 +714,7 @@ impl Membership {
         match state {
             State::Active => {
                 let required = self.entry(slot).is_some_and(|e| e.required);
-                self.expire(slot);
+                self.expire(slot, now);
                 if required { Gone::Lost } else { Gone::Removed }
             }
             _ => {
@@ -709,16 +741,21 @@ impl Membership {
         }
         let required = self.is_required(id);
         let mut found = self.find(sm.receiver);
+        let mut tombstone = None;
         if let Some(slot) = found {
             let expired = self
                 .entry(slot)
                 .is_some_and(|e| e.state == State::Active && !self.live(e, now));
             if expired {
-                self.expire(slot);
+                self.expire(slot, now);
             }
             match self.entry(slot).map(|e| e.state) {
                 Some(State::LostRequired) => return Err(StatusRejected::Lost),
                 Some(State::Active | State::Pending) => {}
+                Some(State::Tombstone) => {
+                    found = None;
+                    tombstone = self.tombstone_admits(slot, sm, now)?;
+                }
                 _ => found = None,
             }
         }
@@ -771,6 +808,9 @@ impl Membership {
             }
         }
 
+        if let Some(slot) = tombstone {
+            self.free(slot);
+        }
         let slot = match found {
             Some(slot) => slot,
             None => self.allocate(required)?,
@@ -830,8 +870,12 @@ impl Membership {
     /// it before applying.
     #[must_use]
     pub fn current(&self, member: MemberRef) -> bool {
-        self.entry(usize::from(member.slot))
-            .is_some_and(|e| e.state != State::Free && e.generation == member.generation)
+        self.entry(usize::from(member.slot)).is_some_and(|e| {
+            matches!(
+                e.state,
+                State::Pending | State::Active | State::LostRequired
+            ) && e.generation == member.generation
+        })
     }
 
     /// `lane`'s submission edge at `now`.
@@ -932,16 +976,20 @@ impl Membership {
                 let receiver_id = self.required.get(at).copied().unwrap_or(0);
                 self.counters.bump(|c| &mut c.not_joined);
                 self.event(MemberEvent::NotJoined { receiver_id });
-                actions += 1;
+                let Some(next) = actions.checked_add(1) else {
+                    return actions;
+                };
+                actions = next;
             }
         }
         let slots = self.entries.len();
-        let mut visited = 0;
-        while actions < limit && visited < slots {
+        for _ in 0..slots {
+            let Some(next) = actions.checked_add(1).filter(|next| *next <= limit) else {
+                break;
+            };
+            actions = next;
             let slot = self.cursor;
-            self.cursor = if slot + 1 >= slots { 0 } else { slot + 1 };
-            visited += 1;
-            actions += 1;
+            self.cursor = slot.checked_add(1).filter(|n| *n < slots).unwrap_or(0);
             let Some(entry) = self.entry(slot).copied() else {
                 continue;
             };
@@ -950,7 +998,13 @@ impl Membership {
                     self.free(slot);
                     self.counters.bump(|c| &mut c.join_expired);
                 }
-                State::Active if !self.live(&entry, now) => self.expire(slot),
+                State::Active if !self.live(&entry, now) => self.expire(slot, now),
+                State::Tombstone
+                    if age_ns(now, entry.last_accepted) >= self.config.receiver_timeout =>
+                {
+                    self.free(slot);
+                    self.counters.bump(|c| &mut c.tombstones_cleared);
+                }
                 _ => {}
             }
         }
@@ -979,9 +1033,9 @@ impl Membership {
         })
     }
 
-    /// Expires the active entry at `slot`: a required member is lost, an
-    /// optional one removed.
-    fn expire(&mut self, slot: usize) {
+    /// Expires the active entry at `slot` at `now`: a required member is
+    /// lost; an optional one leaves a tombstone.
+    fn expire(&mut self, slot: usize, now: u64) {
         let Some(entry) = self.entry(slot).copied() else {
             return;
         };
@@ -997,7 +1051,11 @@ impl Membership {
                 consumption: entry.consumption,
             });
         } else {
-            self.free(slot);
+            if let Some(e) = self.entries.get_mut(slot) {
+                e.state = State::Tombstone;
+                e.bindings = [None; BINDINGS];
+                e.last_accepted = now;
+            }
             self.counters.bump(|c| &mut c.expired);
             self.event(MemberEvent::Expired {
                 member,
@@ -1007,7 +1065,53 @@ impl Membership {
         }
     }
 
-    /// Takes a free slot for a newcomer, raising its generation; optional
+    /// Whether the tombstone at `slot` lets `sm` rejoin at `now` (ACS
+    /// 15647): `Some(slot)` to clear it once the SM is accepted, `None` when
+    /// it was silent for `receiver_timeout` and is cleared already.
+    ///
+    /// # Errors
+    ///
+    /// [`StatusRejected::Expired`] for an SM that is not fresh against it;
+    /// the tombstone notes that it was seen.
+    fn tombstone_admits(
+        &mut self,
+        slot: usize,
+        sm: &StatusMessage,
+        now: u64,
+    ) -> Result<Option<usize>, StatusRejected> {
+        let Some(entry) = self.entry(slot).copied() else {
+            return Ok(None);
+        };
+        if age_ns(now, entry.last_accepted) >= self.config.receiver_timeout {
+            self.free(slot);
+            self.counters.bump(|c| &mut c.tombstones_cleared);
+            return Ok(None);
+        }
+        let mut lower = false;
+        let mut advanced = false;
+        let mut caught_up = true;
+        for ((status, last), sent) in sm
+            .lanes
+            .as_slice()
+            .iter()
+            .zip(entry.consumption)
+            .zip(self.sent_high)
+        {
+            lower |= status.consumption < last;
+            advanced |= status.consumption > last;
+            caught_up &= status.consumption == sent;
+        }
+        if caught_up || (advanced && !lower) {
+            return Ok(Some(slot));
+        }
+        if let Some(e) = self.entries.get_mut(slot) {
+            e.last_accepted = now;
+        }
+        Err(StatusRejected::Expired)
+    }
+
+    /// Takes a slot for a newcomer, raising its generation: a free one,
+    /// else the tombstone seen longest ago (cleared and counted). Optional
     /// newcomers leave room for every required receiver not yet in the
     /// table. Exhausted slots are retired and skipped.
     fn allocate(&mut self, required: bool) -> Result<usize, StatusRejected> {
@@ -1024,19 +1128,30 @@ impl Membership {
                 })
                 .count()
         };
-        let mut free = self
-            .entries
-            .iter()
-            .filter(|e| e.state == State::Free && !e.retired)
-            .count();
+        let usable = |e: &Entry| !e.retired && matches!(e.state, State::Free | State::Tombstone);
+        let mut free = self.entries.iter().filter(|e| usable(e)).count();
         while free > reserved {
-            let Some(slot) = self
+            let slot = self
                 .entries
                 .iter()
                 .position(|e| e.state == State::Free && !e.retired)
-            else {
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| usable(e))
+                        .min_by_key(|(_, e)| e.last_accepted)
+                        .map(|(slot, _)| slot)
+                });
+            let Some(slot) = slot else {
                 break;
             };
+            if self
+                .entry(slot)
+                .is_some_and(|e| e.state == State::Tombstone)
+            {
+                self.counters.bump(|c| &mut c.tombstones_cleared);
+            }
             let Some(entry) = self.entries.get_mut(slot) else {
                 break;
             };
@@ -1048,15 +1163,24 @@ impl Membership {
                 entry.state = State::Pending;
                 return Ok(slot);
             }
-            entry.retired = true;
+            *entry = Entry {
+                retired: true,
+                ..*entry
+            };
+            entry.state = State::Free;
             self.counters.bump(|c| &mut c.retired_slots);
-            free -= 1;
+            let Some(left) = free.checked_sub(1) else {
+                break;
+            };
+            free = left;
         }
         Err(StatusRejected::TableFull)
     }
 
     /// Adds `key`'s binding to the entry at `slot`, unless it holds it or
-    /// already holds `max_paths` (refused and counted).
+    /// already holds `max_paths`: then it is refused, counted and not
+    /// recorded, so the member can be removed while still reachable on it
+    /// until that path's next accepted SM.
     fn bind(&mut self, slot: usize, key: &SmKey) {
         let binding = (key.endpoint, key.source);
         let limit = usize::from(self.config.max_paths);
@@ -1139,6 +1263,7 @@ impl Membership {
             StatusRejected::Overflow => &mut c.overflow,
             StatusRejected::BootChanged => &mut c.boot_changed,
             StatusRejected::Lost => &mut c.lost_rejected,
+            StatusRejected::Expired => &mut c.expired_rejected,
             StatusRejected::TableFull => &mut c.table_full,
             StatusRejected::PendingFull => &mut c.pending_full,
         });
@@ -1150,7 +1275,7 @@ impl Membership {
 fn zero_or_repeated(ids: &[u64]) -> bool {
     ids.iter()
         .enumerate()
-        .any(|(at, id)| *id == 0 || ids.iter().skip(at + 1).any(|other| other == id))
+        .any(|(at, id)| *id == 0 || ids.iter().take(at).any(|other| other == id))
 }
 
 #[cfg(test)]

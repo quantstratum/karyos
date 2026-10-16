@@ -221,7 +221,10 @@ release may break APIs, wire formats and shared-memory layouts.
   `tagged`, then the minimum with every live required edge),
   `NoReceiverWindow` or `Held`. `admission` opens once the required set
   has joined and stops for good at a required loss, whose last consumption
-  stays in `retention`. `timers` expires members within a bound with a fair
+  stays in `retention`. An expired optional member leaves a tombstone: it
+  rejoins only with an SM fresh against its last consumption or after a
+  new `expect`, so stationary SMs cannot defeat `pause_timeout` (ACS
+  15647). `timers` expires members within a bound with a fair
   cursor, and membership events are queued in a bounded queue. Not wired
   yet: the sender agent's SM handoff and gate.
 

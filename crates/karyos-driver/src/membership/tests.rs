@@ -459,10 +459,13 @@ fn stationary_sms_keep_a_member_only_until_pause_timeout() {
     assert!(counts.stationary > counts.paused && counts.paused > 0);
 }
 
-/// A caught-up member stays live on unchanged SMs: an idle group is not
-/// lost, and a replayed SM of a caught-up member holds nothing back.
+/// A caught-up member stays live on unchanged SMs, so an idle group is not
+/// lost. By rule (ii) of ACS 15604 and 15610 this also lets a replay of a
+/// dead member's caught-up SM keep it live while the sender is idle: the
+/// documented residual risk of the trusted profile, harmless because a
+/// caught-up member holds nothing back.
 #[test]
-fn a_caught_up_member_is_fresh() {
+fn a_caught_up_member_stays_live_even_on_replays() {
     let mut table = Membership::new(config(2), identity(1), alias(), &Roles::default(), 0).unwrap();
     assert!(table.advance_sent(lane(0), 100));
     assert!(table.advance_sent(lane(1), 7));
@@ -528,8 +531,18 @@ fn an_expired_optional_member_rejoins_as_a_new_membership() {
             consumption: [500, 0, 0, 0],
         }
     );
-    // A lower consumption is a fresh join point, not a stale SM.
-    let (second, joined, _) = accepted(status(&mut table, &sm(1, &[(400, 100)]), TIMEOUT + 1));
+    // A delayed older SM cannot rejoin below the tombstone (ACS 15647).
+    assert_eq!(
+        rejected(status(&mut table, &sm(1, &[(400, 100)]), TIMEOUT + 1)),
+        StatusRejected::Expired
+    );
+    assert_eq!(
+        rejected(status(&mut table, &sm(1, &[(500, 100)]), TIMEOUT + 2)),
+        StatusRejected::Expired,
+        "stationary"
+    );
+    // An advance is fresh against the tombstone: a new join point.
+    let (second, joined, _) = accepted(status(&mut table, &sm(1, &[(600, 100)]), TIMEOUT + 3));
     assert!(joined);
     assert_eq!(second.slot, first.slot);
     assert_eq!(second.generation, first.generation + 1);
@@ -762,7 +775,10 @@ fn a_receiver_over_several_paths_is_one_member() {
     assert!(fresh, "liveness is per member");
     assert_eq!(table.counters().paths_full, 1);
     assert_eq!(table.counters().joins, 2);
-    assert_eq!(table.binding_gone(&path(ahead.receiver, 3)), Gone::Unknown);
+    assert_eq!(
+        table.binding_gone(&path(ahead.receiver, 3), 0),
+        Gone::Unknown
+    );
 }
 
 /// The key must be the SM's own; a mismatch is rejected whole.
@@ -808,12 +824,15 @@ fn only_the_last_gone_binding_removes_a_member() {
     let (optional, _, _) = accepted(status(&mut table, &two, 0));
     assert_eq!(table.admission(0), Admission::Open);
 
-    assert_eq!(table.binding_gone(&path(one.receiver, 1)), Gone::Remaining);
+    assert_eq!(
+        table.binding_gone(&path(one.receiver, 1), 0),
+        Gone::Remaining
+    );
     assert_eq!(table.admission(0), Admission::Open);
-    assert_eq!(table.binding_gone(&path(one.receiver, 1)), Gone::Unknown);
-    assert_eq!(table.binding_gone(&path(two.receiver, 1)), Gone::Removed);
+    assert_eq!(table.binding_gone(&path(one.receiver, 1), 0), Gone::Unknown);
+    assert_eq!(table.binding_gone(&path(two.receiver, 1), 0), Gone::Removed);
     assert!(!table.current(optional));
-    assert_eq!(table.binding_gone(&path(one.receiver, 2)), Gone::Lost);
+    assert_eq!(table.binding_gone(&path(one.receiver, 2), 0), Gone::Lost);
     assert_eq!(table.admission(0), Admission::LostRequired);
     assert_eq!(table.limit(lane(0), 0), Limit::Held);
     assert_eq!(table.retention(lane(0)), Some(10));
@@ -826,8 +845,82 @@ fn only_the_last_gone_binding_removes_a_member() {
     assert_eq!((counts.bindings_gone, counts.unbound), (3, 2));
     // An expected entry that loses its only binding is removed.
     let pending = table.expect(&path(receiver(3, 1), 1), 0).unwrap();
-    assert_eq!(table.binding_gone(&path(receiver(3, 1), 1)), Gone::Removed);
+    assert_eq!(
+        table.binding_gone(&path(receiver(3, 1), 1), 0),
+        Gone::Removed
+    );
     assert!(!table.current(pending));
+}
+
+/// P1-1 of the #251 review (ACS 15647): a paused optional member expired
+/// at `pause_timeout` does not rejoin on its stationary SMs, so the sender
+/// stays unblocked; it rejoins once it advances.
+#[test]
+fn a_paused_member_does_not_rejoin_on_stationary_sms() {
+    let mut table = Membership::new(config(1), identity(1), alias(), &Roles::default(), 0).unwrap();
+    assert!(table.advance_sent(lane(0), 1000));
+    accepted(status(&mut table, &sm(1, &[(100, 100)]), 0));
+    accepted(status(&mut table, &sm(2, &[(900, 100)]), 0));
+    let mut now = 0;
+    while now < PAUSE + 10 * SECOND {
+        now += 10 * MS;
+        let _ = status(&mut table, &sm(1, &[(100, 100)]), now);
+        accepted(status(&mut table, &sm(2, &[(1000, 100)]), now));
+    }
+    assert_eq!(
+        table.limit(lane(0), now),
+        Limit::Edge(1100),
+        "only 2 bounds"
+    );
+    assert!(table.counters().expired_rejected > 0);
+    assert_eq!(table.counters().expired, 1);
+    let (_, joined, _) = accepted(status(&mut table, &sm(1, &[(101, 100)]), now + MS));
+    assert!(joined);
+    assert_eq!(table.limit(lane(0), now + MS), Limit::Edge(201));
+}
+
+/// A tombstone is cleared by `receiver_timeout` of silence, by a new
+/// `expect` and when its slot is needed; a caught-up SM rejoins at once.
+#[test]
+fn a_tombstone_lifts_on_silence_expect_or_need() {
+    let mut table = Membership::new(
+        MembershipConfig {
+            max_receivers: 2,
+            max_pending: 2,
+            ..config(1)
+        },
+        identity(1),
+        alias(),
+        &Roles::default(),
+        0,
+    )
+    .unwrap();
+    assert!(table.advance_sent(lane(0), 100));
+    accepted(status(&mut table, &sm(1, &[(50, 100)]), 0));
+    table.timers(TIMEOUT, 64);
+    // Silence: a stationary SM after receiver_timeout joins afresh.
+    assert_eq!(
+        rejected(status(&mut table, &sm(1, &[(50, 100)]), 2 * TIMEOUT - 1)),
+        StatusRejected::Expired
+    );
+    let (_, joined, _) = accepted(status(&mut table, &sm(1, &[(50, 100)]), 3 * TIMEOUT));
+    assert!(joined, "silent since 2 * TIMEOUT - 1");
+    assert_eq!(table.counters().tombstones_cleared, 1);
+    // A new expect lifts it.
+    table.timers(4 * TIMEOUT, 64);
+    table.expect(&path(receiver(1, 1), 1), 4 * TIMEOUT).unwrap();
+    let (_, joined, _) = accepted(status(&mut table, &sm(1, &[(50, 100)]), 4 * TIMEOUT));
+    assert!(joined);
+    // Caught up: fresh against the tombstone.
+    table.timers(5 * TIMEOUT, 64);
+    let (_, joined, _) = accepted(status(&mut table, &sm(1, &[(100, 100)]), 5 * TIMEOUT));
+    assert!(joined);
+    // Need: with the table full of a member and a tombstone, a newcomer
+    // takes the tombstone's slot.
+    table.timers(6 * TIMEOUT, 64);
+    accepted(status(&mut table, &sm(2, &[(0, 100)]), 6 * TIMEOUT));
+    accepted(status(&mut table, &sm(3, &[(0, 100)]), 6 * TIMEOUT));
+    assert_eq!(table.counters().tombstones_cleared, 2);
 }
 
 /// The timers stop at their limit and resume from their cursor.
