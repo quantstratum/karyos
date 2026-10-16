@@ -963,7 +963,7 @@ mod tests {
         let mut driver = driver(64);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let guard = driver.add_guard("orders").unwrap();
-        driver.guard_stream(handle, guard, 4).unwrap();
+        driver.guard_stream(handle, guard, 4, None).unwrap();
         assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
         let _old_reader = driver.subscribe(handle, Role::Required).unwrap();
         let mut writer = driver.publication(handle).unwrap();

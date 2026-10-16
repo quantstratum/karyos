@@ -55,6 +55,12 @@ pub enum OfferOutcome {
     /// reopen the application takes a new publication
     /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, GC-8).
     Gated,
+    /// The publication's rate limit holds no token for another message;
+    /// nothing was appended, retry later. An early rejection by the
+    /// handle's copy of the limit; the driver's sender gate is
+    /// authoritative (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, Rate limits).
+    RateLimited,
 }
 
 /// Result of [`ClientPublication::try_claim`]. Each call makes at most
@@ -87,6 +93,9 @@ pub enum ClaimOutcome<'a, T: TermBytes = HeapTerms> {
     /// The publication's guard closed or a deadline was missed, as
     /// [`OfferOutcome::Gated`].
     Gated,
+    /// The rate limit holds no token for another message, as
+    /// [`OfferOutcome::RateLimited`]; nothing reserved.
+    RateLimited,
 }
 
 /// Result of [`ClientClaim::commit`]. Embedded API, provisional, as
@@ -509,11 +518,20 @@ impl<T: TermBytes> ClientPublication<T> {
         if let Some(config) = self.conflation {
             config.validate_publication(options.reserved_value, payload.len())?;
         }
+        // The rate copy is asked last, so it refuses only a message that
+        // would otherwise be appended.
+        if let Some(binding) = &mut self.guard
+            && !binding.rate_admits()
+        {
+            return Ok(OfferOutcome::RateLimited);
+        }
         Ok(match self.inner.append(payload, options)? {
             AppendOutcome::Appended { position } => {
-                // An accepted message gets exactly one final record.
+                // An accepted message gets exactly one final record, and
+                // takes one token of the rate copy.
                 if let Some(binding) = &mut self.guard {
                     binding.reserve();
+                    binding.charge_rate();
                 }
                 OfferOutcome::Accepted {
                     lane: self.inner.buffer().lane(),
@@ -611,6 +629,11 @@ impl<T: TermBytes> ClientPublication<T> {
             })?;
             config.validate_publication(options.reserved_value, value_length)?;
         }
+        if let Some(binding) = &mut self.guard
+            && !binding.rate_admits()
+        {
+            return Ok(ClaimOutcome::RateLimited);
+        }
         let lane = self.inner.buffer().lane();
         let base = self.base;
         let link = self.link.as_deref();
@@ -624,6 +647,9 @@ impl<T: TermBytes> ClientPublication<T> {
             && reserves(&outcome)
         {
             binding.reserve();
+            if matches!(outcome, SysClaimOutcome::Claimed(_)) {
+                binding.charge_rate();
+            }
         }
         Ok(match outcome {
             SysClaimOutcome::Claimed(inner) => ClaimOutcome::Claimed(ClientClaim {
@@ -1208,6 +1234,26 @@ mod tests {
 
         /// A publication bound to guard word 1 at open epoch 2.
         fn guarded() -> (Driver, ClientPublication) {
+            guarded_with(None)
+        }
+
+        thread_local! {
+            /// The rate copy's clock in these tests, per test thread.
+            static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+        }
+
+        fn now() -> u64 {
+            NOW.with(core::cell::Cell::get)
+        }
+
+        fn advance(nanos: u64) {
+            NOW.with(|now| now.set(now.get() + nanos));
+        }
+
+        /// As [`guarded`], with a rate limit read against [`now`].
+        fn guarded_with(
+            rate: Option<karyos_sys::rate_limit::RatePolicy>,
+        ) -> (Driver, ClientPublication) {
             let slots = capacity(MESSAGES, 1).unwrap();
             let guard = Arc::new(HeapWords::zeroed(2));
             guard.words()[1].store(guard::created(), Ordering::Relaxed);
@@ -1227,6 +1273,10 @@ mod tests {
                 MESSAGES,
             )
             .unwrap();
+            let binding = match rate {
+                Some(policy) => binding.with_rate(policy, now),
+                None => binding,
+            };
             let (_buffer, conductor, publication) = setup(true);
             let driver = Driver {
                 conductor,
@@ -1240,6 +1290,60 @@ mod tests {
 
         fn accepted(outcome: OfferOutcome) -> bool {
             matches!(outcome, OfferOutcome::Accepted { .. })
+        }
+
+        fn messages_per_second(per_second: u64, burst: u64) -> karyos_sys::rate_limit::RatePolicy {
+            karyos_sys::rate_limit::RatePolicy {
+                messages: karyos_sys::rate_limit::Rate { per_second, burst },
+                // A byte limit the copy ignores: the gate charges frames.
+                bytes: Some(karyos_sys::rate_limit::Rate {
+                    per_second: 1,
+                    burst: 1,
+                }),
+            }
+        }
+
+        /// G-e3: the handle's copy of the rate limit refuses early, appends
+        /// and reserves nothing, and an accepted message takes one token.
+        #[test]
+        fn a_spent_rate_copy_refuses_offers_and_claims_early() {
+            let (mut driver, mut publication) = guarded_with(Some(messages_per_second(10, 1)));
+            let binding =
+                |publication: &ClientPublication| publication.guard().unwrap().rate_tokens();
+            assert_eq!(binding(&publication), Some(1));
+            // A payload far above the byte burst: only the message bucket is
+            // copied, so it is not refused for its size.
+            assert!(accepted(publication.offer(&[7; 256]).unwrap()));
+            assert_eq!(binding(&publication), Some(0));
+            let before = driver.conductor.head().unwrap();
+            assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::RateLimited);
+            assert!(matches!(
+                publication.try_claim(8).unwrap(),
+                ClaimOutcome::RateLimited
+            ));
+            assert_eq!(driver.conductor.head().unwrap(), before, "nothing appended");
+            assert_eq!(publication.guard().unwrap().outstanding(), 1);
+            // A tenth of a second earns one token: a claim takes it.
+            advance(100_000_000);
+            let ClaimOutcome::Claimed(claim) = publication.try_claim(8).unwrap() else {
+                panic!("not claimed");
+            };
+            drop(claim);
+            assert_eq!(binding(&publication), Some(0));
+            // C_m = 2 reservations wait for their records: back pressure
+            // comes first, and a refusal charges nothing.
+            assert_eq!(
+                publication.offer(b"y").unwrap(),
+                OfferOutcome::BackPressured
+            );
+            driver.outcome(Kind::Submitted);
+            driver.outcome(Kind::Aborted);
+            let _ = publication.poll_outcomes(8, |_, _| {}).unwrap();
+            assert_eq!(publication.guard().unwrap().outstanding(), 0);
+            assert_eq!(publication.offer(b"y").unwrap(), OfferOutcome::RateLimited);
+            advance(100_000_000);
+            assert!(accepted(publication.offer(b"z").unwrap()));
+            assert_eq!(binding(&publication), Some(0));
         }
 
         #[test]

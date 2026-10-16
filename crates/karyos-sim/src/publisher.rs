@@ -17,7 +17,8 @@ pub enum Attempt {
     Accepted(u64),
     /// The block at a stream position will never carry the message.
     Aborted(u64),
-    /// Back pressure, an admin action or no subscriber: nothing reserved.
+    /// Back pressure, an admin action, no subscriber or a rate limit:
+    /// nothing reserved.
     Retry,
     /// The publication is closed.
     Closed,
@@ -110,9 +111,11 @@ impl SimPublisher for ClientPublication {
         Ok(
             match ClientPublication::offer_with(self, payload, keyed(key))? {
                 OfferOutcome::Accepted { position, .. } => Attempt::Accepted(position),
+                // No rate limit in the simulator either; a refusal retries.
                 OfferOutcome::BackPressured
                 | OfferOutcome::AdminAction
-                | OfferOutcome::NotConnected => Attempt::Retry,
+                | OfferOutcome::NotConnected
+                | OfferOutcome::RateLimited => Attempt::Retry,
                 // No guard in the simulator: a gate seal ends the publication.
                 OfferOutcome::Closed | OfferOutcome::Gated => Attempt::Closed,
             },
@@ -125,7 +128,8 @@ impl SimPublisher for ClientPublication {
             ClaimOutcome::Aborted { position, .. } => Claimed::Outcome(Attempt::Aborted(position)),
             ClaimOutcome::BackPressured
             | ClaimOutcome::AdminAction
-            | ClaimOutcome::NotConnected => Claimed::Outcome(Attempt::Retry),
+            | ClaimOutcome::NotConnected
+            | ClaimOutcome::RateLimited => Claimed::Outcome(Attempt::Retry),
             ClaimOutcome::Closed | ClaimOutcome::Gated => Claimed::Outcome(Attempt::Closed),
         })
     }

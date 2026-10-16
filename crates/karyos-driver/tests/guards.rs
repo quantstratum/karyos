@@ -14,14 +14,15 @@ use karyos_client::{
     OfferOutcome,
 };
 use karyos_driver::{
-    DriverConfig, DriverError, EmbeddedDriver, Reconfiguration, SealState, StreamConfig,
-    StreamHandle, WalkerUnavailable,
+    DriverConfig, DriverError, EmbeddedDriver, GuardRate, RateScope, Reconfiguration, SealState,
+    StreamConfig, StreamHandle, WalkerUnavailable,
 };
 use karyos_sys::frame::Lane;
 use karyos_sys::guard::Closed;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
 use karyos_sys::log_buffer::{Role, SealReason};
 use karyos_sys::outcome_ring::{Kind, Record};
+use karyos_sys::rate_limit::{Rate, RatePolicy, RatePolicyError};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
@@ -59,7 +60,7 @@ fn guarded(messages: u64) -> (EmbeddedDriver, StreamHandle, karyos_driver::Guard
     let mut driver = EmbeddedDriver::new().unwrap();
     let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
     let guard = driver.add_guard("orders").unwrap();
-    driver.guard_stream(handle, guard, messages).unwrap();
+    driver.guard_stream(handle, guard, messages, None).unwrap();
     assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
     (driver, handle, guard)
 }
@@ -163,7 +164,7 @@ fn a_handle_is_issued_only_under_an_open_guard() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
     let guard = driver.add_guard("orders").unwrap();
-    driver.guard_stream(handle, guard, 4).unwrap();
+    driver.guard_stream(handle, guard, 4, None).unwrap();
     assert!(matches!(
         driver.publication(handle),
         Err(DriverError::GuardNotOpen { guard: 1 })
@@ -187,22 +188,22 @@ fn guarding_is_refused_where_it_cannot_hold() {
         true,
     );
     assert_eq!(
-        driver.guard_stream(concurrent, guard, 4),
+        driver.guard_stream(concurrent, guard, 4, None),
         Err(DriverError::InvalidPublicationMode)
     );
     let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
     assert_eq!(
-        driver.guard_stream(handle, guard, 0),
+        driver.guard_stream(handle, guard, 0, None),
         Err(DriverError::InvalidConfig)
     );
     // max_reserved is an eighth of a term: five do not fit half a term.
     assert_eq!(
-        driver.guard_stream(handle, guard, 5),
+        driver.guard_stream(handle, guard, 5, None),
         Err(DriverError::InvalidConfig)
     );
-    driver.guard_stream(handle, guard, 4).unwrap();
+    driver.guard_stream(handle, guard, 4, None).unwrap();
     assert_eq!(
-        driver.guard_stream(handle, guard, 4),
+        driver.guard_stream(handle, guard, 4, None),
         Err(DriverError::InvalidConfig)
     );
     // A guarded stream is not reconfigured (G-d2).
@@ -220,7 +221,7 @@ fn guarding_is_refused_where_it_cannot_hold() {
     let late = stream(&mut driver, 4, PublicationMode::Exclusive, true);
     let _publication = driver.publication(late).unwrap();
     assert_eq!(
-        driver.guard_stream(late, guard, 4),
+        driver.guard_stream(late, guard, 4, None),
         Err(DriverError::InvalidConfig)
     );
 }
@@ -232,7 +233,7 @@ fn the_walker_does_not_connect_the_stream() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let handle = stream(&mut driver, 2, PublicationMode::Exclusive, false);
     let guard = driver.add_guard("orders").unwrap();
-    driver.guard_stream(handle, guard, 4).unwrap();
+    driver.guard_stream(handle, guard, 4, None).unwrap();
     assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
     let mut publication = driver.publication(handle).unwrap();
     assert_eq!(publication.offer(b"a").unwrap(), OfferOutcome::NotConnected);
@@ -465,7 +466,7 @@ fn a_replaced_incarnation_is_kept_until_its_walker_ended() {
     .unwrap();
     let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
     let guard = driver.add_guard("orders").unwrap();
-    driver.guard_stream(handle, guard, 4).unwrap();
+    driver.guard_stream(handle, guard, 4, None).unwrap();
     assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
     let mut publication = driver.publication(handle).unwrap();
     for value in [b"a", b"b", b"c"] {
@@ -526,7 +527,7 @@ fn guard_stream_names_the_walkers_missing_credit() {
     let mut readers: Vec<_> = (0..4)
         .map(|_| driver.subscribe(handle, Role::Optional).unwrap())
         .collect();
-    let stream_id = match driver.guard_stream(handle, guard, 4) {
+    let stream_id = match driver.guard_stream(handle, guard, 4, None) {
         Err(DriverError::GuardWalkerUnavailable {
             stream,
             reason: WalkerUnavailable::NoSpareCredit,
@@ -543,7 +544,7 @@ fn guard_stream_names_the_walkers_missing_credit() {
     );
     drop(readers.pop());
     let _ = driver.do_work().unwrap();
-    driver.guard_stream(handle, guard, 4).unwrap();
+    driver.guard_stream(handle, guard, 4, None).unwrap();
 }
 
 /// A full cell table is told apart from a missing credit: required readers
@@ -557,7 +558,7 @@ fn guard_stream_names_the_walkers_missing_cell() {
         .map(|_| driver.subscribe(handle, Role::Required).unwrap())
         .collect();
     assert!(matches!(
-        driver.guard_stream(handle, guard, 4),
+        driver.guard_stream(handle, guard, 4, None),
         Err(DriverError::GuardWalkerUnavailable {
             reason: WalkerUnavailable::NoReaderCell,
             ..
@@ -567,4 +568,107 @@ fn guard_stream_names_the_walkers_missing_cell() {
         WalkerUnavailable::NoReaderCell.to_string(),
         "no reader cell"
     );
+}
+
+fn per_second(messages: u64, burst: u64, bytes: Option<(u64, u64)>) -> GuardRate {
+    GuardRate {
+        scope: RateScope::Publication,
+        policy: RatePolicy {
+            messages: Rate {
+                per_second: messages,
+                burst,
+            },
+            bytes: bytes.map(|(per_second, burst)| Rate { per_second, burst }),
+        },
+    }
+}
+
+/// G-e3 (GC-5): only the publication scope is supported, and a policy is
+/// validated against the stream's largest frame; nothing is guarded on a
+/// refusal.
+#[test]
+fn guard_stream_validates_its_rate_limit() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
+    let guard = driver.add_guard("orders").unwrap();
+    for scope in [
+        RateScope::Strategy,
+        RateScope::Account,
+        RateScope::Destination,
+    ] {
+        let rate = GuardRate {
+            scope,
+            ..per_second(10, 1, None)
+        };
+        assert_eq!(
+            driver.guard_stream(handle, guard, 4, Some(rate)),
+            Err(DriverError::RateScopeUnsupported { scope })
+        );
+    }
+    assert_eq!(
+        driver.guard_stream(handle, guard, 4, Some(per_second(0, 1, None))),
+        Err(DriverError::InvalidRatePolicy(RatePolicyError::Zero))
+    );
+    // The largest frame is the MTU, aligned: a byte burst of 64 cannot
+    // hold it.
+    assert!(matches!(
+        driver.guard_stream(handle, guard, 4, Some(per_second(10, 1, Some((1000, 64))))),
+        Err(DriverError::InvalidRatePolicy(
+            RatePolicyError::BurstBelowFrame { burst: 64, .. }
+        ))
+    ));
+    let frame = u64::from(DEFAULT_MTU);
+    driver
+        .guard_stream(
+            handle,
+            guard,
+            4,
+            Some(per_second(10, 2, Some((frame, frame)))),
+        )
+        .unwrap();
+}
+
+/// Every handle bound to a rate-limited guard carries the copy, a fresh
+/// incarnation's too: past the burst it refuses early and appends nothing.
+#[test]
+fn a_rate_limited_handle_refuses_past_its_burst() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
+    let guard = driver.add_guard("orders").unwrap();
+    // One message a second: no refill during the test.
+    driver
+        .guard_stream(handle, guard, 4, Some(per_second(1, 2, None)))
+        .unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut publication = driver.publication(handle).unwrap();
+    for value in [b"a", b"b"] {
+        assert!(matches!(
+            publication.offer(value).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    assert_eq!(publication.offer(b"c").unwrap(), OfferOutcome::RateLimited);
+    assert!(matches!(
+        publication.try_claim(8).unwrap(),
+        ClaimOutcome::RateLimited
+    ));
+    let _ = driver.do_work().unwrap();
+    assert_eq!(
+        outcomes(&mut publication).len(),
+        2,
+        "two messages, two records"
+    );
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    drop(publication);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let mut fresh = driver.publication(handle).unwrap();
+    assert_eq!(fresh.guard().unwrap().rate_tokens(), Some(2));
+    for value in [b"d", b"e"] {
+        assert!(matches!(
+            fresh.offer(value).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    assert_eq!(fresh.offer(b"f").unwrap(), OfferOutcome::RateLimited);
 }

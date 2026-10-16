@@ -43,6 +43,16 @@ release may break APIs, wire formats and shared-memory layouts.
   nothing), `refill_at`, `refund`, and their datagram forms
   (`admits_datagram`, `try_admit_datagram`, `refund_datagram`) for a
   datagram that starts several messages.
+- Rate limits of guarded publications (G-e3, GC-5):
+  `EmbeddedDriver::guard_stream` takes an optional `GuardRate` (a
+  `RateScope` and a `RatePolicy`), refuses scopes other than
+  `RateScope::Publication` (`DriverError::RateScopeUnsupported`) and
+  policies that fail validation against the stream's largest frame
+  (`DriverError::InvalidRatePolicy`). Every handle bound to the guard keeps
+  a copy of the message bucket (`GuardBinding::with_rate`), and `offer` and
+  `try_claim` return the new `OfferOutcome::RateLimited` and
+  `ClaimOutcome::RateLimited` while it holds no token, appending nothing.
+  The sender gate's bucket stays authoritative.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 
