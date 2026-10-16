@@ -404,6 +404,76 @@ fn apply(options: &mut Options, option: &str, value: &str) -> Option<()> {
     Some(())
 }
 
+/// The command line of a diagnostic tool (`karyos-stat`,
+/// `karyos-errors`): `--dir <path>` (required), `--interval <duration>`
+/// (default 1 s, at least 1 ms) and one flag without a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolArgs {
+    /// The driver's admission socket directory.
+    pub dir: PathBuf,
+    /// The period of repeated output.
+    pub interval: Duration,
+    /// Whether the tool's flag was given.
+    pub flag: bool,
+}
+
+/// Parses a diagnostic tool's arguments after the program name, with
+/// `flag` its one option without a value. `None` asks for the help text.
+///
+/// # Errors
+///
+/// As [`parse`]: an unknown option, a missing or invalid value, or an
+/// absent `--dir`. `--help` wins over any error that follows it.
+pub fn parse_tool<I>(args: I, flag: &'static str) -> Result<Option<ToolArgs>, ArgsError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let (mut dir, mut interval, mut flagged) = (None, Duration::from_secs(1), false);
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let text = arg
+            .to_str()
+            .ok_or_else(|| ArgsError::UnknownOption(arg.to_string_lossy().into_owned()))?;
+        if text == "-h" || text == "--help" {
+            return Ok(None);
+        }
+        if text == flag {
+            flagged = true;
+            continue;
+        }
+        let (name, inline) = match text.split_once('=') {
+            Some((name, value)) if name.starts_with("--") => (name, Some(OsString::from(value))),
+            _ => (text, None),
+        };
+        let option = ["--dir", "--interval"]
+            .into_iter()
+            .find(|option| *option == name)
+            .ok_or_else(|| ArgsError::UnknownOption(text.to_owned()))?;
+        let value = inline
+            .or_else(|| args.next())
+            .ok_or(ArgsError::MissingValue(option))?;
+        if option == "--dir" {
+            dir = Some(PathBuf::from(value));
+            continue;
+        }
+        let invalid = |value: &OsString| ArgsError::InvalidValue {
+            option,
+            value: value.to_string_lossy().into_owned(),
+        };
+        interval = value
+            .to_str()
+            .and_then(nanos)
+            .filter(|nanos| *nanos >= 1_000_000)
+            .map(Duration::from_nanos)
+            .ok_or_else(|| invalid(&value))?;
+    }
+    Ok(Some(ToolArgs {
+        dir: dir.ok_or(ArgsError::Missing("--dir"))?,
+        interval,
+        flag: flagged,
+    }))
+}
+
 /// A decimal count.
 fn count(value: &str) -> Option<usize> {
     value.parse().ok()
@@ -424,7 +494,7 @@ fn size(value: &str) -> Option<u64> {
 
 /// A duration in nanoseconds: a decimal integer followed by `ns`, `us`,
 /// `ms` or `s`.
-fn nanos(value: &str) -> Option<u64> {
+pub(crate) fn nanos(value: &str) -> Option<u64> {
     let (digits, scale) = if let Some(digits) = value.strip_suffix("ns") {
         (digits, 1)
     } else if let Some(digits) = value.strip_suffix("us") {
@@ -642,6 +712,52 @@ mod tests {
             ArgsError::Missing("--dir"),
         ] {
             assert!(!error.to_string().contains('\n'));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_tests {
+    use super::*;
+
+    fn tool(args: &[&str]) -> Result<Option<ToolArgs>, ArgsError> {
+        parse_tool(args.iter().map(OsString::from), "--once")
+    }
+
+    #[test]
+    fn a_tool_command_line_parses_its_dir_interval_and_flag() {
+        assert_eq!(
+            tool(&["--dir", "/d"]),
+            Ok(Some(ToolArgs {
+                dir: PathBuf::from("/d"),
+                interval: Duration::from_secs(1),
+                flag: false,
+            }))
+        );
+        assert_eq!(
+            tool(&["--once", "--interval=250ms", "--dir=/d"]),
+            Ok(Some(ToolArgs {
+                dir: PathBuf::from("/d"),
+                interval: Duration::from_millis(250),
+                flag: true,
+            }))
+        );
+        assert_eq!(tool(&["--dir", "/d", "--help", "--bogus"]), Ok(None));
+        assert_eq!(tool(&[]), Err(ArgsError::Missing("--dir")));
+        assert_eq!(
+            tool(&["--follow"]),
+            Err(ArgsError::UnknownOption("--follow".into()))
+        );
+        assert_eq!(tool(&["--dir"]), Err(ArgsError::MissingValue("--dir")));
+        // Below 1 ms, or not a duration.
+        for value in ["999us", "5", "fast"] {
+            assert_eq!(
+                tool(&["--dir", "/d", "--interval", value]),
+                Err(ArgsError::InvalidValue {
+                    option: "--interval",
+                    value: value.into(),
+                })
+            );
         }
     }
 }

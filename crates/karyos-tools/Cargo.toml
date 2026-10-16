@@ -31,5 +31,13 @@ tracing-subscriber.workspace = true
 name = "karyosd"
 path = "src/bin/karyosd.rs"
 
+[[bin]]
+name = "karyos-stat"
+path = "src/bin/karyos-stat.rs"
+
+[[bin]]
+name = "karyos-errors"
+path = "src/bin/karyos-errors.rs"
+
 [lints]
 workspace = true
