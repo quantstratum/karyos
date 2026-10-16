@@ -34,6 +34,13 @@
 //! has two. `KARYOS_MEASURE_SMOKE=1` starts from the smoke plan, whose
 //! small `N` is labelled `insufficient samples`. `--plan-only` prints
 //! the plan and its estimated runtime and runs nothing.
+//!
+//! ```text
+//! karyos-bench analyze --out <dir>
+//! ```
+//!
+//! decides every point of a `measure` directory and writes `report.md`
+//! and `analysis.json` into it (`analyze.rs`).
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -44,7 +51,7 @@ use karyos_bench::inventory::{self, Eligibility, Inventory, Scope};
 use karyos_bench::manifest::{ILLUSTRATIVE_E_MAX, MtuRule, primary};
 use karyos_bench::plan::{self, PlanOptions};
 use karyos_bench::wire::process::Cores;
-use karyos_bench::{Workload, defaults, measure, report, run};
+use karyos_bench::{Workload, analyze, defaults, measure, report, run};
 
 struct Options {
     workload: Option<Workload>,
@@ -222,6 +229,24 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
     measure::run_plan(&plan, &dir, &Labels::detect(), &cores, out).map_err(|error| error.0)
 }
 
+fn analyze_command(args: &[String]) -> Result<String, String> {
+    let dir = match args {
+        [flag, dir] if flag == "--out" => PathBuf::from(dir),
+        _ => return Err("analyze needs --out <dir>".to_string()),
+    };
+    let analysis = analyze::write(&dir).map_err(|error| error.0)?;
+    Ok(format!(
+        "wrote {}: {}, overall {}\n",
+        dir.join("report.md").display(),
+        if analysis.decision_grade() {
+            "decision grade"
+        } else {
+            "not decision grade"
+        },
+        analysis.overall.label()
+    ))
+}
+
 fn main() -> ExitCode {
     // The child of an IPC workload runs its part and nothing else.
     #[cfg(target_os = "linux")]
@@ -255,6 +280,18 @@ fn main() -> ExitCode {
             }
             Err(message) => {
                 let _ = writeln!(err, "karyos-bench inventory: {message}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("analyze") {
+        return match analyze_command(args.get(1..).unwrap_or_default()) {
+            Ok(report) => {
+                let _ = write!(out, "{report}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(err, "karyos-bench analyze: {message}");
                 ExitCode::from(2)
             }
         };

@@ -24,6 +24,7 @@
 //! inventory`), environment classification and decision eligibility
 //! ([`mod@env`]).
 
+pub mod analyze;
 pub mod decision;
 pub mod env;
 pub mod inventory;
@@ -32,6 +33,7 @@ pub mod ipc;
 pub mod manifest;
 pub mod measure;
 pub mod plan;
+pub mod preflight;
 pub mod report;
 pub mod samples;
 pub mod stats;

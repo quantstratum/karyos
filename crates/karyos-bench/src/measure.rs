@@ -10,6 +10,9 @@
 //!   host, the plan's options and label, and the cores or why there are
 //!   none;
 //! - `plan.txt`: the plan as [`plan::render`] prints it;
+//! - `preflight-start.txt`, and `preflight.txt` in every run directory:
+//!   the preflight snapshots ([`preflight`]), taken before the first run
+//!   and before each run;
 //! - `runs/<index>_<point>_<configuration>_r<round>/`: the raw sample
 //!   files and sidecars of each run;
 //! - `results.jsonl`: one hand-written JSON line per run, in plan order.
@@ -25,6 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::env::Labels;
 use crate::manifest::{MANIFEST_SHA256, VERSION};
 use crate::plan::{self, INSUFFICIENT, Plan, PlannedRun};
+use crate::preflight;
 use crate::samples::MISSING;
 use crate::wire::process::{Cores, FAULTS, ProcessOptions, faults_requested, run_processes};
 use crate::wire::stage::{StageLoad, StageSamples};
@@ -103,6 +107,7 @@ pub fn result_line(
                 format!("\"receive_missing\":{}", count_missing(&samples.receive)),
                 format!("\"backend_drops\":{}", samples.backend_drops),
                 format!("\"backpressure\":{}", samples.backpressure),
+                format!("\"ack_timeouts\":{}", samples.ack_timeouts),
                 format!("\"batches\":{}", samples.batches.len()),
                 format!("\"functional_only\":{}", samples.functional_only),
                 format!("\"functional_reasons\":[{}]", reasons.join(",")),
@@ -137,6 +142,7 @@ pub fn header(plan: &Plan, labels: &Labels, cores: &Result<Cores, String>) -> St
         format!("\"cpu\":{}", json_string(&labels.cpu)),
         format!("\"profile\":{}", json_string(labels.profile)),
         format!("\"commit\":{}", json_string(&labels.commit)),
+        format!("\"class\":{}", json_string(&labels.environment.to_string())),
         format!("\"environment\":{}", json_string(&labels.qualification)),
         format!("\"messages\":{}", options.messages),
         format!("\"warmup\":{}", options.warmup),
@@ -198,6 +204,8 @@ pub fn run_plan(
         .map_err(|cause| io("measure.json", cause))?;
     std::fs::write(out.join("plan.txt"), plan::render(plan))
         .map_err(|cause| io("plan.txt", cause))?;
+    std::fs::write(out.join("preflight-start.txt"), preflight::capture())
+        .map_err(|cause| io("preflight-start.txt", cause))?;
     let mut results = std::fs::File::create(out.join("results.jsonl"))
         .map_err(|cause| io("results.jsonl", cause))?;
     let pinned = cores.as_ref().ok().copied();
@@ -206,7 +214,12 @@ pub fn run_plan(
     for (index, planned) in plan.runs.iter().enumerate() {
         let dir = format!("runs/{index:04}_{}", planned.slug());
         let started = Instant::now();
+        // The preflight snapshot of this run (4.2 condition 4).
+        std::fs::create_dir_all(out.join(&dir)).map_err(|cause| io("run directory", cause))?;
+        std::fs::write(out.join(&dir).join("preflight.txt"), preflight::capture())
+            .map_err(|cause| io("preflight.txt", cause))?;
         let options = ProcessOptions {
+            profile: planned.configuration.clone(),
             run_index: planned.round,
             cores: pinned,
             ..ProcessOptions::default()
