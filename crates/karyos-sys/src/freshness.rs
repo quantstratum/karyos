@@ -7,7 +7,7 @@
 //! committed, before the writer has reconciled that value's slot.
 //!
 //! The barrier is a header and a ring of `G` loss records over atomic
-//! words, under one fence-based seqlock (the slot seqlock of
+//! words, under one fence-based seqlock (the protocol of the slots of
 //! [`conflation`](crate::conflation)):
 //!
 //! ```text
@@ -21,8 +21,10 @@
 //!
 //! 1. [`BarrierWords::append_loss`] publishes the record and the new
 //!    `loss_seq` (Release), before the receive owner commits the gap.
-//! 2. It reconciles every slot through that sequence, under each slot's
-//!    seqlock.
+//! 2. It reconciles every slot through that sequence: a freshness-only
+//!    write of the slot's [`SlotFreshness`] words
+//!    ([`FreshSlotWords::set_freshness`](crate::conflation::FreshSlotWords::set_freshness)),
+//!    which advances the slot's sequence but not its value version.
 //! 3. Only then [`BarrierWords::retire_through`] retires the record. The
 //!    rule is this order: a slot seqlock's Release fence precedes the
 //!    retirement, so a reader that sees the retirement sees the slot's

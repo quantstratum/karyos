@@ -5,33 +5,43 @@
 //! key, one writer, any number of readers that see the latest coherent value
 //! of each key and may skip intermediate ones.
 //!
-//! Each slot is a version word, a length word and the value words, on its
-//! own 128-byte strides. Slots use the fence-based seqlock with atomic data
-//! words (Boehm, "Can seqlocks get along with programming language memory
-//! models?", MSPC 2012): the writer stores the odd version (Relaxed), issues
-//! a Release fence, stores the length and value words (Relaxed) and stores
-//! the next even version (Release). A reader loads the version (Acquire),
-//! copies the length and value words (Relaxed) into private storage, issues
-//! an Acquire fence and reloads the version (Relaxed); it uses the copy only
-//! if both loads saw the same even, nonzero version. If the copy contains a
-//! word of a later write, that write's Release fence synchronizes with the
-//! reader's Acquire fence, so the second load sees at least that write's odd
-//! version and the copy is rejected.
+//! Each table slot ([`FreshSlotWords`], table layout version 2) is a
+//! sequence word, a value version word, a length word, the two freshness
+//! words of [`SlotFreshness`] (`quantstratum-docs:
+//! karyos/design/gaps-and-unreliable-delivery.md`, GU-8) and the value
+//! words, on its own 128-byte strides. Slots use the fence-based seqlock
+//! with atomic data words (Boehm, "Can seqlocks get along with programming
+//! language memory models?", MSPC 2012) on the sequence: the writer stores
+//! the odd sequence (Relaxed), issues a Release fence, stores the other
+//! words (Relaxed) and stores the next even sequence (Release). A reader
+//! loads the sequence (Acquire), copies the other words (Relaxed) into
+//! private storage, issues an Acquire fence and reloads the sequence
+//! (Relaxed); it uses the copy only if both loads saw the same even
+//! sequence. If the copy contains a word of a later write, that write's
+//! Release fence synchronizes with the reader's Acquire fence, so the second
+//! load sees at least that write's odd sequence and the copy is rejected. A
+//! value write advances the value version by 2 (even, nonzero once
+//! written); a freshness-only write advances the sequence alone.
 //!
 //! Every word is accessed only atomically, so a reader racing the writer
 //! copies stale or mixed values and discards them, never a data race.
 //!
-//! After each write the writer appends `(key, version)` to an update
-//! journal (a broadcast buffer). A reader queues the keys it reads from the
-//! journal; when the journal laps it, entries were lost and it scans the
-//! slot versions instead. Every poll is bounded by a key budget and a retry
+//! After each value write the writer appends `(key, value version)` to an
+//! update journal (a broadcast buffer). A reader queues the keys it reads
+//! from the journal; when the journal laps it, entries were lost and it
+//! scans the slots' value versions instead. A slot whose sequence is odd
+//! (mid-write, a freshness-only write included) stays queued until it
+//! settles. Freshness-only changes reach readers through the loss barrier
+//! ([`crate::freshness`]), not through the journal. Every poll is bounded by a key budget and a retry
 //! budget, and pending keys are served in FIFO order, so a slot that stays
 //! unstable cannot stall a poll or starve the other keys.
 //!
-//! [`SlotWords`] and its functions are the protocol over any atomic words
-//! (also checked with Loom); [`conflation`] builds the owned, safe API over
-//! heap memory.
+//! [`SlotWords`] (the version-1 slot, which the record journal keeps),
+//! [`FreshSlotWords`] and their functions are the protocols over any atomic
+//! words (also checked with Loom); [`conflation`] builds the owned, safe API
+//! over heap memory.
 
+use crate::freshness::SlotFreshness;
 use crate::load_words::LoadWords;
 use crate::sync::{AtomicU64, Ordering, fence};
 
@@ -199,6 +209,8 @@ impl<'a> SlotWords<'a> {
         let Some(version) = self.word(VERSION) else {
             return Err(ConflationError::InvalidConfig);
         };
+        let stored_length =
+            u64::try_from(value.len()).map_err(|_| ConflationError::InvalidConfig)?;
         // Only this writer stores the version, so it is even here.
         let current = version.load(Ordering::Relaxed);
         let (Some(odd), Some(even)) = (current.checked_add(1), current.checked_add(2)) else {
@@ -207,7 +219,7 @@ impl<'a> SlotWords<'a> {
         version.store(odd, Ordering::Relaxed);
         fence(Ordering::Release);
         if let Some(length) = self.word(LENGTH) {
-            length.store(value.len() as u64, Ordering::Relaxed);
+            length.store(stored_length, Ordering::Relaxed);
         }
         for (index, chunk) in value.chunks(WORD_BYTES).enumerate() {
             let mut bytes = [0u8; WORD_BYTES];
@@ -279,6 +291,243 @@ pub fn read_slot<W: LoadWords>(words: &W, out: &mut [u8]) -> SlotRead {
     }
 }
 
+/// Word index of a fresh slot's seqlock sequence.
+const FRESH_SEQ: usize = 0;
+/// Word index of a fresh slot's public value version.
+const FRESH_VERSION: usize = 1;
+/// Word index of a fresh slot's value length.
+const FRESH_LENGTH: usize = 2;
+/// Word index of a fresh slot's applied loss sequence ([`SlotFreshness`]).
+const FRESH_APPLIED: usize = 3;
+/// Word index of a fresh slot's stale start.
+const FRESH_STALE_SINCE: usize = 4;
+/// Word index of a fresh slot's first value word.
+const FRESH_VALUE: usize = 5;
+
+/// The words of one slot of a conflation view with freshness (`quantstratum-docs:
+/// karyos/design/gaps-and-unreliable-delivery.md`, GU-8): a seqlock
+/// sequence, the public value version, the length, the two freshness words
+/// of [`SlotFreshness`] and the value words.
+///
+/// One fence-based seqlock on the sequence covers every other word, as for
+/// [`SlotWords`]: a reader that validates the copy sees the value and its
+/// freshness coherent. A value write advances the value version; a
+/// freshness-only write ([`FreshSlotWords::set_freshness`]) advances the
+/// sequence but not the value version, so application versions count value
+/// replacements only. The single-writer preconditions of [`SlotWords`]
+/// apply.
+#[derive(Debug, Clone, Copy)]
+pub struct FreshSlotWords<'a> {
+    words: &'a [AtomicU64],
+}
+
+/// What a fresh slot read found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshRead {
+    /// The key was never written.
+    Empty,
+    /// A write was in progress, or the copy was overwritten; retry later.
+    Unstable,
+    /// A coherent value was copied, with its freshness words.
+    Value {
+        /// Its value version (even, nonzero).
+        version: u64,
+        /// Bytes copied into the caller's buffer.
+        length: usize,
+        /// The slot's freshness words, coherent with the value.
+        freshness: SlotFreshness,
+    },
+}
+
+impl<'a> FreshSlotWords<'a> {
+    /// Wraps a slot's words: the five header words and at least one value
+    /// word.
+    #[must_use]
+    pub fn new(words: &'a [AtomicU64]) -> Option<Self> {
+        (words.len() > FRESH_VALUE).then_some(Self { words })
+    }
+
+    /// Value capacity in bytes.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        (self.words.len() - FRESH_VALUE) * WORD_BYTES
+    }
+
+    fn word(&self, index: usize) -> Option<&'a AtomicU64> {
+        self.words.get(index)
+    }
+
+    /// The current value version, for a scan (Relaxed: it only decides
+    /// whether the key is read again).
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.word(FRESH_VERSION)
+            .map_or(0, |word| word.load(Ordering::Relaxed))
+    }
+
+    /// Whether one more value write fits both the sequence and the value
+    /// version space.
+    #[must_use]
+    pub fn can_write(&self) -> bool {
+        [FRESH_SEQ, FRESH_VERSION].iter().all(|&index| {
+            self.word(index)
+                .is_some_and(|word| word.load(Ordering::Relaxed).checked_add(2).is_some())
+        })
+    }
+
+    /// Writes `value`, keeping the freshness words. Returns the new value
+    /// version.
+    ///
+    /// The value version advances by 2, checked, so public versions stay
+    /// the even, nonzero sequence of layout 1 (2, 4, 6, ...): readers keep
+    /// 0 as "never written" and compare delivered versions and journal
+    /// records as before. The seqlock has its own word, so the value
+    /// version is never odd as a lock state.
+    ///
+    /// # Errors
+    ///
+    /// [`ConflationError::ValueTooLarge`] and
+    /// [`ConflationError::VersionsExhausted`]; nothing is stored on error.
+    pub fn write(&self, value: &[u8]) -> Result<u64, ConflationError> {
+        if value.len() > self.capacity() {
+            return Err(ConflationError::ValueTooLarge {
+                length: value.len(),
+                max: self.capacity(),
+            });
+        }
+        let version = self
+            .word(FRESH_VERSION)
+            .ok_or(ConflationError::InvalidConfig)?;
+        let next = version
+            .load(Ordering::Relaxed)
+            .checked_add(2)
+            .ok_or(ConflationError::VersionsExhausted)?;
+        let stored_length =
+            u64::try_from(value.len()).map_err(|_| ConflationError::InvalidConfig)?;
+        self.locked(|| {
+            version.store(next, Ordering::Relaxed);
+            if let Some(length) = self.word(FRESH_LENGTH) {
+                length.store(stored_length, Ordering::Relaxed);
+            }
+            for (index, chunk) in value.chunks(WORD_BYTES).enumerate() {
+                let mut bytes = [0u8; WORD_BYTES];
+                if let Some(prefix) = bytes.get_mut(..chunk.len()) {
+                    prefix.copy_from_slice(chunk);
+                }
+                if let Some(word) = self.word(FRESH_VALUE + index) {
+                    word.store(u64::from_le_bytes(bytes), Ordering::Relaxed);
+                }
+            }
+        })?;
+        Ok(next)
+    }
+
+    /// Writes the freshness words only: the sequence advances, the value
+    /// version does not.
+    ///
+    /// # Errors
+    ///
+    /// [`ConflationError::VersionsExhausted`]; nothing is stored on error.
+    pub fn set_freshness(&self, freshness: SlotFreshness) -> Result<(), ConflationError> {
+        self.locked(|| {
+            if let Some(word) = self.word(FRESH_APPLIED) {
+                word.store(freshness.loss_applied, Ordering::Relaxed);
+            }
+            if let Some(word) = self.word(FRESH_STALE_SINCE) {
+                word.store(freshness.stale_since, Ordering::Relaxed);
+            }
+        })
+    }
+
+    /// Runs `body`'s Relaxed stores inside one seqlock write: the odd
+    /// sequence (Relaxed), a Release fence, the body, the next even
+    /// sequence (Release).
+    fn locked(&self, body: impl FnOnce()) -> Result<(), ConflationError> {
+        let seq = self.word(FRESH_SEQ).ok_or(ConflationError::InvalidConfig)?;
+        // Only this writer stores the sequence, so it is even here.
+        let current = seq.load(Ordering::Relaxed);
+        let (Some(odd), Some(even)) = (current.checked_add(1), current.checked_add(2)) else {
+            return Err(ConflationError::VersionsExhausted);
+        };
+        seq.store(odd, Ordering::Relaxed);
+        fence(Ordering::Release);
+        body();
+        seq.store(even, Ordering::Release);
+        Ok(())
+    }
+
+    /// Copies the current value and freshness into `out` if coherent. See
+    /// [`read_fresh_slot`].
+    #[must_use]
+    pub fn read(&self, out: &mut [u8]) -> FreshRead {
+        read_fresh_slot(&self.words, out)
+    }
+}
+
+/// The fresh slot reader over any words a reader can load: the protocol of
+/// [`read_slot`] on the sequence, copying the value version, length,
+/// freshness words and value words in between.
+#[must_use]
+pub fn read_fresh_slot<W: LoadWords>(words: &W, out: &mut [u8]) -> FreshRead {
+    let Some(capacity) = words
+        .len()
+        .checked_sub(FRESH_VALUE)
+        .and_then(|value_words| value_words.checked_mul(WORD_BYTES))
+    else {
+        return FreshRead::Unstable;
+    };
+    let Some(first) = words.load_acquire(FRESH_SEQ) else {
+        return FreshRead::Unstable;
+    };
+    if first % 2 == 1 {
+        return FreshRead::Unstable;
+    }
+    let (Some(version), Some(length), Some(loss_applied), Some(stale_since)) = (
+        words.load(FRESH_VERSION),
+        words.load(FRESH_LENGTH),
+        words.load(FRESH_APPLIED),
+        words.load(FRESH_STALE_SINCE),
+    ) else {
+        return FreshRead::Unstable;
+    };
+    let copied = usize::try_from(length)
+        .ok()
+        .filter(|&length| length <= capacity && length <= out.len());
+    if let Some(target) = copied.and_then(|copied| out.get_mut(..copied)) {
+        for (index, chunk) in target.chunks_mut(WORD_BYTES).enumerate() {
+            if let Some(word) = words.load(FRESH_VALUE + index) {
+                let bytes = word.to_le_bytes();
+                if let Some(prefix) = bytes.get(..chunk.len()) {
+                    chunk.copy_from_slice(prefix);
+                }
+            }
+        }
+    }
+    fence(Ordering::Acquire);
+    if words.load(FRESH_SEQ) != Some(first) {
+        return FreshRead::Unstable;
+    }
+    if version == 0 {
+        return FreshRead::Empty;
+    }
+    // Value versions are even (the writer advances them by 2): an odd one
+    // is not a version this protocol wrote.
+    if version % 2 == 1 {
+        return FreshRead::Unstable;
+    }
+    match copied {
+        Some(length) => FreshRead::Value {
+            version,
+            length,
+            freshness: SlotFreshness {
+                loss_applied,
+                stale_since,
+            },
+        },
+        None => FreshRead::Unstable,
+    }
+}
+
 #[cfg(not(loom))]
 pub use owned::{Budget, ConflationReader, ConflationWriter, PollReport, conflation};
 
@@ -290,8 +539,8 @@ mod owned {
     use std::sync::Arc;
 
     use super::{
-        ConflationConfig, ConflationError, STRIDE_WORDS, SlotRead, SlotWords, VALUE, VERSION,
-        WORD_BYTES, read_slot,
+        ConflationConfig, ConflationError, FRESH_SEQ, FRESH_VALUE, FRESH_VERSION, FreshRead,
+        FreshSlotWords, STRIDE_WORDS, WORD_BYTES, read_fresh_slot,
     };
     use crate::atomic_view::HeapWords;
     use crate::broadcast::{
@@ -308,7 +557,8 @@ mod owned {
     /// Layout version of a conflation table region. Readers reject any
     /// other version.
     #[cfg(target_os = "linux")]
-    pub const LAYOUT_VERSION: u64 = 1;
+    /// Version 2: slots carry the freshness words (GU-8).
+    pub const LAYOUT_VERSION: u64 = 2;
 
     /// The sizes of a table, checked once: `keys` slots of `slot_words`
     /// words each, then the journal's trailer and its data area of
@@ -339,7 +589,7 @@ mod owned {
             }
             let slot_words = value_capacity
                 .div_ceil(WORD_BYTES)
-                .checked_add(VALUE)?
+                .checked_add(FRESH_VALUE)?
                 .checked_next_multiple_of(STRIDE_WORDS)?;
             Some(Self {
                 keys,
@@ -455,16 +705,26 @@ mod owned {
             self.slots.sub(start, self.geometry.slot_words)
         }
 
-        /// The current version, for a scan (Relaxed, as
-        /// [`SlotWords::version`]).
+        /// The current value version, for a scan (Relaxed, as
+        /// [`FreshSlotWords::version`]).
         fn version(&self, key: u32) -> u64 {
             self.slot(key)
-                .and_then(|slot| slot.load(VERSION))
+                .and_then(|slot| slot.load(FRESH_VERSION))
                 .unwrap_or(0)
         }
 
-        fn read(&self, key: u32, out: &mut [u8]) -> Option<SlotRead> {
-            Some(read_slot(&self.slot(key)?, out))
+        /// Whether the slot's seqlock is mid-write (Relaxed, as
+        /// [`View::version`]): a freshness-only write leaves the value
+        /// version unchanged, so the sweep keeps such a key queued until it
+        /// settles.
+        fn unsettled(&self, key: u32) -> bool {
+            self.slot(key)
+                .and_then(|slot| slot.load(FRESH_SEQ))
+                .is_some_and(|seq| seq % 2 == 1)
+        }
+
+        fn read(&self, key: u32, out: &mut [u8]) -> Option<FreshRead> {
+            Some(read_fresh_slot(&self.slot(key)?, out))
         }
     }
 
@@ -530,8 +790,8 @@ mod owned {
             View::new(slots, data, trailer, self.geometry)
         }
 
-        fn slot(&self, key: u32) -> Option<SlotWords<'_>> {
-            SlotWords::new(self.view()?.slot(key)?)
+        fn slot(&self, key: u32) -> Option<FreshSlotWords<'_>> {
+            FreshSlotWords::new(self.view()?.slot(key)?)
         }
     }
 
@@ -772,14 +1032,14 @@ mod owned {
         pub(super) fn seed_version(&self, key: u32, version: u64) {
             use crate::sync::Ordering;
             if let Some(slot) = self.table.slot(key)
-                && let Some(word) = slot.word(super::VERSION)
+                && let Some(word) = slot.word(super::FRESH_VERSION)
             {
                 word.store(version, Ordering::Relaxed);
             }
         }
 
         #[cfg(test)]
-        pub(super) fn table_slot(&self, key: u32) -> Option<SlotWords<'_>> {
+        pub(super) fn table_slot(&self, key: u32) -> Option<FreshSlotWords<'_>> {
             self.table.slot(key)
         }
 
@@ -792,7 +1052,12 @@ mod owned {
 
         #[cfg(test)]
         pub(super) fn slot_version_word(&self, key: u32) -> Option<&crate::sync::AtomicU64> {
-            self.table.slot(key)?.word(super::VERSION)
+            self.table.slot(key)?.word(super::FRESH_VERSION)
+        }
+
+        #[cfg(test)]
+        pub(super) fn slot_seq_word(&self, key: u32) -> Option<&crate::sync::AtomicU64> {
+            self.table.slot(key)?.word(super::FRESH_SEQ)
         }
     }
 
@@ -910,11 +1175,15 @@ mod owned {
                 address: 0,
                 len: record.structure_length,
             };
-            if record.kind != crate::ipc::RegionKind::ConflationTable
-                || record.layout != LAYOUT_VERSION
-                || record.generation != 0
-            {
+            if record.kind != crate::ipc::RegionKind::ConflationTable || record.generation != 0 {
                 return Err(invalid);
+            }
+            // A version-1 table has no freshness words: refused, typed.
+            if record.layout != LAYOUT_VERSION {
+                return Err(crate::error::SysError::LayoutVersion {
+                    found: record.layout,
+                    expected: LAYOUT_VERSION,
+                });
             }
             let structure = region.structure();
             let mut line = [0u64; STRIDE_WORDS];
@@ -1121,9 +1390,9 @@ mod owned {
                 if self.scan_remaining > 0 {
                     self.scan_remaining -= 1;
                 }
-                let version = with_view!(&self.source, view => view
-                    .map_or(0, |view| view.version(key)));
-                if version != 0 && self.changed(key, version) {
+                let (version, unsettled) = with_view!(&self.source, view => view
+                    .map_or((0, false), |view| (view.version(key), view.unsettled(key))));
+                if unsettled || (version != 0 && self.changed(key, version)) {
                     self.push(key);
                 }
             }
@@ -1141,9 +1410,12 @@ mod owned {
                     .and_then(|view| view.read(key, &mut self.value)));
                 match read {
                     None => return,
-                    Some(SlotRead::Unstable) => continue,
-                    Some(SlotRead::Empty) => return,
-                    Some(SlotRead::Value { version, length }) => {
+                    Some(FreshRead::Unstable) => continue,
+                    Some(FreshRead::Empty) => return,
+                    // Freshness reaches readers in a later step (GU-8).
+                    Some(FreshRead::Value {
+                        version, length, ..
+                    }) => {
                         let delivered = self.delivered.get(key as usize).copied().unwrap_or(0);
                         if version <= delivered {
                             report.skipped += 1;

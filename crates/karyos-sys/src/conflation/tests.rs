@@ -199,9 +199,9 @@ fn a_stuck_slot_does_not_starve_the_others() {
     }
     // Key 3 is stuck mid-write: a writer paused between its odd and even
     // stores.
-    let odd = writer.slot_version_word(3).unwrap().load(Ordering::Relaxed) + 1;
+    let odd = writer.slot_seq_word(3).unwrap().load(Ordering::Relaxed) + 1;
     writer
-        .slot_version_word(3)
+        .slot_seq_word(3)
         .unwrap()
         .store(odd, Ordering::Relaxed);
     writer.write(7, &value(7, 500, 8)).unwrap();
@@ -645,14 +645,13 @@ mod region {
     }
 
     /// The attach checks the record: the kind, the layout version and the
-    /// generation, each alone.
+    /// generation, each alone; another layout version is a typed refusal.
     #[test]
     fn attachment_checks_the_record() {
         let (region, record) = foreign(|_| {});
         assert!(view_of(&region, record, SealProfile::DriverOnly, CONFIG).is_ok());
-        let changes: [fn(&mut RegionRecord); 3] = [
+        let changes: [fn(&mut RegionRecord); 2] = [
             |record| record.kind = RegionKind::Counters,
-            |record| record.layout = LAYOUT_VERSION + 1,
             |record| record.generation = 1,
         ];
         for (case, change) in changes.into_iter().enumerate() {
@@ -663,6 +662,20 @@ mod region {
                     Err(SysError::InvalidRegion { .. })
                 ),
                 "record change {case} was accepted"
+            );
+        }
+        // Another layout version, the version-1 table without freshness
+        // words among them, is refused with a typed error.
+        for layout in [1, LAYOUT_VERSION + 1] {
+            let (region, record) = foreign(|record| record.layout = layout);
+            assert_eq!(record.layout, layout);
+            assert!(
+                matches!(
+                    view_of(&region, record, SealProfile::DriverOnly, CONFIG),
+                    Err(SysError::LayoutVersion { found, expected: LAYOUT_VERSION })
+                        if found == layout
+                ),
+                "layout {layout} was accepted"
             );
         }
         // A region of another kind, attached as a table: the header
@@ -768,4 +781,153 @@ mod region {
             assert!(conflation(keys, value_capacity, journal_capacity).is_err());
         }
     }
+}
+
+// Fresh slots (GU-8).
+
+fn fresh_words(value_words: usize) -> Vec<AtomicU64> {
+    (0..5 + value_words).map(|_| AtomicU64::new(0)).collect()
+}
+
+/// A freshness-only write advances the sequence but not the value version,
+/// and a value write keeps the freshness words.
+#[test]
+fn freshness_writes_keep_the_value_version() {
+    use crate::freshness::{STALE, SlotFreshness};
+    let words = fresh_words(2);
+    let slot = FreshSlotWords::new(&words).unwrap();
+    let mut out = [0u8; 16];
+    assert_eq!(slot.read(&mut out), FreshRead::Empty);
+    let stale = SlotFreshness {
+        loss_applied: 1 | STALE,
+        stale_since: 8,
+    };
+    slot.set_freshness(stale).unwrap();
+    assert_eq!(slot.read(&mut out), FreshRead::Empty, "no value yet");
+    assert_eq!(slot.write(b"first").unwrap(), 2);
+    assert_eq!(
+        slot.read(&mut out),
+        FreshRead::Value {
+            version: 2,
+            length: 5,
+            freshness: stale
+        }
+    );
+    assert_eq!(&out[..5], b"first");
+    let fresh = SlotFreshness {
+        loss_applied: 1,
+        stale_since: 0,
+    };
+    slot.set_freshness(fresh).unwrap();
+    assert_eq!(slot.version(), 2, "freshness is not a value replacement");
+    assert_eq!(slot.write(b"second!").unwrap(), 4);
+    assert_eq!(
+        slot.read(&mut out),
+        FreshRead::Value {
+            version: 4,
+            length: 7,
+            freshness: fresh
+        }
+    );
+    // Four seqlock writes: two freshness writes and two values.
+    assert_eq!(words[0].load(Ordering::Relaxed), 8);
+}
+
+#[test]
+fn a_fresh_slot_refuses_what_it_cannot_store() {
+    let words = fresh_words(1);
+    let slot = FreshSlotWords::new(&words).unwrap();
+    assert_eq!(slot.capacity(), 8);
+    assert_eq!(
+        slot.write(b"123456789"),
+        Err(ConflationError::ValueTooLarge { length: 9, max: 8 })
+    );
+    words[1].store(u64::MAX - 1, Ordering::Relaxed);
+    assert!(!slot.can_write());
+    assert_eq!(slot.write(b"x"), Err(ConflationError::VersionsExhausted));
+    words[1].store(0, Ordering::Relaxed);
+    words[0].store(u64::MAX - 1, Ordering::Relaxed);
+    assert!(!slot.can_write());
+    assert_eq!(slot.write(b"x"), Err(ConflationError::VersionsExhausted));
+    assert_eq!(
+        slot.set_freshness(crate::freshness::SlotFreshness::default()),
+        Err(ConflationError::VersionsExhausted)
+    );
+    assert_eq!(words[1].load(Ordering::Relaxed), 0, "nothing stored");
+    assert!(FreshSlotWords::new(&words[..5]).is_none());
+    // Mid-write: unstable.
+    words[0].store(3, Ordering::Relaxed);
+    assert_eq!(slot.read(&mut [0u8; 8]), FreshRead::Unstable);
+}
+
+/// GU-8: a freshness-only write leaves the public version unchanged. A
+/// reader that meets it in progress retries the key and then delivers the
+/// same version once; the freshness write alone is not a new version.
+#[test]
+fn a_freshness_write_is_not_a_new_version_and_is_retried() {
+    use crate::freshness::{STALE, SlotFreshness};
+    let mut writer = conflation(4, 8, 1024).unwrap();
+    let mut reader = writer.reader();
+    let _ = drain(&mut reader, BUDGET);
+    assert_eq!(writer.write(1, b"a").unwrap(), 2);
+    // A freshness write in progress: the sequence is odd.
+    let seq = writer.slot_seq_word(1).unwrap();
+    let even = seq.load(Ordering::Relaxed);
+    seq.store(even + 1, Ordering::Relaxed);
+    let mut seen = Vec::new();
+    let report = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    assert_eq!((report.delivered, report.unstable), (0, 1));
+    // The write completes; the value version stays 2.
+    seq.store(even, Ordering::Relaxed);
+    writer
+        .table_slot(1)
+        .unwrap()
+        .set_freshness(SlotFreshness {
+            loss_applied: 1 | STALE,
+            stale_since: 0,
+        })
+        .unwrap();
+    assert_eq!(seq.load(Ordering::Relaxed), even + 2);
+    assert_eq!(
+        writer.slot_version_word(1).unwrap().load(Ordering::Relaxed),
+        2
+    );
+    let _ = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    assert_eq!(seen, [(1, 2)], "retried, delivered once");
+    let report = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    assert_eq!(report.delivered, 0);
+    // The settled freshness write is not even served: the scan reads the
+    // value version, not the sequence.
+    assert_eq!(report.skipped, 0);
+    assert_eq!(seen, [(1, 2)]);
+}
+
+/// A slot left mid-write by a freshness-only write stays queued: the value
+/// version did not change, yet a closed table is never reported finished
+/// while the slot is unsettled.
+#[test]
+fn a_slot_stuck_in_a_freshness_write_stays_pending() {
+    let mut writer = conflation(4, 8, 1024).unwrap();
+    let mut reader = writer.reader();
+    writer.write(1, b"a").unwrap();
+    let _ = drain(&mut reader, BUDGET);
+    let seq = writer.slot_seq_word(1).unwrap();
+    seq.store(seq.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    drop(writer);
+    for _ in 0..4 {
+        let report = reader.poll_changed(BUDGET, |_, _, _| {});
+        assert!(report.closed);
+        assert!(!report.finished, "an unsettled slot is not finished");
+        assert!(report.pending >= 1 || report.unstable >= 1);
+    }
+}
+
+/// An odd value version is not one the writer stored: unstable.
+#[test]
+fn an_odd_value_version_is_unstable() {
+    let words = fresh_words(1);
+    let slot = FreshSlotWords::new(&words).unwrap();
+    slot.write(b"x").unwrap();
+    words[1].store(5, Ordering::Relaxed);
+    assert_eq!(slot.read(&mut [0u8; 8]), FreshRead::Unstable);
 }
