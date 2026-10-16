@@ -45,6 +45,16 @@ pub trait LaneGate: SenderGate {
         let _ = lane;
     }
 
+    /// Whether `lane` is aborting for good in this gate (its guard closed,
+    /// a sender fault): a gate that wraps this one must not then declare
+    /// another end for the lane, such as a missed deadline
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, G7: the
+    /// loser of a close against a deadline changes nothing).
+    fn aborting(&self, lane: usize) -> bool {
+        let _ = lane;
+        false
+    }
+
     /// `lane`'s head left its queue, reported `how`: the gate's own record
     /// of the head moves on with the sender's. A head the backend keeps
     /// pending is not reported; it is exposed again, through the gate.

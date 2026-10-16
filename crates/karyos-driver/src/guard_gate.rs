@@ -588,6 +588,12 @@ impl LaneGate for GuardGate {
         affordable
     }
 
+    fn aborting(&self, lane: usize) -> bool {
+        self.lanes
+            .get(lane)
+            .is_some_and(|state| state.aborting.is_some())
+    }
+
     fn flushing(&mut self, lane: usize) {
         self.flushing = Some(lane);
     }

@@ -117,6 +117,21 @@ release may break APIs, wire formats and shared-memory layouts.
   `timed_gate::TimedGate` wraps a lane gate, holds a head until its time and
   passes only the due prefix of an exposure to the inner gate, its permit
   the minimum of the two.
+- Cancel-on-deadline (P2.11 T1 step 5, G7): `TimedGate` takes a
+  `LatePolicy` per lane (tolerance, `cancel_on_deadline`). Under cancel, a
+  head not exposed by its time plus the tolerance aborts the lane for good
+  (`deadline_missed`, counted once in `deadline_aborts`), and
+  `TimedGate::between_gates` seals its buffer once through
+  `timed_gate::seal_deadline_missed` (`SealReason::DeadlineMissed`; a sealed
+  buffer keeps its first reason). Otherwise a head submitted beyond the
+  tolerance counts in `late_sends`. The inner gate is not told, but a lane
+  it already aborts never misses: karyos-io's `LaneGate` gains
+  `aborting(lane)` (default false; `GuardGate` reports its aborting
+  incarnations), so a guard close that lands first stays the lane's end
+  (G7). `TimedGate::earliest` also wakes for a deadline under cancel,
+  `TimedGate::stage` takes the datagram's ticket and `left` counts a report
+  for another ticket as a fault, and `ScheduleConsumer::new` takes its
+  capacity from the ring (`ScheduleReader::capacity`).
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

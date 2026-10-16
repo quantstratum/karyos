@@ -415,6 +415,12 @@ impl ScheduleReader {
         Ok(())
     }
 
+    /// The ring's capacity in entries, as it declared it at attach.
+    #[must_use]
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
     /// Entries read so far.
     #[must_use]
     pub fn read(&self) -> u64 {
