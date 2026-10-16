@@ -39,5 +39,13 @@ path = "src/bin/karyos-stat.rs"
 name = "karyos-errors"
 path = "src/bin/karyos-errors.rs"
 
+# Not documented: its rustdoc output would collide with the karyos-trace
+# library's (target/doc/karyos_trace); its logic is documented in the
+# library's `trace` module.
+[[bin]]
+name = "karyos-trace"
+path = "src/bin/karyos-trace.rs"
+doc = false
+
 [lints]
 workspace = true

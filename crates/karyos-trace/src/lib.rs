@@ -8,8 +8,11 @@
 //! `quantstratum-docs: karyos/design/trace-records.md`; loss attribution to traces in one journal
 //! (`attribution`), as designed in `quantstratum-docs: karyos/design/trace-attribution.md`; and
 //! the sampling policy (`sampling`), as designed in
-//! `quantstratum-docs: karyos/design/trace-sampling.md`. Seals for long-running journals, clock
-//! calibration and histograms do not exist yet.
+//! `quantstratum-docs: karyos/design/trace-sampling.md`; and the report
+//! (`report`) over journal sources (`source`), the in-process collector or
+//! a tool's reader of the driver's trace mirror, as designed in
+//! `quantstratum-docs: karyos/design/trace-tool.md`. Seals for long-running
+//! journals, clock calibration and histograms do not exist yet.
 
 pub mod agent;
 pub mod attribution;
@@ -21,6 +24,7 @@ pub mod journal;
 pub mod record;
 pub mod report;
 pub mod sampling;
+pub mod source;
 pub mod trace_clock;
 
 pub use agent::{AgentCounter, AgentCounts, TraceAgent};
@@ -38,6 +42,10 @@ pub use record::{
     MAX_LANE, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId, RECORD_VERSION,
     RECORD_WORDS, SubscriberId, TraceIds, TraceRecord, decode_record, encode_record,
 };
-pub use report::{HistogramConfig, JournalId, TraceAnswer, TraceReport};
+pub use report::{
+    HistogramConfig, JournalClock, JournalId, PublicationKey, PublicationSummary, TraceAnswer,
+    TraceReport,
+};
 pub use sampling::{Decision, IdSource, Sampler, Sampling};
-pub use trace_clock::{ClockProvenance, MonotonicClock, TraceClock};
+pub use source::{JournalSource, SourceLosses, SourceState};
+pub use trace_clock::{ClockProvenance, HostMonotonicClock, MonotonicClock, TraceClock};

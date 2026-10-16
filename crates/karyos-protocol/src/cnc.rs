@@ -537,7 +537,9 @@ pub enum Command {
         registration: u64,
         /// The clock provenance of the journal's observer: a raw word the
         /// driver records in the journal's table entry without
-        /// interpreting it (the trace crate defines its values).
+        /// interpreting it (`karyos-trace`'s `ClockProvenance::word`: 0
+        /// opaque, 1 the standard library's monotonic clock, 2 the host's
+        /// `CLOCK_MONOTONIC`).
         provenance: u64,
     },
     /// The final delivery boundary of one of the client's journals, sent
@@ -2745,7 +2747,7 @@ mod properties {
                     (ALLOCATE_COUNTER, ALLOCATE_COUNTER_WORDS),
                     (RELEASE_COUNTER, 3),
                     (REPORT_LOSS, REPORT_LOSS_WORDS),
-                    (TRACE_JOURNAL, 5),
+                    (TRACE_JOURNAL, 6),
                     (CLOSE_JOURNAL, 3),
                     (QUERY_CUTOVER, 2),
                 ],

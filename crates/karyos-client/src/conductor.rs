@@ -715,7 +715,10 @@ impl<T: TermBytes> ClientConductor<T> {
     /// one of this client's live subscriptions (a subscriber journal) or
     /// live publications (a publisher journal). `provenance` is the clock
     /// provenance word of the journal's observer, which the driver records
-    /// in the journal's table entry without interpreting it. Returns the
+    /// in the journal's table entry without interpreting it: the word of
+    /// the agent clock's `karyos_trace::ClockProvenance` (0 opaque, 1 the
+    /// standard library's monotonic clock, 2 the host's `CLOCK_MONOTONIC`,
+    /// the only one a tool can calibrate across processes). Returns the
     /// request sequence. It completes as [`Outcome::Journal`] (in process)
     /// or [`Outcome::FetchableJournal`] (remote), or is refused with
     /// `UnknownRegistration` (a registration that is not a live one of this
