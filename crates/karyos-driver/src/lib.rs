@@ -25,6 +25,7 @@ pub mod guard_gate;
 mod guard_streams;
 pub mod guards;
 mod ledger;
+pub mod paths;
 mod positions;
 mod remote_generations;
 pub mod schedule;
