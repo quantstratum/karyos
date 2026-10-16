@@ -25,38 +25,10 @@ use crate::manifest::{
 use crate::samples;
 use crate::stats::{self, BootstrapSpec, Estimate, PointBootstrap, Resampling, StatsError, Value};
 
-/// The environments of manifest 6.3. Full classification is batch B2; this
-/// is the hook of 8.8.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Environment {
-    /// Physical Linux host, x86_64: the decision metric.
-    E1,
-    /// Two physical Linux hosts on one switch: round trip and fan-out.
-    E2,
-    /// aarch64: reported as Not demonstrated in this version (Q-5).
-    E3,
-    /// macOS workspace and Linux VMs: functional only, never decides.
-    E4,
-}
-
-impl Environment {
-    /// Whether a result from this environment may decide (6.3, 8.8).
-    #[must_use]
-    pub const fn decides(self) -> bool {
-        matches!(self, Self::E1 | Self::E2)
-    }
-}
-
-impl fmt::Display for Environment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::E1 => "E1",
-            Self::E2 => "E2",
-            Self::E3 => "E3",
-            Self::E4 => "E4",
-        })
-    }
-}
+/// The environments of manifest 6.3, classified by [`crate::env::classify`];
+/// [`Environment::decides`] is the hook of 8.8.
+pub use crate::env::Environment;
+use crate::env::Ineligible;
 
 /// One side of a comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -879,6 +851,10 @@ pub enum GradeReason {
     ProvisionalEMax,
     /// A run comes from an environment that does not decide.
     Environment(Environment),
+    /// A run's host fails a condition of decision eligibility
+    /// (measurement-harness.md 4.2); the class itself is reported as
+    /// [`GradeReason::Environment`].
+    Ineligible(Ineligible),
     /// Fewer measured messages per run than 8.1 requires.
     Samples(u64),
     /// Fewer warmup messages per run than 8.1 requires.
@@ -920,6 +896,7 @@ impl fmt::Display for GradeReason {
         match self {
             Self::ProvisionalEMax => f.write_str("provisional E_max"),
             Self::Environment(environment) => write!(f, "environment {environment}"),
+            Self::Ineligible(reason) => write!(f, "ineligible host: {reason}"),
             Self::Samples(n) => write!(f, "{n} samples per run, below 10^6"),
             Self::Warmup(n) => write!(f, "warmup {n}, below 10^5"),
             Self::Runs(n) => write!(f, "{n} runs, below 5"),
@@ -956,6 +933,9 @@ pub enum Grade {
 pub struct GradeInputs<'a> {
     /// The envelope budget.
     pub e_max: EMax,
+    /// The failed eligibility conditions of every run's host
+    /// ([`crate::env::decision_eligible`]); empty when all are eligible.
+    pub ineligible: &'a [Ineligible],
     /// The smallest warmup of any run (discarded before the samples, so
     /// not in the results).
     pub min_warmup: u64,
@@ -994,6 +974,11 @@ pub(crate) fn grade_with(inputs: &GradeInputs<'_>, method: Resampling) -> Grade 
     }
     if !crate::manifest::manifest_hash_is_final() {
         push(GradeReason::ManifestHashPending);
+    }
+    for reason in inputs.ineligible {
+        if !matches!(reason, Ineligible::Class(_)) {
+            push(GradeReason::Ineligible(reason.clone()));
+        }
     }
     if inputs.results.is_empty() {
         push(GradeReason::NoPoints);
@@ -1400,6 +1385,7 @@ mod tests {
     fn grade_inputs<'a>(results: &'a [PointResult], overall: &'a Overall) -> GradeInputs<'a> {
         GradeInputs {
             e_max: EMax::Decided(64),
+            ineligible: &[],
             min_warmup: 100_002,
             results,
             overall,
@@ -1485,6 +1471,26 @@ mod tests {
         assert_eq!(
             grade(&grade_inputs(&[], &complete)),
             Grade::NotDecisionGrade(vec![GradeReason::NoPoints])
+        );
+    }
+
+    #[test]
+    fn an_ineligible_host_is_not_decision_grade() {
+        // B2: every failed eligibility condition is listed; the class
+        // itself is reported through the environment, never twice.
+        let complete = overall(&all(&Outcome::Tie), DecisionSet::default());
+        let results = [result(Shape::W1, DECISION_METHOD)];
+        let ineligible = [
+            Ineligible::Class(Environment::E4),
+            Ineligible::NoHostRecord { host: "h".into() },
+        ];
+        let mut inputs = grade_inputs(&results, &complete);
+        inputs.ineligible = &ineligible;
+        assert_eq!(
+            grade(&inputs),
+            Grade::NotDecisionGrade(vec![GradeReason::Ineligible(Ineligible::NoHostRecord {
+                host: "h".into()
+            })])
         );
     }
 

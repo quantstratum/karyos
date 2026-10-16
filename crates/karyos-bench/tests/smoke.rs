@@ -3,7 +3,8 @@
 //! Every workload in a short smoke mode, and the history format. No timing
 //! is asserted.
 
-use karyos_bench::env::Labels;
+use karyos_bench::env::{Environment, Labels};
+use karyos_bench::inventory;
 use karyos_bench::{Config, Workload, defaults, report, run};
 
 fn smoke(config: Config) -> Config {
@@ -21,7 +22,10 @@ fn every_workload_runs_and_reports() {
         let measurement = run(config).unwrap_or_else(|cause| panic!("{config}: {cause}"));
         assert!(measurement.rate > 0.0, "{config}");
         let text = report::text(&measurement, &labels);
-        assert!(text.contains("environment: unqualified"), "{text}");
+        assert!(
+            text.contains(&format!("environment: {}\n", labels.qualification)),
+            "{text}"
+        );
         let line = report::history_line(&measurement, &labels);
         assert_eq!(
             report::field(&line, "workload"),
@@ -66,6 +70,86 @@ fn every_workload_runs_and_reports() {
             assert!(report::field(&line, "term_rotations_per_second").is_some());
         }
     }
+}
+
+/// The environment label replaces `unqualified`: a class of manifest 6.3
+/// with its verdict, in the text and in the history line. macOS and the
+/// Docker runs of `scripts/linux-test.sh` are E4, never decision grade.
+#[test]
+fn reports_carry_the_environment_class() {
+    let labels = Labels::detect();
+    assert!(
+        [
+            "E1 eligible",
+            "E1 ineligible",
+            "E3 not demonstrated",
+            "E4 non-decision"
+        ]
+        .contains(&labels.qualification.as_str()),
+        "{}",
+        labels.qualification
+    );
+    if cfg!(target_os = "macos") || std::path::Path::new("/.dockerenv").exists() {
+        assert_eq!(labels.environment, Environment::E4);
+        assert_eq!(labels.qualification, "E4 non-decision");
+    }
+    let measurement = run(smoke(defaults(200)[0])).unwrap_or_else(|cause| panic!("{cause}"));
+    let line = report::history_line(&measurement, &labels);
+    assert_eq!(
+        report::field(&line, "environment"),
+        Some(labels.qualification.as_str())
+    );
+}
+
+/// `karyos-bench inventory --out <dir>` writes the record with every
+/// field of the environments README, present or `unavailable`, and
+/// prints the class.
+#[test]
+fn the_inventory_command_writes_a_complete_record() {
+    let dir = std::env::temp_dir().join(format!("karyos-bench-smoke-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-bench"))
+        .args(["inventory", "--out"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let environments = dir.join("environments");
+    let records: Vec<_> = std::fs::read_dir(&environments)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let text = std::fs::read_to_string(&records[0]).unwrap();
+    let headings: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("### "))
+        .collect();
+    let fields: Vec<&str> = inventory::SPEC_FIELDS
+        .iter()
+        .chain(&inventory::METHOD_FIELDS)
+        .copied()
+        .collect();
+    assert_eq!(headings, fields, "{text}");
+    for section in text.split("\n### ").skip(1) {
+        let body: Vec<&str> = section
+            .lines()
+            .skip(1)
+            .filter(|line| !line.is_empty() && !line.starts_with("Source:"))
+            .collect();
+        assert!(!body.is_empty(), "empty field: {section}");
+    }
+    let labels = Labels::detect();
+    assert!(
+        stdout.contains(&format!("class {}", labels.environment)),
+        "{stdout}"
+    );
+    assert!(text.contains(&format!("Environment class: {}", labels.environment)));
+    if labels.environment != Environment::E1 {
+        assert!(stdout.contains("does not decide"), "{stdout}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
