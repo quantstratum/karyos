@@ -12,7 +12,7 @@
 //! length). Only an item the backend reports `Submitted` is service; an
 //! `Unknown` item is uncertain: not debited, charged to the byte budget, and
 //! its lane suspended until the control path resolves it
-//! ([`LaneSender::resolve`]).
+//! ([`LaneSender::needs_control`] reports the suspension).
 //!
 //! Every allocation happens in [`LaneSender::new`]; the data calls do not
 //! allocate.
