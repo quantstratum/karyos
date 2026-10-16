@@ -1432,9 +1432,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 scope: crate::guards::RateScope::Publication,
                 policy,
             }) => {
-                let frame = karyos_sys::sizing::align_frame(found.config.mtu)
-                    .map(u64::from)
-                    .map_err(|_| DriverError::InvalidConfig)?;
+                // Every datagram fits the MTU (aggregate-lanes.md), so a byte
+                // burst that holds the MTU holds whatever a route's sender
+                // gate is validated against.
+                let frame = u64::from(found.config.mtu);
                 policy
                     .validate(frame)
                     .map_err(DriverError::InvalidRatePolicy)?;

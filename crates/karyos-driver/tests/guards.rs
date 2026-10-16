@@ -609,8 +609,8 @@ fn guard_stream_validates_its_rate_limit() {
         driver.guard_stream(handle, guard, 4, Some(per_second(0, 1, None))),
         Err(DriverError::InvalidRatePolicy(RatePolicyError::Zero))
     );
-    // The largest frame is the MTU, aligned: a byte burst of 64 cannot
-    // hold it.
+    // The bound is the MTU, which no datagram exceeds: a byte burst of 64
+    // cannot hold it, one byte short of the MTU neither.
     assert!(matches!(
         driver.guard_stream(handle, guard, 4, Some(per_second(10, 1, Some((1000, 64))))),
         Err(DriverError::InvalidRatePolicy(
@@ -618,6 +618,12 @@ fn guard_stream_validates_its_rate_limit() {
         ))
     ));
     let frame = u64::from(DEFAULT_MTU);
+    assert!(matches!(
+        driver.guard_stream(handle, guard, 4, Some(per_second(10, 2, Some((frame, frame - 1))))),
+        Err(DriverError::InvalidRatePolicy(
+            RatePolicyError::BurstBelowFrame { frame: f, .. }
+        )) if f == frame
+    ));
     driver
         .guard_stream(
             handle,
