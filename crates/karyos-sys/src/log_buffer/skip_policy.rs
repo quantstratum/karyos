@@ -139,9 +139,18 @@ pub struct SkipReport {
 }
 
 impl SkipReport {
+    /// Counts one seal of `extent` bytes. One call seals at most
+    /// `SEALS_PER_DUTY` holes on each of at most `Lane::COUNT` lanes, each
+    /// within one term, so neither sum can overflow; the increments are
+    /// checked and apply together.
     fn count(&mut self, extent: u32) {
-        self.sealed = self.sealed.saturating_add(1);
-        self.sealed_bytes = self.sealed_bytes.saturating_add(u64::from(extent));
+        if let (Some(sealed), Some(bytes)) = (
+            self.sealed.checked_add(1),
+            self.sealed_bytes.checked_add(u64::from(extent)),
+        ) {
+            self.sealed = sealed;
+            self.sealed_bytes = bytes;
+        }
     }
 }
 

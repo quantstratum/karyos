@@ -386,3 +386,57 @@ fn close_counters_are_per_lane_and_never_wrap() {
     assert_eq!(counters.unrecoverable, 1);
     assert!(counters.overflowed, "sticky");
 }
+
+/// A committed failure stops the whole duty: a hole due on another lane is
+/// not sealed in that call.
+#[test]
+fn a_committed_failure_stops_the_other_lanes() {
+    let lane_one = Lane::try_new(1).unwrap();
+    let params = ImageParams::new(
+        SESSION,
+        STREAM,
+        2,
+        TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+        DEFAULT_MTU,
+    )
+    .unwrap();
+    let buffer = |lane: Lane| {
+        let (plain, _) = image();
+        Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                lane,
+                ..plain.config
+            })
+            .unwrap(),
+        )
+    };
+    let mut owner = ReceiveOwner::new(params, vec![buffer(Lane::ZERO), buffer(lane_one)]).unwrap();
+    // A hole [64, 128) on each lane.
+    for lane in [Lane::ZERO, lane_one] {
+        for (offset, fill) in [(0, 1), (128, 2)] {
+            let mut bytes = data(0, offset, fill);
+            let flags = Flags::new(true, true, false, false, lane);
+            bytes[..8]
+                .copy_from_slice(&Word0::new(64, flags, FrameType::Data).pack().to_le_bytes());
+            let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+            let Some(Item::Frame(frame)) = datagram.items().next() else {
+                panic!("no frame");
+            };
+            owner.receive(&frame).unwrap();
+        }
+    }
+    let mut skip = SkipPolicy::new(
+        SkipConfig {
+            reorder_timeout_ns: 0,
+            ..SkipConfig::unreliable()
+        },
+        2,
+    )
+    .unwrap();
+    owner.fail_next_advance(Lane::ZERO, SysError::ResourcesUnavailable);
+    let report = skip.duty(&mut owner, 5).unwrap();
+    assert!(report.committed_failure.is_some());
+    assert_eq!(report.sealed, 1, "lane 1 not sealed in that call");
+    assert_eq!(owner.first_hole(lane_one).unwrap(), Some((64, 64)));
+    assert_eq!(owner.first_loss(lane_one), Some(None));
+}
