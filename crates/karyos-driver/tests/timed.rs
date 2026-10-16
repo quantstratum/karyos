@@ -22,27 +22,49 @@ use karyos_sys::term::TermId;
 const SECOND: u64 = 1_000_000_000;
 
 fn stream(driver: &mut EmbeddedDriver, schedule_capacity: u32) -> StreamHandle {
-    driver
-        .add_stream(StreamConfig {
-            buffer: LogBufferConfig {
-                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
-                spare_slots: 3,
-                max_subscribers: 4,
-                mtu: DEFAULT_MTU,
-                max_reserved: MIN_TERM_LENGTH / 8,
-                initial_term_id: TermId::new(7),
-                lane: Lane::ZERO,
-                session_id: 1,
-                stream_id: 2,
-                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
-                publication: PublicationMode::Exclusive,
-                schedule_capacity,
-            },
-            allow_unconnected: true,
-            on_required_loss: LossPolicy::Hold,
-            conflation: None,
-        })
-        .unwrap()
+    try_stream(driver, schedule_capacity).unwrap()
+}
+
+fn try_stream(
+    driver: &mut EmbeddedDriver,
+    schedule_capacity: u32,
+) -> Result<StreamHandle, DriverError> {
+    driver.add_stream(StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 3,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 2,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Exclusive,
+            schedule_capacity,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    })
+}
+
+/// The driver refuses a schedule capacity that is not a power of two up
+/// to the bound with the schedule's own error, not a publication mode one.
+#[test]
+fn a_schedule_capacity_is_bounded() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let max = karyos_sys::schedule_ring::MAX_CAPACITY;
+    for capacity in [3, max * 2] {
+        assert_eq!(
+            try_stream(&mut driver, capacity).err(),
+            Some(DriverError::Sys(karyos_sys::error::SysError::Schedule(
+                karyos_sys::schedule_ring::ScheduleError::Capacity { capacity }
+            ))),
+        );
+    }
+    assert!(try_stream(&mut driver, max).is_ok());
 }
 
 fn invalid(result: Result<OfferOutcome, ClientError>) -> bool {

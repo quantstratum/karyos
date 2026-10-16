@@ -98,7 +98,10 @@ release may break APIs, wire formats and shared-memory layouts.
   (`DriverError::NotTimed` for a lane that is not timed), and a CnC
   publication of a timed lane is refused for now. In karyos-sys,
   `Publication::append_scheduled` pushes the message's schedule entry after
-  its reservation and before its commit store (`SysError::Schedule`).
+  its reservation and before its commit store (`SysError::Schedule`). A
+  schedule capacity is a power of two up to `schedule_ring::MAX_CAPACITY`
+  (2^20), refused otherwise with `ScheduleError::Capacity`, and attach checks
+  the ring's own capacity word against the configuration.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

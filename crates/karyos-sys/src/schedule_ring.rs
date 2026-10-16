@@ -66,7 +66,18 @@ pub enum ScheduleError {
     /// 2^64 entries were pushed on the lane.
     #[error("the schedule ring's entries are exhausted")]
     Exhausted,
+    /// A lane's schedule capacity is not a power of two up to
+    /// [`MAX_CAPACITY`].
+    #[error("schedule capacity {capacity} is not a power of two in 1..={max}", max = MAX_CAPACITY)]
+    Capacity {
+        /// The capacity given.
+        capacity: u32,
+    },
 }
+
+/// The largest schedule capacity a lane takes: 2^20 entries (16 MiB of
+/// ring), a second of timed messages at a million a second.
+pub const MAX_CAPACITY: u32 = 1 << 20;
 
 /// One message's schedule: the position of its first frame and its
 /// requested time in the publication's clock domain.

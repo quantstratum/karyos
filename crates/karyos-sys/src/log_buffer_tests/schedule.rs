@@ -27,18 +27,21 @@ fn a_timed_buffer_carries_its_schedule_ring() {
     assert_eq!(reader.peek(ring), Ok(Some(entry)));
 }
 
-/// A schedule capacity is a power of two, on an exclusive publication.
+/// A schedule capacity is a power of two up to the bound, on an exclusive
+/// publication.
 #[test]
-fn a_schedule_needs_a_power_of_two_and_an_exclusive_publication() {
-    for capacity in [3, 6, 1000] {
-        assert!(
-            matches!(
-                new_buffer(LogBufferConfig {
-                    schedule_capacity: capacity,
-                    ..config(3, 2)
-                }),
-                Err(SysError::InvalidPublicationMode { .. })
-            ),
+fn a_schedule_needs_a_bounded_power_of_two_and_an_exclusive_publication() {
+    let max = crate::schedule_ring::MAX_CAPACITY;
+    for capacity in [3, 6, 1000, max * 2, max + 1, u32::MAX] {
+        assert_eq!(
+            new_buffer(LogBufferConfig {
+                schedule_capacity: capacity,
+                ..config(3, 2)
+            })
+            .err(),
+            Some(SysError::Schedule(
+                crate::schedule_ring::ScheduleError::Capacity { capacity }
+            )),
             "{capacity}"
         );
     }

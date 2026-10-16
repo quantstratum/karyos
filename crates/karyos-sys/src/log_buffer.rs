@@ -423,9 +423,12 @@ impl LogBuffer<SharedTerms> {
     ///
     /// # Errors
     ///
-    /// Returns [`SysError::InvalidRegion`] for a region that is not a log
-    /// buffer region, a configuration block that is not valid or does not
-    /// match the region, and the validation errors of [`LogBuffer::new`].
+    /// Returns [`SysError::LayoutVersion`] for a region or configuration
+    /// block of another layout version, [`SysError::InvalidRegion`] for a
+    /// region that is not a log buffer region, a configuration block that
+    /// is not valid or does not match the region, or a schedule ring whose
+    /// own capacity is not the configuration's, and the validation errors
+    /// of [`LogBuffer::new`].
     pub fn attach(region: crate::ipc::Region) -> Result<Self, SysError> {
         let record = region.record();
         let invalid = SysError::InvalidRegion {
@@ -457,8 +460,7 @@ impl LogBuffer<SharedTerms> {
         let (config, generation, max_message_length) = parse_config(&words).ok_or(invalid)?;
         let (layout, slots, expected_max) = Self::plan(&config)?;
         let structure_length = layout.total.checked_mul(crate::atomic_view::WORD_BYTES);
-        if record.layout != LAYOUT_VERSION
-            || record.generation != u64::from(generation.get())
+        if record.generation != u64::from(generation.get())
             || structure_length != Some(record.structure_length)
             || max_message_length != expected_max
         {
@@ -473,6 +475,15 @@ impl LogBuffer<SharedTerms> {
             slots,
             max_message_length,
         )?;
+        // Capacities whose rings round to the same region length (1 and
+        // 2) would attach on a rewritten configuration word: the ring's own
+        // capacity word, written at creation, must agree.
+        if let Some(ring) = buffer.schedule_ring() {
+            let declared = ring.first().map(|word| word.load(Ordering::Acquire));
+            if declared != Some(u64::from(buffer.config.schedule_capacity)) {
+                return Err(invalid);
+            }
+        }
         buffer.conductor_taken.store(true, Ordering::Relaxed);
         Ok(buffer)
     }
@@ -616,7 +627,11 @@ impl<T: TermBytes> LogBuffer<T> {
         self.active_count()
             .store(u64::from(start.get()), Ordering::Relaxed);
         if let Some(ring) = self.schedule_ring() {
-            // `plan` checked the capacity and `Layout` sized the words.
+            // `plan` checked that the capacity is a power of two and
+            // `Layout` sized the words with `ring_words` of that capacity,
+            // which are exactly what `init` checks; so `init` cannot fail
+            // here, in release as in debug, and the assertion only guards
+            // a future change to either.
             let initialised =
                 crate::schedule_ring::init(ring, u64::from(self.config.schedule_capacity));
             debug_assert!(initialised.is_ok(), "{initialised:?}");
@@ -4840,14 +4855,17 @@ fn corrupt(offset: u32, reason: &'static str) -> SysError {
 
 /// The log buffer tests run on both backings.
 /// A timed lane's schedule (`quantstratum-docs: karyos/design/timed-tx.md`,
-/// TT-1 and GC-7): a capacity of 0 (not timed) or a power of two, on an
-/// exclusive publication only.
+/// TT-1 and GC-7): a capacity of 0 (not timed) or a power of two up to
+/// [`crate::schedule_ring::MAX_CAPACITY`], on an exclusive publication
+/// only.
 fn check_schedule(config: &LogBufferConfig) -> Result<(), SysError> {
     match config.schedule_capacity {
         0 => Ok(()),
-        capacity if !capacity.is_power_of_two() => Err(SysError::InvalidPublicationMode {
-            reason: "a schedule capacity is a power of two",
-        }),
+        capacity
+            if !capacity.is_power_of_two() || capacity > crate::schedule_ring::MAX_CAPACITY =>
+        {
+            Err(crate::schedule_ring::ScheduleError::Capacity { capacity }.into())
+        }
         _ if config.publication != PublicationMode::Exclusive => {
             Err(SysError::InvalidPublicationMode {
                 reason: "a timed lane needs an exclusive publication (GC-7)",
@@ -5411,6 +5429,46 @@ mod region_tests {
         let seen = attached.schedule_ring().unwrap();
         let reader = crate::schedule_ring::ScheduleReader::attach(seen).unwrap();
         assert_eq!(reader.peek(seen), Ok(Some(entry)));
+    }
+
+    /// Rings of capacity 1 and 2 round to the same region length, so a
+    /// configuration word rewritten from 2 to 1 still lays out; the ring's
+    /// own capacity word refuses it at attach.
+    #[test]
+    fn attach_checks_the_ring_capacity_against_the_configuration() {
+        let creator = LogBuffer::create_in(
+            1,
+            9,
+            LogBufferConfig {
+                schedule_capacity: 2,
+                ..config(PublicationMode::Exclusive)
+            },
+            generation(),
+        )
+        .unwrap();
+        let one = LogBuffer::create_in(
+            1,
+            10,
+            LogBufferConfig {
+                schedule_capacity: 1,
+                ..config(PublicationMode::Exclusive)
+            },
+            generation(),
+        )
+        .unwrap();
+        assert_eq!(
+            one.region().unwrap().record().structure_length,
+            creator.region().unwrap().record().structure_length
+        );
+        assert!(attach(&creator).is_ok());
+        let word = creator.region().unwrap().structure().get(18).unwrap();
+        word.store(1, Ordering::Release);
+        assert!(matches!(
+            attach(&creator),
+            Err(SysError::InvalidRegion { .. })
+        ));
+        word.store(2, Ordering::Release);
+        assert!(attach(&creator).is_ok());
     }
 
     /// A region of an older layout version, 1 (shipped in v0.1.0-alpha.1,
