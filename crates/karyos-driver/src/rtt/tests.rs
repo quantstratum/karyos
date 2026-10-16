@@ -2,17 +2,49 @@
 
 #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
 
+use std::net::{IpAddr, Ipv4Addr};
+
 use super::*;
 
 const MS: u64 = 1_000_000;
 const SECOND: u64 = 1_000_000_000;
 
-fn probes(paths: usize) -> RttProbes {
-    RttProbes::new(RttConfig::default(), paths).unwrap()
+/// Ids 1, 2, 3 and so on, or a failure while `fail` is set.
+#[derive(Debug, Default)]
+struct Ids {
+    next: u64,
+    fail: bool,
+}
+
+impl ProbeIds for Ids {
+    fn probe_id(&mut self) -> Option<u64> {
+        if self.fail {
+            return None;
+        }
+        self.next += 1;
+        Some(self.next)
+    }
+}
+
+/// A source that only draws zero.
+struct Zero;
+
+impl ProbeIds for Zero {
+    fn probe_id(&mut self) -> Option<u64> {
+        Some(0)
+    }
+}
+
+fn probes(paths: usize) -> RttProbes<Ids> {
+    RttProbes::with_ids(RttConfig::default(), paths, Ids::default()).unwrap()
+}
+
+fn source(host: u8) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, host)), 40_000)
 }
 
 /// Sends `path`'s due probe at `now`, submitted, and returns it.
-fn send(probes: &mut RttProbes, path: usize, now: u64) -> Probe {
+fn send(probes: &mut RttProbes<Ids>, path: usize, now: u64) -> Probe {
     let probe = probes.due(path, now).unwrap();
     probes.submitted(probe, now);
     probe
@@ -51,13 +83,31 @@ fn the_configuration_is_validated() {
             rttm_reply_rate: 0,
             ..base
         },
+        RttConfig {
+            rttm_reply_sources: 0,
+            ..base
+        },
     ] {
         assert_eq!(config.validate(), Err(RttConfigError::Zero));
+        assert_eq!(RttReplies::new(&config).err(), Some(RttConfigError::Zero));
     }
 }
 
-/// One outstanding probe per path, one per interval, with checked ids
-/// from 1 shared by the image's paths.
+/// The operating system's ids are nonzero and do not repeat in practice.
+#[test]
+fn os_probe_ids_are_random() {
+    let mut ids = OsProbeIds;
+    let drawn: Vec<u64> = (0..8).map(|_| ids.probe_id().unwrap()).collect();
+    assert!(drawn.iter().all(|id| *id != 0));
+    for (at, id) in drawn.iter().enumerate() {
+        assert!(!drawn[at + 1..].contains(id));
+    }
+    let mut probes = RttProbes::new(RttConfig::default(), 1).unwrap();
+    assert_ne!(probes.due(0, 0).unwrap().probe_id, 0);
+}
+
+/// One outstanding probe per path, one per interval, with ids from the
+/// image's source.
 #[test]
 fn probes_follow_the_interval_one_at_a_time() {
     let mut probes = probes(2);
@@ -213,29 +263,74 @@ fn the_snapshot_is_the_largest_live_estimate() {
     assert_eq!(probes.snapshot([]), MS);
 }
 
-/// The ids never wrap: exhaustion stops probing for good.
+/// A failed id draw sends nothing, is counted, and the next try waits an
+/// interval; a zero id counts as a failure.
 #[test]
-fn exhausted_ids_stop_probing() {
+fn a_failed_id_draw_sends_nothing() {
     let mut probes = probes(1);
-    probes.next_id = Some(u64::MAX);
-    let last = probes.due(0, 0).unwrap();
-    assert_eq!(last.probe_id, u64::MAX);
-    assert!(probes.counts().exhausted);
-    probes.not_submitted(last);
+    probes.ids.fail = true;
+    assert_eq!(probes.due(0, 0), None);
+    probes.ids.fail = false;
+    assert_eq!(probes.due(0, SECOND - 1), None, "waits an interval");
+    assert!(probes.due(0, SECOND).is_some());
+    let mut zeros = RttProbes::with_ids(RttConfig::default(), 1, Zero).unwrap();
+    assert_eq!(zeros.due(0, 0), None);
+    assert_eq!(zeros.counts().id_failures, 1);
+    assert_eq!(probes.counts().id_failures, 1);
+    assert_eq!(probes.counts().probes, 1);
+}
+
+/// The binding generation never wraps: at its end the path is retired and
+/// never probes again, counted once.
+#[test]
+fn an_exhausted_generation_retires_the_path() {
+    let mut probes = probes(2);
+    probes.paths[0].generation = u64::MAX;
+    let old = send(&mut probes, 0, 0);
+    probes.rebind(0);
+    probes.rebind(0);
+    assert_eq!(probes.counts().generations_exhausted, 1);
     assert_eq!(probes.due(0, 10 * SECOND), None);
+    assert_eq!(
+        probes.reply(0, u64::MAX, old.probe_id, MS),
+        ReplyOutcome::Ignored
+    );
+    assert_eq!(probes.estimate(0), MS);
+    assert!(probes.due(1, 10 * SECOND).is_some(), "other paths go on");
 }
 
 /// The sender answers at most rttm_reply_rate requests per second per
-/// receiver; the rest are dropped and counted.
+/// source; the rest are dropped and counted, and one source cannot starve
+/// another.
 #[test]
-fn replies_are_rate_limited() {
-    let mut replies = RttReplies::new(&RttConfig::default(), 0);
-    let answered = (0..20).filter(|_| replies.admit(0)).count();
+fn replies_are_rate_limited_per_source() {
+    let mut replies = RttReplies::new(&RttConfig::default()).unwrap();
+    let answered = (0..20).filter(|_| replies.admit(source(1), 0)).count();
     assert_eq!(answered, 16);
     assert_eq!(replies.dropped(), 4);
+    assert!(
+        replies.admit(source(2), 0),
+        "another source keeps its budget"
+    );
     // 1/16 s later one more token.
-    assert!(replies.admit(SECOND / 16));
-    assert!(!replies.admit(SECOND / 16));
+    assert!(replies.admit(source(1), SECOND / 16));
+    assert!(!replies.admit(source(1), SECOND / 16));
     assert_eq!(RttReplies::service_delay(10, 25), 15);
     assert_eq!(RttReplies::service_delay(25, 10), 0);
+}
+
+/// The source table is bounded: a new source beyond it is dropped and
+/// counted until an entry has been idle for a second.
+#[test]
+fn the_reply_sources_are_bounded() {
+    let mut replies = RttReplies::new(&RttConfig {
+        rttm_reply_sources: 2,
+        ..RttConfig::default()
+    })
+    .unwrap();
+    assert!(replies.admit(source(1), 0));
+    assert!(replies.admit(source(2), 0));
+    assert!(!replies.admit(source(3), 0));
+    assert_eq!(replies.sources_full(), 1);
+    assert!(replies.admit(source(3), SECOND));
 }

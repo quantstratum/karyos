@@ -7,9 +7,11 @@
 //! path with RTTM; the sender only replies.
 //!
 //! - **Probes** ([`RttProbes`], one per image). Each path holds at most one
-//!   outstanding REQUEST, whose `probe_id` comes from a checked per-image
-//!   counter starting at 1; exhaustion stops probing for good, never wraps.
-//!   A probe is due every `rtt_probe_interval` and expires after
+//!   outstanding REQUEST, whose `probe_id` is a random nonzero 64-bit value
+//!   ([`ProbeIds`]; the operating system's source in the driver), so an
+//!   off-path spoofer cannot forge a reply and skew the RTT that NAK timing
+//!   uses. A failed draw sends nothing until the next interval and is
+//!   counted. A probe is due every `rtt_probe_interval` and expires after
 //!   `rtt_probe_timeout`. Its start is the time read immediately before the
 //!   backend call that the backend reports as submitting it; a probe only
 //!   accepted, failed or uncertain yields no sample.
@@ -25,16 +27,22 @@
 //!   `rtt_sample_window` accepted samples, so one fast sample cannot
 //!   shorten every retry at once; before the first sample, and after a
 //!   rebinding, it is `rtt_initial`. A stale estimate is kept while probes
-//!   continue. With redundant paths, NAK timing uses the largest estimate
+//!   continue. A path whose binding generation is exhausted stops probing
+//!   for good and is counted; the generation never wraps. With redundant paths, NAK timing uses the largest estimate
 //!   over the image's live paths ([`RttProbes::snapshot`]).
-//! - **Replies** ([`RttReplies`], the sender's, per receiver): at most
-//!   `rttm_reply_rate` per second; excess requests are dropped and counted.
+//! - **Replies** ([`RttReplies`], the sender's): at most `rttm_reply_rate`
+//!   per second per source endpoint, in a table of `rttm_reply_sources`
+//!   (as the SETUP answer rate), so one source cannot starve the others;
+//!   excess requests and sources beyond the table are dropped and counted.
 //!
 //! Every per-path array is sized at construction; the data calls do not
 //! allocate. Times are checked: an overflowing deadline is never wrapped.
 
+use std::net::SocketAddr;
+
 use karyos_sys::host_clock::age_ns;
-use karyos_sys::rate_limit::{Rate, RateLimiter, RatePolicy};
+
+use crate::sessions::rate::{EndpointRates, RateRefused};
 
 /// The RTT settings (RC-1; provisional and configurable), in nanoseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +57,10 @@ pub struct RttConfig {
     pub rtt_initial: u64,
     /// Accepted samples kept per path (default 4).
     pub rtt_sample_window: u8,
-    /// REPLYs a sender sends per receiver per second (default 16).
+    /// REPLYs a sender sends per source endpoint per second (default 16).
     pub rttm_reply_rate: u64,
+    /// Source endpoints the reply rate tracks at once (default 64).
+    pub rttm_reply_sources: usize,
 }
 
 impl Default for RttConfig {
@@ -62,6 +72,7 @@ impl Default for RttConfig {
             rtt_initial: 1_000_000,
             rtt_sample_window: 4,
             rttm_reply_rate: 16,
+            rttm_reply_sources: 64,
         }
     }
 }
@@ -73,8 +84,9 @@ pub enum RttConfigError {
     /// the floor is zero.
     #[error("rtt_floor <= rtt_initial <= rtt_probe_timeout does not hold, or the floor is 0")]
     Order,
-    /// The probe interval, the sample window or the reply rate is zero.
-    #[error("the probe interval, the sample window or the reply rate is 0")]
+    /// The probe interval, the sample window, the reply rate or the reply
+    /// sources is zero.
+    #[error("the probe interval, the sample window, the reply rate or the reply sources is 0")]
     Zero,
 }
 
@@ -91,7 +103,10 @@ impl RttConfig {
         {
             return Err(RttConfigError::Order);
         }
-        if self.rtt_probe_interval == 0 || self.rtt_sample_window == 0 || self.rttm_reply_rate == 0
+        if self.rtt_probe_interval == 0
+            || self.rtt_sample_window == 0
+            || self.rttm_reply_rate == 0
+            || self.rttm_reply_sources == 0
         {
             return Err(RttConfigError::Zero);
         }
@@ -124,8 +139,10 @@ pub struct RttCounts {
     pub unmatched: u64,
     /// Replies to an outstanding probe past its timeout.
     pub late: u64,
-    /// Whether the probe ids are exhausted: probing stopped for good.
-    pub exhausted: bool,
+    /// Probes not sent because the id source failed.
+    pub id_failures: u64,
+    /// Paths whose binding generation is exhausted: they stopped probing.
+    pub generations_exhausted: u64,
     /// Counts that would have overflowed and kept their last value.
     pub overflows: u64,
 }
@@ -154,11 +171,37 @@ struct Outstanding {
     start: Option<u64>,
 }
 
+/// Where probe ids come from: random nonzero 64-bit values.
+pub trait ProbeIds {
+    /// A fresh nonzero id; `None` when the source failed.
+    fn probe_id(&mut self) -> Option<u64>;
+}
+
+/// Probe ids from the operating system (`karyos_sys::random::fill_u64s`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsProbeIds;
+
+impl ProbeIds for OsProbeIds {
+    fn probe_id(&mut self) -> Option<u64> {
+        // A zero draw is retried once, then reported as a failure.
+        for _ in 0..2 {
+            let mut word = [0u64; 1];
+            karyos_sys::random::fill_u64s(&mut word).ok()?;
+            if word != [0] {
+                return word.first().copied();
+            }
+        }
+        None
+    }
+}
+
 /// One path of an image.
 #[derive(Debug, Clone)]
 struct PathRtt {
     /// The path binding's generation: a rebinding moves it.
     generation: u64,
+    /// The generation is exhausted: the path never probes again.
+    retired: bool,
     outstanding: Option<Outstanding>,
     /// The probe answered last, to tell a duplicate.
     answered: Option<u64>,
@@ -191,21 +234,33 @@ pub enum ReplyOutcome {
 
 /// The receiver's RTT probes of one image.
 #[derive(Debug)]
-pub struct RttProbes {
+pub struct RttProbes<I: ProbeIds = OsProbeIds> {
     config: RttConfig,
     paths: Vec<PathRtt>,
-    /// The next `probe_id`; `None` once exhausted.
-    next_id: Option<u64>,
+    ids: I,
     counts: RttCounts,
 }
 
 impl RttProbes {
-    /// The probes of an image with `paths` paths; it allocates only here.
+    /// The probes of an image with `paths` paths, with ids from the
+    /// operating system; it allocates only here.
     ///
     /// # Errors
     ///
     /// See [`RttConfigError`].
     pub fn new(config: RttConfig, paths: usize) -> Result<Self, RttConfigError> {
+        Self::with_ids(config, paths, OsProbeIds)
+    }
+}
+
+impl<I: ProbeIds> RttProbes<I> {
+    /// The probes of an image with `paths` paths, with ids from `ids`; it
+    /// allocates only here.
+    ///
+    /// # Errors
+    ///
+    /// See [`RttConfigError`].
+    pub fn with_ids(config: RttConfig, paths: usize, ids: I) -> Result<Self, RttConfigError> {
         config.validate()?;
         let window = usize::from(config.rtt_sample_window);
         Ok(Self {
@@ -213,6 +268,7 @@ impl RttProbes {
             paths: (0..paths)
                 .map(|_| PathRtt {
                     generation: 0,
+                    retired: false,
                     outstanding: None,
                     answered: None,
                     last_probe: None,
@@ -220,7 +276,7 @@ impl RttProbes {
                     next_sample: 0,
                 })
                 .collect(),
-            next_id: Some(1),
+            ids,
             counts: RttCounts::default(),
         })
     }
@@ -233,12 +289,13 @@ impl RttProbes {
 
     /// The probe `path` should send at `now`, if one is due: none is
     /// outstanding (an expired one is dropped and counted first) and
-    /// `rtt_probe_interval` passed since the last. `None` once the probe
-    /// ids are exhausted.
+    /// `rtt_probe_interval` passed since the last. `None` for a retired
+    /// path, and when the id source fails (counted; the next try waits an
+    /// interval).
     pub fn due(&mut self, path: usize, now: u64) -> Option<Probe> {
         let timeout = self.config.rtt_probe_timeout;
         let interval = self.config.rtt_probe_interval;
-        let state = self.paths.get_mut(path)?;
+        let state = self.paths.get_mut(path).filter(|state| !state.retired)?;
         if let Some(probe) = state.outstanding {
             if age_ns(now, probe.issued_at) < timeout {
                 return None;
@@ -252,17 +309,16 @@ impl RttProbes {
         {
             return None;
         }
-        let probe_id = self.next_id?;
-        self.next_id = probe_id.checked_add(1);
-        if self.next_id.is_none() {
-            self.counts.exhausted = true;
-        }
+        state.last_probe = Some(now);
+        let Some(probe_id) = self.ids.probe_id().filter(|id| *id != 0) else {
+            bump(&mut self.counts.id_failures, &mut self.counts.overflows);
+            return None;
+        };
         state.outstanding = Some(Outstanding {
             probe_id,
             issued_at: now,
             start: None,
         });
-        state.last_probe = Some(now);
         bump(&mut self.counts.probes, &mut self.counts.overflows);
         Some(Probe {
             path,
@@ -365,10 +421,22 @@ impl RttProbes {
     /// `path` was bound again (a path lost and re-established): its
     /// generation moves, its samples go, and its estimate is
     /// `rtt_initial` until the first new sample. A reply to the old
-    /// binding's probe is unmatched.
+    /// binding's probe is unmatched. At an exhausted generation the path
+    /// is retired instead: it never probes again, and that is counted.
     pub fn rebind(&mut self, path: usize) {
         if let Some(state) = self.paths.get_mut(path) {
-            state.generation = state.generation.checked_add(1).unwrap_or(state.generation);
+            match state.generation.checked_add(1) {
+                Some(next) => state.generation = next,
+                None => {
+                    if !state.retired {
+                        state.retired = true;
+                        bump(
+                            &mut self.counts.generations_exhausted,
+                            &mut self.counts.overflows,
+                        );
+                    }
+                }
+            }
             state.outstanding = None;
             state.answered = None;
             state.last_probe = None;
@@ -399,51 +467,62 @@ impl RttProbes {
     }
 }
 
-/// The sender's RTTM replies to one receiver: at most `rttm_reply_rate`
-/// per second, excess requests dropped and counted.
+/// The sender's RTTM replies: at most `rttm_reply_rate` per second per
+/// source endpoint, in a bounded table of `rttm_reply_sources` (a source
+/// idle for a second may be replaced); excess requests and sources beyond
+/// the table are dropped and counted.
 #[derive(Debug)]
 pub struct RttReplies {
-    limiter: RateLimiter,
+    rates: EndpointRates,
     dropped: u64,
+    sources_full: u64,
     overflows: u64,
 }
 
 impl RttReplies {
-    /// The replies to one receiver, starting at `now`.
-    #[must_use]
-    pub fn new(config: &RttConfig, now: u64) -> Self {
-        let rate = Rate {
-            per_second: config.rttm_reply_rate,
-            burst: config.rttm_reply_rate,
-        };
-        Self {
-            limiter: RateLimiter::new(
-                RatePolicy {
-                    messages: rate,
-                    bytes: None,
-                },
-                now,
-            ),
+    /// The sender's replies; the table is allocated here.
+    ///
+    /// # Errors
+    ///
+    /// See [`RttConfigError`].
+    pub fn new(config: &RttConfig) -> Result<Self, RttConfigError> {
+        config.validate()?;
+        let rates = EndpointRates::new(config.rttm_reply_rate, config.rttm_reply_sources)
+            .ok_or(RttConfigError::Zero)?;
+        Ok(Self {
+            rates,
             dropped: 0,
+            sources_full: 0,
             overflows: 0,
+        })
+    }
+
+    /// Whether a valid REQUEST from `source` seen at `now` is answered;
+    /// one that is not is dropped and counted.
+    pub fn admit(&mut self, source: SocketAddr, now: u64) -> bool {
+        match self.rates.admit(source, now) {
+            Ok(()) => true,
+            Err(RateRefused::Limited) => {
+                bump(&mut self.dropped, &mut self.overflows);
+                false
+            }
+            Err(RateRefused::TableFull) => {
+                bump(&mut self.sources_full, &mut self.overflows);
+                false
+            }
         }
     }
 
-    /// Whether a valid REQUEST seen at `now` is answered; one that is not
-    /// is dropped and counted.
-    pub fn admit(&mut self, now: u64) -> bool {
-        self.limiter.refill_at(now);
-        if self.limiter.try_admit_datagram(0, 1) {
-            return true;
-        }
-        bump(&mut self.dropped, &mut self.overflows);
-        false
-    }
-
-    /// REQUESTs dropped over the rate.
+    /// REQUESTs dropped over their source's rate.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// REQUESTs dropped because the source table was full.
+    #[must_use]
+    pub fn sources_full(&self) -> u64 {
+        self.sources_full
     }
 
     /// The REPLY's `service_delay_ns`: from the REQUEST's receipt at
