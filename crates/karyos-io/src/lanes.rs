@@ -37,6 +37,24 @@ use crate::backend::{
 pub trait LaneGate: SenderGate {
     /// Whether `lane` may send its head now.
     fn admits(&mut self, lane: usize) -> bool;
+
+    /// `lane`'s head left its queue, reported `how`: the gate's own record
+    /// of the head moves on with the sender's. A head the backend keeps
+    /// pending is not reported; it is exposed again, through the gate.
+    fn left(&mut self, lane: usize, staged: Staged, how: Left) {
+        let _ = (lane, staged, how);
+    }
+}
+
+/// How a staged head left its queue ([`LaneGate::left`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Left {
+    /// The backend submitted it.
+    Submitted,
+    /// It left without exposure.
+    Returned,
+    /// Its exposure is unproven: it may have been sent.
+    Unknown,
 }
 
 /// One datagram committed to a lane's queue and not yet reported.
@@ -412,11 +430,13 @@ impl<B: TxBackend, G: LaneGate> LaneSource for Source<'_, B, G> {
         match item.outcome {
             TxItemOutcome::Submitted { .. } => {
                 entry.staged.pop_front();
+                self.gate.left(lane, head, Left::Submitted);
                 Service::Served
             }
             TxItemOutcome::Returned { .. } => {
                 // The item left its queue without exposure: not service.
                 entry.staged.pop_front();
+                self.gate.left(lane, head, Left::Returned);
                 Service::NotServed
             }
             TxItemOutcome::Unknown => {
@@ -425,6 +445,7 @@ impl<B: TxBackend, G: LaneGate> LaneSource for Source<'_, B, G> {
                 // lane waits for the control path, the others go on.
                 entry.staged.pop_front();
                 entry.suspended = true;
+                self.gate.left(lane, head, Left::Unknown);
                 Service::Uncertain
             }
             TxItemOutcome::Pending { cause } => match cause {

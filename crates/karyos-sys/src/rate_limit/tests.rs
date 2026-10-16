@@ -67,6 +67,63 @@ fn a_frame_is_charged_to_every_bucket_or_none() {
     assert_eq!(limiter.byte_tokens(), Some(0));
 }
 
+/// The gate's check charges nothing and agrees with the charge that
+/// follows it.
+#[test]
+fn admits_charges_nothing_and_agrees_with_try_admit() {
+    let mut limiter = RateLimiter::new(policy(10, 1, Some((1000, 500))), 0);
+    for _ in 0..3 {
+        assert!(limiter.admits(500, true));
+    }
+    assert_eq!(
+        (limiter.message_tokens(), limiter.byte_tokens()),
+        (1, Some(500))
+    );
+    assert!(!limiter.admits(501, false));
+    assert!(limiter.try_admit(500, true));
+    assert!(!limiter.admits(1, false));
+    assert!(!limiter.admits(0, true));
+    // A refill earns what admit_frame's would, and charges nothing.
+    limiter.refill_at(SECOND / 10);
+    assert!(limiter.admits(100, true));
+    assert_eq!(limiter.message_tokens(), 1);
+    assert_eq!(limiter.byte_tokens(), Some(100));
+    // A backward step keeps the last refill time.
+    limiter.refill_at(0);
+    limiter.refill_at(SECOND / 10 + SECOND / 10);
+    assert_eq!(limiter.message_tokens(), 1);
+    assert_eq!(limiter.byte_tokens(), Some(200));
+}
+
+/// A refund gives back exactly a charge, capped at the burst.
+#[test]
+fn a_refund_gives_back_a_charge_capped_at_the_burst() {
+    let mut limiter = RateLimiter::new(policy(10, 2, Some((1000, 500))), 0);
+    assert!(limiter.try_admit(300, true));
+    assert_eq!(
+        (limiter.message_tokens(), limiter.byte_tokens()),
+        (1, Some(200))
+    );
+    limiter.refund(300, true);
+    assert_eq!(
+        (limiter.message_tokens(), limiter.byte_tokens()),
+        (2, Some(500))
+    );
+    // Already full: the refund is capped, never above the burst.
+    limiter.refund(300, true);
+    assert_eq!(
+        (limiter.message_tokens(), limiter.byte_tokens()),
+        (2, Some(500))
+    );
+    // A later frame of a message gives back bytes only.
+    assert!(limiter.try_admit(500, false));
+    limiter.refund(500, false);
+    assert_eq!(
+        (limiter.message_tokens(), limiter.byte_tokens()),
+        (2, Some(500))
+    );
+}
+
 #[test]
 fn a_long_idle_time_caps_at_the_burst() {
     let mut limiter = RateLimiter::new(policy(u64::MAX, 5, Some((u64::MAX, 1 << 40))), 0);
