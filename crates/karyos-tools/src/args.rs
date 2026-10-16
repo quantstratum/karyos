@@ -79,9 +79,10 @@ Shutdown:
 
   -h, --help                        print this text
 
-Exit status: 0 after an orderly shutdown with every client gone; 2 on a
-configuration or startup error; 3 when clients were still attached at the
-end of the shutdown linger.
+Exit status: 0 after an orderly shutdown with every client gone and every
+stream freed; 2 on a configuration or startup error; 3 when the shutdown
+linger ended first (clients still attached or a stream not yet freed); 4
+when the driver entered its terminal state.
 ";
 
 /// The default term length of configured streams: 1 MiB.
