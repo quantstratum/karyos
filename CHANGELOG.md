@@ -182,14 +182,19 @@ release may break APIs, wire formats and shared-memory layouts.
   `path_liveness_timeout`.
 - RTT observations (P2.7 B, reliable-transport.md, RC-1, ACS 15597):
   `karyos_driver::rtt::RttProbes` probes each path of an image with at most
-  one outstanding RTTM REQUEST (checked ids from 1, never wrapped),
+  one outstanding RTTM REQUEST (random nonzero 64-bit ids from
+  `ProbeIds`, the operating system's in the driver, so an off-path
+  spoofer cannot forge a reply; a failed draw is counted),
   samples only submitted probes from the time read before the submitting
   call to the validated reply, never subtracts `service_delay_ns`, raises a
   sample below `rtt_floor` to it, refuses a zero sample, keeps the largest
   of the last `rtt_sample_window` samples as the path's estimate
   (`rtt_initial` before any or after a rebinding) and gives NAK timing the
-  largest estimate over the live paths (`snapshot`). `RttReplies` limits a
-  sender's replies to `rttm_reply_rate` per receiver per second.
+  largest estimate over the live paths (`snapshot`). A path whose binding
+  generation is exhausted stops probing and is counted, never wrapped.
+  `RttReplies` limits a sender's replies to `rttm_reply_rate` per second
+  per source endpoint, in a bounded table of `rttm_reply_sources`, so one
+  source cannot starve the others (ACS 15618).
   `path_liveness_timeout`. The path rows decide admission: `lookup` and
   the bound-key checks go through them, so a first path lost at its
   timeout stops admitting and returns only through a fresh challenge, as a
