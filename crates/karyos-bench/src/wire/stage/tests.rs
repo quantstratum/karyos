@@ -51,6 +51,7 @@ fn every_shape_runs_closed_loop_over_loopback() {
             "{shape}"
         );
         assert!(samples.functional_only);
+        assert!(!samples.functional_reasons.is_empty());
         assert_eq!(samples.messages_per_sample == 1, shape != Shape::W5);
     }
 }
@@ -166,6 +167,92 @@ fn a_duplicate_datagram_invalidates_the_run() {
     assert!(fault.contains("duplicate"), "{fault}");
     // Five datagrams with one repeated never complete the message.
     assert_eq!(receiver.receive[1], MISSING);
+}
+
+#[test]
+fn a_duplicate_warmup_datagram_invalidates_the_run() {
+    let (run, prepared) = w6();
+    let mut receiver = Receiver::new(&run, &prepared, &Trusted).unwrap();
+    let warmup = datagrams(&prepared, 1);
+    let now = Instant::now();
+    assert!(receiver.accept(&warmup[2], now, now).is_continue());
+    let fault = fault_of(&mut receiver, &warmup[2]);
+    assert!(fault.contains("sequence 1: duplicate"), "{fault}");
+    assert_eq!(receiver.completed, 0);
+}
+
+#[test]
+fn a_receiver_stop_ends_an_open_loop_wait() {
+    // At one message per second, message 1 is due 1 s after message 0;
+    // the receiver stops after 50 ms, inside that wait.
+    let run = stage_run(Shape::W1, StageLoad::Open { rate: 1 }, 5, 0);
+    let prepared = Prepared::new(&run, &Trusted).unwrap();
+    let (mut tx, _tx_rx) = prepared
+        .endpoint()
+        .unwrap()
+        .split()
+        .map_err(|_| "split")
+        .unwrap();
+    let receiving = prepared.endpoint().unwrap();
+    let peer = receiving.capabilities().local;
+    let stop = AtomicBool::new(false);
+    let started = Instant::now();
+    let result = thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(50));
+            stop.store(true, Ordering::Release);
+        });
+        send_role(
+            &run,
+            &prepared,
+            &Trusted,
+            &mut tx,
+            peer,
+            &SendControl {
+                wait: &|_| Wait::Completed,
+                stopped: &|| stop.load(Ordering::Acquire),
+            },
+        )
+    });
+    let error = result.err().map(|error| error.0).unwrap_or_default();
+    assert!(error.contains("receiver stopped"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn unacknowledged_messages_past_the_drop_budget_end_the_run() {
+    // 1000 messages allow one timeout (M-11): the second ends the run.
+    let run = stage_run(Shape::W1, StageLoad::Closed, 1_000, 0);
+    let prepared = Prepared::new(&run, &Trusted).unwrap();
+    let (mut tx, _tx_rx) = prepared
+        .endpoint()
+        .unwrap()
+        .split()
+        .map_err(|_| "split")
+        .unwrap();
+    let receiving = prepared.endpoint().unwrap();
+    let waits = AtomicU32::new(0);
+    let result = send_role(
+        &run,
+        &prepared,
+        &Trusted,
+        &mut tx,
+        receiving.capabilities().local,
+        &SendControl {
+            wait: &|_| {
+                waits.fetch_add(1, Ordering::Relaxed);
+                Wait::TimedOut
+            },
+            stopped: &|| false,
+        },
+    );
+    let error = result.err().map(|error| error.0).unwrap_or_default();
+    assert!(error.contains("2 messages unacknowledged"), "{error}");
+    assert_eq!(waits.load(Ordering::Relaxed), 2);
 }
 
 #[test]

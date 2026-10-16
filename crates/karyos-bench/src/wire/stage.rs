@@ -4,10 +4,10 @@
 //! (`quantstratum-docs: karyos/design/measurement-harness.md` §5.3, M-5,
 //! H-5). [`send_role`] drives the TX half of one loopback endpoint and
 //! [`receive_role`] the RX half of another; [`run`] composes them on two
-//! threads of one process. Batch B3c-2 moves each role into its own
-//! process; until then every result of [`run`] is functional only (E4):
-//! eligibility needs one isolated core per process (measurement-harness.md
-//! 4.2), which two threads of one process are not.
+//! threads of one process, and `wire::process` runs each in its own.
+//! Every result of [`run`] is functional only (E4): eligibility needs one
+//! isolated core per process (measurement-harness.md 4.2), which two
+//! threads of one process are not.
 //!
 //! - **Send stage:** from the message's frames ready (stamped from its
 //!   [`Template`]) to the last `TxFrame::commit` of its datagrams; the
@@ -53,6 +53,7 @@ use karyos_protocol::protection::{Protection, Verdict};
 use karyos_protocol::sizing::TermLength;
 use karyos_sys::receive::{ImageParams, ValidatedDatagram};
 
+use crate::decision::drops_exceed;
 use crate::manifest::{MtuRule, Shape};
 use crate::samples::{MISSING, SATURATED};
 use crate::wire::compose::{IDENTITY, TERM, Template, sequence_of};
@@ -68,6 +69,33 @@ pub const RECEIVE_DEADLINE: Duration = Duration::from_secs(120);
 /// How long the R1 sender waits for a message to complete before it
 /// counts the message lost and sends the next.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How long a receive role of `run` may take: [`RECEIVE_DEADLINE`] plus,
+/// under R2, the time its schedule spans.
+///
+/// # Errors
+///
+/// A message count or rate the clock cannot hold.
+pub fn receive_deadline(run: &StageRun) -> Result<Duration, BenchError> {
+    let transfer = match run.load {
+        StageLoad::Closed => Duration::ZERO,
+        StageLoad::Open { rate } => {
+            let total = run
+                .warmup
+                .checked_add(run.messages)
+                .ok_or_else(|| BenchError("message count overflow".into()))?;
+            let nanos = u128::from(total)
+                .checked_mul(1_000_000_000)
+                .and_then(|nanos| nanos.checked_div(u128::from(rate)))
+                .and_then(|nanos| u64::try_from(nanos).ok())
+                .ok_or_else(|| BenchError(format!("R2 schedule of {total} at {rate}")))?;
+            Duration::from_nanos(nanos)
+        }
+    };
+    RECEIVE_DEADLINE
+        .checked_add(transfer)
+        .ok_or_else(|| BenchError("receive deadline overflow".into()))
+}
 
 /// Frames the send queue holds, and datagrams one flush may submit.
 const QUEUE_DEPTH: u16 = 64;
@@ -121,12 +149,16 @@ pub struct StageSamples {
     /// Flushes that stopped for lack of room in the kernel (backpressure,
     /// §5.3).
     pub backpressure: u64,
+    /// R1 messages not acknowledged within [`ACK_TIMEOUT`].
+    pub ack_timeouts: u64,
     /// Messages each sequence stands for: the frames of a W5 datagram,
     /// one otherwise (M-5b).
     pub messages_per_sample: usize,
-    /// Always `true` for [`run`]: the two roles share a process, so the
-    /// result is functional only (E4) whatever the host.
+    /// Whether the result is functional only (E4): always `true` for
+    /// [`run`], whose two roles share a process, whatever the host.
     pub functional_only: bool,
+    /// Why the result is functional only; empty when it is not.
+    pub functional_reasons: Vec<String>,
     /// The local address of the receiving endpoint.
     pub receiver: SocketAddr,
 }
@@ -216,7 +248,9 @@ impl<'p, P: Protection> Receiver<'p, P> {
                 u32::try_from(prepared.template.datagrams())
                     .map_err(|_| BenchError("datagram count".into()))?,
             )
-            .map_or(u64::MAX, |bit| bit.wrapping_sub(1));
+            // 64 datagrams shift out of range: every bit is set.
+            .map_or(Some(u64::MAX), |bit| bit.checked_sub(1))
+            .ok_or_else(|| BenchError("datagram mask".into()))?;
         // Every batch delivers at least one datagram, so this bounds them.
         let batch_room = usize::try_from(prepared.total)
             .ok()
@@ -557,12 +591,23 @@ pub fn receive_role<P: Protection>(
     })
 }
 
+/// How an R1 wait for one message ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// The receiver completed the message.
+    Completed,
+    /// [`ACK_TIMEOUT`] passed first.
+    TimedOut,
+    /// The receiver has stopped.
+    Stopped,
+}
+
 /// How a send role follows the receiver.
 #[derive(Clone, Copy)]
 pub struct SendControl<'a> {
-    /// Under R1, waits until message `sequence` completes or
-    /// [`ACK_TIMEOUT`] passes; `false` when the receiver has stopped.
-    pub wait: &'a dyn Fn(u64) -> bool,
+    /// Under R1, waits until message `sequence` completes, for at most
+    /// [`ACK_TIMEOUT`].
+    pub wait: &'a dyn Fn(u64) -> Wait,
     /// Whether the receiver has stopped; the role then fails at once.
     pub stopped: &'a dyn Fn() -> bool,
 }
@@ -574,6 +619,8 @@ pub struct Sent {
     pub send: Vec<u32>,
     /// Flushes that stopped for lack of room in the kernel.
     pub backpressure: u64,
+    /// R1 messages not acknowledged within [`ACK_TIMEOUT`].
+    pub ack_timeouts: u64,
 }
 
 fn receiver_stopped() -> BenchError {
@@ -675,6 +722,7 @@ pub fn send_role<P: Protection>(
     let mut buffer = vec![0_u8; room];
     let mut report = TxReport::new();
     let mut backpressure = 0_u64;
+    let mut ack_timeouts = 0_u64;
     let schedule = match run.load {
         StageLoad::Open { rate } => Some(Schedule::new(Instant::now(), rate)?),
         StageLoad::Closed => None,
@@ -748,11 +796,28 @@ pub fn send_role<P: Protection>(
                 })?;
         }
         flush_all(tx, queue, &mut report, &mut backpressure, stopped)?;
-        if run.load == StageLoad::Closed && !wait(sequence) {
-            return Err(receiver_stopped());
+        if run.load == StageLoad::Closed {
+            match wait(sequence) {
+                Wait::Completed => {}
+                Wait::Stopped => return Err(receiver_stopped()),
+                Wait::TimedOut => {
+                    // Each costs ACK_TIMEOUT: past the drop budget the run
+                    // is Not demonstrated anyway (M-11), so it ends here.
+                    ack_timeouts = increment(ack_timeouts, "ack timeout count")?;
+                    if drops_exceed(ack_timeouts, run.messages) {
+                        return Err(BenchError(format!(
+                            "{ack_timeouts} messages unacknowledged within {ACK_TIMEOUT:?}, above 0.1% (M-11)"
+                        )));
+                    }
+                }
+            }
         }
     }
-    Ok(Sent { send, backpressure })
+    Ok(Sent {
+        send,
+        backpressure,
+        ack_timeouts,
+    })
 }
 
 /// Sets its flag when dropped, so a role that returns, fails or panics
@@ -786,6 +851,7 @@ pub fn run<P: Protection + Sync>(
     let (_rx_tx, mut rx) = receiving
         .split()
         .map_err(|_| BenchError("split receiver".into()))?;
+    let deadline = receive_deadline(&run)?;
     let completed = AtomicU64::new(0);
     let sender_done = AtomicBool::new(false);
     let receiver_done = AtomicBool::new(false);
@@ -801,7 +867,7 @@ pub fn run<P: Protection + Sync>(
                 &ReceiveControl {
                     finished: &|| sender_done.load(Ordering::Acquire),
                     ack: &|count| completed.store(count, Ordering::Release),
-                    deadline: RECEIVE_DEADLINE,
+                    deadline,
                 },
             )
         });
@@ -812,13 +878,13 @@ pub fn run<P: Protection + Sync>(
                 let start = Instant::now();
                 loop {
                     if completed.load(Ordering::Acquire) > sequence {
-                        return true;
+                        return Wait::Completed;
                     }
                     if stopped() {
-                        return false;
+                        return Wait::Stopped;
                     }
                     if start.elapsed() >= ACK_TIMEOUT {
-                        return true;
+                        return Wait::TimedOut;
                     }
                     std::hint::spin_loop();
                 }
@@ -854,8 +920,10 @@ pub fn run<P: Protection + Sync>(
         batches: received.batches,
         backend_drops: received.drops,
         backpressure: sent.backpressure,
+        ack_timeouts: sent.ack_timeouts,
         messages_per_sample: prepared.messages_per_sample,
         functional_only: true,
+        functional_reasons: vec!["the roles share one process".to_string()],
         receiver: receiver_address,
     })
 }

@@ -145,6 +145,16 @@ fn main() -> ExitCode {
             }
         };
     }
+    // A wire child runs its role and nothing else.
+    if let Some(result) = karyos_bench::wire::process::child() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(cause) => {
+                let _ = writeln!(std::io::stderr(), "karyos-bench wire child: {cause}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let args: Vec<String> = std::env::args().skip(1).collect();
