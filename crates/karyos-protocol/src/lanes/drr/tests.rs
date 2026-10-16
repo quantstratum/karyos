@@ -633,3 +633,27 @@ fn persistent_backpressure_still_rotates_the_lanes() {
     assert_eq!(second.lanes[1].served_bytes, 300);
     assert_eq!(source.served, [1, 1, 1]);
 }
+
+/// Backpressure on the last lane wraps the cursor and counts that round as
+/// usual: no extra empty pass, and no round withheld.
+#[test]
+fn backpressure_on_the_last_lane_counts_its_round() {
+    struct LastBlocked;
+    impl LaneSource for LastBlocked {
+        fn probe(&mut self, _lane: usize) -> Probe {
+            Probe::Eligible { charge: 100 }
+        }
+        fn serve(&mut self, lane: usize) -> Service {
+            if lane == 1 {
+                Service::Backpressure
+            } else {
+                Service::Served
+            }
+        }
+    }
+    let mut drr = drr(&[100, 100], 100);
+    let report = drr.run(ALL, &mut LastBlocked);
+    assert_eq!(report.stop, Stop::Backpressure { lane: 1 });
+    assert_eq!(report.rounds, 1);
+    assert_eq!(drr.cursor(), 0);
+}

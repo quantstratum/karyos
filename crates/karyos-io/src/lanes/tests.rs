@@ -437,3 +437,25 @@ fn the_send_order_is_the_same_under_any_split_into_calls() {
         assert_eq!(order(work), whole, "work {work} per call");
     }
 }
+
+/// A send fault holds its lane; `retry_queue` clears it on the same queue,
+/// which keeps its pending items, so the lane keeps its staged records and
+/// its faulted head is sent again: nothing is staged twice.
+#[test]
+fn a_cleared_send_fault_retries_the_same_head() {
+    let mut f = Fixture::new(&[100, 100], 100);
+    let head = f.stage(0, 50, 64);
+    f.socket
+        .push_send(SendResult::Error(crate::sockets::ops::Errno::ACCES));
+    let first = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&first), [0, 0]);
+    assert_eq!(f.sender.needs_control(0), Some(true));
+    assert_eq!(f.sender.pending(0), Some(1));
+    f.tx.retry_queue(f.queues[0]).unwrap();
+    f.sender.retry(0);
+    f.accept(1);
+    let second = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&second), [64, 0]);
+    assert_eq!(f.sender.pending(0), Some(0));
+    assert!(!f.tx.is_pending(head));
+}

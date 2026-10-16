@@ -211,8 +211,9 @@ pub enum Stop {
     /// A full pass found no lane eligible.
     Idle,
     /// The backend had no room for `lane`'s head ([`Service::Backpressure`]):
-    /// the lane forfeited its deficit, the cursor is on the next lane and
-    /// no round was counted for the pass.
+    /// the lane forfeited its deficit and the cursor is on the next lane,
+    /// with no extra empty pass (a wrap from the last lane counts a round
+    /// as usual).
     Backpressure {
         /// The lane whose head found no room.
         lane: usize,
@@ -437,13 +438,10 @@ impl Drr {
                             if let Some(deficit) = self.deficit.get_mut(lane) {
                                 *deficit = 0;
                             }
-                            // The visit ends; the cursor moves on without
-                            // completing a round.
-                            self.credited = false;
-                            self.cursor = lane
-                                .checked_add(1)
-                                .filter(|next| *next < self.config.lanes)
-                                .unwrap_or(0);
+                            // The visit ends and the cursor moves on, with no
+                            // extra empty pass; a wrap from the last lane
+                            // counts a round as usual.
+                            self.advance(report)?;
                             return Ok(Stop::Backpressure { lane });
                         }
                         Service::Uncertain => {

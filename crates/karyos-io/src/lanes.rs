@@ -26,8 +26,8 @@ use karyos_protocol::lanes::drr::{
 };
 
 use crate::backend::{
-    FlushRequest, FlushStop, PendingCause, QueueError, SenderGate, TxBackend, TxItemOutcome,
-    TxQueueId, TxReport, TxTicket,
+    BackendFailure, FlushRequest, FlushStop, PendingCause, QueueError, SenderGate, TxBackend,
+    TxItemOutcome, TxQueueId, TxReport, TxTicket,
 };
 
 /// The driver's gate for a lane sender: the exposure-time
@@ -244,12 +244,23 @@ impl LaneSender {
             .map(|entry| entry.suspended || entry.control)
     }
 
-    /// The control path reopened `lane` on `queue` after an endpoint reset
+    /// The control path cleared `lane`'s send fault with `retry_queue`: the
+    /// same queue keeps its pending items, so the lane keeps its staged
+    /// records and its faulted head is tried again, after a fresh gate
+    /// check. An invariant fault or an uncertain item needs
+    /// [`LaneSender::reopen`] after a reset instead.
+    pub fn retry(&mut self, lane: usize) {
+        if let Some(entry) = self.lanes.get_mut(lane) {
+            entry.control = false;
+        }
+    }
+
+    /// The control path gave `lane` a new `queue`, after an endpoint reset
     /// (which returned every pending item and closed every queue) or after
-    /// it cleared the lane's queue fault. The lane's staged records are
-    /// dropped: the packetizer stages again from the first position not
-    /// confirmed submitted (a resend on a reliable channel), or the session
-    /// reports the uncertain range as a gap (an unreliable one).
+    /// `close_queue`. The lane's staged records are dropped: the packetizer
+    /// stages again from the first position not confirmed submitted (a
+    /// resend on a reliable channel), or the session reports the uncertain
+    /// range as a gap (an unreliable one).
     pub fn reopen(&mut self, lane: usize, queue: TxQueueId) {
         if let Some(entry) = self.lanes.get_mut(lane) {
             entry.queue = queue;
@@ -322,8 +333,10 @@ impl<B: TxBackend, G: LaneGate> Source<'_, B, G> {
     fn without_entry(&mut self, lane: usize, stop: FlushStop) -> Service {
         match stop {
             FlushStop::Queue(QueueError::NotActive) => {
+                // The endpoint is resetting or retired: stop the call, as
+                // backpressure does, rather than an empty pass.
                 self.inactive = true;
-                Service::NotServed
+                Service::Backpressure
             }
             FlushStop::Queue(
                 QueueError::UnknownQueue | QueueError::RouteUnknown | QueueError::NeedsReset,
@@ -332,6 +345,10 @@ impl<B: TxBackend, G: LaneGate> Source<'_, B, G> {
             FlushStop::ReportNotEmpty | FlushStop::GateError { .. } => {
                 self.fail(SenderFailure::Sender { lane, stop })
             }
+            // An invariant fault of this queue only; it shows as
+            // `NeedsReset` from now on.
+            FlushStop::Failed(BackendFailure::Invariant { .. }) => self.hold(lane),
+            // An OS failure stopped the half: every lane waits for the reset.
             FlushStop::Failed(_) => self.fail(SenderFailure::Backend { lane, stop }),
             // `QueueEmpty` contradicts the staged count and
             // `HeadExceedsBudget` the committed length; nothing else stops
@@ -427,6 +444,7 @@ impl<B: TxBackend, G: LaneGate> LaneSource for Source<'_, B, G> {
                 PendingCause::ErrorLost | PendingCause::NotAttempted => {
                     self.fail(SenderFailure::Invariant { lane, stop })
                 }
+                PendingCause::Failed(BackendFailure::Invariant { .. }) => self.hold(lane),
                 PendingCause::Failed(_) => self.fail(SenderFailure::Backend { lane, stop }),
             },
         }
