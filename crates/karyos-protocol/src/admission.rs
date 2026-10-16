@@ -83,7 +83,8 @@
 //! network). A remote client maps the buffer at that base, so the
 //! positions it reports (a loss report, a trace) are absolute stream
 //! positions. A position stays below 2^63, so a base with the top bit set
-//! is refused.
+//! is refused; a manifest of other regions (a conflation table, a journal)
+//! carries base 0.
 //!
 //! **Version 2** (coordinator decision, ACS 13677). The trace journal
 //! region adds the `Journal` and `TraceMirror` kinds and a fifth
@@ -581,7 +582,9 @@ fn records_from(header: usize, words: &[u64]) -> Result<Vec<Record>, AdmissionEr
 /// The identity rule of a manifest: records that are all journals carry a
 /// zero stream registration, incarnation and base; any other manifest
 /// carries a nonzero stream registration and incarnation; journal records
-/// never share a manifest with others; a base is below 2^63.
+/// never share a manifest with others; a base is below 2^63, and nonzero
+/// only for log buffer records, the only regions that start at a stream
+/// position.
 fn check_manifest_identity(
     records: &[Record],
     stream_registration: u64,
@@ -597,7 +600,11 @@ fn check_manifest_identity(
     } else {
         journals == records.len() && stream_registration == 0 && incarnation == 0 && base == 0
     };
-    if valid && base >> 63 == 0 {
+    let positioned = !records.is_empty()
+        && records
+            .iter()
+            .all(|record| record.kind == RegionKind::LogBuffer);
+    if valid && base >> 63 == 0 && (base == 0 || positioned) {
         Ok(())
     } else {
         Err(AdmissionError::Reserved)
@@ -1229,6 +1236,46 @@ mod tests {
         ));
     }
 
+    /// Review of #218: only a log buffer starts at a stream position, so a
+    /// manifest of any other region carries base 0, both ways.
+    #[test]
+    fn only_a_log_buffer_manifest_carries_a_base() {
+        let table = Record {
+            kind: RegionKind::ConflationTable,
+            ..record(1, Capability::None)
+        };
+        let manifest = |records: Vec<Record>, base| Message::Manifest {
+            fetch: 1,
+            key: 2,
+            registration: 3,
+            stream_registration: 4,
+            incarnation: 1,
+            base,
+            records,
+        };
+        round_trip(&manifest(vec![table], 0));
+        round_trip(&manifest(vec![record(1, Capability::None)], 4096));
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        for refused in [
+            manifest(vec![table], 4096),
+            manifest(Vec::new(), 4096),
+            manifest(vec![record(1, Capability::None), table], 4096),
+        ] {
+            assert_eq!(
+                refused.encode(&mut out),
+                Err(AdmissionError::Reserved),
+                "{refused:?}"
+            );
+        }
+        let length = manifest(vec![table], 0).encode(&mut out).unwrap();
+        let mut words = words_of(&out[..length]);
+        words[6] = 4096;
+        assert_eq!(
+            Message::decode(&bytes_of(&words)),
+            Err(AdmissionError::Reserved)
+        );
+    }
+
     /// A journal grant's manifest: journal records only, the journal number
     /// as registration, zero stream registration and incarnation; anything
     /// else with a journal record is refused, both ways.
@@ -1787,7 +1834,15 @@ mod properties {
                         journal,
                         base,
                     )| {
-                        let base = if valid { base >> 1 } else { base };
+                        let positioned = !records.is_empty()
+                            && records
+                                .iter()
+                                .all(|record| record.kind == RegionKind::LogBuffer);
+                        let base = match (valid, positioned) {
+                            (true, true) => base >> 1,
+                            (true, false) => 0,
+                            (false, _) => base,
+                        };
                         let (stream_registration, incarnation, base) =
                             if valid && journal && !records.is_empty() {
                                 for record in &mut records {
