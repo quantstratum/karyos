@@ -74,6 +74,7 @@ mod deadline;
 mod frame_reader;
 mod image_read;
 mod receive_owner;
+mod sender_read;
 mod skip_policy;
 
 pub use frame_reader::{
@@ -81,6 +82,10 @@ pub use frame_reader::{
 };
 pub use receive_owner::{
     GapCounters, ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received,
+};
+pub use sender_read::{
+    CanonicalKind, DEFAULT_CORRUPT_RETRIES, ReadError, ReadOrigin, ReadOutcome, SenderRead,
+    SenderReadCounters,
 };
 pub use skip_policy::{
     Close, CloseCause, DEFAULT_FAR_WINDOW_TIMEOUT_NS, DEFAULT_REORDER_TIMEOUT_NS,
@@ -5135,6 +5140,7 @@ mod heap_tests {
     include!("log_buffer_tests/walker.rs");
     include!("log_buffer_tests/diagnostics.rs");
     include!("log_buffer_tests/frame_reader.rs");
+    include!("log_buffer_tests/sender_read.rs");
     include!("log_buffer_tests/schedule.rs");
 }
 
@@ -5164,6 +5170,7 @@ mod shared_tests {
     include!("log_buffer_tests/walker.rs");
     include!("log_buffer_tests/diagnostics.rs");
     include!("log_buffer_tests/frame_reader.rs");
+    include!("log_buffer_tests/sender_read.rs");
     include!("log_buffer_tests/schedule.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
