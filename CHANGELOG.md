@@ -21,6 +21,11 @@ release may break APIs, wire formats and shared-memory layouts.
   walker, which holds one spare-slot credit for the stream's life, finds no
   credit (`WalkerUnavailable::NoSpareCredit`) or no reader cell
   (`WalkerUnavailable::NoReaderCell`).
+- Driver positions are absolute stream positions after a guard close and
+  reopen: `EmbeddedDriver::seal_state` reports the current mapping's base
+  plus its seal (`DriverError::PositionsExhausted` past the position
+  range), and a revoked required participant's loss record names the base
+  of its incarnation plus its cell position.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

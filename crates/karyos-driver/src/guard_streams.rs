@@ -213,13 +213,17 @@ impl<T: TermBytes> GuardedStream<T> {
                 PollOutcome::Skipped { .. } => continue,
                 PollOutcome::Pending | PollOutcome::Revoked { .. } => return Ok(walked),
             };
+            let (Some(start), Some(end)) = (base.checked_add(position), base.checked_add(end))
+            else {
+                return Err(crate::error::DriverError::PositionsExhausted);
+            };
             let record = Record {
                 kind,
                 lane,
                 receiver: 0,
                 incarnation,
-                start: base + position,
-                end: base + end,
+                start,
+                end,
                 epoch: 0,
                 reason,
                 lost: 0,
