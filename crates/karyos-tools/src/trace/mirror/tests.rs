@@ -14,7 +14,7 @@ use karyos_sys::trace_mirror::{
 use karyos_trace::{
     AttributionConfig, ClockProvenance, HostMonotonicClock, ObservedTime, Point, PublicationId,
     RECORD_WORDS, SubscriberId, TraceAnswer, TraceIds, TraceRecord, TraceReport, Verdict,
-    encode_record, trace_journal,
+    decode_record, encode_record, trace_journal,
 };
 
 use super::*;
@@ -72,6 +72,8 @@ fn observation(
             incarnation: 1,
         }),
         packet: None,
+        // Every Publish of these tests starts its own trace.
+        root: point == Point::Publish,
     }
 }
 
@@ -135,10 +137,15 @@ impl Driver {
 
     /// The journal at `index` stores `record` and the driver mirrors it.
     fn store(&mut self, index: usize, record: &TraceRecord) {
+        self.store_words(index, &words(record));
+    }
+
+    /// The journal at `index` stores the record `words` as given.
+    fn store_words(&mut self, index: usize, words: &[u64]) {
         let entry = *self.entry(index);
         let appended = self
             .mirror
-            .append(entry.journal, entry.attempted, &words(record))
+            .append(entry.journal, entry.attempted, words)
             .unwrap();
         let entry = self.entry(index);
         entry.attempted += 1;
@@ -729,4 +736,175 @@ fn mirror_ranges_leave_out_the_journal_ranges_and_watermark() {
     assert_eq!(mirror_ranges(&[(2, 4)], &[range(0, 9)], None), []);
     assert_eq!(mirror_ranges(&[(5, 5)], &[], None), []);
     assert_eq!(count(&[(3, 3), (6, 7)]), 3);
+}
+
+/// A message of trace `[trace, 1]` that is not its root: a child of span 1,
+/// or with `parentless` a join without a parent edge.
+fn non_root(position: u64, trace: u64, time: u64, parentless: bool) -> TraceRecord {
+    let mut record = publish(position, trace, time);
+    record.root = false;
+    record.ids.span_id = 2;
+    record.ids.parent_span_id = if parentless { 0 } else { 1 };
+    record
+}
+
+/// T6: a trace whose root Publish lies below the attach horizon is out of
+/// scope even though its later message was delivered in full. Negative
+/// control (verified by disabling `require_roots`): Complete.
+#[test]
+fn a_trace_whose_root_is_below_the_horizon_is_out_of_scope() {
+    let mut driver = Driver::new(4, 2, 2);
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+    // The root and its poll are overwritten before the attach; the child
+    // and its poll are retained.
+    driver.store(0, &publish(0, 1, 10));
+    driver.store(1, &poll(0, 1, 15));
+    driver.store(0, &non_root(64, 1, 20, false));
+    driver.store(1, &poll(64, 1, 25));
+    driver.end(0, JournalState::Closed, None);
+    driver.end(1, JournalState::Closed, Some(128));
+    let mut tool = MirrorTool::new(INSTANCE);
+    let attach = driver.scan(&mut tool);
+    assert_eq!(attach.overwritten, 2);
+    let report = tool.report().unwrap();
+    assert_eq!(answer(&report, 1), TraceAnswer::OutOfScope);
+}
+
+/// T6: a parentless join (zero `parent_span_id`, no `root` flag) above the
+/// horizon is not taken for the root, nor is a version 1 `Publish`; the
+/// same trace with a root-flagged `Publish` is Complete.
+#[test]
+fn only_a_root_flagged_publish_counts_as_the_root() {
+    let join = non_root(0, 1, 10, true);
+    let mut v1 = words(&publish(0, 1, 10));
+    v1[0] = v1[0] & !(0xFF | 1 << 56) | 1;
+    assert!(!decode_record(&v1).unwrap().0.root);
+    for (published, root) in [
+        (words(&join), false),
+        (v1, false),
+        (words(&publish(0, 1, 10)), true),
+    ] {
+        let mut driver = Driver::new(4, 2, 64);
+        driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+        driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+        driver.store_words(0, &published);
+        driver.store(1, &poll(0, 1, 15));
+        driver.end(0, JournalState::Closed, None);
+        driver.end(1, JournalState::Closed, Some(1));
+        let mut tool = MirrorTool::new(INSTANCE);
+        let _ = driver.scan(&mut tool);
+        let report = tool.report().unwrap();
+        let expected = if root {
+            TraceAnswer::Final(Verdict::Complete)
+        } else {
+            TraceAnswer::OutOfScope
+        };
+        assert_eq!(answer(&report, 1), expected, "root {root}");
+    }
+}
+
+/// T7: a following tool holds a `Publish` while a subscriber journal
+/// expected for it is created, ended and recycled between two scans, its
+/// log entry dropped once covered: the gap in journal numbers puts the
+/// message out of scope and is counted. Negative control (verified by not
+/// declaring the missed messages out of scope): Complete.
+#[test]
+fn a_missed_journal_puts_the_held_messages_out_of_scope() {
+    let mut driver = Driver::new(2, 1, 2);
+    let mut tool = MirrorTool::new(INSTANCE);
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    let _ = driver.scan(&mut tool);
+    driver.store(0, &publish(0, 1, 10));
+    let _ = driver.scan(&mut tool);
+    assert_eq!(answer(&tool.report().unwrap(), 1), TraceAnswer::Provisional);
+    // Between two scans: the subscriber journal polls the message, ends,
+    // and its entry is reused while its record and the Publish leave the
+    // ring; it is covered, so its log entry is dropped too.
+    driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+    driver.store(1, &poll(0, 1, 15));
+    driver.end(1, JournalState::Closed, Some(64));
+    driver.recycle(1, 0);
+    driver.open(1, 3, JournalKind::Publisher, OTHER);
+    driver.store(1, &observation(OTHER, Point::Publish, 0, 50, 20));
+    driver.store(1, &observation(OTHER, Point::Publish, 64, 51, 30));
+    assert!(driver.mirror.write_log(0, None));
+    driver.end(0, JournalState::Closed, None);
+    driver.end(1, JournalState::Closed, None);
+    let scan = driver.scan(&mut tool);
+    assert_eq!(scan.missed, 1);
+    assert_eq!(tool.missed(), (1, 1));
+    let report = tool.report().unwrap();
+    assert_eq!(answer(&report, 1), TraceAnswer::OutOfScope);
+    // A message the gap's scan delivered is held at the gap too: the missed
+    // journal could have observed any publication.
+    assert_eq!(answer(&report, 51), TraceAnswer::OutOfScope);
+    // The scope stays narrowed at later scans.
+    let _ = driver.scan(&mut tool);
+    assert_eq!(answer(&tool.report().unwrap(), 1), TraceAnswer::OutOfScope);
+    assert_eq!(tool.missed(), (1, 1));
+}
+
+/// T7: numbers at or below the first scan's highest are never gaps: a tool
+/// attaching to a driver whose table and log skip numbers puts nothing out
+/// of scope, then or later.
+#[test]
+fn skipped_numbers_before_the_attach_are_not_missed_journals() {
+    let mut driver = Driver::new(4, 2, 64);
+    driver.open(0, 4, JournalKind::Publisher, PUBLICATION);
+    driver.open(1, 9, JournalKind::Subscriber, PUBLICATION);
+    let mut pairs = [NotedPublisher::default(); MAX_RECYCLE_PAIRS];
+    pairs[0] = NotedPublisher {
+        journal: 2,
+        attempted: 0,
+    };
+    assert!(driver.mirror.write_log(
+        0,
+        Some(&RecycledJournal {
+            journal: 6,
+            stream: OTHER.registration,
+            incarnation: OTHER.incarnation,
+            state: JournalState::Closed,
+            boundary: Some(0),
+            pairs,
+            pair_count: 1,
+        })
+    ));
+    driver.store(0, &publish(0, 1, 10));
+    driver.store(1, &poll(0, 1, 15));
+    driver.end(0, JournalState::Closed, None);
+    driver.end(1, JournalState::Closed, Some(1));
+    let mut tool = MirrorTool::new(INSTANCE);
+    assert_eq!(driver.scan(&mut tool).missed, 0);
+    assert_eq!(driver.scan(&mut tool).missed, 0);
+    assert_eq!(tool.missed(), (0, 0));
+    assert_eq!(
+        answer(&tool.report().unwrap(), 1),
+        TraceAnswer::Final(Verdict::Complete)
+    );
+}
+
+/// T7: a trace already final before the gap keeps its answer.
+#[test]
+fn a_final_answer_survives_a_missed_journal() {
+    let mut driver = Driver::new(2, 1, 8);
+    let mut tool = MirrorTool::new(INSTANCE);
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    driver.store(0, &publish(0, 1, 10));
+    driver.end(0, JournalState::Closed, None);
+    let _ = driver.scan(&mut tool);
+    let _ = driver.scan(&mut tool);
+    assert_eq!(
+        answer(&tool.report().unwrap(), 1),
+        TraceAnswer::Final(Verdict::Complete)
+    );
+    // Journal 2 lives and goes between two scans; journal 3 shows the gap.
+    driver.open(1, 3, JournalKind::Publisher, OTHER);
+    driver.end(1, JournalState::Closed, None);
+    let scan = driver.scan(&mut tool);
+    assert_eq!(scan.missed, 1);
+    assert_eq!(
+        answer(&tool.report().unwrap(), 1),
+        TraceAnswer::Final(Verdict::Complete)
+    );
 }

@@ -82,7 +82,11 @@ fn stream(key: StreamKey) -> StreamConfig {
     StreamConfig {
         buffer: LogBufferConfig {
             term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
-            spare_slots: 3,
+            // Each optional subscription takes a spare-slot credit, and the
+            // exclusive publication one, below `spare_slots` minus the
+            // cleaning headroom: four spare slots admit the publication and
+            // the two subscriptions of the clock test's child.
+            spare_slots: 4,
             max_subscribers: 4,
             mtu: DEFAULT_MTU,
             max_reserved: MIN_TERM_LENGTH / 8,
@@ -323,6 +327,8 @@ impl Traced {
                 incarnation: 1,
             }),
             packet: None,
+            // Every Publish of these tests starts its own trace.
+            root: point == Point::Publish,
         };
         let collected = Stamp {
             time: observed.time,

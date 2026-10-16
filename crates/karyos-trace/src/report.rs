@@ -54,10 +54,14 @@
 //! any message out of scope gets [`TraceAnswer::OutOfScope`], never a
 //! verdict. The position rule relies on a journal observing one
 //! publication in position order; a message whose observations lie wholly
-//! below every horizon is unknown to the report.
+//! below every horizon is unknown to the report, which is why a reader
+//! with horizons calls [`TraceReport::require_roots`] (T6): a trace is then
+//! `Complete` only if a root-flagged `Publish` of it was observed. Single
+//! messages can be declared out of scope with
+//! [`TraceReport::out_of_scope_message`] (a tool's missed journals, T7).
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::attribution::{AttributionConfig, Attributor, Verdict, combine};
 use crate::clocks::{Calibration, ClockKey, Observation, latency};
@@ -228,6 +232,8 @@ struct Message {
     publication: PublicationId,
     trace_id: [u64; 2],
     publish: Option<(JournalId, ObservedTime)>,
+    /// Its `Publish` record carries the `root` flag.
+    root: bool,
     polls: Vec<(JournalId, ObservedTime)>,
 }
 
@@ -323,6 +329,19 @@ pub struct PublicationSummary {
     pub out_of_scope: u64,
 }
 
+/// A message the report holds, from [`TraceReport::messages`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldMessage {
+    /// Its publication.
+    pub publication: PublicationKey,
+    /// Its lane.
+    pub lane: u8,
+    /// Its position.
+    pub position: u64,
+    /// The current answer of its trace.
+    pub answer: TraceAnswer,
+}
+
 /// The report over a set of journals (control path).
 #[derive(Debug)]
 pub struct TraceReport {
@@ -334,6 +353,10 @@ pub struct TraceReport {
     /// Publications whose messages at or below a position (every message
     /// for `None`) are out of scope.
     excluded: Vec<(PublicationKey, Option<u64>)>,
+    /// Single messages declared out of scope.
+    excluded_messages: HashSet<MessageKey>,
+    /// A trace can be `Complete` only with a root `Publish` observed (T6).
+    roots_required: bool,
     /// Set when [`TraceReport::trace`] first returns a final answer: from
     /// then on the registered journals are frozen, so no later journal can
     /// widen an expected set a final answer was given for.
@@ -352,6 +375,8 @@ impl TraceReport {
             messages: HashMap::new(),
             calibrations: Vec::new(),
             excluded: Vec::new(),
+            excluded_messages: HashSet::new(),
+            roots_required: false,
             frozen: Cell::new(false),
         }
     }
@@ -485,6 +510,25 @@ impl TraceReport {
         self.excluded.push((publication, through));
     }
 
+    /// Declares the message of `publication` at `position` in `lane` out of
+    /// the report's scope (a tool's missed journal, `quantstratum-docs:
+    /// karyos/design/trace-tool.md`, T7). Declarations accumulate.
+    pub fn out_of_scope_message(&mut self, publication: PublicationKey, lane: u8, position: u64) {
+        self.excluded_messages.insert((publication, lane, position));
+    }
+
+    /// Requires an observed root for a final `Complete` (`quantstratum-docs:
+    /// karyos/design/trace-tool.md`, "Trace horizon", T6): a trace that
+    /// would be `Complete` but none of whose observed `Publish` records
+    /// carries the `root` flag is out of scope. A reader whose sources start
+    /// after their journals' start (a tool) needs it, since a trace's
+    /// earlier messages may all lie below every horizon; a report that
+    /// reads every journal from its start (in process) has no horizon and
+    /// answers without it.
+    pub fn require_roots(&mut self) {
+        self.roots_required = true;
+    }
+
     /// Adds an explicit calibration, for clocks the report cannot calibrate
     /// automatically.
     pub fn add_calibration(&mut self, calibration: Calibration) {
@@ -565,7 +609,10 @@ impl TraceReport {
                         });
                     message.trace_id = record.ids.trace_id;
                     match record.point {
-                        Point::Publish => message.publish = Some((id, observed)),
+                        Point::Publish => {
+                            message.publish = Some((id, observed));
+                            message.root = record.root;
+                        }
                         Point::SubscriberPoll => message.polls.push((id, observed)),
                         _ => {}
                     }
@@ -640,12 +687,11 @@ impl TraceReport {
         if messages.is_empty() {
             return TraceAnswer::Unknown;
         }
-        if messages
-            .iter()
-            .any(|((publication, _lane, position), message)| {
-                self.out_of_reach(publication, *position, message)
-            })
-        {
+        if messages.iter().any(|(key, message)| {
+            let (publication, _lane, position) = key;
+            self.excluded_messages.contains(*key)
+                || self.out_of_reach(publication, *position, message)
+        }) {
             return TraceAnswer::OutOfScope;
         }
         let mut expected: Vec<usize> = Vec::new();
@@ -712,7 +758,47 @@ impl TraceReport {
         if publish_missing {
             return TraceAnswer::Final(Verdict::Incomplete);
         }
-        TraceAnswer::Final(combine(verdicts.into_iter().map(|(_, verdict)| verdict)))
+        let verdict = combine(verdicts.into_iter().map(|(_, verdict)| verdict));
+        // T6: Complete only from an observed root.
+        if verdict == Verdict::Complete
+            && self.roots_required
+            && !messages.iter().any(|(_, message)| message.root)
+        {
+            return TraceAnswer::OutOfScope;
+        }
+        TraceAnswer::Final(verdict)
+    }
+
+    /// Every message the report holds, with the current answer of its
+    /// trace (one answer per trace; a final one freezes the registered
+    /// journals, as with [`TraceReport::trace`]). Records without a trace
+    /// id are left out.
+    #[must_use]
+    pub fn messages(&self) -> Vec<HeldMessage> {
+        let mut traces: HashMap<[u64; 2], Vec<(&MessageKey, &Message)>> = HashMap::new();
+        for (key, message) in &self.messages {
+            if message.trace_id != [0, 0] {
+                traces
+                    .entry(message.trace_id)
+                    .or_default()
+                    .push((key, message));
+            }
+        }
+        let mut out = Vec::new();
+        for (trace_id, messages) in &traces {
+            let answer = self.answer(*trace_id, messages);
+            out.extend(
+                messages
+                    .iter()
+                    .map(|((publication, lane, position), _)| HeldMessage {
+                        publication: *publication,
+                        lane: *lane,
+                        position: *position,
+                        answer,
+                    }),
+            );
+        }
+        out
     }
 
     /// Per publication, the messages the report holds and the answers of

@@ -28,8 +28,10 @@ The report has one section per publication: its messages, the latency
 from Publish to each SubscriberPoll (count, min, p50, p99, p99.9 and max,
 each as an interval that holds its uncertainty, or unavailable) and the
 traces that are complete, incomplete, provisional (a journal is still
-open) or out of scope. A final line gives the mirror loss and the journals
-excluded as malformed.
+open) or out of scope. A trace is complete only if its root Publish was
+seen. Two final lines give the missed journals (journals created and
+recycled between two rescans, which put the messages held then out of
+scope) and the mirror loss with the journals excluded as malformed.
 
 Exit status: 0 after a report; 1 on a usage error; 2 when the driver
 cannot be attached.

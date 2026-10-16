@@ -4,7 +4,8 @@
 //! karyos/design/trace-tool.md`, "The command"): one section per
 //! publication with its message count, the latency from `Publish` to each
 //! `SubscriberPoll` and the trace counts by answer, then one line with the
-//! mirror loss and the journals excluded as malformed.
+//! missed journals (T7) and one with the mirror loss and the journals
+//! excluded as malformed.
 //!
 //! A latency is an interval that holds every value the observations and
 //! the calibration allow, so each quantile prints as `[low, high]` ns (one
@@ -134,6 +135,12 @@ pub fn render(tool: &MirrorTool, report: &TraceReport) -> Result<String, Histogr
             .collect::<Vec<_>>()
             .join(", ")
     };
+    // T7: why a scope shrank.
+    let (events, numbers) = tool.missed();
+    let _ = writeln!(
+        out,
+        "missed journals: {events} scans found {numbers} journal numbers in neither the table nor the recycle log"
+    );
     let _ = writeln!(
         out,
         "mirror loss: {} ring records overwritten, {} journal sequences; journals excluded as malformed: {malformed}",
@@ -195,7 +202,7 @@ mod tests {
         let report = tool.report().unwrap();
         assert_eq!(
             render(&tool, &report).unwrap(),
-            "no traced messages\nmirror loss: 0 ring records overwritten, 0 journal sequences; journals excluded as malformed: none\n"
+            "no traced messages\nmissed journals: 0 scans found 0 journal numbers in neither the table nor the recycle log\nmirror loss: 0 ring records overwritten, 0 journal sequences; journals excluded as malformed: none\n"
         );
     }
 }

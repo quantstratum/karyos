@@ -106,8 +106,19 @@ impl AgentCounts {
     }
 }
 
+/// Fresh traces decided by [`TraceHook::on_publish`] whose `Publish` was
+/// not recorded yet. A handle commits a message soon after deciding it, so
+/// a few suffice; past this the oldest is forgotten and its `Publish`
+/// records without the `root` flag, which only narrows a tool's scope.
+const PENDING_ROOTS: usize = 16;
+
 /// The trace hook of one client handle. It owns its journal's writer; its
 /// clock's domain is the writer's collection clock.
+///
+/// It sets the `root` flag (`quantstratum-docs:
+/// karyos/design/trace-records.md`, "Root flag") on the `Publish` record of
+/// a message it decided as a fresh trace, one without incoming context,
+/// never on a child or a parentless join.
 #[derive(Debug)]
 pub struct TraceAgent<R = OsRandom, C = MonotonicClock> {
     sampler: Sampler,
@@ -115,6 +126,8 @@ pub struct TraceAgent<R = OsRandom, C = MonotonicClock> {
     clock: C,
     writer: TraceWriter,
     counts: AgentCounts,
+    /// `(trace_id, span_id)` of fresh traces awaiting their `Publish`.
+    roots: Vec<([u64; 2], u64)>,
 }
 
 impl<R: RandomSource, C: TraceClock> TraceAgent<R, C> {
@@ -131,6 +144,7 @@ impl<R: RandomSource, C: TraceClock> TraceAgent<R, C> {
             clock,
             writer,
             counts: AgentCounts::default(),
+            roots: Vec::with_capacity(PENDING_ROOTS),
         }
     }
 
@@ -179,17 +193,34 @@ where
         incoming: Option<&TraceExtension>,
         _message: &PublishContext,
     ) -> Option<TraceExtension> {
+        // No context, or one whose trace id is zero: a fresh trace.
+        let fresh = incoming.is_none_or(|ext| ext.trace_id == [0, 0]);
         match self
             .sampler
             .decide(incoming.map(|ext| TraceIds::from(*ext)), &mut self.ids)
         {
-            Decision::Traced(ids) => Some(TraceExtension::from(ids)),
+            Decision::Traced(ids) => {
+                if fresh {
+                    if self.roots.len() == PENDING_ROOTS {
+                        let _ = self.roots.remove(0);
+                    }
+                    self.roots.push((ids.trace_id, ids.span_id));
+                }
+                Some(TraceExtension::from(ids))
+            }
             Decision::Untraced | Decision::IdsUnavailable | Decision::MessageIdsExhausted => None,
         }
     }
 
     fn on_committed(&mut self, ext: &TraceExtension, at: &Committed) {
         let observed = self.clock.now();
+        let pending = self
+            .roots
+            .iter()
+            .position(|root| *root == (ext.trace_id, ext.span_id));
+        if let Some(index) = pending {
+            let _ = self.roots.remove(index);
+        }
         self.record(
             TraceRecord {
                 point: Point::Publish,
@@ -200,6 +231,7 @@ where
                 observed,
                 subscriber: None,
                 packet: None,
+                root: pending.is_some(),
             },
             observed,
         );
@@ -217,6 +249,7 @@ where
                 observed,
                 subscriber: Some(at.subscriber.into()),
                 packet: None,
+                root: false,
             },
             observed,
         );

@@ -51,12 +51,22 @@
 //!   positions at or below its boundary, or every message of it for a
 //!   writer lost entry, are out of scope.
 //!
+//! - **Trace horizon (T6).** A trace can be `Complete` only if the tool
+//!   observed its root, a `Publish` record with the `root` flag; every
+//!   other trace that would be `Complete` is out of scope.
+//! - **Missed journals (T7).** The tool tracks the journal numbers it sees
+//!   in the table or the log. Numbers at or below the highest of the first
+//!   scan are never gaps; after that, a number above the previous scan's
+//!   highest that a scan shows in neither is a missed journal, which puts
+//!   every held message whose trace was not final after the previous
+//!   scan out of scope, for every publication, for the tool's life.
+//!
 //! The tool cannot bound a trace's span in a journal, so the report's
 //! attribution uses `D = u64::MAX` (`quantstratum-docs:
 //! karyos/design/trace-attribution.md`): any loss in a journal makes every
 //! trace it holds `Incomplete`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use karyos_protocol::journal::{DropRange, JournalError};
 use karyos_sys::trace_mirror::{
@@ -65,8 +75,8 @@ use karyos_sys::trace_mirror::{
 };
 use karyos_trace::{
     AttributionConfig, ClockProvenance, Collected, HistogramConfig, JournalClock, JournalSource,
-    ObserverId, Point, PublicationKey, RECORD_WORDS, SourceLosses, SourceState, TraceError,
-    TraceRecord, TraceReport, decode_record,
+    ObserverId, Point, PublicationKey, RECORD_WORDS, SourceLosses, SourceState, TraceAnswer,
+    TraceError, TraceRecord, TraceReport, decode_record,
 };
 
 /// Loss intervals each journal's attributor keeps. With `D = u64::MAX` a
@@ -331,6 +341,8 @@ pub struct ScanReport {
     /// Ring records overwritten before this scan read them (before the
     /// attach, for the first scan).
     pub overwritten: u64,
+    /// Journal numbers this scan missed (T7).
+    pub missed: u64,
 }
 
 /// The tool's view of a trace mirror, followed across scans.
@@ -346,6 +358,16 @@ pub struct MirrorTool {
     /// Delivered ring records of a journal the tool never saw in the
     /// table: overwritten during the scan, so mirror loss.
     unattributed: u64,
+    /// The highest journal number the last scan showed in the table or
+    /// the log (T7).
+    highest: Option<u64>,
+    /// Scans that found missed journals, and the numbers missed.
+    missed_events: u64,
+    missed_numbers: u64,
+    /// Messages a missed journal put out of scope.
+    missed_scope: HashSet<(PublicationKey, u8, u64)>,
+    /// Messages whose trace had a final answer after the last scan.
+    finals: HashSet<(PublicationKey, u8, u64)>,
 }
 
 impl MirrorTool {
@@ -361,6 +383,11 @@ impl MirrorTool {
             recycled: BTreeMap::new(),
             overwritten: 0,
             unattributed: 0,
+            highest: None,
+            missed_events: 0,
+            missed_numbers: 0,
+            missed_scope: HashSet::new(),
+            finals: HashSet::new(),
         }
     }
 
@@ -380,6 +407,8 @@ impl MirrorTool {
         for tracked in self.journals.values_mut() {
             tracked.present = false;
         }
+        // Journal numbers this scan shows in the table or the log (T7).
+        let mut shown: BTreeSet<u64> = BTreeSet::new();
         for index in 0..reader.entries() {
             match reader.entry(index) {
                 EntryRead::Entry(entry) => {
@@ -404,6 +433,7 @@ impl MirrorTool {
                     tracked.entry = entry;
                     tracked.index = index;
                     tracked.present = true;
+                    shown.insert(entry.journal);
                 }
                 // Being written: what the tool last read there stands.
                 EntryRead::Busy => {
@@ -418,6 +448,7 @@ impl MirrorTool {
         }
         for index in 0..reader.log_entries() {
             if let LogRead::Entry(entry) = reader.log_entry(index) {
+                shown.insert(entry.journal);
                 self.recycled.insert(entry.journal, entry);
             }
         }
@@ -428,10 +459,67 @@ impl MirrorTool {
                 None => self.unattributed = self.unattributed.saturating_add(1),
             }
         }
+        let missed = self.missed_journals(&shown);
+        if missed > 0 {
+            self.missed_events = self.missed_events.saturating_add(1);
+            self.missed_numbers = self.missed_numbers.saturating_add(missed);
+            // Every held message whose trace was not final after the last
+            // scan, with those this scan delivered: the missed journal may
+            // have been expected for any of them, of any publication.
+            if let Ok(report) = self.report() {
+                for held in report.messages() {
+                    let key = (held.publication, held.lane, held.position);
+                    if !self.finals.contains(&key) {
+                        self.missed_scope.insert(key);
+                    }
+                }
+            }
+        }
+        self.finals = self
+            .report()
+            .map(|report| {
+                report
+                    .messages()
+                    .into_iter()
+                    .filter(|held| matches!(held.answer, TraceAnswer::Final(_)))
+                    .map(|held| (held.publication, held.lane, held.position))
+                    .collect()
+            })
+            .unwrap_or_default();
         ScanReport {
             delivered: count,
             overwritten: scan.overwritten,
+            missed,
         }
+    }
+
+    /// The journal numbers this scan missed (T7): numbers are assigned in
+    /// order and never reused, so a number above the previous scan's
+    /// highest that this scan shows neither in the table nor in the log
+    /// belongs to a journal created, ended and recycled between two scans.
+    /// Numbers at or below the first scan's highest are never gaps: a
+    /// journal recycled before the attach without a log entry was covered.
+    fn missed_journals(&mut self, shown: &BTreeSet<u64>) -> u64 {
+        // An empty first scan sets 0: any later number not shown counts,
+        // which can only narrow the scope.
+        let top = shown.last().copied();
+        let Some(previous) = self.highest else {
+            self.highest = Some(top.unwrap_or(0));
+            return 0;
+        };
+        let Some(top) = top.filter(|top| *top > previous) else {
+            return 0;
+        };
+        self.highest = Some(top);
+        let above = shown.range(previous + 1..=top).count() as u64;
+        (top - previous).saturating_sub(above)
+    }
+
+    /// Scans that found missed journals, and the journal numbers missed
+    /// over the tool's life (T7).
+    #[must_use]
+    pub fn missed(&self) -> (u64, u64) {
+        (self.missed_events, self.missed_numbers)
     }
 
     /// The driver instance as two words.
@@ -547,6 +635,10 @@ impl MirrorTool {
                 through,
             );
         }
+        for (publication, lane, position) in &self.missed_scope {
+            report.out_of_scope_message(*publication, *lane, *position);
+        }
+        report.require_roots();
         report.drain()?;
         Ok(report)
     }

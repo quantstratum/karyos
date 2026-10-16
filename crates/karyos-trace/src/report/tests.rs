@@ -534,6 +534,7 @@ fn observation(point: Point, position: u64, trace: u64, time: u64) -> crate::rec
             incarnation: 1,
         }),
         packet: None,
+        root: point == Point::Publish,
     }
 }
 
@@ -800,4 +801,65 @@ fn an_open_source_keeps_its_traces_provisional() {
     report.drain().unwrap();
     assert_eq!(report.trace([1, 1]), TraceAnswer::Provisional);
     assert_eq!(report.summary()[0].provisional, 1);
+}
+
+/// T6 in the report: with roots required, a trace that would be Complete
+/// without a root-flagged Publish is out of scope, an Incomplete one stays
+/// Incomplete; without the requirement (the in-process report, which has
+/// no horizon) the answer is unchanged.
+#[test]
+fn required_roots_put_rootless_complete_traces_out_of_scope() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let build = |required: bool, polled: bool| {
+        let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+        let mut publish = observation(Point::Publish, 0, 1, 10);
+        publish.root = false;
+        report
+            .add_publisher_source(recorded(1, 0, &[publish], CLOSED), host(true), key)
+            .unwrap();
+        let polls: &[crate::record::TraceRecord] = if polled {
+            &[observation(Point::SubscriberPoll, 0, 1, 20)]
+        } else {
+            &[]
+        };
+        report
+            .add_subscriber_source(recorded(2, 0, polls, closed_at(1)), host(true), key, 0)
+            .unwrap();
+        if required {
+            report.require_roots();
+        }
+        report.drain().unwrap();
+        report.trace([1, 1])
+    };
+    assert_eq!(build(false, true), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(build(true, true), TraceAnswer::OutOfScope);
+    assert_eq!(build(true, false), TraceAnswer::Final(Verdict::Incomplete));
+}
+
+/// A message declared out of scope puts its trace out of scope.
+#[test]
+fn a_declared_message_is_out_of_scope() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    report
+        .add_publisher_source(
+            recorded(
+                1,
+                0,
+                &[
+                    observation(Point::Publish, 0, 1, 10),
+                    observation(Point::Publish, 64, 2, 20),
+                ],
+                CLOSED,
+            ),
+            host(true),
+            key,
+        )
+        .unwrap();
+    report.out_of_scope_message(key, 0, 64);
+    report.drain().unwrap();
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(report.trace([2, 1]), TraceAnswer::OutOfScope);
+    let held = report.messages();
+    assert_eq!(held.len(), 2);
 }

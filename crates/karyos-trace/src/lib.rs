@@ -40,11 +40,12 @@ pub use journal::{
 };
 pub use record::{
     MAX_LANE, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId, RECORD_VERSION,
-    RECORD_WORDS, SubscriberId, TraceIds, TraceRecord, decode_record, encode_record,
+    RECORD_VERSION_1, RECORD_WORDS, SubscriberId, TraceIds, TraceRecord, decode_record,
+    encode_record,
 };
 pub use report::{
-    HistogramConfig, JournalClock, JournalId, PublicationKey, PublicationSummary, TraceAnswer,
-    TraceReport,
+    HeldMessage, HistogramConfig, JournalClock, JournalId, PublicationKey, PublicationSummary,
+    TraceAnswer, TraceReport,
 };
 pub use sampling::{Decision, IdSource, Sampler, Sampling};
 pub use source::{JournalSource, SourceLosses, SourceState};
