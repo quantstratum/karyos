@@ -243,7 +243,6 @@ fn refuse(socket: &OwnedFd, code: u64) {
     }
 }
 
-/// The manifest record of one CnC or diagnostic grant of `region`.
 /// An admission step's work count, checked (SPEC.md §14): a sum that does
 /// not fit keeps the count and records the first overflow, which the duty
 /// cycle reports as [`DriverError::WorkCountOverflow`] after the step ran
@@ -280,11 +279,13 @@ impl Work {
         }
     }
 
-    fn done(self) -> Result<u32, DriverError> {
-        self.overflow.map_or(Ok(self.count), Err)
+    /// The count of the work that fit, and the first overflow if any.
+    fn done(self) -> (u32, Option<DriverError>) {
+        (self.count, self.overflow)
     }
 }
 
+/// The manifest record of one CnC or diagnostic grant of `region`.
 fn record(region: &Region, export: u64) -> Option<Record> {
     let header = region.record();
     // The one wire and sys kind table (`karyos_protocol::admission::SYS_KINDS`).
@@ -372,7 +373,7 @@ impl<T: StreamTerms> Admission<T> {
     /// One admission step: accepts, reads `Hello`s and client messages,
     /// drains the outbound queues and checks exit proofs. Returns work
     /// done.
-    fn serve(&mut self, driver: &mut EmbeddedDriver<T>) -> Result<u32, DriverError> {
+    fn serve(&mut self, driver: &mut EmbeddedDriver<T>) -> (u32, Option<DriverError>) {
         let mut work = Work::default();
         // Accept up to the pending bound.
         let mut now = None;
@@ -1087,15 +1088,12 @@ fn grant_record(
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
-    /// The admission step of a duty cycle; 0 without IPC.
-    ///
-    /// # Errors
-    ///
-    /// [`DriverError::WorkCountOverflow`] when its work count does not fit
-    /// `u32`; the step ran to its end.
-    pub(crate) fn serve_admission(&mut self) -> Result<u32, DriverError> {
+    /// The admission step of a duty cycle: the count of the work that fit
+    /// in `u32`, and [`DriverError::WorkCountOverflow`] if some did not
+    /// (the step ran to its end); 0 without IPC.
+    pub(crate) fn serve_admission(&mut self) -> (u32, Option<DriverError>) {
         let Some(mut admission) = self.admission.take() else {
-            return Ok(0);
+            return (0, None);
         };
         let work = admission.serve(self);
         self.admission = Some(admission);
@@ -1131,33 +1129,32 @@ mod work_tests {
         let mut work = Work::default();
         work.add(2);
         work.add_items(3);
-        assert!(matches!(
-            Work {
-                count: 5,
-                overflow: None
-            }
-            .done(),
-            Ok(5)
-        ));
+        assert_eq!(work.count, 5);
+        assert!(work.overflow.is_none());
         work.add(u32::MAX);
         work.add(1);
         // The work that fit is still counted.
-        assert_eq!(work.count, 6);
         assert!(matches!(
             work.done(),
-            Err(DriverError::WorkCountOverflow {
-                count: 5,
-                delta: u32::MAX
-            })
+            (
+                6,
+                Some(DriverError::WorkCountOverflow {
+                    count: 5,
+                    delta: u32::MAX
+                })
+            )
         ));
         let mut work = Work::default();
         work.add_items(usize::MAX);
         assert!(matches!(
             work.done(),
-            Err(DriverError::WorkCountOverflow {
-                count: 0,
-                delta: u32::MAX
-            })
+            (
+                0,
+                Some(DriverError::WorkCountOverflow {
+                    count: 0,
+                    delta: u32::MAX
+                })
+            )
         ));
     }
 }
