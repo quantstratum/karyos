@@ -3,6 +3,8 @@
 //! One interface over the exclusive and the concurrent client publication,
 //! so that the scheduler drives both with the same script.
 
+use karyos_sys::log_buffer::AppendOptions;
+
 use karyos_client::{
     ClaimOutcome, ClientClaim, ClientConcurrentClaim, ClientConcurrentPublication, ClientError,
     ClientPublication, CommitOutcome, ConcurrentClaimOutcome, ConcurrentOfferOutcome, OfferOutcome,
@@ -43,18 +45,27 @@ pub enum Claimed<'a> {
 
 /// A publication of either mode.
 pub trait SimPublisher {
-    /// Offers one message.
+    /// Offers one message with `key` as its reserved value (the key of a
+    /// conflated stream).
     ///
     /// # Errors
     ///
     /// As the client publication.
-    fn offer(&mut self, payload: &[u8]) -> Result<Attempt, ClientError>;
-    /// Claims `length` bytes.
+    fn offer(&mut self, payload: &[u8], key: i64) -> Result<Attempt, ClientError>;
+    /// Claims `length` bytes with `key` as the reserved value.
     ///
     /// # Errors
     ///
     /// As the client publication.
-    fn claim(&mut self, length: u32) -> Result<Claimed<'_>, ClientError>;
+    fn claim(&mut self, length: u32, key: i64) -> Result<Claimed<'_>, ClientError>;
+}
+
+/// Append options carrying `key` as the reserved value.
+fn keyed(key: i64) -> AppendOptions {
+    AppendOptions {
+        reserved_value: key,
+        ..AppendOptions::default()
+    }
 }
 
 fn committed(outcome: CommitOutcome) -> Attempt {
@@ -95,18 +106,20 @@ impl SimClaim for ClientConcurrentClaim<'_> {
 }
 
 impl SimPublisher for ClientPublication {
-    fn offer(&mut self, payload: &[u8]) -> Result<Attempt, ClientError> {
-        Ok(match ClientPublication::offer(self, payload)? {
-            OfferOutcome::Accepted { position, .. } => Attempt::Accepted(position),
-            OfferOutcome::BackPressured
-            | OfferOutcome::AdminAction
-            | OfferOutcome::NotConnected => Attempt::Retry,
-            OfferOutcome::Closed => Attempt::Closed,
-        })
+    fn offer(&mut self, payload: &[u8], key: i64) -> Result<Attempt, ClientError> {
+        Ok(
+            match ClientPublication::offer_with(self, payload, keyed(key))? {
+                OfferOutcome::Accepted { position, .. } => Attempt::Accepted(position),
+                OfferOutcome::BackPressured
+                | OfferOutcome::AdminAction
+                | OfferOutcome::NotConnected => Attempt::Retry,
+                OfferOutcome::Closed => Attempt::Closed,
+            },
+        )
     }
 
-    fn claim(&mut self, length: u32) -> Result<Claimed<'_>, ClientError> {
-        Ok(match self.try_claim(length)? {
+    fn claim(&mut self, length: u32, key: i64) -> Result<Claimed<'_>, ClientError> {
+        Ok(match self.try_claim_with(length, keyed(key))? {
             ClaimOutcome::Claimed(claim) => Claimed::Claim(Box::new(claim)),
             ClaimOutcome::Aborted { position, .. } => Claimed::Outcome(Attempt::Aborted(position)),
             ClaimOutcome::BackPressured
@@ -118,19 +131,21 @@ impl SimPublisher for ClientPublication {
 }
 
 impl SimPublisher for ClientConcurrentPublication {
-    fn offer(&mut self, payload: &[u8]) -> Result<Attempt, ClientError> {
-        Ok(match ClientConcurrentPublication::offer(self, payload)? {
-            ConcurrentOfferOutcome::Accepted { position, .. } => Attempt::Accepted(position),
-            ConcurrentOfferOutcome::Aborted { position, .. } => Attempt::Aborted(position),
-            ConcurrentOfferOutcome::BackPressured
-            | ConcurrentOfferOutcome::AdminAction
-            | ConcurrentOfferOutcome::NotConnected => Attempt::Retry,
-            ConcurrentOfferOutcome::Closed => Attempt::Closed,
-        })
+    fn offer(&mut self, payload: &[u8], key: i64) -> Result<Attempt, ClientError> {
+        Ok(
+            match ClientConcurrentPublication::offer_with(self, payload, keyed(key))? {
+                ConcurrentOfferOutcome::Accepted { position, .. } => Attempt::Accepted(position),
+                ConcurrentOfferOutcome::Aborted { position, .. } => Attempt::Aborted(position),
+                ConcurrentOfferOutcome::BackPressured
+                | ConcurrentOfferOutcome::AdminAction
+                | ConcurrentOfferOutcome::NotConnected => Attempt::Retry,
+                ConcurrentOfferOutcome::Closed => Attempt::Closed,
+            },
+        )
     }
 
-    fn claim(&mut self, length: u32) -> Result<Claimed<'_>, ClientError> {
-        Ok(match self.try_claim(length)? {
+    fn claim(&mut self, length: u32, key: i64) -> Result<Claimed<'_>, ClientError> {
+        Ok(match self.try_claim_with(length, keyed(key))? {
             ConcurrentClaimOutcome::Claimed(claim) => Claimed::Claim(Box::new(claim)),
             ConcurrentClaimOutcome::Aborted { position, .. } => {
                 Claimed::Outcome(Attempt::Aborted(position))

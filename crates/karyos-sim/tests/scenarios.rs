@@ -89,6 +89,14 @@ fn stall_abort() {
     stall_sweep("stall-abort");
 }
 
+/// A conflated stream with paused views and writers that keep updating:
+/// versions never go backwards and every key ends at its latest accepted
+/// value (conflation-end-to-end.md, Tests).
+#[test]
+fn conflated() {
+    sweep("conflated");
+}
+
 #[test]
 fn a_seed_reproduces_its_run() {
     for scenario in scenarios::all() {
