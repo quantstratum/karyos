@@ -237,3 +237,33 @@ fn the_walker_does_not_connect_the_stream() {
         Err(ClientError::OutcomesLost)
     ));
 }
+
+/// The driver walks every duty cycle, so the walker's hold on the floor
+/// never stalls a publisher that reads its outcomes: many terms go by.
+#[test]
+fn the_walker_keeps_up_across_many_terms() {
+    let (mut driver, handle, _guard) = guarded(4);
+    let mut publication = driver.publication(handle).unwrap();
+    let payload = vec![7u8; 1000];
+    let total = 4 * MIN_TERM_LENGTH as usize / payload.len();
+    let mut accepted = 0;
+    let mut recorded = 0;
+    let mut rounds = 0;
+    while accepted < total {
+        rounds += 1;
+        assert!(rounds < 50 * total, "the publisher stalled at {accepted}");
+        match publication.offer(&payload).unwrap() {
+            OfferOutcome::Accepted { .. } => accepted += 1,
+            OfferOutcome::BackPressured | OfferOutcome::AdminAction => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        let _ = driver.do_work().unwrap();
+        recorded += outcomes(&mut publication).len();
+    }
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    recorded += outcomes(&mut publication).len();
+    assert_eq!(recorded, total, "one final record per message");
+    assert_eq!(publication.guard().unwrap().outstanding(), 0);
+}

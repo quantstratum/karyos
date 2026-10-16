@@ -541,6 +541,12 @@ mod tests {
             (Event::TraceMirrorOverwritten, "trace mirror overwritten"),
             (Event::TraceJournalsOpen, "trace journals open"),
             (Event::TraceJournalFaults, "trace journal faults"),
+            (Event::GuardOutcomesWritten, "guard outcomes written"),
+            (Event::GuardOutcomesLost, "guard outcomes lost"),
+            (
+                Event::GuardWalkerBudgetExhausted,
+                "guard walker budget exhausted",
+            ),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();
