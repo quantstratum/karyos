@@ -983,6 +983,36 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(())
     }
 
+    /// Subscribes to every configured lane of `aggregate` with `role`, in
+    /// one control call, all or nothing (`quantstratum-docs:
+    /// karyos/design/aggregate-subscriber.md`, l3): one frame-level reader
+    /// per lane and the aggregate's DRR profile. A failure at any lane
+    /// drops the lanes already subscribed, which detaches their cells.
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::subscribe`] for any lane.
+    pub fn subscribe_aggregate(
+        &mut self,
+        aggregate: &AggregateHandle,
+        role: Role,
+    ) -> Result<karyos_client::aggregate::AggregateSubscription<T>, DriverError> {
+        let first = aggregate
+            .streams()
+            .next()
+            .ok_or(DriverError::UnknownStream { stream: 0 })?;
+        let profile = self.stream(first)?.aggregate.profile;
+        let mut lanes = Vec::with_capacity(usize::from(aggregate.lanes()));
+        for stream in aggregate.streams() {
+            let lane = self.stream(stream)?.config.lane;
+            // On error, `lanes` drops here: every cell already taken
+            // detaches.
+            lanes.push((lane, self.subscribe(stream, role)?));
+        }
+        karyos_client::aggregate::AggregateSubscription::new(profile, lanes)
+            .map_err(|_| DriverError::InvalidConfig)
+    }
+
     /// Removes an aggregate: every lane is sealed as
     /// [`EmbeddedDriver::remove_stream`] seals a stream, in one control
     /// step. The seals are separate stores, one per lane, each with its own
@@ -2646,5 +2676,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod aggregate_subscriber_tests;
 #[cfg(test)]
 mod aggregate_tests;
