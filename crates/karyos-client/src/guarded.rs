@@ -129,7 +129,7 @@ impl GuardBinding {
         lanes: u8,
         message_capacity: u64,
     ) -> Result<Self, ClientError> {
-        if message_capacity == 0 {
+        if message_capacity == 0 || index >= guard.len() {
             return Err(OutcomeError::Layout.into());
         }
         let reader = OutcomeReader::attach(&*ring, lanes)?;
@@ -155,7 +155,9 @@ impl GuardBinding {
     /// Reserved messages whose final record has not been read yet.
     #[must_use]
     pub fn outstanding(&self) -> u64 {
-        self.reserved.saturating_sub(self.released)
+        // `released <= reserved`: a release needs an outstanding
+        // reservation (see `poll_outcomes`).
+        self.reserved - self.released
     }
 
     /// Whether the ring's records ended (`OutcomesLost`).
@@ -167,7 +169,9 @@ impl GuardBinding {
     /// The early check, then the reservation bound. A faulted outcome
     /// stream is terminal before either.
     pub(crate) fn admission(&self) -> Admission {
-        if self.reader.ended() {
+        // An exhausted reservation count is as terminal as a fault; it
+        // takes 2^64 messages.
+        if self.reader.ended() || self.reserved == u64::MAX {
             return Admission::Lost;
         }
         if !guard::admits_in(&*self.guard, self.index, self.epoch) {
@@ -181,7 +185,9 @@ impl GuardBinding {
 
     /// Counts one reserved message.
     pub(crate) fn reserve(&mut self) {
-        self.reserved = self.reserved.saturating_add(1);
+        // Admission refuses at `u64::MAX`, so this cannot overflow.
+        debug_assert!(self.reserved < u64::MAX, "reservations exhausted");
+        self.reserved += 1;
     }
 
     /// Reads up to `limit` records in sequence order. A final message
@@ -190,7 +196,10 @@ impl GuardBinding {
     ///
     /// # Errors
     ///
-    /// [`ClientError::Outcomes`] for a corrupt record; it is never skipped.
+    /// [`ClientError::Outcomes`] for a corrupt record, which is never
+    /// skipped, and for a final message record with no outstanding
+    /// reservation (a driver that broke the reservation protocol), which
+    /// is consumed but releases nothing.
     pub fn poll_outcomes(
         &mut self,
         limit: usize,
@@ -200,18 +209,26 @@ impl GuardBinding {
             ring,
             consumed,
             reader,
+            reserved,
             released,
             ..
         } = self;
-        Ok(
-            reader.poll(&**ring, consumed.cell(), limit, |sequence, record| {
-                let message = is_message(record.kind);
-                handler(sequence, record);
-                if message {
-                    *released = released.saturating_add(1);
+        let mut unreserved = None;
+        let delivered = reader.poll(&**ring, consumed.cell(), limit, |sequence, record| {
+            let message = is_message(record.kind);
+            handler(sequence, record);
+            if message {
+                if *released < *reserved {
+                    *released += 1;
+                } else {
+                    unreserved = unreserved.or(Some(sequence));
                 }
-            })?,
-        )
+            }
+        })?;
+        match unreserved {
+            Some(sequence) => Err(OutcomeError::Corrupt { sequence }.into()),
+            None => Ok(delivered),
+        }
     }
 }
 
