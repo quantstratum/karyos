@@ -172,6 +172,16 @@ pub struct AgentConfig {
     pub rsp_setup_destinations: usize,
     /// `rsp_setup_rate` per driver (default 256 per second).
     pub rsp_setup_rate: u64,
+    /// `sm_interval` in ns: an installed image's SM cadence (default 10 ms,
+    /// multicast-flow-control.md MC-6).
+    pub sm_interval: u64,
+    /// `image_liveness_timeout` in ns: an image with no evidence from its
+    /// binding for this long is retired (default 10 s, network-sessions.md
+    /// S5).
+    pub image_liveness_timeout: u64,
+    /// Receiver bindings the sender tracks (the receivers it answered),
+    /// at least 1 (default 64).
+    pub receiver_bindings: usize,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -198,6 +208,9 @@ impl Default for AgentConfig {
             rsp_setup_per_destination: 20,
             rsp_setup_destinations: 64,
             rsp_setup_rate: 256,
+            sm_interval: 10_000_000,
+            image_liveness_timeout: 10_000_000_000,
+            receiver_bindings: 64,
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -225,6 +238,9 @@ impl AgentConfig {
             || self.rsp_setup_per_destination == 0
             || self.rsp_setup_destinations == 0
             || self.rsp_setup_rate == 0
+            || self.sm_interval == 0
+            || self.image_liveness_timeout == 0
+            || self.receiver_bindings == 0
         {
             return Err(AgentError::InvalidConfig(
                 "a network capacity or budget is zero",

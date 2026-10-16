@@ -22,8 +22,13 @@
 //! - **Credit.** Every command of the chain posts into a unit the receiver
 //!   reserved at the answer, so no post waits for room.
 //! - **Attachment.** Local subscribers may attach to an image only once the
-//!   receiver reported it installed ([`ImageTable::installed`]). Retirement,
-//!   `StorageReclaimed` and the image's first SM come with phase 5.
+//!   receiver reported it installed ([`ImageTable::installed`]), and never
+//!   once it reported it retired.
+//! - **Retirement (S1).** On `RetireImage` the image is retiring: no new
+//!   attachment. Once nothing but the table holds its lanes (every
+//!   subscriber detached and the receiver dropped its owner), the table
+//!   frees the storage, releases the charge and posts `StorageReclaimed`
+//!   into the unit reserved at the answer.
 //! - **Shutdown.** On a stop the conductor drops the table with the agents.
 //!   An image whose `InstallImage` was posted but not answered shares its
 //!   lanes between the table and the unread command; both are freed when
@@ -105,6 +110,16 @@ pub enum ImageEvent {
         /// The pending slot.
         slot: SlotRef,
     },
+    /// The receiver retired the image: no new attachment.
+    Retiring {
+        /// The installed slot.
+        slot: SlotRef,
+    },
+    /// A retired image's storage was freed and `StorageReclaimed` posted.
+    Reclaimed {
+        /// The installed slot.
+        slot: SlotRef,
+    },
 }
 
 /// The table's counters; checked, sticky on overflow.
@@ -116,6 +131,10 @@ pub struct ImageCounters {
     pub installed: u64,
     /// Images the receiver released.
     pub released: u64,
+    /// Images the receiver retired.
+    pub retired: u64,
+    /// Retired images whose storage was reclaimed.
+    pub reclaimed: u64,
     /// Refused: the storage budget would be exceeded.
     pub refused_budget: u64,
     /// Refused: the table is full.
@@ -145,6 +164,9 @@ enum State {
     Offered,
     /// Installed under this slot.
     Installed(SlotRef),
+    /// Retired under this installed slot: storage freed once no loan holds
+    /// it.
+    Retiring(SlotRef),
     /// `RefuseImage` posted.
     Refused,
 }
@@ -157,8 +179,9 @@ struct Image {
     lanes: Vec<Arc<LogBuffer>>,
     /// Term bytes charged to the budget.
     charge: u64,
-    /// The `StorageReclaimed` unit, held until phase 5 posts it.
-    _reclaimed: Reservation,
+    /// The `StorageReclaimed` unit, posted once a retired image's storage
+    /// is reclaimed.
+    reclaimed: Reservation,
     state: State,
 }
 
@@ -243,8 +266,9 @@ impl ImageTable {
         })
     }
 
-    /// Serves every session event the receiver posted, reporting image
-    /// events to `on_event`; returns how many it served.
+    /// Serves every session event the receiver posted, then reclaims the
+    /// retired images no loan holds any more, reporting image events to
+    /// `on_event`; returns how many events it served.
     pub fn poll(&mut self, link: &SessionLink, mut on_event: impl FnMut(ImageEvent)) -> u32 {
         let mut served = 0u32;
         while let Some(event) = link.take_event() {
@@ -254,7 +278,40 @@ impl ImageTable {
                 None => break,
             }
         }
+        self.reclaim(link, &mut on_event);
         served
+    }
+
+    /// Frees every retiring image whose lanes only the table holds, and
+    /// posts its `StorageReclaimed`.
+    fn reclaim(&mut self, link: &SessionLink, on_event: &mut impl FnMut(ImageEvent)) {
+        let mut index = 0usize;
+        while let Some(image) = self.images.get(index) {
+            let State::Retiring(slot) = image.state else {
+                match index.checked_add(1) {
+                    Some(next) => index = next,
+                    None => return,
+                }
+                continue;
+            };
+            let held = image.lanes.iter().any(|lane| Arc::strong_count(lane) > 1);
+            if held {
+                match index.checked_add(1) {
+                    Some(next) => index = next,
+                    None => return,
+                }
+                continue;
+            }
+            let image = self.images.swap_remove(index);
+            match self.charged.checked_sub(image.charge) {
+                Some(charged) => self.charged = charged,
+                None => self.counters.overflowed = true,
+            }
+            self.counters.bump(|c| &mut c.reclaimed);
+            // The receiver gone: the driver is stopping.
+            let _ = link.post(image.reclaimed, SessionCommand::StorageReclaimed { slot });
+            on_event(ImageEvent::Reclaimed { slot });
+        }
     }
 
     /// Serves one session event.
@@ -294,6 +351,20 @@ impl ImageTable {
                     _ => self.counters.bump(|c| &mut c.stale_replies),
                 }
             }
+            SessionEvent::RetireImage { slot } => {
+                let found = self
+                    .images
+                    .iter_mut()
+                    .find(|image| image.state == State::Installed(slot));
+                match found {
+                    Some(image) => {
+                        image.state = State::Retiring(slot);
+                        self.counters.bump(|c| &mut c.retired);
+                        on_event(ImageEvent::Retiring { slot });
+                    }
+                    None => self.counters.bump(|c| &mut c.stale_replies),
+                }
+            }
             SessionEvent::ImageReleased { slot } => {
                 let found = self.images.iter().position(|image| {
                     image.slot == slot && matches!(image.state, State::Offered | State::Refused)
@@ -310,7 +381,7 @@ impl ImageTable {
                 }
                 on_event(match image.state {
                     State::Refused => ImageEvent::Refused { slot },
-                    State::Offered | State::Installed(_) => {
+                    State::Offered | State::Installed(_) | State::Retiring(_) => {
                         self.counters.bump(|c| &mut c.released);
                         ImageEvent::Released { slot }
                     }
@@ -360,7 +431,7 @@ impl ImageTable {
             identity,
             lanes,
             charge,
-            _reclaimed: reclaimed,
+            reclaimed,
             state,
         };
         // Then the budget, before any allocation.

@@ -25,8 +25,8 @@
 //! validates `session_command_capacity >= 3 * max_images`. If the credit were ever
 //! missing, the answer is dropped and counted and the challenge stays
 //! pending until its expiry. `RetireImage` and `StorageReclaimed` are
-//! posted by phase 5; until then their units are held, and released with
-//! the image.
+//! posted at retirement (phase 5b); their units are held until then, and
+//! released with an image that is never installed.
 
 use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
 use karyos_sys::log_buffer::ReceiveOwner;
@@ -55,6 +55,13 @@ pub enum SessionCommand {
         /// The reply's unit, reserved at the answer.
         reply: Reservation,
         /// The pending session slot.
+        slot: SlotRef,
+    },
+    /// `StorageReclaimed`: every loan on the retired image at `slot` (its
+    /// installed slot) is gone and its storage freed; the tombstone may go
+    /// once its quarantine passes. No reply.
+    StorageReclaimed {
+        /// The installed slot.
         slot: SlotRef,
     },
 }
@@ -93,6 +100,13 @@ pub enum SessionEvent {
     /// storage (`ReleaseImage`).
     ImageReleased {
         /// The pending slot.
+        slot: SlotRef,
+    },
+    /// The installed image at `slot` is retired: its binding is gone and
+    /// no datagram reaches it; the conductor reclaims its storage once
+    /// every loan on it is released and answers `StorageReclaimed`.
+    RetireImage {
+        /// The installed slot.
         slot: SlotRef,
     },
 }
