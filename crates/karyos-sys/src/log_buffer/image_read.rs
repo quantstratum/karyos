@@ -202,13 +202,16 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         if offset != start {
             return Err(corrupt(start, "local gap position"));
         }
+        let header = start
+            .checked_add(8)
+            .ok_or_else(|| corrupt(start, "local gap position"))?;
         let mut body = [0u8; GAP_BODY_LENGTH];
-        // SAFETY: the caller holds a read loan for this slot's term; `start
-        // + 8` is a multiple of 8 and the 24 bytes after word 0 lie inside
+        // SAFETY: the caller holds a read loan for this slot's term;
+        // `header`, `start + 8`, is a multiple of 8 and the 24 bytes after word 0 lie inside
         // the record (its extent is at least 32, checked by `check_word0`),
         // with no other word 0; `frame` loaded this record's word 0 with
         // Acquire, and the owner stored these bytes before its Release.
-        unsafe { buffer.regions.read_bytes(slot, start + 8, &mut body) };
+        unsafe { buffer.regions.read_bytes(slot, header, &mut body) };
         let site = GapSite {
             term_offset: start,
             term_id: buffer

@@ -32,11 +32,12 @@ use crate::term_bytes::{HeapTerms, TermBytes};
 
 /// Bits per bitmap word.
 const WORD_BITS: usize = 64;
-/// Bitmap words a duty cycle clears per lane: bounded cleaning work. Three
-/// bitmaps per set (`covered`, `starts`, `gap_starts`): 1.5 times the two
-/// bitmaps' 1024, so a set is clean in as many duty cycles as before
+/// Bitmap word indexes a duty cycle clears per lane, in every bitmap of a
+/// set: bounded cleaning work. A set has three bitmaps (`covered`, `starts`,
+/// `gap_starts`), so a duty clears up to 3072 words, 1.5 times the two
+/// bitmaps' 2048, and a set is clean in as many duty cycles as before
 /// (`quantstratum-docs: karyos/design/local-gap-layout.md`).
-const CLEAN_CHUNK_WORDS: usize = 1536;
+const CLEAN_CHUNK_WORDS: usize = 1024;
 /// Bitmap sets per lane: the trailing term, the window and one spare
 /// (owner decision D2).
 const SETS: usize = 4;
@@ -291,9 +292,10 @@ impl<T: TermBytes> ReceiveOwner<T> {
     /// [`ReceiveError::InvalidGap`] for an interval outside one term or not
     /// 32-aligned, [`ReceiveError::Conflict`] for an interval overlapping a
     /// committed frame, [`ReceiveError::Foreign`] for a lane the image does
-    /// not have, [`ReceiveError::Sys`] for a corrupt shared state. The image
-    /// is unchanged in every error case and for `Late`, `Ahead` and
-    /// `NotReady`.
+    /// not have, [`ReceiveError::Sys`] for a corrupt shared state. No record
+    /// is written and no position moves in every error case and for `Late`,
+    /// `Ahead` and `NotReady`; as for `receive`, a `NotReady` attempt may
+    /// already have activated terms up to the interval's (`write_loan`).
     pub fn seal_gap(
         &mut self,
         lane: Lane,
@@ -536,8 +538,19 @@ impl<T: TermBytes> LaneOwner<T> {
                 None => return Ok(Received::NotReady),
             },
         };
-        let unit = (offset / FRAME_ALIGNMENT) as usize;
-        let units = (extent / FRAME_ALIGNMENT) as usize;
+        let (Ok(unit), Ok(units)) = (
+            usize::try_from(offset / FRAME_ALIGNMENT),
+            usize::try_from(extent / FRAME_ALIGNMENT),
+        ) else {
+            return Err(invalid);
+        };
+        // Both fit: the interval was checked to end inside the term.
+        let (Some(header), Some(end)) = (
+            offset.checked_add(8),
+            position.checked_add(u64::from(extent)),
+        ) else {
+            return Err(invalid);
+        };
         if any_set(&self.set(index)?.covered, unit, units) {
             return Err(ReceiveError::Conflict {
                 lane,
@@ -567,7 +580,7 @@ impl<T: TermBytes> LaneOwner<T> {
         unsafe {
             buffer
                 .regions
-                .write_bytes(slot, offset + 8, &gap_body(site, reason))
+                .write_bytes(slot, header, &gap_body(site, reason))
         };
         // SAFETY: write loan held; `offset` is the start of this record.
         let first = unsafe { buffer.regions.word0(slot, offset) };
@@ -575,7 +588,6 @@ impl<T: TermBytes> LaneOwner<T> {
         let set = self.set_mut(index)?;
         set_bit(&mut set.gap_starts, unit);
         set_range(&mut set.covered, unit, units);
-        let end = position + u64::from(extent);
         self.high = self.high.max(end);
         if position == self.rebuild {
             self.advance()?;
@@ -783,21 +795,19 @@ impl<T: TermBytes> LaneOwner<T> {
                 continue;
             }
             let words = set.covered.len();
-            // The budget counts words of all three bitmaps.
-            let end = (set.cursor + budget / 3).min(words);
+            let end = (set.cursor + budget).min(words);
             for bits in [&mut set.covered, &mut set.starts, &mut set.gap_starts] {
                 if let Some(range) = bits.get_mut(set.cursor..end) {
                     range.fill(0);
                 }
             }
-            // `end - cursor <= budget / 3`: the budget covers the three.
-            budget -= 3 * (end - set.cursor);
+            budget -= end - set.cursor;
             set.cursor = end;
             if set.cursor == words {
                 set.dirty = false;
                 set.cursor = 0;
             }
-            if budget < 3 {
+            if budget == 0 {
                 break;
             }
         }

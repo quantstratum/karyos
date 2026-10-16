@@ -1166,6 +1166,17 @@ fn a_gap_interrupts_a_message_and_never_covers_a_frame() {
     );
     assert_eq!(poll(&mut subscription), skipped(64, 64, LOST));
     assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+    // The reader resumes at the next BEGIN after the gap.
+    recv(&mut owner, &fragment(0, 128, 32, true, false, 2)).unwrap();
+    recv(&mut owner, &fragment(0, 192, 32, false, true, 3)).unwrap();
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Message {
+            position: 128,
+            length: 64,
+            ..
+        }
+    ));
 }
 
 /// Only an image with the capability takes a gap, and only an interval of
@@ -1261,4 +1272,162 @@ fn the_capability_is_in_the_configuration_block() {
     not_image[11] = 1;
     not_image[16] = 0;
     assert!(crate::log_buffer::parse_config(&not_image).is_none());
+}
+
+/// The slot of term 0 under the owner's write loan.
+fn held(owner: &ReceiveOwner<Terms>) -> u8 {
+    owner.lanes[0].held_slot(TermCount::try_new(0).unwrap()).unwrap()
+}
+
+/// A local gap word 0 in an image without the capability, or in a
+/// publication log, is an unknown frame type, never a gap.
+#[test]
+fn a_gap_record_without_the_capability_is_corrupt() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 64, 64, 1)), committed(64, 64));
+    let slot = held(&owner);
+    // SAFETY: the owner holds the write loan on `slot`'s term 0; offset 0
+    // is a frame start no one has written in this incarnation.
+    let word0 = unsafe { buffer.regions.word0(slot, 0) };
+    crate::publication::publish_block(
+        word0,
+        crate::local_gap::gap_word0(64, Lane::ZERO).unwrap(),
+    );
+    let mut out = vec![0u8; 16 * 1024];
+    assert!(matches!(
+        subscription.poll(&mut out),
+        Err(SysError::CorruptTerm {
+            offset: 0,
+            reason: "frame type"
+        })
+    ));
+
+    let plain = image(0);
+    let log = Arc::new(
+        new_image(LogBufferConfig {
+            publication: PublicationMode::Exclusive,
+            ..plain.config
+        })
+        .unwrap(),
+    );
+    let mut conductor = log.conductor().unwrap();
+    let mut reader = conductor.subscribe(Role::Optional).unwrap();
+    let Lookup::Slot(slot) = log.lookup(TermCount::try_new(0).unwrap()).unwrap() else {
+        panic!("no term 0");
+    };
+    // SAFETY: a test of one thread: term 0 is active and nothing else
+    // writes or reads offset 0 while the store runs.
+    let word0 = unsafe { log.regions.word0(slot, 0) };
+    crate::publication::publish_block(
+        word0,
+        crate::local_gap::gap_word0(64, Lane::ZERO).unwrap(),
+    );
+    assert!(matches!(
+        reader.poll(&mut out),
+        Err(SysError::CorruptTerm { offset: 0, .. })
+    ));
+}
+
+/// A sealed record whose header disagrees with its site, or carries an
+/// unknown version, is corrupt when a reader meets it.
+#[test]
+fn a_corrupted_gap_record_is_refused_by_a_reader() {
+    for (at, byte, reason) in [
+        (8, 0x20, "local gap site"),
+        (8 + 16, 2, "local gap version"),
+        (8 + 18, 1, "local gap reserved bytes"),
+    ] {
+        let buffer = gap_image(0);
+        let mut conductor = buffer.conductor().unwrap();
+        let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+        let mut owner = owner(&buffer);
+        assert_eq!(seal(&mut owner, 0, 64), committed(0, 64));
+        // The record's eight bytes at `at & !7`, with one byte changed.
+        let base = at & !7;
+        let mut word = [0u8; 8];
+        let slot = held(&owner);
+        // SAFETY: loan held by the owner; a test of one thread; `base` is a
+        // multiple of 8 inside the record, after its word 0.
+        unsafe { buffer.regions.read_bytes(slot, base, &mut word) };
+        word[(at - base) as usize] = byte;
+        // SAFETY: as above; nothing reads while this runs.
+        unsafe { buffer.regions.write_bytes(slot, base, &word) };
+        let mut out = vec![0u8; 16 * 1024];
+        assert!(
+            matches!(
+                subscription.poll(&mut out),
+                Err(SysError::CorruptTerm { offset: 0, reason: found }) if found == reason
+            ),
+            "{reason}"
+        );
+    }
+}
+
+/// Paths of a seal that leave the image as it was, and one that crosses
+/// into the next term.
+#[test]
+fn a_seal_outside_the_window_changes_nothing_and_one_at_the_term_end_advances() {
+    let t = u64::from(TERM);
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = owner(&buffer);
+    // Ahead: nothing written, no position moved.
+    assert_eq!(seal(&mut owner, 3 * t, 64), Ok(Received::Ahead));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(0));
+    assert_eq!(owner.high_water(Lane::ZERO), Some(0));
+    // A gap from the rebuild position to the term's end moves the rebuild
+    // position into the next term.
+    assert_eq!(seal(&mut owner, 0, TERM), committed(0, TERM));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(t));
+    conductor.duty_cycle().unwrap();
+    finish(&mut owner, 1, 0);
+    conductor.duty_cycle().unwrap();
+    // Term 0 is now the trailing term: a seal there is late.
+    assert_eq!(seal(&mut owner, 64, 64), Ok(Received::Late));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(2 * t));
+}
+
+/// The cleaning span is 1024 indexes in every bitmap: a set of 1024 words
+/// per bitmap (a 2 MiB term) is clean in one duty cycle, as before the
+/// third bitmap.
+#[test]
+fn a_set_is_clean_in_as_many_duty_cycles_as_before() {
+    const BIG: u32 = 2 * 1024 * 1024;
+    let term = TermLength::try_new(BIG).unwrap();
+    let plain = image(0);
+    let buffer = Arc::new(
+        new_image(LogBufferConfig {
+            term_length: term,
+            max_reserved: BIG / 8,
+            publication: PublicationMode::Image {
+                join: 0,
+                local_gaps: true,
+            },
+            ..plain.config
+        })
+        .unwrap(),
+    );
+    let params = ImageParams::new(SESSION, STREAM, 1, term, DEFAULT_MTU).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = ReceiveOwner::new(params, vec![Arc::clone(&buffer)]).unwrap();
+    assert_eq!(owner.lanes[0].sets[0].covered.len(), 1024);
+    let b = u64::from(BIG);
+    for count in 0..3u64 {
+        let reason = crate::local_gap::GapReason::ReorderExpired;
+        assert_eq!(
+            owner.seal_gap(Lane::ZERO, count * b, BIG, reason),
+            committed(count * b, BIG)
+        );
+        conductor.duty_cycle().unwrap();
+    }
+    let dirty = owner.lanes[0].sets.iter().filter(|set| set.dirty).count();
+    assert!(dirty >= 1);
+    let mut duties = 1;
+    while owner.duty() {
+        duties += 1;
+    }
+    assert_eq!(duties, dirty);
 }
