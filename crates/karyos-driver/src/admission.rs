@@ -64,6 +64,7 @@ use karyos_protocol::admission::{
     hello_version, refusal, tool_hello_version,
 };
 use karyos_sys::command_ring::RingConsumer;
+use karyos_sys::host_clock::age_ns;
 use karyos_sys::ipc::{self, PidFd, Recv, Region, Sent};
 
 use crate::counters::Event;
@@ -392,7 +393,7 @@ impl<T: StreamTerms> Admission<T> {
             match ipc::recv(pending.socket.as_fd(), &mut buffer) {
                 Ok(Recv::WouldBlock) => {
                     let now = *now.get_or_insert_with(|| driver.clock.now());
-                    if now.saturating_sub(pending.since) >= self.config.hello_timeout {
+                    if age_ns(now, pending.since) >= self.config.hello_timeout {
                         drop(self.pending.swap_remove(index));
                         work.add(1);
                     } else {
@@ -430,9 +431,7 @@ impl<T: StreamTerms> Admission<T> {
             }
             let step = match (step, remote.draining_since) {
                 (Step::Keep, Some(since))
-                    if now
-                        .get_or_insert_with(|| driver.clock.now())
-                        .saturating_sub(since)
+                    if age_ns(*now.get_or_insert_with(|| driver.clock.now()), since)
                         >= self.config.fetch_deadline =>
                 {
                     driver.diagnostics.error(
@@ -724,9 +723,7 @@ impl<T: StreamTerms> Admission<T> {
             }
             if keep
                 && !tool.outbound.is_empty()
-                && now
-                    .get_or_insert_with(|| driver.clock.now())
-                    .saturating_sub(tool.since)
+                && age_ns(*now.get_or_insert_with(|| driver.clock.now()), tool.since)
                     >= self.config.fetch_deadline
             {
                 driver.diagnostics.error(
