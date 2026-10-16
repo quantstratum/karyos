@@ -2,10 +2,13 @@
 
 //! Tests of the sockets endpoint against the scripted socket: the rows of
 //! `quantstratum-docs: karyos/design/sockets-backend.md` section 12 that
-//! need no kernel. Each test is named after its row. Rows that need a real
-//! socket are listed, with their batch, in `deferred_rows`.
+//! need no kernel. Each test is named after its row. On Linux, `loopback`
+//! runs the rows that need only a real socket on loopback. Rows that need
+//! more are listed, with their batch, in `DEFERRED_ROWS`.
 
 mod lifecycle;
+#[cfg(target_os = "linux")]
+mod loopback;
 mod model;
 mod rx;
 mod tx;
@@ -21,20 +24,21 @@ use crate::backend::{
 };
 use crate::sockets::scripted::ScriptedSocket;
 
-/// Rows of section 12 that need a real socket, kernel or driver, and the
-/// batch that covers them. Kept as data so the coverage claim is reviewed
-/// with the code.
+/// Rows of section 12 that need a real socket, kernel or driver beyond
+/// Linux loopback, and the batch that covers them. Kept as data so the
+/// coverage claim is reviewed with the code. On Linux, `loopback` covers RX
+/// oversize, split halves, the round trip, the buffer read back, the
+/// unverified path MTU, the unanswered port and multicast loop within one
+/// namespace.
 const DEFERRED_ROWS: &[(&str, &str)] = &[
     (
-        "RX oversize (loopback 9,000 bytes)",
-        "S3: OsSocket on Linux and macOS loopback",
+        "RX oversize, split halves and loopback round trip on macOS",
+        "the macOS std::net batch (portable.rs)",
     ),
     (
-        "Split halves (loopback traffic)",
-        "S3: OsSocket; the scripted two thread case runs here",
+        "Multicast between interfaces or namespaces",
+        "S4: network namespaces",
     ),
-    ("Loopback round trip", "S3"),
-    ("Multicast", "S4: namespaces and loopback multicast"),
     (
         "Probes (seccomp ENOSYS and EPERM)",
         "S4: container with a seccomp profile",
@@ -69,7 +73,7 @@ const DEFERRED_ROWS: &[(&str, &str)] = &[
 /// The deferred rows are named, each with its batch.
 #[test]
 fn deferred_rows_name_their_batch() {
-    assert_eq!(DEFERRED_ROWS.len(), 8);
+    assert_eq!(DEFERRED_ROWS.len(), 6);
     assert!(
         DEFERRED_ROWS
             .iter()
@@ -272,7 +276,7 @@ impl Harness {
 }
 
 /// Retires `endpoint`, emptying the report after each call.
-pub(super) fn retire_all(endpoint: &mut SocketsEndpoint<ScriptedSocket>) -> Vec<TxEntry> {
+pub(super) fn retire_all<O: SocketOps>(endpoint: &mut SocketsEndpoint<O>) -> Vec<TxEntry> {
     let mut report = TxReport::new();
     let mut entries = Vec::new();
     loop {

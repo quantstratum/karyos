@@ -38,9 +38,9 @@ pub type SendHook = Box<dyn FnMut(&RouteAddr, &[&[u8]]) + Send>;
 /// One scripted receive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ScriptedRecv {
-    /// A datagram, delivered as the Linux kernel does with `MSG_TRUNC`: the
-    /// buffer receives its start, and a datagram longer than the buffer
-    /// reports its true length.
+    /// A datagram, delivered as the Linux socket does with `MSG_TRUNC`: the
+    /// buffer receives its start, and a datagram that fills or exceeds the
+    /// buffer reports its true length.
     Datagram {
         payload: Vec<u8>,
         source: Option<SocketAddr>,
@@ -356,7 +356,7 @@ impl SocketOps for ScriptedSocket {
         let result = match entry {
             ScriptedRecv::Datagram { payload, source } => {
                 let len = copy_prefix(buffer, payload);
-                let truncated = (payload.len() > buffer.len()).then_some(payload.len());
+                let truncated = (payload.len() >= buffer.len()).then_some(payload.len());
                 RecvResult::Datagram {
                     len,
                     truncated,
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_as_long_as_the_buffer_is_not_truncated() {
+    fn a_payload_filling_the_buffer_reports_its_length() {
         let mut socket = live();
         socket.push_recv_datagram(b"abcd", None);
         let mut buffer = [0_u8; 4];
@@ -550,7 +550,7 @@ mod tests {
             socket.recv(&mut buffer),
             RecvResult::Datagram {
                 len: 4,
-                truncated: None,
+                truncated: Some(4),
                 source: None
             }
         );

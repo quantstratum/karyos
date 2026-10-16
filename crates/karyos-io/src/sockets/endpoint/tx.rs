@@ -60,7 +60,7 @@ pub struct RouteInfo {
     pub path_mtu: CapabilityState,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RouteEntry {
     address: RouteAddr,
     info: RouteInfo,
@@ -740,7 +740,7 @@ impl TxCore {
             Some(Fault::Send(error)) => return stopped(FlushStop::Faulted(error)),
             None => {}
         }
-        let Some(address) = self.routes.get(route).map(|entry| entry.address) else {
+        let Some(address) = self.routes.get(route).map(|entry| &entry.address) else {
             return stopped(FlushStop::Queue(QueueError::RouteUnknown));
         };
         if run.head == NO_SLOT {
@@ -865,7 +865,7 @@ impl TxCore {
                     }
                 }
                 let prefix = datagrams.get(..permitted_at)?;
-                Some((bytes, ops.send(&address, prefix)))
+                Some((bytes, ops.send(address, prefix)))
             });
         let Some(Some((exposed_bytes, result))) = exposed else {
             self.broken("the permitted prefix lies in the pool");
