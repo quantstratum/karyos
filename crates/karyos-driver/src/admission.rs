@@ -846,17 +846,9 @@ impl<T: StreamTerms> Admission<T> {
         let Some(stream) = driver.streams.iter().find(|s| s.id == grant.stream) else {
             return refuse(remote, refusal::RESOURCES);
         };
-        // The mapping of the grant's own generation: the current one or a
-        // retained predecessor.
-        let buffer = if stream.generation.get() == grant.generation {
-            Some(&stream.buffer)
-        } else {
-            stream
-                .retained
-                .iter()
-                .find(|retained| retained.generation.get() == grant.generation)
-                .map(|retained| &retained.buffer)
-        };
+        // The mapping of the grant's own incarnation and generation: never
+        // another incarnation's buffer; a retired one is refused.
+        let buffer = stream.grant_buffer(grant.incarnation, grant.generation);
         let Some(region) =
             buffer.and_then(|buffer| <T as crate::embedded::sealed::Create>::region(buffer))
         else {
@@ -909,9 +901,10 @@ impl<T: StreamTerms> Admission<T> {
             return refuse(remote, refusal::RESOURCES);
         };
         // The publication identity of the grant, whose driver part is the
-        // instance of `Admitted` (ACS 13555). One incarnation per stream
-        // registration, kept across mapping generations. A journal grant
-        // names no stream: both are zero.
+        // instance of `Admitted` (ACS 13555), and the incarnation the grant
+        // was issued on (a fresh incarnation follows a guard close and
+        // reopen; a mapping cutover keeps it). A journal grant names no
+        // stream: both are zero.
         let (stream_registration, incarnation) = match grant.participant {
             Participant::Journal { .. } => (0, 0),
             // The publication's identity: the aggregate's registration; the
@@ -922,7 +915,7 @@ impl<T: StreamTerms> Admission<T> {
                     .iter()
                     .find(|s| s.id == grant.stream)
                     .map_or(grant.stream, |s| s.aggregate.registration),
-                crate::embedded::FIRST_INCARNATION,
+                grant.incarnation,
             ),
         };
         let (Some(manifest), Some(region_message)) = (

@@ -341,7 +341,7 @@ impl<T: StreamTerms> Stream<T> {
     /// Forgets dropped or fenced members and predecessors nothing references
     /// any more (the driver holds two references: the buffer and its
     /// conductor).
-    pub(crate) fn forget_unused(&mut self, charged: &[(u64, u32)]) {
+    pub(crate) fn forget_unused(&mut self, charged: &[(u64, u64, u32)]) {
         self.members.retain(|member| {
             member
                 .link
@@ -350,10 +350,10 @@ impl<T: StreamTerms> Stream<T> {
         });
         // A remote grant of a predecessor's generation keeps it too, until
         // its Detach or its client's exit proof.
-        let id = self.id;
+        let (id, incarnation) = (self.id, self.incarnation);
         self.retained.retain(|retained| {
             Arc::strong_count(&retained.buffer) > 2
-                || charged.contains(&(id, retained.generation.get()))
+                || charged.contains(&(id, incarnation, retained.generation.get()))
         });
     }
 }

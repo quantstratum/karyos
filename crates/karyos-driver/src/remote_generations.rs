@@ -78,7 +78,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 stream_id: target.stream_id,
                 session_id: target.session_id,
             };
-            let (base, generation) = (target.base, target.generation.get());
+            let (base, generation, incarnation) =
+                (target.base, target.generation.get(), target.incarnation);
             match reserved {
                 Some((export, participant, handover)) => {
                     if let Some(ledger) = self.ledger_mut(client) {
@@ -91,6 +92,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             state: GrantState::Held,
                             sent: false,
                             generation,
+                            incarnation,
                             fence_at,
                             fenced: false,
                         });
@@ -227,15 +229,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(stream) = self.streams.iter_mut().find(|s| s.id == grant.stream) else {
             return false;
         };
-        let conductor = if stream.generation.get() == grant.generation {
-            &mut stream.conductor
-        } else if let Some(retained) = stream
-            .retained
-            .iter_mut()
-            .find(|retained| retained.generation.get() == grant.generation)
-        {
-            &mut retained.conductor
-        } else {
+        let Some(conductor) = stream.grant_conductor(grant.incarnation, grant.generation) else {
             return false;
         };
         match grant.participant {
@@ -266,15 +260,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     && grant.stream != 0
                     && grant.participant != Participant::Conflation
             })
-            .max_by_key(|grant| grant.generation)
+            .max_by_key(|grant| (grant.incarnation, grant.generation))
             .copied()?;
         let target = self.streams.iter().find(|s| s.id == newest.stream)?;
         let current = target.generation.get();
+        // A grant of a replaced incarnation: that incarnation was sealed by
+        // a guard close and is final, whatever generation it shares with
+        // the fresh one.
+        let replaced = newest.incarnation != target.incarnation;
         let pending = !newest.fenced && newest.fence_at.is_some() && newest.generation == current;
         // A cutover seals the current mapping too, until the successor
         // opens: only a seal with no cutover in progress closes the stream.
         let sealed = target.cutover.is_none() && target.conductor.seal_state() != SealState::Active;
-        let state = if target.retiring || sealed {
+        let state = if target.retiring || sealed || replaced {
             CutoverState::Closed
         } else if newest.fenced {
             CutoverState::Fenced
@@ -302,9 +300,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Some(state)
     }
 
-    /// The `(stream, generation)` pairs some remote grant still charges.
-    pub(crate) fn charged_generations(&self) -> Vec<(u64, u32)> {
-        let mut charged: Vec<(u64, u32)> = self
+    /// The `(stream, incarnation, generation)` triples some remote grant
+    /// still charges.
+    pub(crate) fn charged_generations(&self) -> Vec<(u64, u64, u32)> {
+        let mut charged: Vec<(u64, u64, u32)> = self
             .clients
             .iter()
             .filter_map(|slot| slot.ledger.as_ref())
@@ -315,7 +314,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     .grants()
                     .iter()
                     .filter(|g| g.participant != Participant::Conflation)
-                    .map(|g| (g.stream, g.generation))
+                    .map(|g| (g.stream, g.incarnation, g.generation))
             })
             .collect();
         charged.sort_unstable();
