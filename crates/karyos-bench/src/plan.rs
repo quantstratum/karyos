@@ -54,6 +54,12 @@ pub const INSUFFICIENT: &str = "insufficient samples";
 /// Names follow the sample files' profile rule (no `/`).
 pub const AA: [&str; 3] = ["trusted", "trusted-a", "trusted-b"];
 
+/// The configurations of the synthetic check (B3e, ACS 15453): the
+/// baseline, `a` the synthetic test profile spinning 500 ns in each stage,
+/// and `b` another trusted copy. Report-only: Synthetic is never a
+/// candidate.
+pub const SYNTHETIC_CHECK: [&str; 3] = ["trusted", "synthetic-500", "trusted-a"];
+
 /// The assumed cost of one R1 message, for the runtime estimate only.
 const R1_ESTIMATE: Duration = Duration::from_micros(20);
 
@@ -103,6 +109,15 @@ impl PlanOptions {
             messages: SMOKE_MESSAGES,
             warmup: SMOKE_WARMUP,
             ..Self::decision(e_max, rule)
+        }
+    }
+
+    /// `self` with the configurations of [`SYNTHETIC_CHECK`].
+    #[must_use]
+    pub fn with_synthetic_check(self) -> Self {
+        Self {
+            configurations: SYNTHETIC_CHECK.iter().map(ToString::to_string).collect(),
+            ..self
         }
     }
 
@@ -210,6 +225,10 @@ pub fn expand(points: &[Point], options: &PlanOptions) -> Result<Plan, BenchErro
         .any(|name| name.starts_with("trusted"))
     {
         return Err(BenchError("no trusted configuration in the round".into()));
+    }
+    // Every configuration must name a profile this build has.
+    for configuration in &options.configurations {
+        crate::wire::profile::Profile::of(configuration)?;
     }
     let mut runs = Vec::new();
     let mut skipped = Vec::new();
@@ -448,7 +467,7 @@ mod tests {
             ]
         );
         let mut three = PlanOptions::decision(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope);
-        three.configurations = vec!["trusted".into(), "x".into(), "y".into()];
+        three.configurations = vec!["trusted".into(), "trusted-x".into(), "trusted-y".into()];
         let plan = expand(&primary()[..1], &three).unwrap();
         let round2: Vec<&str> = plan
             .runs
@@ -456,7 +475,7 @@ mod tests {
             .filter(|run| run.round == 2)
             .map(|run| run.configuration.as_str())
             .collect();
-        assert_eq!(round2, ["y", "trusted", "x"]);
+        assert_eq!(round2, ["trusted-y", "trusted", "trusted-x"]);
     }
 
     #[test]

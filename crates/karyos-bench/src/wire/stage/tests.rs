@@ -61,7 +61,7 @@ fn every_shape_runs_closed_loop_over_loopback() {
 #[test]
 fn the_allocation_build_counts_and_both_stages_allocate_nothing() {
     // The counting allocator is this test binary's (lib.rs).
-    assert_eq!(BUILD, "alloc-count");
+    assert!(BUILD.starts_with("alloc-count"), "{BUILD}");
     let (vector, allocations) = counted(|| vec![1_u8; 16]);
     assert_eq!(vector.len(), 16);
     assert!(allocations >= 1, "counting is off");
@@ -168,6 +168,41 @@ fn a_receiver_done_with_every_message_never_stops_the_sender() {
             }
         }
     });
+}
+
+#[test]
+fn the_synthetic_profile_adds_its_spin_to_each_stage() {
+    use crate::wire::profile::Profile;
+    // Medians with a tolerance (ACS 15453): Synthetic spins at least
+    // 500 ns in seal and in open, but the median added time can be less:
+    // a busy spin keeps the core clocked up, so the rest of the stage runs
+    // faster than in the trusted run (seen: +334 ns on macOS). The bounds
+    // only show the spin is there and is not runaway.
+    let median = |values: &[u32]| {
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        u64::from(sorted[sorted.len() / 2])
+    };
+    let stages = |configuration: &str| {
+        let samples = run(
+            stage_run(Shape::W1, StageLoad::Closed, 2_000, 200),
+            &Profile::of(configuration).unwrap(),
+        )
+        .unwrap();
+        (median(&samples.send), median(&samples.receivers[0].receive))
+    };
+    let (trusted_send, trusted_receive) = stages("trusted");
+    let (synthetic_send, synthetic_receive) = stages("synthetic-500");
+    for (stage, trusted, synthetic) in [
+        ("send", trusted_send, synthetic_send),
+        ("receive", trusted_receive, synthetic_receive),
+    ] {
+        let added = synthetic.saturating_sub(trusted);
+        assert!(
+            (125..20_000).contains(&added),
+            "{stage}: trusted {trusted} ns, synthetic {synthetic} ns"
+        );
+    }
 }
 
 #[test]

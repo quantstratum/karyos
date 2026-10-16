@@ -51,7 +51,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use karyos_protocol::protection::Trusted;
+use crate::wire::profile::Profile;
 
 use crate::env;
 use crate::inventory::{Inventory, Scope, parse_cpu_list};
@@ -639,10 +639,11 @@ pub fn child() -> Option<Result<(), BenchError>> {
 
 fn run_child(role: &str) -> Result<(), BenchError> {
     let context = ChildContext::from_env()?;
-    let prepared = Prepared::new(&context.run, &Trusted)?;
+    let profile = Profile::of(&context.profile)?;
+    let prepared = Prepared::new(&context.run, &profile)?;
     match role {
-        "rx" => receive_child(&context, &prepared),
-        "tx" => send_child(&context, &prepared),
+        "rx" => receive_child(&context, &prepared, &profile),
+        "tx" => send_child(&context, &prepared, &profile),
         other => Err(BenchError(format!("no wire role {other}"))),
     }
 }
@@ -709,7 +710,11 @@ impl Drop for ReceiverControl {
     }
 }
 
-fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), BenchError> {
+fn receive_child(
+    context: &ChildContext,
+    prepared: &Prepared,
+    profile: &Profile,
+) -> Result<(), BenchError> {
     let run = &context.run;
     let endpoint = match (run.receivers, context.group) {
         (1, None) => prepared.endpoint()?,
@@ -754,7 +759,7 @@ fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), Benc
     let received = receive_role(
         run,
         prepared,
-        &Trusted,
+        profile,
         &mut rx,
         local,
         &ReceiveControl {
@@ -926,7 +931,11 @@ impl SenderControl {
     }
 }
 
-fn send_child(context: &ChildContext, prepared: &Prepared) -> Result<(), BenchError> {
+fn send_child(
+    context: &ChildContext,
+    prepared: &Prepared,
+    profile: &Profile,
+) -> Result<(), BenchError> {
     let peers = variable(PEER)?;
     let mut parts = peers.split_whitespace();
     let data: SocketAddr = parts
@@ -973,7 +982,7 @@ fn send_child(context: &ChildContext, prepared: &Prepared) -> Result<(), BenchEr
     let sent = send_role(
         &context.run,
         prepared,
-        &Trusted,
+        profile,
         &mut tx,
         data,
         &SendControl {
@@ -1259,7 +1268,7 @@ pub fn run_processes(
     options: &ProcessOptions,
 ) -> Result<StageSamples, BenchError> {
     faults_allowed(&options.faults)?;
-    let prepared = Prepared::new(run, &Trusted)?;
+    let prepared = Prepared::new(run, &Profile::of(&options.profile)?)?;
     let expected =
         usize::try_from(run.messages).map_err(|_| BenchError("too many messages".into()))?;
     let count = usize::from(run.receivers);

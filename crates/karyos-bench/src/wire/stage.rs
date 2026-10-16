@@ -202,12 +202,15 @@ impl SenderGate for Open {
 }
 
 /// The build this process is: `alloc-count` counts allocations inside
-/// both stages and is never used for timing (M-9; coordinator, ACS 15372);
-/// `timing` is every other build.
-pub const BUILD: &str = if cfg!(feature = "alloc-count") {
-    "alloc-count"
-} else {
-    "timing"
+/// both stages and is never used for timing (M-9; coordinator, ACS
+/// 15372); `timing` is every other build. `+synthetic` marks a build with
+/// the synthetic test profile, whose every result is report-only (ACS
+/// 15453).
+pub const BUILD: &str = match (cfg!(feature = "alloc-count"), cfg!(feature = "synthetic")) {
+    (true, true) => "alloc-count+synthetic",
+    (true, false) => "alloc-count",
+    (false, true) => "timing+synthetic",
+    (false, false) => "timing",
 };
 
 /// Runs `f` and, in the allocation build, counts this thread's

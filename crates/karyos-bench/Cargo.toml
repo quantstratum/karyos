@@ -27,6 +27,13 @@ test-hooks = []
 # self dev-dependency enables it too, so any build of its test or bench
 # targets (`--all-targets`, `cargo test`) is an alloc-count binary.
 alloc-count = ["karyos-sys/test-hooks"]
+# The synthetic test profile (`wire::profile`, `Synthetic` of
+# karyos-protocol): configurations `synthetic-<spin_ns>`, to check the
+# harness end to end (measurement-harness.md §5.2). A build with it is
+# never a timing build for a decision: its BUILD says `+synthetic`, `make
+# timing-build-check` requires plain `timing`, and `analyze` makes every
+# run of it report-only, its trusted runs included (ACS 15453).
+synthetic = ["karyos-protocol/test-hooks"]
 
 [dependencies]
 karyos-sys.workspace = true
@@ -44,7 +51,7 @@ karyos.workspace = true
 
 [dev-dependencies]
 # The bench itself with `test-hooks`, for the fault tests of tests/smoke.rs.
-karyos-bench = { path = ".", features = ["test-hooks", "alloc-count"] }
+karyos-bench = { path = ".", features = ["test-hooks", "alloc-count", "synthetic"] }
 criterion = { version = "=0.7.0", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

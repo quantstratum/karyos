@@ -8,8 +8,10 @@
 //! - [`load`]: the R1, R2 and R3 loads.
 //! - [`stage`]: the send and receive stages of one run over loopback.
 //! - [`process`]: each role in its own process.
+//! - [`profile`]: the protection profile a configuration names.
 
 pub mod compose;
 pub mod load;
 pub mod process;
+pub mod profile;
 pub mod stage;
