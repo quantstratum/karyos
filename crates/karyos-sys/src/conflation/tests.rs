@@ -896,5 +896,38 @@ fn a_freshness_write_is_not_a_new_version_and_is_retried() {
     assert_eq!(seen, [(1, 2)], "retried, delivered once");
     let report = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
     assert_eq!(report.delivered, 0);
+    // The settled freshness write is not even served: the scan reads the
+    // value version, not the sequence.
+    assert_eq!(report.skipped, 0);
     assert_eq!(seen, [(1, 2)]);
+}
+
+/// A slot left mid-write by a freshness-only write stays queued: the value
+/// version did not change, yet a closed table is never reported finished
+/// while the slot is unsettled.
+#[test]
+fn a_slot_stuck_in_a_freshness_write_stays_pending() {
+    let mut writer = conflation(4, 8, 1024).unwrap();
+    let mut reader = writer.reader();
+    writer.write(1, b"a").unwrap();
+    let _ = drain(&mut reader, BUDGET);
+    let seq = writer.slot_seq_word(1).unwrap();
+    seq.store(seq.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    drop(writer);
+    for _ in 0..4 {
+        let report = reader.poll_changed(BUDGET, |_, _, _| {});
+        assert!(report.closed);
+        assert!(!report.finished, "an unsettled slot is not finished");
+        assert!(report.pending >= 1 || report.unstable >= 1);
+    }
+}
+
+/// An odd value version is not one the writer stored: unstable.
+#[test]
+fn an_odd_value_version_is_unstable() {
+    let words = fresh_words(1);
+    let slot = FreshSlotWords::new(&words).unwrap();
+    slot.write(b"x").unwrap();
+    words[1].store(5, Ordering::Relaxed);
+    assert_eq!(slot.read(&mut [0u8; 8]), FreshRead::Unstable);
 }

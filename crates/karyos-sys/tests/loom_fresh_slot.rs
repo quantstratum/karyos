@@ -44,13 +44,14 @@ fn model(inside_seqlock: bool) {
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(2);
     builder.check(move || {
-        // The five header words and two value words.
+        // The five header words and two value words: both values span
+        // both words.
         let words: Arc<Vec<AtomicU64>> = Arc::new((0..7).map(|_| AtomicU64::new(0)).collect());
         let writer = {
             let words = Arc::clone(&words);
             thread::spawn(move || {
                 let slot = FreshSlotWords::new(&words).unwrap();
-                assert_eq!(slot.write(b"first"), Ok(2));
+                assert_eq!(slot.write(b"first value!"), Ok(2));
                 for freshness in [FIRST, SECOND] {
                     if inside_seqlock {
                         slot.set_freshness(freshness).unwrap();
@@ -60,7 +61,7 @@ fn model(inside_seqlock: bool) {
                         words[4].store(freshness.stale_since, Ordering::Relaxed);
                     }
                 }
-                assert_eq!(slot.write(b"second!!"), Ok(4));
+                assert_eq!(slot.write(b"second value!!!"), Ok(4));
             })
         };
         let reader = {
@@ -79,9 +80,9 @@ fn model(inside_seqlock: bool) {
                         "torn freshness"
                     );
                     match version {
-                        2 => assert_eq!(&out[..length], b"first", "torn value"),
+                        2 => assert_eq!(&out[..length], b"first value!", "torn value"),
                         4 => {
-                            assert_eq!(&out[..length], b"second!!", "torn value");
+                            assert_eq!(&out[..length], b"second value!!!", "torn value");
                             assert_eq!(freshness, SECOND, "a value write lost the freshness");
                         }
                         other => panic!("unexpected version {other}"),

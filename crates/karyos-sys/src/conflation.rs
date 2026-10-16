@@ -5,32 +5,41 @@
 //! key, one writer, any number of readers that see the latest coherent value
 //! of each key and may skip intermediate ones.
 //!
-//! Each slot is a version word, a length word and the value words, on its
-//! own 128-byte strides. Slots use the fence-based seqlock with atomic data
-//! words (Boehm, "Can seqlocks get along with programming language memory
-//! models?", MSPC 2012): the writer stores the odd version (Relaxed), issues
-//! a Release fence, stores the length and value words (Relaxed) and stores
-//! the next even version (Release). A reader loads the version (Acquire),
-//! copies the length and value words (Relaxed) into private storage, issues
-//! an Acquire fence and reloads the version (Relaxed); it uses the copy only
-//! if both loads saw the same even, nonzero version. If the copy contains a
-//! word of a later write, that write's Release fence synchronizes with the
-//! reader's Acquire fence, so the second load sees at least that write's odd
-//! version and the copy is rejected.
+//! Each table slot ([`FreshSlotWords`], table layout version 2) is a
+//! sequence word, a value version word, a length word, the two freshness
+//! words of [`SlotFreshness`] (`quantstratum-docs:
+//! karyos/design/gaps-and-unreliable-delivery.md`, GU-8) and the value
+//! words, on its own 128-byte strides. Slots use the fence-based seqlock
+//! with atomic data words (Boehm, "Can seqlocks get along with programming
+//! language memory models?", MSPC 2012) on the sequence: the writer stores
+//! the odd sequence (Relaxed), issues a Release fence, stores the other
+//! words (Relaxed) and stores the next even sequence (Release). A reader
+//! loads the sequence (Acquire), copies the other words (Relaxed) into
+//! private storage, issues an Acquire fence and reloads the sequence
+//! (Relaxed); it uses the copy only if both loads saw the same even
+//! sequence. If the copy contains a word of a later write, that write's
+//! Release fence synchronizes with the reader's Acquire fence, so the second
+//! load sees at least that write's odd sequence and the copy is rejected. A
+//! value write advances the value version by 2 (even, nonzero once
+//! written); a freshness-only write advances the sequence alone.
 //!
 //! Every word is accessed only atomically, so a reader racing the writer
 //! copies stale or mixed values and discards them, never a data race.
 //!
-//! After each write the writer appends `(key, version)` to an update
-//! journal (a broadcast buffer). A reader queues the keys it reads from the
-//! journal; when the journal laps it, entries were lost and it scans the
-//! slot versions instead. Every poll is bounded by a key budget and a retry
+//! After each value write the writer appends `(key, value version)` to an
+//! update journal (a broadcast buffer). A reader queues the keys it reads
+//! from the journal; when the journal laps it, entries were lost and it
+//! scans the slots' value versions instead. A slot whose sequence is odd
+//! (mid-write, a freshness-only write included) stays queued until it
+//! settles. Freshness-only changes reach readers through the loss barrier
+//! ([`crate::freshness`]), not through the journal. Every poll is bounded by a key budget and a retry
 //! budget, and pending keys are served in FIFO order, so a slot that stays
 //! unstable cannot stall a poll or starve the other keys.
 //!
-//! [`SlotWords`] and its functions are the protocol over any atomic words
-//! (also checked with Loom); [`conflation`] builds the owned, safe API over
-//! heap memory.
+//! [`SlotWords`] (the version-1 slot, which the record journal keeps),
+//! [`FreshSlotWords`] and their functions are the protocols over any atomic
+//! words (also checked with Loom); [`conflation`] builds the owned, safe API
+//! over heap memory.
 
 use crate::freshness::SlotFreshness;
 use crate::load_words::LoadWords;
@@ -200,6 +209,8 @@ impl<'a> SlotWords<'a> {
         let Some(version) = self.word(VERSION) else {
             return Err(ConflationError::InvalidConfig);
         };
+        let stored_length =
+            u64::try_from(value.len()).map_err(|_| ConflationError::InvalidConfig)?;
         // Only this writer stores the version, so it is even here.
         let current = version.load(Ordering::Relaxed);
         let (Some(odd), Some(even)) = (current.checked_add(1), current.checked_add(2)) else {
@@ -208,7 +219,7 @@ impl<'a> SlotWords<'a> {
         version.store(odd, Ordering::Relaxed);
         fence(Ordering::Release);
         if let Some(length) = self.word(LENGTH) {
-            length.store(value.len() as u64, Ordering::Relaxed);
+            length.store(stored_length, Ordering::Relaxed);
         }
         for (index, chunk) in value.chunks(WORD_BYTES).enumerate() {
             let mut bytes = [0u8; WORD_BYTES];
@@ -391,10 +402,12 @@ impl<'a> FreshSlotWords<'a> {
             .load(Ordering::Relaxed)
             .checked_add(2)
             .ok_or(ConflationError::VersionsExhausted)?;
+        let stored_length =
+            u64::try_from(value.len()).map_err(|_| ConflationError::InvalidConfig)?;
         self.locked(|| {
             version.store(next, Ordering::Relaxed);
             if let Some(length) = self.word(FRESH_LENGTH) {
-                length.store(value.len() as u64, Ordering::Relaxed);
+                length.store(stored_length, Ordering::Relaxed);
             }
             for (index, chunk) in value.chunks(WORD_BYTES).enumerate() {
                 let mut bytes = [0u8; WORD_BYTES];
@@ -497,6 +510,11 @@ pub fn read_fresh_slot<W: LoadWords>(words: &W, out: &mut [u8]) -> FreshRead {
     if version == 0 {
         return FreshRead::Empty;
     }
+    // Value versions are even (the writer advances them by 2): an odd one
+    // is not a version this protocol wrote.
+    if version % 2 == 1 {
+        return FreshRead::Unstable;
+    }
     match copied {
         Some(length) => FreshRead::Value {
             version,
@@ -521,8 +539,8 @@ mod owned {
     use std::sync::Arc;
 
     use super::{
-        ConflationConfig, ConflationError, FRESH_VALUE, FRESH_VERSION, FreshRead, FreshSlotWords,
-        STRIDE_WORDS, WORD_BYTES, read_fresh_slot,
+        ConflationConfig, ConflationError, FRESH_SEQ, FRESH_VALUE, FRESH_VERSION, FreshRead,
+        FreshSlotWords, STRIDE_WORDS, WORD_BYTES, read_fresh_slot,
     };
     use crate::atomic_view::HeapWords;
     use crate::broadcast::{
@@ -693,6 +711,16 @@ mod owned {
             self.slot(key)
                 .and_then(|slot| slot.load(FRESH_VERSION))
                 .unwrap_or(0)
+        }
+
+        /// Whether the slot's seqlock is mid-write (Relaxed, as
+        /// [`View::version`]): a freshness-only write leaves the value
+        /// version unchanged, so the sweep keeps such a key queued until it
+        /// settles.
+        fn unsettled(&self, key: u32) -> bool {
+            self.slot(key)
+                .and_then(|slot| slot.load(FRESH_SEQ))
+                .is_some_and(|seq| seq % 2 == 1)
         }
 
         fn read(&self, key: u32, out: &mut [u8]) -> Option<FreshRead> {
@@ -1362,9 +1390,9 @@ mod owned {
                 if self.scan_remaining > 0 {
                     self.scan_remaining -= 1;
                 }
-                let version = with_view!(&self.source, view => view
-                    .map_or(0, |view| view.version(key)));
-                if version != 0 && self.changed(key, version) {
+                let (version, unsettled) = with_view!(&self.source, view => view
+                    .map_or((0, false), |view| (view.version(key), view.unsettled(key))));
+                if unsettled || (version != 0 && self.changed(key, version)) {
                     self.push(key);
                 }
             }
