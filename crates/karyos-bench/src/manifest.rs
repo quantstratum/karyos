@@ -304,8 +304,9 @@ impl Shape {
     /// # Errors
     ///
     /// [`ManifestError::EnvelopeTooLarge`] when `e_max` leaves no frame
-    /// room, [`ManifestError::W6DatagramCount`] when W6 does not take 5
-    /// datagrams, [`ManifestError::NoSizeFormula`] for W8.
+    /// room, [`ManifestError::W6DatagramCount`] when W6 takes a count other
+    /// than manifest 2.0 6.1 states (5, or 6 for E from 161 to 176 when
+    /// `mtu` counts the envelope), [`ManifestError::NoSizeFormula`] for W8.
     pub fn size(self, e_max: u32, rule: MtuRule) -> Result<Size, ManifestError> {
         let single = |payload: u32, ext: bool, mtu: u32| Size {
             payload,
@@ -329,8 +330,12 @@ impl Shape {
                 mtu: MTU,
             }),
             Self::W6 => {
+                // Manifest 2.0 6.1: the fragment plan's count, 5 datagrams,
+                // or 6 for E from 161 to 176 when `mtu` counts the envelope.
                 let datagrams = w6_datagrams(e_max, rule)?;
-                if datagrams == W6_DATAGRAMS {
+                if datagrams == W6_DATAGRAMS
+                    || (datagrams == W6_DATAGRAMS + 1 && e_max <= W6_E_MAX_LIMIT)
+                {
                     Ok(Size {
                         payload: W6_LENGTH,
                         frames_per_datagram: 1,
@@ -674,7 +679,7 @@ mod tests {
         // Exhaustive over 0..=176 and both rules. The aligned fragment
         // plan of SPEC §4 agrees with the manifest up to E_max = 160; under
         // CountsEnvelope, 161..=176 align the budget to 1216 and c to 1184,
-        // so W6 takes 6 datagrams there and the model refuses it.
+        // so W6 takes 6 datagrams there, as manifest 2.0 6.1 states.
         for e_max in 0..=W6_E_MAX_LIMIT {
             for rule in MtuRule::ALL {
                 let datagrams = w6_datagrams(e_max, rule).unwrap();
@@ -689,14 +694,9 @@ mod tests {
                     assert_eq!(size.datagrams_per_message, 5);
                 } else {
                     assert_eq!((datagrams, c), (6, 1184), "E_max {e_max}");
-                    assert_eq!(
-                        Shape::W6.size(e_max, rule),
-                        Err(ManifestError::W6DatagramCount {
-                            e_max,
-                            rule,
-                            datagrams: 6
-                        })
-                    );
+                    // Manifest 2.0 6.1 states this count.
+                    let size = Shape::W6.size(e_max, rule).unwrap();
+                    assert_eq!(size.datagrams_per_message, 6);
                 }
             }
         }
