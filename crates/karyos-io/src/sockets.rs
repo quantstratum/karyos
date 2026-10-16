@@ -20,6 +20,8 @@ pub mod ops;
 pub mod portable;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod scripted;
+#[cfg(any(target_os = "macos", test))]
+mod std_results;
 
 /// The [`ops::SocketOps`] of this platform (3.9): `rustix` on Linux.
 #[cfg(target_os = "linux")]
@@ -29,5 +31,7 @@ pub type OsSocket = linux::LinuxSocket;
 #[cfg(target_os = "macos")]
 pub type OsSocket = portable::PortableSocket;
 
-/// The sockets endpoint over the operating system's sockets (3.8).
+/// The sockets endpoint over the operating system's sockets (3.8), on the
+/// platforms that have an [`OsSocket`].
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub type SocketsBackend = endpoint::SocketsEndpoint<OsSocket>;
