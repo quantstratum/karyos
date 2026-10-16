@@ -179,7 +179,12 @@ release may break APIs, wire formats and shared-memory layouts.
   with no image created and no conductor chain reserved, refuse a full
   image (`Ignored::PathsFull`), and keep refusing an identity challenged or
   answered under another key. `SessionConfig` gains `max_paths` and
-  `path_liveness_timeout`.
+  `path_liveness_timeout`. The path rows decide admission: `lookup` and
+  the bound-key checks go through them, so a first path lost at its
+  timeout stops admitting and returns only through a fresh challenge, as a
+  later path. `ReceiveSessions::timers` removes lost paths within
+  `timer_actions`. Not wired yet: refreshing a path on fresh DATA and
+  PATH_HB intake, which phase 5c calls through `paths_mut()`.
 - RTT observations (P2.7 B, reliable-transport.md, RC-1, ACS 15597):
   `karyos_driver::rtt::RttProbes` probes each path of an image with at most
   one outstanding RTTM REQUEST (random nonzero 64-bit ids from
@@ -195,12 +200,27 @@ release may break APIs, wire formats and shared-memory layouts.
   `RttReplies` limits a sender's replies to `rttm_reply_rate` per second
   per source endpoint, in a bounded table of `rttm_reply_sources`, so one
   source cannot starve the others (ACS 15618).
-  `path_liveness_timeout`. The path rows decide admission: `lookup` and
-  the bound-key checks go through them, so a first path lost at its
-  timeout stops admitting and returns only through a fresh challenge, as a
-  later path. `ReceiveSessions::timers` removes lost paths within
-  `timer_actions`. Not wired yet: refreshing a path on fresh DATA and
-  PATH_HB intake, which phase 5c calls through `paths_mut()`.
+- Multicast receiver membership and flow control (P2.7 A,
+  multicast-flow-control.md, MC-1 to MC-9, ACS 15597, 15604 and 15610):
+  `karyos_driver::membership::Membership`, one publication incarnation's
+  receiver table, owned by its sender agent. It takes SMs the session
+  binding validated and keys members by `receiver_id` and
+  `receiver_boot_id`, with a checked generation per slot (`MemberRef`,
+  `current`) and retired slots at exhaustion. Roles and tags are
+  configured (`Roles`): a mismatched `group_tag` rejects the SM, and a
+  required receiver has one membership per incarnation. The join fixes
+  each lane's window in `min_window..=max_window`; a changed window, a
+  stale or impossible consumption (above `sent_high`) or an overflowing
+  edge rejects the whole SM. An SM is fresh when it advances a lane or
+  reports `sent_high` on every lane; a stationary member lives until
+  `pause_timeout` (default 60 s), counted as `stationary` and `paused`.
+  `limit` gives a lane's edge (the strategy's extremum, `min`, `max` or
+  `tagged`, then the minimum with every live required edge),
+  `NoReceiverWindow` or `Held`. `admission` opens once the required set
+  has joined and stops for good at a required loss, whose last consumption
+  stays in `retention`. `timers` expires members within a bound with a fair
+  cursor, and membership events are queued in a bounded queue. Not wired
+  yet: the sender agent's SM handoff and gate.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 
