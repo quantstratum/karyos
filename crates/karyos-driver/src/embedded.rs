@@ -1208,11 +1208,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let alive = self.serve_liveness();
         self.sweep_ended_registrations();
         self.free_retired_streams();
-        let mut work = self
-            .serve_commands()
-            .saturating_add(admitted)
-            .saturating_add(alive);
+        let mut work = self.serve_commands();
         let mut first_error = None;
+        add_work(&self.counters, &mut work, &mut first_error, admitted);
+        add_work(&self.counters, &mut work, &mut first_error, alive);
         let charged = self.charged_generations();
         let mut opened = Vec::new();
         let clock = &mut self.clock;
@@ -1268,7 +1267,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.report_withdrawn_bounds();
         }
         match self.feed_conflation() {
-            Ok(feeder_work) => work = work.saturating_add(feeder_work),
+            Ok(feeder_work) => add_work(&self.counters, &mut work, &mut first_error, feeder_work),
             Err(error) => {
                 first_error.get_or_insert(error);
             }
@@ -1276,7 +1275,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mirrored = self
             .trace_journals
             .drain(&mut self.diagnostics, &mut self.counters);
-        work = work.saturating_add(mirrored);
+        add_work(&self.counters, &mut work, &mut first_error, mirrored);
         self.update_stream_gauges();
         self.sample_positions();
         match first_error {
@@ -1360,7 +1359,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     continue;
                 }
             };
-            work = work.saturating_add(summary.delivered);
+            add_work(
+                &self.counters,
+                &mut work,
+                &mut first_error,
+                summary.delivered,
+            );
             if (terminal.is_some() || stream.conflation_terminal.is_some())
                 && let Some(cutover) = stream.cutover.take()
             {
