@@ -1461,6 +1461,42 @@ fn a_gap_moves_the_resolved_prefix_not_the_received_high_water() {
     assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)), "never cleared");
 }
 
+/// GU-1: a gap sealed above an earlier one leaves the first loss at the
+/// lower start (the minimum, not the latest seal).
+#[test]
+fn a_higher_gap_sealed_later_keeps_the_lower_first_loss() {
+    let buffer = gap_image(0);
+    let mut owner = owner(&buffer);
+    assert_eq!(seal(&mut owner, 64, 64), committed(64, 64));
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)));
+    assert_eq!(seal(&mut owner, 192, 64), committed(192, 64));
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)), "the lowest gap");
+}
+
+/// GU-1: the cursor's first loss is kept since the join; an overrun
+/// rejoin does not clear it.
+#[test]
+fn a_rejoin_after_an_overrun_keeps_the_cursor_first_loss() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(seal(&mut owner, 0, 64), committed(0, 64));
+    assert_eq!(poll(&mut subscription), skipped(0, 64, LOST));
+    assert_eq!(subscription.first_loss(), Some(0));
+    // The rebuild position moves more than half a term past the reader.
+    recv(&mut owner, &record(FrameType::Aborted, 0, 64, TERM / 2)).unwrap();
+    let begin = 64 + TERM / 2;
+    recv(&mut owner, &data(0, begin, 64, 1)).unwrap();
+    recv(&mut owner, &data(0, begin + 64, 64, 2)).unwrap();
+    conductor.duty_cycle().unwrap();
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Overrun { .. }
+    ));
+    assert_eq!(subscription.first_loss(), Some(0), "kept across the rejoin");
+}
+
 /// GU-3: fragments without BEGIN after a reported gap are `AfterLoss`,
 /// never `Orphan`; the reader resynchronizes at the next BEGIN, and a later
 /// run without BEGIN and without a gap is an `Orphan` again. The cursor's
