@@ -23,6 +23,13 @@ karyos-cluster.workspace = true
 karyos-feed.workspace = true
 karyos-sim.workspace = true
 karyos.workspace = true
+signal-hook.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "karyosd"
+path = "src/bin/karyosd.rs"
 
 [lints]
 workspace = true

@@ -17,6 +17,9 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `loom` | 0.7.2 | crates.io | default features off | model checking, only under `--cfg loom` | all | MIT | ADR-0033 (`loom`, dev only) |
 | `proptest` | 1.11.0 | crates.io | default features off; `std` | dev-dependency of `karyos-sys` and `karyos-protocol` (tests only; `karyos-protocol` added for the layout properties of issue #10, coordinator approved 2026-10-15) | all | MIT OR Apache-2.0 | ADR-0033 (`proptest`, dev only); owner confirmed phase 1 on 2026-10-15 (Q25, issue #40) |
 | `criterion` | 0.7.0 (pinned `=0.7.0`) | crates.io | default features off; `cargo_bench_support` | microbenchmarks only, dev-dependency of `karyos-bench` | all | Apache-2.0 OR MIT | owner approved 2026-10-15 (Q25, issue #12); exact resolution 0.7.0 under ADR-0033, coordinator decision 2026-10-15 (ACS 13315) |
+| `signal-hook` | 0.4.5 | crates.io | default features off (no `channel`, `iterator` or `extended-siginfo`); only the safe `signal_hook::flag::register` is used | runtime, `karyos-tools` only (the `karyosd` binary: `SIGTERM` and `SIGINT` set a flag) | all | MIT OR Apache-2.0 | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
+| `tracing` | 0.1.44 | crates.io | default features off (no `std` request, no `attributes` proc macro) | runtime, `karyos-tools` only (control-path logs of `karyosd`, SPEC.md §11) | all | MIT | owner approved phase 1 on 2026-10-15 (Q25, ACS 11869, issue #40); exact resolution owner decision ACS 13810 (2026-10-16), under ADR-0033 |
+| `tracing-subscriber` | 0.3.23 | crates.io | default features off; `fmt`, `std` (no `ansi`, `env-filter`, `regex`, `tracing-log`, `smallvec`) | runtime, `karyos-tools` only (the subscriber the `karyosd` binary installs; no library installs one) | all | MIT | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
 
 `criterion` is pinned to `=0.7.0`. The owner admitted the criterion family
 (Q25), and ADR-0033 allows a compliant exact resolution within an admitted
@@ -25,6 +28,24 @@ C++ toolchain): from 0.8.0 criterion depends unconditionally, for every
 `unix` and `windows` target and whatever its features, on `alloca`, whose
 build script compiles C with `cc` on every build. A move to 0.8 or later
 therefore needs a deliberate change and a fresh check of this rule.
+
+`signal-hook`, `tracing` and `tracing-subscriber` are dependencies of
+`karyos-tools` only, so they reach the operational binaries and no library
+crate (owner decision ACS 13810, 2026-10-16). Their transitive runtime
+crates, all admitted under the same decision and ADR-0033, are:
+`signal-hook-registry` 1.4.8 (MIT OR Apache-2.0), `libc` 0.2.190 (MIT OR
+Apache-2.0) and `errno` 0.3.14 (MIT OR Apache-2.0) under `signal-hook`;
+`tracing-core` 0.1.36 (MIT), `pin-project-lite` 0.2.17 (Apache-2.0 OR MIT)
+and `once_cell` 1.21.4 (MIT OR Apache-2.0) under `tracing`; and
+`sharded-slab` 0.1.7 (MIT), `lazy_static` 1.5.1 (MIT OR Apache-2.0),
+`thread_local` 1.1.10 (MIT OR Apache-2.0) and `cfg-if` 1.0.5 (MIT OR
+Apache-2.0) under `tracing-subscriber`'s `fmt` registry. Every one of them
+was already in the lockfile through `loom` or a dev-dependency except
+`signal-hook` and `signal-hook-registry`. The lockfile's resolved feature
+list for `tracing-subscriber` is the union with `loom`'s request
+(`ansi`, `env-filter`, `tracing-log` and others); a normal build of
+`karyos-tools` enables only `alloc`, `fmt`, `registry`, `sharded-slab`,
+`std` and `thread_local` (`cargo tree -e normal,features`).
 
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
 absent from every normal and release build and from the graph shipped to
@@ -49,11 +70,15 @@ runs in CI and fails when the committed file is stale, so a lockfile, feature
 or build-script change cannot reuse old admission evidence. Reach classes:
 
 - `runtime`: may be linked into Karyos builds. On the supported targets the
-  evaluated runtime graph is `thiserror`, plus `rustix`, `bitflags` and
-  `linux-raw-sys` on Linux. The raw edges also list `libc` and `errno` under
-  `rustix`, either as optional dependencies of the `linux_raw` backend that
-  only the unused `use-libc` feature enables, or behind `rustix_use_libc` or
-  `miri`; neither applies to normal builds.
+  evaluated runtime graph of the library crates is `thiserror`, plus
+  `rustix`, `bitflags` and `linux-raw-sys` on Linux. The `karyos-tools`
+  binaries add `signal-hook`, `signal-hook-registry`, `libc`, `errno`,
+  `tracing`, `tracing-core`, `pin-project-lite`, `once_cell`,
+  `tracing-subscriber`, `sharded-slab`, `lazy_static`, `thread_local` and
+  `cfg-if` on every supported target. The raw edges also list `libc` and
+  `errno` under `rustix`, either as optional dependencies of the
+  `linux_raw` backend that only the unused `use-libc` feature enables, or
+  behind `rustix_use_libc` or `miri`; neither applies to normal builds.
 - `build`: runs only at compile time, as a proc macro or its dependency
   (`thiserror-impl`, `syn`, `quote`, `proc-macro2`, `unicode-ident`).
   ADR-0033 approves `syn`, `quote` and `proc-macro2` for the codec; here they
@@ -75,7 +100,9 @@ rather than repeated here.
 
 On x86_64 and aarch64 Linux `rustix` uses its `linux_raw` backend: system
 calls through Rust inline assembly and the pure-Rust `linux-raw-sys`
-bindings, with no `libc`. Its `libc` backend (`errno`, `libc`) is selected
+bindings, with no `libc`. The `karyosd` binary links `libc` through
+`signal-hook-registry`, which installs the `sigaction` handler; no library
+crate does. Its `libc` backend (`errno`, `libc`) is selected
 only by `--cfg rustix_use_libc`, which Karyos never sets, or under Miri.
 
 Effective target conditions that exclude packages from the supported
@@ -84,7 +111,7 @@ and `valuable` (`cfg(tracing_unstable)`, a flag Karyos never sets).
 
 ## Build scripts
 
-Twelve packages in the graph have build scripts. None compiles C or C++ on a
+Thirteen packages in the graph have build scripts. None compiles C or C++ on a
 supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 
 | Package | Reach | What the build script does |
@@ -93,8 +120,9 @@ supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 | `proc-macro2` 1.0.107 | build | Runs `rustc --version` and a probe compile to set cfgs |
 | `rustix` 1.1.5 | runtime (Linux) | Runs `rustc` probes to select the backend and set cfgs; no build dependencies |
 | `quote` 1.0.47 | build | Runs `rustc --version` to set cfgs |
+| `signal-hook` 0.4.5 | runtime, `karyos-tools` only | Empty `main` unless the `extended-siginfo-raw` feature is on, which would compile `extract.c` with the optional `cc` build dependency; Karyos leaves it off, so `cc` is not requested |
 | `rustversion` 1.0.23 | loom | Runs `rustc --version` to generate version constants |
-| `libc` 0.2.190 | loom; dev, under `getrandom` on macOS and Linux `gnu`/`musl` (tests only); also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in normal builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
+| `libc` 0.2.190 | runtime, `karyos-tools` only, under `signal-hook` and `signal-hook-registry` on every supported target; loom; dev, under `getrandom` on macOS and Linux `gnu`/`musl` (tests only); also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in library builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
 | `generator` 0.8.10 | loom | Invokes `cc` to assemble `asm_ppc64le_elf.S` only when the target architecture is `powerpc64`, which Karyos does not support |
 | `valuable` 0.1.1 | loom | Emits atomic-support cfgs from the target name |
 | `getrandom` 0.3.4 | dev | Runs `rustc --version` to choose cfgs (sanitizer and old Windows backends); compiles nothing |

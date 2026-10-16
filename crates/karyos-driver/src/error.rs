@@ -67,6 +67,10 @@ pub enum DriverError {
     /// The driver is in its terminal state: its broadcast buffer is closed.
     #[error("the driver is in its terminal state")]
     Terminal,
+    /// The driver stopped admitting clients
+    /// ([`crate::EmbeddedDriver::stop_admitting`]).
+    #[error("the driver is not admitting clients")]
+    NotAdmitting,
     /// The process has used every driver identity.
     #[error("driver identities exhausted")]
     DriverIdsExhausted,
