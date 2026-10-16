@@ -101,6 +101,12 @@ impl Guard {
     }
 
     /// Waits at most [`STALL`] for the child's report `line`.
+    ///
+    /// A child that printed the line and exited may still have it in the
+    /// pipe, so its exit alone is no failure: the end of its output is.
+    /// The reader forwards every line before it disconnects, and a child's
+    /// exit closes its output, so an exited child fails here only once
+    /// the line has not come by then.
     fn report(&mut self, line: &str) -> Result<(), BenchError> {
         let start = Instant::now();
         loop {
@@ -112,8 +118,8 @@ impl Guard {
                     return Err(BenchError("the child closed its output".into()));
                 }
             }
-            self.alive()?;
             if start.elapsed() > STALL {
+                self.alive()?;
                 return Err(BenchError(format!("no report {line:?} from the child")));
             }
         }
@@ -323,7 +329,19 @@ fn receive(
         if summary.closed.is_some() {
             return Err(BenchError("the stream closed".into()));
         }
-        waiting(start, &mut checked, watch)?;
+        if let Err(cause) = waiting(start, &mut checked, watch) {
+            // The child may have committed the message after this poll and
+            // then exited: what it committed before its exit is readable,
+            // so one last poll decides, not the exit.
+            let summary = subscription
+                .poll(|_, _| {}, MessageLimit::new(1))
+                .map_err(|cause| error("poll", cause))?;
+            return if summary.delivered == 1 {
+                Ok(())
+            } else {
+                Err(cause)
+            };
+        }
     }
 }
 
@@ -574,4 +592,43 @@ fn run_child(spec: &str) -> Result<(), BenchError> {
     drop(ping_in);
     drop(client);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A guard over a child that has already exited with success, and the
+    /// sender of its report channel.
+    fn exited() -> (Guard, std::sync::mpsc::Sender<String>) {
+        let mut child = Command::new("true").spawn().unwrap();
+        assert!(child.wait().unwrap().success());
+        let (sender, reports) = channel();
+        let guard = Guard {
+            child: Some(child),
+            reports,
+        };
+        (guard, sender)
+    }
+
+    #[test]
+    fn a_report_still_in_the_pipe_of_an_exited_child_is_read() {
+        // The child printed the line and exited; the reader forwards it
+        // late, as under load (the #238 gate flake).
+        let (mut guard, sender) = exited();
+        let late = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            sender.send(READ_ALL.to_string()).unwrap();
+        });
+        assert_eq!(guard.report(READ_ALL), Ok(()));
+        late.join().unwrap();
+    }
+
+    #[test]
+    fn an_exited_child_without_its_report_fails() {
+        let (mut guard, sender) = exited();
+        drop(sender);
+        let error = guard.report(READ_ALL).unwrap_err();
+        assert!(error.0.contains("exited early"), "{error:?}");
+    }
 }
