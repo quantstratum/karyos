@@ -25,7 +25,16 @@ fn serve(
     out: &mut Vec<Seen>,
 ) {
     for _ in 0..calls {
-        match reader.serve_frame().unwrap() {
+        let step = reader.serve_frame().unwrap();
+        // Every call released the loan it took.
+        let subscription = reader.subscription();
+        assert_eq!(
+            subscription.buffer().cells()[subscription.cell()]
+                .loan
+                .load(core::sync::atomic::Ordering::Acquire),
+            0
+        );
+        match step {
             FrameStep::Copied { charge } => *charged += u64::from(charge),
             FrameStep::Complete { charge, info } => {
                 *charged += u64::from(charge);

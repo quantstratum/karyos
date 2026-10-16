@@ -303,3 +303,54 @@ proptest! {
         prop_assert_eq!(strip(&by_frame), strip(&by_poll));
     }
 }
+
+/// Closed is terminal: once returned, a later call answers it again without
+/// reading the term, so a word changed or reused after the seal never turns
+/// it into an overrun or an error.
+#[test]
+fn closed_is_terminal() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = FrameReader::new(conductor.subscribe(Role::Optional).unwrap());
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = append_retrying(&mut publication, &mut conductor, &fr_message(7, 100), || {});
+    conductor.seal().unwrap();
+    let _ = publication.append(&[1], AppendOptions::default()).unwrap();
+    drop(publication);
+    let _ = conductor.duty_cycle().unwrap();
+    let mut delivered = Vec::new();
+    fr_serve(&mut reader, 1, &mut 0, &mut delivered);
+    let closed = reader.serve_frame().unwrap();
+    assert!(matches!(closed, FrameStep::Ended(FrameEnd::Closed { .. })), "{closed:?}");
+    // A word that reads as corrupt at the reader's position: never read.
+    let at = u32::try_from(reader.subscription().position()).unwrap();
+    word0_of_term0(&buffer, at).store(u64::MAX, Ordering::Release);
+    assert_eq!(reader.serve_frame().unwrap(), closed);
+    assert!(fr_loan_released(&reader));
+}
+
+/// The retention floor is rechecked after the loan when a message resumes:
+/// a floor published past the assembly's start, with the term still
+/// active, ends the assembly as an overrun.
+#[test]
+fn a_floor_past_the_assembly_overruns_it() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = FrameReader::new(conductor.subscribe(Role::Optional).unwrap());
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = append_retrying(&mut publication, &mut conductor, &fr_message(8, 5000), || {});
+    assert!(matches!(reader.serve_frame().unwrap(), FrameStep::Copied { .. }));
+    let head = buffer.reserved_head().load(Ordering::Acquire);
+    // The term stays active; only the floor moves past the start.
+    buffer.floor().store(64, Ordering::Release);
+    assert_eq!(
+        reader.serve_frame().unwrap(),
+        FrameStep::Ended(FrameEnd::Overrun {
+            from: 0,
+            lost_to: 64,
+            resume: head
+        })
+    );
+    assert!(fr_loan_released(&reader));
+    assert!(!reader.ready());
+}

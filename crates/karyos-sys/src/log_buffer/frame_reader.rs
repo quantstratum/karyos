@@ -246,6 +246,11 @@ impl<O: BufferOwner> FrameReader<O> {
         };
         let served = context.serve(assembly, &mut self.assembly);
         let (state, step) = match served {
+            // Closed is terminal like Revoked: later calls answer it again
+            // without a loan, whatever happens to the slot after the seal.
+            Ok((_, FrameStep::Ended(end @ FrameEnd::Closed { .. }))) => {
+                (State::Ended(Ok(end)), Ok(FrameStep::Ended(end)))
+            }
             Ok((state, step)) => (state, Ok(step)),
             Err(error) => (State::Ended(Err(error)), Err(error)),
         };
@@ -259,6 +264,10 @@ impl<O: BufferOwner> FrameReader<O> {
     /// `deliver` returned). Returns whether a message was delivered. If
     /// `deliver` panics the message stays complete and the next `take`
     /// delivers it again.
+    ///
+    /// It does not check for a revocation after the message completed: a
+    /// message complete before the revocation is delivered, as `poll`
+    /// delivers a message it copied before one.
     pub fn take(&mut self, deliver: impl FnOnce(&[u8], MessageInfo)) -> bool {
         let State::Ready(info, next) = self.state else {
             return false;
@@ -491,6 +500,10 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                 let end = FrameEnd::Revoked { position };
                 Ok((State::Ended(Ok(end)), FrameStep::Ended(end)))
             }
+            // No consistent head yet: the assembly is dropped and the cursor
+            // stays at its start. Every overrun trigger (a gone slot, a
+            // refused loan, a floor past the start) persists, so the next
+            // call overruns again and never copies a fragment twice.
             Step::Done(_) | Step::NextTerm => Ok((State::Idle, FrameStep::Pending)),
         }
     }

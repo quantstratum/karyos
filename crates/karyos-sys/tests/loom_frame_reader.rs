@@ -32,6 +32,13 @@
 //! Payload bytes are plain values in Loom `UnsafeCell`s, where Loom reports
 //! any read and write not ordered by happens-before.
 //!
+//! Limits: `log_buffer` is not built under Loom, so these models compose
+//! the production helpers in `FrameReader`'s order rather than run
+//! `serve_frame` itself. The splice models take and release a loan in each
+//! call, across a slot reclaimed and reused for a later term, for a
+//! publication block and for an image; the resume models check the
+//! ordering of one term without loans.
+//!
 //! Run with `make loom`.
 
 #![cfg(loom)]
@@ -143,14 +150,15 @@ fn committed_slot() -> Arc<Slot> {
 /// One call of the reader: under a loan of `target`, reads fragment
 /// `index` (its word 0 Acquire at the block start, Relaxed inside the
 /// block) and its payload. `None` when the loan is refused.
-fn serve(slot: &Slot, target: LoanTarget, index: usize) -> Option<u64> {
+fn serve(slot: &Slot, target: LoanTarget, index: usize, image: bool) -> Option<u64> {
     let [loan] = &slot.loan;
     match take_loan(loan, &slot.revoked, &slot.descriptor, target).unwrap() {
         LoanOutcome::Granted => {}
         LoanOutcome::Retry | LoanOutcome::Overrun | LoanOutcome::Revoked => return None,
     }
-    let raw = if index == 0 {
-        observe_block(&slot.word0[0])
+    // An image fragment is its own publication: Acquire on each.
+    let raw = if index == 0 || image {
+        observe_block(&slot.word0[index])
     } else {
         load_interior(&slot.word0[1])
     };
@@ -161,7 +169,7 @@ fn serve(slot: &Slot, target: LoanTarget, index: usize) -> Option<u64> {
 
 /// The driver reclaims term A, cleans the slot and reuses it for term C
 /// (count 2), which it writes and publishes, unless a loan quarantines it.
-fn reuse(slot: &Slot) {
+fn reuse(slot: &Slot, image: bool) {
     let active = descriptor(0, SlotState::Active);
     let reclaiming = begin_reclaim(&slot.descriptor, active).unwrap();
     if loan_held(&slot.loan, SlotIndex::try_new(0).unwrap(), reclaiming).unwrap() {
@@ -176,25 +184,34 @@ fn reuse(slot: &Slot) {
     let ready = descriptor(2, SlotState::Ready);
     publish(&slot.descriptor, ready);
     activate(&slot.descriptor, ready).unwrap();
-    slot.payload[0].write(C[0]);
-    slot.payload[1].write(C[1]);
-    store_interior(&slot.word0[1], last());
-    publish_block(&slot.word0[0], first());
+    if image {
+        // The receive owner publishes each fragment as it arrives.
+        slot.payload[0].write(C[0]);
+        publish_block(&slot.word0[0], first());
+        slot.payload[1].write(C[1]);
+        publish_block(&slot.word0[1], last());
+    } else {
+        slot.payload[0].write(C[0]);
+        slot.payload[1].write(C[1]);
+        store_interior(&slot.word0[1], last());
+        publish_block(&slot.word0[0], first());
+    }
 }
 
-fn splice_model(slot_alone: bool) {
+fn splice_model(slot_alone: bool, image: bool) {
     loom::model(move || {
         let slot = committed_slot();
         let driver = {
             let slot = Arc::clone(&slot);
-            thread::spawn(move || reuse(&slot))
+            thread::spawn(move || reuse(&slot, image))
         };
-        if let Some(head) = serve(&slot, target(0), 0) {
+        // Each call takes and releases its own loan.
+        if let Some(head) = serve(&slot, target(0), 0, image) {
             // Paused between the calls; the second targets the assembly's
             // term, or, in the control, whatever term the slot holds.
-            let tail = serve(&slot, target(0), 1).or_else(|| {
+            let tail = serve(&slot, target(0), 1, image).or_else(|| {
                 if slot_alone {
-                    serve(&slot, target(2), 1)
+                    serve(&slot, target(2), 1, image)
                 } else {
                     None
                 }
@@ -210,13 +227,28 @@ fn splice_model(slot_alone: bool) {
 
 #[test]
 fn a_resumed_assembly_never_mixes_two_terms() {
-    splice_model(false);
+    splice_model(false, false);
 }
 
 #[test]
-#[should_panic]
+fn a_resumed_image_assembly_never_mixes_two_terms() {
+    splice_model(false, true);
+}
+
+/// Loom's first failing schedule reads the reused term's payload while the
+/// driver writes it: a race reported before the splice assertion.
+#[test]
+#[should_panic(expected = "Concurrent read and write accesses")]
 fn control_a_loan_on_the_slot_alone_splices_terms() {
-    splice_model(true);
+    splice_model(true, false);
+}
+
+/// In an image every fragment has its own Acquire, so the reused term's
+/// bytes are ordered: the control completes a message of two terms.
+#[test]
+#[should_panic(expected = "spliced message")]
+fn control_an_image_loan_on_the_slot_alone_splices_terms() {
+    splice_model(true, true);
 }
 
 fn floor_model(check_floor: bool) {
@@ -232,7 +264,7 @@ fn floor_model(check_floor: bool) {
         };
         let start = 0u64;
         let mut delivered = false;
-        if serve(&slot, target(0), 0).is_some() {
+        if serve(&slot, target(0), 0, false).is_some() {
             while slot.published.load(Ordering::Acquire) == 0 {
                 thread::yield_now();
             }
