@@ -38,7 +38,8 @@
 //! ```text
 //! karyos-bench analyze --out <dir>
 //! karyos-bench alloc --out <dir>      (the alloc-count build only)
-//! karyos-bench build-info             (prints `build timing` or `build alloc-count`)
+//! karyos-bench build-info             (prints `build timing` or `build alloc-count`,
+//!                                       with `+synthetic` in a synthetic build)
 //! ```
 //!
 //! decides every point of a `measure` directory and writes `report.md`
@@ -173,6 +174,8 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
     };
     let mut dir = None;
     let mut plan_only = false;
+    // The last --plan wins.
+    let mut synthetic = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} needs a value"));
@@ -183,9 +186,9 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
         match arg.as_str() {
             "--out" => dir = Some(PathBuf::from(value()?)),
             "--plan" => match value()?.as_str() {
-                "primary" => {}
+                "primary" => synthetic = false,
                 // The B3e check: report-only, in a synthetic build.
-                "synthetic" => options = options.with_synthetic_check(),
+                "synthetic" => synthetic = true,
                 set => return Err(format!("unknown plan {set}: primary or synthetic")),
             },
             "--plan-only" => plan_only = true,
@@ -208,6 +211,9 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
             }
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if synthetic {
+        options = options.with_synthetic_check();
     }
     if karyos_bench::wire::process::faults_requested() {
         return Err(format!(

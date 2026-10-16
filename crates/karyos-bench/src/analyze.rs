@@ -337,7 +337,21 @@ impl Analysis {
     pub fn decision_grade(&self) -> bool {
         self.grade == Grade::Decision && self.blockers.is_empty()
     }
+
+    /// Whether a synthetic build measured: every result is then
+    /// report-only, whatever the environment.
+    #[must_use]
+    pub fn synthetic_build(&self) -> bool {
+        self.build.ends_with("+synthetic")
+    }
 }
+
+/// The blocker of the synthetic test profile, for a synthetic build and
+/// for a synthetic configuration (§5.2, ACS 15453).
+const SYNTHETIC_BLOCKER: &str = "Synthetic is a test profile, never a candidate (§5.2)";
+
+/// The tag of every verdict a synthetic build prints.
+const SYNTHETIC_TAG: &str = "report only (synthetic build); ";
 
 fn parse_rule(text: &str) -> Result<MtuRule, BenchError> {
     match text {
@@ -563,14 +577,12 @@ pub fn analyze_with(out: &Path, interval_on_e4: bool) -> Result<Analysis, BenchE
     let mut blockers: Vec<String> = Vec::new();
     if build.ends_with("+synthetic") {
         blockers.push(format!(
-            "a {build} build: every run is report-only, its trusted runs included (§5.2, ACS 15453)"
+            "{SYNTHETIC_BLOCKER}: a {build} build, whose every run is report-only, its trusted runs included (ACS 15453)"
         ));
     }
     for configuration in &options.configurations {
         if crate::wire::profile::is_synthetic(configuration) {
-            blockers.push(format!(
-                "{configuration} is the synthetic test profile, never a candidate (§5.2)"
-            ));
+            blockers.push(format!("{SYNTHETIC_BLOCKER}: {configuration}"));
         }
     }
     // The record's preflight fields, which every run must match (4.2
@@ -928,7 +940,7 @@ pub fn report(analysis: &Analysis) -> String {
     );
     let _ = writeln!(
         out,
-        "- Host `{}`, commit `{}`, build `{}`, environment {} ({}).",
+        "- Host `{}`, commit `{}`, cargo profile `{}`, environment {} ({}).",
         analysis.host,
         analysis.commit,
         analysis.profile,
@@ -994,8 +1006,13 @@ pub fn report(analysis: &Analysis) -> String {
     for point in &analysis.points {
         let _ = writeln!(
             out,
-            "### {}: {}{}\n",
+            "### {}: {}{}{}\n",
             point.point,
+            if analysis.synthetic_build() {
+                SYNTHETIC_TAG
+            } else {
+                ""
+            },
             if matches!(point.point.fanout, Fanout::F2 { .. }) {
                 "reported only (M-6); "
             } else {
@@ -1130,7 +1147,12 @@ pub fn report(analysis: &Analysis) -> String {
     let _ = writeln!(out, "\n## Overall (8.6)\n");
     let _ = writeln!(
         out,
-        "{verdict}, {}: {} won by a, {} by b, {} ties.",
+        "{}{verdict}, {}: {} won by a, {} by b, {} ties.",
+        if analysis.synthetic_build() {
+            SYNTHETIC_TAG
+        } else {
+            ""
+        },
         overall.label(),
         overall.wins_a.len(),
         overall.wins_b.len(),
@@ -1935,20 +1957,37 @@ mod tests {
         // point, and the synthetic build and profile block a decision.
         assert!(analysis.overall.wins_a.is_empty() && analysis.overall.wins_b.is_empty());
         assert!(!analysis.decision_grade());
+        // The E4 interval leaves the grade as it is: E4 still does not
+        // decide (M3).
+        let Grade::NotDecisionGrade(reasons) = &analysis.grade else {
+            panic!("graded {:?}", analysis.grade);
+        };
+        assert!(reasons.contains(&decision::GradeReason::Environment(Environment::E4)));
         assert!(
             analysis
                 .blockers
                 .iter()
-                .any(|b| b.contains("timing+synthetic build"))
+                .any(|b| b.starts_with(SYNTHETIC_BLOCKER) && b.contains("timing+synthetic build"))
         );
         assert!(
             analysis
                 .blockers
                 .iter()
-                .any(|b| b.contains("synthetic-500 is the synthetic test profile"))
+                .any(|b| *b == format!("{SYNTHETIC_BLOCKER}: synthetic-500"))
         );
         let report = read(&out.join("report.md")).unwrap();
         assert!(report.contains("**report only, E4**"));
+        // Every verdict a synthetic build prints says so, on any
+        // environment.
+        for line in report.lines().filter(|line| line.starts_with("### ")) {
+            assert!(line.contains(SYNTHETIC_TAG), "{line}");
+        }
+        let overall = report
+            .lines()
+            .skip_while(|line| !line.starts_with("## Overall"))
+            .nth(2)
+            .unwrap();
+        assert!(overall.starts_with(SYNTHETIC_TAG), "{overall}");
         // The p50 sanity check sees the 1000 ns too: a's p50 is 1000 above.
         assert!(
             report.contains(

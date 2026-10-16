@@ -552,77 +552,44 @@ fn an_already_joined_group_is_refused() {
 }
 
 /// A synthetic configuration runs its profile in both child processes
-/// (B3e): the send stage carries the 500 ns spin of `seal`.
+/// (B3e): against a trusted run, the send stage carries the spin of
+/// `seal` and the receive stage the spin of `open`. The spin is far above
+/// the trusted stages, so neither a zero spin nor a child that ignores
+/// its profile passes.
 #[test]
 fn a_synthetic_configuration_runs_in_its_processes() {
     use karyos_bench::manifest::Shape;
     use karyos_bench::wire::process::{ProcessOptions, run_processes};
     use karyos_bench::wire::stage::StageLoad;
-    let dir = TempDir::new("wire-synthetic");
-    let samples = run_processes(
-        &wire_run(Shape::W1, StageLoad::Closed, 200),
-        &dir.0,
-        &ProcessOptions {
-            profile: "synthetic-500".to_string(),
-            ..ProcessOptions::default()
-        },
-    )
-    .unwrap_or_else(|cause| panic!("{cause}"));
-    let mut send = samples.send.clone();
-    send.sort_unstable();
-    assert!(send[100] >= 500, "median send stage {} ns", send[100]);
-}
-
-/// The B3e evidence: the synthetic check plan measured and analyzed with
-/// `--interval-on-e4`, printed for the PR. Ignored by default; run with
-/// `scripts/linux-test.sh -p karyos-bench --test smoke synthetic_evidence
-/// -- --ignored --nocapture`.
-#[test]
-#[ignore = "evidence run, minutes"]
-fn synthetic_evidence() {
-    use karyos_bench::manifest::{ILLUSTRATIVE_E_MAX, MtuRule, primary};
-    use karyos_bench::plan::{PlanOptions, expand};
-    let dir = TempDir::new("synthetic-evidence");
-    // N = 10^5 after 10^4 (ACS 15467): run in release for the evidence.
-    let mut options =
-        PlanOptions::smoke(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope).with_synthetic_check();
-    options.messages = 100_000;
-    options.warmup = 10_000;
-    let plan = expand(&primary(), &options).unwrap();
-    let mut log = Vec::new();
-    karyos_bench::measure::run_plan(
-        &plan,
-        &dir.0,
-        &karyos_bench::env::Labels::detect(),
-        &Err("evidence run".into()),
-        &karyos_bench::measure::HostFacts::default(),
-        &mut log,
-    )
-    .unwrap();
-    // The test build is an allocation build; the evidence reads as the
-    // synthetic timing build it stands for.
-    for name in ["measure.json", "results.jsonl"] {
-        let text = std::fs::read_to_string(dir.0.join(name)).unwrap();
-        std::fs::write(
-            dir.0.join(name),
-            text.replace(
-                &format!("\"build\":\"{}\"", karyos_bench::wire::stage::BUILD),
-                "\"build\":\"timing+synthetic\"",
-            ),
+    const SPIN_NS: u32 = 20_000;
+    let medians = |profile: &str| {
+        let dir = TempDir::new("wire-synthetic");
+        let samples = run_processes(
+            &wire_run(Shape::W1, StageLoad::Closed, 200),
+            &dir.0,
+            &ProcessOptions {
+                profile: profile.to_string(),
+                ..ProcessOptions::default()
+            },
         )
-        .unwrap();
-    }
-    karyos_bench::analyze::write_with(&dir.0, true).unwrap();
-    let report = std::fs::read_to_string(dir.0.join("report.md")).unwrap();
-    for line in report.lines().filter(|line| {
-        line.starts_with("###")
-            || line.contains("report only")
-            || line.contains("Expected")
-            || line.starts_with("- Build")
-            || line.starts_with("- Host")
-    }) {
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout(), "{line}");
+        .unwrap_or_else(|cause| panic!("{profile}: {cause}"));
+        let median = |values: &[u32]| {
+            let mut values = values.to_vec();
+            values.sort_unstable();
+            values[values.len() / 2]
+        };
+        (median(&samples.send), median(&samples.receivers[0].receive))
+    };
+    let (trusted_send, trusted_receive) = medians("trusted");
+    let (send, receive) = medians(&format!("synthetic-{SPIN_NS}"));
+    for (stage, trusted, synthetic) in [
+        ("send", trusted_send, send),
+        ("receive", trusted_receive, receive),
+    ] {
+        assert!(
+            synthetic.saturating_sub(trusted) >= SPIN_NS / 2,
+            "{stage}: median {synthetic} ns against trusted {trusted} ns"
+        );
     }
 }
 

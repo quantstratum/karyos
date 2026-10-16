@@ -61,6 +61,8 @@ measure:
 timing-build-check:
 	$(CARGO) build -p karyos-bench --release --locked
 	test "$$($${CARGO_TARGET_DIR:-target}/release/karyos-bench build-info)" = "build timing"
+	! $${CARGO_TARGET_DIR:-target}/release/karyos-bench measure --plan synthetic --plan-only >/dev/null 2>&1
+	$${CARGO_TARGET_DIR:-target}/release/karyos-bench measure --plan synthetic --plan-only 2>&1 | grep -q "needs the synthetic build"
 
 miri:
 	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-sys --lib --locked

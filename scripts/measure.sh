@@ -16,6 +16,12 @@
 # 5. runs `karyos-bench analyze`, which writes report.md and
 #    analysis.json, even when runs failed: a failed run is a result.
 #
+# With `--plan synthetic` (the last --plan wins) it runs the synthetic
+# check instead (§5.2): step 1 builds the synthetic build (feature
+# synthetic) into its own target directory, step 4 is skipped (the
+# allocation step counts the primary plan), and step 5 adds
+# `--interval-on-e4`. Every result of that build is report-only.
+#
 # Usage: scripts/measure.sh [measure arguments...], for example
 # --plan-only. Environment:
 #   KARYOS_ENVIRONMENTS   the filed host records (quantstratum-docs:
@@ -40,14 +46,38 @@ for arg in "$@"; do
     fi
 done
 
-cargo build -p karyos-bench --release --locked
+plan=primary
+previous=
+for arg in "$@"; do
+    if [ "$previous" = "--plan" ]; then
+        plan=$arg
+    fi
+    previous=$arg
+done
+case $plan in
+    primary)
+        target_dir=${CARGO_TARGET_DIR:-$root/target}
+        features=()
+        build="build timing"
+        ;;
+    synthetic)
+        target_dir=${CARGO_TARGET_DIR:-$root/target}/synthetic
+        features=(--features synthetic)
+        build="build timing+synthetic"
+        ;;
+    *)
+        echo "measure.sh: unknown plan $plan: primary or synthetic" >&2
+        exit 2
+        ;;
+esac
+cargo build -p karyos-bench --release --locked ${features[@]+"${features[@]}"} --target-dir "$target_dir"
 # The binary this build made, wherever cargo puts its target directory:
 # a stale one elsewhere must never run under the current commit.
-bin=${CARGO_TARGET_DIR:-$root/target}/release/karyos-bench
+bin=$target_dir/release/karyos-bench
 # Only a timing build is timed: a build with alloc-count (an
 # --all-features build included) counts allocations instead (M-9).
-if [ "$("$bin" build-info)" != "build timing" ]; then
-    echo "measure.sh: $bin is not a timing build: $("$bin" build-info)" >&2
+if [ "$("$bin" build-info)" != "$build" ]; then
+    echo "measure.sh: $bin is not the $plan plan's build ($build): $("$bin" build-info)" >&2
     exit 2
 fi
 export KARYOS_COMMIT=$commit
@@ -65,6 +95,11 @@ fi
 "$bin" inventory --out "$out" "${records[@]+"${records[@]}"}"
 status=0
 "$bin" measure --plan primary --out "$out" "$@" || status=$?
+if [ "$plan" = synthetic ]; then
+    "$bin" analyze --out "$out" --interval-on-e4
+    echo "measure: wrote $out"
+    exit "$status"
+fi
 # Step 4 may fail without stopping step 5: a failed step is a result too.
 alloc_target=${CARGO_TARGET_DIR:-$root/target}/alloc-count
 alloc_bin=$alloc_target/release/karyos-bench
