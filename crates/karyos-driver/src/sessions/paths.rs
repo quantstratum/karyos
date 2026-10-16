@@ -48,9 +48,8 @@ use super::receive::{BindingKey, SlotRef};
 /// endpoint may carry several publications).
 pub type PathKey = BindingKey;
 
-/// The largest `max_paths` (provisional; the owner-side components of
-/// `crate::paths` bound it alike).
-pub const MAX_PATHS: u8 = 16;
+/// The largest `max_paths`, as the owner-side components bound it.
+pub use crate::paths::MAX_PATHS;
 
 /// The table's limits (redundant-paths.md section 5; provisional).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
