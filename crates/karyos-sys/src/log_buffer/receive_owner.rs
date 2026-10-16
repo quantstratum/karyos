@@ -1103,36 +1103,55 @@ fn words_of(start: usize, len: usize, mut each: impl FnMut(usize, u64) -> bool) 
     false
 }
 
-/// Whether any bit of `[start, start + len)` is set.
 /// Whether `[unit, unit + units)` meets a committed real frame of `set`. A
 /// covered unit belongs to the record that starts at the nearest start bit
 /// at or below it, a real frame (`starts`) or a local gap (`gap_starts`):
 /// the range meets a real frame if the record covering its first unit is
-/// one, or if a real frame starts inside it.
+/// one, or if a real frame starts inside it. Both searches are word-wise.
 fn overlaps_real(set: &Set, unit: usize, units: usize) -> bool {
     if bit(&set.covered, unit) {
-        // The record covering `unit`: scan down to its start, within the
-        // covered run.
-        let mut at = unit;
-        loop {
-            if bit(&set.starts, at) {
-                return true;
+        // The record covering `unit`: the highest start at or below it,
+        // inside the covered run (above its highest uncovered unit).
+        let start = last_one(unit, |word| {
+            word_at(&set.starts, word) | word_at(&set.gap_starts, word)
+        });
+        let uncovered = last_one(unit, |word| !word_at(&set.covered, word));
+        match start {
+            Some(start) if uncovered.is_none_or(|below| below < start) => {
+                if bit(&set.starts, start) {
+                    return true;
+                }
             }
-            if bit(&set.gap_starts, at) {
-                break;
-            }
-            match at.checked_sub(1) {
-                Some(below) if bit(&set.covered, below) => at = below,
-                // A covered unit with no start below it in its run: a broken
-                // map; treat it as real, the conservative answer.
-                _ => return true,
-            }
+            // A covered unit with no start below it in its run: a broken
+            // map; treat it as real, the conservative answer.
+            _ => return true,
         }
     }
-    let end = unit.saturating_add(units);
-    (unit..end).any(|at| bit(&set.starts, at))
+    // No start lies past the map: stop the search at its end.
+    let end = unit.saturating_add(units).min(set.starts.len() * WORD_BITS);
+    any_set(&set.starts, unit, end.saturating_sub(unit))
 }
 
+/// Word `index` of `bits`; zero past its end.
+fn word_at(bits: &[u64], index: usize) -> u64 {
+    bits.get(index).copied().unwrap_or(0)
+}
+
+/// The highest set bit at or below `at` of the bitmap whose words
+/// `word(index)` gives, scanning down whole words.
+fn last_one(at: usize, word: impl Fn(usize) -> u64) -> Option<usize> {
+    let mut index = at / WORD_BITS;
+    let mut value = word(index) & mask(0, at % WORD_BITS + 1);
+    loop {
+        if value != 0 {
+            return Some(index * WORD_BITS + (WORD_BITS - 1 - value.leading_zeros() as usize));
+        }
+        index = index.checked_sub(1)?;
+        value = word(index);
+    }
+}
+
+/// Whether any bit of `[start, start + len)` is set.
 fn any_set(bits: &[u64], start: usize, len: usize) -> bool {
     words_of(start, len, |word, mask| {
         bits.get(word).is_some_and(|value| value & mask != 0)
@@ -1148,8 +1167,6 @@ fn set_range(bits: &mut [u64], start: usize, len: usize) {
     });
 }
 
-/// The first clear bit at or after `start` and below `limit`, or `limit`:
-/// a scan of whole words.
 /// The first set bit at or after `start`, or `limit`.
 fn first_one(bits: &[u64], start: usize, limit: usize) -> usize {
     let mut at = start;
@@ -1164,6 +1181,8 @@ fn first_one(bits: &[u64], start: usize, limit: usize) -> usize {
     limit
 }
 
+/// The first clear bit at or after `start` and below `limit`, or `limit`:
+/// a scan of whole words.
 fn first_zero(bits: &[u64], start: usize, limit: usize) -> usize {
     let mut at = start;
     while at < limit {
