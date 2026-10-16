@@ -484,3 +484,71 @@ fn test_conflation_view_survives_cutover_with_a_slow_feeder_and_a_paused_driver(
         );
     }
 }
+
+/// observability-and-tools.md, Client counters: a conflated view feeds its
+/// reader-side counts into two client counter cells its client allocated;
+/// tools read them in the client counters region.
+#[test]
+fn a_conflated_view_feeds_its_reader_counts_into_client_counters() {
+    use karyos_client::{
+        CONFLATION_BUDGETS_EXHAUSTED, CONFLATION_SKIPS, ClientCounterHandle, Outcome,
+    };
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let stream = driver
+        .add_stream(config(Some(conflation_config())))
+        .unwrap();
+    let mut client = driver.connect().unwrap();
+    let mut allocate = |label: &str| -> ClientCounterHandle {
+        let _ = client
+            .allocate_counter(karyos_driver::counters::TYPE_EVENTS, label, 0, 0)
+            .unwrap();
+        let _ = driver.do_work().unwrap();
+        let mut handle = None;
+        let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+            Outcome::Counter(counter) => handle = Some(counter),
+            other => panic!("unexpected {other:?}"),
+        });
+        handle.unwrap()
+    };
+    let skips = allocate(CONFLATION_SKIPS);
+    let exhausted = allocate(CONFLATION_BUDGETS_EXHAUSTED);
+    let cells = (skips.cell(), exhausted.cell());
+    let mut conflated = driver
+        .subscribe_conflated(stream)
+        .unwrap()
+        .with_counters(skips, exhausted);
+    let mut publication = driver.publication(stream).unwrap();
+    for key in 0..4 {
+        offer_keyed(&mut driver, &mut publication, key, b"v");
+    }
+    let _ = driver.do_work().unwrap();
+    // One key per poll: the budget runs out until the view caught up.
+    for _ in 0..8 {
+        let _ = conflated.poll_changed_with(
+            Budget {
+                keys: 1,
+                retries: 1,
+            },
+            |_, _, _| {},
+        );
+    }
+    let counts = conflated.counts();
+    assert!(counts.budgets_exhausted >= 3, "{counts:?}");
+    let read = |cell: usize| match driver.client_counters().read(cell) {
+        CellRead::Allocated {
+            metadata, value, ..
+        } => (
+            String::from_utf8_lossy(metadata.label()).into_owned(),
+            value,
+        ),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(read(cells.0), (CONFLATION_SKIPS.to_owned(), counts.skips));
+    assert_eq!(
+        read(cells.1),
+        (
+            CONFLATION_BUDGETS_EXHAUSTED.to_owned(),
+            counts.budgets_exhausted
+        )
+    );
+}
