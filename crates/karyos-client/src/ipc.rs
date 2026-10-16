@@ -669,8 +669,9 @@ impl RemoteClient {
             .allocate_counter(type_id, label, stream, participant)
     }
 
-    /// Requests a trace journal of `layout` observing `subscription`, as
-    /// [`ClientConductor::trace_journal`]; it completes as
+    /// Requests a trace journal of `layout` observing `registration` with
+    /// the clock `provenance` word, as [`ClientConductor::trace_journal`];
+    /// it completes as
     /// [`Outcome::FetchableJournal`](crate::Outcome::FetchableJournal).
     ///
     /// # Errors
@@ -679,9 +680,11 @@ impl RemoteClient {
     pub fn trace_journal(
         &mut self,
         layout: karyos_sys::record_journal::JournalLayout,
-        subscription: Option<u64>,
+        registration: u64,
+        provenance: u64,
     ) -> Result<u64, ConductorError> {
-        self.conductor_mut()?.trace_journal(layout, subscription)
+        self.conductor_mut()?
+            .trace_journal(layout, registration, provenance)
     }
 
     /// Gives the final delivery boundary of `journal`, as

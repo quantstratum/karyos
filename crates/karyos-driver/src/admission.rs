@@ -298,6 +298,20 @@ impl<T: StreamTerms> Admission<T> {
         self.instance
     }
 
+    /// The time namespace of admitted client `client` against the
+    /// driver's, through the process its pidfd proves
+    /// (`quantstratum-docs: karyos/design/trace-tool.md`, T2); `None` for
+    /// a client that is not admitted with an open socket.
+    pub(crate) fn time_namespace(
+        &self,
+        client: u64,
+    ) -> Option<karyos_sys::trace_mirror::TimeNamespace> {
+        self.remotes
+            .iter()
+            .find(|remote| remote.client == client)
+            .map(|remote| crate::trace_journals::time_namespace_of(&remote.pidfd))
+    }
+
     /// Takes `count` consecutive ids from a checked counter.
     /// The driver instance and a fresh region id for a stream's log buffer
     /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Terms in the

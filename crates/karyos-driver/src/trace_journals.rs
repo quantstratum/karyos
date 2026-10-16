@@ -22,11 +22,34 @@
 //!   a `client protocol violation` error keyed by the client and the
 //!   journal, stops draining it and marks its entry writer lost. Nothing
 //!   panics.
-//! - **Facts (J3).** The table entry carries the journal's client, state,
-//!   final boundary (`CloseJournal`), last mirrored ring record and loss
-//!   accounting. An entry becomes closed once its writer closed it and the
-//!   driver drained it to its end. An ended entry is reused only once the
-//!   ring retains no record of its journal.
+//! - **Facts (J3, T2, T4).** The table entry carries the journal's client,
+//!   state, kind and observed registration with its stream and
+//!   incarnation (from the driver's own record of the registration, so the
+//!   entry alone names the publication), the subscription's join position
+//!   for a subscriber journal, the time namespace word and the clock
+//!   provenance word, the final boundary (`CloseJournal`), the last
+//!   mirrored ring record and the loss accounting. An entry becomes closed
+//!   once its writer closed it and the driver drained it to its end.
+//! - **Recycling (T5).** An ended entry is reused only once the ring
+//!   retains no record of its journal. When a subscriber journal `S` ends,
+//!   the driver notes every publisher journal `j` of `S`'s publication
+//!   still in the table with its attempted count `A_j` and its stored count
+//!   at that moment, read together with `losses` (for a journal already
+//!   ended, its final counts). `S` is **covered** once, for every noted
+//!   `j`, the drain released every record `j` had stored at that moment
+//!   (so every record below `A_j` was consumed) or `j` ended (drained to its
+//!   end), and the ring's oldest retained sequence is above the ring
+//!   sequence of `j`'s last mirrored record when that drain condition was
+//!   first seen. Reusing the entry of an `S` that is not covered first
+//!   writes a recycle log entry (its publication, final state and
+//!   boundary, and the noted `(j, A_j)` pairs), which is dropped once `S`
+//!   is covered. An `S` with more noted journals than
+//!   [`MAX_RECYCLE_PAIRS`] cannot be logged, and with the log full none
+//!   can: such an entry is reused only once covered, and a `TraceJournal`
+//!   that finds no other free entry is refused with
+//!   `TraceJournalsExhausted`. Free entries are preferred, then ended
+//!   entries that need no log entry. Coverage advances once per duty
+//!   cycle, after the drain.
 //! - **A writer that is gone (J4).** When a remote client's journal grant
 //!   ends (its `Detach`, its exit proof, or a grant never sent), the driver
 //!   drains what is committed and marks the entry closed if the writer had
@@ -35,7 +58,8 @@
 
 use karyos_sys::record_journal::{Drained, JournalDrain, JournalLayout};
 use karyos_sys::trace_mirror::{
-    JournalEntry, JournalState, MAX_MIRROR_PAYLOAD, MIRROR_RANGES, TraceMirror, TraceMirrorReader,
+    JournalEntry, JournalKind, JournalState, MAX_MIRROR_PAYLOAD, MAX_RECYCLE_PAIRS, MIRROR_RANGES,
+    NotedPublisher, RecycledJournal, TimeNamespace, TraceMirror, TraceMirrorReader,
 };
 
 use crate::counters::{DriverCounters, Event};
@@ -51,6 +75,54 @@ pub(crate) enum Refusal {
     Exhausted,
 }
 
+/// What a journal observes, from the driver's own record of the
+/// registration the `TraceJournal` named (T4), and the facts the driver
+/// recorded when it created the journal (T2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Observed {
+    /// Subscriber or publisher journal.
+    pub(crate) kind: JournalKind,
+    /// The observed subscription or publication.
+    pub(crate) registration: u64,
+    /// Its stream's registration.
+    pub(crate) stream: u64,
+    /// The publication's incarnation.
+    pub(crate) incarnation: u64,
+    /// A subscription's join position; `None` for a publisher journal.
+    pub(crate) join: Option<u64>,
+    /// The client's time namespace against the driver's.
+    pub(crate) time_namespace: TimeNamespace,
+    /// The client's clock provenance word.
+    pub(crate) provenance: u64,
+}
+
+/// A publisher journal noted when a subscriber journal ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Note {
+    journal: u64,
+    /// Its attempted count at that moment.
+    attempted: u64,
+    /// Its stored count read after that attempted count (`losses` reads
+    /// the attempted count, then the head, both Acquire): once the drain
+    /// has released this many records, every record below `attempted` was
+    /// consumed. `u64::MAX` when its accounting could not be read (the
+    /// journal then faults and the drain condition waits for its end).
+    stored: u64,
+    /// `Some` once the drain condition was first seen, with the ring
+    /// sequence of the journal's last mirrored record at that point.
+    drained: Option<Option<u64>>,
+}
+
+/// Whether every note's drain condition was seen and the ring no longer
+/// retains a record at or below its mark: no `Publish` that could need the
+/// subscriber journal is pending or retained.
+fn covered(notes: &[Note], oldest: u64) -> bool {
+    notes.iter().all(|note| {
+        note.drained
+            .is_some_and(|last| last.is_none_or(|last| last < oldest))
+    })
+}
+
 /// A journal in the table.
 #[derive(Debug)]
 struct Held {
@@ -60,6 +132,37 @@ struct Held {
     drain: Option<JournalDrain>,
     /// Bytes charged to `max_trace_journal_bytes` while `drain` lives.
     bytes: u64,
+    /// For a subscriber journal that ended: the publisher journals noted at
+    /// its end.
+    notes: Option<Vec<Note>>,
+}
+
+impl Held {
+    /// Whether reusing this ended entry needs a recycle log entry: a
+    /// subscriber journal not yet covered.
+    fn needs_log(&self, oldest: u64) -> bool {
+        self.notes
+            .as_deref()
+            .is_some_and(|notes| !covered(notes, oldest))
+    }
+}
+
+/// A table entry [`TraceJournals::preflight`] found for a new journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reserved {
+    /// The table entry.
+    index: usize,
+    /// The bytes the journal charges.
+    bytes: u64,
+    /// The recycle log entry that reusing the table entry fills, if any.
+    log: Option<usize>,
+}
+
+impl Reserved {
+    /// The bytes the journal charges.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 /// The journal table, the trace mirror and the drain cursor.
@@ -67,6 +170,9 @@ struct Held {
 pub(crate) struct TraceJournals {
     mirror: TraceMirror,
     slots: Vec<Option<Held>>,
+    /// The notes of each recycle log entry the mirror shows, which decide
+    /// when it is dropped.
+    log: Vec<Option<Vec<Note>>>,
     cursor: usize,
     bytes: u64,
     max_bytes: u64,
@@ -90,9 +196,12 @@ impl TraceJournals {
     pub(crate) fn new(mirror: TraceMirror, max_bytes: u64, budget: usize) -> Self {
         let mut slots = Vec::with_capacity(mirror.entries());
         slots.resize_with(mirror.entries(), || None);
+        let mut log = Vec::with_capacity(mirror.log_entries());
+        log.resize_with(mirror.log_entries(), || None);
         Self {
             mirror,
             slots,
+            log,
             cursor: 0,
             bytes: 0,
             max_bytes,
@@ -132,9 +241,10 @@ impl TraceJournals {
     }
 
     /// Checks a request for a journal of `layout` without changing
-    /// anything: its sizes, the bytes budget and a free table entry.
-    /// Returns the entry and the bytes it would charge.
-    pub(crate) fn preflight(&self, layout: &JournalLayout) -> Result<(usize, u64), Refusal> {
+    /// anything: its sizes, the bytes budget and a free table entry (see
+    /// the module documentation, "Recycling"). Returns the entry, the
+    /// bytes it would charge and the recycle log entry its reuse fills.
+    pub(crate) fn preflight(&self, layout: &JournalLayout) -> Result<Reserved, Refusal> {
         let bytes = journal_bytes(layout).ok_or(Refusal::Resources)?;
         let sizes = layout.validate().is_ok()
             && layout.payload_words <= MAX_MIRROR_PAYLOAD
@@ -147,51 +257,206 @@ impl TraceJournals {
             return Err(Refusal::Resources);
         }
         let oldest = self.mirror.bounds().first;
-        let free = self.slots.iter().position(|slot| match slot {
-            None => true,
-            // Reused only once the ring retains no record of the journal.
-            Some(held) => {
-                held.drain.is_none()
-                    && held.entry.state != JournalState::Open
-                    && held.entry.last_record.is_none_or(|last| last < oldest)
+        let free_log = self.log.iter().position(Option::is_none);
+        // The best entry: a free one, then an ended one that needs no log
+        // entry, then one that a free log entry can describe.
+        let mut found: Option<(u8, Reserved)> = None;
+        for (index, slot) in self.slots.iter().enumerate() {
+            let candidate = match slot {
+                None => Some((0, None)),
+                // Reused only once the ring retains no record of the
+                // journal.
+                Some(held)
+                    if held.drain.is_none()
+                        && held.entry.state != JournalState::Open
+                        && held.entry.last_record.is_none_or(|last| last < oldest) =>
+                {
+                    match &held.notes {
+                        Some(notes) if !covered(notes, oldest) => free_log
+                            .filter(|_| notes.len() <= MAX_RECYCLE_PAIRS)
+                            .map(|log| (2, Some(log))),
+                        _ => Some((1, None)),
+                    }
+                }
+                Some(_) => None,
+            };
+            if let Some((rank, log)) = candidate
+                && found.is_none_or(|(best, _)| rank < best)
+            {
+                found = Some((rank, Reserved { index, bytes, log }));
             }
-        });
-        free.map(|index| (index, bytes)).ok_or(Refusal::Exhausted)
+        }
+        found
+            .map(|(_, reserved)| reserved)
+            .ok_or(Refusal::Exhausted)
     }
 
-    /// Opens `journal` of `client` in entry `index` (from
-    /// [`TraceJournals::preflight`]) with its drain.
-    /// `observed` is the subscription the journal observes, with its
-    /// stream and join position, or `None` for a publisher-side journal.
+    /// Opens `journal` of `client` in the entry `reserved` names (from
+    /// [`TraceJournals::preflight`]) with its drain, observing `observed`.
+    /// Reusing the entry of a subscriber journal that is not covered first
+    /// writes its recycle log entry.
     pub(crate) fn insert(
         &mut self,
-        index: usize,
+        reserved: Reserved,
         journal: u64,
         client: u64,
-        observed: Option<(u64, u64, Option<u64>)>,
+        observed: Observed,
         drain: JournalDrain,
-        bytes: u64,
     ) {
+        let Reserved { index, bytes, log } = reserved;
         let layout = drain.layout();
         let mut entry = JournalEntry::open(
             journal,
             client,
+            observed.kind,
             layout.payload_words as u64,
             layout.capacity as u64,
         );
-        if let Some((subscription, stream, join)) = observed {
-            entry.subscription = subscription;
-            entry.stream = stream;
-            entry.join = join;
+        entry.registration = observed.registration;
+        entry.stream = observed.stream;
+        entry.incarnation = observed.incarnation;
+        entry.join = observed.join;
+        entry.time_namespace = observed.time_namespace;
+        entry.provenance = observed.provenance;
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        let oldest = self.mirror.bounds().first;
+        // The log entry before the table entry is reused, so a reader of
+        // the table and then the log never misses the recycled journal.
+        if let (Some(old), Some(log)) = (slot.take(), log)
+            && old.needs_log(oldest)
+            && let Some(free) = self.log.get_mut(log)
+        {
+            let notes = old.notes.unwrap_or_default();
+            let mut record = RecycledJournal {
+                journal: old.entry.journal,
+                stream: old.entry.stream,
+                incarnation: old.entry.incarnation,
+                state: old.entry.state,
+                boundary: old.entry.boundary,
+                pairs: [NotedPublisher::default(); MAX_RECYCLE_PAIRS],
+                pair_count: notes.len().min(MAX_RECYCLE_PAIRS),
+            };
+            for (pair, note) in record.pairs.iter_mut().zip(&notes) {
+                *pair = NotedPublisher {
+                    journal: note.journal,
+                    attempted: note.attempted,
+                };
+            }
+            self.mirror.write_log(log, Some(&record));
+            *free = Some(notes);
         }
-        if let Some(slot) = self.slots.get_mut(index) {
-            self.mirror.write_entry(index, Some(&entry));
-            self.bytes = self.bytes.saturating_add(bytes);
-            *slot = Some(Held {
-                entry,
-                drain: Some(drain),
-                bytes,
-            });
+        self.mirror.write_entry(index, Some(&entry));
+        self.bytes = self.bytes.saturating_add(bytes);
+        *slot = Some(Held {
+            entry,
+            drain: Some(drain),
+            bytes,
+            notes: None,
+        });
+    }
+
+    /// Subscriber journal `index` ended: notes every publisher journal of
+    /// its publication still in the table with its attempted and stored
+    /// counts, once. A publisher journal created later cannot hold a
+    /// `Publish` the subscriber journal could be expected for.
+    fn note_end(&mut self, index: usize) {
+        let Some(Some(subscriber)) = self.slots.get(index) else {
+            return;
+        };
+        if subscriber.entry.kind != JournalKind::Subscriber || subscriber.notes.is_some() {
+            return;
+        }
+        let (stream, incarnation) = (subscriber.entry.stream, subscriber.entry.incarnation);
+        let mut notes = Vec::new();
+        for held in self.slots.iter_mut().flatten().filter(|held| {
+            held.entry.kind == JournalKind::Publisher
+                && held.entry.stream == stream
+                && held.entry.incarnation == incarnation
+        }) {
+            let journal = held.entry.journal;
+            let note = match held.drain.as_mut().map(JournalDrain::losses) {
+                // Ended: its final counts; only the ring condition remains.
+                None => Note {
+                    journal,
+                    attempted: held.entry.attempted,
+                    stored: 0,
+                    drained: Some(held.entry.last_record),
+                },
+                Some(Ok(losses)) => Note {
+                    journal,
+                    attempted: losses.attempted,
+                    stored: losses.stored,
+                    drained: None,
+                },
+                // The violation is sticky: the journal ends writer lost at
+                // its next visit, which meets the drain condition.
+                Some(Err(_)) => Note {
+                    journal,
+                    attempted: held.entry.attempted,
+                    stored: u64::MAX,
+                    drained: None,
+                },
+            };
+            notes.push(note);
+        }
+        if let Some(Some(subscriber)) = self.slots.get_mut(index) {
+            subscriber.notes = Some(notes);
+        }
+    }
+
+    /// Advances every pending note's drain condition, then drops the
+    /// recycle log entries whose subscriber journal is covered.
+    fn advance(&mut self) {
+        let pending = |notes: &[Note]| notes.iter().any(|note| note.drained.is_none());
+        let any = self
+            .slots
+            .iter()
+            .flatten()
+            .filter_map(|held| held.notes.as_deref())
+            .chain(self.log.iter().flatten().map(Vec::as_slice))
+            .any(pending);
+        if any {
+            // Each journal still in the table: (number, released records
+            // or `None` once ended, last mirrored ring record).
+            let progress: Vec<(u64, Option<u64>, Option<u64>)> = self
+                .slots
+                .iter()
+                .flatten()
+                .map(|held| {
+                    (
+                        held.entry.journal,
+                        held.drain.as_ref().map(JournalDrain::consumed),
+                        held.entry.last_record,
+                    )
+                })
+                .collect();
+            let notes = self
+                .slots
+                .iter_mut()
+                .flatten()
+                .filter_map(|held| held.notes.as_mut())
+                .chain(self.log.iter_mut().flatten())
+                .flatten()
+                .filter(|note| note.drained.is_none());
+            for note in notes {
+                note.drained = match progress.iter().find(|seen| seen.0 == note.journal) {
+                    // Reused: it ended, drained to its end, and the ring
+                    // retains none of its records.
+                    None => Some(None),
+                    Some(&(_, None, last)) => Some(last),
+                    Some(&(_, Some(consumed), last)) if consumed >= note.stored => Some(last),
+                    Some(_) => None,
+                };
+            }
+        }
+        let oldest = self.mirror.bounds().first;
+        for (index, slot) in self.log.iter_mut().enumerate() {
+            if slot.as_deref().is_some_and(|notes| covered(notes, oldest)) {
+                self.mirror.write_log(index, None);
+                *slot = None;
+            }
         }
     }
 
@@ -249,6 +514,7 @@ impl TraceJournals {
             held.entry.state = JournalState::WriterLost;
             self.bytes = self.bytes.saturating_sub(held.bytes);
             self.mirror.write_entry(index, Some(&held.entry));
+            self.note_end(index);
         }
     }
 
@@ -286,6 +552,7 @@ impl TraceJournals {
             }
         }
         self.cursor = next;
+        self.advance();
         u32::try_from(self.budget - left).unwrap_or(u32::MAX)
     }
 
@@ -364,6 +631,7 @@ impl TraceJournals {
             }
             Some(Err(_)) => ended = Some(JournalState::WriterLost),
         }
+        let ended_now = ended.is_some();
         if let Some(state) = ended {
             if drain.fault().is_some() {
                 counters.add(Event::TraceJournalFaults, 1);
@@ -381,7 +649,34 @@ impl TraceJournals {
         if held.entry != before {
             self.mirror.write_entry(index, Some(&held.entry));
         }
+        if ended_now {
+            self.note_end(index);
+        }
         taken
+    }
+}
+
+/// The time namespace of the process `pidfd` proves against the driver's
+/// (T2): the namespace files of both processes are compared by device and
+/// inode. Unknown when either cannot be read (a kernel without time
+/// namespaces, or a process the driver cannot inspect) or when the process
+/// exited, since its pid may then name another process. Control path
+/// only.
+#[cfg(target_os = "linux")]
+pub(crate) fn time_namespace_of(pidfd: &karyos_sys::ipc::PidFd) -> TimeNamespace {
+    use std::os::unix::fs::MetadataExt;
+    let own = std::fs::metadata("/proc/self/ns/time");
+    let theirs = std::fs::metadata(format!("/proc/{}/ns/time", pidfd.pid()));
+    // Alive after the read: the pid named the proven process throughout.
+    if pidfd.exited().unwrap_or(true) {
+        return TimeNamespace::Unknown;
+    }
+    match (own, theirs) {
+        (Ok(own), Ok(theirs)) if (own.dev(), own.ino()) == (theirs.dev(), theirs.ino()) => {
+            TimeNamespace::Same
+        }
+        (Ok(_), Ok(_)) => TimeNamespace::Different,
+        _ => TimeNamespace::Unknown,
     }
 }
 

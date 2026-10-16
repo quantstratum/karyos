@@ -447,7 +447,7 @@ impl Fake {
             client: karyos_sys::counters::client_counters_in(instance, 3, 4).unwrap(),
             errors: karyos_sys::diag::error_log_in(instance, 4, 8, 1).unwrap(),
             losses: karyos_sys::diag::loss_report_in(instance, 5, 8).unwrap(),
-            mirror: karyos_sys::trace_mirror::trace_mirror_in(instance, 6, 2, 4).unwrap(),
+            mirror: karyos_sys::trace_mirror::trace_mirror_in(instance, 6, 2, 1, 4).unwrap(),
         }
     }
 
