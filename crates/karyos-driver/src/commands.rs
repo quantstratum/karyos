@@ -832,12 +832,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }
                 };
                 // Recorded by the driver, never taken from the client.
-                let join = subscriber.and_then(|(cell, _, _)| {
-                    target
-                        .conductor
-                        .cell_position(cell)
-                        .map(|position| target.base.saturating_add(position))
-                });
+                // Checked (SPEC.md §14): the cutover bound keeps every
+                // position of a mapping below 2^63, so the sum fits; if it
+                // ever did not, the add is refused, and dropping the
+                // subscription detaches its cell.
+                let join = match subscriber
+                    .and_then(|(cell, _, _)| target.conductor.cell_position(cell))
+                {
+                    Some(position) => match target.base.checked_add(position) {
+                        Some(join) => Some(join),
+                        None => return refuse(ErrorCode::ResourcesUnavailable, detail),
+                    },
+                    None => None,
+                };
                 // Effect: everything below cannot fail.
                 let member = match &capability {
                     Capability::Publication { .. } => MemberKind::Exclusive,
@@ -1315,12 +1322,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
         };
-        // Recorded by the driver, never taken from the client.
+        // Recorded by the driver, never taken from the client. Checked
+        // (SPEC.md §14), as for a local subscription: if the sum did not
+        // fit, the add is refused and the cell ended, which the grant never
+        // sent allows.
         let join = match participant {
-            Participant::Subscriber { cell, .. } => target
-                .conductor
-                .cell_position(cell)
-                .map(|position| target.base.saturating_add(position)),
+            Participant::Subscriber { cell, .. } => match target.conductor.cell_position(cell) {
+                Some(position) => match target.base.checked_add(position) {
+                    Some(join) => Some(join),
+                    None => {
+                        target.conductor.end_subscriber(cell, export);
+                        return refuse(ErrorCode::ResourcesUnavailable, detail);
+                    }
+                },
+                None => None,
+            },
             _ => None,
         };
         // Effect: everything below cannot fail.
@@ -2553,6 +2569,64 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// A join position that does not fit (checked, SPEC.md §14) refuses
+    /// the add, local or remote, and leaves no subscriber behind.
+    #[test]
+    fn a_join_position_that_does_not_fit_refuses_the_subscription() {
+        let (mut driver, stream) = driver_with_stream();
+        let _first = driver.subscribe(stream, Role::Required).unwrap();
+        let mut writer = driver.publication(stream).unwrap();
+        let _ = writer.offer(b"moves the head").unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.streams[0].buffer.attached_subscribers(), 1);
+        driver.streams[0].base = u64::MAX;
+        let mut observer = driver.broadcast.receiver();
+        let (local, mut local_producer, link) = raw_client(&mut driver);
+        let (remote, mut remote_producer) = remote_client(&mut driver, 4);
+        let add = |sequence| Command::AddSubscription {
+            sequence,
+            stream: KEY,
+            role: SubscriberRole::Required,
+        };
+        write(&mut local_producer, add(1));
+        write(&mut remote_producer, add(2));
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        for (client, sequence) in [(local, 1), (remote, 2)] {
+            assert!(
+                answers.contains(&Response::Error {
+                    request: RequestId { client, sequence },
+                    code: ErrorCode::ResourcesUnavailable,
+                    detail: 2,
+                }),
+                "{answers:?}"
+            );
+        }
+        assert_eq!(link.held(), 0);
+        assert!(ledger(&driver, remote).is_empty());
+        assert_eq!(driver.streams[0].buffer.attached_subscribers(), 1);
+        // Control: with the base back, the same adds succeed.
+        driver.streams[0].base = 0;
+        write(&mut local_producer, add(3));
+        write(&mut remote_producer, add(4));
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        assert!(
+            !answers
+                .iter()
+                .any(|answer| matches!(answer, Response::Error { .. })),
+            "{answers:?}"
+        );
+        assert_eq!(link.held(), 1);
+        assert_eq!(ledger(&driver, remote).len(), 1);
     }
 
     fn allocate(sequence: u64, label: &str, stream: u64, participant: u64) -> Command {
