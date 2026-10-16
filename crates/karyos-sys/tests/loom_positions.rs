@@ -18,19 +18,15 @@
 //! a reader scans. A reader that accepts a pass never sees a new cell with
 //! its allocation value of zero, a removed cell still allocated, or a reused
 //! cell under its previous key. Negative control: the same changes without
-//! the odd epoch are accepted mixed. The membership models explore the
-//! counter cells' own seqlocks too, so they are slow and run under `make
-//! loom-full`.
+//! the odd epoch are accepted mixed. The cells' own seqlocks are modelled
+//! in `loom_counters`; here a member cell is its key and value words.
 //!
 //! Run with `make loom`.
 
 #![cfg(loom)]
 
-use karyos_sys::counters::{
-    CellRead, CellWords, CounterKeys, CounterMetadata, META_WORDS, PassRead, TYPE_POSITION,
-    read_pass,
-};
-use karyos_sys::sync::AtomicU64;
+use karyos_sys::counters::{CellWords, META_WORDS, PassRead, read_pass};
+use karyos_sys::sync::{AtomicU64, Ordering};
 use loom::sync::Arc;
 use loom::thread;
 
@@ -146,52 +142,48 @@ enum Membership {
     Reused,
 }
 
-/// A subscriber position cell's metadata for registration `registration`.
-fn subscriber(registration: u64) -> CounterMetadata {
-    CounterMetadata::new(registration, TYPE_POSITION, "subscriber position")
-        .unwrap()
-        .with_keys(CounterKeys {
-            stream: 1,
-            lane: 0,
-            kind: karyos_sys::counters::KIND_SUBSCRIBER,
-            participant: registration,
-        })
+/// A position cell as the pass sees its membership: the registration its
+/// key names (0 for a free cell) and its value. The cell's own seqlock is
+/// modelled in `loom_counters`; here each word is a plain Relaxed access,
+/// so the pass's epoch alone must keep a reader from mixing passes.
+struct Member {
+    key: AtomicU64,
+    value: AtomicU64,
 }
 
-/// What the cell holds as an accepted pass may show it: free, or a
-/// registration and its value.
-fn shown(read: CellRead) -> Option<(u64, u64)> {
-    match read {
-        CellRead::Free => None,
-        CellRead::Allocated {
-            metadata, value, ..
-        } => Some((metadata.keys.participant, value)),
-        CellRead::Changing => panic!("an accepted pass shows a cell being changed"),
-    }
+/// The pass's epoch, one member cell and the head.
+struct Membered {
+    epoch: Cell,
+    member: Member,
+    head: AtomicU64,
 }
 
 /// The first pass (epoch 2, head 20) is complete before the reader starts;
-/// the second (head 40) changes the cell's membership while the reader
-/// scans the head first, then the cell.
+/// the second (head 40) changes the cell's membership, writing the key
+/// first and the value after it, as an allocation does, while the reader
+/// loads the head, then the cell. A mixed read needs the reader preempted
+/// between its loads and the writer before its even epoch, so the bound is
+/// two preemptions.
 fn membership_model(change: Membership, epoch: Epoch) {
     let mut builder = loom::model::Builder::new();
-    // One preemption is enough for a reader between its two loads.
-    builder.preemption_bound = Some(1);
+    builder.preemption_bound = Some(2);
     builder.check(move || {
-        let pass = Arc::new(Pass {
+        let pass = Arc::new(Membered {
             epoch: Cell::new(),
-            subscriber: Cell::new(),
-            floor: Cell::new(),
-            head: Cell::new(),
+            member: Member {
+                key: AtomicU64::new(0),
+                value: AtomicU64::new(0),
+            },
+            head: AtomicU64::new(0),
         });
         // Pass 1: the cell of registration 1 exists unless it is added in
         // pass 2.
         pass.epoch.words().begin_pass(1);
         if change != Membership::Added {
-            pass.subscriber.words().allocate(&subscriber(1)).unwrap();
-            pass.subscriber.words().set(100);
+            pass.member.key.store(1, Ordering::Relaxed);
+            pass.member.value.store(100, Ordering::Relaxed);
         }
-        pass.head.words().set(20);
+        pass.head.store(20, Ordering::Relaxed);
         pass.epoch.words().end_pass(2);
         let writer = {
             let pass = Arc::clone(&pass);
@@ -199,33 +191,29 @@ fn membership_model(change: Membership, epoch: Epoch) {
                 if epoch == Epoch::Odd {
                     pass.epoch.words().begin_pass(3);
                 }
-                let cell = pass.subscriber.words();
-                match change {
-                    Membership::Added => {
-                        cell.allocate(&subscriber(1)).unwrap();
-                        cell.set(7);
-                    }
-                    Membership::Removed => cell.free().unwrap(),
-                    Membership::Reused => {
-                        cell.free().unwrap();
-                        cell.allocate(&subscriber(2)).unwrap();
-                        cell.set(5);
-                    }
-                }
-                pass.head.words().set(40);
+                let (key, value) = match change {
+                    Membership::Added => (1, 7),
+                    Membership::Removed => (0, 0),
+                    Membership::Reused => (2, 5),
+                };
+                pass.member.key.store(key, Ordering::Relaxed);
+                pass.member.value.store(value, Ordering::Relaxed);
+                pass.head.store(40, Ordering::Relaxed);
                 pass.epoch.words().end_pass(4);
             })
         };
         let read = read_pass(
             || pass.epoch.words().load_value(),
             || {
-                let head = pass.head.words().load_value();
-                (head, pass.subscriber.words().read())
+                let head = pass.head.load(Ordering::Relaxed);
+                let key = pass.member.key.load(Ordering::Relaxed);
+                let value = pass.member.value.load(Ordering::Relaxed);
+                (head, key, value)
             },
             1,
         );
-        if let PassRead::Consistent((head, cell)) = read {
-            let cell = shown(cell);
+        if let PassRead::Consistent((head, key, value)) = read {
+            let cell = (key != 0).then_some((key, value));
             let expected = match (change, head) {
                 (Membership::Added, 20) | (Membership::Removed, 40) => None,
                 (Membership::Added, 40) => Some((1, 7)),
@@ -243,25 +231,33 @@ fn membership_model(change: Membership, epoch: Epoch) {
 }
 
 #[test]
-#[ignore = "slow: run by make loom-full"]
 fn an_added_cell_is_never_seen_before_its_pass_set_it() {
     membership_model(Membership::Added, Epoch::Odd);
 }
 
 #[test]
-#[ignore = "slow: run by make loom-full"]
 fn a_removed_cell_is_never_seen_in_the_pass_that_removed_it() {
     membership_model(Membership::Removed, Epoch::Odd);
 }
 
 #[test]
-#[ignore = "slow: run by make loom-full"]
 fn a_reused_cell_is_never_seen_under_its_previous_key() {
     membership_model(Membership::Reused, Epoch::Odd);
 }
 
 #[test]
-#[ignore = "slow: run by make loom-full"]
+#[should_panic(expected = "an accepted pass shows a cell of another pass")]
+fn control_an_added_cell_without_the_odd_epoch_can_be_mixed() {
+    membership_model(Membership::Added, Epoch::Skipped);
+}
+
+#[test]
+#[should_panic(expected = "an accepted pass shows a cell of another pass")]
+fn control_a_removed_cell_without_the_odd_epoch_can_be_mixed() {
+    membership_model(Membership::Removed, Epoch::Skipped);
+}
+
+#[test]
 #[should_panic(expected = "an accepted pass shows a cell of another pass")]
 fn control_membership_without_the_odd_epoch_can_be_mixed() {
     membership_model(Membership::Reused, Epoch::Skipped);
