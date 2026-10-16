@@ -354,6 +354,40 @@ impl<T: TermBytes> ReceiveOwner<T> {
         self.lanes.get(usize::from(lane.get())).map(|l| l.high)
     }
 
+    /// The first hole of `lane` above its resolved prefix, as `(position,
+    /// extent)`: up to the start of the next covered extent, within one
+    /// term (GU-4). `None` while nothing above the prefix is covered.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::Foreign`] for a lane the image does not have,
+    /// [`ReceiveError::Sys`] for a corrupt owner state.
+    pub fn first_hole(&self, lane: Lane) -> Result<Option<(u64, u32)>, ReceiveError> {
+        let owner = self
+            .lanes
+            .get(usize::from(lane.get()))
+            .ok_or(ReceiveError::Foreign)?;
+        Ok(owner.first_hole()?)
+    }
+
+    /// Whether `position` of `lane` lies in the window `{r, r + 1}` of
+    /// terms, `r` the term of the resolved prefix (GU-6: a position beyond
+    /// it cannot be resumed).
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::Foreign`] for a lane the image does not have,
+    /// [`ReceiveError::Sys`] for a position outside the incarnation.
+    pub fn within_window(&self, lane: Lane, position: u64) -> Result<bool, ReceiveError> {
+        let owner = self
+            .lanes
+            .get(usize::from(lane.get()))
+            .ok_or(ReceiveError::Foreign)?;
+        let (r, _) = owner.split_end(owner.rebuild)?;
+        let (count, _) = owner.buffer.split(position)?;
+        Ok(count.get() <= r.get().saturating_add(1))
+    }
+
     /// The received high-water mark of `lane` (`quantstratum-docs:
     /// karyos/design/gaps-and-unreliable-delivery.md`, GU-1): the highest
     /// end of a real committed frame. A sealed gap never moves it.
@@ -659,6 +693,33 @@ impl<T: TermBytes> LaneOwner<T> {
     /// term, which no term count names, is the end of that term: once the
     /// last term is complete the window stays on it, every later copy is
     /// compared there, and nothing new is ever written.
+    /// The first hole above the resolved prefix: from it to the start of
+    /// the next covered extent, within its term (`quantstratum-docs:
+    /// karyos/design/gaps-and-unreliable-delivery.md`, GU-4). `None` while
+    /// nothing above the prefix is covered.
+    fn first_hole(&self) -> Result<Option<(u64, u32)>, SysError> {
+        if self.rebuild >= self.high {
+            return Ok(None);
+        }
+        let (count, offset) = self.buffer.split(self.rebuild)?;
+        let term_length = self.buffer.term_length;
+        let unit = (offset / FRAME_ALIGNMENT) as usize;
+        let end = match self.set_of(count) {
+            // A term with nothing received is a hole to its end.
+            None => self.units,
+            Some(index) => first_one(&self.set(index)?.covered, unit, self.units),
+        };
+        let end_offset = u32::try_from(end)
+            .ok()
+            .and_then(|end| end.checked_mul(FRAME_ALIGNMENT))
+            .filter(|end| *end <= term_length && *end > offset)
+            .ok_or(SysError::CorruptTerm {
+                offset,
+                reason: "hole extent",
+            })?;
+        Ok(Some((self.rebuild, end_offset - offset)))
+    }
+
     fn split_end(&self, position: u64) -> Result<(TermCount, u32), SysError> {
         let term_length = self.buffer.term_length;
         if position == u64::from(TERM_COUNT_LIMIT) * u64::from(term_length) {
@@ -1011,6 +1072,20 @@ fn set_range(bits: &mut [u64], start: usize, len: usize) {
 
 /// The first clear bit at or after `start` and below `limit`, or `limit`:
 /// a scan of whole words.
+/// The first set bit at or after `start`, or `limit`.
+fn first_one(bits: &[u64], start: usize, limit: usize) -> usize {
+    let mut at = start;
+    while at < limit {
+        let word = at / WORD_BITS;
+        let value = bits.get(word).copied().unwrap_or(0) & !((1u64 << (at % WORD_BITS)) - 1);
+        if value != 0 {
+            return (word * WORD_BITS + value.trailing_zeros() as usize).min(limit);
+        }
+        at = (word + 1) * WORD_BITS;
+    }
+    limit
+}
+
 fn first_zero(bits: &[u64], start: usize, limit: usize) -> usize {
     let mut at = start;
     while at < limit {

@@ -74,11 +74,16 @@ mod deadline;
 mod frame_reader;
 mod image_read;
 mod receive_owner;
+mod skip_policy;
 
 pub use frame_reader::{
     FrameEnd, FrameReader, FrameStep, MessageInfo, Peek, SKIP_WALK_FRAMES, STEP_CHARGE, Stepped,
 };
 pub use receive_owner::{ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received};
+pub use skip_policy::{
+    Close, CloseCause, DEFAULT_FAR_WINDOW_TIMEOUT_NS, DEFAULT_REORDER_TIMEOUT_NS,
+    MAX_REORDER_TIMEOUT_NS, SkipConfig, SkipConfigError, SkipPolicy, SkipReport, Unrecoverable,
+};
 pub(crate) mod storage;
 
 #[cfg(test)]

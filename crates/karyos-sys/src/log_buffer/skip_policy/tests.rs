@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The skip policy against a receive owner (`quantstratum-docs:
+//! karyos/design/gaps-and-unreliable-delivery.md`, "Required validation",
+//! "Skip timing" and "Far window").
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "test helpers, as ADR-0007 allows in tests"
+)]
+
+use std::sync::Arc;
+
+use super::*;
+use crate::frame::{Flags, FrameType, Word0};
+use crate::log_buffer::{DEFAULT_CLAIM_DEADLINE, LogBuffer, LogBufferConfig, PublicationMode};
+use crate::receive::{ImageParams, Item, ValidatedDatagram};
+use crate::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+use crate::term::TermId;
+
+const SESSION: i32 = 3;
+const STREAM: i32 = 4;
+const INITIAL: u32 = 9;
+const TERM: u64 = MIN_TERM_LENGTH as u64;
+const MS: u64 = 1_000_000;
+
+fn params() -> ImageParams {
+    ImageParams::new(
+        SESSION,
+        STREAM,
+        1,
+        TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+        DEFAULT_MTU,
+    )
+    .unwrap()
+}
+
+fn image() -> (Arc<LogBuffer>, ReceiveOwner) {
+    let buffer = Arc::new(
+        LogBuffer::new(LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 5,
+            max_subscribers: 2,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(INITIAL),
+            lane: Lane::ZERO,
+            session_id: SESSION,
+            stream_id: STREAM,
+            claim_deadline: DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Image {
+                join: 0,
+                local_gaps: true,
+            },
+        })
+        .unwrap(),
+    );
+    let owner = ReceiveOwner::new(params(), vec![Arc::clone(&buffer)]).unwrap();
+    (buffer, owner)
+}
+
+/// A 64-byte DATA frame of term `term` at `offset`.
+fn data(term: u32, offset: u32, fill: u8) -> Vec<u8> {
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    let mut out = Vec::new();
+    out.extend_from_slice(&Word0::new(64, flags, FrameType::Data).pack().to_le_bytes());
+    out.extend_from_slice(&offset.cast_signed().to_le_bytes());
+    out.extend_from_slice(&SESSION.to_le_bytes());
+    out.extend_from_slice(&STREAM.to_le_bytes());
+    out.extend_from_slice(&INITIAL.wrapping_add(term).to_le_bytes());
+    out.extend_from_slice(&0i64.to_le_bytes());
+    out.extend(std::iter::repeat_n(fill, 32));
+    out
+}
+
+fn receive(owner: &mut ReceiveOwner, bytes: &[u8]) -> Result<Received, ReceiveError> {
+    let datagram = ValidatedDatagram::parse(bytes, &params()).unwrap();
+    let Some(Item::Frame(frame)) = datagram.items().next() else {
+        panic!("no frame");
+    };
+    owner.receive(&frame)
+}
+
+fn policy(config: SkipConfig) -> SkipPolicy {
+    SkipPolicy::new(config, 1).unwrap()
+}
+
+/// Frames at 0 and 128: a hole `[64, 128)`.
+fn with_hole() -> (Arc<LogBuffer>, ReceiveOwner) {
+    let (buffer, mut owner) = image();
+    receive(&mut owner, &data(0, 0, 1)).unwrap();
+    receive(&mut owner, &data(0, 128, 2)).unwrap();
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), Some((64, 64)));
+    (buffer, owner)
+}
+
+#[test]
+fn an_unreliable_hole_is_sealed_at_the_reorder_deadline() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig::unreliable());
+    assert_eq!(skip.duty(&mut owner, 0).unwrap().sealed, 0, "detected at 0");
+    assert_eq!(skip.duty(&mut owner, MS - 1).unwrap().sealed, 0);
+    let report = skip.duty(&mut owner, MS).unwrap();
+    assert_eq!((report.sealed, report.sealed_bytes), (1, 64));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(192));
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), None);
+}
+
+/// The deadline is the larger of the reorder interval and the skew window,
+/// never their sum.
+#[test]
+fn the_deadline_is_the_larger_of_reorder_and_skew() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig {
+        skew_window_ns: 3 * MS,
+        ..SkipConfig::unreliable()
+    });
+    assert_eq!(skip.duty(&mut owner, 0).unwrap().sealed, 0);
+    assert_eq!(skip.duty(&mut owner, 3 * MS - 1).unwrap().sealed, 0);
+    assert_eq!(
+        skip.duty(&mut owner, 3 * MS).unwrap().sealed,
+        1,
+        "not at 4 ms"
+    );
+}
+
+/// A duplicate never restarts the deadline; a repair before it wins.
+#[test]
+fn a_duplicate_does_not_restart_and_a_repair_wins() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig::unreliable());
+    let _ = skip.duty(&mut owner, 0).unwrap();
+    let duplicate = receive(&mut owner, &data(0, 128, 2));
+    assert_eq!(duplicate, Ok(Received::Duplicate));
+    skip.arrived(Lane::ZERO, &duplicate, 128, MS / 2);
+    assert_eq!(skip.duty(&mut owner, MS).unwrap().sealed, 1);
+
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig::unreliable());
+    let _ = skip.duty(&mut owner, 0).unwrap();
+    let repaired = receive(&mut owner, &data(0, 64, 3));
+    skip.arrived(Lane::ZERO, &repaired, 64, MS / 2);
+    let report = skip.duty(&mut owner, MS).unwrap();
+    assert_eq!(report.sealed, 0, "the real frame won");
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(None));
+}
+
+/// A zero interval seals at the first duty that sees the hole.
+#[test]
+fn a_zero_interval_seals_at_once() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig {
+        reorder_timeout_ns: 0,
+        ..SkipConfig::unreliable()
+    });
+    assert_eq!(skip.duty(&mut owner, 5).unwrap().sealed, 1);
+}
+
+/// A hole revealed after the episode began is a new detection, with its
+/// own deadline.
+#[test]
+fn a_later_hole_is_a_new_detection() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig::unreliable());
+    let _ = skip.duty(&mut owner, 0).unwrap();
+    // A frame far above reveals a second hole [192, 320) at 0.5 ms.
+    receive(&mut owner, &data(0, 320, 4)).unwrap();
+    let report = skip.duty(&mut owner, MS).unwrap();
+    assert_eq!(report.sealed, 1, "only the first hole is due");
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), Some((192, 128)));
+    assert_eq!(skip.duty(&mut owner, 2 * MS - 1).unwrap().sealed, 0);
+    assert_eq!(skip.duty(&mut owner, 2 * MS).unwrap().sealed, 1);
+}
+
+/// GU-5: a reliable channel never seals on a timer; `close` closes on a
+/// correlated `RANGE_UNAVAILABLE`, `skip` seals the whole hole.
+#[test]
+fn a_reliable_hole_closes_or_is_skipped_only_when_unrecoverable() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig::reliable());
+    assert_eq!(skip.duty(&mut owner, 10_000 * MS).unwrap().sealed, 0);
+    let report = skip
+        .range_unavailable(&mut owner, Lane::ZERO, 64, 128, 10_000 * MS)
+        .unwrap();
+    assert_eq!(
+        report.close,
+        Some(Close {
+            lane: Lane::ZERO,
+            cause: CloseCause::Unrecoverable,
+            from: 64,
+            to: 128
+        })
+    );
+    assert_eq!(
+        owner.first_hole(Lane::ZERO).unwrap(),
+        Some((64, 64)),
+        "no record"
+    );
+
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    let report = skip
+        .range_unavailable(&mut owner, Lane::ZERO, 64, 96, 0)
+        .unwrap();
+    assert_eq!(
+        (report.sealed, report.sealed_bytes),
+        (1, 64),
+        "the whole hole"
+    );
+    assert_eq!(report.close, None);
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)));
+}
+
+/// GU-6: a lowest retained position beyond the window closes with
+/// `GapCannotResume` under every policy.
+#[test]
+fn a_range_beyond_the_window_cannot_resume() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    let far = 3 * TERM;
+    let report = skip
+        .range_unavailable(&mut owner, Lane::ZERO, far, far + 64, 0)
+        .unwrap();
+    assert_eq!(
+        report
+            .close
+            .map(|close| (close.cause, close.from, close.to)),
+        Some((CloseCause::GapCannotResume, 64, far))
+    );
+}
+
+/// GU-6 on an unreliable channel: arrivals all `Ahead` for the far-window
+/// timeout close the lane; a committed arrival in between restarts it.
+#[test]
+fn arrivals_all_ahead_close_an_unreliable_lane() {
+    let (_buffer, mut owner) = image();
+    receive(&mut owner, &data(0, 0, 1)).unwrap();
+    let mut skip = policy(SkipConfig::unreliable());
+    let ahead = Ok(Received::Ahead);
+    skip.arrived(Lane::ZERO, &ahead, 5 * TERM, 0);
+    skip.arrived(Lane::ZERO, &ahead, 4 * TERM, 500 * MS);
+    assert_eq!(skip.duty(&mut owner, 999 * MS).unwrap().close, None);
+    // A committed arrival restarts the clock.
+    let committed = receive(&mut owner, &data(0, 64, 2));
+    skip.arrived(Lane::ZERO, &committed, 64, 999 * MS);
+    assert_eq!(skip.duty(&mut owner, 1000 * MS).unwrap().close, None);
+    skip.arrived(Lane::ZERO, &ahead, 6 * TERM, 1000 * MS);
+    assert_eq!(skip.duty(&mut owner, 1999 * MS).unwrap().close, None);
+    let report = skip.duty(&mut owner, 2000 * MS).unwrap();
+    assert_eq!(
+        report.close,
+        Some(Close {
+            lane: Lane::ZERO,
+            cause: CloseCause::GapCannotResume,
+            from: 128,
+            to: 6 * TERM
+        })
+    );
+    // Closed: nothing more is reported or sealed.
+    assert_eq!(
+        skip.duty(&mut owner, 3000 * MS).unwrap(),
+        SkipReport::default()
+    );
+}
+
+#[test]
+fn a_reorder_interval_above_one_second_is_refused() {
+    assert_eq!(
+        SkipPolicy::new(
+            SkipConfig {
+                reorder_timeout_ns: MAX_REORDER_TIMEOUT_NS + 1,
+                ..SkipConfig::unreliable()
+            },
+            1
+        )
+        .err(),
+        Some(SkipConfigError::ReorderTimeout(MAX_REORDER_TIMEOUT_NS + 1))
+    );
+}
