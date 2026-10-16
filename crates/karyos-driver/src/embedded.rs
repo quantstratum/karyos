@@ -572,6 +572,18 @@ impl<T: StreamTerms> Stream<T> {
             .map(|replaced| &mut replaced.conductor)
     }
 
+    /// The stream position where incarnation `incarnation`'s current
+    /// mapping starts, as [`Self::conductor_of`] finds its conductor.
+    pub(crate) fn base_of(&self, incarnation: u64) -> Option<u64> {
+        if incarnation == self.incarnation {
+            return Some(self.base);
+        }
+        self.replaced
+            .iter()
+            .find(|replaced| replaced.incarnation == incarnation)
+            .map(|replaced| replaced.base)
+    }
+
     /// The conductor of the mapping a grant names, by incarnation and
     /// generation: the current mapping or a retained predecessor of the
     /// current incarnation, or a replaced incarnation (one mapping, as a
@@ -959,20 +971,38 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// `Active` until it is removed, then `Sealed` until every issued
     /// publication has released, `Positioned` at the end of its last
     /// granted reservation, and `Retired` once every attached subscriber
-    /// has read up to that position.
+    /// has read up to that position. The position is an absolute stream
+    /// position, as offers report: the current mapping's base plus the
+    /// buffer's own seal position.
     ///
     /// # Errors
     ///
     /// Returns [`DriverError::UnknownStream`] for a foreign handle or a
-    /// freed stream.
+    /// freed stream, and [`DriverError::PositionsExhausted`] for a position
+    /// past the stream position range.
     pub fn seal_state(&self, stream: StreamHandle) -> Result<SealState, DriverError> {
-        self.streams
+        let found = self
+            .streams
             .iter()
             .find(|s| stream.driver == self.id && s.id == stream.stream)
-            .map(|s| s.conductor.seal_state())
             .ok_or(DriverError::UnknownStream {
                 stream: stream.stream,
-            })
+            })?;
+        let absolute = |position: u64| {
+            found
+                .base
+                .checked_add(position)
+                .ok_or(DriverError::PositionsExhausted)
+        };
+        Ok(match found.conductor.seal_state() {
+            SealState::Positioned { position } => SealState::Positioned {
+                position: absolute(position)?,
+            },
+            SealState::Retired { position } => SealState::Retired {
+                position: absolute(position)?,
+            },
+            state @ (SealState::Active | SealState::Sealed) => state,
+        })
     }
 
     /// A read-only view of the driver's counters (SPEC.md §11), for tools.

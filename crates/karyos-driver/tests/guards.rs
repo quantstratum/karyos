@@ -434,6 +434,23 @@ fn the_fresh_incarnation_starts_at_the_seal_and_only_when_open() {
         panic!("not accepted");
     };
     assert_eq!(position, seal, "the fresh incarnation starts at the seal");
+    // Coordinator decision (ACS 15320): incarnation 2's seal is an absolute
+    // stream position too, where incarnation 3 starts.
+    assert_eq!(driver.close_guard(guard, 4), Ok(Closed::Now { epoch: 5 }));
+    drop(fresh);
+    let _ = driver.do_work().unwrap();
+    let second = match driver.seal_state(handle).unwrap() {
+        SealState::Positioned { position } | SealState::Retired { position } => position,
+        other => panic!("not positioned: {other:?}"),
+    };
+    assert!(second > seal, "{second} after {seal}");
+    assert_eq!(driver.reopen_guard(guard, 5, 5), Ok(6));
+    let mut third = driver.publication(handle).unwrap();
+    assert_eq!(driver.trace_identity(handle).unwrap().incarnation, 3);
+    let OfferOutcome::Accepted { position, .. } = third.offer(b"d").unwrap() else {
+        panic!("not accepted");
+    };
+    assert_eq!(position, second, "incarnation 3 starts at 2's seal");
 }
 
 /// Review of #209 (M5): with a walker budget of one block, the old readers

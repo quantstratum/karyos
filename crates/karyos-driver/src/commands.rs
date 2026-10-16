@@ -343,10 +343,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 stream_id: target.stream_id,
                 session_id: target.session_id,
             };
+            // The loss names an absolute stream position: the
+            // incarnation's base plus the cell's buffer position. Both stay
+            // below 2^63 (the stream position range), so the checked sum
+            // always exists.
+            let Some(base) = target.base_of(incarnation) else {
+                continue;
+            };
             let Some(conductor) = target.conductor_of(incarnation) else {
                 continue;
             };
-            let position = conductor.cell_position(cell).unwrap_or(0);
+            let Some(position) = base.checked_add(conductor.cell_position(cell).unwrap_or(0))
+            else {
+                continue;
+            };
             // Sealing is idempotent: only the revocation that moves the
             // stream out of `Active` reports its closing. A replaced
             // incarnation is already sealed.
@@ -4863,6 +4873,61 @@ mod tests {
                 .cell_position(old_cell)
                 .is_some()
         );
+    }
+
+    /// Coordinator decision (ACS 15320): a revoked participant's loss names
+    /// an absolute stream position. A remote reader of incarnation 2, whose
+    /// mapping starts at the seal of incarnation 1, is lost at that base,
+    /// not at its buffer position 0.
+    #[test]
+    fn a_revocation_names_an_absolute_position() {
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 4).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let _reader = driver.subscribe(stream, Role::Required).unwrap();
+        let mut publication = driver.publication(stream).unwrap();
+        assert!(matches!(
+            publication.offer(b"a").unwrap(),
+            karyos_client::OfferOutcome::Accepted { .. }
+        ));
+        let _ = driver.close_guard(guard, 2).unwrap();
+        drop(publication);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+        let _fresh = driver.publication(stream).unwrap();
+        assert_eq!(driver.streams[0].incarnation, 2);
+        let base = driver.streams[0].base;
+        assert!(base > 0);
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                lane: Lane::ZERO,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let _ = responses(&mut observer);
+        let registration = ledger(&driver, client)[0].registration;
+        let cell = driver
+            .registrations
+            .iter()
+            .find(|r| r.id == registration)
+            .and_then(|r| r.subscriber)
+            .unwrap()
+            .0;
+        let at = driver.streams[0].conductor.cell_position(cell).unwrap();
+        driver.revoke_client(client);
+        let records = losses(&driver);
+        let [record] = records[..] else {
+            panic!("{records:?}");
+        };
+        assert_eq!(record.incarnation, 2);
+        assert_eq!((record.from, record.to), (base + at, base + at));
     }
 
     /// Review of #213 (M7): a sent grant pins the replaced incarnation after
