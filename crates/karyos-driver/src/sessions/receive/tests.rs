@@ -685,6 +685,7 @@ fn a_later_path_binds_without_an_image() {
     let image = install_on_key_one(&mut sessions, &mut nonces);
     assert_eq!(sessions.paths().live(image), 1);
     assert_eq!(sessions.paths().lookup(key(1)), Some((image, 0)));
+    assert_eq!(sessions.counters().path_bind_failed, 0);
     let nonce = challenged(sessions.announce(key(2), &announce(1), 2 * MS, &mut nonces))
         .challenge
         .nonce;
@@ -818,4 +819,26 @@ fn the_path_settings_are_validated() {
             .is_err()
         );
     }
+}
+
+/// An installed image whose first path cannot be bound (no recorded
+/// joins: a broken invariant) is still installed, and the failure is
+/// counted (s-88 review, P3).
+#[test]
+fn a_failed_first_binding_is_counted() {
+    let mut sessions = table(SessionConfig::default());
+    let pending = inject(&mut sessions, key(1), 1, [91, 0], true);
+    if let Some(slot) = sessions
+        .slots
+        .get_mut(usize::try_from(pending.slot).unwrap())
+        && let State::Challenged { joins, .. } = &mut slot.state
+    {
+        *joins = None;
+    }
+    let ReadyOutcome::Installed(image) = sessions.image_ready(pending, MS) else {
+        panic!("not installed");
+    };
+    assert!(sessions.is_active(image));
+    assert_eq!(sessions.paths().live(image), 0);
+    assert_eq!(sessions.counters().path_bind_failed, 1);
 }

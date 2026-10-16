@@ -267,6 +267,9 @@ pub struct SessionCounters {
     pub installed: u64,
     /// Later paths bound to installed images (RP-1).
     pub paths_bound: u64,
+    /// Installed images whose first path could not be bound: a broken
+    /// invariant (the path table has a row per slot).
+    pub path_bind_failed: u64,
     /// Images released at `ImageReady` (too late) or refused.
     pub released: u64,
     /// Images retired.
@@ -923,11 +926,17 @@ impl ReceiveSessions {
             generation,
         };
         // The first path, at the image's own joins, keyed by the installed
-        // generation.
-        if let Some(joins) = joins {
-            let _ = self
-                .paths
-                .bind_first(installed, identity, term, key, joins, now);
+        // generation. Without a row (a slot beyond the path table, or no
+        // recorded joins: a broken invariant, counted) the image is still
+        // installed and its own liveness is unchanged, but it has no live
+        // path binding, so no later path can join it.
+        let bound = joins.is_some_and(|joins| {
+            self.paths
+                .bind_first(installed, identity, term, key, joins, now)
+                .is_ok()
+        });
+        if !bound {
+            self.counters.bump(|c| &mut c.path_bind_failed);
         }
         ReadyOutcome::Installed(installed)
     }
