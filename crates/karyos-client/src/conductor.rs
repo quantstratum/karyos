@@ -173,6 +173,11 @@ pub enum Request {
         /// Its role.
         role: SubscriberRole,
     },
+    /// A remote client's view of a conflated stream's table.
+    ConflatedSubscription {
+        /// The stream.
+        stream: StreamKey,
+    },
 }
 
 impl Request {
@@ -182,7 +187,8 @@ impl Request {
         match *self {
             Self::Publication { stream, .. }
             | Self::ConcurrentPublication { stream, .. }
-            | Self::Subscription { stream, .. } => stream,
+            | Self::Subscription { stream, .. }
+            | Self::ConflatedSubscription { stream } => stream,
         }
     }
 }
@@ -207,6 +213,8 @@ pub struct FetchableConflated {
     pub key: u64,
     /// The registration the response answered.
     pub registration: u64,
+    /// The stream requested.
+    pub stream: StreamKey,
     /// The table's key count.
     pub keys: u32,
     /// The table's value capacity in bytes.
@@ -621,7 +629,8 @@ impl<T: TermBytes> ClientConductor<T> {
         &mut self,
         stream: StreamKey,
     ) -> Result<u64, ConductorError> {
-        self.submit(Kind::AddConflatedSubscription, None, |sequence| {
+        let request = Request::ConflatedSubscription { stream };
+        self.submit(Kind::AddConflatedSubscription, Some(request), |sequence| {
             Command::AddConflatedSubscription { sequence, stream }
         })
     }
@@ -1192,6 +1201,7 @@ impl<T: TermBytes> ClientConductor<T> {
             }
             if let (
                 Kind::AddConflatedSubscription,
+                Some(Request::ConflatedSubscription { stream }),
                 Response::ConflatedReady {
                     registration,
                     key,
@@ -1200,11 +1210,12 @@ impl<T: TermBytes> ClientConductor<T> {
                     journal_capacity,
                     ..
                 },
-            ) = (kind, response)
+            ) = (kind, pending.request, response)
             {
                 return Outcome::FetchableConflated(FetchableConflated {
                     key,
                     registration,
+                    stream,
                     keys,
                     value_capacity,
                     journal_capacity,

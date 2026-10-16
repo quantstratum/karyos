@@ -983,6 +983,179 @@ fn grant(client: &mut RemoteClient, subscribe: bool) -> Fetchable {
     fetchable.unwrap()
 }
 
+/// The conflated stream of the view test: keys 0 to 3.
+const TABLE: karyos_sys::conflation::ConflationConfig = karyos_sys::conflation::ConflationConfig {
+    keys: 4,
+    value_capacity: 8,
+    journal_capacity: 1024,
+};
+/// Rounds of updates to every key.
+const VIEW_ROUNDS: u8 = 50;
+
+/// A remote view of a conflated stream's table in another process
+/// (`quantstratum-docs: karyos/design/conflation-end-to-end.md`,
+/// Cross-process views, Tests): the child maps the table read-only, sees
+/// the latest value of every key with versions never going backwards, and
+/// `closed` once the stream is removed; its reader-side counts reach the
+/// client counter cells it allocated, which the driver reads; the view's
+/// drop detaches its grant.
+#[test]
+fn test_conflated_a_view_in_another_process_reads_the_latest_values() {
+    let dir = dir("conflated-view");
+    let mut driver = driver(&dir);
+    let stream = driver
+        .add_stream(StreamConfig {
+            buffer: LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 4,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: KEY.session_id,
+                stream_id: KEY.stream_id,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+            },
+            allow_unconnected: false,
+            on_required_loss: LossPolicy::Hold,
+            conflation: Some(TABLE),
+        })
+        .unwrap();
+    let (mut child, reports) = spawn("conflated-view", &dir);
+    let cells = serve_until_prefix(&mut driver, &reports, "viewing cells ");
+    let cells: Vec<usize> = cells.split(' ').map(|cell| cell.parse().unwrap()).collect();
+    let mut publication = driver.publication(stream).unwrap();
+    for round in 0..VIEW_ROUNDS {
+        for key in 0..4u8 {
+            let options = karyos_sys::log_buffer::AppendOptions {
+                reserved_value: i64::from(key),
+                ..karyos_sys::log_buffer::AppendOptions::default()
+            };
+            let value = [key, round];
+            let start = Instant::now();
+            while !matches!(
+                publication.offer_with(&value, options).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                assert!(start.elapsed() < Duration::from_secs(10), "never accepted");
+                let _ = driver.do_work().unwrap();
+            }
+        }
+        let _ = driver.do_work().unwrap();
+    }
+    serve_until_report(&mut driver, &reports, "latest");
+    drop(publication);
+    driver.remove_stream(stream).unwrap();
+    serve_until_report(&mut driver, &reports, "closed");
+    // The child's reader counts reached its cells: a one-key budget runs
+    // out while the view catches up.
+    let reader = driver.client_counters();
+    let value = |cell: usize, label: &str| match reader.read(cell) {
+        CellRead::Allocated {
+            metadata, value, ..
+        } => {
+            assert_eq!(metadata.label(), label.as_bytes());
+            value
+        }
+        other => panic!("{other:?}"),
+    };
+    assert!(value(cells[1], karyos_client::CONFLATION_BUDGETS_EXHAUSTED) > 0);
+    let _ = value(cells[0], karyos_client::CONFLATION_SKIPS);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    release(&mut child.0);
+    assert!(child.0.wait().unwrap().success());
+    assert_eq!(counter(&driver, "grants exported"), 1);
+    assert_eq!(counter(&driver, "grants detached"), 1);
+}
+
+/// Runs duty cycles until the child reports a line that starts with
+/// `prefix`; returns the rest of it.
+fn serve_until_prefix(driver: &mut IpcDriver, reports: &Receiver<String>, prefix: &str) -> String {
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no report {prefix}"
+        );
+        let _ = driver.do_work().unwrap();
+        if let Ok(report) = reports.try_recv() {
+            return report.strip_prefix(prefix).unwrap().to_string();
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// The child of the conflated view test.
+fn conflated_view(dir: &Path, timeout: Duration) {
+    use karyos_client::ipc::ConflatedLimits;
+    use karyos_client::{CONFLATION_BUDGETS_EXHAUSTED, CONFLATION_SKIPS, ClientCounterHandle};
+    let mut client = attach(dir, timeout, 16).unwrap();
+    let next = |client: &mut RemoteClient| -> Outcome {
+        let mut outcome = None;
+        let start = Instant::now();
+        while outcome.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(10), "no completion");
+            let _ = client.poll(usize::MAX, |completion| outcome = Some(completion.outcome));
+            std::thread::yield_now();
+        }
+        outcome.unwrap()
+    };
+    let allocate = |client: &mut RemoteClient, label: &str| -> ClientCounterHandle {
+        let _ = client
+            .allocate_counter(karyos_driver::counters::TYPE_EVENTS, label, 0, 0)
+            .unwrap();
+        let Outcome::Counter(handle) = next(client) else {
+            panic!("no counter");
+        };
+        handle
+    };
+    let skips = allocate(&mut client, CONFLATION_SKIPS);
+    let exhausted = allocate(&mut client, CONFLATION_BUDGETS_EXHAUSTED);
+    let cells = format!("{} {}", skips.cell(), exhausted.cell());
+    let _ = client.add_conflated_subscription(KEY).unwrap();
+    let Outcome::FetchableConflated(fetchable) = next(&mut client) else {
+        panic!("no view");
+    };
+    let budget = karyos_sys::conflation::Budget {
+        keys: 1,
+        retries: 1,
+    };
+    let mut view = client
+        .take_conflated(&fetchable, budget, ConflatedLimits::default())
+        .unwrap()
+        .with_counters(skips, exhausted);
+    report(&format!("viewing cells {cells}"));
+    let mut versions = [0u64; 4];
+    let mut values = [[0u8; 2]; 4];
+    let last = VIEW_ROUNDS - 1;
+    let start = Instant::now();
+    while values.iter().any(|value| value[1] != last) {
+        assert!(start.elapsed() < Duration::from_secs(20), "saw {values:?}");
+        let _ = view.poll_changed_with(budget, |key, version, value| {
+            let key = key as usize;
+            assert!(version > versions[key], "key {key} went back");
+            versions[key] = version;
+            values[key].copy_from_slice(value);
+        });
+        std::thread::yield_now();
+    }
+    for (key, value) in values.iter().enumerate() {
+        assert_eq!(usize::from(value[0]), key);
+    }
+    report("latest");
+    let start = Instant::now();
+    while !view.poll_changed(|_, _| {}).closed {
+        assert!(start.elapsed() < Duration::from_secs(10), "never closed");
+        std::thread::yield_now();
+    }
+    report("closed");
+    drop(view);
+    drop(client);
+    wait_for_go();
+}
+
 /// Runs only as a child process of the tests above.
 #[test]
 fn child() {
@@ -992,6 +1165,7 @@ fn child() {
     let dir = PathBuf::from(dir);
     let timeout = Duration::from_secs(5);
     match scenario.to_str().unwrap() {
+        "conflated-view" => conflated_view(&dir, timeout),
         "round-trip-then-wait" => {
             let mut client = attach(&dir, timeout, 16).unwrap();
             round_trip(&mut client);
