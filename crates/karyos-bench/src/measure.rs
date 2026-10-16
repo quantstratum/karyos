@@ -283,7 +283,7 @@ pub fn header(
 /// A timing build, an `out` that already holds `alloc.json`, or one that
 /// cannot be written.
 pub fn run_alloc(out: &Path, log: &mut dyn Write) -> Result<usize, BenchError> {
-    if BUILD != "alloc-count" {
+    if !cfg!(feature = "alloc-count") {
         return Err(BenchError(
             "allocation counting needs the alloc-count build".into(),
         ));

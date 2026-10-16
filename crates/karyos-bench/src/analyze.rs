@@ -274,6 +274,9 @@ pub struct PointSummary {
     pub point: Point,
     /// Its runs, in plan order.
     pub runs: Vec<RunSummary>,
+    /// With `--interval-on-e4` on an environment that does not decide,
+    /// the evaluation as if it did: report only, never graded or counted.
+    pub report_only: Option<PointResult>,
     /// The evaluation, when every run succeeded.
     pub result: Option<PointResult>,
     /// The outcome.
@@ -316,13 +319,16 @@ pub struct Analysis {
     pub blockers: Vec<String>,
     /// Preflight drift, naming the run and the field.
     pub drift: Vec<String>,
+    /// The build that measured: `timing`, or `timing+synthetic`, whose
+    /// every run is report-only.
+    pub build: String,
+    /// Whether report-only intervals were computed on E4.
+    pub interval_on_e4: bool,
     /// The total runtime of the runs, ms.
     pub runtime_ms: u64,
     /// The allocation run's `<point>\t<result>` entries, when
     /// `alloc.json` is present (M-9).
     pub allocations: Option<Vec<String>>,
-    /// The build that measured.
-    pub build: String,
 }
 
 impl Analysis {
@@ -331,7 +337,21 @@ impl Analysis {
     pub fn decision_grade(&self) -> bool {
         self.grade == Grade::Decision && self.blockers.is_empty()
     }
+
+    /// Whether a synthetic build measured: every result is then
+    /// report-only, whatever the environment.
+    #[must_use]
+    pub fn synthetic_build(&self) -> bool {
+        self.build.ends_with("+synthetic")
+    }
 }
+
+/// The blocker of the synthetic test profile, for a synthetic build and
+/// for a synthetic configuration (§5.2, ACS 15453).
+const SYNTHETIC_BLOCKER: &str = "Synthetic is a test profile, never a candidate (§5.2)";
+
+/// The tag of every verdict a synthetic build prints.
+const SYNTHETIC_TAG: &str = "report only (synthetic build); ";
 
 fn parse_rule(text: &str) -> Result<MtuRule, BenchError> {
     match text {
@@ -475,6 +495,17 @@ fn config<'a>(
 /// Another manifest, a malformed or inconsistent file, or results that
 /// are not the plan's.
 pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
+    analyze_with(out, false)
+}
+
+/// [`analyze`], and with `interval_on_e4` an interval for every point of
+/// an environment that does not decide, labelled "report only, E4": it
+/// never reaches `grade()` or the overall result (ACS 15356).
+///
+/// # Errors
+///
+/// As [`analyze`].
+pub fn analyze_with(out: &Path, interval_on_e4: bool) -> Result<Analysis, BenchError> {
     let header = Object(parse_object(&read(&out.join("measure.json"))?)?);
     let (version, hash) = (
         header.string("manifest_version")?,
@@ -485,10 +516,10 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             "measured under manifest {version} ({hash}); this analysis is for {VERSION} ({MANIFEST_SHA256})"
         )));
     }
-    if header.string("build")? != "timing" {
+    let build = header.string("build")?.to_string();
+    if build != "timing" && build != "timing+synthetic" {
         return Err(BenchError(format!(
-            "measured by the {} build: only a timing build's runs are analyzed (M-9)",
-            header.string("build")?
+            "measured by the {build} build: only a timing build's runs are analyzed (M-9)"
         )));
     }
     if header.string("faults")? != "off" {
@@ -544,6 +575,16 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         .optional_string("host_record")?
         .map(ToString::to_string);
     let mut blockers: Vec<String> = Vec::new();
+    if build.ends_with("+synthetic") {
+        blockers.push(format!(
+            "{SYNTHETIC_BLOCKER}: a {build} build, whose every run is report-only, its trusted runs included (ACS 15453)"
+        ));
+    }
+    for configuration in &options.configurations {
+        if crate::wire::profile::is_synthetic(configuration) {
+            blockers.push(format!("{SYNTHETIC_BLOCKER}: {configuration}"));
+        }
+    }
     // The record's preflight fields, which every run must match (4.2
     // condition 4).
     let record_fields = match &host_record {
@@ -596,9 +637,9 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         runtime_ms = runtime_ms
             .checked_add(line.number("duration_ms")?)
             .ok_or_else(|| BenchError("runtime overflow".into()))?;
-        if line.string("build")? != "timing" {
+        if line.string("build")? != build {
             return Err(BenchError(format!(
-                "result {index} comes from the {} build, not a timing build",
+                "result {index} comes from the {} build, not the {build} build of measure.json",
                 line.string("build")?
             )));
         }
@@ -721,6 +762,7 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
                 runs: vec![summary],
                 result: None,
                 outcome: Outcome::NotDemonstrated(Cause::NotMeasured),
+                report_only: None,
             }),
         }
         if last {
@@ -749,6 +791,22 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
                 .map_err(|cause| BenchError(format!("{}: {cause}", planned.point)))?;
                 current.outcome = result.outcome.clone();
                 current.result = Some(result);
+                if interval_on_e4 && !environment.decides() {
+                    // Report only: the same evaluation as if E1, for its
+                    // interval; never graded or counted (ACS 15356).
+                    current.report_only = Some(
+                        decision::evaluate_point(&PointInput {
+                            point: planned.point,
+                            environment: Environment::E1,
+                            a: config(&point_runs, &a)?,
+                            b: config(&point_runs, &b)?,
+                            trusted: config(&point_runs, BASELINE)?,
+                            attempt: Attempt::First,
+                            spec,
+                        })
+                        .map_err(|cause| BenchError(format!("{}: {cause}", planned.point)))?,
+                    );
+                }
             } else {
                 current.outcome = Outcome::NotDemonstrated(Cause::Other(format!(
                     "{} failed runs: {}",
@@ -844,8 +902,9 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         blockers,
         drift,
         runtime_ms,
+        build,
+        interval_on_e4,
         allocations,
-        build: header.string("build")?.to_string(),
     })
 }
 
@@ -881,7 +940,7 @@ pub fn report(analysis: &Analysis) -> String {
     );
     let _ = writeln!(
         out,
-        "- Host `{}`, commit `{}`, build `{}`, environment {} ({}).",
+        "- Host `{}`, commit `{}`, cargo profile `{}`, environment {} ({}).",
         analysis.host,
         analysis.commit,
         analysis.profile,
@@ -909,6 +968,21 @@ pub fn report(analysis: &Analysis) -> String {
          down; {}.",
         seed_text()
     );
+    let _ = writeln!(out, "- Build: {}.", analysis.build);
+    for configuration in &options.configurations {
+        let spin = configuration
+            .strip_prefix(crate::wire::profile::SYNTHETIC)
+            .and_then(|spin| spin.parse::<u64>().ok());
+        if let Some(spin) = spin {
+            let _ = writeln!(
+                out,
+                "- Expected, a stated expectation and not a check: {configuration} adds about \
+                 2 × {spin} = {} ns to the decision sample, since it spins {spin} ns in seal \
+                 and in open and the sample sums both stages.",
+                spin.checked_mul(2).unwrap_or(spin)
+            );
+        }
+    }
     let _ = writeln!(out, "- Measured runtime: {} ms.\n", analysis.runtime_ms);
     let _ = writeln!(out, "## Eligibility (4.2)\n");
     let _ = writeln!(
@@ -932,8 +1006,13 @@ pub fn report(analysis: &Analysis) -> String {
     for point in &analysis.points {
         let _ = writeln!(
             out,
-            "### {}: {}{}\n",
+            "### {}: {}{}{}\n",
             point.point,
+            if analysis.synthetic_build() {
+                SYNTHETIC_TAG
+            } else {
+                ""
+            },
             if matches!(point.point.fanout, Fanout::F2 { .. }) {
                 "reported only (M-6); "
             } else {
@@ -996,6 +1075,37 @@ pub fn report(analysis: &Analysis) -> String {
                 );
             }
         }
+        if let Some(report_only) = &point.report_only {
+            let interval = |estimate: &stats::Estimate| match estimate.interval.ends {
+                Some((low, high)) => format!("{} [{low}, {high}]", estimate.point),
+                None => format!("{} (no interval)", estimate.point),
+            };
+            let estimates = report_only.bootstrap.as_ref().map_or_else(
+                || "no interval".to_string(),
+                |bootstrap| {
+                    format!(
+                        "added a {} ns, added b {} ns, difference a - b {} ns",
+                        interval(&bootstrap.added_a),
+                        interval(&bootstrap.added_b),
+                        interval(&bootstrap.difference)
+                    )
+                },
+            );
+            let _ = writeln!(
+                out,
+                "- **report only, E4** (`--interval-on-e4`; never graded or counted): {estimates}; it would read: {}",
+                outcome_text(&report_only.outcome)
+            );
+        }
+        let shown = |d: Option<i128>| d.map_or_else(|| "n/a".to_string(), |d| d.to_string());
+        let [p50_a, p50_b, p50_ab] = p50_differences(point, &options.configurations);
+        let _ = writeln!(
+            out,
+            "- p50, report only, not the manifest statistic (E4 sanity): a - trusted {} ns, b - trusted {} ns, a - b {} ns",
+            shown(p50_a),
+            shown(p50_b),
+            shown(p50_ab)
+        );
         let _ = writeln!(
             out,
             "\n| run | configuration | round | n | missing | saturated | p50 | p99 | p99.9 | H-5 callback p99.9 (receiver 0) | backpressure | ack timeouts | error |"
@@ -1037,7 +1147,12 @@ pub fn report(analysis: &Analysis) -> String {
     let _ = writeln!(out, "\n## Overall (8.6)\n");
     let _ = writeln!(
         out,
-        "{verdict}, {}: {} won by a, {} by b, {} ties.",
+        "{}{verdict}, {}: {} won by a, {} by b, {} ties.",
+        if analysis.synthetic_build() {
+            SYNTHETIC_TAG
+        } else {
+            ""
+        },
         overall.label(),
         overall.wins_a.len(),
         overall.wins_b.len(),
@@ -1165,6 +1280,76 @@ fn json_list(items: &[String]) -> String {
     )
 }
 
+/// The mean of the per-run p50 of each configuration of `point`, in
+/// configuration order: report only, not the manifest statistic (an E4
+/// sanity check, ACS 15467); `None` for a configuration with an infinite
+/// or missing p50.
+fn mean_p50(point: &PointSummary, configurations: &[String]) -> Vec<Option<u64>> {
+    configurations
+        .iter()
+        .map(|configuration| {
+            let values: Vec<u64> = point
+                .runs
+                .iter()
+                .filter(|run| &run.configuration == configuration)
+                .map(|run| run.quantiles[0].map(u64::from))
+                .collect::<Option<_>>()?;
+            let count = u64::try_from(values.len()).ok().filter(|n| *n > 0)?;
+            values
+                .iter()
+                .try_fold(0_u64, |total, v| total.checked_add(*v))?
+                .checked_div(count)
+        })
+        .collect()
+}
+
+/// `x - y` of two means, signed.
+fn difference(x: Option<u64>, y: Option<u64>) -> Option<i128> {
+    Some(i128::from(x?) - i128::from(y?))
+}
+
+/// The p50 differences a - trusted, b - trusted and a - b of `point`.
+fn p50_differences(point: &PointSummary, configurations: &[String]) -> [Option<i128>; 3] {
+    let means = mean_p50(point, configurations);
+    let (trusted, a, b) = (
+        means.first().copied().flatten(),
+        means.get(1).copied().flatten(),
+        means.get(2).copied().flatten(),
+    );
+    [
+        difference(a, trusted),
+        difference(b, trusted),
+        difference(a, b),
+    ]
+}
+
+/// The added latencies and their difference of `result`, as JSON.
+fn estimates_json(result: Option<&PointResult>) -> String {
+    result
+        .and_then(|result| result.bootstrap.as_ref())
+        .map_or_else(
+            || "null".to_string(),
+            |bootstrap| {
+                let estimate = |e: &stats::Estimate| {
+                    format!(
+                        "{{\"point\":{},\"interval\":{}}}",
+                        json_value(e.point),
+                        e.interval.ends.map_or_else(
+                            || "null".to_string(),
+                            |(low, high)| format!("[{},{}]", json_value(low), json_value(high))
+                        )
+                    )
+                };
+                format!(
+                    "{{\"added_a\":{},\"added_b\":{},\"difference\":{}}}",
+                    estimate(&bootstrap.added_a),
+                    estimate(&bootstrap.added_b),
+                    estimate(&bootstrap.difference)
+                )
+            },
+        )
+}
+
 /// `analysis.json`: one object, machine readable.
 #[must_use]
 pub fn json(analysis: &Analysis) -> String {
@@ -1172,31 +1357,17 @@ pub fn json(analysis: &Analysis) -> String {
         .points
         .iter()
         .map(|point| {
-            let estimates = point
-                .result
-                .as_ref()
-                .and_then(|result| result.bootstrap.as_ref())
-                .map_or_else(
-                    || "null".to_string(),
-                    |bootstrap| {
-                        let estimate = |e: &stats::Estimate| {
-                            format!(
-                                "{{\"point\":{},\"interval\":{}}}",
-                                json_value(e.point),
-                                e.interval.ends.map_or_else(
-                                    || "null".to_string(),
-                                    |(low, high)| format!("[{},{}]", json_value(low), json_value(high))
-                                )
-                            )
-                        };
-                        format!(
-                            "{{\"added_a\":{},\"added_b\":{},\"difference\":{}}}",
-                            estimate(&bootstrap.added_a),
-                            estimate(&bootstrap.added_b),
-                            estimate(&bootstrap.difference)
-                        )
-                    },
-                );
+            let estimates = estimates_json(point.result.as_ref());
+            let report_only = point.report_only.as_ref().map_or_else(
+                || "null".to_string(),
+                |result| {
+                    format!(
+                        "{{\"label\":\"report only, E4\",\"outcome\":{},\"estimates\":{}}}",
+                        json_string(&outcome_text(&result.outcome)),
+                        estimates_json(Some(result))
+                    )
+                },
+            );
             let cvs = point.result.as_ref().map_or_else(
                 || "null".to_string(),
                 |result| {
@@ -1235,8 +1406,16 @@ pub fn json(analysis: &Analysis) -> String {
                     )
                 })
                 .collect();
+            let number = |d: Option<i128>| d.map_or_else(|| "null".to_string(), |d| d.to_string());
+            let [p50_a, p50_b, p50_ab] = p50_differences(point, &analysis.options.configurations);
+            let p50 = format!(
+                "{{\"label\":\"report only, not the manifest statistic (E4 sanity)\",\"a_minus_trusted\":{},\"b_minus_trusted\":{},\"a_minus_b\":{}}}",
+                number(p50_a),
+                number(p50_b),
+                number(p50_ab)
+            );
             format!(
-                "{{\"point\":{},\"outcome\":{},\"cv\":{cvs},\"runs\":[{}],\"estimates\":{estimates}}}",
+                "{{\"point\":{},\"outcome\":{},\"cv\":{cvs},\"runs\":[{}],\"estimates\":{estimates},\"report_only\":{report_only},\"p50\":{p50}}}",
                 json_string(&point.point.to_string()),
                 json_string(&outcome_text(&point.outcome)),
                 runs.join(",")
@@ -1271,6 +1450,7 @@ pub fn json(analysis: &Analysis) -> String {
                 .as_ref()
                 .map_or_else(|| "null".to_string(), |entries| json_list(entries))
         ),
+        format!("\"interval_on_e4\":{}", analysis.interval_on_e4),
         format!("\"rounds\":{}", analysis.options.runs),
         format!("\"decision_grade\":{}", analysis.decision_grade()),
         format!("\"grade_reasons\":{}", json_list(&grade)),
@@ -1306,7 +1486,16 @@ pub fn json(analysis: &Analysis) -> String {
 ///
 /// The errors of [`analyze`], or a file that cannot be written.
 pub fn write(out: &Path) -> Result<Analysis, BenchError> {
-    let analysis = analyze(out)?;
+    write_with(out, false)
+}
+
+/// [`write()`] with [`analyze_with`]'s `interval_on_e4`.
+///
+/// # Errors
+///
+/// As [`write()`].
+pub fn write_with(out: &Path, interval_on_e4: bool) -> Result<Analysis, BenchError> {
+    let analysis = analyze_with(out, interval_on_e4)?;
     for (name, text) in [
         ("report.md", report(&analysis)),
         ("analysis.json", json(&analysis)),
@@ -1380,7 +1569,7 @@ mod tests {
         record: Option<&str>,
         edit: &Edit,
     ) -> std::path::PathBuf {
-        fixture_with(name, class, hash, facts, record, false, edit)
+        fixture_with(name, class, hash, facts, record, |_| {}, edit)
     }
 
     /// [`fixture`] with F2 on or off. Under F2, receiver `i` of a run is
@@ -1391,7 +1580,7 @@ mod tests {
         hash: &str,
         facts: &str,
         record: Option<&str>,
-        f2: bool,
+        tune: fn(&mut PlanOptions),
         edit: &Edit,
     ) -> std::path::PathBuf {
         let out =
@@ -1400,7 +1589,9 @@ mod tests {
         let mut options = PlanOptions::smoke(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope);
         options.messages = 10;
         options.warmup = 0;
-        options.f2 = f2;
+        options.f2 = false;
+        tune(&mut options);
+        let f2 = options.f2;
         let plan = plan::expand(&primary(), &options).unwrap();
         let configurations: Vec<String> = options
             .configurations
@@ -1660,7 +1851,15 @@ mod tests {
 
     #[test]
     fn an_f2_point_is_decided_on_its_slowest_receiver() {
-        let out = fixture_with("f2", "E1", MANIFEST_SHA256, ELIGIBLE, None, true, &none);
+        let out = fixture_with(
+            "f2",
+            "E1",
+            MANIFEST_SHA256,
+            ELIGIBLE,
+            None,
+            |o| o.f2 = true,
+            &none,
+        );
         let analysis = write(&out).unwrap();
         assert_eq!(analysis.points.len(), 16);
         let f2 = analysis
@@ -1700,6 +1899,110 @@ mod tests {
     }
 
     #[test]
+    fn a_synthetic_check_is_report_only_with_its_e4_interval() {
+        // a = synthetic-500 adds 1000 ns to every decision sample.
+        let out = fixture_with(
+            "synthetic",
+            "E4",
+            MANIFEST_SHA256,
+            ELIGIBLE,
+            None,
+            |o| *o = o.clone().with_synthetic_check(),
+            &|planned, _, outcome, _| {
+                if let (true, Ok(samples)) = (planned.configuration == "synthetic-500", outcome) {
+                    for value in samples.send.iter_mut() {
+                        *value += 1_000;
+                    }
+                }
+            },
+        );
+        let header = read(&out.join("measure.json")).unwrap();
+        std::fs::write(
+            out.join("measure.json"),
+            header.replace("\"build\":\"timing\"", "\"build\":\"timing+synthetic\""),
+        )
+        .unwrap();
+        let results = read(&out.join("results.jsonl")).unwrap();
+        std::fs::write(
+            out.join("results.jsonl"),
+            results.replace("\"build\":\"timing\"", "\"build\":\"timing+synthetic\""),
+        )
+        .unwrap();
+        // Without the flag, E4 stops at the environment: no interval.
+        let plain = analyze(&out).unwrap();
+        assert!(plain.points.iter().all(|p| p.report_only.is_none()));
+        let analysis = write_with(&out, true).unwrap();
+        for point in &analysis.points {
+            assert!(matches!(
+                point.outcome,
+                Outcome::NotDemonstrated(Cause::Environment(Environment::E4))
+            ));
+            let report_only = point.report_only.as_ref().unwrap();
+            // The slower a loses; its added latency is the 1000 ns.
+            assert_eq!(
+                report_only.outcome,
+                Outcome::Win(Side::B),
+                "{}",
+                point.point
+            );
+            let added = report_only.bootstrap.as_ref().unwrap().added_a.point;
+            // About 1000 ns: the runs' own offsets differ by a few.
+            assert!(
+                matches!(added, stats::Value::Finite(ns) if (980..=1_020).contains(&ns)),
+                "{}: {added:?}",
+                point.point
+            );
+        }
+        // Never graded or counted: the overall stays without a decided
+        // point, and the synthetic build and profile block a decision.
+        assert!(analysis.overall.wins_a.is_empty() && analysis.overall.wins_b.is_empty());
+        assert!(!analysis.decision_grade());
+        // The E4 interval leaves the grade as it is: E4 still does not
+        // decide (M3).
+        let Grade::NotDecisionGrade(reasons) = &analysis.grade else {
+            panic!("graded {:?}", analysis.grade);
+        };
+        assert!(reasons.contains(&decision::GradeReason::Environment(Environment::E4)));
+        assert!(
+            analysis
+                .blockers
+                .iter()
+                .any(|b| b.starts_with(SYNTHETIC_BLOCKER) && b.contains("timing+synthetic build"))
+        );
+        assert!(
+            analysis
+                .blockers
+                .iter()
+                .any(|b| *b == format!("{SYNTHETIC_BLOCKER}: synthetic-500"))
+        );
+        let report = read(&out.join("report.md")).unwrap();
+        assert!(report.contains("**report only, E4**"));
+        // Every verdict a synthetic build prints says so, on any
+        // environment.
+        for line in report.lines().filter(|line| line.starts_with("### ")) {
+            assert!(line.contains(SYNTHETIC_TAG), "{line}");
+        }
+        let overall = report
+            .lines()
+            .skip_while(|line| !line.starts_with("## Overall"))
+            .nth(2)
+            .unwrap();
+        assert!(overall.starts_with(SYNTHETIC_TAG), "{overall}");
+        // The p50 sanity check sees the 1000 ns too: a's p50 is 1000 above.
+        assert!(
+            report.contains(
+                "p50, report only, not the manifest statistic (E4 sanity): a - trusted 996 ns"
+            ),
+            "{report}"
+        );
+        assert!(report.contains("adds about 2 × 500 = 1000 ns"));
+        let json = read(&out.join("analysis.json")).unwrap();
+        assert!(json.contains("\"interval_on_e4\":true"));
+        assert!(json.contains("\"label\":\"report only, E4\""));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn another_manifest_is_refused() {
         let out = fixture("hash", "E4", &"0".repeat(64), ELIGIBLE, None, &none);
         assert!(error_of(&out).contains("measured under manifest"));
@@ -1723,7 +2026,7 @@ mod tests {
             results.replacen("\"build\":\"timing\"", "\"build\":\"alloc-count\"", 1),
         )
         .unwrap();
-        assert!(error_of(&out).contains("not a timing build"));
+        assert!(error_of(&out).contains("build of measure.json"));
         std::fs::write(out.join("results.jsonl"), &results).unwrap();
         // The allocation run's own file is reported, never decided on; it
         // must cover exactly the measured points, from the same commit.

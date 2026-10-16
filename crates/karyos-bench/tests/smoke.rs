@@ -551,6 +551,48 @@ fn an_already_joined_group_is_refused() {
     assert!(error.contains("already joined"), "{error}");
 }
 
+/// A synthetic configuration runs its profile in both child processes
+/// (B3e): against a trusted run, the send stage carries the spin of
+/// `seal` and the receive stage the spin of `open`. The spin is far above
+/// the trusted stages, so neither a zero spin nor a child that ignores
+/// its profile passes.
+#[test]
+fn a_synthetic_configuration_runs_in_its_processes() {
+    use karyos_bench::manifest::Shape;
+    use karyos_bench::wire::process::{ProcessOptions, run_processes};
+    use karyos_bench::wire::stage::StageLoad;
+    const SPIN_NS: u32 = 20_000;
+    let medians = |profile: &str| {
+        let dir = TempDir::new("wire-synthetic");
+        let samples = run_processes(
+            &wire_run(Shape::W1, StageLoad::Closed, 200),
+            &dir.0,
+            &ProcessOptions {
+                profile: profile.to_string(),
+                ..ProcessOptions::default()
+            },
+        )
+        .unwrap_or_else(|cause| panic!("{profile}: {cause}"));
+        let median = |values: &[u32]| {
+            let mut values = values.to_vec();
+            values.sort_unstable();
+            values[values.len() / 2]
+        };
+        (median(&samples.send), median(&samples.receivers[0].receive))
+    };
+    let (trusted_send, trusted_receive) = medians("trusted");
+    let (send, receive) = medians(&format!("synthetic-{SPIN_NS}"));
+    for (stage, trusted, synthetic) in [
+        ("send", trusted_send, send),
+        ("receive", trusted_receive, receive),
+    ] {
+        assert!(
+            synthetic.saturating_sub(trusted) >= SPIN_NS / 2,
+            "{stage}: median {synthetic} ns against trusted {trusted} ns"
+        );
+    }
+}
+
 /// Lost hellos are repeated: no message waits for an acknowledgement
 /// that cannot come.
 #[test]
@@ -762,7 +804,12 @@ fn the_allocation_build_counts_every_point_and_never_times() {
         .arg("build-info")
         .output()
         .unwrap();
-    assert_eq!(String::from_utf8_lossy(&info.stdout), "build alloc-count\n");
+    // With the synthetic test profile too: `alloc-count+synthetic`.
+    assert!(
+        String::from_utf8_lossy(&info.stdout).starts_with("build alloc-count"),
+        "{}",
+        String::from_utf8_lossy(&info.stdout)
+    );
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-bench"))
         .args(["alloc", "--out"])
         .arg(&dir.0)
@@ -775,7 +822,7 @@ fn the_allocation_build_counts_every_point_and_never_times() {
         String::from_utf8_lossy(&output.stderr)
     );
     let alloc = std::fs::read_to_string(dir.0.join("alloc.json")).unwrap();
-    assert!(alloc.contains("\"build\":\"alloc-count\""), "{alloc}");
+    assert!(alloc.contains("\"build\":\"alloc-count"), "{alloc}");
     assert!(alloc.contains("W1/R1/F1\\u0009send=0 receive=0"), "{alloc}");
     let measure = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-bench"))
         .args(["measure", "--out"])
