@@ -176,6 +176,11 @@ const JOURNAL_READY: u32 = 0x86;
 const CUTOVER_STATE: u32 = 0x87;
 const CONFLATED_READY: u32 = 0x88;
 const GUARD_STATE: u32 = 0x89;
+
+/// Whether `epoch` is one a guard can be closed at (`karyos_sys::guard`).
+const fn closed_epoch(epoch: u64) -> bool {
+    karyos_sys::guard::encode(karyos_sys::guard::GuardState { epoch, open: false }).is_some()
+}
 const PARTICIPANT_LOST: u32 = 0xC1;
 const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
 const PUBLICATION_CLOSED: u32 = 0xC3;
@@ -1048,7 +1053,14 @@ impl Command {
                 guard,
                 expected,
                 operation,
-            } => write_words(&[sequence, guard, expected, operation], out),
+            } => {
+                if !closed_epoch(expected) {
+                    return Err(CncError::Reserved {
+                        type_id: GUARD_REOPEN,
+                    });
+                }
+                write_words(&[sequence, guard, expected, operation], out)
+            }
         }
     }
 
@@ -1226,6 +1238,10 @@ impl Command {
             }
             GUARD_REOPEN => {
                 let [sequence, guard, expected, operation] = read_words::<4>(type_id, bytes)?;
+                // Only a closed epoch can be reopened: odd, 1 to MAX_EPOCH.
+                if !closed_epoch(expected) {
+                    return Err(CncError::Reserved { type_id });
+                }
                 Ok(Self::GuardReopen {
                     sequence,
                     guard,
@@ -2678,6 +2694,35 @@ mod journal_tests {
     }
 
     #[test]
+    fn a_reopen_of_an_impossible_epoch_is_refused() {
+        // Epoch 0, an open (even) epoch, and one above MAX_EPOCH.
+        for expected in [0, 2, karyos_sys::guard::MAX_EPOCH + 1, u64::MAX] {
+            assert_eq!(
+                Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, expected, 7])),
+                Err(CncError::Reserved {
+                    type_id: GUARD_REOPEN
+                }),
+                "{expected}"
+            );
+            let mut out = [0u8; MAX_COMMAND_LENGTH];
+            assert_eq!(
+                Command::GuardReopen {
+                    sequence: 1,
+                    guard: 3,
+                    expected,
+                    operation: 7,
+                }
+                .encode(&mut out),
+                Err(CncError::Reserved {
+                    type_id: GUARD_REOPEN
+                })
+            );
+        }
+        let last = karyos_sys::guard::MAX_EPOCH;
+        assert!(Command::decode(GUARD_REOPEN, &bytes_of(&[1, 3, last, 7])).is_ok());
+    }
+
+    #[test]
     fn a_guard_state_that_breaks_the_encoding_is_refused() {
         // Epoch 0, and an open bit on an odd epoch.
         for word in [0, 1, (3 << 1) | 1] {
@@ -3152,14 +3197,18 @@ mod properties {
                     operation,
                 }
             }),
-            any::<(u64, u64, u64, u64)>().prop_map(|(sequence, guard, expected, operation)| {
-                Command::GuardReopen {
-                    sequence,
-                    guard,
-                    expected,
-                    operation,
-                }
-            }),
+            (
+                any::<(u64, u64, u64)>(),
+                0..=(karyos_sys::guard::MAX_EPOCH >> 1)
+            )
+                .prop_map(|((sequence, guard, operation), half)| {
+                    Command::GuardReopen {
+                        sequence,
+                        guard,
+                        expected: half * 2 + 1,
+                        operation,
+                    }
+                }),
         ]
     }
 

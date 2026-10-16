@@ -478,11 +478,22 @@ impl<T: TermBytes> ClientPublication<T> {
     ) -> Result<OfferOutcome, ClientError> {
         // A forgotten claim is resolved before any early return.
         self.inner.resolve_forgotten_claim();
-        match self.guard.as_ref().map(GuardBinding::admission) {
-            Some(Admission::Gated) => return Ok(OfferOutcome::Gated),
-            Some(Admission::BackPressured) => return Ok(OfferOutcome::BackPressured),
-            Some(Admission::Lost) => return Err(ClientError::OutcomesLost),
-            Some(Admission::Open) | None => {}
+        let admission = self.guard.as_ref().map(GuardBinding::admission);
+        if let Some(refused) = admission.filter(|admission| *admission != Admission::Open) {
+            // A sealed handle releases first and reports its seal
+            // (publication-seal.md: a guard seal reports `Gated` and
+            // releases), whatever the guard check says.
+            if let Some(reason) = self.inner.close_if_sealed() {
+                if reason.is_gate() {
+                    return Ok(OfferOutcome::Gated);
+                }
+                return Ok(self.after_end().offer());
+            }
+            return match refused {
+                Admission::Lost => Err(ClientError::OutcomesLost),
+                Admission::BackPressured => Ok(OfferOutcome::BackPressured),
+                Admission::Gated | Admission::Open => Ok(OfferOutcome::Gated),
+            };
         }
         if !self.connected() {
             // A sealed publication still releases (publication-seal.md);
@@ -554,11 +565,20 @@ impl<T: TermBytes> ClientPublication<T> {
         // A forgotten claim is resolved before any early return; the
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
-        match self.guard.as_ref().map(GuardBinding::admission) {
-            Some(Admission::Gated) => return Ok(ClaimOutcome::Gated),
-            Some(Admission::BackPressured) => return Ok(ClaimOutcome::BackPressured),
-            Some(Admission::Lost) => return Err(ClientError::OutcomesLost),
-            Some(Admission::Open) | None => {}
+        let admission = self.guard.as_ref().map(GuardBinding::admission);
+        if let Some(refused) = admission.filter(|admission| *admission != Admission::Open) {
+            // As in `offer_with`: a sealed handle releases first.
+            if let Some(reason) = self.inner.close_if_sealed() {
+                if reason.is_gate() {
+                    return Ok(ClaimOutcome::Gated);
+                }
+                return Ok(self.after_end().claim());
+            }
+            return match refused {
+                Admission::Lost => Err(ClientError::OutcomesLost),
+                Admission::BackPressured => Ok(ClaimOutcome::BackPressured),
+                Admission::Gated | Admission::Open => Ok(ClaimOutcome::Gated),
+            };
         }
         if !self.connected() {
             if let Some(reason) = self.inner.close_if_sealed() {
@@ -599,11 +619,9 @@ impl<T: TermBytes> ClientPublication<T> {
             (Some(extension), Some(trace)) => Some((trace, extension)),
             _ => None,
         };
-        // A claimed block, committed or aborted later, and a reservation
-        // aborted at once each get exactly one final record.
         let outcome = self.inner.try_claim(length, options)?;
-        if let (Some(binding), SysClaimOutcome::Claimed(_) | SysClaimOutcome::Aborted { .. }) =
-            (guard, &outcome)
+        if let Some(binding) = guard
+            && reserves(&outcome)
         {
             binding.reserve();
         }
@@ -704,6 +722,16 @@ impl End {
             End::Closed => ClaimOutcome::Closed,
         }
     }
+}
+
+/// Whether a claim attempt reserved a block of the log: a claimed block,
+/// committed or aborted later, and a reservation aborted at once each get
+/// exactly one final outcome record.
+fn reserves<T: TermBytes>(outcome: &SysClaimOutcome<'_, Arc<LogBuffer<T>>>) -> bool {
+    matches!(
+        outcome,
+        SysClaimOutcome::Claimed(_) | SysClaimOutcome::Aborted { .. }
+    )
 }
 
 #[cfg(test)]
@@ -1149,6 +1177,7 @@ mod tests {
         const MESSAGES: u64 = 2;
 
         struct Driver {
+            conductor: Conductor<Arc<LogBuffer>>,
             guard: Arc<HeapWords>,
             ring: Arc<HeapWords>,
             consumed: Arc<AtomicU64>,
@@ -1198,8 +1227,9 @@ mod tests {
                 MESSAGES,
             )
             .unwrap();
-            let (_buffer, _conductor, publication) = setup(true);
+            let (_buffer, conductor, publication) = setup(true);
             let driver = Driver {
+                conductor,
                 guard,
                 ring,
                 consumed,
@@ -1333,6 +1363,60 @@ mod tests {
             ));
         }
 
+        /// A final message record with no outstanding reservation is a
+        /// driver protocol break: reported, consumed, releasing nothing.
+        #[test]
+        fn an_unreserved_final_record_is_corrupt() {
+            let (mut driver, mut publication) = guarded();
+            driver.outcome(Kind::Submitted);
+            assert_eq!(
+                publication.poll_outcomes(8, |_, _| {}),
+                Err(ClientError::Outcomes(
+                    karyos_sys::outcome_ring::OutcomeError::Corrupt { sequence: 1 }
+                ))
+            );
+            assert_eq!(publication.guard().unwrap().outstanding(), 0);
+        }
+
+        #[test]
+        fn claim_outcomes_that_reserve() {
+            assert!(reserves::<HeapTerms>(&SysClaimOutcome::Aborted {
+                position: 64
+            }));
+            assert!(!reserves::<HeapTerms>(&SysClaimOutcome::BackPressured));
+            assert!(!reserves::<HeapTerms>(&SysClaimOutcome::AdminAction));
+            assert!(!reserves::<HeapTerms>(&SysClaimOutcome::Closed));
+            assert!(!reserves::<HeapTerms>(&SysClaimOutcome::Gated));
+        }
+
+        /// A guard close seals the handle; the early check refuses, but the
+        /// handle still releases its seal and reports `Gated`.
+        #[test]
+        fn a_guard_sealed_handle_releases_before_the_early_check() {
+            let (mut driver, mut publication) = guarded();
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert_eq!(
+                guard::close(&driver.guard.words()[1]),
+                Ok(guard::Closed::Now { epoch: 3 })
+            );
+            driver
+                .conductor
+                .seal_with_reason(karyos_sys::log_buffer::SealReason::GuardClosed)
+                .unwrap();
+            let _ = driver.conductor.duty_cycle().unwrap();
+            assert_eq!(publication.offer(b"b").unwrap(), OfferOutcome::Gated);
+            let _ = driver.conductor.duty_cycle().unwrap();
+            assert!(
+                matches!(
+                    driver.conductor.seal_state(),
+                    karyos_sys::log_buffer::SealState::Retired { .. }
+                ),
+                "{:?}",
+                driver.conductor.seal_state()
+            );
+            assert!(matches!(publication.try_claim(8), Ok(ClaimOutcome::Gated)));
+        }
+
         #[test]
         fn a_binding_refuses_a_bad_ring() {
             let ring = Arc::new(HeapWords::zeroed(ring_words(3).unwrap()));
@@ -1355,6 +1439,20 @@ mod tests {
             );
             let ring = Arc::new(HeapWords::zeroed(ring_words(3).unwrap()));
             init(ring.words(), 3).unwrap();
+            // A guard index past the guard view.
+            assert_eq!(
+                GuardBinding::new(
+                    words(HeapWords::zeroed(1)),
+                    1,
+                    2,
+                    Arc::clone(&ring) as Arc<dyn crate::guarded::SharedWords>,
+                    cell(),
+                    1,
+                    1
+                )
+                .unwrap_err(),
+                ClientError::Outcomes(karyos_sys::outcome_ring::OutcomeError::Layout)
+            );
             assert_eq!(
                 GuardBinding::new(words(HeapWords::zeroed(1)), 0, 2, ring, cell(), 1, 0)
                     .unwrap_err(),
