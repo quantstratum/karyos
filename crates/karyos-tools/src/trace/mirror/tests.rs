@@ -102,6 +102,8 @@ fn words(record: &TraceRecord) -> [u64; RECORD_WORDS] {
 struct Driver {
     mirror: TraceMirror,
     entries: Vec<Option<JournalEntry>>,
+    /// The next mirror sequence (T7).
+    next_sequence: u64,
 }
 
 impl Driver {
@@ -109,7 +111,23 @@ impl Driver {
         Self {
             mirror: trace_mirror(entries, log, ring).unwrap(),
             entries: vec![None; entries],
+            next_sequence: 1,
         }
+    }
+
+    /// Assigns the next mirror sequence and publishes the high-water mark,
+    /// as the driver does before it writes the entry.
+    fn assign(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.mirror.assign_sequence(sequence);
+        sequence
+    }
+
+    /// A journal created and recycled, covered, before anyone saw it: its
+    /// sequence is assigned and never shown.
+    fn unseen(&mut self) {
+        let _ = self.assign();
     }
 
     fn entry(&mut self, index: usize) -> &mut JournalEntry {
@@ -131,6 +149,7 @@ impl Driver {
         entry.time_namespace = TimeNamespace::Same;
         entry.provenance = ClockProvenance::HostMonotonic.word();
         entry.join = (kind == JournalKind::Subscriber).then_some(0);
+        entry.sequence = self.assign();
         self.entries[index] = Some(entry);
         self.write(index);
     }
@@ -204,6 +223,7 @@ impl Driver {
                 boundary: old.boundary,
                 pairs,
                 pair_count: 1,
+                sequence: old.sequence,
             })
         ));
         self.write(index);
@@ -832,10 +852,10 @@ fn a_missed_journal_puts_the_held_messages_out_of_scope() {
     driver.end(0, JournalState::Closed, None);
     driver.end(1, JournalState::Closed, None);
     let scan = driver.scan(&mut tool);
-    assert_eq!(scan.missed, 1);
-    assert_eq!(tool.missed(), (1, 1));
     let report = tool.report().unwrap();
     assert_eq!(answer(&report, 1), TraceAnswer::OutOfScope);
+    assert_eq!(scan.missed, 1);
+    assert_eq!(tool.missed(), (1, 1));
     // A message the gap's scan delivered is held at the gap too: the missed
     // journal could have observed any publication.
     assert_eq!(answer(&report, 51), TraceAnswer::OutOfScope);
@@ -845,35 +865,27 @@ fn a_missed_journal_puts_the_held_messages_out_of_scope() {
     assert_eq!(tool.missed(), (1, 1));
 }
 
-/// T7: numbers at or below the first scan's highest are never gaps: a tool
-/// attaching to a driver whose table and log skip numbers puts nothing out
-/// of scope, then or later.
+/// T7: sequences at or below the high-water mark read at the first scan
+/// are never gaps: a tool attaching to a driver whose table and log skip
+/// sequences (journals recycled, covered, before the attach) puts nothing
+/// out of scope, then or later.
 #[test]
-fn skipped_numbers_before_the_attach_are_not_missed_journals() {
+fn skipped_sequences_before_the_attach_are_not_missed_journals() {
     let mut driver = Driver::new(4, 2, 64);
+    driver.unseen();
     driver.open(0, 4, JournalKind::Publisher, PUBLICATION);
+    driver.unseen();
+    driver.open(2, 6, JournalKind::Subscriber, OTHER);
+    driver.end(2, JournalState::Closed, Some(0));
+    driver.recycle(2, 0);
+    driver.unseen();
     driver.open(1, 9, JournalKind::Subscriber, PUBLICATION);
-    let mut pairs = [NotedPublisher::default(); MAX_RECYCLE_PAIRS];
-    pairs[0] = NotedPublisher {
-        journal: 2,
-        attempted: 0,
-    };
-    assert!(driver.mirror.write_log(
-        0,
-        Some(&RecycledJournal {
-            journal: 6,
-            stream: OTHER.registration,
-            incarnation: OTHER.incarnation,
-            state: JournalState::Closed,
-            boundary: Some(0),
-            pairs,
-            pair_count: 1,
-        })
-    ));
+    driver.unseen();
     driver.store(0, &publish(0, 1, 10));
     driver.store(1, &poll(0, 1, 15));
     driver.end(0, JournalState::Closed, None);
     driver.end(1, JournalState::Closed, Some(1));
+    assert_eq!(driver.mirror.reader().assigned_sequence(), 7);
     let mut tool = MirrorTool::new(INSTANCE);
     assert_eq!(driver.scan(&mut tool).missed, 0);
     assert_eq!(driver.scan(&mut tool).missed, 0);
@@ -882,6 +894,37 @@ fn skipped_numbers_before_the_attach_are_not_missed_journals() {
         answer(&tool.report().unwrap(), 1),
         TraceAnswer::Final(Verdict::Complete)
     );
+}
+
+/// T7 (REVIEWER-02, #149): the newest journal, a subscriber journal
+/// expected for a held `Publish`, is created, ended, covered and recycled
+/// without a log entry between two scans, and nothing newer exists. The
+/// table and the log show nothing above the previous scan's mark; the
+/// header's high-water mark still reveals the missed sequence, so the
+/// message is out of scope, never Complete. Negative control (verified by
+/// counting gaps only up to the highest sequence shown): Complete.
+#[test]
+fn the_newest_missed_journal_is_counted_from_the_header() {
+    let mut driver = Driver::new(2, 1, 2);
+    let mut tool = MirrorTool::new(INSTANCE);
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    driver.store(0, &publish(0, 1, 10));
+    let _ = driver.scan(&mut tool);
+    assert_eq!(answer(&tool.report().unwrap(), 1), TraceAnswer::Provisional);
+    driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+    driver.store(1, &poll(0, 1, 15));
+    driver.end(1, JournalState::Closed, Some(64));
+    // Covered: later messages push the poll and the Publish out of the
+    // ring, and the entry is freed without a log entry.
+    driver.store(0, &publish(1 << 20, 60, 20));
+    driver.store(0, &publish((1 << 20) + 64, 61, 30));
+    driver.end(0, JournalState::Closed, None);
+    driver.entries[1] = None;
+    driver.write(1);
+    let scan = driver.scan(&mut tool);
+    assert_eq!(answer(&tool.report().unwrap(), 1), TraceAnswer::OutOfScope);
+    assert_eq!(scan.missed, 1);
+    assert_eq!(tool.missed(), (1, 1));
 }
 
 /// T7: a trace already final before the gap keeps its answer.
@@ -898,7 +941,8 @@ fn a_final_answer_survives_a_missed_journal() {
         answer(&tool.report().unwrap(), 1),
         TraceAnswer::Final(Verdict::Complete)
     );
-    // Journal 2 lives and goes between two scans; journal 3 shows the gap.
+    // A journal lives and goes between two scans unseen.
+    driver.unseen();
     driver.open(1, 3, JournalKind::Publisher, OTHER);
     driver.end(1, JournalState::Closed, None);
     let scan = driver.scan(&mut tool);

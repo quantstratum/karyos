@@ -54,12 +54,19 @@
 //! - **Trace horizon (T6).** A trace can be `Complete` only if the tool
 //!   observed its root, a `Publish` record with the `root` flag; every
 //!   other trace that would be `Complete` is out of scope.
-//! - **Missed journals (T7).** The tool tracks the journal numbers it sees
-//!   in the table or the log. Numbers at or below the highest of the first
-//!   scan are never gaps; after that, a number above the previous scan's
-//!   highest that a scan shows in neither is a missed journal, which puts
-//!   every held message whose trace was not final after the previous
-//!   scan out of scope, for every publication, for the tool's life.
+//! - **Missed journals (T7, ACS 13973).** The driver numbers the journals
+//!   it creates with a dense mirror sequence (not the journal number,
+//!   which shares the trace number space) and publishes the highest one
+//!   assigned in the mirror header before it writes that journal's entry.
+//!   Each scan reads that high-water mark first (Acquire), then the table,
+//!   then the log. Sequences at or below the mark read at the first scan
+//!   are never gaps; after that, every sequence above the previous scan's
+//!   mark and at or below this one's that the table and the log both
+//!   lack is a missed journal, which puts every held message whose trace
+//!   was not final after the previous scan out of scope, for every
+//!   publication, for the tool's life. Read in the other order, a journal
+//!   created between the two reads would count as missed, which is only
+//!   conservative.
 //!
 //! The tool cannot bound a trace's span in a journal, so the report's
 //! attribution uses `D = u64::MAX` (`quantstratum-docs:
@@ -358,8 +365,8 @@ pub struct MirrorTool {
     /// Delivered ring records of a journal the tool never saw in the
     /// table: overwritten during the scan, so mirror loss.
     unattributed: u64,
-    /// The highest journal number the last scan showed in the table or
-    /// the log (T7).
+    /// The mirror's high-water mark of assigned sequences as the last scan
+    /// read it (T7); `None` before the first scan.
     highest: Option<u64>,
     /// Scans that found missed journals, and the numbers missed.
     missed_events: u64,
@@ -396,6 +403,8 @@ impl MirrorTool {
     pub fn scan(&mut self, reader: &TraceMirrorReader) -> ScanReport {
         let attach = self.scans == 0;
         self.scans += 1;
+        // T7: the high-water mark before the table and the log.
+        let assigned = reader.assigned_sequence();
         let mut delivered: Vec<(u64, u64, Vec<u64>)> = Vec::new();
         let scan = reader.scan(&mut self.cursor, |record| {
             delivered.push((record.journal, record.sequence, record.payload.to_vec()));
@@ -407,7 +416,7 @@ impl MirrorTool {
         for tracked in self.journals.values_mut() {
             tracked.present = false;
         }
-        // Journal numbers this scan shows in the table or the log (T7).
+        // Mirror sequences this scan shows in the table or the log (T7).
         let mut shown: BTreeSet<u64> = BTreeSet::new();
         for index in 0..reader.entries() {
             match reader.entry(index) {
@@ -433,7 +442,7 @@ impl MirrorTool {
                     tracked.entry = entry;
                     tracked.index = index;
                     tracked.present = true;
-                    shown.insert(entry.journal);
+                    shown.insert(entry.sequence);
                 }
                 // Being written: what the tool last read there stands.
                 EntryRead::Busy => {
@@ -448,7 +457,7 @@ impl MirrorTool {
         }
         for index in 0..reader.log_entries() {
             if let LogRead::Entry(entry) = reader.log_entry(index) {
-                shown.insert(entry.journal);
+                shown.insert(entry.sequence);
                 self.recycled.insert(entry.journal, entry);
             }
         }
@@ -459,7 +468,7 @@ impl MirrorTool {
                 None => self.unattributed = self.unattributed.saturating_add(1),
             }
         }
-        let missed = self.missed_journals(&shown);
+        let missed = self.missed_journals(assigned, &shown);
         if missed > 0 {
             self.missed_events = self.missed_events.saturating_add(1);
             self.missed_numbers = self.missed_numbers.saturating_add(missed);
@@ -493,26 +502,25 @@ impl MirrorTool {
         }
     }
 
-    /// The journal numbers this scan missed (T7): numbers are assigned in
-    /// order and never reused, so a number above the previous scan's
-    /// highest that this scan shows neither in the table nor in the log
-    /// belongs to a journal created, ended and recycled between two scans.
-    /// Numbers at or below the first scan's highest are never gaps: a
-    /// journal recycled before the attach without a log entry was covered.
-    fn missed_journals(&mut self, shown: &BTreeSet<u64>) -> u64 {
-        // An empty first scan sets 0: any later number not shown counts,
-        // which can only narrow the scope.
-        let top = shown.last().copied();
+    /// The mirror sequences this scan missed (T7): the driver assigns
+    /// them densely and publishes the high-water mark `assigned` before
+    /// the entry, so a sequence above the previous scan's mark and at or
+    /// below `assigned` that this scan `shown` neither in the table nor in
+    /// the log belongs to a journal created, ended and recycled between
+    /// two scans. Sequences at or below the first scan's mark are never
+    /// gaps: a journal recycled before the attach without a log entry was
+    /// covered.
+    fn missed_journals(&mut self, assigned: u64, shown: &BTreeSet<u64>) -> u64 {
         let Some(previous) = self.highest else {
-            self.highest = Some(top.unwrap_or(0));
+            self.highest = Some(assigned);
             return 0;
         };
-        let Some(top) = top.filter(|top| *top > previous) else {
+        if assigned <= previous {
             return 0;
-        };
-        self.highest = Some(top);
-        let above = shown.range(previous + 1..=top).count() as u64;
-        (top - previous).saturating_sub(above)
+        }
+        self.highest = Some(assigned);
+        let seen = shown.range(previous + 1..=assigned).count() as u64;
+        (assigned - previous).saturating_sub(seen)
     }
 
     /// Scans that found missed journals, and the journal numbers missed
