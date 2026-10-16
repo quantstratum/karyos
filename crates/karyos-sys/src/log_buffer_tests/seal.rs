@@ -598,6 +598,7 @@ fn a_seal_reason_reaches_readers_publishers_and_the_conductor() {
         SealReason::RequiredParticipantLost,
         SealReason::ConflationVersionsExhausted,
         SealReason::StreamRemoved,
+        SealReason::ConflationFeederLost,
     ] {
         let buffer = new_buffer(config(3, 2)).unwrap();
         let mut conductor = buffer.conductor().unwrap();
