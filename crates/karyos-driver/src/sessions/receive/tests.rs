@@ -461,3 +461,186 @@ fn the_configuration_is_checked() {
     }
     assert!(ReceiveSessions::new(SessionConfig::default(), [0, 0]).is_err());
 }
+
+/// Puts a challenge for `identity(incarnation)` under `key` straight into
+/// a free slot, as a race that passed the announcement checks would.
+fn inject(
+    sessions: &mut ReceiveSessions,
+    key: BindingKey,
+    incarnation: u64,
+    nonce: [u64; 2],
+    answered: bool,
+) -> SlotRef {
+    let index = sessions
+        .slots
+        .iter()
+        .position(|slot| slot.state == State::Free)
+        .unwrap();
+    let slot = &mut sessions.slots[index];
+    slot.state = State::Challenged {
+        key,
+        identity: identity(incarnation),
+        term: term(),
+        lane_count: 2,
+        nonce,
+        created_at: 0,
+        answered,
+    };
+    SlotRef {
+        slot: u32::try_from(index).unwrap(),
+        generation: slot.generation,
+    }
+}
+
+fn other_key() -> BindingKey {
+    BindingKey {
+        alias: Alias {
+            session_id: 50,
+            stream_id: 6,
+        },
+        ..key(2)
+    }
+}
+
+/// Installs `identity(1)` on `key(1)`.
+fn install_on_key_one(sessions: &mut ReceiveSessions, nonces: &mut Counter) -> SlotRef {
+    let nonce = challenged(sessions.announce(key(1), &announce(1), 0, nonces))
+        .challenge
+        .nonce;
+    let pending = accepted(sessions.answer(key(1), &answer(1, nonce), MS, || true));
+    let ReadyOutcome::Installed(bound) = sessions.image_ready(pending, MS) else {
+        panic!("not installed");
+    };
+    bound
+}
+
+/// Review P1 scenario A: X is active on K1; a delayed SETUP for X under K2
+/// is refused at the announcement. A K2 challenge that got in before (a
+/// race) still cannot install X: after K1 retires, the answer and
+/// `ImageReady` both see the quarantine.
+#[test]
+fn an_old_challenge_cannot_bypass_the_quarantine() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let bound = install_on_key_one(&mut sessions, &mut nonces);
+    let other_announce = SetupAnnounce {
+        alias: other_key().alias,
+        ..announce(1)
+    };
+    assert_eq!(
+        sessions.announce(other_key(), &other_announce, 2 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    inject(&mut sessions, other_key(), 1, [77, 0], false);
+    sessions.retire(bound, 3 * MS);
+    let late_answer = SetupAnswer {
+        alias: other_key().alias,
+        ..answer(1, [77, 0])
+    };
+    assert_eq!(
+        sessions.answer(other_key(), &late_answer, 4 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::Quarantined)
+    );
+    // Answered before the retirement, installed after it: released.
+    let answered = inject(&mut sessions, key(3), 1, [78, 0], true);
+    assert_eq!(
+        sessions.image_ready(answered, 5 * MS),
+        ReadyOutcome::Release(answered)
+    );
+    assert_eq!(sessions.counters().installed, 1);
+}
+
+/// Review P1 scenario B: one identity from two source ports installs one
+/// image. The second key is refused at the announcement; a raced challenge
+/// is refused at the answer and at `ImageReady`.
+#[test]
+fn one_identity_installs_one_image() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces));
+    assert_eq!(
+        sessions.announce(key(2), &announce(1), 0, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+
+    let mut sessions = table(SessionConfig::default());
+    install_on_key_one(&mut sessions, &mut nonces);
+    inject(&mut sessions, key(2), 1, [79, 0], false);
+    let raced_answer = SetupAnswer {
+        alias: key(2).alias,
+        ..answer(1, [79, 0])
+    };
+    assert_eq!(
+        sessions.answer(key(2), &raced_answer, 2 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    let answered = inject(&mut sessions, key(3), 1, [80, 0], true);
+    assert_eq!(
+        sessions.image_ready(answered, 3 * MS),
+        ReadyOutcome::Release(answered)
+    );
+    assert_eq!(sessions.counters().installed, 1);
+}
+
+/// The per-source bound counts an IPv4-mapped IPv6 source as its IPv4
+/// address.
+#[test]
+fn ipv4_mapped_sources_share_a_budget() {
+    let config = SessionConfig {
+        max_pending_per_source: 1,
+        ..SessionConfig::default()
+    };
+    let mut sessions = table(config);
+    let mut nonces = Counter::default();
+    challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces));
+    let mapped = BindingKey {
+        source: "[::ffff:10.0.0.1]:2".parse().unwrap(),
+        ..key(2)
+    };
+    assert_eq!(
+        sessions.announce(mapped, &announce(2), 0, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::ChallengeCapacity)
+    );
+}
+
+/// A control whose alias differs from its key's is dropped.
+#[test]
+fn an_alias_mismatch_is_dropped() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let mut wrong = announce(1);
+    wrong.alias.session_id = 99;
+    assert_eq!(
+        sessions.announce(key(1), &wrong, 0, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::AliasMismatch)
+    );
+    let nonce = challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces))
+        .challenge
+        .nonce;
+    let mut wrong = answer(1, nonce);
+    wrong.alias.session_id = 99;
+    assert_eq!(
+        sessions.answer(key(1), &wrong, MS, || true),
+        AnswerOutcome::Dropped(Ignored::AliasMismatch)
+    );
+}
+
+/// Conductor replies carry the installed generation; one for the
+/// challenge's generation is ignored and counted.
+#[test]
+fn a_stale_reclaim_is_counted() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let nonce = challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces))
+        .challenge
+        .nonce;
+    let pending = accepted(sessions.answer(key(1), &answer(1, nonce), MS, || true));
+    let ReadyOutcome::Installed(slot) = sessions.image_ready(pending, MS) else {
+        panic!("not installed");
+    };
+    sessions.retire(slot, MS);
+    sessions.storage_reclaimed(pending);
+    assert_eq!(sessions.counters().stale_commands, 1);
+    sessions.storage_reclaimed(slot);
+    assert_eq!(sessions.timers(20 * SECOND), 1);
+}

@@ -25,6 +25,12 @@
 //! - **Bound.** A SETUP for the bound identity is ignored and counted; one
 //!   for another identity is rejected until the image retires; neither
 //!   refreshes liveness.
+//! - **One owner per identity.** An identity active, challenged or answered
+//!   under one key is refused under any other (a second path or a second
+//!   writer) until redundant paths are reviewed (RP-1). The quarantine and
+//!   this uniqueness are checked at the announcement and again at the
+//!   answer and at `ImageReady`, so a challenge created before a retirement
+//!   or before another key bound the identity never installs it.
 //! - **Retirement.** The binding goes at once; the full identity stays
 //!   quarantined for `alias_quarantine`, and the slot stays charged until
 //!   both the quarantine has passed and the conductor reclaimed the
@@ -193,6 +199,12 @@ pub enum Ignored {
     AlreadyAnswered,
     /// The conductor command chain could not be reserved.
     NoCommandCredit,
+    /// The identity is active, challenged or answered under another key: a
+    /// second path or a second writer (one receive owner per image,
+    /// ADR-0018; redundant paths wait for RP-1).
+    DuplicateIdentity,
+    /// The control's alias differs from the key's.
+    AliasMismatch,
 }
 
 /// Counters of the table; increments are checked and `overflowed` is
@@ -217,6 +229,9 @@ pub struct SessionCounters {
     pub retired: u64,
     /// Slots retired for good because their generation is exhausted.
     pub slots_exhausted: u64,
+    /// Conductor replies naming a slot at another generation or state,
+    /// ignored.
+    pub stale_commands: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -363,12 +378,29 @@ impl ReceiveSessions {
         })
     }
 
+    /// Whether `identity` is active, challenged or answered under a key
+    /// other than `key`.
+    fn elsewhere(&self, identity: &Identity, key: &BindingKey) -> bool {
+        self.slots.iter().any(|slot| match slot.state {
+            State::Active {
+                key: other,
+                identity: held,
+            }
+            | State::Challenged {
+                key: other,
+                identity: held,
+                ..
+            } => held == *identity && other != *key,
+            _ => false,
+        })
+    }
+
     fn pending(&self, source: Option<SocketAddr>) -> usize {
         self.slots
             .iter()
             .filter(|slot| match slot.state {
                 State::Challenged { key, .. } => {
-                    source.is_none_or(|source| key.source.ip() == source.ip())
+                    source.is_none_or(|source| source_ip(key.source) == source_ip(source))
                 }
                 _ => false,
             })
@@ -426,8 +458,14 @@ impl ReceiveSessions {
         now: u64,
         nonces: &mut impl NonceSource,
     ) -> AnnounceOutcome {
+        if announce.alias != key.alias {
+            return AnnounceOutcome::Dropped(self.ignore(Ignored::AliasMismatch));
+        }
         if self.quarantined(&announce.identity, now) {
             return AnnounceOutcome::Dropped(self.ignore(Ignored::Quarantined));
+        }
+        if self.elsewhere(&announce.identity, &key) {
+            return AnnounceOutcome::Dropped(self.ignore(Ignored::DuplicateIdentity));
         }
         let timeout = self.config.setup_challenge_timeout;
         let existing = self.slots.iter().position(|slot| match slot.state {
@@ -580,6 +618,9 @@ impl ReceiveSessions {
         if answered {
             return AnswerOutcome::Dropped(self.ignore(Ignored::AlreadyAnswered));
         }
+        if answer.alias != key.alias {
+            return AnswerOutcome::Dropped(self.ignore(Ignored::AliasMismatch));
+        }
         if answer.identity != identity
             || answer.term != term
             || answer.joins.count() != lane_count
@@ -590,6 +631,14 @@ impl ReceiveSessions {
         }
         if age_ns(now, created_at) >= timeout {
             return AnswerOutcome::Dropped(self.ignore(Ignored::Expired));
+        }
+        // Rechecked here: the identity may have been retired, or bound under
+        // another key, since its announcement was challenged.
+        if self.quarantined(&identity, now) {
+            return AnswerOutcome::Dropped(self.ignore(Ignored::Quarantined));
+        }
+        if self.elsewhere(&identity, &key) {
+            return AnswerOutcome::Dropped(self.ignore(Ignored::DuplicateIdentity));
         }
         if !reserve() {
             return AnswerOutcome::Dropped(self.ignore(Ignored::NoCommandCredit));
@@ -611,10 +660,17 @@ impl ReceiveSessions {
     }
 
     /// The conductor's `ImageReady` for `slot` at `now`: installs the
-    /// image if its challenge is still answered and within its timeout.
+    /// image if its challenge is still answered, within its timeout, its
+    /// identity not quarantined and not bound under another key.
+    ///
+    /// `slot` carries the challenge's generation, as `CreateImage` did; on
+    /// installation the generation moves, and [`ReadyOutcome::Installed`]
+    /// carries the new one, which `ImageInstalled`, `RetireImage` and
+    /// `StorageReclaimed` must carry from then on.
     pub fn image_ready(&mut self, slot: SlotRef, now: u64) -> ReadyOutcome {
         let timeout = self.config.setup_challenge_timeout;
-        let Some(entry) = self.get_mut(slot) else {
+        let Some(entry) = self.get(slot).copied() else {
+            self.counters.bump(|c| &mut c.stale_commands);
             return ReadyOutcome::Release(slot);
         };
         let State::Challenged {
@@ -625,9 +681,16 @@ impl ReceiveSessions {
             ..
         } = entry.state
         else {
+            self.counters.bump(|c| &mut c.stale_commands);
             return ReadyOutcome::Release(slot);
         };
-        if age_ns(now, created_at) >= timeout {
+        let refused = age_ns(now, created_at) >= timeout
+            || self.quarantined(&identity, now)
+            || self.elsewhere(&identity, &key);
+        let Some(entry) = self.get_mut(slot) else {
+            return ReadyOutcome::Release(slot);
+        };
+        if refused {
             entry.state = State::Free;
             self.counters.bump(|c| &mut c.released);
             return ReadyOutcome::Release(slot);
@@ -657,6 +720,8 @@ impl ReceiveSessions {
         {
             entry.state = State::Free;
             self.counters.bump(|c| &mut c.released);
+        } else {
+            self.counters.bump(|c| &mut c.stale_commands);
         }
     }
 
@@ -678,14 +743,29 @@ impl ReceiveSessions {
         true
     }
 
-    /// The conductor's `StorageReclaimed`: the tombstone may go once its
-    /// quarantine has passed.
+    /// The conductor's `StorageReclaimed` for the installed generation of
+    /// `slot`: the tombstone may go once its quarantine has passed. A
+    /// reply for another generation is ignored and counted
+    /// (`stale_commands`).
     pub fn storage_reclaimed(&mut self, slot: SlotRef) {
         if let Some(entry) = self.get_mut(slot)
             && let State::Retired { reclaimed, .. } = &mut entry.state
         {
             *reclaimed = true;
+        } else {
+            self.counters.bump(|c| &mut c.stale_commands);
         }
+    }
+}
+
+/// The address a source counts under: an IPv4-mapped IPv6 address is the
+/// IPv4 address, so one host cannot double its per-source budget.
+fn source_ip(source: SocketAddr) -> std::net::IpAddr {
+    match source.ip() {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
     }
 }
 
