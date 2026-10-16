@@ -112,7 +112,10 @@ impl From<AppendOutcome> for ConcurrentOfferOutcome {
             AppendOutcome::Appended { position } => Self::Appended { position },
             AppendOutcome::BackPressured => Self::BackPressured,
             AppendOutcome::AdminAction => Self::AdminAction,
-            AppendOutcome::Closed => Self::Closed,
+            // GC-7: a concurrent buffer is never guarded or scheduled, so
+            // it is never sealed with a gate reason; a gate seal reads as
+            // closed here.
+            AppendOutcome::Closed | AppendOutcome::Gated => Self::Closed,
         }
     }
 }
@@ -793,9 +796,13 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     /// (`quantstratum-docs: karyos/design/publication-seal.md`). Resolves a forgotten claim
     /// first. For wrappers that return before an attempt (the connection
     /// rule), so that a sealed publication is still released.
-    pub fn close_if_sealed(&mut self) -> bool {
+    ///
+    /// Returns the seal's reason once the handle is closed, `None` while
+    /// the buffer is not sealed, as `Publication::close_if_sealed`.
+    pub fn close_if_sealed(&mut self) -> Option<super::SealReason> {
         self.resolve_claim();
-        self.state == HandleState::Closed || self.observe_seal()
+        (self.state == HandleState::Closed || self.observe_seal())
+            .then(|| self.buffer.observed_seal_reason())
     }
 
     /// Whether the handle is closed: it observed the seal and released. A

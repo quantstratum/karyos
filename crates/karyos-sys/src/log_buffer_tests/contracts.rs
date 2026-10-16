@@ -1069,7 +1069,7 @@ fn test_log_buffer_required_set_transitions_limit_follows_and_never_decreases() 
                 back_pressured = true;
                 break;
             }
-            AppendOutcome::Closed => panic!("not sealed"),
+            AppendOutcome::Closed | AppendOutcome::Gated => panic!("not sealed"),
         }
         drain_optional(&mut optional);
     }

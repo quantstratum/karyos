@@ -113,7 +113,8 @@ impl SimPublisher for ClientPublication {
                 OfferOutcome::BackPressured
                 | OfferOutcome::AdminAction
                 | OfferOutcome::NotConnected => Attempt::Retry,
-                OfferOutcome::Closed => Attempt::Closed,
+                // No guard in the simulator: a gate seal ends the publication.
+                OfferOutcome::Closed | OfferOutcome::Gated => Attempt::Closed,
             },
         )
     }
@@ -125,7 +126,7 @@ impl SimPublisher for ClientPublication {
             ClaimOutcome::BackPressured
             | ClaimOutcome::AdminAction
             | ClaimOutcome::NotConnected => Claimed::Outcome(Attempt::Retry),
-            ClaimOutcome::Closed => Claimed::Outcome(Attempt::Closed),
+            ClaimOutcome::Closed | ClaimOutcome::Gated => Claimed::Outcome(Attempt::Closed),
         })
     }
 }

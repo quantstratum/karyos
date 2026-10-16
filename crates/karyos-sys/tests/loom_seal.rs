@@ -428,6 +428,11 @@ enum Reason {
 /// reader polls the seal word by Acquire. Whenever it sees the seal, sealed
 /// or already positioned, it reads the reason.
 fn reason_model(order: Reason) {
+    reason_model_with(order, 2);
+}
+
+/// As [`reason_model`], with reason `code`.
+fn reason_model_with(order: Reason, code: u64) {
     builder().check(move || {
         let words = Arc::new((AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(1)));
         let reader = {
@@ -437,7 +442,7 @@ fn reason_model(order: Reason) {
                 if seal_word.load(Ordering::Acquire) & SEAL_SEALED != 0 {
                     assert_eq!(
                         seal_reason(reason_word),
-                        2,
+                        code,
                         "the seal was seen without its reason"
                     );
                 }
@@ -445,10 +450,10 @@ fn reason_model(order: Reason) {
         };
         let (seal_word, reason_word, limit) = &*words;
         match order {
-            Reason::BeforeTheSwap => seal_with_reason(seal_word, reason_word, limit, 2),
+            Reason::BeforeTheSwap => seal_with_reason(seal_word, reason_word, limit, code),
             Reason::AfterTheSwap => {
                 seal(seal_word, limit);
-                reason_word.store(2, Ordering::Relaxed);
+                reason_word.store(code, Ordering::Relaxed);
             }
         }
         position_seal(seal_word, 64);
@@ -465,4 +470,18 @@ fn a_seal_is_never_seen_without_its_reason() {
 #[should_panic(expected = "the seal was seen without its reason")]
 fn control_a_reason_stored_after_the_swap() {
     reason_model(Reason::AfterTheSwap);
+}
+
+/// A guard close seals with `GuardClosed` (5): an offer that finds the seal
+/// always reads the gate reason, so it reports `Gated`, never `Closed`
+/// (guards-and-abort.md, GC-8).
+#[test]
+fn a_guard_seal_is_never_seen_without_its_reason() {
+    reason_model_with(Reason::BeforeTheSwap, 5);
+}
+
+#[test]
+#[should_panic(expected = "the seal was seen without its reason")]
+fn control_a_guard_reason_stored_after_the_swap() {
+    reason_model_with(Reason::AfterTheSwap, 5);
 }

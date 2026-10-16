@@ -342,7 +342,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
             // A sealed handle still releases (publication-seal.md).
-            if self.inner.close_if_sealed() {
+            if self.inner.close_if_sealed().is_some() {
                 return Ok(self.after_end().concurrent_offer());
             }
             return Ok(ConcurrentOfferOutcome::NotConnected);
@@ -468,7 +468,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
-            if self.inner.close_if_sealed() {
+            if self.inner.close_if_sealed().is_some() {
                 return Ok(self.after_end().concurrent_claim());
             }
             return Ok(ConcurrentClaimOutcome::NotConnected);

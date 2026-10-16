@@ -52,7 +52,9 @@ fn offer_keyed(
             OfferOutcome::BackPressured | OfferOutcome::AdminAction => {
                 let _ = driver.do_work().unwrap();
             }
-            OfferOutcome::NotConnected | OfferOutcome::Closed => panic!("publication unavailable"),
+            OfferOutcome::NotConnected | OfferOutcome::Closed | OfferOutcome::Gated => {
+                panic!("publication unavailable")
+            }
         }
     }
     panic!("offer never accepted");
