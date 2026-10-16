@@ -36,6 +36,7 @@ pub mod diag;
 pub mod diag_ring;
 pub mod error;
 pub mod frame;
+pub mod freshness;
 pub mod guard;
 pub mod host_clock;
 pub mod load_words;
