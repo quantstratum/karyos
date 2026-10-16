@@ -190,6 +190,12 @@ release may break APIs, wire formats and shared-memory layouts.
   (`rtt_initial` before any or after a rebinding) and gives NAK timing the
   largest estimate over the live paths (`snapshot`). `RttReplies` limits a
   sender's replies to `rttm_reply_rate` per receiver per second.
+  `path_liveness_timeout`. The path rows decide admission: `lookup` and
+  the bound-key checks go through them, so a first path lost at its
+  timeout stops admitting and returns only through a fresh challenge, as a
+  later path. `ReceiveSessions::timers` removes lost paths within
+  `timer_actions`. Not wired yet: refreshing a path on fresh DATA and
+  PATH_HB intake, which phase 5c calls through `paths_mut()`.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

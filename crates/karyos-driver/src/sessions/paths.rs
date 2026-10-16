@@ -105,8 +105,8 @@ pub struct PathCounters {
     pub path_hb: u64,
     /// PATH_HB from a key bound to no image.
     pub path_hb_unbound: u64,
-    /// Counts that would have overflowed and kept their last value.
-    pub overflows: u64,
+    /// An increment did not apply (sticky).
+    pub overflowed: bool,
 }
 
 impl PathCounters {
@@ -114,7 +114,7 @@ impl PathCounters {
         let count = field(self);
         match count.checked_add(1) {
             Some(next) => *count = next,
-            None => self.overflows = self.overflows.saturating_add(1),
+            None => self.overflowed = true,
         }
     }
 }
@@ -365,11 +365,16 @@ impl PathBindings {
             .map_or(0, |row| row.paths.iter().flatten().count())
     }
 
-    /// Removes every binding with no fresh evidence for
+    /// Removes up to `limit` bindings with no fresh evidence for
     /// `path_liveness_timeout`, reporting each to `lost` as image, path and
-    /// key. The image stays; the caller applies the image's own liveness.
-    /// Returns how many were lost.
-    pub fn timers(&mut self, now: u64, mut lost: impl FnMut(SlotRef, usize, PathKey)) -> u32 {
+    /// key; the rest wait for the next call. The image stays; the caller
+    /// applies the image's own liveness. Returns how many were lost.
+    pub fn timers(
+        &mut self,
+        now: u64,
+        limit: u32,
+        mut lost: impl FnMut(SlotRef, usize, PathKey),
+    ) -> u32 {
         let timeout = self.config.path_liveness_timeout;
         let mut count = 0u32;
         for row in &mut self.rows {
@@ -380,10 +385,14 @@ impl PathBindings {
                 let Some(bound) = *binding else {
                     continue;
                 };
+                if count >= limit {
+                    return count;
+                }
                 if age_ns(now, bound.last_fresh) >= timeout {
                     *binding = None;
                     lost(image.slot, path, bound.key);
-                    count += 1;
+                    // Bounded by `limit`, a u32: it cannot overflow.
+                    count = count.checked_add(1).unwrap_or(count);
                     self.counters.bump(|c| &mut c.lost);
                 }
             }

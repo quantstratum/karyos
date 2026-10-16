@@ -190,13 +190,14 @@ fn a_path_without_fresh_evidence_is_lost() {
     assert_eq!(table.path_hb(key(1, 7000), SECOND - 1), Some((SLOT, 1)));
     let mut lost = Vec::new();
     assert_eq!(
-        table.timers(SECOND, |slot, path, key| lost.push((slot, path, key))),
+        table.timers(SECOND, u32::MAX, |slot, path, key| lost
+            .push((slot, path, key))),
         0
     );
     // Only path 1 is refreshed again.
     assert!(table.refresh(SLOT, 1, 2 * SECOND - 2));
     assert_eq!(
-        table.timers(2 * SECOND - 1, |slot, path, key| lost
+        table.timers(2 * SECOND - 1, u32::MAX, |slot, path, key| lost
             .push((slot, path, key))),
         1
     );
@@ -249,4 +250,24 @@ fn retirement_clears_the_image() {
     );
     assert_eq!(table.live(next), 1);
     assert_eq!(table.live(SLOT), 0);
+}
+
+/// A first binding at a slot's new generation drops every binding of the
+/// slot's earlier image (#247 review P3).
+#[test]
+fn a_first_binding_replaces_an_older_generation() {
+    let mut table = installed(4);
+    table
+        .offer_later(SLOT, key(1, 1), identity(1), term(), joins(&[0, 0]), 1)
+        .unwrap();
+    let next = SlotRef {
+        generation: 4,
+        ..SLOT
+    };
+    table
+        .bind_first(next, identity(2), term(), key(2, 2), joins(&[0]), 5)
+        .unwrap();
+    assert_eq!(table.lookup(key(1, 1)), None);
+    assert_eq!(table.lookup(key(0, 7000)), None);
+    assert_eq!(table.live(next), 1);
 }
