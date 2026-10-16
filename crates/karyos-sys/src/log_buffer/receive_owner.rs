@@ -947,6 +947,7 @@ mod heap_tests {
     }
 
     include!("receive_owner/tests.rs");
+    include!("receive_owner/frame_reader_tests.rs");
 }
 
 #[cfg(test)]
@@ -962,4 +963,5 @@ mod shared_tests {
     }
 
     include!("receive_owner/tests.rs");
+    include!("receive_owner/frame_reader_tests.rs");
 }

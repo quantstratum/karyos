@@ -17,6 +17,13 @@
 //! and the conductor rotated; until then its frames are refused as `Ahead`
 //! and sent again, so the writer and the reader run concurrently across
 //! rotations and reclamation.
+//!
+//! The frame scenarios run the reversed and rotation scenarios with the
+//! child reading through a `FrameReader` (`quantstratum-docs:
+//! karyos/design/frame-level-service.md`, "Platform tests"): every fragment
+//! is read under its own loan in its own call, resumed across calls while
+//! the owner writes and the conductor rotates and reclaims in the other
+//! process, and every message must still arrive once and byte for byte.
 
 #![cfg(target_os = "linux")]
 // Test helpers outside #[test] functions are not covered by clippy.toml's
@@ -37,8 +44,8 @@ use karyos_sys::ipc::{
     Recv, Region, RegionKind, RegionRecord, Sent, accept, connect, listen, recv, send,
 };
 use karyos_sys::log_buffer::{
-    DEFAULT_CLAIM_DEADLINE, LogBuffer, LogBufferConfig, PollOutcome, PublicationMode, ReceiveOwner,
-    Received, Role, Subscription,
+    DEFAULT_CLAIM_DEADLINE, FrameReader, FrameStep, LogBuffer, LogBufferConfig, PollOutcome,
+    PublicationMode, ReceiveOwner, Received, Role, Subscription,
 };
 use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
@@ -49,6 +56,8 @@ const SCENARIO: &str = "KARYOS_IMAGE_SCENARIO";
 const DIR: &str = "KARYOS_IMAGE_DIR";
 const RECORD: &str = "KARYOS_IMAGE_RECORD";
 const COUNT: &str = "KARYOS_IMAGE_MESSAGES";
+/// Set when the child reads through a `FrameReader`.
+const FRAME: &str = "KARYOS_IMAGE_FRAME_READER";
 
 /// Messages of three 64-byte fragments, 192 bytes each, all in term 0.
 const MESSAGES: u32 = 150;
@@ -179,8 +188,17 @@ fn messages(scenario: &str) -> u32 {
 /// Runs `scenario` with the reader in a child: returns once the child
 /// reported every message read and exited successfully.
 fn run(scenario: &str) {
+    run_with(scenario, false);
+}
+
+/// As [`run`], the child reading through a `FrameReader` when `frame`.
+fn run_with(scenario: &str, frame: bool) {
     let total = messages(scenario);
-    let dir = private_dir(scenario);
+    // Parallel tests of one scenario need their own directories.
+    let dir = private_dir(&format!(
+        "{scenario}-{}",
+        if frame { "frame" } else { "poll" }
+    ));
     let listener = listen(&dir, 1).unwrap();
     let creator = Arc::new(
         LogBuffer::<SharedTerms>::create_in(
@@ -202,6 +220,7 @@ fn run(scenario: &str) {
         .env(DIR, &dir)
         .env(RECORD, record_text(cell, region.record()))
         .env(COUNT, total.to_string())
+        .env(FRAME, if frame { "1" } else { "0" })
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -338,6 +357,16 @@ fn a_reader_in_another_process_bounds_rotation_across_four_terms() {
     run("rotations");
 }
 
+#[test]
+fn a_frame_reader_in_another_process_resumes_reversed_fragments() {
+    run_with("reversed", true);
+}
+
+#[test]
+fn a_frame_reader_in_another_process_reads_across_rotations() {
+    run_with("rotations", true);
+}
+
 fn report(line: &str) {
     // A newline first: libtest may have started a line without ending it.
     let mut stdout = std::io::stdout();
@@ -391,6 +420,11 @@ fn child() {
     )
     .unwrap();
     report("attached");
+    if std::env::var(FRAME).as_deref() == Ok("1") {
+        read_frames(FrameReader::new(reader), total);
+        drop(socket);
+        return;
+    }
     let mut out = vec![0u8; 256];
     let mut seen = 0u32;
     let start = Instant::now();
@@ -418,4 +452,35 @@ fn child() {
     report(&format!("read {seen}"));
     drop(reader);
     drop(socket);
+}
+
+/// The child's frame-level reading: one fragment per call, each message
+/// taken once complete and compared with what was sent.
+fn read_frames(mut reader: FrameReader<Arc<LogBuffer<SharedTerms>>>, total: u32) {
+    let mut seen = 0u32;
+    let start = Instant::now();
+    while seen < total {
+        if start.elapsed() > Duration::from_secs(15) {
+            report(&format!("stuck at {seen}"));
+            std::process::exit(1);
+        }
+        match reader.serve_frame().unwrap() {
+            FrameStep::Copied { .. } | FrameStep::Stepped { .. } => {}
+            FrameStep::Complete { .. } => {
+                let mut same = false;
+                assert!(reader.take(|bytes, _| same = bytes == &message(seen)[..]));
+                if !same {
+                    report(&format!("message {seen} differs"));
+                    std::process::exit(1);
+                }
+                seen += 1;
+            }
+            FrameStep::Pending => std::thread::sleep(Duration::from_micros(50)),
+            other => {
+                report(&format!("message {seen}: {other:?}"));
+                std::process::exit(1);
+            }
+        }
+    }
+    report(&format!("read {seen}"));
 }
