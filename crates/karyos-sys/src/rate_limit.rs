@@ -101,39 +101,51 @@ impl Bucket {
     fn full(rate: Rate) -> Self {
         Self {
             rate,
-            level: Self::nanos(rate.burst),
+            level: Self::cap(rate),
         }
     }
 
-    const fn nanos(tokens: u64) -> u128 {
-        // A u64 times 10^9 fits a u128.
-        tokens as u128 * NANOS
+    /// `tokens` in nano-tokens; `None` on overflow, which a `u64` times
+    /// 10^9 never reaches in a `u128`.
+    fn nanos(tokens: u64) -> Option<u128> {
+        u128::from(tokens).checked_mul(NANOS)
     }
 
-    /// Adds the tokens `elapsed` nanoseconds earn, capped at the burst.
+    /// The burst in nano-tokens. A `u64` burst always fits; the fallback
+    /// is unreachable.
+    fn cap(rate: Rate) -> u128 {
+        Self::nanos(rate.burst).unwrap_or(u128::MAX)
+    }
+
+    /// Adds the tokens `elapsed` nanoseconds earn, capped at the burst: a
+    /// product or a sum that would overflow caps the bucket too.
     fn refill(&mut self, elapsed: u64) {
-        let cap = Self::nanos(self.rate.burst);
-        // elapsed and the rate are u64: their product fits a u128.
-        let earned = u128::from(elapsed) * u128::from(self.rate.per_second);
-        self.level = match self.level.checked_add(earned) {
+        let cap = Self::cap(self.rate);
+        let earned = u128::from(elapsed).checked_mul(u128::from(self.rate.per_second));
+        self.level = match earned.and_then(|earned| self.level.checked_add(earned)) {
             Some(level) if level < cap => level,
             _ => cap,
         };
     }
 
     fn holds(&self, tokens: u64) -> bool {
-        self.level >= Self::nanos(tokens)
+        Self::nanos(tokens).is_some_and(|need| self.level >= need)
     }
 
-    /// Takes `tokens`; the caller checked [`Self::holds`].
+    /// Takes `tokens`; the caller checked [`Self::holds`], so the
+    /// subtraction cannot fail. Were it to, nothing is taken.
     fn take(&mut self, tokens: u64) {
-        self.level -= Self::nanos(tokens);
+        let left = Self::nanos(tokens).and_then(|need| self.level.checked_sub(need));
+        debug_assert!(left.is_some(), "a take the bucket does not hold");
+        if let Some(left) = left {
+            self.level = left;
+        }
     }
 
-    /// Whole tokens held.
+    /// Whole tokens held. The level is at most the burst in nano-tokens, so
+    /// the quotient fits a `u64`; the burst is the unreachable fallback.
     fn tokens(&self) -> u64 {
-        // The level is at most the burst in nano-tokens.
-        u64::try_from(self.level / NANOS).unwrap_or(u64::MAX)
+        u64::try_from(self.level / NANOS).unwrap_or(self.rate.burst)
     }
 }
 
