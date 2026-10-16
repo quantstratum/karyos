@@ -334,11 +334,11 @@ fn wire_roles_run_in_their_own_processes() {
         }
         assert_eq!(samples.receive_callback.len(), 200);
         assert_eq!(samples.ack_timeouts, 0);
-        // Not pinned until B4 (coordinator decision, ACS 15273).
+        // Unpinned children are never decision eligible (ACS 15273).
         assert!(samples.functional_only);
         assert_eq!(
-            samples.functional_reasons.first().map(String::as_str),
-            Some("not pinned")
+            samples.functional_reasons.get(..2),
+            Some(&["rx not pinned".to_string(), "tx not pinned".to_string()][..])
         );
     }
 }
@@ -360,9 +360,9 @@ fn faulty_run(
         &wire_run(Shape::W1, StageLoad::Closed, messages),
         &dir.0,
         &ProcessOptions {
-            run_index: 0,
             deadline,
             faults,
+            ..ProcessOptions::default()
         },
     );
     (result.err().map(|error| error.0), started.elapsed())
@@ -485,6 +485,47 @@ fn a_frozen_sender_meets_the_deadline() {
     );
 }
 
+/// Children started under `taskset` read their own core back, so a
+/// pinned run carries no pinning reason (B4a). Skipped, with a line on
+/// stderr, without `taskset` or with one CPU.
+#[cfg(target_os = "linux")]
+#[test]
+fn pinned_wire_children_read_their_core_back() {
+    use karyos_bench::manifest::Shape;
+    use karyos_bench::wire::process::{Cores, ProcessOptions, run_processes};
+    use karyos_bench::wire::stage::StageLoad;
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    if karyos_bench::env::command("taskset", &["--version"]).is_none() || cpus < 2 {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "skipped: taskset unavailable or {cpus} CPU"
+        );
+        return;
+    }
+    let dir = TempDir::new("wire-pin");
+    let samples = run_processes(
+        &wire_run(Shape::W1, StageLoad::Closed, 200),
+        &dir.0,
+        &ProcessOptions {
+            cores: Some(Cores {
+                receiver: 0,
+                sender: 1,
+            }),
+            ..ProcessOptions::default()
+        },
+    )
+    .unwrap_or_else(|cause| panic!("{cause}"));
+    assert!(
+        !samples
+            .functional_reasons
+            .iter()
+            .any(|reason| reason.contains("pinned") || reason.contains("affinity")),
+        "{:?}",
+        samples.functional_reasons
+    );
+}
+
 /// A wire child exits on its own once its parent's end of its standard
 /// input closes, so a parent that dies leaves no orphan.
 #[test]
@@ -527,6 +568,28 @@ fn an_orphaned_wire_child_exits() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     assert_eq!(status.code(), Some(ORPHANED));
+}
+
+/// The bench binary refuses to measure with injected faults requested,
+/// before it prints a plan or writes a file (ACS 15309).
+#[test]
+fn measure_refuses_injected_faults() {
+    let dir = TempDir::new("measure-faults");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-bench"))
+        .args(["measure", "--out"])
+        .arg(&dir.0)
+        .env("KARYOS_MEASURE_SMOKE", "1")
+        .env(karyos_bench::wire::process::FAULTS, "no_stop=1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("never runs with injected faults"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!dir.0.join("measure.json").exists());
 }
 
 /// The child part of the IPC workloads: the workload runs this binary

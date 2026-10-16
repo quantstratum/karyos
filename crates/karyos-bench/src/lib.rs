@@ -30,6 +30,8 @@ pub mod inventory;
 #[cfg(target_os = "linux")]
 pub mod ipc;
 pub mod manifest;
+pub mod measure;
+pub mod plan;
 pub mod report;
 pub mod samples;
 pub mod stats;

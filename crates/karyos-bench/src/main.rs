@@ -22,6 +22,18 @@
 //! the directory of filed records (`quantstratum-docs:
 //! karyos/environments`), which eligibility checks against; without it
 //! the host has no record and is ineligible.
+//!
+//! ```text
+//! karyos-bench measure --out <dir> [--plan primary] [--plan-only]
+//!              [--runs <n>] [--messages <N>] [--warmup <n>]
+//!              [--e-max <bytes>] [--rule counts|excludes]
+//! ```
+//!
+//! expands the plan (`plan.rs`) and runs it into `<dir>`
+//! (`measure.rs`), each child pinned to an isolated core when the host
+//! has two. `KARYOS_MEASURE_SMOKE=1` starts from the smoke plan, whose
+//! small `N` is labelled `insufficient samples`. `--plan-only` prints
+//! the plan and its estimated runtime and runs nothing.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -29,7 +41,10 @@ use std::process::ExitCode;
 
 use karyos_bench::env::{self, Labels};
 use karyos_bench::inventory::{self, Eligibility, Inventory, Scope};
-use karyos_bench::{Workload, defaults, report, run};
+use karyos_bench::manifest::{ILLUSTRATIVE_E_MAX, MtuRule, primary};
+use karyos_bench::plan::{self, PlanOptions};
+use karyos_bench::wire::process::Cores;
+use karyos_bench::{Workload, defaults, measure, report, run};
 
 struct Options {
     workload: Option<Workload>,
@@ -133,6 +148,80 @@ fn inventory_command(args: &[String]) -> Result<String, String> {
     Ok(report)
 }
 
+fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String> {
+    let smoke = std::env::var("KARYOS_MEASURE_SMOKE").is_ok_and(|value| value == "1");
+    let mut options = if smoke {
+        PlanOptions::smoke(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope)
+    } else {
+        PlanOptions::decision(ILLUSTRATIVE_E_MAX, MtuRule::CountsEnvelope)
+    };
+    let mut dir = None;
+    let mut plan_only = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = || args.next().ok_or(format!("{arg} needs a value"));
+        let number = |text: &String| {
+            text.parse::<u64>()
+                .map_err(|_| format!("{arg} needs a number"))
+        };
+        match arg.as_str() {
+            "--out" => dir = Some(PathBuf::from(value()?)),
+            "--plan" => {
+                let set = value()?;
+                if set != "primary" {
+                    return Err(format!("unknown plan {set}: only primary"));
+                }
+            }
+            "--plan-only" => plan_only = true,
+            "--runs" => {
+                options.runs =
+                    u32::try_from(number(value()?)?).map_err(|_| "--runs too large".to_string())?;
+            }
+            "--messages" => options.messages = number(value()?)?,
+            "--warmup" => options.warmup = number(value()?)?,
+            "--e-max" => {
+                options.e_max = u32::try_from(number(value()?)?)
+                    .map_err(|_| "--e-max too large".to_string())?;
+            }
+            "--rule" => {
+                options.rule = match value()?.as_str() {
+                    "counts" => MtuRule::CountsEnvelope,
+                    "excludes" => MtuRule::ExcludesEnvelope,
+                    other => return Err(format!("unknown rule {other}")),
+                };
+            }
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    if karyos_bench::wire::process::faults_requested() {
+        return Err(format!(
+            "{} is set: a measurement never runs with injected faults",
+            karyos_bench::wire::process::FAULTS
+        ));
+    }
+    let plan = plan::expand(&primary(), &options).map_err(|error| error.0)?;
+    if plan_only {
+        let _ = write!(out, "{}", plan::render(&plan));
+        return Ok(0);
+    }
+    let dir = dir.ok_or("measure needs --out <dir>")?;
+    let cores = Cores::detect();
+    let _ = write!(out, "{}", plan::render(&plan));
+    match &cores {
+        Ok(cores) => {
+            let _ = writeln!(
+                out,
+                "pinned: rx core {}, tx core {}",
+                cores.receiver, cores.sender
+            );
+        }
+        Err(reason) => {
+            let _ = writeln!(out, "unpinned: {reason}; every result is functional only");
+        }
+    }
+    measure::run_plan(&plan, &dir, &Labels::detect(), &cores, out).map_err(|error| error.0)
+}
+
 fn main() -> ExitCode {
     // The child of an IPC workload runs its part and nothing else.
     #[cfg(target_os = "linux")]
@@ -166,6 +255,19 @@ fn main() -> ExitCode {
             }
             Err(message) => {
                 let _ = writeln!(err, "karyos-bench inventory: {message}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("measure") {
+        return match measure_command(args.get(1..).unwrap_or_default(), &mut out) {
+            Ok(0) => ExitCode::SUCCESS,
+            Ok(failed) => {
+                let _ = writeln!(err, "karyos-bench measure: {failed} runs failed");
+                ExitCode::FAILURE
+            }
+            Err(message) => {
+                let _ = writeln!(err, "karyos-bench measure: {message}");
                 ExitCode::from(2)
             }
         };
