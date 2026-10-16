@@ -316,3 +316,53 @@ fn the_dropped_counter_is_checked() {
         Some(super::AgentCounter::Dropped)
     );
 }
+
+/// The `root` flag (trace-records.md, "Root flag"): set on the `Publish`
+/// of a fresh trace (no context, or a context whose trace id is zero),
+/// never on a child, a parentless join or a `SubscriberPoll`.
+#[test]
+fn test_trace_root_flag_marks_only_fresh_traces() {
+    let (mut agent, mut collector, _) = new_agent(Sampling::All, 64, 16);
+    let commit = |agent: &mut Agent, ext: &TraceExtension, position| {
+        agent.on_committed(
+            ext,
+            &Committed {
+                publication: PUBLICATION,
+                lane: Lane::ZERO,
+                position,
+            },
+        );
+    };
+    let fresh = agent.on_publish(None, &context()).unwrap();
+    let zero_context = TraceExtension {
+        trace_id: [0, 0],
+        ..fresh
+    };
+    let fresh_too = agent.on_publish(Some(&zero_context), &context()).unwrap();
+    let child = agent.on_publish(Some(&fresh), &context()).unwrap();
+    let join = TraceExtension {
+        span_id: 0,
+        parent_span_id: 0,
+        ..fresh
+    };
+    let parentless = agent.on_publish(Some(&join), &context()).unwrap();
+    assert_eq!(parentless.parent_span_id, 0, "a parentless join");
+    for (position, ext) in [&fresh, &fresh_too, &child, &parentless].iter().enumerate() {
+        commit(&mut agent, ext, position as u64 * 64);
+    }
+    agent.on_delivered(
+        &fresh,
+        &Delivered {
+            publication: PUBLICATION,
+            subscriber: SubscriberIdentity {
+                driver: [1, 2],
+                registration: 9,
+                incarnation: 1,
+            },
+            lane: Lane::ZERO,
+            position: 0,
+        },
+    );
+    let roots: Vec<bool> = records(&mut collector).iter().map(|r| r.root).collect();
+    assert_eq!(roots, [true, true, false, false, false]);
+}

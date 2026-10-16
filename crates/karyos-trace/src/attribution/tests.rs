@@ -26,6 +26,7 @@ fn record(trace: u64) -> TraceRecord {
         observed: ObservedTime::default(),
         subscriber: None,
         packet: None,
+        root: false,
     }
 }
 

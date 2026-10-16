@@ -964,6 +964,8 @@ fn recycling_a_subscriber_entry_logs_it_until_covered() {
         }],
         "the later publisher journal is not noted"
     );
+    // The log entry keeps the recycled journal's mirror sequence (T7).
+    assert_eq!(log[0].sequence, 2);
     // Ring 2, the last noted `Publish`, is still retained: kept.
     append(&mut late, [20]);
     let _ = driver.do_work().unwrap();
@@ -1156,4 +1158,71 @@ fn a_noted_journal_that_dropped_records_still_drains() {
         logged(&driver).is_empty(),
         "covered once the stored count is released"
     );
+}
+
+/// T7 (ACS 13973): the mirror sequence numbers the journals the driver
+/// created densely from 1. Trace numbers drawn by the application,
+/// registrations and refused `TraceJournal` requests (an unknown
+/// registration, sizes the mirror cannot hold, a full table) do not
+/// advance it, though some of them advance the journal number.
+#[test]
+fn mirror_sequences_are_dense_over_created_journals() {
+    let mut driver = driver(3, 64, 64);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let first = journal(&mut driver, &mut conductor, publication);
+    for _ in 0..3 {
+        let _ = driver.next_trace_number().unwrap();
+    }
+    let (_subscription, subscription) = subscribe(&mut driver, &mut conductor);
+    assert_eq!(
+        refused(&request(
+            &mut driver,
+            &mut conductor,
+            LAYOUT,
+            subscription + 1000
+        )),
+        ErrorCode::UnknownRegistration
+    );
+    let oversized = JournalLayout {
+        payload_words: karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD + 1,
+        ..LAYOUT
+    };
+    assert_eq!(
+        refused(&request(
+            &mut driver,
+            &mut conductor,
+            oversized,
+            publication
+        )),
+        ErrorCode::ResourcesUnavailable
+    );
+    // The header's high-water mark moved with the first journal only.
+    assert_eq!(driver.trace_mirror().assigned_sequence(), 1);
+    let second = journal(&mut driver, &mut conductor, subscription);
+    let _ = driver.next_trace_number().unwrap();
+    let third = journal(&mut driver, &mut conductor, publication);
+    assert_eq!(
+        refused(&request(&mut driver, &mut conductor, LAYOUT, publication)),
+        ErrorCode::TraceJournalsExhausted
+    );
+    // The journal numbers skip the trace numbers drawn in between.
+    assert!(second.journal() > first.journal() + 1);
+    assert!(third.journal() > second.journal() + 1);
+    let sequences: Vec<(u64, u64)> = [&first, &second, &third]
+        .iter()
+        .map(|journal| {
+            (
+                journal.journal(),
+                entry(&driver, journal.journal()).sequence,
+            )
+        })
+        .collect();
+    assert_eq!(
+        sequences
+            .iter()
+            .map(|(_, sequence)| *sequence)
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert_eq!(driver.trace_mirror().assigned_sequence(), 3);
 }

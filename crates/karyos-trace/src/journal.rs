@@ -259,6 +259,7 @@ mod tests {
             },
             subscriber: None,
             packet: None,
+            root: false,
         }
     }
 

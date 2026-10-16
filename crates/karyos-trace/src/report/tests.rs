@@ -468,3 +468,398 @@ fn test_trace_registration_after_a_final_answer_is_refused() {
         TraceAnswer::Final(Verdict::Complete)
     );
 }
+
+/// A source over records held in memory, as a tool's would be.
+#[derive(Debug)]
+struct Recorded {
+    observer: ObserverId,
+    start: u64,
+    items: std::collections::VecDeque<Collected>,
+    attempted: u64,
+    state: crate::source::SourceState,
+}
+
+impl crate::source::JournalSource for Recorded {
+    fn observer(&self) -> ObserverId {
+        self.observer
+    }
+
+    fn start(&self) -> u64 {
+        self.start
+    }
+
+    fn take(&mut self) -> Collected {
+        match self.items.pop_front() {
+            Some(item) => item,
+            None if self.state == crate::source::SourceState::Open => Collected::Empty,
+            None => Collected::Closed,
+        }
+    }
+
+    fn losses(&mut self) -> crate::source::SourceLosses {
+        crate::source::SourceLosses {
+            attempted: self.attempted,
+            stored: 0,
+            ..Default::default()
+        }
+    }
+
+    fn state(&self) -> crate::source::SourceState {
+        self.state
+    }
+}
+
+/// `point` of message `position` in trace `trace`, at host time `time`.
+fn observation(point: Point, position: u64, trace: u64, time: u64) -> crate::record::TraceRecord {
+    crate::record::TraceRecord {
+        point,
+        publication: PublicationId::from(IDENTITY),
+        lane: 0,
+        position,
+        ids: crate::record::TraceIds {
+            trace_id: [trace, 1],
+            span_id: 1,
+            parent_span_id: 0,
+            message_id: position,
+        },
+        observed: ObservedTime {
+            time,
+            clock: 1,
+            epoch: crate::trace_clock::HostMonotonicClock::EPOCH,
+            uncertainty: 10,
+        },
+        subscriber: (point == Point::SubscriberPoll).then_some(crate::record::SubscriberId {
+            driver: IDENTITY.driver,
+            registration: 9,
+            incarnation: 1,
+        }),
+        packet: None,
+        root: point == Point::Publish,
+    }
+}
+
+/// A closed source of `records` from sequence `start` on, without gaps.
+fn recorded(
+    journal: u64,
+    start: u64,
+    records: &[crate::record::TraceRecord],
+    state: crate::source::SourceState,
+) -> Recorded {
+    let items = records
+        .iter()
+        .zip(start..)
+        .map(|(record, sequence)| Collected::Record {
+            sequence,
+            gap: None,
+            record: *record,
+            collected: karyos_protocol::journal::Stamp {
+                time: record.observed.time,
+                clock: record.observed.clock,
+                epoch: record.observed.epoch,
+            },
+        })
+        .collect();
+    Recorded {
+        observer: ObserverId {
+            driver: IDENTITY.driver,
+            journal,
+        },
+        start,
+        items,
+        attempted: start + records.len() as u64,
+        state,
+    }
+}
+
+fn host(driver_time_namespace: bool) -> JournalClock {
+    JournalClock {
+        provenance: ClockProvenance::HostMonotonic,
+        driver_time_namespace,
+    }
+}
+
+const CLOSED: crate::source::SourceState = crate::source::SourceState::Closed { boundary: None };
+
+fn closed_at(boundary: u64) -> crate::source::SourceState {
+    crate::source::SourceState::Closed {
+        boundary: Some(boundary),
+    }
+}
+
+/// Two host clocks of different journals (processes) in the driver's time
+/// namespace are calibrated with zero offset; one outside it, or an opaque
+/// clock, is not (T2).
+#[test]
+fn host_clocks_calibrate_only_within_the_driver_time_namespace() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    for (publisher, subscriber, available) in [
+        (host(true), host(true), true),
+        (host(true), host(false), false),
+        (host(false), host(false), false),
+        (ClockProvenance::Opaque.into(), host(true), false),
+    ] {
+        let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+        let publish = observation(Point::Publish, 64, 1, 1_000);
+        let poll = observation(Point::SubscriberPoll, 64, 1, 1_500);
+        report
+            .add_publisher_source(recorded(1, 0, &[publish], CLOSED), publisher, key)
+            .unwrap();
+        report
+            .add_subscriber_source(recorded(2, 0, &[poll], closed_at(65)), subscriber, key, 0)
+            .unwrap();
+        report.drain().unwrap();
+        assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+        let latencies = report.latencies().unwrap();
+        let [(_, histogram)] = &latencies[..] else {
+            panic!("one publication");
+        };
+        if available {
+            assert_eq!(histogram.available(), 1);
+            // 500 ns, widened by both observations' and both resolutions'
+            // uncertainty, never narrower.
+            match histogram.quantile(1, 2).unwrap() {
+                crate::histogram::Quantile::Interval {
+                    low: Some(low),
+                    high: Some(high),
+                } => assert!(low <= 500 && high >= 500, "{low} {high}"),
+                other => panic!("{other:?}"),
+            }
+        } else {
+            assert_eq!(histogram.unavailable(Unavailable::NoCalibration), 1);
+        }
+    }
+}
+
+/// A lost subscriber journal (writer gone without a boundary, or
+/// malformed) is expected for every message from its join on and makes
+/// those traces final Incomplete, with or without records; a lost
+/// publisher journal makes a message without its Publish Incomplete.
+#[test]
+fn a_lost_journal_makes_its_traces_incomplete() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let lost = crate::source::SourceState::Lost;
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    report
+        .add_publisher_source(
+            recorded(1, 0, &[observation(Point::Publish, 64, 1, 10)], CLOSED),
+            host(true),
+            key,
+        )
+        .unwrap();
+    report
+        .add_subscriber_source(recorded(2, 0, &[], lost), host(true), key, 0)
+        .unwrap();
+    report.drain().unwrap();
+    assert_eq!(
+        report.trace([1, 1]),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    report
+        .add_publisher_source(recorded(1, 0, &[], lost), host(true), key)
+        .unwrap();
+    report
+        .add_subscriber_source(
+            recorded(
+                2,
+                0,
+                &[observation(Point::SubscriberPoll, 64, 1, 20)],
+                closed_at(65),
+            ),
+            host(true),
+            key,
+            0,
+        )
+        .unwrap();
+    report.drain().unwrap();
+    assert_eq!(
+        report.trace([1, 1]),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+}
+
+/// A source that starts mid-journal (a tool's attach horizon): a message
+/// below the first position it delivered whose observation it lacks is out
+/// of scope; one at or after it gets a verdict, read as a journal that
+/// begins at the start.
+#[test]
+fn observations_below_a_source_start_are_out_of_scope() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    // The publisher journal read from its start: Publish of 0, 64, 128.
+    report
+        .add_publisher_source(
+            recorded(
+                1,
+                0,
+                &[
+                    observation(Point::Publish, 0, 1, 10),
+                    observation(Point::Publish, 64, 2, 20),
+                    observation(Point::Publish, 128, 3, 30),
+                ],
+                CLOSED,
+            ),
+            host(true),
+            key,
+        )
+        .unwrap();
+    // The subscriber journal read from sequence 5 on: its polls of 0 and
+    // 64 were below its start; 128 is the first it delivered.
+    report
+        .add_subscriber_source(
+            recorded(
+                2,
+                5,
+                &[observation(Point::SubscriberPoll, 128, 3, 40)],
+                closed_at(192),
+            ),
+            host(true),
+            key,
+            0,
+        )
+        .unwrap();
+    report.drain().unwrap();
+    assert_eq!(report.trace([1, 1]), TraceAnswer::OutOfScope);
+    assert_eq!(report.trace([2, 1]), TraceAnswer::OutOfScope);
+    assert_eq!(report.trace([3, 1]), TraceAnswer::Final(Verdict::Complete));
+    let [summary] = &report.summary()[..] else {
+        panic!("one publication");
+    };
+    assert_eq!(
+        (
+            summary.messages,
+            summary.complete,
+            summary.incomplete,
+            summary.provisional,
+            summary.out_of_scope
+        ),
+        (3, 1, 0, 0, 2)
+    );
+}
+
+/// Declared ranges of a publication are out of scope, every message for
+/// `None` (a tool's recycle log, T5); other publications are not.
+#[test]
+fn declared_publication_ranges_are_out_of_scope() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let build = |through: Option<u64>| {
+        let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+        report
+            .add_publisher_source(
+                recorded(
+                    1,
+                    0,
+                    &[
+                        observation(Point::Publish, 0, 1, 10),
+                        observation(Point::Publish, 64, 2, 20),
+                    ],
+                    CLOSED,
+                ),
+                host(true),
+                key,
+            )
+            .unwrap();
+        report.out_of_scope(key, through);
+        report.out_of_scope(PublicationKey::from(PublicationId::from(IDENTITY_B)), None);
+        report.drain().unwrap();
+        report
+    };
+    let report = build(Some(32));
+    assert_eq!(report.trace([1, 1]), TraceAnswer::OutOfScope);
+    assert_eq!(report.trace([2, 1]), TraceAnswer::Final(Verdict::Complete));
+    let report = build(None);
+    assert_eq!(report.trace([2, 1]), TraceAnswer::OutOfScope);
+}
+
+/// A source that is still open keeps its traces provisional, and the
+/// summary counts them so.
+#[test]
+fn an_open_source_keeps_its_traces_provisional() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    report
+        .add_publisher_source(
+            recorded(1, 0, &[observation(Point::Publish, 0, 1, 10)], CLOSED),
+            host(true),
+            key,
+        )
+        .unwrap();
+    report
+        .add_subscriber_source(
+            recorded(
+                2,
+                0,
+                &[observation(Point::SubscriberPoll, 0, 1, 20)],
+                crate::source::SourceState::Open,
+            ),
+            host(true),
+            key,
+            0,
+        )
+        .unwrap();
+    report.drain().unwrap();
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Provisional);
+    assert_eq!(report.summary()[0].provisional, 1);
+}
+
+/// T6 in the report: with roots required, a trace that would be Complete
+/// without a root-flagged Publish is out of scope, an Incomplete one stays
+/// Incomplete; without the requirement (the in-process report, which has
+/// no horizon) the answer is unchanged.
+#[test]
+fn required_roots_put_rootless_complete_traces_out_of_scope() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let build = |required: bool, polled: bool| {
+        let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+        let mut publish = observation(Point::Publish, 0, 1, 10);
+        publish.root = false;
+        report
+            .add_publisher_source(recorded(1, 0, &[publish], CLOSED), host(true), key)
+            .unwrap();
+        let polls: &[crate::record::TraceRecord] = if polled {
+            &[observation(Point::SubscriberPoll, 0, 1, 20)]
+        } else {
+            &[]
+        };
+        report
+            .add_subscriber_source(recorded(2, 0, polls, closed_at(1)), host(true), key, 0)
+            .unwrap();
+        if required {
+            report.require_roots();
+        }
+        report.drain().unwrap();
+        report.trace([1, 1])
+    };
+    assert_eq!(build(false, true), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(build(true, true), TraceAnswer::OutOfScope);
+    assert_eq!(build(true, false), TraceAnswer::Final(Verdict::Incomplete));
+}
+
+/// A message declared out of scope puts its trace out of scope.
+#[test]
+fn a_declared_message_is_out_of_scope() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+    report
+        .add_publisher_source(
+            recorded(
+                1,
+                0,
+                &[
+                    observation(Point::Publish, 0, 1, 10),
+                    observation(Point::Publish, 64, 2, 20),
+                ],
+                CLOSED,
+            ),
+            host(true),
+            key,
+        )
+        .unwrap();
+    report.out_of_scope_message(key, 0, 64);
+    report.drain().unwrap();
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(report.trace([2, 1]), TraceAnswer::OutOfScope);
+    let held = report.messages();
+    assert_eq!(held.len(), 2);
+}

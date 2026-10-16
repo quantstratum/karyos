@@ -9,10 +9,13 @@
 //! cycle loop and orderly shutdown ([`daemon`]) and its idle strategy
 //! ([`idle`]); `karyos-stat` ([`stat`]) and `karyos-errors` ([`errors`]),
 //! which attach as tools, with their shared command line
-//! ([`args::parse_tool`]).
+//! ([`args::parse_tool`]); and `karyos-trace` (`quantstratum-docs:
+//! karyos/design/trace-tool.md`), whose command line, mirror reader,
+//! output and run loop live in [`trace`].
 
 pub mod args;
 pub mod daemon;
 pub mod errors;
 pub mod idle;
 pub mod stat;
+pub mod trace;

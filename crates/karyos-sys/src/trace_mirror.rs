@@ -35,7 +35,8 @@
 //!
 //! Layout (structure words): a header stride (table entries, words per
 //! entry, words per ring record, ring capacity, log entries, words per log
-//! entry), then the log entries of [`LOG_ENTRY_WORDS`] words, then the
+//! entry, and in word 6 the highest mirror sequence assigned so far, T7),
+//! then the log entries of [`LOG_ENTRY_WORDS`] words, then the
 //! table entries of [`ENTRY_WORDS`] words, then the ring (its own header
 //! stride and records of [`MIRROR_RECORD_WORDS`] words).
 //!
@@ -56,7 +57,8 @@
 //! | 18 | Time namespace: 0 unknown, 1 the driver's, 2 another |
 //! | 19 | Clock provenance, as the client sent it (opaque to the driver) |
 //! | 20 to 67 | Drop ranges: first, last, first time, last time, clock, epoch |
-//! | 68 to 79 | Reserved, zero |
+//! | 68 | Mirror sequence: the journal's place among the journals the driver created, from 1, dense (T7) |
+//! | 69 to 79 | Reserved, zero |
 //!
 //! | Log entry word | Field |
 //! | --- | --- |
@@ -65,7 +67,9 @@
 //! | 2, 3 | Its publication: stream registration, incarnation |
 //! | 4 | Final state (bits 0..8: 2 closed, 3 writer lost), flags (bits 8..16: boundary), noted pair count (bits 16..24) |
 //! | 5 | Final delivery boundary (valid when its flag is set) |
-//! | 6 to 31 | Noted pairs: publisher journal number, its attempted count when the subscriber journal ended |
+//! | 6 | Mirror sequence of the recycled subscriber journal (T7) |
+//! | 7 to 30 | Noted pairs: publisher journal number, its attempted count when the subscriber journal ended |
+//! | 31 | Reserved, zero |
 //!
 //! Readers issue only `Relaxed` loads and `Acquire` fences, so they work
 //! over a read-only mapping.
@@ -106,10 +110,16 @@ const HEADER_RECORD_WORDS: usize = 2;
 const HEADER_CAPACITY: usize = 3;
 const HEADER_LOG_ENTRIES: usize = 4;
 const HEADER_LOG_WORDS: usize = 5;
+/// Header word of the highest mirror sequence assigned so far (T7).
+const HEADER_SEQUENCE: usize = 6;
 /// Entry word of the drop ranges.
 const RANGES: usize = 20;
+/// Entry word of the mirror sequence.
+const ENTRY_SEQUENCE: usize = 68;
+/// Log entry word of the mirror sequence.
+const LOG_SEQUENCE: usize = 6;
 /// Log entry word of the noted pairs.
-const PAIRS: usize = 6;
+const PAIRS: usize = 7;
 /// Words of one drop range in an entry.
 const RANGE_FIELDS: usize = 6;
 /// Attempts a reader makes on an entry before reporting it busy.
@@ -123,6 +133,8 @@ const HAS_WATERMARK: u64 = 8;
 // The ranges fit an entry, and the pairs a log entry.
 const _: () = assert!(RANGES + MIRROR_RANGES * RANGE_FIELDS <= ENTRY_WORDS);
 const _: () = assert!(PAIRS + MAX_RECYCLE_PAIRS * 2 <= LOG_ENTRY_WORDS);
+const _: () = assert!(ENTRY_SEQUENCE >= RANGES + MIRROR_RANGES * RANGE_FIELDS);
+const _: () = assert!(ENTRY_SEQUENCE < ENTRY_WORDS && LOG_SEQUENCE < PAIRS);
 
 /// The state of a journal in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -280,6 +292,12 @@ pub struct JournalEntry {
     pub ranges: [DropRange; MIRROR_RANGES],
     /// Valid drop ranges.
     pub range_count: usize,
+    /// The mirror sequence (`trace-tool.md`, T7): the driver numbers the
+    /// journals it creates 1, 2, 3 and so on, with no gap and from its own
+    /// counter, unlike the journal number, which shares the trace number
+    /// space. A tool detects a journal it never saw from a gap in it. 0
+    /// until set.
+    pub sequence: u64,
 }
 
 impl JournalEntry {
@@ -316,6 +334,7 @@ impl JournalEntry {
             unstable: 0,
             ranges: [DropRange::default(); MIRROR_RANGES],
             range_count: 0,
+            sequence: 0,
         }
     }
 
@@ -377,6 +396,9 @@ impl JournalEntry {
             for (word, value) in chunk.iter_mut().zip(fields) {
                 *word = value;
             }
+        }
+        if let Some(word) = words.get_mut(ENTRY_SEQUENCE) {
+            *word = self.sequence;
         }
         words
     }
@@ -442,6 +464,7 @@ impl JournalEntry {
             unstable: word(13),
             ranges,
             range_count,
+            sequence: word(ENTRY_SEQUENCE),
         })
     }
 }
@@ -497,6 +520,8 @@ pub struct RecycledJournal {
     pub pairs: [NotedPublisher; MAX_RECYCLE_PAIRS],
     /// Valid noted pairs.
     pub pair_count: usize,
+    /// The recycled journal's mirror sequence ([`JournalEntry::sequence`]).
+    pub sequence: u64,
 }
 
 impl RecycledJournal {
@@ -521,6 +546,7 @@ impl RecycledJournal {
             self.incarnation,
             self.state.code() | flags << 8 | count << 16,
             self.boundary.unwrap_or(0),
+            self.sequence,
         ];
         for (word, value) in words.iter_mut().zip(fixed) {
             *word = value;
@@ -570,6 +596,7 @@ impl RecycledJournal {
             boundary: (flags & HAS_BOUNDARY != 0).then_some(word(5)),
             pairs,
             pair_count,
+            sequence: word(LOG_SEQUENCE),
         })
     }
 }
@@ -698,6 +725,17 @@ impl TraceMirror {
     #[must_use]
     pub fn log_entries(&self) -> usize {
         self.log
+    }
+
+    /// Publishes `sequence` as the highest mirror sequence assigned so far
+    /// (T7), with Release. The driver calls it before it writes the table
+    /// entry of the journal that sequence numbers, so a reader that loads
+    /// it (Acquire) before reading the table and the log never misses a
+    /// journal below it: one it does not find there was recycled unseen.
+    pub fn assign_sequence(&mut self, sequence: u64) {
+        if let Some(word) = self.store.words().get(HEADER_SEQUENCE) {
+            word.store(sequence, Ordering::Release);
+        }
     }
 
     /// Writes table entry `index` under its seqlock: `entry`, or a free
@@ -921,6 +959,19 @@ impl TraceMirrorReader {
         self.log
     }
 
+    /// The highest mirror sequence the driver assigned so far (T7), 0
+    /// before the first journal, loaded with Acquire. A tool reads it
+    /// before the table and the log: every sequence at or below it whose
+    /// journal is in neither was created and recycled unseen. Read after
+    /// the table instead, a journal created between the two reads would
+    /// look missed, which is only conservative.
+    #[must_use]
+    pub fn assigned_sequence(&self) -> u64 {
+        let value = self.store.load(HEADER_SEQUENCE).unwrap_or(0);
+        fence(Ordering::Acquire);
+        value
+    }
+
     /// Reads table entry `index` under its seqlock, with a bounded number
     /// of attempts. An index out of range reads as free.
     #[must_use]
@@ -1071,6 +1122,7 @@ mod tests {
             last: 6,
             ..entry.ranges[0]
         };
+        entry.sequence = 0xABC;
         entry
     }
 
@@ -1083,6 +1135,7 @@ mod tests {
             boundary: Some(4096),
             pairs: [NotedPublisher::default(); MAX_RECYCLE_PAIRS],
             pair_count: pairs,
+            sequence: 0x5EC,
         };
         for (index, pair) in log.pairs.iter_mut().take(pairs).enumerate() {
             *pair = NotedPublisher {
@@ -1135,6 +1188,44 @@ mod tests {
         assert_eq!(reader.entry(1), EntryRead::Free);
         assert!(!mirror.write_entry(3, Some(&written)));
         assert_eq!(reader.entry(3), EntryRead::Free);
+    }
+
+    /// The mirror sequence (T7) sits in entry word 68 and log entry word 6;
+    /// the noted pairs follow it in words 7 to 30, twelve of them, and log
+    /// word 31 stays zero.
+    #[test]
+    fn the_mirror_sequence_has_its_own_words() {
+        assert_eq!(MAX_RECYCLE_PAIRS, 12);
+        let mut mirror = trace_mirror(1, 1, 4).unwrap();
+        assert!(mirror.write_entry(0, Some(&entry(5))));
+        let full = recycled(9, MAX_RECYCLE_PAIRS);
+        assert!(mirror.write_log(0, Some(&full)));
+        let words = mirror.store.words();
+        let table = mirror.geometry.table;
+        let load = |index: usize| words[index].load(Ordering::Relaxed);
+        assert_eq!(load(table + 68), 0xABC);
+        assert!((69..ENTRY_WORDS).all(|word| load(table + word) == 0));
+        let log = STRIDE_WORDS;
+        assert_eq!(load(log + 6), 0x5EC);
+        assert_eq!((load(log + 7), load(log + 8)), (100, 0));
+        assert_eq!((load(log + 29), load(log + 30)), (111, 110));
+        assert_eq!(load(log + 31), 0);
+        let reader = mirror.reader();
+        let EntryRead::Entry(read) = reader.entry(0) else {
+            panic!("entry");
+        };
+        assert_eq!(read.sequence, 0xABC);
+        let LogRead::Entry(read) = reader.log_entry(0) else {
+            panic!("log entry");
+        };
+        assert_eq!(read.sequence, 0x5EC);
+        // The high-water mark sits in header word 6, apart from the rest.
+        assert_eq!(reader.assigned_sequence(), 0);
+        mirror.assign_sequence(7);
+        assert_eq!(reader.assigned_sequence(), 7);
+        let words = mirror.store.words();
+        assert_eq!(words[6].load(Ordering::Relaxed), 7);
+        assert_eq!(words[5].load(Ordering::Relaxed), LOG_ENTRY_WORDS as u64);
     }
 
     /// Words no driver writes (an unknown kind or time namespace code)

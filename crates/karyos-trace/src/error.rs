@@ -37,6 +37,9 @@ pub enum TraceError {
     /// or is present on a point that is not packet level.
     #[error("packet identity does not match the observation point")]
     Packet,
+    /// The `root` flag is set on a point other than `Publish`.
+    #[error("the root flag is set on a point other than Publish")]
+    Root,
     /// The collection stamp uses another clock than the journal's declared
     /// collection clock, or an epoch below the last accepted one; nothing
     /// was appended.

@@ -30,6 +30,12 @@
 //!   provenance word, the final boundary (`CloseJournal`), the last
 //!   mirrored ring record and the loss accounting. An entry becomes closed
 //!   once its writer closed it and the driver drained it to its end.
+//! - **Mirror sequence (T7, ACS 13973).** Each journal the driver creates
+//!   gets the next mirror sequence, from 1, in its entry and in its recycle
+//!   log entry: a counter of its own, advanced only when a `TraceJournal`
+//!   succeeds, so a tool can tell a journal it never saw from a gap, which
+//!   the journal number (from the trace number space that
+//!   `EmbeddedDriver::next_trace_number` also draws from) cannot.
 //! - **Recycling (T5).** An ended entry is reused only once the ring
 //!   retains no record of its journal. When a subscriber journal `S` ends,
 //!   the driver notes every publisher journal `j` of `S`'s publication
@@ -177,6 +183,10 @@ pub(crate) struct TraceJournals {
     bytes: u64,
     max_bytes: u64,
     budget: usize,
+    /// The mirror sequence of the next journal created (T7): its own
+    /// counter, advanced only by [`TraceJournals::insert`], so the
+    /// sequences of the journals the driver created are dense from 1.
+    next_sequence: u64,
 }
 
 /// Bytes of a region's header stride (`karyos_sys::ipc::HEADER_STRIDE`).
@@ -206,6 +216,7 @@ impl TraceJournals {
             bytes: 0,
             max_bytes,
             budget,
+            next_sequence: 1,
         }
     }
 
@@ -318,6 +329,13 @@ impl TraceJournals {
         entry.join = observed.join;
         entry.time_namespace = observed.time_namespace;
         entry.provenance = observed.provenance;
+        // Exhaustion of a 64-bit count of created journals cannot happen;
+        // the last value would repeat rather than wrap.
+        entry.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        // The high-water mark first (Release), then the log and the entry:
+        // a tool reads it before the table and the log.
+        self.mirror.assign_sequence(entry.sequence);
         let Some(slot) = self.slots.get_mut(index) else {
             return;
         };
@@ -337,6 +355,7 @@ impl TraceJournals {
                 boundary: old.entry.boundary,
                 pairs: [NotedPublisher::default(); MAX_RECYCLE_PAIRS],
                 pair_count: notes.len().min(MAX_RECYCLE_PAIRS),
+                sequence: old.entry.sequence,
             };
             for (pair, note) in record.pairs.iter_mut().zip(&notes) {
                 *pair = NotedPublisher {

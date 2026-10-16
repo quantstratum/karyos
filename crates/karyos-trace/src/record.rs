@@ -16,8 +16,18 @@ pub const OBSERVATION_WORDS: usize = 22;
 /// Words of a journal record: the observation and the collection stamp
 /// (time, clock, epoch) in words 22 to 24.
 pub const RECORD_WORDS: usize = OBSERVATION_WORDS + 3;
-/// Layout version written in word 0.
-pub const RECORD_VERSION: u8 = 1;
+/// Layout version written in word 0: version 2 adds the `root` flag (bit
+/// 56) to version 1's layout of the same width (`quantstratum-docs:
+/// karyos/design/trace-records.md`, "Root flag", ACS 13936).
+pub const RECORD_VERSION: u8 = 2;
+/// The oldest layout version still decoded: version 1, whose bit 56 was
+/// reserved, decodes with `root` false.
+pub const RECORD_VERSION_1: u8 = 1;
+/// Word 0 bit of the `root` flag (layout version 2).
+const ROOT_BIT: u64 = 1 << 56;
+/// Word 0 bits that are reserved in every version: the `destination` token
+/// (bits 24..56, zero until enabled) and bits 57..64.
+const RESERVED_BITS: u64 = !0xFF_FFFF & !ROOT_BIT;
 /// Highest lane (SPEC.md §7.4: four lanes).
 pub const MAX_LANE: u8 = 3;
 
@@ -182,6 +192,10 @@ pub struct TraceRecord {
     pub subscriber: Option<SubscriberId>,
     /// Present exactly for packet-level points.
     pub packet: Option<PacketId>,
+    /// The `Publish` of a message that started a fresh trace (no incoming
+    /// context); never set on a parentless join or on another point. A
+    /// version 1 record decodes with `root` false.
+    pub root: bool,
 }
 
 /// Splits a word into its two little-endian 32-bit halves.
@@ -199,11 +213,14 @@ impl TraceRecord {
     ///
     /// # Errors
     ///
-    /// [`TraceError::Lane`], [`TraceError::Subscriber`] and
-    /// [`TraceError::Packet`].
+    /// [`TraceError::Lane`], [`TraceError::Subscriber`],
+    /// [`TraceError::Packet`] and [`TraceError::Root`].
     pub fn validate(&self) -> Result<(), TraceError> {
         if self.lane > MAX_LANE {
             return Err(TraceError::Lane { lane: self.lane });
+        }
+        if self.root && self.point != Point::Publish {
+            return Err(TraceError::Root);
         }
         let polls = self.point == Point::SubscriberPoll;
         let subscriber_valid = match self.subscriber {
@@ -239,7 +256,8 @@ impl TraceRecord {
         Ok([
             u64::from(RECORD_VERSION)
                 | (u64::from(self.point.code()) << 8)
-                | (u64::from(self.lane) << 16),
+                | (u64::from(self.lane) << 16)
+                | if self.root { ROOT_BIT } else { 0 },
             self.publication.driver[0],
             self.publication.driver[1],
             self.publication.registration,
@@ -267,13 +285,14 @@ impl TraceRecord {
         ])
     }
 
-    /// Decodes and checks a record.
+    /// Decodes and checks a record of layout version 2 or 1 (whose `root`
+    /// is false).
     ///
     /// # Errors
     ///
     /// [`TraceError::Version`], [`TraceError::UnknownPoint`],
-    /// [`TraceError::ReservedBits`], and the errors of
-    /// [`TraceRecord::validate`].
+    /// [`TraceError::ReservedBits`] (bit 56 included in a version 1
+    /// record), and the errors of [`TraceRecord::validate`].
     pub fn decode(words: &[u64; OBSERVATION_WORDS]) -> Result<Self, TraceError> {
         let [
             head,
@@ -300,10 +319,12 @@ impl TraceRecord {
             path_attempt,
         ] = *words;
         let version = head as u8;
-        if version != RECORD_VERSION {
+        if version != RECORD_VERSION && version != RECORD_VERSION_1 {
             return Err(TraceError::Version { version });
         }
-        if head >> 24 != 0 {
+        let root = head & ROOT_BIT != 0;
+        // Bit 56 was reserved in version 1.
+        if head & RESERVED_BITS != 0 || (root && version == RECORD_VERSION_1) {
             return Err(TraceError::ReservedBits);
         }
         let point = Point::from_code((head >> 8) as u8)?;
@@ -355,6 +376,7 @@ impl TraceRecord {
             },
             subscriber,
             packet,
+            root,
         };
         record.validate()?;
         Ok(record)
@@ -449,6 +471,7 @@ mod tests {
                 path: u32::MAX,
                 attempt: 2,
             }),
+            root: point == Point::Publish,
         }
     }
 
@@ -525,10 +548,10 @@ mod tests {
     fn decoding_checks_every_word_rule() {
         let good = sample(Point::KernelRx).encode().unwrap();
         let mut version = good;
-        version[0] = (version[0] & !0xFF) | 2;
+        version[0] = (version[0] & !0xFF) | 3;
         assert_eq!(
             TraceRecord::decode(&version),
-            Err(TraceError::Version { version: 2 })
+            Err(TraceError::Version { version: 3 })
         );
         let mut reserved = good;
         reserved[0] |= 1 << 40;
@@ -604,9 +627,10 @@ mod tests {
                 incarnation: 0x14,
             }),
             packet: None,
+            root: false,
         };
         let golden: [u64; OBSERVATION_WORDS] = [
-            0x0002_0401, // version 1, point 4 (SubscriberPoll), lane 2
+            0x0002_0402, // version 2, point 4 (SubscriberPoll), lane 2
             0x0101,
             0x0202,
             0x03,
@@ -642,5 +666,61 @@ mod tests {
         assert_eq!(full[..OBSERVATION_WORDS], golden);
         assert_eq!(full[OBSERVATION_WORDS..], [0x15, 0x16, 0x17]);
         assert_eq!(decode_record(&full), Ok((record, collected)));
+        // Version 1 of the same layout decodes to the same record.
+        let mut v1 = golden;
+        v1[0] = 0x0002_0401;
+        assert_eq!(TraceRecord::decode(&v1), Ok(record));
+    }
+
+    /// Layout version 2's root flag: bit 56 of word 0 on a `Publish`.
+    #[test]
+    fn the_root_flag_round_trips_in_version_2() {
+        let root = sample(Point::Publish);
+        assert!(root.root);
+        let words = root.encode().unwrap();
+        assert_eq!(words[0] & 0xFF, 2, "the encoder writes version 2");
+        assert_eq!(words[0] >> 56, 1);
+        assert_eq!(TraceRecord::decode(&words), Ok(root));
+        let plain = TraceRecord {
+            root: false,
+            ..root
+        };
+        let words = plain.encode().unwrap();
+        assert_eq!(words[0] >> 24, 0);
+        assert_eq!(TraceRecord::decode(&words), Ok(plain));
+    }
+
+    /// A version 1 record decodes with `root` false; a version 1 record
+    /// with bit 56 set, and `root` on a point other than `Publish`, are
+    /// refused on both sides.
+    #[test]
+    fn version_1_records_are_never_roots_and_root_is_validated() {
+        let plain = TraceRecord {
+            root: false,
+            ..sample(Point::Publish)
+        };
+        let mut v1 = plain.encode().unwrap();
+        v1[0] = (v1[0] & !0xFF) | 1;
+        assert_eq!(TraceRecord::decode(&v1), Ok(plain));
+        let mut flagged = v1;
+        flagged[0] |= 1 << 56;
+        assert_eq!(TraceRecord::decode(&flagged), Err(TraceError::ReservedBits));
+        for point in POINTS.iter().copied().filter(|p| *p != Point::Publish) {
+            let wrong = TraceRecord {
+                root: true,
+                ..sample(point)
+            };
+            assert_eq!(wrong.encode(), Err(TraceError::Root), "{point:?}");
+            let mut words = sample(point).encode().unwrap();
+            words[0] |= 1 << 56;
+            assert_eq!(TraceRecord::decode(&words), Err(TraceError::Root));
+        }
+        // Bit 57 stays reserved in version 2.
+        let mut reserved = plain.encode().unwrap();
+        reserved[0] |= 1 << 57;
+        assert_eq!(
+            TraceRecord::decode(&reserved),
+            Err(TraceError::ReservedBits)
+        );
     }
 }
