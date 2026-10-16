@@ -802,8 +802,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.counters.set(Event::ClaimsWaiting, gauge(waiting));
         self.counters
             .set(Event::ClientsConnected, gauge(self.clients.len()));
-        self.counters
-            .set(Event::HandOverHeld, gauge(self.held_total()));
+        match self.held_total() {
+            Some(held) => self.counters.set(Event::HandOverHeld, gauge(held)),
+            None => self.counters.add(Event::CounterOverflows, 1),
+        }
         match self
             .streams
             .iter()
@@ -812,9 +814,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Some(leases) => self.counters.set(Event::LeasesLive, leases),
             None => self.counters.add(Event::CounterOverflows, 1),
         }
-        let retained = self.streams.iter().map(|s| s.retained.len()).sum();
-        self.counters
-            .set(Event::GenerationsRetired, gauge(retained));
+        match self
+            .streams
+            .iter()
+            .try_fold(0usize, |sum, s| sum.checked_add(s.retained.len()))
+        {
+            Some(retained) => self
+                .counters
+                .set(Event::GenerationsRetired, gauge(retained)),
+            None => self.counters.add(Event::CounterOverflows, 1),
+        }
         // Over every live mapping: the current one and the retained
         // predecessors, which still hold slots, credits and loans.
         // Checked sums, as `LeasesLive` above: a sum that does not fit

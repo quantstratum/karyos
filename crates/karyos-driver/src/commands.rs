@@ -607,8 +607,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         })
     }
 
-    pub(crate) fn held_total(&self) -> usize {
-        self.clients.iter().map(|slot| slot.link.held()).sum()
+    /// Handed-over publications held for every client; `None` if the sum
+    /// does not fit `usize` (checked, SPEC.md §14), which admission treats
+    /// as over the hand-over limit.
+    pub(crate) fn held_total(&self) -> Option<usize> {
+        self.clients
+            .iter()
+            .try_fold(0usize, |sum, slot| sum.checked_add(slot.link.held()))
     }
 
     /// Serves one decoded command: its single response, or, for a
@@ -757,7 +762,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     None => {}
                 }
                 if link.held() >= self.config.max_pending_per_client
-                    || self.held_total() >= self.config.max_hand_over
+                    || self
+                        .held_total()
+                        .is_none_or(|held| held >= self.config.max_hand_over)
                 {
                     return refuse(ErrorCode::ResourcesUnavailable, detail);
                 }
@@ -2978,7 +2985,10 @@ mod tests {
             client_cell(&driver, cell),
             karyos_sys::counters::CellRead::Free
         );
-        assert_eq!(driver.client_counters.owned_by(client.owner().client), Some(0));
+        assert_eq!(
+            driver.client_counters.owned_by(client.owner().client),
+            Some(0)
+        );
     }
 
     #[test]
