@@ -8,10 +8,13 @@
 //! bootstrap of manifest 8.3 needs the run strata.
 //!
 //! A sample is a `u32` count of nanoseconds per message. [`MISSING`]
-//! (`u32::MAX`) marks a dropped or orphaned message: it ranks above every
-//! measured value of its run, as +∞ (coordinator, ACS 14828). A measured
-//! value that does not fit below [`SATURATED`] is stored as [`SATURATED`]
-//! and counted; a run with any saturated sample is not valid.
+//! (`u32::MAX`) marks a dropped message, one sent and not received: it
+//! ranks above every measured value of its run, as +∞ (coordinator, ACS
+//! 14828). An orphan, a message received with no send partner, is not a
+//! drop: it invalidates the run (design 2.3, M-11), and [`combine`]
+//! refuses it with [`SamplesError::Orphan`]. A measured value that does
+//! not fit below [`SATURATED`] is stored as [`SATURATED`] and counted; a
+//! run with any saturated sample is not valid.
 //!
 //! # File format (version 1, little endian)
 //!
@@ -69,6 +72,14 @@ pub enum SamplesError {
     TrailingBytes,
     /// A header field is out of range.
     InvalidField(&'static str),
+    /// A message was received with no send partner: the run is invalid
+    /// (design 2.3, M-11).
+    Orphan {
+        /// The message index in the run.
+        index: usize,
+        /// The receiver that holds it.
+        receiver: usize,
+    },
     /// An I/O error.
     Io(std::io::Error),
 }
@@ -83,6 +94,10 @@ impl fmt::Display for SamplesError {
             Self::Truncated => f.write_str("sample file truncated"),
             Self::TrailingBytes => f.write_str("trailing bytes after the samples"),
             Self::InvalidField(field) => write!(f, "invalid header field: {field}"),
+            Self::Orphan { index, receiver } => write!(
+                f,
+                "message {index} received by receiver {receiver} with no send: run invalid"
+            ),
             Self::Io(cause) => write!(f, "sample file I/O: {cause}"),
         }
     }
@@ -170,15 +185,18 @@ pub fn sample_from_ns(ns: u64) -> (u32, bool) {
 
 /// The per-message decision samples of one run: send plus the slowest
 /// receive over the receivers (coordinator M-5a; H-3, ACS 14817). A
-/// message missing at the sender or at any receiver is [`MISSING`]. A sum
-/// that does not fit saturates at [`SATURATED`].
+/// message sent and missing at any receiver is a drop, [`MISSING`]; one
+/// missing everywhere is [`MISSING`] too. A sum that does not fit
+/// saturates at [`SATURATED`].
 ///
 /// Returns the samples and the count of saturated sums.
 ///
 /// # Errors
 ///
 /// [`SamplesError::InvalidField`] when there is no receiver or the
-/// lengths differ (send and receive are joined on the message sequence).
+/// lengths differ (send and receive are joined on the message sequence);
+/// [`SamplesError::Orphan`] when a receiver measured a message that has
+/// no send sample, which invalidates the run (design 2.3, M-11).
 pub fn combine(send: &[u32], receives: &[&[u32]]) -> Result<(Vec<u32>, u64), SamplesError> {
     if receives.is_empty() {
         return Err(SamplesError::InvalidField("no receiver"));
@@ -190,8 +208,11 @@ pub fn combine(send: &[u32], receives: &[&[u32]]) -> Result<(Vec<u32>, u64), Sam
     let mut out = Vec::with_capacity(send.len());
     for (index, &sent) in send.iter().enumerate() {
         let mut slowest = 0u32;
-        for receive in receives {
+        for (receiver, receive) in receives.iter().enumerate() {
             let value = receive.get(index).copied().unwrap_or(MISSING);
+            if sent == MISSING && value != MISSING {
+                return Err(SamplesError::Orphan { index, receiver });
+            }
             slowest = slowest.max(value);
         }
         let value = if sent == MISSING || slowest == MISSING {
@@ -300,6 +321,34 @@ fn stage_from(code: u8, receiver: u16) -> Result<Stage, SamplesError> {
     }
 }
 
+/// Cross-checks a header against the manifest and its samples (review of
+/// #186, P3): manifest load and fan-out values, a receiver index within
+/// the fan-out, and a saturated count equal to the [`SATURATED`] samples.
+fn check(header: &Header, samples: &[u32]) -> Result<(), SamplesError> {
+    if !header.point.load.is_manifest() {
+        return Err(SamplesError::InvalidField("load"));
+    }
+    if !header.point.fanout.is_manifest() {
+        return Err(SamplesError::InvalidField("fan-out"));
+    }
+    if let Stage::Receive { receiver } = header.stage
+        && receiver >= u16::from(header.point.fanout.receivers())
+    {
+        return Err(SamplesError::InvalidField("receiver"));
+    }
+    let saturated = samples
+        .iter()
+        .filter(|&&value| value == SATURATED)
+        .fold(0u64, |count, _| count.saturating_add(1));
+    if saturated != header.saturated {
+        return Err(SamplesError::InvalidField("saturated"));
+    }
+    if !valid_profile(&header.profile) {
+        return Err(SamplesError::InvalidField("profile"));
+    }
+    Ok(())
+}
+
 fn valid_profile(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_PROFILE_LEN
@@ -314,12 +363,10 @@ fn valid_profile(name: &str) -> bool {
 ///
 /// [`SamplesError::InvalidField`] for a profile name that is empty, longer
 /// than [`MAX_PROFILE_LEN`] or not made of ASCII letters, digits, `-`, `_`
-/// and `.`.
+/// and `.`, and for the header checks of [`decode`].
 pub fn encode(run: &RunSamples) -> Result<Vec<u8>, SamplesError> {
     let header = &run.header;
-    if !valid_profile(&header.profile) {
-        return Err(SamplesError::InvalidField("profile"));
-    }
+    check(header, &run.samples)?;
     let profile_len =
         u8::try_from(header.profile.len()).map_err(|_| SamplesError::InvalidField("profile"))?;
     let count =
@@ -394,8 +441,10 @@ impl<'a> Cursor<'a> {
 /// [`SamplesError::BadMagic`], [`SamplesError::UnsupportedVersion`],
 /// [`SamplesError::Truncated`] when the input is shorter than the header or
 /// the samples it announces, [`SamplesError::TrailingBytes`] when it is
-/// longer, and [`SamplesError::InvalidField`] for an out-of-range field
-/// (including a saturated count above the sample count).
+/// longer, and [`SamplesError::InvalidField`] for an out-of-range field:
+/// a load or fan-out value outside manifest 6.1, a receiver index outside
+/// the fan-out, or a saturated count that differs from the count of
+/// [`SATURATED`] samples.
 pub fn decode(bytes: &[u8]) -> Result<RunSamples, SamplesError> {
     let mut cursor = Cursor { rest: bytes };
     if cursor
@@ -453,31 +502,27 @@ pub fn decode(bytes: &[u8]) -> Result<RunSamples, SamplesError> {
     if cursor.rest.len() > byte_len {
         return Err(SamplesError::TrailingBytes);
     }
-    if saturated > count {
-        return Err(SamplesError::InvalidField("saturated"));
-    }
     let (words, rest) = cursor.rest.as_chunks::<4>();
     if !rest.is_empty() {
         return Err(SamplesError::Truncated);
     }
     let samples: Vec<u32> = words.iter().map(|word| u32::from_le_bytes(*word)).collect();
-    Ok(RunSamples {
-        header: Header {
-            point: Point {
-                shape,
-                load,
-                fanout,
-            },
-            profile,
-            stage,
-            run,
-            seed,
-            clock_resolution_ns,
-            warmup,
-            saturated,
+    let header = Header {
+        point: Point {
+            shape,
+            load,
+            fanout,
         },
-        samples,
-    })
+        profile,
+        stage,
+        run,
+        seed,
+        clock_resolution_ns,
+        warmup,
+        saturated,
+    };
+    check(&header, &samples)?;
+    Ok(RunSamples { header, samples })
 }
 
 /// Writes one run's samples to `writer`.
@@ -607,10 +652,52 @@ mod tests {
             decode(&shape),
             Err(SamplesError::InvalidField("shape"))
         ));
-        let mut count = bytes;
+        let mut count = bytes.clone();
         let at = count.len() - 6 * 4 - 8;
         count[at] = 7;
         assert!(matches!(decode(&count), Err(SamplesError::Truncated)));
+    }
+
+    #[test]
+    fn header_cross_checks() {
+        let bytes = encode(&example()).unwrap();
+        // Byte offsets: load code 12, invalid percent 13, rate 14..18,
+        // receivers 19, receiver index 21..23, saturated count 47..55.
+        let corrupt = |at: usize, value: &[u8]| {
+            let mut copy = bytes.clone();
+            copy[at..at + value.len()].copy_from_slice(value);
+            decode(&copy)
+        };
+        let field = |result: Result<RunSamples, SamplesError>| match result {
+            Err(SamplesError::InvalidField(field)) => field,
+            other => panic!("{other:?}"),
+        };
+        // An R2 rate that is not 100 000 or 1 000 000.
+        assert_eq!(field(corrupt(14, &99_999u32.to_le_bytes())), "load");
+        // R4 with 50% invalid tags.
+        assert_eq!(field(corrupt(12, &[4, 50])), "load");
+        assert!(corrupt(12, &[4, 10]).is_ok());
+        // F2 with 3 receivers.
+        assert_eq!(field(corrupt(19, &[3])), "fan-out");
+        // Receiver index 4 of 4 receivers.
+        assert_eq!(field(corrupt(21, &4u16.to_le_bytes())), "receiver");
+        assert!(corrupt(21, &0u16.to_le_bytes()).is_ok());
+        // A saturated count that differs from the SATURATED samples.
+        assert_eq!(field(corrupt(47, &2u64.to_le_bytes())), "saturated");
+        assert_eq!(field(corrupt(47, &0u64.to_le_bytes())), "saturated");
+        // Encoding refuses the same headers.
+        let mut run = example();
+        run.header.saturated = 0;
+        assert!(matches!(
+            encode(&run),
+            Err(SamplesError::InvalidField("saturated"))
+        ));
+        let mut run = example();
+        run.header.point.fanout = Fanout::F1;
+        assert!(matches!(
+            encode(&run),
+            Err(SamplesError::InvalidField("receiver"))
+        ));
     }
 
     #[test]
@@ -627,14 +714,39 @@ mod tests {
 
     #[test]
     fn combine_takes_the_slowest_receiver_and_keeps_drops() {
+        // Message 2 is lost everywhere; message 3 is sent and lost at the
+        // first receiver: both are drops.
         let send = [10, 10, MISSING, 10, u32::MAX - 5];
-        let first = [5, 50, 5, MISSING, 10];
-        let second = [7, 1, 5, 5, 10];
+        let first = [5, 50, MISSING, MISSING, 10];
+        let second = [7, 1, MISSING, 5, 10];
         let (combined, saturated) = combine(&send, &[&first, &second]).unwrap();
         assert_eq!(combined, vec![17, 60, MISSING, MISSING, SATURATED]);
         assert_eq!(saturated, 1);
         assert!(combine(&send, &[]).is_err());
         assert!(combine(&send, &[&first[..2]]).is_err());
+    }
+
+    #[test]
+    fn an_orphan_invalidates_the_run() {
+        // Message 2 has no send sample but the second receiver measured
+        // it: an orphan, not a drop (design 2.3, M-11).
+        let send = [10, 10, MISSING];
+        let first = [5, 5, MISSING];
+        let second = [5, 5, 7];
+        assert!(matches!(
+            combine(&send, &[&first, &second]),
+            Err(SamplesError::Orphan {
+                index: 2,
+                receiver: 1
+            })
+        ));
+        assert!(matches!(
+            combine(&send, &[&second]),
+            Err(SamplesError::Orphan {
+                index: 2,
+                receiver: 0
+            })
+        ));
     }
 
     #[test]

@@ -40,7 +40,30 @@
 //!   variance; it is pending the owner as a manifest 1.1 change and is
 //!   never the default.
 //! - [`Resampling::Iid`]: single messages within fixed runs, the
-//!   stratified scheme with a block of one.
+//!   stratified scheme with a block of one. Never decision grade (M-10:
+//!   whole units, never single messages).
+//! - [`Resampling::RunWelchT`]: no resampling. The interval is Welch's
+//!   t interval on the per-run p99.9 values (see
+//!   [`Resampling::RunWelchT`]). It is the remedy measured for the
+//!   undercoverage of [`Resampling::TwoStage`] with 5 runs (review of
+//!   #186, ACS 14914) and, like it, awaits the owner (manifest 1.1).
+//!
+//! # Undefined resamples
+//!
+//! A resample in which both p99.9 values are infinite (drops) has an
+//! undefined contrast. Its sign is unknown, so [`interval`] counts it as
+//! −∞ for the lower end and as +∞ for the upper end: it can only widen the
+//! interval, never turn a tie into a win. When more than 2.5% of the
+//! resamples are undefined both ends are infinite, and
+//! `decision::classify` reports the point as Not demonstrated.
+//!
+//! # Reproducibility
+//!
+//! A seed reproduces an interval exactly on one platform, whatever the
+//! thread count. The binomial draws use `f64::ln` and `f64::ln_1p` from
+//! the platform's math library, which may differ in the last bit between
+//! platforms; across platforms an interval can therefore differ in rare
+//! draws, not in distribution.
 //!
 //! # Cost
 //!
@@ -104,6 +127,11 @@ pub enum StatsError {
     TooLarge,
     /// Zero resamples.
     NoResamples,
+    /// The configurations of a comparison differ in run count or in
+    /// samples per run.
+    UnequalConfigs,
+    /// The run-level t interval needs at least 2 runs per configuration.
+    TooFewRuns,
 }
 
 impl fmt::Display for StatsError {
@@ -117,6 +145,10 @@ impl fmt::Display for StatsError {
             ),
             Self::TooLarge => f.write_str("too many pooled samples"),
             Self::NoResamples => f.write_str("zero resamples"),
+            Self::UnequalConfigs => {
+                f.write_str("configurations differ in run count or samples per run")
+            }
+            Self::TooFewRuns => f.write_str("the run-level t interval needs at least 2 runs"),
         }
     }
 }
@@ -284,6 +316,19 @@ pub fn samples_per_run(block_len: usize) -> u64 {
         .saturating_mul(block)
 }
 
+/// The warmup messages discarded per run for a block length: the
+/// manifest's 10^5 (8.1) rounded up to whole blocks, so that the measured
+/// messages start on a block boundary. For W5 at `E_max` = 64 the warmup
+/// is 21 × 4762 = 100 002 messages, so every block of 21 measured messages
+/// is one datagram (review of #186, P3).
+#[must_use]
+pub fn warmup_per_run(block_len: usize) -> u64 {
+    let block = u64::try_from(block_len.max(1)).unwrap_or(u64::MAX);
+    section8::WARMUP_PER_RUN
+        .div_ceil(block)
+        .saturating_mul(block)
+}
+
 /// How one configuration is redrawn in a bootstrap resample (see the
 /// module documentation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -303,6 +348,34 @@ pub enum Resampling {
         /// Messages per block; divides the samples per run.
         block_len: usize,
     },
+    /// No resampling: Welch's t interval on run-level estimates. Each run
+    /// gives one p99.9; for configurations `X` and `Y` of `k` runs each,
+    /// with means `m` and sample variances `s²` of those values, the
+    /// interval of `p99.9(X) - p99.9(Y)` is
+    /// `(m_X - m_Y) ± t(0.975, ν) × sqrt(s²_X / k + s²_Y / k)`, with the
+    /// Welch-Satterthwaite `ν` rounded down (between `k - 1` and `2k - 2`)
+    /// and the ends rounded outwards to whole nanoseconds.
+    ///
+    /// The run is the unit of independence, so the interval carries the
+    /// between-run variance, and the t quantile corrects for the few runs:
+    /// estimate the parameter once per independent group and apply a t
+    /// test to the group estimates (Ibragimov and Müller, "t-statistic
+    /// based correlation and heterogeneity robust inference", Journal of
+    /// Business and Economic Statistics 28 (2010) 453-468), with unequal
+    /// variances (Welch, "The generalization of 'Student's' problem when
+    /// several different population variances are involved", Biometrika
+    /// 34 (1947) 28-35; Satterthwaite, Biometrics Bulletin 2 (1946)
+    /// 110-114).
+    ///
+    /// The interval is centred on the difference of the run means, while
+    /// the point estimate stays the pooled p99.9 (H-1); a point estimate
+    /// on the other side of an interval that excludes zero is Not
+    /// demonstrated (`decision::classify`). At the design CV of about 8%
+    /// the A/A rate of an interval excluding zero is 4.8% ± 0.9% with 5
+    /// runs of 10^6 messages (2000 replications), where two stage
+    /// resampling gives 14.7% and a delete-a-group jackknife of the pooled
+    /// p99.9 gives 8.3% (see the test `calibration_at_design_cv`).
+    RunWelchT,
 }
 
 impl Resampling {
@@ -312,10 +385,14 @@ impl Resampling {
         Self::StratifiedBlocks { block_len }
     }
 
-    const fn block_len(self) -> usize {
+    /// The block length of a resampling scheme; `None` for the run-level
+    /// t interval, whose unit is the whole run.
+    #[must_use]
+    pub const fn block_len(self) -> Option<usize> {
         match self {
-            Self::Iid => 1,
-            Self::StratifiedBlocks { block_len } | Self::TwoStage { block_len } => block_len,
+            Self::Iid => Some(1),
+            Self::StratifiedBlocks { block_len } | Self::TwoStage { block_len } => Some(block_len),
+            Self::RunWelchT => None,
         }
     }
 }
@@ -330,6 +407,7 @@ impl fmt::Display for Resampling {
             Self::TwoStage { block_len } => {
                 write!(f, "two stage (runs, then blocks of {block_len})")
             }
+            Self::RunWelchT => f.write_str("run-level Welch t on per-run p99.9"),
         }
     }
 }
@@ -429,21 +507,25 @@ impl fmt::Display for Value {
     }
 }
 
-/// A percentile interval of a resampled contrast.
+/// A 95% interval of a contrast.
 ///
-/// **Undefined resamples** (`∞ - ∞`) are excluded and counted: the ends
-/// are the nearest ranks 2.5% and 97.5% of the remaining resamples,
-/// ordered `-∞ < finite < +∞`. An end may be infinite. When every resample
-/// is undefined there is no interval ([`Interval::ends`] is `None`), and
-/// the point cannot be classified.
+/// For a bootstrap it is the percentile interval: the nearest ranks 2.5%
+/// and 97.5% of the resamples, ordered `-∞ < finite < +∞`. An end may be
+/// infinite. **Undefined resamples** (`∞ - ∞`) have an unknown sign, so
+/// they count as −∞ for the lower end and as +∞ for the upper end (review
+/// of #186, P3): they widen the interval and are counted. With more than
+/// 2.5% undefined, both ends are infinite. [`Interval::ends`] is `None`
+/// only when there is no resample at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Interval {
-    /// The 2.5% and 97.5% ends, `None` when every resample is undefined.
+    /// The 2.5% and 97.5% ends, `None` without any resample.
     pub ends: Option<(Value, Value)>,
     /// Resamples with an infinite contrast (`±∞`), reported.
     pub infinite: u32,
-    /// Resamples with an undefined contrast (`∞ - ∞`), excluded, reported.
+    /// Resamples with an undefined contrast (`∞ - ∞`), reported.
     pub undefined: u32,
+    /// All resamples (0 for the run-level t interval).
+    pub resamples: u32,
 }
 
 impl Interval {
@@ -462,6 +544,14 @@ impl Interval {
     #[must_use]
     pub const fn is_bounded(&self) -> bool {
         matches!(self.ends, Some((Value::Finite(_), Value::Finite(_))))
+    }
+
+    /// Whether more than 2.5% of the resamples are undefined; such a
+    /// point is Not demonstrated (review of #186, P3).
+    #[must_use]
+    pub fn too_many_undefined(&self) -> bool {
+        let tail = u64::from((1000 - section8::CONFIDENCE_PER_MILLE) / 2);
+        u64::from(self.undefined) * 1000 > tail * u64::from(self.resamples)
     }
 }
 
@@ -499,6 +589,7 @@ pub fn interval(values: &[Value]) -> Interval {
     };
     let infinite = count(|v| matches!(v, Value::NegInf | Value::PosInf));
     let undefined = count(|v| matches!(v, Value::Undefined));
+    let unknown = usize::try_from(undefined).unwrap_or(usize::MAX);
     let mut sorted: Vec<Value> = values
         .iter()
         .copied()
@@ -506,17 +597,21 @@ pub fn interval(values: &[Value]) -> Interval {
         .collect();
     sorted.sort_unstable();
     let tail = u64::from((1000 - section8::CONFIDENCE_PER_MILLE) / 2);
-    let n = u64::try_from(sorted.len()).unwrap_or(u64::MAX);
-    let at = |num: u64| {
-        nearest_rank(n, num, 1000)
-            .and_then(|rank| usize::try_from(rank - 1).ok())
-            .and_then(|index| sorted.get(index).copied())
-    };
-    let ends = at(tail).zip(at(1000 - tail));
+    let n = u64::try_from(values.len()).unwrap_or(u64::MAX);
+    let index =
+        |num: u64| nearest_rank(n, num, 1000).and_then(|rank| usize::try_from(rank - 1).ok());
+    // Lower end: the undefined resamples first, as -inf.
+    let low = index(tail).map(|i| match i.checked_sub(unknown) {
+        Some(i) => sorted.get(i).copied().unwrap_or(Value::PosInf),
+        None => Value::NegInf,
+    });
+    // Upper end: the undefined resamples last, as +inf.
+    let high = index(1000 - tail).map(|i| sorted.get(i).copied().unwrap_or(Value::PosInf));
     Interval {
-        ends,
+        ends: low.zip(high),
         infinite,
         undefined,
+        resamples: u32::try_from(values.len()).unwrap_or(u32::MAX),
     }
 }
 
@@ -834,16 +929,100 @@ fn run_bootstrap(models: &[Model], spec: &BootstrapSpec) -> Result<Vec<u32>, Sta
     Ok(out)
 }
 
+/// Checks that every configuration has the same run count and the same
+/// samples per run (review of #186, P3), and returns that shape.
+fn check_configs(configs: &[&[&[u32]]]) -> Result<(usize, usize), StatsError> {
+    let mut shape = None;
+    for runs in configs {
+        let per_run = check_runs(runs)?;
+        match shape {
+            None => shape = Some((runs.len(), per_run)),
+            Some(seen) if seen == (runs.len(), per_run) => {}
+            Some(_) => return Err(StatsError::UnequalConfigs),
+        }
+    }
+    shape.ok_or(StatsError::Empty)
+}
+
 fn models(
     configs: &[&[&[u32]]],
-    resampling: Resampling,
+    block_len: usize,
     first_level: Option<usize>,
 ) -> Result<Vec<Model>, StatsError> {
     let (num, den) = section8::DECISION_QUANTILE;
     configs
         .iter()
-        .map(|runs| Model::new(runs, resampling.block_len(), num, den, first_level))
+        .map(|runs| Model::new(runs, block_len, num, den, first_level))
         .collect()
+}
+
+/// Two-sided 97.5% quantiles of Student's t for 1 to 30 degrees of
+/// freedom (standard tables, four decimals). Beyond 30 the value at 30 is
+/// used, which is conservative.
+const T_975: [f64; 30] = [
+    12.7062, 4.3027, 3.1824, 2.7764, 2.5706, 2.4469, 2.3646, 2.3060, 2.2622, 2.2281, 2.2010,
+    2.1788, 2.1604, 2.1448, 2.1314, 2.1199, 2.1098, 2.1009, 2.0930, 2.0860, 2.0796, 2.0739, 2.0687,
+    2.0639, 2.0595, 2.0555, 2.0518, 2.0484, 2.0452, 2.0423,
+];
+
+/// `t(0.975, df)` from [`T_975`]; `df` of 0 gives +∞.
+fn t_975(df: usize) -> f64 {
+    match df {
+        0 => f64::INFINITY,
+        df => T_975
+            .get(df.min(T_975.len()) - 1)
+            .copied()
+            .unwrap_or(f64::INFINITY),
+    }
+}
+
+/// Welch's t interval of `p99.9(X) - p99.9(Y)` on the per-run p99.9
+/// values (see [`Resampling::RunWelchT`]). An infinite per-run p99.9
+/// makes the sign unknown: the interval is `(-∞, +∞)`.
+fn run_welch_interval(x: &[&[u32]], y: &[&[u32]]) -> Result<Interval, StatsError> {
+    let unknown = Interval {
+        ends: Some((Value::NegInf, Value::PosInf)),
+        infinite: 0,
+        undefined: 0,
+        resamples: 0,
+    };
+    let k = x.len();
+    if k < 2 || y.len() != k {
+        return Err(StatsError::TooFewRuns);
+    }
+    let moments = |runs: &[&[u32]]| -> Option<(f64, f64)> {
+        let values = per_run_p999(runs)
+            .into_iter()
+            .map(|value| value.filter(|&v| v != MISSING).map(f64::from))
+            .collect::<Option<Vec<f64>>>()?;
+        let n = f64::from(u32::try_from(values.len()).ok()?);
+        let mean = values.iter().sum::<f64>() / n;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        Some((mean, variance / n))
+    };
+    let (Some((mx, ex)), Some((my, ey))) = (moments(x), moments(y)) else {
+        return Ok(unknown);
+    };
+    let each = f64::from(u32::try_from(k - 1).map_err(|_| StatsError::TooLarge)?);
+    let nu = (ex + ey).powi(2) / (ex * ex / each + ey * ey / each);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let df = if nu.is_finite() {
+        (nu.floor() as usize).clamp(k - 1, 2 * k - 2)
+    } else {
+        k - 1
+    };
+    let half = t_975(df) * (ex + ey).sqrt();
+    let centre = mx - my;
+    let (low, high) = ((centre - half).floor(), (centre + half).ceil());
+    if !(low.is_finite() && high.is_finite()) {
+        return Ok(unknown);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let ends = (Value::Finite(low as i64), Value::Finite(high as i64));
+    Ok(Interval {
+        ends: Some(ends),
+        ..unknown
+    })
 }
 
 /// The bootstrap of one point: profiles `a` and `b` against `trusted`
@@ -859,9 +1038,28 @@ pub fn bootstrap_point(
     trusted: &[&[u32]],
     spec: &BootstrapSpec,
 ) -> Result<PointBootstrap, StatsError> {
-    let models = models(&[a, b, trusted], spec.resampling, None)?;
-    let table = run_bootstrap(&models, spec)?;
+    check_configs(&[a, b, trusted])?;
     let p999 = [pooled_p999(a)?, pooled_p999(b)?, pooled_p999(trusted)?];
+    let Some(block_len) = spec.resampling.block_len() else {
+        let [pa, pb, pt] = p999;
+        return Ok(PointBootstrap {
+            p999,
+            added_a: Estimate {
+                point: Value::contrast(pa, pt),
+                interval: run_welch_interval(a, trusted)?,
+            },
+            added_b: Estimate {
+                point: Value::contrast(pb, pt),
+                interval: run_welch_interval(b, trusted)?,
+            },
+            difference: Estimate {
+                point: Value::contrast(pa, pb),
+                interval: run_welch_interval(a, b)?,
+            },
+        });
+    };
+    let models = models(&[a, b, trusted], block_len, None)?;
+    let table = run_bootstrap(&models, spec)?;
     let mut added_a = Vec::with_capacity(table.len() / 3);
     let mut added_b = Vec::with_capacity(table.len() / 3);
     let mut difference = Vec::with_capacity(table.len() / 3);
@@ -899,7 +1097,15 @@ pub fn bootstrap_difference(
     y: &[&[u32]],
     spec: &BootstrapSpec,
 ) -> Result<Estimate, StatsError> {
-    let models = models(&[x, y], spec.resampling, None)?;
+    check_configs(&[x, y])?;
+    let point = Value::contrast(pooled_p999(x)?, pooled_p999(y)?);
+    let Some(block_len) = spec.resampling.block_len() else {
+        return Ok(Estimate {
+            point,
+            interval: run_welch_interval(x, y)?,
+        });
+    };
+    let models = models(&[x, y], block_len, None)?;
     let table = run_bootstrap(&models, spec)?;
     let values: Vec<Value> = table
         .as_chunks::<2>()
@@ -908,7 +1114,7 @@ pub fn bootstrap_difference(
         .map(|&[qx, qy]| Value::contrast(qx, qy))
         .collect();
     Ok(Estimate {
-        point: Value::contrast(pooled_p999(x)?, pooled_p999(y)?),
+        point,
         interval: interval(&values),
     })
 }
@@ -916,6 +1122,69 @@ pub fn bootstrap_difference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Calibration evidence only, not a production method: the
+    /// delete-a-group jackknife (Kott, Journal of Official Statistics 17
+    /// (2001) 521-526; Shao and Wu, Annals of Statistics 17 (1989)
+    /// 1176-1197), which undercovers here (8.3% at the design CV).
+    ///
+    /// The leave-one-run-out pooled p99.9 values and their jackknife variance
+    /// `(k - 1) / k × Σ (θ(-i) - θ̄)²`; `None` when a value is infinite.
+    pub(super) fn jackknife_variance(runs: &[&[u32]]) -> Result<Option<f64>, StatsError> {
+        let k = runs.len();
+        if k < 2 {
+            return Err(StatsError::TooFewRuns);
+        }
+        let mut values = Vec::with_capacity(k);
+        for left_out in 0..k {
+            let pooled: Vec<u32> = runs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != left_out)
+                .flat_map(|(_, run)| run.iter().copied())
+                .collect();
+            match p999(&pooled) {
+                Some(value) if value != MISSING => values.push(f64::from(value)),
+                _ => return Ok(None),
+            }
+        }
+        let kf = f64::from(u32::try_from(k).map_err(|_| StatsError::TooLarge)?);
+        let mean = values.iter().sum::<f64>() / kf;
+        let squares = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>();
+        Ok(Some((kf - 1.0) / kf * squares))
+    }
+
+    /// The run-jackknife t interval of `point` with the variances of its two
+    /// configurations and `df` degrees of freedom (see
+    /// the calibration's `k - 1` or Welch-Satterthwaite).
+    pub(super) fn jackknife_interval(
+        point: Value,
+        variances: [Option<f64>; 2],
+        df: usize,
+    ) -> Interval {
+        let unknown = Interval {
+            ends: Some((Value::NegInf, Value::PosInf)),
+            infinite: 0,
+            undefined: 0,
+            resamples: 0,
+        };
+        let (Value::Finite(point), [Some(vx), Some(vy)]) = (point, variances) else {
+            return unknown;
+        };
+        let half = t_975(df) * (vx + vy).sqrt();
+        #[allow(clippy::cast_precision_loss)]
+        let centre = point as f64;
+        let (low, high) = ((centre - half).floor(), (centre + half).ceil());
+        if !(low.is_finite() && high.is_finite()) {
+            return unknown;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let ends = (Value::Finite(low as i64), Value::Finite(high as i64));
+        Interval {
+            ends: Some(ends),
+            ..unknown
+        }
+    }
 
     fn spec(resampling: Resampling, resamples: u32, seed: u64) -> BootstrapSpec {
         BootstrapSpec {
@@ -988,15 +1257,15 @@ mod tests {
 
     #[test]
     fn cv_and_its_exact_gate() {
-        // mean 100, sample sd 10: cv exactly 10%.
-        let exact = [90u32, 100, 110, 100, 100];
-        // Sum of squared deviations 200, n - 1 = 4: variance 50. Use a set
-        // whose variance is exactly 100: deviations -10, +10, -10, +10, 0
-        // give 400 / 4 = 100.
+        // Mean 100, squared deviations 400 over n - 1 = 4: variance 100,
+        // sample sd 10, so the CV is exactly 10%, which does not exceed 10%.
         let ten = [90u32, 110, 90, 110, 100];
         assert!((cv(&ten).unwrap() - 0.1).abs() < 1e-12);
         assert_eq!(cv_exceeds(&ten, 10), Some(false));
-        assert_eq!(cv_exceeds(&exact, 10), Some(false));
+        // Squared deviations 200: variance 50, CV 7.07%.
+        let lower = [90u32, 100, 110, 100, 100];
+        assert!((cv(&lower).unwrap() - 0.0707).abs() < 1e-4);
+        assert_eq!(cv_exceeds(&lower, 10), Some(false));
         // 10.1%: deviations of 101 on a mean of 1000.
         let above = [899u32, 1101, 899, 1101, 1000];
         assert!((cv(&above).unwrap() - 0.101).abs() < 1e-9);
@@ -1053,6 +1322,97 @@ mod tests {
             bootstrap_difference(&refs(&a), &refs(&a), &s),
             Err(StatsError::NoResamples)
         );
+        // Configurations must match in run count and samples per run.
+        let s = spec(Resampling::Iid, 10, 0);
+        let three = uniform_runs(2, 3, 10, 1, 5);
+        let longer = uniform_runs(3, 2, 20, 1, 5);
+        assert_eq!(
+            bootstrap_difference(&refs(&a), &refs(&three), &s),
+            Err(StatsError::UnequalConfigs)
+        );
+        assert_eq!(
+            bootstrap_point(&refs(&a), &refs(&a), &refs(&longer), &s),
+            Err(StatsError::UnequalConfigs)
+        );
+        let one = uniform_runs(4, 1, 10, 1, 5);
+        assert_eq!(
+            bootstrap_difference(&refs(&one), &refs(&one), &spec(Resampling::RunWelchT, 1, 0)),
+            Err(StatsError::TooFewRuns)
+        );
+    }
+
+    #[test]
+    fn run_welch_t_interval() {
+        // Constant runs: each run's p99.9 is its value. x: 100..=140 by
+        // 10, mean 120, s² 250, s²/k 50; y: all 100, s² 0. Welch df
+        // 50² / (50² / 4) = 4, t(0.975, 4) = 2.7764, se sqrt(50): the
+        // interval is 20 ± 19.63, rounded outwards to (0, 40).
+        let x: Vec<Vec<u32>> = [100u32, 110, 120, 130, 140]
+            .iter()
+            .map(|&v| vec![v; 1000])
+            .collect();
+        let y: Vec<Vec<u32>> = vec![vec![100u32; 1000]; 5];
+        let welch = spec(Resampling::RunWelchT, 1, 0);
+        let estimate = bootstrap_difference(&refs(&x), &refs(&y), &welch).unwrap();
+        // The point estimate stays the pooled p99.9 (H-1): 140 - 100.
+        assert_eq!(estimate.point, Value::Finite(40));
+        assert_eq!(
+            estimate.interval.ends,
+            Some((Value::Finite(0), Value::Finite(40)))
+        );
+        assert_eq!(estimate.interval.resamples, 0);
+        // Equal variances: df = 100² / (2 × 50² / 4) = 8, t = 2.3060,
+        // se 10: 10 ± 23.06, rounded outwards to (-14, 34).
+        let z: Vec<Vec<u32>> = [90u32, 100, 110, 120, 130]
+            .iter()
+            .map(|&v| vec![v; 1000])
+            .collect();
+        let estimate = bootstrap_difference(&refs(&x), &refs(&z), &welch).unwrap();
+        assert_eq!(
+            estimate.interval.ends,
+            Some((Value::Finite(-14), Value::Finite(34)))
+        );
+        // An infinite per-run p99.9 makes the sign unknown.
+        let mut dropped = y.clone();
+        for run in &mut dropped {
+            run[..2].fill(MISSING);
+        }
+        let estimate = bootstrap_difference(&refs(&x), &refs(&dropped), &welch).unwrap();
+        assert_eq!(estimate.interval.ends, Some((Value::NegInf, Value::PosInf)));
+        // The three intervals of a point.
+        let point = bootstrap_point(&refs(&x), &refs(&z), &refs(&y), &welch).unwrap();
+        assert_eq!(
+            point.difference.interval.ends.unwrap().0,
+            Value::Finite(-14)
+        );
+        assert_eq!(point.added_a.interval.ends.unwrap().1, Value::Finite(40));
+        assert_eq!(t_975(4), 2.7764);
+        assert_eq!(t_975(100), 2.0423);
+        assert!(t_975(0).is_infinite());
+    }
+
+    #[test]
+    fn calibration_jackknife_helper() {
+        // Pooled p99.9 of 4 runs of 1000 is rank 3996 of 4000: the 4th
+        // largest. With constant runs the leave-one-out p99.9 is the
+        // largest remaining run value: 140, 140, 140, 140, 130; mean 138,
+        // Σ squares 80, V = 4/5 × 80 = 64, sd 8; t(0.975, 4) = 2.7764.
+        let x: Vec<Vec<u32>> = [100u32, 110, 120, 130, 140]
+            .iter()
+            .map(|&v| vec![v; 1000])
+            .collect();
+        let variance = jackknife_variance(&refs(&x)).unwrap();
+        assert_eq!(variance, Some(64.0));
+        let found = jackknife_interval(Value::Finite(40), [variance, Some(0.0)], 4);
+        assert_eq!(found.ends, Some((Value::Finite(17), Value::Finite(63))));
+    }
+
+    #[test]
+    fn warmup_ends_on_a_block_boundary() {
+        assert_eq!(warmup_per_run(21), 100_002);
+        assert_eq!(warmup_per_run(21) % 21, 0);
+        assert_eq!(warmup_per_run(64), 100_032);
+        assert_eq!(warmup_per_run(1), 100_000);
     }
 
     /// The naive resampler: every block drawn explicitly.
@@ -1186,20 +1546,37 @@ mod tests {
     }
 
     #[test]
-    fn undefined_resamples_are_excluded_and_counted() {
-        // 40 resamples: 10 undefined, 2 at +inf, the rest finite -14..=13.
-        let mut values: Vec<Value> = (-14..14).map(Value::Finite).collect();
-        values.extend([Value::PosInf, Value::PosInf]);
+    fn undefined_resamples_have_an_unknown_sign() {
+        // 1000 resamples: 990 finite in 1..=990 and 10 undefined (1%).
+        let mut values: Vec<Value> = (1..=990).map(Value::Finite).collect();
         values.extend(std::iter::repeat_n(Value::Undefined, 10));
         let found = interval(&values);
-        assert_eq!((found.infinite, found.undefined), (2, 10));
-        // 30 ordered values: ranks ceil(0.75) = 1 and ceil(29.25) = 30.
-        assert_eq!(found.ends, Some((Value::Finite(-14), Value::PosInf)));
-        assert!(found.contains_zero());
-        assert!(!found.is_bounded());
+        assert_eq!(
+            (found.infinite, found.undefined, found.resamples),
+            (0, 10, 1000)
+        );
+        // Ranks 25 and 975 of 1000. Low: the 10 undefined count as -inf
+        // first, so it is the 15th finite value; high: they count as +inf
+        // last, so it is the 975th finite value.
+        assert_eq!(found.ends, Some((Value::Finite(15), Value::Finite(975))));
+        assert!(!found.contains_zero());
+        assert!(!found.too_many_undefined());
         // The order of the input does not matter.
         values.reverse();
         assert_eq!(interval(&values), found);
+        // 30 undefined (3%): excluding them would leave a lower end of 25,
+        // a win; with an unknown sign the lower end is -inf, the interval
+        // contains 0, and the point is too undefined to classify.
+        let mut edge: Vec<Value> = (1..=970).map(Value::Finite).collect();
+        edge.extend(std::iter::repeat_n(Value::Undefined, 30));
+        let found = interval(&edge);
+        assert_eq!(found.ends, Some((Value::NegInf, Value::PosInf)));
+        assert!(found.contains_zero());
+        assert!(found.too_many_undefined());
+        // Exactly 2.5% is not more than 2.5%.
+        let mut limit: Vec<Value> = (1..=975).map(Value::Finite).collect();
+        limit.extend(std::iter::repeat_n(Value::Undefined, 25));
+        assert!(!interval(&limit).too_many_undefined());
         // An infinite end is a tie only if the interval contains 0.
         let positive: Vec<Value> = (1..=40)
             .map(Value::Finite)
@@ -1208,13 +1585,17 @@ mod tests {
         let found = interval(&positive);
         assert_eq!(found.ends, Some((Value::Finite(2), Value::PosInf)));
         assert!(!found.contains_zero());
+        assert_eq!(found.infinite, 5);
         let negative: Vec<Value> = std::iter::repeat_n(Value::NegInf, 39)
             .chain([Value::Finite(-1)])
             .collect();
         assert!(!interval(&negative).contains_zero());
-        // All undefined: no interval.
-        let none = interval(&[Value::Undefined; 4]);
-        assert_eq!((none.ends, none.undefined), (None, 4));
+        // All undefined: both ends infinite. No resample: no interval.
+        let all = interval(&[Value::Undefined; 4]);
+        assert_eq!(all.ends, Some((Value::NegInf, Value::PosInf)));
+        assert!(all.too_many_undefined());
+        let none = interval(&[]);
+        assert_eq!(none.ends, None);
         assert!(!none.contains_zero());
     }
 
@@ -1227,17 +1608,24 @@ mod tests {
         assert_eq!(samples_per_run(1), 1_000_000);
     }
 
-    /// Synthetic runs with a between-run shift and clustered tails: bursts
-    /// of `burst` consecutive slow messages.
-    fn clustered_runs(rng: &mut Rng, runs: usize, n: usize, burst: usize) -> Vec<Vec<u32>> {
+    /// Messages per burst in the calibration data, and the block length of
+    /// the block methods.
+    const BURST: usize = 50;
+
+    /// Synthetic runs with a between-run shift and clustered tails. Each
+    /// run is shifted by `U(0, shift)` ns; a message is `1000 + U(0, 200)`
+    /// ns, and with probability 1/2000 a burst of [`BURST`] consecutive
+    /// messages at a common level `3000 + U(0, 1500)` (+ `U(0, 100)` each)
+    /// starts instead.
+    fn clustered_runs(rng: &mut Rng, runs: usize, n: usize, shift: u64) -> Vec<Vec<u32>> {
         (0..runs)
             .map(|_| {
-                let shift = u32::try_from(rng.below(300)).unwrap();
-                let mut run = Vec::with_capacity(n);
+                let shift = u32::try_from(rng.below(shift)).unwrap();
+                let mut run = Vec::with_capacity(n + BURST);
                 while run.len() < n {
                     if rng.below(2000) == 0 {
                         let level = 3000 + u32::try_from(rng.below(1500)).unwrap();
-                        for _ in 0..burst {
+                        for _ in 0..BURST {
                             run.push(level + shift + u32::try_from(rng.below(100)).unwrap());
                         }
                     } else {
@@ -1250,57 +1638,267 @@ mod tests {
             .collect()
     }
 
-    /// Calibration (coordinator, ACS 14831): the A/A rate at which the
-    /// interval of the difference excludes zero, for each resampling, on
-    /// data with a between-run shift and clustered tails. Only the two
-    /// stage rate is asserted; the other rates are printed and recorded
-    /// here. The data: 5 runs of 50 000 messages per configuration, each
-    /// run shifted by U(0, 300) ns, a base of 1000 + U(0, 200) ns, and
-    /// bursts of 50 consecutive messages at 3000 + U(0, 1500) ns starting
-    /// with probability 1/2000 per message; 1000 resamples per interval.
+    /// One calibration case.
+    #[derive(Debug, Clone, Copy)]
+    struct Case {
+        runs: usize,
+        samples: usize,
+        shift: u64,
+        replications: u32,
+        resamples: u32,
+    }
+
+    /// The methods compared, in the order of a result row.
+    const METHODS: [&str; 7] = [
+        "iid",
+        "stratified blocks of 50 (default)",
+        "two stage, blocks of 50",
+        "run jackknife of pooled p99.9, t(k - 1)",
+        "run jackknife of pooled p99.9, t(Welch df)",
+        "run-level t, Student, t(2k - 2)",
+        "run-level t, Welch df (RunWelchT)",
+    ];
+
+    /// Mean and sample variance of the per-run p99.9 values.
+    fn run_moments(runs: &[&[u32]]) -> (f64, f64) {
+        let values: Vec<f64> = per_run_p999(runs)
+            .into_iter()
+            .map(|v| f64::from(v.unwrap()))
+            .collect();
+        let k = values.len() as f64;
+        let mean = values.iter().sum::<f64>() / k;
+        let var = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (k - 1.0);
+        (mean, var)
+    }
+
+    /// Whether `centre ± t(df) × se` excludes zero.
+    fn t_excludes(centre: f64, se: f64, df: usize) -> bool {
+        let half = t_975(df) * se;
+        centre - half > 0.0 || centre + half < 0.0
+    }
+
+    /// One A/A replication: whether each method's interval excludes zero,
+    /// and the per-run p99.9 CV of each configuration.
+    fn replicate(case: Case, replication: u32) -> ([bool; 7], [f64; 2]) {
+        let mut rng = resample_rng(0x00CA_11B8_A7E0, replication);
+        let a = clustered_runs(&mut rng, case.runs, case.samples, case.shift);
+        let b = clustered_runs(&mut rng, case.runs, case.samples, case.shift);
+        let (ra, rb) = (refs(&a), refs(&b));
+        let run_cv = |runs: &[&[u32]]| {
+            let values: Vec<u32> = per_run_p999(runs).into_iter().map(Option::unwrap).collect();
+            cv(&values).unwrap()
+        };
+        let cvs = [run_cv(&ra), run_cv(&rb)];
+        let mut excluded = [false; 7];
+        let methods = [
+            Resampling::Iid,
+            Resampling::StratifiedBlocks { block_len: BURST },
+            Resampling::TwoStage { block_len: BURST },
+        ];
+        let mut built: Option<(usize, Vec<Model>)> = None;
+        for (slot, resampling) in excluded.iter_mut().zip(methods) {
+            let block_len = resampling.block_len().unwrap();
+            if built.as_ref().map(|(len, _)| *len) != Some(block_len) {
+                drop(built.take());
+                built = Some((block_len, models(&[&ra, &rb], block_len, None).unwrap()));
+            }
+            let spec = BootstrapSpec {
+                resampling,
+                resamples: case.resamples,
+                seed: u64::from(replication),
+                threads: NonZeroUsize::new(1),
+            };
+            let table = run_bootstrap(&built.as_ref().unwrap().1, &spec).unwrap();
+            let values: Vec<Value> = table
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[x, y]| Value::contrast(x, y))
+                .collect();
+            *slot = !interval(&values).contains_zero();
+        }
+        drop(built);
+        let point = Value::contrast(pooled_p999(&ra).unwrap(), pooled_p999(&rb).unwrap());
+        let (va, vb) = (
+            jackknife_variance(&ra).unwrap().unwrap(),
+            jackknife_variance(&rb).unwrap().unwrap(),
+        );
+        excluded[3] =
+            !jackknife_interval(point, [Some(va), Some(vb)], case.runs - 1).contains_zero();
+        // Welch-Satterthwaite with k - 1 degrees of freedom per variance,
+        // rounded down (Welch, Biometrika 34 (1947) 28-35).
+        let each = (case.runs - 1) as f64;
+        let nu = (va + vb).powi(2) / (va * va / each + vb * vb / each);
+        let df = if nu.is_finite() {
+            nu.floor() as usize
+        } else {
+            case.runs - 1
+        };
+        excluded[4] = !jackknife_interval(point, [Some(va), Some(vb)], df).contains_zero();
+        // Run-level t intervals on the per-run p99.9 values: Student's
+        // two-sample t with pooled variance and 2k - 2 degrees of freedom,
+        // and Welch's with the Welch-Satterthwaite df rounded down.
+        let ((ma, sa), (mb, sb)) = (run_moments(&ra), run_moments(&rb));
+        let k = case.runs as f64;
+        let pooled = (sa + sb) / 2.0;
+        excluded[5] = t_excludes(ma - mb, (pooled * 2.0 / k).sqrt(), 2 * case.runs - 2);
+        let (ea, eb) = (sa / k, sb / k);
+        let nu = (ea + eb).powi(2) / (ea * ea / each + eb * eb / each);
+        let df = if nu.is_finite() {
+            nu.floor() as usize
+        } else {
+            case.runs - 1
+        };
+        excluded[6] = t_excludes(ma - mb, (ea + eb).sqrt(), df);
+        (excluded, cvs)
+    }
+
+    /// Runs a case on parallel workers; every replication is seeded by
+    /// its index, so the result does not depend on the worker count.
+    /// Returns the exclusion counts and the mean per-run p99.9 CV.
+    #[allow(clippy::print_stderr)]
+    fn calibrate(case: Case) -> ([u32; 7], f64) {
+        // About 32 bytes per sample are live in one replication.
+        let per_replication = case.runs * case.samples * 2 * 32;
+        let workers = thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .min((4usize << 30) / per_replication)
+            .max(1);
+        let started = std::time::Instant::now();
+        let results: Vec<([bool; 7], [f64; 2])> = thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        (0..case.replications)
+                            .filter(|r| usize::try_from(*r).unwrap() % workers == worker)
+                            .map(|r| replicate(case, r))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        let mut counts = [0u32; 7];
+        let mut cv_sum = 0.0;
+        for (excluded, cvs) in &results {
+            for (count, &hit) in counts.iter_mut().zip(excluded) {
+                *count += u32::from(hit);
+            }
+            cv_sum += cvs[0] + cvs[1];
+        }
+        let mean_cv = cv_sum / (2.0 * f64::from(case.replications));
+        let reps = f64::from(case.replications);
+        eprintln!(
+            "calibration k = {} runs x {} samples, shift U(0, {}) ns, {} replications, {} \
+             resamples: mean per-run p99.9 CV {:.2}% ({:.0?}, {workers} workers)",
+            case.runs,
+            case.samples,
+            case.shift,
+            case.replications,
+            case.resamples,
+            100.0 * mean_cv,
+            started.elapsed(),
+        );
+        for (name, &count) in METHODS.iter().zip(&counts) {
+            let rate = f64::from(count) / reps;
+            let half = 1.96 * (rate * (1.0 - rate) / reps).sqrt();
+            eprintln!(
+                "  {name}: A/A non-tie rate {:.1}% +/- {:.1}% ({count}/{})",
+                100.0 * rate,
+                100.0 * half,
+                case.replications
+            );
+        }
+        (counts, mean_cv)
+    }
+
+    /// The run shift that gives the design's per-run p99.9 CV of about 8%
+    /// with this generator (measured by [`calibrate`] and printed).
+    const DESIGN_SHIFT: u64 = 1500;
+
+    /// Calibration at the design CV (review of #186, ACS 14914): the A/A
+    /// rate at which a method's 95% interval of the difference excludes
+    /// zero, with a between-run shift and clustered tails, at the
+    /// decision's 5 runs × 10^6 messages and, for sensitivity, at 5 × 10^4
+    /// messages per run. Only the chosen method's rate is asserted.
     ///
-    /// Measured on 2026-10-16 (1000 replications, Apple M5 Max, release):
-    /// iid 84.6%, stratified blocks of 50 (the default) 28.0%, two stage
-    /// 5.3%. Fixed run strata do not carry the between-run variance, so
-    /// with run-to-run shifts the default's interval is too narrow; this
-    /// is the evidence for the pending manifest 1.1 question (ACS 14831).
-    /// Heavy: run with
-    /// `cargo test --release -p karyos-bench -- --ignored calibration --nocapture`.
+    /// Measured on 2026-10-16 (Apple M5 Max, release, 2000 replications,
+    /// 1000 resamples; mean per-run p99.9 CV 7.98% at 10^6 and 8.21% at
+    /// 5 × 10^4 messages per run), A/A rate of an interval excluding zero
+    /// at 10^6 (and 5 × 10^4) messages per run, ± 95% binomial half-width
+    /// of about 1%:
+    ///
+    /// | Method | 10^6 | 5 × 10^4 |
+    /// | --- | --- | --- |
+    /// | iid | 97.2% | 90.1% |
+    /// | stratified blocks of 50 (default) | 86.0% | 52.6% |
+    /// | two stage, blocks of 50 | 14.7% | 11.7% |
+    /// | run jackknife of pooled p99.9, t(k - 1) | 8.3% | 7.8% |
+    /// | run jackknife of pooled p99.9, t(Welch df) | 10.2% | 9.1% |
+    /// | run-level Student t, t(2k - 2) | 5.9% | 5.9% |
+    /// | run-level Welch t (`RunWelchT`) | 4.8% | 4.9% |
+    ///
+    /// Fewer messages per run add within-run noise that hides part of the
+    /// between-run variance, so 5 × 10^4 understates the undercoverage of
+    /// the resampling methods. Heavy (about 4 minutes): run with
+    /// `cargo test --release -p karyos-bench -- --ignored calibration_at --nocapture`.
     #[test]
     #[ignore = "heavy calibration, run in release"]
-    #[allow(clippy::print_stderr)]
-    fn calibration_a_a_non_tie_rate() {
-        let replications = 1000u32;
-        let burst = 50;
-        let variants = [
-            Resampling::Iid,
-            Resampling::StratifiedBlocks { block_len: burst },
-            Resampling::TwoStage { block_len: burst },
-        ];
-        let mut rates = Vec::new();
-        for resampling in variants {
-            let mut rng = Rng::new(2026);
-            let mut excluded = 0u32;
-            for replication in 0..replications {
-                let a = clustered_runs(&mut rng, 5, 50_000, burst);
-                let b = clustered_runs(&mut rng, 5, 50_000, burst);
-                let estimate = bootstrap_difference(
-                    &refs(&a),
-                    &refs(&b),
-                    &spec(resampling, 1000, u64::from(replication)),
-                )
-                .unwrap();
-                if !estimate.interval.contains_zero() {
-                    excluded += 1;
-                }
-            }
-            let rate = f64::from(excluded) / f64::from(replications);
-            eprintln!(
-                "calibration: {resampling}: A/A non-tie rate {rate:.3} ({excluded}/{replications})"
-            );
-            rates.push(rate);
+    fn calibration_at_design_cv() {
+        let design = Case {
+            runs: 5,
+            samples: 1_000_000,
+            shift: DESIGN_SHIFT,
+            replications: 2000,
+            resamples: 1000,
+        };
+        let (counts, mean_cv) = calibrate(design);
+        assert!((0.075..=0.085).contains(&mean_cv), "CV {mean_cv}");
+        let small = Case {
+            samples: 50_000,
+            ..design
+        };
+        calibrate(small);
+        // Only the chosen method is asserted: RunWelchT near 5%.
+        let rate = f64::from(counts[6]) / f64::from(design.replications);
+        assert!(rate <= 0.07, "run-level Welch t rate {rate}");
+    }
+
+    /// The run count each method needs at the design CV (review of #186):
+    /// k = 5, 10 and 20 runs of 10^6 messages, 500 replications each
+    /// (± about 2%).
+    ///
+    /// Measured on 2026-10-16 (mean per-run p99.9 CV 7.98%, 8.13%, 8.23%):
+    ///
+    /// | Method | k = 5 | k = 10 | k = 20 |
+    /// | --- | --- | --- | --- |
+    /// | iid | 97.0% | 98.2% | 97.4% |
+    /// | stratified blocks of 50 (default) | 84.8% | 89.6% | 86.4% |
+    /// | two stage, blocks of 50 | 12.4% | 9.0% | 6.2% |
+    /// | run jackknife of pooled p99.9, t(k - 1) | 8.2% | 6.6% | 4.0% |
+    /// | run jackknife of pooled p99.9, t(Welch df) | 9.4% | 7.0% | 4.8% |
+    /// | run-level Student t, t(2k - 2) | 5.8% | 6.0% | 4.2% |
+    /// | run-level Welch t (`RunWelchT`) | 4.6% | 5.4% | 4.2% |
+    ///
+    /// Two stage resampling needs about 20 runs to approach 5%; fixed run
+    /// strata never do, whatever the run count. Heavy (about 25 minutes):
+    /// run with
+    /// `cargo test --release -p karyos-bench -- --ignored calibration_runs --nocapture`.
+    #[test]
+    #[ignore = "heavy calibration, run in release"]
+    fn calibration_runs_sweep() {
+        for runs in [5, 10, 20] {
+            calibrate(Case {
+                runs,
+                samples: 1_000_000,
+                shift: DESIGN_SHIFT,
+                replications: 500,
+                resamples: 1000,
+            });
         }
-        assert!(rates[2] <= 0.075, "two stage rate {}", rates[2]);
     }
 
     /// The decision-size bootstrap: 3 configurations of 5 runs × 10^6

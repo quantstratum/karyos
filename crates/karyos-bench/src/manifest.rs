@@ -481,6 +481,26 @@ pub enum Load {
     },
 }
 
+impl Load {
+    /// Whether the parameters are values of manifest 6.1: R2, R4 and R5
+    /// rates of the R2 table (100 000 or 1 000 000 per second) and R4
+    /// invalid tags at 10% or 100%.
+    #[must_use]
+    pub const fn is_manifest(self) -> bool {
+        const fn rate_ok(rate: u32) -> bool {
+            rate == RATE_100K || rate == RATE_1M
+        }
+        match self {
+            Self::R1 | Self::R3 => true,
+            Self::R2 { rate } | Self::R5 { rate } => rate_ok(rate),
+            Self::R4 {
+                rate,
+                invalid_percent,
+            } => rate_ok(rate) && (invalid_percent == 10 || invalid_percent == 100),
+        }
+    }
+}
+
 impl fmt::Display for Load {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -509,6 +529,16 @@ pub enum Fanout {
 }
 
 impl Fanout {
+    /// Whether the receiver count is a value of manifest 6.1 (F2: 1, 4 or
+    /// 16).
+    #[must_use]
+    pub const fn is_manifest(self) -> bool {
+        match self {
+            Self::F1 => true,
+            Self::F2 { receivers } => matches!(receivers, 1 | 4 | 16),
+        }
+    }
+
     /// The receiver count.
     #[must_use]
     pub const fn receivers(self) -> u8 {

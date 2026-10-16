@@ -19,7 +19,9 @@
 
 use std::fmt;
 
-use crate::manifest::{EMax, Fanout, MtuRule, Point, max_message_length_64k, primary, section8};
+use crate::manifest::{
+    EMax, Fanout, MtuRule, Point, Shape, max_message_length_64k, primary, section8,
+};
 use crate::samples;
 use crate::stats::{self, BootstrapSpec, Estimate, PointBootstrap, Resampling, StatsError, Value};
 
@@ -68,14 +70,17 @@ pub enum Side {
 /// Why a point is not demonstrated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cause {
-    /// More than 0.1% of a configuration's messages were dropped, so its
-    /// p99.9 is infinite (coordinator M-11, ACS 14828).
+    /// More than 0.1% of one run's messages were dropped, so its p99.9 is
+    /// infinite (coordinator M-11, ACS 14828). The gate applies to each
+    /// run, not to the pooled configuration (review of #186, P3).
     Drops {
         /// The configuration.
         profile: String,
-        /// Missing messages.
+        /// The run index.
+        run: usize,
+        /// Missing messages in the run.
         missing: u64,
-        /// All messages.
+        /// All messages of the run.
         total: u64,
     },
     /// A run of the configuration has a saturated sample
@@ -97,8 +102,20 @@ pub enum Cause {
     },
     /// The environment cannot decide (6.3, 8.8).
     Environment(Environment),
-    /// Every bootstrap resample of the difference was undefined.
+    /// There is no interval (no resample).
     NoInterval,
+    /// More than 2.5% of the resamples of the difference are undefined
+    /// (`∞ - ∞`), so the sign of the difference is unknown (review of
+    /// #186, P3).
+    UndefinedResamples {
+        /// Undefined resamples.
+        undefined: u32,
+        /// All resamples.
+        resamples: u32,
+    },
+    /// The interval excludes zero on one side while the point estimate is
+    /// on the other side or at zero (review of #186, P3).
+    Inconsistent,
     /// The point is not part of the results.
     NotMeasured,
     /// Another cause, such as `F2 before P2.7` or `profile not
@@ -111,9 +128,13 @@ impl fmt::Display for Cause {
         match self {
             Self::Drops {
                 profile,
+                run,
                 missing,
                 total,
-            } => write!(f, "drops: {profile} lost {missing} of {total} messages"),
+            } => write!(
+                f,
+                "drops: {profile} run {run} lost {missing} of {total} messages"
+            ),
             Self::Saturated { profile } => write!(f, "saturated samples in {profile}"),
             Self::Variation { profiles } => {
                 write!(
@@ -132,7 +153,17 @@ impl fmt::Display for Cause {
             Self::Environment(environment) => {
                 write!(f, "environment {environment} does not decide")
             }
-            Self::NoInterval => f.write_str("no defined bootstrap resample"),
+            Self::NoInterval => f.write_str("no bootstrap resample"),
+            Self::UndefinedResamples {
+                undefined,
+                resamples,
+            } => write!(
+                f,
+                "{undefined} of {resamples} resamples undefined (both p99.9 infinite)"
+            ),
+            Self::Inconsistent => {
+                f.write_str("point estimate on the other side of zero from the interval")
+            }
             Self::NotMeasured => f.write_str("not measured"),
             Self::Other(cause) => f.write_str(cause),
         }
@@ -157,15 +188,28 @@ pub enum Outcome {
 /// never the total p99.9). Otherwise the side with the lower added latency
 /// wins: `a` when the whole interval is below zero.
 ///
-/// An infinite end counts like any other: the interval is a tie only if it
-/// contains zero (ACS 14838). The 2% rule applies only when the
-/// difference and both added latencies are finite.
+/// - An infinite end counts like any other: the interval is a tie only if
+///   it contains zero (ACS 14838). The 2% rule applies only when the
+///   difference and both added latencies are finite.
+/// - More than 2.5% undefined resamples make the point Not demonstrated
+///   (review of #186, P3): their sign is unknown.
+/// - A percentile interval need not contain its point estimate. When the
+///   interval excludes zero but the point estimate is zero or on the
+///   other side, the evidence contradicts itself and the point is Not
+///   demonstrated (review of #186, P3).
 #[must_use]
 pub fn classify(difference: &Estimate, added_a: Value, added_b: Value) -> Outcome {
-    let Some((low, _)) = difference.interval.ends else {
+    let interval = &difference.interval;
+    let Some((low, _)) = interval.ends else {
         return Outcome::NotDemonstrated(Cause::NoInterval);
     };
-    if difference.interval.contains_zero() {
+    if interval.too_many_undefined() {
+        return Outcome::NotDemonstrated(Cause::UndefinedResamples {
+            undefined: interval.undefined,
+            resamples: interval.resamples,
+        });
+    }
+    if interval.contains_zero() {
         return Outcome::Tie;
     }
     if let (Value::Finite(diff), Value::Finite(a), Value::Finite(b)) =
@@ -178,11 +222,18 @@ pub fn classify(difference: &Estimate, added_a: Value, added_b: Value) -> Outcom
             return Outcome::Tie;
         }
     }
-    // The interval excludes zero: it lies wholly on one side.
-    if low > Value::Finite(0) {
-        Outcome::Win(Side::B)
+    // The interval excludes zero: it lies wholly on one side, and the
+    // point estimate must lie on the same side.
+    let above = low > Value::Finite(0);
+    let consistent = if above {
+        difference.point > Value::Finite(0) && difference.point != Value::Undefined
     } else {
-        Outcome::Win(Side::A)
+        difference.point < Value::Finite(0)
+    };
+    match (consistent, above) {
+        (false, _) => Outcome::NotDemonstrated(Cause::Inconsistent),
+        (true, true) => Outcome::Win(Side::B),
+        (true, false) => Outcome::Win(Side::A),
     }
 }
 
@@ -274,16 +325,26 @@ pub struct Config<'a> {
     pub saturated: u64,
 }
 
-impl Config<'_> {
-    fn missing_and_total(&self) -> (u64, u64) {
-        self.runs
-            .iter()
-            .fold((0u64, 0u64), |(missing, total), run| {
-                (
-                    missing.saturating_add(samples::missing(run)),
-                    total.saturating_add(u64::try_from(run.len()).unwrap_or(u64::MAX)),
-                )
-            })
+/// The drops of one run (M-11), reported for every run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunDrops {
+    /// The configuration.
+    pub profile: String,
+    /// The run index.
+    pub run: usize,
+    /// Missing messages.
+    pub missing: u64,
+    /// All messages.
+    pub total: u64,
+}
+
+impl RunDrops {
+    /// The drop rate.
+    #[must_use]
+    pub fn rate(&self) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let rate = self.missing as f64 / (self.total.max(1)) as f64;
+        rate
     }
 }
 
@@ -315,13 +376,15 @@ pub struct PointResult {
     pub outcome: Outcome,
     /// Per configuration: name, per-run p99.9, CV (reported, H-1).
     pub spread: Vec<(String, Vec<u32>, Option<f64>)>,
-    /// Per configuration: name, missing and total messages (M-11).
-    pub drops: Vec<(String, u64, u64)>,
+    /// Per run of every configuration: missing and total messages
+    /// (M-11).
+    pub drops: Vec<RunDrops>,
     /// The bootstrap, when it ran.
     pub bootstrap: Option<PointBootstrap>,
 }
 
-/// Evaluates one point: the environment (8.8), drops (M-11), saturation,
+/// Evaluates one point: the environment (8.8), drops per run (M-11),
+/// saturation,
 /// the CV gate per configuration (8.4), then the bootstrap (8.3) and the
 /// classification (8.5).
 ///
@@ -339,8 +402,14 @@ pub fn evaluate_point(input: &PointInput<'_>) -> Result<PointResult, StatsError>
             .collect();
         let cv = stats::cv(&per_run);
         spread.push((config.profile.to_string(), per_run, cv));
-        let (missing, total) = config.missing_and_total();
-        drops.push((config.profile.to_string(), missing, total));
+        for (run, samples) in config.runs.iter().enumerate() {
+            drops.push(RunDrops {
+                profile: config.profile.to_string(),
+                run,
+                missing: samples::missing(samples),
+                total: u64::try_from(samples.len()).unwrap_or(u64::MAX),
+            });
+        }
     }
     let done = |outcome: Outcome, spread, drops| {
         Ok(PointResult {
@@ -358,15 +427,17 @@ pub fn evaluate_point(input: &PointInput<'_>) -> Result<PointResult, StatsError>
             drops,
         );
     }
-    for (profile, missing, total) in &drops {
-        if drops_exceed(*missing, *total) {
-            let cause = Cause::Drops {
-                profile: profile.clone(),
-                missing: *missing,
-                total: *total,
-            };
-            return done(Outcome::NotDemonstrated(cause), spread, drops);
-        }
+    if let Some(run) = drops
+        .iter()
+        .find(|run| drops_exceed(run.missing, run.total))
+    {
+        let cause = Cause::Drops {
+            profile: run.profile.clone(),
+            run: run.run,
+            missing: run.missing,
+            total: run.total,
+        };
+        return done(Outcome::NotDemonstrated(cause), spread, drops);
     }
     if let Some(config) = configs.iter().find(|config| config.saturated > 0) {
         let cause = Cause::Saturated {
@@ -755,9 +826,22 @@ pub enum GradeReason {
     Runs(u32),
     /// Fewer resamples than 8.3 requires.
     Resamples(u32),
-    /// The resampling does not keep the runs as fixed strata (8.3); the
-    /// two stage variant awaits the owner (manifest 1.1).
+    /// The resampling is not stratified by run in whole blocks (8.3,
+    /// M-10): message-level [`Resampling::Iid`] never is, and the two
+    /// stage and run jackknife variants await the owner (manifest 1.1).
     Resampling(Resampling),
+    /// Stratified blocks of the wrong length for the shape: M-10 resamples
+    /// whole units, a datagram for W5 and [`stats::DEFAULT_BLOCK_LEN`]
+    /// otherwise (see [`stats::block_len`]).
+    BlockLength {
+        /// The shape.
+        shape: Shape,
+        /// The block length used.
+        used: usize,
+        /// The block length required; `None` when the shape has none at
+        /// this `E_max`.
+        required: Option<usize>,
+    },
     /// The overall result is incomplete (H-4).
     Incomplete,
 }
@@ -785,16 +869,19 @@ pub struct GradeInputs<'a> {
     pub min_warmup: u64,
     /// The smallest run count of any configuration at any point.
     pub min_runs: u32,
-    /// The bootstrap spec used.
-    pub spec: BootstrapSpec,
+    /// The bootstrap resamples used (the smallest at any point).
+    pub resamples: u32,
+    /// The shape and resampling of every point of the comparison.
+    pub points: &'a [(Shape, Resampling)],
     /// The overall result.
     pub overall: &'a Overall,
 }
 
 /// The decision grade: refused for a provisional `E_max` (M-7), an
 /// environment that does not decide (6.3), too few samples, warmup, runs
-/// or resamples (8.1 to 8.3), a resampling outside fixed run strata, or an
-/// incomplete overall result (H-4).
+/// or resamples (8.1 to 8.3), a resampling other than stratified whole
+/// blocks of the shape's length (M-10; review of #186), or an incomplete
+/// overall result (H-4).
 #[must_use]
 pub fn grade(inputs: &GradeInputs<'_>) -> Grade {
     let mut reasons = Vec::new();
@@ -817,11 +904,24 @@ pub fn grade(inputs: &GradeInputs<'_>) -> Grade {
     if inputs.min_runs < section8::MIN_RUNS {
         reasons.push(GradeReason::Runs(inputs.min_runs));
     }
-    if inputs.spec.resamples < section8::BOOTSTRAP_RESAMPLES {
-        reasons.push(GradeReason::Resamples(inputs.spec.resamples));
+    if inputs.resamples < section8::BOOTSTRAP_RESAMPLES {
+        reasons.push(GradeReason::Resamples(inputs.resamples));
     }
-    if matches!(inputs.spec.resampling, Resampling::TwoStage { .. }) {
-        reasons.push(GradeReason::Resampling(inputs.spec.resampling));
+    for &(shape, resampling) in inputs.points {
+        let reason = match resampling {
+            Resampling::StratifiedBlocks { block_len } => {
+                let required = stats::block_len(shape, inputs.e_max.bytes()).ok();
+                (required != Some(block_len)).then_some(GradeReason::BlockLength {
+                    shape,
+                    used: block_len,
+                    required,
+                })
+            }
+            other => Some(GradeReason::Resampling(other)),
+        };
+        if let Some(reason) = reason.filter(|reason| !reasons.contains(reason)) {
+            reasons.push(reason);
+        }
     }
     if !inputs.overall.is_complete() {
         reasons.push(GradeReason::Incomplete);
@@ -847,6 +947,7 @@ mod tests {
                 ends: Some((Value::Finite(low), Value::Finite(high))),
                 infinite: 0,
                 undefined: 0,
+                resamples: 10_000,
             },
         }
     }
@@ -898,17 +999,18 @@ mod tests {
 
     #[test]
     fn infinite_ends_tie_only_when_they_contain_zero() {
-        let open = |low: Value, high: Value| Estimate {
-            point: Value::PosInf,
+        let open = |point: Value, low: Value, high: Value| Estimate {
+            point,
             interval: Interval {
                 ends: Some((low, high)),
                 infinite: 3,
                 undefined: 1,
+                resamples: 1000,
             },
         };
         assert_eq!(
             classify(
-                &open(Value::Finite(5), Value::PosInf),
+                &open(Value::PosInf, Value::Finite(5), Value::PosInf),
                 Value::PosInf,
                 Value::Finite(10)
             ),
@@ -916,7 +1018,7 @@ mod tests {
         );
         assert_eq!(
             classify(
-                &open(Value::Finite(-5), Value::PosInf),
+                &open(Value::PosInf, Value::Finite(-5), Value::PosInf),
                 Value::PosInf,
                 Value::Finite(10)
             ),
@@ -924,7 +1026,7 @@ mod tests {
         );
         assert_eq!(
             classify(
-                &open(Value::NegInf, Value::Finite(-1)),
+                &open(Value::NegInf, Value::NegInf, Value::Finite(-1)),
                 Value::Finite(1),
                 Value::PosInf
             ),
@@ -935,12 +1037,73 @@ mod tests {
             interval: Interval {
                 ends: None,
                 infinite: 0,
-                undefined: 10,
+                undefined: 0,
+                resamples: 0,
             },
         };
         assert_eq!(
             classify(&none, Value::Undefined, Value::Undefined),
             Outcome::NotDemonstrated(Cause::NoInterval)
+        );
+    }
+
+    #[test]
+    fn too_many_undefined_resamples_are_not_demonstrated() {
+        // 30 of 1000 resamples undefined (3% > 2.5%): the interval built
+        // by stats::interval is (-inf, +inf), and the point is Not
+        // demonstrated rather than a tie.
+        let mut values: Vec<Value> = (1..=970).map(Value::Finite).collect();
+        values.extend(std::iter::repeat_n(Value::Undefined, 30));
+        let difference = Estimate {
+            point: Value::Finite(500),
+            interval: stats::interval(&values),
+        };
+        assert_eq!(
+            classify(&difference, Value::Finite(900), Value::Finite(400)),
+            Outcome::NotDemonstrated(Cause::UndefinedResamples {
+                undefined: 30,
+                resamples: 1000
+            })
+        );
+        // 10 of 1000 (1%): classified, the undefined counted at both ends.
+        let mut values: Vec<Value> = (1..=990).map(Value::Finite).collect();
+        values.extend(std::iter::repeat_n(Value::Undefined, 10));
+        let difference = Estimate {
+            point: Value::Finite(500),
+            interval: stats::interval(&values),
+        };
+        assert_eq!(
+            classify(&difference, Value::Finite(900), Value::Finite(400)),
+            Outcome::Win(Side::B)
+        );
+    }
+
+    #[test]
+    fn the_point_estimate_must_agree_with_the_interval() {
+        // The interval is above zero but the point estimate is below it:
+        // contradictory evidence. Added latencies of 100 and 50 put the 2%
+        // band at 2 ns, so a point of -5 is outside it.
+        let difference = estimate(-5, 10, 60);
+        assert_eq!(
+            classify(&difference, Value::Finite(100), Value::Finite(50)),
+            Outcome::NotDemonstrated(Cause::Inconsistent)
+        );
+        let difference = estimate(5, -60, -10);
+        assert_eq!(
+            classify(&difference, Value::Finite(50), Value::Finite(100)),
+            Outcome::NotDemonstrated(Cause::Inconsistent)
+        );
+        // A point estimate of zero is always inside the 2% band: a tie.
+        let difference = estimate(0, 10, 60);
+        assert_eq!(
+            classify(&difference, Value::Finite(100), Value::Finite(50)),
+            Outcome::Tie
+        );
+        // Agreement wins as before.
+        let difference = estimate(-35, -60, -10);
+        assert_eq!(
+            classify(&difference, Value::Finite(50), Value::Finite(100)),
+            Outcome::Win(Side::A)
         );
     }
 
@@ -1099,7 +1262,8 @@ mod tests {
             min_samples: 1_000_000,
             min_warmup: 100_000,
             min_runs: 5,
-            spec: BootstrapSpec::manifest(Resampling::default_with(64), 1),
+            resamples: 10_000,
+            points: &[(Shape::W1, Resampling::default_with(64))],
             overall: &found,
         });
         assert_eq!(
@@ -1111,23 +1275,27 @@ mod tests {
     #[test]
     fn decision_grade_conditions() {
         let complete = overall(&all(&Outcome::Tie), DecisionSet::default());
+        let good = [
+            (Shape::W1, Resampling::default_with(64)),
+            (Shape::W5, Resampling::default_with(21)),
+        ];
         let mut inputs = GradeInputs {
             e_max: EMax::Decided(64),
             environments: &[Environment::E1, Environment::E1],
             min_samples: 1_000_020,
-            min_warmup: 100_000,
+            min_warmup: 100_002,
             min_runs: 5,
-            spec: BootstrapSpec::manifest(Resampling::default_with(21), 1),
+            resamples: 10_000,
+            points: &good,
             overall: &complete,
         };
         assert_eq!(grade(&inputs), Grade::Decision);
         inputs.e_max = EMax::Provisional(64);
         inputs.environments = &[Environment::E4, Environment::E3, Environment::E4];
         inputs.min_samples = 999_999;
-        inputs.spec = BootstrapSpec {
-            resamples: 1000,
-            ..BootstrapSpec::manifest(Resampling::TwoStage { block_len: 64 }, 1)
-        };
+        inputs.resamples = 1000;
+        let two_stage = [(Shape::W1, Resampling::TwoStage { block_len: 64 })];
+        inputs.points = &two_stage;
         assert_eq!(
             grade(&inputs),
             Grade::NotDecisionGrade(vec![
@@ -1138,6 +1306,54 @@ mod tests {
                 GradeReason::Resamples(1000),
                 GradeReason::Resampling(Resampling::TwoStage { block_len: 64 }),
             ])
+        );
+    }
+
+    #[test]
+    fn decision_grade_needs_whole_units() {
+        // M-10: whole units, never single messages (review of #186, P2).
+        let complete = overall(&all(&Outcome::Tie), DecisionSet::default());
+        let check = |points: &[(Shape, Resampling)]| {
+            grade(&GradeInputs {
+                e_max: EMax::Decided(64),
+                environments: &[Environment::E1],
+                min_samples: 1_000_020,
+                min_warmup: 100_002,
+                min_runs: 5,
+                resamples: 10_000,
+                points,
+                overall: &complete,
+            })
+        };
+        let refused = |reason: GradeReason| Grade::NotDecisionGrade(vec![reason]);
+        assert_eq!(
+            check(&[(Shape::W1, Resampling::Iid)]),
+            refused(GradeReason::Resampling(Resampling::Iid))
+        );
+        assert_eq!(
+            check(&[(Shape::W1, Resampling::default_with(1))]),
+            refused(GradeReason::BlockLength {
+                shape: Shape::W1,
+                used: 1,
+                required: Some(64)
+            })
+        );
+        // W5 blocks must be its datagrams (21 at E_max 64), not 64.
+        assert_eq!(
+            check(&[(Shape::W5, Resampling::default_with(64))]),
+            refused(GradeReason::BlockLength {
+                shape: Shape::W5,
+                used: 64,
+                required: Some(21)
+            })
+        );
+        assert_eq!(
+            check(&[(Shape::W3, Resampling::RunWelchT)]),
+            refused(GradeReason::Resampling(Resampling::RunWelchT))
+        );
+        assert_eq!(
+            check(&[(Shape::W5, Resampling::default_with(21))]),
+            Grade::Decision
         );
     }
 
@@ -1322,9 +1538,11 @@ mod tests {
             })
         );
         assert!(result.bootstrap.is_none());
-        // Drops: 21 in one run, over 0.1% of the 20 000 messages.
+        // Drops: 5 in run 1, over 0.1% of its 4000 messages, while the
+        // pooled configuration (5 of 20 000) is under 0.1%. The gate is per
+        // run (review of #186, P3).
         let mut dropped = a.clone();
-        for value in dropped[1].iter_mut().take(21) {
+        for value in dropped[1].iter_mut().take(5) {
             *value = samples::MISSING;
         }
         let result = evaluate_point(&input(
@@ -1337,9 +1555,33 @@ mod tests {
             result.outcome,
             Outcome::NotDemonstrated(Cause::Drops {
                 profile: "a".into(),
-                missing: 21,
-                total: 20_000
+                run: 1,
+                missing: 5,
+                total: 4000
             })
         );
+        // Every run is reported, with its rate.
+        assert_eq!(result.drops.len(), 15);
+        let run = result
+            .drops
+            .iter()
+            .find(|run| run.profile == "a" && run.run == 1)
+            .unwrap();
+        assert!((run.rate() - 0.00125).abs() < 1e-12);
+        // 4 drops in a run of 4000 is exactly 0.1%: not over the limit.
+        let mut edge = a.clone();
+        for value in edge[1].iter_mut().take(4) {
+            *value = samples::MISSING;
+        }
+        let result = evaluate_point(&input(
+            config("a", &edge),
+            config("trusted", &t),
+            config("trusted", &t),
+        ))
+        .unwrap();
+        assert!(!matches!(
+            result.outcome,
+            Outcome::NotDemonstrated(Cause::Drops { .. })
+        ));
     }
 }
