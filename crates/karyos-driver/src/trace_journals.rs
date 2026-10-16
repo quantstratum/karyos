@@ -153,6 +153,17 @@ impl Held {
     }
 }
 
+/// The bytes held once a journal that charged `bytes` ends: `held` never
+/// holds less than one journal's charge, so the difference is checked
+/// (SPEC.md §14); if the accounting ever broke, the charge goes to zero
+/// explicitly and one `counter overflows` is counted.
+fn release(held: u64, bytes: u64, counters: &DriverCounters) -> u64 {
+    held.checked_sub(bytes).unwrap_or_else(|| {
+        counters.add(Event::CounterOverflows, 1);
+        0
+    })
+}
+
 /// A table entry [`TraceJournals::preflight`] found for a new journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Reserved {
@@ -162,6 +173,10 @@ pub(crate) struct Reserved {
     bytes: u64,
     /// The recycle log entry that reusing the table entry fills, if any.
     log: Option<usize>,
+    /// The bytes held once the journal is charged (checked here).
+    total: u64,
+    /// The journal's sequence and the next one (checked here).
+    sequence: (u64, u64),
 }
 
 impl Reserved {
@@ -257,16 +272,23 @@ impl TraceJournals {
     /// bytes it would charge and the recycle log entry its reuse fills.
     pub(crate) fn preflight(&self, layout: &JournalLayout) -> Result<Reserved, Refusal> {
         let bytes = journal_bytes(layout).ok_or(Refusal::Resources)?;
+        let total = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= self.max_bytes);
         let sizes = layout.validate().is_ok()
             && layout.payload_words <= MAX_MIRROR_PAYLOAD
-            && layout.drop_ranges <= MIRROR_RANGES
-            && self
-                .bytes
-                .checked_add(bytes)
-                .is_some_and(|total| total <= self.max_bytes);
-        if !sizes {
+            && layout.drop_ranges <= MIRROR_RANGES;
+        let (true, Some(total)) = (sizes, total) else {
             return Err(Refusal::Resources);
-        }
+        };
+        // Exhaustion of a 64-bit count of created journals cannot happen;
+        // it is checked all the same (SPEC.md §14) and refuses the journal.
+        let next = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(Refusal::Exhausted)?;
+        let sequence = (self.next_sequence, next);
         let oldest = self.mirror.bounds().first;
         let free_log = self.log.iter().position(Option::is_none);
         // The best entry: a free one, then an ended one that needs no log
@@ -294,7 +316,16 @@ impl TraceJournals {
             if let Some((rank, log)) = candidate
                 && found.is_none_or(|(best, _)| rank < best)
             {
-                found = Some((rank, Reserved { index, bytes, log }));
+                found = Some((
+                    rank,
+                    Reserved {
+                        index,
+                        bytes,
+                        log,
+                        total,
+                        sequence,
+                    },
+                ));
             }
         }
         found
@@ -314,7 +345,13 @@ impl TraceJournals {
         observed: Observed,
         drain: JournalDrain,
     ) {
-        let Reserved { index, bytes, log } = reserved;
+        let Reserved {
+            index,
+            bytes,
+            log,
+            total,
+            sequence: (sequence, next_sequence),
+        } = reserved;
         let layout = drain.layout();
         let mut entry = JournalEntry::open(
             journal,
@@ -329,10 +366,9 @@ impl TraceJournals {
         entry.join = observed.join;
         entry.time_namespace = observed.time_namespace;
         entry.provenance = observed.provenance;
-        // Exhaustion of a 64-bit count of created journals cannot happen;
-        // the last value would repeat rather than wrap.
-        entry.sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        // Both checked by `preflight`, which nothing changed since.
+        entry.sequence = sequence;
+        self.next_sequence = next_sequence;
         // The high-water mark first (Release), then the log and the entry:
         // a tool reads it before the table and the log.
         self.mirror.assign_sequence(entry.sequence);
@@ -367,7 +403,7 @@ impl TraceJournals {
             *free = Some(notes);
         }
         self.mirror.write_entry(index, Some(&entry));
-        self.bytes = self.bytes.saturating_add(bytes);
+        self.bytes = total;
         *slot = Some(Held {
             entry,
             drain: Some(drain),
@@ -522,7 +558,17 @@ impl TraceJournals {
             .get(index)
             .and_then(Option::as_ref)
             .and_then(|held| held.drain.as_ref())
-            .map_or(0, |drain| drain.layout().capacity.saturating_add(1));
+            .map(|drain| drain.layout().capacity);
+        let limit = match limit.map(|capacity| (capacity, capacity.checked_add(1))) {
+            None => 0,
+            Some((_, Some(limit))) => limit,
+            // A capacity of `usize::MAX` records cannot be mapped; checked
+            // all the same (SPEC.md §14): the capacity bounds the drain.
+            Some((capacity, None)) => {
+                counters.add(Event::CounterOverflows, 1);
+                capacity
+            }
+        };
         // The final visit rereads the loss accounting whatever it took, so
         // a drop recorded after the last read reaches the entry for good.
         self.drain_one(index, limit, true, diagnostics, counters);
@@ -531,7 +577,7 @@ impl TraceJournals {
         {
             drop(drain);
             held.entry.state = JournalState::WriterLost;
-            self.bytes = self.bytes.saturating_sub(held.bytes);
+            self.bytes = release(self.bytes, held.bytes, counters);
             self.mirror.write_entry(index, Some(&held.entry));
             self.note_end(index);
         }
@@ -562,7 +608,14 @@ impl TraceJournals {
                 continue;
             }
             let taken = self.drain_one(index, left, false, diagnostics, counters);
-            left = left.saturating_sub(taken);
+            // A drain takes at most what it was given.
+            left = match left.checked_sub(taken) {
+                Some(left) => left,
+                None => {
+                    counters.add(Event::CounterOverflows, 1);
+                    0
+                }
+            };
             if left == 0 {
                 // The next cycle starts after the journal that used the
                 // rest of the budget.
@@ -605,7 +658,11 @@ impl TraceJournals {
                     // a record that could not be appended is not counted.
                     if let Some(appended) = self.mirror.append(journal, sequence, payload) {
                         held.entry.last_record = Some(appended.seq);
-                        held.entry.mirrored = held.entry.mirrored.saturating_add(1);
+                        // A count that does not fit keeps its last value.
+                        match held.entry.mirrored.checked_add(1) {
+                            Some(mirrored) => held.entry.mirrored = mirrored,
+                            None => counters.add(Event::CounterOverflows, 1),
+                        }
                         counters.add(Event::TraceRecordsMirrored, 1);
                         if appended.overwrote.is_some() {
                             counters.add(Event::TraceMirrorOverwritten, 1);
@@ -663,7 +720,7 @@ impl TraceJournals {
             }
             held.drain = None;
             held.entry.state = state;
-            self.bytes = self.bytes.saturating_sub(held.bytes);
+            self.bytes = release(self.bytes, held.bytes, counters);
         }
         if held.entry != before {
             self.mirror.write_entry(index, Some(&held.entry));
