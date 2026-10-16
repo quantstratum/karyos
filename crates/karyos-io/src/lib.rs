@@ -17,4 +17,5 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
     karyos_sys::alloc_count::CountingAllocator;
 
 pub mod backend;
+pub mod lanes;
 pub mod sockets;

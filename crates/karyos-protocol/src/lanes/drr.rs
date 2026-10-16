@@ -156,6 +156,25 @@ pub enum Service {
     Served,
     /// It was not served (a known failed attempt); nothing is debited.
     NotServed,
+    /// Whether it was served is unknown (an unproven backend exposure,
+    /// `quantstratum-docs: karyos/design/lane-sender.md`, LS-3): nothing is
+    /// debited, since the fairness bound counts confirmed service only, but
+    /// its charge is taken from the call's byte budget, so uncertainty can
+    /// never overrun it. The source makes the lane ineligible until the
+    /// control path resolves it.
+    Uncertain,
+    /// The backend had no room for it (a shared socket's `EAGAIN` or
+    /// `ENOBUFS`, `quantstratum-docs: karyos/design/lane-sender.md`, LS-4):
+    /// nothing is debited, the lane forfeits its deficit as for any
+    /// inadmissible backend (owner decision P3) and its visit ends, and the
+    /// call stops with [`Stop::Backpressure`], the cursor on the next lane,
+    /// so a backend that never has room for one lane's quantum cannot hold
+    /// the cursor on it.
+    Backpressure,
+    /// The source cannot go on (a broken backend, queue state or caller):
+    /// nothing is debited or forfeited, the visit is kept, and the call
+    /// stops with [`Stop::Halted`] rather than a full ineligible pass.
+    Halt,
 }
 
 /// The lanes a scheduler serves.
@@ -195,6 +214,20 @@ pub enum Stop {
     },
     /// A full pass found no lane eligible.
     Idle,
+    /// The source halted while serving `lane` ([`Service::Halt`]): the
+    /// visit is kept and no deficit was forfeited.
+    Halted {
+        /// The lane under the cursor.
+        lane: usize,
+    },
+    /// The backend had no room for `lane`'s head ([`Service::Backpressure`]):
+    /// the lane forfeited its deficit and the cursor is on the next lane,
+    /// with no extra empty pass (a wrap from the last lane counts a round
+    /// as usual).
+    Backpressure {
+        /// The lane whose head found no room.
+        lane: usize,
+    },
     /// A step failed (see [`DrrError`]): nothing was credited or served
     /// for it, and the report still counts the steps before it.
     Failed(DrrError),
@@ -213,6 +246,9 @@ pub struct LaneReport {
     pub forfeited: u64,
     /// Failed service attempts.
     pub failed: u64,
+    /// Charged bytes of uncertain attempts, taken from the byte budget and
+    /// never debited.
+    pub uncertain_bytes: u64,
 }
 
 /// What one call did.
@@ -405,6 +441,25 @@ impl Drr {
                         }
                         Service::NotServed => {
                             entry.failed = entry.failed.checked_add(1).ok_or(overflow)?;
+                        }
+                        Service::Backpressure => {
+                            let lost = self.deficit.get(lane).copied().unwrap_or(0);
+                            entry.forfeited = entry.forfeited.checked_add(lost).ok_or(overflow)?;
+                            if let Some(deficit) = self.deficit.get_mut(lane) {
+                                *deficit = 0;
+                            }
+                            // The visit ends and the cursor moves on, with no
+                            // extra empty pass; a wrap from the last lane
+                            // counts a round as usual.
+                            self.advance(report)?;
+                            return Ok(Stop::Backpressure { lane });
+                        }
+                        Service::Halt => return Ok(Stop::Halted { lane }),
+                        Service::Uncertain => {
+                            entry.uncertain_bytes =
+                                entry.uncertain_bytes.checked_add(charge).ok_or(overflow)?;
+                            // `charge <= bytes` was checked above.
+                            bytes = bytes.checked_sub(charge).ok_or(overflow)?;
                         }
                     }
                 }

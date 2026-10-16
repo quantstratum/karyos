@@ -535,3 +535,147 @@ proptest! {
         }
     }
 }
+
+/// LS-3: an uncertain attempt is never debited but is taken from the byte
+/// budget; the source then holds the lane ineligible, which forfeits its
+/// deficit, and the other lanes are served.
+#[test]
+fn an_uncertain_attempt_spends_budget_and_is_never_debited() {
+    struct Uncertain {
+        suspended: bool,
+        served: Vec<usize>,
+    }
+    impl LaneSource for Uncertain {
+        fn probe(&mut self, lane: usize) -> Probe {
+            if lane == 0 && self.suspended {
+                Probe::Ineligible
+            } else {
+                Probe::Eligible { charge: 100 }
+            }
+        }
+        fn serve(&mut self, lane: usize) -> Service {
+            if lane == 0 {
+                self.suspended = true;
+                Service::Uncertain
+            } else {
+                self.served.push(lane);
+                Service::Served
+            }
+        }
+    }
+    let mut drr = Drr::new(DrrConfig::new(&[200, 200], 100).unwrap());
+    let mut source = Uncertain {
+        suspended: false,
+        served: Vec::new(),
+    };
+    let report = drr.run(
+        Budget {
+            work: 16,
+            bytes: 250,
+        },
+        &mut source,
+    );
+    // 100 uncertain plus 100 served leave 50, below the next head.
+    assert_eq!(
+        report.stop,
+        Stop::BytesLimited {
+            lane: 1,
+            charge: 100
+        }
+    );
+    assert_eq!(report.lanes[0].uncertain_bytes, 100);
+    assert_eq!(report.lanes[0].served_bytes, 0);
+    assert_eq!(report.lanes[1].served_bytes, 100);
+    assert_eq!(source.served, [1]);
+    // Never debited: the uncertain lane kept its whole quantum until its
+    // next probe found it ineligible, which forfeited it.
+    assert_eq!(report.lanes[0].forfeited, 200);
+}
+
+/// LS-4 (coordinator decision): a backend with no room for one lane, call
+/// after call, never holds the cursor on it. The blocked lane forfeits and
+/// ends its visit, the call stops with `Backpressure` on the next lane, and
+/// no round is counted for the blocked pass, so the next call serves the
+/// other lane.
+#[test]
+fn persistent_backpressure_still_rotates_the_lanes() {
+    struct Blocked {
+        served: Vec<usize>,
+    }
+    impl LaneSource for Blocked {
+        fn probe(&mut self, _lane: usize) -> Probe {
+            Probe::Eligible { charge: 100 }
+        }
+        fn serve(&mut self, lane: usize) -> Service {
+            if lane == 0 {
+                Service::Backpressure
+            } else {
+                self.served.push(lane);
+                Service::Served
+            }
+        }
+    }
+    let mut drr = drr(&[300, 300], 100);
+    let mut source = Blocked { served: Vec::new() };
+    let first = drr.run(ALL, &mut source);
+    assert_eq!(first.stop, Stop::Backpressure { lane: 0 });
+    assert_eq!(first.lanes[0].forfeited, 300);
+    assert_eq!(first.rounds, 0);
+    assert_eq!(drr.cursor(), 1);
+    // The next call starts on lane 1, which is served its quantum.
+    let second = drr.run(
+        Budget {
+            work: 3,
+            bytes: u64::MAX,
+        },
+        &mut source,
+    );
+    assert_eq!(second.lanes[1].served_bytes, 300);
+    assert_eq!(source.served, [1, 1, 1]);
+}
+
+/// Backpressure on the last lane wraps the cursor and counts that round as
+/// usual: no extra empty pass, and no round withheld.
+#[test]
+fn backpressure_on_the_last_lane_counts_its_round() {
+    struct LastBlocked;
+    impl LaneSource for LastBlocked {
+        fn probe(&mut self, _lane: usize) -> Probe {
+            Probe::Eligible { charge: 100 }
+        }
+        fn serve(&mut self, lane: usize) -> Service {
+            if lane == 1 {
+                Service::Backpressure
+            } else {
+                Service::Served
+            }
+        }
+    }
+    let mut drr = drr(&[100, 100], 100);
+    let report = drr.run(ALL, &mut LastBlocked);
+    assert_eq!(report.stop, Stop::Backpressure { lane: 1 });
+    assert_eq!(report.rounds, 1);
+    assert_eq!(drr.cursor(), 0);
+}
+
+/// A halted source stops the call at once: nothing is debited or
+/// forfeited, the visit is kept and no round is counted.
+#[test]
+fn a_halted_source_keeps_the_visit() {
+    struct Halting;
+    impl LaneSource for Halting {
+        fn probe(&mut self, _lane: usize) -> Probe {
+            Probe::Eligible { charge: 100 }
+        }
+        fn serve(&mut self, _lane: usize) -> Service {
+            Service::Halt
+        }
+    }
+    let mut drr = drr(&[300, 300], 100);
+    let report = drr.run(ALL, &mut Halting);
+    assert_eq!(report.stop, Stop::Halted { lane: 0 });
+    assert_eq!(report.lanes[0].forfeited, 0);
+    assert_eq!(report.rounds, 0);
+    assert_eq!((drr.cursor(), drr.deficit(0)), (0, Some(300)));
+    assert!(drr.in_visit());
+}
