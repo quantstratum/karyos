@@ -24,12 +24,13 @@ use std::path::Path;
 
 use crate::decision::{
     self, Attempt, Cause, Config, DECISION_METHOD, DecisionSet, Environment, Grade, GradeInputs,
-    Outcome, Overall, PointInput, PointResult, Side, Verdict,
+    Outcome, Overall, PointInput, PointResult, Side, TieBreak, TieBreakInput, Verdict,
 };
+use crate::env::Ineligible;
 use crate::manifest::{EMax, MANIFEST_SHA256, MtuRule, Point, VERSION, primary};
-use crate::plan::{self, INSUFFICIENT, Plan, PlanOptions};
+use crate::plan::{self, INSUFFICIENT, Plan, PlanOptions, PlannedRun};
 use crate::preflight;
-use crate::samples::{self, MISSING};
+use crate::samples::{self, MISSING, Stage};
 use crate::stats::{self, BootstrapSpec, Resampling};
 use crate::workloads::BenchError;
 
@@ -90,13 +91,23 @@ impl Cursor<'_> {
             match self.chars.next().ok_or_else(|| self.bad("open string"))? {
                 '"' => return Ok(out),
                 '\\' => match self.chars.next().ok_or_else(|| self.bad("escape"))? {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
                     'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
                     'u' => {
                         let hex: String = (0..4).filter_map(|_| self.chars.next()).collect();
+                        if hex.len() != 4 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                            return Err(self.bad("\\u needs four hex digits"));
+                        }
                         let code = u32::from_str_radix(&hex, 16).map_err(|_| self.bad("\\u"))?;
                         out.push(char::from_u32(code).ok_or_else(|| self.bad("\\u"))?);
                     }
-                    other => out.push(other),
+                    other => return Err(self.bad(&format!("unknown escape \\{other}"))),
                 },
                 c => out.push(c),
             }
@@ -240,6 +251,9 @@ pub struct RunSummary {
     /// p50, p99 and p99.9 of the decision samples, ns; `None` when
     /// infinite.
     pub quantiles: [Option<u32>; 3],
+    /// The p99.9 of receiver 0's stage from each message's own first
+    /// callback (H-5, reported alongside), ns; `None` when infinite.
+    pub callback_p999: Option<u32>,
     /// Kernel pushbacks of the sender.
     pub backpressure: u64,
     /// R1 messages not acknowledged in time.
@@ -278,6 +292,12 @@ pub struct Analysis {
     pub qualification: String,
     /// The plan's fixed options.
     pub options: PlanOptions,
+    /// `E_max` as measured: provisional until decision 5.
+    pub e_max: EMax,
+    /// The F1 eligibility conditions the host failed, as measured.
+    pub ineligible: Vec<Ineligible>,
+    /// The host record the eligibility and the preflight checks cite.
+    pub host_record: Option<String>,
     /// The cores the children were pinned to, or why they were not.
     pub cores: String,
     /// Every planned point, decided or not.
@@ -323,39 +343,89 @@ fn parse_class(text: &str) -> Result<Environment, BenchError> {
     }
 }
 
-/// The decision samples of one successful run, exactly `N` of them, with
-/// the saturation count of both stages.
-fn decision_samples(dir: &Path, per: u64, n: u64) -> Result<(Vec<u32>, u64), BenchError> {
-    let file = |name: &str| {
-        samples::read_file(&dir.join(name))
-            .map_err(|cause| BenchError(format!("{}: {cause}", dir.join(name).display())))
+/// What one successful run's files hold.
+struct RunData {
+    /// Exactly `N` decision samples (M-5a, M-5b).
+    kept: Vec<u32>,
+    /// Saturated decision samples (design 2.3), counted once.
+    saturated: u64,
+    /// Missing messages in the send and the receive stage files.
+    missing: (u64, u64),
+    /// The p99.9 of the H-5 callback stage.
+    callback_p999: Option<u32>,
+}
+
+/// Reads and checks one run's files: both sample headers must name the
+/// planned point, configuration, stage and round.
+fn run_data(dir: &Path, planned: &PlannedRun, n: u64) -> Result<RunData, BenchError> {
+    let file = |name: &str, stage: Stage| -> Result<Vec<u32>, BenchError> {
+        let path = dir.join(name);
+        let read = samples::read_file(&path)
+            .map_err(|cause| BenchError(format!("{}: {cause}", path.display())))?;
+        let header = &read.header;
+        if header.point != planned.point
+            || header.profile != planned.configuration
+            || header.stage != stage
+            || header.run != planned.round
+        {
+            return Err(BenchError(format!(
+                "{}: header {} {} {:?} run {} is not the planned run",
+                path.display(),
+                header.point,
+                header.profile,
+                header.stage,
+                header.run
+            )));
+        }
+        Ok(read.samples)
     };
-    let (send, receive) = (file("send.samples")?, file("receive.samples")?);
-    let (combined, saturated) = samples::combine(&send.samples, &[&receive.samples])
+    let send = file("send.samples", Stage::Send)?;
+    let receive = file("receive.samples", Stage::Receive { receiver: 0 })?;
+    let (combined, saturated) = samples::combine(&send, &[&receive])
         .map_err(|cause| BenchError(format!("{}: {cause}", dir.display())))?;
-    let saturated = [send.header.saturated, receive.header.saturated, saturated]
-        .into_iter()
-        .try_fold(0_u64, u64::checked_add)
-        .ok_or_else(|| BenchError("saturation count overflow".into()))?;
-    Ok((plan::keep_n(&combined, per, n)?, saturated))
+    let sidecar = read(&dir.join("receive.rx"))?;
+    let callback = sidecar
+        .lines()
+        .find_map(|line| line.strip_prefix("callback "))
+        .ok_or_else(|| BenchError(format!("{}: no callback line", dir.display())))?;
+    let callback: Vec<u32> = if callback.is_empty() {
+        Vec::new()
+    } else {
+        callback
+            .split(',')
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| BenchError(format!("{}: bad callback sample", dir.display())))
+            })
+            .collect::<Result<_, _>>()?
+    };
+    Ok(RunData {
+        kept: plan::keep_n(&combined, planned.messages_per_sample, n)?,
+        saturated,
+        missing: (samples::missing(&send), samples::missing(&receive)),
+        callback_p999: stats::p999(&callback).filter(|v| *v != MISSING),
+    })
 }
 
 /// The runs of configuration `name` among one point's runs.
-fn config<'a>(runs: &'a [(String, Vec<u32>, u64)], name: &'a str) -> Config<'a> {
+fn config<'a>(
+    runs: &'a [(String, Vec<u32>, u64)],
+    name: &'a str,
+) -> Result<Config<'a>, BenchError> {
     let mine = || {
         runs.iter()
             .filter(move |(configuration, _, _)| configuration == name)
     };
-    Config {
+    Ok(Config {
         profile: name,
         runs: mine().map(|(_, kept, _)| kept.as_slice()).collect(),
-        // A saturation count past u64 is still a saturation.
         saturated: mine()
             .try_fold(0_u64, |total, (_, _, saturated)| {
                 total.checked_add(*saturated)
             })
-            .unwrap_or(u64::MAX),
-    }
+            .ok_or_else(|| BenchError("saturation count overflow".into()))?,
+    })
 }
 
 /// Analyzes the `measure` directory `out`.
@@ -399,6 +469,43 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         }
     };
     let environment = parse_class(header.string("class")?)?;
+    let e_max = if header.string("e_max_status")? == "decided" {
+        EMax::Decided(options.e_max)
+    } else {
+        EMax::Provisional(options.e_max)
+    };
+    let ineligible: Vec<Ineligible> = header
+        .list("ineligible")?
+        .iter()
+        .map(|reason| Ineligible::decode(reason).map_err(BenchError))
+        .collect::<Result<_, _>>()?;
+    let eligible = match header.get("eligible")? {
+        Json::Raw(raw) if raw == "true" => true,
+        Json::Raw(raw) if raw == "false" => false,
+        _ => return Err(BenchError("eligible is not a boolean".into())),
+    };
+    if eligible != ineligible.is_empty() {
+        return Err(BenchError(
+            "measure.json: eligible contradicts its reasons".into(),
+        ));
+    }
+    let host_record = header
+        .optional_string("host_record")?
+        .map(ToString::to_string);
+    let mut blockers: Vec<String> = Vec::new();
+    // The record's preflight fields, which every run must match (4.2
+    // condition 4).
+    let record_fields = match &host_record {
+        None => None,
+        Some(_) => {
+            let text = read(&out.join("host-record.md"))?;
+            let fields = preflight::from_record(&text).map(ToString::to_string);
+            if fields.is_none() {
+                blockers.push("the host record has no preflight fields (4.3)".to_string());
+            }
+            fields
+        }
+    };
     let lines: Vec<Object> = read(&out.join("results.jsonl"))?
         .lines()
         .map(|line| parse_object(line).map(Object))
@@ -413,7 +520,6 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
     let start = read(&out.join("preflight-start.txt"))?;
     let mut previous = start.clone();
     let mut drift = Vec::new();
-    let mut blockers: Vec<String> = Vec::new();
     let mut runtime_ms = 0_u64;
     let mut points: Vec<PointSummary> = Vec::new();
     let spec = BootstrapSpec::manifest(DECISION_METHOD, SEED);
@@ -439,16 +545,41 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
         runtime_ms = runtime_ms
             .checked_add(line.number("duration_ms")?)
             .ok_or_else(|| BenchError("runtime overflow".into()))?;
-        let dir = out.join(line.string("dir")?);
+        let planned_dir = format!("runs/{index:04}_{}", planned.slug());
+        if line.string("dir")? != planned_dir {
+            return Err(BenchError(format!(
+                "result {index} names {}, the plan has {planned_dir}",
+                line.string("dir")?
+            )));
+        }
+        for (field, value) in [
+            ("sequences", planned.run.messages),
+            ("messages_per_sample", planned.messages_per_sample),
+            ("surplus", planned.surplus),
+            ("warmup", planned.run.warmup),
+        ] {
+            if line.number(field)? != value {
+                return Err(BenchError(format!(
+                    "result {index}: {field} {}, the plan has {value}",
+                    line.number(field)?
+                )));
+            }
+        }
+        let dir = out.join(&planned_dir);
         let label = format!(
             "run {index} ({} {} round {})",
             planned.point, planned.configuration, planned.round
         );
         let snapshot = read(&dir.join("preflight.txt"))?;
-        for (against, base) in [
+        let record_base = record_fields.clone().unwrap_or_default();
+        let mut bases = vec![
             ("the first snapshot", &start),
             ("the previous run", &previous),
-        ] {
+        ];
+        if record_fields.is_some() {
+            bases.push(("the host record", &record_base));
+        }
+        for (against, base) in bases {
             for field in preflight::drift(base, &snapshot)? {
                 let entry = format!("{label} against {against}: {field}");
                 if !drift.contains(&entry) {
@@ -466,6 +597,7 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             missing: 0,
             saturated: 0,
             quantiles: [None; 3],
+            callback_p999: None,
             backpressure: 0,
             ack_timeouts: 0,
             functional_reasons: Vec::new(),
@@ -475,13 +607,34 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             summary.backpressure = line.number("backpressure")?;
             summary.ack_timeouts = line.number("ack_timeouts")?;
             summary.functional_reasons = line.list("functional_reasons")?.to_vec();
+            let functional_only = match line.get("functional_only")? {
+                Json::Raw(raw) if raw == "true" => true,
+                Json::Raw(raw) if raw == "false" => false,
+                _ => return Err(BenchError(format!("result {index}: functional_only"))),
+            };
+            if functional_only == summary.functional_reasons.is_empty() {
+                return Err(BenchError(format!(
+                    "result {index}: functional_only contradicts its reasons"
+                )));
+            }
             for reason in &summary.functional_reasons {
                 if !blockers.contains(reason) {
                     blockers.push(reason.clone());
                 }
             }
-            let (kept, saturated) =
-                decision_samples(&dir, planned.messages_per_sample, options.messages)?;
+            let data = run_data(&dir, planned, options.messages)?;
+            if (
+                line.number("send_missing")?,
+                line.number("receive_missing")?,
+            ) != data.missing
+            {
+                return Err(BenchError(format!(
+                    "result {index}: missing counts differ from the sample files {:?}",
+                    data.missing
+                )));
+            }
+            let (kept, saturated) = (data.kept, data.saturated);
+            summary.callback_p999 = data.callback_p999;
             let finite = |value: Option<u32>| value.filter(|v| *v != MISSING);
             summary.n = u64::try_from(kept.len()).map_err(|_| BenchError("n".into()))?;
             summary.missing = samples::missing(&kept);
@@ -523,9 +676,9 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
                 let result = decision::evaluate_point(&PointInput {
                     point: planned.point,
                     environment,
-                    a: config(&point_runs, &a),
-                    b: config(&point_runs, &b),
-                    trusted: config(&point_runs, BASELINE),
+                    a: config(&point_runs, &a)?,
+                    b: config(&point_runs, &b)?,
+                    trusted: config(&point_runs, BASELINE)?,
                     attempt: Attempt::First,
                     spec,
                 })
@@ -554,8 +707,8 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
     let overall = decision::overall(&outcomes, DecisionSet::default());
     let results: Vec<PointResult> = points.iter().filter_map(|p| p.result.clone()).collect();
     let grade = decision::grade(&GradeInputs {
-        e_max: EMax::Provisional(options.e_max),
-        ineligible: &[],
+        e_max,
+        ineligible: &ineligible,
         min_warmup: options.warmup,
         results: &results,
         overall: &overall,
@@ -574,6 +727,9 @@ pub fn analyze(out: &Path) -> Result<Analysis, BenchError> {
             ),
         },
         options,
+        e_max,
+        ineligible,
+        host_record,
         points,
         skipped: plan.skipped,
         overall,
@@ -627,7 +783,7 @@ pub fn report(analysis: &Analysis) -> String {
     let _ = writeln!(
         out,
         "- E_max {}, rule {:?}; N {} after a warmup of {}; {} rounds of {}.",
-        EMax::Provisional(options.e_max),
+        analysis.e_max,
         options.rule,
         options.messages,
         options.warmup,
@@ -644,11 +800,25 @@ pub fn report(analysis: &Analysis) -> String {
          down; {}.",
         seed_text()
     );
+    let _ = writeln!(out, "- Measured runtime: {} ms.\n", analysis.runtime_ms);
+    let _ = writeln!(out, "## Eligibility (4.2)\n");
     let _ = writeln!(
         out,
-        "- Measured runtime: {} s.\n",
-        analysis.runtime_ms / 1000
+        "- Host record cited: {}.",
+        analysis
+            .host_record
+            .as_deref()
+            .map_or_else(|| "none".to_string(), |path| format!("`{path}`"))
     );
+    if analysis.ineligible.is_empty() {
+        let _ = writeln!(out, "- F1: eligible.");
+    } else {
+        let _ = writeln!(out, "- F1: ineligible:");
+        for reason in &analysis.ineligible {
+            let _ = writeln!(out, "  - {reason}");
+        }
+    }
+    let _ = writeln!(out);
     let _ = writeln!(out, "## Points\n");
     for point in &analysis.points {
         let _ = writeln!(
@@ -671,6 +841,16 @@ pub fn report(analysis: &Analysis) -> String {
                 );
             }
             if let Some(bootstrap) = &result.bootstrap {
+                let pooled: Vec<String> = bootstrap
+                    .pooled_p999
+                    .iter()
+                    .map(|v| ns(Some(*v).filter(|v| *v != MISSING)))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "- pooled p99.9 of a, b and trusted (reported, never deciding): [{}] ns",
+                    pooled.join(", ")
+                );
                 let interval = |estimate: &stats::Estimate| match estimate.interval.ends {
                     Some((low, high)) => format!("{} [{low}, {high}]", estimate.point),
                     None => format!("{} (no interval)", estimate.point),
@@ -686,16 +866,16 @@ pub fn report(analysis: &Analysis) -> String {
         }
         let _ = writeln!(
             out,
-            "\n| run | configuration | round | n | missing | saturated | p50 | p99 | p99.9 | backpressure | ack timeouts | error |"
+            "\n| run | configuration | round | n | missing | saturated | p50 | p99 | p99.9 | H-5 callback p99.9 | backpressure | ack timeouts | error |"
         );
         let _ = writeln!(
             out,
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         );
         for run in &point.runs {
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 run.index,
                 run.configuration,
                 run.round,
@@ -705,6 +885,7 @@ pub fn report(analysis: &Analysis) -> String {
                 ns(run.quantiles[0]),
                 ns(run.quantiles[1]),
                 ns(run.quantiles[2]),
+                ns(run.callback_p999),
                 run.backpressure,
                 run.ack_timeouts,
                 run.error.as_deref().unwrap_or("").replace('|', "\\|")
@@ -733,6 +914,29 @@ pub fn report(analysis: &Analysis) -> String {
     for (point, cause) in &overall.missing {
         let _ = writeln!(out, "- {point}: {cause}");
     }
+    let _ = writeln!(out, "\n## Tie breakers (8.7)\n");
+    // Both sides of an A/A run are the trusted profile: the same
+    // simplicity and the same envelope.
+    let same = TieBreakInput {
+        simplicity: decision::Simplicity {
+            dependency_families: 0,
+            crates: 0,
+            primitive_families: 0,
+        },
+        envelope: 0,
+    };
+    let decided = match decision::break_tie(&same, &same) {
+        TieBreak::Simplicity(side) => format!("(a) simplicity: {side:?}"),
+        TieBreak::MtuOverhead(side) => format!("(b) MTU overhead: {side:?}"),
+        TieBreak::OwnerDecides => {
+            "(c) the owner decides: a and b are the same profile, equally simple, with the same envelope"
+                .to_string()
+        }
+    };
+    let _ = writeln!(
+        out,
+        "Applied only to an overall tie: (a) simplicity, (b) MTU overhead at 1408, (c) the owner. Here: {decided}."
+    );
     let _ = writeln!(out, "\n## Grade\n");
     match &analysis.grade {
         Grade::Decision => {
@@ -772,6 +976,17 @@ fn json_string(text: &str) -> String {
     out
 }
 
+/// A contrast as a JSON value: a number when finite, else `"+inf"`,
+/// `"-inf"` or `"undefined"`.
+fn json_value(value: stats::Value) -> String {
+    match value {
+        stats::Value::Finite(ns) => ns.to_string(),
+        stats::Value::PosInf => "\"+inf\"".to_string(),
+        stats::Value::NegInf => "\"-inf\"".to_string(),
+        stats::Value::Undefined => "\"undefined\"".to_string(),
+    }
+}
+
 fn json_list(items: &[String]) -> String {
     format!(
         "[{}]",
@@ -800,10 +1015,10 @@ pub fn json(analysis: &Analysis) -> String {
                         let estimate = |e: &stats::Estimate| {
                             format!(
                                 "{{\"point\":{},\"interval\":{}}}",
-                                json_string(&e.point.to_string()),
+                                json_value(e.point),
                                 e.interval.ends.map_or_else(
                                     || "null".to_string(),
-                                    |(low, high)| json_list(&[low.to_string(), high.to_string()])
+                                    |(low, high)| format!("[{},{}]", json_value(low), json_value(high))
                                 )
                             )
                         };
@@ -815,11 +1030,49 @@ pub fn json(analysis: &Analysis) -> String {
                         )
                     },
                 );
+            let cvs = point.result.as_ref().map_or_else(
+                || "null".to_string(),
+                |result| {
+                    let cvs: Vec<String> = result
+                        .spread
+                        .iter()
+                        .map(|(name, _, cv)| {
+                            format!(
+                                "{}:{}",
+                                json_string(name),
+                                cv.map_or_else(|| "null".to_string(), |cv| format!("{cv:.6}"))
+                            )
+                        })
+                        .collect();
+                    format!("{{{}}}", cvs.join(","))
+                },
+            );
+            let runs: Vec<String> = point
+                .runs
+                .iter()
+                .map(|run| {
+                    let number = |v: Option<u32>| v.map_or_else(|| "null".to_string(), |v| v.to_string());
+                    format!(
+                        "{{\"index\":{},\"configuration\":{},\"round\":{},\"n\":{},\"missing\":{},\"saturated\":{},\"p50\":{},\"p99\":{},\"p999\":{},\"callback_p999\":{},\"error\":{}}}",
+                        run.index,
+                        json_string(&run.configuration),
+                        run.round,
+                        run.n,
+                        run.missing,
+                        run.saturated,
+                        number(run.quantiles[0]),
+                        number(run.quantiles[1]),
+                        number(run.quantiles[2]),
+                        number(run.callback_p999),
+                        run.error.as_deref().map_or_else(|| "null".to_string(), json_string)
+                    )
+                })
+                .collect();
             format!(
-                "{{\"point\":{},\"outcome\":{},\"runs\":{},\"estimates\":{estimates}}}",
+                "{{\"point\":{},\"outcome\":{},\"cv\":{cvs},\"runs\":[{}],\"estimates\":{estimates}}}",
                 json_string(&point.point.to_string()),
                 json_string(&outcome_text(&point.outcome)),
-                point.runs.len()
+                runs.join(",")
             )
         })
         .collect();
@@ -847,6 +1100,25 @@ pub fn json(analysis: &Analysis) -> String {
         format!("\"decision_grade\":{}", analysis.decision_grade()),
         format!("\"grade_reasons\":{}", json_list(&grade)),
         format!("\"blockers\":{}", json_list(&analysis.blockers)),
+        format!("\"drift\":{}", json_list(&analysis.drift)),
+        format!("\"eligible\":{}", analysis.ineligible.is_empty()),
+        format!(
+            "\"ineligible\":{}",
+            json_list(
+                &analysis
+                    .ineligible
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            )
+        ),
+        format!(
+            "\"host_record\":{}",
+            analysis
+                .host_record
+                .as_deref()
+                .map_or_else(|| "null".to_string(), json_string)
+        ),
         format!("\"overall\":{}", json_string(analysis.overall.label())),
         format!("\"points\":[{}]", points.join(",")),
     ];
@@ -891,20 +1163,47 @@ mod tests {
         assert!(parse_object(r#"{"a":"open}"#).is_err());
     }
 
+    #[test]
+    fn the_json_reader_refuses_what_json_does_not_allow() {
+        assert!(parse_object(r#"{"a":"\q"}"#).is_err());
+        assert!(parse_object(r#"{"a":"\u12"}"#).is_err());
+        assert!(parse_object(r#"{"a":"\u12zz"}"#).is_err());
+        assert_eq!(
+            Object(parse_object(r#"{"a":"\tA\/"}"#).unwrap())
+                .string("a")
+                .unwrap(),
+            "\tA/"
+        );
+    }
+
     use std::time::Duration;
 
-    use crate::manifest::ILLUSTRATIVE_E_MAX;
+    use crate::manifest::{ILLUSTRATIVE_E_MAX, Shape};
     use crate::measure::result_line;
-    use crate::samples::{Header, RunSamples, Stage};
+    use crate::samples::{Header, RunSamples};
     use crate::wire::stage::StageSamples;
 
+    /// The `measure.json` fields of an eligible host without a record,
+    /// E_max provisional.
+    const ELIGIBLE: &str = "\"e_max_status\":\"provisional E_max (illustrative, manifest 6.1)\",\
+                            \"eligible\":true,\"ineligible\":[],\"host_record\":null";
+
+    /// One run as the fixture is about to write it: its plan entry, its
+    /// outcome and its preflight snapshot.
+    type Edit = dyn Fn(&PlannedRun, usize, &mut Result<StageSamples, BenchError>, &mut String);
+
     /// A measured directory of the smoke plan with `N` = 10, class
-    /// `class`, every run passed through `edit` before it is written.
+    /// `class`, `facts` as the eligibility fields of `measure.json`, an
+    /// optional cited host record, every run passed through `edit` before
+    /// it is written. Run `i`'s samples are `1000 + 10 * (i % 5) + j`, so
+    /// the CV gate accepts every configuration.
     fn fixture(
         name: &str,
         class: &str,
         hash: &str,
-        edit: impl Fn(usize, &mut Result<StageSamples, BenchError>, &mut String),
+        facts: &str,
+        record: Option<&str>,
+        edit: &Edit,
     ) -> std::path::PathBuf {
         let out =
             std::env::temp_dir().join(format!("karyos-analyze-{name}-{}", std::process::id()));
@@ -919,6 +1218,13 @@ mod tests {
             .map(|c| format!("\"{c}\""))
             .collect();
         std::fs::create_dir_all(out.join("runs")).unwrap();
+        let facts = match record {
+            Some(text) => {
+                std::fs::write(out.join("host-record.md"), text).unwrap();
+                facts.replace("\"host_record\":null", "\"host_record\":\"/records/h.md\"")
+            }
+            None => facts.to_string(),
+        };
         std::fs::write(
             out.join("measure.json"),
             format!(
@@ -927,7 +1233,7 @@ mod tests {
                  \"commit\":\"c\",\"class\":\"{class}\",\"environment\":\"{class}\",\
                  \"messages\":10,\"warmup\":0,\"rounds\":5,\"e_max\":64,\
                  \"rule\":\"CountsEnvelope\",\"configurations\":[{}],\
-                 \"cores\":null,\"unpinned\":\"none\"}}\n",
+                 \"cores\":null,\"unpinned\":\"none\",{facts}}}\n",
                 configurations.join(",")
             ),
         )
@@ -935,10 +1241,9 @@ mod tests {
         std::fs::write(out.join("preflight-start.txt"), "clocksource tsc\n").unwrap();
         let mut results = String::new();
         for (index, planned) in plan.runs.iter().enumerate() {
-            let dir = format!("runs/{index:04}");
+            let dir = format!("runs/{index:04}_{}", planned.slug());
             std::fs::create_dir_all(out.join(&dir)).unwrap();
             let count = usize::try_from(planned.run.messages).unwrap();
-            // Every run alike, but for a spread the CV gate accepts.
             let base = 1_000 + u32::try_from(index % 5).unwrap() * 10;
             let data: Vec<u32> = (0..count)
                 .map(|i| base + u32::try_from(i).unwrap())
@@ -946,7 +1251,7 @@ mod tests {
             let mut outcome = Ok(StageSamples {
                 send: data.clone(),
                 receive: data,
-                receive_callback: vec![0; count],
+                receive_callback: vec![7; count],
                 batches: vec![1; count],
                 backend_drops: 0,
                 backpressure: 0,
@@ -957,7 +1262,7 @@ mod tests {
                 receiver: "127.0.0.1:1".parse().unwrap(),
             });
             let mut preflight = "clocksource tsc\n".to_string();
-            edit(index, &mut outcome, &mut preflight);
+            edit(planned, index, &mut outcome, &mut preflight);
             std::fs::write(out.join(&dir).join("preflight.txt"), &preflight).unwrap();
             if let Ok(samples) = &outcome {
                 for (file, stage, values) in [
@@ -987,6 +1292,19 @@ mod tests {
                     )
                     .unwrap();
                 }
+                let callback: Vec<String> = samples
+                    .receive_callback
+                    .iter()
+                    .map(u32::to_string)
+                    .collect();
+                std::fs::write(
+                    out.join(&dir).join("receive.rx"),
+                    format!(
+                        "affinity 0\ndrops 0\nbatches 1\ncallback {}\n",
+                        callback.join(",")
+                    ),
+                )
+                .unwrap();
             }
             results.push_str(&result_line(
                 index,
@@ -1002,20 +1320,33 @@ mod tests {
         out
     }
 
-    fn none(_: usize, _: &mut Result<StageSamples, BenchError>, _: &mut String) {}
+    fn none(_: &PlannedRun, _: usize, _: &mut Result<StageSamples, BenchError>, _: &mut String) {}
+
+    fn plain(name: &str) -> std::path::PathBuf {
+        fixture(name, "E1", MANIFEST_SHA256, ELIGIBLE, None, &none)
+    }
+
+    fn error_of(out: &Path) -> String {
+        analyze(out).err().map(|e| e.0).unwrap_or_default()
+    }
 
     #[test]
     fn a_measured_directory_is_decided_point_by_point() {
-        let out = fixture("ok", "E1", MANIFEST_SHA256, none);
+        let out = plain("ok");
         let analysis = write(&out).unwrap();
         assert_eq!(analysis.points.len(), 8);
         // W5 expands its one sequence of 21 messages to exactly N = 10.
         let w5 = analysis
             .points
             .iter()
-            .find(|p| p.point.shape == crate::manifest::Shape::W5)
+            .find(|p| p.point.shape == Shape::W5)
             .unwrap();
         assert!(w5.runs.iter().all(|run| run.n == 10));
+        // The decision sample is send plus receive (M-5a): run 0's largest
+        // is 2 * (1000 + 9).
+        let first = &analysis.points[0].runs[0];
+        assert_eq!(first.quantiles[2], Some(2_018));
+        assert_eq!(first.callback_p999, Some(7));
         // E1 decides, so every point has its interval; the grade still
         // refuses the provisional E_max and the small N.
         assert!(
@@ -1028,29 +1359,131 @@ mod tests {
         let report = read(&out.join("report.md")).unwrap();
         assert!(report.contains(MANIFEST_SHA256));
         assert!(report.contains(INSUFFICIENT));
+        assert!(report.contains("Tie breakers (8.7)"));
+        assert!(report.contains("pooled p99.9"));
         let json = read(&out.join("analysis.json")).unwrap();
         assert!(json.trim().starts_with('{') && json.trim().ends_with('}'));
         assert!(json.contains("\"decision_grade\":false"));
         assert!(json.contains("\"seed\":null"));
+        assert!(json.contains("\"p999\":2018"));
         assert!(report.contains("seed: none (RunWelchT is deterministic)"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]
+    fn an_ineligible_host_never_reaches_decision_grade() {
+        let facts = "\"e_max_status\":\"decided\",\"eligible\":false,\
+                     \"ineligible\":[\"clock_source\\thpet\"],\"host_record\":null";
+        let out = fixture("ineligible", "E1", MANIFEST_SHA256, facts, None, &none);
+        let analysis = write(&out).unwrap();
+        assert_eq!(analysis.e_max, EMax::Decided(64));
+        assert_eq!(
+            analysis.ineligible,
+            [Ineligible::ClockSource("hpet".into())]
+        );
+        let Grade::NotDecisionGrade(reasons) = &analysis.grade else {
+            panic!("an ineligible host was graded decision");
+        };
+        assert!(
+            reasons.contains(&decision::GradeReason::Ineligible(Ineligible::ClockSource(
+                "hpet".into()
+            )))
+        );
+        assert!(!reasons.contains(&decision::GradeReason::ProvisionalEMax));
+        assert!(!analysis.decision_grade());
+        let report = read(&out.join("report.md")).unwrap();
+        assert!(report.contains("F1: ineligible"));
+        assert!(report.contains("clock source hpet, not tsc"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn functional_reasons_block_a_decision() {
+        let out = fixture(
+            "functional",
+            "E1",
+            MANIFEST_SHA256,
+            ELIGIBLE,
+            None,
+            &|_, index, outcome, _| {
+                if let (0, Ok(samples)) = (index, outcome) {
+                    samples.functional_only = true;
+                    samples.functional_reasons = vec!["rx not pinned".into()];
+                }
+            },
+        );
+        let analysis = analyze(&out).unwrap();
+        assert_eq!(analysis.blockers, ["rx not pinned"]);
+        assert!(!analysis.decision_grade());
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn a_slower_b_loses_an_asymmetric_a_a() {
+        let out = fixture(
+            "asymmetric",
+            "E1",
+            MANIFEST_SHA256,
+            ELIGIBLE,
+            None,
+            &|planned, _, outcome, _| {
+                if let (true, Ok(samples)) = (planned.configuration == "trusted-b", outcome) {
+                    for value in samples.send.iter_mut().chain(samples.receive.iter_mut()) {
+                        *value *= 2;
+                    }
+                }
+            },
+        );
+        let analysis = analyze(&out).unwrap();
+        assert!(
+            analysis
+                .points
+                .iter()
+                .all(|p| p.outcome == Outcome::Win(Side::A)),
+            "{:?}",
+            analysis
+                .points
+                .iter()
+                .map(|p| &p.outcome)
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
     fn another_manifest_is_refused() {
-        let out = fixture("hash", "E4", &"0".repeat(64), none);
-        let error = analyze(&out).err().map(|e| e.0).unwrap_or_default();
-        assert!(error.contains("measured under manifest"), "{error}");
+        let out = fixture("hash", "E4", &"0".repeat(64), ELIGIBLE, None, &none);
+        assert!(error_of(&out).contains("measured under manifest"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn faults_not_off_are_refused() {
+        let out = plain("faults");
+        let header = read(&out.join("measure.json")).unwrap();
+        std::fs::write(
+            out.join("measure.json"),
+            header.replace("\"faults\":\"off\"", "\"faults\":\"on\""),
+        )
+        .unwrap();
+        assert!(error_of(&out).contains("faults off"));
         let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]
     fn a_failed_run_leaves_its_point_not_demonstrated() {
-        let out = fixture("failed", "E1", MANIFEST_SHA256, |index, outcome, _| {
-            if index == 4 {
-                *outcome = Err(BenchError("orphan sequence 9 (M-11)".into()));
-            }
-        });
+        let out = fixture(
+            "failed",
+            "E1",
+            MANIFEST_SHA256,
+            ELIGIBLE,
+            None,
+            &|_, index, outcome, _| {
+                if index == 4 {
+                    *outcome = Err(BenchError("orphan sequence 9 (M-11)".into()));
+                }
+            },
+        );
         let analysis = analyze(&out).unwrap();
         let first = analysis.points.first().unwrap();
         assert!(
@@ -1064,11 +1497,18 @@ mod tests {
 
     #[test]
     fn preflight_drift_names_the_run_and_the_field() {
-        let out = fixture("drift", "E1", MANIFEST_SHA256, |index, _, preflight| {
-            if index == 7 {
-                *preflight = "clocksource hpet\n".to_string();
-            }
-        });
+        let out = fixture(
+            "drift",
+            "E1",
+            MANIFEST_SHA256,
+            ELIGIBLE,
+            None,
+            &|_, index, _, preflight| {
+                if index == 7 {
+                    *preflight = "clocksource hpet\n".to_string();
+                }
+            },
+        );
         let analysis = analyze(&out).unwrap();
         assert!(
             analysis
@@ -1095,8 +1535,47 @@ mod tests {
     }
 
     #[test]
+    fn every_run_is_compared_with_the_host_record() {
+        let record =
+            "# h\n\n## Preflight fields (4.3)\n\nfields:\n\n```text\nclocksource hpet\n```\n";
+        let out = fixture(
+            "record",
+            "E1",
+            MANIFEST_SHA256,
+            ELIGIBLE,
+            Some(record),
+            &none,
+        );
+        let analysis = analyze(&out).unwrap();
+        assert_eq!(analysis.host_record.as_deref(), Some("/records/h.md"));
+        assert!(
+            analysis.drift.iter().any(|d| d.starts_with("run 0 ")
+                && d.contains("against the host record: clocksource: hpet -> tsc")),
+            "{:?}",
+            analysis.drift
+        );
+        let out_blockless = fixture(
+            "record-blockless",
+            "E1",
+            MANIFEST_SHA256,
+            ELIGIBLE,
+            Some("# h\n"),
+            &none,
+        );
+        let analysis = analyze(&out_blockless).unwrap();
+        assert!(
+            analysis
+                .blockers
+                .iter()
+                .any(|b| b.contains("no preflight fields"))
+        );
+        let _ = std::fs::remove_dir_all(&out);
+        let _ = std::fs::remove_dir_all(&out_blockless);
+    }
+
+    #[test]
     fn results_that_are_not_the_plan_are_refused() {
-        let out = fixture("swap", "E1", MANIFEST_SHA256, none);
+        let out = plain("swap");
         let results = read(&out.join("results.jsonl")).unwrap();
         let swapped = results.replacen(
             "\"configuration\":\"trusted\"",
@@ -1104,8 +1583,60 @@ mod tests {
             1,
         );
         std::fs::write(out.join("results.jsonl"), swapped).unwrap();
-        let error = analyze(&out).err().map(|e| e.0).unwrap_or_default();
-        assert!(error.contains("the plan has"), "{error}");
+        assert!(error_of(&out).contains("the plan has"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn swapped_directories_and_files_are_refused() {
+        // Two lines naming each other's directories.
+        let out = plain("dirs");
+        let results = read(&out.join("results.jsonl")).unwrap();
+        let mut lines: Vec<String> = results.lines().map(ToString::to_string).collect();
+        let dir = |line: &str| {
+            Object(parse_object(line).unwrap())
+                .string("dir")
+                .unwrap()
+                .to_string()
+        };
+        let (first, second) = (dir(&lines[0]), dir(&lines[1]));
+        lines[0] = lines[0].replace(&first, &second);
+        lines[1] = lines[1].replace(&second, &first);
+        std::fs::write(out.join("results.jsonl"), lines.join("\n") + "\n").unwrap();
+        assert!(error_of(&out).contains("the plan has runs/0000"));
+        let _ = std::fs::remove_dir_all(&out);
+        // The send and receive files of one run swapped.
+        let out = plain("files");
+        let run = out.join(&first);
+        std::fs::rename(run.join("send.samples"), run.join("tmp")).unwrap();
+        std::fs::rename(run.join("receive.samples"), run.join("send.samples")).unwrap();
+        std::fs::rename(run.join("tmp"), run.join("receive.samples")).unwrap();
+        assert!(error_of(&out).contains("is not the planned run"));
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn line_fields_must_match_the_plan_and_the_files() {
+        let out = plain("fields");
+        let results = read(&out.join("results.jsonl")).unwrap();
+        std::fs::write(
+            out.join("results.jsonl"),
+            results.replacen("\"send_missing\":0", "\"send_missing\":3", 1),
+        )
+        .unwrap();
+        assert!(error_of(&out).contains("missing counts differ"));
+        std::fs::write(
+            out.join("results.jsonl"),
+            results.replacen("\"functional_only\":false", "\"functional_only\":true", 1),
+        )
+        .unwrap();
+        assert!(error_of(&out).contains("functional_only contradicts"));
+        std::fs::write(
+            out.join("results.jsonl"),
+            results.replacen("\"surplus\":0", "\"surplus\":1", 1),
+        )
+        .unwrap();
+        assert!(error_of(&out).contains("surplus"));
         let _ = std::fs::remove_dir_all(&out);
     }
 }

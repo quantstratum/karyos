@@ -226,7 +226,16 @@ fn measure_command(args: &[String], out: &mut dyn Write) -> Result<usize, String
             let _ = writeln!(out, "unpinned: {reason}; every result is functional only");
         }
     }
-    measure::run_plan(&plan, &dir, &Labels::detect(), &cores, out).map_err(|error| error.0)
+    let facts = measure::HostFacts::detect();
+    match &facts.record {
+        Some((path, _)) => {
+            let _ = writeln!(out, "host record: {}", path.display());
+        }
+        None => {
+            let _ = writeln!(out, "host record: none (set KARYOS_ENVIRONMENTS)");
+        }
+    }
+    measure::run_plan(&plan, &dir, &Labels::detect(), &cores, &facts, out).map_err(|error| error.0)
 }
 
 fn analyze_command(args: &[String]) -> Result<String, String> {

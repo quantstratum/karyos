@@ -293,6 +293,107 @@ pub enum Ineligible {
     },
 }
 
+impl Ineligible {
+    /// A one-line form that [`Ineligible::decode`] reads back: the kind,
+    /// then each field, separated by tabs (a list field takes the rest).
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let fields: Vec<String> = match self {
+            Self::Class(environment) => vec!["class".into(), environment.to_string()],
+            Self::NoHostRecord { host } => vec!["no_host_record".into(), host.clone()],
+            Self::RecordHost { recorded, running } => {
+                vec!["record_host".into(), recorded.clone(), running.clone()]
+            }
+            Self::RecordKernel { recorded, running } => {
+                vec!["record_kernel".into(), recorded.clone(), running.clone()]
+            }
+            Self::IsolatedCores { needed, isolated } => vec![
+                "isolated_cores".into(),
+                needed.to_string(),
+                isolated.to_string(),
+            ],
+            Self::NohzFull { needed, cores } => {
+                vec!["nohz_full".into(), needed.to_string(), cores.to_string()]
+            }
+            Self::Governor { cpus } => std::iter::once("governor".to_string())
+                .chain(cpus.iter().cloned())
+                .collect(),
+            Self::ClockSource(source) => vec!["clock_source".into(), source.clone()],
+            Self::CpuIdle { states } => std::iter::once("cpuidle".to_string())
+                .chain(states.iter().cloned())
+                .collect(),
+        };
+        fields.join("\t")
+    }
+
+    /// The inverse of [`Ineligible::encode`].
+    ///
+    /// # Errors
+    ///
+    /// An unknown kind or a malformed field.
+    pub fn decode(text: &str) -> Result<Self, String> {
+        let bad = || format!("bad eligibility reason {text:?}");
+        let mut fields = text.split('\t');
+        let kind = fields.next().ok_or_else(bad)?;
+        let rest: Vec<String> = fields.map(ToString::to_string).collect();
+        let one = |index: usize| rest.get(index).cloned().ok_or_else(bad);
+        let number =
+            |index: usize| -> Result<usize, String> { one(index)?.parse().map_err(|_| bad()) };
+        let exactly = |count: usize| (rest.len() == count).then_some(()).ok_or_else(bad);
+        Ok(match kind {
+            "class" => {
+                exactly(1)?;
+                Self::Class(match one(0)?.as_str() {
+                    "E1" => Environment::E1,
+                    "E2" => Environment::E2,
+                    "E3" => Environment::E3,
+                    "E4" => Environment::E4,
+                    _ => return Err(bad()),
+                })
+            }
+            "no_host_record" => {
+                exactly(1)?;
+                Self::NoHostRecord { host: one(0)? }
+            }
+            "record_host" => {
+                exactly(2)?;
+                Self::RecordHost {
+                    recorded: one(0)?,
+                    running: one(1)?,
+                }
+            }
+            "record_kernel" => {
+                exactly(2)?;
+                Self::RecordKernel {
+                    recorded: one(0)?,
+                    running: one(1)?,
+                }
+            }
+            "isolated_cores" => {
+                exactly(2)?;
+                Self::IsolatedCores {
+                    needed: number(0)?,
+                    isolated: number(1)?,
+                }
+            }
+            "nohz_full" => {
+                exactly(2)?;
+                Self::NohzFull {
+                    needed: number(0)?,
+                    cores: number(1)?,
+                }
+            }
+            "governor" => Self::Governor { cpus: rest },
+            "clock_source" => {
+                exactly(1)?;
+                Self::ClockSource(one(0)?)
+            }
+            "cpuidle" => Self::CpuIdle { states: rest },
+            _ => return Err(bad()),
+        })
+    }
+}
+
 impl fmt::Display for Ineligible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -741,6 +842,48 @@ mod tests {
     fn record_of(inventory: &Inventory) -> String {
         let classification = classify(inventory);
         render(inventory, &classification, &[] as &[Eligibility])
+    }
+
+    #[test]
+    fn eligibility_reasons_survive_their_one_line_form() {
+        let reasons = [
+            Ineligible::Class(Environment::E4),
+            Ineligible::NoHostRecord { host: "h".into() },
+            Ineligible::RecordHost {
+                recorded: "a".into(),
+                running: "b".into(),
+            },
+            Ineligible::RecordKernel {
+                recorded: "6.8".into(),
+                running: "6.9".into(),
+            },
+            Ineligible::IsolatedCores {
+                needed: 2,
+                isolated: 0,
+            },
+            Ineligible::NohzFull {
+                needed: 5,
+                cores: 1,
+            },
+            Ineligible::Governor {
+                cpus: vec!["cpu2 powersave".into(), "cpu3 ondemand".into()],
+            },
+            Ineligible::ClockSource("hpet".into()),
+            Ineligible::CpuIdle { states: Vec::new() },
+        ];
+        for reason in reasons {
+            assert_eq!(Ineligible::decode(&reason.encode()), Ok(reason.clone()));
+        }
+        for bad in [
+            "",
+            "class",
+            "class\tE9",
+            "isolated_cores\t2",
+            "nohz_full\tx\t1",
+            "other\t1",
+        ] {
+            assert!(Ineligible::decode(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

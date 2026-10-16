@@ -32,7 +32,7 @@ utc=$(date -u +%Y%m%dT%H%M%SZ)
 out=${KARYOS_MEASURE_OUT:-$root/target/karyos-measure/$utc-$commit}
 
 for arg in "$@"; do
-    if [ "$arg" = "--out" ]; then
+    if [ "$arg" = "--out" ] || [ "${arg#--out=}" != "$arg" ]; then
         echo "measure.sh: set KARYOS_MEASURE_OUT, not --out: the inventory and the runs share one directory" >&2
         exit 2
     fi
