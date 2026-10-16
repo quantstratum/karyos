@@ -528,7 +528,7 @@ impl<'a> BroadcastWords<'a> {
 impl BroadcastWords<'_> {
     /// Test only: moves an empty buffer's positions to `position`, a
     /// multiple of 8.
-    fn seed(&self, position: u64) {
+    pub(crate) fn seed(&self, position: u64) {
         for index in [TAIL_INTENT, TAIL, LATEST] {
             if let Some(word) = self.trailer(index) {
                 word.store(position, Ordering::Relaxed);

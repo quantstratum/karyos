@@ -282,33 +282,302 @@ pub fn read_slot<W: LoadWords>(words: &W, out: &mut [u8]) -> SlotRead {
 #[cfg(not(loom))]
 pub use owned::{Budget, ConflationReader, ConflationWriter, PollReport, conflation};
 
+#[cfg(all(not(loom), target_os = "linux"))]
+pub use owned::{LAYOUT_VERSION, conflation_in};
+
 #[cfg(not(loom))]
 mod owned {
     use std::sync::Arc;
 
-    use super::{ConflationError, STRIDE_WORDS, SlotRead, SlotWords, VALUE, WORD_BYTES};
+    use super::{
+        ConflationConfig, ConflationError, STRIDE_WORDS, SlotRead, SlotWords, VALUE, VERSION,
+        WORD_BYTES, read_slot,
+    };
     use crate::atomic_view::HeapWords;
-    use crate::broadcast::{BroadcastReceiver, BroadcastTransmitter, Received, broadcast};
+    use crate::broadcast::{
+        BroadcastError, BroadcastReader, BroadcastWords, MIN_CAPACITY, Receive, TRAILER_WORDS,
+    };
+    use crate::load_words::LoadWords;
+    use crate::sync::AtomicU64;
 
     /// Message type of a journal record.
     const JOURNAL_TYPE: u32 = 1;
     /// Bytes of a journal record payload: key, padding, version.
     const JOURNAL_PAYLOAD: usize = 16;
 
+    /// Layout version of a conflation table region. Readers reject any
+    /// other version.
+    #[cfg(target_os = "linux")]
+    pub const LAYOUT_VERSION: u64 = 1;
+
+    /// The sizes of a table, checked once: `keys` slots of `slot_words`
+    /// words each, then the journal's trailer and its data area of
+    /// `journal_capacity` bytes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Geometry {
+        keys: u32,
+        value_capacity: usize,
+        slot_words: usize,
+        slots_words: usize,
+        journal_capacity: usize,
+        journal_words: usize,
+        max_extent: u64,
+    }
+
+    impl Geometry {
+        /// The geometry of a table, or `None` when a size is zero or
+        /// overflows, or the journal capacity is not a power of two of at
+        /// least [`MIN_CAPACITY`] bytes (largest record extent
+        /// `journal_capacity / 8`, as for every owned broadcast buffer).
+        fn new(keys: u32, value_capacity: usize, journal_capacity: usize) -> Option<Self> {
+            if keys == 0
+                || value_capacity == 0
+                || journal_capacity < MIN_CAPACITY
+                || !journal_capacity.is_power_of_two()
+            {
+                return None;
+            }
+            let slot_words = value_capacity
+                .div_ceil(WORD_BYTES)
+                .checked_add(VALUE)?
+                .checked_next_multiple_of(STRIDE_WORDS)?;
+            Some(Self {
+                keys,
+                value_capacity,
+                slot_words,
+                slots_words: slot_words.checked_mul(keys as usize)?,
+                journal_capacity,
+                journal_words: journal_capacity / WORD_BYTES,
+                max_extent: u64::try_from(journal_capacity / 8).ok()?,
+            })
+        }
+
+        /// The configuration a publication checks against.
+        fn config(&self) -> ConflationConfig {
+            ConflationConfig {
+                keys: self.keys,
+                value_capacity: self.value_capacity,
+                journal_capacity: self.journal_capacity,
+            }
+        }
+
+        /// Word index of the journal trailer in a region's structure, after
+        /// the configuration line and the slots.
+        #[cfg(target_os = "linux")]
+        fn trailer_at(&self) -> Option<usize> {
+            STRIDE_WORDS.checked_add(self.slots_words)
+        }
+
+        /// Word index of the journal data area in a region's structure.
+        #[cfg(target_os = "linux")]
+        fn data_at(&self) -> Option<usize> {
+            self.trailer_at()?.checked_add(TRAILER_WORDS)
+        }
+
+        /// Bytes of a region's structure: the configuration line, the
+        /// slots, the journal trailer and the journal data area.
+        #[cfg(target_os = "linux")]
+        fn structure_length(&self) -> Option<usize> {
+            self.data_at()?
+                .checked_add(self.journal_words)?
+                .checked_mul(WORD_BYTES)
+        }
+
+        /// The configuration line of a region: keys, value capacity, slot
+        /// words and journal capacity; the rest of the stride is zero.
+        #[cfg(target_os = "linux")]
+        fn config_line(&self) -> [u64; 4] {
+            [
+                u64::from(self.keys),
+                self.value_capacity as u64,
+                self.slot_words as u64,
+                self.journal_capacity as u64,
+            ]
+        }
+    }
+
+    /// Words a table reader takes slices of: writable heap or region
+    /// words, or a read-only mapping (Linux).
+    trait Words: LoadWords + Sized {
+        /// The words `start..start + count`; `None` when out of bounds.
+        fn sub(&self, start: usize, count: usize) -> Option<Self>;
+    }
+
+    impl Words for &[AtomicU64] {
+        fn sub(&self, start: usize, count: usize) -> Option<Self> {
+            let end = start.checked_add(count)?;
+            self.get(start..end)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Words for crate::atomic_view::ReadOnlyWords<'_> {
+        fn sub(&self, start: usize, count: usize) -> Option<Self> {
+            let words = self.range(start, count);
+            (words.len() == count).then_some(words)
+        }
+    }
+
+    /// What a reader loads: the slots and the journal.
+    struct View<W> {
+        slots: W,
+        journal: BroadcastReader<W>,
+        geometry: Geometry,
+    }
+
+    impl<W: Words> View<W> {
+        fn new(slots: W, data: W, trailer: W, geometry: Geometry) -> Option<Self> {
+            let journal = BroadcastReader::new(data, trailer, geometry.max_extent).ok()?;
+            (slots.len() == geometry.slots_words && journal.max_payload() >= JOURNAL_PAYLOAD)
+                .then_some(Self {
+                    slots,
+                    journal,
+                    geometry,
+                })
+        }
+
+        fn slot(&self, key: u32) -> Option<W> {
+            if key >= self.geometry.keys {
+                return None;
+            }
+            let start = (key as usize).checked_mul(self.geometry.slot_words)?;
+            self.slots.sub(start, self.geometry.slot_words)
+        }
+
+        /// The current version, for a scan (Relaxed, as
+        /// [`SlotWords::version`]).
+        fn version(&self, key: u32) -> u64 {
+            self.slot(key)
+                .and_then(|slot| slot.load(VERSION))
+                .unwrap_or(0)
+        }
+
+        fn read(&self, key: u32, out: &mut [u8]) -> Option<SlotRead> {
+            Some(read_slot(&self.slot(key)?, out))
+        }
+    }
+
+    /// Where a writable table lives.
+    #[derive(Debug)]
+    enum Store {
+        /// Heap memory of this process.
+        Heap {
+            slots: HeapWords,
+            data: HeapWords,
+            trailer: HeapWords,
+        },
+        /// A shared region (Linux): configuration line, slots, journal
+        /// trailer, journal data.
+        #[cfg(target_os = "linux")]
+        Mapped(crate::ipc::Region),
+    }
+
     #[derive(Debug)]
     struct Table {
-        slots: HeapWords,
-        keys: u32,
-        slot_words: usize,
+        store: Store,
+        geometry: Geometry,
     }
 
     impl Table {
-        fn slot(&self, key: u32) -> Option<SlotWords<'_>> {
-            if key >= self.keys {
-                return None;
+        /// The slots, the journal data area and the journal trailer.
+        fn parts(&self) -> (&[AtomicU64], &[AtomicU64], &[AtomicU64]) {
+            match &self.store {
+                Store::Heap {
+                    slots,
+                    data,
+                    trailer,
+                } => (
+                    slots.words().as_slice(),
+                    data.words().as_slice(),
+                    trailer.words().as_slice(),
+                ),
+                #[cfg(target_os = "linux")]
+                Store::Mapped(region) => {
+                    let structure = region.structure().as_slice();
+                    let geometry = &self.geometry;
+                    let part = |start: Option<usize>, count: usize| {
+                        start
+                            .and_then(|start| structure.sub(start, count))
+                            .unwrap_or(&[])
+                    };
+                    (
+                        part(Some(STRIDE_WORDS), geometry.slots_words),
+                        part(geometry.data_at(), geometry.journal_words),
+                        part(geometry.trailer_at(), TRAILER_WORDS),
+                    )
+                }
             }
-            let start = (key as usize).checked_mul(self.slot_words)?;
-            SlotWords::new(self.slots.range(start, self.slot_words)?)
+        }
+
+        fn journal(&self) -> Result<BroadcastWords<'_>, BroadcastError> {
+            let (_, data, trailer) = self.parts();
+            BroadcastWords::new(data, trailer, self.geometry.max_extent)
+        }
+
+        fn view(&self) -> Option<View<&[AtomicU64]>> {
+            let (slots, data, trailer) = self.parts();
+            View::new(slots, data, trailer, self.geometry)
+        }
+
+        fn slot(&self, key: u32) -> Option<SlotWords<'_>> {
+            SlotWords::new(self.view()?.slot(key)?)
+        }
+    }
+
+    /// A table in a region mapped read-only (Linux).
+    #[cfg(target_os = "linux")]
+    #[derive(Debug)]
+    struct ReadOnlyTable {
+        region: crate::ipc::ReadOnlyRegion,
+        geometry: Geometry,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ReadOnlyTable {
+        fn view(&self) -> Option<View<crate::atomic_view::ReadOnlyWords<'_>>> {
+            let structure = self.region.structure();
+            let geometry = self.geometry;
+            View::new(
+                structure.sub(STRIDE_WORDS, geometry.slots_words)?,
+                structure.sub(geometry.data_at()?, geometry.journal_words)?,
+                structure.sub(geometry.trailer_at()?, TRAILER_WORDS)?,
+                geometry,
+            )
+        }
+    }
+
+    /// The table a reader reads.
+    #[derive(Debug)]
+    enum Source {
+        Local(Arc<Table>),
+        #[cfg(target_os = "linux")]
+        ReadOnly(ReadOnlyTable),
+    }
+
+    /// Runs `$body` with `$view` bound to the source's view (an `Option`),
+    /// whatever words it loads.
+    macro_rules! with_view {
+        ($source:expr, $view:ident => $body:expr) => {
+            match $source {
+                Source::Local(table) => {
+                    let $view = table.view();
+                    $body
+                }
+                #[cfg(target_os = "linux")]
+                Source::ReadOnly(table) => {
+                    let $view = table.view();
+                    $body
+                }
+            }
+        };
+    }
+
+    fn writer(table: Table) -> ConflationWriter {
+        let value_capacity = table.geometry.value_capacity;
+        ConflationWriter {
+            table: Arc::new(table),
+            value_capacity,
+            closed: false,
         }
     }
 
@@ -326,42 +595,98 @@ mod owned {
         journal_capacity: usize,
     ) -> Result<ConflationWriter, ConflationError> {
         let invalid = ConflationError::InvalidConfig;
-        if keys == 0 || value_capacity == 0 {
-            return Err(invalid);
+        let geometry = Geometry::new(keys, value_capacity, journal_capacity).ok_or(invalid)?;
+        let zeroed = |count| HeapWords::zeroed(count).map_err(|_| invalid);
+        let table = Table {
+            store: Store::Heap {
+                slots: zeroed(geometry.slots_words)?,
+                data: zeroed(geometry.journal_words)?,
+                trailer: zeroed(TRAILER_WORDS)?,
+            },
+            geometry,
+        };
+        table.view().ok_or(invalid)?;
+        Ok(writer(table))
+    }
+
+    /// Creates a table as [`conflation`] in a new shared region of kind
+    /// `ConflationTable` (driver side; `quantstratum-docs:
+    /// karyos/design/conflation-end-to-end.md`, Cross-process views) and
+    /// returns its only writer. Only the driver writes the region, so it is
+    /// created in the A2 seal order and views attach it read-only with
+    /// [`ConflationReader::attach_read_only`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::SysError::InvalidRegion`] for a geometry
+    /// [`conflation`] refuses, and the errors of
+    /// [`crate::ipc::Region::create_driver_only`].
+    #[cfg(target_os = "linux")]
+    pub fn conflation_in(
+        instance: u128,
+        region: u64,
+        keys: u32,
+        value_capacity: usize,
+        journal_capacity: usize,
+    ) -> Result<ConflationWriter, crate::error::SysError> {
+        use crate::sync::Ordering;
+        let geometry = Geometry::new(keys, value_capacity, journal_capacity);
+        let structure_length = geometry.and_then(|geometry| geometry.structure_length());
+        let (Some(geometry), Some(structure_length)) = (geometry, structure_length) else {
+            return Err(crate::error::SysError::InvalidRegion { address: 0, len: 0 });
+        };
+        let invalid = crate::error::SysError::InvalidRegion {
+            address: 0,
+            len: structure_length,
+        };
+        let mapped = crate::ipc::Region::create_driver_only(crate::ipc::RegionRecord {
+            instance,
+            region,
+            kind: crate::ipc::RegionKind::ConflationTable,
+            generation: 0,
+            layout: LAYOUT_VERSION,
+            structure_length,
+        })?;
+        let structure = mapped.structure();
+        for (index, value) in geometry.config_line().into_iter().enumerate() {
+            structure
+                .get(index)
+                .ok_or(invalid)?
+                .store(value, Ordering::Release);
         }
-        let value_words = value_capacity.div_ceil(WORD_BYTES);
-        let slot_words = value_words
-            .checked_add(VALUE)
-            .and_then(|words| words.checked_next_multiple_of(STRIDE_WORDS))
-            .ok_or(invalid)?;
-        let total = slot_words.checked_mul(keys as usize).ok_or(invalid)?;
-        let slots = HeapWords::zeroed(total).map_err(|_| invalid)?;
-        let journal = broadcast(journal_capacity).map_err(|_| invalid)?;
-        if journal.max_payload() < JOURNAL_PAYLOAD {
-            return Err(invalid);
-        }
-        Ok(ConflationWriter {
-            table: Arc::new(Table {
-                slots,
-                keys,
-                slot_words,
-            }),
-            journal,
-            value_capacity,
-            closed: false,
-        })
+        let table = Table {
+            store: Store::Mapped(mapped),
+            geometry,
+        };
+        table.view().ok_or(invalid)?;
+        Ok(writer(table))
     }
 
     /// The table's only writer (not `Clone`). Dropping it closes the table.
     #[derive(Debug)]
     pub struct ConflationWriter {
         table: Arc<Table>,
-        journal: BroadcastTransmitter,
         value_capacity: usize,
         closed: bool,
     }
 
     impl ConflationWriter {
+        /// The shared region, to pass its descriptor; `None` on the heap.
+        #[cfg(target_os = "linux")]
+        #[must_use]
+        pub fn region(&self) -> Option<&crate::ipc::Region> {
+            match &self.table.store {
+                Store::Mapped(region) => Some(region),
+                Store::Heap { .. } => None,
+            }
+        }
+
+        /// The table's configuration.
+        #[must_use]
+        pub fn config(&self) -> ConflationConfig {
+            self.table.geometry.config()
+        }
+
         /// Writes the value of `key` and records it in the journal. Returns
         /// the new version.
         ///
@@ -384,10 +709,14 @@ mod owned {
             let slot = self.table.slot(key).ok_or(ConflationError::KeyOutOfRange {
                 key: i64::from(key),
             })?;
+            let journal = self
+                .table
+                .journal()
+                .map_err(|_| ConflationError::InvalidConfig)?;
             // Admit the journal record before the slot changes: under the
             // single writer, the transmit below then cannot fail, so every
             // committed version gets its record.
-            if !self.journal.has_room(JOURNAL_PAYLOAD) {
+            if !journal.has_room(JOURNAL_PAYLOAD) {
                 self.close();
                 return Err(ConflationError::VersionsExhausted);
             }
@@ -402,7 +731,7 @@ mod owned {
             let mut record = [0u8; JOURNAL_PAYLOAD];
             record[..4].copy_from_slice(&key.to_le_bytes());
             record[8..].copy_from_slice(&version.to_le_bytes());
-            if self.journal.transmit(JOURNAL_TYPE, &record).is_err() {
+            if journal.transmit(JOURNAL_TYPE, &record).is_err() {
                 // Unreachable after `has_room`; if it ever happens, close: a
                 // reader that sees the table closed scans every slot once.
                 self.close();
@@ -415,28 +744,16 @@ mod owned {
         /// values and see [`PollReport::closed`].
         pub fn close(&mut self) {
             self.closed = true;
-            self.journal.close();
+            if let Ok(journal) = self.table.journal() {
+                journal.close();
+            }
         }
 
         /// A new reader (control path: allocates its private state). It
         /// starts with a full scan, so it delivers every key already written.
         #[must_use]
         pub fn reader(&self) -> ConflationReader {
-            let keys = self.table.keys as usize;
-            ConflationReader {
-                table: Arc::clone(&self.table),
-                journal: self.journal.receiver(),
-                delivered: vec![0; keys].into_boxed_slice(),
-                queued: vec![0; keys.div_ceil(64)].into_boxed_slice(),
-                queue: vec![0; keys].into_boxed_slice(),
-                head: 0,
-                len: 0,
-                in_flight: None,
-                scan_cursor: 0,
-                scan_remaining: self.table.keys,
-                closed_seen: false,
-                value: vec![0; self.value_capacity].into_boxed_slice(),
-            }
+            ConflationReader::new(Source::Local(Arc::clone(&self.table)), self.table.geometry)
         }
 
         #[cfg(test)]
@@ -456,7 +773,9 @@ mod owned {
 
         #[cfg(test)]
         pub(super) fn seed_journal(&self, position: u64) {
-            self.journal.seed(position);
+            if let Ok(journal) = self.table.journal() {
+                journal.seed(position);
+            }
         }
 
         #[cfg(test)]
@@ -480,7 +799,6 @@ mod owned {
         /// Read attempts per served key; zero counts as one.
         pub retries: u32,
     }
-
     /// What one poll did.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct PollReport {
@@ -515,8 +833,10 @@ mod owned {
     /// A reader with private delivered versions, queue and value buffer.
     #[derive(Debug)]
     pub struct ConflationReader {
-        table: Arc<Table>,
-        journal: BroadcastReceiver,
+        source: Source,
+        keys: u32,
+        cursor: u64,
+        scratch: Box<[u8]>,
         delivered: Box<[u64]>,
         queued: Box<[u64]>,
         queue: Box<[u32]>,
@@ -530,6 +850,99 @@ mod owned {
     }
 
     impl ConflationReader {
+        fn new(source: Source, geometry: Geometry) -> Self {
+            let keys = geometry.keys as usize;
+            let (cursor, max_payload) = with_view!(&source, view => view
+                .map_or((0, 0), |view| (view.journal.tail(), view.journal.max_payload())));
+            Self {
+                source,
+                keys: geometry.keys,
+                cursor,
+                scratch: vec![0; max_payload].into_boxed_slice(),
+                delivered: vec![0; keys].into_boxed_slice(),
+                queued: vec![0; keys.div_ceil(64)].into_boxed_slice(),
+                queue: vec![0; keys].into_boxed_slice(),
+                head: 0,
+                len: 0,
+                in_flight: None,
+                scan_cursor: 0,
+                scan_remaining: geometry.keys,
+                closed_seen: false,
+                value: vec![0; geometry.value_capacity].into_boxed_slice(),
+            }
+        }
+
+        /// A reader of a table in a region mapped read-only (a view's side;
+        /// `quantstratum-docs: karyos/design/conflation-end-to-end.md`,
+        /// Cross-process views), starting with a full scan. The
+        /// configuration line is read once and must describe a table that
+        /// fills the region exactly; from then on every slot read and
+        /// journal record is validated as on the heap, with loads only.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::SysError::InvalidRegion`] unless the
+        /// region is a conflation table of this layout that matches its
+        /// configuration line.
+        #[cfg(target_os = "linux")]
+        pub fn attach_read_only(
+            region: crate::ipc::ReadOnlyRegion,
+        ) -> Result<Self, crate::error::SysError> {
+            let record = region.record();
+            let invalid = crate::error::SysError::InvalidRegion {
+                address: 0,
+                len: record.structure_length,
+            };
+            if record.kind != crate::ipc::RegionKind::ConflationTable
+                || record.layout != LAYOUT_VERSION
+                || record.generation != 0
+            {
+                return Err(invalid);
+            }
+            let structure = region.structure();
+            let mut line = [0u64; STRIDE_WORDS];
+            for (index, word) in line.iter_mut().enumerate() {
+                *word = structure.load_acquire(index).ok_or(invalid)?;
+            }
+            let [
+                keys,
+                value_capacity,
+                slot_words,
+                journal_capacity,
+                rest @ ..,
+            ] = line;
+            let geometry = u32::try_from(keys).ok().zip(
+                usize::try_from(value_capacity)
+                    .ok()
+                    .zip(usize::try_from(journal_capacity).ok()),
+            );
+            let geometry = geometry
+                .and_then(|(keys, (value_capacity, journal_capacity))| {
+                    Geometry::new(keys, value_capacity, journal_capacity)
+                })
+                .ok_or(invalid)?;
+            if geometry.config_line() != [keys, value_capacity, slot_words, journal_capacity]
+                || rest.iter().any(|word| *word != 0)
+                || geometry.structure_length() != Some(record.structure_length)
+            {
+                return Err(invalid);
+            }
+            let table = ReadOnlyTable { region, geometry };
+            table.view().ok_or(invalid)?;
+            Ok(Self::new(Source::ReadOnly(table), geometry))
+        }
+
+        /// The configuration of the table this reader reads, to compare
+        /// with what a view was granted.
+        #[must_use]
+        pub fn config(&self) -> ConflationConfig {
+            match &self.source {
+                Source::Local(table) => table.geometry.config(),
+                #[cfg(target_os = "linux")]
+                Source::ReadOnly(table) => table.geometry.config(),
+            }
+        }
+
         /// The version last delivered for `key` (0 if none).
         #[must_use]
         pub fn delivered_version(&self, key: u32) -> Option<u64> {
@@ -602,9 +1015,11 @@ mod owned {
             }
             // Once closed, the journal may lack the last record: scan every
             // slot once.
-            if !self.closed_seen && self.journal.is_closed() {
+            let closed = with_view!(&self.source, view => view
+                .is_none_or(|view| view.journal.is_closed()));
+            if !self.closed_seen && closed {
                 self.closed_seen = true;
-                self.scan_remaining = self.table.keys;
+                self.scan_remaining = self.keys;
             }
             if budget.keys == 0 {
                 return self.report(report);
@@ -636,17 +1051,25 @@ mod owned {
 
         fn drain_journal(&mut self, limit: u32, report: &mut PollReport) {
             for _ in 0..limit {
-                let (key, version) = match self.journal.receive() {
-                    Received::Pending => {
+                let received = with_view!(&self.source, view => view.map_or(
+                    Ok(Receive::Pending),
+                    |view| view.journal.receive(&mut self.cursor, &mut self.scratch),
+                ));
+                let (key, version) = match received {
+                    // The scratch is sized for the largest payload at
+                    // creation, so an error is not expected; it reads as
+                    // nothing new, as for a broadcast receiver.
+                    Ok(Receive::Pending) | Err(_) => {
                         report.journal_drained = true;
                         return;
                     }
-                    Received::Lapped { .. } => {
+                    Ok(Receive::Lapped { .. }) => {
                         report.lapped = true;
-                        self.scan_remaining = self.table.keys;
+                        self.scan_remaining = self.keys;
                         continue;
                     }
-                    Received::Message { payload, .. } => {
+                    Ok(Receive::Message { length, .. }) => {
+                        let payload = self.scratch.get(..length).unwrap_or(&[]);
                         let key = payload
                             .get(..4)
                             .and_then(|bytes| bytes.try_into().ok())
@@ -672,14 +1095,15 @@ mod owned {
         /// lost, or not yet appended when the journal was read. Counts down
         /// a full pass when one is in progress.
         fn sweep(&mut self, limit: u32) {
-            let keys = self.table.keys;
+            let keys = self.keys;
             for _ in 0..limit.min(keys) {
                 let key = self.scan_cursor;
                 self.scan_cursor = (key + 1) % keys;
                 if self.scan_remaining > 0 {
                     self.scan_remaining -= 1;
                 }
-                let version = self.table.slot(key).map_or(0, |slot| slot.version());
+                let version = with_view!(&self.source, view => view
+                    .map_or(0, |view| view.version(key)));
                 if version != 0 && self.changed(key, version) {
                     self.push(key);
                 }
@@ -693,14 +1117,14 @@ mod owned {
             handler: &mut impl FnMut(u32, u64, &[u8]),
             report: &mut PollReport,
         ) {
-            let Some(slot) = self.table.slot(key) else {
-                return;
-            };
             for _ in 0..retries.max(1) {
-                match slot.read(&mut self.value) {
-                    SlotRead::Unstable => continue,
-                    SlotRead::Empty => return,
-                    SlotRead::Value { version, length } => {
+                let read = with_view!(&self.source, view => view
+                    .and_then(|view| view.read(key, &mut self.value)));
+                match read {
+                    None => return,
+                    Some(SlotRead::Unstable) => continue,
+                    Some(SlotRead::Empty) => return,
+                    Some(SlotRead::Value { version, length }) => {
                         let delivered = self.delivered.get(key as usize).copied().unwrap_or(0);
                         if version <= delivered {
                             report.skipped += 1;

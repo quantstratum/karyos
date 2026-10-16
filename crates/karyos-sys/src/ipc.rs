@@ -103,6 +103,9 @@ pub enum RegionKind {
     /// The trace mirror (driver only): the journal table and the record
     /// ring the driver fills from the client journals it drains.
     TraceMirror,
+    /// A conflation table (driver only): the slots and the update journal
+    /// of one conflated stream, which views map read-only.
+    ConflationTable,
 }
 
 impl RegionKind {
@@ -117,6 +120,7 @@ impl RegionKind {
             Self::LossReport => 7,
             Self::ClientCounters => 8,
             Self::TraceMirror => 9,
+            Self::ConflationTable => 10,
         }
     }
 }
