@@ -11,12 +11,24 @@
 //! change against the last record with the same workload, configuration,
 //! host and profile. `--rate` changes the scheduled rate for `open-loop`.
 //! Comparisons report, they never fail.
+//!
+//! ```text
+//! karyos-bench inventory --out <dir> [--records <dir>]
+//! ```
+//!
+//! writes this host's environment record to `<dir>/environments/<host>.md`
+//! (measurement-harness.md 4.3) and prints its class and its decision
+//! eligibility per fan-out with every failed condition. `--records` names
+//! the directory of filed records (`quantstratum-docs:
+//! karyos/environments`), which eligibility checks against; without it
+//! the host has no record and is ineligible.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use karyos_bench::env::Labels;
+use karyos_bench::env::{self, Labels};
+use karyos_bench::inventory::{self, Eligibility, Inventory, Scope};
 use karyos_bench::{Workload, defaults, report, run};
 
 struct Options {
@@ -62,6 +74,65 @@ fn parse() -> Result<Options, String> {
     Ok(options)
 }
 
+fn inventory_command(args: &[String]) -> Result<String, String> {
+    let mut out = None;
+    let mut records = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .map(PathBuf::from)
+                .ok_or(format!("{arg} needs a value"))
+        };
+        match arg.as_str() {
+            "--out" => out = Some(value()?),
+            "--records" => records = Some(value()?),
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let out = out.ok_or("inventory needs --out <dir>")?;
+    let inventory = Inventory::detect(Scope::Full);
+    let classification = env::classify(&inventory);
+    let record = records
+        .as_ref()
+        .and_then(|dir| std::fs::read_to_string(dir.join(format!("{}.md", inventory.host))).ok());
+    let eligibility: Vec<Eligibility> = env::FANOUTS
+        .iter()
+        .map(|fanout| {
+            (
+                *fanout,
+                env::decision_eligible(&inventory, record.as_deref(), *fanout),
+            )
+        })
+        .collect();
+    let text = inventory::render(&inventory, &classification, &eligibility);
+    let path = inventory::write(&out, &inventory, &text)
+        .map_err(|cause| format!("{}: {cause}", out.display()))?;
+    let mut report = format!(
+        "wrote {}\nhost {}: class {} ({})\n",
+        path.display(),
+        inventory.host,
+        classification.environment,
+        classification.environment.usage()
+    );
+    for basis in &classification.basis {
+        report.push_str(&format!("  {basis}\n"));
+    }
+    for (fanout, verdict) in &eligibility {
+        let what = env::fanout_label(*fanout);
+        match verdict {
+            Ok(()) => report.push_str(&format!("{what}: eligible\n")),
+            Err(reasons) => {
+                report.push_str(&format!("{what}: ineligible\n"));
+                for reason in reasons {
+                    report.push_str(&format!("  {reason}\n"));
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 fn main() -> ExitCode {
     // The child of an IPC workload runs its part and nothing else.
     #[cfg(target_os = "linux")]
@@ -76,6 +147,19 @@ fn main() -> ExitCode {
     }
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("inventory") {
+        return match inventory_command(args.get(1..).unwrap_or_default()) {
+            Ok(report) => {
+                let _ = write!(out, "{report}");
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(err, "karyos-bench inventory: {message}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let options = match parse() {
         Ok(options) => options,
         Err(message) => {

@@ -10,18 +10,23 @@
 //! image), latency histograms from `karyos-trace`, environment labels and a
 //! stored history. Open-loop latency is measured from the scheduled send time
 //! through delivery, so producer delay remains visible. Every report is
-//! labelled `unqualified`: nothing here establishes a SPEC.md §12 target,
-//! which needs a qualified physical
-//! host (SPEC.md §15, §17).
+//! labelled with its environment class (E1 to E4 of manifest 6.3) and
+//! verdict, such as `E4 non-decision` ([`mod@env`]): nothing here establishes
+//! a SPEC.md §12 target, which needs an eligible physical host (SPEC.md
+//! §15, §17).
 //!
 //! The P2.8 measurement harness (`quantstratum-docs:
-//! karyos/design/measurement-harness.md`) starts with batch B1: the frozen
+//! karyos/design/measurement-harness.md`) has batch B1: the frozen
 //! manifest as data ([`manifest`]), raw per-message samples ([`samples`]),
 //! the statistics of manifest section 8 ([`stats`]) and the decision rules
-//! of manifest sections 7 and 8 ([`decision`]). No command uses them yet.
+//! of manifest sections 7 and 8 ([`decision`]); and batch B2: the host
+//! inventory of the environments README ([`inventory`], `karyos-bench
+//! inventory`), environment classification and decision eligibility
+//! ([`mod@env`]).
 
 pub mod decision;
 pub mod env;
+pub mod inventory;
 #[cfg(target_os = "linux")]
 pub mod ipc;
 pub mod manifest;
