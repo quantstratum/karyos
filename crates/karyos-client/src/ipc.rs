@@ -292,6 +292,19 @@ impl Session {
         }
     }
 
+    /// The registrations of the links whose handle is alive, once each.
+    fn live_registrations(&self) -> Vec<u64> {
+        let mut registrations: Vec<u64> = self
+            .links()
+            .iter()
+            .filter(|entry| entry.link.strong_count() > 0)
+            .map(|entry| entry.registration)
+            .collect();
+        registrations.sort_unstable();
+        registrations.dedup();
+        registrations
+    }
+
     /// Sends `Detach { export }` once its mapping is gone, and forgets the
     /// export.
     fn detach(&self, export: u64) {
@@ -748,6 +761,19 @@ impl RemoteClient {
             return ConductorPoll::default();
         };
         let report = conductor.poll(limit, on);
+        // A lap may have taken cutover events: ask about every live
+        // registration, at most one query each; what cannot be sent now is
+        // asked at the next poll.
+        if conductor.take_lapped()
+            && let Some(session) = &self.session
+        {
+            for registration in session.live_registrations() {
+                if conductor.query_cutover(registration).is_err() {
+                    conductor.mark_lapped();
+                    break;
+                }
+            }
+        }
         let events = conductor.take_cutover_events();
         let driver_lost = conductor.driver_lost();
         if let Some(session) = &self.session {

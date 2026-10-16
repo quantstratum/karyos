@@ -41,10 +41,10 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use karyos_protocol::cnc::ErrorCode;
 use karyos_protocol::cnc::{
     Command, CounterLabel, Event, MAX_COMMAND_LENGTH, Response, StreamKey, SubscriberRole,
 };
+use karyos_protocol::cnc::{CutoverState, ErrorCode};
 use karyos_sys::broadcast::{BroadcastReceiver, Received};
 use karyos_sys::command_ring::{RingError, RingProducer};
 use karyos_sys::counters::ClientCells;
@@ -228,6 +228,12 @@ enum Kind {
     DroppedCounter,
     TraceJournal,
     CloseJournal,
+    /// A remote client's `QueryCutover` after a lap: never reported.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    QueryCutover,
 }
 
 impl Kind {
@@ -235,7 +241,7 @@ impl Kind {
     fn internal(self) -> bool {
         matches!(
             self,
-            Self::ReleaseCounter | Self::ReportLoss | Self::DroppedCounter
+            Self::ReleaseCounter | Self::ReportLoss | Self::DroppedCounter | Self::QueryCutover
         )
     }
 }
@@ -303,6 +309,9 @@ pub struct ClientConductor<T: TermBytes = HeapTerms> {
     /// `PublicationClosed`), kept for its control path whatever the
     /// application does with its own queue.
     cutover_events: Vec<Event>,
+    /// A remote client fell a lap behind the broadcast buffer since its
+    /// control path last asked: cutover events may be lost.
+    lapped: bool,
     /// The writer view of the driver's client counters region; `None`
     /// when the driver gave none, and allocated counters then complete as
     /// `Unknown`.
@@ -351,6 +360,7 @@ impl<T: TermBytes> ClientConductor<T> {
             events_dropped: 0,
             remote: false,
             cutover_events: Vec::new(),
+            lapped: false,
             cells: None,
             dropped_counter: DroppedCounter::NotRequested,
             session: None,
@@ -392,6 +402,42 @@ impl<T: TermBytes> ClientConductor<T> {
     )]
     pub(crate) fn take_cutover_events(&mut self) -> Vec<Event> {
         core::mem::take(&mut self.cutover_events)
+    }
+
+    /// Whether a lap happened since the last call (a remote client's
+    /// control path then asks about each live registration).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn take_lapped(&mut self) -> bool {
+        core::mem::take(&mut self.lapped)
+    }
+
+    /// Asks again at the next lap check, when a query could not be sent.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn mark_lapped(&mut self) {
+        self.lapped = true;
+    }
+
+    /// Asks the driver for the cutover state of `registration`
+    /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, "Resync after
+    /// a lap"). The answer is the conductor's own: a fenced or closed
+    /// registration becomes a `Fenced` cutover event for the control path,
+    /// and a reserved successor arrives as the `SuccessorReady` the driver
+    /// emits again before it.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist only on Linux")
+    )]
+    pub(crate) fn query_cutover(&mut self, registration: u64) -> Result<u64, ConductorError> {
+        self.submit(Kind::QueryCutover, None, |sequence| Command::QueryCutover {
+            sequence,
+            registration,
+        })
     }
 
     /// Sets the heartbeat interval and the driver timeout, both on this
@@ -958,7 +1004,10 @@ impl<T: TermBytes> ClientConductor<T> {
             // Copy what is needed out of the receiver before acting on it.
             let step = match self.receiver.receive() {
                 Received::Pending => None,
-                Received::Lapped { .. } => Some(None),
+                Received::Lapped { .. } => {
+                    self.lapped |= self.remote;
+                    Some(None)
+                }
                 Received::Message {
                     type_id, payload, ..
                 } if Event::is_event_type(type_id) => {
@@ -1026,6 +1075,24 @@ impl<T: TermBytes> ClientConductor<T> {
                 self.dropped_counter_answered(Some(response));
                 self.sync_dropped_counter();
                 continue;
+            }
+            if let (
+                Kind::QueryCutover,
+                Response::CutoverState {
+                    registration,
+                    state: CutoverState::Fenced | CutoverState::Closed,
+                    ..
+                },
+            ) = (pending.kind, response)
+            {
+                // Only the registration matters to the control path.
+                self.cutover_events.push(Event::Fenced {
+                    stream: StreamKey {
+                        stream_id: 0,
+                        session_id: 0,
+                    },
+                    registration,
+                });
             }
             if pending.kind.internal() {
                 continue;

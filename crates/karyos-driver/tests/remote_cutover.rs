@@ -773,3 +773,183 @@ fn a_predecessor_held_in_process_outlives_the_last_remote_detach() {
     drop(remote);
     drop(client);
 }
+
+// ---- #112: resync after a lap (ipc-data-path.md, "Resync after a lap") ----
+
+/// A driver whose broadcast buffer a few dozen responses lap.
+fn small_broadcast_driver(dir: &Path, deadline_ns: u64) -> IpcDriver {
+    EmbeddedDriver::with_ipc(
+        DriverConfig {
+            cutover_deadline: deadline_ns,
+            broadcast_capacity: 2048,
+            command_budget: 4,
+            cycles_between_drains: 2,
+            ..DriverConfig::default()
+        },
+        IpcConfig {
+            dir: dir.to_path_buf(),
+            max_pending_hellos: 2,
+            hello_timeout: 5_000_000_000,
+            max_outbound_per_client: 8,
+            fetch_deadline: 5_000_000_000,
+            max_exports_per_client: 16,
+            max_fetches_per_client: 4,
+            max_regions_per_fetch: 4,
+            max_fetch_bytes: 1 << 30,
+            max_tools: karyos_driver::DEFAULT_MAX_TOOLS,
+        },
+        Box::new(SystemClock::new()),
+    )
+    .unwrap()
+}
+
+/// Laps every client that does not poll: an in-process client's refused
+/// subscriptions fill the broadcast buffer more than twice over.
+fn flood(driver: &mut IpcDriver) {
+    let mut local = driver.connect().unwrap();
+    let unknown = StreamKey {
+        stream_id: 99,
+        session_id: 1,
+    };
+    let mut answered = 0;
+    let start = Instant::now();
+    while answered < 200 {
+        assert!(start.elapsed() < Duration::from_secs(10), "flood stuck");
+        while local
+            .add_subscription(unknown, SubscriberRole::Optional)
+            .is_ok()
+        {}
+        let _ = driver.do_work().unwrap();
+        let _ = local.poll(usize::MAX, |_| answered += 1);
+    }
+}
+
+/// A remote subscription whose client lost `SuccessorReady` to a lap still
+/// moves before the deadline: after the lap its control path asks about
+/// the registration, the driver answers `Successor` and emits the event
+/// again.
+#[test]
+fn a_lapped_client_recovers_a_lost_successor() {
+    let dir = dir("lapped-successor");
+    let mut driver = small_broadcast_driver(&dir, 2_000_000_000);
+    let stream = driver
+        .add_stream(stream_config(PublicationMode::Exclusive))
+        .unwrap();
+    let (client, mut subscription) = remote_grant(
+        &mut driver,
+        &dir,
+        |client| {
+            let _ = client
+                .add_subscription(KEY, SubscriberRole::Required)
+                .unwrap();
+        },
+        |client, fetchable| client.take_subscription(fetchable).unwrap(),
+    );
+    let mut publication = driver.publication(stream).unwrap();
+    let reserved = counter(&driver, "grants reserved");
+    reconfigure(&mut driver, stream);
+    // The exclusive cutover opens once the publication observed the seal:
+    // the successor is reserved and SuccessorReady emitted, then lapped
+    // before the client reads it.
+    let start = Instant::now();
+    while counter(&driver, "grants reserved") == reserved {
+        assert!(start.elapsed() < Duration::from_secs(10), "never opened");
+        let _ = publication.offer(b"after").unwrap();
+        let _ = driver.do_work().unwrap();
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    flood(&mut driver);
+    let mut client = client;
+    let after = serve_while(&mut driver, || {
+        let mut after = None;
+        let mut seen = None;
+        let start = Instant::now();
+        while seen.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(10), "never moved");
+            let _ = client.poll(usize::MAX, |_| {});
+            if after.is_none()
+                && let OfferOutcome::Accepted { position, .. } =
+                    publication.offer(b"after").unwrap()
+            {
+                after = Some(position);
+            }
+            let summary = subscription
+                .poll(
+                    |bytes, info| {
+                        if bytes == b"after" {
+                            seen = Some(info.position);
+                        }
+                    },
+                    MessageLimit::new(8),
+                )
+                .unwrap();
+            assert!(summary.closed.is_none(), "closed instead of moving");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        assert_eq!(seen, after);
+        after
+    });
+    assert!(after.is_some());
+    assert_eq!(counter(&driver, "grants fenced"), 0);
+    drop(subscription);
+    drop(client);
+}
+
+/// A remote subscription whose client lost both `SuccessorReady` and
+/// `Fenced` to laps ends at the seal: after the lap its control path asks,
+/// the driver answers `Fenced`, and the link closes, instead of the handle
+/// waiting at the seal until the driver is lost.
+#[test]
+fn a_lapped_client_learns_a_lost_fence() {
+    let dir = dir("lapped-fence");
+    let mut driver = small_broadcast_driver(&dir, 50_000_000);
+    let stream = driver
+        .add_stream(stream_config(PublicationMode::Exclusive))
+        .unwrap();
+    let (client, mut subscription) = remote_grant(
+        &mut driver,
+        &dir,
+        |client| {
+            let _ = client
+                .add_subscription(KEY, SubscriberRole::Required)
+                .unwrap();
+        },
+        |client, fetchable| client.take_subscription(fetchable).unwrap(),
+    );
+    let mut publication = driver.publication(stream).unwrap();
+    assert!(matches!(
+        publication.offer(b"before").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    reconfigure(&mut driver, stream);
+    // The client sleeps through the deadline; both events are lapped. The
+    // exclusive cutover opens once the publication observed the seal.
+    let start = Instant::now();
+    while counter(&driver, "grants fenced") == 0 {
+        assert!(start.elapsed() < Duration::from_secs(10), "never fenced");
+        let _ = publication.offer(b"after").unwrap();
+        let _ = driver.do_work().unwrap();
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    flood(&mut driver);
+    let mut client = client;
+    let closed = serve_while(&mut driver, || {
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "never closed");
+            let _ = client.poll(usize::MAX, |_| {});
+            let summary = subscription.poll(|_, _| {}, MessageLimit::new(8)).unwrap();
+            if let Some(end) = summary.closed {
+                return end;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    });
+    assert!(closed > 0);
+    assert_eq!(
+        subscription.generation_link().unwrap().status(),
+        LinkStatus::Closed
+    );
+    drop(subscription);
+    drop(client);
+}

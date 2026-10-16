@@ -26,12 +26,25 @@
 //! | `0x08` | `ReportLoss` | sequence | driver instance id, high word | driver instance id, low word | stream registration |
 //! | `0x09` | `TraceJournal` | sequence | capacity in records (a power of two) | payload words (nonzero) | drop ranges (nonzero) |
 //! | `0x0A` | `CloseJournal` | sequence | journal number (nonzero) | final delivery boundary | |
+//! | `0x0B` | `QueryCutover` | sequence | registration | | |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
 //! | `0x84` | `Error` | client | sequence | code (1 to 7, see [`ErrorCode`]) | detail |
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
+//! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
+//!
+//! `QueryCutover` and `CutoverState` (`quantstratum-docs:
+//! karyos/design/ipc-data-path.md`, "Resync after a lap"; coordinator
+//! decision ACS 13908): a remote client that fell a lap behind the
+//! broadcast buffer, and so may have lost a `SuccessorReady`, `Fenced` or
+//! `PublicationClosed`, asks the driver about each of its live remote
+//! registrations. For a reserved successor the driver emits the
+//! registration's `SuccessorReady` again just before the answer, so the
+//! answer itself needs only the state and fits the response limit. A
+//! registration that is not one of the sender's is refused with `Error`
+//! and `UnknownRegistration`.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -117,12 +130,14 @@ const RELEASE_COUNTER: u32 = 0x07;
 const REPORT_LOSS: u32 = 0x08;
 const TRACE_JOURNAL: u32 = 0x09;
 const CLOSE_JOURNAL: u32 = 0x0A;
+const QUERY_CUTOVER: u32 = 0x0B;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
 const ERROR: u32 = 0x84;
 const COUNTER_ALLOCATED: u32 = 0x85;
 const JOURNAL_READY: u32 = 0x86;
+const CUTOVER_STATE: u32 = 0x87;
 const PARTICIPANT_LOST: u32 = 0xC1;
 const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
 const PUBLICATION_CLOSED: u32 = 0xC3;
@@ -535,6 +550,14 @@ pub enum Command {
         /// The final delivery boundary.
         boundary: u64,
     },
+    /// Ask for the cutover state of one of the client's remote
+    /// registrations, after a lap of the broadcast buffer.
+    QueryCutover {
+        /// Request sequence.
+        sequence: u64,
+        /// The registration.
+        registration: u64,
+    },
 }
 
 /// Why the driver refused a command.
@@ -639,6 +662,52 @@ pub enum Response {
         /// The hand-over key.
         key: u64,
     },
+    /// The cutover state of a registration `QueryCutover` asked about.
+    CutoverState {
+        /// The request.
+        request: RequestId,
+        /// The registration.
+        registration: u64,
+        /// Its state.
+        state: CutoverState,
+    },
+}
+
+/// Where a remote registration stands in its stream's cutovers, as
+/// `CutoverState` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutoverState {
+    /// No cutover waits for it: its handle's current mapping is the
+    /// stream's.
+    Current,
+    /// A successor was reserved for it and is neither adopted nor fenced;
+    /// its `SuccessorReady` was emitted again just before this answer.
+    Successor,
+    /// Its successor was fenced, or none could be reserved.
+    Fenced,
+    /// Its stream was closed: removed or sealed for good.
+    Closed,
+}
+
+impl CutoverState {
+    const fn code(self) -> u64 {
+        match self {
+            Self::Current => 0,
+            Self::Successor => 1,
+            Self::Fenced => 2,
+            Self::Closed => 3,
+        }
+    }
+
+    const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Current),
+            1 => Some(Self::Successor),
+            2 => Some(Self::Fenced),
+            3 => Some(Self::Closed),
+            _ => None,
+        }
+    }
 }
 
 fn stream_word(stream: StreamKey) -> u64 {
@@ -697,6 +766,7 @@ impl Command {
             Self::ReportLoss { .. } => REPORT_LOSS,
             Self::TraceJournal { .. } => TRACE_JOURNAL,
             Self::CloseJournal { .. } => CLOSE_JOURNAL,
+            Self::QueryCutover { .. } => QUERY_CUTOVER,
         }
     }
 
@@ -713,7 +783,8 @@ impl Command {
             | Self::ReleaseCounter { sequence, .. }
             | Self::ReportLoss { sequence, .. }
             | Self::TraceJournal { sequence, .. }
-            | Self::CloseJournal { sequence, .. } => sequence,
+            | Self::CloseJournal { sequence, .. }
+            | Self::QueryCutover { sequence, .. } => sequence,
         }
     }
 
@@ -820,6 +891,10 @@ impl Command {
                 journal,
                 boundary,
             } => write_words(&[sequence, journal, boundary], out),
+            Self::QueryCutover {
+                sequence,
+                registration,
+            } => write_words(&[sequence, registration], out),
         }
     }
 
@@ -969,6 +1044,13 @@ impl Command {
                     boundary,
                 })
             }
+            QUERY_CUTOVER => {
+                let [sequence, registration] = read_words::<2>(type_id, bytes)?;
+                Ok(Self::QueryCutover {
+                    sequence,
+                    registration,
+                })
+            }
             _ => Err(CncError::UnknownType { type_id }),
         }
     }
@@ -985,6 +1067,7 @@ impl Response {
             Self::Error { .. } => ERROR,
             Self::CounterAllocated { .. } => COUNTER_ALLOCATED,
             Self::JournalReady { .. } => JOURNAL_READY,
+            Self::CutoverState { .. } => CUTOVER_STATE,
         }
     }
 
@@ -997,7 +1080,8 @@ impl Response {
             | Self::OperationSucceeded { request }
             | Self::Error { request, .. }
             | Self::CounterAllocated { request, .. }
-            | Self::JournalReady { request, .. } => request,
+            | Self::JournalReady { request, .. }
+            | Self::CutoverState { request, .. } => request,
         }
     }
 
@@ -1039,6 +1123,14 @@ impl Response {
                 journal,
                 key,
             } => write_words(&[request.client, request.sequence, journal, key], out),
+            Self::CutoverState {
+                request,
+                registration,
+                state,
+            } => write_words(
+                &[request.client, request.sequence, registration, state.code()],
+                out,
+            ),
         }
     }
 
@@ -1096,6 +1188,15 @@ impl Response {
                     request: RequestId { client, sequence },
                     journal,
                     key,
+                })
+            }
+            CUTOVER_STATE => {
+                let [client, sequence, registration, state] = read_words::<4>(type_id, bytes)?;
+                let state = CutoverState::from_code(state).ok_or(CncError::Reserved { type_id })?;
+                Ok(Self::CutoverState {
+                    request: RequestId { client, sequence },
+                    registration,
+                    state,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -1632,7 +1733,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x0B, &out[..length]),
+            Command::decode(0x0C, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         let mut response = [0u8; MAX_RESPONSE_LENGTH];
@@ -1790,6 +1891,24 @@ mod tests {
         assert_eq!(
             Command::decode(0x06, &bad[..length]),
             Err(CncError::Reserved { type_id: 0x06 })
+        );
+        // Only the four cutover states exist.
+        let state = Response::CutoverState {
+            request: RequestId {
+                client: 1,
+                sequence: 2,
+            },
+            registration: 3,
+            state: CutoverState::Fenced,
+        };
+        let mut words = [0u8; MAX_RESPONSE_LENGTH];
+        let length = state.encode(&mut words).unwrap();
+        assert_eq!(Response::decode(0x87, &words[..length]), Ok(state));
+        let mut bad = words;
+        bad[24] = 4;
+        assert_eq!(
+            Response::decode(0x87, &bad[..length]),
+            Err(CncError::Reserved { type_id: 0x87 })
         );
         // A response type is no command, and a counter response decodes
         // only at its exact length.
@@ -2167,6 +2286,7 @@ mod properties {
             REPORT_LOSS,
             TRACE_JOURNAL,
             CLOSE_JOURNAL,
+            QUERY_CUTOVER,
         ],
     };
 
@@ -2182,6 +2302,7 @@ mod properties {
             ERROR,
             COUNTER_ALLOCATED,
             JOURNAL_READY,
+            CUTOVER_STATE,
         ],
     };
 
@@ -2487,6 +2608,10 @@ mod properties {
                     boundary,
                 }
             }),
+            any::<(u64, u64)>().prop_map(|(sequence, registration)| Command::QueryCutover {
+                sequence,
+                registration,
+            }),
         ]
     }
 
@@ -2539,7 +2664,25 @@ mod properties {
                     key,
                 }
             }),
+            (request(), any::<u64>(), cutover_state()).prop_map(
+                |(request, registration, state)| Response::CutoverState {
+                    request,
+                    registration,
+                    state,
+                }
+            ),
         ]
+    }
+
+    fn cutover_state() -> impl Strategy<Value = CutoverState> {
+        prop::sample::select(
+            &[
+                CutoverState::Current,
+                CutoverState::Successor,
+                CutoverState::Fenced,
+                CutoverState::Closed,
+            ][..],
+        )
     }
 
     fn event() -> impl Strategy<Value = Event> {
@@ -2604,6 +2747,7 @@ mod properties {
                     (REPORT_LOSS, REPORT_LOSS_WORDS),
                     (TRACE_JOURNAL, 5),
                     (CLOSE_JOURNAL, 3),
+                    (QUERY_CUTOVER, 2),
                 ],
             ),
         ) {
@@ -2622,6 +2766,7 @@ mod properties {
                     (ERROR, 4),
                     (COUNTER_ALLOCATED, 4),
                     (JOURNAL_READY, 4),
+                    (CUTOVER_STATE, 4),
                 ],
             ),
         ) {

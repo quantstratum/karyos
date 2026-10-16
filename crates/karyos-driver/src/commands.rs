@@ -954,6 +954,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     refuse(ErrorCode::UnknownRegistration, journal)
                 }
             }
+            Command::QueryCutover { registration, .. } => {
+                match self.query_cutover(client, registration) {
+                    Some(state) => Response::CutoverState {
+                        request,
+                        registration,
+                        state,
+                    },
+                    None => refuse(ErrorCode::UnknownRegistration, registration),
+                }
+            }
         }
     }
 
@@ -1616,6 +1626,82 @@ mod tests {
         stream_id: 2,
         session_id: 1,
     };
+
+    /// `QueryCutover` answers about the sender's own registrations only:
+    /// another client's registration, a local client's and an unknown one
+    /// are refused alike, so nothing leaks across clients. With no cutover
+    /// a live registration is `Current`, and a removed stream's `Closed`.
+    #[test]
+    fn query_cutover_answers_only_the_senders_registrations() {
+        let (mut driver, stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (owner, mut producer) = remote_client(&mut driver, 4);
+        let (_other, mut stranger) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Optional,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let registration = ledger(&driver, owner)[0].registration;
+        let _ = responses(&mut observer);
+        let query = |sequence| Command::QueryCutover {
+            sequence,
+            registration,
+        };
+        write(&mut producer, query(2));
+        write(&mut stranger, query(3));
+        write(
+            &mut stranger,
+            Command::QueryCutover {
+                sequence: 4,
+                registration: registration + 1000,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        assert!(
+            answers.contains(&Response::CutoverState {
+                request: RequestId {
+                    client: owner,
+                    sequence: 2,
+                },
+                registration,
+                state: karyos_protocol::cnc::CutoverState::Current,
+            }),
+            "{answers:?}"
+        );
+        for sequence in [3, 4] {
+            assert!(
+                answers.iter().any(|answer| matches!(
+                    answer,
+                    Response::Error {
+                        request: RequestId { sequence: s, .. },
+                        code: ErrorCode::UnknownRegistration,
+                        ..
+                    } if *s == sequence
+                )),
+                "{answers:?}"
+            );
+        }
+        driver.remove_stream(stream).unwrap();
+        write(&mut producer, query(5));
+        let _ = driver.do_work().unwrap();
+        assert!(responses(&mut observer).contains(&Response::CutoverState {
+            request: RequestId {
+                client: owner,
+                sequence: 5,
+            },
+            registration,
+            state: karyos_protocol::cnc::CutoverState::Closed,
+        }));
+    }
 
     #[test]
     fn a_remote_subscription_is_reserved_under_an_export_and_answered_with_its_key() {
