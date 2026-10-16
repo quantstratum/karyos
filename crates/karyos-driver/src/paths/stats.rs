@@ -4,34 +4,51 @@
 //! karyos/design/redundant-paths.md`, sections 2, 3 and 5; RP-1, RP-2,
 //! RP-6).
 //!
-//! The receive owner reports each validated frame it takes from a path,
-//! with what arbitration made of it ([`Arrival`]). Per path, bounded and
-//! preallocated:
+//! The receive owner reports each validated frame it takes from a bound
+//! path, with what arbitration made of it ([`Arrival`]). Per path, bounded
+//! and preallocated:
 //!
 //! | Statistic | Rule |
 //! | --- | --- |
 //! | Wins | Frames this path committed first |
-//! | Duplicates | Valid frames this path delivered after another path committed them |
+//! | Duplicates | Valid frames, fresh on this path, that another path committed first |
+//! | Stale | Frames at or below this path's own mark: a replay, or a late copy on the path |
 //! | Conflicts | Valid frames whose bytes differ from the committed copy |
 //! | Late | Frames below the image's join point (RP-1) |
-//! | Missing bytes | Per term, at its cleaning: committed bytes minus the fresh bytes this path delivered in it |
+//! | Missing bytes | Per whole term the path was bound for, at its cleaning: committed bytes minus the fresh bytes this path delivered in it |
 //! | Arrival difference | Per duplicate, its arrival minus the first arrival, on the receiver's clock, in a log2 histogram |
 //!
 //! **Freshness (RP-2, ACS 15519).** A frame is fresh on a path when it
-//! ends above the highest position that path had delivered on its lane: a
-//! copy of a frame another path committed is fresh on this path, a replay
-//! or a late copy at or below the path's own mark is not. Path liveness
-//! takes only fresh evidence ([`PathStats::arrived`] says which); it never
-//! refreshes the image. Only fresh bytes count as delivered for the
-//! missing bytes, so a replay cannot hide a path's losses.
+//! ends above the path's mark on its lane: the highest position the path
+//! delivered, seeded at binding with the join point its answer stated
+//! (RP-1), and kept across a loss, since a rebound path's history is still
+//! old history. A copy of a frame another path committed is fresh on this
+//! path; a replay or a late copy at or below the mark is not. Path
+//! liveness takes only fresh evidence ([`PathStats::arrived`] says which);
+//! it never refreshes the image.
 //!
-//! First arrivals are kept per lane in a ring of the last
-//! `skew_sample_frames` committed frames, as position and time. A
-//! duplicate whose position is in the ring yields a difference, found by
+//! **Missing bytes.** A path is charged only for whole terms of its
+//! binding: from the first term after the one holding its join point,
+//! until the term in which it was lost (excluded). Only fresh bytes of
+//! winning or duplicate copies count as delivered, so a replay or a
+//! conflicting copy cannot hide a loss, and the bytes delivered in a term
+//! stay counted across a loss. Under reordering on one path, a frame that
+//! arrives after a later one is not fresh and counts as missing: missing
+//! bytes are an upper bound. Each term of a lane is cleaned once, in
+//! order; a term cleaned again, or out of order, charges nothing and
+//! counts as an accounting fault.
+//!
+//! **Arrival differences.** First arrivals are kept per lane in a ring of
+//! the last `skew_sample_frames` committed frames, as position and time.
+//! A duplicate whose position is in the ring yields a difference, found by
 //! a scan from the newest entry (duplicates trail their first arrival by
-//! at most the skew, so the scan is short; it is bounded by the ring);
-//! one that is not is counted as unmatched. Nothing grows with the term
-//! size.
+//! at most the skew, so the scan is short; it is bounded by the ring); one
+//! that is not counts as unmatched. Times are the readers' receive times
+//! ([`Delivered::now`]), never the owner's service time, which would add
+//! queueing to the skew; a difference that reads negative is 0
+//! (`host_clock::age_ns`). Nothing grows with the term size.
+
+use karyos_sys::host_clock::age_ns;
 
 use super::{PathConfig, add, bump};
 
@@ -68,7 +85,8 @@ pub struct Delivered {
     pub position: u64,
     /// Its aligned length in bytes.
     pub length: u64,
-    /// The arrival on the receiver's monotonic clock.
+    /// When the path's reader received it, on the receiver's monotonic
+    /// clock: not when the owner served it.
     pub now: u64,
 }
 
@@ -77,8 +95,10 @@ pub struct Delivered {
 pub struct PathCounts {
     /// Frames this path committed first.
     pub wins: u64,
-    /// Valid frames delivered after another path committed them.
+    /// Valid frames, fresh on this path, another path committed first.
     pub duplicates: u64,
+    /// Frames at or below this path's own mark.
+    pub stale: u64,
     /// Valid frames whose bytes differ from the committed copy.
     pub conflicts: u64,
     /// Frames below the image's join point.
@@ -96,6 +116,7 @@ impl Default for PathCounts {
         Self {
             wins: 0,
             duplicates: 0,
+            stale: 0,
             conflicts: 0,
             late: 0,
             missing_bytes: 0,
@@ -110,6 +131,28 @@ impl Default for PathCounts {
 struct TermBytes {
     term: Option<u64>,
     bytes: u64,
+}
+
+/// One path on one lane.
+#[derive(Debug, Clone)]
+struct PathLane {
+    /// Whether the path is bound now.
+    bound: bool,
+    /// The end of the highest frame the path delivered, seeded at the join.
+    mark: Option<u64>,
+    /// The first term charged for missing bytes; `None` before any binding.
+    charge_from: Option<u64>,
+    /// The term of the loss, not charged; `None` while bound.
+    charge_until: Option<u64>,
+    /// Fresh bytes per term slot.
+    terms: Vec<TermBytes>,
+}
+
+impl PathLane {
+    fn charged(&self, term: u64) -> bool {
+        self.charge_from.is_some_and(|from| term >= from)
+            && self.charge_until.is_none_or(|until| term < until)
+    }
 }
 
 /// One lane's ring of first arrivals.
@@ -128,14 +171,19 @@ impl ArrivalRing {
         } else if let Some(entry) = self.entries.get_mut(self.head) {
             *entry = (position, now);
         }
-        self.head = (self.head + 1) % capacity;
+        self.head = self
+            .head
+            .checked_add(1)
+            .filter(|next| *next < capacity)
+            .unwrap_or(0);
     }
 
     /// The first arrival of `position`, searched from the newest entry.
     fn find(&self, position: u64) -> Option<u64> {
-        let len = self.entries.len();
-        (0..len)
-            .map(|back| (self.head + len - 1 - back) % len)
+        let head = self.head.min(self.entries.len());
+        (0..head)
+            .rev()
+            .chain((head..self.entries.len()).rev())
             .filter_map(|index| self.entries.get(index))
             .find(|(at, _)| *at == position)
             .map(|(_, time)| *time)
@@ -145,25 +193,30 @@ impl ArrivalRing {
 /// The histogram bucket of an arrival difference.
 #[must_use]
 pub fn arrival_bucket(difference: u64) -> usize {
-    let bits = (u64::BITS - difference.leading_zeros()) as usize;
-    bits.min(ARRIVAL_BUCKETS - 1)
+    let last = ARRIVAL_BUCKETS - 1;
+    difference
+        .checked_ilog2()
+        .and_then(|log| log.checked_add(1))
+        .map_or(0, |bits| {
+            usize::try_from(bits).map_or(last, |bits| bits.min(last))
+        })
 }
 
 /// The statistics of one image's paths.
 #[derive(Debug)]
 pub struct PathStats {
-    lanes: usize,
-    term_slots: usize,
+    term_slots: u64,
     ring_capacity: usize,
     counts: Vec<PathCounts>,
-    /// Per path and lane: the end of the highest frame the path delivered.
-    high_water: Vec<Option<u64>>,
-    /// Per path, lane and term slot.
-    term_bytes: Vec<TermBytes>,
+    /// Per path, then per lane.
+    paths: Vec<Vec<PathLane>>,
     rings: Vec<ArrivalRing>,
-    /// Terms cleaned with more fresh bytes on a path than committed, a term
-    /// slot overwritten before its cleaning, or a duplicate timed before
-    /// its first arrival: accounting faults, not counted as statistics.
+    /// Per lane: the last term cleaned.
+    cleaned: Vec<Option<u64>>,
+    /// Accounting faults, not counted as statistics: a path that delivered
+    /// more fresh bytes in a term than were committed, a term slot
+    /// overwritten before its cleaning, or a term cleaned again or out of
+    /// order.
     inconsistent: u64,
     overflows: u64,
 }
@@ -175,32 +228,76 @@ impl PathStats {
     /// least 1.
     #[must_use]
     pub fn new(config: &PathConfig, lanes: usize, term_slots: usize) -> Self {
-        let paths = usize::from(config.max_paths);
         let lanes = lanes.max(1);
-        let term_slots = term_slots.max(1);
+        let slots = term_slots.max(1);
         let ring_capacity = usize::from(config.skew_sample_frames).max(1);
+        let lane = PathLane {
+            bound: false,
+            mark: None,
+            charge_from: None,
+            charge_until: None,
+            terms: vec![TermBytes::default(); slots],
+        };
         Self {
-            lanes,
-            term_slots,
+            term_slots: u64::try_from(slots).unwrap_or(u64::MAX),
             ring_capacity,
-            counts: vec![PathCounts::default(); paths],
-            high_water: vec![None; paths * lanes],
-            term_bytes: vec![TermBytes::default(); paths * lanes * term_slots],
+            counts: vec![PathCounts::default(); usize::from(config.max_paths)],
+            paths: (0..config.max_paths)
+                .map(|_| vec![lane.clone(); lanes])
+                .collect(),
             rings: (0..lanes)
                 .map(|_| ArrivalRing {
                     entries: Vec::with_capacity(ring_capacity),
                     head: 0,
                 })
                 .collect(),
+            cleaned: vec![None; lanes],
             inconsistent: 0,
             overflows: 0,
         }
     }
 
-    /// Records a frame `delivered` by a path and what arbitration made of
-    /// it; returns whether it was fresh on that path (RP-2): liveness
-    /// evidence for the path, never for the image. An unknown path or
-    /// lane records nothing and is not fresh.
+    fn slot(&self, term: u64) -> usize {
+        term.checked_rem(self.term_slots)
+            .and_then(|slot| usize::try_from(slot).ok())
+            .unwrap_or(0)
+    }
+
+    /// `path` was bound with the join point its answer stated per lane,
+    /// `(position, term)` (RP-1): its mark rises to the join (a rebound
+    /// path keeps a higher mark), and it is charged for missing bytes from
+    /// the term after the join's.
+    pub fn path_bound(&mut self, path: usize, joins: &[(u64, u64)]) {
+        let Some(lanes) = self.paths.get_mut(path) else {
+            return;
+        };
+        for (lane, (position, term)) in lanes.iter_mut().zip(joins) {
+            lane.bound = true;
+            lane.mark = Some(lane.mark.map_or(*position, |mark| mark.max(*position)));
+            lane.charge_from = term.checked_add(1);
+            lane.charge_until = None;
+        }
+    }
+
+    /// `path`'s binding went, during `terms` (per lane): it is no longer
+    /// charged from those terms on. Its mark and the bytes it delivered
+    /// stay; its counts stay.
+    pub fn path_lost(&mut self, path: usize, terms: &[u64]) {
+        let Some(lanes) = self.paths.get_mut(path) else {
+            return;
+        };
+        for (lane, term) in lanes.iter_mut().zip(terms) {
+            if lane.bound {
+                lane.bound = false;
+                lane.charge_until = Some(*term);
+            }
+        }
+    }
+
+    /// Records a frame `delivered` by a bound path and what arbitration
+    /// made of it; returns whether it was fresh on that path (RP-2):
+    /// liveness evidence for the path, never for the image. An unknown or
+    /// unbound path or lane records nothing and is not fresh.
     pub fn arrived(&mut self, delivered: Delivered, arrival: Arrival) -> bool {
         let Delivered {
             path,
@@ -210,36 +307,37 @@ impl PathStats {
             length,
             now,
         } = delivered;
-        if lane >= self.lanes || path >= self.counts.len() {
+        let slot = self.slot(term);
+        let Some(state) = self
+            .paths
+            .get_mut(path)
+            .and_then(|lanes| lanes.get_mut(lane))
+            .filter(|state| state.bound)
+        else {
             return false;
-        }
+        };
         let Some(end) = position.checked_add(length) else {
             return false;
         };
-        let lane_index = path * self.lanes + lane;
-        let fresh = match self.high_water.get_mut(lane_index) {
-            Some(mark) if mark.is_none_or(|mark| end > mark) => {
-                *mark = Some(end);
-                true
-            }
-            _ => false,
-        };
-        if fresh && arrival != Arrival::Late {
-            let slot = lane_index * self.term_slots
-                + usize::try_from(term % self.term_slots as u64).unwrap_or(0);
-            if let Some(bytes) = self.term_bytes.get_mut(slot) {
-                if bytes.term != Some(term) {
-                    if bytes.term.is_some() {
-                        // The slot's earlier term was never cleaned.
-                        bump(&mut self.inconsistent, &mut self.overflows);
-                    }
-                    *bytes = TermBytes {
-                        term: Some(term),
-                        bytes: 0,
-                    };
+        let fresh = state.mark.is_none_or(|mark| end > mark);
+        if fresh {
+            state.mark = Some(end);
+        }
+        if fresh
+            && matches!(arrival, Arrival::First | Arrival::Duplicate)
+            && let Some(bytes) = state.terms.get_mut(slot)
+        {
+            if bytes.term != Some(term) {
+                if bytes.term.is_some() {
+                    // The slot's earlier term was never cleaned.
+                    bump(&mut self.inconsistent, &mut self.overflows);
                 }
-                add(&mut bytes.bytes, length, &mut self.overflows);
+                *bytes = TermBytes {
+                    term: Some(term),
+                    bytes: 0,
+                };
             }
+            add(&mut bytes.bytes, length, &mut self.overflows);
         }
         let Some(counts) = self.counts.get_mut(path) else {
             return fresh;
@@ -251,21 +349,18 @@ impl PathStats {
                     ring.record(position, now, self.ring_capacity);
                 }
             }
+            // A replay or a late copy on this path: stale, out of the
+            // duplicates and of the histogram.
+            Arrival::Duplicate if !fresh => bump(&mut counts.stale, &mut self.overflows),
             Arrival::Duplicate => {
                 bump(&mut counts.duplicates, &mut self.overflows);
                 match self.rings.get(lane).and_then(|ring| ring.find(position)) {
-                    // The receiver's own clock is monotonic: a copy that
-                    // reads as arriving before the first is an accounting
-                    // fault, never a difference.
-                    Some(first) => match now.checked_sub(first) {
-                        Some(difference) => {
-                            if let Some(bucket) = counts.arrival.get_mut(arrival_bucket(difference))
-                            {
-                                bump(bucket, &mut self.overflows);
-                            }
+                    Some(first) => {
+                        let bucket = arrival_bucket(age_ns(now, first));
+                        if let Some(bucket) = counts.arrival.get_mut(bucket) {
+                            bump(bucket, &mut self.overflows);
                         }
-                        None => bump(&mut self.inconsistent, &mut self.overflows),
-                    },
+                    }
                     None => bump(&mut counts.unmatched, &mut self.overflows),
                 }
             }
@@ -275,17 +370,25 @@ impl PathStats {
         fresh
     }
 
-    /// `term` of `lane` was cleaned with `committed` bytes: each path's
-    /// missing bytes grow by what it did not deliver fresh in it, and the
-    /// term's slots are freed.
+    /// `term` of `lane` was cleaned with `committed` bytes: each path
+    /// charged for that term has its missing bytes grow by what it did not
+    /// deliver fresh in it, and the term's slots are freed. Terms are
+    /// cleaned once each, in order.
     pub fn term_cleaned(&mut self, lane: usize, term: u64, committed: u64) {
-        if lane >= self.lanes {
+        let Some(last) = self.cleaned.get_mut(lane) else {
+            return;
+        };
+        if last.is_some_and(|last| term <= last) {
+            bump(&mut self.inconsistent, &mut self.overflows);
             return;
         }
-        let slot = usize::try_from(term % self.term_slots as u64).unwrap_or(0);
-        for path in 0..self.counts.len() {
-            let index = (path * self.lanes + lane) * self.term_slots + slot;
-            let delivered = match self.term_bytes.get_mut(index) {
+        *last = Some(term);
+        let slot = self.slot(term);
+        for (path, lanes) in self.paths.iter_mut().enumerate() {
+            let Some(state) = lanes.get_mut(lane) else {
+                continue;
+            };
+            let delivered = match state.terms.get_mut(slot) {
                 Some(bytes) if bytes.term == Some(term) => {
                     let delivered = bytes.bytes;
                     *bytes = TermBytes::default();
@@ -293,6 +396,9 @@ impl PathStats {
                 }
                 _ => 0,
             };
+            if !state.charged(term) {
+                continue;
+            }
             match committed.checked_sub(delivered) {
                 Some(missing) => {
                     if let Some(counts) = self.counts.get_mut(path) {
@@ -304,34 +410,13 @@ impl PathStats {
         }
     }
 
-    /// Forgets `path`'s freshness and term bytes, when its binding goes;
-    /// its counts stay.
-    pub fn path_lost(&mut self, path: usize) {
-        if path >= self.counts.len() {
-            return;
-        }
-        for lane in 0..self.lanes {
-            let lane_index = path * self.lanes + lane;
-            if let Some(mark) = self.high_water.get_mut(lane_index) {
-                *mark = None;
-            }
-            for slot in 0..self.term_slots {
-                if let Some(bytes) = self.term_bytes.get_mut(lane_index * self.term_slots + slot) {
-                    *bytes = TermBytes::default();
-                }
-            }
-        }
-    }
-
     /// `path`'s counts.
     #[must_use]
     pub fn counts(&self, path: usize) -> Option<&PathCounts> {
         self.counts.get(path)
     }
 
-    /// Accounting faults: a path that delivered more fresh bytes in a term
-    /// than were committed, a term overwritten before its cleaning, or a
-    /// duplicate timed before its first arrival.
+    /// Accounting faults: see the field.
     #[must_use]
     pub fn inconsistent(&self) -> u64 {
         self.inconsistent

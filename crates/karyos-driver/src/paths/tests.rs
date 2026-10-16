@@ -152,6 +152,16 @@ fn frame(path: usize, position: u64, now: u64) -> Delivered {
     }
 }
 
+/// Stats with `paths` paths of one lane, each bound at position 0 in term
+/// 0 (charged from term 1).
+fn bound(paths: u8, ring: u16) -> PathStats {
+    let mut stats = PathStats::new(&config(paths, 8, ring), 1, 4);
+    for path in 0..usize::from(paths) {
+        stats.path_bound(path, &[(0, 0)]);
+    }
+    stats
+}
+
 #[test]
 fn arrival_buckets_are_log2() {
     assert_eq!(arrival_bucket(0), 0);
@@ -163,22 +173,24 @@ fn arrival_buckets_are_log2() {
 }
 
 /// RP-2: a cross-path duplicate is fresh on the path that carried it; a
-/// replay or a late copy at or below that path's own mark is not.
+/// replay or a late copy at or below that path's own mark is not, and is
+/// counted stale, out of the duplicates and the histogram.
 #[test]
 fn freshness_is_judged_per_path() {
-    let mut stats = PathStats::new(&config(2, 8, 8), 1, 4);
+    let mut stats = bound(2, 8);
     assert!(stats.arrived(frame(0, 0, 10), Arrival::First));
     // The same frame from path 1: a duplicate, fresh on path 1.
     assert!(stats.arrived(frame(1, 0, 12), Arrival::Duplicate));
-    // A replay on path 0, and on path 1: not fresh.
+    // A replay on each path: not fresh, stale.
     assert!(!stats.arrived(frame(0, 0, 14), Arrival::Duplicate));
     assert!(!stats.arrived(frame(1, 0, 14), Arrival::Duplicate));
     // A new frame refreshes again; an older one does not.
     assert!(stats.arrived(frame(1, 128, 20), Arrival::First));
     assert!(!stats.arrived(frame(1, 64, 21), Arrival::First));
-    // A lost path starts afresh.
-    stats.path_lost(1);
-    assert!(stats.arrived(frame(1, 64, 22), Arrival::Duplicate));
+    let counts = stats.counts(1).unwrap();
+    assert_eq!((counts.duplicates, counts.stale), (1, 1));
+    assert_eq!(counts.arrival.iter().sum::<u64>(), 1);
+    assert_eq!(stats.counts(0).unwrap().stale, 1);
     // Unknown paths and lanes record nothing.
     assert!(!stats.arrived(frame(2, 0, 30), Arrival::First));
     assert!(!stats.arrived(
@@ -190,33 +202,60 @@ fn freshness_is_judged_per_path() {
     ));
 }
 
+/// #243 review P2-1: a path's mark starts at its join, and stays across a
+/// loss, so replays of old history on a rebound path are never fresh; an
+/// unbound path records nothing.
+#[test]
+fn the_mark_starts_at_the_join_and_survives_a_loss() {
+    let mut stats = PathStats::new(&config(2, 8, 8), 1, 4);
+    assert!(!stats.arrived(frame(1, 0, 1), Arrival::Duplicate));
+    stats.path_bound(0, &[(0, 0)]);
+    stats.path_bound(1, &[(128, 0)]);
+    for position in [0, 64, 128] {
+        assert!(stats.arrived(frame(0, position, 2), Arrival::First));
+    }
+    // Path 1 joined at 128: frames ending at or below it are history.
+    assert!(!stats.arrived(frame(1, 0, 3), Arrival::Duplicate));
+    assert!(!stats.arrived(frame(1, 64, 3), Arrival::Duplicate));
+    assert!(stats.arrived(frame(1, 128, 3), Arrival::Duplicate));
+    stats.path_lost(1, &[0]);
+    assert!(!stats.arrived(frame(1, 192, 4), Arrival::Duplicate));
+    // Rebound at a lower join: the higher mark stays; replays are stale.
+    stats.path_bound(1, &[(64, 0)]);
+    for position in [0, 64, 128] {
+        assert!(!stats.arrived(frame(1, position, 5), Arrival::Duplicate));
+    }
+    assert!(stats.arrived(frame(1, 192, 6), Arrival::Duplicate));
+}
+
 /// Duplicates yield arrival differences on the receiver's clock; one whose
-/// first arrival left the ring is unmatched.
+/// first arrival left the ring is unmatched; a negative difference is 0
+/// (#243 review P2-3).
 #[test]
 fn duplicates_measure_the_arrival_difference() {
-    let mut stats = PathStats::new(&config(2, 8, 2), 1, 4);
+    let mut stats = bound(2, 2);
     stats.arrived(frame(0, 0, 1_000), Arrival::First);
     stats.arrived(frame(0, 64, 2_000), Arrival::First);
-    stats.arrived(frame(1, 64, 2_000 + 3), Arrival::Duplicate);
     stats.arrived(frame(1, 0, 1_000 + MS), Arrival::Duplicate);
+    stats.arrived(frame(1, 64, 2_000 + 3), Arrival::Duplicate);
     // Two more first arrivals push positions 0 and 64 out of the ring of
-    // 2: a late copy of 64 is unmatched.
+    // 2: a copy of 128 read before its first arrival is a 0 difference.
     stats.arrived(frame(0, 128, 3_000), Arrival::First);
     stats.arrived(frame(0, 192, 4_000), Arrival::First);
-    stats.arrived(frame(1, 64, 4_010), Arrival::Duplicate);
-    let mut late_zero = PathStats::new(&config(2, 8, 2), 1, 4);
-    late_zero.arrived(frame(0, 0, 10), Arrival::First);
-    late_zero.arrived(frame(1, 0, 10), Arrival::Duplicate);
-    assert_eq!(late_zero.counts(1).unwrap().arrival[0], 1);
-    // A copy timed before its first arrival is an accounting fault.
-    late_zero.arrived(frame(1, 0, 9), Arrival::Duplicate);
-    assert_eq!(late_zero.inconsistent(), 1);
-    assert_eq!(late_zero.counts(1).unwrap().arrival.iter().sum::<u64>(), 1);
+    stats.arrived(frame(1, 128, 2_990), Arrival::Duplicate);
     let counts = stats.counts(1).unwrap();
     assert_eq!(counts.duplicates, 3);
-    assert_eq!(counts.arrival[arrival_bucket(3)], 1);
     assert_eq!(counts.arrival[arrival_bucket(MS)], 1);
-    assert_eq!(counts.unmatched, 1);
+    assert_eq!(counts.arrival[arrival_bucket(3)], 1);
+    assert_eq!(counts.arrival[0], 1);
+    assert_eq!(stats.inconsistent(), 0);
+    let mut ring = bound(2, 2);
+    for position in [0, 64, 128] {
+        ring.arrived(frame(0, position, position), Arrival::First);
+    }
+    // Position 0 left the ring of 2.
+    ring.arrived(frame(1, 0, 500), Arrival::Duplicate);
+    assert_eq!(ring.counts(1).unwrap().unmatched, 1);
     assert_eq!(stats.counts(0).unwrap().wins, 4);
 }
 
@@ -224,45 +263,82 @@ fn duplicates_measure_the_arrival_difference() {
 /// never as delivered bytes.
 #[test]
 fn late_frames_are_counted_per_path() {
-    let mut stats = PathStats::new(&config(2, 8, 8), 1, 4);
+    let mut stats = bound(2, 8);
     stats.arrived(frame(1, 0, 1), Arrival::Late);
     stats.arrived(frame(1, 64, 2), Arrival::Late);
     stats.arrived(frame(0, 128, 3), Arrival::First);
-    stats.term_cleaned(0, 0, 64);
     assert_eq!(stats.counts(1).unwrap().late, 2);
     assert_eq!(stats.counts(0).unwrap().late, 0);
-    assert_eq!(stats.counts(1).unwrap().missing_bytes, 64);
-    assert_eq!(stats.counts(0).unwrap().missing_bytes, 0);
 }
 
-/// Missing bytes per term at its cleaning, with no bitmap: a replay on
-/// one path does not hide its losses; conflicts are counted.
+fn in_term(term: u64, delivered: Delivered) -> Delivered {
+    Delivered { term, ..delivered }
+}
+
+/// Missing bytes per whole term of a binding: a replay or a conflicting
+/// copy does not count as delivered; a never-bound path and the join's own
+/// term are not charged; bytes delivered before a loss stay; the term of
+/// the loss and later are not charged (#243 review P2-2).
 #[test]
-fn missing_bytes_follow_fresh_deliveries() {
-    let mut stats = PathStats::new(&config(2, 8, 8), 1, 4);
-    for position in [0, 64, 128] {
-        stats.arrived(frame(0, position, position), Arrival::First);
+fn missing_bytes_follow_the_binding() {
+    let mut stats = PathStats::new(&config(3, 8, 8), 1, 4);
+    stats.path_bound(0, &[(0, 0)]);
+    stats.path_bound(1, &[(0, 0)]);
+    // Term 0 is the join's: cleaned, charged to nobody.
+    stats.arrived(in_term(0, frame(0, 0, 1)), Arrival::First);
+    stats.term_cleaned(0, 0, 64);
+    // Term 1: path 0 carries 3 frames; path 1 one, then replays it and
+    // sends a conflicting copy of another.
+    for position in [64, 128, 192] {
+        stats.arrived(in_term(1, frame(0, position, position)), Arrival::First);
     }
-    // Path 1 carries only the first frame, then replays it twice.
-    stats.arrived(frame(1, 0, 5), Arrival::Duplicate);
-    stats.arrived(frame(1, 0, 6), Arrival::Duplicate);
-    stats.arrived(frame(1, 0, 7), Arrival::Conflict);
-    stats.term_cleaned(0, 0, 192);
+    stats.arrived(in_term(1, frame(1, 64, 5)), Arrival::Duplicate);
+    stats.arrived(in_term(1, frame(1, 64, 6)), Arrival::Duplicate);
+    stats.arrived(in_term(1, frame(1, 128, 7)), Arrival::Conflict);
+    stats.term_cleaned(0, 1, 192);
     assert_eq!(stats.counts(0).unwrap().missing_bytes, 0);
     assert_eq!(stats.counts(1).unwrap().missing_bytes, 128);
-    assert_eq!(stats.counts(1).unwrap().conflicts, 1);
+    assert_eq!(stats.counts(2).unwrap().missing_bytes, 0, "never bound");
+    // Term 2: path 1 delivers one frame of 4, then is lost in term 3.
+    for position in [256, 320, 384, 448] {
+        stats.arrived(in_term(2, frame(0, position, position)), Arrival::First);
+    }
+    stats.arrived(in_term(2, frame(1, 256, 9)), Arrival::Duplicate);
+    stats.path_lost(1, &[3]);
+    stats.term_cleaned(0, 2, 256);
+    assert_eq!(stats.counts(1).unwrap().missing_bytes, 128 + 192);
+    // Term 3, the loss's: not charged to path 1.
+    stats.term_cleaned(0, 3, 64);
+    assert_eq!(stats.counts(1).unwrap().missing_bytes, 128 + 192);
+    assert_eq!(stats.counts(0).unwrap().missing_bytes, 64);
     assert_eq!(stats.inconsistent(), 0);
-    // A term cleaned with more fresh bytes than committed is a fault, not
-    // a negative missing count.
-    stats.arrived(
-        Delivered {
-            term: 1,
-            ..frame(0, 192, 9)
-        },
-        Arrival::First,
-    );
-    stats.term_cleaned(0, 1, 32);
-    assert_eq!(stats.inconsistent(), 1);
+}
+
+/// Each term is cleaned once, in order; a second cleaning charges nothing
+/// and is an accounting fault.
+#[test]
+fn a_term_is_cleaned_once() {
+    let mut stats = bound(1, 8);
+    stats.term_cleaned(0, 1, 64);
+    stats.term_cleaned(0, 1, 64);
+    stats.term_cleaned(0, 0, 64);
+    assert_eq!(stats.counts(0).unwrap().missing_bytes, 64);
+    assert_eq!(stats.inconsistent(), 2);
+}
+
+/// Reordering on one path: a frame that arrives after a later one is not
+/// fresh, so it counts as missing; missing bytes are an upper bound.
+#[test]
+fn reordering_on_a_path_counts_as_missing() {
+    let mut stats = bound(2, 8);
+    for position in [0, 64] {
+        stats.arrived(in_term(1, frame(0, position, position)), Arrival::First);
+    }
+    stats.arrived(in_term(1, frame(1, 64, 5)), Arrival::Duplicate);
+    stats.arrived(in_term(1, frame(1, 0, 6)), Arrival::Duplicate);
+    stats.term_cleaned(0, 1, 128);
+    assert_eq!(stats.counts(1).unwrap().missing_bytes, 64);
+    assert_eq!(stats.counts(1).unwrap().stale, 1);
 }
 
 /// A seeded model of two paths over one lane: path 0 loses frames with
@@ -281,6 +357,9 @@ fn the_statistics_match_a_seeded_two_path_model() {
     let frames = 4_000u64;
     let term_frames = 500u64;
     let mut stats = PathStats::new(&config(2, 8, 64), 1, 4);
+    // Bound at position 0 in term 0: charged from term 1 on.
+    stats.path_bound(0, &[(0, 0)]);
+    stats.path_bound(1, &[(0, 0)]);
     let mut wins = [0u64; 2];
     let mut duplicates = [0u64; 2];
     let mut missing = [0u64; 2];
@@ -291,7 +370,7 @@ fn the_statistics_match_a_seeded_two_path_model() {
         let position = index * 64;
         let term = index / term_frames;
         let carried = [next() % 10 != 0, next() % 4 != 0];
-        let first = if next() % 2 == 0 { 0 } else { 1 };
+        let first = usize::from(next() % 2 != 0);
         let order = [first, 1 - first];
         let mut committed_by = None;
         for path in order {
@@ -326,7 +405,9 @@ fn the_statistics_match_a_seeded_two_path_model() {
         if (index + 1) % term_frames == 0 {
             stats.term_cleaned(0, term, committed);
             for path in 0..2 {
-                missing[path] += committed - delivered[path];
+                if term > 0 {
+                    missing[path] += committed - delivered[path];
+                }
                 delivered[path] = 0;
             }
             committed = 0;

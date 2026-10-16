@@ -72,10 +72,13 @@ impl<T> PathQueues<T> {
     /// path per turn, starting after the path served last.
     pub fn pop(&mut self) -> Option<(usize, T)> {
         let paths = self.queues.len();
-        for offset in 0..paths {
-            let path = (self.next + offset) % paths;
+        let start = self.next.min(paths);
+        for path in (start..paths).chain(0..start) {
             if let Some(datagram) = self.queues.get_mut(path).and_then(VecDeque::pop_front) {
-                self.next = (path + 1) % paths;
+                self.next = path
+                    .checked_add(1)
+                    .filter(|next| *next < paths)
+                    .unwrap_or(0);
                 return Some((path, datagram));
             }
         }

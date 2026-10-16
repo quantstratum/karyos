@@ -165,9 +165,10 @@ release may break APIs, wire formats and shared-memory layouts.
   detection, no window below two live paths, the larger of reorder and skew
   on unreliable channels), `queues::PathQueues` (bounded per path, drops
   counted per path, served round robin) and `stats::PathStats` (wins,
-  duplicates, conflicts, per-path `Late`, missing bytes per term from fresh
-  deliveries only, arrival differences from a ring of first arrivals per
-  lane, and freshness per path for path liveness).
+  duplicates, stale replays, conflicts, per-path `Late`, missing bytes per
+  whole term of a binding from fresh deliveries only, arrival differences
+  from a ring of first arrivals per lane, and freshness per path for path
+  liveness, the mark seeded at the path's join and kept across a loss).
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

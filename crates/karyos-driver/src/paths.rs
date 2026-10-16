@@ -107,11 +107,15 @@ fn bump(count: &mut u64, overflows: &mut u64) {
 }
 
 /// Adds `delta` to `count`, checked; an overflow leaves it and counts in
-/// `overflows`.
+/// `overflows`, itself kept at its end.
 fn add(count: &mut u64, delta: u64, overflows: &mut u64) {
     match count.checked_add(delta) {
         Some(next) => *count = next,
-        None => *overflows = overflows.saturating_add(1),
+        None => {
+            if let Some(next) = overflows.checked_add(1) {
+                *overflows = next;
+            }
+        }
     }
 }
 
