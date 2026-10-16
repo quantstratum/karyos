@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Section 12 rows on a real Linux socket over loopback (section 9,
-//! "Loopback, Linux"): RX oversize, split halves on two threads, the round
+//! Section 12 rows on a real socket over loopback (section 9, "Loopback,
+//! Linux and macOS"): RX oversize, split halves on two threads, the round
 //! trip, the buffer and path MTU probes, an unanswered port and loopback
-//! multicast. Unprivileged; the endpoint runs over [`LinuxSocket`].
+//! multicast. Unprivileged; the endpoint runs over [`OsSocket`], `rustix`
+//! on Linux and `std::net` on macOS, so every row runs on both platforms.
+//! Where the platforms differ by design (the oversize length, the buffer
+//! read back, the route MTU), the expected result is selected by platform
+//! and both are asserted, never skipped.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -15,7 +19,7 @@ use crate::backend::{
     Capability, CapabilityState, ClaimError, FlushStop, PendingCause, Reason, ReturnReason,
     RxDropReason, RxStop, TxItemOutcome,
 };
-use crate::sockets::linux::LinuxSocket;
+use crate::sockets::OsSocket;
 
 /// How long a test waits for loopback traffic that should already be there.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -34,7 +38,7 @@ fn loopback_any_port() -> SocketAddr {
 }
 
 /// [`config`] bound to `local`, without buffer requests.
-fn linux_config(local: SocketAddr) -> SocketsConfig {
+fn os_config(local: SocketAddr) -> SocketsConfig {
     let mut config = config();
     config.local = local;
     config.send_buffer = None;
@@ -44,22 +48,21 @@ fn linux_config(local: SocketAddr) -> SocketsConfig {
 
 /// An endpoint over a real socket.
 struct Node {
-    tx: SocketsTx<LinuxSocket>,
-    rx: SocketsRx<LinuxSocket>,
+    tx: SocketsTx<OsSocket>,
+    rx: SocketsRx<OsSocket>,
     local: SocketAddr,
 }
 
 impl Node {
     fn open(config: &SocketsConfig) -> Self {
-        let endpoint =
-            SocketsEndpoint::open(config, InstanceId::FIRST, LinuxSocket::new()).unwrap();
+        let endpoint = SocketsEndpoint::open(config, InstanceId::FIRST, OsSocket::new()).unwrap();
         let local = endpoint.capabilities().local;
         let (tx, rx) = endpoint.split().unwrap();
         Self { tx, rx, local }
     }
 
     fn loopback() -> Self {
-        Self::open(&linux_config(loopback_any_port()))
+        Self::open(&os_config(loopback_any_port()))
     }
 
     /// A route and a queue of 8 towards `peer`.
@@ -109,7 +112,7 @@ impl Node {
 
 /// Polls `rx` until `handler` holds `datagrams` datagrams and drops, or
 /// [`PATIENCE`] runs out.
-fn receive(rx: &mut SocketsRx<LinuxSocket>, handler: &mut Recorder, datagrams: usize) {
+fn receive(rx: &mut SocketsRx<OsSocket>, handler: &mut Recorder, datagrams: usize) {
     let budget = config().rx_budget().unwrap();
     let start = Instant::now();
     while handler.datagrams.len() + handler.drops.len() < datagrams && start.elapsed() < PATIENCE {
@@ -128,9 +131,22 @@ fn all_submitted(entries: &[TxEntry]) -> bool {
         .all(|entry| matches!(entry.outcome, TxItemOutcome::Submitted { .. }))
 }
 
+/// The length an oversize drop reports (4.4): the true length on Linux
+/// (`MSG_TRUNC`), none on macOS, where a read that fills the
+/// `max_datagram + 1` buffer is all that is known.
+fn reported_length(received: usize) -> Option<usize> {
+    if cfg!(target_os = "linux") {
+        Some(received)
+    } else {
+        None
+    }
+}
+
 /// Section 12, RX oversize: `max_datagram + 1` and 9,000 bytes are dropped
-/// as `Oversize` with the length Linux reports, never delivered short; a
-/// datagram of exactly `max_datagram` is delivered whole.
+/// as `Oversize`, never delivered short, with the length Linux reports and
+/// none on macOS; a datagram of exactly `max_datagram` is delivered whole.
+/// 9,000 bytes stays below the macOS default `net.inet.udp.maxdgram` of
+/// 9,216.
 #[test]
 fn rx_oversize_on_loopback() {
     let mut node = Node::loopback();
@@ -144,7 +160,7 @@ fn rx_oversize_on_loopback() {
     let oversize = |received| RxDrop {
         reason: RxDropReason::Oversize {
             limit: 256,
-            received: Some(received),
+            received: reported_length(received),
         },
         source: Some(source),
     };
@@ -313,7 +329,8 @@ fn split_halves_on_two_threads() {
     drop(a_tx);
 }
 
-/// Section 12, reset, on a real socket (section 9, "Loopback, Linux"):
+/// Section 12, reset, on a real socket (section 9, "Loopback, Linux and
+/// macOS"):
 /// pending items return with `Reset`; the finished reset closes the
 /// socket, which `reopen` proves by binding the same address again (an
 /// open descriptor would fail it with `EADDRINUSE`); `reopen` probes again
@@ -349,7 +366,7 @@ fn reset_on_loopback() {
             reason: ReturnReason::Reset
         }));
 
-    let snapshot = *endpoint.reopen(&linux_config(local)).unwrap();
+    let snapshot = *endpoint.reopen(&os_config(local)).unwrap();
     assert_eq!(snapshot.local, local, "the closed socket freed its port");
     assert_eq!(snapshot.epoch.get().get(), 2);
     assert_eq!(
@@ -374,12 +391,13 @@ fn reset_on_loopback() {
 
 /// The snapshot of a real socket: the probed rows, the `LibraryApi` rows of
 /// decision O-3 and the buffer read backs (section 12, buffer sizes).
+#[cfg(target_os = "linux")]
 #[test]
 fn snapshot_of_a_linux_socket() {
-    let mut wanted = linux_config(loopback_any_port());
+    let mut wanted = os_config(loopback_any_port());
     wanted.send_buffer = SocketsConfig::new(loopback_any_port()).send_buffer;
     wanted.recv_buffer = SocketsConfig::new(loopback_any_port()).recv_buffer;
-    let endpoint = SocketsEndpoint::open(&wanted, InstanceId::FIRST, LinuxSocket::new()).unwrap();
+    let endpoint = SocketsEndpoint::open(&wanted, InstanceId::FIRST, OsSocket::new()).unwrap();
     let snapshot = *endpoint.capabilities();
     assert_eq!(snapshot.platform, Platform::Linux);
     assert_ne!(snapshot.local.port(), 0);
@@ -423,7 +441,74 @@ fn snapshot_of_a_linux_socket() {
         let mut required = wanted;
         required.require = CapabilitySet::EMPTY.with(capability);
         assert_eq!(
-            SocketsEndpoint::open(&required, InstanceId::FIRST, LinuxSocket::new()).err(),
+            SocketsEndpoint::open(&required, InstanceId::FIRST, OsSocket::new()).err(),
+            Some(OpenError::RequiredCapability { capability, state })
+        );
+    }
+    let (tx, rx) = endpoint.split().unwrap();
+    let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+    assert!(retire_all(&mut endpoint).is_empty());
+}
+
+/// The snapshot of a real macOS socket (4.1, 8.1, decision O-2): what
+/// `std` cannot do is recorded, never made up. Batching is the
+/// `Fallback(Platform)` of single sends; don't fragment and the buffer
+/// requests are `Fallback(LibraryApi)` with no effective size; the
+/// decision O-3 rows are `LibraryApi` as on Linux. A required buffer or
+/// batching fails to open (8.3).
+#[cfg(target_os = "macos")]
+#[test]
+fn snapshot_of_a_macos_socket() {
+    let mut wanted = os_config(loopback_any_port());
+    wanted.send_buffer = SocketsConfig::new(loopback_any_port()).send_buffer;
+    wanted.recv_buffer = SocketsConfig::new(loopback_any_port()).recv_buffer;
+    let endpoint = SocketsEndpoint::open(&wanted, InstanceId::FIRST, OsSocket::new()).unwrap();
+    let snapshot = *endpoint.capabilities();
+    assert_eq!(snapshot.platform, Platform::MacOs);
+    assert_ne!(snapshot.local.port(), 0);
+    let library = CapabilityState::Unavailable(Reason::LibraryApi);
+    for state in [
+        snapshot.rx_batch,
+        snapshot.gso,
+        snapshot.gro,
+        snapshot.kernel_stamps,
+        snapshot.hardware_stamps,
+        snapshot.busy_poll,
+    ] {
+        assert_eq!(state, library);
+    }
+    let fallback = CapabilityState::Fallback(Reason::LibraryApi);
+    assert_eq!(snapshot.dont_fragment, fallback);
+    assert_eq!(
+        snapshot.tx_batch,
+        CapabilityState::Fallback(Reason::Platform)
+    );
+    assert_eq!(snapshot.user_observations, CapabilityState::Active);
+    assert!(!snapshot.enobufs_reported);
+    for (buffer, requested) in [
+        (snapshot.send_buffer, wanted.send_buffer),
+        (snapshot.recv_buffer, wanted.recv_buffer),
+    ] {
+        assert_eq!(
+            buffer,
+            BufferSize {
+                requested,
+                effective: None,
+                state: fallback,
+            }
+        );
+    }
+    let missing = [
+        (Capability::DontFragment, fallback),
+        (Capability::TxBatch, snapshot.tx_batch),
+        (Capability::SendBuffer, fallback),
+        (Capability::RecvBuffer, fallback),
+    ];
+    for (capability, state) in missing {
+        let mut required = wanted;
+        required.require = CapabilitySet::EMPTY.with(capability);
+        assert_eq!(
+            SocketsEndpoint::open(&required, InstanceId::FIRST, OsSocket::new()).err(),
             Some(OpenError::RequiredCapability { capability, state })
         );
     }
@@ -437,6 +522,7 @@ fn snapshot_of_a_linux_socket() {
 /// the temporary socket cannot connect to without `SO_BROADCAST`) is
 /// `Fallback(Unverified)`, or `PathUnverified` when the path MTU is
 /// required.
+#[cfg(target_os = "linux")]
 #[test]
 fn path_mtu_on_loopback() {
     let mut node = Node::loopback();
@@ -457,7 +543,7 @@ fn path_mtu_on_loopback() {
     );
     node.shutdown();
 
-    let mut required = linux_config(loopback_any_port());
+    let mut required = os_config(loopback_any_port());
     required.require = CapabilitySet::EMPTY.with(Capability::PathMtu);
     let mut node = Node::open(&required);
     assert_eq!(
@@ -469,10 +555,40 @@ fn path_mtu_on_loopback() {
     peer.shutdown();
 }
 
-/// Section 12, `ECONNREFUSED` on send, on a real socket: without
-/// `IP_RECVERR` an unconnected socket gets no ICMP error, so datagrams to a
-/// port nobody listens on are `Submitted` and neither half counts a peer
-/// error. The `PeerError` path of a reported `ECONNREFUSED` is the scripted
+/// Section 12, path MTU on macOS: no route MTU is measured (4.5), so every
+/// route, loopback included, takes the declared fallback,
+/// `Fallback(Unverified)` with no route MTU, and fails with
+/// `PathUnverified` when the path MTU is required.
+#[cfg(target_os = "macos")]
+#[test]
+fn path_mtu_on_loopback() {
+    let mut node = Node::loopback();
+    let peer = Node::loopback();
+    let route = node.tx.add_route(peer.local).unwrap();
+    assert_eq!(
+        node.tx.route_info(route).unwrap(),
+        RouteInfo {
+            route_mtu: None,
+            path_mtu: CapabilityState::Fallback(Reason::Unverified),
+        }
+    );
+    node.shutdown();
+
+    let mut required = os_config(loopback_any_port());
+    required.require = CapabilitySet::EMPTY.with(Capability::PathMtu);
+    let mut node = Node::open(&required);
+    assert_eq!(
+        node.tx.add_route(peer.local),
+        Err(RouteError::PathUnverified)
+    );
+    node.shutdown();
+    peer.shutdown();
+}
+
+/// Section 12, `ECONNREFUSED` on send, on a real socket: an unconnected
+/// socket gets no ICMP error (on Linux without `IP_RECVERR`, S-9; on macOS
+/// as on every BSD), so datagrams to a port nobody listens on are
+/// `Submitted` and neither half counts a peer error. The `PeerError` path of a reported `ECONNREFUSED` is the scripted
 /// test `econnrefused_on_send`.
 #[test]
 fn an_unanswered_port_on_loopback() {
@@ -502,11 +618,11 @@ fn an_unanswered_port_on_loopback() {
 /// A multicast endpoint on `local` joined to `group` on the default
 /// interface, or `None` when the host cannot join (a recorded skip).
 fn multicast_node(local: SocketAddr, group: Ipv4Addr, loopback: bool) -> Option<Node> {
-    let mut wanted = linux_config(local);
+    let mut wanted = os_config(local);
     let mut multicast = MulticastConfig::new(IpAddr::V4(group), InterfaceSel::Index(0));
     multicast.loopback = loopback;
     wanted.multicast = Some(multicast);
-    match SocketsEndpoint::open(&wanted, InstanceId::FIRST, LinuxSocket::new()) {
+    match SocketsEndpoint::open(&wanted, InstanceId::FIRST, OsSocket::new()) {
         Ok(endpoint) => {
             let local = endpoint.capabilities().local;
             let (tx, rx) = endpoint.split().unwrap();
@@ -523,9 +639,11 @@ fn multicast_node(local: SocketAddr, group: Ipv4Addr, loopback: bool) -> Option<
 /// joined on the default interface, the sender's own datagrams looped back
 /// (`IP_MULTICAST_LOOP`), the receiver bound to the group address so a
 /// second group on the same port is not delivered, and loop off honored.
-/// Needs an interface with a multicast route (a container's `eth0`); `lo`
-/// has no multicast flag. Cross host delivery and an explicit interface
-/// stay with the namespace rows (S4).
+/// Needs an interface with a multicast route: a container's `eth0` on
+/// Linux, where `lo` has no multicast flag, or the macOS default route
+/// interface, through which `std` also sends (no `IP_MULTICAST_IF`). A host
+/// without one records a skip. Delivery between namespaces and an explicit
+/// interface stay deferred (`DEFERRED_ROWS`).
 #[test]
 fn multicast_loopback_on_the_default_interface() {
     let group_a = Ipv4Addr::new(239, 255, 77, 1);

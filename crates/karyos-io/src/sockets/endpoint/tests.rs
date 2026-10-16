@@ -2,12 +2,11 @@
 
 //! Tests of the sockets endpoint against the scripted socket: the rows of
 //! `quantstratum-docs: karyos/design/sockets-backend.md` section 12 that
-//! need no kernel. Each test is named after its row. On Linux, `loopback`
-//! runs the rows that need only a real socket on loopback. Rows that need
-//! more are listed, with their batch, in `DEFERRED_ROWS`.
+//! need no kernel. Each test is named after its row. `loopback` runs the
+//! rows that need only a real socket on loopback, on Linux and on macOS.
+//! Rows that need more are listed, with their batch, in `DEFERRED_ROWS`.
 
 mod lifecycle;
-#[cfg(target_os = "linux")]
 mod loopback;
 mod model;
 mod rx;
@@ -25,27 +24,39 @@ use crate::backend::{
 use crate::sockets::scripted::ScriptedSocket;
 
 /// Rows of section 12 that need a real socket, kernel or driver beyond
-/// Linux loopback, and the batch that covers them. Kept as data so the
-/// coverage claim is reviewed with the code. On Linux, `loopback` covers RX
-/// oversize, split halves, the round trip, reset and reopen, the buffer
-/// read back, the unverified path MTU, the unanswered port and multicast
-/// loop within one namespace.
+/// loopback, and the batch that covers them. Kept as data so the coverage
+/// claim is reviewed with the code. `loopback` covers, on Linux and macOS,
+/// RX oversize, split halves, the round trip, reset and reopen, the buffer
+/// read back (its macOS form: the request recorded without an effective
+/// size), the unverified path MTU, the unanswered port and multicast loop
+/// on the default interface within one host or namespace.
+///
+/// The four Linux rows below cannot run in `scripts/linux-test.sh`
+/// without changing its privilege model, which is a coordinator decision
+/// (O-7): its `docker run` keeps Docker's default capabilities and seccomp
+/// profile, under which `unshare(CLONE_NEWUSER | CLONE_NEWNET)` fails with
+/// `EPERM` and `CAP_NET_ADMIN` is absent, and the `rust` image has no `ip`
+/// (iproute2).
 const DEFERRED_ROWS: &[(&str, &str)] = &[
     (
-        "RX oversize, split halves and loopback round trip on macOS",
-        "the macOS std::net batch (portable.rs)",
+        "Multicast between interfaces or namespaces (two veth ends), and \
+         no cross group delivery across them",
+        "Linux namespace gate: a container with CAP_NET_ADMIN and \
+         CAP_SYS_ADMIN (or a seccomp profile allowing unprivileged user \
+         namespaces) and iproute2; decision O-7",
     ),
     (
-        "Multicast between interfaces or namespaces",
-        "S4: network namespaces",
+        "Probes (seccomp ENOSYS and EPERM for sendmmsg): Unsupported and \
+         Denied, fallback when optional, failure when required",
+        "Linux seccomp gate: a container run with \
+         --security-opt seccomp=<profile returning ENOSYS, then EPERM, for \
+         sendmmsg>; changes scripts/linux-test.sh, decision O-7",
     ),
     (
-        "Probes (seccomp ENOSYS and EPERM)",
-        "S4: container with a seccomp profile",
-    ),
-    (
-        "Path MTU (1280 byte namespace link, MTU shrink)",
-        "S4: network namespace",
+        "Path MTU (1280 byte namespace link: PathTooSmall for 1408 bytes \
+         over IPv6; MTU shrink faults the queue with MessageTooLarge)",
+        "Linux namespace gate: CAP_NET_ADMIN to set a link MTU, in a \
+         network namespace with veth ends and iproute2; decision O-7",
     ),
     (
         "Small SO_SNDBUF on loopback: a real EAGAIN under a burst (section 9 \
@@ -83,7 +94,7 @@ const DEFERRED_ROWS: &[(&str, &str)] = &[
 /// The deferred rows are named, each with its batch.
 #[test]
 fn deferred_rows_name_their_batch() {
-    assert_eq!(DEFERRED_ROWS.len(), 7);
+    assert_eq!(DEFERRED_ROWS.len(), 6);
     assert!(
         DEFERRED_ROWS
             .iter()
