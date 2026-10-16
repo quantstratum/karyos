@@ -15,10 +15,12 @@
 //! and the protection seam of the wire data path (`protection`,
 //! `quantstratum-docs: karyos/design/measurement-harness.md` §5.2);
 //! and the persistent deficit round robin of priority lanes (`lanes`,
-//! `quantstratum-docs: karyos/design/aggregate-lanes.md`).
-//! Concurrent shared-memory access and URI parsing do not exist yet.
+//! `quantstratum-docs: karyos/design/aggregate-lanes.md`); and channel URI
+//! parsing (`channel`, SPEC.md §5). Concurrent shared-memory access does not
+//! exist yet.
 
 pub mod admission;
+pub mod channel;
 pub mod cnc;
 pub mod error;
 pub mod frame;
