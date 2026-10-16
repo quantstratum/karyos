@@ -1392,17 +1392,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // refusal is told apart from a full cell table.
         let id = found.id;
         let unavailable = |reason| DriverError::GuardWalkerUnavailable { stream: id, reason };
-        let allowed = usize::from(
-            found
-                .config
-                .spare_slots
-                .saturating_sub(karyos_sys::log_buffer::CLEANING_HEADROOM),
-        );
-        if found
-            .conductor
-            .spare_credits()
-            .checked_add(1)
-            .is_none_or(|credits| credits > allowed)
+        // A stream whose spare slots are all cleaning headroom can host no
+        // walker.
+        let allowed = found
+            .config
+            .spare_slots
+            .checked_sub(karyos_sys::log_buffer::CLEANING_HEADROOM)
+            .map(usize::from);
+        let credits = found.conductor.spare_credits().checked_add(1);
+        if allowed
+            .zip(credits)
+            .is_none_or(|(allowed, credits)| credits > allowed)
         {
             return Err(unavailable(WalkerUnavailable::NoSpareCredit));
         }
