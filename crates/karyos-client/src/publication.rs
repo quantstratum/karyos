@@ -634,13 +634,15 @@ impl<T: TermBytes> ClientPublication<T> {
         }
         let appended = match (tx_time, &mut self.schedule) {
             (Some(time), Some(binding)) => {
-                let outcome = self.inner.append_scheduled(payload, options, time)?;
-                // Back pressure from a full ring, before anything was
-                // reserved, is counted under its reason.
-                if outcome == AppendOutcome::BackPressured && !self.inner.schedule_has_room()? {
-                    crate::schedule::count(binding.counters.rejected_ring_full.as_ref());
+                match self.inner.append_scheduled(payload, options, time)? {
+                    karyos_sys::log_buffer::ScheduledOutcome::Append(outcome) => outcome,
+                    // A full ring, before anything was reserved: back
+                    // pressure, counted under its reason.
+                    karyos_sys::log_buffer::ScheduledOutcome::ScheduleFull => {
+                        crate::schedule::count(binding.counters.rejected_ring_full.as_ref());
+                        AppendOutcome::BackPressured
+                    }
                 }
-                outcome
             }
             _ => self.inner.append(payload, options)?,
         };

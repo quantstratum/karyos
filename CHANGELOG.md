@@ -145,7 +145,10 @@ release may break APIs, wire formats and shared-memory layouts.
   in each label): `timed scheduled offers`, `timed rejections` invalid, too
   far, overflow and ring full, `timed late sends`, `timed deadline aborts`
   and an 8 cell lateness histogram (`timed_gate::LATENESS_LABELS`), which a
-  `TimedGate` counts into once given them (`attach_counters`).
+  `TimedGate` counts into once given them (`attach_counters`). In
+  karyos-sys, `Publication::append_scheduled` now returns
+  `ScheduledOutcome`: an append's `AppendOutcome`, or `ScheduleFull` for a
+  full ring, so a full ring is counted exactly.
 - Timed simulator scenarios (P2.11 T1 step 6): `timed-send-late` and
   `timed-cancel` in karyos-sim's `tests/timed.rs`, 40 seeds each, drive a
   timed stream on virtual time through `ScheduleConsumer` and `TimedGate`

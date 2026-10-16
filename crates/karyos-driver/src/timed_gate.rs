@@ -111,8 +111,9 @@ pub const LATENESS_LABELS: [&str; LATENESS_BUCKETS] = [
 /// Cells of the lateness histogram.
 pub const LATENESS_BUCKETS: usize = 8;
 
-/// The histogram bucket of a lateness (`None` beyond `i64`, a clock far
-/// past the time: the last bucket).
+/// The histogram bucket of a lateness. `None`, a lateness that does not
+/// fit an `i64` (the submission and the requested time more than 2^63 ns
+/// apart, either way), goes to the last bucket.
 #[must_use]
 pub fn lateness_bucket(late: Option<i64>) -> usize {
     match late {
@@ -146,8 +147,9 @@ pub struct TimedLaneCounters {
 fn count(counter: Option<&Counter>, overflows: &mut u64) {
     if let Some(counter) = counter
         && counter.increment(1).is_err()
+        && let Some(next) = overflows.checked_add(1)
     {
-        *overflows = overflows.saturating_add(1);
+        *overflows = next;
     }
 }
 
@@ -565,8 +567,10 @@ impl<G: LaneGate> LaneGate for TimedGate<G> {
             return;
         };
         let tolerance = state.policy.tolerance;
-        let cells = state.counters.clone();
-        match state.heads.pop_front() {
+        let head = state.heads.pop_front();
+        // Borrowed, not cloned: one submission costs no reference count.
+        let cells = state.counters.as_deref();
+        match head {
             None => bump(&mut self.counts.faults, &mut self.counts.overflows),
             // The records diverged: counted, and the inner gate decides.
             Some(head) if head.ticket != staged.ticket => {
@@ -584,14 +588,13 @@ impl<G: LaneGate> LaneGate for TimedGate<G> {
                 {
                     bump(&mut self.counts.late_sends, &mut self.counts.overflows);
                     count(
-                        cells.as_ref().and_then(|cells| cells.late_sends.as_ref()),
+                        cells.and_then(|cells| cells.late_sends.as_ref()),
                         &mut self.counts.overflows,
                     );
                 }
                 let late = lateness(self.now, time);
                 count(
                     cells
-                        .as_ref()
                         .and_then(|cells| cells.lateness.get(lateness_bucket(late)))
                         .and_then(Option::as_ref),
                     &mut self.counts.overflows,

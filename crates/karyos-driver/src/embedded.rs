@@ -1897,8 +1897,24 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         // A timed lane's handle gets its schedule binding, prepared before
         // the publication is taken, so a refusal takes nothing.
-        self.ensure_timed_counters(stream)?;
+        // The binding first, so a refused one allocates no counters; then
+        // the lane's counters, which its handles share.
         let schedule = self.prepare_schedule_binding(stream)?;
+        let schedule = match schedule {
+            Some(binding) => {
+                self.ensure_timed_counters(stream)?;
+                let counters = self
+                    .stream_ref(stream)?
+                    .timed_counters
+                    .as_ref()
+                    .map(|counters| Arc::clone(&counters.offers));
+                Some(match counters {
+                    Some(counters) => binding.with_counters(counters),
+                    None => binding,
+                })
+            }
+            None => None,
+        };
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = match stream.spare.take() {
@@ -1944,11 +1960,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Some(clock) => clock.clone(),
             None => karyos_client::schedule::ScheduleClock::host(options.domain)?,
         };
-        let mut binding = karyos_client::schedule::ScheduleBinding::new(options, clock);
-        if let Some(counters) = &found.timed_counters {
-            binding = binding.with_counters(Arc::clone(&counters.offers));
-        }
-        Ok(Some(binding))
+        Ok(Some(karyos_client::schedule::ScheduleBinding::new(
+            options, clock,
+        )))
     }
 
     /// Allocates a timed lane's counters once, when its first handle is

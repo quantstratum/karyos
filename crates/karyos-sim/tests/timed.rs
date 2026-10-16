@@ -353,9 +353,7 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
         .map_err(|error| setup(format!("{error:?}")))?;
     let mut consumer = ring(&driver, handle)
         .ok_or_else(|| "no schedule ring".to_owned())
-        .and_then(|words| {
-            ScheduleConsumer::new(words, CAPACITY as usize).map_err(|error| format!("{error:?}"))
-        })
+        .and_then(|words| ScheduleConsumer::new(words).map_err(|error| format!("{error:?}")))
         .map_err(setup)?;
     let mut wire = Wire::open().map_err(setup)?;
     let mut sender = DrrConfig::new(&[256, 256], 256)
@@ -405,8 +403,13 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
         gate.set_now(now);
         // 1. A timed offer.
         if rng.chance(1, 2) {
-            let low = now.saturating_sub(2 * TOLERANCE);
-            let drawn = rng.between(low, now + HORIZON);
+            // The clock starts at START, far above both bounds.
+            let (Some(low), Some(high)) =
+                (now.checked_sub(2 * TOLERANCE), now.checked_add(HORIZON))
+            else {
+                return Err(run.fail("the clock left its range"));
+            };
+            let drawn = rng.between(low, high);
             let time = last_time.map_or(drawn, |last: u64| drawn.max(last));
             match publication.offer_at(&next_offer.to_le_bytes(), time) {
                 Ok(OfferOutcome::Accepted { position, .. }) => {
@@ -431,8 +434,10 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
             let (token, staged) = wire
                 .commit(IMMEDIATE, sequence)
                 .map_err(|reason| run.fail(reason))?;
-            gate.stage(IMMEDIATE, token, None, |_| sender.staged(IMMEDIATE, staged))
-                .map_err(|error| run.fail(format!("stage immediate: {error:?}")))?;
+            gate.stage(IMMEDIATE, token, staged.ticket, None, |_| {
+                sender.staged(IMMEDIATE, staged)
+            })
+            .map_err(|error| run.fail(format!("stage immediate: {error:?}")))?;
             pending[IMMEDIATE].push_back(Pending {
                 ticket: staged.ticket,
                 sequence: step,
@@ -478,8 +483,10 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
             let (token, staged) = wire
                 .commit(TIMED, sequence)
                 .map_err(|reason| run.fail(reason))?;
-            gate.stage(TIMED, token, time, |_| sender.staged(TIMED, staged))
-                .map_err(|error| run.fail(format!("stage timed: {error:?}")))?;
+            gate.stage(TIMED, token, staged.ticket, time, |_| {
+                sender.staged(TIMED, staged)
+            })
+            .map_err(|error| run.fail(format!("stage timed: {error:?}")))?;
             pending[TIMED].push_back(Pending {
                 ticket: staged.ticket,
                 sequence,
@@ -562,6 +569,19 @@ fn run_timed(scenario: &TimedScenario, seed: u64) -> Result<TimedReport, Failure
         if gate.deadline_missed(TIMED) {
             if !scenario.cancel_on_deadline {
                 return Err(run.fail("a miss without cancel-on-deadline"));
+            }
+            // A declared miss is a real one: the first timed head not yet
+            // submitted was past its time plus the tolerance.
+            if !report.aborted {
+                let first = pending[TIMED].iter().find_map(|head| head.time);
+                let real = first
+                    .and_then(|time| now.checked_sub(time))
+                    .is_some_and(|late| late > TOLERANCE);
+                if !real {
+                    return Err(run.fail(format!(
+                        "a miss declared at {now} with the first pending time {first:?}"
+                    )));
+                }
             }
             if !report.aborted {
                 run.note(format!("deadline missed at {now}"));

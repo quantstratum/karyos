@@ -72,12 +72,10 @@ fn timed(capacity: u32) -> LogBufferConfig {
 fn a_timed_lane_takes_scheduled_appends_only() {
     let buffer = new_buffer(timed(4)).unwrap();
     let mut publication = buffer.publication().unwrap().unwrap();
-    let not_scheduled = Err(SysError::Schedule(
-        crate::schedule_ring::ScheduleError::NotScheduled,
-    ));
+    let not_scheduled = SysError::Schedule(crate::schedule_ring::ScheduleError::NotScheduled);
     assert_eq!(
         publication.append(b"a", AppendOptions::default()),
-        not_scheduled
+        Err(not_scheduled)
     );
     assert!(matches!(
         publication.try_claim(8, AppendOptions::default()),
@@ -89,9 +87,9 @@ fn a_timed_lane_takes_scheduled_appends_only() {
     let mut plain_publication = plain.publication().unwrap().unwrap();
     assert_eq!(
         plain_publication.append_scheduled(b"a", AppendOptions::default(), 1),
-        not_scheduled
+        Err(not_scheduled)
     );
-    assert_eq!(plain_publication.schedule_has_room(), not_scheduled.map(|_| true));
+    assert_eq!(plain_publication.schedule_has_room(), Err(not_scheduled));
 }
 
 /// Times never go backwards on a timed lane, also in sys: a time below the
@@ -102,7 +100,7 @@ fn a_time_below_the_last_is_refused() {
     let mut publication = buffer.publication().unwrap().unwrap();
     assert!(matches!(
         publication.append_scheduled(b"a", AppendOptions::default(), 20),
-        Ok(AppendOutcome::Appended { .. })
+        Ok(crate::log_buffer::ScheduledOutcome::Append(AppendOutcome::Appended { .. }))
     ));
     let head = buffer.reserved_head().load(Ordering::Acquire);
     assert_eq!(
@@ -114,7 +112,7 @@ fn a_time_below_the_last_is_refused() {
     assert_eq!(buffer.reserved_head().load(Ordering::Acquire), head);
     assert!(matches!(
         publication.append_scheduled(b"c", AppendOptions::default(), 20),
-        Ok(AppendOutcome::Appended { .. })
+        Ok(crate::log_buffer::ScheduledOutcome::Append(AppendOutcome::Appended { .. }))
     ));
 }
 
@@ -127,16 +125,16 @@ fn a_full_schedule_still_observes_the_seal() {
     let mut publication = buffer.publication().unwrap().unwrap();
     assert!(matches!(
         publication.append_scheduled(b"a", AppendOptions::default(), 1),
-        Ok(AppendOutcome::Appended { .. })
+        Ok(crate::log_buffer::ScheduledOutcome::Append(AppendOutcome::Appended { .. }))
     ));
     assert_eq!(
         publication.append_scheduled(b"b", AppendOptions::default(), 2),
-        Ok(AppendOutcome::BackPressured)
+        Ok(crate::log_buffer::ScheduledOutcome::ScheduleFull)
     );
     conductor.seal().unwrap();
     assert_eq!(
         publication.append_scheduled(b"b", AppendOptions::default(), 2),
-        Ok(AppendOutcome::Closed)
+        Ok(crate::log_buffer::ScheduledOutcome::Append(AppendOutcome::Closed))
     );
     assert_ne!(buffer.exclusive_released().load(Ordering::Acquire), 0);
 }
@@ -161,7 +159,8 @@ fn the_entry_is_visible_before_the_block_is_committed() {
         })
         .unwrap();
     assert!(paused);
-    let AppendOutcome::Appended { position } = outcome else {
+    let crate::log_buffer::ScheduledOutcome::Append(AppendOutcome::Appended { position }) = outcome
+    else {
         panic!("{outcome:?}");
     };
     assert_eq!(
@@ -181,7 +180,7 @@ fn a_full_schedule_backpressures_before_reserving() {
             publication
                 .append_scheduled(b"a", AppendOptions::default(), time)
                 .unwrap(),
-            AppendOutcome::Appended { .. }
+            crate::log_buffer::ScheduledOutcome::Append(AppendOutcome::Appended { .. })
         ));
     }
     let head = buffer.reserved_head().load(Ordering::Acquire);
@@ -189,7 +188,7 @@ fn a_full_schedule_backpressures_before_reserving() {
         publication
             .append_scheduled(b"b", AppendOptions::default(), 30)
             .unwrap(),
-        AppendOutcome::BackPressured
+        crate::log_buffer::ScheduledOutcome::ScheduleFull
     );
     assert_eq!(buffer.reserved_head().load(Ordering::Acquire), head);
 }
@@ -226,11 +225,12 @@ fn scheduled_appends_keep_the_ring_in_step_with_the_log() {
                 .append_scheduled(&message(sequence), AppendOptions::default(), time)
                 .unwrap()
             {
-                AppendOutcome::Appended { position } => {
+                crate::log_buffer::ScheduledOutcome::Append(AppendOutcome::Appended { position }) => {
                     expected.push((position, time));
                     break;
                 }
-                AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
+                crate::log_buffer::ScheduledOutcome::ScheduleFull
+                | crate::log_buffer::ScheduledOutcome::Append(AppendOutcome::BackPressured | AppendOutcome::AdminAction) => {
                     refused += 1;
                     drain(&mut subscription, &mut reader, &mut seen);
                     let _ = conductor.duty_cycle().unwrap();
