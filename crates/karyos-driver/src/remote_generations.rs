@@ -58,9 +58,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .map_or(u64::MAX, |target| {
                     crate::commands::fetch_bytes(&target.buffer)
                 });
-            let admitted = self
-                .ledger(client)
-                .is_some_and(|ledger| !ledger.full() && ledger.fetchable(1, bytes));
+            // A successor waits until its fence deadline; one that cannot
+            // be represented (SPEC.md §14) gives no successor: the grant is
+            // fenced at once.
+            let fence_at = now.checked_add(deadline);
+            let admitted = fence_at.is_some()
+                && self
+                    .ledger(client)
+                    .is_some_and(|ledger| !ledger.full() && ledger.fetchable(1, bytes));
             let reserved = if admitted {
                 self.reserve_successor(stream, &old)
             } else {
@@ -86,7 +91,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             state: GrantState::Held,
                             sent: false,
                             generation,
-                            fence_at: Some(now.saturating_add(deadline)),
+                            fence_at,
                             fenced: false,
                         });
                     }

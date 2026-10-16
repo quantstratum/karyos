@@ -76,6 +76,7 @@ use karyos_protocol::cnc::{
 };
 use karyos_sys::command_ring::{RingConsumer, command_ring};
 use karyos_sys::counters::{CounterKeys, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER};
+use karyos_sys::host_clock::age_ns;
 use karyos_sys::log_buffer::{LossPolicy, PublicationEnd, Revocation, Role, SealState};
 use karyos_sys::record_journal::{JournalDrain, JournalLayout};
 use karyos_sys::registration;
@@ -244,7 +245,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let now = self.clock.now();
         let due = self
             .last_beat
-            .is_none_or(|last| now.saturating_sub(last) >= self.config.heartbeat_interval);
+            .is_none_or(|last| age_ns(now, last) >= self.config.heartbeat_interval);
         if due {
             // A closed broadcast buffer stays closed; nothing to advance.
             let _ = self.broadcast.beat();
@@ -264,7 +265,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let beat = consumer.heartbeat();
             match slot.seen {
                 Some((seen, since)) if seen == beat => {
-                    if now.saturating_sub(since) >= timeout {
+                    if age_ns(now, since) >= timeout {
                         late.push(index);
                     }
                 }
@@ -2984,6 +2985,59 @@ mod tests {
         assert!(ledger(&driver, client).is_empty());
         assert!(driver.registrations.is_empty());
         assert_eq!(counter(&driver, "grants ended"), ended + 1);
+    }
+
+    /// A fence deadline that cannot be represented (`now` plus the
+    /// cutover deadline overflows) gives no successor: the sent grant is
+    /// fenced at once (SPEC.md §14), never left waiting forever.
+    #[test]
+    fn an_unrepresentable_fence_deadline_fences_at_once() {
+        let (mut driver, stream) = driver_with_stream();
+        driver.config.cutover_deadline = u64::MAX;
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        write(
+            &mut producer,
+            Command::AddSubscription {
+                sequence: 1,
+                stream: KEY,
+                role: SubscriberRole::Required,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let old = ledger(&driver, client)[0];
+        remote_ledger(&mut driver, client).mark_sent(old.export);
+        let _ = responses(&mut observer);
+        let _ = driver
+            .reconfigure_stream(
+                stream,
+                crate::generations::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 5,
+                },
+            )
+            .unwrap();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+        }
+        assert_eq!(ledger(&driver, client).len(), 1);
+        let mut events = Vec::new();
+        while let Received::Message {
+            type_id, payload, ..
+        } = observer.receive()
+        {
+            if let Ok(event) = karyos_protocol::cnc::Event::decode(type_id, payload) {
+                events.push(event);
+            }
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                karyos_protocol::cnc::Event::Fenced { registration, .. }
+                    if *registration == old.registration
+            )),
+            "{events:?}"
+        );
     }
 
     fn allocate(sequence: u64, label: &str, stream: u64, participant: u64) -> Command {
