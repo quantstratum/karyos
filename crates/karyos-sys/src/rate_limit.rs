@@ -142,6 +142,16 @@ impl Bucket {
         }
     }
 
+    /// Gives back `tokens` taken earlier, capped at the burst: a sum that
+    /// would overflow caps the bucket too.
+    fn give(&mut self, tokens: u64) {
+        let cap = Self::cap(self.rate);
+        self.level = match Self::nanos(tokens).and_then(|back| self.level.checked_add(back)) {
+            Some(level) if level < cap => level,
+            _ => cap,
+        };
+    }
+
     /// Whole tokens held. The level is at most the burst in nano-tokens, so
     /// the quotient fits a `u64`; the burst is the unreachable fallback.
     fn tokens(&self) -> u64 {
@@ -186,12 +196,36 @@ impl RateLimiter {
     /// clock at `now` with [`age_ns`] (a backward step earns nothing and
     /// keeps the last refill time), then [`Self::try_admit`].
     pub fn admit_frame(&mut self, now: u64, length: u64, first_of_message: bool) -> bool {
+        self.refill_at(now);
+        self.try_admit(length, first_of_message)
+    }
+
+    /// Whether [`Self::try_admit`] would admit a first-send frame of
+    /// `length` bytes with the tokens held, charging nothing: a gate's
+    /// check before the frame is sent.
+    #[must_use]
+    pub fn admits(&self, length: u64, first_of_message: bool) -> bool {
+        self.admits_datagram(length, u64::from(first_of_message))
+    }
+
+    /// Whether a first-send datagram of `length` bytes that starts
+    /// `messages` messages would be admitted with the tokens held, charging
+    /// nothing. A datagram may carry several frames, each starting a
+    /// message (`quantstratum-docs: karyos/design/aggregate-lanes.md`).
+    #[must_use]
+    pub fn admits_datagram(&self, length: u64, messages: u64) -> bool {
+        let message_ok = messages == 0 || self.messages.holds(messages);
+        message_ok && self.bytes.as_ref().is_none_or(|bytes| bytes.holds(length))
+    }
+
+    /// [`Self::refill`] for the time since the last refill, read from the
+    /// clock at `now` as [`Self::admit_frame`] does, charging nothing.
+    pub fn refill_at(&mut self, now: u64) {
         let elapsed = age_ns(now, self.last);
         if elapsed > 0 {
             self.last = now;
             self.refill(elapsed);
         }
-        self.try_admit(length, first_of_message)
     }
 
     /// Admits a first-send frame of `length` bytes with the tokens held:
@@ -199,18 +233,41 @@ impl RateLimiter {
     /// byte bucket every frame costs its length. Either every bucket is
     /// charged or none is; `false` means the frame waits, in order.
     pub fn try_admit(&mut self, length: u64, first_of_message: bool) -> bool {
-        let message_ok = !first_of_message || self.messages.holds(1);
-        let bytes_ok = self.bytes.as_ref().is_none_or(|bytes| bytes.holds(length));
-        if !(message_ok && bytes_ok) {
+        self.try_admit_datagram(length, u64::from(first_of_message))
+    }
+
+    /// Admits a first-send datagram of `length` bytes that starts
+    /// `messages` messages: `messages` message tokens and, with a byte
+    /// bucket, `length` byte tokens, all or none.
+    pub fn try_admit_datagram(&mut self, length: u64, messages: u64) -> bool {
+        if !self.admits_datagram(length, messages) {
             return false;
         }
-        if first_of_message {
-            self.messages.take(1);
+        if messages > 0 {
+            self.messages.take(messages);
         }
         if let Some(bytes) = &mut self.bytes {
             bytes.take(length);
         }
         true
+    }
+
+    /// Gives back what [`Self::try_admit`] charged a frame that was not
+    /// sent after all (a reservation released), each bucket capped at its
+    /// burst. The caller refunds only a charge it made.
+    pub fn refund(&mut self, length: u64, first_of_message: bool) {
+        self.refund_datagram(length, u64::from(first_of_message));
+    }
+
+    /// Gives back what [`Self::try_admit_datagram`] charged a datagram that
+    /// was not sent after all, each bucket capped at its burst.
+    pub fn refund_datagram(&mut self, length: u64, messages: u64) {
+        if messages > 0 {
+            self.messages.give(messages);
+        }
+        if let Some(bytes) = &mut self.bytes {
+            bytes.give(length);
+        }
     }
 
     /// Whole message tokens held at the last refill.

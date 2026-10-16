@@ -27,6 +27,23 @@ release may break APIs, wire formats and shared-memory layouts.
   range), and a revoked required participant's loss record names the base
   of its incarnation plus its cell position.
 
+### Added
+
+- `karyos_driver::guard_gate::GuardGate`, the sender gate of a guarded
+  publication's lanes (G-e2): one Acquire load of the guard word per
+  check, `Aborting` and the applied epoch published once per incarnation,
+  a between gates step, and the publication's authoritative token bucket,
+  shared by its lanes, whose tokens are reserved at exposure and refunded
+  for a head that left unsent; a head it cannot pay for is held in order
+  (`GateCounts::rate_held`, not a fault).
+- `karyos_io::lanes::LaneGate::flushing` and `LaneGate::left` (default
+  no-ops) and `Left`: the sender names the lane it flushes before each
+  flush and reports each head that left its queue to its gate.
+- `karyos_sys::rate_limit::RateLimiter::admits` (a check that charges
+  nothing), `refill_at`, `refund`, and their datagram forms
+  (`admits_datagram`, `try_admit_datagram`, `refund_datagram`) for a
+  datagram that starts several messages.
+
 ## [0.1.0-alpha.1]: 2026-10-15
 
 First alpha: the embedded driver on every supported platform and the

@@ -26,6 +26,12 @@ const BOUND: u16 = 4;
 struct Gate {
     closed: [bool; 4],
     deny_exposure: bool,
+    /// Heads reported gone, by kind (submitted, returned, unknown), without
+    /// allocating, and the last one.
+    left: [u32; 3],
+    last_left: Option<(usize, TxTicket, Left)>,
+    /// Lanes announced as flushed, by lane, without allocating.
+    flushing: [u32; 4],
 }
 
 impl SenderGate for Gate {
@@ -43,6 +49,20 @@ impl SenderGate for Gate {
 impl LaneGate for Gate {
     fn admits(&mut self, lane: usize) -> bool {
         !self.closed[lane]
+    }
+
+    fn flushing(&mut self, lane: usize) {
+        self.flushing[lane] += 1;
+    }
+
+    fn left(&mut self, lane: usize, staged: Staged, how: Left) {
+        let kind = match how {
+            Left::Submitted => 0,
+            Left::Returned => 1,
+            Left::Unknown => 2,
+        };
+        self.left[kind] += 1;
+        self.last_left = Some((lane, staged.ticket, how));
     }
 }
 
@@ -263,7 +283,9 @@ fn an_unproven_exposure_suspends_its_lane_and_spends_budget() {
     f.stage(1, 50, 64);
     f.socket.push_send(SendResult::OutOfAbi { proven: 0 });
     f.accept(1);
-    let report = f.serve(&mut Gate::default(), 1000);
+    let mut gate = Gate::default();
+    let report = f.serve(&mut gate, 1000);
+    assert_eq!(gate.left, [1, 0, 1], "lane 1 submitted, lane 0 unknown");
     assert_eq!(report.drr.lanes[0].uncertain_bytes, 64);
     assert_eq!(served(&report), [0, 64]);
     assert_eq!(f.sender.suspended(0), Some(true));
@@ -665,9 +687,17 @@ fn faked(replies: Vec<fake::Reply>) -> (LaneSender, fake::Fake) {
 }
 
 fn serve_faked(sender: &mut LaneSender, backend: &mut fake::Fake) -> SenderReport {
+    serve_faked_with(sender, backend, &mut Gate::default())
+}
+
+fn serve_faked_with(
+    sender: &mut LaneSender,
+    backend: &mut fake::Fake,
+    gate: &mut Gate,
+) -> SenderReport {
     sender.serve(
         backend,
-        &mut Gate::default(),
+        gate,
         Budget {
             work: 16,
             bytes: 1000,
@@ -686,10 +716,16 @@ fn a_returned_head_is_dropped_and_the_next_one_served() {
         (Some((fake::RETURNED, fake::ticket(0))), FlushStop::Exposed),
         (Some((SUBMITTED, fake::ticket(2))), FlushStop::Exposed),
     ]);
-    let report = serve_faked(&mut sender, &mut backend);
+    let mut gate = Gate::default();
+    let report = serve_faked_with(&mut sender, &mut backend, &mut gate);
     assert_eq!(report.drr.lanes[0].served_bytes, 64);
     assert_eq!(report.drr.lanes[0].failed, 1);
     assert_eq!(sender.pending(0), Some(0));
+    // The gate hears of each flush before it and of each head that left,
+    // as it left.
+    assert_eq!(gate.flushing, [2, 1, 0, 0]);
+    assert_eq!(gate.left, [1, 1, 0]);
+    assert_eq!(gate.last_left, Some((0, fake::ticket(2), Left::Submitted)));
 }
 
 /// An endpoint resetting or retired (`Queue(NotActive)`) stops the call as
