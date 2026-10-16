@@ -53,6 +53,42 @@ fn mixed() {
     sweep("mixed");
 }
 
+/// A stall scenario: the sweep passes, and the driver revoked a client's
+/// reader in some seed, so the loss path ran.
+fn stall_sweep(name: &str) {
+    let scenario = scenarios::all()
+        .into_iter()
+        .find(|scenario| scenario.name == name)
+        .unwrap_or_else(|| panic!("no scenario {name}"));
+    let (mut accepted, mut revoked) = (0, 0);
+    for seed in scenarios::seeds() {
+        match run(&scenario, seed) {
+            Ok(report) => {
+                accepted += report.accepted;
+                revoked += report.revoked;
+            }
+            Err(failure) => panic!("{failure}"),
+        }
+    }
+    assert!(accepted > 0, "scenario {name} accepted nothing");
+    assert!(revoked > 0, "scenario {name} revoked no client");
+}
+
+#[test]
+fn stall_hold() {
+    stall_sweep("stall-hold");
+}
+
+#[test]
+fn stall_continue() {
+    stall_sweep("stall-continue");
+}
+
+#[test]
+fn stall_abort() {
+    stall_sweep("stall-abort");
+}
+
 #[test]
 fn a_seed_reproduces_its_run() {
     for scenario in scenarios::all() {

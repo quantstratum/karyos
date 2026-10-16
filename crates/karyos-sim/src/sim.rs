@@ -5,11 +5,14 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::time::Duration;
 
-use karyos_client::{ClientSubscription, MessageLimit};
+use karyos_client::{ClientConductor, ClientSubscription, MessageLimit, Outcome, PollSummary};
 use karyos_driver::{
-    DriverConfig, DriverError, EmbeddedDriver, Reconfiguration, StreamConfig, StreamHandle,
+    DriverConfig, DriverError, EmbeddedDriver, LossPolicy, Reconfiguration, StreamConfig,
+    StreamHandle,
 };
+use karyos_protocol::cnc::{StreamKey, SubscriberRole};
 use karyos_sys::error::SysError;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
@@ -26,6 +29,13 @@ use crate::rng::Rng;
 pub const CLAIM_DEADLINE: u64 = 60;
 /// Virtual time units a handle has to move at a cutover.
 pub const CUTOVER_DEADLINE: u64 = 120;
+/// The driver's heartbeat interval, in virtual time units.
+pub const HEARTBEAT_INTERVAL: u64 = 10;
+/// Virtual time units after which the driver times out a client whose
+/// heartbeat stopped.
+pub const CLIENT_TIMEOUT: u64 = 200;
+/// Commands a client's subscription may take to be served at setup.
+const SETUP_LIMIT: u32 = 1000;
 /// Steps kept in a failure's trace.
 const TRACE: usize = 48;
 /// Quiet rounds that end the drain phase.
@@ -48,6 +58,10 @@ pub struct Faults {
     pub removal: bool,
     /// A stream is reconfigured (cutover).
     pub cutover: bool,
+    /// A client stops: its heartbeat and its reads stop together, for
+    /// long enough that the driver may time it out, sometimes while its
+    /// reader holds a loan.
+    pub stall: bool,
 }
 
 /// One stream of a scenario.
@@ -61,6 +75,10 @@ pub struct StreamPlan {
     pub required: u8,
     /// Optional readers.
     pub optional: u8,
+    /// Required readers, each the only subscription of a client that
+    /// connects through a conductor and beats: the readers a stall
+    /// fault can make the driver lose.
+    pub clients: u8,
 }
 
 /// A scenario: streams, faults and a step budget.
@@ -72,6 +90,8 @@ pub struct Scenario {
     pub streams: Vec<StreamPlan>,
     /// The faults.
     pub faults: Faults,
+    /// What every stream does when it loses a required reader.
+    pub on_required_loss: LossPolicy,
     /// Steps before the drain phase.
     pub steps: u64,
 }
@@ -115,6 +135,10 @@ pub struct Report {
     pub accepted: usize,
     /// Messages delivered over all readers.
     pub delivered: usize,
+    /// Client readers the driver revoked.
+    pub revoked: usize,
+    /// Client readers revoked while they held a loan.
+    pub revoked_holding: usize,
     /// A digest of the whole trace: equal for equal seeds.
     pub digest: u64,
 }
@@ -134,6 +158,24 @@ enum Kind {
         subscription: ClientSubscription,
         view: ReaderView,
     },
+    /// A required reader whose client beats while it is not paused.
+    Client {
+        conductor: Box<ClientConductor>,
+        subscription: ClientSubscription,
+        view: ReaderView,
+        /// Virtual time of its last heartbeat.
+        last_beat: u64,
+        /// The longest gap between two heartbeats so far.
+        longest_silence: u64,
+    },
+}
+
+/// Who a client reader is, for its checks.
+struct Client {
+    id: u32,
+    stream: usize,
+    /// The longest gap between its heartbeats so far.
+    silence: u64,
 }
 
 struct Actor {
@@ -162,6 +204,8 @@ struct Sim<'s> {
     /// Reader observations so far: the drain phase ends when it stops
     /// growing.
     observed: u64,
+    /// Client readers revoked while they held a loan.
+    revoked_holding: usize,
 }
 
 /// Runs `scenario` with `seed`.
@@ -189,12 +233,54 @@ fn mode_publishers(plan: &StreamPlan) -> u8 {
     }
 }
 
+/// Connects a client through a conductor and takes a required
+/// subscription to stream `stream_id`, running the driver until it is
+/// served. The client beats on every conductor poll, and its own timeout
+/// for the driver is out of reach: only the driver's liveness decides.
+fn connect_reader(
+    driver: &mut EmbeddedDriver,
+    stream_id: i32,
+) -> Result<(ClientConductor, ClientSubscription), String> {
+    let mut conductor = driver
+        .connect()
+        .map_err(|error| format!("connect: {error}"))?;
+    conductor.set_liveness(Duration::ZERO, Duration::from_secs(3600));
+    let sequence = conductor
+        .add_subscription(
+            StreamKey {
+                stream_id,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .map_err(|error| format!("client subscribe: {error}"))?;
+    for _ in 0..SETUP_LIMIT {
+        driver
+            .do_work()
+            .map_err(|error| format!("do_work: {error}"))?;
+        let mut served = None;
+        let _ = conductor.poll(usize::MAX, |completion| {
+            if completion.sequence == sequence {
+                served = Some(completion.outcome);
+            }
+        });
+        match served {
+            Some(Outcome::Subscription(subscription)) => return Ok((conductor, subscription)),
+            Some(other) => return Err(format!("client subscribe: {other:?}")),
+            None => {}
+        }
+    }
+    Err("client subscribe: not served".into())
+}
+
 impl<'s> Sim<'s> {
     fn new(scenario: &'s Scenario, seed: u64) -> Result<Self, Failure> {
         let clock = SimClock::default();
         let config = DriverConfig {
             cutover_deadline: CUTOVER_DEADLINE,
             max_retained_generations: 2,
+            heartbeat_interval: HEARTBEAT_INTERVAL,
+            client_liveness_timeout: CLIENT_TIMEOUT,
             ..DriverConfig::default()
         };
         let fail = |reason: String| Failure {
@@ -217,7 +303,7 @@ impl<'s> Sim<'s> {
                         term_length: TermLength::try_new(MIN_TERM_LENGTH)
                             .map_err(|error| fail(format!("term: {error}")))?,
                         spare_slots: 6,
-                        max_subscribers: plan.required + plan.optional + 1,
+                        max_subscribers: plan.required + plan.optional + plan.clients + 1,
                         mtu: DEFAULT_MTU,
                         max_reserved: MIN_TERM_LENGTH / 8,
                         initial_term_id: TermId::new(7),
@@ -228,7 +314,7 @@ impl<'s> Sim<'s> {
                         publication: plan.publication,
                     },
                     allow_unconnected: true,
-                    on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                    on_required_loss: scenario.on_required_loss,
                     conflation: None,
                 })
                 .map_err(|error| fail(format!("stream: {error}")))?;
@@ -251,6 +337,18 @@ impl<'s> Sim<'s> {
                     .map_err(|error| fail(format!("subscribe: {error}")))?;
                 let view = ReaderView::new(role, subscription.position());
                 add(Kind::Reader { subscription, view });
+            }
+            for _ in 0..plan.clients {
+                let (conductor, subscription) =
+                    connect_reader(&mut driver, stream_id).map_err(fail)?;
+                let view = ReaderView::new(Role::Required, subscription.position());
+                add(Kind::Client {
+                    conductor: Box::new(conductor),
+                    subscription,
+                    view,
+                    last_beat: 0,
+                    longest_silence: 0,
+                });
             }
             match plan.publication {
                 PublicationMode::Exclusive => {
@@ -290,6 +388,7 @@ impl<'s> Sim<'s> {
             digest: 0xCBF2_9CE4_8422_2325,
             draining: false,
             observed: 0,
+            revoked_holding: 0,
         })
     }
 
@@ -328,9 +427,32 @@ impl<'s> Sim<'s> {
             .collect()
     }
 
+    /// Every client that is not paused beats, as its conductor's duty
+    /// would. A client running a poll is out of `actors` and does not.
+    fn beat(&mut self) {
+        let now = self.clock.get();
+        for actor in self.actors.iter_mut().flatten() {
+            if actor.closed || actor.paused_until > self.step {
+                continue;
+            }
+            if let Kind::Client {
+                conductor,
+                last_beat,
+                longest_silence,
+                ..
+            } = &mut actor.kind
+            {
+                let _ = conductor.poll(usize::MAX, |_| {});
+                *longest_silence = (*longest_silence).max(now - *last_beat);
+                *last_beat = now;
+            }
+        }
+    }
+
     /// One step: an actor's call, or a driver duty cycle.
     fn step(&mut self, depth: u8) -> Result<(), Failure> {
         self.step += 1;
+        self.beat();
         let runnable = self.runnable();
         let pick = self.rng.below(runnable.len() as u64 + 1) as usize;
         match runnable.get(pick) {
@@ -422,6 +544,14 @@ impl<'s> Sim<'s> {
             let steps = self.rng.between(5, 120);
             actor.paused_until = self.step + steps;
             self.note(format!("actor {} pauses for {steps}", actor.id));
+        } else if !self.draining
+            && faults.stall
+            && matches!(actor.kind, Kind::Client { .. })
+            && self.rng.chance(1, 30)
+        {
+            let steps = self.rng.between(20, 300);
+            actor.paused_until = self.step + steps;
+            self.note(format!("client {} stalls for {steps}", actor.id));
         } else {
             let result = match &mut actor.kind {
                 Kind::Exclusive(publication) => self.publish(
@@ -441,6 +571,25 @@ impl<'s> Sim<'s> {
                 Kind::Reader { subscription, view } => self
                     .read(subscription, view, actor.id, actor.stream)
                     .map(|()| false),
+                Kind::Client {
+                    subscription,
+                    view,
+                    last_beat,
+                    longest_silence,
+                    ..
+                } => {
+                    let silence = (*longest_silence).max(self.clock.get() - *last_beat);
+                    self.read_client(
+                        subscription,
+                        view,
+                        Client {
+                            id: actor.id,
+                            stream: actor.stream,
+                            silence,
+                        },
+                        depth,
+                    )
+                }
             };
             match result {
                 Ok(closed) => actor.closed |= closed,
@@ -563,6 +712,21 @@ impl<'s> Sim<'s> {
             Ok(summary) => summary,
             Err(error) => return Err(self.failure(format!("reader {id} poll: {error}"))),
         };
+        self.observe(view, id, stream, &summary, errors)
+    }
+
+    /// Checks one poll's summary, after the checks of its deliveries.
+    fn observe(
+        &mut self,
+        view: &mut ReaderView,
+        id: u32,
+        stream: usize,
+        summary: &PollSummary,
+        errors: Vec<String>,
+    ) -> Result<(), Failure> {
+        let Some(record) = self.streams.get(stream).map(|s| &s.record) else {
+            return Ok(());
+        };
         let mut checks = errors;
         if let Some(abort) = summary.aborted
             && let Err(error) = view.aborted(record, abort.position)
@@ -589,6 +753,91 @@ impl<'s> Sim<'s> {
         Ok(())
     }
 
+    /// One poll of a client's required reader. Under the stall fault the
+    /// client may stop while it holds the loan of a delivered message:
+    /// the other actors and the driver run, the driver's clock moves past
+    /// the client timeout or not, and the message must be unchanged when
+    /// the client resumes. Returns whether the reader is revoked.
+    fn read_client(
+        &mut self,
+        subscription: &mut ClientSubscription,
+        view: &mut ReaderView,
+        client: Client,
+        depth: u8,
+    ) -> Result<bool, Failure> {
+        let Client {
+            id,
+            stream,
+            silence,
+        } = client;
+        let limit = self.rng.between(1, 8) as u32;
+        let mut stall =
+            (self.scenario.faults.stall && !self.draining && depth == 0 && self.rng.chance(1, 20))
+                .then(|| self.rng.between(20, 300));
+        let mut errors = Vec::new();
+        let mut failure = None;
+        let mut held = false;
+        // The longest silence, including one in a loan stall below.
+        let mut silent = silence;
+        let polled = subscription.poll(
+            |bytes, info| {
+                let Some(record) = self.streams.get(stream).map(|s| &s.record) else {
+                    return;
+                };
+                if let Err(error) = view.message(record, info.position, bytes) {
+                    errors.push(error);
+                }
+                let Some(steps) = stall.take() else {
+                    return;
+                };
+                held = true;
+                let copy = bytes.to_vec();
+                let since = self.clock.get();
+                self.note(format!(
+                    "client {id} stalls for {steps} holding the loan at {}",
+                    info.position
+                ));
+                if let Err(error) = self.run_others(steps, depth) {
+                    failure = Some(error);
+                    return;
+                }
+                silent = silent.max(self.clock.get() - since);
+                // Whatever the policy did meanwhile, the loaned slot was
+                // not reused.
+                if bytes != copy.as_slice() {
+                    errors.push(format!("{} changed under a held loan", info.position));
+                }
+            },
+            MessageLimit::new(limit),
+        );
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        let summary = match polled {
+            Ok(summary) => summary,
+            Err(error) => return Err(self.failure(format!("client {id} poll: {error}"))),
+        };
+        let newly_revoked = summary.revoked.is_some() && view.revoked().is_none();
+        if let Some(position) = summary.revoked {
+            if let Err(error) = view.revoked_at(position) {
+                errors.push(error);
+            }
+            // The driver times out only a client silent for the timeout.
+            if silent < CLIENT_TIMEOUT {
+                errors.push(format!(
+                    "revoked at {position} after a silence of {silent} < {CLIENT_TIMEOUT}"
+                ));
+            }
+        }
+        self.observe(view, id, stream, &summary, errors)?;
+        if newly_revoked {
+            self.revoked_holding += usize::from(held);
+            self.observed += 1;
+            self.note(format!("client {id} revoked: {summary:?}"));
+        }
+        Ok(summary.revoked.is_some())
+    }
+
     /// Every pause ends; only readers and the driver run until nothing
     /// changes for a while.
     fn drain(&mut self) -> Result<(), Failure> {
@@ -604,11 +853,12 @@ impl<'s> Sim<'s> {
                 return Err(self.failure("the drain phase did not settle".into()));
             }
             let before = self.observed;
+            self.beat();
             for index in 0..self.actors.len() {
                 let is_reader = matches!(
                     self.actors.get(index),
                     Some(Some(Actor {
-                        kind: Kind::Reader { .. },
+                        kind: Kind::Reader { .. } | Kind::Client { .. },
                         ..
                     }))
                 );
@@ -631,9 +881,11 @@ impl<'s> Sim<'s> {
 
     fn finish(self) -> Result<Report, Failure> {
         let mut delivered = 0;
+        let mut revoked = 0;
         for actor in self.actors.iter().flatten() {
-            if let Kind::Reader { view, .. } = &actor.kind {
+            if let Kind::Reader { view, .. } | Kind::Client { view, .. } = &actor.kind {
                 delivered += view.delivered();
+                revoked += usize::from(view.revoked().is_some());
                 let Some(stream) = self.streams.get(actor.stream) else {
                     continue;
                 };
@@ -645,6 +897,8 @@ impl<'s> Sim<'s> {
             steps: self.step,
             accepted: self.streams.iter().map(|s| s.record.accepted_count()).sum(),
             delivered,
+            revoked,
+            revoked_holding: self.revoked_holding,
             digest: self.digest,
         })
     }

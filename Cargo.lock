@@ -324,6 +324,7 @@ dependencies = [
  "karyos-client",
  "karyos-cluster",
  "karyos-driver",
+ "karyos-protocol",
  "karyos-sys",
 ]
 

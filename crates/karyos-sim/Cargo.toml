@@ -13,6 +13,7 @@ publish.workspace = true
 [dependencies]
 karyos-sys.workspace = true
 karyos-client.workspace = true
+karyos-protocol.workspace = true
 karyos-driver.workspace = true
 karyos-archive.workspace = true
 karyos-cluster.workspace = true
