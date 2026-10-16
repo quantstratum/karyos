@@ -4436,8 +4436,11 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // Publisher credits are reserved for the buffer's life: 1 for the
         // exclusive publication, `P` for concurrent ones.
         let publishers = buffer.first_subscriber_cell() as u32;
-        let takes_credit =
-            matches!(role, Role::Optional | Role::Observer | Role::Walker) || reserve;
+        // Exhaustive over the roles, so a new role must decide.
+        let takes_credit = match role {
+            Role::Optional | Role::Observer | Role::Walker => true,
+            Role::Required => reserve,
+        };
         let credits = credited + publishers + u32::from(takes_credit);
         if credits > u32::from(buffer.spare_slots - CLEANING_HEADROOM) {
             return Err(SysError::ResourcesUnavailable);

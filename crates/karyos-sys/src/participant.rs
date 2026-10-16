@@ -43,6 +43,21 @@ pub const CELL_OBSERVER: u64 = 8;
 /// streams"). Everything else is as for [`CELL_OBSERVER`].
 pub const CELL_WALKER: u64 = 9;
 
+/// Every cell state, in value order: the one list the predicate tests
+/// enumerate, so a new state cannot be left out of them.
+pub const CELL_STATES: [u64; 10] = [
+    CELL_FREE,
+    CELL_REQUIRED,
+    CELL_OPTIONAL,
+    CELL_PUBLICATION,
+    CELL_REQUIRED_RESERVED,
+    CELL_LOST_HOLDING,
+    CELL_LOST,
+    CELL_LOST_RESERVED,
+    CELL_OBSERVER,
+    CELL_WALKER,
+];
+
 /// Whether a cell in `state` is a live reader of any role: it has a
 /// position and reads. Every site that asks about readers goes through
 /// this or one of the predicates below, never a list of states, so a new
@@ -231,7 +246,14 @@ mod tests {
             assert_eq!(is_observer_like(state), observer, "observer-like({state})");
             assert_eq!(bounds(state), bounding, "bounds({state})");
         }
-        // The table is every state there is: the next value is unused.
+        // The table covers every state, in the order of CELL_STATES, and the
+        // states are the values 0 to 9 with no gap: a new constant must be
+        // added to CELL_STATES and here.
+        let states: Vec<u64> = table.iter().map(|row| row.0).collect();
+        assert_eq!(states, CELL_STATES);
+        let expected: Vec<u64> = (0..).take(CELL_STATES.len()).collect();
+        assert_eq!(CELL_STATES.to_vec(), expected);
+        // Any other value is no reader at all.
         let next = CELL_WALKER + 1;
         assert!(!is_reader(next) && !bounds(next) && !is_observer_like(next));
         assert!(!holds_floor(next));
