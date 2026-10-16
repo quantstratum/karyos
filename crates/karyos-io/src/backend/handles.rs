@@ -16,10 +16,6 @@ use std::num::{NonZeroU16, NonZeroU32};
 use super::{BackendEpoch, RouteId, TxQueueId};
 
 /// A handle a [`HandleTable`] issues.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 pub(crate) trait Handle: Copy + Eq {
     /// Builds the handle of `index` with `generation` in `epoch`.
     fn issue(epoch: BackendEpoch, index: u16, generation: NonZeroU32) -> Self;
@@ -59,10 +55,6 @@ impl Handle for RouteId {
 
 /// Why a handle could not be issued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 pub(crate) enum IssueError {
     /// Every entry is in use.
     Full,
@@ -72,10 +64,6 @@ pub(crate) enum IssueError {
 
 /// Up to `capacity` live entries, each named by one handle.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 pub(crate) struct HandleTable<H, T> {
     entries: Box<[Option<(H, T)>]>,
     /// The epoch new handles are issued in; only handles of this epoch
@@ -88,10 +76,6 @@ pub(crate) struct HandleTable<H, T> {
 impl<H: Handle, T> HandleTable<H, T> {
     /// An empty table of `capacity` entries in `epoch`, allocated here, on
     /// the control path.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn new(capacity: NonZeroU16, epoch: BackendEpoch) -> Self {
         let entries = (0..capacity.get()).map(|_| None).collect();
         Self {
@@ -102,10 +86,6 @@ impl<H: Handle, T> HandleTable<H, T> {
     }
 
     /// Whether an entry is free.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn has_free(&self) -> bool {
         self.entries.iter().any(Option::is_none)
     }
@@ -121,10 +101,6 @@ impl<H: Handle, T> HandleTable<H, T> {
 
     /// Stores `value` in the first free entry and returns its handle,
     /// issued in the table's epoch.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn insert(&mut self, value: T) -> Result<H, IssueError> {
         let (index, free) = self
             .entries
@@ -146,10 +122,6 @@ impl<H: Handle, T> HandleTable<H, T> {
 
     /// The entry `handle` names, if it is live: its epoch is the table's,
     /// and the index and generation match.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn get(&self, handle: H) -> Option<&T> {
         if handle.issue_epoch() != self.epoch {
             return None;
@@ -161,10 +133,6 @@ impl<H: Handle, T> HandleTable<H, T> {
     }
 
     /// The entry `handle` names, mutably, if it is live.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn get_mut(&mut self, handle: H) -> Option<&mut T> {
         if handle.issue_epoch() != self.epoch {
             return None;
@@ -176,10 +144,6 @@ impl<H: Handle, T> HandleTable<H, T> {
     }
 
     /// Removes the entry `handle` names, if it is live.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn remove(&mut self, handle: H) -> Option<T> {
         if handle.issue_epoch() != self.epoch {
             return None;
@@ -194,20 +158,12 @@ impl<H: Handle, T> HandleTable<H, T> {
     /// Removes every entry and moves the table to `new_epoch` (reset), so
     /// no handle of an earlier epoch matches again. The generation counter
     /// is kept.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn clear(&mut self, new_epoch: BackendEpoch) {
         self.entries.iter_mut().for_each(|entry| *entry = None);
         self.epoch = new_epoch;
     }
 
     /// The live entries with their handles.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn iter(&self) -> impl Iterator<Item = (H, &T)> {
         self.entries
             .iter()

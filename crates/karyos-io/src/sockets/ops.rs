@@ -8,6 +8,9 @@
 
 use std::net::SocketAddr;
 
+use super::endpoint::{BufferSize, Membership, SocketsConfig};
+use crate::backend::{CapabilityState, OpenError};
+
 /// The destination of a route, stored once at `add_route` so sends never
 /// convert or allocate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,15 +159,72 @@ mod codes {
     pub(super) const ENOSYS: i32 = 78;
 }
 
-/// The only place that performs socket system calls. Both calls are
-/// nonblocking: they never wait, poll a descriptor or retry.
-pub trait SocketOps {
+/// The only place that performs socket system calls.
+///
+/// The data calls, [`send`](Self::send) and [`recv`](Self::recv), are
+/// nonblocking: they never wait, poll a descriptor or retry. The other
+/// methods run on the control path only: `open` and `reopen` create and
+/// configure the socket ([`open`](Self::open)), `reset` and `retire` close
+/// it ([`close`](Self::close)), `split` duplicates its descriptor
+/// ([`try_clone`](Self::try_clone)) and `add_route` measures the route MTU
+/// ([`route_mtu`](Self::route_mtu)), sections 3.8, 3.10, 4.1 and 4.5.
+pub trait SocketOps: Sized {
     /// Sends `datagrams`, in order, to `route`: one `sendmmsg`, or single
     /// sends stopping at the first error.
     fn send(&mut self, route: &RouteAddr, datagrams: &[&[u8]]) -> SendResult;
 
     /// Receives one datagram into `buffer`.
     fn recv(&mut self, buffer: &mut [u8]) -> RecvResult;
+
+    /// Creates, configures and binds the socket for `config` (4.1) and
+    /// runs the probes of 8.2. A failure leaves no socket open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenError::Os`] when a setup call fails; no partial socket
+    /// is kept.
+    fn open(&mut self, config: &SocketsConfig) -> Result<SocketProbes, OpenError>;
+
+    /// Closes this descriptor. Datagrams still in the kernel send buffer may
+    /// go out; neither direction touches user memory afterwards. Closing a
+    /// closed socket does nothing.
+    fn close(&mut self);
+
+    /// Duplicates the descriptor for the other half of `split` (3.10):
+    /// `fcntl_dupfd_cloexec` on Linux, `UdpSocket::try_clone` on macOS.
+    /// Closing either descriptor leaves the other working.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error of the duplication.
+    fn try_clone(&self) -> Result<Self, Errno>;
+
+    /// Measures the route MTU towards `route` (4.5): `IP_MTU` or
+    /// `IPV6_MTU` on a connected temporary socket on Linux. `None` when it
+    /// cannot be measured, always on macOS, which selects the declared
+    /// fallback.
+    fn route_mtu(&mut self, route: &RouteAddr) -> Option<u32>;
+}
+
+/// What [`SocketOps::open`] established about the new socket: the platform
+/// dependent rows of the capability snapshot (8.1); the endpoint adds the
+/// rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SocketProbes {
+    /// The bound local address, with the port the kernel chose for port 0.
+    pub local: SocketAddr,
+    /// Index of the interface owning `local`; `None` for a wildcard.
+    pub interface: Option<u32>,
+    /// `IP_MTU_DISCOVER` set to `Do` and read back.
+    pub dont_fragment: CapabilityState,
+    /// The `sendmmsg` probe.
+    pub tx_batch: CapabilityState,
+    /// The send buffer request and its read back.
+    pub send_buffer: BufferSize,
+    /// The receive buffer request and its read back.
+    pub recv_buffer: BufferSize,
+    /// The joined group, when the configuration has one.
+    pub multicast: Option<Membership>,
 }
 
 /// The result of one [`SocketOps::send`].
@@ -180,6 +240,17 @@ pub enum SendResult {
     },
     /// The call failed before handing off any datagram.
     Error(Errno),
+    /// The call returned a result outside its documented ABI (4.3): a
+    /// `msg_len` (`MMsgHdr::bytes_sent`) or a single send result that is
+    /// not the datagram's length. Only the first `proven` datagrams carry a
+    /// valid length; the exposure of every later datagram of the call is
+    /// unproven. A count above the request is detected by the endpoint
+    /// from [`SendResult::Sent`].
+    OutOfAbi {
+        /// Datagrams, from the first, whose acceptance a valid length
+        /// proves.
+        proven: usize,
+    },
 }
 
 /// The result of one [`SocketOps::recv`].

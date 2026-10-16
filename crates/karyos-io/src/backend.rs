@@ -16,12 +16,10 @@
 
 #![forbid(unsafe_code)]
 
-// The sockets endpoint (P2.3 batch S2) is the first user of the handle
-// table, the slot pool, the queue table and the ledger; until then only
-// their unit tests use them, and each unused item carries its own
-// `expect(dead_code)`, which S2 removes item by item.
-mod handles;
-mod ledger;
+// The handle table, the slot pool, the queue table and the ledger: the
+// building blocks of the sockets endpoint.
+pub(crate) mod handles;
+pub(crate) mod ledger;
 mod pool;
 mod queues;
 
@@ -192,10 +190,6 @@ impl SubmissionId {
     /// Builds the identity of one claim of `slot`.
     #[inline]
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) const fn new(
         instance: InstanceId,
         epoch: BackendEpoch,
@@ -249,10 +243,6 @@ impl TxTicket {
     /// The ticket of the pending item `id`.
     #[inline]
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) const fn new(id: SubmissionId) -> Self {
         Self(id)
     }
@@ -613,10 +603,6 @@ impl TxReport {
     /// Starts filling the report: `None` when it still holds entries, which
     /// the calling operation turns into its `ReportNotEmpty` result before
     /// it calls a gate or the kernel and before it changes any state.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn writer(&mut self) -> Option<ReportWriter<'_>> {
         if self.is_empty() {
             self.head = 0;
@@ -635,18 +621,10 @@ impl Default for TxReport {
 
 /// Appends entries to a report that was empty when the call started.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 pub(crate) struct ReportWriter<'a> {
     report: &'a mut TxReport,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-)]
 impl ReportWriter<'_> {
     /// Entries the report can still take.
     pub(crate) fn remaining(&self) -> usize {
@@ -746,6 +724,11 @@ pub enum PendingCause {
     PeerError,
     /// The queue head failed with this error; the queue is faulted.
     Faulted(SendError),
+    /// The call failed in a way that ends the half (`EBADF`, `ENOTSOCK`,
+    /// `EFAULT`, `EINVAL`, section 4.7) before handing off this item; the
+    /// flush stopped with [`FlushStop::Failed`] and the control path must
+    /// reset the endpoint, which returns the item.
+    Failed(BackendFailure),
 }
 
 /// Why an item was returned without exposure.
@@ -1065,6 +1048,10 @@ pub enum BackendFailure {
         /// The operation whose result broke its contract.
         operation: &'static str,
     },
+    /// The endpoint is resetting, reset or retired: the half makes no
+    /// system call until the control path reopens it (section 7.3).
+    #[error("endpoint is not active")]
+    NotActive,
 }
 
 /// Why a queue operation failed.
@@ -1142,6 +1129,9 @@ pub enum RouteError {
     /// Route generations are exhausted for the instance. Terminal.
     #[error("route identities exhausted")]
     IdentityExhausted,
+    /// The endpoint is resetting, reset or retired.
+    #[error("endpoint is not active")]
+    NotActive,
 }
 
 /// Why an endpoint could not open, reopen or retire.
@@ -1183,6 +1173,9 @@ pub enum OpenError {
     /// `reopen` or `retire` while pending items remain unreturned.
     #[error("reset incomplete: pending items remain")]
     ResetIncomplete,
+    /// `reopen` of a retired endpoint: retirement is final.
+    #[error("endpoint is retired")]
+    Retired,
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,10 +1206,6 @@ pub struct RxDatagram<'a> {
 
 impl<'a> RxDatagram<'a> {
     /// Lends `bytes`, received from `source` on `path` in `epoch`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) const fn new(
         bytes: &'a [u8],
         source: SocketAddr,
