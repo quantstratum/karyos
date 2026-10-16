@@ -13,7 +13,19 @@
 
 use std::sync::Mutex;
 
+use karyos_io::sockets::scripted::ScriptedSocket;
+
 use super::*;
+
+type S = ScriptedSocket;
+
+/// A ping reply as a comparable pair.
+fn pong(event: &AgentEvent<S>) -> Option<(AgentKind, u64)> {
+    match event {
+        AgentEvent::Pong { agent, token } => Some((*agent, *token)),
+        _ => None,
+    }
+}
 
 const MODES: [ThreadingMode; 3] = [
     ThreadingMode::Shared,
@@ -21,24 +33,28 @@ const MODES: [ThreadingMode; 3] = [
     ThreadingMode::Dedicated,
 ];
 
-fn new_agents(config: AgentConfig) -> (NetworkAgents, AgentLinks) {
+fn new_agents(config: AgentConfig) -> (NetworkAgents<S>, AgentLinks<S>) {
     network_agents(config).unwrap()
 }
 
-fn start(mode: ThreadingMode, agents: NetworkAgents, config: AgentConfig) -> AgentRunner {
+fn start(mode: ThreadingMode, agents: NetworkAgents<S>, config: AgentConfig) -> AgentRunner<S> {
     AgentRunner::start(mode, agents, config, YieldThenSleep::default).unwrap()
 }
 
 /// Collects `count` events from `link`, driving `agents` when they run on
 /// this thread, within a bounded number of tries.
-fn events(link: &AgentLink, agents: &mut Option<NetworkAgents>, count: usize) -> Vec<AgentEvent> {
+fn events(
+    link: &AgentLink<S>,
+    agents: &mut Option<NetworkAgents<S>>,
+    count: usize,
+) -> Vec<(AgentKind, u64)> {
     let mut seen = Vec::new();
     for _ in 0..100_000 {
         if let Some(agents) = agents.as_mut() {
             agents.do_work(0).unwrap();
         }
         while let Some(event) = link.take_event() {
-            seen.push(event);
+            seen.extend(pong(&event));
         }
         if seen.len() >= count {
             return seen;
@@ -49,7 +65,7 @@ fn events(link: &AgentLink, agents: &mut Option<NetworkAgents>, count: usize) ->
 }
 
 /// Waits until `runner` reports `kind` failed.
-fn wait_failed(runner: &AgentRunner, kind: AgentKind) {
+fn wait_failed(runner: &AgentRunner<S>, kind: AgentKind) {
     for _ in 0..10_000 {
         if runner.failed().contains(&kind) {
             return;
@@ -113,9 +129,13 @@ fn the_configuration_is_checked() {
             command_budget: 0,
             ..AgentConfig::default()
         },
+        AgentConfig {
+            max_endpoints: 0,
+            ..AgentConfig::default()
+        },
     ] {
         assert!(matches!(
-            network_agents(config),
+            network_agents::<S>(config),
             Err(AgentError::InvalidConfig(_))
         ));
     }
@@ -139,11 +159,8 @@ fn a_command_needs_its_reply_slot() {
     );
     agents.do_work(0).unwrap();
     assert_eq!(
-        links.sender.take_event(),
-        Some(AgentEvent::Pong {
-            agent: AgentKind::Sender,
-            token: 1
-        })
+        links.sender.take_event().as_ref().and_then(pong),
+        Some((AgentKind::Sender, 1))
     );
     links.sender.ping(3).unwrap();
 }
