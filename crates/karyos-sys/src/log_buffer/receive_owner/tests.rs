@@ -1756,3 +1756,20 @@ fn last_one_scans_down_whole_words() {
     assert_eq!(last_one(128 + 63, word), Some(128 + 63));
     assert_eq!(last_one(1000, word), Some(128 + 63));
 }
+
+/// GU-11: a gap counter increment that would overflow keeps the value and
+/// sets the sticky flag; other counters still count.
+#[test]
+fn gap_counters_never_wrap() {
+    let mut counters = GapCounters {
+        gap_bytes: u64::MAX - 10,
+        ..GapCounters::default()
+    };
+    counters.sealed(64, crate::local_gap::GapReason::ReorderExpired);
+    assert_eq!(counters.gap_bytes, u64::MAX - 10);
+    assert!(counters.overflowed);
+    assert_eq!((counters.gaps_sealed, counters.reorder_expired), (1, 1));
+    counters.sealed(32, crate::local_gap::GapReason::RangeUnavailable);
+    assert_eq!(counters.range_unavailable_skips, 1);
+    assert!(counters.overflowed, "sticky");
+}

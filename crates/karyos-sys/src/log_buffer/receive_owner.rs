@@ -431,19 +431,21 @@ impl<T: TermBytes> ReceiveOwner<T> {
 
     /// Whether `position` of `lane` lies in the window `{r, r + 1}` of
     /// terms, `r` the term of the resolved prefix (GU-6: a position beyond
-    /// it cannot be resumed).
+    /// it cannot be resumed). A position outside the incarnation, which a
+    /// peer may report, is outside the window.
     ///
     /// # Errors
     ///
-    /// [`ReceiveError::Foreign`] for a lane the image does not have,
-    /// [`ReceiveError::Sys`] for a position outside the incarnation.
+    /// [`ReceiveError::Foreign`] for a lane the image does not have.
     pub fn within_window(&self, lane: Lane, position: u64) -> Result<bool, ReceiveError> {
         let owner = self
             .lanes
             .get(usize::from(lane.get()))
             .ok_or(ReceiveError::Foreign)?;
         let (r, _) = owner.split_end(owner.rebuild)?;
-        let (count, _) = owner.buffer.split(position)?;
+        let Ok((count, _)) = owner.buffer.split(position) else {
+            return Ok(false);
+        };
         Ok(count.get() <= r.get().saturating_add(1))
     }
 
@@ -453,6 +455,15 @@ impl<T: TermBytes> ReceiveOwner<T> {
     #[must_use]
     pub fn received_high_water(&self, lane: Lane) -> Option<u64> {
         self.lanes.get(usize::from(lane.get())).map(|l| l.received)
+    }
+
+    /// Makes the next advance of `lane`'s resolved prefix fail with
+    /// `error`.
+    #[cfg(test)]
+    pub(crate) fn fail_next_advance(&mut self, lane: Lane, error: SysError) {
+        if let Some(owner) = self.lanes.get_mut(usize::from(lane.get())) {
+            owner.fail_advance = Some(error);
+        }
     }
 
     /// The local gap counters of `lane` (GU-11).
@@ -525,6 +536,10 @@ struct LaneOwner<T: TermBytes> {
     loans: [Option<(TermCount, u8)>; 2],
     /// Set when the last receive found the next term unprepared.
     lagged: bool,
+    /// Returned by the next `advance`: tests reproduce a failure after a
+    /// gap record was published.
+    #[cfg(test)]
+    fail_advance: Option<SysError>,
 }
 
 impl<T: TermBytes> LaneOwner<T> {
@@ -552,6 +567,8 @@ impl<T: TermBytes> LaneOwner<T> {
             sets: [set(), set(), set(), set()],
             loans: [None, None],
             lagged: false,
+            #[cfg(test)]
+            fail_advance: None,
         }
     }
 
@@ -729,6 +746,9 @@ impl<T: TermBytes> LaneOwner<T> {
             session_id: buffer.config.session_id,
             stream_id: buffer.config.stream_id,
         };
+        // Borrowed before the publication: nothing after it may fail before
+        // the record is in the owner's maps.
+        let set = self.set_mut(index)?;
         // SAFETY: the owner holds the write loan on `slot`'s current term;
         // the 24 bytes start 8 bytes into the record, a multiple of 8, and
         // lie inside its extent (at least 32), which the owner's record
@@ -743,7 +763,6 @@ impl<T: TermBytes> LaneOwner<T> {
         // SAFETY: write loan held; `offset` is the start of this record.
         let first = unsafe { buffer.regions.word0(slot, offset) };
         publish_block(first, word0);
-        let set = self.set_mut(index)?;
         set_bit(&mut set.gap_starts, unit);
         set_range(&mut set.covered, unit, units);
         self.high = self.high.max(end);
@@ -942,6 +961,10 @@ impl<T: TermBytes> LaneOwner<T> {
     /// Advances the rebuild position over every covered unit from it,
     /// publishes it, and moves the window when it crosses a term end.
     fn advance(&mut self) -> Result<(), SysError> {
+        #[cfg(test)]
+        if let Some(error) = self.fail_advance.take() {
+            return Err(error);
+        }
         let buffer = Arc::clone(&self.buffer);
         // At most the two window terms can be crossed in one advance.
         for _ in 0..3 {
@@ -1128,8 +1151,16 @@ fn overlaps_real(set: &Set, unit: usize, units: usize) -> bool {
         }
     }
     // No start lies past the map: stop the search at its end.
-    let end = unit.saturating_add(units).min(set.starts.len() * WORD_BITS);
-    any_set(&set.starts, unit, end.saturating_sub(unit))
+    let Some(map_end) = set.starts.len().checked_mul(WORD_BITS) else {
+        // A map too large to address: the conservative answer.
+        return true;
+    };
+    let end = unit
+        .checked_add(units)
+        .map_or(map_end, |end| end.min(map_end));
+    // A range starting past the map meets no start.
+    end.checked_sub(unit)
+        .is_some_and(|len| any_set(&set.starts, unit, len))
 }
 
 /// Word `index` of `bits`; zero past its end.
@@ -1144,7 +1175,9 @@ fn last_one(at: usize, word: impl Fn(usize) -> u64) -> Option<usize> {
     let mut value = word(index) & mask(0, at % WORD_BITS + 1);
     loop {
         if value != 0 {
-            return Some(index * WORD_BITS + (WORD_BITS - 1 - value.leading_zeros() as usize));
+            // `value` is non-zero: `ilog2` is its highest set bit, below 64.
+            let bit = usize::try_from(value.ilog2()).ok()?;
+            return index.checked_mul(WORD_BITS)?.checked_add(bit);
         }
         index = index.checked_sub(1)?;
         value = word(index);
