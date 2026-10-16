@@ -15,7 +15,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use karyos_client::ipc::{RemoteClient, attach};
+use karyos_client::ipc::{AttachError, ConflatedLimits, RemoteClient, attach};
 use karyos_client::{ClientPublication, Completion, FetchableConflated, OfferOutcome, Outcome};
 use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, StreamConfig, SystemClock};
 use karyos_protocol::admission::{MAX_MESSAGE_LENGTH, Message, RegionKind, refusal};
@@ -229,6 +229,7 @@ fn a_fetched_conflated_view_reads_the_table_read_only() {
         FetchableConflated {
             key: fetchable.registration,
             registration: fetchable.registration,
+            stream: KEY,
             keys: 4,
             value_capacity: 8,
             journal_capacity: 1024,
@@ -545,4 +546,125 @@ fn a_view_record_carries_the_lane() {
     };
     assert_eq!(records[0].lane, 2);
     let _ = next_message(&mut driver, socket);
+}
+
+/// `take_conflated` maps the table read-only and reads the latest values;
+/// dropping the view unmaps it and sends its `Detach`, which ends the
+/// grant.
+#[test]
+fn a_taken_view_reads_and_detaches_on_drop() {
+    let dir = dir("take");
+    let mut driver = driver(&dir);
+    let stream = driver.add_stream(stream_config(2, Some(TABLE))).unwrap();
+    let mut client = attach_serving(&mut driver, &dir);
+    let Outcome::FetchableConflated(fetchable) = request_view(&mut driver, &mut client, KEY) else {
+        panic!("expected a fetchable view");
+    };
+    let mut view = serve_while(&mut driver, || {
+        client.take_conflated(&fetchable, BUDGET, ConflatedLimits::default())
+    })
+    .unwrap();
+    let mut publication = driver.publication(stream).unwrap();
+    offer_keyed(&mut driver, &mut publication, 3, b"latest");
+    let mut seen = Vec::new();
+    let start = Instant::now();
+    while seen.is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "nothing delivered"
+        );
+        let _ = driver.do_work().unwrap();
+        let _ = view.poll_changed(|key, value| seen.push((key, value.to_vec())));
+    }
+    assert_eq!(seen, vec![(3, b"latest".to_vec())]);
+    assert_eq!(counter(&driver, "grants exported"), 1);
+    drop(view);
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants detached") == 1
+    });
+    assert_eq!(counter(&driver, "grants ended"), 1);
+}
+
+/// A take that fails rolls back: a configuration over each of the view's
+/// limits, a record of another stream, a configuration whose length is
+/// not the region's (refused before mapping) and one of the same length
+/// that the region does not hold each fail, and the grant is detached and
+/// ended.
+#[test]
+fn a_failed_take_is_rolled_back() {
+    let dir = dir("rollback");
+    let mut driver = driver(&dir);
+    let _stream = driver.add_stream(stream_config(2, Some(TABLE))).unwrap();
+    let mut client = attach_serving(&mut driver, &dir);
+    let cases: [(Change, Expected); 6] = [
+        (
+            |_, limits| limits.max_keys = 3,
+            |error| matches!(error, AttachError::TooLarge),
+        ),
+        (
+            |_, limits| limits.max_value_capacity = 7,
+            |error| matches!(error, AttachError::TooLarge),
+        ),
+        (
+            |_, limits| limits.max_journal_capacity = 512,
+            |error| matches!(error, AttachError::TooLarge),
+        ),
+        (
+            |fetchable, _| fetchable.stream.stream_id = 9,
+            |error| matches!(error, AttachError::Protocol),
+        ),
+        // A configuration of another length: refused before mapping.
+        (
+            |fetchable, _| fetchable.keys = 3,
+            |error| matches!(error, AttachError::Protocol),
+        ),
+        // One of the same length (value capacities 8 and 16 take the same
+        // slot words) that the region does not hold: its header check.
+        (
+            |fetchable, _| fetchable.value_capacity = 16,
+            |error| matches!(error, AttachError::Sys(SysError::InvalidRegion { .. })),
+        ),
+    ];
+    for (case, (change, expected)) in cases.into_iter().enumerate() {
+        let Outcome::FetchableConflated(mut fetchable) =
+            request_view(&mut driver, &mut client, KEY)
+        else {
+            panic!("expected a fetchable view");
+        };
+        let mut limits = ConflatedLimits::default();
+        change(&mut fetchable, &mut limits);
+        let Err(error) = serve_while(&mut driver, || {
+            client.take_conflated(&fetchable, BUDGET, limits)
+        }) else {
+            panic!("case {case}: the take succeeded");
+        };
+        assert!(expected(&error), "case {case}: {error:?}");
+        let ended = case as u64 + 1;
+        serve_until(&mut driver, |driver| {
+            counter(driver, "grants detached") == ended
+        });
+        assert_eq!(counter(&driver, "grants ended"), ended);
+    }
+}
+
+/// A change to a view's answer or limits before its take.
+type Change = fn(&mut FetchableConflated, &mut ConflatedLimits);
+/// What a failed take must report.
+type Expected = fn(&AttachError) -> bool;
+
+const BUDGET: Budget = Budget {
+    keys: 16,
+    retries: 4,
+};
+
+/// Runs `client` on another thread while this one runs duty cycles.
+fn serve_while<R: Send>(driver: &mut IpcDriver, client: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| {
+        let handle = scope.spawn(client);
+        while !handle.is_finished() {
+            let _ = driver.do_work().unwrap();
+            std::thread::yield_now();
+        }
+        handle.join().unwrap()
+    })
 }

@@ -69,6 +69,7 @@ use karyos_protocol::cnc::{Event, StreamKey, SubscriberRole};
 use karyos_protocol::trace_hook::PublicationIdentity;
 use karyos_sys::broadcast::BroadcastReceiver;
 use karyos_sys::command_ring::RingProducer;
+use karyos_sys::conflation::{Budget, ConflationConfig, ConflationReader};
 use karyos_sys::counters::{CellRead, ClientCells, CountersReader};
 use karyos_sys::error::SysError;
 use karyos_sys::ipc::{self, PidFd, ReadOnlyRegion, Recv, Region, RegionRecord, SealProfile, Sent};
@@ -80,8 +81,10 @@ use karyos_sys::term_bytes::SharedTerms;
 
 use crate::concurrent::ClientConcurrentPublication;
 use crate::conductor::{
-    ClientConductor, Completion, ConductorError, ConductorPoll, Fetchable, Request,
+    ClientConductor, Completion, ConductorError, ConductorPoll, Fetchable, FetchableConflated,
+    Request,
 };
+use crate::conflated_subscription::ConflatedSubscription;
 use crate::error::ClientError;
 use crate::generation::{GenerationLink, Successor};
 use crate::journal::{ClientJournal, FetchableJournal};
@@ -117,6 +120,55 @@ pub enum AttachError {
     /// A system call or a region check failed.
     #[error(transparent)]
     Sys(#[from] SysError),
+    /// A conflated view's table exceeds the limits the view accepts
+    /// ([`ConflatedLimits`]); nothing was mapped and the grant was
+    /// detached.
+    #[error("the conflation table exceeds the view's limits")]
+    TooLarge,
+}
+
+/// What a remote conflated view accepts of its table's configuration,
+/// checked before anything is mapped or allocated for it: the reader's
+/// private state grows with the key count and the value capacity, and its
+/// copy buffer with the journal capacity (`quantstratum-docs:
+/// karyos/design/conflation-end-to-end.md`, Cross-process views).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConflatedLimits {
+    /// Most keys.
+    pub max_keys: u32,
+    /// Largest value capacity in bytes.
+    pub max_value_capacity: usize,
+    /// Largest journal capacity in bytes.
+    pub max_journal_capacity: usize,
+}
+
+impl Default for ConflatedLimits {
+    /// 2^20 keys, 64 KiB values and a 64 MiB journal: provisional
+    /// defaults, to be calibrated before the release (coordinator
+    /// decision, ACS 14545); a view passes its own limits to
+    /// [`RemoteClient::take_conflated`].
+    fn default() -> Self {
+        Self {
+            max_keys: 1 << 20,
+            max_value_capacity: 1 << 16,
+            max_journal_capacity: 1 << 26,
+        }
+    }
+}
+
+impl ConflatedLimits {
+    /// The configuration of `fetchable`, if it is within these limits.
+    fn admit(&self, fetchable: &FetchableConflated) -> Option<ConflationConfig> {
+        let config = ConflationConfig {
+            keys: fetchable.keys,
+            value_capacity: usize::try_from(fetchable.value_capacity).ok()?,
+            journal_capacity: usize::try_from(fetchable.journal_capacity).ok()?,
+        };
+        (config.keys <= self.max_keys
+            && config.value_capacity <= self.max_value_capacity
+            && config.journal_capacity <= self.max_journal_capacity)
+            .then_some(config)
+    }
 }
 
 /// A client admitted by a driver in another process.
@@ -756,6 +808,70 @@ impl RemoteClient {
         }
     }
 
+    /// Takes the view of a [`FetchableConflated`]: fetches its table's
+    /// region, checks the configuration of the answer against `limits`,
+    /// the record against the stream requested and the length that
+    /// configuration implies, maps the region read-only
+    /// (the driver-only seal profile) and requires the configuration of
+    /// the table, then returns a view that polls with `budget` and whose
+    /// drop unmaps the table and sends the grant's `Detach`. Blocks at most
+    /// the attach timeout per message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttachError::Refused`] when the driver refuses the fetch,
+    /// [`AttachError::TooLarge`] for a configuration over `limits`,
+    /// [`AttachError::Protocol`] for a manifest or record that does not
+    /// match the view, [`AttachError::Timeout`], and [`AttachError::Sys`]
+    /// for a region of another kind, profile or configuration. Whatever
+    /// arrived is closed and detached: the take is rolled back.
+    pub fn take_conflated(
+        &self,
+        fetchable: &FetchableConflated,
+        budget: Budget,
+        limits: ConflatedLimits,
+    ) -> Result<ConflatedSubscription, AttachError> {
+        let session = self.session.as_ref().ok_or(AttachError::Protocol)?;
+        let fetched = fetch_descriptor(
+            session,
+            fetchable.key,
+            fetchable.registration,
+            WireKind::ConflationTable,
+        )?;
+        let export = fetched.record.export;
+        let attached = (|| {
+            let config = limits.admit(fetchable).ok_or(AttachError::TooLarge)?;
+            let record = &fetched.record;
+            if (record.stream_id, record.session_id)
+                != (fetchable.stream.stream_id, fetchable.stream.session_id)
+            {
+                return Err(AttachError::Protocol);
+            }
+            let expected = fetched_region(session.instance, record)?;
+            // The mapping's length must be the one the admitted
+            // configuration implies, before anything is mapped.
+            if config.structure_length() != Some(expected.structure_length) {
+                return Err(AttachError::Protocol);
+            }
+            let region = ReadOnlyRegion::attach(fetched.fd, expected, SealProfile::DriverOnly)?;
+            Ok(ConflationReader::attach_read_only(region, config)?)
+        })();
+        match attached {
+            Ok(reader) => Ok(
+                ConflatedSubscription::new(reader, budget).with_guard(Detach {
+                    session: Arc::clone(session),
+                    export,
+                }),
+            ),
+            Err(error) => {
+                // The descriptor is closed and nothing stays mapped: the
+                // Detach is the proof.
+                session.detach(export);
+                Err(error)
+            }
+        }
+    }
+
     /// Reports completed requests to `on`, as [`ClientConductor::poll`],
     /// then serves the cutovers of the handles taken: it fetches and
     /// prepares their successors, closes the fenced ones and drops what
@@ -1109,6 +1225,8 @@ fn prepare_successor(
                 export: detach(),
             }
         }
+        // A conflated view has no log buffer generations, so no successor.
+        Request::ConflatedSubscription { .. } => return Err(AttachError::Protocol),
     })
 }
 
@@ -1148,17 +1266,52 @@ struct FetchedRegion {
     incarnation: u64,
 }
 
-/// Sends `Fetch { key }` and receives its `Manifest` and its one `Region`:
-/// the manifest must answer this fetch, with `key` and `registration`, and
-/// carry one record of `kind`; the region is attached against that record
-/// and the session's full instance. From the arrival of the descriptor the
-/// export is live; on a later failure it is detached.
+/// [`fetch_descriptor`], then the region attached writable against the
+/// record and the session's full instance; on a failure the export is
+/// detached.
 fn fetch_region(
     session: &Session,
     key: u64,
     registration: u64,
     kind: WireKind,
 ) -> Result<FetchedRegion, AttachError> {
+    let fetched = fetch_descriptor(session, key, registration, kind)?;
+    let record = fetched.record;
+    let attached = fetched_region(session.instance, &record)
+        .and_then(|expected| Region::attach(fetched.fd, expected).map_err(AttachError::from));
+    match attached {
+        Ok(region) => Ok(FetchedRegion {
+            record,
+            region,
+            stream_registration: fetched.stream_registration,
+            incarnation: fetched.incarnation,
+        }),
+        Err(error) => {
+            session.detach(record.export);
+            Err(error)
+        }
+    }
+}
+
+/// A fetched record and its region's descriptor, not yet mapped. Its
+/// export is live: a failure from here on detaches it.
+struct FetchedDescriptor {
+    record: Record,
+    fd: OwnedFd,
+    stream_registration: u64,
+    incarnation: u64,
+}
+
+/// Sends `Fetch { key }` and receives its `Manifest` and its one `Region`:
+/// the manifest must answer this fetch, with `key` and `registration`, and
+/// carry one record of `kind`. From the arrival of the descriptor the
+/// export is live.
+fn fetch_descriptor(
+    session: &Session,
+    key: u64,
+    registration: u64,
+    kind: WireKind,
+) -> Result<FetchedDescriptor, AttachError> {
     let _exchange = session
         .fetching
         .lock()
@@ -1227,20 +1380,12 @@ fn fetch_region(
     // The descriptor arrived: from here the export is charged and must be
     // detached.
     session.state().live.push(record.export);
-    let attached = fetched_region(session.instance, &record)
-        .and_then(|expected| Region::attach(fd, expected).map_err(AttachError::from));
-    match attached {
-        Ok(region) => Ok(FetchedRegion {
-            record,
-            region,
-            stream_registration,
-            incarnation,
-        }),
-        Err(error) => {
-            session.detach(record.export);
-            Err(error)
-        }
-    }
+    Ok(FetchedDescriptor {
+        record,
+        fd,
+        stream_registration,
+        incarnation,
+    })
 }
 
 /// Receives and discards the regions of an aborted fetch, detaching each
@@ -1267,10 +1412,13 @@ fn abort(session: &Session, fetch: u64, records: &[Record]) {
     }
 }
 
-/// The region header a fetched record describes: a log buffer or a
-/// journal.
+/// The region header a fetched record describes: a log buffer, a journal
+/// or a conflation table.
 fn fetched_region(instance: u128, record: &Record) -> Result<RegionRecord, AttachError> {
-    if !matches!(record.kind, WireKind::LogBuffer | WireKind::Journal) {
+    if !matches!(
+        record.kind,
+        WireKind::LogBuffer | WireKind::Journal | WireKind::ConflationTable
+    ) {
         return Err(AttachError::Protocol);
     }
     Ok(RegionRecord {

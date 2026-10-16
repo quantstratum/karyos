@@ -50,6 +50,10 @@ pub struct ConflatedSubscription {
     budget: Budget,
     counts: ReaderCounts,
     sink: Option<CounterSink>,
+    /// Dropped last, after the reader and its mapping: a remote view's
+    /// `Detach` (`quantstratum-docs:
+    /// karyos/design/conflation-end-to-end.md`, Lifetime).
+    guard: Option<Box<dyn core::any::Any + Send + Sync>>,
 }
 
 impl ConflatedSubscription {
@@ -60,7 +64,19 @@ impl ConflatedSubscription {
             budget,
             counts: ReaderCounts::default(),
             sink: None,
+            guard: None,
         }
+    }
+
+    /// Keeps `guard` until the view is dropped, after its reader: a remote
+    /// view's `Detach`, sent once its table is unmapped.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote views exist only on Linux")
+    )]
+    pub(crate) fn with_guard(mut self, guard: impl core::any::Any + Send + Sync) -> Self {
+        self.guard = Some(Box::new(guard));
+        self
     }
 
     /// Feeds the reader-side counts into two client counter cells, which
