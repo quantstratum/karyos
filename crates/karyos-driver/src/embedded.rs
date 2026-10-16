@@ -232,7 +232,9 @@ impl Default for DriverConfig {
             command_budget: 64,
             cycles_between_drains: 2,
             ring_capacity: 1024,
-            broadcast_capacity: 16 * 1024,
+            // Room for two cycles of `command_budget` responses of the
+            // largest extent (`ConflatedReady`), with headroom.
+            broadcast_capacity: 32 * 1024,
             max_streams: 64,
             max_retained_generations: 2,
             cutover_deadline: 1_000_000_000,
@@ -1782,6 +1784,35 @@ mod tests {
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
             conflation: None,
         }
+    }
+
+    /// The default broadcast capacity keeps a margin over the largest
+    /// response extent, which `ConflatedReady` raised to 64 bytes: the
+    /// default needs half of it, and every command budget that built with
+    /// 40-byte extents at 16 KiB (up to 102) still builds.
+    #[test]
+    fn the_default_broadcast_capacity_keeps_a_margin() {
+        assert_eq!(RESPONSE_EXTENT, 64);
+        let config = DriverConfig::default();
+        let needed = RESPONSE_EXTENT * 2 * config.command_budget * config.cycles_between_drains;
+        assert!(2 * needed <= config.broadcast_capacity);
+        for command_budget in [64, 102, 128] {
+            assert!(
+                EmbeddedDriver::with_config(DriverConfig {
+                    command_budget,
+                    ..DriverConfig::default()
+                })
+                .is_ok(),
+                "{command_budget}"
+            );
+        }
+        assert!(matches!(
+            EmbeddedDriver::with_config(DriverConfig {
+                command_budget: 129,
+                ..DriverConfig::default()
+            }),
+            Err(DriverError::InvalidConfig)
+        ));
     }
 
     /// conflation-end-to-end.md, Counters: the feeder counts the messages

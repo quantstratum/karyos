@@ -51,10 +51,15 @@ fn dir(name: &str) -> PathBuf {
 
 /// A driver on the system clock with timeouts of 5 s.
 fn driver(dir: &Path) -> IpcDriver {
+    driver_with(dir, |config| config)
+}
+
+/// As [`driver`], with the admission settings changed by `change`.
+fn driver_with(dir: &Path, change: impl FnOnce(IpcConfig) -> IpcConfig) -> IpcDriver {
     let timeout = 5_000_000_000;
     EmbeddedDriver::with_ipc(
         DriverConfig::default(),
-        IpcConfig {
+        change(IpcConfig {
             dir: dir.to_path_buf(),
             max_pending_hellos: 2,
             hello_timeout: timeout,
@@ -65,7 +70,7 @@ fn driver(dir: &Path) -> IpcDriver {
             max_regions_per_fetch: 4,
             max_fetch_bytes: 1 << 30,
             max_tools: karyos_driver::DEFAULT_MAX_TOOLS,
-        },
+        }),
         Box::new(SystemClock::new()),
     )
     .unwrap()
@@ -466,4 +471,78 @@ fn access_mode(fd: BorrowedFd<'_>) -> u32 {
         .unwrap()
         .trim();
     u32::from_str_radix(flags, 8).unwrap() & 0o3
+}
+
+/// Every check comes before any effect: a view over the client's export
+/// bound, or whose region no fetch could carry, is refused, and the
+/// refusal consumes no registration or export id.
+#[test]
+fn a_refused_view_takes_no_identity() {
+    let dir = dir("bounds");
+    // One table fits the fetch byte bound, the other one does not.
+    let mut driver = driver_with(&dir, |config| IpcConfig {
+        max_exports_per_client: 2,
+        max_fetch_bytes: 4096,
+        ..config
+    });
+    let _small = driver.add_stream(stream_config(2, Some(TABLE))).unwrap();
+    let _large = driver
+        .add_stream(stream_config(
+            3,
+            Some(ConflationConfig { keys: 64, ..TABLE }),
+        ))
+        .unwrap();
+    let mut client = attach_serving(&mut driver, &dir);
+    let large = StreamKey {
+        stream_id: 3,
+        session_id: 1,
+    };
+    let view = |driver: &mut IpcDriver, client: &mut RemoteClient, stream| match request_view(
+        driver, client, stream,
+    ) {
+        Outcome::FetchableConflated(fetchable) => Ok(fetchable.registration),
+        Outcome::Refused { code, .. } => Err(code),
+        other => panic!("{other:?}"),
+    };
+    let first = view(&mut driver, &mut client, KEY).unwrap();
+    assert_eq!(
+        view(&mut driver, &mut client, large),
+        Err(ErrorCode::ResourcesUnavailable)
+    );
+    assert_eq!(view(&mut driver, &mut client, KEY), Ok(first + 1));
+    // Two grants held: the export bound refuses a third.
+    assert_eq!(
+        view(&mut driver, &mut client, KEY),
+        Err(ErrorCode::ResourcesUnavailable)
+    );
+    assert_eq!(counter(&driver, "grants reserved"), 2);
+    // The client's exit ends both held grants.
+    drop(client);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants ended"), 2);
+}
+
+/// The record of a view carries its stream's lane.
+#[test]
+fn a_view_record_carries_the_lane() {
+    let dir = dir("lane");
+    let mut driver = driver(&dir);
+    let mut config = stream_config(2, Some(TABLE));
+    config.buffer.lane = Lane::try_new(2).unwrap();
+    let _stream = driver.add_stream(config).unwrap();
+    let mut client = attach_serving(&mut driver, &dir);
+    let Outcome::FetchableConflated(fetchable) = request_view(&mut driver, &mut client, KEY) else {
+        panic!("expected a fetchable view");
+    };
+    let socket = client.admission_socket().unwrap();
+    let fetch = encode(&Message::Fetch {
+        fetch: 1,
+        key: fetchable.key,
+    });
+    assert_eq!(ipc::send(socket, &fetch, None).unwrap(), Sent::Sent);
+    let (Message::Manifest { records, .. }, _) = next_message(&mut driver, socket) else {
+        panic!("no manifest");
+    };
+    assert_eq!(records[0].lane, 2);
+    let _ = next_message(&mut driver, socket);
 }
