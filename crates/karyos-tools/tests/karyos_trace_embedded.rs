@@ -99,6 +99,7 @@ fn record(
             incarnation: 1,
         }),
         packet: None,
+        network: None,
         root: point == Point::Publish,
     };
     let stamp = Stamp {
