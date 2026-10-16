@@ -32,8 +32,11 @@ use crate::term_bytes::{HeapTerms, TermBytes};
 
 /// Bits per bitmap word.
 const WORD_BITS: usize = 64;
-/// Bitmap words a duty cycle clears per lane: bounded cleaning work.
-const CLEAN_CHUNK_WORDS: usize = 1024;
+/// Bitmap words a duty cycle clears per lane: bounded cleaning work. Three
+/// bitmaps per set (`covered`, `starts`, `gap_starts`): 1.5 times the two
+/// bitmaps' 1024, so a set is clean in as many duty cycles as before
+/// (`quantstratum-docs: karyos/design/local-gap-layout.md`).
+const CLEAN_CHUNK_WORDS: usize = 1536;
 /// Bitmap sets per lane: the trailing term, the window and one spare
 /// (owner decision D2).
 const SETS: usize = 4;
@@ -85,6 +88,21 @@ pub enum ReceiveError {
     /// The frame was validated against other image parameters.
     #[error("the frame was validated for another image")]
     Foreign,
+    /// A local gap was asked of an image without the `LOCAL_GAPS`
+    /// capability.
+    #[error("the image may not hold local gaps")]
+    NoLocalGaps,
+    /// A local gap interval that is not a positive multiple of 32 bytes
+    /// starting on a 32-byte boundary inside one term.
+    #[error("invalid local gap at position {position} (extent {extent}) of lane {lane:?}")]
+    InvalidGap {
+        /// The lane.
+        lane: Lane,
+        /// The interval's position.
+        position: u64,
+        /// The interval's extent.
+        extent: u32,
+    },
     /// The image's shared state is not what the owner wrote: a protocol
     /// error of another party, or a defect.
     #[error(transparent)]
@@ -258,6 +276,43 @@ impl<T: TermBytes> ReceiveOwner<T> {
         result
     }
 
+    /// Seals `[position, position + extent)` of `lane` as a local gap
+    /// (`quantstratum-docs: karyos/design/local-gap-layout.md`): writes the
+    /// record's header after its word 0, then publishes word 0 with one
+    /// Release store, marks the interval covered and advances the rebuild
+    /// position across it. The interval must lie in one term of the window
+    /// and overlap no committed frame; this primitive never narrows it, so
+    /// the caller rechecks its extent maps first (the skip policy's
+    /// business, not decided here).
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::NoLocalGaps`] for an image without the capability,
+    /// [`ReceiveError::InvalidGap`] for an interval outside one term or not
+    /// 32-aligned, [`ReceiveError::Conflict`] for an interval overlapping a
+    /// committed frame, [`ReceiveError::Foreign`] for a lane the image does
+    /// not have, [`ReceiveError::Sys`] for a corrupt shared state. The image
+    /// is unchanged in every error case and for `Late`, `Ahead` and
+    /// `NotReady`.
+    pub fn seal_gap(
+        &mut self,
+        lane: Lane,
+        position: u64,
+        extent: u32,
+        reason: crate::local_gap::GapReason,
+    ) -> Result<Received, ReceiveError> {
+        let owner = self
+            .lanes
+            .get_mut(usize::from(lane.get()))
+            .ok_or(ReceiveError::Foreign)?;
+        let result = owner.seal_gap(lane, position, extent, reason);
+        if owner.lagged {
+            owner.lagged = false;
+            self.counters.bump(ReceiveCounter::CleanerLag, 1);
+        }
+        result
+    }
+
     /// Bounded background work: clears released bitmap sets, at most
     /// `CLEAN_CHUNK_WORDS` words per lane. Returns whether work remains.
     pub fn duty(&mut self) -> bool {
@@ -303,6 +358,10 @@ struct Set {
     term: Option<TermCount>,
     covered: Vec<u64>,
     starts: Vec<u64>,
+    /// The starts of local gap records: kept apart from `starts`, which
+    /// marks real frames only, so a late copy can tell a real overlap from
+    /// one with a local gap alone.
+    gap_starts: Vec<u64>,
     /// Released and not yet fully zeroed: never used until clean.
     dirty: bool,
     cursor: usize,
@@ -332,6 +391,7 @@ impl<T: TermBytes> LaneOwner<T> {
             term: None,
             covered: vec![0; words],
             starts: vec![0; words],
+            gap_starts: vec![0; words],
             dirty: false,
             cursor: 0,
         };
@@ -428,6 +488,99 @@ impl<T: TermBytes> LaneOwner<T> {
             position: start,
             extent: frame.extent(),
         })
+    }
+
+    fn seal_gap(
+        &mut self,
+        lane: Lane,
+        position: u64,
+        extent: u32,
+        reason: crate::local_gap::GapReason,
+    ) -> Result<Received, ReceiveError> {
+        use crate::local_gap::{GapSite, gap_body, gap_word0};
+        let buffer = Arc::clone(&self.buffer);
+        if !buffer.local_gaps() {
+            return Err(ReceiveError::NoLocalGaps);
+        }
+        let invalid = ReceiveError::InvalidGap {
+            lane,
+            position,
+            extent,
+        };
+        let (count, offset) = buffer.split(position)?;
+        let word0 = gap_word0(extent, lane).ok_or(invalid)?;
+        if !offset.is_multiple_of(FRAME_ALIGNMENT)
+            || offset
+                .checked_add(extent)
+                .is_none_or(|end| end > buffer.term_length)
+        {
+            return Err(invalid);
+        }
+        if position < self.join {
+            return Ok(Received::Late);
+        }
+        let (r, _) = self.split_end(self.rebuild)?;
+        let (c, rr) = (count.get(), r.get());
+        if c > rr.saturating_add(1) {
+            return Ok(Received::Ahead);
+        }
+        // The trailing term is covered from the join point up: nothing is
+        // left to seal there.
+        if c < rr {
+            return Ok(Received::Late);
+        }
+        let index = match self.set_of(count) {
+            Some(index) => index,
+            None => match self.assign_set(count) {
+                Some(index) => index,
+                None => return Ok(Received::NotReady),
+            },
+        };
+        let unit = (offset / FRAME_ALIGNMENT) as usize;
+        let units = (extent / FRAME_ALIGNMENT) as usize;
+        if any_set(&self.set(index)?.covered, unit, units) {
+            return Err(ReceiveError::Conflict {
+                lane,
+                position,
+                extent,
+            });
+        }
+        let Some(slot) = self.write_loan(count)? else {
+            return Ok(Received::NotReady);
+        };
+        let site = GapSite {
+            term_offset: offset,
+            term_id: buffer
+                .initial_term_id
+                .advanced_by(count)
+                .get()
+                .cast_signed(),
+            session_id: buffer.config.session_id,
+            stream_id: buffer.config.stream_id,
+        };
+        // SAFETY: the owner holds the write loan on `slot`'s current term;
+        // the 24 bytes start 8 bytes into the record, a multiple of 8, and
+        // lie inside its extent (at least 32), which the owner's record
+        // shows uncovered, so they hold no word 0 of this term and were
+        // never written in this incarnation; no reader reaches them before
+        // the Release publication below.
+        unsafe {
+            buffer
+                .regions
+                .write_bytes(slot, offset + 8, &gap_body(site, reason))
+        };
+        // SAFETY: write loan held; `offset` is the start of this record.
+        let first = unsafe { buffer.regions.word0(slot, offset) };
+        publish_block(first, word0);
+        let set = self.set_mut(index)?;
+        set_bit(&mut set.gap_starts, unit);
+        set_range(&mut set.covered, unit, units);
+        let end = position + u64::from(extent);
+        self.high = self.high.max(end);
+        if position == self.rebuild {
+            self.advance()?;
+        }
+        Ok(Received::Committed { position, extent })
     }
 
     /// [`LogBuffer::split`], except that the end of the incarnation's last
@@ -630,19 +783,21 @@ impl<T: TermBytes> LaneOwner<T> {
                 continue;
             }
             let words = set.covered.len();
-            let end = (set.cursor + budget).min(words);
-            for bits in [&mut set.covered, &mut set.starts] {
+            // The budget counts words of all three bitmaps.
+            let end = (set.cursor + budget / 3).min(words);
+            for bits in [&mut set.covered, &mut set.starts, &mut set.gap_starts] {
                 if let Some(range) = bits.get_mut(set.cursor..end) {
                     range.fill(0);
                 }
             }
-            budget -= end - set.cursor;
+            // `end - cursor <= budget / 3`: the budget covers the three.
+            budget -= 3 * (end - set.cursor);
             set.cursor = end;
             if set.cursor == words {
                 set.dirty = false;
                 set.cursor = 0;
             }
-            if budget == 0 {
+            if budget < 3 {
                 break;
             }
         }

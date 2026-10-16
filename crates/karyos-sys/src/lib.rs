@@ -38,6 +38,7 @@ pub mod frame;
 pub mod host_clock;
 pub mod load_words;
 pub mod loan;
+pub mod local_gap;
 pub mod participant;
 // Real memory with std atomics, like `term_memory`.
 #[cfg(not(loom))]

@@ -48,7 +48,7 @@ fn image(join: u64) -> Arc<LogBuffer<Terms>> {
             session_id: SESSION,
             stream_id: STREAM,
             claim_deadline: DEFAULT_CLAIM_DEADLINE,
-            publication: PublicationMode::Image { join },
+            publication: PublicationMode::Image { join, local_gaps: false },
         })
         .unwrap(),
     )
@@ -952,7 +952,7 @@ fn a_late_joiner_inside_a_partial_message_skips_its_rest() {
 fn a_join_point_off_the_frame_alignment_is_refused() {
     for join in [1, 8, 16, u64::from(TERM) + 40] {
         let config = LogBufferConfig {
-            publication: PublicationMode::Image { join },
+            publication: PublicationMode::Image { join, local_gaps: false },
             ..image(0).config
         };
         assert!(
@@ -1084,4 +1084,181 @@ fn a_reader_that_rejoins_after_an_overrun_is_joining_again() {
         poll(&mut subscription),
         skipped(resume, 64, SkipReason::JoinedMidMessage)
     );
+}
+
+/// An image whose owner may seal local gaps.
+fn gap_image(join: u64) -> Arc<LogBuffer<Terms>> {
+    let plain = image(join);
+    Arc::new(
+        new_image(LogBufferConfig {
+            publication: PublicationMode::Image {
+                join,
+                local_gaps: true,
+            },
+            ..plain.config
+        })
+        .unwrap(),
+    )
+}
+
+fn seal(
+    owner: &mut ReceiveOwner<Terms>,
+    position: u64,
+    extent: u32,
+) -> Result<Received, ReceiveError> {
+    owner.seal_gap(
+        Lane::ZERO,
+        position,
+        extent,
+        crate::local_gap::GapReason::ReorderExpired,
+    )
+}
+
+const LOST: SkipReason = SkipReason::LocalGap(crate::local_gap::GapReason::ReorderExpired);
+
+/// A sealed interval is published as one record, advances the rebuild
+/// position across it, and a reader skips it as a local gap, then reads
+/// the next message.
+#[test]
+fn a_sealed_gap_is_skipped_by_a_reader() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 128, 64, 1)), committed(128, 64));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(0));
+    assert_eq!(seal(&mut owner, 0, 128), committed(0, 128));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(192));
+    assert_eq!(poll(&mut subscription), skipped(0, 128, LOST));
+    assert!(matches!(
+        poll(&mut subscription),
+        PollOutcome::Message { position: 128, .. }
+    ));
+    // The record is final: a late copy into it conflicts.
+    assert_eq!(recv(&mut owner, &data(0, 64, 64, 2)), conflict(64, 64));
+    // A record's reason is reported as sealed.
+    let reason = crate::local_gap::GapReason::RangeUnavailable;
+    assert_eq!(
+        owner.seal_gap(Lane::ZERO, 192, 64, reason),
+        committed(192, 64)
+    );
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(192, 64, SkipReason::LocalGap(reason))
+    );
+}
+
+/// A gap interrupts a message in progress, which is skipped up to it; a
+/// gap never covers a committed frame.
+#[test]
+fn a_gap_interrupts_a_message_and_never_covers_a_frame() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    recv(&mut owner, &fragment(0, 0, 32, true, false, 1)).unwrap();
+    assert_eq!(seal(&mut owner, 0, 64), conflict(0, 64));
+    assert_eq!(seal(&mut owner, 32, 64), conflict(32, 64));
+    assert_eq!(seal(&mut owner, 64, 64), committed(64, 64));
+    assert_eq!(
+        poll(&mut subscription),
+        skipped(0, 64, SkipReason::Interrupted)
+    );
+    assert_eq!(poll(&mut subscription), skipped(64, 64, LOST));
+    assert_eq!(poll(&mut subscription), PollOutcome::Pending);
+}
+
+/// Only an image with the capability takes a gap, and only an interval of
+/// whole 32-byte units inside one term of the window.
+#[test]
+fn a_gap_needs_the_capability_and_a_valid_interval() {
+    let plain = image(0);
+    let mut plain_owner = owner(&plain);
+    assert_eq!(seal(&mut plain_owner, 0, 64), Err(ReceiveError::NoLocalGaps));
+    let t = u64::from(TERM);
+    let buffer = gap_image(0);
+    let mut owner = owner(&buffer);
+    let invalid = |position, extent| {
+        Err(ReceiveError::InvalidGap {
+            lane: Lane::ZERO,
+            position,
+            extent,
+        })
+    };
+    assert_eq!(seal(&mut owner, 0, 0), invalid(0, 0));
+    assert_eq!(seal(&mut owner, 0, 40), invalid(0, 40));
+    assert_eq!(seal(&mut owner, 8, 64), invalid(8, 64));
+    assert_eq!(seal(&mut owner, t - 32, 64), invalid(t - 32, 64));
+    assert_eq!(seal(&mut owner, 2 * t, 64), Ok(Received::Ahead));
+    // Up to the end of the term is valid.
+    assert_eq!(seal(&mut owner, t - 64, 64), committed(t - 64, 64));
+    assert_eq!(
+        owner.seal_gap(
+            Lane::try_new(1).unwrap(),
+            0,
+            64,
+            crate::local_gap::GapReason::ReorderExpired
+        ),
+        Err(ReceiveError::Foreign)
+    );
+    // Below the join point is late.
+    let joined = gap_image(t);
+    let mut joined_owner = owner_of(&joined);
+    assert_eq!(seal(&mut joined_owner, 0, 64), Ok(Received::Late));
+}
+
+fn owner_of(buffer: &Arc<LogBuffer<Terms>>) -> ReceiveOwner<Terms> {
+    ReceiveOwner::new(params(), vec![Arc::clone(buffer)]).unwrap()
+}
+
+/// A released set's three bitmaps are cleared within the scaled cleaning
+/// budget, so a gap's start never survives into a reused set.
+#[test]
+fn cleaning_clears_the_gap_bitmap_too() {
+    let buffer = gap_image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(seal(&mut owner, 0, 64), committed(0, 64));
+    finish(&mut owner, 0, 64);
+    conductor.duty_cycle().unwrap();
+    for term in 1..3 {
+        finish(&mut owner, term, 0);
+        conductor.duty_cycle().unwrap();
+    }
+    let lane = &owner.lanes[0];
+    assert!(lane.sets.iter().any(|set| set.dirty));
+    // One duty cleans every word of a minimum-term set (32 words each).
+    assert!(!owner.duty());
+    for set in &owner.lanes[0].sets {
+        assert!(!set.dirty);
+        if set.term.is_none() {
+            assert!(set.gap_starts.iter().all(|word| *word == 0));
+            assert!(set.covered.iter().all(|word| *word == 0));
+        }
+    }
+}
+
+/// The capability survives the configuration block, and a block an older
+/// layout would write without it still parses; a capability on a log that
+/// is not an image, or an unknown capability bit, is refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_capability_is_in_the_configuration_block() {
+    let buffer = gap_image(0);
+    let words = crate::log_buffer::config_words(
+        &buffer.config,
+        buffer.generation,
+        buffer.max_message_length,
+    );
+    let (config, _, _) = crate::log_buffer::parse_config(&words).unwrap();
+    assert_eq!(config.publication, buffer.config.publication);
+    // The word after `join`.
+    assert_eq!(words[17], 1);
+    let mut unknown = words;
+    unknown[17] = 2;
+    assert!(crate::log_buffer::parse_config(&unknown).is_none());
+    let mut not_image = words;
+    not_image[11] = 1;
+    not_image[16] = 0;
+    assert!(crate::log_buffer::parse_config(&not_image).is_none());
 }
