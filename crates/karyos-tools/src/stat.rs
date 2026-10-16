@@ -24,6 +24,7 @@ use karyos_sys::counters::{
     CellRead, CounterMetadata, CountersReader, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER,
     PassRead, TYPE_POSITION, read_pass,
 };
+use karyos_sys::host_clock::age_ns;
 
 /// The usage text of `karyos-stat --help`.
 pub const HELP: &str = "\
@@ -123,8 +124,8 @@ pub fn report(counters: &CountersReader, client_counters: &CountersReader, now: 
         PassRead::Inconsistent(cells) => (false, cells),
     };
     // Read with the cells, inside the pass. A completed pass has a
-    // positive epoch; its time is 0 where the host clock is not
-    // available.
+    // positive epoch. A timestamp ahead of the reader's clock has age zero
+    // ("Timestamps"), never an underflow.
     let fixed_value = |name: &str| {
         cells
             .iter()
@@ -132,16 +133,13 @@ pub fn report(counters: &CountersReader, client_counters: &CountersReader, now: 
             .map(|(_, value)| *value)
     };
     let sampled = fixed_value("positions epoch").is_some_and(|epoch| epoch > 0);
-    let age = fixed_value("positions sampled at")
-        .filter(|at| *at != 0)
-        .and_then(|at| now.checked_sub(at));
+    let age = fixed_value("positions sampled at").map(|at| age_ns(now, at));
     let _ = writeln!(
         out,
         "sample: {}, {}",
         match (sampled, age) {
-            (false, _) => "never sampled".to_owned(),
             (true, Some(age)) => format!("age {}.{:06} ms", age / 1_000_000, age % 1_000_000),
-            (true, None) => "age unknown".to_owned(),
+            _ => "never sampled".to_owned(),
         },
         if consistent {
             "consistent"
@@ -322,6 +320,68 @@ mod tests {
             .unwrap_or_else(|| panic!("{text}"));
         assert!(subscriber.ends_with("position 0 lag 480"), "{subscriber}");
         assert!(text.ends_with("client counters:\n  (none)\n"), "{text}");
+    }
+
+    /// The sample's age in nanoseconds, as a report prints it.
+    fn age(report: &str) -> u64 {
+        let text = report
+            .strip_prefix("sample: age ")
+            .and_then(|rest| rest.split(" ms").next())
+            .unwrap_or_else(|| panic!("{report}"));
+        let (millis, fraction) = text.split_once('.').unwrap();
+        millis.parse::<u64>().unwrap() * 1_000_000 + fraction.parse::<u64>().unwrap()
+    }
+
+    /// observability-and-tools.md, Tests, "Timestamps": a stalled sampler
+    /// yields a growing age. With no duty cycle the driver samples nothing
+    /// more, so `positions sampled at` stays and the age grows with the
+    /// reader's clock.
+    #[test]
+    fn a_stalled_sampler_yields_a_growing_age() {
+        let mut driver = EmbeddedDriver::with_config(DriverConfig {
+            position_sample_interval: 1,
+            ..DriverConfig::default()
+        })
+        .unwrap();
+        let _ = driver.add_stream(stream_config()).unwrap();
+        let _ = driver.do_work().unwrap();
+        let first = report(
+            &driver.counters(),
+            &driver.client_counters(),
+            host_monotonic_ns(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = report(
+            &driver.counters(),
+            &driver.client_counters(),
+            host_monotonic_ns(),
+        );
+        assert!(
+            age(&second) >= age(&first) + 20_000_000,
+            "{first}\n{second}"
+        );
+        // A duty cycle samples again: the age drops back.
+        let _ = driver.do_work().unwrap();
+        let third = report(
+            &driver.counters(),
+            &driver.client_counters(),
+            host_monotonic_ns(),
+        );
+        assert!(age(&third) < age(&second), "{second}\n{third}");
+    }
+
+    /// observability-and-tools.md, Tests, "Timestamps": a timestamp ahead
+    /// of the reader shows age zero.
+    #[test]
+    fn a_timestamp_ahead_of_the_reader_shows_age_zero() {
+        let mut driver = EmbeddedDriver::with_config(DriverConfig {
+            position_sample_interval: 1,
+            ..DriverConfig::default()
+        })
+        .unwrap();
+        let _ = driver.do_work().unwrap();
+        let text = report(&driver.counters(), &driver.client_counters(), 0);
+        assert!(text.starts_with("sample: age 0.000000 ms, "), "{text}");
     }
 
     #[test]
