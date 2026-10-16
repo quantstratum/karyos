@@ -148,9 +148,11 @@ impl Tracked {
         }
     }
 
-    /// Whether `record` contradicts the entry (T4).
+    /// Whether `record` contradicts the entry (T4): another publication,
+    /// another lane, or a point of the other side.
     fn contradicts(&self, record: &TraceRecord, driver: [u64; 2]) -> bool {
         PublicationKey::from(record.publication) != self.publication(driver)
+            || record.lane != self.entry.lane.get()
             || match self.entry.kind {
                 JournalKind::Subscriber => record.point == Point::Publish,
                 JournalKind::Publisher => record.point == Point::SubscriberPoll,

@@ -62,6 +62,7 @@
 //!   closed it, writer lost otherwise. An in-process writer closes its
 //!   journal when dropped.
 
+use karyos_sys::frame::Lane;
 use karyos_sys::record_journal::{Drained, JournalDrain, JournalLayout};
 use karyos_sys::trace_mirror::{
     JournalEntry, JournalKind, JournalState, MAX_MIRROR_PAYLOAD, MAX_RECYCLE_PAIRS, MIRROR_RANGES,
@@ -93,7 +94,7 @@ pub(crate) struct Observed {
     /// Its publication's registration (the aggregate's).
     pub(crate) stream: u64,
     /// Its lane: journals pair within a lane.
-    pub(crate) lane: u8,
+    pub(crate) lane: Lane,
     /// The publication's incarnation.
     pub(crate) incarnation: u64,
     /// A subscription's join position; `None` for a publisher journal.
@@ -143,9 +144,6 @@ struct Held {
     /// For a subscriber journal that ended: the publisher journals noted at
     /// its end.
     notes: Option<Vec<Note>>,
-    /// The observed lane; a subscriber journal pairs with publisher
-    /// journals of its lane only.
-    lane: u8,
 }
 
 impl Held {
@@ -367,6 +365,7 @@ impl TraceJournals {
         );
         entry.registration = observed.registration;
         entry.stream = observed.stream;
+        entry.lane = observed.lane;
         entry.incarnation = observed.incarnation;
         entry.join = observed.join;
         entry.time_namespace = observed.time_namespace;
@@ -391,6 +390,7 @@ impl TraceJournals {
             let mut record = RecycledJournal {
                 journal: old.entry.journal,
                 stream: old.entry.stream,
+                lane: old.entry.lane,
                 incarnation: old.entry.incarnation,
                 state: old.entry.state,
                 boundary: old.entry.boundary,
@@ -414,7 +414,6 @@ impl TraceJournals {
             drain: Some(drain),
             bytes,
             notes: None,
-            lane: observed.lane,
         });
     }
 
@@ -432,14 +431,14 @@ impl TraceJournals {
         let (stream, incarnation, lane) = (
             subscriber.entry.stream,
             subscriber.entry.incarnation,
-            subscriber.lane,
+            subscriber.entry.lane,
         );
         let mut notes = Vec::new();
         for held in self.slots.iter_mut().flatten().filter(|held| {
             held.entry.kind == JournalKind::Publisher
                 && held.entry.stream == stream
                 && held.entry.incarnation == incarnation
-                && held.lane == lane
+                && held.entry.lane == lane
         }) {
             let journal = held.entry.journal;
             let note = match held.drain.as_mut().map(JournalDrain::losses) {

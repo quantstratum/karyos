@@ -58,7 +58,8 @@
 //! | 19 | Clock provenance, as the client sent it (opaque to the driver) |
 //! | 20 to 67 | Drop ranges: first, last, first time, last time, clock, epoch |
 //! | 68 | Mirror sequence: the journal's place among the journals the driver created, from 1, dense (T7) |
-//! | 69 to 79 | Reserved, zero |
+//! | 69 | Lane of the observed registration, below 4: with word 15 it names the aggregate lane (`aggregate-ownership.md`) |
+//! | 70 to 79 | Reserved, zero |
 //!
 //! | Log entry word | Field |
 //! | --- | --- |
@@ -69,7 +70,7 @@
 //! | 5 | Final delivery boundary (valid when its flag is set) |
 //! | 6 | Mirror sequence of the recycled subscriber journal (T7) |
 //! | 7 to 30 | Noted pairs: publisher journal number, its attempted count when the subscriber journal ended |
-//! | 31 | Reserved, zero |
+//! | 31 | Lane of its publication, below 4 |
 //!
 //! Readers issue only `Relaxed` loads and `Acquire` fences, so they work
 //! over a read-only mapping.
@@ -82,6 +83,7 @@ use crate::diag_ring::{
     Appended, Bounds, FIELDS, RingReader, RingWriter, STRIDE_WORDS, Scan, ring_words, scan,
 };
 use crate::error::SysError;
+use crate::frame::Lane;
 use crate::record_journal::DropRange;
 use crate::sync::{AtomicU64, Ordering, fence};
 
@@ -116,8 +118,12 @@ const HEADER_SEQUENCE: usize = 6;
 const RANGES: usize = 20;
 /// Entry word of the mirror sequence.
 const ENTRY_SEQUENCE: usize = 68;
+/// Entry word of the observed lane.
+const ENTRY_LANE: usize = 69;
 /// Log entry word of the mirror sequence.
 const LOG_SEQUENCE: usize = 6;
+/// Log entry word of the publication's lane.
+const LOG_LANE: usize = 31;
 /// Log entry word of the noted pairs.
 const PAIRS: usize = 7;
 /// Words of one drop range in an entry.
@@ -255,6 +261,9 @@ pub struct JournalEntry {
     /// `incarnation` and the driver instance it names the publication
     /// `(driver_id, registration, incarnation)`.
     pub stream: u64,
+    /// The lane of the observed registration: the publication is the
+    /// aggregate `stream` on this lane, and journals pair within a lane.
+    pub lane: Lane,
     /// The incarnation of that publication; a mapping cutover keeps it.
     pub incarnation: u64,
     /// The client's time namespace against the driver's, checked when the
@@ -319,6 +328,7 @@ impl JournalEntry {
             kind,
             registration: 0,
             stream: 0,
+            lane: Lane::ZERO,
             incarnation: 0,
             time_namespace: TimeNamespace::Unknown,
             provenance: 0,
@@ -400,6 +410,9 @@ impl JournalEntry {
         if let Some(word) = words.get_mut(ENTRY_SEQUENCE) {
             *word = self.sequence;
         }
+        if let Some(word) = words.get_mut(ENTRY_LANE) {
+            *word = u64::from(self.lane.get());
+        }
         words
     }
 
@@ -415,6 +428,7 @@ impl JournalEntry {
         let state = JournalState::from_code(packed & 0xFF)?;
         let kind = JournalKind::from_code(word(16))?;
         let time_namespace = TimeNamespace::from_code(word(18))?;
+        let lane = lane_from(word(ENTRY_LANE))?;
         let flags = (packed >> 8) & 0xFF;
         let range_count = usize::try_from((packed >> 16) & 0xFF)
             .ok()
@@ -449,6 +463,7 @@ impl JournalEntry {
             kind,
             registration: word(14),
             stream: word(15),
+            lane,
             incarnation: word(17),
             time_namespace,
             provenance: word(19),
@@ -467,6 +482,13 @@ impl JournalEntry {
             sequence: word(ENTRY_SEQUENCE),
         })
     }
+}
+
+/// The lane of a lane word; `None` for a value no driver writes.
+fn lane_from(word: u64) -> Option<Lane> {
+    u8::try_from(word)
+        .ok()
+        .and_then(|lane| Lane::try_new(lane).ok())
 }
 
 /// What a reader found in a table entry.
@@ -510,6 +532,8 @@ pub struct RecycledJournal {
     pub journal: u64,
     /// Its publication's stream registration.
     pub stream: u64,
+    /// Its publication's lane.
+    pub lane: Lane,
     /// Its publication's incarnation.
     pub incarnation: u64,
     /// Its final state: closed or writer lost.
@@ -561,6 +585,9 @@ impl RecycledJournal {
         {
             *chunk = [pair.journal, pair.attempted];
         }
+        if let Some(word) = words.get_mut(LOG_LANE) {
+            *word = u64::from(self.lane.get());
+        }
         words
     }
 
@@ -575,6 +602,7 @@ impl RecycledJournal {
         let packed = word(4);
         let state =
             JournalState::from_code(packed & 0xFF).filter(|state| *state != JournalState::Open)?;
+        let lane = lane_from(word(LOG_LANE))?;
         let flags = (packed >> 8) & 0xFF;
         let pair_count = usize::try_from((packed >> 16) & 0xFF)
             .ok()
@@ -591,6 +619,7 @@ impl RecycledJournal {
         Some(Self {
             journal,
             stream: word(2),
+            lane,
             incarnation: word(3),
             state,
             boundary: (flags & HAS_BOUNDARY != 0).then_some(word(5)),
@@ -1098,6 +1127,7 @@ mod tests {
         let mut entry = JournalEntry::open(journal, 7, JournalKind::Subscriber, 25, 64);
         entry.registration = 12;
         entry.stream = 3;
+        entry.lane = Lane::try_new(2).unwrap();
         entry.incarnation = 1;
         entry.time_namespace = TimeNamespace::Same;
         entry.provenance = 0xFEED;
@@ -1130,6 +1160,7 @@ mod tests {
         let mut log = RecycledJournal {
             journal,
             stream: 3,
+            lane: Lane::try_new(3).unwrap(),
             incarnation: 1,
             state: JournalState::Closed,
             boundary: Some(4096),
@@ -1165,6 +1196,7 @@ mod tests {
             (read.join, read.registration, read.stream, read.incarnation),
             (Some(0), 12, 3, 1)
         );
+        assert_eq!(read.lane.get(), 2);
         assert_eq!(
             (read.kind, read.time_namespace, read.provenance),
             (JournalKind::Subscriber, TimeNamespace::Same, 0xFEED)
@@ -1190,9 +1222,10 @@ mod tests {
         assert_eq!(reader.entry(3), EntryRead::Free);
     }
 
-    /// The mirror sequence (T7) sits in entry word 68 and log entry word 6;
-    /// the noted pairs follow it in words 7 to 30, twelve of them, and log
-    /// word 31 stays zero.
+    /// The mirror sequence (T7) sits in entry word 68 and log entry word 6,
+    /// and the lane in entry word 69 and log entry word 31; the noted pairs
+    /// fill words 7 to 30, twelve of them, and entry words 70 to 79 stay
+    /// zero.
     #[test]
     fn the_mirror_sequence_has_its_own_words() {
         assert_eq!(MAX_RECYCLE_PAIRS, 12);
@@ -1204,12 +1237,13 @@ mod tests {
         let table = mirror.geometry.table;
         let load = |index: usize| words[index].load(Ordering::Relaxed);
         assert_eq!(load(table + 68), 0xABC);
-        assert!((69..ENTRY_WORDS).all(|word| load(table + word) == 0));
+        assert_eq!(load(table + 69), 2);
+        assert!((70..ENTRY_WORDS).all(|word| load(table + word) == 0));
         let log = STRIDE_WORDS;
         assert_eq!(load(log + 6), 0x5EC);
         assert_eq!((load(log + 7), load(log + 8)), (100, 0));
         assert_eq!((load(log + 29), load(log + 30)), (111, 110));
-        assert_eq!(load(log + 31), 0);
+        assert_eq!(load(log + 31), 3);
         let reader = mirror.reader();
         let EntryRead::Entry(read) = reader.entry(0) else {
             panic!("entry");
@@ -1228,13 +1262,13 @@ mod tests {
         assert_eq!(words[5].load(Ordering::Relaxed), LOG_ENTRY_WORDS as u64);
     }
 
-    /// Words no driver writes (an unknown kind or time namespace code)
-    /// read as free, never as a value.
+    /// Words no driver writes (an unknown kind or time namespace code, a
+    /// lane of 4 or more) read as free, never as a value.
     #[test]
     fn unknown_codes_read_free() {
         let mut mirror = trace_mirror(1, 1, 4).unwrap();
         let table = mirror.geometry.table;
-        for (word, value) in [(16, 3), (16, 0), (18, 3)] {
+        for (word, value) in [(16, 3), (16, 0), (18, 3), (69, 4), (69, 1 << 8)] {
             mirror.write_entry(0, Some(&entry(1)));
             mirror.store.words()[table + word].store(value, Ordering::Relaxed);
             assert_eq!(mirror.reader().entry(0), EntryRead::Free, "word {word}");
@@ -1290,6 +1324,10 @@ mod tests {
         );
         assert_eq!(reader.log_entry(1), LogRead::Free);
         words[start + 4].store(packed, Ordering::Relaxed);
+        // A lane of 4 or more.
+        words[start + LOG_LANE].store(4, Ordering::Relaxed);
+        assert_eq!(reader.log_entry(1), LogRead::Free);
+        words[start + LOG_LANE].store(3, Ordering::Relaxed);
         // Busy while its version is odd.
         let version = &words[start];
         let even = version.load(Ordering::Relaxed);
