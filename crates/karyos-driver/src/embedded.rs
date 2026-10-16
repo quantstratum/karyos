@@ -1223,7 +1223,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         #[cfg(target_os = "linux")]
         let admitted = self.serve_admission();
         #[cfg(not(target_os = "linux"))]
-        let admitted = 0;
+        let admitted: Result<u32, DriverError> = Ok(0);
         // Retire before sampling liveness: an orderly close at the
         // deadline is a retirement, not a time-out.
         self.retire_closed_clients();
@@ -1232,7 +1232,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.free_retired_streams();
         let mut work = self.serve_commands();
         let mut first_error = None;
-        add_work(&self.counters, &mut work, &mut first_error, admitted);
+        match admitted {
+            Ok(admitted) => add_work(&self.counters, &mut work, &mut first_error, admitted),
+            // Its own count overflowed: counted as `add_work` counts one.
+            Err(error) => {
+                self.counters.add(Event::CounterOverflows, 1);
+                first_error.get_or_insert(error);
+            }
+        }
         add_work(&self.counters, &mut work, &mut first_error, alive);
         let charged = self.charged_generations();
         let mut opened = Vec::new();
