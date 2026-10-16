@@ -27,6 +27,7 @@ pub mod guards;
 mod ledger;
 mod positions;
 mod remote_generations;
+pub mod sessions;
 mod trace_journals;
 
 #[cfg(target_os = "linux")]
