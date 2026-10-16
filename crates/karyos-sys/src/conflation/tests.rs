@@ -199,9 +199,9 @@ fn a_stuck_slot_does_not_starve_the_others() {
     }
     // Key 3 is stuck mid-write: a writer paused between its odd and even
     // stores.
-    let odd = writer.slot_version_word(3).unwrap().load(Ordering::Relaxed) + 1;
+    let odd = writer.slot_seq_word(3).unwrap().load(Ordering::Relaxed) + 1;
     writer
-        .slot_version_word(3)
+        .slot_seq_word(3)
         .unwrap()
         .store(odd, Ordering::Relaxed);
     writer.write(7, &value(7, 500, 8)).unwrap();
@@ -768,4 +768,81 @@ mod region {
             assert!(conflation(keys, value_capacity, journal_capacity).is_err());
         }
     }
+}
+
+// Fresh slots (GU-8).
+
+fn fresh_words(value_words: usize) -> Vec<AtomicU64> {
+    (0..5 + value_words).map(|_| AtomicU64::new(0)).collect()
+}
+
+/// A freshness-only write advances the sequence but not the value version,
+/// and a value write keeps the freshness words.
+#[test]
+fn freshness_writes_keep_the_value_version() {
+    use crate::freshness::{STALE, SlotFreshness};
+    let words = fresh_words(2);
+    let slot = FreshSlotWords::new(&words).unwrap();
+    let mut out = [0u8; 16];
+    assert_eq!(slot.read(&mut out), FreshRead::Empty);
+    let stale = SlotFreshness {
+        loss_applied: 1 | STALE,
+        stale_since: 8,
+    };
+    slot.set_freshness(stale).unwrap();
+    assert_eq!(slot.read(&mut out), FreshRead::Empty, "no value yet");
+    assert_eq!(slot.write(b"first").unwrap(), 2);
+    assert_eq!(
+        slot.read(&mut out),
+        FreshRead::Value {
+            version: 2,
+            length: 5,
+            freshness: stale
+        }
+    );
+    assert_eq!(&out[..5], b"first");
+    let fresh = SlotFreshness {
+        loss_applied: 1,
+        stale_since: 0,
+    };
+    slot.set_freshness(fresh).unwrap();
+    assert_eq!(slot.version(), 2, "freshness is not a value replacement");
+    assert_eq!(slot.write(b"second!").unwrap(), 4);
+    assert_eq!(
+        slot.read(&mut out),
+        FreshRead::Value {
+            version: 4,
+            length: 7,
+            freshness: fresh
+        }
+    );
+    // Four seqlock writes: two freshness writes and two values.
+    assert_eq!(words[0].load(Ordering::Relaxed), 8);
+}
+
+#[test]
+fn a_fresh_slot_refuses_what_it_cannot_store() {
+    let words = fresh_words(1);
+    let slot = FreshSlotWords::new(&words).unwrap();
+    assert_eq!(slot.capacity(), 8);
+    assert_eq!(
+        slot.write(b"123456789"),
+        Err(ConflationError::ValueTooLarge { length: 9, max: 8 })
+    );
+    words[1].store(u64::MAX - 1, Ordering::Relaxed);
+    assert!(!slot.can_write());
+    assert_eq!(slot.write(b"x"), Err(ConflationError::VersionsExhausted));
+    words[1].store(0, Ordering::Relaxed);
+    words[0].store(u64::MAX - 1, Ordering::Relaxed);
+    assert!(!slot.can_write());
+    assert_eq!(slot.write(b"x"), Err(ConflationError::VersionsExhausted));
+    assert_eq!(
+        slot.set_freshness(crate::freshness::SlotFreshness::default()),
+        Err(ConflationError::VersionsExhausted)
+    );
+    assert_eq!(words[1].load(Ordering::Relaxed), 0, "nothing stored");
+    assert!(FreshSlotWords::new(&words[..5]).is_none());
+    // Mid-write: unstable.
+    words[0].store(3, Ordering::Relaxed);
+    assert_eq!(slot.read(&mut [0u8; 8]), FreshRead::Unstable);
 }
