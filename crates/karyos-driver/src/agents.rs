@@ -35,8 +35,10 @@
 //!   resources can be released. The conductor treats it as fatal for the
 //!   driver.
 
+pub mod control;
 pub mod endpoints;
 pub mod ring;
+pub mod roles;
 
 use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -140,6 +142,30 @@ pub struct AgentConfig {
     pub command_budget: u32,
     /// Endpoint halves each agent holds at once, at least 1.
     pub max_endpoints: usize,
+    /// The receiver's session table (network-sessions.md S5).
+    pub sessions: crate::sessions::receive::SessionConfig,
+    /// Publications the sender announces at once, at least 1.
+    pub publications: usize,
+    /// `setup_interval` in ns (default 100 ms).
+    pub setup_interval: u64,
+    /// `setup_answer_rate` and its source table.
+    pub answer_rate: crate::sessions::send::AnswerRate,
+    /// Entries of the receiver-to-sender control ring, at least 1.
+    pub control_capacity: usize,
+    /// Control destinations the sender caches per endpoint, at least 1.
+    pub control_routes: usize,
+    /// Datagrams the receiver reads per endpoint and cycle, at least 1.
+    pub rx_datagrams: u32,
+    /// Subscribed streams and published aliases the receiver tracks, each
+    /// at least 1.
+    pub subscriptions: usize,
+    /// `rsp_setup_rate_per_destination` (network-control-schemas.md §7.4,
+    /// default 20 per second).
+    pub rsp_setup_per_destination: u64,
+    /// Destinations the per-destination RSP_SETUP rate tracks (default 64).
+    pub rsp_setup_destinations: usize,
+    /// `rsp_setup_rate` per driver (default 256 per second).
+    pub rsp_setup_rate: u64,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -154,6 +180,17 @@ impl Default for AgentConfig {
             event_capacity: 64,
             command_budget: 16,
             max_endpoints: 16,
+            sessions: crate::sessions::receive::SessionConfig::default(),
+            publications: 64,
+            setup_interval: 100_000_000,
+            answer_rate: crate::sessions::send::AnswerRate::default(),
+            control_capacity: 256,
+            control_routes: 8,
+            rx_datagrams: 64,
+            subscriptions: 64,
+            rsp_setup_per_destination: 20,
+            rsp_setup_destinations: 64,
+            rsp_setup_rate: 256,
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -171,6 +208,19 @@ impl AgentConfig {
         if self.command_budget == 0 {
             return Err(AgentError::InvalidConfig(
                 "command_budget must be at least 1",
+            ));
+        }
+        if self.publications == 0
+            || self.control_capacity == 0
+            || self.control_routes == 0
+            || self.rx_datagrams == 0
+            || self.subscriptions == 0
+            || self.rsp_setup_per_destination == 0
+            || self.rsp_setup_destinations == 0
+            || self.rsp_setup_rate == 0
+        {
+            return Err(AgentError::InvalidConfig(
+                "a network capacity or budget is zero",
             ));
         }
         if self.max_endpoints == 0 {
@@ -238,6 +288,42 @@ pub enum AgentCommand<O: SocketOps> {
         /// The endpoint.
         endpoint: EndpointId,
     },
+    /// Receiver only: challenge SETUP for `stream_id` on `endpoint` (a
+    /// stream this driver subscribes to, network-control-schemas.md §6.2
+    /// step 2). Answer [`AgentEvent::Configured`].
+    AddSubscription {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The subscribed stream.
+        stream_id: i32,
+    },
+    /// Receiver only: `alias` on `endpoint` is a local publication, so
+    /// controls for it go to the sender (the pre-filter of DN-4). Answer
+    /// [`AgentEvent::Configured`].
+    AddPublishedAlias {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
+    },
+    /// Sender only: start announcing `publication` to `destination` (the
+    /// channel route); `joins` are its join points until the sender reads
+    /// its log (phase 5). Answer [`AgentEvent::PublicationAdded`] or
+    /// [`AgentEvent::PublicationRefused`].
+    AddPublication {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The publication incarnation.
+        publication: crate::sessions::send::Publication,
+        /// Its channel destination.
+        destination: std::net::SocketAddr,
+        /// Each lane's join point.
+        joins: karyos_protocol::network::Lanes<u64>,
+    },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
     Panic,
@@ -287,6 +373,50 @@ pub enum AgentEvent<O: SocketOps> {
         /// The half.
         half: Option<Half<O>>,
     },
+    /// The sender announces the publication.
+    PublicationAdded {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+    },
+    /// The agent refused the publication (the wrong agent, a full table or
+    /// a duplicate alias).
+    PublicationRefused {
+        /// The agent.
+        agent: AgentKind,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+    },
+    /// The answer to a receiver configuration command: `accepted` is false
+    /// when its table is full.
+    Configured {
+        /// The agent.
+        agent: AgentKind,
+        /// Whether the entry was added (or was already there).
+        accepted: bool,
+    },
+    /// The agent does not serve this command.
+    Unsupported {
+        /// The agent.
+        agent: AgentKind,
+    },
+    /// Receiver: a SETUP answer was accepted; the conductor creates the
+    /// image (network-sessions.md S1; the full command chain is phase 4b-2).
+    CreateImage {
+        /// The endpoint it arrived on.
+        endpoint: EndpointId,
+        /// The pending session slot, at its challenge generation.
+        slot: crate::sessions::receive::SlotRef,
+        /// The answering incarnation.
+        identity: karyos_protocol::network::Identity,
+        /// Term parameters.
+        term: karyos_protocol::network::TermParams,
+        /// Each lane's join point.
+        joins: karyos_protocol::network::Lanes<u64>,
+    },
 }
 
 /// What an agent has from the conductor: its rings, its stop flag and its
@@ -312,7 +442,10 @@ struct AgentCore<O: SocketOps> {
 impl<O: SocketOps> AgentCore<O> {
     /// One duty cycle: the stop flag first, then up to the budget's
     /// commands; returns how many were served.
-    fn serve_commands(&mut self) -> Result<u32, AgentError> {
+    fn serve_commands(
+        &mut self,
+        role: &mut dyn FnMut(AgentCommand<O>) -> Option<(Reservation, AgentEvent<O>)>,
+    ) -> Result<u32, AgentError> {
         #[cfg(test)]
         if let Some(calls) = &self.calls
             && let Ok(mut calls) = calls.lock()
@@ -395,6 +528,15 @@ impl<O: SocketOps> AgentCore<O> {
                         break;
                     }
                 }
+                command @ (AgentCommand::AddPublication { .. }
+                | AgentCommand::AddSubscription { .. }
+                | AgentCommand::AddPublishedAlias { .. }) => {
+                    if let Some((reply, event)) = role(command)
+                        && self.reply(reply, event)?
+                    {
+                        break;
+                    }
+                }
                 #[cfg(test)]
                 AgentCommand::Panic => {
                     #[allow(clippy::panic, reason = "test-only command")]
@@ -453,6 +595,7 @@ impl<O: SocketOps> AgentCore<O> {
 #[derive(Debug)]
 pub struct SenderAgent<O: SocketOps> {
     core: AgentCore<O>,
+    role: roles::SenderRole,
 }
 
 /// The receiver agent (`driver-network-agents.md` §3.2). This phase
@@ -460,6 +603,7 @@ pub struct SenderAgent<O: SocketOps> {
 #[derive(Debug)]
 pub struct ReceiverAgent<O: SocketOps> {
     core: AgentCore<O>,
+    role: roles::ReceiverRole,
 }
 
 impl<O: SocketOps> SenderAgent<O> {
@@ -481,8 +625,21 @@ impl<O: SocketOps> SenderAgent<O> {
     ///
     /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
-        let _ = now;
-        self.core.serve_commands()
+        let Self { core, role } = self;
+        let served = core.serve_commands(&mut |command| role.command(command))?;
+        if core.stopped {
+            return Ok(served);
+        }
+        let work = role.duty(&mut core.halves, now)?;
+        served
+            .checked_add(work)
+            .ok_or(AgentError::CountOverflow(AgentKind::Sender))
+    }
+
+    /// The sender's counters.
+    #[must_use]
+    pub fn counters(&self) -> roles::SenderCounters {
+        self.role.counters()
     }
 
     /// Whether the agent stopped: its flag was set or its conductor is
@@ -512,8 +669,21 @@ impl<O: SocketOps> ReceiverAgent<O> {
     ///
     /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
-        let _ = now;
-        self.core.serve_commands()
+        let Self { core, role } = self;
+        let served = core.serve_commands(&mut |command| role.command(command))?;
+        if core.stopped {
+            return Ok(served);
+        }
+        let work = role.duty(&mut core.halves, &core.events, now)?;
+        served
+            .checked_add(work)
+            .ok_or(AgentError::CountOverflow(AgentKind::Receiver))
+    }
+
+    /// The receiver's counters.
+    #[must_use]
+    pub fn counters(&self) -> roles::ReceiverCounters {
+        self.role.counters()
     }
 
     /// Whether the agent stopped: its flag was set or its conductor is
@@ -704,11 +874,16 @@ pub fn network_agents<O: SocketOps>(
     };
     let (sender_core, sender_link) = make(AgentKind::Sender);
     let (receiver_core, receiver_link) = make(AgentKind::Receiver);
+    let (sender_role, receiver_role) = roles::roles(&config)?;
     Ok((
         NetworkAgents {
-            sender: SenderAgent { core: sender_core },
+            sender: SenderAgent {
+                core: sender_core,
+                role: sender_role,
+            },
             receiver: ReceiverAgent {
                 core: receiver_core,
+                role: receiver_role,
             },
         },
         AgentLinks {
@@ -726,9 +901,11 @@ const FAILED: u8 = 2;
 /// What a runner thread drives.
 #[derive(Debug)]
 enum Work<O: SocketOps> {
-    Sender(SenderAgent<O>),
-    Receiver(ReceiverAgent<O>),
-    Both(NetworkAgents<O>),
+    /// Every variant is boxed: the agents are large, and the runner builds
+    /// this once, at start.
+    Sender(Box<SenderAgent<O>>),
+    Receiver(Box<ReceiverAgent<O>>),
+    Both(Box<NetworkAgents<O>>),
 }
 
 /// Runs one agent's duty cycle, turning a panic into
@@ -831,8 +1008,8 @@ impl<O: SocketOps> Stopped<O> {
 
     fn take(&mut self, work: Work<O>) {
         match work {
-            Work::Sender(agent) => self.sender = Some(agent),
-            Work::Receiver(agent) => self.receiver = Some(agent),
+            Work::Sender(agent) => self.sender = Some(*agent),
+            Work::Receiver(agent) => self.receiver = Some(*agent),
             Work::Both(agents) => {
                 self.sender = Some(agents.sender);
                 self.receiver = Some(agents.receiver);
@@ -919,12 +1096,18 @@ impl<O: SocketOps + Send + 'static> AgentRunner<O> {
                 });
             }
             ThreadingMode::Dedicated => vec![
-                (vec![AgentKind::Receiver], Work::Receiver(agents.receiver)),
-                (vec![AgentKind::Sender], Work::Sender(agents.sender)),
+                (
+                    vec![AgentKind::Receiver],
+                    Work::Receiver(Box::new(agents.receiver)),
+                ),
+                (
+                    vec![AgentKind::Sender],
+                    Work::Sender(Box::new(agents.sender)),
+                ),
             ],
             ThreadingMode::SharedNetwork => vec![(
                 vec![AgentKind::Receiver, AgentKind::Sender],
-                Work::Both(agents),
+                Work::Both(Box::new(agents)),
             )],
         };
         let mut threads = Vec::with_capacity(work.len());

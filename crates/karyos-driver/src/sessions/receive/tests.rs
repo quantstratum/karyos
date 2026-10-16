@@ -236,9 +236,9 @@ fn an_answer_needs_the_command_chain_and_counts_once() {
     );
     // An identical announcement resends; a different one waits for the
     // conductor.
-    challenged(sessions.announce(key(1), &announce(1), 4 * MS, &mut nonces));
+    challenged(sessions.announce(key(1), &announce(1), 60 * MS, &mut nonces));
     assert_eq!(
-        sessions.announce(key(1), &announce(2), 5 * MS, &mut nonces),
+        sessions.announce(key(1), &announce(2), 61 * MS, &mut nonces),
         AnnounceOutcome::Dropped(Ignored::AwaitingInstallation)
     );
     // An answered challenge survives the timers past its expiry, until
@@ -484,6 +484,7 @@ fn inject(
         lane_count: 2,
         nonce,
         created_at: 0,
+        last_sent: 0,
         answered,
     };
     SlotRef {
@@ -643,4 +644,28 @@ fn a_stale_reclaim_is_counted() {
     assert_eq!(sessions.counters().stale_commands, 1);
     sessions.storage_reclaimed(slot);
     assert_eq!(sessions.timers(20 * SECOND), 1);
+}
+
+/// Review of #235, P1-3: identical announcements resend the challenge at
+/// most once per `challenge_resend_interval` (50 ms).
+#[test]
+fn resends_are_held_off() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces));
+    let mut sent = 0;
+    for step in 1..=200u64 {
+        // 200 identical announcements within 25 ms.
+        if let AnnounceOutcome::Challenge(_) =
+            sessions.announce(key(1), &announce(1), step * 125_000, &mut nonces)
+        {
+            sent += 1;
+        }
+    }
+    assert_eq!(sent, 0);
+    challenged(sessions.announce(key(1), &announce(1), 50 * MS, &mut nonces));
+    assert_eq!(
+        sessions.announce(key(1), &announce(1), 60 * MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::ResendHoldoff)
+    );
 }

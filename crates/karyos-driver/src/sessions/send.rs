@@ -37,8 +37,8 @@ use karyos_protocol::network::{
     TermParams,
 };
 use karyos_sys::host_clock::age_ns;
-use karyos_sys::rate_limit::{Rate, RateLimiter, RatePolicy};
 
+use super::rate::{EndpointRates, RateRefused};
 use crate::agents::EndpointId;
 
 /// One publication incarnation as its SETUPs describe it.
@@ -120,18 +120,6 @@ impl Default for AnswerRate {
     }
 }
 
-/// One source endpoint's bucket.
-#[derive(Debug, Clone, Copy)]
-struct RateSource {
-    source: SocketAddr,
-    limiter: RateLimiter,
-    last: u64,
-}
-
-/// A second in ns: a bucket idle this long is full again (its burst is its
-/// rate per second).
-const SECOND: u64 = 1_000_000_000;
-
 #[derive(Debug, Clone, Copy)]
 struct Session {
     publication: Publication,
@@ -146,8 +134,7 @@ pub struct SendSessions {
     sessions: Vec<Session>,
     capacity: usize,
     setup_interval: u64,
-    rate: AnswerRate,
-    rates: Vec<RateSource>,
+    rates: EndpointRates,
     counters: SendCounters,
 }
 
@@ -186,8 +173,8 @@ impl SendSessions {
             sessions: Vec::with_capacity(capacity),
             capacity,
             setup_interval,
-            rate,
-            rates: Vec::with_capacity(rate.sources),
+            rates: EndpointRates::new(rate.per_second, rate.sources)
+                .ok_or(SendSessionError::InvalidConfig)?,
             counters: SendCounters::default(),
         })
     }
@@ -385,69 +372,22 @@ impl SendSessions {
 
     /// Charges one answer to `source`'s bucket at `now`.
     fn admit(&mut self, source: SocketAddr, now: u64) -> Result<(), SendIgnored> {
-        let source = normalized(source);
-        let index = match self.rates.iter().position(|entry| entry.source == source) {
-            Some(index) => index,
-            None => {
-                let policy = RatePolicy {
-                    messages: Rate {
-                        per_second: self.rate.per_second,
-                        burst: self.rate.per_second,
-                    },
-                    bytes: None,
-                };
-                let entry = RateSource {
-                    source,
-                    limiter: RateLimiter::new(policy, now),
-                    last: now,
-                };
-                if self.rates.len() < self.rate.sources {
-                    self.rates.push(entry);
-                    self.rates.len() - 1
-                } else if let Some(index) = self
-                    .rates
-                    .iter()
-                    .position(|entry| age_ns(now, entry.last) >= SECOND)
-                {
-                    // Idle a second: its bucket is full again, so reusing it
-                    // for another source grants nothing early.
-                    if let Some(slot) = self.rates.get_mut(index) {
-                        *slot = entry;
-                    }
-                    index
-                } else {
-                    self.counters.bump(|c| &mut c.rate_sources_full);
-                    return Err(SendIgnored::RateSources);
-                }
+        match self.rates.admit(source, now) {
+            Ok(()) => Ok(()),
+            Err(RateRefused::Limited) => {
+                self.counters.bump(|c| &mut c.rate_limited);
+                Err(SendIgnored::RateLimited)
             }
-        };
-        let Some(entry) = self.rates.get_mut(index) else {
-            return Err(SendIgnored::RateSources);
-        };
-        entry.last = now;
-        if entry.limiter.admit_frame(now, 0, true) {
-            Ok(())
-        } else {
-            self.counters.bump(|c| &mut c.rate_limited);
-            Err(SendIgnored::RateLimited)
+            Err(RateRefused::TableFull) => {
+                self.counters.bump(|c| &mut c.rate_sources_full);
+                Err(SendIgnored::RateSources)
+            }
         }
     }
 
     fn ignore(&mut self, reason: SendIgnored) -> SendIgnored {
         self.counters.bump(|c| &mut c.dropped);
         reason
-    }
-}
-
-/// A source endpoint as its bucket is keyed: an IPv4-mapped IPv6 endpoint
-/// is its IPv4 endpoint.
-fn normalized(source: SocketAddr) -> SocketAddr {
-    match source {
-        SocketAddr::V6(v6) => v6
-            .ip()
-            .to_ipv4_mapped()
-            .map_or(source, |v4| SocketAddr::from((v4, v6.port()))),
-        SocketAddr::V4(_) => source,
     }
 }
 

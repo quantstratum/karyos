@@ -8,6 +8,7 @@
 //! timers. It is a state machine with no I/O: the caller passes decoded
 //! controls, the binding key and the time, and sends what it returns.
 
+pub mod rate;
 pub mod receive;
 pub mod send;
 

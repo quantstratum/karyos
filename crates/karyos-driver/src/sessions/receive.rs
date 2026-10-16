@@ -77,6 +77,10 @@ pub struct SessionConfig {
     pub alias_quarantine: u64,
     /// Timer actions per receiver duty (default 64).
     pub timer_actions: u32,
+    /// The least time between two sends of one challenge, in ns
+    /// (`challenge_resend_interval`, network-control-schemas.md §7.4,
+    /// default 50 ms).
+    pub challenge_resend_interval: u64,
 }
 
 impl Default for SessionConfig {
@@ -88,6 +92,7 @@ impl Default for SessionConfig {
             setup_challenge_timeout: 1_000_000_000,
             alias_quarantine: 10_000_000_000,
             timer_actions: 64,
+            challenge_resend_interval: 50_000_000,
         }
     }
 }
@@ -205,6 +210,8 @@ pub enum Ignored {
     DuplicateIdentity,
     /// The control's alias differs from the key's.
     AliasMismatch,
+    /// The challenge was sent less than `challenge_resend_interval` ago.
+    ResendHoldoff,
 }
 
 /// Counters of the table; increments are checked and `overflowed` is
@@ -259,6 +266,8 @@ enum State {
         lane_count: u8,
         nonce: [u64; 2],
         created_at: u64,
+        /// When this challenge was last handed out for sending.
+        last_sent: u64,
         answered: bool,
     },
     Active {
@@ -490,6 +499,7 @@ impl ReceiveSessions {
                     lane_count,
                     nonce,
                     created_at,
+                    last_sent,
                     answered,
                     ..
                 } => {
@@ -497,6 +507,17 @@ impl ReceiveSessions {
                         && term == announce.term
                         && lane_count == announce.lane_count;
                     if identical && (answered || age_ns(now, created_at) < timeout) {
+                        // At most one resend per `challenge_resend_interval`
+                        // (§7.4): a burst of identical announcements does
+                        // not multiply the challenges.
+                        if age_ns(now, last_sent) < self.config.challenge_resend_interval {
+                            return AnnounceOutcome::Dropped(self.ignore(Ignored::ResendHoldoff));
+                        }
+                        if let Some(entry) = self.slots.get_mut(index)
+                            && let State::Challenged { last_sent, .. } = &mut entry.state
+                        {
+                            *last_sent = now;
+                        }
                         // The same challenge, its expiry unchanged.
                         self.counters.bump(|c| &mut c.challenge_resends);
                         return AnnounceOutcome::Challenge(self.challenge(key, identity, nonce));
@@ -518,6 +539,7 @@ impl ReceiveSessions {
                             lane_count: announce.lane_count,
                             nonce: fresh,
                             created_at: now,
+                            last_sent: now,
                             answered: false,
                         };
                     }
@@ -559,6 +581,7 @@ impl ReceiveSessions {
                 lane_count: announce.lane_count,
                 nonce,
                 created_at: now,
+                last_sent: now,
                 answered: false,
             };
         }
@@ -761,12 +784,7 @@ impl ReceiveSessions {
 /// The address a source counts under: an IPv4-mapped IPv6 address is the
 /// IPv4 address, so one host cannot double its per-source budget.
 fn source_ip(source: SocketAddr) -> std::net::IpAddr {
-    match source.ip() {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
-        v4 => v4,
-    }
+    super::rate::normalized(source).ip()
 }
 
 #[cfg(test)]
