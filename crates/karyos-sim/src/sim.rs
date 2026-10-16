@@ -165,8 +165,10 @@ enum Kind {
         view: ReaderView,
         /// Virtual time of its last heartbeat.
         last_beat: u64,
-        /// The longest gap between two heartbeats so far.
-        longest_silence: u64,
+        /// The longest gap between two heartbeats since its last poll that
+        /// found it not revoked: the driver revoked it after that poll, so
+        /// only a silence since then can explain a revocation.
+        silence_since_poll: u64,
     },
 }
 
@@ -174,7 +176,8 @@ enum Kind {
 struct Client {
     id: u32,
     stream: usize,
-    /// The longest gap between its heartbeats so far.
+    /// The longest gap between its heartbeats since its last poll that
+    /// found it not revoked, the current one included.
     silence: u64,
 }
 
@@ -347,7 +350,7 @@ impl<'s> Sim<'s> {
                     subscription,
                     view,
                     last_beat: 0,
-                    longest_silence: 0,
+                    silence_since_poll: 0,
                 });
             }
             match plan.publication {
@@ -438,12 +441,12 @@ impl<'s> Sim<'s> {
             if let Kind::Client {
                 conductor,
                 last_beat,
-                longest_silence,
+                silence_since_poll,
                 ..
             } = &mut actor.kind
             {
                 let _ = conductor.poll(usize::MAX, |_| {});
-                *longest_silence = (*longest_silence).max(now - *last_beat);
+                *silence_since_poll = (*silence_since_poll).max(now - *last_beat);
                 *last_beat = now;
             }
         }
@@ -575,11 +578,11 @@ impl<'s> Sim<'s> {
                     subscription,
                     view,
                     last_beat,
-                    longest_silence,
+                    silence_since_poll,
                     ..
                 } => {
-                    let silence = (*longest_silence).max(self.clock.get() - *last_beat);
-                    self.read_client(
+                    let silence = (*silence_since_poll).max(self.clock.get() - *last_beat);
+                    let revoked = self.read_client(
                         subscription,
                         view,
                         Client {
@@ -588,7 +591,13 @@ impl<'s> Sim<'s> {
                             silence,
                         },
                         depth,
-                    )
+                    );
+                    // Not revoked yet: a later revocation needs a later
+                    // silence.
+                    if matches!(revoked, Ok(false)) {
+                        *silence_since_poll = 0;
+                    }
+                    revoked
                 }
             };
             match result {
@@ -777,7 +786,8 @@ impl<'s> Sim<'s> {
         let mut errors = Vec::new();
         let mut failure = None;
         let mut held = false;
-        // The longest silence, including one in a loan stall below.
+        // The longest silence since the last poll, including one in a loan
+        // stall below.
         let mut silent = silence;
         let polled = subscription.poll(
             |bytes, info| {

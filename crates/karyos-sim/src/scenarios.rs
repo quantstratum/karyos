@@ -55,6 +55,13 @@ fn scenario(name: &'static str, faults: Faults) -> Scenario {
 /// `continue` a required reader takes a spare-slot credit like an optional
 /// one, so the concurrent stream keeps one optional reader: three
 /// publishers and three readers spend the six credits.
+///
+/// `hold` and `continue` give identical runs: after a revocation with a
+/// held loan, the loaned slot stops the publisher under `continue` where
+/// the kept bound stops it under `hold`, and without a loan both withdraw
+/// the bound at once. Their difference (the bound kept or withdrawn, the
+/// credit) is covered by the driver's liveness tests and the Loom models
+/// of `karyos_sys::participant`.
 fn stall(name: &'static str, policy: LossPolicy) -> Scenario {
     let concurrent = StreamPlan {
         optional: 1,
@@ -64,7 +71,10 @@ fn stall(name: &'static str, policy: LossPolicy) -> Scenario {
     Scenario {
         name,
         streams: vec![
+            // The client is the only required reader here: nothing else
+            // bounds the publisher while the client is live.
             StreamPlan {
+                required: 0,
                 clients: 1,
                 ..exclusive_plan()
             },
