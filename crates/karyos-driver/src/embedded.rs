@@ -56,6 +56,7 @@ use crate::commands::ClientSlot;
 use crate::counters::{DriverCounters, Event, TYPE_EVENTS};
 use crate::error::DriverError;
 use crate::generations::{Cutover, Member, MemberKind, Retained};
+use crate::guards::GuardHandle;
 
 /// The term backing of a driver's streams (`quantstratum-docs:
 /// karyos/design/ipc-data-path.md`, Terms in the types): heap words for an
@@ -223,6 +224,12 @@ pub struct DriverConfig {
     pub trace_drain_budget: usize,
     /// Records of the trace mirror's ring.
     pub trace_mirror_records: usize,
+    /// Guards configured at once (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`).
+    pub max_guards: usize,
+    /// Records of the guard audit ring (G9 interim); a full ring overwrites
+    /// its oldest record and counts it. Zero keeps only the count.
+    pub guard_audit_records: usize,
 }
 
 impl Default for DriverConfig {
@@ -263,6 +270,8 @@ impl Default for DriverConfig {
             max_trace_journal_bytes: 64 * 1024 * 1024,
             trace_drain_budget: 1024,
             trace_mirror_records: 4096,
+            max_guards: 16,
+            guard_audit_records: 1024,
         }
     }
 }
@@ -574,6 +583,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) diagnostics: crate::diagnostics::Diagnostics,
     /// The client trace journals and the trace mirror.
     pub(crate) trace_journals: crate::trace_journals::TraceJournals,
+    /// The guard registry and its audit ring.
+    pub(crate) guards: crate::guards::Guards,
 }
 
 /// The incarnation of a stream's publication in the embedded driver: one per
@@ -794,6 +805,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 config.max_trace_journal_bytes,
                 config.trace_drain_budget,
             ),
+            guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
         })
     }
 
@@ -1125,6 +1137,84 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     #[must_use]
     pub fn is_admitting(&self) -> bool {
         self.admitting
+    }
+
+    /// Adds a guard named `name`, created closed at epoch 1, on the control
+    /// path (`quantstratum-docs: karyos/design/guards-and-abort.md`).
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidConfig`] for an empty name or one longer than
+    /// [`crate::guards::MAX_GUARD_NAME`] bytes, [`DriverError::DuplicateGuard`],
+    /// [`DriverError::TooManyGuards`] and [`DriverError::GuardIdsExhausted`].
+    pub fn add_guard(&mut self, name: &str) -> Result<GuardHandle, DriverError> {
+        self.guards.add(name)
+    }
+
+    /// The guard named `name`.
+    #[must_use]
+    pub fn guard(&self, name: &str) -> Option<GuardHandle> {
+        self.guards.find(name)
+    }
+
+    /// A guard's state.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::UnknownGuard`] for a foreign handle;
+    /// [`DriverError::Guard`] for a corrupt word (a broken invariant).
+    pub fn guard_state(
+        &self,
+        guard: GuardHandle,
+    ) -> Result<karyos_sys::guard::GuardState, DriverError> {
+        self.guards.state(guard)
+    }
+
+    /// Closes a guard for the in-process caller (G1), with the caller's
+    /// `operation` id for the audit record. Idempotent at the current
+    /// epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::UnknownGuard`] and [`DriverError::Guard`]; every
+    /// call, refused or not, is audited.
+    pub fn close_guard(
+        &mut self,
+        guard: GuardHandle,
+        operation: u64,
+    ) -> Result<karyos_sys::guard::Closed, DriverError> {
+        let now = self.clock.now();
+        self.guards
+            .close(guard, operation, crate::guards::Requester::InProcess, now)
+    }
+
+    /// Reopens a guard closed at `expected` for the in-process caller (G1),
+    /// returning the new open epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::UnknownGuard`] and [`DriverError::Guard`]
+    /// (`NotClosedAt`, `Exhausted`); every call is audited.
+    pub fn reopen_guard(
+        &mut self,
+        guard: GuardHandle,
+        expected: u64,
+        operation: u64,
+    ) -> Result<u64, DriverError> {
+        let now = self.clock.now();
+        self.guards.reopen(
+            guard,
+            expected,
+            operation,
+            crate::guards::Requester::InProcess,
+            now,
+        )
+    }
+
+    /// A snapshot of the guard audit ring (G9 interim).
+    #[must_use]
+    pub fn guard_audit(&self) -> crate::guards::Audit {
+        self.guards.audit()
     }
 
     /// Creates a stream (control path: allocates its log buffer).
