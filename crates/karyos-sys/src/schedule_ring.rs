@@ -59,6 +59,10 @@ pub enum ScheduleError {
     /// contradict each other: a broken invariant.
     #[error("the schedule ring's counts are inconsistent")]
     Invariant,
+    /// The lane is not timed, or a timed lane was given a plain offer or
+    /// claim: a timed lane carries timed messages only.
+    #[error("not a timed lane, or a timed lane offered without a time")]
+    NotScheduled,
     /// 2^64 entries were pushed on the lane.
     #[error("the schedule ring's entries are exhausted")]
     Exhausted,
@@ -215,6 +219,10 @@ impl SchedulePublisher {
         let order = self.head_load;
         #[cfg(not(loom))]
         let order = Ordering::Acquire;
+        // 2^64 entries are refused before the reservation, not after it.
+        if self.tail == u64::MAX {
+            return Err(ScheduleError::Exhausted);
+        }
         let head = word(ring, HEAD)?.load(order);
         let waiting = self
             .tail

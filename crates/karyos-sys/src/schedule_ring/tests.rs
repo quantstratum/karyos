@@ -112,9 +112,10 @@ fn inconsistent_counts_are_refused() {
     ring[TAIL].store(u64::MAX, Ordering::Relaxed);
     ring[HEAD].store(u64::MAX, Ordering::Relaxed);
     let mut publisher = SchedulePublisher::attach(&ring).unwrap();
-    assert_eq!(publisher.has_room(&ring), Ok(true));
+    // Refused at the room check, before any message is reserved.
+    assert_eq!(publisher.has_room(&ring), Err(ScheduleError::Exhausted));
     assert_eq!(
         publisher.push(&ring, entry(0)),
-        Err(ScheduleError::Exhausted)
+        Err(ScheduleError::Invariant)
     );
 }

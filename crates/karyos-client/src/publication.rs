@@ -254,6 +254,9 @@ pub struct ClientPublication<T: TermBytes = HeapTerms> {
     /// The guard and outcome ring of a guarded handle (`quantstratum-docs:
     /// karyos/design/guards-and-abort.md`).
     guard: Option<GuardBinding>,
+    /// The schedule of a timed lane's handle (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`).
+    schedule: Option<crate::schedule::ScheduleBinding>,
     /// The export of a handle adopted from another process's grant. Last:
     /// it is dropped after the mapping, and its drop sends `Detach`.
     _export: Option<Export>,
@@ -285,8 +288,42 @@ impl<T: TermBytes> ClientPublication<T> {
             conflation: None,
             _lease: None,
             guard: None,
+            schedule: None,
             _export: None,
         }
+    }
+
+    /// Binds the handle to its timed lane's schedule. The driver calls
+    /// this while issuing a timed publication; callers should normally
+    /// obtain handles from the driver.
+    #[must_use]
+    pub fn with_schedule(mut self, binding: crate::schedule::ScheduleBinding) -> Self {
+        self.schedule = Some(binding);
+        self
+    }
+
+    /// The schedule of a timed lane's handle, if any.
+    #[must_use]
+    pub fn schedule(&self) -> Option<&crate::schedule::ScheduleBinding> {
+        self.schedule.as_ref()
+    }
+
+    /// Offers one message of a timed lane with its requested not-before
+    /// time `tx_time`, in the publication's clock domain
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`). Before anything is
+    /// reserved: a time below the lane's last accepted one is refused
+    /// (`InvalidSchedule`: times within a timed lane never go backwards),
+    /// one beyond `now + max_horizon` is `ScheduleTooFar`, an overflowing
+    /// deadline `ScheduleOverflow`, and a full schedule ring returns
+    /// `BackPressured`. A time already past is accepted and goes at once.
+    /// Otherwise as [`ClientPublication::offer`].
+    ///
+    /// # Errors
+    ///
+    /// The schedule refusals above, `InvalidSchedule` for a lane that is
+    /// not timed, and the errors of [`ClientPublication::offer`].
+    pub fn offer_at(&mut self, payload: &[u8], tx_time: u64) -> Result<OfferOutcome, ClientError> {
+        self.offer_inner(payload, AppendOptions::default(), Some(tx_time))
     }
 
     /// Binds the handle to its guard and outcome ring. The driver calls
@@ -511,8 +548,33 @@ impl<T: TermBytes> ClientPublication<T> {
         payload: &[u8],
         options: AppendOptions,
     ) -> Result<OfferOutcome, ClientError> {
+        self.offer_inner(payload, options, None)
+    }
+
+    fn offer_inner(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        tx_time: Option<u64>,
+    ) -> Result<OfferOutcome, ClientError> {
         // A forgotten claim is resolved before any early return.
         self.inner.resolve_forgotten_claim();
+        // A timed lane takes timed offers only, and only it does; the time
+        // is checked before anything is reserved.
+        match (tx_time, &self.schedule) {
+            (None, Some(_)) => {
+                return Err(ClientError::InvalidSchedule {
+                    reason: "a timed lane takes offer_at only",
+                });
+            }
+            (Some(_), None) => {
+                return Err(ClientError::InvalidSchedule {
+                    reason: "offer_at on a lane that is not timed",
+                });
+            }
+            (Some(time), Some(binding)) => binding.check(time)?,
+            (None, None) => {}
+        }
         let admission = self.guard.as_ref().map(GuardBinding::admission);
         if let Some(refused) = admission.filter(|admission| *admission != Admission::Open) {
             // A sealed handle releases first and reports its seal
@@ -558,13 +620,23 @@ impl<T: TermBytes> ClientPublication<T> {
             }
             return Ok(OfferOutcome::RateLimited);
         }
-        Ok(match self.inner.append(payload, options)? {
+        let appended = match (tx_time, &mut self.schedule) {
+            (Some(time), Some(binding)) => {
+                self.inner
+                    .append_scheduled(payload, options, &mut binding.publisher, time)?
+            }
+            _ => self.inner.append(payload, options)?,
+        };
+        Ok(match appended {
             AppendOutcome::Appended { position } => {
                 // An accepted message gets exactly one final record, and
                 // takes one token of the rate copy.
                 if let Some(binding) = &mut self.guard {
                     binding.reserve();
                     binding.charge_rate();
+                }
+                if let (Some(time), Some(binding)) = (tx_time, &mut self.schedule) {
+                    binding.accepted(time);
                 }
                 OfferOutcome::Accepted {
                     lane: self.inner.buffer().lane(),
@@ -616,6 +688,11 @@ impl<T: TermBytes> ClientPublication<T> {
         // A forgotten claim is resolved before any early return; the
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
+        if self.schedule.is_some() {
+            return Err(ClientError::InvalidSchedule {
+                reason: "a timed lane takes offer_at only",
+            });
+        }
         let admission = self.guard.as_ref().map(GuardBinding::admission);
         if let Some(refused) = admission.filter(|admission| *admission != Admission::Open) {
             // As in `offer_with`: a sealed handle releases first.

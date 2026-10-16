@@ -46,6 +46,29 @@ pub enum ClientError {
     /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, G5).
     #[error(transparent)]
     Outcomes(#[from] OutcomeError),
+    /// A timed send was refused before reservation
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`, section 7): a
+    /// requested time below the lane's last accepted one (times within a
+    /// timed lane never go backwards), a plain offer or claim on a timed
+    /// lane, a timed offer on a lane that is not timed, or a clock domain
+    /// this host does not have.
+    #[error("invalid schedule: {reason}")]
+    InvalidSchedule {
+        /// What is wrong.
+        reason: &'static str,
+    },
+    /// The requested time is beyond the publication's `max_horizon`.
+    #[error("requested time {tx_time} is beyond the horizon {limit}")]
+    ScheduleTooFar {
+        /// The requested time.
+        tx_time: u64,
+        /// The latest time accepted now.
+        limit: u64,
+    },
+    /// A deadline sum (`now + max_horizon`, `tx_time + lateness_tolerance`)
+    /// overflows the time type: refused, never wrapped.
+    #[error("a schedule deadline overflows the time type")]
+    ScheduleOverflow,
     /// A lower layer failed.
     #[error(transparent)]
     Sys(SysError),
@@ -57,6 +80,11 @@ impl From<SysError> for ClientError {
             SysError::EmptyMessage => Self::EmptyMessage,
             SysError::Layout(LayoutError::MessageTooLarge { length, max }) => {
                 Self::MessageTooLarge { length, max }
+            }
+            SysError::Schedule(karyos_sys::schedule_ring::ScheduleError::NotScheduled) => {
+                Self::InvalidSchedule {
+                    reason: "a timed lane takes timed offers only, and only a timed lane does",
+                }
             }
             other => Self::Sys(other),
         }

@@ -122,6 +122,13 @@ pub enum DriverError {
         /// The sender id.
         sender: u64,
     },
+    /// The stream is not a timed lane: its buffer has no schedule ring
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`).
+    #[error("stream {stream} is not a timed lane")]
+    NotTimed {
+        /// The stream id.
+        stream: u64,
+    },
     /// The stream's incarnation numbers are exhausted; they are never
     /// reused.
     #[error("stream {stream}'s incarnations are exhausted")]

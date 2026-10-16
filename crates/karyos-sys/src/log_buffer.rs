@@ -1699,11 +1699,65 @@ impl<O: BufferOwner> Publication<O> {
         if self.state == PublicationState::Closed {
             return Ok(self.ended_append());
         }
+        // A timed lane carries timed messages only (timed-tx.md, TT-1).
+        if self.buffer.schedule_ring().is_some() {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
+        }
         let outcome = PublicationContext {
             buffer: &self.buffer,
             state: &mut self.state,
         }
-        .append(payload, options)?;
+        .append(payload, options, &mut |_| {})?;
+        match outcome {
+            AppendOutcome::Appended { .. } => Ok(outcome),
+            _ if self.observe_seal() => Ok(self.ended_append()),
+            _ => Ok(outcome),
+        }
+    }
+
+    /// Appends one message of a timed lane with its requested `time`
+    /// (`quantstratum-docs: karyos/design/timed-tx.md`, section 2, TT-1):
+    /// the schedule ring's room is checked before the message is reserved
+    /// (none is back pressure, and nothing is reserved), and the entry of
+    /// the reserved message's first frame is pushed after the reservation
+    /// and before the block's commit store, so a sender that sees the
+    /// committed frame finds its entry. `publisher` is the lane's publisher
+    /// of the ring, held by the handle across appends.
+    ///
+    /// # Errors
+    ///
+    /// As [`Publication::append`]; [`SysError::Schedule`] with
+    /// `NotScheduled` for a lane that is not timed, `Exhausted` past 2^64
+    /// entries and `Layout` or `Invariant` for a ring that does not match
+    /// the publisher. Nothing is reserved on error.
+    pub fn append_scheduled(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        publisher: &mut crate::schedule_ring::SchedulePublisher,
+        time: u64,
+    ) -> Result<AppendOutcome, SysError> {
+        self.resolve_claim();
+        if self.state == PublicationState::Closed {
+            return Ok(self.ended_append());
+        }
+        let buffer = &*self.buffer;
+        let ring = buffer
+            .schedule_ring()
+            .ok_or(crate::schedule_ring::ScheduleError::NotScheduled)?;
+        if !publisher.has_room(ring)? {
+            return Ok(AppendOutcome::BackPressured);
+        }
+        let outcome = PublicationContext {
+            buffer: &self.buffer,
+            state: &mut self.state,
+        }
+        .append(payload, options, &mut |position| {
+            // Room was checked and the count is not exhausted: the push of
+            // a reserved message cannot be refused.
+            let pushed = publisher.push(ring, crate::schedule_ring::Entry { position, time });
+            debug_assert!(pushed.is_ok(), "{pushed:?}");
+        })?;
         match outcome {
             AppendOutcome::Appended { .. } => Ok(outcome),
             _ if self.observe_seal() => Ok(self.ended_append()),
@@ -1752,6 +1806,10 @@ impl<O: BufferOwner> Publication<O> {
         self.resolve_claim();
         if self.state == PublicationState::Closed {
             return Ok(self.ended_claim());
+        }
+        // A timed lane carries timed messages only (timed-tx.md, TT-1).
+        if self.buffer.schedule_ring().is_some() {
+            return Err(crate::schedule_ring::ScheduleError::NotScheduled.into());
         }
         let step = PublicationContext {
             buffer: &self.buffer,
@@ -2082,10 +2140,14 @@ struct PublicationContext<'a, T: TermBytes> {
 }
 
 impl<T: TermBytes> PublicationContext<'_, T> {
+    /// Reserves and writes one message; `reserved` sees the first frame's
+    /// position after the reservation and before the block is written and
+    /// committed (a timed lane's schedule entry).
     fn append(
         &mut self,
         payload: &[u8],
         options: AppendOptions,
+        reserved_at: &mut dyn FnMut(u64),
     ) -> Result<AppendOutcome, SysError> {
         if payload.is_empty() {
             return Err(SysError::EmptyMessage);
@@ -2116,6 +2178,7 @@ impl<T: TermBytes> PublicationContext<'_, T> {
             } => {
                 #[cfg(feature = "test-hooks")]
                 crate::test_pause::reached(crate::test_pause::PausePoint::ExclusiveReserved);
+                reserved_at(position);
                 self.write_block(slot, count, tail, payload, &plan, options);
                 Ok(AppendOutcome::Appended { position })
             }

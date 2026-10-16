@@ -461,6 +461,9 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// retiring: served until their walker ended and their readers passed
     /// the seal.
     pub(crate) replaced: Vec<Replaced<T>>,
+    /// A timed lane's settings (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`); the defaults when not set.
+    pub(crate) schedule: Option<karyos_client::schedule::ScheduleOptions>,
 }
 
 /// A sealed incarnation a fresh one replaced, retiring like a removed
@@ -1790,6 +1793,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guarded: None,
             incarnation: FIRST_INCARNATION,
             replaced: Vec::new(),
+            schedule: None,
         })
     }
 
@@ -1830,6 +1834,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 return Err(error);
             }
         };
+        // A timed lane's handle gets its schedule binding, prepared before
+        // the publication is taken, so a refusal takes nothing.
+        let schedule = self.prepare_schedule_binding(stream)?;
         let stream = self.active_stream(stream)?;
         stream.issuing()?;
         let inner = match stream.spare.take() {
@@ -1852,8 +1859,61 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             publication = publication.with_guard(client);
             guarded.bind(bound);
         }
+        if let Some(schedule) = schedule {
+            publication = publication.with_schedule(schedule);
+        }
         self.update_stream_gauges();
         Ok(publication)
+    }
+
+    /// The schedule binding of a timed lane's next handle; `None` for a
+    /// lane that is not timed.
+    fn prepare_schedule_binding(
+        &self,
+        stream: StreamHandle,
+    ) -> Result<Option<karyos_client::schedule::ScheduleBinding>, DriverError> {
+        let found = self.stream_ref(stream)?;
+        let Some(ring) = found.buffer.schedule_ring() else {
+            return Ok(None);
+        };
+        let options = found.schedule.unwrap_or_default();
+        let clock = options.domain.clock()?;
+        Ok(Some(karyos_client::schedule::ScheduleBinding::new(
+            ring, options, clock,
+        )?))
+    }
+
+    /// Sets a timed lane's settings (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`, TT-2 and TT-3) on the control path,
+    /// before any publication handle is issued: its clock domain, horizon,
+    /// lateness tolerance and cancel-on-deadline. Without it a timed lane
+    /// uses [`karyos_client::schedule::ScheduleOptions::default`].
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NotTimed`] for a stream whose buffer has no schedule
+    /// ring (`schedule_capacity` 0); [`DriverError::InvalidConfig`] once a
+    /// handle was issued; [`DriverError::Client`] with `InvalidSchedule`
+    /// for the `Tai` domain off Linux; the stream lookup errors.
+    pub fn schedule_stream(
+        &mut self,
+        stream: StreamHandle,
+        options: karyos_client::schedule::ScheduleOptions,
+    ) -> Result<(), DriverError> {
+        let _ = options.domain.clock()?;
+        let found = self.active_stream(stream)?;
+        if found.buffer.schedule_ring().is_none() {
+            return Err(DriverError::NotTimed { stream: found.id });
+        }
+        let issued = found
+            .members
+            .iter()
+            .any(|member| matches!(member.kind, MemberKind::Exclusive));
+        if issued {
+            return Err(DriverError::InvalidConfig);
+        }
+        found.schedule = Some(options);
+        Ok(())
     }
 
     /// Creates the fresh incarnation of a guarded stream a guard close
