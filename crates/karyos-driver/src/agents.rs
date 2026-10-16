@@ -302,6 +302,8 @@ struct AgentCore<O: SocketOps> {
     /// The endpoint halves this agent holds, at most `max_endpoints`
     /// (allocated at creation).
     halves: Vec<(EndpointId, Half<O>)>,
+    /// The most halves the agent holds (`AgentConfig::max_endpoints`).
+    max_endpoints: usize,
     /// Test only: records each duty cycle's agent, in call order.
     #[cfg(test)]
     calls: Option<Arc<std::sync::Mutex<Vec<AgentKind>>>>,
@@ -359,7 +361,7 @@ impl<O: SocketOps> AgentCore<O> {
                     half,
                 } => {
                     let event = if half.agent() != self.kind
-                        || self.halves.len() >= self.halves.capacity()
+                        || self.halves.len() >= self.max_endpoints
                         || self.halves.iter().any(|(held, _)| *held == endpoint)
                     {
                         AgentEvent::Refused {
@@ -427,6 +429,19 @@ impl<O: SocketOps> AgentCore<O> {
         }
     }
 
+    /// Takes the halves of the commands still unread in the command ring:
+    /// after a stop, an `Attach` the agent never served still carries its
+    /// half.
+    fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {
+        let mut halves = Vec::new();
+        while let Ok(Some(command)) = self.commands.try_take() {
+            if let AgentCommand::Attach { endpoint, half, .. } = command {
+                halves.push((endpoint, half));
+            }
+        }
+        halves
+    }
+
     /// Hands back every half this agent holds.
     fn take_halves(&mut self) -> impl Iterator<Item = (EndpointId, Half<O>)> + '_ {
         self.halves.drain(..)
@@ -448,6 +463,12 @@ pub struct ReceiverAgent<O: SocketOps> {
 }
 
 impl<O: SocketOps> SenderAgent<O> {
+    /// After a stop: the halves of `Attach` commands the agent never read
+    /// (DN-8). The conductor reclaims them with the held ones.
+    pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {
+        self.core.take_unread_halves()
+    }
+
     /// Hands back every endpoint half the agent holds, for the conductor
     /// to join and retire after a stop (DN-8).
     pub fn take_halves(&mut self) -> impl Iterator<Item = (EndpointId, Half<O>)> + '_ {
@@ -473,6 +494,12 @@ impl<O: SocketOps> SenderAgent<O> {
 }
 
 impl<O: SocketOps> ReceiverAgent<O> {
+    /// After a stop: the halves of `Attach` commands the agent never read
+    /// (DN-8). The conductor reclaims them with the held ones.
+    pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {
+        self.core.take_unread_halves()
+    }
+
     /// Hands back every endpoint half the agent holds, for the conductor
     /// to join and retire after a stop (DN-8).
     pub fn take_halves(&mut self) -> impl Iterator<Item = (EndpointId, Half<O>)> + '_ {
@@ -662,6 +689,7 @@ pub fn network_agents<O: SocketOps>(
             stop: Arc::clone(&stop),
             stopped: false,
             halves: Vec::with_capacity(config.max_endpoints),
+            max_endpoints: config.max_endpoints,
             #[cfg(test)]
             calls: None,
         };

@@ -8,27 +8,40 @@
 //! the joined endpoint:
 //!
 //! - **Open.** Both agents' command and reply slots are reserved before the
-//!   socket is opened, so an open either attaches both halves or leaves
-//!   nothing behind.
+//!   socket is opened. [`EndpointEvent::Opened`] follows once both agents
+//!   answered `Attached`.
 //! - **Reset.** The conductor asks both agents for their halves, joins
-//!   them, resets the endpoint (draining the items it returns), reopens it
-//!   with the next epoch, splits it and attaches the new halves.
+//!   them, resets the endpoint (reporting each item it returns), reopens it
+//!   with the next epoch, splits it and attaches the new halves;
+//!   [`EndpointEvent::Reopened`] follows once both agents hold them again.
 //! - **Retire.** The same hand back and join, then `retire` until complete:
 //!   the socket closes and the entry leaves the table.
+//! - **Failure.** When an agent refuses a half, or a command to one agent
+//!   cannot be posted after the other's was, the entry is failing: it is
+//!   not active, the half still with an agent is asked back and dropped
+//!   (closing its descriptor), and one [`EndpointEvent::Failed`] reports it
+//!   once both halves are accounted for; then the entry leaves the table.
 //! - **Stop.** After the runner hands the agents back (DN-8),
-//!   [`Endpoints::reclaim`] takes their halves, joins and retires every
-//!   endpoint, so every descriptor is closed.
+//!   [`Endpoints::reclaim`] collects every half: held by the agents, in
+//!   their unread commands, in unpolled answers and in the table. It joins
+//!   and retires every endpoint whose two halves it finds and drops the
+//!   rest, so every descriptor closes.
 //!
-//! Every step runs on the control path; the table holds at most
-//! `max_endpoints` entries, allocated at creation.
+//! Every step runs on the control path. The table holds at most the
+//! agents' `max_endpoints` entries, allocated at creation. Reference
+//! counting endpoints per stream and their lookup by local bind and family
+//! (design §4.2) belong to phase 4, where streams use them.
 
-use karyos_io::backend::{InstanceId, OpenError, TxReport};
+use karyos_io::backend::{InstanceId, OpenError, TxEntry, TxReport};
 use karyos_io::sockets::endpoint::{
     Retired, SocketsConfig, SocketsEndpoint, SocketsRx, SocketsTx, SplitFailure,
 };
 use karyos_io::sockets::ops::SocketOps;
 
-use super::{AgentCommand, AgentError, AgentEvent, AgentKind, AgentLinks, EndpointId, Half};
+use super::{
+    AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, AgentLink, AgentLinks,
+    EndpointId, Half, NetworkAgents,
+};
 
 /// Why an endpoint operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -39,7 +52,7 @@ pub enum EndpointError {
     /// No entry of that id.
     #[error("unknown endpoint {0:?}")]
     Unknown(EndpointId),
-    /// The endpoint is resetting, retiring or attaching.
+    /// The endpoint is resetting, retiring, attaching or failing.
     #[error("endpoint {0:?} is busy")]
     Busy(EndpointId),
     /// Opening or reopening the socket failed.
@@ -71,7 +84,8 @@ pub enum EndpointError {
 pub enum EndpointEvent {
     /// Both halves are attached: the endpoint is active.
     Opened(EndpointId),
-    /// A reset finished: the endpoint is active again, at its next epoch.
+    /// A reset finished and both agents hold the new halves: the endpoint
+    /// is active again, at its next epoch.
     Reopened {
         /// The endpoint.
         endpoint: EndpointId,
@@ -85,7 +99,15 @@ pub enum EndpointEvent {
         /// TX items the retirement returned.
         returned: u32,
     },
-    /// The endpoint failed and was retired; its socket is closed.
+    /// One TX item a reset or retirement returned, never sent: its report
+    /// entry, for the sender's outcome accounting (phase 7).
+    Returned {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The item's report entry.
+        entry: TxEntry,
+    },
+    /// The endpoint failed: both halves are closed and the entry is gone.
     Failed {
         /// The endpoint.
         endpoint: EndpointId,
@@ -101,10 +123,35 @@ enum Purpose {
     Retire,
 }
 
+/// An agent's answer to an `Attach`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Pending,
+    Attached,
+}
+
+/// Where one half of a failing entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fate {
+    /// Its `Attach` was posted; no answer yet.
+    Posted,
+    /// The agent holds it: a `Detach` is due.
+    Held,
+    /// A `Detach` was posted; no answer yet.
+    Detaching,
+    /// Closed, refused, never posted or with a gone agent.
+    Done,
+}
+
 /// An entry's state.
 enum State<O: SocketOps> {
-    /// Both halves were posted; waiting for both answers.
-    Attaching { sender: bool, receiver: bool },
+    /// Both halves were posted; waiting for both answers. `reopen` holds
+    /// the items a reset returned, for its [`EndpointEvent::Reopened`].
+    Attaching {
+        sender: Answer,
+        receiver: Answer,
+        reopen: Option<u32>,
+    },
     /// Both agents hold their halves.
     Active,
     /// Waiting for both halves to come back.
@@ -112,13 +159,20 @@ enum State<O: SocketOps> {
         purpose: Purpose,
         tx: Option<SocketsTx<O>>,
         rx: Option<SocketsRx<O>>,
-        answers: u8,
+        sender: bool,
+        receiver: bool,
     },
     /// Reopened and split, waiting for ring room to attach the halves.
     Split {
         tx: SocketsTx<O>,
         rx: SocketsRx<O>,
         returned: u32,
+    },
+    /// Bringing back and closing the halves after a failure.
+    Failing {
+        error: EndpointError,
+        sender: Fate,
+        receiver: Fate,
     },
 }
 
@@ -150,11 +204,19 @@ impl<O: SocketOps> std::fmt::Debug for Endpoints<O> {
 /// most `MAX_TX_SLOTS` of them.
 const MAX_DRAIN_CALLS: u32 = 4096;
 
+/// The link of `agent`.
+fn link_of<O: SocketOps>(links: &AgentLinks<O>, agent: AgentKind) -> &AgentLink<O> {
+    match agent {
+        AgentKind::Sender => &links.sender,
+        AgentKind::Receiver => &links.receiver,
+    }
+}
+
 impl<O: SocketOps> Endpoints<O> {
     /// A table sized for the agents of `config`: at most their
     /// `max_endpoints` endpoints, so no agent refuses a half for room.
     #[must_use]
-    pub fn new(config: &super::AgentConfig) -> Self {
+    pub fn new(config: &AgentConfig) -> Self {
         let max = config.max_endpoints;
         Self {
             entries: Vec::with_capacity(max),
@@ -164,7 +226,7 @@ impl<O: SocketOps> Endpoints<O> {
         }
     }
 
-    /// The endpoints in the table.
+    /// The endpoints in the table, failing ones included.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -176,15 +238,12 @@ impl<O: SocketOps> Endpoints<O> {
         self.entries.is_empty()
     }
 
-    /// Whether `endpoint` is active.
+    /// Whether `endpoint` is active: both agents hold its halves.
     #[must_use]
     pub fn is_active(&self, endpoint: EndpointId) -> bool {
-        self.entry(endpoint)
-            .is_some_and(|entry| matches!(entry.state, State::Active))
-    }
-
-    fn entry(&self, endpoint: EndpointId) -> Option<&Entry<O>> {
-        self.entries.iter().find(|entry| entry.id == endpoint)
+        self.entries
+            .iter()
+            .any(|entry| entry.id == endpoint && matches!(entry.state, State::Active))
     }
 
     fn index(&self, endpoint: EndpointId) -> Result<usize, EndpointError> {
@@ -196,13 +255,14 @@ impl<O: SocketOps> Endpoints<O> {
 
     /// Opens an endpoint over `ops`, splits it and attaches its halves to
     /// the agents; [`EndpointEvent::Opened`] follows once both answered.
-    /// On error nothing is left open or posted.
     ///
     /// # Errors
     ///
     /// [`EndpointError::TableFull`], [`EndpointError::Agent`] when a ring
     /// has no room, [`EndpointError::Open`], [`EndpointError::Split`],
-    /// [`EndpointError::Exhausted`].
+    /// [`EndpointError::Exhausted`]: nothing is left open or posted. An
+    /// [`EndpointError::Agent`] after the sender's half was posted (the
+    /// receiver gone) leaves a failing entry that brings that half back.
     pub fn open(
         &mut self,
         links: &AgentLinks<O>,
@@ -217,14 +277,14 @@ impl<O: SocketOps> Endpoints<O> {
         let instance = self.next.ok_or(EndpointError::Exhausted)?;
         let endpoint =
             SocketsEndpoint::open(&config, instance, ops).map_err(EndpointError::Open)?;
-        // Nothing to undo if the identities run out later: the counter
-        // only moves forward.
+        // The counter only moves forward: a later failure wastes the id.
         self.next = instance.next().ok();
         // A refused split drops the endpoint, which closes its socket.
         let (tx, rx) = endpoint
             .split()
             .map_err(|error| EndpointError::Split(error.error))?;
         let id = EndpointId(instance.get().get());
+        // A failed sender commit drops both halves: nothing was posted.
         links
             .sender
             .commit(to_sender, |reply| AgentCommand::Attach {
@@ -233,22 +293,32 @@ impl<O: SocketOps> Endpoints<O> {
                 half: Half::Tx(Box::new(tx)),
             })
             .map_err(EndpointError::Agent)?;
-        links
+        let state = match links
             .receiver
             .commit(to_receiver, |reply| AgentCommand::Attach {
                 reply,
                 endpoint: id,
                 half: Half::Rx(Box::new(rx)),
-            })
-            .map_err(EndpointError::Agent)?;
-        self.entries.push(Entry {
-            id,
-            config,
-            state: State::Attaching {
-                sender: false,
-                receiver: false,
+            }) {
+            Ok(()) => State::Attaching {
+                sender: Answer::Pending,
+                receiver: Answer::Pending,
+                reopen: None,
             },
-        });
+            Err(error) => {
+                self.entries.push(Entry {
+                    id,
+                    config,
+                    state: State::Failing {
+                        error: EndpointError::Agent(error.clone()),
+                        sender: Fate::Posted,
+                        receiver: Fate::Done,
+                    },
+                });
+                return Err(EndpointError::Agent(error));
+            }
+        };
+        self.entries.push(Entry { id, config, state });
         Ok(id)
     }
 
@@ -298,15 +368,26 @@ impl<O: SocketOps> Endpoints<O> {
         }
         let to_sender = links.sender.prepare().map_err(EndpointError::Agent)?;
         let to_receiver = links.receiver.prepare().map_err(EndpointError::Agent)?;
-        for (link, prepared) in [(&links.sender, to_sender), (&links.receiver, to_receiver)] {
-            link.commit(prepared, |reply| AgentCommand::Detach { reply, endpoint })
-                .map_err(EndpointError::Agent)?;
-        }
+        // A failed sender commit posts nothing: the entry stays active.
+        links
+            .sender
+            .commit(to_sender, |reply| AgentCommand::Detach { reply, endpoint })
+            .map_err(EndpointError::Agent)?;
+        // The receiver gone: its half never comes back; the join then
+        // fails and the endpoint is reported failed.
+        let receiver_gone = links
+            .receiver
+            .commit(to_receiver, |reply| AgentCommand::Detach {
+                reply,
+                endpoint,
+            })
+            .is_err();
         entry.state = State::Detaching {
             purpose,
             tx: None,
             rx: None,
-            answers: 0,
+            sender: false,
+            receiver: receiver_gone,
         };
         Ok(())
     }
@@ -322,24 +403,20 @@ impl<O: SocketOps> Endpoints<O> {
     ) {
         for link in [&links.sender, &links.receiver] {
             while let Some(event) = link.take_event() {
-                if let Some(event) = self.answer(event, &mut on_event) {
+                if let Some(event) = self.answer(event) {
                     other(event);
                 }
             }
         }
-        // Entries split after a reset, waiting for ring room.
-        for index in 0..self.entries.len() {
-            self.attach_split(links, index, &mut on_event);
+        // Backwards, so a removed entry never makes the loop skip another.
+        for index in (0..self.entries.len()).rev() {
+            self.advance(links, index, &mut on_event);
         }
     }
 
     /// Applies one agent answer; returns events that are not about an
     /// endpoint of this table.
-    fn answer(
-        &mut self,
-        event: AgentEvent<O>,
-        on_event: &mut impl FnMut(EndpointEvent),
-    ) -> Option<AgentEvent<O>> {
+    fn answer(&mut self, event: AgentEvent<O>) -> Option<AgentEvent<O>> {
         let (endpoint, agent) = match &event {
             AgentEvent::Attached { agent, endpoint }
             | AgentEvent::Refused {
@@ -351,39 +428,71 @@ impl<O: SocketOps> Endpoints<O> {
             AgentEvent::Pong { .. } | AgentEvent::Stopped { .. } => return Some(event),
         };
         let Ok(index) = self.index(endpoint) else {
-            // An answer for an endpoint already gone: drop it (a half in it
-            // closes its descriptor).
+            // An answer for an endpoint already gone: dropped (a half in
+            // it closes its descriptor).
             return None;
         };
         let entry = self.entries.get_mut(index)?;
         match (event, &mut entry.state) {
-            (AgentEvent::Attached { .. }, State::Attaching { sender, receiver }) => {
-                match agent {
-                    AgentKind::Sender => *sender = true,
-                    AgentKind::Receiver => *receiver = true,
-                }
-                if *sender && *receiver {
-                    entry.state = State::Active;
-                    on_event(EndpointEvent::Opened(endpoint));
-                }
+            (
+                AgentEvent::Attached { .. },
+                State::Attaching {
+                    sender, receiver, ..
+                },
+            ) => {
+                *match agent {
+                    AgentKind::Sender => sender,
+                    AgentKind::Receiver => receiver,
+                } = Answer::Attached;
             }
-            (AgentEvent::Refused { half, .. }, State::Attaching { .. }) => {
-                // A broken invariant: the table is sized from the agents'
-                // capacity and every id is new. The refused half is
-                // dropped, closing its descriptor; the entry becomes active
-                // so that `retire` brings the other half back and closes
-                // it.
+            (
+                AgentEvent::Refused { half, .. },
+                State::Attaching {
+                    sender, receiver, ..
+                },
+            ) => {
+                // A broken invariant: the refused half is dropped, closing
+                // it; the other is brought back and closed.
                 drop(half);
-                entry.state = State::Active;
-                on_event(EndpointEvent::Failed {
-                    endpoint,
+                let fate = |answer| match answer {
+                    Answer::Pending => Fate::Posted,
+                    Answer::Attached => Fate::Held,
+                };
+                let (sender, receiver) = match agent {
+                    AgentKind::Sender => (Fate::Done, fate(*receiver)),
+                    AgentKind::Receiver => (fate(*sender), Fate::Done),
+                };
+                entry.state = State::Failing {
                     error: EndpointError::Refused(agent),
-                });
+                    sender,
+                    receiver,
+                };
+            }
+            (
+                event,
+                State::Failing {
+                    sender, receiver, ..
+                },
+            ) => {
+                let fate = match agent {
+                    AgentKind::Sender => sender,
+                    AgentKind::Receiver => receiver,
+                };
+                // Any half in the answer is dropped here, closing it.
+                *fate = match (event, *fate) {
+                    (AgentEvent::Attached { .. }, Fate::Posted) => Fate::Held,
+                    (AgentEvent::Refused { .. } | AgentEvent::Detached { .. }, _) => Fate::Done,
+                    (_, unchanged) => unchanged,
+                };
             }
             (
                 AgentEvent::Detached { half, .. },
                 State::Detaching {
-                    tx, rx, answers, ..
+                    tx,
+                    rx,
+                    sender,
+                    receiver,
+                    ..
                 },
             ) => {
                 match half {
@@ -391,16 +500,89 @@ impl<O: SocketOps> Endpoints<O> {
                     Some(Half::Rx(half)) => *rx = Some(*half),
                     None => {}
                 }
-                // Two answers at most: one per agent.
-                *answers = answers.checked_add(1).unwrap_or(u8::MAX);
-                if *answers >= 2 {
-                    self.finish(index, on_event);
+                match agent {
+                    AgentKind::Sender => *sender = true,
+                    AgentKind::Receiver => *receiver = true,
                 }
             }
             // An answer that does not fit the entry's state: dropped.
             _ => {}
         }
         None
+    }
+
+    /// Advances one entry whose answers are in: reports an attachment,
+    /// finishes a hand back, attaches a split endpoint or settles a
+    /// failure.
+    fn advance(
+        &mut self,
+        links: &AgentLinks<O>,
+        index: usize,
+        on_event: &mut impl FnMut(EndpointEvent),
+    ) {
+        let Some(entry) = self.entries.get_mut(index) else {
+            return;
+        };
+        let id = entry.id;
+        match &mut entry.state {
+            State::Attaching {
+                sender: Answer::Attached,
+                receiver: Answer::Attached,
+                reopen,
+            } => {
+                let event = match reopen {
+                    None => EndpointEvent::Opened(id),
+                    Some(returned) => EndpointEvent::Reopened {
+                        endpoint: id,
+                        returned: *returned,
+                    },
+                };
+                entry.state = State::Active;
+                on_event(event);
+            }
+            State::Detaching {
+                sender: true,
+                receiver: true,
+                ..
+            } => self.finish(index, on_event),
+            State::Split { .. } => self.attach_split(links, index, on_event),
+            State::Failing {
+                error,
+                sender,
+                receiver,
+            } => {
+                for (agent, fate) in [
+                    (AgentKind::Sender, &mut *sender),
+                    (AgentKind::Receiver, &mut *receiver),
+                ] {
+                    if *fate != Fate::Held {
+                        continue;
+                    }
+                    let link = link_of(links, agent);
+                    // No room yet: tried again on the next poll.
+                    let Ok(prepared) = link.prepare() else {
+                        continue;
+                    };
+                    *fate = match link.commit(prepared, |reply| AgentCommand::Detach {
+                        reply,
+                        endpoint: id,
+                    }) {
+                        Ok(()) => Fate::Detaching,
+                        // The agent is gone: its half comes back at reclaim.
+                        Err(_) => Fate::Done,
+                    };
+                }
+                if *sender == Fate::Done && *receiver == Fate::Done {
+                    let error = error.clone();
+                    self.entries.swap_remove(index);
+                    on_event(EndpointEvent::Failed {
+                        endpoint: id,
+                        error,
+                    });
+                }
+            }
+            State::Attaching { .. } | State::Active | State::Detaching { .. } => {}
+        }
     }
 
     /// Both halves are back: join, then reset, reopen and split, or
@@ -417,30 +599,22 @@ impl<O: SocketOps> Endpoints<O> {
         };
         let id = entry.id;
         let config = entry.config;
-        let (Some(tx), Some(rx)) = (tx, rx) else {
-            // A half was missing: what came back is dropped, closing it.
+        let joined = match (tx, rx) {
+            (Some(tx), Some(rx)) => SocketsEndpoint::join(tx, rx).ok(),
+            // A missing half: what came back is dropped, closing it.
+            _ => None,
+        };
+        let Some(mut endpoint) = joined else {
             self.entries.swap_remove(index);
             on_event(EndpointEvent::Failed {
                 endpoint: id,
                 error: EndpointError::Join,
             });
             return;
-        };
-        let Ok(mut endpoint) = SocketsEndpoint::join(tx, rx) else {
-            self.entries.swap_remove(index);
-            on_event(EndpointEvent::Failed {
-                endpoint: id,
-                error: EndpointError::Join,
-            });
-            return;
-        };
-        let failed = |error| EndpointEvent::Failed {
-            endpoint: id,
-            error,
         };
         match purpose {
             Purpose::Reset => {
-                let outcome = Self::drain_reset(&mut endpoint, &mut self.report)
+                let outcome = Self::drain_reset(&mut endpoint, &mut self.report, id, on_event)
                     .and_then(|returned| {
                         endpoint
                             .reopen(&config)
@@ -461,20 +635,26 @@ impl<O: SocketOps> Endpoints<O> {
                     }
                     Err(error) => {
                         self.entries.swap_remove(index);
-                        on_event(failed(error));
+                        on_event(EndpointEvent::Failed {
+                            endpoint: id,
+                            error,
+                        });
                     }
                 }
             }
             Purpose::Retire => {
-                let retired = Self::drain_retire(&mut endpoint, &mut self.report);
+                let retired = Self::drain_retire(&mut endpoint, &mut self.report, id, on_event);
                 self.entries.swap_remove(index);
-                match retired {
-                    Ok(returned) => on_event(EndpointEvent::Retired {
+                on_event(match retired {
+                    Ok(returned) => EndpointEvent::Retired {
                         endpoint: id,
                         returned,
-                    }),
-                    Err(error) => on_event(failed(error)),
-                }
+                    },
+                    Err(error) => EndpointEvent::Failed {
+                        endpoint: id,
+                        error,
+                    },
+                });
             }
         }
     }
@@ -496,59 +676,61 @@ impl<O: SocketOps> Endpoints<O> {
         else {
             return;
         };
-        let State::Split { tx, rx, returned } = std::mem::replace(
-            &mut entry.state,
-            State::Attaching {
-                sender: false,
-                receiver: false,
-            },
-        ) else {
+        let State::Split { tx, rx, returned } = std::mem::replace(&mut entry.state, State::Active)
+        else {
             return;
         };
         let id = entry.id;
-        let posted = links
+        if let Err(error) = links
             .sender
             .commit(to_sender, |reply| AgentCommand::Attach {
                 reply,
                 endpoint: id,
                 half: Half::Tx(Box::new(tx)),
             })
-            .and_then(|()| {
-                links
-                    .receiver
-                    .commit(to_receiver, |reply| AgentCommand::Attach {
-                        reply,
-                        endpoint: id,
-                        half: Half::Rx(Box::new(rx)),
-                    })
-            });
-        match posted {
-            Ok(()) => on_event(EndpointEvent::Reopened {
+        {
+            // Nothing posted: the halves are dropped, closing them.
+            drop(rx);
+            self.entries.swap_remove(index);
+            on_event(EndpointEvent::Failed {
                 endpoint: id,
-                returned,
-            }),
-            Err(error) => {
-                self.entries.swap_remove(index);
-                on_event(EndpointEvent::Failed {
-                    endpoint: id,
-                    error: EndpointError::Agent(error),
-                });
-            }
+                error: EndpointError::Agent(error),
+            });
+            return;
         }
+        entry.state = match links
+            .receiver
+            .commit(to_receiver, |reply| AgentCommand::Attach {
+                reply,
+                endpoint: id,
+                half: Half::Rx(Box::new(rx)),
+            }) {
+            Ok(()) => State::Attaching {
+                sender: Answer::Pending,
+                receiver: Answer::Pending,
+                reopen: Some(returned),
+            },
+            Err(error) => State::Failing {
+                error: EndpointError::Agent(error),
+                sender: Fate::Posted,
+                receiver: Fate::Done,
+            },
+        };
     }
 
-    /// Resets until the endpoint has returned every item.
+    /// Resets until the endpoint has returned every item, reporting each.
     fn drain_reset(
         endpoint: &mut SocketsEndpoint<O>,
         report: &mut TxReport,
+        id: EndpointId,
+        on_event: &mut impl FnMut(EndpointEvent),
     ) -> Result<u32, EndpointError> {
         let mut returned = 0u32;
         for _ in 0..MAX_DRAIN_CALLS {
             let outcome = endpoint.reset(report);
             returned = returned
-                .checked_add(u32::from(outcome.returned))
+                .checked_add(Self::report_returned(report, id, on_event))
                 .ok_or(EndpointError::Drain)?;
-            while report.pop_front().is_some() {}
             if !outcome.more && !outcome.report_not_empty {
                 return Ok(returned);
             }
@@ -556,47 +738,82 @@ impl<O: SocketOps> Endpoints<O> {
         Err(EndpointError::Drain)
     }
 
-    /// Retires until complete.
+    /// Retires until complete, reporting each returned item.
     fn drain_retire(
         endpoint: &mut SocketsEndpoint<O>,
         report: &mut TxReport,
+        id: EndpointId,
+        on_event: &mut impl FnMut(EndpointEvent),
     ) -> Result<u32, EndpointError> {
         let mut returned = 0u32;
         for _ in 0..MAX_DRAIN_CALLS {
             let outcome = endpoint.retire(report);
-            while report.pop_front().is_some() {}
-            match outcome {
-                Retired::Complete { returned: last } => {
-                    return returned
-                        .checked_add(u32::from(last))
-                        .ok_or(EndpointError::Drain);
-                }
-                Retired::More { returned: some } => {
-                    returned = returned
-                        .checked_add(u32::from(some))
-                        .ok_or(EndpointError::Drain)?;
-                }
-                Retired::ReportNotEmpty | Retired::ResetIncomplete => {}
+            returned = returned
+                .checked_add(Self::report_returned(report, id, on_event))
+                .ok_or(EndpointError::Drain)?;
+            if matches!(outcome, Retired::Complete { .. }) {
+                return Ok(returned);
             }
         }
         Err(EndpointError::Drain)
     }
 
-    /// After a stop (DN-8): joins the halves the agents handed back with
-    /// [`super::SenderAgent::take_halves`] and
-    /// [`super::ReceiverAgent::take_halves`] and retires every endpoint, so
-    /// every descriptor closes. Returns how many endpoints retired cleanly;
-    /// halves without a partner are dropped, which closes them too.
-    pub fn reclaim(&mut self, halves: impl IntoIterator<Item = (EndpointId, Half<O>)>) -> usize {
-        let mut txs = Vec::with_capacity(self.entries.len());
-        let mut rxs = Vec::with_capacity(self.entries.len());
+    /// Empties `report`, reporting each entry; returns how many.
+    fn report_returned(
+        report: &mut TxReport,
+        id: EndpointId,
+        on_event: &mut impl FnMut(EndpointEvent),
+    ) -> u32 {
+        let mut count = 0u32;
+        // At most a report's capacity per call: no overflow.
+        while let Some(entry) = report.pop_front() {
+            count += 1;
+            on_event(EndpointEvent::Returned {
+                endpoint: id,
+                entry,
+            });
+        }
+        count
+    }
+
+    /// After a stop (DN-8): collects every half, from the agents (held, and
+    /// in commands they never read), from the answers still unread in the
+    /// links and from the table; joins and retires every endpoint whose two
+    /// halves it finds and drops the others, so every descriptor closes.
+    /// Returned items are reported to `on_event`; returns how many endpoints
+    /// retired cleanly.
+    pub fn reclaim(
+        &mut self,
+        links: &AgentLinks<O>,
+        agents: &mut NetworkAgents<O>,
+        mut on_event: impl FnMut(EndpointEvent),
+    ) -> usize {
+        let mut halves = Vec::new();
+        halves.extend(agents.sender.take_halves());
+        halves.extend(agents.receiver.take_halves());
+        halves.extend(agents.sender.take_unread_halves());
+        halves.extend(agents.receiver.take_unread_halves());
+        for link in [&links.sender, &links.receiver] {
+            while let Some(event) = link.take_event() {
+                match event {
+                    AgentEvent::Refused { endpoint, half, .. }
+                    | AgentEvent::Detached {
+                        endpoint,
+                        half: Some(half),
+                        ..
+                    } => halves.push((endpoint, half)),
+                    _ => {}
+                }
+            }
+        }
+        let mut txs = Vec::with_capacity(halves.len());
+        let mut rxs = Vec::with_capacity(halves.len());
         for (id, half) in halves {
             match half {
                 Half::Tx(tx) => txs.push((id, *tx)),
                 Half::Rx(rx) => rxs.push((id, *rx)),
             }
         }
-        // Halves held in the table itself (mid reset or retirement).
         for entry in self.entries.drain(..) {
             match entry.state {
                 State::Detaching { tx, rx, .. } => {
@@ -607,10 +824,10 @@ impl<O: SocketOps> Endpoints<O> {
                     txs.push((entry.id, tx));
                     rxs.push((entry.id, rx));
                 }
-                State::Attaching { .. } | State::Active => {}
+                State::Attaching { .. } | State::Active | State::Failing { .. } => {}
             }
         }
-        // At most one per table entry: no overflow.
+        // At most one per collected TX half: no overflow.
         let mut retired = 0usize;
         for (id, tx) in txs {
             let Some(position) = rxs.iter().position(|(other, _)| *other == id) else {
@@ -618,7 +835,7 @@ impl<O: SocketOps> Endpoints<O> {
             };
             let (_, rx) = rxs.swap_remove(position);
             if let Ok(mut endpoint) = SocketsEndpoint::join(tx, rx)
-                && Self::drain_retire(&mut endpoint, &mut self.report).is_ok()
+                && Self::drain_retire(&mut endpoint, &mut self.report, id, &mut on_event).is_ok()
             {
                 retired += 1;
             }
