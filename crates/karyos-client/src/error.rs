@@ -4,6 +4,7 @@
 
 use karyos_sys::conflation::ConflationError;
 use karyos_sys::error::{LayoutError, SysError};
+use karyos_sys::outcome_ring::OutcomeError;
 use thiserror::Error;
 
 /// Errors returned by publications and subscriptions.
@@ -35,6 +36,10 @@ pub enum ClientError {
     /// A conflated publication rejected its key or value size.
     #[error(transparent)]
     Conflation(#[from] ConflationError),
+    /// A guarded publication's outcome ring is invalid or corrupt
+    /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, G5).
+    #[error(transparent)]
+    Outcomes(#[from] OutcomeError),
     /// A lower layer failed.
     #[error(transparent)]
     Sys(SysError),

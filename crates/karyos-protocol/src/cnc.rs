@@ -28,14 +28,26 @@
 //! | `0x0A` | `CloseJournal` | sequence | journal number (nonzero) | final delivery boundary | |
 //! | `0x0B` | `QueryCutover` | sequence | registration | | |
 //! | `0x0C` | `AddConflatedSubscription` | sequence | stream and session as above | | |
+//! | `0x0D` | `GuardClose` | sequence | guard | operation id | |
+//! | `0x0E` | `GuardReopen` | sequence | guard | expected closed epoch | operation id |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
-//! | `0x84` | `Error` | client | sequence | code (1 to 7, see [`ErrorCode`]) | detail |
+//! | `0x84` | `Error` | client | sequence | code (1 to 11, see [`ErrorCode`]) | detail |
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
 //! | `0x88` | `ConflatedReady` | client | sequence | registration | hand-over key |
+//! | `0x89` | `GuardState` | client | sequence | guard | guard word (`karyos_sys::guard`) |
+//!
+//! `GuardClose` and `GuardReopen` (`quantstratum-docs:
+//! karyos/design/guards-and-abort.md`, local guards): a local operator
+//! closes a guard, or reopens one closed at the epoch it names, on the
+//! driver's control path, authorized by the calling process's credentials
+//! (G1). The operation id is the requester's own id for the audit record
+//! (Audit A). The driver answers `GuardState` with the guard's word after
+//! the transition, or `Error` with `UnknownGuard`, `GuardNotClosedAt`
+//! (detail: the current guard word), `GuardExhausted` or `NotAuthorized`.
 //!
 //! The lane word of `AddPublication`, `AddConcurrentPublication` and
 //! `AddSubscription` (`quantstratum-docs: karyos/design/aggregate-ownership.md`,
@@ -153,6 +165,8 @@ const TRACE_JOURNAL: u32 = 0x09;
 const CLOSE_JOURNAL: u32 = 0x0A;
 const QUERY_CUTOVER: u32 = 0x0B;
 const ADD_CONFLATED_SUBSCRIPTION: u32 = 0x0C;
+const GUARD_CLOSE: u32 = 0x0D;
+const GUARD_REOPEN: u32 = 0x0E;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -161,6 +175,7 @@ const COUNTER_ALLOCATED: u32 = 0x85;
 const JOURNAL_READY: u32 = 0x86;
 const CUTOVER_STATE: u32 = 0x87;
 const CONFLATED_READY: u32 = 0x88;
+const GUARD_STATE: u32 = 0x89;
 const PARTICIPANT_LOST: u32 = 0xC1;
 const REQUIRED_BOUND_WITHDRAWN: u32 = 0xC2;
 const PUBLICATION_CLOSED: u32 = 0xC3;
@@ -596,6 +611,26 @@ pub enum Command {
         /// The stream.
         stream: StreamKey,
     },
+    /// Close a guard (local control, G1).
+    GuardClose {
+        /// Request sequence.
+        sequence: u64,
+        /// The guard.
+        guard: u64,
+        /// The requester's operation id, for the audit record.
+        operation: u64,
+    },
+    /// Reopen a guard closed at `expected` (local control, G1).
+    GuardReopen {
+        /// Request sequence.
+        sequence: u64,
+        /// The guard.
+        guard: u64,
+        /// The closed epoch the reopen replaces.
+        expected: u64,
+        /// The requester's operation id, for the audit record.
+        operation: u64,
+    },
 }
 
 /// Why the driver refused a command.
@@ -618,6 +653,15 @@ pub enum ErrorCode {
     /// journal, or by an ended one whose records the trace mirror still
     /// retains. Nothing was created.
     TraceJournalsExhausted,
+    /// No such guard.
+    UnknownGuard,
+    /// A reopen named an epoch the guard is not closed at; the detail is
+    /// the current guard word.
+    GuardNotClosedAt,
+    /// A reopen would exceed the guard's last epoch; it stays closed.
+    GuardExhausted,
+    /// The calling process is not authorized for this guard (G1).
+    NotAuthorized,
 }
 
 impl ErrorCode {
@@ -630,6 +674,10 @@ impl ErrorCode {
             Self::IdentitiesExhausted => 5,
             Self::InvalidPublicationMode => 6,
             Self::TraceJournalsExhausted => 7,
+            Self::UnknownGuard => 8,
+            Self::GuardNotClosedAt => 9,
+            Self::GuardExhausted => 10,
+            Self::NotAuthorized => 11,
         }
     }
 
@@ -642,6 +690,10 @@ impl ErrorCode {
             5 => Self::IdentitiesExhausted,
             6 => Self::InvalidPublicationMode,
             7 => Self::TraceJournalsExhausted,
+            8 => Self::UnknownGuard,
+            9 => Self::GuardNotClosedAt,
+            10 => Self::GuardExhausted,
+            11 => Self::NotAuthorized,
             _ => return None,
         })
     }
@@ -708,6 +760,15 @@ pub enum Response {
         registration: u64,
         /// Its state.
         state: CutoverState,
+    },
+    /// A guard's state after a `GuardClose` or `GuardReopen`.
+    GuardState {
+        /// The request.
+        request: RequestId,
+        /// The guard.
+        guard: u64,
+        /// Its state.
+        state: karyos_sys::guard::GuardState,
     },
     /// The view of a conflated stream's table is ready for hand-over.
     ConflatedReady {
@@ -830,6 +891,8 @@ impl Command {
             Self::CloseJournal { .. } => CLOSE_JOURNAL,
             Self::QueryCutover { .. } => QUERY_CUTOVER,
             Self::AddConflatedSubscription { .. } => ADD_CONFLATED_SUBSCRIPTION,
+            Self::GuardClose { .. } => GUARD_CLOSE,
+            Self::GuardReopen { .. } => GUARD_REOPEN,
         }
     }
 
@@ -848,7 +911,9 @@ impl Command {
             | Self::TraceJournal { sequence, .. }
             | Self::CloseJournal { sequence, .. }
             | Self::QueryCutover { sequence, .. }
-            | Self::AddConflatedSubscription { sequence, .. } => sequence,
+            | Self::AddConflatedSubscription { sequence, .. }
+            | Self::GuardClose { sequence, .. }
+            | Self::GuardReopen { sequence, .. } => sequence,
         }
     }
 
@@ -973,6 +1038,17 @@ impl Command {
             Self::AddConflatedSubscription { sequence, stream } => {
                 write_words(&[sequence, stream_word(stream)], out)
             }
+            Self::GuardClose {
+                sequence,
+                guard,
+                operation,
+            } => write_words(&[sequence, guard, operation], out),
+            Self::GuardReopen {
+                sequence,
+                guard,
+                expected,
+                operation,
+            } => write_words(&[sequence, guard, expected, operation], out),
         }
     }
 
@@ -1140,6 +1216,23 @@ impl Command {
                     stream: stream_from(stream),
                 })
             }
+            GUARD_CLOSE => {
+                let [sequence, guard, operation] = read_words::<3>(type_id, bytes)?;
+                Ok(Self::GuardClose {
+                    sequence,
+                    guard,
+                    operation,
+                })
+            }
+            GUARD_REOPEN => {
+                let [sequence, guard, expected, operation] = read_words::<4>(type_id, bytes)?;
+                Ok(Self::GuardReopen {
+                    sequence,
+                    guard,
+                    expected,
+                    operation,
+                })
+            }
             _ => Err(CncError::UnknownType { type_id }),
         }
     }
@@ -1158,6 +1251,7 @@ impl Response {
             Self::JournalReady { .. } => JOURNAL_READY,
             Self::CutoverState { .. } => CUTOVER_STATE,
             Self::ConflatedReady { .. } => CONFLATED_READY,
+            Self::GuardState { .. } => GUARD_STATE,
         }
     }
 
@@ -1172,7 +1266,8 @@ impl Response {
             | Self::CounterAllocated { request, .. }
             | Self::JournalReady { request, .. }
             | Self::CutoverState { request, .. }
-            | Self::ConflatedReady { request, .. } => request,
+            | Self::ConflatedReady { request, .. }
+            | Self::GuardState { request, .. } => request,
         }
     }
 
@@ -1238,6 +1333,21 @@ impl Response {
                     u64::from(keys),
                     value_capacity,
                     journal_capacity,
+                ],
+                out,
+            ),
+            Self::GuardState {
+                request,
+                guard,
+                state,
+            } => write_words(
+                &[
+                    request.client,
+                    request.sequence,
+                    guard,
+                    karyos_sys::guard::encode(state).ok_or(CncError::Reserved {
+                        type_id: GUARD_STATE,
+                    })?,
                 ],
                 out,
             ),
@@ -1327,6 +1437,16 @@ impl Response {
                     keys,
                     value_capacity,
                     journal_capacity,
+                })
+            }
+            GUARD_STATE => {
+                let [client, sequence, guard, word] = read_words::<4>(type_id, bytes)?;
+                let state =
+                    karyos_sys::guard::decode(word).map_err(|_| CncError::Reserved { type_id })?;
+                Ok(Self::GuardState {
+                    request: RequestId { client, sequence },
+                    guard,
+                    state,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -2002,7 +2122,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x0D, &out[..length]),
+            Command::decode(0x0F, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         // A lane word of 4 or more, or with any bit above the lane, is
@@ -2493,6 +2613,103 @@ mod journal_tests {
     }
 
     #[test]
+    fn guard_messages_have_fixed_bytes() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let close = Command::GuardClose {
+            sequence: 5,
+            guard: 3,
+            operation: 77,
+        };
+        let length = close.encode(&mut out).unwrap();
+        assert_eq!(close.type_id(), 0x0D);
+        assert_eq!(close.sequence(), 5);
+        assert_eq!(
+            &out[..length],
+            &[
+                5, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 77, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+        assert_eq!(Command::decode(0x0D, &out[..length]), Ok(close));
+        let reopen = Command::GuardReopen {
+            sequence: 6,
+            guard: 3,
+            expected: 1,
+            operation: 78,
+        };
+        let length = reopen.encode(&mut out).unwrap();
+        assert_eq!(reopen.type_id(), 0x0E);
+        assert_eq!(words_of(&out[..length]), [6, 3, 1, 78]);
+        assert_eq!(Command::decode(0x0E, &out[..length]), Ok(reopen));
+        let request = RequestId {
+            client: 2,
+            sequence: 6,
+        };
+        let state = Response::GuardState {
+            request,
+            guard: 3,
+            state: karyos_sys::guard::GuardState {
+                epoch: 2,
+                open: true,
+            },
+        };
+        let mut out = [0u8; MAX_RESPONSE_LENGTH];
+        let length = state.encode(&mut out).unwrap();
+        assert_eq!(state.type_id(), 0x89);
+        assert_eq!(state.request(), request);
+        // Epoch 2, open: the guard word (2 << 1) | 1.
+        assert_eq!(words_of(&out[..length]), [2, 6, 3, 5]);
+        assert_eq!(Response::decode(0x89, &out[..length]), Ok(state));
+        for (code, word) in [
+            (ErrorCode::UnknownGuard, 8),
+            (ErrorCode::GuardNotClosedAt, 9),
+            (ErrorCode::GuardExhausted, 10),
+            (ErrorCode::NotAuthorized, 11),
+        ] {
+            let refused = Response::Error {
+                request,
+                code,
+                detail: 7,
+            };
+            let length = refused.encode(&mut out).unwrap();
+            assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
+            assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
+        }
+        assert_eq!(ErrorCode::from_code(12), None);
+    }
+
+    #[test]
+    fn a_guard_state_that_breaks_the_encoding_is_refused() {
+        // Epoch 0, and an open bit on an odd epoch.
+        for word in [0, 1, (3 << 1) | 1] {
+            assert_eq!(
+                Response::decode(GUARD_STATE, &bytes_of(&[2, 6, 3, word])),
+                Err(CncError::Reserved {
+                    type_id: GUARD_STATE
+                }),
+                "{word:#x}"
+            );
+        }
+        let broken = Response::GuardState {
+            request: RequestId {
+                client: 2,
+                sequence: 6,
+            },
+            guard: 3,
+            state: karyos_sys::guard::GuardState {
+                epoch: 3,
+                open: true,
+            },
+        };
+        let mut out = [0u8; MAX_RESPONSE_LENGTH];
+        assert_eq!(
+            broken.encode(&mut out),
+            Err(CncError::Reserved {
+                type_id: GUARD_STATE
+            })
+        );
+    }
+
+    #[test]
     fn journal_commands_are_decoded_strictly() {
         // A capacity that is zero or not a power of two, no payload or no
         // drop range, registration 0 (the publisher journal of the layout
@@ -2541,9 +2758,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 8 is not defined.
+        // Error code 12 is not defined.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 8, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 12, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }
@@ -2587,6 +2804,8 @@ mod properties {
             CLOSE_JOURNAL,
             QUERY_CUTOVER,
             ADD_CONFLATED_SUBSCRIPTION,
+            GUARD_CLOSE,
+            GUARD_REOPEN,
         ],
     };
 
@@ -2604,6 +2823,7 @@ mod properties {
             JOURNAL_READY,
             CUTOVER_STATE,
             CONFLATED_READY,
+            GUARD_STATE,
         ],
     };
 
@@ -2925,6 +3145,21 @@ mod properties {
             (any::<u64>(), stream()).prop_map(|(sequence, stream)| {
                 Command::AddConflatedSubscription { sequence, stream }
             }),
+            any::<(u64, u64, u64)>().prop_map(|(sequence, guard, operation)| {
+                Command::GuardClose {
+                    sequence,
+                    guard,
+                    operation,
+                }
+            }),
+            any::<(u64, u64, u64, u64)>().prop_map(|(sequence, guard, expected, operation)| {
+                Command::GuardReopen {
+                    sequence,
+                    guard,
+                    expected,
+                    operation,
+                }
+            }),
         ]
     }
 
@@ -2938,6 +3173,10 @@ mod properties {
                 ErrorCode::IdentitiesExhausted,
                 ErrorCode::InvalidPublicationMode,
                 ErrorCode::TraceJournalsExhausted,
+                ErrorCode::UnknownGuard,
+                ErrorCode::GuardNotClosedAt,
+                ErrorCode::GuardExhausted,
+                ErrorCode::NotAuthorized,
             ][..],
         );
         prop_oneof![
@@ -2994,6 +3233,16 @@ mod properties {
                         value_capacity,
                         journal_capacity,
                     }
+                }
+            ),
+            (request(), any::<u64>(), 1..=karyos_sys::guard::MAX_EPOCH).prop_map(
+                |(request, guard, epoch)| Response::GuardState {
+                    request,
+                    guard,
+                    state: karyos_sys::guard::GuardState {
+                        epoch,
+                        open: epoch.is_multiple_of(2),
+                    },
                 }
             ),
         ]
@@ -3075,6 +3324,8 @@ mod properties {
                     (CLOSE_JOURNAL, 3),
                     (QUERY_CUTOVER, 2),
                     (ADD_CONFLATED_SUBSCRIPTION, 2),
+                    (GUARD_CLOSE, 3),
+                    (GUARD_REOPEN, 4),
                 ],
             ),
         ) {
@@ -3095,6 +3346,7 @@ mod properties {
                     (JOURNAL_READY, 4),
                     (CUTOVER_STATE, 4),
                     (CONFLATED_READY, CONFLATED_READY_WORDS),
+                    (GUARD_STATE, 4),
                 ],
             ),
         ) {

@@ -22,6 +22,7 @@ pub mod conflated_subscription;
 pub mod counter;
 pub mod error;
 pub mod generation;
+pub mod guarded;
 #[cfg(target_os = "linux")]
 pub mod ipc;
 pub mod journal;
@@ -47,6 +48,7 @@ pub use conflated_subscription::{
 pub use counter::{ClientCounterHandle, CounterReleases};
 pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};
+pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};

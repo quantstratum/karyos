@@ -19,6 +19,7 @@ use crate::error::ClientError;
 use crate::generation::{
     End, GenerationLink, Next, Retired, RetiredHandle, Successor, representable,
 };
+use crate::guarded::{Admission, GuardBinding};
 use crate::link::{Export, Lease, Origin};
 use crate::trace::{PublishTrace, TraceDecision};
 
@@ -215,6 +216,9 @@ pub struct ClientPublication<T: TermBytes = HeapTerms> {
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
+    /// The guard and outcome ring of a guarded handle (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`).
+    guard: Option<GuardBinding>,
     /// The export of a handle adopted from another process's grant. Last:
     /// it is dropped after the mapping, and its drop sends `Detach`.
     _export: Option<Export>,
@@ -245,7 +249,40 @@ impl<T: TermBytes> ClientPublication<T> {
             trace: None,
             conflation: None,
             _lease: None,
+            guard: None,
             _export: None,
+        }
+    }
+
+    /// Binds the handle to its guard and outcome ring. The driver calls
+    /// this while issuing a guarded publication; callers should normally
+    /// obtain handles from the driver.
+    #[must_use]
+    pub fn with_guard(mut self, binding: GuardBinding) -> Self {
+        self.guard = Some(binding);
+        self
+    }
+
+    /// The guard binding of a guarded handle.
+    #[must_use]
+    pub fn guard(&self) -> Option<&GuardBinding> {
+        self.guard.as_ref()
+    }
+
+    /// Reads up to `limit` outcome records of a guarded handle in sequence
+    /// order (see [`GuardBinding::poll_outcomes`]); 0 for an unguarded one.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Outcomes`] for a corrupt record.
+    pub fn poll_outcomes(
+        &mut self,
+        limit: usize,
+        handler: impl FnMut(u64, karyos_sys::outcome_ring::Record),
+    ) -> Result<usize, ClientError> {
+        match &mut self.guard {
+            Some(binding) => binding.poll_outcomes(limit, handler),
+            None => Ok(0),
         }
     }
 
@@ -441,6 +478,11 @@ impl<T: TermBytes> ClientPublication<T> {
     ) -> Result<OfferOutcome, ClientError> {
         // A forgotten claim is resolved before any early return.
         self.inner.resolve_forgotten_claim();
+        match self.guard.as_ref().map(GuardBinding::admission) {
+            Some(Admission::Gated) => return Ok(OfferOutcome::Gated),
+            Some(Admission::BackPressured) => return Ok(OfferOutcome::BackPressured),
+            Some(Admission::Open) | None => {}
+        }
         if !self.connected() {
             // A sealed publication still releases (publication-seal.md);
             // a guard or deadline seal is `Gated` (GC-8).
@@ -456,10 +498,16 @@ impl<T: TermBytes> ClientPublication<T> {
             config.validate_publication(options.reserved_value, payload.len())?;
         }
         Ok(match self.inner.append(payload, options)? {
-            AppendOutcome::Appended { position } => OfferOutcome::Accepted {
-                lane: self.inner.buffer().lane(),
-                position: self.base + position,
-            },
+            AppendOutcome::Appended { position } => {
+                // An accepted message gets exactly one final record.
+                if let Some(binding) = &mut self.guard {
+                    binding.reserve();
+                }
+                OfferOutcome::Accepted {
+                    lane: self.inner.buffer().lane(),
+                    position: self.base + position,
+                }
+            }
             AppendOutcome::BackPressured => OfferOutcome::BackPressured,
             AppendOutcome::AdminAction => OfferOutcome::AdminAction,
             AppendOutcome::Closed => self.after_end().offer(),
@@ -505,6 +553,11 @@ impl<T: TermBytes> ClientPublication<T> {
         // A forgotten claim is resolved before any early return; the
         // connection check only prevents a new reservation.
         self.inner.resolve_forgotten_claim();
+        match self.guard.as_ref().map(GuardBinding::admission) {
+            Some(Admission::Gated) => return Ok(ClaimOutcome::Gated),
+            Some(Admission::BackPressured) => return Ok(ClaimOutcome::BackPressured),
+            Some(Admission::Open) | None => {}
+        }
         if !self.connected() {
             if let Some(reason) = self.inner.close_if_sealed() {
                 if reason.is_gate() {
@@ -539,11 +592,20 @@ impl<T: TermBytes> ClientPublication<T> {
         let lane = self.inner.buffer().lane();
         let base = self.base;
         let link = self.link.as_deref();
+        let guard = self.guard.as_mut();
         let trace = match (extension, &mut self.trace) {
             (Some(extension), Some(trace)) => Some((trace, extension)),
             _ => None,
         };
-        Ok(match self.inner.try_claim(length, options)? {
+        // A claimed block, committed or aborted later, and a reservation
+        // aborted at once each get exactly one final record.
+        let outcome = self.inner.try_claim(length, options)?;
+        if let (Some(binding), SysClaimOutcome::Claimed(_) | SysClaimOutcome::Aborted { .. }) =
+            (guard, &outcome)
+        {
+            binding.reserve();
+        }
+        Ok(match outcome {
             SysClaimOutcome::Claimed(inner) => ClaimOutcome::Claimed(ClientClaim {
                 inner,
                 lane,
@@ -1070,5 +1132,178 @@ mod tests {
         );
         let conductor = buffer.conductor_owned().unwrap();
         (buffer, conductor)
+    }
+
+    mod guarded {
+        use super::*;
+        use crate::guarded::{GuardBinding, HeapWords};
+        use karyos_sys::guard;
+        use karyos_sys::outcome_ring::{
+            Kind, OutcomeWriter, Produced, Record, capacity, init, ring_words,
+        };
+        use karyos_sys::sync::{AtomicU64, Ordering};
+
+        /// `C_m` of the tests, and a ring with room for one range record.
+        const MESSAGES: u64 = 2;
+
+        struct Driver {
+            guard: Arc<HeapWords>,
+            ring: Arc<HeapWords>,
+            consumed: Arc<AtomicU64>,
+            writer: OutcomeWriter,
+        }
+
+        impl Driver {
+            fn outcome(&mut self, kind: Kind) {
+                let record = Record {
+                    kind,
+                    lane: 0,
+                    receiver: 0,
+                    incarnation: 1,
+                    start: 0,
+                    end: 64,
+                    epoch: 2,
+                    reason: 0,
+                    lost: 0,
+                };
+                assert!(matches!(
+                    self.writer
+                        .produce(self.ring.words(), &self.consumed, record)
+                        .unwrap(),
+                    Produced::Written(_)
+                ));
+            }
+        }
+
+        /// A publication bound to guard word 1 at open epoch 2.
+        fn guarded() -> (Driver, ClientPublication) {
+            let slots = capacity(MESSAGES, 1).unwrap();
+            let guard = Arc::new(HeapWords::zeroed(2));
+            guard.words()[1].store(guard::created(), Ordering::Relaxed);
+            assert_eq!(guard::reopen(&guard.words()[1], 1), Ok(2));
+            let ring = Arc::new(HeapWords::zeroed(
+                ring_words(usize::try_from(slots).unwrap()).unwrap(),
+            ));
+            init(ring.words(), slots).unwrap();
+            let consumed = Arc::new(AtomicU64::new(0));
+            let binding = GuardBinding::new(
+                Arc::clone(&guard) as Arc<dyn crate::guarded::SharedWords>,
+                1,
+                2,
+                Arc::clone(&ring) as Arc<dyn crate::guarded::SharedWords>,
+                Arc::clone(&consumed) as Arc<dyn crate::guarded::ConsumedCell>,
+                1,
+                MESSAGES,
+            )
+            .unwrap();
+            let (_buffer, _conductor, publication) = setup(true);
+            let driver = Driver {
+                guard,
+                ring,
+                consumed,
+                writer: OutcomeWriter::new(slots).unwrap(),
+            };
+            (driver, publication.with_guard(binding))
+        }
+
+        fn accepted(outcome: OfferOutcome) -> bool {
+            matches!(outcome, OfferOutcome::Accepted { .. })
+        }
+
+        #[test]
+        fn a_closed_guard_is_gated_before_any_reservation() {
+            let (driver, mut publication) = guarded();
+            assert_eq!(
+                guard::close(&driver.guard.words()[1]),
+                Ok(guard::Closed::Now { epoch: 3 })
+            );
+            assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::Gated);
+            assert!(matches!(publication.try_claim(8), Ok(ClaimOutcome::Gated)));
+            assert_eq!(publication.guard().unwrap().outstanding(), 0);
+            // A reopen is a new epoch: the handle bound to epoch 2 stays
+            // gated.
+            assert_eq!(guard::reopen(&driver.guard.words()[1], 3), Ok(4));
+            assert_eq!(publication.offer(b"x").unwrap(), OfferOutcome::Gated);
+        }
+
+        #[test]
+        fn reservations_bound_admission_until_their_records_are_read() {
+            let (mut driver, mut publication) = guarded();
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            let claim = claimed(publication.try_claim(8));
+            let _ = claim.commit();
+            assert_eq!(publication.guard().unwrap().outstanding(), MESSAGES);
+            assert_eq!(
+                publication.offer(b"c").unwrap(),
+                OfferOutcome::BackPressured
+            );
+            assert!(matches!(
+                publication.try_claim(8),
+                Ok(ClaimOutcome::BackPressured)
+            ));
+            // A range record releases nothing; a final message record
+            // releases one reservation once it is read.
+            driver.outcome(Kind::Range);
+            assert_eq!(publication.poll_outcomes(8, |_, _| {}).unwrap(), 1);
+            assert_eq!(
+                publication.offer(b"c").unwrap(),
+                OfferOutcome::BackPressured
+            );
+            driver.outcome(Kind::Submitted);
+            let mut kinds = Vec::new();
+            assert_eq!(
+                publication
+                    .poll_outcomes(8, |_, record| kinds.push(record.kind))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(kinds, [Kind::Submitted]);
+            assert_eq!(driver.consumed.load(Ordering::Relaxed), 2);
+            assert_eq!(publication.guard().unwrap().outstanding(), 1);
+            assert!(accepted(publication.offer(b"c").unwrap()));
+        }
+
+        #[test]
+        fn a_panicking_handler_releases_nothing() {
+            let (mut driver, mut publication) = guarded();
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            driver.outcome(Kind::Aborted);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                publication.poll_outcomes(1, |_, _| panic!("handler"))
+            }));
+            assert!(result.is_err());
+            assert_eq!(publication.guard().unwrap().outstanding(), 1);
+            assert_eq!(publication.poll_outcomes(1, |_, _| {}).unwrap(), 1);
+            assert_eq!(publication.guard().unwrap().outstanding(), 0);
+        }
+
+        #[test]
+        fn a_binding_refuses_a_bad_ring() {
+            let ring = Arc::new(HeapWords::zeroed(ring_words(3).unwrap()));
+            init(ring.words(), 3).unwrap();
+            ring.words()[0].store(2, Ordering::Relaxed);
+            let words = |words: HeapWords| Arc::new(words) as Arc<dyn crate::guarded::SharedWords>;
+            let cell = || Arc::new(AtomicU64::new(0)) as Arc<dyn crate::guarded::ConsumedCell>;
+            assert_eq!(
+                GuardBinding::new(
+                    words(HeapWords::zeroed(1)),
+                    0,
+                    2,
+                    ring as Arc<dyn crate::guarded::SharedWords>,
+                    cell(),
+                    1,
+                    1,
+                )
+                .unwrap_err(),
+                ClientError::Outcomes(karyos_sys::outcome_ring::OutcomeError::Version(2))
+            );
+            let ring = Arc::new(HeapWords::zeroed(ring_words(3).unwrap()));
+            init(ring.words(), 3).unwrap();
+            assert_eq!(
+                GuardBinding::new(words(HeapWords::zeroed(1)), 0, 2, ring, cell(), 1, 0)
+                    .unwrap_err(),
+                ClientError::Outcomes(karyos_sys::outcome_ring::OutcomeError::Layout)
+            );
+        }
     }
 }
