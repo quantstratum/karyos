@@ -198,6 +198,7 @@ fn a_reliable_hole_closes_or_is_skipped_only_when_unrecoverable() {
         Some((64, 64)),
         "no record"
     );
+    assert_eq!(skip.counters().unrecoverable, 1);
 
     let (_buffer, mut owner) = with_hole();
     let mut skip = policy_of(SkipConfig {
@@ -269,6 +270,7 @@ fn arrivals_all_ahead_close_an_unreliable_lane() {
         skip.duty(&mut owner, 3000 * MS).unwrap(),
         SkipReport::default()
     );
+    assert_eq!(skip.counters().gap_cannot_resume, 1);
 }
 
 #[test]
