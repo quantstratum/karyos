@@ -1,33 +1,72 @@
 {
   "evaluated": {
     "aarch64-apple-darwin": [
+      "cfg-if v1.0.5",
+      "errno v0.3.14",
+      "lazy_static v1.5.1",
+      "libc v0.2.190",
+      "once_cell v1.21.4",
+      "pin-project-lite v0.2.17",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
+      "sharded-slab v0.1.7",
+      "signal-hook v0.4.5",
+      "signal-hook-registry v1.4.8",
       "syn v3.0.8",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
+      "thread_local v1.1.10",
+      "tracing v0.1.44",
+      "tracing-core v0.1.36",
+      "tracing-subscriber v0.3.23",
       "unicode-ident v1.0.26"
     ],
     "aarch64-unknown-linux-gnu": [
       "bitflags v2.13.2",
+      "cfg-if v1.0.5",
+      "errno v0.3.14",
+      "lazy_static v1.5.1",
+      "libc v0.2.190",
       "linux-raw-sys v0.12.1",
+      "once_cell v1.21.4",
+      "pin-project-lite v0.2.17",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
       "rustix v1.1.5",
+      "sharded-slab v0.1.7",
+      "signal-hook v0.4.5",
+      "signal-hook-registry v1.4.8",
       "syn v3.0.8",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
+      "thread_local v1.1.10",
+      "tracing v0.1.44",
+      "tracing-core v0.1.36",
+      "tracing-subscriber v0.3.23",
       "unicode-ident v1.0.26"
     ],
     "x86_64-unknown-linux-gnu": [
       "bitflags v2.13.2",
+      "cfg-if v1.0.5",
+      "errno v0.3.14",
+      "lazy_static v1.5.1",
+      "libc v0.2.190",
       "linux-raw-sys v0.12.1",
+      "once_cell v1.21.4",
+      "pin-project-lite v0.2.17",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
       "rustix v1.1.5",
+      "sharded-slab v0.1.7",
+      "signal-hook v0.4.5",
+      "signal-hook-registry v1.4.8",
       "syn v3.0.8",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
+      "thread_local v1.1.10",
+      "tracing v0.1.44",
+      "tracing-core v0.1.36",
+      "tracing-subscriber v0.3.23",
       "unicode-ident v1.0.26"
     ]
   },
@@ -62,6 +101,9 @@
           []
         ],
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -287,6 +329,9 @@
           []
         ],
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -593,9 +638,17 @@
           "kind": "normal",
           "target": "cfg(windows)",
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#signal-hook-registry@1.4.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         }
       ],
       "features": [
+        "default",
         "std"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#errno@0.3.14",
@@ -603,18 +656,7 @@
       "name": "errno",
       "paths": {
         "runtime": [
-          [
-            "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
-            "cfg(target_os = \"linux\")"
-          ],
-          [
-            "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
-            "cfg(target_os = \"linux\")"
-          ],
-          [
-            "cfg(target_os = \"linux\")",
-            "cfg(windows)"
-          ]
+          []
         ]
       },
       "proc_macro": false,
@@ -796,6 +838,9 @@
       "paths": {
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -902,6 +947,20 @@
           "kind": "normal",
           "target": "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#signal-hook-registry@1.4.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#signal-hook@0.4.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         }
       ],
       "features": [
@@ -944,29 +1003,7 @@
           ]
         ],
         "runtime": [
-          [
-            "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
-            "cfg(target_os = \"linux\")"
-          ],
-          [
-            "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
-            "cfg(target_os = \"linux\")"
-          ],
-          [
-            "cfg(target_os = \"hermit\")",
-            "cfg(target_os = \"linux\")",
-            "cfg(windows)"
-          ],
-          [
-            "cfg(target_os = \"linux\")",
-            "cfg(target_os = \"wasi\")",
-            "cfg(windows)"
-          ],
-          [
-            "cfg(target_os = \"linux\")",
-            "cfg(unix)",
-            "cfg(windows)"
-          ]
+          []
         ]
       },
       "proc_macro": false,
@@ -1062,6 +1099,9 @@
       "paths": {
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -1109,6 +1149,9 @@
       "name": "matchers",
       "paths": {
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -1161,6 +1204,9 @@
         ],
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -1187,6 +1233,9 @@
       "name": "nu-ansi-term",
       "paths": {
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -1266,6 +1315,9 @@
       "paths": {
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -1313,6 +1365,9 @@
       "name": "pin-project-lite",
       "paths": {
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -1751,6 +1806,9 @@
         ],
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -1802,6 +1860,9 @@
           []
         ],
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -2106,6 +2167,9 @@
       "paths": {
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -2140,6 +2204,54 @@
       "version": "2.0.1"
     },
     {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "workspace:karyos-tools@0.1.0-alpha.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#signal-hook@0.4.5",
+      "license": "MIT OR Apache-2.0",
+      "name": "signal-hook",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.5"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#signal-hook@0.4.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#signal-hook-registry@1.4.8",
+      "license": "MIT OR Apache-2.0",
+      "name": "signal-hook-registry",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.4.8"
+    },
+    {
       "build_script": false,
       "edges": [
         {
@@ -2156,6 +2268,9 @@
       "name": "smallvec",
       "paths": {
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -2345,6 +2460,9 @@
       "paths": {
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -2393,6 +2511,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-tools@0.1.0-alpha.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
@@ -2403,6 +2528,9 @@
       "name": "tracing",
       "paths": {
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -2446,6 +2574,9 @@
       "paths": {
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -2476,6 +2607,9 @@
       "paths": {
         "loom-runtime": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -2493,6 +2627,16 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [
+            "fmt",
+            "std"
+          ],
+          "from": "workspace:karyos-tools@0.1.0-alpha.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
@@ -2517,6 +2661,9 @@
       "name": "tracing-subscriber",
       "paths": {
         "loom-runtime": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -2609,6 +2756,11 @@
       "name": "valuable",
       "paths": {
         "loom-runtime": [
+          [
+            "cfg(tracing_unstable)"
+          ]
+        ],
+        "runtime": [
           [
             "cfg(tracing_unstable)"
           ]
@@ -2743,7 +2895,6 @@
         ],
         "runtime": [
           [
-            "cfg(target_os = \"linux\")",
             "cfg(windows)"
           ]
         ]
@@ -2860,7 +3011,6 @@
         ],
         "runtime": [
           [
-            "cfg(target_os = \"linux\")",
             "cfg(windows)"
           ]
         ]

@@ -382,6 +382,9 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) next_registration: u64,
     pub(crate) scan_cursor: usize,
     pub(crate) terminal: bool,
+    /// Whether new clients are admitted; cleared once by
+    /// [`EmbeddedDriver::stop_admitting`].
+    pub(crate) admitting: bool,
     pub(crate) counters: DriverCounters,
     /// The client counters region and the owner of each allocated cell.
     pub(crate) client_counters: ClientCounters,
@@ -607,6 +610,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             next_registration: 1,
             scan_cursor: 0,
             terminal: false,
+            admitting: true,
             clock,
             next_export: 1,
             holding: Vec::new(),
@@ -814,6 +818,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    /// Stops admitting clients, for an orderly shutdown
+    /// (`quantstratum-docs: karyos/design/observability-and-tools.md`,
+    /// Binaries): [`EmbeddedDriver::connect`] then returns
+    /// [`DriverError::NotAdmitting`], and in IPC mode a client `Hello` is
+    /// refused with `SHUTTING_DOWN`, so that a client does not retry as it
+    /// would after `LIMIT`. Clients already admitted are served as
+    /// before, and tools are still admitted, so that diagnostics stay
+    /// readable. It cannot be undone; calling it again has no effect.
+    pub fn stop_admitting(&mut self) {
+        self.admitting = false;
+    }
+
+    /// Whether new clients are admitted: true until
+    /// [`EmbeddedDriver::stop_admitting`].
+    #[must_use]
+    pub fn is_admitting(&self) -> bool {
+        self.admitting
     }
 
     /// Creates a stream (control path: allocates its log buffer).

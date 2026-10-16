@@ -47,7 +47,10 @@ karyos-bench = { path = "crates/karyos-bench", version = "0.1.0-alpha.1" }
 loom = { version = "0.7.2", default-features = false }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "mm", "net", "param", "process", "rand", "time"] }
+signal-hook = { version = "0.4.5", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 # Inherited by every crate except karyos-sys and karyos-io (SPEC.md §14).
 [workspace.lints.rust]

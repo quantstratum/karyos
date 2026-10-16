@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use karyos_client::ipc::{AttachError, RemoteClient, attach};
+use karyos_client::tool::attach_tool;
 use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, MonotonicClock};
-use karyos_protocol::admission::{MAX_MESSAGE_LENGTH, Message, VERSION};
+use karyos_protocol::admission::{MAX_MESSAGE_LENGTH, Message, VERSION, refusal};
 use karyos_sys::ipc::{self, PidFd, Recv, SOCKET_NAME, Sent};
 use karyos_sys::term_bytes::SharedTerms;
 
@@ -384,4 +385,37 @@ fn test_admission_descriptors_do_not_leak() {
         }
     }
     assert_eq!(open_fds(), baseline, "descriptors leaked");
+}
+
+#[test]
+fn test_admission_stopped_driver_refuses_clients_and_admits_tools() {
+    let _serial = serial();
+    let dir = dir("stopped");
+    let clock = ManualClock::default();
+    let mut driver = driver_with(&dir, 2, &clock);
+    let client = attach_serving(&mut driver, &dir).unwrap();
+    assert_eq!(driver.clients(), 1);
+    driver.stop_admitting();
+    // A new client is refused with SHUTTING_DOWN; the admitted one stays.
+    let refused = attach_serving(&mut driver, &dir);
+    assert!(
+        matches!(refused, Err(AttachError::Refused { code }) if code == refusal::SHUTTING_DOWN),
+        "{refused:?}"
+    );
+    assert_eq!(driver.clients(), 1);
+    // A tool is still admitted, so that diagnostics stay readable.
+    let tool = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| attach_tool(&dir, Duration::from_secs(5)));
+        while !handle.is_finished() {
+            let _ = driver.do_work().unwrap();
+            std::thread::yield_now();
+        }
+        handle.join().unwrap()
+    })
+    .unwrap();
+    assert_eq!(driver.tools(), 1);
+    drop(client);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    drop(tool);
+    let _ = std::fs::remove_dir_all(&dir);
 }

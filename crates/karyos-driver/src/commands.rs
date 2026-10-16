@@ -148,11 +148,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// Returns [`DriverError::TooManyClients`] at `max_clients`,
-    /// [`DriverError::ClientIdsExhausted`], and [`DriverError::Terminal`]
-    /// after the driver entered its terminal state.
+    /// [`DriverError::ClientIdsExhausted`], [`DriverError::Terminal`]
+    /// after the driver entered its terminal state, and
+    /// [`DriverError::NotAdmitting`] after
+    /// [`EmbeddedDriver::stop_admitting`].
     pub fn connect(&mut self) -> Result<ClientConductor<T>, DriverError> {
         if self.terminal {
             return Err(DriverError::Terminal);
+        }
+        if !self.admitting {
+            return Err(DriverError::NotAdmitting);
         }
         if self.clients.len() >= self.config.max_clients {
             return Err(DriverError::TooManyClients);
@@ -2912,6 +2917,37 @@ mod tests {
             );
         }
         drop(fresh);
+    }
+
+    #[test]
+    fn a_driver_that_stopped_admitting_refuses_connect_and_serves_its_clients() {
+        let mut driver = driver();
+        assert!(driver.is_admitting());
+        let mut client = driver.connect().unwrap();
+        driver.stop_admitting();
+        driver.stop_admitting();
+        assert!(!driver.is_admitting());
+        assert!(matches!(driver.connect(), Err(DriverError::NotAdmitting)));
+        // The client admitted before is still served.
+        let request = client
+            .add_publication(
+                StreamKey {
+                    stream_id: 2,
+                    session_id: 1,
+                },
+                false,
+            )
+            .unwrap();
+        let _ = driver.do_work().unwrap();
+        let mut done = Vec::new();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].sequence, request);
+        assert!(!matches!(done[0].outcome, Outcome::Unknown));
+        assert_eq!(driver.clients(), 1);
+        drop(client);
+        let _ = driver.do_work().unwrap();
+        assert_eq!(driver.clients(), 0);
     }
 
     #[test]
