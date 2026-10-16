@@ -44,12 +44,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::{self, ErrorKind};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 
 use super::endpoint::{BufferSize, InterfaceSel, Membership, MulticastConfig, SocketsConfig};
 use super::ops::{Errno, RecvResult, RouteAddr, SendResult, SocketOps, SocketProbes};
+use super::std_results::{recv_error, retry_intr, send_step};
 use crate::backend::{CapabilityState, OpenError, Reason};
 
 /// A UDP socket on macOS, or a closed one before [`SocketOps::open`] and
@@ -87,14 +88,6 @@ fn os(operation: &'static str) -> impl Fn(io::Error) -> OpenError {
     move |error| OpenError::Os {
         operation,
         errno: raw(&error),
-    }
-}
-
-/// Runs a control path call, retrying it once after `EINTR` (4.7).
-fn retry_intr<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
-    match call() {
-        Err(error) if error.kind() == ErrorKind::Interrupted => call(),
-        result => result,
     }
 }
 
@@ -219,22 +212,9 @@ pub struct CountedSend {
 fn send_each(socket: &UdpSocket, address: SocketAddr, datagrams: &[&[u8]]) -> CountedSend {
     // `sent` datagrams before this one, and the calls including this one.
     for ((sent, calls), datagram) in (0_usize..).zip(1_usize..).zip(datagrams) {
-        let result = match socket.send_to(datagram, address) {
-            Ok(len) if len == datagram.len() => continue,
-            Ok(_) => SendResult::OutOfAbi { proven: sent },
-            Err(error) => match error.raw_os_error() {
-                Some(raw) if sent == 0 => SendResult::Error(Errno::from_raw(raw)),
-                Some(raw) => SendResult::Sent {
-                    sent,
-                    error: Some(Errno::from_raw(raw)),
-                },
-                // An error `std` made up without a system call result
-                // proves nothing about this datagram: its exposure is
-                // unproven (6.3), never assumed absent.
-                None => SendResult::OutOfAbi { proven: sent },
-            },
-        };
-        return CountedSend { result, calls };
+        if let Some(result) = send_step(sent, datagram.len(), &socket.send_to(datagram, address)) {
+            return CountedSend { result, calls };
+        }
     }
     CountedSend {
         result: SendResult::Sent {
@@ -278,23 +258,7 @@ impl SocketOps for PortableSocket {
                 truncated: None,
                 source: Some(source),
             },
-            Err(error) => match error.raw_os_error() {
-                Some(raw) => RecvResult::Error(Errno::from_raw(raw)),
-                // `std` reports a source address of a family other than
-                // IPv4 or IPv6 as an `InvalidInput` error without an errno,
-                // made after `recvfrom` consumed the datagram and lost its
-                // length: an `UnsupportedSource` drop (4.4) with nothing
-                // lent.
-                None if error.kind() == ErrorKind::InvalidInput => RecvResult::Datagram {
-                    len: 0,
-                    truncated: None,
-                    source: None,
-                },
-                // Any other error without an errno is not documented for
-                // `recv_from`; 0 makes it a failure of the half, the
-                // conservative outcome, rather than a guessed class.
-                None => RecvResult::Error(Errno::from_raw(0)),
-            },
+            Err(error) => recv_error(&error),
         }
     }
 
