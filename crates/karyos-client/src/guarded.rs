@@ -13,6 +13,10 @@
 //!   message only while `reserved - released` is below the message
 //!   capacity `C_m`, and returns `BackPressured` otherwise; a reservation
 //!   is released when its final record has been read.
+//! - **Fault.** Once the driver's final `OutcomesLost` record is read, the
+//!   outstanding reservations can never be released: offers and claims
+//!   fail with [`ClientError::OutcomesLost`] for good, never
+//!   `BackPressured` forever.
 //! - **Outcomes.** [`GuardBinding::poll_outcomes`] reads the driver's
 //!   outcome ring in sequence order and publishes the consumed count with
 //!   Release once each record's handler returns, before any admission that
@@ -87,6 +91,8 @@ pub(crate) enum Admission {
     Gated,
     /// `C_m` reservations wait for their records.
     BackPressured,
+    /// The outcome stream ended with `OutcomesLost`: terminal.
+    Lost,
 }
 
 /// The guard and outcome ring a publication handle is bound to.
@@ -158,8 +164,12 @@ impl GuardBinding {
         self.reader.ended()
     }
 
-    /// The early check, then the reservation bound.
+    /// The early check, then the reservation bound. A faulted outcome
+    /// stream is terminal before either.
     pub(crate) fn admission(&self) -> Admission {
+        if self.reader.ended() {
+            return Admission::Lost;
+        }
         if !guard::admits_in(&*self.guard, self.index, self.epoch) {
             return Admission::Gated;
         }

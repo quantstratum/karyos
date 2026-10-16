@@ -481,6 +481,7 @@ impl<T: TermBytes> ClientPublication<T> {
         match self.guard.as_ref().map(GuardBinding::admission) {
             Some(Admission::Gated) => return Ok(OfferOutcome::Gated),
             Some(Admission::BackPressured) => return Ok(OfferOutcome::BackPressured),
+            Some(Admission::Lost) => return Err(ClientError::OutcomesLost),
             Some(Admission::Open) | None => {}
         }
         if !self.connected() {
@@ -556,6 +557,7 @@ impl<T: TermBytes> ClientPublication<T> {
         match self.guard.as_ref().map(GuardBinding::admission) {
             Some(Admission::Gated) => return Ok(ClaimOutcome::Gated),
             Some(Admission::BackPressured) => return Ok(ClaimOutcome::BackPressured),
+            Some(Admission::Lost) => return Err(ClientError::OutcomesLost),
             Some(Admission::Open) | None => {}
         }
         if !self.connected() {
@@ -1275,6 +1277,60 @@ mod tests {
             assert_eq!(publication.guard().unwrap().outstanding(), 1);
             assert_eq!(publication.poll_outcomes(1, |_, _| {}).unwrap(), 1);
             assert_eq!(publication.guard().unwrap().outstanding(), 0);
+        }
+
+        #[test]
+        fn a_faulted_outcome_stream_is_terminal() {
+            let (mut driver, mut publication) = guarded();
+            assert!(accepted(publication.offer(b"a").unwrap()));
+            assert!(accepted(publication.offer(b"b").unwrap()));
+            // The client has not read; a third record faults it.
+            driver.outcome(Kind::Submitted);
+            driver.outcome(Kind::Submitted);
+            driver.outcome(Kind::Range);
+            assert_eq!(
+                driver
+                    .writer
+                    .produce(
+                        driver.ring.words(),
+                        &driver.consumed,
+                        Record {
+                            kind: Kind::Submitted,
+                            lane: 0,
+                            receiver: 0,
+                            incarnation: 1,
+                            start: 0,
+                            end: 64,
+                            epoch: 2,
+                            reason: 0,
+                            lost: 0,
+                        }
+                    )
+                    .unwrap(),
+                Produced::Lost
+            );
+            let mut kinds = Vec::new();
+            assert_eq!(
+                publication
+                    .poll_outcomes(8, |_, record| kinds.push(record.kind))
+                    .unwrap(),
+                4
+            );
+            assert_eq!(
+                kinds,
+                [
+                    Kind::Submitted,
+                    Kind::Submitted,
+                    Kind::Range,
+                    Kind::OutcomesLost
+                ]
+            );
+            assert!(publication.guard().unwrap().outcomes_ended());
+            assert_eq!(publication.offer(b"c"), Err(ClientError::OutcomesLost));
+            assert!(matches!(
+                publication.try_claim(8),
+                Err(ClientError::OutcomesLost)
+            ));
         }
 
         #[test]
