@@ -396,6 +396,17 @@ mod owned {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    impl ConflationConfig {
+        /// Bytes of the structure of a table region of this configuration
+        /// ([`conflation_in`]); `None` for a configuration it refuses. A
+        /// view compares a region's length with it before mapping it.
+        #[must_use]
+        pub fn structure_length(&self) -> Option<usize> {
+            Geometry::new(self.keys, self.value_capacity, self.journal_capacity)?.structure_length()
+        }
+    }
+
     /// Words a table reader takes slices of: writable heap or region
     /// words, or a read-only mapping (Linux).
     trait Words: LoadWords + Sized {

@@ -585,26 +585,43 @@ fn a_taken_view_reads_and_detaches_on_drop() {
     assert_eq!(counter(&driver, "grants ended"), 1);
 }
 
-/// A take that fails rolls back: a configuration over the view's limits,
-/// a record of another stream, and a table whose configuration differs
-/// from the answer each fail, and the grant is detached and ended.
+/// A take that fails rolls back: a configuration over each of the view's
+/// limits, a record of another stream, a configuration whose length is
+/// not the region's (refused before mapping) and one of the same length
+/// that the region does not hold each fail, and the grant is detached and
+/// ended.
 #[test]
 fn a_failed_take_is_rolled_back() {
     let dir = dir("rollback");
     let mut driver = driver(&dir);
     let _stream = driver.add_stream(stream_config(2, Some(TABLE))).unwrap();
     let mut client = attach_serving(&mut driver, &dir);
-    let cases: [(Change, Expected); 3] = [
+    let cases: [(Change, Expected); 6] = [
         (
             |_, limits| limits.max_keys = 3,
+            |error| matches!(error, AttachError::TooLarge),
+        ),
+        (
+            |_, limits| limits.max_value_capacity = 7,
+            |error| matches!(error, AttachError::TooLarge),
+        ),
+        (
+            |_, limits| limits.max_journal_capacity = 512,
             |error| matches!(error, AttachError::TooLarge),
         ),
         (
             |fetchable, _| fetchable.stream.stream_id = 9,
             |error| matches!(error, AttachError::Protocol),
         ),
+        // A configuration of another length: refused before mapping.
         (
             |fetchable, _| fetchable.keys = 3,
+            |error| matches!(error, AttachError::Protocol),
+        ),
+        // One of the same length (value capacities 8 and 16 take the same
+        // slot words) that the region does not hold: its header check.
+        (
+            |fetchable, _| fetchable.value_capacity = 16,
             |error| matches!(error, AttachError::Sys(SysError::InvalidRegion { .. })),
         ),
     ];

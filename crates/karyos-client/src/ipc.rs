@@ -807,7 +807,8 @@ impl RemoteClient {
 
     /// Takes the view of a [`FetchableConflated`]: fetches its table's
     /// region, checks the configuration of the answer against `limits`,
-    /// the record against the stream requested, maps the region read-only
+    /// the record against the stream requested and the length that
+    /// configuration implies, maps the region read-only
     /// (the driver-only seal profile) and requires the configuration of
     /// the table, then returns a view that polls with `budget` and whose
     /// drop unmaps the table and sends the grant's `Detach`. Blocks at most
@@ -844,6 +845,11 @@ impl RemoteClient {
                 return Err(AttachError::Protocol);
             }
             let expected = fetched_region(session.instance, record)?;
+            // The mapping's length must be the one the admitted
+            // configuration implies, before anything is mapped.
+            if config.structure_length() != Some(expected.structure_length) {
+                return Err(AttachError::Protocol);
+            }
             let region = ReadOnlyRegion::attach(fetched.fd, expected, SealProfile::DriverOnly)?;
             Ok(ConflationReader::attach_read_only(region, config)?)
         })();
