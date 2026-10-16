@@ -16,8 +16,8 @@
 //! charged. A fenced grant is never moved by a later cutover: its
 //! participant never reached that generation.
 
-use karyos_protocol::cnc::{Event as DriverEvent, StreamKey};
-use karyos_sys::log_buffer::LossPolicy;
+use karyos_protocol::cnc::{CutoverState, Event as DriverEvent, StreamKey};
+use karyos_sys::log_buffer::{LossPolicy, SealState};
 use karyos_sys::registration;
 
 use crate::embedded::{EmbeddedDriver, StreamTerms};
@@ -239,6 +239,56 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             Participant::Journal { .. } => false,
         }
+    }
+
+    /// Answers `QueryCutover` (`quantstratum-docs:
+    /// karyos/design/ipc-data-path.md`, "Resync after a lap"): where
+    /// `registration`, one of remote client `client`'s, stands now, from
+    /// the newest of its stream grants. A reserved successor that is
+    /// neither adopted nor fenced has its `SuccessorReady` emitted again
+    /// before the answer, so the client can fetch it. `None` when the
+    /// registration is not one of the client's: the answer never reveals
+    /// another client's grants.
+    pub(crate) fn query_cutover(&mut self, client: u64, registration: u64) -> Option<CutoverState> {
+        let newest = self
+            .ledger(client)?
+            .grants()
+            .iter()
+            .filter(|grant| grant.registration == registration && grant.stream != 0)
+            .max_by_key(|grant| grant.generation)
+            .copied()?;
+        let target = self.streams.iter().find(|s| s.id == newest.stream)?;
+        let current = target.generation.get();
+        let pending = !newest.fenced && newest.fence_at.is_some() && newest.generation == current;
+        // A cutover seals the current mapping too, until the successor
+        // opens: only a seal with no cutover in progress closes the stream.
+        let sealed = target.cutover.is_none() && target.conductor.seal_state() != SealState::Active;
+        let state = if target.retiring || sealed {
+            CutoverState::Closed
+        } else if newest.fenced {
+            CutoverState::Fenced
+        } else if pending {
+            CutoverState::Successor
+        } else if newest.generation != current {
+            // No successor could be reserved for it: it cannot move.
+            CutoverState::Fenced
+        } else {
+            CutoverState::Current
+        };
+        if state == CutoverState::Successor {
+            let event = DriverEvent::SuccessorReady {
+                stream: StreamKey {
+                    stream_id: target.stream_id,
+                    session_id: target.session_id,
+                },
+                registration,
+                key: newest.key,
+                base: target.base,
+                generation: u64::from(current),
+            };
+            self.emit(&event);
+        }
+        Some(state)
     }
 
     /// The `(stream, generation)` pairs some remote grant still charges.
