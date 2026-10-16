@@ -11,6 +11,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod admission;
+pub mod agents;
 mod client_counters;
 pub mod clock;
 mod commands;
