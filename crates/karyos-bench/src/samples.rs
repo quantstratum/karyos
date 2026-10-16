@@ -220,7 +220,9 @@ pub fn combine(send: &[u32], receives: &[&[u32]]) -> Result<(Vec<u32>, u64), Sam
         } else {
             let (value, clipped) = sample_from_ns(u64::from(sent) + u64::from(slowest));
             if clipped {
-                saturated = saturated.saturating_add(1);
+                saturated = saturated
+                    .checked_add(1)
+                    .ok_or(SamplesError::InvalidField("saturated count"))?;
             }
             value
         };
@@ -336,10 +338,9 @@ fn check(header: &Header, samples: &[u32]) -> Result<(), SamplesError> {
     {
         return Err(SamplesError::InvalidField("receiver"));
     }
-    let saturated = samples
-        .iter()
-        .filter(|&&value| value == SATURATED)
-        .fold(0u64, |count, _| count.saturating_add(1));
+    let saturated = samples.iter().filter(|&&value| value == SATURATED).count();
+    let saturated =
+        u64::try_from(saturated).map_err(|_| SamplesError::InvalidField("saturated"))?;
     if saturated != header.saturated {
         return Err(SamplesError::InvalidField("saturated"));
     }
@@ -371,7 +372,13 @@ pub fn encode(run: &RunSamples) -> Result<Vec<u8>, SamplesError> {
         u8::try_from(header.profile.len()).map_err(|_| SamplesError::InvalidField("profile"))?;
     let count =
         u64::try_from(run.samples.len()).map_err(|_| SamplesError::InvalidField("count"))?;
-    let mut out = Vec::with_capacity(run.samples.len().saturating_mul(4).saturating_add(128));
+    let capacity = run
+        .samples
+        .len()
+        .checked_mul(4)
+        .and_then(|bytes| bytes.checked_add(128))
+        .ok_or(SamplesError::InvalidField("count"))?;
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     let (shape, shape_param) = shape_code(header.point.shape);

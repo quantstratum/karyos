@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The wire threat model and comparison manifest, version `1.0`, as data
+//! The wire threat model and comparison manifest, version `2.0`, as data
 //! (`quantstratum-docs: karyos/design/wire-threat-model-manifest.md`).
+//! Version 2.0 (owner approval, ACS 15075) keeps the operating points and
+//! thresholds of 1.0 and makes the run-level Welch t interval the interval
+//! method of §8.3 (see `decision::DECISION_METHOD`).
 //!
 //! The manifest is frozen (manifest 9). This module states its operating
 //! points (6.1), its primary set (6.1) and the constants of its section 8.
@@ -16,12 +19,34 @@ use karyos_sys::frame::Flags;
 use karyos_sys::sizing::{DEFAULT_MTU, FragmentPlan, TermLength};
 
 /// The manifest version every result cites (manifest 9).
-pub const VERSION: &str = "1.0";
+pub const VERSION: &str = "2.0";
 
-/// The SHA-256 of the manifest file as committed at the freeze
-/// (manifest 9; ACS note `threat-model-manifest-v1-hash`). The file cannot
-/// contain its own hash, so every result records it.
-pub const SHA256: &str = "7e42ac9df17705a40e2987257e67b7462a187e7e313f983ac381f43ca06fbe90";
+/// The SHA-256 of the manifest file of [`VERSION`] (manifest 9). The file
+/// cannot contain its own hash, so every result records it. This is the
+/// 2.0 file at quantstratum-docs PR #70 head 345ff84 (coordinator, after
+/// ACS 15075); if the review changes the file, this constant changes with
+/// it. A value that is not 64 lowercase hex digits makes every result not
+/// decision grade (`decision::GradeReason::ManifestHashPending`).
+pub const MANIFEST_SHA256: &str =
+    "a0228318c31aabdaf90ab62ed62f7c657557634446793a170c4f935c733114a9";
+
+/// The SHA-256 of manifest version 1.0 at its freeze (ACS note
+/// `threat-model-manifest-v1-hash`), kept for results that cite 1.0.
+pub const MANIFEST_1_0_SHA256: &str =
+    "7e42ac9df17705a40e2987257e67b7462a187e7e313f983ac381f43ca06fbe90";
+
+/// Whether [`MANIFEST_SHA256`] is a final hash: 64 lowercase hex digits.
+#[must_use]
+pub fn manifest_hash_is_final() -> bool {
+    is_sha256_hex(MANIFEST_SHA256)
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 
 /// The default MTU of the operating points (manifest 6.1; SPEC §4).
 pub const MTU: u32 = DEFAULT_MTU;
@@ -746,8 +771,14 @@ mod tests {
 
     #[test]
     fn version_and_hash() {
-        assert_eq!(VERSION, "1.0");
-        assert_eq!(SHA256.len(), 64);
-        assert!(SHA256.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(VERSION, "2.0");
+        assert!(is_sha256_hex(MANIFEST_1_0_SHA256));
+        assert_eq!(
+            MANIFEST_SHA256,
+            "a0228318c31aabdaf90ab62ed62f7c657557634446793a170c4f935c733114a9"
+        );
+        assert!(manifest_hash_is_final());
+        assert!(!is_sha256_hex("PENDING"));
+        assert!(!is_sha256_hex(&"A".repeat(64)));
     }
 }
