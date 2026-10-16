@@ -427,6 +427,119 @@ fn f2_receivers_share_one_group() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
+/// Runs W1 under R1 with 4 receivers and `faults`, returning the error
+/// and the time the run took (Linux only: F2 needs the group port shared).
+#[cfg(target_os = "linux")]
+fn faulty_f2(
+    name: &str,
+    messages: u64,
+    faults: karyos_bench::wire::process::Faults,
+) -> (Option<String>, std::time::Duration) {
+    use karyos_bench::manifest::Shape;
+    use karyos_bench::wire::process::{ProcessOptions, run_processes};
+    use karyos_bench::wire::stage::StageLoad;
+    let dir = TempDir::new(name);
+    let mut run = wire_run(Shape::W1, StageLoad::Closed, messages);
+    run.receivers = 4;
+    let started = std::time::Instant::now();
+    let result = run_processes(
+        &run,
+        &dir.0,
+        &ProcessOptions {
+            faults,
+            ..ProcessOptions::default()
+        },
+    );
+    (result.err().map(|error| error.0), started.elapsed())
+}
+
+/// One F2 receiver slow to acknowledge the last message is no stop for
+/// the sender: a receiver that stops after a message has it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_slow_last_ack_at_one_receiver_is_no_stop() {
+    use karyos_bench::wire::process::Faults;
+    let (error, _) = faulty_f2(
+        "f2-slow",
+        200,
+        Faults {
+            only_receiver: Some(3),
+            rx_last_ack_delay_ms: Some(100),
+            ..Faults::default()
+        },
+    );
+    assert_eq!(error, None);
+}
+
+/// One F2 receiver failing alone ends the run, and names that receiver.
+#[cfg(target_os = "linux")]
+#[test]
+fn one_crashed_f2_receiver_ends_the_run() {
+    use karyos_bench::wire::process::Faults;
+    let (error, took) = faulty_f2(
+        "f2-crash",
+        200,
+        Faults {
+            only_receiver: Some(2),
+            rx_crash_at: Some(50),
+            ..Faults::default()
+        },
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("rx2 child failed"), "{error}");
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+}
+
+/// One F2 receiver ending early alone stops the sender through its stop;
+/// without its stop, the parent ends a sender that outlives it.
+#[cfg(target_os = "linux")]
+#[test]
+fn one_early_f2_receiver_stops_the_sender() {
+    use karyos_bench::wire::process::Faults;
+    let early = Faults {
+        only_receiver: Some(1),
+        rx_deadline_ms: Some(300),
+        ..Faults::default()
+    };
+    let (error, took) = faulty_f2("f2-early", 1_000_000, early);
+    let error = error.unwrap_or_default();
+    assert!(error.contains("tx child failed"), "{error}");
+    assert!(took < std::time::Duration::from_millis(2_000), "{took:?}");
+    let (error, took) = faulty_f2(
+        "f2-early-silent",
+        1_000_000,
+        Faults {
+            no_stop: true,
+            ..early
+        },
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("outlived"), "{error}");
+    assert!(took < std::time::Duration::from_secs(8), "{took:?}");
+}
+
+/// A run whose multicast group this host has already joined is refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_already_joined_group_is_refused() {
+    use karyos_bench::wire::process::{Faults, group_of};
+    let nonce = 0x5eed_0000_0000_7a11;
+    let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    socket
+        .join_multicast_v4(&group_of(nonce), &std::net::Ipv4Addr::LOCALHOST)
+        .unwrap();
+    let (error, _) = faulty_f2(
+        "f2-joined",
+        200,
+        Faults {
+            nonce: Some(nonce),
+            ..Faults::default()
+        },
+    );
+    let error = error.unwrap_or_default();
+    assert!(error.contains("already joined"), "{error}");
+}
+
 /// Lost hellos are repeated: no message waits for an acknowledgement
 /// that cannot come.
 #[test]

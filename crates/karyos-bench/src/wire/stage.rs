@@ -174,6 +174,9 @@ pub struct StageSamples {
     /// Where the sender sent: the receiving endpoint's address under F1,
     /// the multicast group under F2.
     pub destination: SocketAddr,
+    /// The cores the run used: each receiver's, then the sender's; empty
+    /// when unpinned.
+    pub cores: Vec<usize>,
 }
 
 /// A gate that permits every candidate: the measured path has no guard.
@@ -999,6 +1002,7 @@ pub fn run<P: Protection + Sync>(
         functional_only: true,
         functional_reasons: vec!["the roles share one process".to_string()],
         destination: receiver_address,
+        cores: Vec::new(),
     })
 }
 

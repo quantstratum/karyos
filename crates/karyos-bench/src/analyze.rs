@@ -423,10 +423,15 @@ fn run_data(dir: &Path, planned: &PlannedRun, n: u64) -> Result<RunData, BenchEr
             receives.iter().map(|r| samples::missing(r)).collect(),
         ),
         callback_p999: stats::p999(&callback).filter(|v| *v != MISSING),
+        // Each receiver's own p99.9 on the same expansion to N as the
+        // decision sample (it matters for W5).
         receivers: receives
             .iter()
-            .map(|r| stats::p999(r).filter(|v| *v != MISSING))
-            .collect(),
+            .map(|r| {
+                plan::keep_n(r, planned.messages_per_sample, n)
+                    .map(|kept| stats::p999(&kept).filter(|v| *v != MISSING))
+            })
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -865,8 +870,13 @@ pub fn report(analysis: &Analysis) -> String {
     for point in &analysis.points {
         let _ = writeln!(
             out,
-            "### {}: {}\n",
+            "### {}: {}{}\n",
             point.point,
+            if matches!(point.point.fanout, Fanout::F2 { .. }) {
+                "reported only (M-6); "
+            } else {
+                ""
+            },
             outcome_text(&point.outcome)
         );
         if let Fanout::F2 { receivers } = point.point.fanout {
@@ -926,7 +936,7 @@ pub fn report(analysis: &Analysis) -> String {
         }
         let _ = writeln!(
             out,
-            "\n| run | configuration | round | n | missing | saturated | p50 | p99 | p99.9 | H-5 callback p99.9 | backpressure | ack timeouts | error |"
+            "\n| run | configuration | round | n | missing | saturated | p50 | p99 | p99.9 | H-5 callback p99.9 (receiver 0) | backpressure | ack timeouts | error |"
         );
         let _ = writeln!(
             out,
@@ -973,6 +983,12 @@ pub fn report(analysis: &Analysis) -> String {
     );
     for (point, cause) in &overall.missing {
         let _ = writeln!(out, "- {point}: {cause}");
+    }
+    for point in &overall.reported_only {
+        let _ = writeln!(
+            out,
+            "- {point}: reported only (M-6, F2 before P2.7), outside the decision set"
+        );
     }
     let _ = writeln!(out, "\n## Tie breakers (8.7)\n");
     // Both sides of an A/A run are the trusted profile: the same
@@ -1339,6 +1355,7 @@ mod tests {
                 functional_only: false,
                 functional_reasons: Vec::new(),
                 destination: "127.0.0.1:1".parse().unwrap(),
+                cores: Vec::new(),
             });
             let mut preflight = "clocksource tsc\n".to_string();
             edit(planned, index, &mut outcome, &mut preflight);
@@ -1390,7 +1407,6 @@ mod tests {
                 index,
                 planned,
                 &dir,
-                None,
                 Duration::from_millis(1),
                 &outcome,
             ));
@@ -1563,6 +1579,14 @@ mod tests {
         let report = read(&out.join("report.md")).unwrap();
         assert!(report.contains("partial: no SM/NAK (P2.7)"));
         assert!(report.contains("effective quantile p99.975"));
+        assert!(report.contains(&format!("### {}: reported only (M-6); ", f2.point)));
+        // Each receiver's own p99.9: run 0's are 1009, 1019, 1029, 1039.
+        let own = format!(
+            "- run {} receivers' own p99.9: [1009, 1019, 1029, 1039] ns",
+            f2.runs[0].index
+        );
+        assert!(report.contains(&own), "{own}");
+        assert!(report.contains(&format!("- {}: reported only (M-6", f2.point)));
         // F2 stays reported only (M-6): the overall excludes it.
         assert!(analysis.overall.reported_only.contains(&f2.point));
         let _ = std::fs::remove_dir_all(&out);

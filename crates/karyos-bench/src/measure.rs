@@ -89,7 +89,6 @@ pub fn result_line(
     index: usize,
     planned: &PlannedRun,
     dir: &str,
-    cores: Option<&Cores>,
     duration: Duration,
     outcome: &Result<StageSamples, BenchError>,
 ) -> String {
@@ -111,9 +110,14 @@ pub fn result_line(
         format!("\"e_max\":{}", run.e_max),
         format!("\"rule\":{}", json_string(&format!("{:?}", run.rule))),
         format!("\"receivers\":{}", run.receivers),
+        // The cores the run used, receivers first; null when unpinned or
+        // failed.
         format!(
             "\"cores\":{}",
-            cores.map_or_else(|| "null".to_string(), |c| core_list(&c.quiet))
+            match outcome {
+                Ok(samples) if !samples.cores.is_empty() => core_list(&samples.cores),
+                _ => "null".to_string(),
+            }
         ),
         format!("\"duration_ms\":{}", duration.as_millis()),
         format!("\"dir\":{}", json_string(dir)),
@@ -314,7 +318,7 @@ pub fn run_plan(
         };
         let outcome = run_processes(&planned.run, &out.join(&dir), &options);
         let duration = started.elapsed();
-        let line = result_line(index, planned, &dir, pinned, duration, &outcome);
+        let line = result_line(index, planned, &dir, duration, &outcome);
         writeln!(results, "{line}").map_err(|cause| io("results.jsonl", cause))?;
         let summary = match &outcome {
             Ok(samples) => format!(
@@ -417,7 +421,6 @@ mod tests {
             3,
             planned,
             "runs/0003_x",
-            None,
             Duration::from_millis(12),
             &Err(BenchError("orphan sequence 9 (M-11)".into())),
         );

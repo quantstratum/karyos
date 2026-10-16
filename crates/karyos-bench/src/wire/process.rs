@@ -205,6 +205,23 @@ pub struct Faults {
     pub tx_crash_at: Option<u64>,
     /// The sender stops responding waiting for this message.
     pub tx_freeze_at: Option<u64>,
+    /// The receive child the receiver faults apply to; every receiver
+    /// without it.
+    pub only_receiver: Option<u16>,
+    /// The receiver waits this many milliseconds before acknowledging
+    /// the run's last message.
+    pub rx_last_ack_delay_ms: Option<u64>,
+    /// The run's nonce, in place of a fresh one, so a test can predict the
+    /// multicast group.
+    pub nonce: Option<u64>,
+}
+
+impl Faults {
+    /// Whether the receiver faults apply to receive child `receiver`.
+    #[must_use]
+    pub fn applies_to(&self, receiver: u16) -> bool {
+        self.only_receiver.is_none_or(|only| only == receiver)
+    }
 }
 
 impl Faults {
@@ -226,6 +243,9 @@ impl Faults {
             ("rx_deadline_ms", self.rx_deadline_ms),
             ("tx_crash_at", self.tx_crash_at),
             ("tx_freeze_at", self.tx_freeze_at),
+            ("only_receiver", self.only_receiver.map(u64::from)),
+            ("rx_last_ack_delay_ms", self.rx_last_ack_delay_ms),
+            ("nonce", self.nonce),
         ] {
             if let Some(value) = value {
                 parts.push(format!("{key}={value}"));
@@ -253,6 +273,11 @@ impl Faults {
                 "rx_deadline_ms" => faults.rx_deadline_ms = Some(number),
                 "tx_crash_at" => faults.tx_crash_at = Some(number),
                 "tx_freeze_at" => faults.tx_freeze_at = Some(number),
+                "only_receiver" => {
+                    faults.only_receiver = Some(u16::try_from(number).map_err(|_| bad())?);
+                }
+                "rx_last_ack_delay_ms" => faults.rx_last_ack_delay_ms = Some(number),
+                "nonce" => faults.nonce = Some(number),
                 _ => return Err(bad()),
             }
         }
@@ -490,7 +515,9 @@ fn fanout(run: &StageRun) -> Result<Fanout, BenchError> {
 /// organisation-local scope.
 #[must_use]
 pub fn group_of(nonce: u64) -> Ipv4Addr {
-    let [low, high, ..] = nonce.to_le_bytes();
+    // Every bit of the nonce counts: its four 16-bit words folded.
+    let folded = nonce ^ (nonce >> 16) ^ (nonce >> 32) ^ (nonce >> 48);
+    let [low, high, ..] = folded.to_le_bytes();
     Ipv4Addr::new(239, 255, high, low)
 }
 
@@ -674,8 +701,10 @@ impl Drop for ReceiverControl {
         if self.peer.get().is_none() {
             self.pump();
         }
+        // The count tells the sender which messages this receiver has: a
+        // stop after the last one it waits for is no stop for it.
         for _ in 0..STOP_REPEATS {
-            self.send(STOP, 0);
+            self.send(STOP, self.completed.get());
         }
     }
 }
@@ -707,7 +736,7 @@ fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), Benc
         peer: Cell::new(None),
         done: Cell::new(false),
         completed: Cell::new(0),
-        no_stop: context.faults.no_stop,
+        no_stop: context.faults.no_stop && context.faults.applies_to(context.receiver),
     };
     {
         let mut stdout = std::io::stdout().lock();
@@ -715,7 +744,13 @@ fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), Benc
             .map_err(|cause| error("ready", cause))?;
         stdout.flush().map_err(|cause| error("ready", cause))?;
     }
-    let faults = context.faults;
+    // Receiver faults (tests only) apply to the named receiver alone.
+    let faults = if context.faults.applies_to(context.receiver) {
+        context.faults
+    } else {
+        Faults::default()
+    };
+    let total = prepared.total;
     let received = receive_role(
         run,
         prepared,
@@ -731,6 +766,9 @@ fn receive_child(context: &ChildContext, prepared: &Prepared) -> Result<(), Benc
                 if faults.rx_crash_at.is_some_and(|at| count >= at) {
                     // An injected crash (tests only): no destructor runs.
                     std::process::exit(1);
+                }
+                if let (Some(millis), true) = (faults.rx_last_ack_delay_ms, count >= total) {
+                    std::thread::sleep(Duration::from_millis(millis));
                 }
                 control.ack(count);
             },
@@ -770,7 +808,12 @@ struct SenderControl {
     completed: Vec<Cell<u64>>,
     /// Whether each receiver has been heard from.
     heard: Vec<Cell<bool>>,
-    stopped: Cell<bool>,
+    /// Each receiver's stop, with the messages it had completed.
+    stops: Vec<Cell<Option<u64>>>,
+    /// Whether the control socket failed.
+    failed: Cell<bool>,
+    /// Warmup plus measured messages of the run.
+    total: u64,
     last_hello: Cell<Option<Instant>>,
     hellos_to_drop: Cell<u32>,
 }
@@ -810,9 +853,11 @@ impl SenderControl {
                     let Some(index) = self.peers.iter().position(|peer| *peer == from) else {
                         continue;
                     };
-                    let (Some(heard), Some(completed)) =
-                        (self.heard.get(index), self.completed.get(index))
-                    else {
+                    let (Some(heard), Some(completed), Some(stop)) = (
+                        self.heard.get(index),
+                        self.completed.get(index),
+                        self.stops.get(index),
+                    ) else {
                         continue;
                     };
                     match buffer
@@ -823,16 +868,17 @@ impl SenderControl {
                             heard.set(true);
                             completed.set(completed.get().max(count));
                         }
-                        Some((STOP, _)) => {
+                        Some((STOP, count)) => {
                             heard.set(true);
-                            self.stopped.set(true);
+                            completed.set(completed.get().max(count));
+                            stop.set(Some(count));
                         }
                         _ => {}
                     }
                 }
                 Err(cause) if cause.kind() == ErrorKind::WouldBlock => return,
                 Err(_) => {
-                    self.stopped.set(true);
+                    self.failed.set(true);
                     return;
                 }
             }
@@ -844,6 +890,16 @@ impl SenderControl {
         self.completed.iter().map(Cell::get).min().unwrap_or(0)
     }
 
+    /// Whether a receiver stopped with fewer than `count` messages
+    /// completed, or with no more than `count` when `inclusive`.
+    fn stopped_short(&self, count: u64, inclusive: bool) -> bool {
+        self.failed.get()
+            || self.stops.iter().any(|stop| {
+                stop.get()
+                    .is_some_and(|completed| completed < count || (inclusive && completed == count))
+            })
+    }
+
     fn wait(&self, sequence: u64) -> Wait {
         let start = Instant::now();
         loop {
@@ -851,7 +907,8 @@ impl SenderControl {
             if self.completed() > sequence {
                 return Wait::Completed;
             }
-            if self.stopped.get() {
+            // A receiver that stopped after this message is no stop for it.
+            if self.stopped_short(sequence, true) {
                 return Wait::Stopped;
             }
             if start.elapsed() >= ACK_TIMEOUT {
@@ -861,9 +918,10 @@ impl SenderControl {
         }
     }
 
+    /// Whether a receiver stopped before the run's last message.
     fn stopped(&self) -> bool {
         self.pump();
-        self.stopped.get()
+        self.stopped_short(self.total, false)
     }
 }
 
@@ -895,8 +953,10 @@ fn send_child(context: &ChildContext, prepared: &Prepared) -> Result<(), BenchEr
         nonce: context.nonce,
         completed: controls.iter().map(|_| Cell::new(0)).collect(),
         heard: controls.iter().map(|_| Cell::new(false)).collect(),
+        stops: controls.iter().map(|_| Cell::new(None)).collect(),
         peers: controls,
-        stopped: Cell::new(false),
+        failed: Cell::new(false),
+        total: prepared.total,
         last_hello: Cell::new(None),
         hellos_to_drop: Cell::new(context.faults.drop_hellos),
     };
@@ -1132,13 +1192,17 @@ struct Receiver {
     status: Option<ExitStatus>,
 }
 
-/// Waits for `child`'s ready line, until `deadline`.
-fn ready(child: &mut Guard, deadline: Instant) -> Result<(SocketAddr, SocketAddr), BenchError> {
+/// Waits for receive child `index`'s ready line, until `deadline`.
+fn ready(
+    child: &mut Guard,
+    index: u16,
+    deadline: Instant,
+) -> Result<(SocketAddr, SocketAddr), BenchError> {
     let stdout = child
         .0
         .stdout
         .take()
-        .ok_or_else(|| BenchError("the receive child has no output".into()))?;
+        .ok_or_else(|| BenchError(format!("rx{index} has no output")))?;
     let (sender, lines) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         // Read to the end: closing the pipe early would fail the child's
@@ -1149,9 +1213,19 @@ fn ready(child: &mut Guard, deadline: Instant) -> Result<(SocketAddr, SocketAddr
             }
         }
     });
-    let line = lines
+    let line = match lines
         .recv_timeout(READY_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())))
-        .map_err(|_| BenchError("a receive child never got ready".into()))?;
+    {
+        Ok(line) => line,
+        Err(_) => {
+            return Err(BenchError(
+                match child.0.try_wait().map_err(|cause| error("rx", cause))? {
+                    Some(status) => format!("rx{index} exited before it was ready: {status}"),
+                    None => format!("rx{index} never got ready"),
+                },
+            ));
+        }
+    };
     let mut addresses = line
         .strip_prefix(READY)
         .unwrap_or_default()
@@ -1159,7 +1233,7 @@ fn ready(child: &mut Guard, deadline: Instant) -> Result<(SocketAddr, SocketAddr
         .map(|address| address.parse::<SocketAddr>().ok());
     match (addresses.next(), addresses.next(), addresses.next()) {
         (Some(Some(data)), Some(Some(control)), None) => Ok((data, control)),
-        _ => Err(BenchError(format!("bad ready line {line}"))),
+        _ => Err(BenchError(format!("rx{index}: bad ready line {line}"))),
     }
 }
 
@@ -1200,7 +1274,7 @@ pub fn run_processes(
     std::fs::create_dir_all(dir).map_err(|cause| error("sample directory", cause))?;
     let spawn = Spawn {
         run,
-        nonce: nonce(),
+        nonce: options.faults.nonce.unwrap_or_else(nonce),
         options,
     };
     let group = if count > 1 {
@@ -1234,7 +1308,7 @@ pub fn run_processes(
             extra.push((GROUP, SocketAddrV4::new(group, port).to_string()));
         }
         let mut guard = spawn.child("rx", &out, None, core_of(usize::from(index)), &extra)?;
-        let (data, control) = ready(&mut guard, deadline)?;
+        let (data, control) = ready(&mut guard, index, deadline)?;
         receivers.push(Receiver {
             guard,
             data,
@@ -1280,11 +1354,13 @@ pub fn run_processes(
                 }
             }
         }
-        if receivers.iter().all(|r| r.status.is_some()) {
+        // A receiver that ended, even one that never heard a hello and so
+        // could not say it stopped, ends the run unless the sender follows.
+        if receivers.iter().any(|r| r.status.is_some()) {
             let ended = *receivers_ended.get_or_insert_with(Instant::now);
             if sent.is_none() && ended.elapsed() >= OUTLIVE {
                 return Err(BenchError(format!(
-                    "the sender outlived the receivers by {OUTLIVE:?}"
+                    "the sender outlived a receiver by {OUTLIVE:?}"
                 )));
             }
         }
@@ -1324,7 +1400,7 @@ pub fn run_processes(
         pinning.push(format!(
             "{} receivers and a sender need {} quiet cores; the host has {}",
             count,
-            count.saturating_add(1),
+            count.checked_add(1).unwrap_or(count),
             options.cores.as_ref().map_or(0, |cores| cores.quiet.len())
         ));
     }
@@ -1367,6 +1443,14 @@ pub fn run_processes(
         sender_core,
     ));
     let functional_reasons = functional_reasons(pinning, fanout);
+    let cores = match &assigned {
+        Some(Some((receivers, sender))) => receivers
+            .iter()
+            .copied()
+            .chain(std::iter::once(*sender))
+            .collect(),
+        _ => Vec::new(),
+    };
     Ok(StageSamples {
         send: send.samples,
         receivers: per_receiver,
@@ -1376,6 +1460,7 @@ pub fn run_processes(
         functional_only: !functional_reasons.is_empty(),
         functional_reasons,
         destination,
+        cores,
     })
 }
 
@@ -1416,10 +1501,13 @@ mod tests {
     }
 
     #[test]
-    fn groups_are_organisation_local_and_follow_the_nonce() {
+    fn groups_are_organisation_local_and_follow_every_bit_of_the_nonce() {
         assert_eq!(group_of(0x1234), Ipv4Addr::new(239, 255, 0x12, 0x34));
         assert!(group_of(u64::MAX).is_multicast());
         assert_ne!(group_of(1), group_of(2));
+        // Nonces that differ only in their high words still differ.
+        assert_ne!(group_of(1 << 16), group_of(0));
+        assert_ne!(group_of(1 << 48), group_of(0));
     }
 
     #[test]
@@ -1529,6 +1617,9 @@ mod tests {
             rx_deadline_ms: Some(6),
             tx_crash_at: Some(7),
             tx_freeze_at: Some(8),
+            only_receiver: Some(3),
+            rx_last_ack_delay_ms: Some(100),
+            nonce: Some(u64::MAX),
         };
         assert_eq!(Faults::decode(&faults.encode()).ok(), Some(faults));
         assert_eq!(Faults::decode("").ok(), Some(Faults::default()));
