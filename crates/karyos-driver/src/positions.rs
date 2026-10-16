@@ -495,6 +495,7 @@ mod tests {
                 stream_id,
                 claim_deadline: 100,
                 publication: PublicationMode::Exclusive,
+                schedule_capacity: 0,
             },
             allow_unconnected: true,
             on_required_loss: LossPolicy::Hold,

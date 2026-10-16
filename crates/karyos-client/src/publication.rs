@@ -830,6 +830,7 @@ mod tests {
                 stream_id: 2,
                 claim_deadline: DEFAULT_CLAIM_DEADLINE,
                 publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                schedule_capacity: 0,
             })
             .unwrap(),
         );
@@ -1223,6 +1224,7 @@ mod tests {
                 stream_id: 2,
                 claim_deadline: DEFAULT_CLAIM_DEADLINE,
                 publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                schedule_capacity: 0,
             })
             .unwrap(),
         );

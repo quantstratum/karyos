@@ -331,6 +331,7 @@ impl<'s> Sim<'s> {
                         stream_id,
                         claim_deadline: CLAIM_DEADLINE,
                         publication: plan.publication,
+                        schedule_capacity: 0,
                     },
                     allow_unconnected: true,
                     on_required_loss: scenario.on_required_loss,

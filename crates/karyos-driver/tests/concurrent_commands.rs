@@ -36,6 +36,7 @@ fn stream_config(stream_id: i32, publication: PublicationMode) -> StreamConfig {
             stream_id,
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
             publication,
+            schedule_capacity: 0,
         },
         allow_unconnected: false,
         on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,

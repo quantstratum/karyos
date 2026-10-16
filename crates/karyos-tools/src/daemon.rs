@@ -152,6 +152,7 @@ pub fn stream_config(
             stream_id: stream.stream_id,
             publication: PublicationMode::Exclusive,
             claim_deadline: terms.claim_deadline,
+            schedule_capacity: 0,
         },
         allow_unconnected: false,
         on_required_loss: LossPolicy::Hold,

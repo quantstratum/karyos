@@ -77,6 +77,13 @@ release may break APIs, wire formats and shared-memory layouts.
   the commit retries and never takes a stale entry), with negative controls
   for a commit before its entry, a Relaxed head load and a head released
   before the read. Not yet mapped into a log buffer's region.
+- The log buffer region carries a timed lane's schedule ring (P2.11 T1,
+  TT-1): `LogBufferConfig::schedule_capacity` (0 for a lane that is not timed,
+  which gets no ring words; otherwise a power of two on an exclusive
+  publication), a configuration block word, and a schedule section before the
+  terms, initialised at creation and read through `LogBuffer::schedule_ring`.
+  The region layout version is 3; regions of versions 1 and 2 are refused at
+  attach with `SysError::LayoutVersion`.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

@@ -55,6 +55,7 @@ fn image() -> (Arc<LogBuffer>, ReceiveOwner) {
                 join: 0,
                 local_gaps: true,
             },
+            schedule_capacity: 0,
         })
         .unwrap(),
     );

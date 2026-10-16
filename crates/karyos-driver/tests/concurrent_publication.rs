@@ -55,6 +55,7 @@ fn config(stream_id: i32, publication: PublicationMode, allow_unconnected: bool)
             stream_id,
             claim_deadline: DEADLINE,
             publication,
+            schedule_capacity: 0,
         },
         allow_unconnected,
         on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,

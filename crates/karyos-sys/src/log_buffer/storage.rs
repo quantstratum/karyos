@@ -227,6 +227,10 @@ pub(crate) struct Layout {
     pub(crate) tails: usize,
     pub(crate) cells: usize,
     pub(crate) publishers: usize,
+    /// The schedule ring of a timed lane (`schedule_words` words, 0 for a
+    /// lane that is not timed).
+    pub(crate) schedule: usize,
+    pub(crate) schedule_words: usize,
     pub(crate) terms: usize,
     pub(crate) slots: usize,
     pub(crate) cell_count: usize,
@@ -244,12 +248,14 @@ fn line_up(words: usize) -> Option<usize> {
 
 impl Layout {
     /// The layout of a buffer with `slots` slots, `cells` registry cells,
-    /// `publishers` publisher slots and, when `terms_in_backing`, `slots`
-    /// terms of `term_length` bytes. Checked arithmetic throughout.
+    /// `publishers` publisher slots, a schedule ring of `schedule_capacity`
+    /// entries (none for 0) and, when `terms_in_backing`, `slots` terms of
+    /// `term_length` bytes. Checked arithmetic throughout.
     pub(crate) fn new(
         slots: u8,
         cells: usize,
         publishers: usize,
+        schedule_capacity: u32,
         term_length: u32,
         terms_in_backing: bool,
     ) -> Result<Self, SysError> {
@@ -276,7 +282,15 @@ impl Layout {
         let tails = next(table, Some(slots))?;
         let cells_at = next(tails, slots.checked_mul(LINE_WORDS))?;
         let publishers_at = next(cells_at, cells.checked_mul(Cell::WORDS))?;
-        let terms = next(publishers_at, publishers.checked_mul(LINE_WORDS))?;
+        let schedule = next(publishers_at, publishers.checked_mul(LINE_WORDS))?;
+        let schedule_words = match schedule_capacity {
+            0 => 0,
+            capacity => usize::try_from(capacity)
+                .ok()
+                .and_then(crate::schedule_ring::ring_words)
+                .ok_or(overflow)?,
+        };
+        let terms = next(schedule, Some(schedule_words))?;
         let total = next(terms, Some(term_words))?;
         Ok(Self {
             config,
@@ -286,6 +300,8 @@ impl Layout {
             tails,
             cells: cells_at,
             publishers: publishers_at,
+            schedule,
+            schedule_words,
             terms,
             slots,
             cell_count: cells,
@@ -302,7 +318,7 @@ mod tests {
 
     #[test]
     fn sections_start_on_strides_and_do_not_overlap() {
-        let layout = Layout::new(9, 5, 3, 64 * 1024, true).unwrap();
+        let layout = Layout::new(9, 5, 3, 0, 64 * 1024, true).unwrap();
         let starts = [
             layout.config,
             layout.control,
@@ -322,7 +338,17 @@ mod tests {
         assert!(layout.publishers - layout.cells >= 5 * LINE_WORDS);
         assert!(layout.terms - layout.publishers >= 3 * LINE_WORDS);
         assert_eq!(layout.total - layout.terms, 9 * 64 * 1024 / 8);
-        let local = Layout::new(9, 5, 0, 64 * 1024, false).unwrap();
+        let local = Layout::new(9, 5, 0, 0, 64 * 1024, false).unwrap();
+        // An untimed lane has no ring words: the terms start where they
+        // would without the section.
+        assert_eq!((local.schedule_words, local.terms), (0, local.schedule));
+        let timed = Layout::new(9, 5, 0, 4, 64 * 1024, false).unwrap();
+        assert_eq!(
+            timed.schedule_words,
+            crate::schedule_ring::ring_words(4).unwrap()
+        );
+        assert!(timed.terms >= timed.schedule + timed.schedule_words);
+        assert_eq!(timed.schedule, local.schedule);
         assert_eq!(local.term_words, 0);
         assert_eq!(local.total, local.terms);
     }

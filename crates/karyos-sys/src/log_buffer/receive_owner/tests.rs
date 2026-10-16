@@ -49,6 +49,7 @@ fn image(join: u64) -> Arc<LogBuffer<Terms>> {
             stream_id: STREAM,
             claim_deadline: DEFAULT_CLAIM_DEADLINE,
             publication: PublicationMode::Image { join, local_gaps: false },
+            schedule_capacity: 0,
         })
         .unwrap(),
     )

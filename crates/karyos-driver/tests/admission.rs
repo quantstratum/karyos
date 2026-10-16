@@ -467,6 +467,7 @@ fn shared_stream_config() -> StreamConfig {
             stream_id: 2,
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
             publication: PublicationMode::Exclusive,
+            schedule_capacity: 0,
         },
         allow_unconnected: false,
         on_required_loss: LossPolicy::Hold,

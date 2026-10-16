@@ -236,6 +236,11 @@ pub struct LogBufferConfig {
     /// [`Conductor::abort_expired_claims`] (nanoseconds by convention); at
     /// least 1 (`quantstratum-docs: karyos/design/claim-deadline.md`).
     pub claim_deadline: u64,
+    /// Entries of the lane's schedule ring (`quantstratum-docs:
+    /// karyos/design/timed-tx.md`, TT-1): 0 for a lane that is not timed,
+    /// which has no ring words; otherwise a power of two, on an exclusive
+    /// publication (GC-7).
+    pub schedule_capacity: u32,
 }
 
 /// How a buffer is published to (`quantstratum-docs: karyos/design/concurrent-publication.md`).
@@ -293,6 +298,8 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     tails: NonNull<[Line]>,
     cells: NonNull<[Cell]>,
     publishers: NonNull<[PublisherSlot]>,
+    /// The schedule ring's words; empty for a lane that is not timed.
+    schedule: NonNull<[AtomicU64]>,
     /// Every word more than one party touches: heap words of this process
     /// or a shared region.
     backing: Arc<Backing>,
@@ -430,10 +437,22 @@ impl LogBuffer<SharedTerms> {
         if record.kind != crate::ipc::RegionKind::LogBuffer {
             return Err(invalid);
         }
+        // Another layout version is never interpreted: its record or its
+        // configuration block names it, typed.
+        let version = |found: u64| SysError::LayoutVersion {
+            found,
+            expected: LAYOUT_VERSION,
+        };
+        if record.layout != LAYOUT_VERSION {
+            return Err(version(record.layout));
+        }
         let structure = region.structure();
         let mut words = [0u64; CONFIG_WORDS];
         for (index, word) in words.iter_mut().enumerate() {
             *word = structure.get(index).ok_or(invalid)?.load(Ordering::Acquire);
+        }
+        if words[0] != LAYOUT_VERSION {
+            return Err(version(words[0]));
         }
         let (config, generation, max_message_length) = parse_config(&words).ok_or(invalid)?;
         let (layout, slots, expected_max) = Self::plan(&config)?;
@@ -506,10 +525,12 @@ impl<T: TermBytes> LogBuffer<T> {
         let max_message_length =
             plan.max_message_length(config.max_reserved, config.term_length)?;
         let publisher_cells = publisher_cells(config.publication);
+        check_schedule(config)?;
         let layout = Layout::new(
             slots,
             usize::from(config.max_subscribers) + publisher_cells,
             publisher_cells,
+            config.schedule_capacity,
             config.term_length.get(),
             T::IN_BACKING,
         )?;
@@ -551,6 +572,7 @@ impl<T: TermBytes> LogBuffer<T> {
             tails: backing.overlays(layout.tails, layout.slots)?,
             cells: backing.overlays(layout.cells, layout.cell_count)?,
             publishers: backing.overlays(layout.publishers, layout.publisher_count)?,
+            schedule: backing.overlays(layout.schedule, layout.schedule_words)?,
             backing,
             layout,
             conductor_taken: AtomicBool::new(false),
@@ -593,6 +615,12 @@ impl<T: TermBytes> LogBuffer<T> {
         }
         self.active_count()
             .store(u64::from(start.get()), Ordering::Relaxed);
+        if let Some(ring) = self.schedule_ring() {
+            // `plan` checked the capacity and `Layout` sized the words.
+            let initialised =
+                crate::schedule_ring::init(ring, u64::from(self.config.schedule_capacity));
+            debug_assert!(initialised.is_ok(), "{initialised:?}");
+        }
         self.reserved_head().store(join, Ordering::Relaxed);
         self.floor().store(join, Ordering::Relaxed);
         let publisher_cells = self.layout.publisher_count;
@@ -797,6 +825,15 @@ impl<T: TermBytes> LogBuffer<T> {
     #[must_use]
     pub fn config(&self) -> &LogBufferConfig {
         &self.config
+    }
+
+    /// The words of a timed lane's schedule ring (`crate::schedule_ring`),
+    /// initialised at creation; `None` for a lane that is not timed.
+    #[must_use]
+    pub fn schedule_ring(&self) -> Option<&[AtomicU64]> {
+        // SAFETY: as `control`, for the schedule ring section.
+        let words = unsafe { self.schedule.as_ref() };
+        (self.config.schedule_capacity > 0).then_some(words)
     }
 
     /// The term length in bytes.
@@ -4739,6 +4776,24 @@ fn corrupt(offset: u32, reason: &'static str) -> SysError {
 }
 
 /// The log buffer tests run on both backings.
+/// A timed lane's schedule (`quantstratum-docs: karyos/design/timed-tx.md`,
+/// TT-1 and GC-7): a capacity of 0 (not timed) or a power of two, on an
+/// exclusive publication only.
+fn check_schedule(config: &LogBufferConfig) -> Result<(), SysError> {
+    match config.schedule_capacity {
+        0 => Ok(()),
+        capacity if !capacity.is_power_of_two() => Err(SysError::InvalidPublicationMode {
+            reason: "a schedule capacity is a power of two",
+        }),
+        _ if config.publication != PublicationMode::Exclusive => {
+            Err(SysError::InvalidPublicationMode {
+                reason: "a timed lane needs an exclusive publication (GC-7)",
+            })
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The configuration block of a buffer (`quantstratum-docs: karyos/design/ipc-log-buffer.md`):
 /// a layout version, every configuration field, the generation and the
 /// largest message, padded with zeros to [`CONFIG_WORDS`].
@@ -4777,6 +4832,7 @@ fn config_words(
         u64::from(max_message_length),
         join,
         capabilities,
+        u64::from(config.schedule_capacity),
     ];
     for (word, field) in words.iter_mut().zip(fields) {
         *word = field;
@@ -4809,6 +4865,7 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
         max_message_length,
         join,
         capabilities,
+        schedule_capacity,
         rest @ ..,
     ] = words;
     if *version != LAYOUT_VERSION || rest.iter().any(|word| *word != 0) {
@@ -4845,6 +4902,7 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
         stream_id: small(stream_id)?.cast_signed(),
         claim_deadline: *claim_deadline,
         publication,
+        schedule_capacity: small(schedule_capacity)?,
     };
     Some((
         config,
@@ -4856,8 +4914,12 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
 /// The layout version of the shared log buffer region. Version 2 gives bit
 /// 61 of the seal word a meaning (`SEAL_SUCCESSOR`, ADR-0061) and narrows
 /// the seal position to bits 0..60, so a reader of version 1 would misread
-/// a cutover seal; version 1 regions are refused at attach.
-pub const LAYOUT_VERSION: u64 = 2;
+/// a cutover seal. Version 3 adds the schedule capacity to the
+/// configuration block and, for a timed lane, the schedule ring section
+/// before the terms (`quantstratum-docs: karyos/design/timed-tx.md`,
+/// TT-1); version 1 and 2 regions are refused at attach (only version 1
+/// shipped, in v0.1.0-alpha.1).
+pub const LAYOUT_VERSION: u64 = 3;
 
 /// Bit 0 of an image's capabilities word (`image_capabilities`, the word
 /// after `join` in the configuration block): the image may hold local gap
@@ -4892,6 +4954,7 @@ mod heap_tests {
     include!("log_buffer_tests/walker.rs");
     include!("log_buffer_tests/diagnostics.rs");
     include!("log_buffer_tests/frame_reader.rs");
+    include!("log_buffer_tests/schedule.rs");
 }
 
 #[cfg(test)]
@@ -4920,6 +4983,7 @@ mod shared_tests {
     include!("log_buffer_tests/walker.rs");
     include!("log_buffer_tests/diagnostics.rs");
     include!("log_buffer_tests/frame_reader.rs");
+    include!("log_buffer_tests/schedule.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber
@@ -5016,6 +5080,7 @@ mod region_tests {
             stream_id: 2,
             claim_deadline: DEFAULT_CLAIM_DEADLINE,
             publication,
+            schedule_capacity: 0,
         }
     }
 
@@ -5212,10 +5277,16 @@ mod region_tests {
         };
         // Version, term length, spare slots beyond the slot bound, a zero
         // claim deadline, an unknown mode, a generation that differs from
-        // the region's, a largest message that differs, a trailing word.
+        // the region's, a largest message that differs, a schedule capacity
+        // that is not a power of two or that the region holds no ring for,
+        // a trailing word.
         for (index, value) in [
             (0, 1),
-            (0, 3),
+            (0, 2),
+            (0, 4),
+            (18, 3),
+            (18, 8),
+            (19, 1),
             (1, 1000),
             (2, 200),
             (10, 0),
@@ -5250,17 +5321,48 @@ mod region_tests {
         assert!(Region::attach(received.fd.unwrap(), other).is_err());
     }
 
-    /// A region of layout version 1, from before the seal word's successor
-    /// bit (ADR-0061), is refused at attach: by its record and by its
-    /// configuration block, so a mixed build never misreads a seal.
+    /// A timed lane's ring lives in the region: the participant attaching
+    /// it sees the creator's capacity and entries.
     #[test]
-    fn attach_refuses_a_version_1_region() {
-        assert_eq!(LAYOUT_VERSION, 2);
+    fn a_participant_sees_the_schedule_ring() {
+        let creator = LogBuffer::create_in(
+            1,
+            8,
+            LogBufferConfig {
+                schedule_capacity: 8,
+                ..config(PublicationMode::Exclusive)
+            },
+            generation(),
+        )
+        .unwrap();
+        let ring = creator.schedule_ring().unwrap();
+        let mut publisher = crate::schedule_ring::SchedulePublisher::attach(ring).unwrap();
+        assert_eq!(publisher.has_room(ring), Ok(true));
+        let entry = crate::schedule_ring::Entry {
+            position: 128,
+            time: 7,
+        };
+        publisher.push(ring, entry).unwrap();
+        let attached = attach(&creator).unwrap();
+        assert_eq!(attached.config().schedule_capacity, 8);
+        let seen = attached.schedule_ring().unwrap();
+        let reader = crate::schedule_ring::ScheduleReader::attach(seen).unwrap();
+        assert_eq!(reader.peek(seen), Ok(Some(entry)));
+    }
+
+    /// A region of an older layout version, 1 (shipped in v0.1.0-alpha.1,
+    /// before the seal word's successor bit, ADR-0061) or 2 (before the
+    /// schedule ring, TT-1), is refused at attach with `LayoutVersion`, by
+    /// its record and by its configuration block, so a mixed build never
+    /// misreads a seal or a ring.
+    #[test]
+    fn attach_refuses_an_older_region() {
+        assert_eq!(LAYOUT_VERSION, 3);
         let creator =
             LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
         let record = creator.region().unwrap().record();
         let source = creator.region().unwrap().structure();
-        for (record_layout, block_version) in [(1, 1), (1, 2), (2, 1)] {
+        for (record_layout, block_version) in [(1, 1), (2, 2), (2, 3), (3, 2), (3, 1)] {
             let old = Region::create(RegionRecord {
                 region: 9,
                 layout: record_layout,
@@ -5287,12 +5389,18 @@ mod region_tests {
                 panic!("no message");
             };
             let attached = Region::attach(received.fd.unwrap(), old.record()).unwrap();
-            assert!(
-                matches!(
-                    LogBuffer::attach(attached),
-                    Err(SysError::InvalidRegion { .. })
-                ),
-                "record layout {record_layout}, block version {block_version} accepted"
+            let found = if record_layout == LAYOUT_VERSION {
+                block_version
+            } else {
+                record_layout
+            };
+            assert_eq!(
+                LogBuffer::attach(attached).err(),
+                Some(SysError::LayoutVersion {
+                    found,
+                    expected: LAYOUT_VERSION
+                }),
+                "record layout {record_layout}, block version {block_version}"
             );
         }
     }
