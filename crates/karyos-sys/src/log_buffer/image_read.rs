@@ -21,7 +21,7 @@ use crate::term_bytes::TermBytes;
 
 /// What a committed block of an image is.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     /// A wire frame type.
     Frame(FrameType),
     /// A local gap record of an image with the `LOCAL_GAPS` capability.
@@ -29,16 +29,16 @@ enum Kind {
 }
 
 /// One committed frame of the walk.
-struct Frame {
-    word0: Word0,
-    kind: Kind,
+pub(super) struct Frame {
+    pub(super) word0: Word0,
+    pub(super) kind: Kind,
     /// Aligned extent of the frame in the term.
-    reserved: u32,
+    pub(super) reserved: u32,
 }
 
 impl Frame {
     /// Whether it is a DATA frame.
-    fn data(&self) -> bool {
+    pub(super) fn data(&self) -> bool {
         self.kind == Kind::Frame(FrameType::Data)
     }
 }
@@ -69,7 +69,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                     extent: first.reserved,
                 });
             }
-            _ if !flags.begin() => return self.orphan_run(slot, start),
+            _ if !flags.begin() => return self.orphan_run(slot, start, usize::MAX),
             _ => {}
         }
         let max_reserved = buffer.config.max_reserved;
@@ -121,11 +121,20 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     }
 
     /// Skips the committed run of DATA frames without BEGIN at `start`, up
-    /// to the next BEGIN, ABORTED, PAD or uncommitted frame.
-    fn orphan_run(&self, slot: u8, start: u32) -> Result<Validated, SysError> {
+    /// to the next BEGIN, ABORTED, PAD or uncommitted frame, or after
+    /// `limit` frames (a frame reader's bounded skip step; the rest of the
+    /// run is the next step).
+    pub(super) fn orphan_run(
+        &self,
+        slot: u8,
+        start: u32,
+        limit: usize,
+    ) -> Result<Validated, SysError> {
         let term_length = self.buffer.term_length;
         let mut offset = start;
-        while offset < term_length {
+        let mut walked = 0usize;
+        while offset < term_length && walked < limit {
+            walked += 1;
             match self.frame(slot, offset)? {
                 Some(frame) if frame.data() && !frame.word0.flags().begin() => {
                     offset += frame.reserved;
@@ -147,7 +156,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     /// The committed frame at `offset`, its word 0 loaded with Acquire (each
     /// is its own publication in an image), or `None` when not published
     /// yet. Its extent is checked against the term end.
-    fn frame(&self, slot: u8, offset: u32) -> Result<Option<Frame>, SysError> {
+    pub(super) fn frame(&self, slot: u8, offset: u32) -> Result<Option<Frame>, SysError> {
         let term_length = self.buffer.term_length;
         // SAFETY: the caller holds a read loan for this slot's term; `offset`
         // is a frame start of the walk (`start` or the end of a committed
@@ -196,7 +205,12 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     /// [`Self::frame`] loaded with Acquire and checked: its header is
     /// checked against the read position and the image, and the interval
     /// is skipped without reading it.
-    fn local_gap(&self, slot: u8, start: u32, extent: u32) -> Result<Validated, SysError> {
+    pub(super) fn local_gap(
+        &self,
+        slot: u8,
+        start: u32,
+        extent: u32,
+    ) -> Result<Validated, SysError> {
         let buffer = self.buffer;
         let (count, offset) = buffer.split(self.cursor.position)?;
         if offset != start {

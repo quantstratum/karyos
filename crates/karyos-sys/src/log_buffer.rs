@@ -71,9 +71,13 @@ use storage::{Backing, CONFIG_WORDS, Cell, Control, Layout, Line, PublisherSlot}
 
 mod concurrent;
 mod deadline;
+mod frame_reader;
 mod image_read;
 mod receive_owner;
 
+pub use frame_reader::{
+    FrameEnd, FrameReader, FrameStep, MessageInfo, SKIP_WALK_FRAMES, STEP_CHARGE, Stepped,
+};
 pub use receive_owner::{ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received};
 pub(crate) mod storage;
 
@@ -4670,6 +4674,7 @@ mod heap_tests {
     include!("log_buffer_tests/loss.rs");
     include!("log_buffer_tests/observer.rs");
     include!("log_buffer_tests/diagnostics.rs");
+    include!("log_buffer_tests/frame_reader.rs");
 }
 
 #[cfg(test)]
@@ -4696,6 +4701,7 @@ mod shared_tests {
     include!("log_buffer_tests/loss.rs");
     include!("log_buffer_tests/observer.rs");
     include!("log_buffer_tests/diagnostics.rs");
+    include!("log_buffer_tests/frame_reader.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
     /// the protocol stores arbitrary values into the term a subscriber
