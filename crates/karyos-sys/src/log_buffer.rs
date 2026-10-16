@@ -243,6 +243,11 @@ pub enum PublicationMode {
     Image {
         /// The join point: the stream position where the image starts.
         join: u64,
+        /// The `LOCAL_GAPS` capability: the receive owner may seal local
+        /// gap records in this image (`quantstratum-docs:
+        /// karyos/design/local-gap-layout.md`). A reader of an older layout
+        /// refuses such an image at attach.
+        local_gaps: bool,
     },
 }
 
@@ -597,10 +602,21 @@ impl<T: TermBytes> LogBuffer<T> {
         matches!(self.config.publication, PublicationMode::Image { .. })
     }
 
+    /// Whether this buffer is an image that may hold local gap records.
+    fn local_gaps(&self) -> bool {
+        matches!(
+            self.config.publication,
+            PublicationMode::Image {
+                local_gaps: true,
+                ..
+            }
+        )
+    }
+
     /// The join point of an image; 0 for any other buffer.
     fn join(&self) -> u64 {
         match self.config.publication {
-            PublicationMode::Image { join } => join,
+            PublicationMode::Image { join, .. } => join,
             _ => 0,
         }
     }
@@ -977,7 +993,7 @@ fn check_publication_mode(config: &LogBufferConfig) -> Result<(), SysError> {
 fn check_publication_mode_on(config: &LogBufferConfig, lse: bool) -> Result<(), SysError> {
     let (publishers, allow_non_lse) = match config.publication {
         PublicationMode::Exclusive => return Ok(()),
-        PublicationMode::Image { join } => return check_image(config, join),
+        PublicationMode::Image { join, .. } => return check_image(config, join),
         PublicationMode::Concurrent {
             publishers,
             allow_non_lse,
@@ -2502,6 +2518,10 @@ pub enum SkipReason {
     /// Fragments without their BEGIN where this reader joined, in the
     /// middle of a message: the rest of a message it never saw start.
     JoinedMidMessage,
+    /// An interval the receive owner sealed as lost: a local gap record
+    /// (`quantstratum-docs: karyos/design/local-gap-layout.md`). Nothing
+    /// in it was delivered.
+    LocalGap(crate::local_gap::GapReason),
 }
 
 /// A registered subscriber's private cursor.
@@ -4447,13 +4467,15 @@ fn config_words(
     generation: Generation,
     max_message_length: u32,
 ) -> [u64; CONFIG_WORDS] {
-    let (mode, publishers, allow_non_lse, join) = match config.publication {
-        PublicationMode::Exclusive => (1, 0, 0, 0),
+    let (mode, publishers, allow_non_lse, join, capabilities) = match config.publication {
+        PublicationMode::Exclusive => (1, 0, 0, 0, 0),
         PublicationMode::Concurrent {
             publishers,
             allow_non_lse,
-        } => (2, u64::from(publishers), u64::from(allow_non_lse), 0),
-        PublicationMode::Image { join } => (3, 0, 0, join),
+        } => (2, u64::from(publishers), u64::from(allow_non_lse), 0, 0),
+        PublicationMode::Image { join, local_gaps } => {
+            (3, 0, 0, join, u64::from(local_gaps) * IMAGE_LOCAL_GAPS)
+        }
     };
     let mut words = [0u64; CONFIG_WORDS];
     let fields = [
@@ -4474,6 +4496,7 @@ fn config_words(
         u64::from(generation.get()),
         u64::from(max_message_length),
         join,
+        capabilities,
     ];
     for (word, field) in words.iter_mut().zip(fields) {
         *word = field;
@@ -4505,6 +4528,7 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
         generation,
         max_message_length,
         join,
+        capabilities,
         rest @ ..,
     ] = words;
     if *version != LAYOUT_VERSION || rest.iter().any(|word| *word != 0) {
@@ -4512,12 +4536,21 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
     }
     let small = |value: &u64| u32::try_from(*value).ok();
     let publication = match (*mode, *allow_non_lse) {
-        (1, 0) if *publishers == 0 && *join == 0 => PublicationMode::Exclusive,
-        (2, flag @ (0 | 1)) if *join == 0 => PublicationMode::Concurrent {
+        (1, 0) if *publishers == 0 && *join == 0 && *capabilities == 0 => {
+            PublicationMode::Exclusive
+        }
+        (2, flag @ (0 | 1)) if *join == 0 && *capabilities == 0 => PublicationMode::Concurrent {
             publishers: u8::try_from(*publishers).ok()?,
             allow_non_lse: flag == 1,
         },
-        (3, 0) if *publishers == 0 => PublicationMode::Image { join: *join },
+        // Only an image may carry capabilities, and only those this layout
+        // knows.
+        (3, 0) if *publishers == 0 && *capabilities & !IMAGE_LOCAL_GAPS == 0 => {
+            PublicationMode::Image {
+                join: *join,
+                local_gaps: *capabilities & IMAGE_LOCAL_GAPS != 0,
+            }
+        }
         _ => return None,
     };
     let config = LogBufferConfig {
@@ -4545,6 +4578,13 @@ fn parse_config(words: &[u64; CONFIG_WORDS]) -> Option<(LogBufferConfig, Generat
 /// the seal position to bits 0..60, so a reader of version 1 would misread
 /// a cutover seal; version 1 regions are refused at attach.
 pub const LAYOUT_VERSION: u64 = 2;
+
+/// Bit 0 of an image's capabilities word (`image_capabilities`, the word
+/// after `join` in the configuration block): the image may hold local gap
+/// records. A reader of an older layout requires the word zero, so it
+/// refuses such an image at attach (`quantstratum-docs:
+/// karyos/design/local-gap-layout.md`, "The image capability").
+const IMAGE_LOCAL_GAPS: u64 = 1;
 
 #[cfg(test)]
 mod heap_tests {
@@ -4767,7 +4807,10 @@ mod region_tests {
         use crate::frame::{FrameType, Word0};
         use crate::receive::{ImageParams, Item, ValidatedDatagram};
 
-        let mut image_config = config(PublicationMode::Image { join: 0 });
+        let mut image_config = config(PublicationMode::Image {
+            join: 0,
+            local_gaps: false,
+        });
         image_config.spare_slots = 5;
         let creator = Arc::new(LogBuffer::create_in(1, 6, image_config, generation()).unwrap());
         let mut conductor = creator.conductor_owned().unwrap();

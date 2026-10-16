@@ -73,7 +73,10 @@ fn config() -> LogBufferConfig {
         session_id: 1,
         stream_id: 2,
         claim_deadline: DEFAULT_CLAIM_DEADLINE,
-        publication: PublicationMode::Image { join: 0 },
+        publication: PublicationMode::Image {
+            join: 0,
+            local_gaps: false,
+        },
     }
 }
 

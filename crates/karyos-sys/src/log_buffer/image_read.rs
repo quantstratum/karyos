@@ -14,16 +14,33 @@
 use super::{FRAME_ALIGNMENT, SkipReason, SubscriptionContext, Validated, corrupt};
 use crate::error::SysError;
 use crate::frame::{FrameType, PROTOCOL_VERSION, Word0};
+use crate::local_gap::{GAP_BODY_LENGTH, GapSite, LOCAL_GAP_TYPE, check_body, check_word0};
 use crate::publication::observe_block;
 use crate::sizing::align_frame;
 use crate::term_bytes::TermBytes;
 
+/// What a committed block of an image is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A wire frame type.
+    Frame(FrameType),
+    /// A local gap record of an image with the `LOCAL_GAPS` capability.
+    LocalGap,
+}
+
 /// One committed frame of the walk.
 struct Frame {
     word0: Word0,
-    frame_type: FrameType,
+    kind: Kind,
     /// Aligned extent of the frame in the term.
     reserved: u32,
+}
+
+impl Frame {
+    /// Whether it is a DATA frame.
+    fn data(&self) -> bool {
+        self.kind == Kind::Frame(FrameType::Data)
+    }
 }
 
 impl<T: TermBytes> SubscriptionContext<'_, T> {
@@ -36,14 +53,15 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             return Ok(Validated::Pending);
         };
         let flags = first.word0.flags();
-        match first.frame_type {
-            FrameType::Pad => {
+        match first.kind {
+            Kind::LocalGap => return self.local_gap(slot, start, first.reserved),
+            Kind::Frame(FrameType::Pad) => {
                 if first.reserved != term_length - start {
                     return Err(corrupt(start, "pad extent"));
                 }
                 return Ok(Validated::Pad);
             }
-            FrameType::Aborted => {
+            Kind::Frame(FrameType::Aborted) => {
                 if flags.lane() != buffer.config.lane {
                     return Err(corrupt(start, "aborted lane"));
                 }
@@ -92,7 +110,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                 // A fragment not yet received: the message is incomplete.
                 return Ok(Validated::Pending);
             };
-            if next.frame_type != FrameType::Data || next.word0.flags().begin() {
+            if !next.data() || next.word0.flags().begin() {
                 return Ok(Validated::Skip {
                     extent: offset - start,
                     reason: SkipReason::Interrupted,
@@ -109,9 +127,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         let mut offset = start;
         while offset < term_length {
             match self.frame(slot, offset)? {
-                Some(frame)
-                    if frame.frame_type == FrameType::Data && !frame.word0.flags().begin() =>
-                {
+                Some(frame) if frame.data() && !frame.word0.flags().begin() => {
                     offset += frame.reserved;
                 }
                 _ => break,
@@ -145,6 +161,16 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         if word0.version() != PROTOCOL_VERSION {
             return Err(corrupt(offset, "version"));
         }
+        if word0.frame_type_code() == LOCAL_GAP_TYPE && self.buffer.local_gaps() {
+            let reserved = check_word0(word0, offset, term_length, self.buffer.config.lane)
+                .map_err(|reason| corrupt(offset, reason))?;
+            return Ok(Some(Frame {
+                word0,
+                kind: Kind::LocalGap,
+                reserved,
+            }));
+        }
+        // Without the capability a local gap type is an unknown type.
         let frame_type = FrameType::try_from_code(word0.frame_type_code())
             .map_err(|_| corrupt(offset, "frame type"))?;
         let length = signed.cast_unsigned();
@@ -161,8 +187,45 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         }
         Ok(Some(Frame {
             word0,
-            frame_type,
+            kind: Kind::Frame(frame_type),
             reserved,
         }))
+    }
+
+    /// The local gap record at `start` of `extent` bytes, whose word 0
+    /// [`Self::frame`] loaded with Acquire and checked: its header is
+    /// checked against the read position and the image, and the interval
+    /// is skipped without reading it.
+    fn local_gap(&self, slot: u8, start: u32, extent: u32) -> Result<Validated, SysError> {
+        let buffer = self.buffer;
+        let (count, offset) = buffer.split(self.cursor.position)?;
+        if offset != start {
+            return Err(corrupt(start, "local gap position"));
+        }
+        let header = start
+            .checked_add(8)
+            .ok_or_else(|| corrupt(start, "local gap position"))?;
+        let mut body = [0u8; GAP_BODY_LENGTH];
+        // SAFETY: the caller holds a read loan for this slot's term;
+        // `header`, `start + 8`, is a multiple of 8 and the 24 bytes after word 0 lie inside
+        // the record (its extent is at least 32, checked by `check_word0`),
+        // with no other word 0; `frame` loaded this record's word 0 with
+        // Acquire, and the owner stored these bytes before its Release.
+        unsafe { buffer.regions.read_bytes(slot, header, &mut body) };
+        let site = GapSite {
+            term_offset: start,
+            term_id: buffer
+                .initial_term_id
+                .advanced_by(count)
+                .get()
+                .cast_signed(),
+            session_id: buffer.config.session_id,
+            stream_id: buffer.config.stream_id,
+        };
+        let reason = check_body(&body, site).map_err(|reason| corrupt(start, reason))?;
+        Ok(Validated::Skip {
+            extent,
+            reason: SkipReason::LocalGap(reason),
+        })
     }
 }

@@ -937,8 +937,13 @@ fn dispatcher_vectors() {
     assert_eq!(unbound_reply(&error, d5.len()), None);
     assert!(unbound_reply(&error, 39).is_none());
     assert!(unbound_reply(&error, 40).is_some());
-    // D-6 to D-10, none answered.
-    let cases: [(&str, Vec<u8>, ControlError); 5] = [
+    // D-6 to D-10, none answered; and the image-local gap type.
+    let cases: [(&str, Vec<u8>, ControlError); 6] = [
+        (
+            "local gap",
+            mutate(phb, 0x06, &[0x01, 0xFF]),
+            ControlError::UnknownType { code: 0xFF01 },
+        ),
         (
             "D-6",
             mutate(phb, 0x06, &[0x11, 0x00]),

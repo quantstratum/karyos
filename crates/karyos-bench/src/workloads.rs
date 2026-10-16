@@ -315,7 +315,10 @@ fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchE
             session_id: 1,
             stream_id: 1,
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
-            publication: PublicationMode::Image { join: 0 },
+            publication: PublicationMode::Image {
+                join: 0,
+                local_gaps: false,
+            },
         })
         .map_err(|cause| error("image", cause))?,
     );

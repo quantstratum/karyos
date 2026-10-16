@@ -249,6 +249,11 @@ fn header_fields_are_checked() {
         rejected(&with(6, &[0x09, 0])),
         ParseError::FrameType { code: 0x09, .. }
     ));
+    // The image-local gap type is never a wire frame.
+    assert!(matches!(
+        rejected(&with(6, &crate::local_gap::LOCAL_GAP_TYPE.to_le_bytes())),
+        ParseError::FrameType { code: 0xFF01, .. }
+    ));
     assert!(matches!(
         rejected(&with(12, &[0; 4])),
         ParseError::Session { .. }
