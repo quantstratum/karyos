@@ -1351,7 +1351,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 Ok(summary) => summary,
                 // The feeder cannot read on: the stream ends explicitly.
                 Err(error) => {
-                    lost.push((stream.id, stream.key(), error.cause.to_string()));
+                    // A stream already closed for good was reported then.
+                    let open = stream.conductor.seal_reason().is_none();
+                    lost.push((stream.id, stream.key(), error.cause.to_string(), open));
                     if let Err(error) = lose_feeder(stream) {
                         first_error.get_or_insert(DriverError::from(error));
                     }
@@ -1389,6 +1391,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     stream.id,
                     stream.key(),
                     "the feeder ended before its stream".to_owned(),
+                    true,
                 ));
                 if let Err(error) = lose_feeder(stream) {
                     first_error.get_or_insert(DriverError::from(error));
@@ -1411,17 +1414,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 reason: CloseReason::ConflationVersionsExhausted,
             });
         }
-        for (id, stream, cause) in lost {
+        // The loss is always logged; only a stream it closes is reported,
+        // so a stream closed for good earlier gets no second closing.
+        for (id, stream, cause, open) in lost {
             self.diagnostics.error(
                 &mut self.counters,
                 crate::diagnostics::ErrorCode::ConflationFeederLost,
                 [id, 0],
                 &format!("conflation feeder lost: {cause}"),
             );
-            self.emit(&DriverEvent::PublicationClosed {
-                stream,
-                reason: CloseReason::ConflationFeederLost,
-            });
+            if open {
+                self.emit(&DriverEvent::PublicationClosed {
+                    stream,
+                    reason: CloseReason::ConflationFeederLost,
+                });
+            }
         }
         match first_error {
             Some(error) => Err(error),
