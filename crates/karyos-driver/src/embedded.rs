@@ -817,21 +817,34 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .set(Event::GenerationsRetired, gauge(retained));
         // Over every live mapping: the current one and the retained
         // predecessors, which still hold slots, credits and loans.
-        let (mut quarantined, mut credits, mut loans) = (0usize, 0usize, 0usize);
-        for stream in &self.streams {
-            let conductors = core::iter::once(&stream.conductor)
-                .chain(stream.retained.iter().map(|retained| &retained.conductor));
-            for conductor in conductors {
-                quarantined = quarantined.saturating_add(conductor.quarantined_slots());
-                credits = credits.saturating_add(conductor.spare_credits());
-                loans = loans.saturating_add(conductor.loans_outstanding());
+        // Checked sums, as `LeasesLive` above: a sum that does not fit
+        // leaves its gauge at its last value and counts one `counter
+        // overflows` (SPEC.md §14, ADR-0007).
+        let conductors = || {
+            self.streams.iter().flat_map(|stream| {
+                core::iter::once(&stream.conductor)
+                    .chain(stream.retained.iter().map(|retained| &retained.conductor))
+            })
+        };
+        for (event, sum) in [
+            (
+                Event::SlotsQuarantined,
+                conductors().try_fold(0usize, |sum, c| sum.checked_add(c.quarantined_slots())),
+            ),
+            (
+                Event::SpareReservationsInUse,
+                conductors().try_fold(0usize, |sum, c| sum.checked_add(c.spare_credits())),
+            ),
+            (
+                Event::LoansOutstanding,
+                conductors().try_fold(0usize, |sum, c| sum.checked_add(c.loans_outstanding())),
+            ),
+        ] {
+            match sum {
+                Some(sum) => self.counters.set(event, gauge(sum)),
+                None => self.counters.add(Event::CounterOverflows, 1),
             }
         }
-        self.counters
-            .set(Event::SlotsQuarantined, gauge(quarantined));
-        self.counters
-            .set(Event::SpareReservationsInUse, gauge(credits));
-        self.counters.set(Event::LoansOutstanding, gauge(loans));
         self.counters
             .set(Event::TraceJournalsOpen, gauge(self.trace_journals.open()));
     }
