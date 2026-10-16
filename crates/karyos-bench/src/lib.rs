@@ -15,6 +15,8 @@
 //! host (SPEC.md §15, §17).
 
 pub mod env;
+#[cfg(target_os = "linux")]
+pub mod ipc;
 pub mod report;
 pub mod workloads;
 
@@ -96,6 +98,29 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
             publishers: 1,
             iterations,
             warmup: (iterations / 10).max(warmup),
+            term_length,
+            target_rate: None,
+        });
+    }
+    // Between processes: only where the driver's IPC mode exists.
+    if cfg!(target_os = "linux") {
+        for message in [32, 256, 1024] {
+            configs.push(Config {
+                workload: Workload::IpcPingPong,
+                message,
+                publishers: 1,
+                iterations,
+                warmup,
+                term_length,
+                target_rate: None,
+            });
+        }
+        configs.push(Config {
+            workload: Workload::IpcThroughput,
+            message: 32,
+            publishers: 1,
+            iterations,
+            warmup,
             term_length,
             target_rate: None,
         });

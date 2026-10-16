@@ -63,6 +63,17 @@ fn parse() -> Result<Options, String> {
 }
 
 fn main() -> ExitCode {
+    // The child of an IPC workload runs its part and nothing else.
+    #[cfg(target_os = "linux")]
+    if let Some(result) = karyos_bench::ipc::child() {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(cause) => {
+                let _ = writeln!(std::io::stderr(), "karyos-bench child: {cause}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let mut out = std::io::stdout().lock();
     let mut err = std::io::stderr().lock();
     let options = match parse() {

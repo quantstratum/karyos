@@ -67,7 +67,7 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
     );
     if let Some(histogram) = &measurement.latency {
         let what = match measurement.config.workload {
-            Workload::PingPong => "round trip",
+            Workload::PingPong | Workload::IpcPingPong => "round trip",
             Workload::OpenLoop => "scheduled latency (due time to delivery)",
             _ => "latency",
         };
@@ -82,8 +82,10 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
             ));
         }
         out.push('\n');
-        if measurement.config.workload == Workload::PingPong
-            && let Some(median) = upper(histogram, 1, 2)
+        if matches!(
+            measurement.config.workload,
+            Workload::PingPong | Workload::IpcPingPong
+        ) && let Some(median) = upper(histogram, 1, 2)
         {
             out.push_str(&format!(
                 "  one-way estimate: half the median round trip, about {} ns, \
