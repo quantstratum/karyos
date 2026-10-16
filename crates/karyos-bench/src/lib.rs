@@ -13,11 +13,21 @@
 //! labelled `unqualified`: nothing here establishes a SPEC.md §12 target,
 //! which needs a qualified physical
 //! host (SPEC.md §15, §17).
+//!
+//! The P2.8 measurement harness (`quantstratum-docs:
+//! karyos/design/measurement-harness.md`) starts with batch B1: the frozen
+//! manifest as data ([`manifest`]), raw per-message samples ([`samples`]),
+//! the statistics of manifest section 8 ([`stats`]) and the decision rules
+//! of manifest sections 7 and 8 ([`decision`]). No command uses them yet.
 
+pub mod decision;
 pub mod env;
 #[cfg(target_os = "linux")]
 pub mod ipc;
+pub mod manifest;
 pub mod report;
+pub mod samples;
+pub mod stats;
 pub mod workloads;
 
 pub use workloads::{BenchError, Config, Measurement, Workload, run};

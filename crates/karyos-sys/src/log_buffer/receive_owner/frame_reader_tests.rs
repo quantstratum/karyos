@@ -5,7 +5,9 @@
 // incomplete messages, skips and equivalence with `poll`), included after
 // `receive_owner/tests.rs`, whose helpers they use.
 
-use crate::log_buffer::{FrameEnd, FrameReader, FrameStep, MessageInfo, STEP_CHARGE, Stepped};
+use crate::log_buffer::{
+    FrameEnd, FrameReader, FrameStep, MessageInfo, Peek, STEP_CHARGE, Stepped,
+};
 
 /// What a reader produced: a message (its bytes and position) or a skip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,8 +27,9 @@ fn serve(
     out: &mut Vec<Seen>,
 ) {
     for _ in 0..calls {
+        let peeked = reader.peek().unwrap();
         let step = reader.serve_frame().unwrap();
-        // Every call released the loan it took.
+        // Every call, the peek included, released the loan it took.
         let subscription = reader.subscription();
         assert_eq!(
             subscription.buffer().cells()[subscription.cell()]
@@ -34,6 +37,16 @@ fn serve(
                 .load(core::sync::atomic::Ordering::Acquire),
             0
         );
+        // Nothing arrives between them here: the peek predicts the step.
+        let expected = match step {
+            FrameStep::Copied { charge }
+            | FrameStep::Complete { charge, .. }
+            | FrameStep::Stepped { charge, .. } => Peek::Step { charge },
+            FrameStep::Ready => Peek::Ready,
+            FrameStep::Pending => Peek::Pending,
+            FrameStep::Ended(_) => Peek::Ended,
+        };
+        assert_eq!(peeked, expected, "peek before {step:?}");
         match step {
             FrameStep::Copied { charge } => *charged += u64::from(charge),
             FrameStep::Complete { charge, info } => {

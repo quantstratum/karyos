@@ -500,3 +500,42 @@ fn an_aborted_claim_is_stepped_over_by_its_word0_alone() {
 fn control_reading_inside_an_aborted_claim_races() {
     aborted_model(true);
 }
+
+/// A peek (aggregate-subscriber.md, AS-1) reads a block's word 0 and header
+/// under its own loan, exactly as `serve_frame` does up to the copy. A
+/// peek whose loan is refused, because the driver reclaimed and is cleaning
+/// the slot, reads nothing. Control: a peek that reads the header anyway
+/// races the cleaning writes.
+fn peek_model(read_on_refusal: bool) {
+    loom::model(move || {
+        let slot = committed_slot();
+        let driver = {
+            let slot = Arc::clone(&slot);
+            thread::spawn(move || reuse(&slot, false))
+        };
+        let [loan] = &slot.loan;
+        let granted = take_loan(loan, &slot.revoked, &slot.descriptor, target(0)).unwrap()
+            == LoanOutcome::Granted;
+        if granted {
+            if observe_block(&slot.word0[0]) as u32 as i32 > 0 {
+                // The header read the peek's charge comes from.
+                assert_eq!(slot.payload[0].read(), A[0]);
+            }
+            release_loan(loan);
+        } else if read_on_refusal {
+            let _ = slot.payload[0].read();
+        }
+        driver.join().unwrap();
+    });
+}
+
+#[test]
+fn a_peek_under_a_refused_loan_reads_nothing() {
+    peek_model(false);
+}
+
+#[test]
+#[should_panic(expected = "Concurrent read and write accesses")]
+fn control_a_peek_that_reads_without_its_loan_races() {
+    peek_model(true);
+}

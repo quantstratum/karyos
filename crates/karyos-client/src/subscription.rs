@@ -686,19 +686,7 @@ impl<T: TermBytes> ClientSubscription<T> {
     /// Applies the rejoin policy after `overrun` was reported (the poll
     /// that observed it, outside any loan).
     fn rejoin(&mut self, overrun: &Overrun) -> RejoinOutcome {
-        let outcome = match &mut self.rejoin {
-            RejoinPolicy::RejoinAtHead => RejoinOutcome::ResumedAtHead,
-            RejoinPolicy::Snapshot(source) => rebuild(source.as_mut(), overrun).into(),
-            RejoinPolicy::Close => RejoinOutcome::Closed,
-            RejoinPolicy::Replay { secondary } => RejoinOutcome::ReplayFallback {
-                reason: ReplayFallbackReason::NoArchive,
-                secondary: match secondary {
-                    Secondary::RejoinAtHead => SecondaryOutcome::ResumedAtHead,
-                    Secondary::Snapshot(source) => rebuild(source.as_mut(), overrun),
-                    Secondary::Close => SecondaryOutcome::Closed,
-                },
-            },
-        };
+        let outcome = apply_rejoin(&mut self.rejoin, overrun);
         if outcome.closed() {
             self.close_by_overrun(*overrun, outcome);
         }
@@ -791,6 +779,55 @@ impl<T: TermBytes> ClientSubscription<T> {
             },
             // A successor of another kind is a driver bug: never used.
             Next::Moved { .. } | Next::End => None,
+        }
+    }
+}
+
+/// Applies `policy` once after `overrun` was reported, outside any loan.
+pub(crate) fn apply_rejoin(policy: &mut RejoinPolicy, overrun: &Overrun) -> RejoinOutcome {
+    match policy {
+        RejoinPolicy::RejoinAtHead => RejoinOutcome::ResumedAtHead,
+        RejoinPolicy::Snapshot(source) => rebuild(source.as_mut(), overrun).into(),
+        RejoinPolicy::Close => RejoinOutcome::Closed,
+        RejoinPolicy::Replay { secondary } => RejoinOutcome::ReplayFallback {
+            reason: ReplayFallbackReason::NoArchive,
+            secondary: match secondary {
+                Secondary::RejoinAtHead => SecondaryOutcome::ResumedAtHead,
+                Secondary::Snapshot(source) => rebuild(source.as_mut(), overrun),
+                Secondary::Close => SecondaryOutcome::Closed,
+            },
+        },
+    }
+}
+
+/// What an aggregate lane keeps of a subscription
+/// (`quantstratum-docs: karyos/design/aggregate-subscriber.md`, "Per-lane
+/// state"): the cell, now served by a frame reader, and the state around
+/// it.
+pub(crate) struct LaneParts<T: TermBytes> {
+    pub(crate) inner: Option<Subscription<Arc<LogBuffer<T>>>>,
+    pub(crate) rejoin: RejoinPolicy,
+    pub(crate) link: Option<Arc<GenerationLink<T>>>,
+    pub(crate) base: u64,
+    pub(crate) trace: Option<DeliveryTrace>,
+    pub(crate) loss: Option<Box<LossReporter>>,
+    pub(crate) lease: Option<Lease>,
+    pub(crate) export: Option<Export>,
+}
+
+impl<T: TermBytes> ClientSubscription<T> {
+    /// The parts an aggregate lane keeps; the private copy buffer goes, as
+    /// the lane's frame reader has its own assembly.
+    pub(crate) fn into_lane_parts(self) -> LaneParts<T> {
+        LaneParts {
+            inner: self.inner,
+            rejoin: self.rejoin,
+            link: self.link,
+            base: self.base,
+            trace: self.trace,
+            loss: self.loss,
+            lease: self._lease,
+            export: self._export,
         }
     }
 }

@@ -150,6 +150,24 @@ pub enum FrameStep {
     Ended(FrameEnd),
 }
 
+/// What [`FrameReader::peek`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Peek {
+    /// `serve_frame` would serve one block, charged `charge`: a DATA
+    /// fragment's reserved length, [`STEP_CHARGE`] for a stepped record,
+    /// 0 for an `Interrupted` skip.
+    Step {
+        /// The block's charge.
+        charge: u32,
+    },
+    /// A complete message awaits [`FrameReader::take`].
+    Ready,
+    /// Nothing to serve now.
+    Pending,
+    /// `serve_frame` would end the reader or report an overrun.
+    Ended,
+}
+
 /// A message in progress.
 #[derive(Debug, Clone, Copy)]
 struct Assembly {
@@ -256,6 +274,30 @@ impl<O: BufferOwner> FrameReader<O> {
         };
         self.state = state;
         step
+    }
+
+    /// What the next [`FrameReader::serve_frame`] would do, without doing
+    /// it: no copy, no cursor or assembly change and no position
+    /// publication. A hint for a scheduler's charge, never a reservation.
+    ///
+    /// # Errors
+    ///
+    /// The errors the next `serve_frame` would return, except that a
+    /// required reader's lap answers `Ok(Peek::Ended)`: `serve_frame` then
+    /// returns `RequiredSubscriberLapped`. A peek never ends the reader.
+    pub fn peek(&mut self) -> Result<Peek, SysError> {
+        let assembly = match self.state {
+            State::Idle => None,
+            State::Assembling(assembly) => Some(assembly),
+            State::Ready(..) => return Ok(Peek::Ready),
+            State::Ended(Ok(_)) => return Ok(Peek::Ended),
+            State::Ended(Err(error)) => return Err(error),
+        };
+        SubscriptionContext {
+            buffer: &self.subscription.buffer,
+            cursor: &mut self.subscription.cursor,
+        }
+        .peek(assembly)
     }
 
     /// Delivers the complete message once to `deliver`, borrowing the
@@ -377,7 +419,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             release_loan(&cell.loan);
             return self.frame_overrun();
         }
-        let read = self.read_fragment(slot, offset, assembly, bytes);
+        let read = self.read_fragment(slot, start, offset, assembly, Some(bytes));
         release_loan(&cell.loan);
         let read = read?;
         if !matches!(
@@ -458,6 +500,78 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         })
     }
 
+    /// What [`FrameReader::serve_frame`] would do from `assembly`, read
+    /// under a loan of the same target and stopped before any copy, cursor
+    /// or position change (`quantstratum-docs:
+    /// karyos/design/aggregate-subscriber.md`, AS-1).
+    fn peek(&self, assembly: Option<Assembly>) -> Result<Peek, SysError> {
+        let buffer = self.buffer;
+        let mut position = assembly.map_or(self.cursor.position, |a| a.next_position());
+        // At most two iterations: the end of one term and the next term.
+        for _ in 0..2 {
+            let (count, offset) = buffer.split(position)?;
+            if offset == buffer.term_length {
+                if assembly.is_some() {
+                    return Err(corrupt(offset, "assembly at term end"));
+                }
+                position = buffer.position(count.next()?, 0);
+                continue;
+            }
+            let slot = match buffer.lookup(count)? {
+                Lookup::Slot(slot) => slot,
+                Lookup::Missing => return Ok(self.peek_pending(assembly, position)),
+                Lookup::Gone => return Ok(Peek::Ended),
+            };
+            let cell = buffer.cell(self.cursor.cell)?;
+            match take_loan(
+                &cell.loan,
+                &cell.revoked,
+                buffer.descriptor(slot)?,
+                buffer.target(slot, count)?,
+            )? {
+                LoanOutcome::Granted => {}
+                LoanOutcome::Retry => return Ok(self.peek_pending(assembly, position)),
+                LoanOutcome::Overrun | LoanOutcome::Revoked => return Ok(Peek::Ended),
+            }
+            let start = assembly.map_or(position, |a| a.position);
+            if start < buffer.floor().load(Ordering::Acquire) {
+                release_loan(&cell.loan);
+                return Ok(Peek::Ended);
+            }
+            let read = self.read_fragment(slot, start, offset, assembly, None);
+            release_loan(&cell.loan);
+            return Ok(match read? {
+                Fragment::Pending => self.peek_pending(assembly, position),
+                Fragment::Pad | Fragment::Aborted { .. } => Peek::Step {
+                    charge: STEP_CHARGE,
+                },
+                Fragment::Skip {
+                    reason: SkipReason::Interrupted,
+                    ..
+                } => Peek::Step { charge: 0 },
+                Fragment::Skip { .. } => Peek::Step {
+                    charge: STEP_CHARGE,
+                },
+                Fragment::Copied { charge, .. } | Fragment::Complete { charge, .. } => {
+                    Peek::Step { charge }
+                }
+            });
+        }
+        Ok(self.peek_pending(assembly, position))
+    }
+
+    /// `Pending`, or `Ended` for a reader between messages at the seal
+    /// position, as [`Self::pending`] at `position`.
+    fn peek_pending(&self, assembly: Option<Assembly>, position: u64) -> Peek {
+        if assembly.is_some() {
+            return Peek::Pending;
+        }
+        match decode_seal(self.buffer.seal().load(Ordering::Acquire)) {
+            SealWord::Positioned(sealed) if position >= sealed => Peek::Ended,
+            _ => Peek::Pending,
+        }
+    }
+
     /// Nothing to serve: `Pending`, or `Closed` once a reader between
     /// messages reached the seal position, as `Subscription::poll`.
     fn pending_with(&self, assembly: Option<Assembly>) -> FrameStep {
@@ -513,14 +627,15 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     fn read_fragment(
         &self,
         slot: u8,
+        position: u64,
         offset: u32,
         assembly: Option<Assembly>,
-        bytes: &mut [u8],
+        bytes: Option<&mut [u8]>,
     ) -> Result<Fragment, SysError> {
         match (self.buffer.image(), assembly) {
-            (false, None) => self.publication_block(slot, offset, bytes),
+            (false, None) => self.publication_block(slot, position, offset, bytes),
             (false, Some(assembly)) => self.publication_fragment(slot, assembly, bytes),
-            (true, None) => self.image_block(slot, offset, bytes),
+            (true, None) => self.image_block(slot, position, offset, bytes),
             (true, Some(assembly)) => self.image_fragment(slot, assembly, bytes),
         }
     }
@@ -531,8 +646,9 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     fn publication_block(
         &self,
         slot: u8,
+        position: u64,
         start: u32,
-        bytes: &mut [u8],
+        bytes: Option<&mut [u8]>,
     ) -> Result<Fragment, SysError> {
         let buffer = self.buffer;
         let term_length = buffer.term_length;
@@ -570,7 +686,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
                     return Err(corrupt(start, "BEGIN placement"));
                 }
                 let reserved = self.data_extent(word0, start)?;
-                let assembly = self.first_header(slot, start, word0)?;
+                let assembly = self.first_header(slot, position, start, word0, bytes.is_some())?;
                 self.copy(slot, assembly, word0, reserved, false, bytes)
             }
             _ => Err(corrupt(start, "frame type")),
@@ -585,7 +701,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         &self,
         slot: u8,
         assembly: Assembly,
-        bytes: &mut [u8],
+        bytes: Option<&mut [u8]>,
     ) -> Result<Fragment, SysError> {
         let offset = assembly.next;
         // SAFETY: read loan held for this slot's term (the assembly's);
@@ -605,7 +721,13 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
 
     /// The frame at `start` of an image, between messages: as
     /// `validate_image_block`, one record at a time.
-    fn image_block(&self, slot: u8, start: u32, bytes: &mut [u8]) -> Result<Fragment, SysError> {
+    fn image_block(
+        &self,
+        slot: u8,
+        position: u64,
+        start: u32,
+        bytes: Option<&mut [u8]>,
+    ) -> Result<Fragment, SysError> {
         let term_length = self.buffer.term_length;
         let Some(first) = self.frame(slot, start)? else {
             return Ok(Fragment::Pending);
@@ -617,7 +739,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         };
         match first.kind {
             super::image_read::Kind::LocalGap => {
-                skipped(self.local_gap(slot, start, first.reserved)?)
+                skipped(self.local_gap(slot, position, start, first.reserved)?)
             }
             super::image_read::Kind::Frame(FrameType::Pad) => {
                 if first.reserved != term_length - start {
@@ -636,7 +758,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             _ if !flags.begin() => skipped(self.orphan_run(slot, start, SKIP_WALK_FRAMES)?),
             _ => {
                 let assembly = Assembly {
-                    position: self.cursor.position,
+                    position,
                     start,
                     next: start,
                     written: 0,
@@ -654,7 +776,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         &self,
         slot: u8,
         assembly: Assembly,
-        bytes: &mut [u8],
+        bytes: Option<&mut [u8]>,
     ) -> Result<Fragment, SysError> {
         let offset = assembly.next;
         let Some(frame) = self.frame(slot, offset)? else {
@@ -677,7 +799,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         slot: u8,
         assembly: Assembly,
         frame: super::image_read::Frame,
-        bytes: &mut [u8],
+        bytes: Option<&mut [u8]>,
     ) -> Result<Fragment, SysError> {
         let buffer = self.buffer;
         let offset = assembly.next;
@@ -703,7 +825,13 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             });
         }
         let assembly = if offset == assembly.start {
-            self.first_header(slot, offset, frame.word0)?
+            self.first_header(
+                slot,
+                assembly.position,
+                offset,
+                frame.word0,
+                bytes.is_some(),
+            )?
         } else {
             assembly
         };
@@ -727,9 +855,27 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
 
     /// A new assembly at the BEGIN fragment `word0` at `start`, with its
     /// reserved value and extension read under the loan.
-    fn first_header(&self, slot: u8, start: u32, word0: Word0) -> Result<Assembly, SysError> {
+    fn first_header(
+        &self,
+        slot: u8,
+        position: u64,
+        start: u32,
+        word0: Word0,
+        read: bool,
+    ) -> Result<Assembly, SysError> {
         let buffer = self.buffer;
         let mut reserved_value = [0u8; 8];
+        if !read {
+            // A peek reads no header bytes.
+            return Ok(Assembly {
+                position,
+                start,
+                next: start,
+                written: 0,
+                reserved_value: 0,
+                extension: None,
+            });
+        }
         // SAFETY: read loan held; header bytes 24..32 of a committed frame
         // whose length is at least its header (checked by the caller).
         unsafe {
@@ -752,7 +898,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             None
         };
         Ok(Assembly {
-            position: self.cursor.position,
+            position,
             start,
             next: start,
             written: 0,
@@ -772,7 +918,7 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         word: Word0,
         reserved: u32,
         image: bool,
-        bytes: &mut [u8],
+        bytes: Option<&mut [u8]>,
     ) -> Result<Fragment, SysError> {
         let buffer = self.buffer;
         let offset = assembly.next;
@@ -795,17 +941,19 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         if !image && !flags.end() && next == buffer.term_length {
             return Err(corrupt(next, "block without END"));
         }
-        let target = bytes
-            .get_mut(assembly.written as usize..written as usize)
-            .ok_or_else(|| corrupt(offset, "message longer than the assembly"))?;
-        // SAFETY: read loan held for the assembly's term; the payload of a
-        // committed DATA frame whose extent lies inside the term (checked
-        // by `data_extent` or the image walk).
-        unsafe {
-            buffer
-                .regions
-                .read_bytes(slot, offset + header_length, target)
-        };
+        if let Some(bytes) = bytes {
+            let target = bytes
+                .get_mut(assembly.written as usize..written as usize)
+                .ok_or_else(|| corrupt(offset, "message longer than the assembly"))?;
+            // SAFETY: read loan held for the assembly's term; the payload of
+            // a committed DATA frame whose extent lies inside the term
+            // (checked by `data_extent` or the image walk).
+            unsafe {
+                buffer
+                    .regions
+                    .read_bytes(slot, offset + header_length, target)
+            };
+        }
         let assembly = Assembly {
             next,
             written,
