@@ -187,8 +187,8 @@ pub struct IrqAffinity {
 pub enum Scope {
     /// Every field of the record.
     Full,
-    /// What classification and eligibility need: no `ethtool`, cpuidle
-    /// or IRQ scan. Used for the labels of every report.
+    /// What classification and eligibility need: no `ethtool` or IRQ
+    /// scan (cpuidle is read, for the eligibility of 4.2). Used for the labels of every report.
     Classification,
 }
 
@@ -217,6 +217,14 @@ pub struct Inventory {
     pub virt_container: Reading,
     /// Container markers found on the file system or in PID 1's cgroup.
     pub container_markers: Vec<String>,
+    /// `/sys/class/dmi/id/sys_vendor`.
+    pub dmi_sys_vendor: Reading,
+    /// `/sys/class/dmi/id/board_vendor`.
+    pub dmi_board_vendor: Reading,
+    /// `/sys/class/dmi/id/product_name`.
+    pub dmi_product: Reading,
+    /// `/sys/hypervisor/type`, present under a hypervisor such as Xen.
+    pub hypervisor_type: Reading,
     /// `/proc/cmdline`.
     pub cmdline: Reading,
     /// The interfaces of `/sys/class/net` except `lo`.
@@ -261,7 +269,16 @@ impl Inventory {
         let mut inventory = Self {
             host: host_name(probe),
             os: os.to_string(),
-            arch: arch.to_string(),
+            arch: if os == "linux" {
+                probe
+                    .run("uname", &["-m"])
+                    .map(|machine| machine.trim().to_string())
+                    .ok()
+                    .filter(|machine| !machine.is_empty())
+                    .unwrap_or_else(|| arch.to_string())
+            } else {
+                arch.to_string()
+            },
             date: today(),
             commit: env::clean(
                 &std::env::var("KARYOS_COMMIT")
@@ -275,9 +292,13 @@ impl Inventory {
             virt: probe.run("systemd-detect-virt", &[]),
             virt_container: probe.run("systemd-detect-virt", &["--container"]),
             container_markers: container_markers(probe),
+            dmi_sys_vendor: probe.read("/sys/class/dmi/id/sys_vendor"),
+            dmi_board_vendor: probe.read("/sys/class/dmi/id/board_vendor"),
+            dmi_product: probe.read("/sys/class/dmi/id/product_name"),
+            hypervisor_type: probe.read("/sys/hypervisor/type"),
             cmdline: probe.read("/proc/cmdline"),
             interfaces: Err(SKIPPED.to_string()),
-            cpus: cpus(probe, full),
+            cpus: cpus(probe),
             boost: boost(probe),
             isolated: probe.read(&format!("{CPU}/isolated")),
             nohz_full: probe.read(&format!("{CPU}/nohz_full")),
@@ -392,7 +413,7 @@ fn container_markers(probe: &Probe<'_>) -> Vec<String> {
     markers
 }
 
-fn cpus(probe: &Probe<'_>, full: bool) -> Result<Vec<Cpu>, String> {
+fn cpus(probe: &Probe<'_>) -> Result<Vec<Cpu>, String> {
     let names = probe.list(CPU)?;
     let mut cpus = Vec::new();
     for name in names {
@@ -403,25 +424,21 @@ fn cpus(probe: &Probe<'_>, full: bool) -> Result<Vec<Cpu>, String> {
             continue;
         };
         let base = format!("{CPU}/{name}");
-        let idle = if full {
-            probe.list(&format!("{base}/cpuidle")).map(|states| {
-                states
-                    .into_iter()
-                    .filter(|state| state.starts_with("state"))
-                    .map(|state| {
-                        let dir = format!("{base}/cpuidle/{state}");
-                        IdleState {
-                            name: probe.read(&format!("{dir}/name")),
-                            disable: probe.read(&format!("{dir}/disable")),
-                            latency: probe.read(&format!("{dir}/latency")),
-                            state,
-                        }
-                    })
-                    .collect()
-            })
-        } else {
-            Err(SKIPPED.to_string())
-        };
+        let idle = probe.list(&format!("{base}/cpuidle")).map(|states| {
+            states
+                .into_iter()
+                .filter(|state| state.starts_with("state"))
+                .map(|state| {
+                    let dir = format!("{base}/cpuidle/{state}");
+                    IdleState {
+                        name: probe.read(&format!("{dir}/name")),
+                        disable: probe.read(&format!("{dir}/disable")),
+                        latency: probe.read(&format!("{dir}/latency")),
+                        state,
+                    }
+                })
+                .collect()
+        });
         cpus.push(Cpu {
             index,
             governor: probe.read(&format!("{base}/cpufreq/scaling_governor")),
@@ -749,11 +766,37 @@ pub fn parse_interrupts(text: &str) -> Vec<(u32, String)> {
 #[must_use]
 pub fn record_node_and_release(record: &str) -> Option<(String, String)> {
     let (_, section) = record.split_once("### Kernel and host")?;
-    let (_, block) = section.split_once("```")?;
-    let (block, _) = block.split_once("```")?;
-    let mut lines = block.lines();
-    lines.next(); // the info string of the fence
-    lines.find_map(parse_uname)
+    first_block(section)?.lines().find_map(parse_uname)
+}
+
+/// The cpuidle states enabled in a record (`disable` 0), as CPU number
+/// and state directory, or `None` when the record has no readable
+/// cpuidle block.
+#[must_use]
+pub fn record_enabled_idle(record: &str) -> Option<Vec<(usize, String)>> {
+    let (_, section) = record.split_once("### cpuidle states, per CPU")?;
+    let section = section.split("\n### ").next()?;
+    let body = first_block(section)?;
+    let mut enabled = Vec::new();
+    for line in body.lines() {
+        let Some((head, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let mut words = head.split_whitespace();
+        let (Some(cpu), Some(state)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let Some(index) = cpu
+            .strip_prefix("cpu")
+            .and_then(|number| number.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if rest.split(';').any(|part| part.trim() == "disable 0") {
+            enabled.push((index, state.to_string()));
+        }
+    }
+    Some(enabled)
 }
 
 // Rendering.
@@ -789,12 +832,39 @@ pub fn unavailable(reason: &str) -> String {
     format!("unavailable ({reason})")
 }
 
+/// The longest run of backticks in `text`.
+fn longest_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut run = 0_usize;
+    for c in text.chars() {
+        run = if c == '`' { run.saturating_add(1) } else { 0 };
+        longest = longest.max(run);
+    }
+    longest
+}
+
+/// A fenced block whose fence is longer than any backtick run in `text`,
+/// so command output can never close it early.
 fn block(out: &mut String, text: &str) {
     if text.is_empty() {
         out.push_str("(empty)\n\n");
     } else {
-        let _ = write!(out, "```text\n{text}\n```\n\n");
+        let fence = "`".repeat(longest_backtick_run(text).max(2).saturating_add(1));
+        let _ = write!(out, "{fence}text\n{text}\n{fence}\n\n");
     }
+}
+
+/// The body of the first fenced block in `section`, whatever the length
+/// of its fence.
+fn first_block(section: &str) -> Option<&str> {
+    let start = section.find("```")?;
+    let after = section.get(start..)?;
+    let fence_len = after.chars().take_while(|c| *c == '`').count();
+    let fence = after.get(..fence_len)?;
+    let body_start = after.find('\n')?.saturating_add(1);
+    let body = after.get(body_start..)?;
+    let close = body.find(&format!("\n{fence}"))?;
+    body.get(..close)
 }
 
 fn reading(out: &mut String, value: &Reading) {
@@ -909,6 +979,32 @@ pub fn render(
         "`systemd-detect-virt --container`",
         &inventory.virt_container,
     );
+    labelled(
+        &mut out,
+        "`/sys/class/dmi/id/sys_vendor`",
+        &inventory.dmi_sys_vendor,
+    );
+    labelled(
+        &mut out,
+        "`/sys/class/dmi/id/board_vendor`",
+        &inventory.dmi_board_vendor,
+    );
+    labelled(
+        &mut out,
+        "`/sys/class/dmi/id/product_name`",
+        &inventory.dmi_product,
+    );
+    match &inventory.hypervisor_type {
+        Ok(_) => labelled(
+            &mut out,
+            "`/sys/hypervisor/type`",
+            &inventory.hypervisor_type,
+        ),
+        // Absent on a host that runs on no hypervisor: a fact, not a gap.
+        Err(reason) => {
+            let _ = write!(out, "`/sys/hypervisor/type`: absent ({reason})\n\n");
+        }
+    }
     if inventory.container_markers.is_empty() {
         out.push_str(
             "Container markers (`/.dockerenv`, `/run/.containerenv`, `/proc/1/cgroup`): none\n\n",
@@ -1188,7 +1284,7 @@ pub fn render(
         let _ = writeln!(out, "- {basis}");
     }
     out.push('\n');
-    out.push_str("Decision eligibility (measurement-harness.md 4.2, conditions 1 to 4; the manifest hash, `E_max` and the sample count are checked per run):\n\n");
+    out.push_str("Decision eligibility (measurement-harness.md 4.2, conditions 1 to 3; condition 4, the preflight snapshot, is deferred to batch B4; the manifest hash, `E_max` and the sample count are checked per run):\n\n");
     for (fanout, verdict) in eligibility {
         let what = env::fanout_label(*fanout);
         match verdict {
@@ -1394,7 +1490,10 @@ NMI:          0          0          0          0   Non-maskable interrupts";
             .file("/proc/irq/26/smp_affinity_list", "0\n")
             .file("/proc/1/comm", "systemd\n")
             .file("/proc/1/cgroup", "0::/init.scope\n")
-            .file("/proc/812/comm", "irqbalance\n");
+            .file("/proc/812/comm", "irqbalance\n")
+            .file("/sys/class/dmi/id/sys_vendor", "Supermicro\n")
+            .file("/sys/class/dmi/id/board_vendor", "Supermicro\n")
+            .file("/sys/class/dmi/id/product_name", "SYS-5019C-M\n");
         for cpu in 0..8 {
             let base = format!("/sys/devices/system/cpu/cpu{cpu}");
             tree.file(&format!("{base}/cpufreq/scaling_governor"), "performance\n")
@@ -1585,6 +1684,14 @@ NMI:          0          0          0          0   Non-maskable interrupts";
             .map(|fanout| (*fanout, env::decision_eligible(inventory, None, *fanout)))
             .collect();
         render(inventory, &classification, &eligibility)
+    }
+
+    #[test]
+    fn command_output_with_backticks_cannot_close_its_fence() {
+        let mut out = String::new();
+        block(&mut out, "a ``` b\n````");
+        assert!(out.starts_with("`````text\n"), "{out}");
+        assert_eq!(first_block(&out), Some("a ``` b\n````"));
     }
 
     #[test]

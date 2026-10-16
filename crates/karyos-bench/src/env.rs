@@ -6,9 +6,13 @@
 //! manifest 6.3 that is, and whether the host is decision eligible.
 
 use std::fmt;
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-use crate::inventory::{Inventory, Reading, Scope, parse_lscpu, record_node_and_release};
+use crate::inventory::{
+    Inventory, Reading, Scope, parse_lscpu, record_enabled_idle, record_node_and_release,
+};
 use crate::manifest::Fanout;
 
 /// The environments of manifest 6.3.
@@ -64,12 +68,15 @@ pub struct Classification {
     pub basis: Vec<String>,
 }
 
-/// Classifies one host (measurement-harness.md 4.2). macOS, any other
-/// non-Linux system, a container or a VM is E4, whatever the
-/// architecture; a physical Linux aarch64 host is E3; a physical Linux
-/// x86_64 host is E1. A host is physical only when `systemd-detect-virt`
-/// reports `none`, no container marker is present and `lscpu` names no
-/// hypervisor; an unavailable `systemd-detect-virt` leaves it E4.
+/// Classifies one host (measurement-harness.md 4.2, H-6). macOS, any
+/// other non-Linux system, a container, a VM or a cloud instance is E4,
+/// whatever the architecture; a physical Linux aarch64 host is E3; a
+/// physical Linux x86_64 host is E1. A host is physical only when
+/// `systemd-detect-virt` reports `none` for both VM and container, no
+/// container marker is present, `lscpu` names no hypervisor,
+/// `/sys/hypervisor/type` is absent and no DMI string names a cloud
+/// provider; an unavailable `systemd-detect-virt` leaves it E4. The
+/// architecture is the running kernel's (`uname -m`).
 #[must_use]
 pub fn classify(inventory: &Inventory) -> Classification {
     let mut basis = Vec::new();
@@ -87,10 +94,30 @@ pub fn classify(inventory: &Inventory) -> Classification {
         Ok(value) => Some(value.trim().to_string()),
         Err(_) => None,
     };
-    if let Some(container) = reported(&inventory.virt_container).filter(|v| v != "none") {
-        basis.push(format!(
-            "systemd-detect-virt --container reports {container}"
-        ));
+    match &inventory.virt_container {
+        Ok(value) if value.trim() != "none" => basis.push(format!(
+            "systemd-detect-virt --container reports {}",
+            value.trim()
+        )),
+        Ok(_) => {}
+        Err(reason) => basis.push(format!(
+            "container status not confirmed: systemd-detect-virt --container unavailable ({reason})"
+        )),
+    }
+    if let Some(kind) = reported(&inventory.hypervisor_type).filter(|v| !v.is_empty()) {
+        basis.push(format!("/sys/hypervisor/type reports {kind}"));
+    }
+    for vendor in [
+        &inventory.dmi_sys_vendor,
+        &inventory.dmi_board_vendor,
+        &inventory.dmi_product,
+    ]
+    .into_iter()
+    .filter_map(reported)
+    {
+        if let Some(cloud) = cloud_vendor(&vendor) {
+            basis.push(format!("DMI names cloud provider {cloud} ({vendor})"));
+        }
     }
     for marker in &inventory.container_markers {
         basis.push(format!("container marker {marker}"));
@@ -136,6 +163,30 @@ pub fn classify(inventory: &Inventory) -> Classification {
         }
     };
     Classification { environment, basis }
+}
+
+/// Cloud providers recognized in DMI strings: an instance of any of them,
+/// bare metal included, is E4 (measurement-harness.md 4.2).
+const CLOUD_VENDORS: [(&str, &str); 10] = [
+    ("amazon", "Amazon Web Services"),
+    ("google", "Google Cloud"),
+    ("microsoft corporation", "Microsoft Azure"),
+    ("alibaba", "Alibaba Cloud"),
+    ("oraclecloud", "Oracle Cloud"),
+    ("digitalocean", "DigitalOcean"),
+    ("openstack", "OpenStack"),
+    ("linode", "Linode"),
+    ("vultr", "Vultr"),
+    ("scaleway", "Scaleway"),
+];
+
+/// The cloud provider a DMI string names, if any.
+fn cloud_vendor(value: &str) -> Option<&'static str> {
+    let lower = value.to_ascii_lowercase();
+    CLOUD_VENDORS
+        .iter()
+        .find(|(needle, _)| lower.contains(needle))
+        .map(|(_, name)| *name)
 }
 
 /// The class of a pair of hosts: E2 when both are E1 and a switch
@@ -234,6 +285,12 @@ pub enum Ineligible {
     },
     /// The clock source is not `tsc`.
     ClockSource(String),
+    /// cpuidle states enabled on the run's cores that the host record
+    /// does not enable (deeper than the record allows), or unreadable.
+    CpuIdle {
+        /// Each such state, as `cpuN stateM (name)`.
+        states: Vec<String>,
+    },
 }
 
 impl fmt::Display for Ineligible {
@@ -267,16 +324,24 @@ impl fmt::Display for Ineligible {
                 cpus.join(", ")
             ),
             Self::ClockSource(source) => write!(f, "clock source {source}, not tsc"),
+            Self::CpuIdle { states } => write!(
+                f,
+                "cpuidle states enabled beyond the record: {}",
+                states.join(", ")
+            ),
         }
     }
 }
 
 /// Decision eligibility of a host for a run of `fanout`
-/// (measurement-harness.md 4.2, conditions 1 to 4): class E1 or E2; a
+/// (measurement-harness.md 4.2, conditions 1 to 3; condition 4, the
+/// preflight snapshot against the record, is deferred to batch B4 with
+/// the run plan): class E1 or E2; a
 /// record of this host (`record`, the text of its
 /// `environments/<host>.md`) taken on the running kernel; an isolated core
 /// per process, each in `nohz_full`; the `performance` governor or a fixed
-/// frequency on those cores; and the `tsc` clock source. Every failed
+/// frequency on those cores; no cpuidle state enabled on those cores that
+/// the record does not enable; and the `tsc` clock source. Every failed
 /// condition is listed. The manifest hash, `E_max` and the sample count
 /// (conditions 5 to 7) belong to the run and are checked by
 /// [`crate::decision::grade`].
@@ -371,6 +436,36 @@ pub fn decision_eligible(
             }
         }
     }
+    if let Some(text) = record {
+        let mut deeper = Vec::new();
+        let allowed = record_enabled_idle(text).unwrap_or_else(|| {
+            deeper.push("record has no readable cpuidle block".to_string());
+            Vec::new()
+        });
+        if let Ok(cpus) = &inventory.cpus {
+            for cpu in cpus
+                .iter()
+                .filter(|cpu| isolated.is_empty() || isolated.contains(&cpu.index))
+            {
+                match &cpu.idle {
+                    Err(reason) => deeper.push(format!("cpu{} unavailable ({reason})", cpu.index)),
+                    Ok(states) => {
+                        for state in states {
+                            if state.disable.as_deref().map(str::trim) == Ok("0")
+                                && !allowed.contains(&(cpu.index, state.state.clone()))
+                            {
+                                let name = state.name.as_deref().map_or("unnamed", str::trim);
+                                deeper.push(format!("cpu{} {} ({name})", cpu.index, state.state));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !deeper.is_empty() {
+            reasons.push(Ineligible::CpuIdle { states: deeper });
+        }
+    }
     match inventory.clocksource.as_deref().map(str::trim) {
         Ok("tsc") => {}
         Ok(other) => reasons.push(Ineligible::ClockSource(other.to_string())),
@@ -429,23 +524,99 @@ pub fn clean(value: &str) -> String {
 /// `<program> not found`, or the exit status with the first line of
 /// standard error.
 pub fn run(program: &str, args: &[&str]) -> Reading {
-    let output = Command::new(program).args(args).output().map_err(|cause| {
-        if cause.kind() == std::io::ErrorKind::NotFound {
-            format!("{program} not found")
-        } else {
-            format!("{program}: {cause}")
+    run_bounded(program, args, RUN_TIMEOUT, RUN_OUTPUT_LIMIT)
+}
+
+/// How long [`run`] waits for a command before killing it.
+pub const RUN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most bytes [`run`] keeps from each output stream.
+pub const RUN_OUTPUT_LIMIT: u64 = 1 << 20;
+
+/// [`run`] with an explicit time limit and output bound: a command still
+/// running after `timeout` is killed and reported as timed out; at most
+/// `limit` bytes of each stream are kept, and more is reported as
+/// truncated, so a wedged or flooding tool never stalls the inventory.
+///
+/// # Errors
+///
+/// As [`run`], plus a timeout.
+pub fn run_bounded(program: &str, args: &[&str], timeout: Duration, limit: u64) -> Reading {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|cause| {
+            if cause.kind() == std::io::ErrorKind::NotFound {
+                format!("{program} not found")
+            } else {
+                format!("{program}: {cause}")
+            }
+        })?;
+    let drain = |stream: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut kept = Vec::new();
+            let mut more = false;
+            if let Some(mut stream) = stream {
+                let _ = (&mut stream).take(limit).read_to_end(&mut kept);
+                let mut rest = [0_u8; 1];
+                more = matches!(stream.read(&mut rest), Ok(n) if n > 0);
+                // Discard the rest so the child never blocks on a full pipe.
+                let _ = std::io::copy(&mut stream, &mut std::io::sink());
+            }
+            (kept, more)
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if started.elapsed() >= timeout => {
+                // The child of this call, by its own handle, never by name.
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(cause) => return Err(format!("{program}: {cause}")),
         }
-    })?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    };
+    let (out, out_more) = stdout.join().unwrap_or_default();
+    let (err, _) = stderr.join().unwrap_or_default();
+    let Some(status) = status else {
+        return Err(format!(
+            "{program}: timed out after {} s",
+            timeout.as_secs()
+        ));
+    };
+    let stdout = String::from_utf8_lossy(&out).trim().to_string();
     if !stdout.is_empty() {
-        return Ok(stdout);
+        return Ok(if out_more {
+            format!("{stdout}\n(output truncated at {limit} bytes)")
+        } else {
+            stdout
+        });
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = String::from_utf8_lossy(&err);
     let first = stderr.lines().next().unwrap_or("").trim();
     Err(if first.is_empty() {
-        format!("{program}: {} with no output", output.status)
+        format!("{program}: {status} with no output")
     } else {
-        format!("{program}: {}: {first}", output.status)
+        format!("{program}: {status}: {first}")
     })
 }
 
@@ -507,12 +678,7 @@ impl Labels {
         let record = host_record(&inventory.host);
         let eligible = decision_eligible(&inventory, record.as_deref(), Fanout::F1).is_ok();
         Self {
-            host: clean(
-                &std::env::var("HOSTNAME")
-                    .ok()
-                    .or_else(|| command("hostname", &[]))
-                    .unwrap_or_else(unknown),
-            ),
+            host: clean(&inventory.host),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
             cpu: clean(&cpu_model().unwrap_or_else(unknown)),
@@ -780,6 +946,84 @@ mod tests {
     }
 
     #[test]
+    fn an_aarch64_container_or_vm_is_e4_not_e3() {
+        for (virt, container) in [("kvm", "none"), ("none", "docker")] {
+            let (tree, canned) = tuned();
+            let canned = canned
+                .with("systemd-detect-virt", virt)
+                .with("systemd-detect-virt --container", container);
+            let inventory = capture(&tree, &canned, "linux", "aarch64");
+            assert_eq!(
+                classify(&inventory).environment,
+                Environment::E4,
+                "{virt} {container}"
+            );
+        }
+        let (tree, canned) = tuned();
+        let inventory = capture(&tree, &canned, "linux", "aarch64");
+        assert_eq!(classify(&inventory).environment, Environment::E3);
+    }
+
+    #[test]
+    fn a_cloud_or_hypervisor_host_is_e4() {
+        let (tree, canned) = tuned();
+        tree.file("/sys/class/dmi/id/sys_vendor", "Amazon EC2\n");
+        let inventory = capture(&tree, &canned, "linux", "x86_64");
+        let classification = classify(&inventory);
+        assert_eq!(classification.environment, Environment::E4);
+        assert!(
+            classification
+                .basis
+                .iter()
+                .any(|b| b.contains("Amazon Web Services"))
+        );
+        let (tree, canned) = tuned();
+        tree.file("/sys/hypervisor/type", "xen\n");
+        let inventory = capture(&tree, &canned, "linux", "x86_64");
+        assert_eq!(classify(&inventory).environment, Environment::E4);
+    }
+
+    #[test]
+    fn an_unconfirmed_container_status_is_e4() {
+        let (tree, canned) = tuned();
+        let canned = canned.without("systemd-detect-virt --container");
+        let inventory = capture(&tree, &canned, "linux", "x86_64");
+        let classification = classify(&inventory);
+        assert_eq!(classification.environment, Environment::E4);
+        assert!(
+            classification
+                .basis
+                .iter()
+                .any(|b| b.starts_with("container status not confirmed"))
+        );
+    }
+
+    #[test]
+    fn a_deeper_cpuidle_state_than_the_record_is_ineligible() {
+        let (tree, canned) = tuned();
+        let recorded = capture(&tree, &canned, "linux", "x86_64");
+        let record = record_of(&recorded);
+        tree.file("/sys/devices/system/cpu/cpu3/cpuidle/state2/disable", "0");
+        let inventory = capture(&tree, &canned, "linux", "x86_64");
+        assert_eq!(
+            decision_eligible(&inventory, Some(&record), Fanout::F1),
+            Err(vec![Ineligible::CpuIdle {
+                states: vec!["cpu3 state2 (C6)".into()]
+            }])
+        );
+    }
+
+    #[test]
+    fn a_wedged_or_flooding_command_is_bounded() {
+        let slow = run_bounded("sleep", &["5"], Duration::from_millis(100), 1024);
+        assert_eq!(slow, Err("sleep: timed out after 0 s".to_string()));
+        let flood = run_bounded("seq", &["1", "100000"], Duration::from_secs(10), 64);
+        let text = flood.unwrap_or_default();
+        assert!(text.ends_with("(output truncated at 64 bytes)"), "{text}");
+        assert!(text.len() < 200, "{text}");
+    }
+
+    #[test]
     fn the_record_must_match_host_and_kernel() {
         let (tree, canned) = tuned();
         let inventory = capture(&tree, &canned, "linux", "x86_64");
@@ -800,12 +1044,17 @@ mod tests {
                 running: "flumix".into()
             }])
         );
+        let empty = decision_eligible(&inventory, Some("# empty"), Fanout::F1);
         assert_eq!(
-            decision_eligible(&inventory, Some("# empty"), Fanout::F1),
-            Err(vec![Ineligible::RecordHost {
+            empty.as_ref().map_err(|reasons| reasons.first().cloned()),
+            Err(Some(Ineligible::RecordHost {
                 recorded: "unreadable".into(),
                 running: "flumix".into()
-            }])
+            }))
+        );
+        assert!(
+            matches!(empty, Err(ref reasons) if matches!(reasons.last(), Some(Ineligible::CpuIdle { states }) if states.first().map(String::as_str) == Some("record has no readable cpuidle block"))),
+            "{empty:?}"
         );
     }
 
