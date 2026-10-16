@@ -965,21 +965,24 @@ pub struct GradeInputs<'a> {
     pub overall: &'a Overall,
 }
 
-/// The decision grade with [`DECISION_METHOD`]: see [`grade_with`].
+/// The decision grade, with [`DECISION_METHOD`] as the only decision
+/// method: refused for a provisional `E_max` (M-7), a pending manifest
+/// hash (manifest 9), an environment that does not decide (6.3), too few
+/// samples, warmup or runs (8.1, 8.2), too few resamples for a bootstrap
+/// method (8.3), no point results, a point evaluated with another method
+/// (report-only) or with blocks of the wrong length for its shape (M-10),
+/// and an incomplete overall result (H-4).
 #[must_use]
 pub fn grade(inputs: &GradeInputs<'_>) -> Grade {
     grade_with(inputs, DECISION_METHOD)
 }
 
-/// The decision grade with `method` as the decision method: refused for
-/// a provisional `E_max` (M-7), a pending manifest hash (manifest 9), an
-/// environment that does not decide (6.3), too few samples, warmup or
-/// runs (8.1, 8.2), too few resamples for a bootstrap method (8.3), no
-/// point results, a point evaluated with another method (report-only) or
-/// with blocks of the wrong length for its shape (M-10), and an
-/// incomplete overall result (H-4).
+/// [`grade`] with `method` as the decision method. Crate-private so
+/// that no caller can grade with a method other than [`DECISION_METHOD`]
+/// (coordinator review of #200); the tests use it to cover the block
+/// length rule of a block decision method.
 #[must_use]
-pub fn grade_with(inputs: &GradeInputs<'_>, method: Resampling) -> Grade {
+pub(crate) fn grade_with(inputs: &GradeInputs<'_>, method: Resampling) -> Grade {
     let mut reasons = Vec::new();
     let mut push = |reason: GradeReason| {
         if !reasons.contains(&reason) {

@@ -396,7 +396,8 @@ pub enum Resampling {
 }
 
 impl Resampling {
-    /// The default: [`Resampling::StratifiedBlocks`] with `block_len`.
+    /// [`Resampling::StratifiedBlocks`] with `block_len`: the fixed-strata
+    /// block bootstrap of manifest 1.0, report only under manifest 2.0.
     #[must_use]
     pub const fn default_with(block_len: usize) -> Self {
         Self::StratifiedBlocks { block_len }
@@ -1849,7 +1850,7 @@ mod tests {
     /// The methods compared, in the order of a result row.
     const METHODS: [&str; 7] = [
         "iid",
-        "stratified blocks of 50 (default)",
+        "stratified blocks of 50 (manifest 1.0)",
         "two stage, blocks of 50",
         "run jackknife of pooled p99.9, t(k - 1)",
         "run jackknife of pooled p99.9, t(Welch df)",
@@ -2079,7 +2080,7 @@ mod tests {
     /// | Method | k = 5 | k = 10 | k = 20 |
     /// | --- | --- | --- | --- |
     /// | iid | 97.0% | 98.2% | 97.4% |
-    /// | stratified blocks of 50 (default) | 84.8% | 89.6% | 86.4% |
+    /// | stratified blocks of 50 (manifest 1.0) | 84.8% | 89.6% | 86.4% |
     /// | two stage, blocks of 50 | 12.4% | 9.0% | 6.2% |
     /// | run jackknife of pooled p99.9, t(k - 1) | 8.2% | 6.6% | 4.0% |
     /// | run jackknife of pooled p99.9, t(Welch df) | 9.4% | 7.0% | 4.8% |
