@@ -45,7 +45,9 @@ pub(super) struct Queued {
     len: usize,
 }
 
-/// What [`PathIntake::push`] did.
+/// What [`PathIntake::push`] did. A datagram is bypassed only when its
+/// endpoint has no queue, so nothing of its path is waiting: a bypass never
+/// overtakes that path's queued datagrams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Queue {
     /// Queued for the drain.
@@ -92,11 +94,18 @@ impl PathIntake {
             .position(|held| *held == Some(endpoint))
     }
 
-    /// Whether `endpoint` has datagrams waiting: the caller then queues
-    /// every later one of its datagrams too, to keep the path's order.
+    /// Whether `endpoint` has datagrams waiting.
     pub(super) fn holds(&self, endpoint: EndpointId) -> bool {
         self.queue_of(endpoint)
             .is_some_and(|queue| self.queues.len(queue) > 0)
+    }
+
+    /// Whether a datagram of `endpoint` goes through the queues: one of a
+    /// `multi`-path image, or any while `endpoint`'s queue holds datagrams,
+    /// so a path that stops being multi-path keeps its order until its
+    /// queue drains.
+    pub(super) fn takes(&self, endpoint: EndpointId, multi: bool) -> bool {
+        multi || self.holds(endpoint)
     }
 
     /// Queues a copy of `bytes` from `endpoint`, polled at `now`.
@@ -127,9 +136,10 @@ impl PathIntake {
             .get_mut(buffer)
             .and_then(|held| held.get_mut(..len))
         else {
-            // Longer than any endpoint delivers: never queued.
+            // Longer than any endpoint delivers (never): dropped, not
+            // delivered past the path's queued datagrams.
             self.free.push(buffer);
-            return Queue::Bypass;
+            return Queue::Dropped;
         };
         target.copy_from_slice(bytes);
         let entry = Queued {

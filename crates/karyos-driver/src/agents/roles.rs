@@ -2119,6 +2119,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.data_seen = 0;
     }
 
+    /// Whether the path queues are allocated (tests).
+    #[cfg(test)]
+    pub(super) fn has_path_queues(&self) -> bool {
+        self.path_intake.is_some()
+    }
+
     /// Delivers every DATA datagram twice from the `from`th since
     /// [`Self::drop_data`] was set (tests).
     #[cfg(test)]
@@ -3727,7 +3733,7 @@ impl<T: StreamTerms> Intake<'_, T> {
         let Some(intake) = role.path_intake.as_deref_mut() else {
             return false;
         };
-        if !multi && !intake.holds(self.endpoint) {
+        if !intake.takes(self.endpoint, multi) {
             return false;
         }
         match intake.push(self.endpoint, (source, alias, self.now), bytes) {

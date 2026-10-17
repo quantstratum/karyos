@@ -118,3 +118,35 @@ fn the_largest_datagram_is_queued_whole() {
     assert_eq!(PathIntake::bytes(&entry, &buffer), bytes.as_slice());
     intake.give_back(entry, buffer);
 }
+
+/// A path whose queue holds datagrams is never bypassed: with every queue
+/// taken, its later datagrams still join its own queue, behind the earlier
+/// ones; only an endpoint with no queue is bypassed.
+#[test]
+fn a_waiting_path_is_never_bypassed() {
+    let mut intake = intake(2, 4);
+    let (a, b, c) = (EndpointId(1), EndpointId(2), EndpointId(3));
+    let _ = intake.push(a, (from(1), ALIAS, 0), &[1; 8]);
+    let _ = intake.push(b, (from(2), ALIAS, 0), &[2; 8]);
+    assert_eq!(intake.push(c, (from(3), ALIAS, 0), &[9; 8]), Queue::Bypass);
+    assert_eq!(intake.push(a, (from(1), ALIAS, 1), &[3; 8]), Queue::Queued);
+    let order: Vec<(EndpointId, u8)> = drain(&mut intake)
+        .into_iter()
+        .map(|(endpoint, byte, _)| (endpoint, byte))
+        .collect();
+    assert_eq!(order, [(a, 1), (b, 2), (a, 3)]);
+}
+
+/// A path that stops being multi-path while its queue holds datagrams
+/// still goes through its queue until the queue drains; then it bypasses.
+#[test]
+fn a_path_keeps_its_queue_until_it_drains() {
+    let mut intake = intake(2, 4);
+    let a = EndpointId(1);
+    assert!(intake.takes(a, true));
+    assert!(!intake.takes(a, false), "nothing waiting: bypass");
+    let _ = intake.push(a, (from(1), ALIAS, 0), &[1; 8]);
+    assert!(intake.takes(a, false), "waiting: queued behind");
+    let _ = drain(&mut intake);
+    assert!(!intake.takes(a, false));
+}
