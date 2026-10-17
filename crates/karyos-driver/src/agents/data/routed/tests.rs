@@ -524,3 +524,94 @@ fn routes_need_their_own_endpoints() {
     let five: Vec<_> = (1..=5).map(|id| at(id, 1)).collect();
     assert_eq!(super::check_routes(&five), Err(OutboundError::Routes));
 }
+
+/// #331 review (M4): a route waiting for its reset takes no new copies;
+/// the datagram is skipped there and goes on the other route.
+#[test]
+fn a_route_waiting_for_its_reset_takes_no_copy() {
+    let (a, observer_a, seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 16);
+    sent(&observer_b, 16);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(1);
+    // Opened on both, then route B waits for its reset.
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    assert_eq!(seen_a.lock().unwrap().len(), 1);
+    outbound.routed.as_deref_mut().unwrap().routes[1].needs_reset = true;
+    let skipped = outbound
+        .routed_sender()
+        .unwrap()
+        .counters(1)
+        .unwrap()
+        .skipped;
+    let _ = log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    let sender = outbound.routed_sender().unwrap();
+    assert_eq!(sender.pending(0, 1), Some(0));
+    assert_eq!(sender.counters(1).unwrap().skipped, skipped + 1);
+    assert_eq!(seen_a.lock().unwrap().len(), 2);
+}
+
+/// #331 review (M6): a copy committed but refused by the sender's record
+/// (here a datagram read again below the route's last copy) marks its route
+/// for a reset, which then takes nothing more.
+#[test]
+fn a_refused_copy_marks_its_route_for_a_reset() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, _observer_b, _seen_b, rx_b) = path_rx(2, 4);
+    sent(&observer_a, 16);
+    let mut halves = vec![a, b];
+    let routes = [
+        (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
+        (EndpointId(2), SocketAddr::from(([127, 0, 0, 2], 41_000))),
+    ];
+    let (mut outbound, mut log) = outbound_routed(&routes, ALIAS, TERM, 1, true);
+    let _ = log.publications[0]
+        .append(&[0; 1000], AppendOptions::default())
+        .unwrap();
+    // A sends it; B blocks and keeps its copy at position 0.
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(1));
+    assert!(!outbound.needs_reset());
+    // The lane reads position 0 again: B's copy of it is out of order.
+    outbound.readers_mut()[0].rewind().unwrap();
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    assert_eq!(outbound.counters().staged_refused, 1);
+    assert!(outbound.routed.as_deref().unwrap().routes[1].needs_reset);
+    assert!(outbound.needs_reset());
+    // The reset returns the unrecorded item.
+    let _rx_b = reset(&mut halves, 1, rx_b);
+}
+
+/// #331 review P3-3: a route waiting for its reset holds no copies that
+/// count against a rewind: they will be dropped. A reset of the other route
+/// then rewinds the reliable lane, as if it were alone.
+#[test]
+fn a_resetting_routes_copies_do_not_block_a_rewind() {
+    let (a, observer_a, seen_a, rx_a) = path_rx(1, 2);
+    let (b, _observer_b, _seen_b, rx_b) = path_rx(2, 8);
+    let mut halves = vec![a, b];
+    let routes = [
+        (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
+        (EndpointId(2), SocketAddr::from(([127, 0, 0, 2], 41_000))),
+    ];
+    let (mut outbound, mut log) = outbound_routed(&routes, ALIAS, TERM, 1, true);
+    let _ = log.publications[0]
+        .append(&[0; 1000], AppendOptions::default())
+        .unwrap();
+    // Staged on both; both block. Then B waits for its reset.
+    for _ in 0..2 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    outbound.routed.as_deref_mut().unwrap().routes[1].needs_reset = true;
+    let _rx_a = reset(&mut halves, 0, rx_a);
+    sent(&observer_a, 32);
+    for _ in 0..4 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    assert_eq!(seen_a.lock().unwrap().len(), 1, "A sends it again");
+    let _rx_b = reset(&mut halves, 1, rx_b);
+}

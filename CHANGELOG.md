@@ -107,7 +107,8 @@ release may break APIs, wire formats and shared-memory layouts.
   uncancelled copies per route. `StageError::OutOfOrder` refuses a copy
   not above its route's last one.
 - A publication over redundant paths (redundant-paths.md section 7, RP-10):
-  `Outbound::new_routed` takes one endpoint and destination per path, and
+  `Outbound::new_routed` (crate-internal: test-only until the publication
+  wiring) takes one endpoint and destination per path, and
   `Outbound::serve_routes` sends each committed datagram once on every
   path, debited once (`karyos_io::lanes::routes::RoutedLaneSender`). Repair
   stays on the founding path, on its queues. A route's failure resets only

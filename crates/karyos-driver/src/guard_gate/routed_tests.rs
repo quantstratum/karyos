@@ -409,3 +409,54 @@ fn a_route_reopen_keeps_the_other_routes_charge() {
     assert_eq!(f.gate.counts().faults, 0);
     assert_eq!(f.sender.pending(0, 0), Some(0));
 }
+
+/// #333 review P3: a close before a lagging route catches up stops that
+/// route's copy: the applied position is the one the other route
+/// submitted, and once the copy is cancelled nothing is in flight.
+#[test]
+fn a_close_before_a_lagging_route_catches_up_stops_it() {
+    let mut f = Fixture::new(None);
+    let end = f.stage(&[0, 1]);
+    f.routes[0].accept(1);
+    // Route 1 would block: its copy lags, exposed.
+    let _ = f.serve();
+    assert_eq!(f.sender.pending(0, 1), Some(1));
+    f.close();
+    f.routes[1].accept(1);
+    assert_eq!(f.catch_up(), 0);
+    assert_eq!(f.routes[1].socket.send_calls(), 1, "only the blocked try");
+    f.gate.between_gates();
+    assert_eq!(f.cell.try_read().unwrap().positions[0], end);
+    f.cancel();
+    f.gate.between_gates();
+    assert_eq!(f.gate.in_flight(), Some(0));
+}
+
+/// #333 review P3: over several routes, a report that is no route's next
+/// head faults the lane and counts in flight until a reopen, as a ticket
+/// mismatch on one route does.
+#[test]
+fn a_report_of_no_routes_head_faults_the_lane() {
+    let mut f = Fixture::new(None);
+    let _ = f.stage(&[0, 1]);
+    // A frame committed on route 0 but never staged through the gate.
+    let queue = f.routes[0].queue;
+    let mut frame = f.routes[0].tx.claim_tx(queue, usize::from(FRAME)).unwrap();
+    frame.bytes_mut().fill(1);
+    let ticket = frame
+        .commit(Commit {
+            len: usize::from(FRAME),
+            token: SenderToken::new(999),
+            options: TxOptions::none(),
+        })
+        .unwrap();
+    let stray = Staged {
+        ticket,
+        charge: u64::from(FRAME),
+        len: FRAME,
+    };
+    f.gate.left(0, stray, Left::Submitted);
+    assert_eq!(f.gate.abort_cause(0), Some(AbortCause::Fault));
+    assert_eq!(f.gate.in_flight(), Some(1));
+    f.cancel();
+}

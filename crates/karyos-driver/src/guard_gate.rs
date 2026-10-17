@@ -539,7 +539,11 @@ impl GuardGate {
     }
 
     /// `index`'s incarnation aborts for good, once, with `cause`; the
-    /// tokens of its heads, which will never be sent, come back.
+    /// tokens of its heads, which will never be sent, come back. That
+    /// includes a head exposed but not reported yet: an abort denies every
+    /// later exposure, and a submission the backend still reports keeps
+    /// its position counted (`left`) but not its refunded charge, so the
+    /// bucket errs generous by at most the heads in flight at the close.
     fn abort(&mut self, index: usize, cause: AbortCause) {
         if let Some(state) = self.lanes.get_mut(index)
             && state.aborting.is_none()
@@ -846,7 +850,20 @@ impl LaneGate for GuardGate {
                 .and_then(VecDeque::pop_front)
                 .map(|entry| (route, entry))
         }) else {
-            bump(&mut self.counts.faults, &mut self.counts.overflows);
+            // One route with an empty ring: a report of nothing staged,
+            // counted, as before routes.
+            if heads.len() == 1 {
+                bump(&mut self.counts.faults, &mut self.counts.overflows);
+                return;
+            }
+            // Several routes and no route's next head: the records diverged,
+            // as a ticket mismatch on one route. Its fate is unknown, so it
+            // counts in flight until a reopen, and the lane cannot be trusted
+            // any more (#333 review).
+            if let Some(count) = unknown.first_mut() {
+                bump(count, &mut self.counts.overflows);
+            }
+            self.fault(Some(lane));
             return;
         };
         if entry.ticket != staged.ticket {
