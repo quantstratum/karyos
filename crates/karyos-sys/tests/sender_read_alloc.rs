@@ -65,7 +65,9 @@ fn a_sender_read_allocates_nothing() {
                 Ok(ReadOutcome::Pending) => break,
                 Err(error) => panic!("{error:?}"),
             }
-            reader.sent(reader.position()).unwrap();
+            if let Some(boundary) = reader.boundary_at_or_below(reader.position()) {
+                reader.sent(boundary).unwrap();
+            }
         }
         reads
     });
