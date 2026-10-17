@@ -34,9 +34,15 @@ impl FakeRtt {
 }
 
 impl RttSource for FakeRtt {
+    /// The image's path (1 in these tests) has the set RTT; any other path
+    /// a far larger one, so a wrong path shows in the retry timing.
     fn rtt_snapshot(&self, path: usize) -> u64 {
         self.asked.set(Some(path));
-        self.rtt.get()
+        if path == 1 {
+            self.rtt.get()
+        } else {
+            self.rtt.get() * 1_000
+        }
     }
 }
 
@@ -111,7 +117,7 @@ fn the_configuration_is_checked() {
 fn a_detected_hole_is_due_at_once() {
     let mut loss = image();
     assert_eq!(loss.due(lane(0), 0), None);
-    loss.observe(lane(0), hole(4096, 256), 10);
+    let _ = loss.observe(lane(0), hole(4096, 256), 10);
     let nak = loss.due(lane(0), 10).unwrap();
     assert_eq!(
         (nak.alias, nak.identity, nak.receiver),
@@ -129,7 +135,7 @@ fn a_detected_hole_is_due_at_once() {
     assert_eq!(loss.due(lane(0), 11), Some(nak));
     // Lanes are independent; one outside the image is ignored.
     assert_eq!(loss.due(lane(1), 11), None);
-    loss.observe(lane(3), hole(0, 32), 11);
+    let _ = loss.observe(lane(3), hole(0, 32), 11);
     assert_eq!(loss.due(lane(3), 11), None);
     let counters = loss.counters();
     assert_eq!((counters.detected, counters.not_submitted), (1, 1));
@@ -142,7 +148,7 @@ fn a_detected_hole_is_due_at_once() {
 fn the_retry_waits_one_rtt_from_submission() {
     let mut loss = image();
     let rtt = FakeRtt::new(1_000);
-    loss.observe(lane(0), hole(0, 64), 0);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
     let nak = loss.due(lane(0), 0).unwrap();
     loss.submitted(&nak, 100, &rtt);
     assert_eq!(rtt.asked.get(), Some(1));
@@ -164,18 +170,18 @@ fn the_retry_waits_one_rtt_from_submission() {
 fn repairs_partial_repairs_and_new_holes() {
     let mut loss = image();
     let rtt = FakeRtt::new(1_000);
-    loss.observe(lane(0), hole(0, 128), 0);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
     let nak = loss.due(lane(0), 0).unwrap();
     loss.submitted(&nak, 0, &rtt);
     // The front 64 bytes arrived: the remainder waits for the same retry.
-    loss.observe(lane(0), hole(64, 64), 500);
+    let _ = loss.observe(lane(0), hole(64, 64), 500);
     assert_eq!(loss.due(lane(0), 999), None);
     let retry = loss.due(lane(0), 1_000).unwrap();
     assert_eq!((retry.range.start, retry.range.length), (64, 64));
     // A hole elsewhere: a new decision, due at once.
-    loss.observe(lane(0), hole(4096, 32), 1_001);
+    let _ = loss.observe(lane(0), hole(4096, 32), 1_001);
     assert_eq!(loss.due(lane(0), 1_001).unwrap().range.start, 4096);
-    loss.observe(lane(0), None, 1_002);
+    let _ = loss.observe(lane(0), None, 1_002);
     assert_eq!(loss.due(lane(0), 5_000), None);
     let counters = loss.counters();
     assert_eq!(
@@ -194,9 +200,9 @@ fn repairs_partial_repairs_and_new_holes() {
 fn a_stale_submission_records_nothing() {
     let mut loss = image();
     let rtt = FakeRtt::new(1_000);
-    loss.observe(lane(0), hole(0, 128), 0);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
     let nak = loss.due(lane(0), 0).unwrap();
-    loss.observe(lane(0), hole(0, 64), 1);
+    let _ = loss.observe(lane(0), hole(0, 64), 1);
     loss.submitted(&nak, 2, &rtt);
     // Still due: the NAK for the old interval was not this hole's.
     assert_eq!(loss.due(lane(0), 3).unwrap().range.length, 64);
@@ -208,7 +214,7 @@ fn a_stale_submission_records_nothing() {
 fn replies_must_echo_the_outstanding_nak() {
     let mut loss = image();
     let rtt = FakeRtt::new(1_000);
-    loss.observe(lane(0), hole(0, 128), 0);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
     let nak = loss.due(lane(0), 0).unwrap();
     // Nothing outstanding yet.
     assert_eq!(
@@ -256,7 +262,7 @@ fn replies_must_echo_the_outstanding_nak() {
 fn range_invalid_closes_at_the_limit() {
     let mut loss = image();
     let rtt = FakeRtt::new(1_000);
-    loss.observe(lane(0), hole(0, 128), 0);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
     let nak = loss.due(lane(0), 0).unwrap();
     loss.submitted(&nak, 0, &rtt);
     let invalid = reply_to(&nak, NakReplyReason::RangeInvalid);
@@ -267,7 +273,7 @@ fn range_invalid_closes_at_the_limit() {
     assert_eq!(loss.due(lane(0), 999), None);
     assert!(loss.due(lane(0), 1_000).is_some());
     // A partial repair is another interval: the count starts over.
-    loss.observe(lane(0), hole(32, 96), 1_000);
+    let _ = loss.observe(lane(0), hole(32, 96), 1_000);
     let nak = loss.due(lane(0), 1_000).unwrap();
     loss.submitted(&nak, 1_000, &rtt);
     let invalid = reply_to(&nak, NakReplyReason::RangeInvalid);
@@ -276,7 +282,7 @@ fn range_invalid_closes_at_the_limit() {
     }
     assert!(!loss.is_closed());
     // Another lane has a NAK due when the image closes.
-    loss.observe(lane(1), hole(0, 32), 1_000);
+    let _ = loss.observe(lane(1), hole(0, 32), 1_000);
     assert!(loss.due(lane(1), 1_000).is_some());
     assert_eq!(
         loss.reply(&invalid, WINDOW_END),
@@ -293,8 +299,8 @@ fn range_invalid_closes_at_the_limit() {
     assert_eq!(loss.due(lane(0), 10_000), None);
     assert_eq!(loss.due(lane(1), 10_000), None);
     let detected = loss.counters().detected;
-    loss.observe(lane(1), hole(4096, 32), 10_000);
-    loss.observe(lane(0), None, 10_000);
+    let _ = loss.observe(lane(1), hole(4096, 32), 10_000);
+    let _ = loss.observe(lane(0), None, 10_000);
     let counters = loss.counters();
     assert_eq!((counters.detected, counters.repaired), (detected, 0));
     assert_eq!((counters.range_invalid, counters.protocol_faults), (5, 1));
@@ -307,7 +313,7 @@ fn range_invalid_closes_at_the_limit() {
 fn range_unavailable_makes_the_whole_hole_unrecoverable() {
     let mut loss = image();
     let rtt = FakeRtt::new(1_000);
-    loss.observe(lane(0), hole(0, 128), 0);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
     let nak = loss.due(lane(0), 0).unwrap();
     loss.submitted(&nak, 0, &rtt);
     let unavailable = reply_to(
@@ -330,11 +336,11 @@ fn range_unavailable_makes_the_whole_hole_unrecoverable() {
     assert!(!loss.is_closed());
     // Never requested again, not even the retained suffix.
     assert_eq!(loss.due(lane(0), 100_000), None);
-    loss.observe(lane(0), hole(64, 64), 100_000);
+    let _ = loss.observe(lane(0), hole(64, 64), 100_000);
     assert_eq!(loss.due(lane(0), 100_000), None);
     // The gap owner skipped it: the next hole is a new decision.
-    loss.observe(lane(0), None, 100_001);
-    loss.observe(lane(0), hole(4096, 32), 100_002);
+    let _ = loss.observe(lane(0), None, 100_001);
+    let _ = loss.observe(lane(0), hole(4096, 32), 100_002);
     assert!(loss.due(lane(0), 100_002).is_some());
     let counters = loss.counters();
     assert_eq!((counters.range_unavailable, counters.repaired), (1, 0));
@@ -346,7 +352,7 @@ fn range_unavailable_makes_the_whole_hole_unrecoverable() {
 fn a_floor_beyond_the_window_cannot_resume() {
     let mut loss = image();
     let rtt = FakeRtt::new(1_000);
-    loss.observe(lane(0), hole(0, 128), 0);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
     let nak = loss.due(lane(0), 0).unwrap();
     loss.submitted(&nak, 0, &rtt);
     let beyond = reply_to(
@@ -380,8 +386,8 @@ fn a_floor_beyond_the_window_cannot_resume() {
 fn one_unresolved_uncertain_nak_per_image() {
     let mut loss = image();
     let rtt = FakeRtt::new(1_000);
-    loss.observe(lane(0), hole(0, 64), 0);
-    loss.observe(lane(1), hole(0, 64), 0);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    let _ = loss.observe(lane(1), hole(0, 64), 0);
     let first = loss.due(lane(0), 0).unwrap();
     loss.uncertain(&first, 10, &rtt).unwrap();
     // Its retry is due one RTT after the report, from new storage.
@@ -401,9 +407,237 @@ fn one_unresolved_uncertain_nak_per_image() {
 #[test]
 fn an_unnameable_hole_is_counted() {
     let mut loss = image();
-    loss.observe(lane(0), hole(16, 64), 0);
+    let _ = loss.observe(lane(0), hole(16, 64), 0);
     assert_eq!(loss.due(lane(0), 0), None);
-    loss.observe(lane(1), hole(0, 48), 0);
+    let _ = loss.observe(lane(1), hole(0, 48), 0);
     assert_eq!(loss.due(lane(1), 0), None);
     assert_eq!(loss.counters().unnameable, 2);
+}
+
+/// #278 review P2 (RC-9, ACS 15712): late data splits a NAKed hole; the
+/// remainder beyond the split is the same decision, and once
+/// RANGE_UNAVAILABLE answered the span it is unrecoverable at once,
+/// never NAKed again.
+#[test]
+fn a_split_hole_stays_one_decision_and_is_unrecoverable_whole() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 1024), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    // Late original data fills [256, 512): the first hole is [0, 256).
+    let _ = loss.observe(lane(0), hole(0, 256), 10);
+    let unavailable = reply_to(
+        &nak,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: 2048,
+        },
+    );
+    assert!(matches!(
+        loss.reply(&unavailable, WINDOW_END),
+        ReplyOutcome::Unrecoverable {
+            hole: Hole {
+                start: 0,
+                length: 256
+            },
+            ..
+        }
+    ));
+    // The gap owner skips [0, 256): the next hole is [512, 1024), inside
+    // the span, unrecoverable at once.
+    assert_eq!(
+        loss.observe(lane(0), hole(512, 512), 20),
+        Observation::Unrecoverable {
+            lane: lane(0),
+            hole: Hole {
+                start: 512,
+                length: 512,
+            },
+            lowest_retained: 2048,
+        }
+    );
+    assert_eq!(loss.due(lane(0), 100_000), None);
+    // A hole past the span is a new decision.
+    let _ = loss.observe(lane(0), hole(4096, 32), 30);
+    assert!(loss.due(lane(0), 30).is_some());
+}
+
+/// Without a reply, the split remainder keeps the decision's anchors: its
+/// retry waits for the original RTT, it is not a new hole due at once.
+#[test]
+fn a_split_remainder_keeps_its_anchors() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 1024), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    let _ = loss.observe(lane(0), hole(0, 256), 10);
+    // [0, 256) arrives; [512, 1024) is still missing.
+    let _ = loss.observe(lane(0), hole(512, 512), 20);
+    assert_eq!(loss.due(lane(0), 999), None);
+    assert_eq!(loss.due(lane(0), 1_000).unwrap().range.start, 512);
+    assert_eq!(loss.counters().detected, 1);
+}
+
+/// A hole that shrinks from its end in AwaitRepair is the same hole.
+#[test]
+fn a_hole_shrinking_from_its_end_keeps_its_anchors() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    let _ = loss.observe(lane(0), hole(0, 64), 10);
+    assert_eq!(loss.due(lane(0), 999), None);
+    assert_eq!(loss.due(lane(0), 1_000).unwrap().range.length, 64);
+    assert_eq!(loss.counters().detected, 1);
+}
+
+/// RANGE_INVALID echoing the NAK of the larger interval, after a partial
+/// repair, does not count toward the new interval's limit.
+#[test]
+fn a_stale_range_invalid_does_not_count() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    let _ = loss.observe(lane(0), hole(64, 64), 10);
+    let invalid = reply_to(&nak, NakReplyReason::RangeInvalid);
+    for _ in 0..5 {
+        assert_eq!(loss.reply(&invalid, WINDOW_END), ReplyOutcome::StillDue);
+    }
+    assert!(!loss.is_closed());
+}
+
+/// RANGE_INVALID counts start over on a new hole elsewhere.
+#[test]
+fn range_invalid_counts_start_over_on_a_new_hole() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    let invalid = reply_to(&nak, NakReplyReason::RangeInvalid);
+    for _ in 0..2 {
+        assert_eq!(loss.reply(&invalid, WINDOW_END), ReplyOutcome::StillDue);
+    }
+    let _ = loss.observe(lane(0), hole(8192, 64), 10);
+    let nak = loss.due(lane(0), 10).unwrap();
+    loss.submitted(&nak, 10, &rtt);
+    let invalid = reply_to(&nak, NakReplyReason::RangeInvalid);
+    for _ in 0..2 {
+        assert_eq!(loss.reply(&invalid, WINDOW_END), ReplyOutcome::StillDue);
+    }
+    assert!(!loss.is_closed());
+}
+
+/// A floor at or below the hole's start contradicts RANGE_UNAVAILABLE:
+/// still unrecoverable, and counted.
+#[test]
+fn a_contradictory_floor_is_an_anomaly() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(256, 128), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    let below = reply_to(
+        &nak,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: 256,
+        },
+    );
+    assert!(matches!(
+        loss.reply(&below, WINDOW_END),
+        ReplyOutcome::Unrecoverable { .. }
+    ));
+    assert_eq!(loss.counters().anomalies, 1);
+}
+
+/// The longest nameable hole is a whole maximal term; one longer, or an
+/// empty one, is not, and each decision counts the fault once.
+#[test]
+fn nak_lengths_are_bounded() {
+    let mut loss = image();
+    let _ = loss.observe(lane(0), hole(0, MAX_NAK_LENGTH), 0);
+    assert_eq!(loss.due(lane(0), 0).unwrap().range.length, MAX_NAK_LENGTH);
+    let _ = loss.observe(lane(1), hole(0, MAX_NAK_LENGTH + 32), 0);
+    assert_eq!(loss.due(lane(1), 0), None);
+    assert_eq!(loss.due(lane(1), 1), None);
+    assert_eq!(loss.counters().unnameable, 1);
+    let _ = loss.observe(lane(1), None, 2);
+    let _ = loss.observe(lane(1), hole(64, 0), 2);
+    assert_eq!(loss.due(lane(1), 2), None);
+    assert_eq!(loss.counters().unnameable, 2);
+}
+
+/// A clock stepped back behind a submission does not make the retry due.
+#[test]
+fn a_clock_stepped_back_does_not_retry() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 5_000, &rtt);
+    assert_eq!(loss.due(lane(0), 4_000), None);
+    assert!(loss.due(lane(0), 6_000).is_some());
+}
+
+/// Counters after each step: a first send is no retry.
+#[test]
+fn retries_count_only_second_sends() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    assert_eq!((loss.counters().submitted, loss.counters().retries), (1, 0));
+    let nak = loss.due(lane(0), 1_000).unwrap();
+    loss.submitted(&nak, 1_000, &rtt);
+    assert_eq!((loss.counters().submitted, loss.counters().retries), (2, 1));
+}
+
+/// A reply on another lane after the image closed is unmatched.
+#[test]
+fn a_reply_after_the_close_is_unmatched() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    let _ = loss.observe(lane(1), hole(0, 64), 0);
+    let first = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&first, 0, &rtt);
+    let second = loss.due(lane(1), 0).unwrap();
+    loss.submitted(&second, 0, &rtt);
+    let beyond = reply_to(
+        &first,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: WINDOW_END,
+        },
+    );
+    assert!(matches!(
+        loss.reply(&beyond, WINDOW_END),
+        ReplyOutcome::GapCannotResume { .. }
+    ));
+    assert_eq!(
+        loss.reply(&reply_to(&second, NakReplyReason::RangeInvalid), WINDOW_END),
+        ReplyOutcome::Unmatched
+    );
+}
+
+/// The span is the decision's first NAK: retrying a fragment inside it
+/// keeps it, so the far remainder is still the same decision.
+#[test]
+fn a_fragment_retry_keeps_the_span() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 1024), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    let _ = loss.observe(lane(0), hole(0, 256), 10);
+    let retry = loss.due(lane(0), 1_000).unwrap();
+    assert_eq!(retry.range.length, 256);
+    loss.submitted(&retry, 1_000, &rtt);
+    let _ = loss.observe(lane(0), hole(512, 512), 1_010);
+    assert_eq!(loss.due(lane(0), 1_010), None);
+    assert_eq!(loss.counters().detected, 1);
 }

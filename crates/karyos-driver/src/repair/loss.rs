@@ -159,6 +159,41 @@ struct LaneLoss {
     decision: Decision,
     /// Consecutive `RANGE_INVALID` replies for the current interval.
     invalid: u32,
+    /// The range of the decision's first NAK: a later hole inside it is
+    /// the same decision, with the same anchors, after late data split it.
+    span: Option<Hole>,
+    /// `RANGE_UNAVAILABLE` answered the span, with this lowest retained
+    /// position: a later hole inside it is unrecoverable at once (RC-9).
+    unavailable: Option<u64>,
+    /// The decision's hole was found unnameable (counted once).
+    unnameable: bool,
+}
+
+impl LaneLoss {
+    const IDLE: Self = Self {
+        decision: Decision::NoGap,
+        invalid: 0,
+        span: None,
+        unavailable: None,
+        unnameable: false,
+    };
+}
+
+/// What an observation found that the gap owner must act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observation {
+    /// Nothing for the gap owner.
+    Nothing,
+    /// A hole inside a span `RANGE_UNAVAILABLE` already answered: it is
+    /// unrecoverable at once, never NAKed again (RC-9, ACS 15712).
+    Unrecoverable {
+        /// The lane.
+        lane: Lane,
+        /// The hole.
+        hole: Hole,
+        /// The lowest retained position of the span's reply.
+        lowest_retained: u64,
+    },
 }
 
 /// What a reply did.
@@ -240,6 +275,9 @@ pub struct LossCounters {
     pub protocol_faults: u64,
     /// Closes with `GapCannotResume`.
     pub gap_cannot_resume: u64,
+    /// `RANGE_UNAVAILABLE` replies whose lowest retained position is at or
+    /// below the hole's start: contradictory, counted.
+    pub anomalies: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -306,10 +344,7 @@ impl ImageLoss {
             receiver,
             path,
             closed: false,
-            lanes: [LaneLoss {
-                decision: Decision::NoGap,
-                invalid: 0,
-            }; MAX_LANES],
+            lanes: [LaneLoss::IDLE; MAX_LANES],
             lane_count,
             uncertain: false,
             faulted: false,
@@ -338,17 +373,26 @@ impl ImageLoss {
     }
 
     /// The lane's first hole at `now`, as the receive owner reports it
-    /// (`None` while nothing above the prefix is missing). A new hole is
-    /// detected; a smaller one inside the current hole is a partial repair
-    /// and keeps every anchor; a hole elsewhere replaces the decision; no
-    /// hole ends it as repaired. An unrecoverable hole stays until the gap
-    /// owner resolves it (the hole then moves on).
-    pub fn observe(&mut self, lane: Lane, hole: Option<Hole>, now: u64) {
+    /// (`None` while nothing above the prefix is missing).
+    ///
+    /// - A new hole is detected and due at once.
+    /// - A hole inside the current one is a partial repair: it keeps every
+    ///   anchor, and the `RANGE_INVALID` count starts over.
+    /// - A hole inside the span of the decision's NAK, after late data
+    ///   split it, is the same decision with the same anchors; once
+    ///   `RANGE_UNAVAILABLE` answered that span it is unrecoverable at
+    ///   once, which the return value hands to the gap owner.
+    /// - A hole elsewhere replaces the decision; no hole ends it.
+    ///
+    /// Besides [`ImageLoss::reply`], this is the only path by which RC-9
+    /// reaches the gap owner: the caller acts on both.
+    #[must_use = "an unrecoverable hole must reach the gap owner"]
+    pub fn observe(&mut self, lane: Lane, hole: Option<Hole>, now: u64) -> Observation {
         if self.closed {
-            return;
+            return Observation::Nothing;
         }
         let Some(state) = self.lane_mut(lane) else {
-            return;
+            return Observation::Nothing;
         };
         let current = match state.decision {
             Decision::NoGap => None,
@@ -356,26 +400,35 @@ impl ImageLoss {
             | Decision::AwaitRepair { hole, .. }
             | Decision::Unrecoverable { hole } => Some(hole),
         };
+        let in_span = |seen: Hole| state.span.is_some_and(|span| span.contains(seen));
         let mut event: Option<fn(&mut LossCounters) -> &mut u64> = None;
+        let mut observation = Observation::Nothing;
         match (current, hole) {
             (None, None) => {}
             (Some(_), None) => {
                 if !matches!(state.decision, Decision::Unrecoverable { .. }) {
                     event = Some(|c| &mut c.repaired);
                 }
-                *state = LaneLoss {
-                    decision: Decision::NoGap,
-                    invalid: 0,
-                };
+                *state = LaneLoss::IDLE;
             }
             (Some(held), Some(seen)) if held == seen => {}
-            (Some(held), Some(seen)) if held.contains(seen) => {
-                // Partial repair: the remainder keeps its anchors.
-                match &mut state.decision {
-                    Decision::NakDue { hole, .. }
-                    | Decision::AwaitRepair { hole, .. }
-                    | Decision::Unrecoverable { hole } => *hole = seen,
-                    Decision::NoGap => {}
+            (Some(held), Some(seen)) if held.contains(seen) || in_span(seen) => {
+                if let Some(lowest_retained) = state.unavailable {
+                    state.decision = Decision::Unrecoverable { hole: seen };
+                    observation = Observation::Unrecoverable {
+                        lane,
+                        hole: seen,
+                        lowest_retained,
+                    };
+                } else {
+                    // A partial repair, or late data split the span: the
+                    // remainder keeps its anchors.
+                    match &mut state.decision {
+                        Decision::NakDue { hole, .. }
+                        | Decision::AwaitRepair { hole, .. }
+                        | Decision::Unrecoverable { hole } => *hole = seen,
+                        Decision::NoGap => {}
+                    }
                 }
                 // Another interval: RANGE_INVALID counts start over.
                 state.invalid = 0;
@@ -387,7 +440,7 @@ impl ImageLoss {
                         hole: seen,
                         detected_at: now,
                     },
-                    invalid: 0,
+                    ..LaneLoss::IDLE
                 };
                 event = Some(|c| &mut c.detected);
             }
@@ -395,6 +448,7 @@ impl ImageLoss {
         if let Some(field) = event {
             self.counters.bump(field);
         }
+        observation
     }
 
     /// The NAK due on `lane` at `now`, if any: a hole just detected or
@@ -423,7 +477,11 @@ impl ImageLoss {
             && hole.start.is_multiple_of(u64::from(FRAME))
             && hole.end().is_some();
         if !nameable {
-            self.counters.bump(|c| &mut c.unnameable);
+            // Never from a valid receive owner: one fault per decision.
+            if !state.unnameable {
+                state.unnameable = true;
+                self.counters.bump(|c| &mut c.unnameable);
+            }
             return None;
         }
         Some(Nak {
@@ -476,8 +534,9 @@ impl ImageLoss {
         Ok(())
     }
 
-    /// The backend resolved the image's uncertain NAKs (the endpoint
-    /// reset): submissions resume.
+    /// The image's uncertain NAKs are resolved, by the endpoint reset or
+    /// by the late completion (release proof) of the uncertain NAK:
+    /// submissions resume.
     pub fn uncertain_resolved(&mut self) {
         self.uncertain = false;
         self.faulted = false;
@@ -501,6 +560,11 @@ impl ImageLoss {
         if hole != requested {
             // Not the lane's current hole: a stale NAK.
             return;
+        }
+        // The decision's first NAK sets its span; retries of fragments
+        // inside it keep it.
+        if !state.span.is_some_and(|span| span.contains(requested)) {
+            state.span = Some(requested);
         }
         state.decision = Decision::AwaitRepair {
             hole,
@@ -541,10 +605,20 @@ impl ImageLoss {
         let Some(state) = self.lane_mut(lane) else {
             return ReplyOutcome::Unmatched;
         };
-        let Decision::AwaitRepair { hole, .. } = state.decision else {
+        let Decision::AwaitRepair {
+            hole, requested, ..
+        } = state.decision
+        else {
             return ReplyOutcome::Unmatched;
         };
         match reply.reason {
+            // An echo of a NAK for a larger interval, from before a partial
+            // repair, keeps the hole due but does not count toward the
+            // limit of the current interval.
+            NakReplyReason::RangeInvalid if requested != hole => {
+                self.counters.bump(|c| &mut c.range_invalid);
+                ReplyOutcome::StillDue
+            }
             NakReplyReason::RangeInvalid => {
                 // A count past `u32` is past any limit.
                 let next = state.invalid.checked_add(1);
@@ -566,7 +640,13 @@ impl ImageLoss {
             }
             NakReplyReason::RangeUnavailable { lowest_retained } => {
                 state.decision = Decision::Unrecoverable { hole };
+                state.unavailable = Some(lowest_retained);
                 self.counters.bump(|c| &mut c.range_unavailable);
+                // A floor at or below the hole's start contradicts the
+                // refusal: still unrecoverable, and counted.
+                if lowest_retained <= hole.start {
+                    self.counters.bump(|c| &mut c.anomalies);
+                }
                 if lowest_retained >= window_end {
                     self.closed = true;
                     self.counters.bump(|c| &mut c.gap_cannot_resume);
