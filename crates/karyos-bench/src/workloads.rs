@@ -81,7 +81,8 @@ pub enum Workload {
     /// received frames: the first touch of its memory (N-5).
     ImageFirstFill,
     /// Appends to an Archive segment store on a real disk, never synced
-    /// (`crate::archive`).
+    /// (`crate::archive`): `(warmup + iterations) × message` bytes written
+    /// to the run directory, removed afterwards.
     ArchiveAppend,
     /// Appends to an Archive segment store and syncs each append, data
     /// then index (`crate::archive`).

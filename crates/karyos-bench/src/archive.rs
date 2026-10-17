@@ -8,6 +8,11 @@
 //! - `archive-sync` appends and then syncs each time: data, then index, as
 //!   a durable position needs. It is a `required` recording's worst case.
 //!
+//! Disk use: a run writes `(warmup + iterations) × message` bytes of data,
+//! plus a 32-byte index entry per append and a 48-byte header per
+//! segment; `archive-append` at 64 KiB and 100 000 iterations writes about
+//! 7 GB. Choose `--iterations` for the disk measured.
+//!
 //! The store lives in a fresh directory under the system's temporary
 //! directory, or under `KARYOS_BENCH_DIR` to measure a chosen disk, and is
 //! removed when the run ends, a panic included. Segments are four terms
@@ -29,9 +34,12 @@ use karyos_archive::segment::{Geometry, SegmentStore, SyncPolicy};
 /// Where an archive run wrote, and how it synced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveRun {
-    /// The directory the segments were written in.
+    /// The directory the segments were written in, through
+    /// [`crate::env::clean`]: no quote or backslash, so the history line
+    /// needs no escaping.
     pub dir: String,
-    /// Its filesystem, where the host says (`unknown` otherwise).
+    /// Its filesystem, where the host says (`unknown` otherwise), cleaned
+    /// the same way.
     pub filesystem: String,
     /// The store's sync policy, and for `archive-sync` the explicit sync
     /// after every append.
