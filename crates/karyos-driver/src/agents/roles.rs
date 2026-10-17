@@ -409,6 +409,10 @@ struct Installed {
     window: u32,
     /// When the last SM was due; `None` before the first.
     sm_last: Option<u64>,
+    /// The consumption its SMs reported per lane, which they never lower:
+    /// a required reader joining during a sample may count below it, and
+    /// the sender would take a lower report for a replay.
+    sm_reported: [u64; 4],
     /// The control ring slot of its next SM, while none waits (S1: one SM
     /// slot per binding).
     sm_slot: Option<Reservation>,
@@ -857,6 +861,7 @@ impl ReceiverRole {
             last_fresh: now,
             window,
             sm_last: None,
+            sm_reported: [0; 4],
             sm_slot: Some(sm_slot),
             sm,
             evidence: now,
@@ -939,12 +944,19 @@ impl ReceiverRole {
         image.sm_last = Some(now);
         let mut entries = [LaneStatus::default(); 4];
         let count = usize::from(image.lane_count);
-        for (lane, entry) in entries.iter_mut().take(count).enumerate() {
-            let consumption = u8::try_from(lane)
+        for ((lane, entry), reported) in entries
+            .iter_mut()
+            .take(count)
+            .enumerate()
+            .zip(image.sm_reported.iter_mut())
+        {
+            let sampled = u8::try_from(lane)
                 .ok()
                 .and_then(|lane| Lane::try_new(lane).ok())
                 .and_then(|lane| image.owner.consumption(lane))
                 .unwrap_or(0);
+            let consumption = sampled.max(*reported);
+            *reported = consumption;
             *entry = LaneStatus {
                 consumption,
                 window: image.window,

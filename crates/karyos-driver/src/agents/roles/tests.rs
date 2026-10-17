@@ -924,6 +924,7 @@ fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
         last_fresh: 0,
         window: 32_768,
         sm_last: None,
+        sm_reported: [0; 4],
         sm_slot: None,
         sm: Arc::new(super::SmSlot::default()),
         evidence: 0,
@@ -1084,4 +1085,33 @@ fn an_unconfirmed_receiver_bounds_at_its_joins() {
         ..alias()
     };
     assert_eq!(sender.consumption(endpoint, other), None);
+}
+
+/// An image's SMs never lower a lane's reported consumption: a sample
+/// below an earlier report (a required reader joining during a sample)
+/// reports the earlier value, which the sender would otherwise take for a
+/// replay; a higher sample is reported as it is.
+#[test]
+fn an_sm_never_lowers_its_consumption() {
+    use karyos_protocol::network::StatusMessage;
+
+    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (mut image, _) = installed_image();
+    // Reported 4096 before; the image's sample is now 0.
+    image.sm_reported[0] = 4096;
+    receiver.images.push(image);
+    let sent = |receiver: &mut super::ReceiverRole, now| {
+        receiver.send_sm(0, now);
+        let Ok(Some(super::ControlItem::Outgoing {
+            control: Control::Status(StatusMessage { lanes, .. }),
+            ..
+        })) = sender.from_receiver.try_take()
+        else {
+            panic!("no SM");
+        };
+        lanes.as_slice()[0].consumption
+    };
+    assert_eq!(sent(&mut receiver, 1), 4096);
+    receiver.images[0].sm_reported[0] = 0;
+    assert_eq!(sent(&mut receiver, 2), 0);
 }

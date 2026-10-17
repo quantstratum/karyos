@@ -3819,6 +3819,23 @@ impl<O: BufferOwner> Conductor<O> {
         })
     }
 
+    /// [`Conductor::subscribe`] with `pause` called between the head read
+    /// and the admission (tests: a head raised there must move the join).
+    #[cfg(test)]
+    pub(crate) fn subscribe_pausing(
+        &mut self,
+        role: Role,
+        pause: &mut dyn FnMut(),
+    ) -> Result<Subscription<O>, SysError> {
+        let cursor = self
+            .context()
+            .subscribe_with_pausing(role, false, 0, pause)?;
+        Ok(Subscription {
+            buffer: self.buffer.clone(),
+            cursor,
+        })
+    }
+
     /// Registers a subscriber for a participant in another process, for
     /// export `export` (nonzero, never reused): the cell is attached as
     /// [`Conductor::subscribe`] attaches it, and its registration word
@@ -4655,6 +4672,18 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         reserve: bool,
         occupant: u64,
     ) -> Result<Cursor, SysError> {
+        self.subscribe_with_pausing(role, reserve, occupant, &mut || {})
+    }
+
+    /// [`Self::subscribe_with`], calling `pause` between the head read and
+    /// the admission.
+    fn subscribe_with_pausing(
+        &mut self,
+        role: Role,
+        reserve: bool,
+        occupant: u64,
+        pause: &mut dyn FnMut(),
+    ) -> Result<Cursor, SysError> {
         let buffer = self.buffer;
         let mut credited = 0u32;
         let mut free = None;
@@ -4689,6 +4718,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         debug_assert_eq!(cell.loan.load(Ordering::Relaxed), 0);
         let mut start = buffer.conductor_head()?;
         cell.position.store(start, Ordering::Relaxed);
+        pause();
         let state = match (role, reserve) {
             (Role::Required, false) => CELL_REQUIRED,
             (Role::Required, true) => CELL_REQUIRED_RESERVED,
