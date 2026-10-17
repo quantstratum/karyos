@@ -145,11 +145,15 @@ struct SendEndpoint {
     users: usize,
 }
 
-/// A network subscription of this driver (W3).
+/// A network subscription of this driver (W3): the receiver holds one
+/// entry per endpoint and stream, so the handles of one key are counted
+/// (#283 P2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NetSubscription {
     endpoint: EndpointId,
     stream_id: i32,
+    /// Handles of this key; the receiver's entry goes with the last.
+    users: usize,
 }
 
 /// Names a network subscription of one driver.
@@ -287,7 +291,12 @@ impl Network {
 
     /// Subscribes `stream_id` on the endpoint bound to `bind` (joined to
     /// `multicast`): the receiver challenges its announcements and
-    /// installs its images (control path).
+    /// installs its images (control path). A second subscription of the
+    /// same endpoint and stream shares the receiver's entry. The
+    /// receiver's answer is not awaited: a receiver whose subscription
+    /// table is full (`AgentConfig::subscriptions`) answers
+    /// `Configured { accepted: false }` and never challenges the stream,
+    /// so no image appears for it.
     ///
     /// # Errors
     ///
@@ -300,6 +309,22 @@ impl Network {
         max_term_length: u32,
     ) -> Result<NetworkSubscription, DriverError> {
         let endpoint = self.hold_endpoint(bind, multicast)?;
+        let handle = NetworkSubscription {
+            endpoint,
+            stream_id,
+        };
+        if let Some(entry) = self
+            .subscriptions
+            .iter_mut()
+            .find(|entry| (entry.endpoint, entry.stream_id) == (endpoint, stream_id))
+        {
+            let Some(users) = entry.users.checked_add(1) else {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::NetworkBusy);
+            };
+            entry.users = users;
+            return Ok(handle);
+        }
         let posted = self
             .links
             .receiver
@@ -316,11 +341,9 @@ impl Network {
         self.subscriptions.push(NetSubscription {
             endpoint,
             stream_id,
+            users: 1,
         });
-        Ok(NetworkSubscription {
-            endpoint,
-            stream_id,
-        })
+        Ok(handle)
     }
 
     /// Stops `subscription`: its images retire and its endpoint is
@@ -342,15 +365,25 @@ impl Network {
             endpoint,
             stream_id,
         } = subscription;
-        self.links
-            .receiver
-            .post(|reply| AgentCommand::RemoveSubscription {
-                reply,
-                endpoint,
-                stream_id,
-            })
-            .map_err(|_| DriverError::NetworkBusy)?;
-        self.subscriptions.swap_remove(index);
+        match self.subscriptions.get_mut(index) {
+            // Another handle still holds the receiver's entry.
+            Some(entry) if entry.users > 1 => {
+                if let Some(users) = entry.users.checked_sub(1) {
+                    entry.users = users;
+                }
+            }
+            _ => {
+                self.links
+                    .receiver
+                    .post(|reply| AgentCommand::RemoveSubscription {
+                        reply,
+                        endpoint,
+                        stream_id,
+                    })
+                    .map_err(|_| DriverError::NetworkBusy)?;
+                self.subscriptions.swap_remove(index);
+            }
+        }
         release(&mut self.send_endpoints, endpoint);
         Ok(true)
     }

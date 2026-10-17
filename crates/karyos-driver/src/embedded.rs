@@ -830,7 +830,9 @@ impl EmbeddedDriver<HeapTerms> {
     /// so the duty cycle prepares the image's terms as for a local stream.
     /// Returns `None`, with nothing added, when the key is in use (a local
     /// stream or an earlier image of the alias), the stream table is full
-    /// or a conductor was already issued.
+    /// or a conductor was already issued. A retiring stream keeps its key
+    /// until it frees, so a new image of that alias installed meanwhile
+    /// stays unexposed for its whole life (interim D2, #283 P3).
     pub(crate) fn add_image_aggregate(
         &mut self,
         lanes: &[Arc<LogBuffer>],

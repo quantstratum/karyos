@@ -226,11 +226,11 @@ fn a_second_image_of_one_alias_is_counted_not_exposed() {
     let mut c = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
     let address = free_address();
-    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
     let _first = a
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
-    let _second = c
+    let second = c
         .add_network_publication(aggregate(10, 3, 1), &channel(address))
         .unwrap();
     pump(&mut a, &mut b, |_, b| {
@@ -238,4 +238,50 @@ fn a_second_image_of_one_alias_is_counted_not_exposed() {
         b.network_images_unexposed() == 1
     });
     assert!(b.network_image(10, 3).is_some());
+    // The unexposed image is still fed past its first term: its terms are
+    // prepared by the network, so the reliable publisher is never held.
+    let mut lane = c.publication(second.lane(Lane::ZERO).unwrap()).unwrap();
+    let mut accepted = 0u32;
+    pump(&mut a, &mut b, |_, _| {
+        let _ = c.do_work().unwrap();
+        while accepted < 256 {
+            match lane.offer(&[5u8; 1000]).unwrap() {
+                OfferOutcome::Accepted { .. } => accepted += 1,
+                _ => break,
+            }
+        }
+        accepted == 256
+    });
+    // Removing the subscription retires both images; the unexposed one
+    // drops its conductors, so both are reclaimed.
+    assert!(b.remove_network_subscription(subscription).unwrap());
+    pump(&mut a, &mut b, |_, b| {
+        let _ = c.do_work().unwrap();
+        b.net.as_ref().unwrap().image_count() == 0
+    });
+}
+
+/// #283 P2: two subscriptions of one endpoint and stream share the
+/// receiver's entry; removing one leaves the image, removing the last
+/// retires it.
+#[test]
+fn subscriptions_of_one_key_are_counted() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let first = b.add_network_subscription(10, &channel(address)).unwrap();
+    let second = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    assert!(b.remove_network_subscription(first).unwrap());
+    for _ in 0..200 {
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+    }
+    assert!(b.network_image(10, 3).is_some(), "the other still holds it");
+    assert!(b.remove_network_subscription(second).unwrap());
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_none());
+    assert!(!b.remove_network_subscription(second).unwrap(), "gone");
 }
