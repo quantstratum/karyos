@@ -669,6 +669,41 @@ fn control_routes_survive_a_reset() {
     assert_eq!(after.send_failures, before.send_failures);
 }
 
+/// A removed publication's alias leaves the receiver's pre-filter, once
+/// (wiring note W-d, ACS 15929).
+#[test]
+fn a_published_alias_is_removed() {
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let add = AgentCommand::<OsSocket>::AddPublishedAlias {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias,
+    };
+    assert!(matches!(
+        role.command(add),
+        Some((_, AgentEvent::Configured { accepted: true, .. }))
+    ));
+    assert_eq!(role.published, [(EndpointId(1), alias)]);
+    for accepted in [true, false] {
+        let remove = AgentCommand::<OsSocket>::RemovePublishedAlias {
+            reply: replies.reserve().unwrap(),
+            endpoint: EndpointId(1),
+            alias,
+        };
+        assert!(matches!(
+            role.command(remove),
+            Some((_, AgentEvent::Configured { accepted: found, .. })) if found == accepted
+        ));
+    }
+    assert!(role.published.is_empty());
+}
+
 /// Two subscriptions of one stream on one endpoint: the stricter
 /// `max_image_term_length` holds, whatever their order.
 #[test]

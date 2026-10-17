@@ -782,6 +782,24 @@ impl ReceiverRole {
                     });
                 Some((reply, configured(accepted)))
             }
+            AgentCommand::RemovePublishedAlias {
+                reply,
+                endpoint,
+                alias,
+            } => {
+                let entry = (endpoint, alias);
+                let found = self.published.iter().position(|held| *held == entry);
+                if let Some(index) = found {
+                    self.published.swap_remove(index);
+                }
+                Some((reply, configured(found.is_some())))
+            }
+            AgentCommand::RemovePublication { reply, .. } => Some((
+                reply,
+                AgentEvent::Unsupported {
+                    agent: AgentKind::Receiver,
+                },
+            )),
             AgentCommand::AddPublication {
                 reply, publication, ..
             } => Some((
@@ -1782,8 +1800,14 @@ impl SenderRole {
                 publication,
                 outbound,
             } => (reply, publication, outbound),
+            AgentCommand::RemovePublication {
+                reply,
+                endpoint,
+                alias,
+            } => return Some((reply, self.remove(endpoint, alias))),
             AgentCommand::AddSubscription { reply, .. }
-            | AgentCommand::AddPublishedAlias { reply, .. } => {
+            | AgentCommand::AddPublishedAlias { reply, .. }
+            | AgentCommand::RemovePublishedAlias { reply, .. } => {
                 return Some((
                     reply,
                     AgentEvent::Unsupported {
@@ -1844,6 +1868,24 @@ impl SenderRole {
             },
         };
         Some((reply, event))
+    }
+
+    /// Stops the publication `alias` on `endpoint`: its SETUP side, its
+    /// bindings and its data path, which goes back to the conductor.
+    fn remove<O: SocketOps>(&mut self, endpoint: EndpointId, alias: Alias) -> AgentEvent<O> {
+        let _ = self.sessions.remove(endpoint, alias);
+        self.bindings
+            .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
+        let outbound = self
+            .publications
+            .iter()
+            .position(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
+            .map(|index| Box::new(self.publications.swap_remove(index)));
+        AgentEvent::PublicationRemoved {
+            endpoint,
+            alias,
+            outbound,
+        }
     }
 
     /// Frees the route slots of endpoints the agent no longer holds: their

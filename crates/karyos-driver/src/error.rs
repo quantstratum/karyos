@@ -31,6 +31,33 @@ pub enum DriverError {
     /// A network agent thread could not start.
     #[error("cannot start the network agent threads")]
     NetworkStart,
+    /// The driver has no network configured (`DriverConfig::network`).
+    #[error("no network is configured")]
+    NetworkUnavailable,
+    /// The channel uses a feature this driver does not wire yet (multi
+    /// destination, redundant paths, an interface name).
+    #[error("unsupported network channel")]
+    UnsupportedChannel,
+    /// A network endpoint could not be opened or its table is full.
+    #[error("network endpoint unavailable")]
+    NetworkEndpoint,
+    /// `AgentConfig::publications` network publications are held (being
+    /// added, active or being removed).
+    #[error("too many network publications")]
+    NetworkPublicationsFull,
+    /// A network agent's command ring is full; retry later.
+    #[error("network agent busy")]
+    NetworkBusy,
+    /// The driver's export and occupant ids are exhausted.
+    #[error("export ids exhausted")]
+    ExportIdsExhausted,
+    /// A network publication's lanes cannot be reconfigured yet: the
+    /// sender's readers follow one mapping.
+    #[error("stream {stream} is a network publication; it cannot be reconfigured")]
+    NetworkCutover {
+        /// The stream.
+        stream: u64,
+    },
     /// The stream handle does not name a live stream of this driver.
     #[error("unknown stream {stream}")]
     UnknownStream {

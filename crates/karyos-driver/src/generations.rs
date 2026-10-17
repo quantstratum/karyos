@@ -437,6 +437,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         reconfiguration: Reconfiguration,
     ) -> Result<PreparedCutover<T>, DriverError> {
         let max_retained = self.config.max_retained_generations;
+        // A network publication's sender readers follow one mapping; its
+        // cutover waits for the sender to follow successors (W2).
+        let target = self.active_stream_mut(stream)?;
+        let (id, registration) = (target.id, target.aggregate.registration);
+        if self
+            .net
+            .as_ref()
+            .is_some_and(|net| net.publication_state(registration).is_some())
+        {
+            return Err(DriverError::NetworkCutover { stream: id });
+        }
         let target = self.active_stream_mut(stream)?;
         // A guarded stream's walker and rings follow one mapping; cutovers
         // of guarded streams wait for G-d2.

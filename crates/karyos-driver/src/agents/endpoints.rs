@@ -600,6 +600,7 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::Stopped { .. }
             | AgentEvent::PublicationAdded { .. }
             | AgentEvent::PublicationRefused { .. }
+            | AgentEvent::PublicationRemoved { .. }
             | AgentEvent::Configured { .. }
             | AgentEvent::NetworkTraceSet { .. }
             | AgentEvent::NetworkJournalOpened { .. }
