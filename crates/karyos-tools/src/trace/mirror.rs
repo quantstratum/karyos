@@ -76,10 +76,13 @@
 //!   receiver journal stays expected, and one lost to a gap makes its trace
 //!   `Incomplete`, never a false `Complete`.
 //! - **Refused network journals.** Header word 7 counts the network
-//!   journals the driver refused; a rise since the last scan (any count at
-//!   the attach) puts every held message whose trace was not final out of
-//!   scope, as for a missed journal: the refused journal may have been
-//!   expected for any of them.
+//!   journals the driver refused, read before and again after the table;
+//!   a rise since the last scan (any count at the attach) puts every held
+//!   message whose trace was not final out of scope, as for a missed
+//!   journal. The word does not name the publication, and a refused journal
+//!   never exists, so a message published later would not expect it: from
+//!   the first refusal on, the tool reports no final `Complete` for its
+//!   life, each such trace out of scope and counted (ACS 15805).
 //!
 //! The tool cannot bound a trace's span in a journal, so the report's
 //! attribution uses `D = u64::MAX` (`quantstratum-docs:
@@ -410,6 +413,8 @@ pub struct MirrorTool {
     refused: Option<u64>,
     /// Scans that saw that count rise.
     refused_rises: u64,
+    /// That count of scans could not rise further.
+    refused_rises_overflowed: bool,
 }
 
 impl MirrorTool {
@@ -432,6 +437,7 @@ impl MirrorTool {
             finals: HashSet::new(),
             refused: None,
             refused_rises: 0,
+            refused_rises_overflowed: false,
         }
     }
 
@@ -511,11 +517,17 @@ impl MirrorTool {
             self.missed_events = self.missed_events.saturating_add(1);
             self.missed_numbers = self.missed_numbers.saturating_add(missed);
         }
+        // Read again after the table and the log: a refusal during the scan
+        // counts in this scan, not the next.
+        let refused = refused.max(reader.network_journals_refused());
         // Any refusal at the attach, or a rise since the last scan.
         let rose = refused > self.refused.unwrap_or(0);
         self.refused = Some(refused);
         if rose {
-            self.refused_rises = self.refused_rises.saturating_add(1);
+            match self.refused_rises.checked_add(1) {
+                Some(rises) => self.refused_rises = rises,
+                None => self.refused_rises_overflowed = true,
+            }
         }
         if missed > 0 || rose {
             // Every held message whose trace was not final after the last
@@ -575,6 +587,12 @@ impl MirrorTool {
     #[must_use]
     pub fn network_refused(&self) -> (u64, u64) {
         (self.refused_rises, self.refused.unwrap_or(0))
+    }
+
+    /// Whether the count of scans that saw a rise stopped rising.
+    #[must_use]
+    pub fn network_refused_overflowed(&self) -> bool {
+        self.refused_rises_overflowed
     }
 
     /// Scans that found missed journals, and the journal numbers missed
@@ -717,6 +735,10 @@ impl MirrorTool {
             report.out_of_scope_message(*publication, *lane, *position);
         }
         report.require_roots();
+        // The mirror's count does not name the refused publication.
+        if let Some(refused) = self.refused {
+            report.withhold_complete(refused);
+        }
         report.drain()?;
         Ok(report)
     }

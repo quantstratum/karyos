@@ -17,13 +17,19 @@ use std::process::Command;
 
 /// The normal dependencies of `package`, one crate per line.
 fn dependencies(package: &str) -> String {
-    let output = Command::new(env!("CARGO"))
+    // The cargo running the tests, at run time; every feature, so no
+    // feature can bring the crate in.
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let output = Command::new(cargo)
         .args([
             "tree",
             "-p",
             package,
             "-e",
             "normal",
+            "--all-features",
+            "--target",
+            "all",
             "--prefix",
             "none",
             "--offline",
