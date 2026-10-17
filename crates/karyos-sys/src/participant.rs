@@ -14,7 +14,7 @@
 use crate::error::SysError;
 use crate::loan::{participant_quiescent, revoke};
 use crate::registration;
-use crate::sync::{AtomicU64, Ordering};
+use crate::sync::{AtomicU64, Ordering, fence};
 
 /// A free cell: the conductor may admit a participant into it.
 pub const CELL_FREE: u64 = 0;
@@ -120,6 +120,32 @@ pub fn reader_minima<'a>(
         }
     }
     (bound, held)
+}
+
+/// Another thread's sample of the minimum position of the cells that bound
+/// the publication (an image's consumption, for its SMs), after `head`'s
+/// owner published its head: a SeqCst fence, then [`reader_minima`]'s
+/// bound. Paired with [`join_after_admit`]: a cell admitted after its head
+/// read is either seen here, or joins at a head at or above the one this
+/// thread published before the fence (store buffering, ruled out by the
+/// two fences).
+pub fn required_minimum<'a>(
+    cells: impl IntoIterator<Item = (&'a AtomicU64, &'a AtomicU64)>,
+) -> Option<u64> {
+    fence(Ordering::SeqCst);
+    reader_minima(cells).0
+}
+
+/// Conductor, after [`admit`]: the join position of a cell admitted at
+/// `start`, rechecked against `head` after a SeqCst fence, so that a
+/// [`required_minimum`] sample that missed the admission never reports a
+/// position above the join. The caller moves the cell's position (Release)
+/// and its cursor to the returned value; moving a join forward is a join
+/// at a later head, and a sample that saw the earlier position only
+/// reports less.
+pub fn join_after_admit(head: &AtomicU64, start: u64) -> u64 {
+    fence(Ordering::SeqCst);
+    head.load(Ordering::Acquire).max(start)
 }
 
 /// Whether a cell in `state` bounds the publication limit.

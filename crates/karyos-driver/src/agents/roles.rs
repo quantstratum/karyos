@@ -181,8 +181,8 @@ pub struct SenderCounters {
     /// confirmed bindings.
     pub bindings_full: u64,
     /// Publications whose endpoint needs a reset before they can send again
-    /// (a gauge, recomputed each cycle; the endpoint table acts on it in
-    /// its own PR, ACS 15721).
+    /// (a gauge, recomputed each cycle); each asks the endpoint table for
+    /// it (`AgentEvent::ResetRequested`).
     pub needs_reset: u64,
     /// Unconfirmed bindings evicted to make room for a new answer.
     pub bindings_evicted: u64,
@@ -192,6 +192,10 @@ pub struct SenderCounters {
     /// SMs whose consumption is below one already reported (replayed or
     /// reordered): the higher value is kept.
     pub sm_stale: u64,
+    /// Reset requests posted to the endpoint table.
+    pub reset_requests: u64,
+    /// Reset requests not posted: the event ring was full.
+    pub reset_requests_full: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -441,6 +445,8 @@ pub struct SenderRole {
     /// A confirmed binding lives this long without an SM
     /// (`image_liveness_timeout`).
     confirmed_timeout: u64,
+    /// Duty cycles run, for the reset request cadence.
+    cycle: u64,
     counters: SenderCounters,
 }
 
@@ -499,6 +505,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             max_bindings: config.receiver_bindings,
             unconfirmed_timeout: config.sessions.setup_challenge_timeout,
             confirmed_timeout: config.image_liveness_timeout,
+            cycle: 0,
             counters: SenderCounters::default(),
         },
         ReceiverRole {
@@ -638,6 +645,15 @@ impl ReceiverRole {
     #[cfg(test)]
     pub(super) fn live_paths(&self, slot: SlotRef) -> usize {
         self.sessions.paths().live(slot)
+    }
+
+    /// The last image evidence of the image at `slot` (tests).
+    #[cfg(test)]
+    pub(super) fn image_evidence(&self, slot: SlotRef) -> Option<u64> {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .map(|image| image.evidence)
     }
 
     /// Hands the receiver a DATA heartbeat on lane 0 of the image at
@@ -920,7 +936,8 @@ impl ReceiverRole {
     }
 
     /// Sends the SM of the image at `index`: every lane's consumption (its
-    /// rebuild position) and window, from the receiver block of this boot.
+    /// rebuild position, or its least required subscriber's position below
+    /// it) and window, from the receiver block of this boot.
     fn send_sm(&mut self, index: usize, now: u64) {
         let boot_id = self.sessions.boot_id();
         let Some(image) = self.images.get_mut(index) else {
@@ -933,7 +950,7 @@ impl ReceiverRole {
             let consumption = u8::try_from(lane)
                 .ok()
                 .and_then(|lane| Lane::try_new(lane).ok())
-                .and_then(|lane| image.owner.rebuild_position(lane))
+                .and_then(|lane| image.owner.consumption(lane))
                 .unwrap_or(0);
             *entry = LaneStatus {
                 consumption,
@@ -1448,6 +1465,12 @@ impl SenderRole {
         self.publications.get(index)
     }
 
+    /// The data path of its `index`-th publication, mutable (tests).
+    #[cfg(test)]
+    pub(crate) fn outbound_mut(&mut self, index: usize) -> Option<&mut Outbound> {
+        self.publications.get_mut(index)
+    }
+
     fn count(&mut self, field: fn(&mut SenderCounters) -> &mut u64) {
         let mut overflowed = self.counters.overflowed;
         bump(field(&mut self.counters), &mut overflowed);
@@ -1577,6 +1600,7 @@ impl SenderRole {
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
+        self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);
         // Bindings past their lifetime go even when nothing arrives.
         self.expire_bindings(now);
@@ -1668,6 +1692,31 @@ impl SenderRole {
         }
         self.counters.needs_reset = needing_reset;
         Ok(work)
+    }
+
+    /// Asks for the reset of each endpoint a publication needs reset on,
+    /// through `post` (which returns whether the request was posted): at
+    /// most once per [`RESET_REQUEST_CYCLES`](super::data::RESET_REQUEST_CYCLES)
+    /// per publication while the need holds. The cadence is per
+    /// publication, so `N` publications on one endpoint post up to `N`
+    /// requests per period; the endpoint table resets once and ignores the
+    /// others while the reset is in flight. Nothing allocates.
+    pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
+        let cycle = self.cycle;
+        for index in 0..self.publications.len() {
+            let Some(outbound) = self.publications.get_mut(index) else {
+                break;
+            };
+            if !outbound.reset_request_due(cycle) {
+                continue;
+            }
+            if post(outbound.endpoint()) {
+                outbound.reset_request_posted(cycle);
+                self.count(|c| &mut c.reset_requests);
+            } else {
+                self.count(|c| &mut c.reset_requests_full);
+            }
+        }
     }
 
     /// The least position every receiver bound to `alias` on `endpoint`

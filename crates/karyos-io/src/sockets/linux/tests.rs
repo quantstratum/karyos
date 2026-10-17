@@ -78,6 +78,7 @@ fn errno_values_match_rustix() {
         (Errno::NOSYS, OsErrno::NOSYS),
         (Errno::NOTSOCK, OsErrno::NOTSOCK),
         (Errno::MSGSIZE, OsErrno::MSGSIZE),
+        (Errno::ADDRINUSE, OsErrno::ADDRINUSE),
         (Errno::ADDRNOTAVAIL, OsErrno::ADDRNOTAVAIL),
         (Errno::NETDOWN, OsErrno::NETDOWN),
         (Errno::NETUNREACH, OsErrno::NETUNREACH),
