@@ -157,6 +157,9 @@ pub struct NetworkShutdown {
     pub late: Vec<LateAgent<OsSocket>>,
     /// Whether every agent that was handed back saw its stop flag.
     pub agents_stopped: bool,
+    /// Guard senders of network publications deregistered with the close,
+    /// so no guard close waits on them.
+    pub guard_senders_released: usize,
 }
 
 /// Where a network publication stands with the sender agent.
@@ -184,6 +187,9 @@ struct NetPublication {
     /// Whether `RemovePublication` is posted; retried while the ring is
     /// full.
     remove_posted: bool,
+    /// A guarded publication's sender gate, registered with the guard's
+    /// owner; released once the sender refused or returned it.
+    guard_sender: Option<crate::guard_ack::GuardSenderId>,
 }
 
 /// An endpoint shared by the publications and subscriptions bound to one
@@ -211,6 +217,27 @@ struct NetSubscription {
     control: Option<EndpointId>,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
+}
+
+/// Guard senders released for the conductor to deregister: at most one
+/// per tracked publication (allocated at start). One past that is dropped
+/// and counted, which the allocation makes unreachable.
+#[derive(Debug)]
+struct ReleasedGuards {
+    ids: Vec<crate::guard_ack::GuardSenderId>,
+    dropped: u64,
+}
+
+impl ReleasedGuards {
+    fn push(&mut self, id: crate::guard_ack::GuardSenderId) {
+        if self.ids.len() < self.ids.capacity() {
+            self.ids.push(id);
+        } else {
+            if let Some(count) = self.dropped.checked_add(1) {
+                self.dropped = count;
+            }
+        }
+    }
 }
 
 /// Names a network subscription of one driver.
@@ -293,6 +320,13 @@ pub(crate) struct Network {
     /// The network's time base, the agents' role clock: `host_monotonic_ns`
     /// (module documentation, Duty).
     clock: fn() -> u64,
+    /// Guard senders of publications the sender refused or returned, for
+    /// the conductor to deregister (at most one per tracked publication,
+    /// allocated at start).
+    released_guards: ReleasedGuards,
+    /// Guard senders the conductor failed to deregister (an unknown id):
+    /// counted, never retried.
+    guard_deregister_failures: u64,
     /// The NAK control groups of multicast data groups (RC-15).
     control_groups: ControlGroups,
     /// Control group joins that failed: those keys run without peer
@@ -340,6 +374,11 @@ impl Network {
             capacity: config.agents.publications,
             stale_overflows: 0,
             clock: karyos_sys::host_clock::host_monotonic_ns,
+            released_guards: ReleasedGuards {
+                ids: Vec::with_capacity(config.agents.publications),
+                dropped: 0,
+            },
+            guard_deregister_failures: 0,
             control_groups: config.nak_control_groups,
             control_join_failures: 0,
         })
@@ -754,7 +793,12 @@ impl Network {
         registration: u64,
         publication: Publication,
         outbound: Box<Outbound>,
+        guard: Option<(
+            crate::agents::data::GuardSpec,
+            crate::guard_ack::GuardSenderId,
+        )>,
     ) -> Result<(), DriverError> {
+        let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
         let (endpoint, alias) = (publication.endpoint, publication.alias);
         // One tracked publication per key: the sender's answers then name
         // exactly one entry, and a key freed locally while its old
@@ -807,7 +851,7 @@ impl Network {
                 reply,
                 publication,
                 outbound,
-                guard: None,
+                guard: spec,
             });
         if posted.is_err() {
             // The receiver learned the alias: it is stale now. The capacity
@@ -825,8 +869,14 @@ impl Network {
             alias,
             state: NetworkPublicationState::Adding,
             remove_posted: false,
+            guard_sender,
         });
         Ok(())
+    }
+
+    /// A released guard sender to deregister, each once.
+    pub(crate) fn pop_released_guard(&mut self) -> Option<crate::guard_ack::GuardSenderId> {
+        self.released_guards.ids.pop()
     }
 
     /// Starts removing the publication `registration`; `false` when it is
@@ -890,10 +940,16 @@ impl Network {
             },
             Agents::Closed => return Ok(0),
         };
-        let (received, sent) = work.map_err(|agent| {
-            self.failed = Some(agent);
-            DriverError::NetworkAgent { agent }
-        })?;
+        let (received, sent) = match work {
+            Ok(work) => work,
+            Err(agent) => {
+                // A failed agent never answers again (DN-9): every tracked
+                // guard sender is released, so no close waits on it.
+                self.failed = Some(agent);
+                self.release_guard_senders();
+                return Err(DriverError::NetworkAgent { agent });
+            }
+        };
         // Unsubscriptions the full ring refused earlier.
         // (None in steady state: nothing is taken or freed then.)
         // Retried in place, keeping the preallocated buffer.
@@ -922,7 +978,11 @@ impl Network {
         #[cfg(test)]
         let mut reopened = Some(self.reopened);
         let mut refusals = self.subscription_refusals;
-        let (publications, send_endpoints) = (&mut self.publications, &mut self.send_endpoints);
+        let (publications, send_endpoints, released) = (
+            &mut self.publications,
+            &mut self.send_endpoints,
+            &mut self.released_guards,
+        );
         let mut stale = Stale {
             queue: &mut self.stale_aliases,
             overflows: &mut self.stale_overflows,
@@ -952,7 +1012,7 @@ impl Network {
                 {
                     refusals = count;
                 }
-                publication_answer(publications, send_endpoints, &mut stale, event);
+                publication_answer(publications, send_endpoints, &mut stale, released, event);
             },
         );
         #[cfg(test)]
@@ -1025,7 +1085,34 @@ impl Network {
             shutdown.endpoints_retired = self.endpoints.reclaim(&self.links, &mut agents, |_| {});
         }
         let _ = self.images.poll(&self.links.sessions, |_| {});
+        // The agents are gone: every tracked guard sender is released for
+        // the conductor to deregister.
+        self.release_guard_senders();
         shutdown
+    }
+
+    /// Moves the guard sender of every tracked publication to the released
+    /// list (agents stopped or failed): the conductor deregisters them.
+    fn release_guard_senders(&mut self) {
+        for entry in &mut self.publications {
+            if let Some(id) = entry.guard_sender.take() {
+                self.released_guards.push(id);
+            }
+        }
+    }
+
+    /// Counts a guard sender the conductor could not deregister.
+    pub(crate) fn count_guard_deregister_failure(&mut self) {
+        if let Some(count) = self.guard_deregister_failures.checked_add(1) {
+            self.guard_deregister_failures = count;
+        }
+    }
+
+    /// Released guard senders dropped for a full list, and deregistrations
+    /// that failed (tests).
+    #[cfg(test)]
+    pub(crate) fn guard_release_counts(&self) -> (u64, u64) {
+        (self.released_guards.dropped, self.guard_deregister_failures)
     }
 
     /// Whether the agents still run.
@@ -1204,8 +1291,16 @@ fn publication_answer(
     publications: &mut Vec<NetPublication>,
     send_endpoints: &mut [SendEndpoint],
     stale: &mut Stale<'_>,
+    released: &mut ReleasedGuards,
     event: AgentEvent<OsSocket>,
 ) {
+    // Each tracked publication releases its guard sender once, and the
+    // list holds one per tracked publication: it never grows past it.
+    let mut release_guard = |entry: &mut NetPublication| {
+        if let Some(id) = entry.guard_sender.take() {
+            released.push(id);
+        }
+    };
     // Answers name the publication's registration (#279 P1), never only
     // its key.
     let find = |publications: &mut Vec<NetPublication>, endpoint, alias, registration| {
@@ -1234,6 +1329,9 @@ fn publication_answer(
         } => {
             if let Some(index) = find(publications, endpoint, alias, registration) {
                 release(send_endpoints, endpoint);
+                if let Some(entry) = publications.get_mut(index) {
+                    release_guard(entry);
+                }
                 // The receiver learned the alias before the refusal.
                 stale.queue_alias(endpoint, alias);
                 match publications.get_mut(index) {
@@ -1255,7 +1353,8 @@ fn publication_answer(
             // The lane readers drop here, on the control path.
             drop(outbound);
             if let Some(index) = find(publications, endpoint, alias, registration) {
-                publications.swap_remove(index);
+                let mut entry = publications.swap_remove(index);
+                release_guard(&mut entry);
                 release(send_endpoints, endpoint);
             }
         }
@@ -1318,5 +1417,8 @@ mod subscribe;
 mod e2e;
 #[cfg(test)]
 mod netem;
+
+pub use publish::NetworkGuard;
+
 #[cfg(test)]
 mod tests;

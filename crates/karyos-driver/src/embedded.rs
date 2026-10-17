@@ -871,6 +871,10 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) guards: crate::guards::Guards,
     /// The sender gates registered with their guards (G-e4).
     pub(crate) guard_senders: crate::guard_ack::GuardSenders,
+    /// Test only: guarding a network publication's lane of this index
+    /// fails, as a walker short of a spare slot does.
+    #[cfg(test)]
+    pub(crate) guard_lane_fault: Option<usize>,
     /// The network agents and their tables, when configured.
     pub(crate) net: Option<crate::net::Network>,
     /// What clients created by channel URI, owned by their registrations
@@ -1215,6 +1219,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             network: crate::network_journals::NetworkTracing::new(config.max_trace_journals),
             guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
+            #[cfg(test)]
+            guard_lane_fault: None,
             // Validated above: the product fits.
             net_owned: Vec::with_capacity(config.network.map_or(0, |network| {
                 crate::net::client::owned_capacity(&network, config.max_clients).unwrap_or(0)
@@ -3149,6 +3155,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // announced subscription, so none is told twice.
         self.announce_existing_images();
         self.serve_images();
+        // The guarded publications the sender refused or returned: their
+        // gates are gone, so their senders leave the close acknowledgement.
+        self.deregister_released_guards();
         served
     }
 
@@ -3218,8 +3227,33 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// stop in time (blocking: such a thread exits once its rings are
     /// gone), so none is ever detached.
     pub fn close_network(&mut self) -> Option<crate::net::NetworkShutdown> {
-        let mut net = self.net.take()?;
-        Some(net.close())
+        let mut shutdown = self.net.as_mut()?.close();
+        // The closed network released every tracked guard sender: none of
+        // them stays in a close acknowledgement.
+        shutdown.guard_senders_released = self.deregister_released_guards();
+        self.net = None;
+        Some(shutdown)
+    }
+
+    /// Deregisters the guard senders the network released (their
+    /// publication was refused, returned or stopped with the agents);
+    /// a failure is counted. Returns how many it deregistered.
+    fn deregister_released_guards(&mut self) -> usize {
+        let mut deregistered = 0usize;
+        while let Some(id) = self
+            .net
+            .as_mut()
+            .and_then(crate::net::Network::pop_released_guard)
+        {
+            if self.deregister_guard_sender(id).is_ok() {
+                if let Some(count) = deregistered.checked_add(1) {
+                    deregistered = count;
+                }
+            } else if let Some(net) = &mut self.net {
+                net.count_guard_deregister_failure();
+            }
+        }
+        deregistered
     }
 
     pub(crate) fn clock_now(&mut self) -> u64 {
