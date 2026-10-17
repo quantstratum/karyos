@@ -475,6 +475,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// otherwise counts it as not sent. Events are best effort: the
     /// counters record every loss either way.
     pub(crate) fn emit(&mut self, event: &DriverEvent) {
+        let _ = self.try_emit(event);
+    }
+
+    /// As [`EmbeddedDriver::emit`]; returns whether the event was sent.
+    pub(crate) fn try_emit(&mut self, event: &DriverEvent) -> bool {
         let mut out = [0u8; MAX_EVENT_LENGTH];
         let sent = event
             .encode(&mut out)
@@ -482,9 +487,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .and_then(|length| out.get(..length))
             .filter(|payload| self.broadcast.has_room(payload.len()))
             .map(|payload| self.broadcast.transmit(event.type_id(), payload));
-        if !matches!(sent, Some(Ok(_))) {
+        let sent = matches!(sent, Some(Ok(_)));
+        if !sent {
             self.counters.add(Event::EventsNotSent, 1);
         }
+        sent
     }
 
     /// Clients currently admitted, including retired ones whose producer has

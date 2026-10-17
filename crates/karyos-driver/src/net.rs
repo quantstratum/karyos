@@ -77,11 +77,17 @@ pub struct NetworkConfig {
     pub images: ImageTemplate,
     /// The log of a network publication a client creates by channel URI
     /// (W5b): the URI's `term-length`, `mtu` and `lanes` override these.
+    /// Validated at start.
     pub stream_defaults: NetworkStreamDefaults,
     /// The NAK control group of each multicast data group (RC-15; an
     /// interim driver-side table until a URI key, ACS 16103). Empty by
     /// default: multicast images then have no peer suppression input.
     pub nak_control_groups: ControlGroups,
+    /// Network publications and subscriptions one client may create by
+    /// channel URI at once, 1 to 4096;
+    /// another is refused with `ResourcesUnavailable` and counted
+    /// (`EmbeddedDriver::network_owned_refusals`).
+    pub max_owned_per_client: usize,
 }
 
 impl Default for NetworkConfig {
@@ -92,6 +98,7 @@ impl Default for NetworkConfig {
             images: ImageTemplate::default(),
             stream_defaults: NetworkStreamDefaults::default(),
             nak_control_groups: [None; MAX_CONTROL_GROUPS],
+            max_owned_per_client: 16,
         }
     }
 }
@@ -571,6 +578,18 @@ impl Network {
         }
     }
 
+    /// Unsubscriptions waiting for room in the receiver's ring.
+    #[cfg(test)]
+    pub(crate) fn pending_unsubscribes(&self) -> usize {
+        self.pending_unsubscribe.len()
+    }
+
+    /// The capacity of the unsubscription buffer.
+    #[cfg(test)]
+    pub(crate) fn pending_unsubscribe_capacity(&self) -> usize {
+        self.pending_unsubscribe.capacity()
+    }
+
     /// The image events of the last cycle, for the conductor to apply;
     /// hand the buffer back with [`Network::return_image_events`].
     pub(crate) fn take_image_events(&mut self) -> Vec<ImageEvent> {
@@ -616,13 +635,33 @@ impl Network {
         });
     }
 
-    /// The exposed images, with the endpoint each arrived on.
-    pub(crate) fn exposed_images(
-        &self,
-    ) -> impl Iterator<Item = (EndpointId, crate::embedded::AggregateHandle)> + '_ {
-        self.net_images
+    /// Whether the aggregate `registration` is the network's: a network
+    /// publication's or an exposed image's.
+    pub(crate) fn is_network_aggregate(&self, registration: u64) -> bool {
+        self.publications
             .iter()
-            .filter_map(|image| image.exposed.map(|handle| (image.endpoint, handle)))
+            .any(|publication| publication.registration == registration)
+            || self.net_images.iter().any(|image| {
+                image
+                    .exposed
+                    .is_some_and(|handle| handle.registration() == registration)
+            })
+    }
+
+    /// An index bound for [`Network::exposed_image_at`].
+    pub(crate) fn image_slots(&self) -> usize {
+        self.net_images.len()
+    }
+
+    /// The exposed image at `index` and the endpoint it arrived on; `None`
+    /// past the end or for an image driven unexposed.
+    pub(crate) fn exposed_image_at(
+        &self,
+        index: usize,
+    ) -> Option<(EndpointId, crate::embedded::AggregateHandle)> {
+        self.net_images
+            .get(index)
+            .and_then(|image| image.exposed.map(|handle| (image.endpoint, handle)))
     }
 
     /// The endpoint of the image `slot`.
@@ -876,10 +915,17 @@ impl Network {
         })?;
         // Unsubscriptions the full ring refused earlier.
         // (None in steady state: nothing is taken or freed then.)
-        if !self.pending_unsubscribe.is_empty() {
-            let pending = core::mem::take(&mut self.pending_unsubscribe);
-            for subscription in pending {
-                self.remove_subscription_later(subscription);
+        // Retried in place, keeping the preallocated buffer.
+        let mut index = 0;
+        while let Some(&subscription) = self.pending_unsubscribe.get(index) {
+            if self.remove_subscription(subscription).is_ok() {
+                self.pending_unsubscribe.swap_remove(index);
+            } else {
+                // Below the buffer's length, which fits in usize.
+                let Some(next) = index.checked_add(1) else {
+                    break;
+                };
+                index = next;
             }
         }
         // Removals the full ring refused earlier.

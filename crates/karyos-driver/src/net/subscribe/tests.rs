@@ -471,3 +471,38 @@ fn a_unicast_subscription_is_not_multicast() {
         Some(false)
     );
 }
+
+/// #294 tests: an unsubscription the receiver's full ring refuses waits,
+/// and is posted once the ring has room, keeping its buffer.
+#[test]
+fn an_unsubscription_waits_for_room_in_the_ring() {
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.agents.command_capacity = 2;
+    let mut b = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let address = free_address();
+    // Its endpoint and its subscription fill the ring until the next
+    // cycle.
+    let first = b.add_network_subscription(10, &channel(address)).unwrap();
+    let net = b.net.as_mut().unwrap();
+    net.remove_subscription_later(first);
+    assert_eq!(net.pending_unsubscribes(), 1, "the full ring refused it");
+    let capacity = net.pending_unsubscribe_capacity();
+    for _ in 0..50 {
+        let _ = b.do_work().unwrap();
+    }
+    let net = b.net.as_ref().unwrap();
+    assert_eq!(net.pending_unsubscribes(), 0);
+    assert_eq!(
+        net.pending_unsubscribe_capacity(),
+        capacity,
+        "the buffer is kept"
+    );
+    assert_eq!(net.subscription_count(), 0);
+}
