@@ -395,7 +395,7 @@ fn run<D>(
                 &config,
                 &mut catalog,
                 &mut active,
-                &failed,
+                &mut failed,
                 now(),
             ) {
                 return;
@@ -450,7 +450,7 @@ fn run<D>(
                         &config,
                         &mut catalog,
                         &mut active,
-                        &failed,
+                        &mut failed,
                         now(),
                     ) {
                         return;
@@ -507,7 +507,7 @@ fn serve<D: Disk + Clone>(
     config: &AgentConfig,
     catalog: &mut Catalog<D>,
     active: &mut Vec<Active<D>>,
-    failed: &[u64],
+    failed: &mut Vec<u64>,
     now: u64,
 ) -> bool {
     match command {
@@ -518,7 +518,14 @@ fn serve<D: Disk + Clone>(
         }
         Command::Stop(id, reply) => {
             let result = match active.iter().position(|recording| recording.id == id) {
-                Some(index) => stop(active.swap_remove(index), catalog, StopReason::Stopped, now),
+                Some(index) => {
+                    let result = stop(active.swap_remove(index), catalog, StopReason::Stopped, now);
+                    // A stop that failed leaves the recording to settle.
+                    if result.is_err() {
+                        failed.push(id);
+                    }
+                    result
+                }
                 None if failed.contains(&id) => Err(AgentError::RecordingFailed { id }),
                 None => Err(AgentError::NotRecording { id }),
             };
