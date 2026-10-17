@@ -2526,6 +2526,7 @@ fn a_split_hole_past_the_floor_is_sealed_whole() {
     super::unrecoverable(
         image,
         &mut receiver.counters,
+        &mut receiver.trace,
         Lane::ZERO,
         hole,
         lowest_retained,
@@ -2659,6 +2660,7 @@ fn the_skip_duty_seals_what_one_reply_could_not() {
     super::unrecoverable(
         &mut receiver.images[0],
         &mut receiver.counters,
+        &mut receiver.trace,
         Lane::ZERO,
         hole,
         2048,
@@ -3189,4 +3191,167 @@ fn the_sender_serves_a_routed_publication_on_every_path() {
     }
     assert_eq!(counts[0].load(Ordering::Relaxed), 2);
     assert_eq!(counts[1].load(Ordering::Relaxed), 2);
+}
+
+/// rp-w4b2b: a routed publication added to the sender has a SETUP side on
+/// each path's endpoint: it is established once a receiver's SM arrives on
+/// a later path, and its removal ends every path's side.
+#[test]
+fn a_routed_publication_has_a_setup_side_per_path() {
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let routes = [
+        (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
+        (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
+    ];
+    let (path, _log) = super::super::data::testing::outbound_routed(
+        &routes,
+        alias(),
+        publication(EndpointId(1)).term,
+        1,
+        false,
+    );
+    let event = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    assert!(matches!(
+        event,
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    assert!(!sender.sessions.is_established(EndpointId(2), alias()));
+    // The receiver of the later path answers and its SM arrives there.
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(2), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(2), receiver, &sm_status([7, 8], 0), 1);
+    assert!(sender.sessions.is_established(EndpointId(2), alias()));
+    assert!(super::established(
+        &sender.sessions,
+        &sender.publications[0]
+    ));
+    // Removing it ends both paths' SETUP sides.
+    let removed = sender.command(AgentCommand::<OsSocket>::RemovePublication {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias: alias(),
+        registration: 1,
+    });
+    assert!(matches!(
+        removed,
+        Some((_, AgentEvent::PublicationRemoved { .. }))
+    ));
+    assert!(!sender.sessions.remove(EndpointId(1), alias()));
+    assert!(!sender.sessions.remove(EndpointId(2), alias()));
+}
+
+/// RP-3: an idle path of an established routed publication sends a PATH_HB
+/// once per `path_heartbeat_interval`; a path that just submitted DATA does
+/// not.
+#[test]
+fn an_idle_path_sends_a_path_heartbeat() {
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+    use karyos_protocol::network::{Datagram, classify};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    use super::super::Half;
+
+    let interval = AgentConfig::default().path_heartbeat_interval;
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let routes = [
+        (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
+        (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
+    ];
+    let (path, mut log) = super::super::data::testing::outbound_routed(
+        &routes,
+        alias(),
+        publication(EndpointId(1)).term,
+        1,
+        false,
+    );
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let event = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    assert!(matches!(
+        event,
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    let mut halves = Vec::new();
+    let mut beats = Vec::new();
+    for id in 1..=2u32 {
+        let socket = ScriptedSocket::new();
+        let observer = socket.observer();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        observer.set_send_hook(Box::new(move |_, datagrams| {
+            for datagram in datagrams {
+                match classify(datagram) {
+                    Ok(Datagram::Control(Control::PathHeartbeat(_))) => {
+                        seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Datagram::DataBatch(_)) => {
+                        seen.fetch_add(1000, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }));
+        for _ in 0..32 {
+            observer.push_send(SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+        }
+        let instance = InstanceId::new(NonZeroU32::new(id).unwrap());
+        let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
+        let (tx, _rx) = endpoint.split().unwrap();
+        halves.push((EndpointId(id), Half::Tx(Box::new(tx))));
+        beats.push(count);
+    }
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    let _ = log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    // Each count holds PATH_HBs in its units and DATA in its thousands.
+    let beat = |at: usize| beats[at].load(Ordering::Relaxed) % 1000;
+    let data = |at: usize| beats[at].load(Ordering::Relaxed) / 1000;
+    for now in 2..6 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    let base = (beat(0), beat(1));
+    // An interval with no DATA: one PATH_HB on each path, then none until
+    // the next interval.
+    let t = 6 + interval;
+    let _ = sender.duty(&mut halves, t).unwrap();
+    let _ = sender.duty(&mut halves, t + 1).unwrap();
+    assert_eq!((beat(0), beat(1)), (base.0 + 1, base.1 + 1));
+    let sent = sender.counters().path_heartbeats_sent;
+    // A path that submits DATA in the cycle is not idle: no PATH_HB.
+    let _ = log.publications[0]
+        .append(&[2; 1000], AppendOptions::default())
+        .unwrap();
+    let _ = sender.duty(&mut halves, t + interval).unwrap();
+    assert_eq!((data(0), data(1)), (2, 2));
+    assert_eq!((beat(0), beat(1)), (base.0 + 1, base.1 + 1));
+    assert_eq!(sender.counters().path_heartbeats_sent, sent);
+    let _ = sender.duty(&mut halves, t + 2 * interval).unwrap();
+    assert_eq!((beat(0), beat(1)), (base.0 + 2, base.1 + 2));
 }

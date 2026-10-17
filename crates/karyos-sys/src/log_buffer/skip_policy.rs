@@ -331,12 +331,31 @@ impl SkipPolicy {
         now: u64,
         gate: &mut G,
     ) -> Result<SkipReport, ReceiveError> {
+        self.duty_observed(owner, now, gate, |_, _, _| {})
+    }
+
+    /// [`SkipPolicy::duty_gated`], telling `sealed` of each committed seal:
+    /// its lane, position and extent, once, after the seal's record is
+    /// published (also when a later step failed, GU-11). A seal that is
+    /// not committed (posted to the gate, or its term not prepared yet)
+    /// tells nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`SkipPolicy::duty`].
+    pub fn duty_observed<T: TermBytes, G: SealGate + ?Sized>(
+        &mut self,
+        owner: &mut ReceiveOwner<T>,
+        now: u64,
+        gate: &mut G,
+        mut sealed: impl FnMut(Lane, u64, u32),
+    ) -> Result<SkipReport, ReceiveError> {
         let mut report = SkipReport::default();
         for index in 0..self.lanes.len() {
             let Some(lane) = u8::try_from(index).ok().and_then(|l| Lane::try_new(l).ok()) else {
                 continue;
             };
-            self.seal_due(owner, lane, now, gate, &mut report)?;
+            self.seal_due(owner, lane, now, gate, &mut report, &mut sealed)?;
             if report.committed_failure.is_some() {
                 break;
             }
@@ -386,6 +405,24 @@ impl SkipPolicy {
         now: u64,
         gate: &mut G,
     ) -> Result<SkipReport, ReceiveError> {
+        self.range_unavailable_observed(owner, lane, floor, now, gate, |_, _, _| {})
+    }
+
+    /// [`SkipPolicy::range_unavailable_gated`], telling `sealed` of each
+    /// committed seal as [`SkipPolicy::duty_observed`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`SkipPolicy::range_unavailable`].
+    pub fn range_unavailable_observed<T: TermBytes, G: SealGate + ?Sized>(
+        &mut self,
+        owner: &mut ReceiveOwner<T>,
+        lane: Lane,
+        floor: u64,
+        now: u64,
+        gate: &mut G,
+        mut sealed: impl FnMut(Lane, u64, u32),
+    ) -> Result<SkipReport, ReceiveError> {
         let mut report = SkipReport::default();
         let Some(state) = self.lanes.get_mut(usize::from(lane.get())) else {
             return Err(ReceiveError::Foreign);
@@ -418,7 +455,7 @@ impl SkipPolicy {
             }
             Unrecoverable::Skip => {
                 state.unrecoverable_to = state.unrecoverable_to.max(floor);
-                self.seal_due(owner, lane, now, gate, &mut report)?;
+                self.seal_due(owner, lane, now, gate, &mut report, &mut sealed)?;
             }
         }
         Ok(report)
@@ -433,6 +470,7 @@ impl SkipPolicy {
         now: u64,
         gate: &mut G,
         report: &mut SkipReport,
+        sealed: &mut impl FnMut(Lane, u64, u32),
     ) -> Result<(), ReceiveError> {
         let config = self.config;
         let Some(state) = self.lanes.get_mut(usize::from(lane.get())) else {
@@ -484,11 +522,19 @@ impl SkipPolicy {
                 return Ok(());
             }
             match owner.seal_gap(lane, position, extent, reason) {
-                Ok(Received::Committed { extent, .. }) => report.count(extent),
+                Ok(Received::Committed { position, extent }) => {
+                    report.count(extent);
+                    sealed(lane, position, extent);
+                }
                 // Published, then a later step failed: count it, report it
                 // and stop.
-                Err(failure @ ReceiveError::GapCommitted { extent, .. }) => {
+                Err(
+                    failure @ ReceiveError::GapCommitted {
+                        position, extent, ..
+                    },
+                ) => {
                     report.count(extent);
+                    sealed(lane, position, extent);
                     report.committed_failure = Some(failure);
                     return Ok(());
                 }

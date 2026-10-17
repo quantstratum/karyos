@@ -1245,3 +1245,55 @@ fn a_requester_is_what_a_nak_is_checked_against() {
         }
     );
 }
+
+/// Sender join over redundant paths (redundant-paths.md section 8): a
+/// later path's ANSWER, with a higher join, binds that path to the same
+/// member and leaves its join unchanged; its SMs on the later path are
+/// accepted below that join, and retention follows them.
+#[test]
+fn a_later_paths_answer_keeps_the_members_join() {
+    let mut table = table(
+        config(1),
+        &Roles {
+            required: &[1],
+            tags: &[],
+        },
+    );
+    let first = table.expect(&path(receiver(1, 1), 1), &[0], 0).unwrap();
+    let later = table.expect(&path(receiver(1, 1), 2), &[8192], SECOND);
+    assert_eq!(later, Ok(first), "the same member, not a new one");
+    let outcome = table.status(&path(receiver(1, 1), 2), &sm(1, &[(0, 4096)]), SECOND);
+    let (member, _, _) = accepted(outcome);
+    assert_eq!(member, first);
+    assert_eq!(table.retention(lane(0)), Some(0));
+    // The founding path's binding is kept: its SMs are accepted too.
+    let outcome = status(&mut table, &sm(1, &[(64, 4096)]), 2 * SECOND);
+    assert_eq!(accepted(outcome).0, first);
+
+    // The answers alone bind both paths: either path's loss leaves the
+    // other, and the member goes only with its last path.
+    let mut table = table_of_one();
+    let _ = table.expect(&path(receiver(1, 1), 1), &[0], 0).unwrap();
+    let _ = table
+        .expect(&path(receiver(1, 1), 2), &[8192], SECOND)
+        .unwrap();
+    assert_eq!(
+        table.binding_gone(&path(receiver(1, 1), 1), SECOND),
+        Gone::Remaining
+    );
+    assert_eq!(
+        table.binding_gone(&path(receiver(1, 1), 2), SECOND),
+        Gone::Removed
+    );
+}
+
+/// A table of one lane whose receiver 1 is required.
+fn table_of_one() -> Membership {
+    table(
+        config(1),
+        &Roles {
+            required: &[1],
+            tags: &[],
+        },
+    )
+}

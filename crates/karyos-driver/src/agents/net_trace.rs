@@ -64,8 +64,55 @@ impl TracedLane {
     }
 }
 
+/// How many sealed gaps a receiver journal's facts keep in process
+/// (trace-network.md §5, `fact_gap_intervals`).
+pub const FACT_GAP_INTERVALS: usize = 16;
+
+/// A receiver journal's sealed local gaps (§5): the first
+/// [`FACT_GAP_INTERVALS`], each `[start, end)`, and whether more were
+/// sealed. A report expects the journal for frames after the last kept gap
+/// when the list overflowed, so a missing commit there is never a false
+/// `Complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GapIntervals {
+    intervals: [(u64, u64); FACT_GAP_INTERVALS],
+    len: u8,
+    overflowed: bool,
+}
+
+impl GapIntervals {
+    /// Keeps the gap of `extent` bytes at `position`. A full list, or a gap
+    /// whose end does not fit, sets the overflow flag instead, so a report
+    /// stays conservative.
+    pub(crate) fn push(&mut self, position: u64, extent: u32) {
+        let end = position.checked_add(u64::from(extent));
+        let next = self.len.checked_add(1);
+        match (self.intervals.get_mut(usize::from(self.len)), end, next) {
+            (Some(slot), Some(end), Some(next)) => {
+                *slot = (position, end);
+                self.len = next;
+            }
+            _ => self.overflowed = true,
+        }
+    }
+
+    /// The kept gaps, lowest first as sealed.
+    #[must_use]
+    pub fn intervals(&self) -> &[(u64, u64)] {
+        self.intervals
+            .get(..usize::from(self.len))
+            .unwrap_or_default()
+    }
+
+    /// Whether gaps beyond the kept ones were sealed.
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
 /// The facts of a journal the agent closed (§5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalFacts {
     /// The publication.
     pub publication: PublicationIdentity,
@@ -77,6 +124,26 @@ pub struct JournalFacts {
     pub boundary: u64,
     /// A receiver's first sealed gap; `None` on the sender.
     pub first_gap: Option<u64>,
+    /// A receiver's sealed gaps; `None` on the sender, and in a facts
+    /// answer repeated after the conductor already has them. Boxed when the
+    /// journal opens (control path), so the events stay small and a close
+    /// allocates nothing.
+    pub gaps: Option<Box<GapIntervals>>,
+}
+
+impl JournalFacts {
+    /// These facts, their gaps moved out of `self` (nothing allocates).
+    #[must_use]
+    pub(crate) fn take(&mut self) -> Self {
+        Self {
+            publication: self.publication,
+            number: self.number,
+            start: self.start,
+            boundary: self.boundary,
+            first_gap: self.first_gap,
+            gaps: self.gaps.take(),
+        }
+    }
 }
 
 /// The sender agent's hook and its journal commands.
@@ -178,6 +245,7 @@ impl SenderTrace {
                     start: traced.start,
                     boundary: traced.boundary,
                     first_gap: None,
+                    gaps: None,
                 });
                 Some((
                     reply,
@@ -196,7 +264,7 @@ impl SenderTrace {
 }
 
 /// One lane of an installed image with an open network journal (§4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TracedImageLane {
     /// The image's installed slot.
     pub(crate) slot: crate::sessions::receive::SlotRef,
@@ -209,11 +277,14 @@ pub(crate) struct TracedImageLane {
     /// The journal's start: the lane's next commit position when it
     /// arrived (the image join fact of §5).
     pub(crate) start: u64,
+    /// The gaps sealed on the lane since the journal opened, boxed when it
+    /// opened.
+    pub(crate) gaps: Box<GapIntervals>,
 }
 
 /// A journal its image's retirement closed: posted to the conductor
 /// unsolicited, and answered again to a later `CloseNetworkJournal`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RetiredJournal {
     pub(crate) lane: Lane,
     pub(crate) facts: JournalFacts,
@@ -264,6 +335,24 @@ impl ReceiverTrace {
         !self.lanes.is_empty()
     }
 
+    /// The gap `[position, position + extent)` was sealed on `lane` of the
+    /// image at `slot`: its journal, if any, keeps it.
+    pub(crate) fn sealed(
+        &mut self,
+        slot: crate::sessions::receive::SlotRef,
+        lane: Lane,
+        position: u64,
+        extent: u32,
+    ) {
+        if let Some(traced) = self
+            .lanes
+            .iter_mut()
+            .find(|traced| traced.slot == slot && traced.lane == lane)
+        {
+            traced.gaps.push(position, extent);
+        }
+    }
+
     /// Replaces the hook; every journal still open closes through the
     /// previous one, without facts. Returns the previous hook and how many
     /// closed (`None` if the count overflowed).
@@ -308,7 +397,7 @@ impl ReceiverTrace {
     pub(crate) fn close(
         &mut self,
         number: u64,
-        facts: impl FnOnce(&TracedImageLane) -> JournalFacts,
+        facts: impl FnOnce(TracedImageLane) -> JournalFacts,
     ) -> Option<JournalFacts> {
         if let Some(index) = self.lanes.iter().position(|traced| traced.number == number) {
             let traced = self.lanes.swap_remove(index);
@@ -316,7 +405,7 @@ impl ReceiverTrace {
                 hook.0
                     .close_journal(NetSide::Receiver, &traced.publication, traced.lane);
             }
-            return Some(facts(&traced));
+            return Some(facts(traced));
         }
         // Closed by its image's retirement: the same facts again, and the
         // unsolicited event is no longer needed.
@@ -335,7 +424,7 @@ impl ReceiverTrace {
     pub(crate) fn retire(
         &mut self,
         slot: crate::sessions::receive::SlotRef,
-        mut facts: impl FnMut(&TracedImageLane) -> JournalFacts,
+        mut facts: impl FnMut(TracedImageLane) -> JournalFacts,
         mut dropped: impl FnMut(),
     ) {
         while let Some(index) = self.lanes.iter().position(|traced| traced.slot == slot) {
@@ -350,9 +439,10 @@ impl ReceiverTrace {
                 self.retired.remove(oldest);
             }
             if self.retired.len() < self.capacity {
+                let lane = traced.lane;
                 self.retired.push(RetiredJournal {
-                    lane: traced.lane,
-                    facts: facts(&traced),
+                    lane,
+                    facts: facts(traced),
                     posted: false,
                 });
             } else {
@@ -362,11 +452,16 @@ impl ReceiverTrace {
     }
 
     /// Posts each retired journal not posted yet through `post`, which
-    /// answers whether its event was taken; a full ring leaves the rest
-    /// for the next cycle.
-    pub(crate) fn post_retired(&mut self, mut post: impl FnMut(Lane, JournalFacts) -> bool) {
+    /// hands the facts back when its ring was full: they wait for the next
+    /// cycle. A posted journal's gaps go with the event; a later close
+    /// answers its facts without them. Nothing allocates.
+    pub(crate) fn post_retired(
+        &mut self,
+        mut post: impl FnMut(Lane, JournalFacts) -> Result<(), JournalFacts>,
+    ) {
         for retired in self.retired.iter_mut().filter(|retired| !retired.posted) {
-            if !post(retired.lane, retired.facts) {
+            if let Err(back) = post(retired.lane, retired.facts.take()) {
+                retired.facts = back;
                 return;
             }
             retired.posted = true;
