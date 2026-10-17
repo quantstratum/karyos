@@ -66,6 +66,8 @@ fn target(session_id: i32, join: u64) -> ReplayTargetConfig {
         mtu: DEFAULT_MTU,
         join,
         lane: Lane::ZERO,
+        source_stream_id: 42,
+        source_session_id: 1,
     }
 }
 
@@ -567,4 +569,70 @@ fn first_index(run: &Run) -> u32 {
     };
     // The payload follows the 32-byte header.
     u32::from_le_bytes(bytes[32..36].try_into().unwrap())
+}
+
+/// #374 review P2: a feed that wrote past the end it finishes at is
+/// refused, typed, and its target retires; so does a dropped feed's, on
+/// the driver's next duty; a frame of another source is refused.
+#[test]
+fn a_target_is_never_left_behind() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let (runs, _) = record(&mut driver, 40);
+    let frames: Vec<&Run> = runs
+        .iter()
+        .filter(|run| matches!(run, Run::Frames(..)))
+        .collect();
+    let (handle, mut feed) = driver.replay_target(target(2, 0)).unwrap();
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    // The first run, then the third: the second is outstanding.
+    for run in [frames[0], frames[2]] {
+        let Run::Frames(position, bytes) = run else {
+            unreachable!()
+        };
+        while !feed.frames(*position, bytes).unwrap() {
+            driver.do_work().unwrap();
+        }
+    }
+    let end = frames[1].position();
+    assert!(matches!(
+        driver.finish_replay(handle, feed, end),
+        Err(DriverError::ReplayOutstanding { .. })
+    ));
+    let mut seen = Vec::new();
+    let terminal = until_terminal(&mut driver, &mut reader, &mut seen);
+    assert!(matches!(
+        terminal.lanes[0].end,
+        Some(LaneEnd::Closed {
+            reason: SealReason::ImageRetired,
+            ..
+        })
+    ));
+    // Dropped unfinished: retired on the next duty.
+    let (handle, feed) = driver.replay_target(target(3, 0)).unwrap();
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    drop(feed);
+    let terminal = until_terminal(&mut driver, &mut reader, &mut seen);
+    assert!(matches!(
+        terminal.lanes[0].end,
+        Some(LaneEnd::Closed {
+            reason: SealReason::ImageRetired,
+            ..
+        })
+    ));
+    // Frames recorded from another session are refused before any write.
+    let (handle, mut feed) = driver
+        .replay_target(ReplayTargetConfig {
+            source_session_id: 9,
+            ..target(4, 0)
+        })
+        .unwrap();
+    let Run::Frames(position, bytes) = frames[0] else {
+        unreachable!()
+    };
+    assert!(matches!(
+        feed.frames(*position, bytes),
+        Err(ReplayFeedError::Invalid { .. })
+    ));
+    assert_eq!(feed.position(), 0);
+    assert!(driver.finish_replay(handle, feed, 0).unwrap());
 }

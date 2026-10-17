@@ -2695,6 +2695,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::WorkCountOverflow`] when the work count does not fit
     /// `u32`.
     pub fn do_work(&mut self) -> Result<u32, DriverError> {
+        // Replay targets whose feed was dropped unfinished retire.
+        self.reap_replays();
         #[cfg(target_os = "linux")]
         let admitted = self.serve_admission();
         #[cfg(not(target_os = "linux"))]

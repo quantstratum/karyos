@@ -131,6 +131,15 @@ pub enum DriverError {
     /// A control-channel limit or size is invalid.
     #[error("invalid driver configuration")]
     InvalidConfig,
+    /// A replay's feed wrote past the end it was finished at; its target
+    /// retired.
+    #[error("a replay finished at {end} but written to {written}")]
+    ReplayOutstanding {
+        /// The end asked for.
+        end: u64,
+        /// Where the feed wrote up to.
+        written: u64,
+    },
     /// A replay target of a lane other than 0: only lane 0 recordings are
     /// replayed (A5).
     #[error("a replay of lane {lane}: only lane 0 is replayed")]
