@@ -1805,3 +1805,168 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
         bound.len() == 2 && bound.iter().all(|bound| *bound > 0)
     });
 }
+
+/// SPEC.md §15 "Guarded session abort", the trusted half
+/// (guards-and-abort.md "Trusted sockets in Phase 2", O-11 and GC-6): a
+/// guard close on a trusted socket channel is local. Messages written but
+/// not sent before it never leave; the sender then sends nothing, no
+/// DATA, repair, control, `SESSION_ABORT` or EOS; the close
+/// acknowledgement names the last position submitted under the old epoch;
+/// and the remote image ends at its liveness timeout with the messages
+/// submitted before the close, and nothing after. A single-path sender
+/// has no idle DATA heartbeat yet (gap G1), so none is checked here. The
+/// reconnection half waits for a reopened network publication to bind a
+/// fresh incarnation.
+#[test]
+fn a_guard_close_on_a_trusted_channel_ends_the_remote_image_at_liveness() {
+    use karyos_sys::guard::Closed;
+    use karyos_sys::outcome_ring::Kind;
+
+    use crate::guard_ack::SenderAck;
+    use crate::net::NetworkGuard;
+
+    let (mut a, mut b) = (
+        fast_driver(ThreadingMode::Shared),
+        fast_driver(ThreadingMode::Shared),
+    );
+    let guard = a.add_guard("trusted").unwrap();
+    assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
+    let address = free_address();
+    let _ = b
+        .add_network_subscription(10, &channel(address, true))
+        .unwrap();
+    let mut config = aggregate(10, 3, 1);
+    // The sender's reservation and the guard's walker.
+    config.stream.buffer.spare_slots = 4;
+    let publication = a
+        .add_guarded_network_publication(
+            config,
+            &channel(address, true),
+            NetworkGuard {
+                guard,
+                messages: 4,
+                rate: None,
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Optional)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let message = |index: u32| {
+        let mut payload = [0u8; 100];
+        payload[..4].copy_from_slice(&index.to_le_bytes());
+        payload
+    };
+    // Ten messages submitted and delivered under the open guard, each a
+    // 160-byte frame.
+    let mut kinds = Vec::new();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = lane
+            .poll_outcomes(64, |_, record| kinds.push(record.kind))
+            .unwrap();
+        if sent < 10
+            && matches!(
+                lane.offer(&message(sent)).unwrap(),
+                OfferOutcome::Accepted { .. }
+            )
+        {
+            sent += 1;
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 10 && kinds.len() == 10
+    });
+    assert!(
+        kinds.iter().all(|kind| *kind == Kind::Submitted),
+        "{kinds:?}"
+    );
+    // Three more written, then the close before any cycle runs: no gate
+    // ever sees them open.
+    for index in 10..13 {
+        assert!(matches!(
+            lane.offer(&message(index)).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    let Closed::Now { epoch } = a.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    assert_eq!(lane.offer(&message(13)).unwrap(), OfferOutcome::Gated);
+    let mut ended = Vec::new();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let _ = lane
+            .poll_outcomes(64, |_, record| ended.push(record.kind))
+            .unwrap();
+        drivers[0]
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .effective()
+            == Some(true)
+            && ended.last() == Some(&Kind::Ended)
+    });
+    // One final record each, then `Ended`. The three never left: the
+    // design gives them `Aborted`, but the walker records a committed
+    // message `Submitted` (the log as the backend), so their kind is not
+    // checked here; the acknowledgement below says they were not sent.
+    assert_eq!(ended.len(), 4, "{ended:?}");
+    assert_eq!(ended.last(), Some(&Kind::Ended));
+    let ack = a.close_guard_ack(guard, epoch).unwrap();
+    let [(_, SenderAck::Applied { positions, .. })] = ack.senders[..] else {
+        panic!("{ack:?}");
+    };
+    assert_eq!(positions[0], 10 * 160, "the last position submitted");
+    // From here the sender is silent.
+    let quiet = (
+        shared(&mut a).sender.outbound_counters(0).unwrap(),
+        shared(&mut a).sender.counters(),
+    );
+    let mut end = None;
+    pump(&mut [&mut a, &mut b], |_| {
+        let poll = reader.poll(|_, _, _| panic!("a message after the close"), BUDGET);
+        end = poll.lanes.first().and_then(|lane| lane.end);
+        end.is_some()
+    });
+    assert_eq!(
+        end,
+        Some(LaneEnd::Closed {
+            position: 10 * 160,
+            reason: SealReason::ImageRetired,
+        })
+    );
+    drop(reader);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].net.as_ref().unwrap().image_count() == 0
+    });
+    let (outbound, sender) = (
+        shared(&mut a).sender.outbound_counters(0).unwrap(),
+        shared(&mut a).sender.counters(),
+    );
+    assert_eq!(
+        (outbound.staged, outbound.submitted, outbound.records),
+        (quiet.0.staged, quiet.0.submitted, quiet.0.records),
+        "no DATA after the close"
+    );
+    assert_eq!(sender.sent, quiet.1.sent, "no control after the close");
+    assert_eq!((sender.eos_sent, sender.repairs), (0, 0));
+    let received = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert_eq!(received.data_committed, 10);
+    assert_eq!(
+        (received.images_retired, received.images_closed_eos),
+        (1, 0),
+        "ended at liveness, not by an EOS"
+    );
+}

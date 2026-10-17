@@ -1089,6 +1089,12 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index)?.sent_high(lane)
     }
 
+    /// The counters of its `index`-th publication's data path (tests).
+    #[cfg(test)]
+    pub(crate) fn outbound_counters(&self, index: usize) -> Option<data::OutboundCounters> {
+        self.role.outbound(index).map(data::Outbound::counters)
+    }
+
     /// Reads NAKs again after [`SenderAgent::ignore_naks`] (tests).
     #[cfg(test)]
     #[cfg_attr(
