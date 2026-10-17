@@ -86,10 +86,11 @@ pub const fn counts_for_connection(state: u64) -> bool {
 }
 
 /// Whether a reader in `state` is listed among the subscriber cells
-/// (diagnostics, positions): the readers that count for connection.
+/// (diagnostics, positions): the readers that count for connection, and a
+/// silent sender, which still bounds the publisher.
 #[must_use]
 pub const fn visible_as_subscriber(state: u64) -> bool {
-    counts_for_connection(state)
+    counts_for_connection(state) || state == CELL_SENDER_SILENT
 }
 
 /// Whether a reader in `state` never bounds, copies its acknowledgement
@@ -297,7 +298,7 @@ mod tests {
             (CELL_LOST_RESERVED, false, false, false, false, false, false),
             (CELL_OBSERVER, true, true, true, true, false, false),
             (CELL_WALKER, true, false, false, true, false, true),
-            (CELL_SENDER_SILENT, true, false, false, false, true, true),
+            (CELL_SENDER_SILENT, true, false, true, false, true, true),
         ];
         for (state, reader, connects, listed, observer, bounding, floor) in table {
             assert_eq!(holds_floor(state), floor, "holds_floor({state})");

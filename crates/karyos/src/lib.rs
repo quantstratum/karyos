@@ -1,20 +1,74 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Public facade: re-exports the client, Archive and Cluster APIs and defines
-//! `karyos::Error`.
+//! Public facade: the SPEC §10 client API, the Archive and Cluster APIs,
+//! and `karyos::Error`.
 //!
-//! Implemented so far: the client API (publications, subscriptions and the
-//! client conductor), the SPEC §10 [`Client`] facade that names channels by
-//! URI, and the error type aggregating client errors. The Archive and
-//! Cluster APIs do not exist yet.
+//! Start at [`Client`]: a [`Context`] names the driver, and the client
+//! adds publications and subscriptions by channel URI. A [`Publication`]
+//! offers or claims with `Result<Accepted, OfferError>`; a
+//! [`Subscription`] polls its stream or the images of a network channel.
+//!
+//! The shape of SPEC §10, against [`Error`]:
+//!
+//! ```no_run
+//! # #[cfg(target_os = "linux")]
+//! # fn main() -> Result<(), karyos::Error> {
+//! use karyos::{
+//!     Client, Context, IdleStrategy, Lane, MessageLength, MessageLimit, OfferError, StreamId,
+//! };
+//!
+//! let ctx = Context::builder()
+//!     .dir("/dev/shm/karyos")
+//!     .idle_strategy(IdleStrategy::BusySpin)
+//!     .build()?;
+//! let mut client = Client::connect(ctx)?;
+//!
+//! // Publish
+//! let mut orders = client.add_exclusive_publication("karyos:ipc?lanes=2", StreamId::new(1001))?;
+//! let encoded = [0u8; 64];
+//! let lane = Lane::try_new(1).expect("a lane below Lane::COUNT");
+//! match orders.offer_on(lane, &encoded) {
+//!     Ok(accepted) => { /* lane and position, accepted locally */ }
+//!     Err(OfferError::BackPressured) => { /* retry or drop */ }
+//!     Err(OfferError::Gated) => { /* kill switch is closed */ }
+//!     Err(e) => return Err(e.into()),
+//! }
+//!
+//! // Encode in place; dropping an uncommitted claim aborts its block
+//! let mut claim = orders.try_claim(MessageLength::try_new(64)?)?;
+//! claim.payload().copy_from_slice(&encoded);
+//! let accepted = claim.commit()?;
+//!
+//! // Subscribe
+//! let mut md = client.add_subscription("karyos:ipc", StreamId::new(2001))?;
+//! md.poll(|payload, _info| drop(payload), MessageLimit::new(16))?;
+//! # let _ = accepted;
+//! # Ok(())
+//! # }
+//! # #[cfg(not(target_os = "linux"))]
+//! # fn main() {}
+//! ```
+//!
+//! [`embedded`] holds the low-level API the driver, the benchmarks and
+//! the simulator use: the client conductor and the per-lane handles with
+//! their outcome enums. The Archive and Cluster APIs do not exist yet.
 
 pub use karyos_client::{
-    Aborted, ClaimOutcome, Client, ClientClaim, ClientConductor, ClientError, ClientPublication,
-    ClientSubscription, CommitOutcome, Completion, ConductorError, ConductorPoll, Connection,
-    Context, ContextBuilder, IdleStrategy, ImageStop, MessageInfo, MessageLimit, OfferOutcome,
-    Outcome, Overrun, PollError, PollSummary, StreamId, Subscription, SubscriptionError,
-    SubscriptionPoll,
+    Accepted, Claim, Client, ClientError, Connection, Context, ContextBuilder, IdleStrategy,
+    ImageStop, Lane, MessageInfo, MessageLength, MessageLimit, OfferError, PollError, PollSummary,
+    Publication, StreamId, Subscription, SubscriptionError, SubscriptionPoll,
 };
+
+/// The low-level client API: the conductor and the per-lane handles with
+/// their outcome enums, for embedded use and the tools built on them.
+pub mod embedded {
+    pub use karyos_client::{
+        Aborted, ClaimOutcome, ClientClaim, ClientConductor, ClientPublication, ClientSubscription,
+        CommitOutcome, Completion, ConductorError, ConductorPoll, OfferOutcome, Outcome, Overrun,
+    };
+}
+
+use embedded::ConductorError;
 
 /// Every error of the public Karyos API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -22,6 +76,9 @@ pub enum Error {
     /// A client error.
     #[error(transparent)]
     Client(#[from] ClientError),
+    /// An offer, a claim or a commit was not accepted.
+    #[error(transparent)]
+    Offer(#[from] OfferError),
     /// A poll failed after possibly delivering messages.
     #[error(transparent)]
     Poll(#[from] PollError),
