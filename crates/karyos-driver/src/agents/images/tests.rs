@@ -150,6 +150,8 @@ struct Rig {
     endpoints: Endpoints<OsSocket>,
     images: ImageTable,
     events: Vec<ImageEvent>,
+    /// The network trace events the agents answered (P2.12 step 3).
+    trace_events: Vec<crate::agents::AgentEvent<OsSocket>>,
     now: u64,
 }
 
@@ -185,6 +187,7 @@ impl Rig {
             images: ImageTable::new(config.sessions.max_images, setup.template),
             events: Vec::new(),
             now: 0,
+            trace_events: Vec::new(),
         };
         let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
         let a = rig
@@ -284,7 +287,23 @@ impl Rig {
             }
         }
         self.agents.do_work(self.now).unwrap();
-        self.endpoints.poll(&self.links, self.now, |_| {}, |_| {});
+        let trace_events = &mut self.trace_events;
+        self.endpoints.poll(
+            &self.links,
+            self.now,
+            |_| {},
+            |event| {
+                if matches!(
+                    event,
+                    crate::agents::AgentEvent::NetworkTraceSet { .. }
+                        | crate::agents::AgentEvent::NetworkJournalOpened { .. }
+                        | crate::agents::AgentEvent::NetworkJournalRefused { .. }
+                        | crate::agents::AgentEvent::NetworkJournalClosed { .. }
+                ) {
+                    trace_events.push(event);
+                }
+            },
+        );
         if serve {
             let events = &mut self.events;
             self.images
@@ -3387,4 +3406,282 @@ fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
         rig.agents.receiver.role.session_counters().challenges,
         challenges + 1
     );
+}
+
+/// P2.12 step 3 PR 2: a hook that records the receiver's commits and its
+/// journals' opens and closes.
+/// What a [`CommitRecorder`] saw: the commits, the journals opened and
+/// how many closed.
+type Recorded = (
+    Vec<(
+        karyos_protocol::frame::TraceExtension,
+        karyos_protocol::trace_hook::NetCommit,
+    )>,
+    Vec<u64>,
+    u32,
+);
+
+#[derive(Clone, Default)]
+struct CommitRecorder(std::sync::Arc<std::sync::Mutex<Recorded>>);
+
+impl karyos_protocol::trace_hook::NetworkTraceHook for CommitRecorder {
+    fn open_journal(&mut self, journal: karyos_protocol::trace_hook::NetJournal) {
+        self.0.lock().unwrap().1.push(journal.number);
+    }
+
+    fn close_journal(
+        &mut self,
+        _side: karyos_protocol::trace_hook::NetSide,
+        _publication: &karyos_protocol::trace_hook::PublicationIdentity,
+        _lane: Lane,
+    ) {
+        self.0.lock().unwrap().2 += 1;
+    }
+
+    fn on_sender_pickup(
+        &mut self,
+        _ext: &karyos_protocol::frame::TraceExtension,
+        _at: &karyos_protocol::trace_hook::NetPickup,
+    ) {
+    }
+
+    fn on_receiver_commit(
+        &mut self,
+        ext: &karyos_protocol::frame::TraceExtension,
+        at: &karyos_protocol::trace_hook::NetCommit,
+    ) {
+        self.0.lock().unwrap().0.push((*ext, *at));
+    }
+}
+
+/// The rig publication's identity, as a trace journal names it.
+fn traced_publication() -> karyos_protocol::trace_hook::PublicationIdentity {
+    karyos_protocol::trace_hook::PublicationIdentity {
+        driver: identity().driver_id,
+        registration: identity().registration_id,
+        stream_id: alias().stream_id,
+        session_id: alias().session_id,
+        incarnation: identity().incarnation,
+    }
+}
+
+fn trace_extension(message_id: u64) -> karyos_protocol::frame::TraceExtension {
+    karyos_protocol::frame::TraceExtension {
+        extension_flags: 0,
+        trace_id: [7, 9],
+        span_id: 3,
+        parent_span_id: 0,
+        message_id,
+    }
+}
+
+impl Rig {
+    /// Sets `hook` on the receiver, then posts it a journal of lane 0 of
+    /// the rig's publication, numbered `number`, and runs a round.
+    fn trace_receiver(&mut self, hook: Option<CommitRecorder>, b: EndpointId, number: u64) {
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::SetNetworkTrace {
+                reply,
+                hook: hook.map(|hook| crate::agents::net_trace::TraceHook(Box::new(hook))),
+            })
+            .unwrap();
+        self.round(true);
+        let (writer, _consumer) = karyos_protocol::journal::record_journal(4, 1, 1).unwrap();
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::OpenNetworkJournal {
+                reply,
+                endpoint: b,
+                alias: alias(),
+                journal: karyos_protocol::trace_hook::NetJournal {
+                    side: karyos_protocol::trace_hook::NetSide::Receiver,
+                    publication: traced_publication(),
+                    lane: Lane::ZERO,
+                    number,
+                    writer,
+                },
+            })
+            .unwrap();
+        self.round(true);
+    }
+
+    /// Asks the receiver to close the journal of lane 0 and returns the
+    /// facts it answered.
+    fn close_receiver_journal(&mut self) -> Option<crate::agents::net_trace::JournalFacts> {
+        self.trace_events.clear();
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::CloseNetworkJournal {
+                reply,
+                publication: traced_publication(),
+                lane: Lane::ZERO,
+            })
+            .unwrap();
+        self.round(true);
+        self.trace_events.iter().find_map(|event| match event {
+            crate::agents::AgentEvent::NetworkJournalClosed { facts, .. } => Some(*facts),
+            _ => None,
+        })?
+    }
+}
+
+/// P2.12 step 3 PR 2 (trace-network.md §4, §5, NT-2): a receiver journal
+/// opens with the lane's next commit position as its start; a traced frame
+/// records one `ReceiverCommit` when it commits, naming its path; an
+/// untraced one records nothing; the close answers the start, the
+/// lane's resolved prefix as the commit boundary and no gap, and closes
+/// the journal through the hook.
+#[test]
+fn a_receiver_journal_records_each_traced_commit_once() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    // Something commits before the journal arrives: its start is past it.
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&[0; 100], AppendOptions::default())
+        .unwrap();
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().data_committed >= 1
+    });
+    let next = rig.agents.receiver.role.rebuild_position(slot, Lane::ZERO);
+    assert!(next.is_some_and(|next| next > 0), "{next:?}");
+    let recorder = CommitRecorder::default();
+    rig.trace_receiver(Some(recorder.clone()), b, 9);
+    let start = rig.trace_events.iter().find_map(|event| match event {
+        crate::agents::AgentEvent::NetworkJournalOpened {
+            number: 9, start, ..
+        } => Some(*start),
+        _ => None,
+    });
+    assert_eq!(start, next, "the start is the lane's next commit position");
+    assert_eq!(recorder.0.lock().unwrap().1, [9]);
+    let mut bytes = [0u8; 64];
+    trace_extension(1).encode(&mut bytes).unwrap();
+    let traced = AppendOptions {
+        extension: Some(bytes),
+        ..AppendOptions::default()
+    };
+    let log = rig.log.as_mut().unwrap();
+    let AppendOutcome::Appended { position } =
+        log.publications[0].append(&[1; 100], traced).unwrap()
+    else {
+        panic!("not appended");
+    };
+    let _ = log.publications[0]
+        .append(&[2; 100], AppendOptions::default())
+        .unwrap();
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().data_committed >= 3
+    });
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let commits = recorder.0.lock().unwrap().0.clone();
+    assert_eq!(commits.len(), 1, "one traced frame, once: {commits:?}");
+    let (ext, at) = commits[0];
+    assert_eq!(ext, trace_extension(1));
+    assert_eq!(
+        (at.publication, at.lane, at.position, at.path),
+        (traced_publication(), Lane::ZERO, position, 0)
+    );
+    let boundary = rig.agents.receiver.role.rebuild_position(slot, Lane::ZERO);
+    let facts = rig.close_receiver_journal().expect("facts");
+    assert_eq!(
+        (Some(facts.start), Some(facts.boundary), facts.first_gap),
+        (next, boundary, None)
+    );
+    assert_eq!(recorder.0.lock().unwrap().2, 1, "closed through the hook");
+    // A second close finds nothing.
+    assert_eq!(rig.close_receiver_journal(), None);
+}
+
+/// P2.12 step 3 PR 2 (Q2, ACS 16519): an image that retires closes its
+/// lanes' journals at once and posts their facts to the conductor
+/// unsolicited; a later close answers the same facts once.
+#[test]
+fn a_retired_image_closes_its_journals_with_their_facts() {
+    let (mut rig, b) = Rig::new(Setup::default());
+    let _slot = established(&mut rig);
+    let recorder = CommitRecorder::default();
+    rig.trace_receiver(Some(recorder.clone()), b, 11);
+    rig.trace_events.clear();
+    rig.now += 11_000 * MS;
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().images_retired >= 1
+    });
+    rig.round(true);
+    let posted = rig.trace_events.iter().find_map(|event| match event {
+        crate::agents::AgentEvent::NetworkJournalClosed {
+            facts: Some(facts), ..
+        } => Some(*facts),
+        _ => None,
+    });
+    let posted = posted.expect("the retirement posted the close");
+    assert_eq!(posted.publication, traced_publication());
+    assert_eq!(recorder.0.lock().unwrap().2, 1, "closed through the hook");
+    // A later close: the same facts, then nothing.
+    assert_eq!(rig.close_receiver_journal(), Some(posted));
+    assert_eq!(rig.close_receiver_journal(), None);
+}
+
+/// P2.12 step 3 PR 2: without a hook, or for a publication no image
+/// receives, the journal is refused and comes back.
+#[test]
+fn a_receiver_journal_is_refused_without_a_hook_or_an_image() {
+    let (mut rig, b) = Rig::new(Setup::default());
+    let _slot = established(&mut rig);
+    rig.trace_receiver(None, b, 3);
+    assert!(rig.trace_events.iter().any(|event| matches!(
+        event,
+        crate::agents::AgentEvent::NetworkJournalRefused { journal, .. } if journal.number == 3
+    )));
+    rig.trace_events.clear();
+    rig.trace_receiver(Some(CommitRecorder::default()), b, 4);
+    assert!(rig.trace_events.iter().any(|event| matches!(
+        event,
+        crate::agents::AgentEvent::NetworkJournalOpened { number: 4, .. }
+    )));
+    // A second journal for the same lane is refused.
+    rig.trace_events.clear();
+    rig.trace_receiver(Some(CommitRecorder::default()), b, 5);
+    assert!(
+        rig.trace_events.iter().any(|event| matches!(
+            event,
+            crate::agents::AgentEvent::NetworkTraceSet {
+                closed: Some(1),
+                ..
+            }
+        )),
+        "the new hook closed the journal the old one held"
+    );
+}
+
+/// P2.12 step 3 PR 2: a frame whose EXT does not decode never reaches the
+/// commit point: datagram validation refuses it (`data_invalid`), so it is
+/// never traced. (The commit point still counts an EXT it cannot decode,
+/// `net_trace_ext_invalid`, should validation ever let one through.)
+#[test]
+fn an_undecodable_extension_is_refused_and_never_traced() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let _slot = established(&mut rig);
+    let recorder = CommitRecorder::default();
+    rig.trace_receiver(Some(recorder.clone()), b, 9);
+    let garbage = AppendOptions {
+        extension: Some([0xFF; 64]),
+        ..AppendOptions::default()
+    };
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0].append(&[1; 100], garbage).unwrap();
+    rig.until(true, |rig| rig.agents.receiver.counters().data_invalid >= 1);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        (counters.data_committed, counters.net_trace_ext_invalid),
+        (0, 0)
+    );
+    assert!(recorder.0.lock().unwrap().0.is_empty());
 }
