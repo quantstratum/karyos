@@ -426,6 +426,23 @@ impl<T: TermBytes> ReceiveOwner<T> {
         )
     }
 
+    /// Test hook (feature `test-hooks`): stores `position` as `lane`'s
+    /// published head, as a rebuild move whose store raced or failed would
+    /// leave it, so dependent crates can check what consumption reports.
+    /// Returns whether the lane exists.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_published_head(&self, lane: Lane, position: u64) -> bool {
+        let Some(owner) = self.lanes.get(usize::from(lane.get())) else {
+            return false;
+        };
+        owner
+            .buffer
+            .reserved_head()
+            .store(position, Ordering::Release);
+        true
+    }
+
     /// The covered end of `lane`: the highest end of any covered extent,
     /// a real frame or a local gap, which loss detection compares the
     /// rebuild position against.

@@ -200,21 +200,29 @@ fn a_head_raised_during_admission_moves_the_join() {
         let buffer = Arc::clone(&buffer);
         move || buffer.reserved_head().store(256, Ordering::Release)
     };
-    let mut raise = raised;
-    let required = conductor
-        .subscribe_pausing(Role::Required, &mut raise)
-        .unwrap();
+    let required = conductor.subscribe_pausing(Role::Required, raised).unwrap();
     assert_eq!(required.position(), 256);
     assert_eq!(required.acknowledged_position(), 256);
     let cell = buffer.cells().get(required.cell()).unwrap();
     assert_eq!(cell.position.load(Ordering::Acquire), 256);
     assert_eq!(buffer.required_position(), Some(256));
     // Without a raise the join is the head read.
-    let mut still = || {};
-    let second = conductor
-        .subscribe_pausing(Role::Optional, &mut still)
-        .unwrap();
+    let second = conductor.subscribe_pausing(Role::Optional, || {}).unwrap();
     assert_eq!(second.position(), 256);
+}
+
+/// Consumption reports the published head, not the owner's rebuild
+/// position: a rebuild move whose head store did not happen (the
+/// `split_end` error path, simulated by lowering the head) is never
+/// reported.
+#[test]
+fn consumption_reports_the_published_head() {
+    let buffer = image(0);
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 0, 128, 7)), committed(0, 128));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(128));
+    buffer.reserved_head().store(64, Ordering::Release);
+    assert_eq!(owner.consumption(Lane::ZERO), Some(64));
 }
 
 #[test]

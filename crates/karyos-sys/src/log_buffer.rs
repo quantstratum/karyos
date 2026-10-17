@@ -3825,7 +3825,7 @@ impl<O: BufferOwner> Conductor<O> {
     pub(crate) fn subscribe_pausing(
         &mut self,
         role: Role,
-        pause: &mut dyn FnMut(),
+        pause: impl FnMut(),
     ) -> Result<Subscription<O>, SysError> {
         let cursor = self
             .context()
@@ -4672,7 +4672,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         reserve: bool,
         occupant: u64,
     ) -> Result<Cursor, SysError> {
-        self.subscribe_with_pausing(role, reserve, occupant, &mut || {})
+        self.subscribe_with_pausing(role, reserve, occupant, || {})
     }
 
     /// [`Self::subscribe_with`], calling `pause` between the head read and
@@ -4682,7 +4682,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         role: Role,
         reserve: bool,
         occupant: u64,
-        pause: &mut dyn FnMut(),
+        mut pause: impl FnMut(),
     ) -> Result<Cursor, SysError> {
         let buffer = self.buffer;
         let mut credited = 0u32;
