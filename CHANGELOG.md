@@ -15,7 +15,9 @@ release may break APIs, wire formats and shared-memory layouts.
   A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
   reserved required or an optional cell and returns a `RecordingReader`:
   the reader and a lease on its stream, so a removed stream lives until
-  its seal is positioned and read. `karyos_archive::source::Guarded`
+  its seal is positioned and read; while it lives the stream refuses a
+  cutover (`DriverError::RecordingCutover`), since the reader follows
+  one mapping. `karyos_archive::source::Guarded`
   keeps the lease with the reader and drops the reader first. The host
   wires the two (SPEC section 14); `karyos-sim` records driver streams end
   to end.

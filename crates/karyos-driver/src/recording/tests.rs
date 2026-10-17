@@ -96,6 +96,18 @@ fn a_recording_reader_admits_only_required_and_optional() {
         );
     }
     assert_eq!(driver.next_export, before);
+    // With every cell taken, the role is still refused as a role: the
+    // check comes before the admission, which would refuse for room.
+    let mut held = Vec::new();
+    while let Ok(subscription) = driver.subscribe(handle, Role::Observer) {
+        held.push(subscription);
+    }
+    assert!(!held.is_empty());
+    assert!(matches!(
+        driver.recording_reader(handle, Role::Observer),
+        Err(DriverError::Sys(SysError::InvalidPublicationMode { .. }))
+    ));
+    drop(held);
     let required = driver.recording_reader(handle, Role::Required).unwrap();
     let optional = driver.recording_reader(handle, Role::Optional).unwrap();
     assert_eq!(driver.next_export, before + 2);
@@ -204,4 +216,32 @@ fn a_recording_reader_keeps_a_removed_stream_to_its_seal() {
         driver.seal_state(handle),
         Err(DriverError::UnknownStream { .. })
     ));
+}
+
+/// #352 review P2: a recording's reader follows one mapping, so a stream it
+/// holds refuses a cutover until the reader and its lease are dropped.
+#[test]
+fn a_recorded_stream_refuses_a_cutover() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = driver.add_stream(stream()).unwrap();
+    let reconfiguration = crate::generations::Reconfiguration {
+        term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+        spare_slots: 6,
+    };
+    let (reader, lease) = driver
+        .recording_reader(handle, Role::Required)
+        .unwrap()
+        .into_parts();
+    assert!(matches!(
+        driver.reconfigure_stream(handle, reconfiguration),
+        Err(DriverError::RecordingCutover { .. })
+    ));
+    // The reader alone dropped: the lease still holds the stream.
+    drop(reader);
+    assert!(matches!(
+        driver.reconfigure_stream(handle, reconfiguration),
+        Err(DriverError::RecordingCutover { .. })
+    ));
+    drop(lease);
+    assert!(driver.reconfigure_stream(handle, reconfiguration).is_ok());
 }

@@ -37,7 +37,7 @@ use karyos_driver::embedded::{EmbeddedDriver, StreamConfig, StreamHandle};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     CanonicalKind, LogBufferConfig, LossPolicy, PublicationMode, ReadError, ReadOrigin,
-    ReadOutcome, Role,
+    ReadOutcome, Role, SealState,
 };
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
@@ -210,22 +210,29 @@ fn offer_free(
 }
 
 /// Removes the stream (its buffer is sealed) and waits for the agent's
-/// `Ended` event of `id`.
+/// `Ended` event of `id`; returns it with the seal position the stream's
+/// conductor set (the recording's lease keeps the stream until then).
 fn seal_and_wait(
     driver: &mut EmbeddedDriver<HeapTerms>,
     handle: StreamHandle,
     archive: &ArchiveHandle,
     id: u64,
-) -> karyos_archive::recorder::Ended {
+) -> (karyos_archive::recorder::Ended, Option<u64>) {
     driver.remove_stream(handle).unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seal = None;
     loop {
         driver.do_work().unwrap();
+        if let Ok(SealState::Positioned { position } | SealState::Retired { position }) =
+            driver.seal_state(handle)
+        {
+            seal = Some(position);
+        }
         match archive.event(Duration::from_millis(10)) {
             Some(Event::Ended {
                 id: ended_id,
                 ended,
-            }) if ended_id == id => return ended,
+            }) if ended_id == id => return (ended, seal),
             Some(Event::Failed { id, failure }) => panic!("recording {id} failed: {failure:?}"),
             _ => assert!(Instant::now() < deadline, "recording {id} never ended"),
         }
@@ -296,7 +303,7 @@ fn the_archive_records_driver_streams_end_to_end() {
         }
     }
     drop(publication);
-    let ended = seal_and_wait(&mut driver, required, &archive, first);
+    let (ended, _) = seal_and_wait(&mut driver, required, &archive, first);
     while !drain(&mut shadow, &mut blocks) {
         driver.do_work().unwrap();
     }
@@ -347,7 +354,12 @@ fn the_archive_records_driver_streams_end_to_end() {
     let tail = [0xEEu8; 700];
     offer_free(&mut driver, &mut publication, &tail);
     drop(publication);
-    let lapped_end = seal_and_wait(&mut driver, lapped, &archive, second);
+    let (lapped_end, lapped_seal) = seal_and_wait(&mut driver, lapped, &archive, second);
+    assert_eq!(
+        Some(lapped_end.position),
+        lapped_seal,
+        "ends at stream 43's seal"
+    );
     assert_eq!(lapped_end.reason, StopReason::Normal);
     assert!(lapped_end.incomplete, "the lap is a recorded loss");
     archive.shutdown().unwrap();

@@ -7,6 +7,7 @@
 //! to the Archive's agent, which reads it through its `FrameSource`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_client::link::{Lease, LeaseEnd};
 use karyos_sys::SysError;
@@ -19,20 +20,37 @@ use crate::error::DriverError;
 
 /// A recording's reader of a stream, with the lease that keeps the stream:
 /// a removed stream is freed only once the lease is dropped, so its
-/// conductor positions the seal the reader ends at. Take the parts with
-/// [`RecordingReader::into_parts`] and keep the lease for as long as the
-/// reader (the Archive's `Guarded` source drops the reader first).
+/// conductor positions the seal the reader ends at; and while the lease
+/// lives, the stream refuses a cutover ([`DriverError::RecordingCutover`]).
+/// Take the parts with [`RecordingReader::into_parts`] and keep the lease
+/// for as long as the reader (the Archive's `Guarded` source drops the
+/// reader first).
 #[derive(Debug)]
 pub struct RecordingReader {
     reader: LaneReader,
-    lease: Lease,
+    lease: RecordingLease,
 }
 
 impl RecordingReader {
     /// The reader and the stream's lease.
     #[must_use]
-    pub fn into_parts(self) -> (LaneReader, Lease) {
+    pub fn into_parts(self) -> (LaneReader, RecordingLease) {
         (self.reader, self.lease)
+    }
+}
+
+/// A recording's hold on its stream: the stream's lease, and its count of
+/// recording readers, released on drop.
+#[derive(Debug)]
+pub struct RecordingLease {
+    _lease: Lease,
+    recordings: Arc<AtomicU64>,
+}
+
+impl Drop for RecordingLease {
+    fn drop(&mut self) {
+        // Release: the driver's cutover check reads it with Acquire.
+        self.recordings.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -48,7 +66,8 @@ impl EmbeddedDriver<HeapTerms> {
     /// # Errors
     ///
     /// [`DriverError::Sys`] with [`SysError::InvalidPublicationMode`] for
-    /// any other role; [`DriverError::ExportIdsExhausted`] when no occupant
+    /// any other role, checked before anything is admitted, and for a
+    /// network image's lane; [`DriverError::ExportIdsExhausted`] when no occupant
     /// id is left; [`DriverError::StreamRetiring`],
     /// [`DriverError::CutoverPending`] and [`DriverError::UnknownStream`]
     /// as [`EmbeddedDriver::subscribe`]; and [`DriverError::Sys`] when the
@@ -75,7 +94,14 @@ impl EmbeddedDriver<HeapTerms> {
             .subscribe_as(role, role == Role::Required, occupant)?;
         let reader = SenderRead::for_recording(subscription, DEFAULT_CORRUPT_RETRIES)?;
         let lease = Lease::acquire(&target.leases, &Arc::new(LeaseEnd::default()));
+        // One reader per lease; the count cannot reach u64::MAX.
+        target.recordings.fetch_add(1, Ordering::Release);
+        let lease = RecordingLease {
+            _lease: lease,
+            recordings: Arc::clone(&target.recordings),
+        };
         self.next_export = next;
+        self.update_stream_gauges();
         Ok(RecordingReader { reader, lease })
     }
 }
