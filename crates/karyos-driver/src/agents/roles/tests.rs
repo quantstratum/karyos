@@ -3190,3 +3190,58 @@ fn the_sender_serves_a_routed_publication_on_every_path() {
     assert_eq!(counts[0].load(Ordering::Relaxed), 2);
     assert_eq!(counts[1].load(Ordering::Relaxed), 2);
 }
+
+/// rp-w4b2b: a routed publication added to the sender has a SETUP side on
+/// each path's endpoint: it is established once a receiver's SM arrives on
+/// a later path, and its removal ends every path's side.
+#[test]
+fn a_routed_publication_has_a_setup_side_per_path() {
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let routes = [
+        (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
+        (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
+    ];
+    let (path, _log) = super::super::data::testing::outbound_routed(
+        &routes,
+        alias(),
+        publication(EndpointId(1)).term,
+        1,
+        false,
+    );
+    let event = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    assert!(matches!(
+        event,
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    assert!(!sender.sessions.is_established(EndpointId(2), alias()));
+    // The receiver of the later path answers and its SM arrives there.
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(2), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(2), receiver, &sm_status([7, 8], 0), 1);
+    assert!(sender.sessions.is_established(EndpointId(2), alias()));
+    assert!(super::established(
+        &sender.sessions,
+        &sender.publications[0]
+    ));
+    // Removing it ends both paths' SETUP sides.
+    let removed = sender.command(AgentCommand::<OsSocket>::RemovePublication {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias: alias(),
+        registration: 1,
+    });
+    assert!(matches!(
+        removed,
+        Some((_, AgentEvent::PublicationRemoved { .. }))
+    ));
+    assert!(!sender.sessions.remove(EndpointId(1), alias()));
+    assert!(!sender.sessions.remove(EndpointId(2), alias()));
+}

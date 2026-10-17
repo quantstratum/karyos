@@ -4004,7 +4004,7 @@ impl SenderRole {
                 // A guarded publication's gate decides every exposure.
                 let guarded = guard.is_none_or(|spec| outbound.guard(spec, (self.clock)()).is_ok());
                 if repairs && guarded {
-                    self.sessions.add(publication)
+                    add_sessions(&mut self.sessions, &publication, &outbound)
                 } else {
                     Err(SendSessionError::InvalidConfig)
                 }
@@ -4044,14 +4044,27 @@ impl SenderRole {
         alias: Alias,
         registration: u64,
     ) -> AgentEvent<O> {
-        let _ = self.sessions.remove(endpoint, alias);
-        self.bindings
-            .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
         let outbound = self
             .publications
             .iter()
             .position(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
             .map(|index| self.publications.swap_remove(index));
+        // Every path's SETUP side and bindings go with it.
+        match outbound.as_deref() {
+            Some(outbound) => {
+                for path in outbound.route_endpoints() {
+                    let _ = self.sessions.remove(path, alias);
+                }
+                self.bindings.retain(|binding| {
+                    !(outbound.serves(binding.endpoint) && binding.alias == alias)
+                });
+            }
+            None => {
+                let _ = self.sessions.remove(endpoint, alias);
+                self.bindings
+                    .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
+            }
+        }
         AgentEvent::PublicationRemoved {
             endpoint,
             alias,
@@ -4236,9 +4249,12 @@ impl SenderRole {
         // (SPEC.md §4) until a receiver's SMs are live again.
         let mut changes = 0u64;
         for outbound in &mut self.publications {
-            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            let alias = outbound.alias();
+            // A confirmed binding on any of its paths keeps it live.
             let bound = self.bindings.iter().any(|binding| {
-                binding.endpoint == endpoint && binding.alias == alias && binding.last_sm.is_some()
+                outbound.serves(binding.endpoint)
+                    && binding.alias == alias
+                    && binding.last_sm.is_some()
             });
             let live = bound || outbound.connected(now);
             if outbound.set_receivers_live(live)
@@ -4247,7 +4263,9 @@ impl SenderRole {
                 changes = next;
             }
             if !live {
-                let _ = self.sessions.disconnected(endpoint, alias);
+                for path in outbound.route_endpoints() {
+                    let _ = self.sessions.disconnected(path, alias);
+                }
             }
         }
         for _ in 0..changes {
@@ -4283,7 +4301,7 @@ impl SenderRole {
                 break;
             };
             let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
-            if !self.sessions.is_established(endpoint, alias) {
+            if !established(&self.sessions, outbound) {
                 // Not served yet, but a guard close still applies (the
                 // close acknowledgement waits for it).
                 if let Some(outbound) = self.publications.get_mut(index) {
@@ -4709,8 +4727,8 @@ impl SenderRole {
             let Some(outbound) = self.publications.get(index) else {
                 break;
             };
-            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
-            if outbound.repair().is_none() || !self.sessions.is_established(endpoint, alias) {
+            let endpoint = outbound.endpoint();
+            if outbound.repair().is_none() || !established(&self.sessions, outbound) {
                 continue;
             }
             let tx = halves.iter_mut().find_map(|(held, half)| match half {
@@ -4952,6 +4970,42 @@ impl SenderRole {
             }
         }
     }
+}
+
+/// Adds the SETUP side of `publication` on each of `outbound`'s paths, all
+/// or nothing: a routed publication answers and announces on every path's
+/// endpoint, and takes one session per path of the table's capacity.
+fn add_sessions(
+    sessions: &mut SendSessions,
+    publication: &crate::sessions::send::Publication,
+    outbound: &Outbound,
+) -> Result<(), SendSessionError> {
+    let mut added = 0usize;
+    for path in outbound.route_endpoints() {
+        let result = sessions.add(crate::sessions::send::Publication {
+            endpoint: path,
+            ..*publication
+        });
+        if let Err(error) = result {
+            for undo in outbound.route_endpoints().take(added) {
+                let _ = sessions.remove(undo, publication.alias);
+            }
+            return Err(error);
+        }
+        // At most four paths: no overflow.
+        if let Some(next) = added.checked_add(1) {
+            added = next;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `outbound` is established on any of its paths: its first sends
+/// go on every path once one receiver's SM has arrived on one.
+fn established(sessions: &SendSessions, outbound: &Outbound) -> bool {
+    outbound
+        .route_endpoints()
+        .any(|path| sessions.is_established(path, outbound.alias()))
 }
 
 #[cfg(test)]
