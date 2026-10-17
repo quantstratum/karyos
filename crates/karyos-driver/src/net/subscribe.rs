@@ -152,6 +152,13 @@ impl EmbeddedDriver<HeapTerms> {
             .map_or(0, crate::net::Network::held_endpoints)
     }
 
+    /// Network publications and subscriptions refused by channel URI
+    /// because their client owned `NetworkConfig::max_owned_per_client`.
+    #[must_use]
+    pub fn network_owned_refusals(&self) -> u64 {
+        self.owned_refusals
+    }
+
     /// Images installed but not exposed so far: their alias was in use.
     #[must_use]
     pub fn network_images_unexposed(&self) -> u64 {
