@@ -25,6 +25,15 @@
 //!   submitted. A reliable lane rewinds its reader to the registered
 //!   position, which is only ever a block boundary, and sends it again; an
 //!   unreliable lane leaves the gap to the receiver's gap policy.
+//! - **Flow control** (multicast-flow-control.md; MC-3, MC-7; ACS 15707).
+//!   With its receivers' [`Membership`] attached, each lane stages a first
+//!   send only while a whole maximum frame from the cursor stays within
+//!   the lane's edge ([`Limit::Edge`]): a read cannot be undone, and a join
+//!   window is at least the largest datagram, so this never stalls. With
+//!   no receiver window ([`Limit::NoReceiverWindow`]) the lane stages
+//!   nothing; while a required loss is unresolved ([`Limit::Held`]) no lane
+//!   stages, and `admits` holds what was staged, in order. Each lane's
+//!   highest submitted position is the membership's `sent_high`.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -39,11 +48,17 @@ use karyos_io::lanes::{LaneGate, LaneSender, Left, SenderFailure, Staged};
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::lanes::drr::{Budget, DrrConfig};
-use karyos_protocol::network::{Alias, Lanes};
+use karyos_protocol::network::{Alias, Lanes, MAX_LANES};
 use karyos_sys::log_buffer::{LogBuffer, ReadError, ReadOrigin, ReadOutcome, SenderRead};
 use karyos_sys::sizing::align_frame;
 
+use karyos_protocol::frame::Lane;
+
 use super::{AgentError, AgentKind, EndpointId};
+use crate::membership::{Limit, Membership};
+
+/// Membership timer actions per cycle.
+const MEMBERSHIP_TIMER_ACTIONS: u32 = 16;
 
 /// A publication's lane reader.
 pub type LaneReader = SenderRead<Arc<LogBuffer>>;
@@ -55,6 +70,8 @@ const STAGED_PER_LANE: u16 = 8;
 /// It records, per lane, the position each submitted head reached.
 struct DataGate<'a> {
     lanes: &'a mut [LaneTrack],
+    /// A required loss is unresolved: staged heads stay queued (MC-7).
+    held: bool,
 }
 
 impl SenderGate for DataGate<'_> {
@@ -71,7 +88,7 @@ impl SenderGate for DataGate<'_> {
 
 impl LaneGate for DataGate<'_> {
     fn admits(&mut self, _lane: usize) -> bool {
-        true
+        !self.held
     }
 
     fn left(&mut self, lane: usize, staged: Staged, how: Left) {
@@ -137,6 +154,10 @@ pub struct OutboundCounters {
     pub send_failures: u64,
     /// Committed datagrams the lane sender refused to record.
     pub staged_refused: u64,
+    /// Lane stagings stopped at the receivers' edge or with no window.
+    pub window_waits: u64,
+    /// Cycles held by an unresolved required loss.
+    pub held: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -161,6 +182,10 @@ pub struct Outbound {
     reliable: bool,
     /// The largest datagram, the channel MTU.
     mtu: usize,
+    /// The largest datagram's aligned charge.
+    max_frame: u64,
+    /// Its receivers, once attached (multicast-flow-control.md).
+    membership: Option<Box<Membership>>,
     sender: LaneSender,
     queues: Vec<TxQueueId>,
     tracks: Vec<LaneTrack>,
@@ -234,6 +259,8 @@ impl Outbound {
             readers,
             reliable,
             mtu: usize::try_from(mtu).map_err(|_| OutboundError::Mtu)?,
+            max_frame: u64::from(max_charge),
+            membership: None,
             sender,
             queues,
             tracks,
@@ -274,6 +301,23 @@ impl Outbound {
     #[must_use]
     pub fn readers(&self) -> &[LaneReader] {
         &self.readers
+    }
+
+    /// Attaches its receivers' membership: from then on first sends follow
+    /// their limits (control path).
+    pub fn attach_membership(&mut self, membership: Box<Membership>) {
+        self.membership = Some(membership);
+    }
+
+    /// Its receivers' membership, if attached.
+    pub fn membership_mut(&mut self) -> Option<&mut Membership> {
+        self.membership.as_deref_mut()
+    }
+
+    /// The largest datagram's aligned charge: the least join window.
+    #[must_use]
+    pub fn max_frame(&self) -> u64 {
+        self.max_frame
     }
 
     /// Each lane's join point for an answer now: where its next read
@@ -356,21 +400,40 @@ impl Outbound {
         tx: &mut SocketsTx<O>,
         budget: Budget,
         consumption: Option<&[u64]>,
+        now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         if !self.open(tx) {
             return Ok(0);
         }
+        // The receivers' limits this cycle; with no membership attached,
+        // first sends are not gated.
+        let mut limits = [Limit::Edge(u64::MAX); MAX_LANES];
+        let mut held = false;
+        if let Some(membership) = self.membership.as_deref_mut() {
+            let _ = membership.timers(now, MEMBERSHIP_TIMER_ACTIONS);
+            for (lane, limit) in limits.iter_mut().enumerate().take(self.readers.len()) {
+                if let Some(lane) = u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()) {
+                    *limit = membership.limit(lane, now);
+                    held |= *limit == Limit::Held;
+                }
+            }
+        }
+        if held {
+            self.counters.bump(|c| &mut c.held, 1);
+        }
         let mut work = 0u32;
         for lane in 0..self.readers.len() {
+            let limit = limits.get(lane).copied().unwrap_or(Limit::Held);
             work = work
-                .checked_add(self.stage(tx, lane)?)
+                .checked_add(self.stage(tx, lane, limit)?)
                 .ok_or(overflow.clone())?;
         }
         let report = self.sender.serve(
             tx,
             &mut DataGate {
                 lanes: &mut self.tracks,
+                held,
             },
             budget,
         );
@@ -387,6 +450,13 @@ impl Outbound {
                 track.high = track.high.max(submitted);
             }
             let submitted = track.high;
+            // The membership's sent frontier (one path: `sent_high`).
+            if let (Some(membership), Some(lane)) = (
+                self.membership.as_deref_mut(),
+                u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()),
+            ) {
+                let _ = membership.advance_sent(lane, submitted);
+            }
             let target = if self.reliable {
                 // No bound receiver: the registered position holds (SPEC §4:
                 // never past what a required receiver consumed).
@@ -493,6 +563,7 @@ impl Outbound {
         &mut self,
         tx: &mut SocketsTx<O>,
         lane: usize,
+        limit: Limit,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         let mut staged = 0u32;
@@ -506,10 +577,22 @@ impl Outbound {
             .pending(lane)
             .is_some_and(|pending| pending < usize::from(STAGED_PER_LANE))
         {
+            // The receivers' edge, before the read (it cannot be undone):
+            // a whole maximum frame from the cursor must fit.
+            let from = reader.position();
+            let fits = match limit {
+                Limit::Edge(edge) => from
+                    .checked_add(self.max_frame)
+                    .is_some_and(|end| end <= edge),
+                Limit::NoReceiverWindow | Limit::Held => false,
+            };
+            if !fits {
+                self.counters.bump(|c| &mut c.window_waits, 1);
+                break;
+            }
             let Ok(mut frame) = tx.claim_tx(queue, self.mtu) else {
                 break;
             };
-            let from = reader.position();
             let (len, next, record) =
                 match reader.read_committed(from, ReadOrigin::Cursor, frame.bytes_mut()) {
                     Ok(ReadOutcome::Copied { len, next }) => (len, next, false),

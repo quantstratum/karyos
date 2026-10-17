@@ -803,6 +803,89 @@ fn the_sender_validates_sms_against_its_bindings() {
     );
 }
 
+/// The membership wiring (ACS 15648, 15707): an accepted SM reaches the
+/// publication's membership under its binding key; a re-bind whose next SM
+/// names another receiver id ends the former membership first; a binding's
+/// expiry ends its member, synchronously.
+#[test]
+fn accepted_sms_and_gone_bindings_reach_the_membership() {
+    use karyos_protocol::frame::Lane;
+    use karyos_protocol::network::{LaneStatus, Receiver, SetupAnswer, StatusMessage};
+
+    use crate::membership::{Membership, MembershipConfig, Roles};
+    use crate::repair::admission::Requester;
+
+    let config = AgentConfig::default();
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let endpoint = EndpointId(1);
+    sender.sessions.add(publication(endpoint)).unwrap();
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let (mut path, _log) = outbound(endpoint, receiver);
+    path.attach_membership(Box::new(
+        Membership::new(
+            MembershipConfig::new(1, 1408, 32_768),
+            identity(),
+            alias(),
+            &Roles::default(),
+            0,
+        )
+        .unwrap(),
+    ));
+    sender.publications.push(*path);
+    let answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(endpoint).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    let status = |receiver_id, consumption| StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[LaneStatus {
+            consumption,
+            window: 32_768,
+        }])
+        .unwrap(),
+    };
+    let member = |sender: &mut super::SenderRole, receiver_id, now| {
+        sender.publications[0].membership_mut().unwrap().requester(
+            Receiver {
+                receiver_boot_id: [7, 8],
+                receiver_id,
+            },
+            Lane::ZERO,
+            now,
+        )
+    };
+    sender.bind(endpoint, receiver, &answer, 0);
+    sender.status(endpoint, receiver, &status(1, 0), 1);
+    assert!(matches!(
+        member(&mut sender, 1, 1),
+        Requester::Member { .. }
+    ));
+    // A new answer (a reinstalled image), then an SM of receiver 2: 1 goes.
+    sender.bind(endpoint, receiver, &answer, 2);
+    sender.status(endpoint, receiver, &status(2, 0), 3);
+    assert_eq!(member(&mut sender, 1, 3), Requester::Unknown);
+    assert!(matches!(
+        member(&mut sender, 2, 3),
+        Requester::Member { .. }
+    ));
+    // Its SMs stop: the binding expires, and the member with it, at once.
+    sender.expire_bindings(3 + config.image_liveness_timeout);
+    assert!(sender.bindings.is_empty());
+    assert_eq!(member(&mut sender, 2, 4), Requester::Unknown);
+}
+
 /// P1: a flood of answered strangers cannot hold the binding table. An
 /// unconfirmed binding expires after `setup_challenge_timeout` and is the
 /// first evicted when the table is full; a confirmed one stays while its
@@ -926,7 +1009,7 @@ fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
         heartbeat_marks: [None; 4],
         last_fresh: 0,
         window: 32_768,
-        sm_last: None,
+        schedule: crate::sm_schedule::SmSchedule::new(10_000_000, &[32_768]).unwrap(),
         sm_slot: None,
         sm: Arc::new(super::SmSlot::default()),
         evidence: 0,
