@@ -717,3 +717,409 @@ fn rtt_probes_answer_for_the_asked_path() {
     assert_eq!(probes.rtt_snapshot(0), config.rtt_initial);
     assert_ne!(probes.rtt_snapshot(1), probes.rtt_snapshot(0));
 }
+
+/// A draw that returns a set value and records the bound it was given.
+struct FakeDraw {
+    value: u64,
+    bound: Option<u64>,
+}
+
+impl DelayDraw for FakeDraw {
+    fn draw(&mut self, bound: u64) -> u64 {
+        self.bound = Some(bound);
+        self.value.min(bound)
+    }
+}
+
+fn draw(value: u64) -> FakeDraw {
+    FakeDraw { value, bound: None }
+}
+
+fn multicast_image(config: MulticastConfig) -> ImageLoss {
+    image().multicast(config).unwrap()
+}
+
+/// A peer receiver's NAK for `hole` on lane 0.
+fn peer(id: u64, start: u64, length: u32) -> Nak {
+    Nak {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [3, 4],
+            receiver_id: id,
+        },
+        range: NakRange {
+            lane: lane(0),
+            length,
+            start,
+        },
+    }
+}
+
+/// W with the default linger and slack (1 ms each) over a 1 ms RTT.
+const W: u64 = 3_000_000;
+const RTT: u64 = 1_000_000;
+
+#[test]
+fn multicast_settings_are_checked() {
+    for (config, what) in [
+        (
+            MulticastConfig {
+                nak_delay_scale: 0,
+                ..MulticastConfig::default()
+            },
+            "scale 0",
+        ),
+        (
+            MulticastConfig {
+                nak_delay_scale: 257,
+                ..MulticastConfig::default()
+            },
+            "scale 257",
+        ),
+        (
+            MulticastConfig {
+                repair_slack_ns: 1_000_000_001,
+                ..MulticastConfig::default()
+            },
+            "slack",
+        ),
+        (
+            MulticastConfig {
+                max_failed_suppressors: 0,
+                ..MulticastConfig::default()
+            },
+            "no failed suppressors",
+        ),
+        (
+            MulticastConfig {
+                max_failed_suppressors: 5,
+                ..MulticastConfig::default()
+            },
+            "five failed suppressors",
+        ),
+    ] {
+        assert!(image().multicast(config).is_err(), "{what}");
+    }
+}
+
+/// RC-2: a hole's NAK waits for its cycle's drawn delay, drawn from
+/// `[0, rtt * scale / 16]` with the RTT copied at the cycle's start.
+#[test]
+fn a_multicast_nak_waits_for_its_drawn_delay() {
+    let mut loss = multicast_image(MulticastConfig {
+        nak_delay_scale: 8,
+        ..MulticastConfig::default()
+    });
+    let rtt = FakeRtt::new(RTT);
+    let mut delay = draw(300_000);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    // No cycle yet: nothing is due.
+    assert_eq!(loss.due(lane(0), 0), None);
+    loss.cycle(lane(0), 100, &rtt, &mut delay);
+    assert_eq!(delay.bound, Some(RTT / 2));
+    assert_eq!(loss.due(lane(0), 100 + 299_999), None);
+    assert!(loss.due(lane(0), 100 + 300_000).is_some());
+    assert_eq!(loss.counters().cycles, 1);
+}
+
+/// B: an eligible peer NAK covering the whole hole before the deadline
+/// cancels the cycle's local NAK and opens its window; when the window
+/// ends with the hole still there the next cycle draws again.
+#[test]
+fn a_covering_peer_nak_suppresses_the_cycle() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(64, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    assert!(loss.peer_nak(&peer(7, 0, 256), 100));
+    assert_eq!(loss.due(lane(0), 500_000), None);
+    // The window runs from the peer NAK.
+    loss.cycle(lane(0), 100 + W - 1, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 1);
+    loss.cycle(lane(0), 100 + W, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 2);
+    assert!(loss.due(lane(0), 100 + W).is_some());
+    assert_eq!(loss.counters().peer_suppressions, 1);
+}
+
+/// A peer NAK suppresses nothing when it covers part of the hole, comes
+/// from this receiver (multicast loopback), names another image, arrives
+/// at or after the deadline (a tie goes to the local NAK), or the response
+/// domain is `requester`.
+#[test]
+fn ineligible_peer_naks_suppress_nothing() {
+    let rtt = FakeRtt::new(RTT);
+    let mut loss = multicast_image(MulticastConfig::default());
+    let _ = loss.observe(lane(0), hole(64, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    let mut own = peer(1, 0, 256);
+    own.receiver = receiver();
+    let mut other = peer(7, 0, 256);
+    other.identity.incarnation = 2;
+    for nak in [peer(7, 96, 32), peer(7, 64, 32), own, other] {
+        assert!(!loss.peer_nak(&nak, 100), "{nak:?}");
+    }
+    assert!(!loss.peer_nak(&peer(7, 0, 256), 500_000), "the tie");
+    assert!(loss.due(lane(0), 500_000).is_some());
+    assert_eq!(loss.counters().peer_naks_ignored, 5);
+    let mut requester = multicast_image(MulticastConfig {
+        group_domain: false,
+        ..MulticastConfig::default()
+    });
+    let _ = requester.observe(lane(0), hole(64, 64), 0);
+    requester.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    assert!(!requester.peer_nak(&peer(7, 0, 256), 100));
+}
+
+/// C: data published inside the hole before the deadline is a repair in
+/// progress; it cancels the local NAK and anchors the window there.
+#[test]
+fn a_published_repair_suppresses_the_cycle() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 128), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    let _ = loss.observe(lane(0), hole(64, 64), 200);
+    assert_eq!(loss.due(lane(0), 500_000), None);
+    loss.cycle(lane(0), 200 + W - 1, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 1);
+    loss.cycle(lane(0), 200 + W, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 2);
+    assert_eq!(loss.counters().repair_suppressions, 1);
+}
+
+/// A local NAK opens the window at its submission, `W` long; the retry is
+/// the next cycle, not a NAK one RTT later.
+#[test]
+fn a_local_nak_waits_for_the_window() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(0));
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 10, &rtt);
+    assert_eq!(loss.due(lane(0), 10 + RTT), None);
+    // Not even at W: only the next cycle makes it due.
+    assert_eq!(loss.due(lane(0), 10 + W), None);
+    loss.cycle(lane(0), 10 + W - 1, &rtt, &mut draw(0));
+    assert_eq!(loss.due(lane(0), 10 + W - 1), None);
+    loss.cycle(lane(0), 10 + W, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 2);
+    assert!(loss.due(lane(0), 10 + W).is_some());
+}
+
+/// RC-14: a peer whose suppression ended a cycle with nothing published
+/// inside the hole cannot suppress it again; after `max_failed` such
+/// peers the hole takes no peer suppression, so its own NAK goes within
+/// `max_failed + 1` cycles (ACS 16108). A suppression followed by a repair
+/// marks nobody.
+#[test]
+fn failed_suppressors_are_bounded() {
+    let mut loss = multicast_image(MulticastConfig {
+        max_failed_suppressors: 2,
+        ..MulticastConfig::default()
+    });
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 256), 0);
+    let mut now = 0;
+    loss.cycle(lane(0), now, &rtt, &mut draw(500_000));
+    // Peer 7 suppresses, then progress: it is not marked.
+    assert!(loss.peer_nak(&peer(7, 0, 256), now + 1));
+    let _ = loss.observe(lane(0), hole(64, 192), now + 2);
+    now += 1 + W;
+    loss.cycle(lane(0), now, &rtt, &mut draw(500_000));
+    assert_eq!(loss.counters().failed_suppressors_marked, 0);
+    // Peers 7 then 8 suppress with no progress: the second disables.
+    for id in [7, 8] {
+        assert!(loss.peer_nak(&peer(id, 0, 256), now + 1), "peer {id}");
+        now += 1 + W;
+        loss.cycle(lane(0), now, &rtt, &mut draw(500_000));
+    }
+    let counters = loss.counters();
+    assert_eq!(counters.failed_suppressors_marked, 2);
+    assert_eq!(counters.peer_suppression_disabled, 1);
+    // Now no peer suppresses this hole, not even a fresh one: the third
+    // cycle's own NAK goes.
+    assert!(!loss.peer_nak(&peer(9, 0, 256), now + 1));
+    assert!(loss.due(lane(0), now + 500_000).is_some());
+    assert_eq!(loss.counters().max_suppressed_run, 3);
+    // A new hole starts with no failed suppressors.
+    let _ = loss.observe(lane(0), hole(8192, 64), now + 2);
+    loss.cycle(lane(0), now + 2, &rtt, &mut draw(500_000));
+    assert!(loss.peer_nak(&peer(7, 8192, 64), now + 3));
+}
+
+/// A failed suppressor of a hole cannot suppress it again while it still
+/// has room in its table.
+#[test]
+fn a_failed_suppressor_cannot_suppress_again() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    assert!(loss.peer_nak(&peer(7, 0, 64), 1));
+    loss.cycle(lane(0), 1 + W, &rtt, &mut draw(500_000));
+    assert!(!loss.peer_nak(&peer(7, 0, 64), 2 + W));
+    assert!(loss.peer_nak(&peer(8, 0, 64), 3 + W));
+}
+
+/// A unicast image ignores cycles and peer NAKs: its NAK is due at once.
+#[test]
+fn a_unicast_image_has_no_cycles() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    assert!(!loss.peer_nak(&peer(7, 0, 64), 1));
+    assert!(loss.due(lane(0), 1).is_some());
+    assert_eq!(loss.counters().cycles, 0);
+}
+
+/// The consecutive suppressed cycles of a hole start over after a cycle
+/// whose local NAK went out; the image keeps the longest run.
+#[test]
+fn a_local_nak_ends_a_suppressed_run() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    let mut now = 0;
+    loss.cycle(lane(0), now, &rtt, &mut draw(500_000));
+    // Two suppressed cycles with no progress: peers 7 and 8 are marked.
+    for id in [7, 8] {
+        assert!(loss.peer_nak(&peer(id, 0, 64), now + 1));
+        now += 1 + W;
+        loss.cycle(lane(0), now, &rtt, &mut draw(500_000));
+    }
+    assert_eq!(loss.counters().max_suppressed_run, 2);
+    // A cycle whose local NAK goes out.
+    now += 500_000;
+    let nak = loss.due(lane(0), now).unwrap();
+    loss.submitted(&nak, now, &rtt);
+    now += W;
+    loss.cycle(lane(0), now, &rtt, &mut draw(500_000));
+    // One more suppressed cycle: a run of 1, the maximum stays 2.
+    assert!(loss.peer_nak(&peer(9, 0, 64), now + 1));
+    now += 1 + W;
+    loss.cycle(lane(0), now, &rtt, &mut draw(500_000));
+    assert_eq!(loss.counters().max_suppressed_run, 2);
+}
+
+/// RC-2: the delay bound follows the RTT snapshot of each cycle's start.
+#[test]
+fn the_delay_bound_follows_the_rtt() {
+    let mut loss = multicast_image(MulticastConfig {
+        nak_delay_scale: 8,
+        ..MulticastConfig::default()
+    });
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    let mut first = draw(0);
+    loss.cycle(lane(0), 0, &rtt, &mut first);
+    assert_eq!(first.bound, Some(RTT / 2));
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    rtt.rtt.set(4 * RTT);
+    let mut second = draw(0);
+    // The first window is the first snapshot's: 1 ms + 2 ms.
+    loss.cycle(lane(0), W, &rtt, &mut second);
+    assert_eq!(second.bound, Some(2 * RTT));
+}
+
+/// A multicast NAK's window is its cycle's, from the RTT copied at the
+/// cycle's start, even when the RTT moved before the submission.
+#[test]
+fn a_local_nak_opens_its_cycles_window() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(0));
+    rtt.rtt.set(10 * RTT);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    loss.cycle(lane(0), W - 1, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 1);
+    loss.cycle(lane(0), W, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 2);
+}
+
+/// A peer NAK for another alias suppresses nothing.
+#[test]
+fn a_peer_nak_for_another_alias_is_ignored() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    let mut other = peer(7, 0, 64);
+    other.alias.session_id += 1;
+    assert!(!loss.peer_nak(&other, 1));
+    assert_eq!(loss.counters().peer_naks_ignored, 1);
+    assert!(loss.due(lane(0), 500_000).is_some());
+}
+
+/// C: only a repair seen before the drawn delay expires suppresses; once
+/// the NAK is due, a repair that leaves the hole does not cancel it.
+#[test]
+fn a_repair_after_the_delay_does_not_cancel_the_nak() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 256), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    // Due at 500_000 but not yet submitted: data lands inside the hole.
+    let _ = loss.observe(lane(0), hole(64, 192), 500_000);
+    assert_eq!(loss.counters().repair_suppressions, 0);
+    assert!(loss.due(lane(0), 500_000).is_some());
+}
+
+/// B: repeated peer NAKs in a suppressed cycle do not extend its window,
+/// which stays anchored at the first.
+#[test]
+fn repeated_peer_naks_do_not_extend_the_window() {
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(500_000));
+    assert!(loss.peer_nak(&peer(7, 0, 64), 100));
+    let _ = loss.peer_nak(&peer(8, 0, 64), 200_000);
+    loss.cycle(lane(0), 100 + W, &rtt, &mut draw(0));
+    assert_eq!(loss.counters().cycles, 2);
+}
+
+/// An RTT whose timing does not fit in `u64` is refused at configuration
+/// and, should one reach a cycle anyway, counted.
+#[test]
+fn a_timing_past_u64_is_refused_and_counted() {
+    let config = MulticastConfig::default();
+    assert!(config.validate_for(10_000_000_000).is_ok());
+    assert_eq!(
+        config.validate_for(u64::MAX / 2),
+        Err(LossConfigError::Multicast(
+            "the NAK timing of rtt_probe_timeout does not fit in u64"
+        ))
+    );
+    let mut loss = multicast_image(config);
+    let rtt = FakeRtt::new(u64::MAX / 2);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut draw(5));
+    assert_eq!(loss.counters().timing_overflows, 1);
+    // The NAK goes at once.
+    assert!(loss.due(lane(0), 0).is_some());
+}
+
+/// A draw above its bound is clamped to it: the local NAK is never due
+/// later than `rtt * scale / 16` after the cycle's start.
+#[test]
+fn a_draw_above_its_bound_is_clamped() {
+    struct Wild;
+    impl DelayDraw for Wild {
+        fn draw(&mut self, _bound: u64) -> u64 {
+            u64::MAX
+        }
+    }
+    let mut loss = multicast_image(MulticastConfig::default());
+    let rtt = FakeRtt::new(RTT);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    loss.cycle(lane(0), 0, &rtt, &mut Wild);
+    assert_eq!(loss.due(lane(0), RTT - 1), None);
+    assert!(loss.due(lane(0), RTT).is_some());
+}

@@ -50,8 +50,31 @@
 //! [`RttSource`] at each submission ([`RttProbes`] in the agent, a fake in
 //! tests); the value is copied, so later samples do not move a retry.
 //!
-//! Multicast cycles with B+C suppression and the redundant-path skew wait
-//! come later. Nothing here allocates; positions and times are checked.
+//! **Multicast cycles, B with C** (owner decision P4; RC-2, RC-3, RC-5,
+//! RC-14; ACS 15898), with [`ImageLoss::multicast`]. A hole's NAK is not
+//! due at once: the caller runs [`ImageLoss::cycle`] each step, which
+//! starts a cycle with one delay `d` drawn uniformly from
+//! `[0, rtt * nak_delay_scale / 16]` ([`DelayDraw`]). The local NAK is due
+//! once `d` has passed, unless before that (an exact tie goes to the local
+//! deadline):
+//!
+//! - an eligible peer NAK covering the whole hole arrived
+//!   ([`ImageLoss::peer_nak`]): eligible only with the `group` response
+//!   domain, from a peer that has not failed to suppress this hole; or
+//! - the receive owner published data inside the hole (a repair in
+//!   progress, seen as a shrink by [`ImageLoss::observe`]).
+//!
+//! Either cancels the cycle's local NAK and opens its window, anchored
+//! then; a local NAK opens the window at its submission. The window is
+//! `W = rtt + repair_linger + repair_slack`; at its end a persisting hole
+//! starts the next cycle with a new draw. A peer whose suppression ended a
+//! cycle with nothing published inside the hole cannot suppress it again;
+//! after `max_failed_suppressors` such peers the hole accepts no peer
+//! suppression (RC-14). Each hole counts its consecutive suppressed
+//! cycles, and the image keeps the maximum as a diagnostic.
+//!
+//! The redundant-path skew wait comes later. Nothing here allocates;
+//! positions and times are checked.
 
 use karyos_protocol::frame::Lane;
 use karyos_protocol::network::{
@@ -60,6 +83,113 @@ use karyos_protocol::network::{
 use karyos_sys::host_clock::age_ns;
 
 use crate::rtt::{ProbeIds, RttProbes};
+
+/// The bounded random draw of a multicast cycle's NAK delay (RC-2).
+pub trait DelayDraw {
+    /// An integer drawn uniformly from `[0, bound]`, without bias.
+    fn draw(&mut self, bound: u64) -> u64;
+}
+
+/// The most failed suppressors one hole remembers (RC-14).
+pub const MAX_FAILED_SUPPRESSORS: usize = 4;
+
+/// A multicast image's NAK timing and suppression (RC-2, RC-3, RC-5, RC-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MulticastConfig {
+    /// The delay bound in sixteenths of an RTT (`nak_delay_scale`, 1 to
+    /// 256, default 16: one RTT).
+    pub nak_delay_scale: u64,
+    /// The sender's coalescing linger (`repair_linger`, default 1 ms).
+    pub repair_linger_ns: u64,
+    /// Repair scheduling and publication slack (`repair_slack`, 0 to 1 s,
+    /// default 1 ms).
+    pub repair_slack_ns: u64,
+    /// Whether repairs go to the group (`repair_domain = group`): only then
+    /// does a peer NAK suppress (B). A `requester` domain, or a channel
+    /// without peer evidence, suppresses nothing.
+    pub group_domain: bool,
+    /// Failed suppressors a hole remembers before it accepts no peer
+    /// suppression (`max_failed_suppressors`, 1 to 4, default 4).
+    pub max_failed_suppressors: usize,
+}
+
+impl Default for MulticastConfig {
+    fn default() -> Self {
+        Self {
+            nak_delay_scale: 16,
+            repair_linger_ns: 1_000_000,
+            repair_slack_ns: 1_000_000,
+            group_domain: true,
+            max_failed_suppressors: MAX_FAILED_SUPPRESSORS,
+        }
+    }
+}
+
+impl MulticastConfig {
+    fn validate(&self) -> Result<(), LossConfigError> {
+        if !(1..=256).contains(&self.nak_delay_scale) {
+            return Err(LossConfigError::Multicast(
+                "nak_delay_scale is not in 1..=256",
+            ));
+        }
+        if self.repair_slack_ns > 1_000_000_000 {
+            return Err(LossConfigError::Multicast("repair_slack above 1 s"));
+        }
+        if !(1..=MAX_FAILED_SUPPRESSORS).contains(&self.max_failed_suppressors) {
+            return Err(LossConfigError::Multicast(
+                "max_failed_suppressors is not in 1..=4",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks that the timing of an RTT up to `max_rtt` (the image's
+    /// `rtt_probe_timeout`, which bounds every sample) fits in `u64`: the
+    /// delay bound `max_rtt * scale / 16` and the window `max_rtt +
+    /// repair_linger + repair_slack`.
+    ///
+    /// # Errors
+    ///
+    /// [`LossConfigError::Multicast`].
+    pub fn validate_for(&self, max_rtt: u64) -> Result<(), LossConfigError> {
+        self.validate()?;
+        if self.delay_bound(max_rtt).is_none() || self.window(max_rtt).is_none() {
+            return Err(LossConfigError::Multicast(
+                "the NAK timing of rtt_probe_timeout does not fit in u64",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The delay bound of a cycle with `rtt`: `rtt * scale / 16`.
+    fn delay_bound(&self, rtt: u64) -> Option<u64> {
+        rtt.checked_mul(self.nak_delay_scale)?.checked_div(16)
+    }
+
+    /// The window of a cycle with `rtt`: `rtt + linger + slack`.
+    fn window(&self, rtt: u64) -> Option<u64> {
+        rtt.checked_add(self.repair_linger_ns)?
+            .checked_add(self.repair_slack_ns)
+    }
+}
+
+/// One multicast cycle of a hole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cycle {
+    /// When the cycle started.
+    start: u64,
+    /// Its drawn delay: the local NAK is due `delay` after `start`.
+    delay: u64,
+    /// Its window `W`, from the RTT copied at its start.
+    window: u64,
+    /// When its window opened, once suppressed: at the first suppressing
+    /// peer NAK or published repair.
+    suppressed: Option<u64>,
+    /// The peer whose NAK suppressed it, if a peer did.
+    by: Option<Receiver>,
+    /// Data was published inside the hole during the cycle.
+    progress: bool,
+}
 
 /// Where NAK timing reads the RTT of an image's path.
 pub trait RttSource {
@@ -105,6 +235,9 @@ pub enum LossConfigError {
     /// The image has no lanes or more than four.
     #[error("an image has 1 to 4 lanes")]
     LaneCount,
+    /// A multicast setting is out of its range.
+    #[error("invalid multicast repair setting: {0}")]
+    Multicast(&'static str),
 }
 
 /// One missing interval of a lane, within one term.
@@ -169,6 +302,16 @@ struct LaneLoss {
     unavailable: Option<(Hole, u64)>,
     /// The decision's hole was found unnameable (counted once).
     unnameable: bool,
+    /// The current multicast cycle, if any.
+    cycle: Option<Cycle>,
+    /// Peers whose suppression of this hole brought no repair (RC-14).
+    failed: [Option<Receiver>; MAX_FAILED_SUPPRESSORS],
+    /// Failed suppressors recorded for this hole.
+    failed_count: usize,
+    /// More peers failed than the hole remembers: no peer suppression.
+    no_peer: bool,
+    /// Consecutive suppressed cycles of this hole.
+    suppressed_run: u64,
 }
 
 impl LaneLoss {
@@ -178,7 +321,36 @@ impl LaneLoss {
         span: None,
         unavailable: None,
         unnameable: false,
+        cycle: None,
+        failed: [None; MAX_FAILED_SUPPRESSORS],
+        failed_count: 0,
+        no_peer: false,
+        suppressed_run: 0,
     };
+}
+
+/// Marks `peer` as a failed suppressor of `state`'s hole (RC-14); the
+/// `max`-th one disables peer suppression for the hole, so its own NAK
+/// goes within `max + 1` cycles (coordinator ruling, ACS 16108). Returns
+/// the counters to bump.
+fn fail_suppressor(state: &mut LaneLoss, peer: Receiver, max: usize) -> [Option<Counter>; 2] {
+    let mut events: [Option<Counter>; 2] = [None; 2];
+    if state.no_peer {
+        return events;
+    }
+    if let (Some(slot), Some(next)) = (
+        state.failed.get_mut(state.failed_count),
+        state.failed_count.checked_add(1),
+    ) {
+        *slot = Some(peer);
+        state.failed_count = next;
+        events[0] = Some(|c| &mut c.failed_suppressors_marked);
+    }
+    if state.failed_count >= max {
+        state.no_peer = true;
+        events[1] = Some(|c| &mut c.peer_suppression_disabled);
+    }
+    events
 }
 
 /// What an observation found that the gap owner must act on.
@@ -245,6 +417,9 @@ pub enum ReplyOutcome {
 #[error("a second uncertain NAK while one is unresolved")]
 pub struct RouteFault;
 
+/// One of the component's counters.
+type Counter = fn(&mut LossCounters) -> &mut u64;
+
 /// The component's counters; checked, sticky on overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LossCounters {
@@ -280,6 +455,25 @@ pub struct LossCounters {
     /// `RANGE_UNAVAILABLE` replies whose lowest retained position is at or
     /// below the hole's start: contradictory, counted.
     pub anomalies: u64,
+    /// Multicast cycles started.
+    pub cycles: u64,
+    /// Cycles whose local NAK an eligible peer NAK cancelled.
+    pub peer_suppressions: u64,
+    /// Cycles whose local NAK a published repair cancelled.
+    pub repair_suppressions: u64,
+    /// Peer NAKs that suppressed nothing: not covering, ineligible, too
+    /// late, or not for this image.
+    pub peer_naks_ignored: u64,
+    /// Peers marked as failed suppressors (RC-14).
+    pub failed_suppressors_marked: u64,
+    /// Holes that stopped accepting peer suppression (RC-14).
+    pub peer_suppression_disabled: u64,
+    /// The most consecutive suppressed cycles of any hole (a gauge).
+    pub max_suppressed_run: u64,
+    /// Multicast timings past `u64` (an RTT beyond what
+    /// [`MulticastConfig::validate_for`] admitted): the cycle's NAK went
+    /// at once, or its window was the RTT alone.
+    pub timing_overflows: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -315,6 +509,8 @@ pub struct ImageLoss {
     /// A route fault was reported: nothing is submitted until the
     /// uncertain outcome is resolved.
     faulted: bool,
+    /// Multicast timing and suppression, when the image is multicast.
+    multicast: Option<MulticastConfig>,
     counters: LossCounters,
 }
 
@@ -350,8 +546,176 @@ impl ImageLoss {
             lane_count,
             uncertain: false,
             faulted: false,
+            multicast: None,
             counters: LossCounters::default(),
         })
+    }
+
+    /// The same state, timed by multicast cycles with B+C suppression.
+    ///
+    /// # Errors
+    ///
+    /// [`LossConfigError::Multicast`] for a setting out of its range.
+    pub fn multicast(mut self, config: MulticastConfig) -> Result<Self, LossConfigError> {
+        config.validate()?;
+        self.multicast = Some(config);
+        Ok(self)
+    }
+
+    /// A multicast step of `lane` at `now`: starts a hole's first cycle,
+    /// and the next one when the current cycle's window ended with the
+    /// hole still there, drawing its delay from `draw` over the RTT
+    /// snapshot of `rtt`. A suppressed cycle that ended with nothing
+    /// published inside the hole marks its suppressor failed (RC-14). A
+    /// no-op on a unicast image.
+    pub fn cycle(&mut self, lane: Lane, now: u64, rtt: &impl RttSource, draw: &mut impl DelayDraw) {
+        let Some(config) = self.multicast else {
+            return;
+        };
+        if self.closed {
+            return;
+        }
+        let snapshot = rtt.rtt_snapshot(self.path);
+        let mut events: [Option<Counter>; 3] = [None; 3];
+        let mut run = None;
+        let mut overflowed = false;
+        let Some(state) = self.lane_mut(lane) else {
+            return;
+        };
+        let start = match (state.decision, state.cycle) {
+            (Decision::NakDue { .. }, None) => true,
+            // A suppressed cycle's window ended with the hole still there.
+            (Decision::NakDue { .. }, Some(cycle)) => {
+                let ended = cycle
+                    .suppressed
+                    .is_some_and(|at| age_ns(now, at) >= cycle.window);
+                if ended {
+                    if let (Some(peer), false) = (cycle.by, cycle.progress) {
+                        let [marked, disabled] =
+                            fail_suppressor(state, peer, config.max_failed_suppressors);
+                        events[0] = marked;
+                        events[1] = disabled;
+                    }
+                    match state.suppressed_run.checked_add(1) {
+                        Some(next) => state.suppressed_run = next,
+                        None => overflowed = true,
+                    }
+                    run = Some(state.suppressed_run);
+                }
+                ended
+            }
+            // The local NAK's window ended with the hole still there.
+            (
+                Decision::AwaitRepair {
+                    hole,
+                    detected_at,
+                    submitted_at,
+                    rtt: window,
+                    ..
+                },
+                _,
+            ) if age_ns(now, submitted_at) >= window => {
+                state.decision = Decision::NakDue { hole, detected_at };
+                state.suppressed_run = 0;
+                true
+            }
+            _ => false,
+        };
+        let mut timing_overflowed = false;
+        if start {
+            // A timing past `u64` NAKs at once, with the RTT as window,
+            // and is counted.
+            let delay = match config.delay_bound(snapshot) {
+                Some(bound) => draw.draw(bound).min(bound),
+                None => {
+                    timing_overflowed = true;
+                    0
+                }
+            };
+            let window = match config.window(snapshot) {
+                Some(window) => window,
+                None => {
+                    timing_overflowed = true;
+                    snapshot
+                }
+            };
+            state.cycle = Some(Cycle {
+                start: now,
+                delay,
+                window,
+                suppressed: None,
+                by: None,
+                progress: false,
+            });
+            events[2] = Some(|c| &mut c.cycles);
+        }
+        for field in events.into_iter().flatten() {
+            self.counters.bump(field);
+        }
+        if timing_overflowed {
+            self.counters.bump(|c| &mut c.timing_overflows);
+        }
+        self.counters.overflowed |= overflowed;
+        if let Some(run) = run
+            && run > self.counters.max_suppressed_run
+        {
+            self.counters.max_suppressed_run = run;
+        }
+    }
+
+    /// A peer NAK from the control group, at `now` (B with C): it cancels
+    /// the local NAK of the lane's current cycle, and opens its window,
+    /// when it names this image, comes from another receiver, covers the
+    /// whole hole and arrives before the cycle's deadline (an exact tie
+    /// goes to the local deadline), on a `group` response domain, from a
+    /// peer that has not failed to suppress this hole. Returns whether it
+    /// suppressed; anything else is counted and ignored.
+    pub fn peer_nak(&mut self, nak: &Nak, now: u64) -> bool {
+        let suppressed = self.suppress(nak, now);
+        self.counters.bump(if suppressed {
+            |c: &mut LossCounters| &mut c.peer_suppressions
+        } else {
+            |c: &mut LossCounters| &mut c.peer_naks_ignored
+        });
+        suppressed
+    }
+
+    fn suppress(&mut self, nak: &Nak, now: u64) -> bool {
+        let Some(config) = self.multicast else {
+            return false;
+        };
+        if self.closed
+            || !config.group_domain
+            || nak.alias != self.alias
+            || nak.identity != self.identity
+            || nak.receiver == self.receiver
+        {
+            return false;
+        }
+        let Some(state) = self.lane_mut(nak.range.lane) else {
+            return false;
+        };
+        let (Decision::NakDue { hole, .. }, Some(cycle)) = (state.decision, &mut state.cycle)
+        else {
+            return false;
+        };
+        let peer = Hole {
+            start: nak.range.start,
+            length: nak.range.length,
+        };
+        let eligible = !state.no_peer
+            && !state
+                .failed
+                .iter()
+                .flatten()
+                .any(|failed| *failed == nak.receiver);
+        let in_time = cycle.suppressed.is_none() && age_ns(now, cycle.start) < cycle.delay;
+        if !(eligible && in_time && peer.contains(hole)) {
+            return false;
+        }
+        cycle.suppressed = Some(now);
+        cycle.by = Some(nak.receiver);
+        true
     }
 
     /// The counters.
@@ -412,6 +776,7 @@ impl ImageLoss {
         let in_span = |seen: Hole| state.span.is_some_and(|span| span.contains(seen));
         let mut event: Option<fn(&mut LossCounters) -> &mut u64> = None;
         let mut observation = Observation::Nothing;
+        let mut repair_suppressed = false;
         match (current, hole) {
             (None, None) => {}
             (Some(_), None) => {
@@ -447,6 +812,7 @@ impl ImageLoss {
                             hole: seen,
                             detected_at: now,
                         };
+                        state.cycle = None;
                     }
                     // A partial repair, or late data split the span: the
                     // remainder keeps its anchors.
@@ -460,6 +826,19 @@ impl ImageLoss {
                 // Another interval: RANGE_INVALID counts start over.
                 state.invalid = 0;
                 event = Some(|c| &mut c.partial_repairs);
+                // Multicast: data published inside the hole is a repair in
+                // progress. Before the cycle's deadline it cancels the local
+                // NAK and opens the window (B with C).
+                if let Some(cycle) = &mut state.cycle {
+                    cycle.progress = true;
+                    let in_time = cycle.suppressed.is_none()
+                        && matches!(state.decision, Decision::NakDue { .. })
+                        && age_ns(now, cycle.start) < cycle.delay;
+                    if in_time {
+                        cycle.suppressed = Some(now);
+                        repair_suppressed = true;
+                    }
+                }
             }
             (_, Some(seen)) => {
                 *state = LaneLoss {
@@ -475,6 +854,9 @@ impl ImageLoss {
         if let Some(field) = event {
             self.counters.bump(field);
         }
+        if repair_suppressed {
+            self.counters.bump(|c| &mut c.repair_suppressions);
+        }
         observation
     }
 
@@ -487,15 +869,31 @@ impl ImageLoss {
             return None;
         }
         let (alias, identity, receiver) = (self.alias, self.identity, self.receiver);
+        let multicast = self.multicast.is_some();
         let state = self.lane_mut(lane)?;
-        let hole = match state.decision {
-            Decision::NakDue { hole, .. } => hole,
-            Decision::AwaitRepair {
-                hole,
-                submitted_at,
-                rtt,
-                ..
-            } if age_ns(now, submitted_at) >= rtt => hole,
+        let hole = match (state.decision, multicast) {
+            (Decision::NakDue { hole, .. }, false) => hole,
+            // Multicast: once the cycle's drawn delay passed, unless the
+            // cycle was suppressed.
+            (Decision::NakDue { hole, .. }, true) => match state.cycle {
+                Some(cycle)
+                    if cycle.suppressed.is_none() && age_ns(now, cycle.start) >= cycle.delay =>
+                {
+                    hole
+                }
+                _ => return None,
+            },
+            // Unicast retries one RTT after submission; multicast retries
+            // through the next cycle (ImageLoss::cycle).
+            (
+                Decision::AwaitRepair {
+                    hole,
+                    submitted_at,
+                    rtt,
+                    ..
+                },
+                false,
+            ) if age_ns(now, submitted_at) >= rtt => hole,
             _ => return None,
         };
         let nameable = hole.length >= FRAME
@@ -523,11 +921,31 @@ impl ImageLoss {
         })
     }
 
-    /// `nak`, from [`ImageLoss::due`], was submitted at `now`: its retry
-    /// is due one RTT later, the snapshot copied now from `rtt`.
+    /// `nak`, from [`ImageLoss::due`], was submitted at `now`. On a
+    /// unicast image its retry is due one RTT later, the snapshot copied
+    /// now from `rtt`; on a multicast image it opens its cycle's window
+    /// `W`, computed from the RTT copied at the cycle's start, and the next
+    /// cycle starts when the window ends with the hole still there.
     pub fn submitted(&mut self, nak: &Nak, now: u64, rtt: &impl RttSource) {
-        let rtt = rtt.rtt_snapshot(self.path);
+        let rtt = self.interval(nak.range.lane, rtt.rtt_snapshot(self.path));
         self.record_submission(nak, now, rtt);
+    }
+
+    /// The wait after a submission of `lane`'s NAK: one RTT for unicast;
+    /// for multicast the current cycle's window `W` (without a cycle, `W`
+    /// over `rtt`; a timing past `u64` falls back to the RTT and is
+    /// counted).
+    fn interval(&mut self, lane: Lane, rtt: u64) -> u64 {
+        let Some(config) = self.multicast else {
+            return rtt;
+        };
+        if let Some(cycle) = self.lane_mut(lane).and_then(|state| state.cycle) {
+            return cycle.window;
+        }
+        config.window(rtt).unwrap_or_else(|| {
+            self.counters.bump(|c| &mut c.timing_overflows);
+            rtt
+        })
     }
 
     /// `nak` could not be submitted (budget or backend): it stays due.
@@ -556,7 +974,7 @@ impl ImageLoss {
         }
         self.uncertain = true;
         self.counters.bump(|c| &mut c.uncertain);
-        let rtt = rtt.rtt_snapshot(self.path);
+        let rtt = self.interval(nak.range.lane, rtt.rtt_snapshot(self.path));
         self.record_submission(nak, now, rtt);
         Ok(())
     }
