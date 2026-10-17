@@ -176,6 +176,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A recording group's journal records, schema 3 version 1 (phase 3,
+  A7a; SPEC §8.3, ADR-0024). `karyos_archive::group::record` holds the
+  journal header (group, first `group_seq`, inline threshold, capture
+  contract, clock provenance, strict or best-effort capture, the
+  caller's manifest), five event records (message inline or by recording
+  reference, conflated value, timer, lifecycle, external), three
+  observations (offer and claim outcomes, timer create and cancel,
+  external), the event end and the gap marker, hand written on the
+  `karyos-codec` runtime as A1. `karyos_archive::group::order` checks a
+  journal's order rules with fixed state. Nothing allocates.
 - Per-path datagram and byte counts (RP-10; rp-w9). Each route of a
   routed publication counts the datagrams and bytes it submitted,
   catch-up copies included (`RouteCounters::datagrams`, `bytes`), and
