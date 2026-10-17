@@ -372,14 +372,20 @@ fn a_subscription_with_another_identity_is_refused() {
 fn a_subscription_with_another_conflated_lane_is_refused() {
     use karyos_sys::frame::Lane;
 
+    const CONFIG: karyos_sys::conflation::ConflationConfig =
+        karyos_sys::conflation::ConflationConfig {
+            keys: 4,
+            value_capacity: 8,
+            journal_capacity: 1024,
+        };
     let lane1 = Lane::try_new(1).unwrap();
     let mut b = driver(ThreadingMode::Shared);
     let address = free_address();
     let first = b
-        .add_network_subscription_conflated(10, &channel(address), Lane::ZERO)
+        .add_network_subscription_conflated(10, &channel(address), Lane::ZERO, CONFIG)
         .unwrap();
     assert_eq!(
-        b.add_network_subscription_conflated(10, &channel(address), lane1),
+        b.add_network_subscription_conflated(10, &channel(address), lane1, CONFIG),
         Err(crate::DriverError::ConflationMismatch)
     );
     assert_eq!(
@@ -388,11 +394,11 @@ fn a_subscription_with_another_conflated_lane_is_refused() {
         "none where the first has one"
     );
     let second = b
-        .add_network_subscription_conflated(10, &channel(address), Lane::ZERO)
+        .add_network_subscription_conflated(10, &channel(address), Lane::ZERO, CONFIG)
         .unwrap();
     let plain = b.add_network_subscription(11, &channel(address)).unwrap();
     assert_eq!(
-        b.add_network_subscription_conflated(11, &channel(address), Lane::ZERO),
+        b.add_network_subscription_conflated(11, &channel(address), Lane::ZERO, CONFIG),
         Err(crate::DriverError::ConflationMismatch),
         "one where the first has none"
     );

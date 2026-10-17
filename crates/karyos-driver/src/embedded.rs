@@ -708,6 +708,32 @@ impl FeederCounters {
 pub(crate) struct ConflationFeeder<T: StreamTerms> {
     pub(crate) subscription: ClientSubscription<T>,
     pub(crate) writer: ConflationWriter,
+    /// The freshness state of a network image's view; `None` for an IPC
+    /// stream's (which has no loss).
+    pub(crate) fresh: Option<FreshFeed>,
+}
+
+/// The feeder side of a network image lane's view
+/// (conflated-network-images.md (b)): the link its table shares with the
+/// receiver's seal gate, and a gap met in the log that the barrier could
+/// not take yet. While one waits, nothing past it is polled, so no value
+/// past a gap is published before the gap is recorded.
+#[derive(Debug)]
+pub(crate) struct FreshFeed {
+    pub(crate) link: karyos_sys::freshness::FreshnessLink,
+    pub(crate) gap: Option<(u64, u64)>,
+}
+
+/// What a network image view's feeder did in one duty, beyond its writes.
+#[derive(Debug, Clone, Copy, Default)]
+struct FreshFed {
+    /// Seal requests acknowledged after the loss was recorded.
+    acked: u64,
+    /// Seal requests whose acknowledgement was withheld: the barrier was
+    /// full.
+    withheld: u64,
+    /// Gaps met in the log and recorded (not through the mailbox).
+    caught_up: u64,
 }
 
 impl<T: StreamTerms> Stream<T> {
@@ -2078,6 +2104,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let feeder = ConflationFeeder {
                     subscription,
                     writer,
+                    fresh: None,
                 };
                 let member = Member {
                     link: Arc::downgrade(&link),
@@ -2852,37 +2879,101 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let Some(config) = stream.conflation else {
                 continue;
             };
+            // A network image's view whose terminal cell is published is
+            // done: its readers deliver nothing more, and the feeder stops
+            // (conflated-network-images.md (c)).
+            if stream
+                .feeder
+                .as_ref()
+                .and_then(|feeder| feeder.fresh.as_ref())
+                .is_some_and(|fresh| {
+                    karyos_sys::freshness::TerminalCell::read(&fresh.link.terminal_words())
+                        .is_some()
+                })
+            {
+                if let Some(mut feeder) = stream.feeder.take() {
+                    feeder.writer.close();
+                }
+                stream
+                    .members
+                    .retain(|member| member.kind != MemberKind::Feeder);
+                if let Some(net) = &mut self.net {
+                    net.count_views(|views| views.add(|c| &mut c.closed_terminal, 1));
+                }
+                continue;
+            }
             let Some(feeder) = &mut stream.feeder else {
                 continue;
             };
             let ConflationFeeder {
                 subscription,
                 writer,
+                fresh,
             } = feeder;
+            // The mailbox and a gap met in the log come first, so a loss is
+            // recorded before any value past it is written.
+            let mut fresh_fed = FreshFed::default();
+            let blocked = match fresh.as_mut() {
+                Some(fresh) => !serve_fresh(writer, fresh, &mut fresh_fed),
+                None => false,
+            };
+            let with_positions = fresh.is_some();
             let mut terminal = None;
             let mut fed = Fed::default();
-            let polled = subscription.poll(
-                |value, info| match config.validate_publication(info.reserved_value, value.len()) {
-                    Err(ConflationError::KeyOutOfRange { .. }) => fed.keys_rejected += 1,
-                    Err(ConflationError::ValueTooLarge { .. }) => fed.values_too_large += 1,
-                    Err(_) => {}
-                    Ok(()) => {
-                        if let Ok(key) = u32::try_from(info.reserved_value) {
-                            match writer.write(key, value) {
-                                Ok(_) => fed.written += 1,
-                                Err(error @ ConflationError::VersionsExhausted) => {
-                                    terminal = Some(error);
+            let polled = if blocked {
+                Ok(karyos_client::subscription::PollSummary::default())
+            } else {
+                subscription.poll(
+                    |value, info| match config
+                        .validate_publication(info.reserved_value, value.len())
+                    {
+                        Err(ConflationError::KeyOutOfRange { .. }) => fed.keys_rejected += 1,
+                        Err(ConflationError::ValueTooLarge { .. }) => fed.values_too_large += 1,
+                        Err(_) => {}
+                        Ok(()) => {
+                            if let Ok(key) = u32::try_from(info.reserved_value) {
+                                let written = if with_positions {
+                                    // Everything below the message is consumed.
+                                    writer.passed(info.position);
+                                    writer.write_at(key, value, info.position)
+                                } else {
+                                    writer.write(key, value)
+                                };
+                                match written {
+                                    Ok(_) => fed.written += 1,
+                                    Err(error @ ConflationError::VersionsExhausted) => {
+                                        terminal = Some(error);
+                                    }
+                                    Err(_) => {}
                                 }
-                                Err(_) => {}
                             }
                         }
-                    }
-                },
-                MessageLimit::new(budget),
-            );
+                    },
+                    MessageLimit::new(budget),
+                )
+            };
             // A failed poll still reports what it handled before the failure.
             if let Some(counters) = &stream.feeder_counters {
                 counters.add(&self.counters, fed);
+            }
+            // A gap the poll stopped at: recorded now, or held (nothing
+            // past it is polled) until the barrier takes it.
+            if let (Some(fresh), Ok(summary)) = (fresh.as_mut(), &polled) {
+                if let Some(skipped) = summary.skipped
+                    && let Some(end) = skipped.position.checked_add(u64::from(skipped.extent))
+                {
+                    fresh.gap = Some((skipped.position, end));
+                    let _ = serve_gap(writer, fresh, &mut fresh_fed);
+                }
+                // Bounded reconciliation of the recorded losses.
+                let _ = writer.reconcile(budget);
+            }
+            if let Some(net) = &mut self.net {
+                net.count_views(|views| {
+                    views.add(|c| &mut c.acked, fresh_fed.acked);
+                    views.add(|c| &mut c.withheld, fresh_fed.withheld);
+                    views.add(|c| &mut c.caught_up, fresh_fed.caught_up);
+                });
             }
             let summary = match polled {
                 Ok(summary) => summary,
@@ -3165,6 +3256,124 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// the lane streams of one aggregate, or is driven unexposed; a
     /// retiring one has its streams sealed and retired, so they free once
     /// no lease holds them and the image table can reclaim the image.
+    /// Builds the conflated view of the installed image `slot`, when its
+    /// key asked for one (conflated-network-images.md (a)): a heap table
+    /// over the link the receiver's seal gate shares, fed from a required
+    /// subscription of the exposed lane, then attached to the mailbox. An
+    /// unexposed image, or a table that cannot be built, gets no view and is
+    /// counted; the gate then seals as without a feeder.
+    fn build_network_view(
+        &mut self,
+        slot: crate::sessions::receive::SlotRef,
+        endpoint: crate::agents::EndpointId,
+        exposed: Option<&AggregateHandle>,
+    ) {
+        let Some((lane, link)) = self.net.as_ref().and_then(|net| net.image_freshness(slot)) else {
+            return;
+        };
+        let built = exposed.and_then(|handle| {
+            let id = handle
+                .lanes
+                .get(usize::from(lane.get()))
+                .copied()
+                .flatten()?;
+            let index = self.streams.iter().position(|stream| stream.id == id)?;
+            let stream_id = self.streams.get(index)?.stream_id;
+            let (_, config) = self.net.as_ref()?.conflation_of(endpoint, stream_id)?;
+            let writer = karyos_sys::conflation::conflation_fresh(
+                config.keys,
+                config.value_capacity,
+                config.journal_capacity,
+                link.clone(),
+            )
+            .ok()?;
+            let stream = self.streams.get_mut(index)?;
+            let inner = stream.conductor.subscribe(Role::Required).ok()?;
+            let generation = GenerationLink::new();
+            let subscription = ClientSubscription::new(inner)
+                .with_generation(Arc::clone(&generation), 0)
+                .ok()?;
+            stream.members.push(Member {
+                link: Arc::downgrade(&generation),
+                kind: MemberKind::Feeder,
+            });
+            stream.conflation = Some(config);
+            stream.feeder = Some(ConflationFeeder {
+                subscription,
+                writer,
+                fresh: Some(FreshFeed {
+                    link: link.clone(),
+                    gap: None,
+                }),
+            });
+            let registration = stream.aggregate.registration;
+            let counters = FeederCounters::allocate(&mut self.counters, registration, lane.get());
+            if let Some(stream) = self.streams.get_mut(index) {
+                stream.feeder_counters = Some(counters);
+            }
+            Some(())
+        });
+        if built.is_some()
+            && let Ok(mailbox) = link.mailbox()
+        {
+            // Attached once its feeder exists: the receiver's gate posts
+            // its seals from now on.
+            mailbox.attach();
+        }
+        if let Some(net) = &mut self.net {
+            net.count_views(|views| {
+                if built.is_some() {
+                    views.add(|c| &mut c.built, 1);
+                } else {
+                    views.add(|c| &mut c.unbuilt, 1);
+                }
+            });
+        }
+    }
+
+    /// The reader of the conflated view of `handle`'s `lane`, a network
+    /// image's (tests).
+    #[cfg(test)]
+    pub(crate) fn network_view_reader(
+        &self,
+        handle: &AggregateHandle,
+        lane: karyos_sys::frame::Lane,
+    ) -> Option<karyos_sys::conflation::ConflationReader> {
+        let id = handle
+            .lanes
+            .get(usize::from(lane.get()))
+            .copied()
+            .flatten()?;
+        let stream = self.streams.iter().find(|stream| stream.id == id)?;
+        Some(stream.feeder.as_ref()?.writer.reader())
+    }
+
+    /// The link the conflated view of `handle`'s `lane` shares with the
+    /// receiver's seal gate (tests).
+    #[cfg(test)]
+    pub(crate) fn network_view_link(
+        &self,
+        handle: &AggregateHandle,
+        lane: karyos_sys::frame::Lane,
+    ) -> Option<karyos_sys::freshness::FreshnessLink> {
+        let id = handle
+            .lanes
+            .get(usize::from(lane.get()))
+            .copied()
+            .flatten()?;
+        let stream = self.streams.iter().find(|stream| stream.id == id)?;
+        Some(stream.feeder.as_ref()?.fresh.as_ref()?.link.clone())
+    }
+
+    /// What the conflated views of network images did.
+    #[must_use]
+    pub fn network_view_counters(&self) -> crate::net::NetworkViewCounters {
+        self.net
+            .as_ref()
+            .map(crate::net::Network::view_counters)
+            .unwrap_or_default()
+    }
+
     fn serve_images(&mut self) {
         let Some(events) = self
             .net
@@ -3184,6 +3393,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     if let Some(net) = &mut self.net {
                         net.record_image(slot, endpoint, exposed, &lanes);
                     }
+                    self.build_network_view(slot, endpoint, exposed.as_ref());
                     if let Some(handle) = exposed {
                         self.announce_image(endpoint, &handle, true);
                     }
@@ -3292,6 +3502,65 @@ fn lose_feeder<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), karyos_sys:
     stream
         .conductor
         .seal_with_reason(SealReason::ConflationFeederLost)
+}
+
+/// Records the gap a network image view's feeder met in its log, unless the
+/// mailbox already did; returns whether it is resolved (recorded, or the
+/// view closed). While the barrier is full it stays held.
+fn serve_gap(writer: &mut ConflationWriter, fresh: &mut FreshFeed, fed: &mut FreshFed) -> bool {
+    let Some((start, end)) = fresh.gap else {
+        return true;
+    };
+    let resolved = writer.recorded(start, end)
+        || match writer.record_loss(start, end) {
+            Ok(_) => {
+                fed.caught_up = fed.caught_up.checked_add(1).unwrap_or(fed.caught_up);
+                true
+            }
+            Err(karyos_sys::conflation::LossError::Full) => false,
+            // Below the frontier or exhausted: the writer published the
+            // terminal cell, and the view closes on the next duty.
+            Err(_) => true,
+        };
+    if resolved {
+        writer.passed(end);
+        fresh.gap = None;
+    }
+    resolved
+}
+
+#[cfg(test)]
+#[path = "embedded/fresh_feed_tests.rs"]
+mod fresh_feed_tests;
+
+/// A network image view's feeder duty before its poll
+/// (conflated-network-images.md (b)): first a held gap from the log, then
+/// the seal mailbox, whose request is acknowledged only once the barrier
+/// recorded the loss. Returns whether the poll may run (no gap is held).
+fn serve_fresh(writer: &mut ConflationWriter, fresh: &mut FreshFeed, fed: &mut FreshFed) -> bool {
+    if !serve_gap(writer, fresh, fed) {
+        return false;
+    }
+    let Ok(mailbox) = fresh.link.mailbox() else {
+        return true;
+    };
+    if let Some(request) = mailbox.pending() {
+        match writer.record_loss(request.start, request.end) {
+            Ok(_) => {
+                if mailbox.acknowledge(request.request).is_ok() {
+                    fed.acked = fed.acked.checked_add(1).unwrap_or(fed.acked);
+                }
+            }
+            Err(karyos_sys::conflation::LossError::Full) => {
+                fed.withheld = fed.withheld.checked_add(1).unwrap_or(fed.withheld);
+            }
+            // Below the frontier or exhausted: the terminal cell is
+            // published; without an ack the receiver's bound closes the
+            // view and seals.
+            Err(_) => {}
+        }
+    }
+    true
 }
 
 fn seal_conflation_terminal<E>(

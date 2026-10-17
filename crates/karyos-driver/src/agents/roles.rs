@@ -4199,6 +4199,16 @@ impl SenderRole {
         self.ignore_naks = true;
     }
 
+    /// Reads NAKs again after [`SenderRole::ignore_naks`] (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast test (T9)")
+    )]
+    pub(super) fn heed_naks(&mut self) {
+        self.ignore_naks = false;
+    }
+
     /// The least position every receiver bound to `alias` on `endpoint`
     /// consumed, per lane: a reliable channel's bound (SPEC §4). A receiver
     /// answered but not yet heard from bounds at its join points. `None`
