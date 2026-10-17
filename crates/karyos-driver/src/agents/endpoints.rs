@@ -77,6 +77,16 @@ pub enum EndpointError {
     /// Every endpoint identity was used.
     #[error("endpoint identities exhausted")]
     Exhausted,
+    /// A reset reopened the endpoint at another local address than the one
+    /// it had bound: its receivers' bindings name the old one, so the
+    /// endpoint fails rather than move silently (ACS 15721).
+    #[error("the endpoint reopened at {found}, not its bound {expected}")]
+    AddressChanged {
+        /// The address it had bound.
+        expected: std::net::SocketAddr,
+        /// The address it reopened at.
+        found: std::net::SocketAddr,
+    },
 }
 
 /// What [`Endpoints::poll`] reports.
@@ -622,7 +632,14 @@ impl<O: SocketOps> Endpoints<O> {
             return;
         };
         let id = entry.id;
-        let config = entry.config;
+        // A reset reopens at the address the endpoint actually bound (a
+        // port 0 bind resolved by the kernel), never a new one: receivers
+        // bind on the source address (ACS 15721).
+        let bound = entry.local;
+        let config = SocketsConfig {
+            local: bound,
+            ..entry.config
+        };
         let joined = match (tx, rx) {
             (Some(tx), Some(rx)) => SocketsEndpoint::join(tx, rx).ok(),
             // A missing half: what came back is dropped, closing it.
@@ -642,8 +659,17 @@ impl<O: SocketOps> Endpoints<O> {
                     .and_then(|returned| {
                         endpoint
                             .reopen(&config)
-                            .map(|snapshot| (returned, snapshot.local))
                             .map_err(EndpointError::Open)
+                            .and_then(|snapshot| {
+                                if snapshot.local == bound {
+                                    Ok((returned, snapshot.local))
+                                } else {
+                                    Err(EndpointError::AddressChanged {
+                                        expected: bound,
+                                        found: snapshot.local,
+                                    })
+                                }
+                            })
                     })
                     .and_then(|(returned, local)| {
                         endpoint
