@@ -11,6 +11,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-archive` gains its recorder and agent (phase 3, A4b). A
+  `Recorder` copies a lane's committed frames from a `FrameSource` into
+  its recording's segment store: data, a padding or aborted block as a
+  fill, a lost range as a gap. `Mode::Required` throttles the publisher
+  when the disk stalls (SPEC section 8.1); `Mode::Async` records a lap as a gap
+  and stops there or resumes at the lowest retained position. The
+  `ArchiveHandle` agent thread owns the catalog and the recorders, settles
+  the catalog at start, and stops each recording in the catalog once its
+  store is closed.
 - The Archive's segment index entries have a kind (phase 3, A4): data, a
   fill (a padding or aborted block's canonical record, covering its
   extent) or a gap (a range an async recording lost, refused to reads).

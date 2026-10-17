@@ -9,9 +9,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod catalog;
 pub mod crc32c;
 pub mod disk;
 #[cfg(test)]
 mod fault;
+pub mod recorder;
 pub mod segment;
