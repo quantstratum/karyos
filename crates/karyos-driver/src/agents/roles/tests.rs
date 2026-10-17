@@ -1123,7 +1123,7 @@ fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
         rtt: crate::rtt::RttProbes::new(crate::rtt::RttConfig::default(), 4).unwrap(),
         probes: (0..4)
             .map(|_| super::PathProbe {
-                slot: Arc::new(super::ProbeSlot::default()),
+                slot: Arc::new(super::ReportSlot::default()),
                 pending: None,
             })
             .collect(),
@@ -1373,7 +1373,7 @@ fn rttm_probes_measure_bound_paths() {
             endpoint,
             destination,
             control: Control::Rttm(request),
-            guard: Some(ItemGuard::Probe(guard)),
+            guard: Some(ItemGuard::Report(guard)),
         })) => {
             assert_eq!((endpoint, destination), (key.endpoint, key.source));
             (request, guard)
@@ -1454,6 +1454,13 @@ fn rttm_probes_measure_bound_paths() {
     drop(guard);
     assert_eq!(role.probe_paths(0, 4_500_000_000).unwrap(), 0);
     assert_eq!(role.images[0].rtt.counts().unsubmitted, 1);
+    // An uncertain REQUEST yields no sample either.
+    assert_eq!(role.probe_paths(0, 5_000_000_000).unwrap(), 1);
+    let (_, mut guard) = take(&mut sender);
+    guard.sending(5_000_000_000);
+    guard.uncertain();
+    assert_eq!(role.probe_paths(0, 5_500_000_000).unwrap(), 0);
+    assert_eq!(role.images[0].rtt.counts().unsubmitted, 2);
     // A probe whose path is lost and bound again is not applied to the
     // new binding.
     assert_eq!(role.probe_paths(0, 6_000_000_000).unwrap(), 1);
@@ -1517,7 +1524,7 @@ fn rttm_requests_are_reported_and_answered() {
     };
 
     use super::super::Half;
-    use super::super::control::{ControlItem, ItemGuard, ProbeGuard, ProbeReport, ProbeSlot};
+    use super::super::control::{ControlItem, ItemGuard, ReportGuard, ReportSlot, SendReport};
 
     let config = AgentConfig {
         rtt: crate::rtt::RttConfig {
@@ -1545,7 +1552,7 @@ fn rttm_requests_are_reported_and_answered() {
     let mut halves = vec![(EndpointId(1), Half::Tx(Box::new(tx)))];
     let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // A REQUEST submitted: its start is the clock before the call.
-    let slot = Arc::new(ProbeSlot::default());
+    let slot = Arc::new(ReportSlot::default());
     let request = Rttm {
         alias: alias(),
         identity: identity(),
@@ -1556,11 +1563,11 @@ fn rttm_requests_are_reported_and_answered() {
         probe_id: 77,
         kind: RttmKind::Request,
     };
-    let outgoing = |slot: &Arc<ProbeSlot>| ControlItem::Outgoing {
+    let outgoing = |slot: &Arc<ReportSlot>| ControlItem::Outgoing {
         endpoint: EndpointId(1),
         destination: source,
         control: Control::Rttm(request),
-        guard: Some(ItemGuard::Probe(ProbeGuard::take(slot))),
+        guard: Some(ItemGuard::Report(ReportGuard::take(slot))),
     };
     observer.push_send(SendResult::Sent {
         sent: 1,
@@ -1569,7 +1576,7 @@ fn rttm_requests_are_reported_and_answered() {
     SENDER_CLOCK.store(500, std::sync::atomic::Ordering::Relaxed);
     role.to_sender.try_post(outgoing(&slot)).unwrap();
     let _ = sender.duty(&mut halves, 600).unwrap();
-    assert_eq!(slot.collect(false), Some(ProbeReport::Submitted(500)));
+    assert_eq!(slot.collect(false), Some(SendReport::Submitted(500)));
     assert_eq!(slot.collect(false), None, "collected once");
     // One the kernel refused: not submitted.
     observer.push_send(SendResult::Error(
@@ -1577,7 +1584,14 @@ fn rttm_requests_are_reported_and_answered() {
     ));
     role.to_sender.try_post(outgoing(&slot)).unwrap();
     let _ = sender.duty(&mut halves, 700).unwrap();
-    assert_eq!(slot.collect(false), Some(ProbeReport::NotSubmitted));
+    assert_eq!(slot.collect(false), Some(SendReport::NotSubmitted));
+    // A result outside the backend's ABI: exposure unknown, reported
+    // uncertain at the start read before the call (RC-6).
+    observer.push_send(SendResult::OutOfAbi { proven: 0 });
+    SENDER_CLOCK.store(750, std::sync::atomic::Ordering::Relaxed);
+    role.to_sender.try_post(outgoing(&slot)).unwrap();
+    let _ = sender.duty(&mut halves, 760).unwrap();
+    assert_eq!(slot.collect(false), Some(SendReport::Uncertain(750)));
     // A REQUEST from no bound receiver is not answered.
     let incoming = |request: Rttm, seen| ControlItem::Incoming {
         endpoint: EndpointId(1),

@@ -29,6 +29,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The receiver's controls report a third send outcome. `ReportSlot` and
+  `ReportGuard` (formerly `ProbeSlot` and `ProbeGuard`) carry an RTTM
+  REQUEST's or a NAK's submission back to the receiver: submitted at the
+  start read before the call, not submitted, or uncertain, when the
+  backend left its exposure unknown (RC-6). `ControlSendError::Uncertain`
+  reports it, and an uncertain RTT probe yields no sample.
 - The network agents measure RTT (RC-1). Each installed image sends one
   RTTM REQUEST per bound path and `rtt_probe_interval`; the sender reads
   the clock immediately before the submitting call and reports the start
