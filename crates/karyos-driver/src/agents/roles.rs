@@ -397,6 +397,9 @@ pub struct ReceiverRole {
     /// Test only: every NAK handed to the sender.
     #[cfg(test)]
     posted_naks: Vec<Nak>,
+    /// Test only: every RSP_SETUP handed to the sender, with its endpoint.
+    #[cfg(test)]
+    posted_challenges: Vec<(EndpointId, Control)>,
     /// The epoch of each endpoint's RX half last seen, at most
     /// `max_endpoints` (allocated at creation): a new one is the endpoint's
     /// reset, which resolves its images' uncertain NAKs (RC-6).
@@ -552,6 +555,39 @@ fn frame_position(image: &Installed, frame: &ValidatedFrame<'_>) -> Option<u64> 
         .checked_add(u64::from(frame.term_offset()))
 }
 
+/// The terms of `image` whose end each lane's rebuild position passed,
+/// told to its path statistics as cleaned with their whole length (RP-6):
+/// what a path did not deliver fresh in them is its missing bytes. At most
+/// two terms per lane and call, so a step stays bounded.
+fn terms_complete(image: &mut Installed) {
+    let term_length = u64::from(image.term_length);
+    for at in 0..usize::from(image.lane_count) {
+        let Some(lane) = u8::try_from(at).ok().and_then(|at| Lane::try_new(at).ok()) else {
+            continue;
+        };
+        let Some(current) = image
+            .owner
+            .rebuild_position(lane)
+            .and_then(|position| position.checked_div(term_length))
+        else {
+            continue;
+        };
+        for _ in 0..2 {
+            let Some(next) = image.next_clean.get_mut(at) else {
+                break;
+            };
+            if *next >= current {
+                break;
+            }
+            image.stats.term_cleaned(at, *next, term_length);
+            match next.checked_add(1) {
+                Some(following) => *next = following,
+                None => break,
+            }
+        }
+    }
+}
+
 fn delivered(
     image: &Installed,
     frame: &ValidatedFrame<'_>,
@@ -655,6 +691,10 @@ struct Installed {
     /// The receiver cycle its last endpoint reset request was posted in,
     /// while a route fault holds its NAKs (RC-6).
     reset_requested: Option<u64>,
+    /// Per lane, the next term the path statistics have not been told is
+    /// complete (RP-6): a term is complete once the lane's rebuild position
+    /// passed its end.
+    next_clean: [u64; 4],
     /// Its subscription's NAK control group: the endpoint joined to it and
     /// the group's address (RC-7, RC-15).
     control_group: Option<(EndpointId, SocketAddr)>,
@@ -992,6 +1032,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             data_seen: 0,
             #[cfg(test)]
             posted_naks: Vec::new(),
+            #[cfg(test)]
+            posted_challenges: Vec::new(),
             rx_epochs: Vec::with_capacity(config.max_endpoints),
             max_endpoints: config.max_endpoints,
             cycle: 0,
@@ -1363,6 +1405,25 @@ impl ReceiverRole {
         &self.posted_naks
     }
 
+    /// The statistics of path `path` of the image at `slot` (tests).
+    #[cfg(test)]
+    pub(super) fn path_counts(
+        &self,
+        slot: SlotRef,
+        path: usize,
+    ) -> Option<crate::paths::stats::PathCounts> {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .and_then(|image| image.stats.counts(path).copied())
+    }
+
+    /// Every RSP_SETUP handed to the sender, with its endpoint (tests).
+    #[cfg(test)]
+    pub(super) fn posted_challenges(&self) -> &[(EndpointId, Control)] {
+        &self.posted_challenges
+    }
+
     /// Replaces the receiver's clock (tests: a rig's virtual time).
     #[cfg(test)]
     pub(super) fn set_clock(&mut self, clock: fn() -> u64) {
@@ -1671,6 +1732,21 @@ impl ReceiverRole {
                 pending: None,
             })
             .collect();
+        // The path statistics start counting complete terms from each
+        // lane's current term (RP-6).
+        let mut next_clean = [0u64; 4];
+        for (at, next) in next_clean
+            .iter_mut()
+            .enumerate()
+            .take(usize::from(chain.lane_count))
+        {
+            *next = u8::try_from(at)
+                .ok()
+                .and_then(|at| Lane::try_new(at).ok())
+                .and_then(|lane| owner.rebuild_position(lane))
+                .and_then(|position| position.checked_div(u64::from(chain.term_length)))
+                .unwrap_or(0);
+        }
         // The table holds a slot for every session, so it has room for
         // every installed image.
         self.images.push(Installed {
@@ -1700,6 +1776,7 @@ impl ReceiverRole {
             closing: None,
             tail_since: [None; 4],
             reset_requested: None,
+            next_clean,
             control_group,
         });
         Ok(())
@@ -1723,10 +1800,25 @@ impl ReceiverRole {
         }
         let mut index = 0usize;
         while let Some(image) = self.images.get(index) {
-            let unsubscribed = self.unsubscribed
-                && !self.subscriptions.iter().any(|(endpoint, stream, ..)| {
-                    (*endpoint, *stream) == (image.key.endpoint, image.key.alias.stream_id)
-                });
+            // An image stays while any of its bound paths' endpoints still
+            // subscribes its stream (RP-2: removing one path's subscription
+            // does not retire an image another path keeps).
+            let unsubscribed = self.unsubscribed && {
+                let stream_id = image.key.alias.stream_id;
+                let subscribed = |endpoint: EndpointId| {
+                    self.subscriptions
+                        .iter()
+                        .any(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id))
+                };
+                let paths = usize::from(self.path_config.max_paths);
+                !subscribed(image.key.endpoint)
+                    && !(0..paths).any(|path| {
+                        self.sessions
+                            .paths()
+                            .key(image.slot, path)
+                            .is_some_and(|key| subscribed(key.endpoint))
+                    })
+            };
             if unsubscribed || age_ns(now, image.evidence) >= self.liveness_timeout {
                 let image = self.images.swap_remove(index);
                 self.retire(sessions, image, now);
@@ -1754,6 +1846,9 @@ impl ReceiverRole {
                 .is_some_and(|image| image.owner.duty());
             if cleaned {
                 work = work.checked_add(1).ok_or(overflow.clone())?;
+            }
+            if let Some(image) = self.images.get_mut(index) {
+                terms_complete(image);
             }
             let Some(image) = self.images.get(index) else {
                 break;
@@ -2654,6 +2749,8 @@ impl Intake<'_> {
             self.role.count(|c| &mut c.rsp_setup_total_limited);
             return false;
         }
+        #[cfg(test)]
+        self.role.posted_challenges.push((self.endpoint, control));
         self.forward(ControlItem::Outgoing {
             endpoint: self.endpoint,
             destination: source,

@@ -26,19 +26,48 @@ use karyos_io::sockets::endpoint::{InterfaceSel, MulticastConfig};
 use karyos_protocol::channel::{Destination, Interface, UdpConfig};
 use karyos_sys::term_bytes::HeapTerms;
 
-use super::NetworkSubscription;
+use super::{LATER_PATHS, NetworkSubscription};
 use crate::agents::images::DEFAULT_MAX_IMAGE_TERM_LENGTH;
 use crate::embedded::{AggregateHandle, EmbeddedDriver};
 use crate::error::DriverError;
 
-/// The local address a subscription binds, and its multicast group.
+/// The local address and multicast group of each later path of a
+/// channel with `paths` (redundant-paths.md): multicast IPv4 only, each
+/// path joining the channel's group on its interface address, the first
+/// path being the route of [`receive_route`]. Unicast `paths` need a
+/// destination per path, which the URI cannot name yet (owner item 11).
+/// Runs on the control path, so it may allocate.
+fn later_routes(channel: &UdpConfig) -> Result<Vec<(SocketAddr, MulticastConfig)>, DriverError> {
+    let Some((_, later)) = channel.paths.split_first() else {
+        return Ok(Vec::new());
+    };
+    let Destination::Multicast { group, .. } = &channel.destination else {
+        return Err(DriverError::UnsupportedChannel);
+    };
+    if later.len() > LATER_PATHS {
+        return Err(DriverError::UnsupportedChannel);
+    }
+    let mut routes = Vec::with_capacity(later.len());
+    for path in later {
+        let Interface::Address(IpAddr::V4(address)) = path else {
+            return Err(DriverError::UnsupportedChannel);
+        };
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), group.port());
+        routes.push((
+            bind,
+            MulticastConfig::new(group.ip(), InterfaceSel::Address(*address)),
+        ));
+    }
+    Ok(routes)
+}
+
+/// The local address a subscription binds, and its multicast group: with
+/// `paths`, those of the first path.
 fn receive_route(
     channel: &UdpConfig,
 ) -> Result<(SocketAddr, Option<MulticastConfig>), DriverError> {
-    if !channel.paths.is_empty() {
-        return Err(DriverError::UnsupportedChannel);
-    }
-    let interface = match &channel.interface {
+    let first_path = channel.paths.first().cloned();
+    let interface = match first_path.as_ref().or(channel.interface.as_ref()) {
         None => None,
         Some(Interface::Address(ip)) => Some(*ip),
         Some(Interface::Name(_)) => return Err(DriverError::UnsupportedChannel),
@@ -84,12 +113,20 @@ impl EmbeddedDriver<HeapTerms> {
         stream_id: i32,
         channel: &UdpConfig,
     ) -> Result<NetworkSubscription, DriverError> {
-        let (bind, multicast) = receive_route(channel)?;
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
+        // Redundant paths need sockets isolated per interface; without
+        // that every datagram would count on every path (owner item 12).
+        if !channel.paths.is_empty() && !net.paths_isolated() {
+            net.count_paths_refused();
+            return Err(DriverError::UnsupportedChannel);
+        }
+        let (bind, multicast) = receive_route(channel)?;
+        let later = later_routes(channel)?;
         net.add_subscription(
             stream_id,
             bind,
             multicast,
+            &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
             channel.reliable,
         )
@@ -142,6 +179,16 @@ impl EmbeddedDriver<HeapTerms> {
         self.net
             .as_ref()
             .map_or(0, crate::net::Network::control_join_failures)
+    }
+
+    /// Channels with `paths` refused because their sockets cannot be
+    /// isolated (owner item 12), and later paths of subscriptions that
+    /// could not be held.
+    #[must_use]
+    pub fn network_path_counters(&self) -> (u64, u64) {
+        self.net
+            .as_ref()
+            .map_or((0, 0), crate::net::Network::path_counters)
     }
 
     /// Endpoints the network holds (tests).

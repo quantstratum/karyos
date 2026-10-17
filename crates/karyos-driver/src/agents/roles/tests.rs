@@ -1202,6 +1202,7 @@ fn installed_image_with(
         closing: None,
         tail_since: [None; 4],
         reset_requested: None,
+        next_clean: [0; 4],
         control_group: None,
     };
     (image, params)
