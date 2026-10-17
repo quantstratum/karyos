@@ -62,6 +62,20 @@ fn path_rx(
     Seen,
     SocketsRx<ScriptedSocket>,
 ) {
+    path_carrying(id, blocked, &[ALIAS])
+}
+
+/// [`path_rx`] for a socket that carries the publications of `aliases`.
+fn path_carrying(
+    id: u32,
+    blocked: usize,
+    aliases: &'static [Alias],
+) -> (
+    (EndpointId, Half<ScriptedSocket>),
+    ScriptedSocket,
+    Seen,
+    SocketsRx<ScriptedSocket>,
+) {
     let socket = ScriptedSocket::new();
     let observer = socket.observer();
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
@@ -79,7 +93,7 @@ fn path_rx(
             let Ok(Datagram::DataBatch(data)) = classify(datagram) else {
                 panic!("not a DATA datagram");
             };
-            assert!(data.alias() == ALIAS || data.alias() == OTHER_ALIAS);
+            assert!(aliases.contains(&data.alias()), "{:?}", data.alias());
             record.lock().unwrap().push(data.bytes().to_vec());
         }
     }));

@@ -34,14 +34,19 @@ fn drain(
     }
 }
 
-/// §8 Degraded path: B returns `EAGAIN` continuously. Its frames are
-/// skipped and it leaves within `path_lag_limit` of the first skip, and A
-/// submits every frame in the cycle it is committed, as on one path.
-#[test]
-fn a_blocked_path_leaves_and_costs_the_other_path_nothing() {
+/// §8 Degraded path: B's socket refuses every send with `errno` (`EAGAIN`
+/// or `ENOBUFS`, which karyos-io reports apart: `WouldBlock` and
+/// `NoBuffers`). Its frames are skipped and it leaves, and A submits every
+/// frame in the cycle it is committed, as on one path. The bound is two
+/// `path_lag_limit` windows, not one: the sliding window must first hold
+/// `path_skip_min_bytes` selected before the skipped share can decide.
+fn a_refusing_path_leaves_and_costs_the_other_path_nothing(errno: Errno) {
     let (a, observer_a, seen_a) = path(1, 0);
     let (b, observer_b, _seen_b) = path(2, 0);
     sent(&observer_a, 256);
+    for _ in 0..256 {
+        observer_b.push_send(SendResult::Error(errno));
+    }
     let mut halves = vec![a, b];
     let (mut outbound, mut log) = routed(0);
     outbound.set_path_policy(policy());
@@ -55,24 +60,57 @@ fn a_blocked_path_leaves_and_costs_the_other_path_nothing() {
         assert_eq!(
             seen_a.lock().unwrap().len(),
             usize::from(k) + 1,
-            "A sends each frame in its own cycle at {now} ns"
+            "{errno:?}: A sends each frame in its own cycle at {now} ns"
         );
         if left_at.is_none() && outbound.path_state(1).map(|state| state.0) == Some(false) {
             left_at = Some(now);
         }
+        // A full socket is a lag, never a fault: B's queue is never held
+        // for its control path (a retry or a reset).
+        assert_ne!(
+            outbound.routed_sender().unwrap().needs_control(0, 1),
+            Some(true),
+            "{errno:?}: B held for control at {now} ns"
+        );
     }
-    let left_at = left_at.expect("B left");
+    let skipped = outbound
+        .routed_sender()
+        .unwrap()
+        .counters(1)
+        .unwrap()
+        .skipped;
+    assert!(skipped > 0, "{errno:?}: B skipped what it could not take");
+    let left_at = left_at.unwrap_or_else(|| panic!("{errno:?}: B left"));
     assert!(
         left_at <= 2 * policy().lag_limit,
-        "B left at {left_at} ns, past two windows"
+        "{errno:?}: B left at {left_at} ns, past two windows"
     );
-    assert_eq!(outbound.path_counters(1).unwrap().exits, 1);
+    let counters = outbound.path_counters(1).unwrap();
+    assert_eq!(counters.exits, 1, "{errno:?}: {counters:?}");
+    assert!(
+        !outbound.needs_reset(),
+        "{errno:?}: no reset for a full socket"
+    );
+    // B left: its copies are gone and it takes no more, so the drain
+    // flushes A only.
     drain(
         &mut outbound,
         &mut halves,
         &[&observer_a, &observer_b],
         u64::from(FRAMES) * STEP,
     );
+}
+
+/// §8 Degraded path, `EAGAIN` (`WouldBlock`).
+#[test]
+fn a_blocked_path_leaves_and_costs_the_other_path_nothing() {
+    a_refusing_path_leaves_and_costs_the_other_path_nothing(Errno::AGAIN);
+}
+
+/// §8 Degraded path, `ENOBUFS` (`NoBuffers`).
+#[test]
+fn a_path_out_of_buffers_leaves_and_costs_the_other_path_nothing() {
+    a_refusing_path_leaves_and_costs_the_other_path_nothing(Errno::NOBUFS);
 }
 
 /// §8 Degraded path: B drains two datagrams of every three. It skips what
@@ -165,15 +203,16 @@ fn a_path_sending_every_99_ms_leaves_within_one_window() {
     );
 }
 
-/// §8 Leaving: only that publication's items on that path go. Another
-/// publication on the same endpoints keeps sending on the path the first
-/// one left.
+/// §8 Leaving: only that incarnation's items on that path are cancelled.
+/// Two publications on the same endpoints both stage copies on B while B
+/// blocks; the first leaves B. Once B drains, only the second's copies go
+/// out on it: the first's were cancelled.
 #[test]
 fn another_publication_on_the_same_endpoint_keeps_sending() {
-    let (a, observer_a, _seen_a) = path(1, 0);
-    let (b, observer_b, _seen_b) = path(2, 0);
+    static BOTH: [Alias; 2] = [ALIAS, OTHER_ALIAS];
+    let (a, observer_a, _seen_a, _rx_a) = path_carrying(1, 0, &BOTH);
+    let (b, observer_b, _seen_b, _rx_b) = path_carrying(2, 0, &BOTH);
     sent(&observer_a, 256);
-    sent(&observer_b, 256);
     let mut halves = vec![a, b];
     let routes = [
         (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
@@ -183,37 +222,44 @@ fn another_publication_on_the_same_endpoint_keeps_sending() {
     let (mut second, mut second_log) = outbound_routed(&routes, OTHER_ALIAS, TERM, 1, false);
     first.set_path_policy(policy());
     second.set_path_policy(policy());
-    commit(&mut first_log, 0, 1);
-    commit(&mut second_log, 0, 1);
+    // B blocks: both publications stage their copies there.
+    commit(&mut first_log, 0, 2);
+    commit(&mut second_log, 0, 2);
     for now in 0..4 {
         let _ = first.serve_routes(&mut halves, BUDGET, None, now).unwrap();
         let _ = second.serve_routes(&mut halves, BUDGET, None, now).unwrap();
     }
+    assert_eq!(first.routed_sender().unwrap().pending(0, 1), Some(2));
+    assert_eq!(second.routed_sender().unwrap().pending(0, 1), Some(2));
     first.leave_before_serve(1);
     let _ = first.serve_routes(&mut halves, BUDGET, None, 10).unwrap();
     assert_eq!(first.path_state(1).map(|state| state.0), Some(false));
+    assert_eq!(
+        first.routed_sender().unwrap().pending(0, 1),
+        Some(0),
+        "the first publication's copies on B were cancelled"
+    );
+    assert_eq!(second.routed_sender().unwrap().pending(0, 1), Some(2));
+    // B drains: only the second publication's two copies go out on it.
+    sent(&observer_b, 64);
     let calls = observer_b.send_calls();
-    commit(&mut first_log, 1, 2);
-    commit(&mut second_log, 1, 2);
     for now in 11..20 {
         let _ = first.serve_routes(&mut halves, BUDGET, None, now).unwrap();
         let _ = second.serve_routes(&mut halves, BUDGET, None, now).unwrap();
     }
     assert_eq!(
-        first.routed_sender().unwrap().pending(0, 1),
-        Some(0),
-        "the first publication takes nothing on B"
-    );
-    assert_eq!(second.path_state(1).map(|state| state.0), Some(true));
-    assert_eq!(
         observer_b.send_calls() - calls,
         2,
-        "the second publication's two datagrams go on B"
+        "the second publication's two copies, none of the first's"
     );
+    assert_eq!(second.routed_sender().unwrap().pending(0, 1), Some(0));
+    assert_eq!(second.path_state(1).map(|state| state.0), Some(true));
 }
 
 /// §8 Service: a frame selected while every path returns `WouldBlock`
-/// debits nothing; once one path submits it, it is debited once.
+/// debits nothing, and with both paths full nothing is skipped: selection
+/// waits. Submitted on two paths, it debits once: A's submit debits it,
+/// B's later copy is a catch-up copy (`late`) that debits nothing.
 #[test]
 fn a_frame_no_path_can_take_debits_nothing() {
     let (a, observer_a, _seen_a) = path(1, 0);
@@ -227,13 +273,33 @@ fn a_frame_no_path_can_take_debits_nothing() {
             .serve_routes(&mut halves, BUDGET, None, now)
             .unwrap();
     }
-    assert!(outbound.routed_sender().unwrap().pending(0, 0).unwrap() > 0);
-    assert_eq!(outbound.routed_sender().unwrap().debited(0), None);
+    let sender = outbound.routed_sender().unwrap();
+    assert!(sender.pending(0, 0).unwrap() > 0);
+    assert_eq!(sender.debited(0), None);
+    for route in 0..2 {
+        assert_eq!(
+            sender.counters(route).unwrap().skipped,
+            0,
+            "route {route}: both full, nothing skipped"
+        );
+    }
     sent(&observer_a, 1);
     let _ = outbound
         .serve_routes(&mut halves, BUDGET, None, 10)
         .unwrap();
     assert_eq!(outbound.routed_sender().unwrap().debited(0), Some(0));
+    sent(&observer_b, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 11)
+        .unwrap();
+    let sender = outbound.routed_sender().unwrap();
+    assert_eq!(
+        sender.counters(1).unwrap().late,
+        1,
+        "B's copy debits nothing"
+    );
+    assert_eq!(sender.debited(0), Some(0), "debited once");
+    assert_eq!(sender.pending(0, 1), Some(0));
     drain(&mut outbound, &mut halves, &[&observer_a, &observer_b], 20);
 }
 
@@ -290,6 +356,20 @@ fn sent_high_never_decreases_across_paths() {
             );
             high = now_high;
         }
+        // No seed passes trivially: something was sent, a path left and
+        // one came back.
+        assert!(high > 0, "seed {seed:#x}: nothing sent");
+        let (exits, entries) = (0..2).fold((0, 0), |(exits, entries), route| {
+            let counters = outbound.path_counters(route).unwrap();
+            (
+                u64::checked_add(exits, counters.exits).unwrap(),
+                u64::checked_add(entries, counters.entries).unwrap(),
+            )
+        });
+        assert!(
+            exits >= 1 && entries >= 1,
+            "seed {seed:#x}: {exits} exits, {entries} entries"
+        );
         drain(
             &mut outbound,
             &mut halves,
