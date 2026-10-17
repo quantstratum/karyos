@@ -1679,6 +1679,28 @@ impl Network {
         }
     }
 
+    /// Per path of the network publication `registration`, the receivers
+    /// whose SMs reached the sender there, in Shared mode (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux two-path test")
+    )]
+    pub(crate) fn publication_path_bindings(&self, registration: u64) -> Vec<usize> {
+        let (Some(entry), Agents::Shared(agents)) = (
+            self.publications
+                .iter()
+                .find(|entry| entry.registration == registration),
+            &self.agents,
+        ) else {
+            return Vec::new();
+        };
+        entry
+            .paths()
+            .map(|path| agents.sender.confirmed_bindings(path, entry.alias))
+            .collect()
+    }
+
     /// Endpoint resets completed so far, for tests.
     #[cfg(test)]
     pub(crate) fn reopened(&self) -> u64 {

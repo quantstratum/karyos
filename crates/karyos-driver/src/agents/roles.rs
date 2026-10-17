@@ -4579,6 +4579,19 @@ impl SenderRole {
     /// paths consumed, per lane: a reliable channel's bound (SPEC §4). A receiver
     /// answered but not yet heard from bounds at its join points. `None`
     /// with no bound receiver at all: a reliable lane then holds.
+    /// The receivers bound to `alias` on `endpoint` whose SMs arrived
+    /// (tests): a path's SMs reach the sender only when the receiver agent
+    /// has the alias published on that path's endpoint.
+    #[cfg(test)]
+    pub(crate) fn confirmed_bindings(&self, endpoint: EndpointId, alias: Alias) -> usize {
+        self.bindings
+            .iter()
+            .filter(|binding| {
+                binding.endpoint == endpoint && binding.alias == alias && binding.last_sm.is_some()
+            })
+            .count()
+    }
+
     /// [`Self::consumption`] of the publication `alias` on `endpoint`, any
     /// of its paths (tests).
     #[cfg(test)]

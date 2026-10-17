@@ -960,6 +960,17 @@ impl<O: SocketOps> ReceiverAgent<O> {
 }
 
 impl<O: SocketOps> SenderAgent<O> {
+    /// The receivers bound to `alias` on `endpoint` whose SMs arrived
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn confirmed_bindings(
+        &self,
+        endpoint: EndpointId,
+        alias: karyos_protocol::network::Alias,
+    ) -> usize {
+        self.role.confirmed_bindings(endpoint, alias)
+    }
+
     /// Drops every NAK unread from now on, as a sender that never repairs
     /// (tests).
     #[cfg(test)]
