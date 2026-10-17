@@ -535,6 +535,43 @@ impl Outbound {
         Ok(())
     }
 
+    /// Returns, through the gate, the staged items of every lane its guard
+    /// aborted: such a lane is never flushed again, so an item the kernel
+    /// refused before the close (would block) would stay in flight and the
+    /// close acknowledgement would never drain. The applied epoch is then
+    /// published again with the work drained.
+    fn cancel_aborted<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        let Self {
+            guard: Some(guard),
+            sender,
+            tracks,
+            readers,
+            counters,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let mut cancelled = false;
+        for lane in 0..readers.len() {
+            if !LaneGate::aborting(&**guard, lane) || sender.pending(lane).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut gate = DataGate {
+                lanes: tracks,
+                held: false,
+                guard: Some(&mut **guard),
+            };
+            match sender.cancel(tx, lane, &mut gate) {
+                Ok(_) => cancelled = true,
+                Err(_) => counters.bump(|c| &mut c.queue_failures, 1),
+            }
+        }
+        if cancelled {
+            guard.between_gates();
+        }
+    }
+
     /// The guard's between gates step at `now`, for a publication not
     /// served this cycle (not established yet): a close applies and its
     /// applied epoch is published all the same.
@@ -594,10 +631,14 @@ impl Outbound {
             *high = track.high;
         }
         // A guard's close stops repairs too: they are submissions (GC-6).
+        // The word is loaded now, so a close since the last cycle's first
+        // sends holds every repair of this one.
         let mut closed = [false; MAX_LANES];
-        if let Some(guard) = self.guard.as_deref() {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.set_now(now);
+            guard.between_gates();
             for (lane, closed) in closed.iter_mut().enumerate() {
-                *closed = guard.aborting(lane);
+                *closed = LaneGate::aborting(&*guard, lane);
             }
         }
         let Some(repair) = self.repair.as_deref_mut() else {
@@ -807,6 +848,8 @@ impl Outbound {
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         if !self.open(tx) {
+            // No queues this cycle, but a guard close still applies.
+            self.guard_tick(now);
             return Ok(0);
         }
         // The receivers' limits this cycle; with no membership attached,
@@ -860,6 +903,7 @@ impl Outbound {
         if let Some(guard) = self.guard.as_deref_mut() {
             guard.between_gates();
         }
+        self.cancel_aborted(tx);
         self.handle_failure(tx, report.failure);
         for (lane, (track, reader)) in self.tracks.iter_mut().zip(&mut self.readers).enumerate() {
             if std::mem::take(&mut track.unsent) {
