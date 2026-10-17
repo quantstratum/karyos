@@ -37,6 +37,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The conductor hands network trace hooks and journals to the agents
+  (P2.12 step 3, PR 3a). `set_network_trace_hook` gives the hook to its
+  side's agent; a journal opens per lane of a publication once the sender
+  added it and of an image once it is installed, including those already
+  there when a hook is set. The agent's start and close facts go to the
+  trace mirror. A publication's sender journals close before the sender
+  removes it, and an image's when it retires. `CloseNetworkJournal` names
+  the journal number, so a stale close never answers a later journal of a
+  reinstalled identity. A journal the agent refuses is closed and counted
+  as refused; one a hook change closes is counted in the new driver counter
+  `network trace journals unhooked`.
 - Receiver network trace points (P2.12 step 3, trace-network.md section 4,
   section 5, NT-2 to NT-4). The receiver agent writes one journal per lane
   of an installed image: `OpenNetworkJournal` starts it at the lane's next

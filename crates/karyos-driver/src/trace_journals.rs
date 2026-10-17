@@ -194,10 +194,6 @@ fn release(held: u64, bytes: u64, counters: &DriverCounters) -> u64 {
 /// Counts a refused network journal in the driver counters, and an
 /// overflow when the mirror's header count could not rise (`header_rose`
 /// false): the refusal is never silent (ACS 15639).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the agents in P2.12 step 3")
-)]
 fn count_refusal(header_rose: bool, counters: &DriverCounters) {
     if !header_rose {
         counters.add(Event::CounterOverflows, 1);
@@ -350,10 +346,6 @@ impl TraceJournals {
 
     /// [`TraceJournals::preflight`] for a network journal, against
     /// `max_network_journal_bytes`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the agents in P2.12 step 3")
-    )]
     pub(crate) fn preflight_network(&self, layout: &JournalLayout) -> Result<Reserved, Refusal> {
         self.preflight_for(layout, true)
     }
@@ -536,10 +528,6 @@ impl TraceJournals {
     /// Counts a refused network journal in the mirror's header word 7 and
     /// in the driver counters; a header count that cannot rise is counted
     /// as an overflow, never silently (ACS 15639).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the agents in P2.12 step 3")
-    )]
     pub(crate) fn refuse_network(&mut self, counters: &DriverCounters) {
         count_refusal(self.mirror.refuse_network_journal(), counters);
     }

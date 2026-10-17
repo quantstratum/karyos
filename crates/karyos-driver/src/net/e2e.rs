@@ -919,6 +919,8 @@ fn multicast_cycles_run_on_the_network_clock() {
 
 mod netem;
 
+mod trace;
+
 /// The table of the conflated views below: four keys of 16 bytes.
 const VIEW: karyos_sys::conflation::ConflationConfig = karyos_sys::conflation::ConflationConfig {
     keys: 4,

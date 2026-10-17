@@ -1104,6 +1104,7 @@ fn journal_facts(
 ) -> super::net_trace::JournalFacts {
     super::net_trace::JournalFacts {
         publication: traced.publication,
+        number: traced.number,
         start: traced.start,
         boundary: owner
             .and_then(|owner| owner.rebuild_position(traced.lane))
@@ -1635,6 +1636,7 @@ impl ReceiverRole {
                                     slot: image.slot,
                                     lane: journal.lane,
                                     publication,
+                                    number: journal.number,
                                     start,
                                 }
                             })
@@ -1662,9 +1664,10 @@ impl ReceiverRole {
                 reply,
                 publication,
                 lane,
+                number,
             } => {
                 let images = &self.images;
-                let facts = self.trace.close(&publication, lane, |traced| {
+                let facts = self.trace.close(number, |traced| {
                     let owner = images
                         .iter()
                         .find(|image| image.slot == traced.slot)
@@ -1677,6 +1680,7 @@ impl ReceiverRole {
                         agent,
                         publication,
                         lane,
+                        number,
                         facts,
                     },
                 ))
@@ -1706,6 +1710,7 @@ impl ReceiverRole {
                 agent: AgentKind::Receiver,
                 publication: facts.publication,
                 lane,
+                number: facts.number,
                 facts: Some(facts),
             })
         });

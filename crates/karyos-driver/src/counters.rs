@@ -107,7 +107,7 @@ pub const TYPE_POSITION: u64 = karyos_sys::counters::TYPE_POSITION;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 56] = [
+const LABELS: [(u64, &str); 57] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -164,6 +164,7 @@ const LABELS: [(u64, &str); 56] = [
     (TYPE_EVENTS, "guard walker budget exhausted"),
     (TYPE_GAUGE, "network trace journals open"),
     (TYPE_EVENTS, "network trace journals refused"),
+    (TYPE_EVENTS, "network trace journals unhooked"),
 ];
 
 /// The fixed counters, which every counters region must hold.
@@ -304,8 +305,12 @@ pub(crate) enum Event {
     /// (`trace-network.md`, NT-3).
     NetworkTraceJournalsOpen,
     /// Network trace journals refused: over `max_network_journal_bytes`,
-    /// or no free table entry (`trace-network.md` §4).
+    /// no free table entry (`trace-network.md` §4), or not taken by their
+    /// agent (no hook there, or its publication or image is gone).
     NetworkTraceJournalsRefused,
+    /// Network trace journals closed without facts because their side's
+    /// hook was replaced or removed: `Lost`, never refused.
+    NetworkTraceJournalsUnhooked,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -562,6 +567,10 @@ mod tests {
             (
                 Event::NetworkTraceJournalsRefused,
                 "network trace journals refused",
+            ),
+            (
+                Event::NetworkTraceJournalsUnhooked,
+                "network trace journals unhooked",
             ),
         ];
         assert_eq!(events.len(), LABELS.len());

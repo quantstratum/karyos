@@ -98,6 +98,8 @@ pub enum ImageEvent {
         endpoint: EndpointId,
         /// The publication incarnation.
         identity: Identity,
+        /// The alias it arrived under.
+        alias: Alias,
     },
     /// The image was not installed; its storage is freed.
     Released {
@@ -176,6 +178,7 @@ struct Image {
     slot: SlotRef,
     endpoint: EndpointId,
     identity: Identity,
+    alias: Alias,
     lanes: Vec<Arc<LogBuffer>>,
     /// Term bytes charged to the budget.
     charge: u64,
@@ -371,6 +374,7 @@ impl ImageTable {
                         slot: installed,
                         endpoint: image.endpoint,
                         identity: image.identity,
+                        alias: image.alias,
                     });
                 }
                 _ => self.counters.bump(|c| &mut c.stale_replies),
@@ -453,6 +457,7 @@ impl ImageTable {
             slot,
             endpoint,
             identity,
+            alias,
             lanes,
             charge,
             reclaimed,
