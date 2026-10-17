@@ -58,7 +58,7 @@
 //!   payload word, so a forged header inside a payload is never landed on.
 //!   The copy that follows validates the block it starts in as the cursor
 //!   path does; its loads are the read's, not the scan's.
-
+//!
 //! Limits of this phase: reads of a draining generation (2.4) and the
 //! retention floor at `sent - retransmit_window` come later; until then
 //! the registered position bounds the floor. A reader covers one lane; the
@@ -78,6 +78,17 @@
 //! whose `Acquire` already orders every interior frame (as `FrameReader`
 //! reads them). Only committed DATA bytes are read; an aborted extent is
 //! never read past its word 0.
+//!
+//! A NAK read trusts a recorded frame start, block end or open block only
+//! under the term count it was recorded for. Checkpoint arrays are tagged
+//! with their count, cleared when the tag changes and read only through
+//! the tag check; the cursor's open block is used only when it and the
+//! cursor lie in the NAK's term count. Each such value was recorded by the
+//! cursor path from a block it validated in that term incarnation, and the
+//! loan on the exact term keeps that incarnation, so the frames it names
+//! are the ones recorded: a walk from them never lands inside a payload.
+//! The copy that follows checks every frame against the block end it is
+//! given.
 
 use core::sync::atomic::{Ordering, fence};
 use std::collections::VecDeque;
@@ -810,13 +821,15 @@ impl<O: BufferOwner> SenderRead<O> {
             Err(_) => return (Err(ReadError::Invariant), 0),
         };
         // The scan's start: the last recorded checkpoint at or below
-        // `offset` of this exact term count, or the term start.
+        // `offset` of this exact term count, or the term start. Only the
+        // array tagged with `count` is read (module documentation, Safety).
         let entries = checkpoints.array(count).unwrap_or(&[]);
         let start = match Self::scan_start(entries, checkpoints.stride, offset) {
             Ok(start) => start,
             Err(error) => return (Err(error), 0),
         };
-        // The cursor's open block, when it lies in this term.
+        // The cursor's open block, only when it and the cursor lie in this
+        // term count.
         let at_cursor = open.filter(|block| block.count == count).and_then(|block| {
             let (cursor_count, at) = buffer.split(subscription.cursor.position).ok()?;
             (cursor_count == count).then_some((at, block.end))
@@ -1071,8 +1084,12 @@ impl<O: BufferOwner> SenderRead<O> {
             .filter(|&(frame, end, begin)| !begin && end > frame);
         let mut at = offset;
         loop {
-            // A fragment start of this block is in no other block: the
-            // recorded end is this block's.
+            // Both sources were recorded under this term count (`entries`
+            // is the array tagged with it, `at_cursor` the open block of
+            // this count), from blocks the cursor path validated in this
+            // term incarnation, which the loan keeps. A fragment start of
+            // this block is in no other block: the recorded end is this
+            // block's.
             if let Some((cursor, end)) = ends.at_cursor
                 && cursor == at
                 && end > at
@@ -1295,7 +1312,10 @@ impl<O: BufferOwner> SenderRead<O> {
                 // start inside a block whose first word 0 was observed with
                 // Acquire and whose frames were validated, in this call or,
                 // for a resumed block, in an earlier call on the same term
-                // incarnation (the loan's exact term proves it).
+                // incarnation (the loan's exact term proves it). For a NAK
+                // read, a resumed block's end comes only from values the
+                // cursor path recorded under this term count, and its first
+                // word 0 was observed by the walk or the cursor path.
                 let word = unsafe { buffer.regions.word0(slot, at) };
                 let raw = load_interior(word);
                 let frame = match check_frame(raw, at, block_end, begin, lane) {
