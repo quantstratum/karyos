@@ -104,10 +104,14 @@ pub struct RouteCounters {
     /// Copies [`RoutedLaneSender::forget`] returned while the route was
     /// detached.
     pub forgotten: u64,
-    /// Datagrams this route submitted, catch-up copies included: each path
-    /// keeps its own count for capacity planning (RP-10).
+    /// The lane sender's first-send DATA copies this route submitted,
+    /// catch-up copies included: each path keeps its own count for
+    /// capacity planning (RP-10). Repairs (counted apart, per route, by the
+    /// driver's `repair_route_counts`), PATH_HB and other controls, and
+    /// copies that left as `Flushed::Unknown` are not counted.
     pub datagrams: u64,
-    /// Bytes this route submitted, catch-up copies included (RP-10).
+    /// The bytes of those copies (RP-10), with the same scope as
+    /// `datagrams`.
     pub bytes: u64,
     /// An increment did not apply.
     pub overflowed: bool,

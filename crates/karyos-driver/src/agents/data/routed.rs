@@ -94,7 +94,8 @@ impl Default for PathPolicy {
     }
 }
 
-/// What a path did in and out of the live set (RP-8).
+/// What a path did in and out of the live set (RP-8), and what it sent
+/// (RP-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PathCounters {
     /// Times it left the live set.
@@ -107,11 +108,13 @@ pub struct PathCounters {
     /// receivers get them by NAK (reliable) or close the gap by their gap
     /// policy (unreliable).
     pub copies_abandoned: u64,
-    /// Datagrams it submitted, catch-up copies included: each path's own
-    /// count, for capacity planning (RP-10). Its route's
-    /// `RouteCounters::datagrams`.
+    /// The first-send DATA copies it submitted, catch-up copies included:
+    /// each path's own count, for capacity planning (RP-10). Its route's
+    /// `RouteCounters::datagrams`; repairs are in
+    /// [`Outbound::repair_route_counts`], and PATH_HB, other controls and
+    /// `Flushed::Unknown` copies are not counted.
     pub datagrams: u64,
-    /// Bytes it submitted, catch-up copies included (RP-10). Its route's
+    /// The bytes of those copies (RP-10), with the same scope. Its route's
     /// `RouteCounters::bytes`.
     pub bytes: u64,
     /// An increment did not apply, here or in its route's counters.

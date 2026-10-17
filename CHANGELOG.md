@@ -11,6 +11,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `RouteCounters` (`karyos-io`) and `PathCounters` (`karyos-driver`)
+  gained the public fields `datagrams` and `bytes` (rp-w9). Neither
+  struct is `#[non_exhaustive]`, so a struct literal that names every
+  field must add them. Both count the lane sender's first sends of DATA
+  only, catch-up copies included: repairs (`repair_route_counts`),
+  PATH_HB and other controls, and `Flushed::Unknown` are not in them.
 - An Archive replay's target stream (phase 3, A5b).
   `EmbeddedDriver::replay_target(ReplayTargetConfig)` makes a one-lane
   image with local gaps, joined at the replay's first position and
@@ -783,6 +789,13 @@ release may break APIs, wire formats and shared-memory layouts.
   again for a hole whose NAK or repair was lost. The network now reads
   `host_monotonic_ns` for its cycles and its close, as runner threads do;
   the driver's clock times claim deadlines only.
+- A replay target checks what it is fed (#374 review). A frame whose
+  header (term id and offset, from the recorded initial term id) names
+  another position than where it lies in the run is refused, and a fill
+  must be a PAD or ABORTED record whose extent is the one given.
+  `finish_replay` and the reaping of a dropped feed refresh the stream
+  gauges, and a dropped feed's target whose retire fails is counted
+  (`replay targets not retired`) instead of ignored.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 

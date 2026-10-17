@@ -48,7 +48,7 @@ use karyos_sys::log_buffer::{
     DEFAULT_CLAIM_DEADLINE, LogBuffer, LogBufferConfig, PublicationMode, ReceiveError,
     ReceiveOwner, Received,
 };
-use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
+use karyos_sys::receive::{FrameKind, ImageParams, Item, ValidatedDatagram};
 use karyos_sys::sizing::TermLength;
 use karyos_sys::term::TermId;
 
@@ -58,6 +58,7 @@ use crate::error::DriverError;
 use karyos_protocol::cnc::CloseReason;
 
 use crate::SealReason;
+use crate::counters::Event;
 
 #[cfg(test)]
 mod tests;
@@ -115,6 +116,9 @@ pub struct ReplayFeed<T: StreamTerms> {
     owner: ReceiveOwner<T>,
     params: ImageParams,
     term_length: u64,
+    /// The recorded stream's initial term id: a frame's term id and offset
+    /// name its position.
+    initial_term_id: TermId,
     /// One frame, its ids rewritten: allocated once, of the mtu.
     scratch: Vec<u8>,
     registration: u64,
@@ -151,8 +155,9 @@ impl<T: StreamTerms> ReplayFeed<T> {
     ///
     /// # Errors
     ///
-    /// [`ReplayFeedError`] for frames that are not whole and valid, or that
-    /// the image refuses.
+    /// [`ReplayFeedError`] for frames that are not whole and valid, whose
+    /// headers name another position than where they lie in the run, or
+    /// that the image refuses.
     pub fn frames(&mut self, position: u64, bytes: &[u8]) -> Result<bool, ReplayFeedError> {
         self.owner.duty();
         let mut offset = 0usize;
@@ -168,7 +173,7 @@ impl<T: StreamTerms> ReplayFeed<T> {
             let frame = bytes
                 .get(offset..end.min(bytes.len()))
                 .ok_or_else(|| invalid(at, "bad frame"))?;
-            if let Taken::NotYet = self.write(at, frame)? {
+            if let Taken::NotYet = self.write(at, frame, None)? {
                 return Ok(false);
             }
             offset = end;
@@ -177,18 +182,24 @@ impl<T: StreamTerms> ReplayFeed<T> {
     }
 
     /// Writes a PAD or ABORTED record at `position`: one frame, whose
-    /// header states the extent it covers. As [`ReplayFeed::frames`].
+    /// header states the extent it covers, which must be `extent`. As
+    /// [`ReplayFeed::frames`].
     ///
     /// # Errors
     ///
-    /// As [`ReplayFeed::frames`].
+    /// As [`ReplayFeed::frames`], and [`ReplayFeedError::Invalid`] for a
+    /// DATA frame or a record whose extent is not `extent`.
     pub fn fill(
         &mut self,
         position: u64,
         record: &[u8],
-        _extent: u32,
+        extent: u32,
     ) -> Result<bool, ReplayFeedError> {
-        self.frames(position, record)
+        self.owner.duty();
+        Ok(matches!(
+            self.write(position, record, Some(extent))?,
+            Taken::Yes
+        ))
     }
 
     /// Seals `[from, to)`, a range the recording lost, as local gap
@@ -207,8 +218,10 @@ impl<T: StreamTerms> ReplayFeed<T> {
                 .and_then(|term| term.checked_mul(self.term_length))
                 .ok_or_else(|| invalid(at, "position overflow"))?;
             let end = term_end.min(to);
-            let extent =
-                u32::try_from(end.saturating_sub(at)).map_err(|_| invalid(at, "gap extent"))?;
+            let extent = end
+                .checked_sub(at)
+                .and_then(|extent| u32::try_from(extent).ok())
+                .ok_or_else(|| invalid(at, "gap extent"))?;
             match self
                 .owner
                 .seal_gap(Lane::ZERO, at, extent, GapReason::RangeUnavailable)?
@@ -223,7 +236,14 @@ impl<T: StreamTerms> ReplayFeed<T> {
         Ok(true)
     }
 
-    fn write(&mut self, position: u64, frame: &[u8]) -> Result<Taken, ReplayFeedError> {
+    /// Writes one frame at `position`; a fill passes the record's `extent`.
+    fn write(
+        &mut self,
+        position: u64,
+        frame: &[u8],
+        fill: Option<u32>,
+    ) -> Result<Taken, ReplayFeedError> {
+        let origin = (self.initial_term_id, self.term_length);
         let copy = self
             .scratch
             .get_mut(..frame.len())
@@ -253,6 +273,20 @@ impl<T: StreamTerms> ReplayFeed<T> {
                 // A header-only frame carries nothing to write.
                 continue;
             };
+            if position_of(origin, frame.term_id(), frame.term_offset()) != Some(position) {
+                return Err(invalid(
+                    position,
+                    "a frame whose header names another position",
+                ));
+            }
+            if let Some(extent) = fill
+                && (frame.kind() == FrameKind::Data || frame.extent() != extent)
+            {
+                return Err(invalid(
+                    position,
+                    "a fill that is not a record of its extent",
+                ));
+            }
             match self.owner.receive(&frame)? {
                 Received::Committed { .. } | Received::Duplicate => {}
                 Received::NotReady | Received::Ahead => return Ok(Taken::NotYet),
@@ -263,6 +297,19 @@ impl<T: StreamTerms> ReplayFeed<T> {
         }
         Ok(Taken::Yes)
     }
+}
+
+/// The position a frame header names: its term's start, counted from the
+/// recorded initial term id with terms of `term_length`, plus its offset.
+fn position_of(
+    (initial_term_id, term_length): (TermId, u64),
+    term_id: TermId,
+    term_offset: u32,
+) -> Option<u64> {
+    let term = term_id.count_from(initial_term_id).ok()?;
+    u64::from(term.get())
+        .checked_mul(term_length)?
+        .checked_add(u64::from(term_offset))
 }
 
 impl<T: StreamTerms> Drop for ReplayFeed<T> {
@@ -362,6 +409,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             owner,
             params,
             term_length: u64::from(term_length.get()),
+            initial_term_id: TermId::new(config.initial_term_id.cast_unsigned()),
             scratch,
             registration: handle.registration(),
             source: (config.source_stream_id, config.source_session_id),
@@ -415,11 +463,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         // The owner goes first: nothing is written after the seal.
         drop(feed);
-        self.retire_target(target, seal, close)?;
+        let retired = self.retire_target(target, seal, close);
+        self.update_stream_gauges();
+        retired?;
         outcome
     }
 
-    /// Retires the targets whose feed was dropped unfinished.
+    /// Retires the targets whose feed was dropped unfinished. A retire that
+    /// fails is counted (`replay targets not retired`); the target is no
+    /// longer tracked.
     pub(crate) fn reap_replays(&mut self) {
         let dropped: Vec<AggregateHandle> = self
             .replays
@@ -427,8 +479,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .extract_if(.., |(_, dropped)| dropped.load(Ordering::Acquire))
             .map(|(target, _)| target)
             .collect();
-        for target in dropped {
-            let _ = self.retire_target(target, SealReason::ImageRetired, CloseReason::ImageRetired);
+        for target in &dropped {
+            if self
+                .retire_target(*target, SealReason::ImageRetired, CloseReason::ImageRetired)
+                .is_err()
+            {
+                self.counters.add(Event::ReplayTargetsNotRetired, 1);
+            }
+        }
+        if !dropped.is_empty() {
+            self.update_stream_gauges();
         }
     }
 
