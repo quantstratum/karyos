@@ -354,6 +354,15 @@ fn a_recording_starts_ends_and_is_listed() {
         RecordingState::Stopped(stop) if stop.position == end
     ));
     assert_eq!(response(&sent[4]).id, 1);
+    // From an id past the last: none, and a count of 0.
+    rig.request(&ControlMessage::ListRecordings(control::ListRecordings {
+        correlation_id: 9,
+        from_id: 2,
+        max_count: 10,
+    }));
+    let sent = rig.sent(6);
+    let none = response(&sent[5]);
+    assert_eq!((none.correlation_id, none.id), (9, 0));
     rig.finish();
 }
 
