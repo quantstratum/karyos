@@ -11,6 +11,30 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-archive` gains its recorder and agent (phase 3, A4b). A
+  `Recorder` copies a lane's committed frames from a `FrameSource` into
+  its recording's segment store: data, a padding or aborted block as a
+  fill, a lost range as a gap. `Mode::Required` throttles the publisher
+  when the disk stalls (SPEC section 8.1); `Mode::Async` records a lap as a gap
+  and stops there or resumes where its source rejoins. The
+  `ArchiveHandle` agent thread owns the catalog and the recorders, settles
+  the catalog at start, and stops each recording in the catalog once its
+  store is closed with everything durable (`SegmentStore::close_synced`,
+  whatever the policy), at the durable position. A source that fails or
+  returns what a source never may ends its recording with
+  `StopReason::Failed(FailKind)`; a store that fails leaves it open for
+  the next start to settle (`Event::Failed { failure }`). A command stop,
+  the shutdown and the seal record `Stopped`, `Shutdown` and `Normal`.
+  Dropped events are counted (`ArchiveHandle::dropped_events`). A store
+  records at most `MAX_GAPS` lost ranges; an async recording lapped past
+  them ends `Lapped`. The catalog format becomes version 2.
+- The Archive's segment index entries have a kind (phase 3, A4): data, a
+  fill (a padding or aborted block's canonical record, covering its
+  extent) or a gap (a range an async recording lost, refused to reads).
+  `SegmentStore::append_fill`, `append_gap` and `gaps`; an unknown kind is
+  refused at recovery. The catalog's stop gains the reason `Lapped` and an
+  `incomplete` flag, which `settle` sets for a recording with gaps. The
+  `Disk` trait's `truncate` becomes `set_len`, which also extends.
 - `karyos-archive` gains its catalog (phase 3, A3): `catalog.kyc`, an
   append-only log of CRC-32C checked records (a recording started,
   stopped or forgotten, and the id watermark), each durable before the
