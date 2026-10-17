@@ -1151,6 +1151,9 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     slot.window = PathWindow::default();
                     bump_path(&mut slot.counters.entries, &mut slot.counters.overflowed);
                     routed.sender.set_live(index, true);
+                    // A fault exit's queues are retried by the control
+                    // path below, now that it is back (`retry_queue` clears
+                    // faults only; a refusal waits for the endpoint reset).
                 }
                 continue;
             }
@@ -1195,7 +1198,12 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             let stalled_long = since
                 .and_then(|since| now.checked_sub(since))
                 .is_some_and(|stalled| stalled > policy.lag_limit);
-            if !(lagging || stalled_long) || live < 2 {
+            // A faulted route leaves too (RP-8), and comes back by
+            // `retry_queue` after its backoff (RP-9).
+            let faulted = slot.needs_reset
+                || (0..self.readers.len())
+                    .any(|lane| routed.sender.needs_control(lane, index) == Some(true));
+            if !(lagging || stalled_long || faulted) || live < 2 {
                 continue;
             }
             if leave(
@@ -1272,7 +1280,11 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     slot.needs_reset = true;
                     continue;
                 }
-                if slot.needs_reset || routed.sender.needs_control(lane, index) != Some(true) {
+                // A left route's faults wait for its return (RP-9).
+                if slot.left
+                    || slot.needs_reset
+                    || routed.sender.needs_control(lane, index) != Some(true)
+                {
                     continue;
                 }
                 self.counters.bump(|c| &mut c.send_faults, 1);

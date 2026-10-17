@@ -379,11 +379,19 @@ fn a_failed_route_resets_only_its_endpoint() {
     assert_eq!(outbound.post_reset_requests(1, |_| true), (0, 0));
     let _rx_b = reset(&mut halves, 1, rx_b);
     sent(&observer_b, 32);
+    // B left on its fault (RP-8); after its backoff (10 ms) it returns on
+    // its new epoch (RP-9).
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 20_000_000)
+        .unwrap();
     let _ = log.publications[0]
         .append(&[9; 1000], AppendOptions::default())
         .unwrap();
     for _ in 0..4 {
-        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, 20_000_000)
+            .unwrap();
     }
     assert!(!outbound.needs_reset());
     assert_eq!(seen_a.lock().unwrap().len(), 3);
@@ -958,4 +966,54 @@ fn a_skipped_frame_passes_the_paths_frontier() {
         .unwrap();
     assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
     assert_eq!(outbound.sent_low(0), Some(FRAME));
+}
+
+/// RP-8 and RP-9: a faulted route leaves while another is live; its queue
+/// is not retried until it returns after its backoff, through
+/// `retry_queue`, and then it sends again.
+#[test]
+fn a_faulted_route_leaves_and_returns_by_retry() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    observer_b.push_send(SendResult::Error(Errno::NETUNREACH));
+    sent(&observer_b, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1000)
+        .unwrap();
+    assert_eq!(
+        outbound.path_state(1).map(|state| state.0),
+        Some(false),
+        "B left"
+    );
+    let calls = observer_b.send_calls();
+    // During its backoff: no retry, no flush.
+    commit(&mut log, 1, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1005)
+        .unwrap();
+    assert_eq!(observer_b.send_calls(), calls);
+    assert_eq!(
+        outbound.routed_sender().unwrap().needs_control(0, 1),
+        Some(true),
+        "not retried while it is out"
+    );
+    // Back after 10 ns: retried, and its next copies go.
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1010)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    commit(&mut log, 2, 1);
+    for now in 1011..1015 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert!(observer_b.send_calls() > calls);
+    assert!(!seen_b.lock().unwrap().is_empty());
+    assert!(!outbound.needs_reset());
 }
