@@ -472,6 +472,25 @@ fn an_invalid_control_group_table_is_refused() {
 /// the control group endpoint.
 #[test]
 fn a_multicast_subscription_joins_its_control_group() {
+    use crate::error::DriverError;
+
+    // The group ports are free when picked, but a parallel test can bind
+    // one before the driver does: an endpoint that cannot bind is a fresh
+    // attempt with fresh ports, never a failure.
+    for _ in 0..8 {
+        match control_group_attempt() {
+            Ok(_) => return,
+            Err(DriverError::NetworkEndpoint) => {}
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    panic!("no free group ports in 8 attempts");
+}
+
+/// One attempt of [`a_multicast_subscription_joins_its_control_group`]:
+/// `Ok(false)` when the host cannot join the data group at all.
+fn control_group_attempt() -> Result<bool, crate::error::DriverError> {
+    use crate::error::DriverError;
     use crate::net::{ControlGroup, MAX_CONTROL_GROUPS};
 
     let data_group = SocketAddr::from(([239, 7, 7, 1], free_port()));
@@ -505,8 +524,10 @@ fn a_multicast_subscription_joins_its_control_group() {
     let before = driver.network_held_endpoints();
     // A host without multicast on its default interface cannot join the
     // data group either: nothing to check there.
-    let Ok(reliable) = driver.add_network_subscription(6, &multicast(data_group, true)) else {
-        return;
+    let reliable = match driver.add_network_subscription(6, &multicast(data_group, true)) {
+        Ok(reliable) => reliable,
+        Err(DriverError::NetworkEndpoint) => return Err(DriverError::NetworkEndpoint),
+        Err(_) => return Ok(false),
     };
     let failed = driver.network_control_join_failures();
     let held = driver.network_held_endpoints();
@@ -520,14 +541,13 @@ fn a_multicast_subscription_joins_its_control_group() {
     );
     assert_eq!(held, before + 2 - usize::try_from(failed).unwrap());
     // Its own data group, whose table entry it does not join.
-    let unreliable = driver
-        .add_network_subscription(7, &multicast(other_group, false))
-        .unwrap();
+    let unreliable = driver.add_network_subscription(7, &multicast(other_group, false))?;
     assert_eq!(driver.network_held_endpoints(), held + 1);
     assert_eq!(driver.network_control_join_failures(), failed);
     assert!(driver.remove_network_subscription(unreliable).unwrap());
     assert!(driver.remove_network_subscription(reliable).unwrap());
     assert_eq!(driver.network_held_endpoints(), before);
+    Ok(true)
 }
 
 /// A unicast subscription's receiver entry is not multicast.
