@@ -221,6 +221,8 @@ pub struct ReceiverCounters {
     /// DATA datagrams of a multi-path image delivered at once, past the
     /// path queues, for lack of a free queue.
     pub path_queue_bypassed: u64,
+    /// DATA datagrams of a multi-path image queued in their path's queue.
+    pub path_queued: u64,
     /// DATA datagrams that failed validation for their image: dropped.
     pub data_invalid: u64,
     /// PATH_HB that refreshed a bound path.
@@ -3433,8 +3435,15 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .checked_mul(per_queue)
             .unwrap_or(per_queue);
         let mut served = 0u32;
+        // The slab is out while its datagrams are delivered: delivery
+        // queues nothing.
+        let slab = self
+            .path_intake
+            .as_deref_mut()
+            .map(path_intake::PathIntake::take_slab)
+            .unwrap_or_default();
         while served < limit {
-            let Some((endpoint, entry, buffer)) = self
+            let Some((endpoint, entry)) = self
                 .path_intake
                 .as_deref_mut()
                 .and_then(path_intake::PathIntake::pop)
@@ -3451,10 +3460,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
             intake.data(
                 entry.source,
                 entry.alias,
-                path_intake::PathIntake::bytes(&entry, &buffer),
+                path_intake::PathIntake::bytes(&entry, &slab),
             );
             if let Some(queues) = self.path_intake.as_deref_mut() {
-                queues.give_back(entry, buffer);
+                queues.release(entry);
             }
             let Some(next) = served.checked_add(1) else {
                 break;
@@ -3462,6 +3471,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             served = next;
         }
         if let Some(queues) = self.path_intake.as_deref_mut() {
+            queues.put_slab(slab);
             queues.release_idle();
         }
         served
@@ -3750,6 +3760,11 @@ impl<T: StreamTerms> Intake<'_, T> {
             alias,
         };
         let role = &mut *self.role;
+        // A receiver with no queues (no later path ever bound) scans
+        // nothing.
+        if role.path_intake.is_none() {
+            return false;
+        }
         let paths = role.sessions.paths();
         let multi = paths
             .lookup(key)
@@ -3761,7 +3776,10 @@ impl<T: StreamTerms> Intake<'_, T> {
             return false;
         }
         match intake.push(self.endpoint, (source, alias, self.now), bytes) {
-            path_intake::Queue::Queued => true,
+            path_intake::Queue::Queued => {
+                role.count(|c| &mut c.path_queued);
+                true
+            }
             path_intake::Queue::Dropped => {
                 role.count(|c| &mut c.path_queue_drops);
                 true
@@ -3770,6 +3788,40 @@ impl<T: StreamTerms> Intake<'_, T> {
                 role.count(|c| &mut c.path_queue_bypassed);
                 false
             }
+        }
+    }
+
+    /// Delivers what this endpoint's path queue holds, in order, at each
+    /// datagram's poll time.
+    fn drain_own_queue(&mut self) {
+        let endpoint = self.endpoint;
+        let Some(intake) = self.role.path_intake.as_deref_mut() else {
+            return;
+        };
+        if !intake.holds(endpoint) {
+            return;
+        }
+        let slab = intake.take_slab();
+        let now = self.now;
+        while let Some(entry) = self
+            .role
+            .path_intake
+            .as_deref_mut()
+            .and_then(|intake| intake.pop_from(endpoint))
+        {
+            self.now = entry.now;
+            self.data(
+                entry.source,
+                entry.alias,
+                path_intake::PathIntake::bytes(&entry, &slab),
+            );
+            if let Some(intake) = self.role.path_intake.as_deref_mut() {
+                intake.release(entry);
+            }
+        }
+        self.now = now;
+        if let Some(intake) = self.role.path_intake.as_deref_mut() {
+            intake.put_slab(slab);
         }
     }
 
@@ -4311,7 +4363,12 @@ impl<T: StreamTerms> RxHandler for Intake<'_, T> {
         self.role.count(|c| &mut c.datagrams);
         let source = datagram.source();
         match classify(datagram.bytes()) {
-            Ok(Datagram::Control(control)) => self.control(source, control),
+            Ok(Datagram::Control(control)) => {
+                // The path's queued DATA first: a reply this control causes
+                // (an ERR) never overtakes it.
+                self.drain_own_queue();
+                self.control(source, control);
+            }
             Ok(Datagram::DataBatch(data) | Datagram::Heartbeat(data)) => {
                 if !self.enqueue(source, data.alias(), data.bytes()) {
                     self.data(source, data.alias(), data.bytes());

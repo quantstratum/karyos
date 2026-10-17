@@ -2026,16 +2026,17 @@ fn aborted_over_the_network(lose: bool) {
         return;
     }
     // The hole is the aborted extent, whole, and every NAK (a retry while
-    // the repair is in flight) stays inside it.
+    // the repair is in flight) names exactly it: none past its end.
     assert!(!posted.is_empty());
     assert_eq!(
         (posted[0].range.start, posted[0].range.length),
         (start, extent)
     );
+    assert_eq!(start + u64::from(extent), end);
     for nak in posted {
-        assert!(
-            nak.range.start >= start && nak.range.start + u64::from(nak.range.length) <= end,
-            "a NAK outside the aborted extent [{start}, {end}): {nak:?}"
+        assert_eq!(
+            nak.range, posted[0].range,
+            "a NAK of another range: {nak:?}"
         );
     }
     let counters = rig.agents.receiver.role.loss_counters(slot).unwrap();
@@ -2065,8 +2066,13 @@ fn peer_frame(
     reserved_value: i64,
     payload: &[u8],
 ) -> Vec<u8> {
-    let term_length = 65_536;
-    let term_id = 9 + u32::try_from(position / term_length).unwrap();
+    // The rig publication's terms, as `Rig::new` announces them.
+    let params = term(65_536);
+    let term_length = u64::from(params.term_length);
+    let term_id = params
+        .initial_term_id
+        .cast_unsigned()
+        .wrapping_add(u32::try_from(position / term_length).unwrap());
     let term_offset = u32::try_from(position % term_length).unwrap();
     let mut bytes = Vec::with_capacity(32 + payload.len());
     bytes.extend_from_slice(&word0.pack().to_le_bytes());
@@ -6132,6 +6138,56 @@ fn a_heartbeat_past_the_terminal_bound_is_counted() {
         "classified at the bound"
     );
     assert_eq!(after.eos_refused, before.eos_refused);
+}
+
+/// rp-w8b: a receiver that has path queues still bypasses them for an
+/// image with one live path. While the later path is live, the founding
+/// path's datagrams are queued; once it is lost, they are not, and none is
+/// bypassed for lack of a queue.
+#[test]
+fn a_single_path_image_bypasses_the_path_queues() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    assert!(rig.agents.receiver.role.has_path_queues());
+    let send = |rig: &mut Rig, byte: u8| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[byte; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..5 {
+            rig.round(true);
+        }
+    };
+    send(&mut rig, 0);
+    assert!(
+        rig.agents.receiver.counters().path_queued > 0,
+        "two live paths: queued"
+    );
+    // The silent later path times out: one live path is left.
+    for second in 1..=15u8 {
+        rig.now += 1_000_000_000;
+        send(&mut rig, second);
+        if rig.agents.receiver.role.live_paths(slot) == 1 {
+            break;
+        }
+    }
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1);
+    let queued = rig.agents.receiver.counters().path_queued;
+    for byte in 100..104u8 {
+        send(&mut rig, byte);
+    }
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(counters.path_queued, queued, "one live path: bypassed");
+    assert_eq!(counters.path_queue_bypassed, 0, "{counters:?}");
+    assert!(rig.agents.receiver.role.has_path_queues(), "kept");
 }
 
 /// rp-w7c, §8 Liveness: an idle path kept by PATH_HB stays live. Data
