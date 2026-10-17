@@ -56,9 +56,11 @@ pub struct Template {
 pub enum CodecError {
     /// The input or the capacity is shorter than the next read or write.
     Truncated {
-        /// Bytes needed from the start of the message.
+        /// Bytes needed, counted from the start of the region read or
+        /// written: the message, or the fixed block (or group entry) for
+        /// [`Block`] reads and [`Encoder`] block writes.
         needed: usize,
-        /// Bytes available.
+        /// Bytes available in that region.
         available: usize,
     },
     /// An unsupported schema, template or version, or a block or entry
@@ -165,20 +167,22 @@ fn truncated(needed: usize, available: usize) -> CodecError {
     CodecError::Truncated { needed, available }
 }
 
+/// `at + len`, or `Truncated` against `available` on overflow.
+fn end(at: usize, len: usize, available: usize) -> Result<usize, CodecError> {
+    at.checked_add(len)
+        .ok_or_else(|| truncated(usize::MAX, available))
+}
+
 /// The bytes `[at, at + len)` of `buf`, or `Truncated`.
 fn range(buf: &[u8], at: usize, len: usize) -> Result<&[u8], CodecError> {
-    let end = at
-        .checked_add(len)
-        .ok_or_else(|| truncated(usize::MAX, buf.len()))?;
+    let end = end(at, len, buf.len())?;
     buf.get(at..end).ok_or_else(|| truncated(end, buf.len()))
 }
 
 /// The mutable bytes `[at, at + len)` of `buf`, or `Truncated`.
 fn range_mut(buf: &mut [u8], at: usize, len: usize) -> Result<&mut [u8], CodecError> {
     let available = buf.len();
-    let end = at
-        .checked_add(len)
-        .ok_or_else(|| truncated(usize::MAX, available))?;
+    let end = end(at, len, available)?;
     buf.get_mut(at..end)
         .ok_or_else(|| truncated(end, available))
 }
@@ -280,6 +284,9 @@ impl<'a> Group<'a> {
     /// Entry `index`, or `None` past the count.
     #[must_use]
     pub fn entry(&self, index: usize) -> Option<Block<'a>> {
+        if index >= self.count {
+            return None;
+        }
         let at = index.checked_mul(self.entry_length)?;
         range(self.entries, at, self.entry_length).ok().map(Block)
     }
@@ -329,6 +336,7 @@ impl Envelope {
 #[derive(Debug)]
 pub struct Decoder<'a> {
     buf: &'a [u8],
+    declared: u32,
     cursor: usize,
 }
 
@@ -375,8 +383,15 @@ impl<'a> Decoder<'a> {
             ENVELOPE_LENGTH,
             usize::from(template.block_length),
         )?);
-        let cursor = ENVELOPE_LENGTH + usize::from(template.block_length);
-        Ok((block, Self { buf, cursor }))
+        let cursor = end(ENVELOPE_LENGTH, block.0.len(), buf.len())?;
+        Ok((
+            block,
+            Self {
+                buf,
+                declared: envelope.message_length,
+                cursor,
+            },
+        ))
     }
 
     /// The next group, whose entries are `entry_length` bytes, at most
@@ -410,12 +425,12 @@ impl<'a> Decoder<'a> {
                 max,
             });
         }
-        let start = self.cursor + GROUP_HEADER_LENGTH;
+        let start = end(self.cursor, GROUP_HEADER_LENGTH, self.buf.len())?;
         let length = count
             .checked_mul(usize::from(entry_length))
             .ok_or_else(|| truncated(usize::MAX, self.buf.len()))?;
         let entries = range(self.buf, start, length)?;
-        self.cursor = start + length;
+        self.cursor = end(start, length, self.buf.len())?;
         Ok(Group {
             entries,
             entry_length: usize::from(entry_length),
@@ -444,9 +459,9 @@ impl<'a> Decoder<'a> {
                 max,
             });
         }
-        let start = self.cursor + VAR_HEADER_LENGTH;
+        let start = end(self.cursor, VAR_HEADER_LENGTH, self.buf.len())?;
         let value = range(self.buf, start, length)?;
-        self.cursor = start + length;
+        self.cursor = end(start, length, self.buf.len())?;
         Ok(value)
     }
 
@@ -475,7 +490,7 @@ impl<'a> Decoder<'a> {
             Ok(())
         } else {
             Err(CodecError::MessageLength {
-                declared: u32::try_from(self.buf.len()).unwrap_or(u32::MAX),
+                declared: self.declared,
                 actual: self.cursor,
             })
         }
@@ -495,18 +510,25 @@ impl<'a> Encoder<'a> {
     /// Writes the envelope of `template`, with a zero `message_length`, and
     /// a zeroed fixed block into `buf`.
     ///
+    /// Whatever happens next, `buf` no longer holds a message: the length
+    /// of any earlier one is zeroed first, even when `buf` is too short for
+    /// this one.
+    ///
     /// # Errors
     ///
     /// [`CodecError::Truncated`] when `buf` cannot hold them.
     pub fn new(buf: &'a mut [u8], template: &Template) -> Result<Self, CodecError> {
+        if let Some(length) = buf.get_mut(8..ENVELOPE_LENGTH) {
+            length.fill(0);
+        }
         let block_length = usize::from(template.block_length);
-        let head = range_mut(buf, 0, ENVELOPE_LENGTH + block_length)?;
-        head.fill(0);
+        let head_length = end(ENVELOPE_LENGTH, block_length, buf.len())?;
+        range_mut(buf, 0, head_length)?.fill(0);
         let mut encoder = Self {
             buf,
             block_length,
             max_length: template.max_length,
-            cursor: ENVELOPE_LENGTH + block_length,
+            cursor: head_length,
         };
         encoder.put(0, &template.schema_id.to_le_bytes())?;
         encoder.put(2, &template.template_id.to_le_bytes())?;
@@ -521,13 +543,11 @@ impl<'a> Encoder<'a> {
     }
 
     fn put_block(&mut self, at: usize, bytes: &[u8]) -> Result<(), CodecError> {
-        let end = at
-            .checked_add(bytes.len())
-            .ok_or_else(|| truncated(usize::MAX, self.block_length))?;
-        if end > self.block_length {
-            return Err(truncated(end, self.block_length));
+        let last = end(at, bytes.len(), self.block_length)?;
+        if last > self.block_length {
+            return Err(truncated(last, self.block_length));
         }
-        self.put(ENVELOPE_LENGTH + at, bytes)
+        self.put(end(ENVELOPE_LENGTH, at, self.buf.len())?, bytes)
     }
 
     /// Writes the u8 at block offset `at`.
@@ -610,10 +630,11 @@ impl<'a> Encoder<'a> {
             count,
             max: usize::from(u16::MAX),
         })?;
+        let available = self.buf.len();
         let mut at = self.cursor;
         self.put(at, &entry_length.to_le_bytes())?;
-        self.put(at + 2, &count16.to_le_bytes())?;
-        at += GROUP_HEADER_LENGTH;
+        self.put(end(at, 2, available)?, &count16.to_le_bytes())?;
+        at = end(at, GROUP_HEADER_LENGTH, available)?;
         for entry in entries {
             if entry.len() != usize::from(entry_length) {
                 return Err(CodecError::LengthOutOfRange {
@@ -624,7 +645,7 @@ impl<'a> Encoder<'a> {
                 });
             }
             self.put(at, entry)?;
-            at += entry.len();
+            at = end(at, entry.len(), available)?;
         }
         self.cursor = at;
         Ok(())
@@ -654,9 +675,11 @@ impl<'a> Encoder<'a> {
                 max,
             });
         };
+        let available = self.buf.len();
+        let start = end(self.cursor, VAR_HEADER_LENGTH, available)?;
         self.put(self.cursor, &length16.to_le_bytes())?;
-        self.put(self.cursor + VAR_HEADER_LENGTH, value)?;
-        self.cursor += VAR_HEADER_LENGTH + length;
+        self.put(start, value)?;
+        self.cursor = end(start, length, available)?;
         Ok(())
     }
 

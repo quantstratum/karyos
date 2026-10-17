@@ -126,7 +126,7 @@ fn samples() -> Vec<ControlMessage<'static>> {
             recording_id: 1,
             start: 0,
             start_time_ns: 5,
-            stop: None,
+            state: RecordingState::Recording { incomplete: false },
             geometry: geometry(),
             stream_id: 10,
             session_id: 3,
@@ -137,7 +137,7 @@ fn samples() -> Vec<ControlMessage<'static>> {
             recording_id: 2,
             start: 64,
             start_time_ns: 5,
-            stop: Some(Stop {
+            state: RecordingState::Stopped(Stop {
                 position: 9000,
                 time_ns: 6,
                 reason: StopReason::Failed(FailKind::Invalid),
@@ -168,6 +168,18 @@ fn samples() -> Vec<ControlMessage<'static>> {
             recording_id: 1,
             position: 64,
             signal: Signal::Failed,
+        }),
+        // An async recording that lapped and resumed, still recording.
+        ControlMessage::RecordingDescriptor(RecordingDescriptor {
+            correlation_id: 13,
+            recording_id: 3,
+            start: 0,
+            start_time_ns: 5,
+            state: RecordingState::Recording { incomplete: true },
+            geometry: geometry(),
+            stream_id: 10,
+            session_id: 3,
+            channel: "ipc",
         }),
     ]
 }
@@ -357,10 +369,16 @@ fn every_invalid_field_is_refused_by_name() {
     let recording = encoded(&samples[11]);
     let stopped = encoded(&samples[12]);
     let started = encoded(&samples[13]);
+    let lapped = encoded(&samples[14]);
+    let failed = encoded(&samples[15]);
+    let stop = encoded(&samples[3]);
+    let stop_replay = encoded(&samples[8]);
     let cases: Vec<(&[u8], usize, u8, &str)> = vec![
         (&start, 32, 3, "mode"),
         (&start, 33, 1, "on_lap"),
         (&every, 33, 0, "on_lap"),
+        (&stop, 8, 0, "recording_id"),
+        (&stop_replay, 8, 0, "replay_id"),
         (&start, 34, 3, "sync_policy"),
         (&start, 8, 1, "sync_interval_ns"),
         (&replay_full, 40, 4, "rate"),
@@ -370,14 +388,22 @@ fn every_invalid_field_is_refused_by_name() {
         (&ok, 16, 6, "code"),
         (&error, 8, 1, "id"),
         (&recording, 68, 10, "stop_reason"),
-        (&recording, 69, 1, "stop"),
+        (&recording, 24, 0, "stop"),
+        (&recording, 40, 1, "stop"),
         (&recording, 69, 2, "incomplete"),
-        (&recording, 56, 3, "geometry"),
+        (&recording, 8, 0, "recording_id"),
+        (&recording, 56, 3, "segment_length"),
+        (&recording, 58, 0, "term_length"),
+        (&recording, 48, 1, "segment_length"),
         (&stopped, 68, 0, "stop"),
         (&started, 24, 4, "signal"),
         (&started, 25, 4, "stop_reason"),
-        (&started, 26, 1, "stop_reason"),
+        (&started, 26, 1, "incomplete"),
+        (&failed, 25, 4, "stop_reason"),
+        (&failed, 26, 1, "incomplete"),
         (&started, 8, 0, "recording_id"),
+        (&lapped, 0, 1, "correlation_id"),
+        (&failed, 0, 1, "correlation_id"),
     ];
     for (bytes, at, byte, field) in cases {
         assert_eq!(
@@ -386,6 +412,14 @@ fn every_invalid_field_is_refused_by_name() {
             "{field} at {at}"
         );
     }
+    // An on_lap value never listed is an invalid enum, not a mismatch.
+    assert!(matches!(
+        with_byte(&start, 33, 3),
+        Err(CodecError::InvalidEnum {
+            field: "on_lap",
+            value: 3
+        })
+    ));
     // An interval of 0 under the interval policy.
     let mut no_interval = every.clone();
     no_interval[12 + 8..12 + 16].copy_from_slice(&0u64.to_le_bytes());
@@ -397,6 +431,9 @@ fn every_invalid_field_is_refused_by_name() {
     let mut zero = replay_scaled.clone();
     zero[12 + 32..12 + 36].copy_from_slice(&0u32.to_le_bytes());
     assert_eq!(field_error(ControlMessage::decode(&zero)), "scale_ppm");
+    let mut over = replay_scaled.clone();
+    over[12 + 32..12 + 36].copy_from_slice(&(MAX_SCALE_PPM + 1).to_le_bytes());
+    assert_eq!(field_error(ControlMessage::decode(&over)), "scale_ppm");
     // A list count of 0 or above the maximum.
     let list = encoded(&samples[4]);
     for count in [0, MAX_LIST_COUNT + 1] {
@@ -421,6 +458,29 @@ fn every_invalid_field_is_refused_by_name() {
 fn encoding_refuses_what_decoding_would() {
     let mut out = [0u8; 2048];
     let long = "x".repeat(MAX_CHANNEL + 1);
+    let replay = |rate, recording_id| {
+        ControlMessage::Replay(Replay {
+            correlation_id: 1,
+            recording_id,
+            position: 0,
+            length: 100,
+            rate,
+            target_stream_id: 1,
+            target_channel: "ipc",
+        })
+    };
+    let signal = |correlation_id, recording_id, signal| {
+        ControlMessage::RecordingSignal(RecordingSignal {
+            correlation_id,
+            recording_id,
+            position: 0,
+            signal,
+        })
+    };
+    let stopped = Signal::Stopped {
+        reason: StopReason::Normal,
+        incomplete: false,
+    };
     let cases: Vec<(ControlMessage<'_>, &str)> = vec![
         (
             ControlMessage::StartRecording(StartRecording {
@@ -483,14 +543,139 @@ fn encoding_refuses_what_decoding_would() {
             }),
             "message",
         ),
+        (replay(ReplayRate::Scaled { ppm: 0 }, 1), "scale_ppm"),
+        (
+            replay(
+                ReplayRate::Scaled {
+                    ppm: MAX_SCALE_PPM + 1,
+                },
+                1,
+            ),
+            "scale_ppm",
+        ),
+        (replay(ReplayRate::Full, 0), "recording_id"),
+        (
+            ControlMessage::RecordingDescriptor(RecordingDescriptor {
+                recording_id: 0,
+                ..descriptor_sample()
+            }),
+            "recording_id",
+        ),
+        (signal(0, 0, Signal::Started), "recording_id"),
+        (signal(1, 1, stopped), "correlation_id"),
+        (signal(1, 1, Signal::Failed), "correlation_id"),
     ];
+    // Each into a buffer that holds a valid message: the failed encoding
+    // leaves no message behind.
+    let earlier = samples()[5];
     for (message, field) in cases {
+        let length = earlier.encode(&mut out).unwrap();
+        assert!(ControlMessage::decode(&out[..length]).is_ok());
         assert_eq!(
             field_error(message.encode(&mut out).map(|_| message)),
             field
         );
         assert_eq!(&out[8..12], &[0, 0, 0, 0], "{field}: no length written");
-        out.fill(0);
+        assert!(ControlMessage::decode(&out[..length]).is_err(), "{field}");
+    }
+}
+
+/// A buffer too short for a message, holding an earlier one, no longer
+/// holds it after the refused encoding.
+#[test]
+fn a_truncated_encoding_leaves_no_message_behind() {
+    let earlier = samples()[3];
+    let mut out = encoded(&earlier);
+    for message in samples() {
+        let length = earlier.encode(&mut out).unwrap();
+        assert_eq!(length, out.len());
+        if encoded(&message).len() <= out.len() {
+            continue;
+        }
+        assert!(matches!(
+            message.encode(&mut out),
+            Err(CodecError::Truncated { .. })
+        ));
+        assert_eq!(&out[8..12], &[0, 0, 0, 0], "{message:?}");
+        assert!(ControlMessage::decode(&out).is_err(), "{message:?}");
+    }
+}
+
+/// Every variable field at its maximum gives the template's maximum
+/// length, and one byte more is refused.
+#[test]
+fn the_maximum_sizes_hold() {
+    let channel = "x".repeat(MAX_CHANNEL);
+    let message = "m".repeat(MAX_RESPONSE_MESSAGE);
+    let longest = [
+        (
+            ControlMessage::StartRecording(StartRecording {
+                channel: &channel,
+                ..start_sample()
+            }),
+            START_RECORDING,
+        ),
+        (
+            ControlMessage::Replay(Replay {
+                correlation_id: 1,
+                recording_id: 1,
+                position: 0,
+                length: 1,
+                rate: ReplayRate::Full,
+                target_stream_id: 1,
+                target_channel: &channel,
+            }),
+            REPLAY,
+        ),
+        (
+            ControlMessage::ControlResponse(ControlResponse {
+                correlation_id: 1,
+                id: 0,
+                code: ResponseCode::Error,
+                message: &message,
+            }),
+            CONTROL_RESPONSE,
+        ),
+        (
+            ControlMessage::RecordingDescriptor(RecordingDescriptor {
+                channel: &channel,
+                ..descriptor_sample()
+            }),
+            RECORDING_DESCRIPTOR,
+        ),
+    ];
+    for (message, template) in longest {
+        let bytes = encoded(&message);
+        assert_eq!(bytes.len(), usize::try_from(template.max_length).unwrap());
+        assert_eq!(ControlMessage::decode(&bytes).unwrap(), message);
+    }
+    for (index, template) in [
+        (3, STOP_RECORDING),
+        (4, LIST_RECORDINGS),
+        (8, STOP_REPLAY),
+        (13, RECORDING_SIGNAL),
+    ] {
+        let bytes = encoded(&samples()[index]);
+        assert_eq!(bytes.len(), usize::try_from(template.max_length).unwrap());
+    }
+    let long_message = "m".repeat(MAX_RESPONSE_MESSAGE + 1);
+    let response = ControlMessage::ControlResponse(ControlResponse {
+        correlation_id: 1,
+        id: 0,
+        code: ResponseCode::Error,
+        message: &long_message,
+    });
+    let mut out = vec![0u8; 2048];
+    assert_eq!(
+        field_error(response.encode(&mut out).map(|_| response)),
+        "message"
+    );
+}
+
+fn descriptor_sample() -> RecordingDescriptor<'static> {
+    match samples()[11] {
+        ControlMessage::RecordingDescriptor(descriptor) => descriptor,
+        _ => unreachable!(),
     }
 }
 

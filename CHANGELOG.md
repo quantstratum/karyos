@@ -19,7 +19,8 @@ release may break APIs, wire formats and shared-memory layouts.
   `CodecError`; it drops its unused dependency on `karyos-protocol`.
   `karyos_archive::control` holds the five requests and three responses
   of schema 1, validated whole on decode and encoded into the caller's
-  buffer without allocating.
+  buffer without allocating; an encoding that fails leaves no message
+  in the buffer, not even an earlier one.
 - The driver hands an Archive recording a lane's reader (phase 3,
   A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
   reserved required or an optional cell and returns a `RecordingReader`:

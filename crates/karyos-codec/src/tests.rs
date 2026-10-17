@@ -239,3 +239,103 @@ fn groups_and_variable_fields_keep_their_bounds() {
         })
     ));
 }
+
+#[test]
+fn a_group_has_no_entry_past_its_count() {
+    // A template whose group has entries of 0 bytes: two of them.
+    let empty = Template {
+        schema_id: 9,
+        template_id: 8,
+        version: 1,
+        block_length: 0,
+        max_length: 16,
+    };
+    let bytes = [9, 0, 8, 0, 1, 0, 0, 0, 16, 0, 0, 0, 0, 0, 2, 0];
+    let (_, mut decoder) = Decoder::new(&bytes, &empty).unwrap();
+    let group = decoder.group("empty", 0, 2).unwrap();
+    decoder.finish().unwrap();
+    assert_eq!(group.count(), 2);
+    assert!(group.entry(1).is_some());
+    assert!(group.entry(2).is_none());
+    assert_eq!(group.iter().count(), 2);
+}
+
+#[test]
+fn the_maximum_length_holds_both_ways() {
+    let mut out = [0u8; 128];
+    let length = encode(&sample(), &mut out).unwrap();
+    let declared = u32::try_from(length).unwrap();
+    // A template whose maximum is exactly this message, and one byte less.
+    let exact = Template {
+        max_length: declared,
+        ..TEST
+    };
+    let short = Template {
+        max_length: declared - 1,
+        ..TEST
+    };
+    assert!(Decoder::new(&out[..length], &exact).is_ok());
+    assert!(matches!(
+        Decoder::new(&out[..length], &short),
+        Err(CodecError::MessageLength { .. })
+    ));
+    let mut again = [0u8; 128];
+    let mut encoder = Encoder::new(&mut again, &exact).unwrap();
+    encoder
+        .bytes("blob", 0, 64, &out[ENVELOPE_LENGTH..length])
+        .unwrap();
+    assert!(matches!(
+        encoder.finish(),
+        Err(CodecError::MessageLength { .. })
+    ));
+    let mut encoder = Encoder::new(&mut again, &exact).unwrap();
+    encoder
+        .bytes(
+            "blob",
+            0,
+            64,
+            &out[ENVELOPE_LENGTH..length - 2 - usize::from(TEST.block_length)],
+        )
+        .unwrap();
+    assert_eq!(encoder.finish().unwrap(), length);
+    assert_eq!(&again[8..12], &declared.to_le_bytes());
+}
+
+#[test]
+fn a_short_buffer_loses_its_earlier_message() {
+    let mut out = [0u8; 128];
+    let length = encode(&sample(), &mut out).unwrap();
+    // Room for the envelope but not the block.
+    let mut short = out[..ENVELOPE_LENGTH + 4].to_vec();
+    assert!(matches!(
+        Encoder::new(&mut short, &TEST),
+        Err(CodecError::Truncated { .. })
+    ));
+    assert_eq!(&short[8..12], &[0, 0, 0, 0]);
+    assert!(length > short.len());
+}
+
+#[test]
+fn bytes_left_over_report_the_declared_length() {
+    // A block and group read, then the fields skipped: the message's
+    // declared length and where decoding stopped.
+    let mut out = [0u8; 128];
+    let length = encode(&sample(), &mut out).unwrap();
+    let (_, mut decoder) = Decoder::new(&out[..length], &TEST).unwrap();
+    decoder.group("entries", 6, 3).unwrap();
+    assert_eq!(
+        decoder.finish(),
+        Err(CodecError::MessageLength {
+            declared: u32::try_from(length).unwrap(),
+            actual: ENVELOPE_LENGTH + 13 + 4 + 12,
+        })
+    );
+}
+
+#[test]
+fn an_encoder_starts_from_a_zeroed_block() {
+    let mut out = [0xFFu8; 128];
+    // An encoder that writes no field of its block.
+    assert!(Encoder::new(&mut out, &TEST).is_ok());
+    assert_eq!(&out[8..ENVELOPE_LENGTH + 13], &[0u8; 4 + 13][..]);
+}

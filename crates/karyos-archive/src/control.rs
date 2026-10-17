@@ -114,7 +114,8 @@ impl<'a> StartRecording<'a> {
             (2, 2) => Mode::Async {
                 on_lap: OnLap::Resume,
             },
-            (1 | 2, _) => return Err(out_of_range("on_lap")),
+            (1 | 2, 0..=2) => return Err(out_of_range("on_lap")),
+            (1 | 2, value) => return Err(invalid_enum("on_lap", value)),
             (value, _) => return Err(invalid_enum("mode", value)),
         };
         let sync_policy = match block.u8(34)? {
@@ -214,7 +215,8 @@ impl StopRecording {
 pub struct ListRecordings {
     /// Echoed in the responses.
     pub correlation_id: u64,
-    /// The first id listed.
+    /// The first id listed: a cursor, so 0 lists from the first
+    /// recording.
     pub from_id: u64,
     /// At most this many, 1 to [`MAX_LIST_COUNT`].
     pub max_count: u32,
@@ -319,13 +321,13 @@ impl<'a> Replay<'a> {
     /// recording id of 0 or a scale outside its bounds, and
     /// [`CodecError::LengthOutOfRange`] for the channel.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &REPLAY)?;
         let (rate, scale) = match self.rate {
             ReplayRate::Full => (1, 0),
             ReplayRate::AsRecorded => (2, 0),
             ReplayRate::Scaled { ppm } if (1..=MAX_SCALE_PPM).contains(&ppm) => (3, ppm),
             ReplayRate::Scaled { .. } => return Err(out_of_range("scale_ppm")),
         };
-        let mut encoder = Encoder::new(out, &REPLAY)?;
         encoder.u64(0, self.correlation_id)?;
         encoder.u64(8, id("recording_id", self.recording_id)?)?;
         encoder.u64(16, self.position)?;
@@ -469,14 +471,27 @@ impl<'a> ControlResponse<'a> {
     /// message (it must be empty on success), and
     /// [`CodecError::ValueOutOfRange`] for an id on an error.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        self.check()?;
         let mut encoder = Encoder::new(out, &CONTROL_RESPONSE)?;
+        self.check()?;
         encoder.u64(0, self.correlation_id)?;
         encoder.u64(8, self.id)?;
         encoder.u8(16, self.code.code())?;
         encoder.bytes("message", 0, MAX_RESPONSE_MESSAGE, self.message.as_bytes())?;
         encoder.finish()
     }
+}
+
+/// Whether a listed recording still records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingState {
+    /// It still records.
+    Recording {
+        /// It lost ranges so far (an async recording that lapped and
+        /// resumed).
+        incomplete: bool,
+    },
+    /// Where, when and why it stopped.
+    Stopped(Stop),
 }
 
 /// One recording of a list.
@@ -490,8 +505,8 @@ pub struct RecordingDescriptor<'a> {
     pub start: u64,
     /// When it started.
     pub start_time_ns: u64,
-    /// Where, when and why it stopped; `None` while it records.
-    pub stop: Option<Stop>,
+    /// Whether it still records, or where it stopped.
+    pub state: RecordingState,
     /// Its segment geometry.
     pub geometry: Geometry,
     /// The recorded stream.
@@ -508,20 +523,26 @@ impl<'a> RecordingDescriptor<'a> {
         let stop_time_ns = block.u64(40)?;
         let reason = block.u8(68)?;
         let incomplete = block.bool("incomplete", 69)?;
-        let stop = match reason {
-            0 if stop_position != u64::MAX || stop_time_ns != 0 || incomplete => {
+        let state = match reason {
+            0 if stop_position != u64::MAX || stop_time_ns != 0 => {
                 return Err(out_of_range("stop"));
             }
-            0 => None,
-            code => Some(Stop {
+            0 => RecordingState::Recording { incomplete },
+            code => RecordingState::Stopped(Stop {
                 position: stop_position,
                 time_ns: stop_time_ns,
                 reason: StopReason::of(code).ok_or_else(|| invalid_enum("stop_reason", code))?,
                 incomplete,
             }),
         };
-        let geometry =
-            Geometry::new(block.u32(56)?, block.u64(48)?).map_err(|_| out_of_range("geometry"))?;
+        let term_length = block.u32(56)?;
+        let geometry = Geometry::new(term_length, block.u64(48)?).map_err(|_| {
+            out_of_range(if term_length == 0 {
+                "term_length"
+            } else {
+                "segment_length"
+            })
+        })?;
         let channel = decoder.str("channel", 1, MAX_CHANNEL)?;
         decoder.finish()?;
         Ok(Self {
@@ -529,7 +550,7 @@ impl<'a> RecordingDescriptor<'a> {
             recording_id: id("recording_id", block.u64(8)?)?,
             start: block.u64(16)?,
             start_time_ns: block.u64(32)?,
-            stop,
+            state,
             geometry,
             stream_id: block.i32(60)?,
             session_id: block.i32(64)?,
@@ -546,9 +567,9 @@ impl<'a> RecordingDescriptor<'a> {
     /// channel.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let mut encoder = Encoder::new(out, &RECORDING_DESCRIPTOR)?;
-        let (stop, time, reason, incomplete) = match self.stop {
-            None => (u64::MAX, 0, 0, false),
-            Some(stop) => (
+        let (stop, time, reason, incomplete) = match self.state {
+            RecordingState::Recording { incomplete } => (u64::MAX, 0, 0, incomplete),
+            RecordingState::Stopped(stop) => (
                 stop.position,
                 stop.time_ns,
                 stop.reason.code(),
@@ -605,8 +626,11 @@ impl RecordingSignal {
     fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
         let reason = block.u8(25)?;
         let incomplete = block.bool("incomplete", 26)?;
+        let correlation_id = block.u64(0)?;
         let signal = match block.u8(24)? {
-            1 | 3 if reason != 0 || incomplete => return Err(out_of_range("stop_reason")),
+            1 | 3 if reason != 0 => return Err(out_of_range("stop_reason")),
+            1 | 3 if incomplete => return Err(out_of_range("incomplete")),
+            2 | 3 if correlation_id != 0 => return Err(out_of_range("correlation_id")),
             1 => Signal::Started,
             3 => Signal::Failed,
             2 => Signal::Stopped {
@@ -618,7 +642,7 @@ impl RecordingSignal {
         };
         decoder.finish()?;
         Ok(Self {
-            correlation_id: block.u64(0)?,
+            correlation_id,
             recording_id: id("recording_id", block.u64(8)?)?,
             position: block.u64(16)?,
             signal,
@@ -630,14 +654,18 @@ impl RecordingSignal {
     /// # Errors
     ///
     /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a recording id of 0.
+    /// a recording id of 0 or a correlation id on a signal other than
+    /// [`Signal::Started`].
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &RECORDING_SIGNAL)?;
         let (signal, reason, incomplete) = match self.signal {
             Signal::Started => (1, 0, false),
             Signal::Stopped { reason, incomplete } => (2, reason.code(), incomplete),
             Signal::Failed => (3, 0, false),
         };
-        let mut encoder = Encoder::new(out, &RECORDING_SIGNAL)?;
+        if signal != 1 && self.correlation_id != 0 {
+            return Err(out_of_range("correlation_id"));
+        }
         encoder.u64(0, self.correlation_id)?;
         encoder.u64(8, id("recording_id", self.recording_id)?)?;
         encoder.u64(16, self.position)?;
