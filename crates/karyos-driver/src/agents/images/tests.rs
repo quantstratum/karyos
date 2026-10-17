@@ -1193,6 +1193,138 @@ fn a_stopped_receiver_back_pressures_a_reliable_publisher() {
     assert!(resumed, "never resumed");
 }
 
+/// T7 (contract-traceability-phase-2.md, "Required sender stall", the
+/// trusted part; SPEC §13): the network sender is a required participant
+/// of its log, with its `L_send` reservation. It stalls in the second half
+/// of term 0, so the publisher's head crosses into term 1 and term 0 is
+/// a candidate for reclamation. While the sender stops consuming (its
+/// agent does not run), its registered position stays, the publisher meets
+/// back pressure within the limit that position allows, and the retention
+/// floor never passes it, however long the conductor runs on: nothing the
+/// sender has not sent is reclaimed. Once the sender runs again, the
+/// remote subscriber reads every message, in order and once.
+#[test]
+fn a_stalled_network_sender_holds_its_log_and_loses_nothing() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, PollOutcome, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    // The sender's reader is the publication's one subscriber cell,
+    // registered as occupant 1.
+    let sender_position = |rig: &Rig| {
+        rig.log.as_ref().unwrap().conductors[0]
+            .subscribers()
+            .find(|cell| cell.registration == 1)
+            .unwrap()
+            .position
+    };
+    let message = |n: u32| {
+        let mut data = vec![0u8; 992];
+        data[..4].copy_from_slice(&n.to_le_bytes());
+        data
+    };
+    let mut received = Vec::new();
+    let mut out = vec![0u8; 2048];
+    let mut read = |subscriber: &mut karyos_sys::log_buffer::Subscription<_>,
+                    received: &mut Vec<u32>| {
+        while let PollOutcome::Message { length, .. } = subscriber.poll(&mut out).unwrap() {
+            subscriber.acknowledge();
+            assert_eq!(length, 992);
+            received.push(u32::from_le_bytes(out[..4].try_into().unwrap()));
+        }
+    };
+    // Forty messages flow first: the sender then stands in the second
+    // half of term 0 (992 bytes after a 32-byte header, 1024 a message).
+    let flowed = 40u32;
+    let mut appended = 0u32;
+    for _ in 0..2000 {
+        // Paced: the publisher takes them as the limit allows.
+        if appended < flowed {
+            let log = rig.log.as_mut().unwrap();
+            if let AppendOutcome::Appended { .. } = log.publications[0]
+                .append(&message(appended), AppendOptions::default())
+                .unwrap()
+            {
+                appended += 1;
+            }
+        }
+        rig.round(true);
+        read(&mut subscriber, &mut received);
+        if received.len() == 40 {
+            break;
+        }
+    }
+    assert_eq!(received, (0..flowed).collect::<Vec<_>>());
+    // The receiver's status messages move the sender's registered position
+    // past them.
+    rig.until(true, |rig| sender_position(rig) == u64::from(flowed) * 1024);
+    // The sender stalls: only the conductor and the receiver run.
+    let stalled_at = sender_position(&rig);
+    // The limit the stalled position allows, once a duty cycle published it.
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.conductors[0].duty_cycle().unwrap();
+    let limit = log.conductors[0].limit();
+    let held = |rig: &mut Rig| {
+        let log = rig.log.as_mut().unwrap();
+        for conductor in &mut log.conductors {
+            let _ = conductor.duty_cycle().unwrap();
+        }
+        rig.now += MS;
+        rig.agents.receiver.do_work(rig.now).unwrap();
+        let conductor = &rig.log.as_ref().unwrap().conductors[0];
+        assert_eq!(sender_position(rig), stalled_at, "a stalled sender moved");
+        assert_eq!(conductor.limit(), limit, "the limit moved during the stall");
+        assert!(
+            conductor.floor() <= stalled_at,
+            "the floor {} passed the stalled sender at {stalled_at}",
+            conductor.floor()
+        );
+    };
+    let mut pressed = false;
+    for _ in 0..2000 {
+        let log = rig.log.as_mut().unwrap();
+        match log.publications[0]
+            .append(&message(appended), AppendOptions::default())
+            .unwrap()
+        {
+            AppendOutcome::Appended { .. } => appended += 1,
+            AppendOutcome::BackPressured => {
+                pressed = true;
+                break;
+            }
+            AppendOutcome::AdminAction => {}
+            other => panic!("{other:?}"),
+        }
+        held(&mut rig);
+    }
+    assert!(pressed, "never back pressured");
+    // Pressed at the limit the stalled position allows, in term 1: term 0
+    // is behind the head, and only the stalled sender keeps it.
+    let head = rig.log.as_ref().unwrap().conductors[0].head().unwrap();
+    assert!(
+        stalled_at < head && head <= limit,
+        "{stalled_at} {head} {limit}"
+    );
+    assert!(head > 65_536, "the head {head} never left term 0");
+    // A long stall: the conductor runs on and reclaims nothing unsent.
+    for _ in 0..500 {
+        held(&mut rig);
+    }
+    // The sender runs again: every message arrives, in order, once.
+    for _ in 0..2000 {
+        rig.round(true);
+        read(&mut subscriber, &mut received);
+        if received.len() == usize::try_from(appended).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(received, (0..appended).collect::<Vec<_>>());
+}
+
 /// Test 5, two lanes: each lane's messages reach its own image lane under
 /// the data DRR, and neither waits for the other.
 #[test]
