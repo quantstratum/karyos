@@ -1048,6 +1048,9 @@ impl<O: SocketOps> ReceiverAgent<O> {
                 .try_post(AgentEvent::ResetRequested { endpoint })
                 .is_ok()
         });
+        // Journals a retirement closed reach the conductor with their facts
+        // (trace-network.md §4); a full ring keeps them for the next cycle.
+        role.post_retired_journals(|event| events.try_post(event).is_ok());
         served.checked_add(work).ok_or(overflow)
     }
 
