@@ -267,23 +267,112 @@ fn step_8_errs_are_bounded() {
     rig.finish();
 }
 
-/// Out of word 0 loads, a repair waits: nothing is refused, and the next
-/// cycle's budget sends it.
+/// Out of word 0 loads, a repair waits: the head read meets `Budget`
+/// (six frames from the term's checkpoint, four loads to walk), the call
+/// suspends with the job kept, nothing is refused, and the next cycle's
+/// budget sends it.
 #[test]
 fn a_repair_waits_for_loads() {
     let mut rig = Rig::new(&RepairConfig::default());
-    rig.publish(3);
-    assert_eq!(rig.nak(2 * FRAME, 1056, 1), NakOutcome::Queued);
+    rig.publish(6);
+    assert_eq!(rig.nak(5 * FRAME, 1056, 1), NakOutcome::Queued);
     let mut budget = RepairBudget {
         bytes: 1 << 16,
-        loads: 1,
+        loads: 3,
     };
     assert_eq!(rig.repair(&mut budget, 2), 0);
+    let suspended = |rig: &Rig| {
+        rig.path
+            .repair()
+            .unwrap()
+            .parts()
+            .2
+            .counts()
+            .budget_suspended
+    };
+    assert_eq!(suspended(&rig), 1);
     let mut replies = Vec::new();
     rig.path.drain_repair_replies(|reply| replies.push(*reply));
     assert!(replies.is_empty());
     rig.scripted(1);
     assert_eq!(rig.repair(&mut RepairBudget::default(), 3), 1);
+    assert_eq!(suspended(&rig), 1);
+    rig.finish();
+}
+
+/// Admission refuses below the retention floor, not below the registered
+/// position: a NAK between the two is served.
+#[test]
+fn a_nak_below_the_registered_position_is_served() {
+    let mut rig = Rig::new(&RepairConfig::default());
+    rig.publish(4);
+    let first = rig.datagrams();
+    // Registered at the third frame; no conductor cycle raised the floor.
+    rig.path.readers_mut()[0].sent(3 * FRAME).unwrap();
+    assert_eq!(rig.path.readers()[0].floor(), 0);
+    assert_eq!(rig.nak(FRAME, 1056, 1), NakOutcome::Queued);
+    rig.scripted(1);
+    assert_eq!(rig.repair(&mut RepairBudget::default(), 2), 1);
+    assert_eq!(rig.datagrams().last(), first.get(1));
+    rig.finish();
+}
+
+/// Repairs go on the publication's repair queue, outside the lane's: with
+/// two lane frames staged in the lane's queue (the kernel refused them),
+/// a repair call offers only the repaired frame and leaves the lane's read
+/// position as it was; the lane's next send offers its two frames, in
+/// order, and the repair is not among them.
+#[test]
+fn a_repair_leaves_the_lane_alone() {
+    let mut rig = Rig::new(&RepairConfig::default());
+    rig.publish(2);
+    for i in 2..4u8 {
+        let _ = rig.log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    // No scripted send: frames 2 and 3 are staged, the first offer refused.
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 0).unwrap();
+    let position = rig.path.readers()[0].position();
+    assert_eq!(position, 4 * FRAME);
+    // The message number each datagram from `from` on carries.
+    let offered = |rig: &Rig, from: usize| -> Vec<u8> {
+        rig.datagrams()[from..]
+            .iter()
+            .map(|bytes| bytes[32])
+            .collect()
+    };
+    let before = rig.datagrams().len();
+    assert_eq!(rig.nak(0, 1056, 1), NakOutcome::Queued);
+    rig.scripted(1);
+    assert_eq!(rig.repair(&mut RepairBudget::default(), 2), 1);
+    assert_eq!(offered(&rig, before), [0]);
+    assert_eq!(rig.path.readers()[0].position(), position);
+    let before = rig.datagrams().len();
+    rig.scripted(2);
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 0).unwrap();
+    assert_eq!(offered(&rig, before), [2, 3]);
+    rig.finish();
+}
+
+/// A repair whose exposure the backend cannot prove (a send result out of
+/// its ABI) ends its job unresolved: counted, never retried, and no ERR.
+#[test]
+fn an_uncertain_repair_ends_its_job() {
+    let mut rig = Rig::new(&RepairConfig::default());
+    rig.publish(2);
+    assert_eq!(rig.nak(0, 1056, 1), NakOutcome::Queued);
+    rig.observer.push_send(SendResult::OutOfAbi { proven: 0 });
+    let _ = rig.repair(&mut RepairBudget::default(), 2);
+    let unresolved = |rig: &Rig| rig.path.repair().unwrap().parts().2.counts().unresolved;
+    assert_eq!(unresolved(&rig), 1);
+    let sent = rig.datagrams().len();
+    rig.scripted(1);
+    assert_eq!(rig.repair(&mut RepairBudget::default(), 3), 0);
+    assert_eq!(rig.datagrams().len(), sent);
+    let mut replies = Vec::new();
+    rig.path.drain_repair_replies(|reply| replies.push(*reply));
+    assert!(replies.is_empty());
     rig.finish();
 }
 

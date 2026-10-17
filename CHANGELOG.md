@@ -57,6 +57,8 @@ release may break APIs, wire formats and shared-memory layouts.
   bound source through the ERR linger. A repair read out of word 0 loads
   now suspends the call with the job and the lane's deficit kept
   (`RepairReadError::Budget`). `AgentConfig::repair` holds the settings.
+  A step 8 ERR goes to the requester's binding as it is at the send; one
+  past the cycle's reply list counts `SenderCounters::nak_replies_dropped`.
 - The network agents measure RTT (RC-1). Each installed image sends one
   RTTM REQUEST per bound path and `rtt_probe_interval`; the sender reads
   the clock immediately before the submitting call and reports the start
