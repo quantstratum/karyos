@@ -15,17 +15,29 @@
 //!   durable, then the index, and only then advances `durable` to the
 //!   `written` it started from. A new segment's files and their directory
 //!   entries are durable before anything in it is written.
-//! - **Policies.** No sync; sync per segment (a finished segment, and the
-//!   close); or sync when [`SegmentStore::tick`] finds the interval passed.
-//!   An explicit [`SegmentStore::sync`] is always possible; under no sync
-//!   it cannot cover a segment finished without one, so `durable` stays.
+//! - **Policies.** No sync; sync per segment (a finished segment, on the
+//!   append that rolls past it, and the close); or sync when
+//!   [`SegmentStore::tick`] finds the interval passed, a finished segment
+//!   included (its files stay open until then, so no sync runs on the
+//!   write path). An explicit [`SegmentStore::sync`] is always possible;
+//!   under no sync it cannot cover a segment finished without one, so
+//!   `durable` stays. Under every policy, the append that rolls into a new
+//!   segment creates its files and syncs them and their directory entries:
+//!   that write-path latency is the price of a durable segment start.
 //! - **Recovery.** [`SegmentStore::recover`] walks the indexes in order and
 //!   stops at the first entry that is torn, whose own CRC fails, that does
 //!   not continue the previous one, or whose data does not match its CRC.
 //!   The index is cut there, the data file shortened, later segments
 //!   dropped and the cut reported; everything kept is synced, so `durable`
 //!   equals `written` afterwards. A write the index does not cover was
-//!   never `written`, so a torn write is never read back.
+//!   never `written`, so a torn write is never read back. The data file is
+//!   shortened to `written`, so no stale byte past it lingers.
+//! - **Headers.** Only the last segment's index header may be missing,
+//!   short, zeroed or torn: that segment was being created, and recovery
+//!   removes it. Any other bad header is a typed error that removes nothing:
+//!   one torn before the last segment, one of another format version, one
+//!   naming another recording or geometry, or one whose start is outside
+//!   its segment.
 //!
 //! A gap in the stream is not the store's: appends are contiguous, and
 //! the recorder (A4) records a gap as its own record.
@@ -198,9 +210,43 @@ pub enum SegmentError {
     /// until it is recovered.
     #[error("the store failed earlier and must be recovered")]
     Failed,
+    /// A segment's index header is bad where recovery cannot treat it as a
+    /// segment being created; nothing was removed.
+    #[error("the index header of the segment at {base} is bad: {problem:?}")]
+    BadHeader {
+        /// The segment's base.
+        base: u64,
+        /// What is wrong.
+        problem: HeaderProblem,
+    },
     /// The operating system's error.
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+/// What is wrong with an index header recovery refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderProblem {
+    /// Missing, short, zeroed or torn, before the last segment; or a data
+    /// file missing under its index.
+    Incomplete,
+    /// Another format (magic or version) under a valid CRC.
+    Foreign,
+    /// Another recording, base or geometry under a valid CRC: the store is
+    /// opened with the wrong arguments.
+    Mismatch,
+    /// Its start lies outside its segment.
+    OutOfRange,
+}
+
+/// What reading an index header gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderRead {
+    Valid(Header),
+    /// Missing, short, zeroed or torn (its CRC fails).
+    Incomplete,
+    /// A valid CRC over another magic or version.
+    Foreign,
 }
 
 /// A recovered store.
@@ -237,10 +283,14 @@ pub struct SegmentStore<D: Disk> {
     written: u64,
     durable: u64,
     current: Option<Open<D::File>>,
+    /// Finished segments the interval policy syncs at its next tick.
+    finished: Vec<Open<D::File>>,
     /// A segment was finished without a sync (no-sync policy): `durable`
     /// can no longer pass it.
     unsynced_behind: bool,
     last_sync_ns: u64,
+    /// A sync ran since the last tick (explicit, or a roll's).
+    synced_since_tick: bool,
     failed: bool,
     /// Test only: the index is not synced (a negative control).
     #[cfg(test)]
@@ -308,20 +358,39 @@ impl Header {
         bytes
     }
 
-    fn decode(bytes: &[u8; 48]) -> Option<Self> {
-        if u32_at(bytes, 0)? != MAGIC
-            || u32_at(bytes, 4)? != VERSION
-            || crc32c(bytes.get(..44)?) != u32_at(bytes, 44)?
-        {
-            return None;
+    fn read(bytes: Option<&[u8; 48]>) -> HeaderRead {
+        let Some(bytes) = bytes else {
+            return HeaderRead::Incomplete;
+        };
+        let checked = bytes
+            .get(..44)
+            .map(crc32c)
+            .zip(u32_at(bytes, 44))
+            .is_some_and(|(crc, stored)| crc == stored);
+        if bytes.iter().all(|byte| *byte == 0) || !checked {
+            return HeaderRead::Incomplete;
         }
-        Some(Self {
-            recording: u64_at(bytes, 8)?,
-            base: u64_at(bytes, 16)?,
-            start: u64_at(bytes, 24)?,
-            segment_length: u64_at(bytes, 32)?,
-            term_length: u32_at(bytes, 40)?,
-        })
+        if u32_at(bytes, 0) != Some(MAGIC) || u32_at(bytes, 4) != Some(VERSION) {
+            return HeaderRead::Foreign;
+        }
+        match (
+            u64_at(bytes, 8),
+            u64_at(bytes, 16),
+            u64_at(bytes, 24),
+            u64_at(bytes, 32),
+            u32_at(bytes, 40),
+        ) {
+            (Some(recording), Some(base), Some(start), Some(segment_length), Some(term_length)) => {
+                HeaderRead::Valid(Self {
+                    recording,
+                    base,
+                    start,
+                    segment_length,
+                    term_length,
+                })
+            }
+            _ => HeaderRead::Incomplete,
+        }
     }
 }
 
@@ -406,8 +475,10 @@ impl<D: Disk> SegmentStore<D> {
             written: start,
             durable: start,
             current: None,
+            finished: Vec::new(),
             unsynced_behind: false,
             last_sync_ns: 0,
+            synced_since_tick: false,
             failed: false,
             #[cfg(test)]
             skip_index_sync: false,
@@ -550,12 +621,17 @@ impl<D: Disk> SegmentStore<D> {
     /// Finishes the open segment, synced unless the policy is no sync, and
     /// opens the one at `base`.
     fn roll(&mut self, base: u64) -> Result<(), SegmentError> {
-        if self.current.as_ref().is_some_and(|open| open.dirty) {
-            if self.policy == SyncPolicy::None {
-                self.unsynced_behind = true;
-            } else {
-                self.sync_open()?;
+        let dirty = self.current.as_ref().is_some_and(|open| open.dirty);
+        match self.policy {
+            SyncPolicy::None if dirty => self.unsynced_behind = true,
+            SyncPolicy::PerSegment if dirty => self.sync_open()?,
+            // The next tick syncs it: no sync on the write path.
+            SyncPolicy::Every { .. } if dirty => {
+                if let Some(open) = self.current.take() {
+                    self.finished.push(open);
+                }
             }
+            _ => {}
         }
         self.current = None;
         let open = self.open_new(base, base)?;
@@ -567,6 +643,11 @@ impl<D: Disk> SegmentStore<D> {
     /// `durable` to the written position it started from.
     fn sync_open(&mut self) -> Result<(), SegmentError> {
         let target = self.written;
+        for open in &self.finished {
+            self.disk.sync(&open.data)?;
+            self.disk.sync(&open.index)?;
+        }
+        self.finished.clear();
         if let Some(open) = self.current.as_mut()
             && open.dirty
         {
@@ -583,6 +664,7 @@ impl<D: Disk> SegmentStore<D> {
         if !self.unsynced_behind {
             self.durable = target;
         }
+        self.synced_since_tick = true;
         Ok(())
     }
 
@@ -614,12 +696,19 @@ impl<D: Disk> SegmentStore<D> {
         if self.failed {
             return Err(SegmentError::Failed);
         }
+        // A sync since the last tick (explicit, or a roll's) restarts the
+        // interval here.
+        if self.synced_since_tick {
+            self.synced_since_tick = false;
+            self.last_sync_ns = now_ns;
+        }
         if let SyncPolicy::Every { interval_ns } = self.policy
             && now_ns.saturating_sub(self.last_sync_ns) >= interval_ns
             && self.written > self.durable
         {
             self.last_sync_ns = now_ns;
-            return self.sync();
+            self.sync()?;
+            self.synced_since_tick = false;
         }
         Ok(self.durable)
     }
@@ -704,6 +793,7 @@ impl<D: Disk> SegmentStore<D> {
             kept: None,
             dropped: 0,
         };
+        let last = bases.last().copied();
         for base in bases {
             // After a cut nothing continues the recording.
             if scan.cut.is_some() {
@@ -711,7 +801,10 @@ impl<D: Disk> SegmentStore<D> {
                 scan.dropped = scan.dropped.saturating_add(1);
                 continue;
             }
-            match scan_segment(&mut disk, dir, recording, geometry, base, &mut scan)? {
+            let is_last = Some(base) == last;
+            match scan_segment(
+                &mut disk, dir, recording, geometry, base, is_last, &mut scan,
+            )? {
                 Some(kept) => {
                     // The previous kept segment is finished; this one is the
                     // newest.
@@ -754,8 +847,10 @@ impl<D: Disk> SegmentStore<D> {
                 entries: kept.entries,
                 dirty: false,
             }),
+            finished: Vec::new(),
             unsynced_behind: false,
             last_sync_ns: 0,
+            synced_since_tick: false,
             failed: false,
             #[cfg(test)]
             skip_index_sync: false,
@@ -807,51 +902,82 @@ fn remove_segment<D: Disk>(
 /// Scans the segment at `base`: `None` when it has no valid header (its
 /// creation did not complete), else the segment, with its index cut at
 /// the first entry that does not hold.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one segment of one recovery: its place and the scan's state"
+)]
 fn scan_segment<D: Disk>(
     disk: &mut D,
     dir: &Path,
     recording: u64,
     geometry: Geometry,
     base: u64,
+    last: bool,
     scan: &mut Scan<D::File>,
 ) -> Result<Option<Kept<D::File>>, SegmentError> {
+    let bad = |problem| SegmentError::BadHeader { base, problem };
     let data_path = dir.join(data_name(recording, base));
     let index_path = dir.join(index_name(recording, base));
-    let index = match disk.open(&index_path) {
-        Ok(index) => index,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
+    // The data file is created before the index: an index alone is never a
+    // crash's leftover.
     let data = match disk.open(&data_path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok(data) => Some(data),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let mut header = [0u8; 48];
-    let header = match disk.read_at(&index, 0, &mut header) {
-        Ok(()) => Header::decode(&header),
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => None,
+    let index = match disk.open(&index_path) {
+        Ok(index) => Some(index),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let expected = Header {
+    let read = match &index {
+        Some(index) => {
+            let mut bytes = [0u8; 48];
+            match disk.read_at(index, 0, &mut bytes) {
+                Ok(()) => Header::read(Some(&bytes)),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Header::read(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        None => HeaderRead::Incomplete,
+    };
+    let (header, data, index) = match (read, data, index) {
+        (HeaderRead::Valid(header), Some(data), Some(index)) => (header, data, index),
+        (HeaderRead::Valid(_), None, Some(_)) => return Err(bad(HeaderProblem::Incomplete)),
+        (HeaderRead::Foreign, _, _) => return Err(bad(HeaderProblem::Foreign)),
+        // Only the last segment can be the one being created (at the
+        // recording's start, or a roll, with nothing written in it).
+        (HeaderRead::Incomplete, _, _) if last => {
+            if scan.start.is_some() && scan.written.is_some_and(|written| written != base) {
+                scan.cut = Some(Cut {
+                    position: scan.written.unwrap_or(base),
+                    reason: CutReason::Header,
+                });
+            }
+            return Ok(None);
+        }
+        _ => return Err(bad(HeaderProblem::Incomplete)),
+    };
+    if (
+        header.recording,
+        header.base,
+        header.segment_length,
+        header.term_length,
+    ) != (
         recording,
         base,
-        start: header.map_or(base, |header| header.start),
-        segment_length: geometry.segment_length,
-        term_length: geometry.term_length,
-    };
-    if header != Some(expected) {
-        // A segment whose header is not durable was being created: before
-        // any recording starts, or at a roll, with nothing written in it.
-        if scan.start.is_some() && scan.written.is_some_and(|written| written != base) {
-            scan.cut = Some(Cut {
-                position: scan.written.unwrap_or(base),
-                reason: CutReason::Header,
-            });
-        }
-        return Ok(None);
+        geometry.segment_length,
+        geometry.term_length,
+    ) {
+        return Err(bad(HeaderProblem::Mismatch));
     }
-    let segment_start = expected.start;
+    let segment_end = base
+        .checked_add(geometry.segment_length)
+        .ok_or(SegmentError::PositionOverflow)?;
+    if header.start < base || header.start >= segment_end {
+        return Err(bad(HeaderProblem::OutOfRange));
+    }
+    let segment_start = header.start;
     let next = scan.written.unwrap_or(segment_start);
     if scan.start.is_none() {
         scan.start = Some(segment_start);
