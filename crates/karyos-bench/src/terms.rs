@@ -22,6 +22,12 @@
 //!   configured term length, and their receive owner are created as the
 //!   conductor's image table does at `CreateImage` (spare slots and
 //!   subscribers of its default template); dropping them is not timed.
+//! - `image-first-fill`: a one-lane image is installed as `image-install`
+//!   does, untimed; then the timed part hands its receive owner one frame
+//!   after another until the first term is full. One sample is one whole
+//!   term, so it holds the first touch of every page of the term, which
+//!   `image-install` leaves out; `receive` measures the same frames on a
+//!   term that was touched before.
 //!
 //! A [`Backing::Heap`] lane is `LogBuffer::new`, a [`Backing::Shared`]
 //! lane `LogBuffer::new_shared` and a [`Backing::Region`] lane
@@ -31,19 +37,20 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use karyos_sys::frame::{Flags, Lane};
+use karyos_sys::frame::{Flags, FrameType, Lane, Word0};
 use karyos_sys::log_buffer::{
     AppendOptions, AppendOutcome, Conductor, DEFAULT_CLAIM_DEADLINE, DEFAULT_CORRUPT_RETRIES,
     DEFAULT_NAK_CHECKPOINT_STRIDE, LogBuffer, LogBufferConfig, NakRead, Publication,
-    PublicationMode, ReadOrigin, ReadOutcome, ReceiveOwner, Role, SenderRead,
+    PublicationMode, ReadOrigin, ReadOutcome, ReceiveOwner, Received, Role, SenderRead,
 };
-use karyos_sys::receive::ImageParams;
+use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
 use karyos_sys::sizing::{DEFAULT_MTU, FragmentPlan, TermLength};
 use karyos_sys::term::TermId;
 use karyos_sys::term_bytes::{HeapTerms, SharedTerms, TermBytes};
 
 use crate::workloads::{
-    Backing, BackingRefused, BenchError, Config, Measurement, error, histogram, record, resolution,
+    Backing, BackingRefused, BenchError, Config, Measurement, error, header, histogram, record,
+    resolution,
 };
 
 /// Spare slots of an image lane: the image table's default template.
@@ -469,6 +476,88 @@ fn install_images<T: TermBytes>(
         let begin = Instant::now();
         let owner = install(params, lanes, term_length, make)?;
         let elapsed = begin.elapsed().as_nanos();
+        drop(owner);
+        if iteration >= config.warmup {
+            record(&mut latencies, elapsed, resolution)?;
+        }
+    }
+    finish(config, latencies, measured_from, resolution)
+}
+
+/// `image-first-fill` on the configured backing.
+///
+/// # Errors
+///
+/// [`BackingRefused::Unsupported`] on a shared backing, a message that does
+/// not fit one frame of the term, and the first lane, receive owner or
+/// receive error.
+pub(crate) fn image_first_fill(config: Config) -> Result<Measurement, BenchError> {
+    match config.backing {
+        Backing::Heap => first_fills(config, heap),
+        Backing::Region => first_fills(config, region),
+        // Shared heap words are touched when they are allocated.
+        Backing::Shared => Err(BackingRefused::Unsupported {
+            workload: config.workload,
+            backing: config.backing,
+        }
+        .into()),
+    }
+}
+
+fn first_fills<T: TermBytes>(
+    config: Config,
+    make: fn(LogBufferConfig) -> Result<LogBuffer<T>, BenchError>,
+) -> Result<Measurement, BenchError> {
+    let term_length =
+        TermLength::try_new(config.term_length).map_err(|cause| error("term length", cause))?;
+    let params = ImageParams::new(1, 1, 1, term_length, DEFAULT_MTU)
+        .map_err(|cause| error("image params", cause))?;
+    let frame_length = config
+        .message
+        .checked_add(32)
+        .and_then(|length| u32::try_from(length).ok())
+        .filter(|length| *length <= DEFAULT_MTU && *length <= config.term_length)
+        .ok_or_else(|| BenchError(format!("message {} needs one frame", config.message)))?;
+    let reserved = frame_length.next_multiple_of(32);
+    let frames = config.term_length / reserved;
+    let flags = Flags::new(true, true, false, false, Lane::ZERO);
+    let mut bytes =
+        vec![7u8; usize::try_from(frame_length).map_err(|cause| error("frame", cause))?];
+    let resolution = resolution();
+    let total = total(&config)?;
+    let mut latencies = histogram()?;
+    let mut measured_from = Instant::now();
+    for iteration in 0..total {
+        if iteration == config.warmup {
+            measured_from = Instant::now();
+        }
+        let mut owner = install(params, 1, term_length, make)?;
+        let mut elapsed = 0u128;
+        for frame in 0..frames {
+            header(
+                Word0::new(frame_length.cast_signed(), flags, FrameType::Data),
+                TermId::new(7),
+                frame * reserved,
+                0,
+            )
+            .encode(&mut bytes)
+            .map_err(|cause| error("header", cause))?;
+            let datagram =
+                ValidatedDatagram::parse(&bytes, &params).map_err(|cause| error("parse", cause))?;
+            let Some(Item::Frame(frame)) = datagram.items().next() else {
+                return Err(BenchError("no frame".into()));
+            };
+            let begin = Instant::now();
+            let received = owner
+                .receive(&frame)
+                .map_err(|cause| error("receive", cause))?;
+            elapsed = elapsed
+                .checked_add(begin.elapsed().as_nanos())
+                .ok_or_else(|| BenchError("fill time overflow".into()))?;
+            if !matches!(received, Received::Committed { .. }) {
+                return Err(BenchError(format!("a frame was {received:?}")));
+            }
+        }
         drop(owner);
         if iteration >= config.warmup {
             record(&mut latencies, elapsed, resolution)?;
