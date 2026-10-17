@@ -174,6 +174,59 @@ fn the_budget_suspends_and_keeps_the_deficit() {
     assert!(!jobs.current(request));
 }
 
+/// A head read out of word 0 loads ends the call: its job and every lane's
+/// deficit are kept, nothing is refused, and the next call resumes where
+/// the read stopped.
+#[test]
+fn a_read_out_of_loads_suspends_the_call() {
+    let mut log = Log::default().data(0, 0, 256, 4).data(1, 0, 256, 2);
+    log.errors.insert((0, 256), RepairReadError::Budget);
+    let mut wire = Wire::default();
+    let mut jobs = new_jobs();
+    let mut scheduler = new_scheduler(2);
+    let first = job(&mut jobs, 1, 0, 0, 3 * 256);
+    let second = job(&mut jobs, 1, 1, 0, 2 * 256);
+    let report = scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert!(
+        matches!(report.stop, Stop::Halted { lane: 0 }),
+        "{report:?}"
+    );
+    assert_eq!(wire.submitted, [(0, 0)]);
+    assert!(wire.replies.is_empty());
+    assert!(jobs.current(first) && jobs.current(second));
+    assert_eq!(jobs.next_for_lane(0).unwrap().cursor, 256);
+    assert_eq!(scheduler.deficit(0), Some(768), "1024 credited, 256 served");
+    assert_eq!(scheduler.counts().budget_suspended, 1);
+    assert_eq!(report.lanes[1].forfeited, 0);
+    // Loads again: the visit resumes uncredited and both jobs finish.
+    log.errors.clear();
+    scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert_eq!(
+        wire.submitted,
+        [(0, 0), (0, 256), (0, 512), (1, 0), (1, 256)]
+    );
+    assert!(!jobs.current(first) && !jobs.current(second));
+}
+
+/// Once a read runs out of loads, no other lane reads a head in that call,
+/// even when the suspended lane's deficit is too small to halt it at once.
+#[test]
+fn a_suspended_call_reads_no_other_lane() {
+    let mut log = Log::default().data(0, 0, 1000, 2).data(1, 0, 256, 2);
+    log.errors.insert((0, 1000), RepairReadError::Budget);
+    let mut wire = Wire::default();
+    let mut jobs = new_jobs();
+    let mut scheduler = new_scheduler(2);
+    job(&mut jobs, 1, 0, 0, 2000);
+    let other = job(&mut jobs, 1, 1, 0, 512);
+    scheduler.serve(&mut jobs, RepairBudget::default(), &mut log, &mut wire, 0);
+    assert_eq!(wire.submitted, [(0, 0)]);
+    assert_eq!(log.reads, 2, "lane 1 read nothing");
+    assert_eq!(scheduler.deficit(0), Some(24), "1024 credited, 1000 served");
+    assert!(jobs.current(other));
+    assert_eq!(jobs.next_for_lane(1).unwrap().cursor, 0);
+}
+
 /// PAD and ABORTED records are charged their canonical 32 bytes, whatever
 /// their logical extent.
 #[test]

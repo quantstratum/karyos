@@ -41,6 +41,7 @@ pub mod data;
 pub mod endpoints;
 pub mod images;
 pub mod net_trace;
+pub mod repair;
 pub mod ring;
 pub mod roles;
 
@@ -196,6 +197,9 @@ pub struct AgentConfig {
     /// The RTT settings: the receiver's probes and the sender's replies
     /// (reliable-transport.md, "RTT observations"; RC-1).
     pub rtt: crate::rtt::RttConfig,
+    /// The repair settings of reliable publications (reliable-transport.md;
+    /// R4, R5, R7).
+    pub repair: repair::RepairConfig,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -227,6 +231,7 @@ impl Default for AgentConfig {
             receiver_bindings: 64,
             idle_image_timeout: 60_000_000_000,
             rtt: crate::rtt::RttConfig::default(),
+            repair: repair::RepairConfig::default(),
             stop_timeout: Duration::from_secs(1),
         }
     }

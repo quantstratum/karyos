@@ -67,6 +67,9 @@ struct Setup {
     reliable: bool,
     /// The receiver's `alias_quarantine`, when not the default.
     alias_quarantine: Option<u64>,
+    /// Whether the sender answers NAKs; tests of the receiver's loss
+    /// handling answer them by hand instead.
+    repairs: bool,
 }
 
 impl Default for Setup {
@@ -77,6 +80,7 @@ impl Default for Setup {
             template: ImageTemplate::default(),
             reliable: false,
             alias_quarantine: None,
+            repairs: true,
         }
     }
 }
@@ -116,6 +120,9 @@ impl Rig {
         VIRTUAL_NOW.with(|now| now.set(0));
         agents.sender.role.set_clock(virtual_now);
         agents.receiver.role.set_clock(virtual_now);
+        if !setup.repairs {
+            agents.sender.role.ignore_naks();
+        }
         let mut rig = Self {
             publisher: EndpointId(u32::MAX),
             log: None,
@@ -1204,14 +1211,15 @@ fn a_sender_with_no_receiver_announces_again() {
 
 /// Phase 6 wiring: a DATA datagram lost on a reliable channel leaves a
 /// hole the receiver NAKs to the sender at once, naming the image and the
-/// hole, and again one RTT later while it is not repaired. (Its repair is
-/// the sender side's; until then the sender counts the NAK unhandled.)
+/// hole, and again one RTT later while it is not repaired (the sender here
+/// ignores NAKs).
 #[test]
 fn a_lost_datagram_is_naked() {
     use karyos_sys::log_buffer::AppendOptions;
 
     let (mut rig, _b) = Rig::new(Setup {
         reliable: true,
+        repairs: false,
         ..Setup::default()
     });
     let slot = established(&mut rig);
@@ -1239,6 +1247,43 @@ fn a_lost_datagram_is_naked() {
     assert_eq!(rig.agents.receiver.role.posted_naks()[1].range, nak.range);
 }
 
+/// Phase 6, both sides: a DATA datagram lost on a reliable channel is
+/// NAKed, resent by the sender's repair path and fills the hole; the
+/// receiver counts it repaired and asks no more.
+#[test]
+fn a_lost_datagram_is_repaired() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|counters| counters.repaired >= 1)
+    });
+    let counters = rig.agents.receiver.role.loss_counters(slot).unwrap();
+    assert_eq!(counters.detected, counters.repaired, "{counters:?}");
+    assert!(rig.agents.sender.counters().repairs >= 1);
+    // Repaired: no NAK follows.
+    let naks = rig.agents.receiver.counters().naks;
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.counters().naks, naks);
+}
+
 /// Phase 6 wiring: a RANGE_UNAVAILABLE that echoes the outstanding NAK
 /// proves the hole unrecoverable; under the default `on_unrecoverable =
 /// close` the image closes and is retired.
@@ -1248,6 +1293,7 @@ fn range_unavailable_closes_a_reliable_image() {
     use karyos_sys::log_buffer::AppendOptions;
 
     let (mut rig, b) = Rig::new(Setup {
+        repairs: false,
         reliable: true,
         ..Setup::default()
     });
@@ -1348,6 +1394,7 @@ fn repeated_range_invalid_closes_the_image() {
     use karyos_sys::log_buffer::AppendOptions;
 
     let (mut rig, b) = Rig::new(Setup {
+        repairs: false,
         reliable: true,
         ..Setup::default()
     });
@@ -1391,6 +1438,7 @@ fn a_nak_retry_waits_one_rtt() {
     use karyos_sys::log_buffer::AppendOptions;
 
     let (mut rig, _b) = Rig::new(Setup {
+        repairs: false,
         reliable: true,
         ..Setup::default()
     });
@@ -1422,6 +1470,7 @@ fn a_route_fault_resets_its_endpoint_and_naks_resume() {
     use karyos_sys::log_buffer::AppendOptions;
 
     let (mut rig, _b) = Rig::new(Setup {
+        repairs: false,
         reliable: true,
         ..Setup::default()
     });
@@ -1482,6 +1531,7 @@ fn a_floor_beyond_the_window_closes_the_image() {
     use karyos_sys::log_buffer::AppendOptions;
 
     let (mut rig, b) = Rig::new(Setup {
+        repairs: false,
         reliable: true,
         ..Setup::default()
     });
@@ -1534,6 +1584,7 @@ fn a_floor_in_the_next_term_is_inside_the_window() {
     use karyos_sys::log_buffer::AppendOptions;
 
     let (mut rig, b) = Rig::new(Setup {
+        repairs: false,
         reliable: true,
         ..Setup::default()
     });

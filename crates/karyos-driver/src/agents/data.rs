@@ -58,13 +58,16 @@ use karyos_io::lanes::{LaneGate, LaneSender, Left, SenderFailure, Staged};
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::lanes::drr::{Budget, DrrConfig};
-use karyos_protocol::network::{Alias, Lanes, MAX_LANES};
+use karyos_protocol::network::{Alias, Identity, Lanes, MAX_LANES, Nak, NakReply};
 use karyos_sys::log_buffer::{LogBuffer, ReadError, ReadOrigin, ReadOutcome, SenderRead};
 use karyos_sys::sizing::align_frame;
 
 use super::net_trace::{TracedLane, traced_frames, traced_frames_per_datagram};
+use super::repair::{NakOutcome, RepairConfig, RepairConfigError, RepairPath};
 use super::{AgentError, AgentKind, EndpointId};
 use crate::membership::{Admission, Limit, Membership};
+use crate::repair::admission::Requester;
+use crate::repair::scheduler::RepairBudget;
 use karyos_protocol::frame::{Lane, TraceExtension};
 use karyos_protocol::trace_hook::{NetPickup, NetworkTraceHook};
 
@@ -210,6 +213,10 @@ pub struct Outbound {
     max_frame: u64,
     /// Its receivers, once attached (multicast-flow-control.md).
     membership: Option<Box<Membership>>,
+    /// The data DRR's configuration, which repair reuses.
+    drr: DrrConfig,
+    /// A reliable publication's repair path, once enabled.
+    repair: Option<Box<RepairPath>>,
     sender: LaneSender,
     queues: Vec<TxQueueId>,
     tracks: Vec<LaneTrack>,
@@ -271,6 +278,7 @@ impl Outbound {
         let placeholder = TxQueueId::new(BackendEpoch::FIRST, u16::MAX, NonZeroU32::MAX);
         let queues = vec![placeholder; lanes];
         let bound = usize::from(STAGED_PER_LANE);
+        let drr = config;
         let sender = LaneSender::new(config, &queues, bound).map_err(|_| OutboundError::Lanes)?;
         let tracks = (0..lanes)
             .map(|_| LaneTrack {
@@ -291,6 +299,8 @@ impl Outbound {
             mtu: usize::try_from(mtu).map_err(|_| OutboundError::Mtu)?,
             max_frame: u64::from(max_charge),
             membership: None,
+            drr,
+            repair: None,
             sender,
             queues,
             tracks,
@@ -322,6 +332,12 @@ impl Outbound {
         self.alias
     }
 
+    /// Whether it is reliable.
+    #[must_use]
+    pub fn reliable(&self) -> bool {
+        self.reliable
+    }
+
     /// Its channel destination.
     #[must_use]
     pub fn destination(&self) -> SocketAddr {
@@ -340,6 +356,12 @@ impl Outbound {
         &self.readers
     }
 
+    /// The readers, mutable (tests).
+    #[cfg(test)]
+    pub(crate) fn readers_mut(&mut self) -> &mut [LaneReader] {
+        &mut self.readers
+    }
+
     /// Attaches its receivers' membership: from then on first sends follow
     /// their limits (control path). Each lane's `sent_high` starts at its
     /// reader's cursor, the join point receivers are answered with: a
@@ -353,6 +375,90 @@ impl Outbound {
             }
         }
         self.membership = Some(membership);
+    }
+
+    /// Enables its repair path (a reliable publication of `term_length`
+    /// terms, incarnation `identity`; control path, allocates).
+    ///
+    /// # Errors
+    ///
+    /// [`RepairConfigError`].
+    pub fn enable_repair(
+        &mut self,
+        config: &RepairConfig,
+        term_length: u32,
+        identity: Identity,
+    ) -> Result<(), RepairConfigError> {
+        self.repair = Some(Box::new(RepairPath::new(
+            config,
+            self.drr,
+            self.mtu,
+            (term_length, self.alias, identity),
+        )?));
+        Ok(())
+    }
+
+    /// Its repair path, if enabled.
+    #[must_use]
+    pub fn repair(&self) -> Option<&RepairPath> {
+        self.repair.as_deref()
+    }
+
+    /// Admits `nak` from a receiver bound to this publication, whose state
+    /// on the lane is `requester`, at `now`. A publication with no repair
+    /// path drops it.
+    pub fn nak(&mut self, nak: &Nak, requester: Requester, now: u64) -> NakOutcome {
+        let lane = usize::from(nak.range.lane.get());
+        let lanes = u8::try_from(self.readers.len()).unwrap_or(u8::MAX);
+        let sent_high = self.tracks.get(lane).map_or(0, |track| track.high);
+        match self.repair.as_deref_mut() {
+            Some(repair) => repair.nak(
+                nak,
+                requester,
+                self.readers.get(lane),
+                sent_high,
+                lanes,
+                now,
+            ),
+            None => NakOutcome::Dropped,
+        }
+    }
+
+    /// Serves its repairs on `tx` within `budget`, which it spends, at
+    /// `now`; returns the heads submitted. Step 8 ERRs wait for
+    /// [`Outbound::drain_repair_replies`].
+    pub fn serve_repair<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        budget: &mut RepairBudget,
+        now: u64,
+    ) -> u32 {
+        if self.repair.is_none() || !self.open(tx) {
+            return 0;
+        }
+        let mut sent_high = [0u64; MAX_LANES];
+        for (high, track) in sent_high.iter_mut().zip(&self.tracks) {
+            *high = track.high;
+        }
+        let Some(repair) = self.repair.as_deref_mut() else {
+            return 0;
+        };
+        let report = repair.serve(tx, &mut self.readers, &sent_high, budget, now);
+        let frames = report
+            .lanes
+            .iter()
+            .try_fold(0u64, |sum, lane| sum.checked_add(lane.served_frames));
+        // At most the cycle's word 0 loads, a u32.
+        frames
+            .and_then(|frames| u32::try_from(frames).ok())
+            .unwrap_or(u32::MAX)
+    }
+
+    /// Hands each step 8 ERR waiting to `send`.
+    pub fn drain_repair_replies(&mut self, send: impl FnMut(&NakReply)) {
+        if let Some(repair) = self.repair.as_deref_mut() {
+            repair.drain_replies(send);
+        }
     }
 
     /// Its receivers' membership, if attached.
@@ -464,6 +570,22 @@ impl Outbound {
         }
         for (lane, queue) in self.queues.iter().enumerate() {
             self.sender.reopen(lane, *queue);
+        }
+        // The repair queue, on the same route and outside the lane sender:
+        // without it the publication sends first sends only, and its jobs
+        // wait (their submissions report the queue broken).
+        if let Some(repair) = self.repair.as_deref_mut() {
+            let queue = tx
+                .open_queue(TxQueueConfig {
+                    authority: Authority::FIRST,
+                    route,
+                    max_pending: NonZeroU16::MIN,
+                })
+                .ok();
+            if queue.is_none() {
+                self.counters.bump(|c| &mut c.queue_failures, 1);
+            }
+            repair.reopened(queue);
         }
         for track in &mut self.tracks {
             track.staged.clear();
