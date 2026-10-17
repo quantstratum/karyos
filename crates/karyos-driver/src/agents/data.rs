@@ -62,10 +62,11 @@ use karyos_protocol::network::{Alias, Lanes, MAX_LANES};
 use karyos_sys::log_buffer::{LogBuffer, ReadError, ReadOrigin, ReadOutcome, SenderRead};
 use karyos_sys::sizing::align_frame;
 
-use karyos_protocol::frame::Lane;
-
+use super::net_trace::{TracedLane, traced_frames, traced_frames_per_datagram};
 use super::{AgentError, AgentKind, EndpointId};
 use crate::membership::{Admission, Limit, Membership};
+use karyos_protocol::frame::{Lane, TraceExtension};
+use karyos_protocol::trace_hook::{NetPickup, NetworkTraceHook};
 
 /// Membership timer actions per cycle.
 const MEMBERSHIP_TIMER_ACTIONS: u32 = 16;
@@ -175,6 +176,12 @@ pub struct OutboundCounters {
     /// Cycles whose first sends waited for a configured required member's
     /// join.
     pub not_joined: u64,
+    /// Traced frames not recorded: their EXT did not decode or did not fit
+    /// their frame (NT-2).
+    pub trace_invalid: u64,
+    /// Traced datagrams whose failed commit the lane could not remember
+    /// (it holds one range): their frames are never recorded.
+    pub trace_unpicked: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -217,6 +224,11 @@ pub struct Outbound {
     report: TxReport,
     next_token: u64,
     counters: OutboundCounters,
+    /// Each lane's open network journal, if any (P2.12 step 3).
+    traced: [Option<TracedLane>; 4],
+    /// The traced frames of the datagram being staged (allocated at
+    /// construction, for the most one datagram can hold).
+    picked: Vec<(TraceExtension, u64)>,
 }
 
 /// Why an outbound publication was refused.
@@ -288,6 +300,13 @@ impl Outbound {
             report: TxReport::new(),
             next_token: 1,
             counters: OutboundCounters::default(),
+            traced: [None; 4],
+            picked: Vec::with_capacity(
+                usize::try_from(mtu)
+                    .ok()
+                    .and_then(traced_frames_per_datagram)
+                    .ok_or(OutboundError::Mtu)?,
+            ),
         })
     }
 
@@ -367,6 +386,50 @@ impl Outbound {
         Lanes::new(joins.get(..self.readers.len())?).ok()
     }
 
+    /// Starts tracing `lane` for `publication`'s journal from the lane's
+    /// next position, which it returns (the start fact, §5). `None` for a
+    /// lane it does not have or one already traced.
+    pub(crate) fn trace(
+        &mut self,
+        lane: usize,
+        publication: karyos_protocol::trace_hook::PublicationIdentity,
+    ) -> Option<u64> {
+        let start = self.readers.get(lane)?.position();
+        let slot = self.traced.get_mut(lane).filter(|slot| slot.is_none())?;
+        *slot = Some(TracedLane {
+            publication,
+            start,
+            boundary: start,
+            unpicked: None,
+        });
+        Some(start)
+    }
+
+    /// Stops tracing `lane` if `publication`'s journal observes it, and
+    /// returns its facts.
+    pub(crate) fn untrace(
+        &mut self,
+        lane: usize,
+        publication: &karyos_protocol::trace_hook::PublicationIdentity,
+    ) -> Option<TracedLane> {
+        let slot = self.traced.get_mut(lane)?;
+        if slot.is_some_and(|traced| traced.publication == *publication) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// Stops tracing every lane, handing each one's lane and facts to
+    /// `closed`.
+    pub(crate) fn untrace_all(&mut self, mut closed: impl FnMut(usize, TracedLane)) {
+        for (lane, slot) in self.traced.iter_mut().enumerate() {
+            if let Some(traced) = slot.take() {
+                closed(lane, traced);
+            }
+        }
+    }
+
     /// Opens the route and the lane queues on `tx` for its current epoch,
     /// once per epoch; a new epoch drops what the old one staged.
     fn open<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) -> bool {
@@ -438,6 +501,23 @@ impl Outbound {
         consumption: Option<&[u64]>,
         now: u64,
     ) -> Result<u32, AgentError> {
+        self.serve_traced(tx, budget, consumption, now, None)
+    }
+
+    /// [`Outbound::serve`] with the sender's network trace `hook`, which
+    /// records a `SenderPickup` for each traced frame of a traced lane.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
+    pub(crate) fn serve_traced<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        budget: Budget,
+        consumption: Option<&[u64]>,
+        now: u64,
+        mut hook: Option<&mut (dyn NetworkTraceHook + 'static)>,
+    ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         if !self.open(tx) {
             return Ok(0);
@@ -473,7 +553,7 @@ impl Outbound {
         for lane in 0..self.readers.len() {
             let limit = limits.get(lane).copied().unwrap_or(Limit::Held);
             work = work
-                .checked_add(self.stage(tx, lane, limit)?)
+                .checked_add(self.stage(tx, lane, limit, hook.as_deref_mut())?)
                 .ok_or(overflow.clone())?;
         }
         let report = self.sender.serve(
@@ -616,6 +696,7 @@ impl Outbound {
         tx: &mut SocketsTx<O>,
         lane: usize,
         limit: Limit,
+        mut hook: Option<&mut (dyn NetworkTraceHook + 'static)>,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         let mut staged = 0u32;
@@ -661,6 +742,25 @@ impl Outbound {
                         break;
                     }
                 };
+            // One branch per datagram without a hook.
+            let traced = if hook.is_some() {
+                self.traced.get(lane).copied().flatten()
+            } else {
+                None
+            };
+            if traced.is_some() {
+                if record {
+                    self.picked.clear();
+                } else {
+                    let skipped = traced_frames(
+                        frame.bytes_mut().get(..len).unwrap_or_default(),
+                        from,
+                        &mut self.picked,
+                    )
+                    .ok_or(overflow.clone())?;
+                    self.counters.bump(|c| &mut c.trace_invalid, skipped);
+                }
+            }
             let token = SenderToken::new(self.next_token);
             self.next_token = self.next_token.checked_add(1).ok_or(overflow.clone())?;
             let Ok(ticket) = frame.commit(Commit {
@@ -669,8 +769,12 @@ impl Outbound {
                 options: TxOptions::none(),
             }) else {
                 // The cursor moved past a read that was not staged: a gap
-                // the receiver closes by repair or by its gap policy.
+                // the receiver closes by repair or by its gap policy. A
+                // resend after a reset is then these frames' first pickup.
                 self.counters.bump(|c| &mut c.queue_failures, 1);
+                if traced.is_some() && !remember_unpicked(&mut self.traced, lane, from, next) {
+                    self.counters.bump(|c| &mut c.trace_unpicked, 1);
+                }
                 break;
             };
             let charge = u32::try_from(len)
@@ -703,6 +807,19 @@ impl Outbound {
                 track.staged.push_back((ticket, next));
                 track.waiting = false;
             }
+            // The bytes are in TX storage (NT-2). Only a first pickup is
+            // recorded: what a reset rewinds and sends again was picked up
+            // before, unless its commit had failed.
+            if let (Some(traced), Some(hook)) = (traced, hook.as_deref_mut()) {
+                pick_up(
+                    &self.picked,
+                    &mut self.traced,
+                    lane,
+                    traced,
+                    from..next,
+                    hook,
+                );
+            }
             self.counters.bump(
                 if record {
                     |c| &mut c.records
@@ -714,6 +831,69 @@ impl Outbound {
             staged = staged.checked_add(1).ok_or(overflow.clone())?;
         }
         Ok(staged)
+    }
+}
+
+/// Remembers that the datagram of `lane` read over `from..next` never
+/// reached TX storage. `false` when the lane already remembers a range
+/// this one does not touch.
+pub(super) fn remember_unpicked(
+    traced_lanes: &mut [Option<TracedLane>; 4],
+    lane: usize,
+    from: u64,
+    next: u64,
+) -> bool {
+    let Some(Some(traced)) = traced_lanes.get_mut(lane) else {
+        return true;
+    };
+    traced.unpicked = match traced.unpicked {
+        None => Some((from, next)),
+        Some((low, high)) if from <= high && low <= next => Some((low.min(from), high.max(next))),
+        Some(_) => return false,
+    };
+    true
+}
+
+/// Records the `SenderPickup` of each frame in `picked` from the datagram
+/// of `lane` read over `span` that was never picked up before, then moves
+/// the lane's pickup boundary and shrinks its unpicked range in
+/// `traced_lanes`.
+pub(super) fn pick_up(
+    picked: &[(TraceExtension, u64)],
+    traced_lanes: &mut [Option<TracedLane>; 4],
+    lane: usize,
+    traced: TracedLane,
+    span: core::ops::Range<u64>,
+    hook: &mut dyn NetworkTraceHook,
+) {
+    let Some(lane_id) = u8::try_from(lane)
+        .ok()
+        .and_then(|lane| Lane::try_new(lane).ok())
+    else {
+        return;
+    };
+    for (ext, position) in picked {
+        if !traced.first_pickup(*position) {
+            continue;
+        }
+        hook.on_sender_pickup(
+            ext,
+            &NetPickup {
+                publication: traced.publication,
+                lane: lane_id,
+                position: *position,
+                path: 0,
+                attempt: 0,
+            },
+        );
+    }
+    if let Some(Some(slot)) = traced_lanes.get_mut(lane) {
+        slot.boundary = slot.boundary.max(span.end);
+        // A rewind resends in order: the range shrinks from its low end.
+        slot.unpicked = slot.unpicked.and_then(|(low, high)| {
+            let low = if span.contains(&low) { span.end } else { low };
+            (low < high).then_some((low, high))
+        });
     }
 }
 

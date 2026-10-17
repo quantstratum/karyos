@@ -40,6 +40,7 @@ pub mod control;
 pub mod data;
 pub mod endpoints;
 pub mod images;
+pub mod net_trace;
 pub mod ring;
 pub mod roles;
 
@@ -192,6 +193,9 @@ pub struct AgentConfig {
     /// fresh evidence (default 60 s, at least `image_liveness_timeout`;
     /// coordinator decision, trusted profile).
     pub idle_image_timeout: u64,
+    /// The RTT settings: the receiver's probes and the sender's replies
+    /// (reliable-transport.md, "RTT observations"; RC-1).
+    pub rtt: crate::rtt::RttConfig,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -222,6 +226,7 @@ impl Default for AgentConfig {
             image_liveness_timeout: 10_000_000_000,
             receiver_bindings: 64,
             idle_image_timeout: 60_000_000_000,
+            rtt: crate::rtt::RttConfig::default(),
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -272,6 +277,9 @@ impl AgentConfig {
                     "image_liveness_timeout below ten sm_interval, or idle_image_timeout below it",
                 )
             })?;
+        self.rtt
+            .validate()
+            .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
         // S1: the control ring holds every pending challenge's RSP_SETUP
         // and one SM slot per image, above a floor for forwarded controls
         // (one path per image until redundant paths, RP-1).
@@ -404,6 +412,40 @@ pub enum AgentCommand<O: SocketOps> {
         /// the lane quanta, built by the conductor ([`data::Outbound::new`]).
         outbound: Box<data::Outbound>,
     },
+    /// Set the agent's network trace hook, or remove it with `None`
+    /// (P2.12 step 3). Journals still open close through the previous hook
+    /// first. Answer [`AgentEvent::NetworkTraceSet`].
+    SetNetworkTrace {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The new hook.
+        hook: Option<net_trace::TraceHook>,
+    },
+    /// Write `journal` for its publication and lane: on the sender, the
+    /// publication `alias` on `endpoint`. Answer
+    /// [`AgentEvent::NetworkJournalOpened`] with the start, or
+    /// [`AgentEvent::NetworkJournalRefused`] with the journal (no hook, the
+    /// wrong side, no such publication or lane, or a lane already traced).
+    OpenNetworkJournal {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
+        /// The journal the conductor created.
+        journal: karyos_protocol::trace_hook::NetJournal,
+    },
+    /// Close the journal of `lane` of `publication`. Answer
+    /// [`AgentEvent::NetworkJournalClosed`].
+    CloseNetworkJournal {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The publication.
+        publication: karyos_protocol::trace_hook::PublicationIdentity,
+        /// The lane.
+        lane: karyos_protocol::frame::Lane,
+    },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
     Panic,
@@ -477,6 +519,50 @@ pub enum AgentEvent<O: SocketOps> {
         agent: AgentKind,
         /// Whether the entry was added (or was already there).
         accepted: bool,
+    },
+    /// The agent holds the new network trace hook.
+    NetworkTraceSet {
+        /// The agent.
+        agent: AgentKind,
+        /// The hook it replaced, dropped on the control path.
+        previous: Option<net_trace::TraceHook>,
+        /// Journals still open that it closed through the previous hook,
+        /// without facts; the conductor treats each as `Lost` (closed
+        /// without a boundary). `None` if the count overflowed.
+        closed: Option<u64>,
+    },
+    /// The agent writes the journal from `start`, its next position on the
+    /// lane when the journal arrived (the start fact, trace-network.md §5).
+    NetworkJournalOpened {
+        /// The agent.
+        agent: AgentKind,
+        /// The publication.
+        publication: karyos_protocol::trace_hook::PublicationIdentity,
+        /// The lane.
+        lane: karyos_protocol::frame::Lane,
+        /// The journal number.
+        number: u64,
+        /// The start.
+        start: u64,
+    },
+    /// The agent cannot write the journal, which comes back.
+    NetworkJournalRefused {
+        /// The agent.
+        agent: AgentKind,
+        /// The journal.
+        journal: karyos_protocol::trace_hook::NetJournal,
+    },
+    /// The agent closed the journal; `facts` is `None` when it had none
+    /// open for the publication and lane.
+    NetworkJournalClosed {
+        /// The agent.
+        agent: AgentKind,
+        /// The publication.
+        publication: karyos_protocol::trace_hook::PublicationIdentity,
+        /// The lane.
+        lane: karyos_protocol::frame::Lane,
+        /// Its start and boundary.
+        facts: Option<net_trace::JournalFacts>,
     },
     /// The agent does not serve this command.
     Unsupported {
@@ -605,7 +691,10 @@ impl<O: SocketOps> AgentCore<O> {
                 }
                 command @ (AgentCommand::AddPublication { .. }
                 | AgentCommand::AddSubscription { .. }
-                | AgentCommand::AddPublishedAlias { .. }) => {
+                | AgentCommand::AddPublishedAlias { .. }
+                | AgentCommand::SetNetworkTrace { .. }
+                | AgentCommand::OpenNetworkJournal { .. }
+                | AgentCommand::CloseNetworkJournal { .. }) => {
                     if let Some((reply, event)) = role(command)
                         && self.reply(reply, event)?
                     {
@@ -1009,7 +1098,7 @@ enum Work<O: SocketOps> {
 
 /// Runs one agent's duty cycle, turning a panic into
 /// [`AgentError::Panicked`] for that agent.
-fn guarded(
+pub(crate) fn guarded(
     kind: AgentKind,
     cycle: impl FnOnce() -> Result<u32, AgentError>,
 ) -> Result<u32, AgentError> {
