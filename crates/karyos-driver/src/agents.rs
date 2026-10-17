@@ -878,6 +878,13 @@ pub struct ReceiverAgent<O: SocketOps> {
 }
 
 impl<O: SocketOps> SenderAgent<O> {
+    /// Drops every NAK unread from now on, as a sender that never repairs
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn ignore_naks(&mut self) {
+        self.role.ignore_naks();
+    }
+
     /// After a stop: the halves of `Attach` commands the agent never read
     /// (DN-8). The conductor reclaims them with the held ones.
     pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {
@@ -929,6 +936,13 @@ impl<O: SocketOps> SenderAgent<O> {
 }
 
 impl<O: SocketOps> ReceiverAgent<O> {
+    /// Drops the DATA datagrams numbered `nth` (from 0) from now on at the
+    /// intake, as a lossy path would (tests).
+    #[cfg(test)]
+    pub(crate) fn drop_data(&mut self, nth: &[u64]) {
+        self.role.drop_data(nth);
+    }
+
     /// After a stop: the halves of `Attach` commands the agent never read
     /// (DN-8). The conductor reclaims them with the held ones.
     pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {

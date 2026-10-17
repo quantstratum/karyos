@@ -390,6 +390,16 @@ release may break APIs, wire formats and shared-memory layouts.
   match a one-path shadow table at every step. On every step the sent
   position stays within each required member's edge.
 
+### Fixed
+
+- The network keeps one time base in every threading mode. In
+  `ThreadingMode::Shared` the agents' cycles took the driver's injectable
+  clock while their role clocks read `host_monotonic_ns`. On Linux every
+  RTTM reply was then late (no RTT sample) and a receiver never asked
+  again for a hole whose NAK or repair was lost. The network now reads
+  `host_monotonic_ns` for its cycles and its close, as runner threads do;
+  the driver's clock times claim deadlines only.
+
 ## [0.1.0-alpha.1]: 2026-10-15
 
 First alpha: the embedded driver on every supported platform and the
