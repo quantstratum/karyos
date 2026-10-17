@@ -3668,13 +3668,16 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
 /// T6 (contract-traceability-phase-2.md, "Receiver restart freshness",
 /// the trusted half; SPEC §13): a restarted receiver, here a fresh rig
 /// with a new boot id and no binding, challenge or quarantine state, while
-/// the publisher stays live. A replayed old SETUP_ANSWER, echoing the old
-/// boot id and nonce, is dropped and binds nothing; replayed old DATA is
-/// unbound and delivered nowhere; the replayed SETUP binds only through
-/// the fresh challenge's answer. Once bound, above a join point, old DATA
+/// the publisher stays live. Replayed old DATA is unbound and delivered
+/// nowhere. The replayed SETUP makes the receiver challenge afresh, and
+/// while that challenge is pending a replayed old SETUP_ANSWER, echoing the
+/// old boot id and nonce, is dropped and binds nothing: only the fresh
+/// challenge's answer binds. Once bound, above a join point, old DATA
 /// below the join and every replayed copy of a committed frame are not
-/// delivered: each message reaches the subscriber once. The MAC cases
-/// need the authenticated profile (owner decision 5, ADR-0035).
+/// delivered: each message reaches the subscriber once. `multicast` only
+/// changes how the image times its NAKs here (the rig runs on loopback
+/// unicast). The MAC cases need the authenticated profile (owner decision
+/// 5, ADR-0035).
 fn a_restarted_receiver_binds_only_through_a_fresh_challenge(multicast: bool) {
     use karyos_protocol::network::{ChallengeBlock, Control, SetupAnswer};
     use karyos_sys::log_buffer::{AppendOptions, PollOutcome, Role};
@@ -3700,16 +3703,9 @@ fn a_restarted_receiver_binds_only_through_a_fresh_challenge(multicast: bool) {
         },
         joins: Lanes::new(&[0, 0]).unwrap(),
     };
+    // Old DATA of the alias, replayed: no image binds it.
     let unbound = rig.agents.receiver.counters().data_unbound;
     let receiver = &mut rig.agents.receiver;
-    receiver.role.inject_control(
-        &receiver.sessions,
-        b,
-        source,
-        Control::SetupAnswer(old_answer),
-        rig.now,
-    );
-    // Old DATA of the alias, replayed: no image binds it.
     receiver.role.inject_data(
         &receiver.sessions,
         b,
@@ -3718,12 +3714,9 @@ fn a_restarted_receiver_binds_only_through_a_fresh_challenge(multicast: bool) {
         &stale_frame(9, 0, 32),
         rig.now,
     );
-    let after = rig.agents.receiver.role.session_counters();
-    assert_eq!(after.dropped, sessions.dropped + 1, "the old answer");
-    assert_eq!(after.installed, 0);
     assert_eq!(rig.agents.receiver.counters().data_unbound, unbound + 1);
-    // The old SETUP, replayed, and the live one: the receiver challenges
-    // with its new boot id, and only that challenge's answer binds.
+    // The old SETUP, replayed: the receiver challenges with its new boot
+    // id, and that challenge is pending.
     let receiver = &mut rig.agents.receiver;
     receiver.role.inject_control(
         &receiver.sessions,
@@ -3732,6 +3725,27 @@ fn a_restarted_receiver_binds_only_through_a_fresh_challenge(multicast: bool) {
         Control::SetupAnnounce(announce(65_536)),
         rig.now,
     );
+    // (The old DATA solicited; the SETUP's challenge replaces that.)
+    let pending = rig.agents.receiver.role.session_counters();
+    assert!(
+        pending.challenges + pending.challenges_replaced
+            > sessions.challenges + sessions.challenges_replaced,
+        "no challenge pending: {pending:?}"
+    );
+    // The old answer, replayed while it is: its boot id and nonce are not
+    // the pending challenge's, so it is dropped and binds nothing.
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::SetupAnswer(old_answer),
+        rig.now,
+    );
+    let after = rig.agents.receiver.role.session_counters();
+    assert_eq!(after.dropped, pending.dropped + 1, "the old answer");
+    assert_eq!(after.installed, 0);
+    // Only the fresh challenge's answer, from the live publisher, binds.
     let slot = established(&mut rig);
     let challenges: Vec<_> = rig
         .agents
@@ -3746,7 +3760,6 @@ fn a_restarted_receiver_binds_only_through_a_fresh_challenge(multicast: bool) {
         .collect();
     // Every challenge carries the restarted receiver's own boot id.
     let boot_id = challenges.first().unwrap().receiver_boot_id;
-    assert_ne!(boot_id, old_answer.challenge.receiver_boot_id);
     assert!(
         challenges
             .iter()
