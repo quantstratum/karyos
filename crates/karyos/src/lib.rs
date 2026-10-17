@@ -25,7 +25,8 @@ pub enum Error {
     /// A poll failed after possibly delivering messages.
     #[error(transparent)]
     Poll(#[from] PollError),
-    /// A client conductor request could not be submitted.
+    /// A client conductor request could not be submitted (the low-level
+    /// API; the facade reports it as `ClientError::Conductor`).
     #[error(transparent)]
     Conductor(#[from] ConductorError),
     /// A facade subscription's poll failed or the subscription is closed.

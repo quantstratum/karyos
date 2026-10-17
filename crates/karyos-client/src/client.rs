@@ -3,12 +3,22 @@
 //! The application facade of SPEC §10 (W7): a [`Client`] that names
 //! channels by URI and blocks on the control path.
 //!
-//! ```text
+//! ```no_run
+//! # #[cfg(target_os = "linux")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use karyos_client::{Client, Context, MessageLimit, StreamId};
+//!
 //! let ctx = Context::builder().dir("/dev/shm/karyos").build()?;
 //! let mut client = Client::connect(ctx)?;
-//! let mut orders = client.add_exclusive_publication(
-//!     "karyos:udp?endpoint=10.0.0.5:40123", StreamId::new(1001))?;
+//! let mut orders = client.add_exclusive_publication("karyos:ipc", StreamId::new(1001))?;
+//! let _ = orders.offer(b"order")?;
 //! let mut md = client.add_subscription("karyos:ipc", StreamId::new(2001))?;
+//! md.poll(|payload, _info| drop(payload), MessageLimit::new(16))?;
+//! client.poll();
+//! # Ok(())
+//! # }
+//! # #[cfg(not(target_os = "linux"))]
+//! # fn main() {}
 //! ```
 //!
 //! A client has one of two connections:
@@ -42,6 +52,15 @@
 //! counted ([`Subscription::images_refused`]), never dropped silently.
 //! Every subscription takes the role `required` for now; role and rejoin
 //! policy by URI are a follow-up.
+//!
+//! A lap of the client's broadcast receiver loses what was broadcast
+//! meanwhile: the network subscriptions are then closed with
+//! [`ClientError::EventsLost`], as their images can no longer be tracked,
+//! and the answer to a control call waiting at that moment may be lost
+//! too: the call then returns [`ClientError::Timeout`] or
+//! [`ClientError::Unknown`], and the facade cannot release what it
+//! granted, which stays held until the client leaves. `ClientError::Attach` exists on
+//! Linux only, where remote clients do.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,6 +158,12 @@ impl Context {
     #[must_use]
     pub fn max_images(&self) -> usize {
         self.max_images
+    }
+
+    /// The most requests in flight on the client's conductor.
+    #[must_use]
+    pub fn max_pending(&self) -> usize {
+        self.max_pending
     }
 }
 
@@ -303,6 +328,9 @@ pub trait Connection: sealed::Sealed {
     fn events_dropped(&self) -> u64;
 
     #[doc(hidden)]
+    fn laps(&self) -> u64;
+
+    #[doc(hidden)]
     fn publication(&self, outcome: Outcome) -> Result<ClientPublication<Self::Terms>, ClientError>;
 
     #[doc(hidden)]
@@ -355,6 +383,10 @@ impl Connection for ClientConductor {
 
     fn events_dropped(&self) -> u64 {
         ClientConductor::events_dropped(self)
+    }
+
+    fn laps(&self) -> u64 {
+        ClientConductor::laps(self)
     }
 
     fn publication(&self, outcome: Outcome) -> Result<ClientPublication<Self::Terms>, ClientError> {
@@ -431,6 +463,10 @@ impl Connection for crate::ipc::RemoteClient {
         crate::ipc::RemoteClient::events_dropped(self)
     }
 
+    fn laps(&self) -> u64 {
+        crate::ipc::RemoteClient::laps(self)
+    }
+
     fn publication(&self, outcome: Outcome) -> Result<ClientPublication<Self::Terms>, ClientError> {
         match outcome {
             Outcome::Fetchable(fetchable) => Ok(self.take_publication(&fetchable)?),
@@ -492,27 +528,48 @@ struct Inbox<T: TermBytes> {
 
 #[derive(Debug)]
 struct InboxState<T: TermBytes> {
-    /// Images attached and not yet taken.
-    arrived: Vec<(i32, ClientSubscription<T>)>,
-    /// Sessions of images retired.
-    retired: Vec<i32>,
+    /// Images attached and not yet taken, by attach id.
+    arrived: Vec<Image<T>>,
+    /// Attach ids of taken images retired since. With `arrived`, at most
+    /// one entry per slot, so both stay within `max_images`.
+    retired: Vec<u64>,
     /// Why the subscription is closed.
     closed: Option<ClientError>,
     /// Images refused: beyond the bound, or their attach failed.
     refused: u64,
 }
 
+/// An attached image: its attach id (the request sequence), its session
+/// and its subscription.
+#[derive(Debug)]
+struct Image<T: TermBytes> {
+    id: u64,
+    session_id: i32,
+    subscription: ClientSubscription<T>,
+}
+
 impl<T: TermBytes> Inbox<T> {
-    fn new() -> Self {
+    fn new(max_images: usize) -> Self {
         Self {
             changed: AtomicBool::new(false),
             state: Mutex::new(InboxState {
-                arrived: Vec::new(),
-                retired: Vec::new(),
+                arrived: Vec::with_capacity(max_images),
+                retired: Vec::with_capacity(max_images),
                 closed: None,
                 refused: 0,
             }),
         }
+    }
+
+    /// Retires the image `id`: one not taken yet is dropped here.
+    fn retire(&self, id: u64) {
+        self.update(|state| {
+            if let Some(index) = state.arrived.iter().position(|image| image.id == id) {
+                drop(state.arrived.swap_remove(index));
+            } else {
+                state.retired.push(id);
+            }
+        });
     }
 
     fn update(&self, change: impl FnOnce(&mut InboxState<T>)) {
@@ -537,8 +594,21 @@ impl<T: TermBytes> Inbox<T> {
 struct Network<T: TermBytes> {
     registration: u64,
     inbox: Weak<Inbox<T>>,
-    /// Images attached or being attached.
-    images: usize,
+    /// The images holding a slot, attached or being attached: at most
+    /// `max_images`. A refused image holds none.
+    slots: Vec<Slot>,
+    /// Closed (events were lost): its events are ignored.
+    closed: bool,
+}
+
+/// An image holding a slot of its network subscription.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    /// The attach request's sequence: the image's id.
+    id: u64,
+    session_id: i32,
+    /// Its grant arrived and was handed to the subscription.
+    attached: bool,
 }
 
 /// An image attach in flight.
@@ -546,8 +616,7 @@ struct Network<T: TermBytes> {
 struct Attach {
     sequence: u64,
     registration: u64,
-    session_id: i32,
-    /// Its image retired first: the grant is dropped.
+    /// Its image retired first: the grant is released.
     cancelled: bool,
 }
 
@@ -567,6 +636,8 @@ pub struct Client<C: Connection> {
     /// Network subscriptions dropped whose removal is not submitted yet.
     removals: Vec<u64>,
     events_dropped: u64,
+    /// The connection's broadcast laps seen so far.
+    laps: u64,
     /// Late grants released after their request timed out.
     late_released: u64,
     completions: Vec<Completion>,
@@ -600,6 +671,7 @@ impl Client<ClientConductor> {
 impl<C: Connection> Client<C> {
     fn new(connection: C, context: Context) -> Self {
         let events_dropped = connection.events_dropped();
+        let laps = connection.laps();
         Self {
             connection,
             context,
@@ -607,16 +679,11 @@ impl<C: Connection> Client<C> {
             attaches: Vec::new(),
             removals: Vec::new(),
             events_dropped,
+            laps,
             late_released: 0,
             completions: Vec::new(),
             events: Vec::new(),
         }
-    }
-
-    /// The connection.
-    #[must_use]
-    pub fn connection(&self) -> &C {
-        &self.connection
     }
 
     /// Grants that arrived after their request timed out, released at
@@ -674,7 +741,7 @@ impl<C: Connection> Client<C> {
                 kind: Kind::Images(Images {
                     registration,
                     inbox,
-                    images: Vec::new(),
+                    images: Vec::with_capacity(self.context.max_images),
                     next: 0,
                     closed: None,
                 }),
@@ -711,7 +778,7 @@ impl<C: Connection> Client<C> {
         let mut completions = core::mem::take(&mut self.completions);
         let mut events = core::mem::take(&mut self.events);
         // At most one queue of events per service: none is dropped before
-        // it is taken.
+        // it is taken. Losses show as laps, checked below.
         let _ = self.connection.poll_into(EVENT_QUEUE, &mut completions);
         self.connection.events_into(&mut events);
         let served = !completions.is_empty() || !events.is_empty();
@@ -727,10 +794,15 @@ impl<C: Connection> Client<C> {
         for event in events.drain(..) {
             self.event(event);
         }
-        let dropped = self.connection.events_dropped();
-        if dropped != self.events_dropped {
+        // A lap lost what was broadcast meanwhile, image events included:
+        // no network subscription can know its images any more.
+        let (dropped, laps) = (self.connection.events_dropped(), self.connection.laps());
+        if dropped != self.events_dropped || laps != self.laps {
             self.events_dropped = dropped;
-            for network in &self.networks {
+            self.laps = laps;
+            for network in &mut self.networks {
+                network.closed = true;
+                network.slots.clear();
                 if let Some(inbox) = network.inbox.upgrade() {
                     inbox.update(|state| state.closed = Some(ClientError::EventsLost));
                 }
@@ -747,11 +819,12 @@ impl<C: Connection> Client<C> {
             Outcome::NetworkSubscription { registration } => {
                 // Registered before the events of this service, which may
                 // announce its first images.
-                let inbox = Arc::new(Inbox::new());
+                let inbox = Arc::new(Inbox::new(self.context.max_images));
                 self.networks.push(Network {
                     registration,
                     inbox: Arc::downgrade(&inbox),
-                    images: 0,
+                    slots: Vec::with_capacity(self.context.max_images),
+                    closed: false,
                 });
                 Found::Network(registration, inbox)
             }
@@ -774,32 +847,37 @@ impl<C: Connection> Client<C> {
             return;
         };
         let attach = self.attaches.swap_remove(index);
-        let Some(position) = self
+        let network = self
             .networks
-            .iter()
-            .position(|network| network.registration == attach.registration)
+            .iter_mut()
+            .find(|network| network.registration == attach.registration);
+        let inbox = network.as_ref().and_then(|network| network.inbox.upgrade());
+        let (Some(network), Some(inbox), false) = (network, inbox, attach.cancelled) else {
+            // Its image retired first, or its subscription is gone: the
+            // grant is released, its slot already free.
+            let _ = self.connection.release(completion.outcome);
+            return;
+        };
+        let Some(slot) = network
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == attach.sequence)
         else {
+            let _ = self.connection.release(completion.outcome);
             return;
         };
-        let inbox = self.networks.get(position).and_then(|n| n.inbox.upgrade());
-        let subscription = self.connection.subscription(completion.outcome);
-        let Some(inbox) = inbox else {
-            return;
-        };
-        match subscription {
-            Ok(subscription) if !attach.cancelled => {
-                inbox.update(|state| state.arrived.push((attach.session_id, subscription)));
+        match self.connection.subscription(completion.outcome) {
+            Ok(subscription) => {
+                slot.attached = true;
+                let image = Image {
+                    id: slot.id,
+                    session_id: slot.session_id,
+                    subscription,
+                };
+                inbox.update(|state| state.arrived.push(image));
             }
-            // Retired before it was attached: dropped, its count already
-            // returned.
-            Ok(_) => {}
             Err(_) => {
-                if let Some(network) = self.networks.get_mut(position) {
-                    // Counted when the attach was sent.
-                    if let Some(images) = network.images.checked_sub(1) {
-                        network.images = images;
-                    }
-                }
+                network.slots.retain(|slot| slot.id != attach.sequence);
                 inbox.update(|state| bump(&mut state.refused));
             }
         }
@@ -823,27 +901,35 @@ impl<C: Connection> Client<C> {
         let Some(network) = self
             .networks
             .iter_mut()
-            .find(|network| network.registration == registration)
+            .find(|network| network.registration == registration && !network.closed)
         else {
             return;
         };
         let Some(inbox) = network.inbox.upgrade() else {
             return;
         };
-        if network.images >= self.context.max_images {
+        // An image already holding a slot is not attached twice.
+        if network
+            .slots
+            .iter()
+            .any(|slot| slot.session_id == stream.session_id)
+        {
+            return;
+        }
+        if network.slots.len() >= self.context.max_images {
             inbox.update(|state| bump(&mut state.refused));
             return;
         }
         match self.connection.add_subscription(stream) {
             Ok(sequence) => {
-                // Below max_images, which is a usize.
-                if let Some(images) = network.images.checked_add(1) {
-                    network.images = images;
-                }
+                network.slots.push(Slot {
+                    id: sequence,
+                    session_id: stream.session_id,
+                    attached: false,
+                });
                 self.attaches.push(Attach {
                     sequence,
                     registration,
-                    session_id: stream.session_id,
                     cancelled: false,
                 });
             }
@@ -855,27 +941,29 @@ impl<C: Connection> Client<C> {
         let Some(network) = self
             .networks
             .iter_mut()
-            .find(|network| network.registration == registration)
+            .find(|network| network.registration == registration && !network.closed)
         else {
             return;
         };
-        let pending = self.attaches.iter_mut().find(|attach| {
-            attach.registration == registration
-                && attach.session_id == stream.session_id
-                && !attach.cancelled
-        });
-        let counted = match pending {
-            Some(attach) => {
-                attach.cancelled = true;
-                true
-            }
-            None => network.inbox.upgrade().is_some_and(|inbox| {
-                inbox.update(|state| state.retired.push(stream.session_id));
-                true
-            }),
+        // Only an image holding a slot frees one; a refused one held none.
+        let Some(index) = network
+            .slots
+            .iter()
+            .position(|slot| slot.session_id == stream.session_id)
+        else {
+            return;
         };
-        if counted && let Some(images) = network.images.checked_sub(1) {
-            network.images = images;
+        let slot = network.slots.swap_remove(index);
+        if slot.attached {
+            if let Some(inbox) = network.inbox.upgrade() {
+                inbox.retire(slot.id);
+            }
+        } else if let Some(attach) = self
+            .attaches
+            .iter_mut()
+            .find(|attach| attach.sequence == slot.id)
+        {
+            attach.cancelled = true;
         }
     }
 
@@ -915,7 +1003,8 @@ enum Kind<T: TermBytes> {
 struct Images<T: TermBytes> {
     registration: u64,
     inbox: Arc<Inbox<T>>,
-    images: Vec<(i32, ClientSubscription<T>)>,
+    /// Reserved for `max_images`: adopting never reallocates.
+    images: Vec<Image<T>>,
     /// The image the next poll starts at.
     next: usize,
     closed: Option<ClientError>,
@@ -1001,10 +1090,12 @@ impl<T: TermBytes> Images<T> {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.images.append(&mut state.arrived);
-        for session_id in state.retired.drain(..) {
-            self.images.retain(|(session, _)| *session != session_id);
+        // Keyed by attach id: a session retired and announced again is a
+        // new image, whatever the order of the two.
+        for id in state.retired.drain(..) {
+            self.images.retain(|image| image.id != id);
         }
+        self.images.append(&mut state.arrived);
         if self.closed.is_none() {
             self.closed = state.closed;
         }
@@ -1041,11 +1132,24 @@ impl<T: TermBytes> Images<T> {
             if remaining == 0 {
                 break;
             }
-            let index = (start + offset) % count;
-            let Some((session_id, image)) = self.images.get_mut(index) else {
+            let Some(index) = start
+                .checked_add(offset)
+                .and_then(|index| index.checked_rem(count))
+            else {
                 break;
             };
-            self.next = (index + 1) % count;
+            let Some(Image {
+                session_id,
+                subscription: image,
+                ..
+            }) = self.images.get_mut(index)
+            else {
+                break;
+            };
+            self.next = index
+                .checked_add(1)
+                .and_then(|next| next.checked_rem(count))
+                .unwrap_or(0);
             match image.poll(&mut *handler, MessageLimit::new(remaining)) {
                 Ok(summary) => {
                     // Within the limit, a u32.

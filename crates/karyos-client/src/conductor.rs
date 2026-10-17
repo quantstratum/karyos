@@ -427,6 +427,9 @@ pub struct ClientConductor<T: TermBytes = HeapTerms> {
     /// A remote client fell a lap behind the broadcast buffer since its
     /// control path last asked: cutover events may be lost.
     lapped: bool,
+    /// Laps of the broadcast receiver, for every client: what was
+    /// broadcast meanwhile, events included, is lost.
+    laps: u64,
     /// The writer view of the driver's client counters region; `None`
     /// when the driver gave none, and allocated counters then complete as
     /// `Unknown`.
@@ -476,6 +479,7 @@ impl<T: TermBytes> ClientConductor<T> {
             remote: false,
             cutover_events: Vec::new(),
             lapped: false,
+            laps: 0,
             cells: None,
             dropped_counter: DroppedCounter::NotRequested,
             session: None,
@@ -517,6 +521,13 @@ impl<T: TermBytes> ClientConductor<T> {
     )]
     pub(crate) fn take_cutover_events(&mut self) -> Vec<Event> {
         core::mem::take(&mut self.cutover_events)
+    }
+
+    /// Laps of the broadcast receiver so far: each lost what was broadcast
+    /// meanwhile, events included. At its end the count keeps its value.
+    #[must_use]
+    pub fn laps(&self) -> u64 {
+        self.laps
     }
 
     /// Whether a lap happened since the last call (a remote client's
@@ -1324,6 +1335,9 @@ impl<T: TermBytes> ClientConductor<T> {
                 Received::Pending => None,
                 Received::Lapped { .. } => {
                     self.lapped |= self.remote;
+                    if let Some(laps) = self.laps.checked_add(1) {
+                        self.laps = laps;
+                    }
                     Some(None)
                 }
                 Received::Message {

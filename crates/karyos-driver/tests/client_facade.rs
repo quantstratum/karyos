@@ -241,13 +241,16 @@ fn a_network_subscription_polls_its_images_in_turn() {
 }
 
 /// An image beyond the context's `max_images` is refused and counted,
-/// never attached.
+/// never attached; a refused image holds no slot, so its retirement frees
+/// none (#306 review P1: A attached, B refused, B retired, C refused).
 #[test]
 fn an_image_beyond_the_bound_is_refused_and_counted() {
-    let (_a, mut a) = driven(2, None);
-    let (_b, mut b) = driven(1, None);
+    let (_a, mut a) = driven(3, None);
+    // The receiver retires an image half a second after its sender goes.
+    let (_b, mut b) = driven(1, Some(500_000_000));
     let mut first = Client::with_conductor(a.remove(0), context());
     let mut second = Client::with_conductor(a.remove(0), context());
+    let mut third = Client::with_conductor(a.remove(0), context());
     let mut subscriber = Client::with_conductor(
         b.remove(0),
         Context::builder()
@@ -264,16 +267,41 @@ fn an_image_beyond_the_bound_is_refused_and_counted() {
         )
         .unwrap();
     let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1");
-    let _one = first
+    let mut one = first
         .add_exclusive_publication(&uri, StreamId::new(9))
         .unwrap();
-    let _two = second
+    until(&mut [&mut subscriber, &mut first], || {
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        reading.image_count() == 1
+    });
+    let two = second
         .add_exclusive_publication(&uri, StreamId::new(9))
         .unwrap();
     until(&mut [&mut subscriber, &mut first, &mut second], || {
         let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
-        reading.image_count() == 1 && reading.images_refused() == 1
+        reading.images_refused() == 1
     });
+    // B goes: its image retires, which frees no slot. A keeps sending so
+    // its image stays live.
+    drop(two);
+    let retired = Instant::now();
+    while retired.elapsed() < Duration::from_millis(1500) {
+        let _ = (first.poll(), subscriber.poll());
+        let _ = one.offer(b"a");
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(64));
+        assert_eq!(reading.image_count(), 1);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let _three = third
+        .add_exclusive_publication(&uri, StreamId::new(9))
+        .unwrap();
+    until(&mut [&mut subscriber, &mut first, &mut third], || {
+        let _ = one.offer(b"a");
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(64));
+        assert!(reading.image_count() <= 1, "max_images is a bound");
+        reading.images_refused() == 2
+    });
+    assert_eq!(reading.image_count(), 1);
 }
 
 /// A driver driven on the caller's thread cannot answer a control call:
@@ -402,6 +430,40 @@ mod remote {
     /// An IPC driver on its own thread, with one stream of id 3, whose
     /// admission socket is in the returned directory.
     fn ipc_driver(name: &str) -> (Driven, std::path::PathBuf) {
+        let (driven, dir, _) = ipc_driver_with(name, 16);
+        (driven, dir)
+    }
+
+    /// A switch that pauses a driver's duty cycle, and the driver's
+    /// acknowledgement that it is paused.
+    #[derive(Clone)]
+    struct Pause {
+        asked: Arc<AtomicBool>,
+        holding: Arc<AtomicBool>,
+    }
+
+    impl Pause {
+        /// Pauses the driver once its current cycle is over.
+        fn hold(&self) {
+            self.asked.store(true, Ordering::Release);
+            while !self.holding.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }
+
+        fn resume(&self) {
+            self.asked.store(false, Ordering::Release);
+        }
+    }
+
+    /// As [`ipc_driver`], with at most `max_exports` grants per client,
+    /// and a pause switch.
+    fn ipc_driver_with(name: &str, max_exports: usize) -> (Driven, std::path::PathBuf, Pause) {
+        let paused = Pause {
+            asked: Arc::new(AtomicBool::new(false)),
+            holding: Arc::new(AtomicBool::new(false)),
+        };
+        let pause = paused.clone();
         let dir = std::env::temp_dir().join(format!("karyos-facade-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let stop = Arc::new(AtomicBool::new(false));
@@ -417,7 +479,7 @@ mod remote {
                     hello_timeout: 5_000_000_000,
                     max_outbound_per_client: 8,
                     fetch_deadline: 5_000_000_000,
-                    max_exports_per_client: 16,
+                    max_exports_per_client: max_exports,
                     max_fetches_per_client: 4,
                     max_regions_per_fetch: 4,
                     max_fetch_bytes: 1 << 30,
@@ -449,7 +511,11 @@ mod remote {
                 .unwrap();
             ready.send(()).unwrap();
             while !flag.load(Ordering::Acquire) {
-                let _ = driver.do_work().unwrap();
+                let held = pause.asked.load(Ordering::Acquire);
+                pause.holding.store(held, Ordering::Release);
+                if !held {
+                    let _ = driver.do_work().unwrap();
+                }
                 std::thread::sleep(Duration::from_micros(50));
             }
         });
@@ -460,6 +526,7 @@ mod remote {
                 thread: Some(thread),
             },
             dir,
+            paused,
         )
     }
 
@@ -543,5 +610,52 @@ mod remote {
             Client::connect(Context::builder().build().unwrap()).err(),
             Some(ClientError::NoDirectory)
         ));
+    }
+
+    /// A remote grant that arrives after its request timed out is taken
+    /// and dropped at once, so its export is free again: with one export
+    /// per client, the next subscription is granted.
+    #[test]
+    fn a_remote_late_grant_is_released() {
+        let (_driver, dir, paused) = ipc_driver_with("late", 1);
+        let mut client = Client::connect(
+            Context::builder()
+                .dir(&dir)
+                .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap(),
+        )
+        .unwrap();
+        paused.hold();
+        assert_eq!(
+            client
+                .add_subscription("karyos:ipc", StreamId::new(3))
+                .err(),
+            Some(ClientError::Timeout)
+        );
+        paused.resume();
+        let start = Instant::now();
+        while client.late_grants_released() == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10), "not released");
+            let _ = client.poll();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The only export is free again.
+        let mut granted = None;
+        let start = Instant::now();
+        while granted.is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the export is still held"
+            );
+            match client.add_subscription("karyos:ipc", StreamId::new(3)) {
+                Ok(subscription) => granted = Some(subscription),
+                Err(ClientError::Refused { .. } | ClientError::Timeout) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
     }
 }

@@ -685,6 +685,13 @@ impl RemoteClient {
         self.losses.dropped()
     }
 
+    /// Laps of the broadcast receiver so far, as
+    /// [`ClientConductor::laps`].
+    #[must_use]
+    pub fn laps(&self) -> u64 {
+        self.conductor.as_ref().map_or(0, ClientConductor::laps)
+    }
+
     /// Driver events dropped because the queue was full, as
     /// [`ClientConductor::events_dropped`].
     #[must_use]

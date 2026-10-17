@@ -1019,3 +1019,83 @@ fn a_publication_made_before_its_subscription_reaches_it() {
         },
     );
 }
+
+/// #306 review: a network subscription whose request timed out is
+/// removed when its late grant arrives, so it holds nothing.
+#[test]
+fn a_late_network_subscription_grant_is_removed() {
+    let mut driver = driver();
+    let mut client = karyos_client::Client::with_conductor(
+        driver.connect().unwrap(),
+        karyos_client::Context::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap(),
+    );
+    let port = port();
+    // The driver runs on this thread: the request times out.
+    assert!(matches!(
+        client.add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            karyos_protocol::cnc::StreamId::new(10),
+        ),
+        Err(karyos_client::ClientError::Timeout)
+    ));
+    let start = std::time::Instant::now();
+    while client.late_grants_released() == 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "not released");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll();
+    }
+    eventually(&mut driver, |driver| {
+        driver.net_owned.is_empty() && driver.net.as_ref().unwrap().subscription_count() == 0
+    });
+}
+
+/// #306 review (P1): a lap of the client's broadcast receiver loses image
+/// events, so the facade closes its network subscriptions with
+/// `EventsLost` instead of keeping images it can no longer track.
+#[test]
+fn a_lap_closes_the_network_subscriptions() {
+    let mut driver = driver();
+    let mut client = karyos_client::Client::with_conductor(
+        driver.connect().unwrap(),
+        karyos_client::Context::builder().build().unwrap(),
+    );
+    let port = port();
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}");
+    let mut reading = std::thread::scope(|scope| {
+        let handle =
+            scope.spawn(|| client.add_subscription(&uri, karyos_protocol::cnc::StreamId::new(10)));
+        while !handle.is_finished() {
+            let _ = driver.do_work().unwrap();
+        }
+        handle.join().unwrap().unwrap()
+    });
+    assert!(reading.poll(|_, _| {}, MessageLimit::new(1)).is_ok());
+    // Another client's answers fill the broadcast many times over while
+    // this client does not poll: its receiver is lapped.
+    let mut other = driver.connect().unwrap();
+    for _ in 0..200 {
+        for _ in 0..32 {
+            let _ = other.add_subscription(
+                StreamKey {
+                    stream_id: 99,
+                    session_id: 1,
+                },
+                SubscriberRole::Optional,
+            );
+        }
+        for _ in 0..40 {
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = other.poll(usize::MAX, |_| {});
+    }
+    let _ = client.poll();
+    assert_eq!(
+        reading.poll(|_, _| {}, MessageLimit::new(1)).err(),
+        Some(karyos_client::SubscriptionError::Closed(
+            karyos_client::ClientError::EventsLost
+        ))
+    );
+}

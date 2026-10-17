@@ -38,8 +38,8 @@ pub mod tool;
 pub mod trace;
 
 pub use client::{
-    Client, Connection, Context, ContextBuilder, IdleStrategy, ImageStop, Subscription,
-    SubscriptionError, SubscriptionPoll,
+    Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES, DEFAULT_MAX_PENDING,
+    DEFAULT_TIMEOUT, IdleStrategy, ImageStop, Subscription, SubscriptionError, SubscriptionPoll,
 };
 pub use concurrent::{
     ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,
