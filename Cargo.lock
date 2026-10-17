@@ -238,6 +238,8 @@ dependencies = [
  "karyos-client",
  "karyos-codec",
  "karyos-io",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]
