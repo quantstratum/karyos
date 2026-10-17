@@ -1080,3 +1080,68 @@ fn every_paths_alias_is_published_and_removed() {
                 .all(|path| !net.receiver_published(*path, alias))
     });
 }
+
+/// A guarded network publication sealed by a guard close takes no fresh
+/// incarnation after the reopen: the network sender does not follow one
+/// yet, so the next handle is refused, typed, rather than accepting offers
+/// that never reach the network.
+#[test]
+fn a_reopened_guarded_network_publication_is_refused_a_fresh_incarnation() {
+    use karyos_sys::guard::Closed;
+    use karyos_sys::log_buffer::SealReason;
+
+    use crate::error::DriverError;
+    use crate::net::NetworkGuard;
+
+    let mut driver = driver();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let mut config = aggregate(10, 1);
+    config.stream.buffer.spare_slots = 4;
+    let handle = driver
+        .add_guarded_network_publication(
+            config,
+            &channel(destination),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    let lane = handle.lane(karyos_sys::frame::Lane::ZERO).unwrap();
+    let publication = driver.publication(lane).unwrap();
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    // The sealed incarnation releases, and its seal is positioned.
+    drop(publication);
+    until(&mut driver, |driver| {
+        driver.seal_reason(lane) == Ok(Some(SealReason::GuardClosed))
+    });
+    assert_eq!(driver.reopen_guard(guard, epoch, epoch), Ok(epoch + 1));
+    // Once the seal is positioned (GuardSealed until then), the next
+    // handle is refused, typed.
+    let mut outcome = None;
+    until(&mut driver, |driver| match driver.publication(lane) {
+        Err(DriverError::GuardSealed { .. }) => false,
+        other => {
+            outcome = Some(other.map(drop));
+            true
+        }
+    });
+    assert!(
+        matches!(outcome, Some(Err(DriverError::NetworkReincarnation { .. }))),
+        "{outcome:?}"
+    );
+    // Nothing changed: still the first incarnation, still refused.
+    assert_eq!(driver.trace_identity(lane).unwrap().incarnation, 1);
+    assert!(matches!(
+        driver.publication(lane),
+        Err(DriverError::NetworkReincarnation { .. })
+    ));
+}

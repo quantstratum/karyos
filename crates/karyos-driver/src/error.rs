@@ -175,6 +175,18 @@ pub enum DriverError {
         /// The stream id.
         stream: u64,
     },
+    /// A lane of a guarded network publication that a guard close sealed
+    /// takes no fresh incarnation after the reopen: the network sender
+    /// does not follow a reincarnation yet (it would keep reading the
+    /// sealed log, and no SETUP would announce the new incarnation), so
+    /// the offer would be accepted and never sent. The publication is
+    /// removed and added again instead (`quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, On the network).
+    #[error("stream {stream} is a guarded network publication: it takes no fresh incarnation")]
+    NetworkReincarnation {
+        /// The stream id.
+        stream: u64,
+    },
     /// `guard_stream` could not admit the stream's walker, a reader that
     /// holds one spare-slot credit for the stream's life
     /// (`quantstratum-docs: karyos/design/guards-and-abort.md`, The

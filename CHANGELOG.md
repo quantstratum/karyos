@@ -770,6 +770,13 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Fixed
 
+- A guarded network publication that a guard close sealed no longer
+  takes a fresh incarnation after the reopen: `publication()` refuses with
+  `DriverError::NetworkReincarnation`. The network sender did not follow
+  the reincarnation (it kept reading the sealed log, and no SETUP
+  announced the new incarnation), so offers were accepted and never sent.
+  The publication is removed and added again until the sender follows a
+  reincarnation.
 - The network keeps one time base in every threading mode. In
   `ThreadingMode::Shared` the agents' cycles took the driver's injectable
   clock while their role clocks read `host_monotonic_ns`. On Linux every
