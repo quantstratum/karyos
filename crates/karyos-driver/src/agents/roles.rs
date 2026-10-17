@@ -99,6 +99,7 @@ const DATA_BUDGET: karyos_protocol::lanes::drr::Budget = karyos_protocol::lanes:
 use super::repair::{NakOutcome as NakIntake, RepairConfig};
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
+use crate::embedded::StreamTerms;
 use crate::membership::{Membership, MembershipConfig, PublicationRoles, Roles, SmKey};
 use crate::repair::admission::Requester;
 use crate::repair::draw::{OsDelayDraw, Refill};
@@ -116,6 +117,7 @@ use crate::sessions::send::{SendSessionError, SendSessions};
 use crate::sm_schedule::{SmDue, SmSchedule};
 use karyos_sys::log_buffer::ReceiveOwner;
 use karyos_sys::log_buffer::{CloseCause, SkipConfig, SkipPolicy};
+use karyos_sys::term_bytes::HeapTerms;
 
 /// The receiver's counters; checked, sticky on overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -433,7 +435,7 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
 
 /// The receiver agent's network state.
 #[derive(Debug)]
-pub struct ReceiverRole {
+pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// Test only: the DATA datagrams to drop at the intake, by their
     /// count since the hook was set (a lossy path).
     #[cfg(test)]
@@ -508,7 +510,7 @@ pub struct ReceiverRole {
     chains: Vec<Chain>,
     /// Installed images (at most `max_images`, allocated at creation).
     /// DATA admission through them is phase 5c.
-    images: Vec<Installed>,
+    images: Vec<Installed<T>>,
     /// One SM slot flag per image, allocated at creation; an image takes
     /// one only the pool holds.
     sm_slots: Vec<Arc<SmSlot>>,
@@ -548,8 +550,8 @@ fn path_joins(joins: &Lanes<u64>, term_length: u32) -> [(u64, u64); 4] {
 /// profile): fresh evidence keeps it alive and restarts the idle clock;
 /// stationary heartbeats keep it alive only until `idle_timeout` after the
 /// last fresh evidence; anything else changes nothing.
-fn apply_evidence(
-    image: &mut Installed,
+fn apply_evidence<T: StreamTerms>(
+    image: &mut Installed<T>,
     fresh: bool,
     stationary: bool,
     now: u64,
@@ -578,7 +580,10 @@ enum HeartbeatClass {
 
 /// Classifies `heartbeat` against the image's receive window and the
 /// highest heartbeat position seen on its lane, which a fresh one raises.
-fn classify_heartbeat(image: &mut Installed, heartbeat: &Heartbeat) -> HeartbeatClass {
+fn classify_heartbeat<T: StreamTerms>(
+    image: &mut Installed<T>,
+    heartbeat: &Heartbeat,
+) -> HeartbeatClass {
     let lane = heartbeat.lane();
     let Some(position) = heartbeat
         .term_id()
@@ -610,7 +615,7 @@ fn classify_heartbeat(image: &mut Installed, heartbeat: &Heartbeat) -> Heartbeat
 /// term outside the incarnation.
 /// The stream position of `frame` in `image`, or `None` for a term outside
 /// the incarnation.
-fn frame_position(image: &Installed, frame: &ValidatedFrame<'_>) -> Option<u64> {
+fn frame_position<T: StreamTerms>(image: &Installed<T>, frame: &ValidatedFrame<'_>) -> Option<u64> {
     let term = u64::from(
         frame
             .term_id()
@@ -632,7 +637,7 @@ fn frame_position(image: &Installed, frame: &ValidatedFrame<'_>) -> Option<u64> 
 /// unreliable image the bytes of a sealed gap, which no path delivered,
 /// are then charged to every path as missing (redundant-paths.md section
 /// 5 charges only committed bytes).
-fn terms_complete(image: &mut Installed) {
+fn terms_complete<T: StreamTerms>(image: &mut Installed<T>) {
     let term_length = u64::from(image.term_length);
     for at in 0..usize::from(image.lane_count) {
         let Some(lane) = u8::try_from(at).ok().and_then(|at| Lane::try_new(at).ok()) else {
@@ -662,12 +667,12 @@ fn terms_complete(image: &mut Installed) {
 }
 
 /// The report slot of the copy of lane `at` on path `path` (RP-7).
-fn copy_index(image: &Installed, at: usize, path: usize) -> Option<usize> {
+fn copy_index<T: StreamTerms>(image: &Installed<T>, at: usize, path: usize) -> Option<usize> {
     at.checked_mul(image.routes.len())?.checked_add(path)
 }
 
 /// Whether a copy of lane `at`'s last NAK still waits for its report.
-fn copies_busy(image: &Installed, at: usize) -> bool {
+fn copies_busy<T: StreamTerms>(image: &Installed<T>, at: usize) -> bool {
     (0..image.routes.len()).any(|path| {
         copy_index(image, at, path)
             .and_then(|index| image.copies.get(index))
@@ -683,7 +688,11 @@ fn copies_busy(image: &Installed, at: usize) -> bool {
 /// Uncertainty counts per path route: a second uncertain copy on one
 /// route while its first is unresolved faults that route, which then
 /// takes no copy until its endpoint is reset.
-fn settle_copies(image: &mut Installed, counters: &mut ReceiverCounters, at: usize) {
+fn settle_copies<T: StreamTerms>(
+    image: &mut Installed<T>,
+    counters: &mut ReceiverCounters,
+    at: usize,
+) {
     for path in 0..image.routes.len() {
         let Some(index) = copy_index(image, at, path) else {
             continue;
@@ -731,7 +740,11 @@ fn settle_copies(image: &mut Installed, counters: &mut ReceiverCounters, at: usi
 /// Settles lane `at`'s NAK on the founding path: RC-6 on the image's own
 /// route. A NAK another path's copy already anchored records nothing more
 /// (RP-7: the anchor is the first copy submitted).
-fn settle_founding(image: &mut Installed, counters: &mut ReceiverCounters, at: usize) {
+fn settle_founding<T: StreamTerms>(
+    image: &mut Installed<T>,
+    counters: &mut ReceiverCounters,
+    at: usize,
+) {
     let Some(report) = image.naks.get_mut(at) else {
         return;
     };
@@ -765,7 +778,7 @@ fn settle_founding(image: &mut Installed, counters: &mut ReceiverCounters, at: u
 /// Once every copy of lane `at`'s round has reported and none was
 /// submitted, anchors its NAK at the earliest uncertain copy, counted as
 /// submitted at its start (RC-6; #310 review).
-fn anchor_uncertain(image: &mut Installed, at: usize) {
+fn anchor_uncertain<T: StreamTerms>(image: &mut Installed<T>, at: usize) {
     let reported =
         !copies_busy(image, at) && image.naks.get(at).is_none_or(|report| !report.slot.busy());
     if reported
@@ -781,7 +794,7 @@ fn anchor_uncertain(image: &mut Installed, at: usize) {
 
 /// Records an uncertain copy of `nak` started at `start` as lane `at`'s
 /// anchor candidate, keeping the earliest start of its round.
-fn uncertain_candidate(image: &mut Installed, at: usize, nak: Nak, start: u64) {
+fn uncertain_candidate<T: StreamTerms>(image: &mut Installed<T>, at: usize, nak: Nak, start: u64) {
     if let Some(candidate) = image.uncertain_at.get_mut(at) {
         match candidate {
             Some((held, earlier)) if *held == nak && *earlier <= start => {}
@@ -800,8 +813,8 @@ fn uncertain_candidate(image: &mut Installed, at: usize, nak: Nak, start: u64) {
 /// without room, which counts as `ring_full_nak` and stays due. A copy
 /// still in the ring delays the lane's next NAK on every path
 /// (`copies_busy`) until the sender reports it.
-fn post_copies(
-    image: &mut Installed,
+fn post_copies<T: StreamTerms>(
+    image: &mut Installed<T>,
     key_of: impl Fn(usize) -> Option<BindingKey>,
     to_sender: &mut RingSender<ControlItem>,
     counters: &mut ReceiverCounters,
@@ -843,8 +856,8 @@ fn post_copies(
     posted
 }
 
-fn delivered(
-    image: &Installed,
+fn delivered<T: StreamTerms>(
+    image: &Installed<T>,
     frame: &ValidatedFrame<'_>,
     path: Option<(SlotRef, usize)>,
     now: u64,
@@ -901,10 +914,10 @@ struct Chain {
 /// An installed image: its receive owner, binding, SM cadence and
 /// liveness.
 #[derive(Debug)]
-struct Installed {
+struct Installed<T: StreamTerms = HeapTerms> {
     /// The installed slot.
     slot: SlotRef,
-    owner: Box<ReceiveOwner>,
+    owner: Box<ReceiveOwner<T>>,
     /// The `RetireImage` unit reserved at the answer.
     retire: Option<Reservation>,
     key: BindingKey,
@@ -1026,7 +1039,12 @@ impl From<CloseCause> for CloseReason {
 /// rebuild position's term: a NAK beyond the sender's position would be
 /// answered RANGE_INVALID. The wait starts when the condition is first
 /// seen and ends when it clears.
-fn tail_hole(image: &mut Installed, lane: Lane, at: usize, now: u64) -> Option<Hole> {
+fn tail_hole<T: StreamTerms>(
+    image: &mut Installed<T>,
+    lane: Lane,
+    at: usize,
+    now: u64,
+) -> Option<Hole> {
     use crate::repair::loss::RttSource;
 
     let rebuild = image.owner.rebuild_position(lane)?;
@@ -1060,8 +1078,8 @@ fn tail_hole(image: &mut Installed, lane: Lane, at: usize, now: u64) -> Option<H
 /// hole is unrecoverable even when the floor lies inside it (RC-9), so the
 /// policy is given the later of the floor and the hole's end: it seals
 /// every hole starting below that.
-fn unrecoverable(
-    image: &mut Installed,
+fn unrecoverable<T: StreamTerms>(
+    image: &mut Installed<T>,
     counters: &mut ReceiverCounters,
     trace: &mut super::net_trace::ReceiverTrace,
     lane: Lane,
@@ -1111,7 +1129,11 @@ fn unrecoverable(
 
 /// The end of `lane`'s receive window `{r, r + 1}` of `owner`: two terms
 /// past the start of the rebuild position's term. `None` past `u64`.
-fn window_end(owner: &ReceiveOwner, lane: Lane, term_length: u32) -> Option<u64> {
+fn window_end<T: StreamTerms>(
+    owner: &ReceiveOwner<T>,
+    lane: Lane,
+    term_length: u32,
+) -> Option<u64> {
     let term = u64::from(term_length);
     let rebuild = owner.rebuild_position(lane)?;
     rebuild.checked_div(term)?.checked_add(2)?.checked_mul(term)
@@ -1132,7 +1154,9 @@ fn receiver_id(slot: SlotRef) -> u64 {
 }
 
 /// The publication identity an image receives (trace-network.md §5).
-fn publication_of(image: &Installed) -> karyos_protocol::trace_hook::PublicationIdentity {
+fn publication_of<T: StreamTerms>(
+    image: &Installed<T>,
+) -> karyos_protocol::trace_hook::PublicationIdentity {
     karyos_protocol::trace_hook::PublicationIdentity {
         driver: image.identity.driver_id,
         registration: image.identity.registration_id,
@@ -1146,9 +1170,9 @@ fn publication_of(image: &Installed) -> karyos_protocol::trace_hook::Publication
 /// lane's resolved prefix as the commit boundary, and the lane's first
 /// sealed gap. Without the image's owner (it is gone), the boundary is
 /// the start and no gap is known.
-fn journal_facts(
+fn journal_facts<T: StreamTerms>(
     traced: super::net_trace::TracedImageLane,
-    owner: Option<&ReceiveOwner>,
+    owner: Option<&ReceiveOwner<T>>,
 ) -> super::net_trace::JournalFacts {
     super::net_trace::JournalFacts {
         publication: traced.publication,
@@ -1185,7 +1209,11 @@ fn tally_by(
 }
 
 /// Settles what an image's seal gate did into the receiver's counters.
-fn tally_gate(counters: &mut ReceiverCounters, image: &mut Installed, gated: u32) {
+fn tally_gate<T: StreamTerms>(
+    counters: &mut ReceiverCounters,
+    image: &mut Installed<T>,
+    gated: u32,
+) {
     tally_by(counters, |c| &mut c.seals_gated, u64::from(gated));
     let Some(gate) = image.gate.as_deref_mut() else {
         return;
@@ -1241,12 +1269,12 @@ impl Sent {
 
 /// The sender agent's network state.
 #[derive(Debug)]
-pub struct SenderRole {
+pub struct SenderRole<T: StreamTerms = HeapTerms> {
     sessions: SendSessions,
     from_receiver: RingReceiver<ControlItem>,
     /// Each publication's data path: readers, channel destination, lane
     /// queues (at most `publications`, allocated at creation).
-    publications: Vec<Box<Outbound>>,
+    publications: Vec<Box<Outbound<T>>>,
     /// Control routes, one slot per endpoint the agent can hold.
     routes: Vec<RouteSlot>,
     budget: u32,
@@ -1333,7 +1361,9 @@ impl MembershipTiming {
 }
 
 /// Both roles and the control ring between them, sized by `config`.
-pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), AgentError> {
+pub(super) fn roles<T: StreamTerms>(
+    config: &AgentConfig,
+) -> Result<(SenderRole<T>, ReceiverRole<T>), AgentError> {
     let capacity = std::num::NonZeroUsize::new(config.control_capacity).ok_or(
         AgentError::InvalidConfig("control_capacity must be at least 1"),
     )?;
@@ -1473,7 +1503,9 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
 /// Reserves an image's whole command chain (S1): `CreateImage`, the
 /// receiver's `RetireImage` and the conductor's units. `None`, with
 /// nothing held, when a ring has no credit.
-fn reserve_chain(sessions: &SessionEnd) -> Option<(Reservation, Reservation, ImageChain)> {
+fn reserve_chain<T: StreamTerms>(
+    sessions: &SessionEnd<T>,
+) -> Option<(Reservation, Reservation, ImageChain)> {
     let create = sessions.events.reserve()?;
     let reply = sessions.events.reserve()?;
     let retire = sessions.events.reserve()?;
@@ -1503,7 +1535,7 @@ fn answerable(source: SocketAddr) -> bool {
     source.port() != 0 && !ip.is_multicast() && !ip.is_unspecified() && !broadcast
 }
 
-impl ReceiverRole {
+impl<T: StreamTerms> ReceiverRole<T> {
     /// The configured identity of the key `(endpoint, stream_id)`
     /// (tests).
     #[cfg(test)]
@@ -1522,8 +1554,8 @@ impl ReceiverRole {
     /// the sender's are refused.
     pub(super) fn command<O: SocketOps>(
         &mut self,
-        command: AgentCommand<O>,
-    ) -> Option<(Reservation, AgentEvent<O>)> {
+        command: AgentCommand<O, T>,
+    ) -> Option<(Reservation, AgentEvent<O, T>)> {
         let max = self.max_entries;
         let configured = |accepted| AgentEvent::Configured {
             agent: AgentKind::Receiver,
@@ -1666,8 +1698,8 @@ impl ReceiverRole {
     /// whose start is the lane's next commit position when it arrives.
     fn trace_command<O: SocketOps>(
         &mut self,
-        command: AgentCommand<O>,
-    ) -> Option<(Reservation, AgentEvent<O>)> {
+        command: AgentCommand<O, T>,
+    ) -> Option<(Reservation, AgentEvent<O, T>)> {
         let agent = AgentKind::Receiver;
         match command {
             AgentCommand::SetNetworkTrace { reply, hook } => {
@@ -1762,7 +1794,7 @@ impl ReceiverRole {
     /// retirement closed; a full ring keeps the rest for the next cycle.
     pub(super) fn post_retired_journals<O: SocketOps>(
         &mut self,
-        mut post: impl FnMut(AgentEvent<O>) -> Option<AgentEvent<O>>,
+        mut post: impl FnMut(AgentEvent<O, T>) -> Option<AgentEvent<O, T>>,
     ) {
         self.trace.post_retired(|lane, facts| {
             let (publication, number) = (facts.publication, facts.number);
@@ -1824,7 +1856,7 @@ impl ReceiverRole {
     #[cfg(test)]
     pub(super) fn inject_control(
         &mut self,
-        sessions: &SessionEnd,
+        sessions: &SessionEnd<T>,
         endpoint: EndpointId,
         source: SocketAddr,
         control: Control,
@@ -1873,7 +1905,7 @@ impl ReceiverRole {
     #[cfg(test)]
     pub(super) fn inject_data(
         &mut self,
-        sessions: &SessionEnd,
+        sessions: &SessionEnd<T>,
         endpoint: EndpointId,
         source: SocketAddr,
         alias: Alias,
@@ -1900,7 +1932,7 @@ impl ReceiverRole {
     )]
     pub(super) fn inject_frame(
         &mut self,
-        sessions: &SessionEnd,
+        sessions: &SessionEnd<T>,
         endpoint: EndpointId,
         source: SocketAddr,
         slot: SlotRef,
@@ -2089,7 +2121,7 @@ impl ReceiverRole {
     #[cfg(test)]
     pub(super) fn inject_heartbeat(
         &mut self,
-        sessions: &SessionEnd,
+        sessions: &SessionEnd<T>,
         endpoint: EndpointId,
         source: SocketAddr,
         slot: SlotRef,
@@ -2143,7 +2175,7 @@ impl ReceiverRole {
     /// [`AgentError::CountOverflow`].
     pub(super) fn serve_sessions(
         &mut self,
-        sessions: &SessionEnd,
+        sessions: &SessionEnd<T>,
         now: u64,
     ) -> Result<u32, AgentError> {
         let mut served = 0u32;
@@ -2227,7 +2259,7 @@ impl ReceiverRole {
     fn install(
         &mut self,
         installed: SlotRef,
-        owner: Box<ReceiveOwner>,
+        owner: Box<ReceiveOwner<T>>,
         chain: Option<Chain>,
         now: u64,
     ) -> Result<Option<(Lane, karyos_sys::freshness::FreshnessLink)>, Option<Reservation>> {
@@ -2458,7 +2490,7 @@ impl ReceiverRole {
     /// # Errors
     ///
     /// [`AgentError::CountOverflow`].
-    fn image_timers(&mut self, sessions: &SessionEnd, now: u64) -> Result<u32, AgentError> {
+    fn image_timers(&mut self, sessions: &SessionEnd<T>, now: u64) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
         let mut work = 0u32;
         // The multicast NAK delays: restocked here, before this step's
@@ -2983,7 +3015,7 @@ impl ReceiverRole {
     /// Retires `image` at `now`, in one transition: the binding goes, the
     /// identity is quarantined, the receive owner is dropped, and
     /// `RetireImage` is posted into its reserved unit.
-    fn retire(&mut self, sessions: &SessionEnd, image: Installed, now: u64) {
+    fn retire(&mut self, sessions: &SessionEnd<T>, image: Installed<T>, now: u64) {
         let Installed {
             slot,
             owner,
@@ -3126,7 +3158,7 @@ impl ReceiverRole {
     pub(super) fn duty<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
-        sessions: &SessionEnd,
+        sessions: &SessionEnd<T>,
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
@@ -3265,15 +3297,15 @@ impl ReceiverRole {
 /// (RC-15): only peer NAKs, validated in order and handed to the images'
 /// suppression state. A group NAK never causes a send, a repair or a
 /// reply, and never reaches the sender (loop rule).
-struct GroupIntake<'a> {
+struct GroupIntake<'a, T: StreamTerms = HeapTerms> {
     endpoint: EndpointId,
     now: u64,
-    role: &'a mut ReceiverRole,
+    role: &'a mut ReceiverRole<T>,
     /// Datagrams read; one poll reads at most its budget's.
     work: u32,
 }
 
-impl GroupIntake<'_> {
+impl<T: StreamTerms> GroupIntake<'_, T> {
     /// Validation 1: a NAK, and nothing else.
     fn bytes(&mut self, bytes: &[u8]) {
         match classify(bytes) {
@@ -3333,7 +3365,7 @@ impl GroupIntake<'_> {
     }
 }
 
-impl RxHandler for GroupIntake<'_> {
+impl<T: StreamTerms> RxHandler for GroupIntake<'_, T> {
     fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
         let Some(work) = self.work.checked_add(1) else {
             return ControlFlow::Break(());
@@ -3350,16 +3382,16 @@ impl RxHandler for GroupIntake<'_> {
 }
 
 /// The receiver's handler of one endpoint's datagrams.
-struct Intake<'a> {
+struct Intake<'a, T: StreamTerms = HeapTerms> {
     endpoint: EndpointId,
     now: u64,
-    role: &'a mut ReceiverRole,
-    sessions: &'a SessionEnd,
+    role: &'a mut ReceiverRole<T>,
+    sessions: &'a SessionEnd<T>,
     /// Datagrams read; one poll reads at most its budget's.
     work: u32,
 }
 
-impl Intake<'_> {
+impl<T: StreamTerms> Intake<'_, T> {
     /// Hands `item` to the sender; a full ring drops it, counted per kind
     /// so that a flood of one kind does not hide another.
     fn forward(&mut self, item: ControlItem) -> bool {
@@ -3931,7 +3963,7 @@ impl Intake<'_> {
     }
 }
 
-impl RxHandler for Intake<'_> {
+impl<T: StreamTerms> RxHandler for Intake<'_, T> {
     fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
         // At most the poll budget's datagrams: no overflow.
         self.work += 1;
@@ -3952,7 +3984,7 @@ impl RxHandler for Intake<'_> {
     }
 }
 
-impl SenderRole {
+impl<T: StreamTerms> SenderRole<T> {
     /// The counters.
     #[must_use]
     pub fn counters(&self) -> SenderCounters {
@@ -3967,13 +3999,13 @@ impl SenderRole {
 
     /// The data path of its `index`-th publication (tests).
     #[cfg(test)]
-    pub(crate) fn outbound(&self, index: usize) -> Option<&Outbound> {
+    pub(crate) fn outbound(&self, index: usize) -> Option<&Outbound<T>> {
         self.publications.get(index).map(|outbound| &**outbound)
     }
 
     /// The data path of its `index`-th publication, mutable (tests).
     #[cfg(test)]
-    pub(crate) fn outbound_mut(&mut self, index: usize) -> Option<&mut Outbound> {
+    pub(crate) fn outbound_mut(&mut self, index: usize) -> Option<&mut Outbound<T>> {
         self.publications
             .get_mut(index)
             .map(|outbound| &mut **outbound)
@@ -3989,8 +4021,8 @@ impl SenderRole {
     /// answered `Unsupported`.
     pub(super) fn command<O: SocketOps>(
         &mut self,
-        command: AgentCommand<O>,
-    ) -> Option<(Reservation, AgentEvent<O>)> {
+        command: AgentCommand<O, T>,
+    ) -> Option<(Reservation, AgentEvent<O, T>)> {
         let (reply, publication, outbound, guard, roles) =
             match command {
                 AgentCommand::AddPublication {
@@ -4116,7 +4148,7 @@ impl SenderRole {
         endpoint: EndpointId,
         alias: Alias,
         registration: u64,
-    ) -> AgentEvent<O> {
+    ) -> AgentEvent<O, T> {
         let mut outbound = self
             .publications
             .iter()
@@ -4608,7 +4640,7 @@ impl SenderRole {
     /// paths consumed, per lane: a reliable channel's bound (SPEC §4). A
     /// receiver answered but not yet heard from bounds at its join points.
     /// `None` with no bound receiver at all: a reliable lane then holds.
-    fn consumption(&self, outbound: &Outbound) -> Option<[u64; 4]> {
+    fn consumption(&self, outbound: &Outbound<T>) -> Option<[u64; 4]> {
         let mut least: Option<[u64; 4]> = None;
         // A receiver bound on any of its paths bounds it: one whose founding
         // path was lost still holds it at its consumption (#336 review).
@@ -5150,10 +5182,10 @@ impl SenderRole {
 /// Adds the SETUP side of `publication` on each of `outbound`'s paths, all
 /// or nothing: a routed publication answers and announces on every path's
 /// endpoint, and takes one session per path of the table's capacity.
-fn add_sessions(
+fn add_sessions<T: StreamTerms>(
     sessions: &mut SendSessions,
     publication: &crate::sessions::send::Publication,
-    outbound: &Outbound,
+    outbound: &Outbound<T>,
 ) -> Result<(), SendSessionError> {
     let mut added = 0usize;
     for path in outbound.route_endpoints() {
@@ -5177,7 +5209,7 @@ fn add_sessions(
 
 /// Whether `outbound` is established on any of its paths: its first sends
 /// go on every path once one receiver's SM has arrived on one.
-fn established(sessions: &SendSessions, outbound: &Outbound) -> bool {
+fn established<T: StreamTerms>(sessions: &SendSessions, outbound: &Outbound<T>) -> bool {
     outbound
         .route_endpoints()
         .any(|path| sessions.is_established(path, outbound.alias()))

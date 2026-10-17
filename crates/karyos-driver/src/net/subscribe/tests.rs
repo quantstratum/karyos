@@ -1168,3 +1168,111 @@ fn an_image_lane_admits_as_many_optional_readers_as_its_spare_credits() {
     serve(&mut local);
     assert_eq!(grants(&local, client), 3, "local stream");
 }
+
+/// A driver clock the test moves.
+#[derive(Debug, Clone, Default)]
+struct ManualClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl crate::clock::MonotonicClock for ManualClock {
+    fn now(&mut self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Resolution 8 (network streams over shared terms): a remote client's
+/// liveness retirement (`serve_liveness`, then `stop_serving`) ends its
+/// image grants whose descriptor never left, with its registrations, at
+/// once. A grant already sent may still be mapped by a process that only
+/// stopped, so it stays charged and pins the retired image's storage
+/// until the client's exit proof (its close flag), which ends it; only
+/// then is the image reclaimed. The export ledger does not depend on the
+/// backing, so a heap driver stands for the IPC driver that grants images
+/// from step n3.
+#[test]
+fn a_liveness_retirement_ends_unsent_image_grants_and_the_exit_proof_the_rest() {
+    use karyos_protocol::cnc::{Command, MAX_COMMAND_LENGTH, StreamKey, SubscriberRole};
+    let clock = ManualClock::default();
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = EmbeddedDriver::with_clock(
+        DriverConfig {
+            network: Some(NetworkConfig {
+                threading: ThreadingMode::Shared,
+                ..NetworkConfig::default()
+            }),
+            heartbeat_interval: 10,
+            client_liveness_timeout: 100,
+            ..DriverConfig::default()
+        },
+        Box::new(clock.clone()),
+    )
+    .unwrap();
+    let address = free_address();
+    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    let registrations = b.registrations.len();
+    // A remote client, admitted with its export ledger.
+    let (mut producer, consumer) = karyos_sys::command_ring::command_ring(1024).unwrap();
+    let link = std::sync::Arc::new(karyos_client::link::ClientLink::new());
+    let client = b
+        .admit(
+            consumer,
+            std::sync::Arc::clone(&link),
+            Some(crate::ledger::Ledger::new(4, 4, 1 << 30)),
+        )
+        .unwrap();
+    for sequence in 1..=2 {
+        let command = Command::AddSubscription {
+            sequence,
+            stream: StreamKey {
+                stream_id: 10,
+                session_id: 3,
+            },
+            lane: Lane::ZERO,
+            role: SubscriberRole::Required,
+        };
+        let mut bytes = [0u8; MAX_COMMAND_LENGTH];
+        let length = command.encode(&mut bytes).unwrap();
+        producer.write(command.type_id(), &bytes[..length]).unwrap();
+    }
+    pump(&mut a, &mut b, |_, b| {
+        b.ledger(client)
+            .is_some_and(|ledger| ledger.grants().len() == 2)
+    });
+    let grants = b.ledger(client).unwrap().grants().to_vec();
+    let image_stream = grants[0].stream;
+    assert!(grants.iter().all(|grant| grant.stream == image_stream));
+    assert!(grants.iter().all(|grant| !grant.sent));
+    // The first grant's descriptor left; the second is still held.
+    b.ledger_mut(client).unwrap().mark_sent(grants[0].export);
+    // The client stops beating: its liveness timeout passes.
+    clock.0.store(100, std::sync::atomic::Ordering::Relaxed);
+    pump(&mut a, &mut b, |_, b| {
+        b.ledger(client)
+            .is_some_and(|ledger| ledger.grants().len() == 1)
+    });
+    let left = b.ledger(client).unwrap().grants().to_vec();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].export, grants[0].export, "the sent grant is kept");
+    assert_eq!(b.registrations.len(), registrations, "its registrations go");
+    // The image retires; the sent grant keeps its stream and storage.
+    assert!(b.remove_network_subscription(subscription).unwrap());
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_none());
+    for _ in 0..50 {
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+    }
+    assert!(b.streams.iter().any(|stream| stream.id == image_stream));
+    assert_eq!(b.net.as_ref().unwrap().image_count(), 1);
+    // The exit proof ends the sent grant: the stream frees and the image
+    // is reclaimed.
+    link.mark_closed();
+    pump(&mut a, &mut b, |_, b| {
+        b.net.as_ref().unwrap().image_count() == 0
+    });
+    assert!(b.ledger(client).is_none());
+    assert!(b.streams.iter().all(|stream| stream.id != image_stream));
+    let _ = (a.close_network(), b.close_network());
+}

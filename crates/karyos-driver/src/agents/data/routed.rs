@@ -429,7 +429,7 @@ impl LaneGate for RoutedGate<'_> {
     }
 }
 
-impl Outbound {
+impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// The data path of the publication `alias` over redundant paths:
     /// `routes` names each path's endpoint and destination, the founding
     /// path first. Otherwise as [`Outbound::new`].
@@ -442,7 +442,7 @@ impl Outbound {
     pub(crate) fn new_routed(
         routes: &[(EndpointId, SocketAddr)],
         alias: karyos_protocol::network::Alias,
-        readers: Vec<super::LaneReader>,
+        readers: Vec<super::LaneReader<T>>,
         quanta: &karyos_protocol::network::Lanes<u64>,
         mtu: u32,
         reliable: bool,

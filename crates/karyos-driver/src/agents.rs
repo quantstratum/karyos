@@ -58,6 +58,9 @@ use karyos_io::sockets::endpoint::{SocketsRx, SocketsTx};
 use karyos_io::sockets::ops::SocketOps;
 use ring::{PostError, Reservation, RingReceiver, RingSender};
 
+use crate::embedded::StreamTerms;
+use karyos_sys::term_bytes::HeapTerms;
+
 /// Which network agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentKind {
@@ -409,7 +412,7 @@ impl<O: SocketOps> Half<O> {
 
 /// A conductor command. Each carries the reservation of its reply.
 #[derive(Debug)]
-pub enum AgentCommand<O: SocketOps> {
+pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// Answer with [`AgentEvent::Pong`] carrying `token`.
     Ping {
         /// The reply's slot.
@@ -502,7 +505,7 @@ pub enum AgentCommand<O: SocketOps> {
         publication: crate::sessions::send::Publication,
         /// Its data path: one reader per lane, the channel destination and
         /// the lane quanta, built by the conductor ([`data::Outbound::new`]).
-        outbound: Box<data::Outbound>,
+        outbound: Box<data::Outbound<T>>,
         /// A guarded publication's guard ([`data::Outbound::guard`]);
         /// `None` for an unguarded one.
         guard: Option<data::GuardSpec>,
@@ -602,7 +605,7 @@ pub enum AgentCommand<O: SocketOps> {
 
 /// An agent's event to the conductor.
 #[derive(Debug)]
-pub enum AgentEvent<O: SocketOps> {
+pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// The reply to a ping.
     Pong {
         /// The agent.
@@ -660,7 +663,7 @@ pub enum AgentEvent<O: SocketOps> {
         /// The registration the command named.
         registration: u64,
         /// The data path, dropped by the conductor.
-        outbound: Option<Box<data::Outbound>>,
+        outbound: Option<Box<data::Outbound<T>>>,
     },
     /// The agent refused the publication (the wrong agent, a full table or
     /// a duplicate alias).
@@ -748,13 +751,16 @@ pub enum AgentEvent<O: SocketOps> {
     },
 }
 
+/// A role's answer to a command: the reply's slot and its event, if any.
+type RoleReply<O, T> = Option<(Reservation, AgentEvent<O, T>)>;
+
 /// What an agent has from the conductor: its rings, its stop flag and its
 /// state.
 #[derive(Debug)]
-struct AgentCore<O: SocketOps> {
+struct AgentCore<O: SocketOps, T: StreamTerms = HeapTerms> {
     kind: AgentKind,
-    commands: RingReceiver<AgentCommand<O>>,
-    events: RingSender<AgentEvent<O>>,
+    commands: RingReceiver<AgentCommand<O, T>>,
+    events: RingSender<AgentEvent<O, T>>,
     budget: u32,
     stop: Arc<AtomicBool>,
     stopped: bool,
@@ -768,12 +774,12 @@ struct AgentCore<O: SocketOps> {
     calls: Option<Arc<std::sync::Mutex<Vec<AgentKind>>>>,
 }
 
-impl<O: SocketOps> AgentCore<O> {
+impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
     /// One duty cycle: the stop flag first, then up to the budget's
     /// commands; returns how many were served.
     fn serve_commands(
         &mut self,
-        role: &mut dyn FnMut(AgentCommand<O>) -> Option<(Reservation, AgentEvent<O>)>,
+        role: &mut dyn FnMut(AgentCommand<O, T>) -> RoleReply<O, T>,
     ) -> Result<u32, AgentError> {
         #[cfg(test)]
         if let Some(calls) = &self.calls
@@ -897,7 +903,7 @@ impl<O: SocketOps> AgentCore<O> {
     /// Posts a reply into its reserved slot. Returns `true` when the
     /// conductor is gone: the agent stops (a half in the lost reply is
     /// dropped, which closes its descriptor).
-    fn reply(&mut self, reply: Reservation, event: AgentEvent<O>) -> Result<bool, AgentError> {
+    fn reply(&mut self, reply: Reservation, event: AgentEvent<O, T>) -> Result<bool, AgentError> {
         match self.events.post(reply, event) {
             Ok(()) => Ok(false),
             Err(PostError::Gone(_)) => {
@@ -932,21 +938,21 @@ impl<O: SocketOps> AgentCore<O> {
 /// The sender agent (`driver-network-agents.md` §3.1). This phase serves
 /// conductor commands only.
 #[derive(Debug)]
-pub struct SenderAgent<O: SocketOps> {
-    core: AgentCore<O>,
-    role: roles::SenderRole,
+pub struct SenderAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
+    core: AgentCore<O, T>,
+    role: roles::SenderRole<T>,
 }
 
 /// The receiver agent (`driver-network-agents.md` §3.2). This phase
 /// serves conductor commands only.
 #[derive(Debug)]
-pub struct ReceiverAgent<O: SocketOps> {
-    core: AgentCore<O>,
-    role: roles::ReceiverRole,
-    sessions: chain::SessionEnd,
+pub struct ReceiverAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
+    core: AgentCore<O, T>,
+    role: roles::ReceiverRole<T>,
+    sessions: chain::SessionEnd<T>,
 }
 
-impl<O: SocketOps> ReceiverAgent<O> {
+impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
     /// Whether `alias` is published on `endpoint` (tests).
     #[cfg(test)]
     pub(crate) fn is_published(
@@ -969,7 +975,7 @@ impl<O: SocketOps> ReceiverAgent<O> {
     }
 }
 
-impl<O: SocketOps> SenderAgent<O> {
+impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     /// The receivers bound to `alias` on `endpoint` whose SMs arrived
     /// (tests).
     #[cfg(test)]
@@ -1048,7 +1054,7 @@ impl<O: SocketOps> SenderAgent<O> {
     }
 }
 
-impl<O: SocketOps> ReceiverAgent<O> {
+impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
     /// Drops the DATA datagrams numbered `nth` (from 0) from now on at the
     /// intake, as a lossy path would (tests).
     #[cfg(test)]
@@ -1143,14 +1149,14 @@ impl<O: SocketOps> ReceiverAgent<O> {
 /// the Shared network mode's thread. The receiver runs first, so control
 /// it posts leaves in the same iteration.
 #[derive(Debug)]
-pub struct NetworkAgents<O: SocketOps> {
+pub struct NetworkAgents<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// The sender agent.
-    pub sender: SenderAgent<O>,
+    pub sender: SenderAgent<O, T>,
     /// The receiver agent.
-    pub receiver: ReceiverAgent<O>,
+    pub receiver: ReceiverAgent<O, T>,
 }
 
-impl<O: SocketOps> NetworkAgents<O> {
+impl<O: SocketOps, T: StreamTerms> NetworkAgents<O, T> {
     /// One iteration: the receiver's duty cycle, then the sender's.
     ///
     /// # Errors
@@ -1180,15 +1186,15 @@ impl<O: SocketOps> NetworkAgents<O> {
 
 /// The conductor's end of one agent's rings and its stop flag.
 #[derive(Debug)]
-pub struct AgentLink<O: SocketOps> {
+pub struct AgentLink<O: SocketOps, T: StreamTerms = HeapTerms> {
     kind: AgentKind,
-    commands: RingSender<AgentCommand<O>>,
-    events: RingSender<AgentEvent<O>>,
-    received: RingReceiver<AgentEvent<O>>,
+    commands: RingSender<AgentCommand<O, T>>,
+    events: RingSender<AgentEvent<O, T>>,
+    received: RingReceiver<AgentEvent<O, T>>,
     stop: Arc<AtomicBool>,
 }
 
-impl<O: SocketOps> AgentLink<O> {
+impl<O: SocketOps, T: StreamTerms> AgentLink<O, T> {
     /// Reserves a command slot and its reply slot, so that commands to
     /// several agents can be committed together or not at all.
     ///
@@ -1212,7 +1218,7 @@ impl<O: SocketOps> AgentLink<O> {
     pub fn commit(
         &self,
         prepared: Prepared,
-        make: impl FnOnce(Reservation) -> AgentCommand<O>,
+        make: impl FnOnce(Reservation) -> AgentCommand<O, T>,
     ) -> Result<(), AgentError> {
         self.commands
             .post(prepared.slot, make(prepared.reply))
@@ -1232,7 +1238,7 @@ impl<O: SocketOps> AgentLink<O> {
     /// [`AgentError::Invariant`] for a broken ring invariant.
     pub fn post(
         &self,
-        make: impl FnOnce(Reservation) -> AgentCommand<O>,
+        make: impl FnOnce(Reservation) -> AgentCommand<O, T>,
     ) -> Result<(), AgentError> {
         let prepared = self.prepare()?;
         self.commit(prepared, make)
@@ -1255,7 +1261,7 @@ impl<O: SocketOps> AgentLink<O> {
 
     /// Takes the agent's oldest event.
     #[must_use]
-    pub fn take_event(&self) -> Option<AgentEvent<O>> {
+    pub fn take_event(&self) -> Option<AgentEvent<O, T>> {
         self.received.try_take().ok().flatten()
     }
 
@@ -1275,13 +1281,13 @@ pub struct Prepared {
 
 /// The conductor's links to both agents.
 #[derive(Debug)]
-pub struct AgentLinks<O: SocketOps> {
+pub struct AgentLinks<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// The sender agent's link.
-    pub sender: AgentLink<O>,
+    pub sender: AgentLink<O, T>,
     /// The receiver agent's link.
-    pub receiver: AgentLink<O>,
+    pub receiver: AgentLink<O, T>,
     /// The session rings to the receiver ([`chain`]).
-    pub sessions: chain::SessionLink,
+    pub sessions: chain::SessionLink<T>,
 }
 
 /// Creates both agents and the conductor's links to them. Every ring is
@@ -1293,6 +1299,21 @@ pub struct AgentLinks<O: SocketOps> {
 pub fn network_agents<O: SocketOps>(
     config: AgentConfig,
 ) -> Result<(NetworkAgents<O>, AgentLinks<O>), AgentError> {
+    network_agents_over::<O, HeapTerms>(config)
+}
+
+/// As [`network_agents`], for streams over the term backing `T`.
+///
+/// # Errors
+///
+/// As [`network_agents`].
+#[expect(
+    clippy::type_complexity,
+    reason = "the agents and their links, as network_agents returns them"
+)]
+pub fn network_agents_over<O: SocketOps, T: StreamTerms>(
+    config: AgentConfig,
+) -> Result<(NetworkAgents<O, T>, AgentLinks<O, T>), AgentError> {
     let (command_capacity, event_capacity, session_command_capacity) = config.validate()?;
     let make = |kind| {
         let (commands, command_receiver) = ring::ring(command_capacity);
@@ -1350,12 +1371,12 @@ const FAILED: u8 = 2;
 
 /// What a runner thread drives.
 #[derive(Debug)]
-enum Work<O: SocketOps> {
+enum Work<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// Every variant is boxed: the agents are large, and the runner builds
     /// this once, at start.
-    Sender(Box<SenderAgent<O>>),
-    Receiver(Box<ReceiverAgent<O>>),
-    Both(Box<NetworkAgents<O>>),
+    Sender(Box<SenderAgent<O, T>>),
+    Receiver(Box<ReceiverAgent<O, T>>),
+    Both(Box<NetworkAgents<O, T>>),
 }
 
 /// Runs one agent's duty cycle, turning a panic into
@@ -1367,7 +1388,7 @@ pub(crate) fn guarded(
     catch_unwind(AssertUnwindSafe(cycle)).unwrap_or(Err(AgentError::Panicked(kind)))
 }
 
-impl<O: SocketOps> Work<O> {
+impl<O: SocketOps, T: StreamTerms> Work<O, T> {
     fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         match self {
             Work::Sender(agent) => guarded(AgentKind::Sender, || agent.do_work(now)),
@@ -1394,48 +1415,48 @@ impl<O: SocketOps> Work<O> {
 
 /// A runner thread's result: its agents and the failure that stopped it,
 /// if any. `None` when the thread was never given work.
-type ThreadResult<O> = Option<(Work<O>, Option<AgentError>)>;
+type ThreadResult<O, T> = Option<(Work<O, T>, Option<AgentError>)>;
 
 /// One runner thread: the agents it drives and its state cell.
 #[derive(Debug)]
-struct AgentThread<O: SocketOps> {
+struct AgentThread<O: SocketOps, T: StreamTerms = HeapTerms> {
     kinds: Vec<AgentKind>,
     state: Arc<AtomicU8>,
-    handle: JoinHandle<ThreadResult<O>>,
+    handle: JoinHandle<ThreadResult<O, T>>,
 }
 
 /// The threads of the Dedicated and Shared network modes (DN-2).
 #[derive(Debug)]
-pub struct AgentRunner<O: SocketOps> {
-    threads: Vec<AgentThread<O>>,
+pub struct AgentRunner<O: SocketOps, T: StreamTerms = HeapTerms> {
+    threads: Vec<AgentThread<O, T>>,
     stops: [Arc<AtomicBool>; 2],
     stop_timeout: Duration,
 }
 
 /// Why [`AgentRunner::start`] failed. The agents come back, unstarted.
 #[derive(Debug)]
-pub struct StartError<O: SocketOps> {
+pub struct StartError<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// What failed.
     pub error: AgentError,
     /// The agents, as they were given ([`Stopped::into_agents`]).
-    pub agents: Stopped<O>,
+    pub agents: Stopped<O, T>,
 }
 
 /// What [`AgentRunner::stop`] got back.
 #[derive(Debug)]
-pub struct Stopped<O: SocketOps> {
+pub struct Stopped<O: SocketOps, T: StreamTerms = HeapTerms> {
     /// The sender agent, unless its thread is late or lost it.
-    pub sender: Option<SenderAgent<O>>,
+    pub sender: Option<SenderAgent<O, T>>,
     /// The receiver agent, unless its thread is late or lost it.
-    pub receiver: Option<ReceiverAgent<O>>,
+    pub receiver: Option<ReceiverAgent<O, T>>,
     /// The failures that stopped threads (DN-9).
     pub failures: Vec<AgentError>,
     /// Threads still running after the timeout, for the conductor to wait
     /// on or abandon.
-    pub late: Vec<LateAgent<O>>,
+    pub late: Vec<LateAgent<O, T>>,
 }
 
-impl<O: SocketOps> Default for Stopped<O> {
+impl<O: SocketOps, T: StreamTerms> Default for Stopped<O, T> {
     fn default() -> Self {
         Self {
             sender: None,
@@ -1446,17 +1467,17 @@ impl<O: SocketOps> Default for Stopped<O> {
     }
 }
 
-impl<O: SocketOps> Stopped<O> {
+impl<O: SocketOps, T: StreamTerms> Stopped<O, T> {
     /// Both agents, when both came back.
     #[must_use]
-    pub fn into_agents(self) -> Option<NetworkAgents<O>> {
+    pub fn into_agents(self) -> Option<NetworkAgents<O, T>> {
         Some(NetworkAgents {
             sender: self.sender?,
             receiver: self.receiver?,
         })
     }
 
-    fn take(&mut self, work: Work<O>) {
+    fn take(&mut self, work: Work<O, T>) {
         match work {
             Work::Sender(agent) => self.sender = Some(*agent),
             Work::Receiver(agent) => self.receiver = Some(*agent),
@@ -1467,7 +1488,7 @@ impl<O: SocketOps> Stopped<O> {
         }
     }
 
-    fn absorb(&mut self, thread: AgentThread<O>) {
+    fn absorb(&mut self, thread: AgentThread<O, T>) {
         let kind = thread.kinds.first().copied().unwrap_or(AgentKind::Receiver);
         match thread.handle.join() {
             Ok(Some((work, failure))) => {
@@ -1483,11 +1504,11 @@ impl<O: SocketOps> Stopped<O> {
 
 /// A runner thread that did not stop within the timeout.
 #[derive(Debug)]
-pub struct LateAgent<O: SocketOps> {
-    thread: AgentThread<O>,
+pub struct LateAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
+    thread: AgentThread<O, T>,
 }
 
-impl<O: SocketOps> LateAgent<O> {
+impl<O: SocketOps, T: StreamTerms> LateAgent<O, T> {
     /// The agents it drives.
     #[must_use]
     pub fn kinds(&self) -> &[AgentKind] {
@@ -1502,14 +1523,14 @@ impl<O: SocketOps> LateAgent<O> {
 
     /// Waits for it to stop and takes its agents back.
     #[must_use]
-    pub fn join(self) -> Stopped<O> {
+    pub fn join(self) -> Stopped<O, T> {
         let mut stopped = Stopped::default();
         stopped.absorb(self.thread);
         stopped
     }
 }
 
-impl<O: SocketOps + Send + 'static> AgentRunner<O> {
+impl<O: SocketOps + Send + 'static, T: StreamTerms + 'static> AgentRunner<O, T> {
     /// Starts the agents' threads in `mode`, each with an idle strategy
     /// from `idle`. Every thread is started before any agent is handed
     /// over, so a failed start leaves nothing running and returns the
@@ -1526,10 +1547,10 @@ impl<O: SocketOps + Send + 'static> AgentRunner<O> {
     )]
     pub fn start<I: IdleStrategy + 'static>(
         mode: ThreadingMode,
-        agents: NetworkAgents<O>,
+        agents: NetworkAgents<O, T>,
         config: AgentConfig,
         idle: impl Fn() -> I,
-    ) -> Result<Self, StartError<O>> {
+    ) -> Result<Self, StartError<O, T>> {
         let stops = [
             Arc::clone(&agents.sender.core.stop),
             Arc::clone(&agents.receiver.core.stop),
@@ -1567,7 +1588,7 @@ impl<O: SocketOps + Send + 'static> AgentRunner<O> {
             let state = Arc::new(AtomicU8::new(RUNNING));
             let thread_state = Arc::clone(&state);
             let strategy = idle();
-            let (handoff, waiting) = mpsc::channel::<Work<O>>();
+            let (handoff, waiting) = mpsc::channel::<Work<O, T>>();
             let name = match kinds.as_slice() {
                 [AgentKind::Sender] => "karyos-sender",
                 [AgentKind::Receiver] => "karyos-receiver",
@@ -1634,7 +1655,7 @@ impl<O: SocketOps + Send + 'static> AgentRunner<O> {
     /// [`Stopped::late`]; a `stop_timeout` too large for the clock waits
     /// without a deadline.
     #[must_use]
-    pub fn stop(self) -> Stopped<O> {
+    pub fn stop(self) -> Stopped<O, T> {
         for stop in &self.stops {
             stop.store(true, Ordering::Release);
         }
@@ -1661,11 +1682,11 @@ impl<O: SocketOps + Send + 'static> AgentRunner<O> {
 
 /// A runner thread's loop: duty cycles until the agents stop or fail; the
 /// agents come back with the failure, if any.
-fn run<O: SocketOps, I: IdleStrategy>(
-    mut work: Work<O>,
+fn run<O: SocketOps, T: StreamTerms, I: IdleStrategy>(
+    mut work: Work<O, T>,
     mut idle: I,
     state: &AtomicU8,
-) -> (Work<O>, Option<AgentError>) {
+) -> (Work<O, T>, Option<AgentError>) {
     loop {
         let now = karyos_sys::host_clock::host_monotonic_ns();
         match work.do_work(now) {

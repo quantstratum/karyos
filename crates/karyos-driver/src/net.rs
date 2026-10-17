@@ -60,11 +60,13 @@ use crate::agents::endpoints::Endpoints;
 use crate::agents::images::{ImageEvent, ImageTable, ImageTemplate};
 use crate::agents::{
     AgentConfig, AgentError, AgentKind, AgentLinks, AgentRunner, LateAgent, NetworkAgents,
-    ThreadingMode, YieldThenSleep, guarded, network_agents,
+    ThreadingMode, YieldThenSleep, guarded, network_agents_over,
 };
+use crate::embedded::StreamTerms;
 use crate::error::DriverError;
 use crate::sessions::receive::SlotRef;
 use karyos_sys::log_buffer::{Conductor, LogBuffer};
+use karyos_sys::term_bytes::HeapTerms;
 use std::sync::Arc;
 
 /// The network configuration of a driver (wiring note W-a).
@@ -141,11 +143,11 @@ impl Default for NetworkStreamDefaults {
 
 /// Where the agents are.
 #[derive(Debug)]
-enum Agents {
+enum Agents<T: StreamTerms> {
     /// On the conductor's thread.
-    Shared(Box<NetworkAgents<OsSocket>>),
+    Shared(Box<NetworkAgents<OsSocket, T>>),
     /// On their own threads.
-    Threads(AgentRunner<OsSocket>),
+    Threads(AgentRunner<OsSocket, T>),
     /// Stopped and reclaimed.
     Closed,
 }
@@ -363,7 +365,7 @@ impl NetworkSubscription {
 
 /// An installed image and the aggregate that exposes it, if any.
 #[derive(Debug)]
-struct NetImage {
+struct NetImage<T: StreamTerms> {
     slot: SlotRef,
     /// The endpoint it arrived on, which its subscription names.
     endpoint: EndpointId,
@@ -375,16 +377,16 @@ struct NetImage {
     /// An unexposed image's lane conductors, driven here so its terms are
     /// still prepared and it keeps being fed (ACS 15937); dropped when it
     /// retires.
-    conductors: Vec<Conductor<Arc<LogBuffer>>>,
+    conductors: Vec<Conductor<Arc<LogBuffer<T>>>>,
 }
 
 /// The conductor's network state.
 #[derive(Debug)]
-pub(crate) struct Network {
-    links: AgentLinks<OsSocket>,
+pub(crate) struct Network<T: StreamTerms = HeapTerms> {
+    links: AgentLinks<OsSocket, T>,
     endpoints: Endpoints<OsSocket>,
-    images: ImageTable,
-    agents: Agents,
+    images: ImageTable<T>,
+    agents: Agents<T>,
     /// The first agent that failed (DN-9), latched.
     failed: Option<AgentKind>,
     publications: Vec<NetPublication>,
@@ -402,7 +404,7 @@ pub(crate) struct Network {
     /// between the two tables, never expected.
     subscription_refusals: u64,
     /// Installed images, at most `max_images`.
-    net_images: Vec<NetImage>,
+    net_images: Vec<NetImage<T>>,
     /// The image table's events of the last cycle, for the conductor.
     image_events: Vec<ImageEvent>,
     /// The agents' network trace answers of the last cycle, and the
@@ -455,7 +457,7 @@ pub(crate) struct Network {
     defer_view_attach: bool,
 }
 
-impl Network {
+impl<T: StreamTerms> Network<T> {
     /// The agents of `config`, started in its threading mode (control
     /// path, at driver start).
     ///
@@ -463,10 +465,13 @@ impl Network {
     ///
     /// [`DriverError::InvalidConfig`] for an agent configuration the agents
     /// refuse; [`DriverError::NetworkStart`] when a thread cannot start.
-    pub(crate) fn start(config: &NetworkConfig) -> Result<Self, DriverError> {
+    pub(crate) fn start(config: &NetworkConfig) -> Result<Self, DriverError>
+    where
+        T: 'static,
+    {
         control_group::validate(&config.nak_control_groups)?;
-        let (agents, links) =
-            network_agents::<OsSocket>(config.agents).map_err(|_| DriverError::InvalidConfig)?;
+        let (agents, links) = network_agents_over::<OsSocket, T>(config.agents)
+            .map_err(|_| DriverError::InvalidConfig)?;
         let agents = match config.threading {
             ThreadingMode::Shared => Agents::Shared(Box::new(agents)),
             mode => Agents::Threads(
@@ -934,7 +939,7 @@ impl Network {
     }
 
     /// The lane buffers of the installed image `slot`.
-    pub(crate) fn image_lanes(&self, slot: SlotRef) -> Option<Vec<Arc<LogBuffer>>> {
+    pub(crate) fn image_lanes(&self, slot: SlotRef) -> Option<Vec<Arc<LogBuffer<T>>>> {
         self.images.installed(slot).map(<[_]>::to_vec)
     }
 
@@ -959,7 +964,7 @@ impl Network {
         endpoint: EndpointId,
         traced: karyos_protocol::trace_hook::PublicationIdentity,
         exposed: Option<crate::embedded::AggregateHandle>,
-        lanes: &[Arc<LogBuffer>],
+        lanes: &[Arc<LogBuffer<T>>],
     ) {
         let mut conductors = Vec::new();
         if exposed.is_none() {
@@ -968,7 +973,7 @@ impl Network {
             }
             conductors = lanes
                 .iter()
-                .filter_map(LogBuffer::conductor_owned)
+                .filter_map(LogBuffer::<T>::conductor_owned)
                 .collect();
         }
         self.net_images.push(NetImage {
@@ -1213,7 +1218,7 @@ impl Network {
         &mut self,
         registration: u64,
         publication: Publication,
-        outbound: Box<Outbound>,
+        outbound: Box<Outbound<T>>,
         guard: Option<(
             crate::agents::data::GuardSpec,
             crate::guard_ack::GuardSenderId,
@@ -1376,7 +1381,11 @@ impl Network {
             .find(|entry| entry.registration == registration)
             .map(|entry| entry.state)
     }
+}
 
+/// The cycles that serve the image table, whose lanes are built on the
+/// heap until step n2 (network streams over shared terms).
+impl Network<HeapTerms> {
     /// One conductor cycle of network work at the network clock's reading:
     /// the agents when they share this thread, then their events. Returns
     /// the work done.
@@ -1590,7 +1599,9 @@ impl Network {
         self.release_guard_senders();
         shutdown
     }
+}
 
+impl<T: StreamTerms> Network<T> {
     /// Moves the guard sender of every tracked publication to the released
     /// list (agents stopped or failed): the conductor deregisters them.
     fn release_guard_senders(&mut self) {
@@ -1760,13 +1771,13 @@ impl Network {
 
     /// The links, for tests that talk to the agents directly.
     #[cfg(test)]
-    pub(crate) fn links(&self) -> &AgentLinks<OsSocket> {
+    pub(crate) fn links(&self) -> &AgentLinks<OsSocket, T> {
         &self.links
     }
 
     /// The endpoint table, for tests.
     #[cfg(test)]
-    pub(crate) fn endpoints_mut(&mut self) -> (&mut Endpoints<OsSocket>, &AgentLinks<OsSocket>) {
+    pub(crate) fn endpoints_mut(&mut self) -> (&mut Endpoints<OsSocket>, &AgentLinks<OsSocket, T>) {
         (&mut self.endpoints, &self.links)
     }
 }
@@ -1784,8 +1795,8 @@ fn release(table: &mut [SendEndpoint], endpoint: EndpointId) {
 /// is not posted yet, after its sender journals' closes, queueing its
 /// alias as stale, then `RemovePublishedAlias` for every stale alias; a
 /// full ring leaves the rest for the next cycle.
-fn post_removals(
-    links: &AgentLinks<OsSocket>,
+fn post_removals<T: StreamTerms>(
+    links: &AgentLinks<OsSocket, T>,
     publications: &mut [NetPublication],
     stale: &mut Stale<'_>,
 ) {
@@ -1867,12 +1878,12 @@ impl NetPublication {
 }
 
 /// Applies the sender's answer about a publication.
-fn publication_answer(
+fn publication_answer<T: StreamTerms>(
     publications: &mut Vec<NetPublication>,
     send_endpoints: &mut [SendEndpoint],
     stale: &mut Stale<'_>,
     released: &mut ReleasedGuards,
-    event: AgentEvent<OsSocket>,
+    event: AgentEvent<OsSocket, T>,
 ) {
     // Each tracked publication releases its guard sender once, and the
     // list holds one per tracked publication: it never grows past it.
@@ -1952,13 +1963,13 @@ trait Stop {
     fn cycle(&mut self, now: u64) -> Result<u32, AgentError>;
 }
 
-impl Stop for crate::agents::SenderAgent<OsSocket> {
+impl<T: StreamTerms> Stop for crate::agents::SenderAgent<OsSocket, T> {
     fn cycle(&mut self, now: u64) -> Result<u32, AgentError> {
         self.do_work(now)
     }
 }
 
-impl Stop for crate::agents::ReceiverAgent<OsSocket> {
+impl<T: StreamTerms> Stop for crate::agents::ReceiverAgent<OsSocket, T> {
     fn cycle(&mut self, now: u64) -> Result<u32, AgentError> {
         self.do_work(now)
     }
