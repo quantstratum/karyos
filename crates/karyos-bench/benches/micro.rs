@@ -1,14 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Focused microbenchmarks for the keyed table and trace sampling hook.
+//! Focused microbenchmarks for the keyed table, the trace sampling hook and
+//! the term byte copies of each backing.
 
 use std::hint::black_box;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_main};
 use karyos_protocol::trace_hook::{PublicationIdentity, PublishContext, TraceHook};
 use karyos_sys::conflation::{Budget, conflation};
 use karyos_sys::frame::Lane;
+use karyos_sys::log_buffer::{
+    AppendOptions, AppendOutcome, DEFAULT_CLAIM_DEADLINE, DEFAULT_CORRUPT_RETRIES, LogBuffer,
+    LogBufferConfig, NakRead, PublicationMode, ReadOrigin, ReadOutcome, Role, SenderRead,
+};
+use karyos_sys::sizing::{DEFAULT_MTU, TermLength};
+use karyos_sys::term::TermId;
+use karyos_sys::term_bytes::TermBytes;
 use karyos_trace::{
     BufferedIds, MonotonicClock, ObserverId, OsRandom, Sampling, TraceAgent, trace_journal,
 };
@@ -84,6 +92,164 @@ fn trace_decisions(c: &mut Criterion) {
     trace_sampling(c, "trace hook decision all", Sampling::All);
 }
 
+/// Payload sizes of the term copies: up to one full frame at the default
+/// MTU (`quantstratum-docs: karyos/design/network-shared-terms.md`, N-5).
+const TERM_COPY_SIZES: [usize; 4] = [32, 256, 1024, 1376];
+
+/// An exclusive lane of 64 KiB terms.
+fn term_lane() -> LogBufferConfig {
+    let term_length = TermLength::try_new(64 * 1024).unwrap_or_else(|_| std::process::abort());
+    LogBufferConfig {
+        term_length,
+        spare_slots: 6,
+        max_subscribers: 2,
+        mtu: DEFAULT_MTU,
+        max_reserved: term_length.get() / 8,
+        initial_term_id: TermId::new(7),
+        lane: Lane::ZERO,
+        session_id: 1,
+        stream_id: 1,
+        claim_deadline: DEFAULT_CLAIM_DEADLINE,
+        publication: PublicationMode::Exclusive,
+        schedule_capacity: 0,
+    }
+}
+
+/// `TermBytes::write_bytes` is sealed in karyos-sys, so the nearest public
+/// path is timed: an exclusive append of one message, which writes its
+/// payload with `write_bytes` after the header. Appends are timed in runs
+/// until the publication waits; then, untimed, a sender read consumes
+/// them and the conductor's duty prepares the next term. Reported only.
+fn term_write<T: TermBytes>(c: &mut Criterion, backing: &str, make: fn() -> LogBuffer<T>) {
+    let mut group = c.benchmark_group(format!("term write (exclusive append), {backing}"));
+    for size in TERM_COPY_SIZES {
+        let payload = vec![0x5a; size];
+        group.throughput(Throughput::Bytes(u64::try_from(size).unwrap_or(u64::MAX)));
+        group.bench_function(BenchmarkId::from_parameter(size), |b| {
+            b.iter_custom(|iterations| {
+                let buffer = make();
+                let mut conductor = buffer.conductor().unwrap_or_else(|| std::process::abort());
+                let mut reader = conductor
+                    .subscribe_as(Role::Required, true, 1)
+                    .ok()
+                    .and_then(|subscription| {
+                        SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES).ok()
+                    })
+                    .unwrap_or_else(|| std::process::abort());
+                let mut publication = buffer
+                    .publication()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| std::process::abort());
+                let mut out = vec![0u8; usize::try_from(DEFAULT_MTU).unwrap_or(usize::MAX)];
+                let mut elapsed = Duration::ZERO;
+                let mut done = 0u64;
+                let mut idle = 0u32;
+                while done < iterations {
+                    let before = done;
+                    let started = Instant::now();
+                    while done < iterations {
+                        match publication.append(black_box(&payload), AppendOptions::default()) {
+                            Ok(AppendOutcome::Appended { position }) => {
+                                black_box(position);
+                                done += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    elapsed += started.elapsed();
+                    // The publication waits: the reader consumes what was
+                    // appended and the conductor prepares the next term.
+                    while let Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. }) =
+                        reader.read_committed(reader.position(), ReadOrigin::Cursor, &mut out)
+                    {
+                    }
+                    if let Some(boundary) = reader.boundary_at_or_below(reader.position())
+                        && reader.sent(boundary).is_err()
+                    {
+                        std::process::abort();
+                    }
+                    // Sticky abort on a publication that makes no progress.
+                    idle = if done > before { 0 } else { idle + 1 };
+                    if idle > 1_000 || conductor.duty_cycle().is_err() {
+                        std::process::abort();
+                    }
+                }
+                elapsed
+            });
+        });
+    }
+    group.finish();
+}
+
+/// `TermBytes::read_bytes` is sealed in karyos-sys, so the nearest public
+/// path is timed: a sender's NAK read of one already sent frame into a
+/// datagram buffer, which validates the frame and copies it with
+/// `read_bytes`. It moves nothing, so every iteration reads the same frame.
+/// Reported only.
+fn term_read<T: TermBytes>(c: &mut Criterion, backing: &str, make: fn() -> LogBuffer<T>) {
+    let mut group = c.benchmark_group(format!("term read (sender NAK read), {backing}"));
+    for size in TERM_COPY_SIZES {
+        let buffer = make();
+        let mut conductor = buffer.conductor().unwrap_or_else(|| std::process::abort());
+        let mut reader = conductor
+            .subscribe_as(Role::Required, true, 1)
+            .ok()
+            .and_then(|subscription| SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES).ok())
+            .unwrap_or_else(|| std::process::abort());
+        let mut publication = buffer
+            .publication()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| std::process::abort());
+        let mut out = vec![0u8; usize::try_from(DEFAULT_MTU).unwrap_or(usize::MAX)];
+        if !matches!(
+            publication.append(&vec![0x5a; size], AppendOptions::default()),
+            Ok(AppendOutcome::Appended { position: 0 })
+        ) {
+            std::process::abort();
+        }
+        let Ok(ReadOutcome::Copied { next, .. }) =
+            reader.read_committed(0, ReadOrigin::Cursor, &mut out)
+        else {
+            std::process::abort();
+        };
+        if reader.sent(next).is_err() {
+            std::process::abort();
+        }
+        let nak = NakRead {
+            bound: next,
+            loads: 64 * 1024 / 32 + 1,
+        };
+        group.throughput(Throughput::Bytes(u64::try_from(size).unwrap_or(u64::MAX)));
+        group.bench_function(BenchmarkId::from_parameter(size), |b| {
+            b.iter(|| {
+                let (result, loads) = reader.read_nak(black_box(0), nak, &mut out);
+                if !matches!(result, Ok(ReadOutcome::Copied { .. })) {
+                    std::process::abort();
+                }
+                black_box(loads);
+            });
+        });
+    }
+    group.finish();
+}
+
+fn heap_lane() -> LogBuffer {
+    LogBuffer::new(term_lane()).unwrap_or_else(|_| std::process::abort())
+}
+
+fn shared_lane() -> LogBuffer<karyos_sys::term_bytes::SharedTerms> {
+    LogBuffer::new_shared(term_lane()).unwrap_or_else(|_| std::process::abort())
+}
+
+fn term_copies(c: &mut Criterion) {
+    term_write(c, "heap", heap_lane);
+    term_write(c, "shared", shared_lane);
+    term_read(c, "heap", heap_lane);
+    term_read(c, "shared", shared_lane);
+}
+
 // criterion 0.7's `criterion_group!` generates an undocumented public
 // function, which the workspace `missing_docs` lint would reject.
 #[allow(
@@ -91,8 +257,8 @@ fn trace_decisions(c: &mut Criterion) {
     reason = "criterion_group! generates an undocumented pub fn"
 )]
 mod group {
-    use super::{conflation_write_poll, trace_decisions};
-    criterion::criterion_group!(benches, conflation_write_poll, trace_decisions);
+    use super::{conflation_write_poll, term_copies, trace_decisions};
+    criterion::criterion_group!(benches, conflation_write_poll, trace_decisions, term_copies);
 }
 use group::benches;
 criterion_main!(benches);

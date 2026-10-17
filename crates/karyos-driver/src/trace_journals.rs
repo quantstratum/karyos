@@ -532,6 +532,23 @@ impl TraceJournals {
         count_refusal(self.mirror.refuse_network_journal(), counters);
     }
 
+    /// Whether a table entry still names a network journal of
+    /// `publication`: until then its refused count may still be needed by
+    /// a report (§5).
+    #[must_use]
+    pub(crate) fn names_network(
+        &self,
+        publication: &karyos_protocol::trace_hook::PublicationIdentity,
+    ) -> bool {
+        self.slots.iter().flatten().any(|held| {
+            held.entry
+                .network
+                .is_some_and(|facts| facts.sender_driver == publication.driver)
+                && (held.entry.stream, held.entry.incarnation)
+                    == (publication.registration, publication.incarnation)
+        })
+    }
+
     /// Updates the facts of network journal `journal` with `update` and
     /// rewrites its entry; `false` (nothing changed) for a journal that is
     /// not a network journal in the table.

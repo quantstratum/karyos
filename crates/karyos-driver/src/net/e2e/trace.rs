@@ -15,7 +15,7 @@ use karyos_protocol::trace_hook::{
 use karyos_sys::counters::CellRead;
 use karyos_sys::trace_mirror::{EntryRead, JournalEntry, JournalState};
 
-use super::{connected, driver, fast_driver, pump};
+use super::{aggregate, channel, connected, driver, driver_with, fast_driver, free_address, pump};
 use crate::EmbeddedDriver;
 use crate::agents::ThreadingMode;
 use karyos_client::OfferOutcome;
@@ -309,4 +309,54 @@ fn a_closed_receiver_journal_returns_its_gaps() {
     assert_eq!(gaps.intervals().len(), 1, "{gaps:?}");
     assert_eq!(Some(gaps.intervals()[0].0), first_gap);
     assert!(!gaps.overflowed());
+}
+
+/// #332 review P2-1: a removal whose sender journal closes find the ring
+/// full keeps them pending; a second removal adds to them, never drops
+/// them, so every lane's journal closes with its boundary.
+#[test]
+fn a_repeated_removal_keeps_the_pending_closes() {
+    let agents = crate::agents::AgentConfig {
+        command_capacity: 2,
+        ..crate::agents::AgentConfig::default()
+    };
+    let (mut a, mut b) = (
+        driver_with(ThreadingMode::Shared, agents),
+        driver(ThreadingMode::Shared),
+    );
+    let sender = hook(&mut a, NetSide::Sender);
+    // The hook's command leaves the small ring first.
+    for _ in 0..4 {
+        let _ = a.do_work().unwrap();
+    }
+    let address = free_address();
+    let _subscription = b
+        .add_network_subscription(10, &channel(address, false))
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 2), &channel(address, false))
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let opened = sender.opened();
+        opened.len() == 2
+            && opened
+                .iter()
+                .all(|number| start(drivers[0], *number).is_some())
+    });
+    let journals = sender.opened();
+    // One slot of the sender's ring is taken: the first close posts, the
+    // second waits.
+    a.net.as_ref().unwrap().links().sender.ping(1).unwrap();
+    a.remove_aggregate(&publication).unwrap();
+    a.remove_aggregate(&publication).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        journals.iter().all(|number| {
+            entry(drivers[0], *number).is_some_and(|entry| entry.state == JournalState::Closed)
+        })
+    });
+    for number in journals {
+        let facts = entry(&a, number).unwrap().network.unwrap();
+        assert!(facts.boundary.is_some(), "journal {number}: {facts:?}");
+    }
+    assert_eq!(counter(&a, "network trace journals unhooked"), 0);
 }

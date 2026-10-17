@@ -1553,8 +1553,11 @@ mod owned {
             }
         }
 
-        #[cfg(test)]
-        pub(super) fn seed_version(&self, key: u32, version: u64) {
+        /// Seeds `key`'s version word, so that a test can exhaust it
+        /// (tests; dependent crates' tests through `test-hooks`).
+        #[cfg(any(test, feature = "test-hooks"))]
+        #[doc(hidden)]
+        pub fn seed_version(&self, key: u32, version: u64) {
             use crate::sync::Ordering;
             if let Some(slot) = self.table.slot(key)
                 && let Some(word) = slot.word(super::FRESH_VERSION)
@@ -1866,6 +1869,14 @@ mod owned {
             if !self.closed_seen && closed {
                 self.closed_seen = true;
                 self.scan_remaining = self.keys;
+            }
+            // A terminal published before the close it precedes (an image's
+            // retirement) is seen with the close: this read is ordered after
+            // the close was observed, so a closed report carries it. One
+            // published after the close (exhausted versions) reaches a later
+            // poll's report.
+            if closed && self.observe_barrier() {
+                return self.report(report);
             }
             if budget.keys == 0 {
                 return self.report(report);
