@@ -886,3 +886,79 @@ fn a_data_heartbeat_does_not_refresh_its_path() {
     assert_eq!(after.data_unbound, before.data_unbound + 2);
     assert!(rig.agents.receiver.role.has_image(slot));
 }
+
+/// §6.3 end to end: the receiver retires an idle image while the sender
+/// stays established, so no announcement comes. DATA for the unbound key
+/// sends one SOLICIT; while the identity is quarantined its answer binds
+/// nothing and the key is held off; once the quarantine passes, the next
+/// SOLICIT's answer installs a new image and DATA is committed in it.
+#[test]
+fn unbound_data_solicits_a_new_image() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup::default());
+    let first = established(&mut rig);
+    rig.now += 11_000 * MS;
+    rig.until(true, |rig| {
+        rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Retiring { .. }))
+    });
+    assert!(!rig.agents.receiver.role.has_image(first));
+    let announces = rig.agents.sender.role.session_counters();
+    // DATA during the quarantine: one SOLICIT, a quarantined answer.
+    let message = vec![3u8; 500];
+    let append = |rig: &mut Rig| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&message, AppendOptions::default())
+            .unwrap();
+    };
+    for _ in 0..5 {
+        append(&mut rig);
+        rig.round(true);
+    }
+    rig.until(true, |rig| {
+        rig.agents.receiver.role.session_counters().solicits >= 1
+    });
+    for _ in 0..50 {
+        append(&mut rig);
+        rig.round(true);
+    }
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert_eq!(sessions.solicits, 1, "{sessions:?}");
+    assert_eq!(sessions.installed, 1);
+    // Past the quarantine and the holdoff: the next SOLICIT installs.
+    rig.now += 11_000 * MS;
+    let mut installed = false;
+    for _ in 0..4000 {
+        append(&mut rig);
+        rig.round(true);
+        if rig.agents.receiver.role.session_counters().installed == 2 {
+            installed = true;
+            break;
+        }
+    }
+    assert!(
+        installed,
+        "{:?}",
+        rig.agents.receiver.role.session_counters()
+    );
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert_eq!((sessions.solicits, sessions.solicits_answered), (2, 1));
+    // No announcement was needed.
+    assert_eq!(
+        rig.agents.sender.role.session_counters().announces,
+        announces.announces
+    );
+    // DATA reaches the new image: its frames are committed. (Frames sent
+    // between the answer and the installation were unbound and dropped:
+    // the hole they leave waits for repair, phase 6, so delivery to a
+    // subscriber is not asserted here.)
+    let committed = rig.agents.receiver.counters().data_committed;
+    for _ in 0..200 {
+        append(&mut rig);
+        rig.round(true);
+    }
+    assert!(rig.agents.receiver.counters().data_committed > committed);
+}

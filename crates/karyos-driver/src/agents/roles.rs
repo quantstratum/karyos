@@ -72,7 +72,7 @@ use crate::sessions::OsNonces;
 use crate::sessions::rate::{EndpointRates, RateRefused, TotalRate, normalized};
 use crate::sessions::receive::{
     AnnounceOutcome, AnswerOutcome, BindingKey, ReadyOutcome as ImageOutcome, ReceiveSessions,
-    SessionConfigError, SlotRef,
+    SessionConfigError, SlotRef, SolicitOutcome,
 };
 use crate::sessions::send::{SendSessionError, SendSessions};
 use karyos_sys::log_buffer::ReceiveOwner;
@@ -1100,6 +1100,7 @@ impl Intake<'_> {
         });
         let Some(image) = found.and_then(|index| role.images.get_mut(index)) else {
             role.count(|c| &mut c.data_unbound);
+            self.solicit(key);
             return;
         };
         let Ok(datagram) = ValidatedDatagram::parse(bytes, &image.params) else {
@@ -1224,6 +1225,31 @@ impl Intake<'_> {
         });
     }
 
+    /// DATA for `key`, which has no active binding, on a subscribed stream
+    /// (network-control-schemas.md §6.3): one SOLICIT per entry to the
+    /// validated unicast source, under the RSP_SETUP limits. A source that
+    /// could not be answered creates no entry.
+    fn solicit(&mut self, key: BindingKey) {
+        let subscribed = self
+            .role
+            .subscriptions
+            .iter()
+            .any(|(held, stream, _)| (*held, *stream) == (key.endpoint, key.alias.stream_id));
+        if !subscribed {
+            return;
+        }
+        if !answerable(key.source) {
+            self.role.count(|c| &mut c.unanswerable_source);
+            return;
+        }
+        let role = &mut *self.role;
+        if let SolicitOutcome::Solicit(solicit) =
+            role.sessions.solicit(key, self.now, &mut role.nonces)
+        {
+            self.challenge(key.source, Control::Solicit(solicit));
+        }
+    }
+
     fn control(&mut self, source: SocketAddr, control: Control) {
         let endpoint = self.endpoint;
         let now = self.now;
@@ -1262,6 +1288,25 @@ impl Intake<'_> {
                 }
             }
             Control::SetupAnswer(answer) => {
+                // A solicited answer brings its own term parameters: the
+                // subscription's term length bound applies here too (an
+                // answer to a challenge restates the announced ones).
+                let Some(max_term_length) = self
+                    .role
+                    .subscriptions
+                    .iter()
+                    .find(|(held, stream, _)| {
+                        (*held, *stream) == (endpoint, answer.alias.stream_id)
+                    })
+                    .map(|(.., max)| *max)
+                else {
+                    self.role.count(|c| &mut c.unsubscribed);
+                    return;
+                };
+                if answer.term.term_length > max_term_length {
+                    self.role.count(|c| &mut c.term_too_large);
+                    return;
+                }
                 let key = BindingKey {
                     endpoint,
                     source,
