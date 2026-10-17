@@ -636,12 +636,59 @@ fn bad_headers_are_typed_errors() {
         })
     ));
     assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), before);
-    // A missing (zeroed) header before the last segment is never a
-    // segment being created.
+    // A zeroed header on the last segment with data behind it: the header
+    // was durable before the data, so it is corruption, and no cut hides
+    // it (the previous segment ends at its base).
+    let disk = FaultDisk::default();
+    written(&disk);
+    overwrite_header(&disk, 256, &[0u8; 48]);
+    let mut raw = disk.clone();
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 256,
+            problem: HeaderProblem::Corrupt
+        })
+    ));
+    assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), before);
+    // The last index gone while its data file holds data.
+    let disk = FaultDisk::default();
+    written(&disk);
+    let mut raw = disk.clone();
+    raw.remove(&Path::new(DIR).join(index_name(RECORDING, 256)))
+        .unwrap();
+    let kept = raw.list(Path::new(DIR)).unwrap().len();
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 256,
+            problem: HeaderProblem::Incomplete
+        })
+    ));
+    assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), kept);
+    // A missing (zeroed) header before the last segment, with data behind
+    // it: corruption.
     let disk = FaultDisk::default();
     written(&disk);
     overwrite_header(&disk, 128, &[0u8; 48]);
     let mut raw = disk.clone();
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 128,
+            problem: HeaderProblem::Corrupt
+        })
+    ));
+    assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), before);
+    // A missing header before the last segment with nothing behind it is
+    // still never a segment being created.
+    let disk = FaultDisk::default();
+    written(&disk);
+    let mut raw = disk.clone();
+    for name in [data_name(RECORDING, 128), index_name(RECORDING, 128)] {
+        let file = raw.open(&Path::new(DIR).join(name)).unwrap();
+        raw.truncate(&file, 0).unwrap();
+    }
     assert!(matches!(
         recover(&disk),
         Err(SegmentError::BadHeader {
@@ -748,6 +795,31 @@ fn the_interval_policy_syncs_a_roll_at_its_tick() {
     assert_eq!(store.finished.len(), 1);
     assert_eq!(store.tick(100).unwrap(), 200);
     assert!(store.finished.is_empty());
+}
+
+/// #339 review P3: a store under the interval policy that is never ticked
+/// keeps at most `MAX_FINISHED` finished segments open; the roll past
+/// them syncs them inline.
+#[test]
+fn the_interval_policy_bounds_the_finished_segments() {
+    let mut store = SegmentStore::create(
+        FaultDisk::default(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::Every { interval_ns: 100 },
+        0,
+    )
+    .unwrap();
+    let length = u64::try_from(MAX_FINISHED).unwrap() * 128;
+    store
+        .append(0, &stream(usize::try_from(length).unwrap() + 1))
+        .unwrap();
+    assert_eq!(store.finished.len(), MAX_FINISHED);
+    assert_eq!(store.durable(), 0, "no sync up to the cap");
+    store.append(length + 1, &stream(128)).unwrap();
+    assert!(store.finished.len() <= MAX_FINISHED);
+    assert!(store.durable() > length, "the roll past the cap synced");
 }
 
 /// #339 review P3: an explicit sync restarts the interval at the next
