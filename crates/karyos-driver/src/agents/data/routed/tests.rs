@@ -65,7 +65,9 @@ fn path(id: u32, blocked: usize) -> ((EndpointId, Half<ScriptedSocket>), Scripte
     }));
     let mut local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
     local.max_routes = NonZeroU16::new(2).unwrap();
-    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    // Each path its own instance, so tickets never collide across routes.
+    let instance = InstanceId::new(std::num::NonZeroU32::new(id).unwrap());
+    let endpoint = SocketsEndpoint::open(&local, instance, socket).unwrap();
     let (tx, _rx) = endpoint.split().unwrap();
     ((EndpointId(id), Half::Tx(Box::new(tx))), observer, seen)
 }
@@ -213,4 +215,52 @@ fn a_missing_path_does_not_stop_the_other() {
     let sender = outbound.routed_sender().unwrap();
     assert_eq!(sender.counters(1).unwrap().skipped, 2);
     assert_eq!(outbound.readers()[0].sent_position(), 2 * FRAME);
+}
+
+/// #321 review P1: with path B absent and path A blocked, no frame is read
+/// that no path can take. Once A unblocks, every message goes out on it, in
+/// order: none is lost.
+#[test]
+fn no_frame_is_lost_while_no_path_can_take_it() {
+    let (a, observer_a, seen_a) = path(1, 8);
+    let mut halves = vec![a];
+    let (mut outbound, _log) = routed(20);
+    // Every send would block: A's queue fills, B has no half.
+    for _ in 0..8 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    assert_eq!(observer_a.send_calls(), 8);
+    sent(&observer_a, 64);
+    for _ in 0..40 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    let seen = seen_a.lock().unwrap().clone();
+    assert_eq!(seen.len(), 20);
+    for (i, bytes) in seen.iter().enumerate() {
+        assert_eq!(usize::from(bytes[32]), i);
+    }
+    assert_eq!(outbound.counters().queue_failures, 0);
+}
+
+/// #321 review P3 (M7): copies leave out of order across routes within one
+/// call: route A submits two positions, then route B catches up the first.
+/// The sent frontier is the highest, and no copy reads as mismatched.
+#[test]
+fn copies_leaving_out_of_order_across_routes_keep_the_frontier() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 1);
+    sent(&observer_a, 16);
+    sent(&observer_b, 16);
+    let mut halves = vec![a, b];
+    let (mut outbound, _log) = routed(2);
+    // One call: B blocks in serve, A sends both, B catches up the first.
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    assert_eq!(seen_b.lock().unwrap().len(), 1);
+    assert_eq!(outbound.sent_high(0), Some(2 * FRAME));
+    for _ in 0..4 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    assert_eq!(seen_b.lock().unwrap().len(), 2);
+    assert_eq!(outbound.sent_high(0), Some(2 * FRAME));
+    assert_eq!(outbound.counters().mismatched, 0);
 }

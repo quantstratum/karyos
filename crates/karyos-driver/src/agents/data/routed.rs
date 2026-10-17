@@ -334,11 +334,8 @@ impl Outbound {
             return Ok(0);
         };
         let bound = usize::from(STAGED_PER_LANE);
-        let room = |sender: &RoutedLaneSender, routes: usize| {
-            (0..routes).any(|route| sender.pending(lane, route).is_some_and(|held| held < bound))
-        };
         let mut staged = 0u32;
-        while room(&routed.sender, routed.routes.len()) {
+        loop {
             let from = reader.position();
             let fits = match limit {
                 Limit::Edge(edge) => from.checked_add(*max_frame).is_some_and(|end| end <= edge),
@@ -352,9 +349,41 @@ impl Outbound {
                 }
                 break;
             }
+            // Claim first, on every eligible route: opened, with its TX half
+            // and room. A frame is read only once a route holds a claimed
+            // frame for it, so with no route to take it, it waits, as on one
+            // path; it is never read and lost (#321 review).
+            let mut frames: [Option<<SocketsTx<O> as TxBackend>::Frame<'_>>; MAX_ROUTES] =
+                std::array::from_fn(|_| None);
+            for (held, half) in halves.iter_mut() {
+                let Half::Tx(tx) = half else {
+                    continue;
+                };
+                let Some(route) = routed.routes.iter().position(|slot| slot.endpoint == *held)
+                else {
+                    continue;
+                };
+                let (Some(slot), Some(frame)) = (routed.routes.get(route), frames.get_mut(route))
+                else {
+                    continue;
+                };
+                let room = routed
+                    .sender
+                    .pending(lane, route)
+                    .is_some_and(|pending| pending < bound);
+                let (true, Some(_), Some(queue)) = (room, slot.opened, slot.queues.get(lane))
+                else {
+                    continue;
+                };
+                *frame = tx.claim_tx(*queue, *mtu).ok();
+            }
+            if frames.iter().all(Option::is_none) {
+                break;
+            }
             let Some(scratch) = routed.scratch.get_mut(..*mtu) else {
                 break;
             };
+            // Unused frames are dropped, which frees their slots.
             let (len, next, record) = match reader.read_committed(from, ReadOrigin::Cursor, scratch)
             {
                 Ok(ReadOutcome::Copied { len, next }) => (len, next, false),
@@ -375,22 +404,9 @@ impl Outbound {
                 break;
             };
             let mut copies = 0u32;
-            for (route, slot) in routed.routes.iter().enumerate() {
-                let has_room = routed
-                    .sender
-                    .pending(lane, route)
-                    .is_some_and(|held| held < bound);
-                let queue = slot.queues.get(lane).copied();
-                let tx = halves.iter_mut().find_map(|(held, half)| match half {
-                    Half::Tx(tx) if *held == slot.endpoint => Some(&mut **tx),
-                    _ => None,
-                });
-                let (true, Some(queue), Some(tx), Some(_)) = (has_room, queue, tx, slot.opened)
-                else {
-                    routed.sender.skipped(route);
-                    continue;
-                };
-                let Ok(mut frame) = tx.claim_tx(queue, len) else {
+            for (route, frame) in frames.iter_mut().enumerate().take(routed.routes.len()) {
+                // A route without a claimed frame skips this datagram (RP-8).
+                let Some(mut frame) = frame.take() else {
                     routed.sender.skipped(route);
                     continue;
                 };
@@ -429,8 +445,9 @@ impl Outbound {
                 copies = copies.checked_add(1).ok_or(overflow.clone())?;
             }
             if copies == 0 {
-                // Read and staged on no route: a gap the receivers close by
-                // repair or their gap policy, as a failed commit on one path.
+                // Claimed but committed on no route: a gap the receivers
+                // close by repair or their gap policy, as a failed commit on
+                // one path.
                 counters.bump(|c| &mut c.queue_failures, 1);
                 break;
             }
