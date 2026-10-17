@@ -11,6 +11,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The driver hands an Archive recording a lane's reader (phase 3,
+  A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
+  reserved required or an optional cell and returns a `RecordingReader`:
+  the reader and a lease on its stream, so a removed stream lives until
+  its seal is positioned and read. `karyos_archive::source::Guarded`
+  keeps the lease with the reader and drops the reader first. The host
+  wires the two (SPEC section 14); `karyos-sim` records driver streams end
+  to end.
 - A recording reads a lane's log through the network sender's read
   capability (phase 3, A4c-1). `SenderRead::for_recording` admits a
   reserved required cell (a `required` recording) or an optional one (an
