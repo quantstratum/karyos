@@ -47,6 +47,7 @@ use super::{
     AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, AgentLink, AgentLinks,
     EndpointId, Half, NetworkAgents,
 };
+use crate::embedded::StreamTerms;
 
 /// Why an endpoint operation failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -269,7 +270,10 @@ impl<O: SocketOps> std::fmt::Debug for Endpoints<O> {
 const MAX_DRAIN_CALLS: u32 = 4096;
 
 /// The link of `agent`.
-fn link_of<O: SocketOps>(links: &AgentLinks<O>, agent: AgentKind) -> &AgentLink<O> {
+fn link_of<O: SocketOps, T: StreamTerms>(
+    links: &AgentLinks<O, T>,
+    agent: AgentKind,
+) -> &AgentLink<O, T> {
     match agent {
         AgentKind::Sender => &links.sender,
         AgentKind::Receiver => &links.receiver,
@@ -338,9 +342,9 @@ impl<O: SocketOps> Endpoints<O> {
     /// [`EndpointError::Exhausted`]: nothing is left open or posted. An
     /// [`EndpointError::Agent`] after the sender's half was posted (the
     /// receiver gone) leaves a failing entry that brings that half back.
-    pub fn open(
+    pub fn open<T: StreamTerms>(
         &mut self,
-        links: &AgentLinks<O>,
+        links: &AgentLinks<O, T>,
         config: SocketsConfig,
         ops: O,
     ) -> Result<EndpointId, EndpointError> {
@@ -425,9 +429,9 @@ impl<O: SocketOps> Endpoints<O> {
     ///
     /// [`EndpointError::Unknown`], [`EndpointError::Busy`] unless active,
     /// [`EndpointError::Agent`] when a ring has no room (nothing posted).
-    pub fn reset(
+    pub fn reset<T: StreamTerms>(
         &mut self,
-        links: &AgentLinks<O>,
+        links: &AgentLinks<O, T>,
         endpoint: EndpointId,
     ) -> Result<(), EndpointError> {
         self.detach(links, endpoint, Purpose::Reset)
@@ -439,17 +443,17 @@ impl<O: SocketOps> Endpoints<O> {
     /// # Errors
     ///
     /// As [`Endpoints::reset`].
-    pub fn retire(
+    pub fn retire<T: StreamTerms>(
         &mut self,
-        links: &AgentLinks<O>,
+        links: &AgentLinks<O, T>,
         endpoint: EndpointId,
     ) -> Result<(), EndpointError> {
         self.detach(links, endpoint, Purpose::Retire)
     }
 
-    fn detach(
+    fn detach<T: StreamTerms>(
         &mut self,
-        links: &AgentLinks<O>,
+        links: &AgentLinks<O, T>,
         endpoint: EndpointId,
         purpose: Purpose,
     ) -> Result<(), EndpointError> {
@@ -491,12 +495,12 @@ impl<O: SocketOps> Endpoints<O> {
     /// at `now` (driver clock, ns), and advances every entry, reporting
     /// endpoint events to `on_event` (failures are counted); other agent
     /// events go to `other`.
-    pub fn poll(
+    pub fn poll<T: StreamTerms>(
         &mut self,
-        links: &AgentLinks<O>,
+        links: &AgentLinks<O, T>,
         now: u64,
         mut on_event: impl FnMut(EndpointEvent),
-        mut other: impl FnMut(AgentEvent<O>),
+        mut other: impl FnMut(AgentEvent<O, T>),
     ) {
         for link in [&links.sender, &links.receiver] {
             while let Some(event) = link.take_event() {
@@ -542,7 +546,12 @@ impl<O: SocketOps> Endpoints<O> {
     /// [`RESET_BACKOFF_MAX`]); a reset after a clean interval starts over
     /// at [`RESET_BACKOFF_MIN`]. The sender asks again while the need
     /// holds, so a deferred or refused request is not lost.
-    fn requested(&mut self, links: &AgentLinks<O>, endpoint: EndpointId, now: u64) {
+    fn requested<T: StreamTerms>(
+        &mut self,
+        links: &AgentLinks<O, T>,
+        endpoint: EndpointId,
+        now: u64,
+    ) {
         self.counters.bump(|c| &mut c.reset_requests);
         let Some(entry) = self
             .entries
@@ -587,7 +596,7 @@ impl<O: SocketOps> Endpoints<O> {
 
     /// Applies one agent answer; returns events that are not about an
     /// endpoint of this table.
-    fn answer(&mut self, event: AgentEvent<O>) -> Option<AgentEvent<O>> {
+    fn answer<T: StreamTerms>(&mut self, event: AgentEvent<O, T>) -> Option<AgentEvent<O, T>> {
         let (endpoint, agent) = match &event {
             AgentEvent::Attached { agent, endpoint }
             | AgentEvent::Refused {
@@ -696,9 +705,9 @@ impl<O: SocketOps> Endpoints<O> {
     /// Advances one entry whose answers are in: reports an attachment,
     /// finishes a hand back, attaches a split endpoint or settles a
     /// failure.
-    fn advance(
+    fn advance<T: StreamTerms>(
         &mut self,
-        links: &AgentLinks<O>,
+        links: &AgentLinks<O, T>,
         index: usize,
         on_event: &mut impl FnMut(EndpointEvent),
     ) {
@@ -859,9 +868,9 @@ impl<O: SocketOps> Endpoints<O> {
     }
 
     /// Attaches the halves of a reset endpoint once both rings have room.
-    fn attach_split(
+    fn attach_split<T: StreamTerms>(
         &mut self,
-        links: &AgentLinks<O>,
+        links: &AgentLinks<O, T>,
         index: usize,
         on_event: &mut impl FnMut(EndpointEvent),
     ) {
@@ -981,9 +990,9 @@ impl<O: SocketOps> Endpoints<O> {
     /// halves it finds and drops the others, so every descriptor closes.
     /// Returned items are reported to `on_event`; returns how many endpoints
     /// retired cleanly.
-    pub fn reclaim(
+    pub fn reclaim<T: StreamTerms>(
         &mut self,
-        links: &AgentLinks<O>,
+        links: &AgentLinks<O, T>,
         agents: &mut NetworkAgents<O>,
         mut on_event: impl FnMut(EndpointEvent),
     ) -> usize {

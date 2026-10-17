@@ -1246,10 +1246,13 @@ fn a_requester_is_what_a_nak_is_checked_against() {
     );
 }
 
-/// Sender join over redundant paths (redundant-paths.md section 8): a
-/// later path's ANSWER, with a higher join, binds that path to the same
-/// member and leaves its join unchanged; its SMs on the later path are
-/// accepted below that join, and retention follows them.
+/// Sender join over redundant paths (redundant-paths.md section 8), at the
+/// membership: `expect` for a later path's binding, with a higher join,
+/// binds that path to the same member and leaves its join unchanged; its
+/// SMs on the later path are accepted below that join, and retention
+/// follows them. The sender role does not call `expect` yet (a member joins
+/// by its first SM, on any path, which binds that path); this pins the
+/// rule for when an ANSWER does.
 #[test]
 fn a_later_paths_answer_keeps_the_members_join() {
     let mut table = table(

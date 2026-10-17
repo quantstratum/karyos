@@ -60,11 +60,13 @@ use crate::agents::endpoints::Endpoints;
 use crate::agents::images::{ImageEvent, ImageTable, ImageTemplate};
 use crate::agents::{
     AgentConfig, AgentError, AgentKind, AgentLinks, AgentRunner, LateAgent, NetworkAgents,
-    ThreadingMode, YieldThenSleep, guarded, network_agents,
+    ThreadingMode, YieldThenSleep, guarded, network_agents_over,
 };
+use crate::embedded::StreamTerms;
 use crate::error::DriverError;
 use crate::sessions::receive::SlotRef;
 use karyos_sys::log_buffer::{Conductor, LogBuffer};
+use karyos_sys::term_bytes::HeapTerms;
 use std::sync::Arc;
 
 /// The network configuration of a driver (wiring note W-a).
@@ -74,7 +76,11 @@ pub struct NetworkConfig {
     pub agents: AgentConfig,
     /// Where the agents run (SPEC.md §3).
     pub threading: ThreadingMode,
-    /// The image log buffers.
+    /// The image log buffers. Its `spare_slots` (default 5) bound the
+    /// optional and observer readers of each image lane: the receive
+    /// owner holds three of the lane's credits, so the default admits one
+    /// such reader, and another is refused with `ResourcesUnavailable`
+    /// ([`ImageTemplate::spare_slots`]).
     pub images: ImageTemplate,
     /// The log of a network publication a client creates by channel URI
     /// (W5b): the URI's `term-length`, `mtu` and `lanes` override these.
@@ -137,11 +143,11 @@ impl Default for NetworkStreamDefaults {
 
 /// Where the agents are.
 #[derive(Debug)]
-enum Agents {
+enum Agents<T: StreamTerms> {
     /// On the conductor's thread.
-    Shared(Box<NetworkAgents<OsSocket>>),
+    Shared(Box<NetworkAgents<OsSocket, T>>),
     /// On their own threads.
-    Threads(AgentRunner<OsSocket>),
+    Threads(AgentRunner<OsSocket, T>),
     /// Stopped and reclaimed.
     Closed,
 }
@@ -183,6 +189,9 @@ struct NetPublication {
     /// The aggregate's registration.
     registration: u64,
     endpoint: EndpointId,
+    /// The endpoints of its later paths (redundant-paths.md): each holds a
+    /// send endpoint and the receiver's published alias, as `endpoint` does.
+    later: [Option<EndpointId>; LATER_PATHS],
     alias: Alias,
     state: NetworkPublicationState,
     /// Whether `RemovePublication` is posted; retried while the ring is
@@ -356,7 +365,7 @@ impl NetworkSubscription {
 
 /// An installed image and the aggregate that exposes it, if any.
 #[derive(Debug)]
-struct NetImage {
+struct NetImage<T: StreamTerms> {
     slot: SlotRef,
     /// The endpoint it arrived on, which its subscription names.
     endpoint: EndpointId,
@@ -368,16 +377,16 @@ struct NetImage {
     /// An unexposed image's lane conductors, driven here so its terms are
     /// still prepared and it keeps being fed (ACS 15937); dropped when it
     /// retires.
-    conductors: Vec<Conductor<Arc<LogBuffer>>>,
+    conductors: Vec<Conductor<Arc<LogBuffer<T>>>>,
 }
 
 /// The conductor's network state.
 #[derive(Debug)]
-pub(crate) struct Network {
-    links: AgentLinks<OsSocket>,
+pub(crate) struct Network<T: StreamTerms = HeapTerms> {
+    links: AgentLinks<OsSocket, T>,
     endpoints: Endpoints<OsSocket>,
-    images: ImageTable,
-    agents: Agents,
+    images: ImageTable<T>,
+    agents: Agents<T>,
     /// The first agent that failed (DN-9), latched.
     failed: Option<AgentKind>,
     publications: Vec<NetPublication>,
@@ -395,7 +404,7 @@ pub(crate) struct Network {
     /// between the two tables, never expected.
     subscription_refusals: u64,
     /// Installed images, at most `max_images`.
-    net_images: Vec<NetImage>,
+    net_images: Vec<NetImage<T>>,
     /// The image table's events of the last cycle, for the conductor.
     image_events: Vec<ImageEvent>,
     /// The agents' network trace answers of the last cycle, and the
@@ -448,7 +457,7 @@ pub(crate) struct Network {
     defer_view_attach: bool,
 }
 
-impl Network {
+impl<T: StreamTerms> Network<T> {
     /// The agents of `config`, started in its threading mode (control
     /// path, at driver start).
     ///
@@ -456,10 +465,13 @@ impl Network {
     ///
     /// [`DriverError::InvalidConfig`] for an agent configuration the agents
     /// refuse; [`DriverError::NetworkStart`] when a thread cannot start.
-    pub(crate) fn start(config: &NetworkConfig) -> Result<Self, DriverError> {
+    pub(crate) fn start(config: &NetworkConfig) -> Result<Self, DriverError>
+    where
+        T: 'static,
+    {
         control_group::validate(&config.nak_control_groups)?;
-        let (agents, links) =
-            network_agents::<OsSocket>(config.agents).map_err(|_| DriverError::InvalidConfig)?;
+        let (agents, links) = network_agents_over::<OsSocket, T>(config.agents)
+            .map_err(|_| DriverError::InvalidConfig)?;
         let agents = match config.threading {
             ThreadingMode::Shared => Agents::Shared(Box::new(agents)),
             mode => Agents::Threads(
@@ -927,7 +939,7 @@ impl Network {
     }
 
     /// The lane buffers of the installed image `slot`.
-    pub(crate) fn image_lanes(&self, slot: SlotRef) -> Option<Vec<Arc<LogBuffer>>> {
+    pub(crate) fn image_lanes(&self, slot: SlotRef) -> Option<Vec<Arc<LogBuffer<T>>>> {
         self.images.installed(slot).map(<[_]>::to_vec)
     }
 
@@ -952,7 +964,7 @@ impl Network {
         endpoint: EndpointId,
         traced: karyos_protocol::trace_hook::PublicationIdentity,
         exposed: Option<crate::embedded::AggregateHandle>,
-        lanes: &[Arc<LogBuffer>],
+        lanes: &[Arc<LogBuffer<T>>],
     ) {
         let mut conductors = Vec::new();
         if exposed.is_none() {
@@ -961,7 +973,7 @@ impl Network {
             }
             conductors = lanes
                 .iter()
-                .filter_map(LogBuffer::conductor_owned)
+                .filter_map(LogBuffer::<T>::conductor_owned)
                 .collect();
         }
         self.net_images.push(NetImage {
@@ -1206,7 +1218,7 @@ impl Network {
         &mut self,
         registration: u64,
         publication: Publication,
-        outbound: Box<Outbound>,
+        outbound: Box<Outbound<T>>,
         guard: Option<(
             crate::agents::data::GuardSpec,
             crate::guard_ack::GuardSenderId,
@@ -1215,6 +1227,14 @@ impl Network {
     ) -> Result<(), DriverError> {
         let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
         let (endpoint, alias) = (publication.endpoint, publication.alias);
+        // Its later paths: each endpoint publishes the alias, so the
+        // receiver hands that path's SMs and NAKs to the sender.
+        let mut later = [None; LATER_PATHS];
+        for (slot, path) in later.iter_mut().zip(outbound.route_endpoints().skip(1)) {
+            *slot = Some(path);
+        }
+        let paths = || core::iter::once(endpoint).chain(later.into_iter().flatten());
+        let mine = |key: &(EndpointId, Alias)| key.1 == alias && paths().any(|path| path == key.0);
         let (traced, lanes) = (
             trace::identity(&publication.identity, alias),
             publication.lane_count,
@@ -1222,47 +1242,64 @@ impl Network {
         // One tracked publication per key: the sender's answers then name
         // exactly one entry, and a key freed locally while its old
         // publication is still being removed waits for it (#279 P1).
-        if self
-            .publications
-            .iter()
-            .any(|entry| (entry.endpoint, entry.alias) == (endpoint, alias))
-        {
+        if self.publications.iter().any(|entry| {
+            entry.alias == alias && entry.paths().any(|held| paths().any(|path| path == held))
+        }) {
             return Err(DriverError::NetworkBusy);
         }
-        // A queued alias of this key is superseded by the add below, so it
-        // takes no room.
+        // Each path's alias takes room, held or stale. A queued alias of
+        // one of its keys is superseded by the add below, so it takes none.
+        let held = self.publications.iter().try_fold(0usize, |held, entry| {
+            held.checked_add(entry.paths().count())
+        });
         let stale_only = self
             .stale_aliases
             .iter()
             .filter(|key| {
-                **key != (endpoint, alias)
-                    && !self
-                        .publications
-                        .iter()
-                        .any(|entry| (entry.endpoint, entry.alias) == **key)
+                !mine(key)
+                    && !self.publications.iter().any(|entry| {
+                        entry.alias == key.1 && entry.paths().any(|path| path == key.0)
+                    })
             })
             .count();
-        if self
-            .publications
-            .len()
-            .checked_add(stale_only)
-            .is_none_or(|held| held >= self.capacity)
-        {
+        let total = held
+            .and_then(|held| held.checked_add(stale_only))
+            .and_then(|held| held.checked_add(paths().count()));
+        if total.is_none_or(|total| total > self.capacity) {
             return Err(DriverError::NetworkPublicationsFull);
         }
-        self.links
-            .receiver
-            .post(|reply| AgentCommand::AddPublishedAlias {
-                reply,
-                endpoint,
-                alias,
-            })
-            .map_err(|_| DriverError::NetworkBusy)?;
+        let mut published = 0usize;
+        for path in paths() {
+            let posted = self
+                .links
+                .receiver
+                .post(|reply| AgentCommand::AddPublishedAlias {
+                    reply,
+                    endpoint: path,
+                    alias,
+                });
+            if posted.is_err() {
+                // The paths already published are stale now; the capacity
+                // check above leaves room for them.
+                let mut stale = Stale {
+                    queue: &mut self.stale_aliases,
+                    overflows: &mut self.stale_overflows,
+                };
+                for path in paths().take(published) {
+                    stale.queue_alias(path, alias);
+                }
+                return Err(DriverError::NetworkBusy);
+            }
+            // At most four paths: no overflow.
+            if let Some(next) = published.checked_add(1) {
+                published = next;
+            }
+        }
         // A key reused before its stale alias was posted: the new
         // `AddPublishedAlias`, now in the ring, supersedes it, and a removal
         // posted later would drop the new publication's alias. One posted
         // earlier precedes the add in the ring.
-        self.stale_aliases.retain(|key| *key != (endpoint, alias));
+        self.stale_aliases.retain(|key| !mine(key));
         let posted = self
             .links
             .sender
@@ -1274,18 +1311,21 @@ impl Network {
                 roles,
             });
         if posted.is_err() {
-            // The receiver learned the alias: it is stale now. The capacity
-            // check above leaves room for it.
-            Stale {
+            // The receiver learned the aliases: they are stale now. The
+            // capacity check above leaves room for them.
+            let mut stale = Stale {
                 queue: &mut self.stale_aliases,
                 overflows: &mut self.stale_overflows,
+            };
+            for path in paths() {
+                stale.queue_alias(path, alias);
             }
-            .queue_alias(endpoint, alias);
             return Err(DriverError::NetworkBusy);
         }
         self.publications.push(NetPublication {
             registration,
             endpoint,
+            later,
             alias,
             state: NetworkPublicationState::Adding,
             remove_posted: false,
@@ -1341,7 +1381,11 @@ impl Network {
             .find(|entry| entry.registration == registration)
             .map(|entry| entry.state)
     }
+}
 
+/// The cycles that serve the image table, whose lanes are built on the
+/// heap until step n2 (network streams over shared terms).
+impl Network<HeapTerms> {
     /// One conductor cycle of network work at the network clock's reading:
     /// the agents when they share this thread, then their events. Returns
     /// the work done.
@@ -1555,7 +1599,9 @@ impl Network {
         self.release_guard_senders();
         shutdown
     }
+}
 
+impl<T: StreamTerms> Network<T> {
     /// Moves the guard sender of every tracked publication to the released
     /// list (agents stopped or failed): the conductor deregisters them.
     fn release_guard_senders(&mut self) {
@@ -1682,13 +1728,13 @@ impl Network {
 
     /// The links, for tests that talk to the agents directly.
     #[cfg(test)]
-    pub(crate) fn links(&self) -> &AgentLinks<OsSocket> {
+    pub(crate) fn links(&self) -> &AgentLinks<OsSocket, T> {
         &self.links
     }
 
     /// The endpoint table, for tests.
     #[cfg(test)]
-    pub(crate) fn endpoints_mut(&mut self) -> (&mut Endpoints<OsSocket>, &AgentLinks<OsSocket>) {
+    pub(crate) fn endpoints_mut(&mut self) -> (&mut Endpoints<OsSocket>, &AgentLinks<OsSocket, T>) {
         (&mut self.endpoints, &self.links)
     }
 }
@@ -1706,8 +1752,8 @@ fn release(table: &mut [SendEndpoint], endpoint: EndpointId) {
 /// is not posted yet, after its sender journals' closes, queueing its
 /// alias as stale, then `RemovePublishedAlias` for every stale alias; a
 /// full ring leaves the rest for the next cycle.
-fn post_removals(
-    links: &AgentLinks<OsSocket>,
+fn post_removals<T: StreamTerms>(
+    links: &AgentLinks<OsSocket, T>,
     publications: &mut [NetPublication],
     stale: &mut Stale<'_>,
 ) {
@@ -1741,7 +1787,9 @@ fn post_removals(
             break;
         }
         entry.remove_posted = true;
-        stale.queue_alias(endpoint, alias);
+        for path in entry.paths() {
+            stale.queue_alias(path, alias);
+        }
     }
     while let Some((endpoint, alias)) = stale.queue.last().copied() {
         let posted = links
@@ -1779,13 +1827,20 @@ impl Stale<'_> {
     }
 }
 
+impl NetPublication {
+    /// The endpoint of each of its paths, the founding one first.
+    fn paths(&self) -> impl Iterator<Item = EndpointId> + '_ {
+        core::iter::once(self.endpoint).chain(self.later.into_iter().flatten())
+    }
+}
+
 /// Applies the sender's answer about a publication.
-fn publication_answer(
+fn publication_answer<T: StreamTerms>(
     publications: &mut Vec<NetPublication>,
     send_endpoints: &mut [SendEndpoint],
     stale: &mut Stale<'_>,
     released: &mut ReleasedGuards,
-    event: AgentEvent<OsSocket>,
+    event: AgentEvent<OsSocket, T>,
 ) {
     // Each tracked publication releases its guard sender once, and the
     // list holds one per tracked publication: it never grows past it.
@@ -1821,12 +1876,15 @@ fn publication_answer(
             registration,
         } => {
             if let Some(index) = find(publications, endpoint, alias, registration) {
-                release(send_endpoints, endpoint);
                 if let Some(entry) = publications.get_mut(index) {
                     release_guard(entry);
+                    // Every path: its send endpoint, and the alias the
+                    // receiver learned before the refusal.
+                    for path in entry.paths() {
+                        release(send_endpoints, path);
+                        stale.queue_alias(path, alias);
+                    }
                 }
-                // The receiver learned the alias before the refusal.
-                stale.queue_alias(endpoint, alias);
                 match publications.get_mut(index) {
                     // Removed before the answer: nothing is left to remove.
                     Some(entry) if entry.state == NetworkPublicationState::Removing => {
@@ -1848,7 +1906,9 @@ fn publication_answer(
             if let Some(index) = find(publications, endpoint, alias, registration) {
                 let mut entry = publications.swap_remove(index);
                 release_guard(&mut entry);
-                release(send_endpoints, endpoint);
+                for path in entry.paths() {
+                    release(send_endpoints, path);
+                }
             }
         }
         _ => {}
@@ -1860,13 +1920,13 @@ trait Stop {
     fn cycle(&mut self, now: u64) -> Result<u32, AgentError>;
 }
 
-impl Stop for crate::agents::SenderAgent<OsSocket> {
+impl<T: StreamTerms> Stop for crate::agents::SenderAgent<OsSocket, T> {
     fn cycle(&mut self, now: u64) -> Result<u32, AgentError> {
         self.do_work(now)
     }
 }
 
-impl Stop for crate::agents::ReceiverAgent<OsSocket> {
+impl<T: StreamTerms> Stop for crate::agents::ReceiverAgent<OsSocket, T> {
     fn cycle(&mut self, now: u64) -> Result<u32, AgentError> {
         self.do_work(now)
     }

@@ -160,11 +160,11 @@ impl SenderTrace {
 
     /// Serves a network trace command over `publications`; `None` for any
     /// other command.
-    pub(crate) fn command<O: SocketOps>(
+    pub(crate) fn command<O: SocketOps, T: crate::embedded::StreamTerms>(
         &mut self,
-        publications: &mut [Box<Outbound>],
-        command: AgentCommand<O>,
-    ) -> Option<(Reservation, AgentEvent<O>)> {
+        publications: &mut [Box<Outbound<T>>],
+        command: AgentCommand<O, T>,
+    ) -> Option<(Reservation, AgentEvent<O, T>)> {
         let agent = AgentKind::Sender;
         match command {
             AgentCommand::SetNetworkTrace { reply, hook } => {
