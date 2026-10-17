@@ -360,8 +360,8 @@ fn a_whole_header_that_does_not_match_is_refused() {
         (13, 0xFF, |error| {
             matches!(error, CatalogError::Corrupt { offset: 0 })
         }),
-        (4, 2, |error| {
-            matches!(error, CatalogError::UnsupportedVersion { version: 2 })
+        (4, 3, |error| {
+            matches!(error, CatalogError::UnsupportedVersion { version: 3 })
         }),
     ];
     for (at, byte, expected) in cases {
@@ -585,4 +585,52 @@ fn lapped_and_incomplete_stops_are_kept() {
         (second.position, second.reason, second.incomplete),
         (60, StopReason::Recovered, true)
     );
+}
+
+/// A catalog of format version 1 (before A4's stop reasons) is refused as
+/// unsupported, and kept.
+#[test]
+fn a_version_1_catalog_is_unsupported() {
+    let (disk, _) = three_started();
+    let mut found = catalog_bytes(&disk)[..HEADER].to_vec();
+    found[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let crc = crc32c(&found[..12]);
+    found[12..16].copy_from_slice(&crc.to_le_bytes());
+    poke(&disk, 0, &found);
+    let kept = catalog_bytes(&disk);
+    assert!(matches!(
+        Catalog::open(disk.clone(), Path::new(DIR)),
+        Err(CatalogError::UnsupportedVersion { version: 1 })
+    ));
+    assert_eq!(catalog_bytes(&disk), kept);
+}
+
+/// A `Stopped` record with a reason byte this version does not know,
+/// under a valid CRC, is corruption, never mapped to a known reason.
+#[test]
+fn an_unknown_stop_reason_is_corrupt() {
+    let (disk, _) = three_started();
+    let end = u64::try_from(catalog_bytes(&disk).len()).unwrap();
+    let mut stopped = Record::Stopped {
+        id: 1,
+        stop: Stop {
+            position: 0,
+            time_ns: 1,
+            reason: StopReason::Stopped,
+            incomplete: false,
+        },
+    }
+    .encode()
+    .unwrap();
+    // Kind and length, then id, position and time: the reason follows.
+    let reason = HEAD + 24;
+    stopped[reason] = 0xEE;
+    let crc = crc32c(&stopped[..stopped.len() - TAIL]);
+    let at = stopped.len() - TAIL;
+    stopped[at..].copy_from_slice(&crc.to_le_bytes());
+    poke(&disk, end, &stopped);
+    assert!(matches!(
+        Catalog::open(disk, Path::new(DIR)),
+        Err(CatalogError::Corrupt { offset }) if offset == end
+    ));
 }

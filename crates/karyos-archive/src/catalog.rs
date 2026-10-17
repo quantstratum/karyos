@@ -57,7 +57,9 @@ const TEMPORARY: &str = "catalog.kyc.tmp";
 /// "KYCT", the catalog magic.
 const MAGIC: u32 = u32::from_le_bytes(*b"KYCT");
 /// The catalog format version.
-const VERSION: u32 = 1;
+/// Version 2: `Stopped` carries the `incomplete` flag and the reasons of
+/// A4 (nothing of version 1 was released).
+const VERSION: u32 = 2;
 /// The header's length: magic, version, reserved, CRC.
 const HEADER: usize = 16;
 /// [`HEADER`] as a file offset.
@@ -78,15 +80,34 @@ const FORGOTTEN: u16 = 4;
 /// Why a recording stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// Its recorder stopped it.
+    /// The recorded stream was sealed, and the recording reached the seal.
     Normal,
     /// A crash left it open; recovery stopped it at its recovered written
     /// position.
     Recovered,
     /// A crash left it open before its segment store existed: it is empty.
     Empty,
-    /// An async recording was lapped and stopped there (`on_lap = Stop`).
+    /// An async recording was lapped and stopped there (`on_lap = Stop`),
+    /// or lapped once more than its store records gaps.
     Lapped,
+    /// A stop command stopped it.
+    Stopped,
+    /// The agent shut down while it recorded.
+    Shutdown,
+    /// Its source failed; its store was closed whole.
+    Failed(FailKind),
+}
+
+/// Why a recording's source failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailKind {
+    /// The source reported an error (revoked, faulted, an invariant).
+    Source,
+    /// A required recording was lapped, which its role excludes.
+    RequiredLapped,
+    /// The source returned what a source never may: a seal away from the
+    /// written position, an empty copy or an empty loss.
+    Invalid,
 }
 
 impl StopReason {
@@ -96,6 +117,11 @@ impl StopReason {
             Self::Recovered => 2,
             Self::Empty => 3,
             Self::Lapped => 4,
+            Self::Stopped => 5,
+            Self::Shutdown => 6,
+            Self::Failed(FailKind::Source) => 7,
+            Self::Failed(FailKind::RequiredLapped) => 8,
+            Self::Failed(FailKind::Invalid) => 9,
         }
     }
 
@@ -105,6 +131,11 @@ impl StopReason {
             2 => Some(Self::Recovered),
             3 => Some(Self::Empty),
             4 => Some(Self::Lapped),
+            5 => Some(Self::Stopped),
+            6 => Some(Self::Shutdown),
+            7 => Some(Self::Failed(FailKind::Source)),
+            8 => Some(Self::Failed(FailKind::RequiredLapped)),
+            9 => Some(Self::Failed(FailKind::Invalid)),
             _ => None,
         }
     }

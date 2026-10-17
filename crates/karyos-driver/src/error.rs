@@ -257,6 +257,16 @@ pub enum DriverError {
     /// The driver has used every shared region identity.
     #[error("region identities exhausted")]
     RegionIdsExhausted,
+    /// An IPC driver with a network could hold more descriptors than this
+    /// process may open (`RLIMIT_NOFILE`): its image lanes, stream
+    /// mappings and clients at their configured bounds. Checked at start.
+    #[error("the driver may need {needed} descriptors, above the limit of {limit}")]
+    DescriptorLimit {
+        /// Descriptors the configured bounds can hold.
+        needed: u64,
+        /// The process's soft limit.
+        limit: u64,
+    },
     /// Every publication the stream can issue is out: its exclusive
     /// publication, or all `P` publisher slots of a concurrent stream.
     #[error("the stream's publication has already been taken")]

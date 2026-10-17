@@ -111,7 +111,7 @@ impl SealedMapping {
             u64::try_from(len).map_err(|_| SysError::InvalidRegion { address: 0, len })?;
 
         let fd = create_memfd(name)?;
-        rustix::fs::ftruncate(&fd, file_len).map_err(os("ftruncate"))?;
+        retry_interrupted(|| rustix::fs::ftruncate(&fd, file_len)).map_err(os("ftruncate"))?;
         rustix::fs::fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW)
             .map_err(os("fcntl_add_seals"))?;
 
@@ -263,6 +263,24 @@ fn create_memfd(name: &str) -> Result<OwnedFd, SysError> {
             rustix::fs::memfd_create(name, base).map_err(os("memfd_create"))
         }
         Err(errno) => Err(os("memfd_create")(errno)),
+    }
+}
+
+/// Calls `call` again while it fails with `EINTR`: a signal handler ran
+/// before the call took effect, so it is called as if for the first time.
+/// Only for calls that are safe to repeat after `EINTR`; never for
+/// `close`, nor for `connect`, which goes on asynchronously after it.
+/// Unbounded: its callers (`ftruncate` and `open` of a memfd) wait on no
+/// timeout, so a retry ends once the signals stop. A socket call is
+/// bounded by its timeout instead (`ipc::recv`, `ipc::send`).
+pub(crate) fn retry_interrupted<T>(
+    mut call: impl FnMut() -> rustix::io::Result<T>,
+) -> rustix::io::Result<T> {
+    loop {
+        match call() {
+            Err(rustix::io::Errno::INTR) => {}
+            done => return done,
+        }
     }
 }
 

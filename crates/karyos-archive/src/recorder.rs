@@ -22,7 +22,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::catalog::StopReason;
+use crate::catalog::{FailKind, StopReason};
 use crate::disk::Disk;
 use crate::segment::{FILL_RECORD, SegmentError, SegmentStore};
 
@@ -165,6 +165,48 @@ pub enum RecorderError {
         /// The store's written position.
         store: u64,
     },
+    /// The source returned what a source never may.
+    #[error("the source returned {0:?}")]
+    Invalid(Invalid),
+}
+
+/// What a source returned that it never may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Invalid {
+    /// A seal away from the written position.
+    SealNotAtWritten {
+        /// The seal.
+        at: u64,
+        /// The written position.
+        written: u64,
+    },
+    /// A copy of no bytes.
+    EmptyCopy {
+        /// Where.
+        position: u64,
+    },
+    /// A loss of no range.
+    EmptyLoss {
+        /// Its start.
+        from: u64,
+        /// Its end, not above its start.
+        to: u64,
+    },
+}
+
+impl RecorderError {
+    /// Why the source failed, when the store is still whole: the recording
+    /// can then be closed and stopped with that reason. `None` for a store
+    /// error, after which the store must be recovered.
+    #[must_use]
+    pub const fn fail_kind(&self) -> Option<FailKind> {
+        match self {
+            Self::Segment(_) => None,
+            Self::Source(_) => Some(FailKind::Source),
+            Self::RequiredLapped { .. } => Some(FailKind::RequiredLapped),
+            Self::Misaligned { .. } | Self::Invalid(_) => Some(FailKind::Invalid),
+        }
+    }
 }
 
 /// Why a recording ended, and where.
@@ -172,7 +214,8 @@ pub enum RecorderError {
 pub struct Ended {
     /// Its last position.
     pub position: u64,
-    /// Why: the seal (normal), or a lap with `OnLap::Stop`.
+    /// Why: the seal (normal), a lap with `OnLap::Stop`, or how it was
+    /// closed (a command, the shutdown, a source failure).
     pub reason: StopReason,
     /// Whether it lost a range.
     pub incomplete: bool,
@@ -271,13 +314,16 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
             self.store.tick(now_ns)?;
             return Ok(duty);
         }
-        while self.store.written().saturating_sub(start) < self.budget {
+        while self.recorded_since(start)? < self.budget {
             match self.source.read(&mut self.buffer)? {
                 Frames::Copied {
                     position,
                     len,
                     next,
                 } => {
+                    if len == 0 {
+                        return Err(RecorderError::Invalid(Invalid::EmptyCopy { position }));
+                    }
                     let bytes = self.buffer.get(..len).ok_or(SourceError::Invariant)?;
                     self.store.append(position, bytes)?;
                     self.source.consumed(next)?;
@@ -297,13 +343,30 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                 }
                 Frames::Pending => break,
                 Frames::Sealed { at } => {
+                    let written = self.store.written();
+                    if at != written {
+                        return Err(RecorderError::Invalid(Invalid::SealNotAtWritten {
+                            at,
+                            written,
+                        }));
+                    }
                     duty.ended = Some(self.end(at, StopReason::Normal));
                     break;
                 }
                 Frames::Lost { from, to } => {
+                    if to <= from {
+                        return Err(RecorderError::Invalid(Invalid::EmptyLoss { from, to }));
+                    }
                     let Mode::Async { on_lap } = self.mode else {
                         return Err(RecorderError::RequiredLapped { from, to });
                     };
+                    // A store holding its most gaps ends the recording here,
+                    // lapped, rather than lose count of what it lost.
+                    if !self.store.gap_fits() {
+                        self.incomplete = true;
+                        duty.ended = Some(self.end(from, StopReason::Lapped));
+                        break;
+                    }
                     self.store.append_gap(from, to)?;
                     self.incomplete = true;
                     match on_lap {
@@ -321,7 +384,7 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
             }
         }
         // Data, fills and gaps alike: the written position's advance.
-        duty.recorded = self.store.written().saturating_sub(start);
+        duty.recorded = self.recorded_since(start)?;
         self.store.tick(now_ns)?;
         Ok(duty)
     }
@@ -346,6 +409,15 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         }
     }
 
+    /// The written position's advance since `start`.
+    fn recorded_since(&self, start: u64) -> Result<u64, RecorderError> {
+        Ok(self
+            .store
+            .written()
+            .checked_sub(start)
+            .ok_or(SegmentError::PositionOverflow)?)
+    }
+
     fn end(&mut self, position: u64, reason: StopReason) -> Ended {
         let ended = Ended {
             position,
@@ -356,19 +428,23 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         ended
     }
 
-    /// Closes the store (synced unless its policy is no sync) and returns
-    /// where the recording ends: where it ended, or its written position.
+    /// Closes the store with everything written durable, whatever its
+    /// policy, and returns where the recording ends: its durable position,
+    /// with the reason it ended for, or `reason` when it had not ended (a
+    /// command, the shutdown, a source failure). The catalog's stop names
+    /// that position, so the segments always hold what it says.
     ///
     /// # Errors
     ///
     /// The store's errors.
-    pub fn close(self) -> Result<Ended, RecorderError> {
-        let ended = self.ended.unwrap_or(Ended {
-            position: self.store.written(),
-            reason: StopReason::Normal,
-            incomplete: self.incomplete,
-        });
-        self.store.close()?;
-        Ok(ended)
+    pub fn close(self, reason: StopReason) -> Result<Ended, RecorderError> {
+        let reason = self.ended.map_or(reason, |ended| ended.reason);
+        let incomplete = self.incomplete;
+        let position = self.store.close_synced()?;
+        Ok(Ended {
+            position,
+            reason,
+            incomplete,
+        })
     }
 }
