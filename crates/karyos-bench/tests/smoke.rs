@@ -5,7 +5,9 @@
 
 use karyos_bench::env::{Environment, Labels};
 use karyos_bench::inventory;
-use karyos_bench::{Backing, BackingRefused, Config, Workload, defaults, report, run};
+use karyos_bench::{
+    Backing, BackingRefused, Config, Workload, archive_configs, defaults, report, run,
+};
 
 /// The counting allocator, so the wire children of these tests count the
 /// allocations of both stages (the allocation build, M-9).
@@ -1139,6 +1141,64 @@ fn a_failing_ipc_child_fails_the_workload_promptly() {
             start.elapsed() < std::time::Duration::from_secs(10),
             "{name} took {:?}",
             start.elapsed()
+        );
+    }
+}
+
+/// The archive workloads run only when named, write their records with
+/// the directory, filesystem, policy and sync kind, key them by
+/// filesystem, and leave no directory behind.
+#[test]
+fn the_archive_workloads_record_where_they_wrote() {
+    assert!(
+        defaults(200).iter().all(|config| !matches!(
+            config.workload,
+            Workload::ArchiveAppend | Workload::ArchiveSync
+        )),
+        "no default run writes to a disk"
+    );
+    let configs = archive_configs(1_000_000);
+    assert!(
+        configs
+            .iter()
+            .any(|config| config.workload == Workload::ArchiveSync && config.iterations == 2000)
+    );
+    let labels = Labels::detect();
+    for config in configs {
+        let config = Config {
+            iterations: 20,
+            warmup: 2,
+            term_length: 64 * 1024,
+            ..config
+        };
+        let measurement = run(config).unwrap_or_else(|cause| panic!("{config}: {cause}"));
+        let archive = measurement.archive.clone().unwrap();
+        assert!(
+            !std::path::Path::new(&archive.dir).exists(),
+            "{} removed",
+            archive.dir
+        );
+        let line = report::history_line(&measurement, &labels);
+        assert!(report::field(&line, "p50_ns").is_some(), "{line}");
+        assert_eq!(report::field(&line, "policy"), Some(archive.policy));
+        assert_eq!(
+            report::field(&line, "filesystem"),
+            Some(archive.filesystem.as_str())
+        );
+        let sync = config.workload == Workload::ArchiveSync;
+        assert_eq!(
+            report::field(&line, "full_fsync"),
+            Some(if sync && cfg!(target_vendor = "apple") {
+                "true"
+            } else {
+                "false"
+            })
+        );
+        assert!(
+            report::field(&line, "key")
+                .unwrap()
+                .ends_with(&format!("|fs={}", archive.filesystem)),
+            "{line}"
         );
     }
 }
