@@ -83,6 +83,8 @@ struct Setup {
     control_group: bool,
     /// The receiver's `group_nak_budget`, when not the default.
     group_nak_budget: Option<u32>,
+    /// Further changes to the agents' configuration.
+    tune: Option<fn(&mut AgentConfig)>,
     /// Messages on each lane before the sender's reader subscribes: the
     /// image then joins above 0.
     before: u8,
@@ -90,6 +92,8 @@ struct Setup {
     identity: Option<crate::membership::ReceiverIdentity>,
     /// The publication's configured roles (MC-1), built at the add.
     roles: Option<fn() -> crate::membership::PublicationRoles>,
+    /// The subscription's conflated lane (conflated-network-images.md).
+    conflated: Option<Lane>,
 }
 
 impl Setup {
@@ -116,9 +120,11 @@ impl Default for Setup {
             guard: None,
             control_group: false,
             group_nak_budget: None,
+            tune: None,
             before: 0,
             identity: None,
             roles: None,
+            conflated: None,
         }
     }
 }
@@ -160,6 +166,9 @@ impl Rig {
         }
         if let Some(budget) = setup.group_nak_budget {
             config.group_nak_budget = budget;
+        }
+        if let Some(tune) = setup.tune {
+            tune(&mut config);
         }
         let (mut agents, links) = network_agents::<OsSocket>(config).unwrap();
         VIRTUAL_NOW.with(|now| now.set(0));
@@ -236,6 +245,7 @@ impl Rig {
                 multicast: setup.multicast,
                 control_group,
                 identity: setup.identity,
+                conflated: setup.conflated,
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
@@ -382,6 +392,7 @@ impl Rig {
                 multicast: false,
                 control_group: None,
                 identity: setup.identity,
+                conflated: setup.conflated,
             })
             .unwrap();
         self.round(true);
@@ -675,10 +686,12 @@ fn stale_replies_are_counted() {
         SessionEvent::ImageInstalled {
             slot: unknown,
             installed: unknown,
+            freshness: None,
         },
         SessionEvent::ImageInstalled {
             slot: pending,
             installed,
+            freshness: None,
         },
         SessionEvent::ImageReleased { slot: pending },
     ] {
@@ -3109,6 +3122,90 @@ fn losing_the_last_path_retires_the_image() {
     assert!(!rig.agents.receiver.role.has_image(slot));
 }
 
+/// C3 (conflated-network-images.md (b)): a conflated lane whose view's
+/// feeder is not attached seals at once, counted; an unconflated image has
+/// no link and its seals are untouched (control).
+#[test]
+fn an_unattached_conflated_lane_seals_at_once() {
+    for conflated in [Some(Lane::ZERO), None] {
+        let (mut rig, _b) = Rig::new(Setup {
+            conflated,
+            ..Setup::default()
+        });
+        let slot = established(&mut rig);
+        assert_eq!(rig.images.freshness(slot).map(|(lane, _)| lane), conflated);
+        lose_one(&mut rig);
+        rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+        let counters = rig.agents.receiver.counters();
+        assert_eq!(counters.seals_unattached, u64::from(conflated.is_some()));
+        assert_eq!((counters.barrier_posts, counters.seals_gated), (0, 0));
+    }
+}
+
+/// With its feeder attached, the hole is posted and its seal held past the
+/// reorder deadline until the feeder acknowledges; then it is sealed, and
+/// the terminal cell stays empty.
+#[test]
+fn an_attached_conflated_lane_seals_after_the_ack() {
+    let (mut rig, _b) = Rig::new(Setup {
+        conflated: Some(Lane::ZERO),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let link = rig.images.freshness(slot).unwrap().1.clone();
+    let feeder = link.mailbox().unwrap();
+    feeder.attach();
+    lose_one(&mut rig);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().barrier_posts >= 1
+    });
+    let request = feeder.pending().unwrap();
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(counters.gaps_sealed, 0, "held for the ack");
+    assert!(counters.seals_gated >= 1);
+    feeder.acknowledge(request.request).unwrap();
+    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.barrier_acks, counters.barrier_timeouts), (1, 0));
+    assert_eq!(
+        karyos_sys::freshness::TerminalCell::read(&link.terminal_words()),
+        None
+    );
+}
+
+/// A stalled feeder: at `barrier_ack_timeout` the receiver publishes the
+/// view's terminal cell with the posted interval, then seals (design (c)).
+#[test]
+fn a_stalled_feeder_closes_the_conflated_view() {
+    let (mut rig, _b) = Rig::new(Setup {
+        conflated: Some(Lane::ZERO),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let link = rig.images.freshness(slot).unwrap().1.clone();
+    let feeder = link.mailbox().unwrap();
+    feeder.attach();
+    lose_one(&mut rig);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().barrier_posts >= 1
+    });
+    let request = feeder.pending().unwrap();
+    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.barrier_timeouts, counters.barrier_acks), (1, 0));
+    assert_eq!(
+        karyos_sys::freshness::TerminalCell::read(&link.terminal_words()),
+        Some(karyos_sys::freshness::Terminal {
+            start: request.start,
+            end: request.end,
+            reason: karyos_sys::freshness::TERMINAL_BARRIER_TIMEOUT,
+        })
+    );
+}
+
 /// #310 review, RC-6 per route: a faulted later route asks for its own
 /// endpoint's reset, and the reset's new epoch clears the route.
 #[test]
@@ -3278,4 +3375,202 @@ fn a_nak_with_no_copy_posted_is_not_counted() {
         rounds += 1;
     }
     assert!(rounds > 3, "{rounds} rounds while the route was faulted");
+}
+
+/// T10 (contract-traceability-phase-2.md, "Challenge lifecycle"): a SETUP
+/// replayed through the liveness timeout neither keeps the image alive nor
+/// blocks a rebind. With the publication silent (its guard closed), the
+/// old ANNOUNCE delivered again every second is dropped and counted while
+/// the image is bound, the image still retires at `image_liveness_timeout`,
+/// the replays after that meet the quarantine (counted, no challenge), and
+/// a new incarnation binds a new image through its own challenge.
+#[test]
+fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let (mut rig, b) = Rig::new(Setup {
+        guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::new(AppliedEpoch::new()),
+            epoch: 2,
+            rate: None,
+        }),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    // The publication goes silent: no DATA, no heartbeat.
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let challenges = rig.agents.receiver.role.session_counters().challenges;
+    let dropped = rig.agents.receiver.role.session_counters().dropped;
+    let replay = |rig: &mut Rig| {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            b,
+            source,
+            karyos_protocol::network::Control::SetupAnnounce(announce(65_536)),
+            rig.now,
+        );
+    };
+    // One replay a second, through the liveness timeout and past it.
+    let mut replays = 0u64;
+    let mut retired_after = None;
+    for second in 1..=12u64 {
+        rig.now += 1_000 * MS;
+        replay(&mut rig);
+        replays += 1;
+        rig.round(true);
+        if retired_after.is_none() && !rig.agents.receiver.role.has_image(slot) {
+            retired_after = Some(second);
+        }
+    }
+    let retired_after = retired_after.expect("the replays kept the image alive");
+    assert!(retired_after <= 11, "retired after {retired_after} s");
+    assert_eq!(rig.agents.receiver.counters().images_retired, 1);
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert_eq!(sessions.dropped, dropped + replays, "every replay counted");
+    assert_eq!(sessions.challenges, challenges, "no replay challenged");
+    // A new incarnation binds a new image.
+    let installed = rig
+        .events
+        .iter()
+        .filter(|event| matches!(event, ImageEvent::Installed { .. }))
+        .count();
+    rig.reannounce(
+        b,
+        SetupAnnounce {
+            identity: Identity {
+                incarnation: 2,
+                ..identity()
+            },
+            ..announce(65_536)
+        },
+    );
+    rig.until(true, |rig| {
+        rig.events
+            .iter()
+            .filter(|event| matches!(event, ImageEvent::Installed { .. }))
+            .count()
+            == installed + 1
+    });
+    assert_eq!(
+        rig.agents.receiver.role.session_counters().challenges,
+        challenges + 1
+    );
+}
+
+/// T8 (contract-traceability-phase-2.md, "Bounded scheduling"): one whole
+/// receiver and sender cycle under overload keeps every per-cycle bound at
+/// once. With small bounds, both lanes publish as fast as the log takes
+/// them and lose datagrams, so each lane's earliest hole is NAKed and two
+/// NAKs can reach the sender in one cycle. Both lanes are needed: the
+/// receiver keeps one NAK in flight per lane, so a single lane never
+/// exceeds a sender budget of one NAK a cycle. Every single cycle reads at most
+/// `rx_datagrams` per endpoint, admits at most `naks_per_cycle` NAKs and
+/// repairs within the repair byte budget; the excess waits (counted), and
+/// every message still arrives, in order.
+#[test]
+fn an_overloaded_cycle_keeps_every_per_cycle_bound() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, Role};
+
+    const RX: u32 = 4;
+    const NAKS: u32 = 1;
+    const REPAIR_BYTES: u64 = 4_096;
+    /// The rig's endpoints: A and B.
+    const ENDPOINTS: u64 = 2;
+    /// The largest datagram a repair submits.
+    const DATAGRAM: u64 = 1_408;
+    const MESSAGES: u8 = 48;
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        tune: Some(|config| {
+            config.rx_datagrams = RX;
+            config.repair.naks_per_cycle = NAKS;
+            config.repair.budget.bytes = REPAIR_BYTES;
+        }),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let mut subscribers = [
+        image_subscriber(&rig, slot, 0, Role::Optional),
+        image_subscriber(&rig, slot, 1, Role::Optional),
+    ];
+    rig.agents
+        .receiver
+        .role
+        .drop_data(&[1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23]);
+    let mut appended = [0u8; 2];
+    let mut delivered = [Vec::new(), Vec::new()];
+    let mut fullest_read = 0u64;
+    let mut before = (rig.agents.receiver.counters(), rig.agents.sender.counters());
+    for _ in 0..4_000 {
+        for (lane, count) in appended.iter_mut().enumerate() {
+            while *count < MESSAGES {
+                let log = rig.log.as_mut().unwrap();
+                match log.publications[lane]
+                    .append(&[*count; 900], AppendOptions::default())
+                    .unwrap()
+                {
+                    AppendOutcome::Appended { .. } => *count += 1,
+                    _ => break,
+                }
+            }
+        }
+        rig.round(true);
+        let after = (rig.agents.receiver.counters(), rig.agents.sender.counters());
+        let read = after.0.datagrams - before.0.datagrams;
+        let admitted = after.1.naks - before.1.naks;
+        let repairs = after.1.repairs - before.1.repairs;
+        assert!(
+            read <= u64::from(RX) * ENDPOINTS,
+            "{read} datagrams in a cycle"
+        );
+        assert!(
+            admitted <= u64::from(NAKS),
+            "{admitted} NAKs admitted in a cycle"
+        );
+        // A repair is admitted while budget remains, so the last one may
+        // overrun it by at most one datagram.
+        assert!(
+            repairs
+                .checked_sub(1)
+                .is_none_or(|full| full * DATAGRAM <= REPAIR_BYTES),
+            "{repairs} repairs in a cycle"
+        );
+        fullest_read = fullest_read.max(read);
+        before = after;
+        for (lane, (_, subscriber)) in subscribers.iter_mut().enumerate() {
+            while let Some(message) = poll_message(subscriber) {
+                delivered[lane].push(message[0]);
+            }
+        }
+        if delivered
+            .iter()
+            .all(|lane| lane.len() == usize::from(MESSAGES))
+        {
+            break;
+        }
+    }
+    for lane in &delivered {
+        assert_eq!(
+            lane,
+            &(0..MESSAGES).collect::<Vec<_>>(),
+            "every message, in order"
+        );
+    }
+    // The bounds were reached, not merely unchallenged.
+    assert!(fullest_read > u64::from(RX), "{fullest_read}");
+    let sender = rig.agents.sender.counters();
+    assert!(sender.nak_cycle_budget >= 1, "{sender:?}");
+    assert!(sender.repairs >= 12, "{sender:?}");
 }

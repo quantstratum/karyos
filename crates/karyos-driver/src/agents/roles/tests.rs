@@ -167,6 +167,7 @@ fn add_publication(
             multicast: false,
             control_group: None,
             identity: None,
+            conflated: None,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -728,6 +729,7 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             multicast: false,
             control_group: None,
             identity: None,
+            conflated: None,
         };
         assert!(matches!(
             role.command(command),
@@ -1204,6 +1206,7 @@ fn installed_image_with(
             pending: None,
         }],
         closing: None,
+        gate: None,
         tail_since: [None; 4],
         reset_requested: None,
         next_clean: [0; 4],
@@ -3112,4 +3115,78 @@ fn a_skipped_copy_leaves_its_slot_free() {
     assert_eq!(counters.nak_copies, 0);
     assert!(image.copies[1].pending.is_none());
     assert!(!super::copies_busy(&image, 0));
+}
+
+/// #321 review P3: the sender role serves a routed publication over every
+/// path's TX half, once it is established: each committed message goes out
+/// on both paths.
+#[test]
+fn the_sender_serves_a_routed_publication_on_every_path() {
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+    use karyos_protocol::network::{Datagram, classify};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    use super::super::Half;
+
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    sender.sessions.add(publication(EndpointId(1))).unwrap();
+    let routes = [
+        (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
+        (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
+    ];
+    let (path, mut log) = super::super::data::testing::outbound_routed(
+        &routes,
+        alias(),
+        publication(EndpointId(1)).term,
+        1,
+        false,
+    );
+    sender.publications.push(path);
+    let mut halves = Vec::new();
+    let mut counts = Vec::new();
+    for id in 1..=2u32 {
+        let socket = ScriptedSocket::new();
+        let observer = socket.observer();
+        let data = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&data);
+        observer.set_send_hook(Box::new(move |_, datagrams| {
+            for datagram in datagrams {
+                if matches!(classify(datagram), Ok(Datagram::DataBatch(_))) {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+        for _ in 0..16 {
+            observer.push_send(SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+        }
+        let instance = InstanceId::new(NonZeroU32::new(id).unwrap());
+        let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
+        let (tx, _rx) = endpoint.split().unwrap();
+        halves.push((EndpointId(id), Half::Tx(Box::new(tx))));
+        counts.push(data);
+    }
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 1 << 20), 1);
+    assert!(sender.sessions.is_established(EndpointId(1), alias()));
+    for i in 0..2u8 {
+        let _ = log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    for now in 2..6 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert_eq!(counts[0].load(Ordering::Relaxed), 2);
+    assert_eq!(counts[1].load(Ordering::Relaxed), 2);
 }

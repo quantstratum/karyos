@@ -32,9 +32,15 @@
 //!   block, or whose endpoint is resetting or retired, takes no more
 //!   flushes in the call, on any lane; the call reports
 //!   [`SenderReport::inactive`] once every route is inactive.
+//! - **Detached.** A route whose TX half is not lent this call
+//!   ([`Routes::route`] is `None`) is out for the call, as a blocked one.
 //! - **Failures.** Mapped as [`super::LaneSender`] maps them
-//!   ([`SenderFailure`]). A failure after another route submitted the head
-//!   still debits it, then stops the call.
+//!   ([`SenderFailure`]). With one route a failure stops the call, as
+//!   [`super::LaneSender`]'s does, after debiting a head another route
+//!   submitted. With several, a failure stops only its route (a failure
+//!   stops only that half, sockets-backend.md 3.10): the route is out for
+//!   the call, its failure is kept for the control path
+//!   ([`RoutedLaneSender::take_failures`]), and the other routes go on.
 //! - **Catching up.** A route behind the debited position (its copy was
 //!   kept pending while another route submitted) flushes its older copies
 //!   in [`RoutedLaneSender::catch_up`], one per route and lane per call,
@@ -101,9 +107,13 @@ pub struct RouteCounters {
 pub struct CatchUp {
     /// Copies submitted.
     pub submitted: u32,
-    /// Set when the call stopped on a failure.
+    /// Set when the call stopped on a failure (one route only; with
+    /// several, see [`RoutedLaneSender::take_failures`]).
     pub failure: Option<SenderFailure>,
 }
+
+/// Each route's failure kept for the control path, the first per route.
+pub type RouteFailures = [Option<SenderFailure>; MAX_ROUTES];
 
 #[derive(Debug)]
 struct RouteLane {
@@ -170,6 +180,23 @@ pub struct RoutedLaneSender {
     max_charge: u64,
     report: TxReport,
     counters: [RouteCounters; MAX_ROUTES],
+    failures: RouteFailures,
+}
+
+/// The routes not lent this call: out from its start.
+fn detached<R: Routes>(routes: &mut R, count: usize) -> [bool; MAX_ROUTES] {
+    let mut out = [false; MAX_ROUTES];
+    for (route, out) in out.iter_mut().enumerate().take(count) {
+        *out = routes.route(route).is_none();
+    }
+    out
+}
+
+/// Keeps `failure` for `route`, unless one is kept already.
+fn keep(failures: &mut RouteFailures, route: usize, failure: SenderFailure) {
+    if let Some(slot) = failures.get_mut(route) {
+        *slot = slot.or(Some(failure));
+    }
 }
 
 impl RoutedLaneSender {
@@ -213,7 +240,15 @@ impl RoutedLaneSender {
             max_charge,
             report: TxReport::new(),
             counters: [RouteCounters::default(); MAX_ROUTES],
+            failures: [None; MAX_ROUTES],
         })
+    }
+
+    /// The failures that stopped one route of several since the last call,
+    /// the first per route: each route's half waits for its control path
+    /// (retry or reset). Taking them clears them.
+    pub fn take_failures(&mut self) -> RouteFailures {
+        std::mem::take(&mut self.failures)
     }
 
     /// The DRR state, for diagnostics.
@@ -409,10 +444,13 @@ impl RoutedLaneSender {
             lanes,
             report,
             counters,
+            failures,
+            routes: count,
             ..
         } = self;
+        let several = *count > 1;
         let mut done = CatchUp::default();
-        let mut out = [false; MAX_ROUTES];
+        let mut out = detached(routes, *count);
         for (lane, entry) in lanes.iter_mut().enumerate() {
             let Some(debited) = entry.debited else {
                 continue;
@@ -456,6 +494,10 @@ impl RoutedLaneSender {
                     Flushed::Denied | Flushed::Again => {}
                     Flushed::Blocked | Flushed::Inactive => *out = true,
                     Flushed::Hold => queue.control = true,
+                    Flushed::Fail(failure) if several => {
+                        keep(failures, index, failure.at(lane));
+                        *out = true;
+                    }
                     Flushed::Fail(failure) => {
                         done.failure = Some(failure.at(lane));
                         return done;
@@ -479,14 +521,16 @@ impl RoutedLaneSender {
                 route.paused = false;
             }
         }
+        let out = detached(routes, self.routes);
         let mut source = Source {
             routes,
             gate,
             lanes: &mut self.lanes,
             report: &mut self.report,
             counters: &mut self.counters,
+            failures: &mut self.failures,
             count: self.routes,
-            out: [false; MAX_ROUTES],
+            out,
             inactive: [false; MAX_ROUTES],
             failure: None,
         };
@@ -612,6 +656,7 @@ struct Source<'a, R, G> {
     lanes: &'a mut [Lane],
     report: &'a mut TxReport,
     counters: &'a mut [RouteCounters; MAX_ROUTES],
+    failures: &'a mut RouteFailures,
     /// The sender's routes.
     count: usize,
     /// Routes that take no more flushes in the call: blocked or inactive.
@@ -670,6 +715,7 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
                 continue;
             }
             let Some(backend) = self.routes.route(index) else {
+                *out = true;
                 continue;
             };
             self.gate.flushing(lane);
@@ -706,6 +752,11 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
                     blocked = true;
                 }
                 Flushed::Hold => queue.control = true,
+                // One route of several: only it stops (module docs).
+                Flushed::Fail(failure) if self.count > 1 => {
+                    keep(self.failures, index, failure.at(lane));
+                    *out = true;
+                }
                 Flushed::Fail(failure) => {
                     self.failure = Some(failure.at(lane));
                     if served {

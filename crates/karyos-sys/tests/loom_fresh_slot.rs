@@ -10,6 +10,11 @@
 //! changes the value version. The control stores the freshness words
 //! outside the seqlock and must fail.
 //!
+//! A second model writes a replacement with the freshness it restores in
+//! one seqlock write ([`FreshSlotWords::write_with_freshness`]): a reader
+//! never pairs the new value with the old freshness. Its control writes
+//! them apart and must fail.
+//!
 //! The conflation table's other slot model, `loom_conflation.rs`, covers
 //! [`SlotWords`](karyos_sys::conflation::SlotWords), which the record
 //! journal still uses.
@@ -104,4 +109,70 @@ fn a_reader_sees_value_and_freshness_coherent() {
 #[should_panic(expected = "torn freshness")]
 fn control_freshness_outside_the_seqlock_is_torn() {
     model(false);
+}
+
+/// The freshness a replacement restores: Fresh through loss 3.
+const RESTORED: SlotFreshness = SlotFreshness {
+    loss_applied: 3,
+    stale_since: 0,
+};
+
+/// A replacement and the freshness it restores are written together
+/// ([`FreshSlotWords::write_with_freshness`]): a reader never sees the new
+/// value with the old (stale) freshness, nor the old value with the new.
+/// The control writes them in two seqlock writes and must fail.
+fn replacement(together: bool) {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    builder.check(move || {
+        let words: Arc<Vec<AtomicU64>> = Arc::new((0..7).map(|_| AtomicU64::new(0)).collect());
+        {
+            let slot = FreshSlotWords::new(&words).unwrap();
+            assert_eq!(slot.write(b"first value!"), Ok(2));
+            slot.set_freshness(FIRST).unwrap();
+        }
+        let writer = {
+            let words = Arc::clone(&words);
+            thread::spawn(move || {
+                let slot = FreshSlotWords::new(&words).unwrap();
+                if together {
+                    assert_eq!(
+                        slot.write_with_freshness(b"second value!!!", RESTORED),
+                        Ok(4)
+                    );
+                } else {
+                    // Control: the value, then its freshness, apart.
+                    assert_eq!(slot.write(b"second value!!!"), Ok(4));
+                    slot.set_freshness(RESTORED).unwrap();
+                }
+            })
+        };
+        let reader = {
+            let words = Arc::clone(&words);
+            thread::spawn(move || {
+                let slot = FreshSlotWords::new(&words).unwrap();
+                let mut out = [0u8; 16];
+                if let FreshRead::Value {
+                    version, freshness, ..
+                } = slot.read(&mut out)
+                {
+                    let expected = if version == 4 { RESTORED } else { FIRST };
+                    assert_eq!(freshness, expected, "a replacement without its freshness");
+                }
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
+    });
+}
+
+#[test]
+fn a_replacement_and_its_freshness_are_seen_together() {
+    replacement(true);
+}
+
+#[test]
+#[should_panic(expected = "a replacement without its freshness")]
+fn control_a_replacement_apart_from_its_freshness_is_seen_stale() {
+    replacement(false);
 }

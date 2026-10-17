@@ -43,6 +43,7 @@
 //!   and retires them with the image. An image it cannot expose is still
 //!   fed: its lane conductors are driven here until it retires.
 
+use karyos_sys::frame::Lane;
 use std::net::{IpAddr, SocketAddr};
 
 use karyos_io::sockets::OsSocket;
@@ -217,6 +218,9 @@ struct NetSubscription {
     control: Option<EndpointId>,
     /// The receiver identity every handle of this key shares (MC-1).
     identity: Option<crate::membership::ReceiverIdentity>,
+    /// The conflated lane and the view's table configuration every handle
+    /// of this key shares (conflated-network-images.md (a)).
+    conflated: Option<(Lane, karyos_sys::conflation::ConflationConfig)>,
     /// The endpoints of the channel's later redundant paths, each with its
     /// own receiver entry (redundant-paths.md; the first path is
     /// `endpoint`).
@@ -239,6 +243,37 @@ impl NetSubscription {
     /// The receiver entries it holds: its first path's and each later one's.
     fn entries(&self) -> Option<usize> {
         self.later.iter().flatten().count().checked_add(1)
+    }
+}
+
+/// What the conflated views of network images did
+/// (conflated-network-images.md). Increments are checked: one that would
+/// overflow keeps its value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetworkViewCounters {
+    /// Views built over an exposed image lane.
+    pub built: u64,
+    /// Installed images with a conflated lane that got no view: unexposed
+    /// (interim keying), or a table that could not be built.
+    pub unbuilt: u64,
+    /// Seal requests acknowledged after the loss was recorded.
+    pub acked: u64,
+    /// Seal requests whose acknowledgement was withheld while the barrier
+    /// was full.
+    pub withheld: u64,
+    /// Gaps met in the log and recorded there (sealed before the attach).
+    pub caught_up: u64,
+    /// Views closed because their terminal cell was published.
+    pub closed_terminal: u64,
+}
+
+impl NetworkViewCounters {
+    /// Adds `delta` to the counter `field` picks.
+    pub(crate) fn add(&mut self, field: fn(&mut Self) -> &mut u64, delta: u64) {
+        let value = field(self);
+        if let Some(next) = value.checked_add(delta) {
+            *value = next;
+        }
     }
 }
 
@@ -365,6 +400,9 @@ pub(crate) struct Network {
     paths_refused: u64,
     /// Later paths of subscriptions that could not be held.
     path_failures: u64,
+    /// What the conflated views of network images did
+    /// (conflated-network-images.md).
+    views: NetworkViewCounters,
 }
 
 impl Network {
@@ -417,6 +455,7 @@ impl Network {
             paths_isolated: <OsSocket as karyos_io::sockets::ops::SocketOps>::isolates_paths(),
             paths_refused: 0,
             path_failures: 0,
+            views: NetworkViewCounters::default(),
         })
     }
 
@@ -479,14 +518,16 @@ impl Network {
     /// shares the first's receiver entry, so it must ask for the same
     /// reliability ([`DriverError::ReliabilityMismatch`] otherwise), and
     /// the same receiver `identity`, configured or not
-    /// ([`DriverError::ReceiverIdentityMismatch`] otherwise).
+    /// ([`DriverError::ReceiverIdentityMismatch`] otherwise), and the same
+    /// `conflated` lane ([`DriverError::ConflationMismatch`] otherwise).
     ///
     /// # Errors
     ///
     /// [`DriverError::NetworkSubscriptionsFull`],
     /// [`DriverError::NetworkEndpoint`], [`DriverError::NetworkBusy`],
     /// [`DriverError::ReliabilityMismatch`],
-    /// [`DriverError::ReceiverIdentityMismatch`].
+    /// [`DriverError::ReceiverIdentityMismatch`],
+    /// [`DriverError::ConflationMismatch`].
     pub(crate) fn add_subscription(
         &mut self,
         stream_id: i32,
@@ -494,7 +535,10 @@ impl Network {
         later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
         reliable: bool,
-        identity: Option<crate::membership::ReceiverIdentity>,
+        (identity, conflated): (
+            Option<crate::membership::ReceiverIdentity>,
+            Option<(Lane, karyos_sys::conflation::ConflationConfig)>,
+        ),
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
         let endpoint = self.hold_endpoint(bind, multicast)?;
@@ -531,6 +575,11 @@ impl Network {
             if entry.identity != identity {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::ReceiverIdentityMismatch);
+            }
+            // Its images gate one lane's seals for one view.
+            if entry.conflated != conflated {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::ConflationMismatch);
             }
             let Some(users) = entry.users.checked_add(1) else {
                 release(&mut self.send_endpoints, endpoint);
@@ -581,6 +630,7 @@ impl Network {
                 multicast: group,
                 control_group: control,
                 identity,
+                conflated: conflated.map(|(lane, _)| lane),
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
@@ -629,6 +679,7 @@ impl Network {
                     multicast: true,
                     control_group: None,
                     identity,
+                    conflated: conflated.map(|(lane, _)| lane),
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
@@ -643,6 +694,7 @@ impl Network {
             reliable,
             control: control.map(|(control, _)| control),
             identity,
+            conflated,
             later: held,
             later_routes,
             users: 1,
@@ -825,6 +877,17 @@ impl Network {
         self.images.installed(slot).map(<[_]>::to_vec)
     }
 
+    /// The conflated lane of the installed image `slot` and a clone of the
+    /// link its view shares with the receiver's seal gate.
+    pub(crate) fn image_freshness(
+        &self,
+        slot: SlotRef,
+    ) -> Option<(Lane, karyos_sys::freshness::FreshnessLink)> {
+        self.images
+            .freshness(slot)
+            .map(|(lane, link)| (lane, link.clone()))
+    }
+
     /// Records the installed image `slot` and the aggregate exposing it;
     /// an unexposed image's lane conductors are taken from `lanes` and
     /// driven here.
@@ -931,6 +994,55 @@ impl Network {
     }
 
     /// Distinct network subscription keys held, for tests.
+    /// Drops the receiver's DATA datagrams numbered `nth` (from 0) from
+    /// now on, as a lossy path would (tests, Shared mode only).
+    #[cfg(test)]
+    pub(crate) fn drop_receiver_data(&mut self, nth: &[u64]) {
+        if let Agents::Shared(agents) = &mut self.agents {
+            agents.receiver.drop_data(nth);
+        }
+    }
+
+    /// What the conflated views of network images did.
+    pub(crate) fn view_counters(&self) -> NetworkViewCounters {
+        self.views
+    }
+
+    /// Counts into the views' counters with `count`.
+    pub(crate) fn count_views(&mut self, count: impl FnOnce(&mut NetworkViewCounters)) {
+        count(&mut self.views);
+    }
+
+    /// The conflated lane and table configuration of the subscription to
+    /// `stream_id` on `endpoint`, the view an image of that key gets.
+    pub(crate) fn conflation_of(
+        &self,
+        endpoint: EndpointId,
+        stream_id: i32,
+    ) -> Option<(Lane, karyos_sys::conflation::ConflationConfig)> {
+        self.subscriptions
+            .iter()
+            .find(|entry| (entry.endpoint, entry.stream_id) == (endpoint, stream_id))
+            .and_then(|entry| entry.conflated)
+    }
+
+    /// Makes the sender drop every NAK unread (`true`) or read them again
+    /// (`false`) (tests, Shared mode only).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast test (T9)")
+    )]
+    pub(crate) fn sender_ignores_naks(&mut self, ignore: bool) {
+        if let Agents::Shared(agents) = &mut self.agents {
+            if ignore {
+                agents.sender.ignore_naks();
+            } else {
+                agents.sender.heed_naks();
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn subscription_count(&self) -> usize {
         self.subscriptions.len()
@@ -1373,6 +1485,19 @@ impl Network {
     pub(crate) fn receiver_counters(&self) -> Option<crate::agents::roles::ReceiverCounters> {
         match &self.agents {
             Agents::Shared(agents) => Some(agents.receiver.counters()),
+            _ => None,
+        }
+    }
+
+    /// The sender agent's counters, in Shared mode (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast test (T9)")
+    )]
+    pub(crate) fn sender_counters(&self) -> Option<crate::agents::roles::SenderCounters> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.sender.counters()),
             _ => None,
         }
     }

@@ -37,19 +37,71 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Conflated views of network images (conflated-network-images.md, C4).
+  `EmbeddedDriver::add_network_subscription_conflated` names the lane and
+  the view's `ConflationConfig`. When the image of such a key is exposed,
+  the conductor builds a heap table over the image's `FreshnessLink`, feeds
+  it from a required subscription of the lane and attaches it to the
+  mailbox. Each duty the feeder first records a gap met in the log (held,
+  and nothing past it polled, while the barrier is full), then serves the
+  seal request, acknowledging only after the loss is recorded (withheld
+  while full), writes values with their positions (`write_at`) and
+  reconciles in bounded passes. A published terminal cell closes the feeder.
+  `EmbeddedDriver::network_view_counters` reports `NetworkViewCounters`:
+  views built and not built, acknowledgements given and withheld, gaps
+  recorded from the log, views closed by their terminal cell.
+- The receiver gates a conflated network image lane's seals
+  (conflated-network-images.md, C3). `AddSubscription` carries the
+  conflated lane (driver-internal entry
+  `EmbeddedDriver::add_network_subscription_conflated`; subscriptions sharing
+  a receiver entry agree on it, `DriverError::ConflationMismatch`). At
+  install the receiver allocates the image's `FreshnessLink`, hands it to the
+  conductor with `ImageInstalled` (`ImageTable::freshness`) and seals that
+  lane through a gate over its barrier mailbox: at once while no feeder is
+  attached, after the feeder's acknowledgement once one is, and past
+  `AgentConfig::barrier_ack_timeout` (default 100 ms, at least 10 ms) after
+  publishing the view's terminal cell, waiting while a feeder's claimed cell
+  is unpublished. New receiver counters: `seals_gated`, `barrier_posts`,
+  `barrier_acks`, `seals_unattached`, `barrier_timeouts`,
+  `barrier_claim_waits`, `barrier_post_failures` and
+  `conflated_lane_out_of_range`.
+- Conflation freshness for network images' views (conflated-network-images.md,
+  C2): `conflation_fresh` builds a heap table with a loss barrier over the
+  terminal cell of a `FreshnessLink` (a seal mailbox and a terminal cell in
+  one allocation, shared with the image's receive owner). Its writer
+  records a loss (`record_loss`, refused below the frontier with the
+  terminal cell published, or while the ring is full), writes values with
+  their freshness (`write_at`, `FreshSlotWords::write_with_freshness`),
+  reconciles the slots in bounded passes and retires the records
+  (`reconcile`), and counts the work (`FreshCounters`). It refuses a value
+  without its position (`ConflationError::PositionRequired`) or below its
+  frontier (`ConflationError::BehindFrontier`), and a terminal close also
+  closes the table. The reader
+  classifies each copied value against the barrier and the terminal cell:
+  `ConflationReader::poll_changed`'s handler gets the `Freshness` as a
+  fourth argument, a new loss serves every written key again, and after the
+  terminal cell nothing is delivered (`PollReport::terminal`). Terminal
+  reasons are `TERMINAL_BARRIER_TIMEOUT`, `TERMINAL_FRESHNESS_EXHAUSTED` and
+  `TERMINAL_BELOW_FRONTIER`. Tables without a barrier deliver every value
+  Fresh; the client's `ConflatedSubscription` keeps its signatures.
 - `karyos_io::lanes::routes::RoutedLaneSender`: one DRR over a lane's
   queues on up to `MAX_ROUTES` routes (redundant-paths.md section 7,
   RP-10). A lane's head is selected once, submitted on every route that
   holds it at its front, and debited once; `catch_up` sends the copies of
   routes that fell behind, debiting nothing, and reports a failure in
-  `CatchUp`. `RouteCounters` count skipped, late and uncancelled copies
-  per route. `StageError::OutOfOrder` refuses a copy not above its route's
-  last one.
+  `CatchUp`. With several routes a failure stops only its route, kept
+  for the control path (`take_failures`), and a route without a TX half
+  this call is out for the call. `RouteCounters` count skipped, late and
+  uncancelled copies per route. `StageError::OutOfOrder` refuses a copy
+  not above its route's last one.
 - A publication over redundant paths (redundant-paths.md section 7, RP-10):
   `Outbound::new_routed` takes one endpoint and destination per path, and
   `Outbound::serve_routes` sends each committed datagram once on every
   path, debited once (`karyos_io::lanes::routes::RoutedLaneSender`). Repair
-  stays on the founding path. A guard covers every path
+  stays on the founding path, on its queues. A route's failure resets only
+  its endpoint (`Outbound::post_reset_requests`) and a faulted queue is
+  retried on its route; a reliable lane reads again after a reset only when
+  no route still holds its copies. A guard covers every path
   (`GuardGate::new_routed`, `GuardGate::stage_copy`,
   `GuardGate::reopen_route`): each copy's exposure loads the guard, a
   position is rate charged once, the applied positions are the highest
