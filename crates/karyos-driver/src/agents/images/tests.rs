@@ -312,6 +312,7 @@ impl Rig {
                     lane_count: 2,
                 },
                 outbound,
+                guard: None,
             })
             .unwrap();
         a2
