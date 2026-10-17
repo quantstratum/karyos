@@ -38,7 +38,10 @@ release may break APIs, wire formats and shared-memory layouts.
   job. A first test checks that the shaping takes effect. The first
   driver fault test, N1 (`net::e2e::netem`), checks over these faults that
   an unreliable channel delivers each message at most once and in order
-  and reports every lost one as a local gap.
+  and reports every lost one as a local gap. N2 checks that a reliable
+  channel delivers every message exactly once and in order through NAKs
+  and the sender's repairs, and N3 does the same with 5% duplicates (the
+  test raises netem's duplicate rate and restores the job's profile).
 - The receiver's controls report a third send outcome. `ReportSlot` and
   `ReportGuard` (formerly `ProbeSlot` and `ProbeGuard`) carry an RTTM
   REQUEST's or a NAK's submission back to the receiver: submitted at the
