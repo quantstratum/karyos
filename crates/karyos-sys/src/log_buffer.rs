@@ -89,9 +89,9 @@ pub use sender_read::{
     SenderReadCounters,
 };
 pub use skip_policy::{
-    Close, CloseCause, DEFAULT_FAR_WINDOW_TIMEOUT_NS, DEFAULT_REORDER_TIMEOUT_NS,
-    MAX_REORDER_TIMEOUT_NS, SkipConfig, SkipConfigError, SkipCounters, SkipPolicy, SkipReport,
-    Unrecoverable,
+    Close, CloseCause, DEFAULT_FAR_WINDOW_TIMEOUT_NS, DEFAULT_REORDER_TIMEOUT_NS, GateAnswer,
+    MAX_REORDER_TIMEOUT_NS, SealGate, SkipConfig, SkipConfigError, SkipCounters, SkipPolicy,
+    SkipReport, Ungated, Unrecoverable,
 };
 pub(crate) mod storage;
 

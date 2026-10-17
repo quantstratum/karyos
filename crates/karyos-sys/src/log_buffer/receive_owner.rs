@@ -73,7 +73,10 @@ pub enum Received {
     /// It overlaps a local gap record still retained and no committed real
     /// frame (`quantstratum-docs: karyos/design/gaps-and-unreliable-delivery.md`,
     /// GU-7): it arrived after its range was sealed as lost, is counted and
-    /// is not written. A sealed interval is never reopened.
+    /// is not written. A sealed interval is never reopened. A frame
+    /// overlapping an interval posted for sealing
+    /// ([`ReceiveOwner::post_seal`]) is refused the same way: posting is
+    /// the point of no return (conflated-network-images.md (b)).
     LateAfterSkip,
 }
 
@@ -390,6 +393,50 @@ impl<T: TermBytes> ReceiveOwner<T> {
         result
     }
 
+    /// Posts `[position, position + extent)` of `lane` for sealing
+    /// (`quantstratum-docs: karyos/design/conflated-network-images.md`,
+    /// (b)): from now on a frame overlapping it is not committed and reads
+    /// [`Received::LateAfterSkip`], so the interval is sealed whole once its
+    /// seal gate permits, and a value in it is never both marked stale and
+    /// delivered. A lane holds one posted interval; a new post replaces it,
+    /// and the seal of an interval overlapping it clears it.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::Foreign`] for a lane the image does not have,
+    /// [`ReceiveError::InvalidGap`] for an empty interval or one past the
+    /// position range. Nothing is posted on error.
+    pub fn post_seal(
+        &mut self,
+        lane: Lane,
+        position: u64,
+        extent: u32,
+    ) -> Result<(), ReceiveError> {
+        let owner = self
+            .lanes
+            .get_mut(usize::from(lane.get()))
+            .ok_or(ReceiveError::Foreign)?;
+        let invalid = ReceiveError::InvalidGap {
+            lane,
+            position,
+            extent,
+        };
+        let end = position
+            .checked_add(u64::from(extent))
+            .filter(|_| extent > 0)
+            .ok_or(invalid)?;
+        owner.posted = Some((position, end));
+        Ok(())
+    }
+
+    /// The interval of `lane` posted for sealing and not sealed yet, as
+    /// `[start, end)`; `None` for a lane without one or one the image does
+    /// not have.
+    #[must_use]
+    pub fn posted(&self, lane: Lane) -> Option<(u64, u64)> {
+        self.lanes.get(usize::from(lane.get()))?.posted
+    }
+
     /// Bounded background work: clears released bitmap sets, at most
     /// `CLEAN_CHUNK_WORDS` words per lane. Returns whether work remains.
     pub fn duty(&mut self) -> bool {
@@ -580,6 +627,9 @@ struct LaneOwner<T: TermBytes> {
     loans: [Option<(TermCount, u8)>; 2],
     /// Set when the last receive found the next term unprepared.
     lagged: bool,
+    /// The interval `[start, end)` posted for sealing and not sealed yet:
+    /// no frame overlapping it is committed.
+    posted: Option<(u64, u64)>,
     /// Returned by the next `advance`: tests reproduce a failure after a
     /// gap record was published.
     #[cfg(test)]
@@ -611,6 +661,7 @@ impl<T: TermBytes> LaneOwner<T> {
             sets: [set(), set(), set(), set()],
             loans: [None, None],
             lagged: false,
+            posted: None,
             #[cfg(test)]
             fail_advance: None,
         }
@@ -692,6 +743,17 @@ impl<T: TermBytes> LaneOwner<T> {
                 Ok(Received::LateAfterSkip)
             };
         }
+        // Posting is the point of no return: the posted interval is sealed
+        // whole, so nothing lands in it.
+        let end = start
+            .checked_add(u64::from(frame.extent()))
+            .ok_or_else(conflict)?;
+        if self
+            .posted
+            .is_some_and(|(from, to)| start < to && from < end)
+        {
+            return Ok(Received::LateAfterSkip);
+        }
         let Some(slot) = self.write_loan(count)? else {
             return Ok(Received::NotReady);
         };
@@ -699,7 +761,6 @@ impl<T: TermBytes> LaneOwner<T> {
         let set = self.set_mut(index)?;
         set_bit(&mut set.starts, unit);
         set_range(&mut set.covered, unit, units);
-        let end = start + u64::from(frame.extent());
         self.high = self.high.max(end);
         self.received = self.received.max(end);
         if start == self.rebuild {
@@ -815,6 +876,14 @@ impl<T: TermBytes> LaneOwner<T> {
                 .map_or(position, |first| first.min(position)),
         );
         self.gaps.sealed(extent, reason);
+        // A seal from the posted interval's start on releases what it
+        // covers; what lies above stays posted.
+        if let Some((from, to)) = self.posted
+            && position <= from
+            && from < end
+        {
+            self.posted = (end < to).then_some((end, to));
+        }
         // The record is published: a failure from here on is reported as
         // committed, so the caller never seals the interval again.
         if position == self.rebuild
