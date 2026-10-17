@@ -198,3 +198,24 @@ fn a_lapped_async_recording_rejoins_at_the_head() {
     assert_eq!(messages, after);
     assert!(!published.is_empty());
 }
+
+/// Records its name when dropped.
+struct Noisy(&'static str, std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+
+impl Drop for Noisy {
+    fn drop(&mut self) {
+        self.1.borrow_mut().push(self.0);
+    }
+}
+
+/// A guarded source drops its source before its guard, so a reader never
+/// outlives the lease on its stream.
+#[test]
+fn a_guarded_source_drops_the_source_first() {
+    let order = std::rc::Rc::default();
+    drop(super::Guarded::new(
+        Noisy("source", std::rc::Rc::clone(&order)),
+        Noisy("guard", std::rc::Rc::clone(&order)),
+    ));
+    assert_eq!(*order.borrow(), ["source", "guard"]);
+}

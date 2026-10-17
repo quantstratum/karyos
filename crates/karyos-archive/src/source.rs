@@ -17,6 +17,48 @@ use crate::recorder::{FrameSource, Frames, SourceError};
 #[cfg(test)]
 mod tests;
 
+/// A source with a guard the recording keeps until it drops the source:
+/// what the source needs alive while it is read, such as the driver's
+/// lease on the recorded stream, which keeps a removed stream until its
+/// seal is positioned and read. The Archive does not know what the guard
+/// is (SPEC §14). The source is dropped first, then the guard.
+#[derive(Debug)]
+pub struct Guarded<S, G> {
+    // Declared before `guard`: fields drop in declaration order.
+    source: S,
+    guard: G,
+}
+
+impl<S, G> Guarded<S, G> {
+    /// `source`, kept with `guard`.
+    pub const fn new(source: S, guard: G) -> Self {
+        Self { source, guard }
+    }
+
+    /// The source and its guard, apart.
+    pub fn into_parts(self) -> (S, G) {
+        (self.source, self.guard)
+    }
+}
+
+impl<S: FrameSource, G> FrameSource for Guarded<S, G> {
+    fn position(&self) -> u64 {
+        self.source.position()
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
+        self.source.read(out)
+    }
+
+    fn consumed(&mut self, position: u64) -> Result<(), SourceError> {
+        self.source.consumed(position)
+    }
+
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        self.source.resume(to)
+    }
+}
+
 impl<O: BufferOwner> FrameSource for SenderRead<O> {
     fn position(&self) -> u64 {
         Self::position(self)
