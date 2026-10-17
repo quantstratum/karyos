@@ -17,3 +17,4 @@ pub mod disk;
 mod fault;
 pub mod recorder;
 pub mod segment;
+pub mod source;

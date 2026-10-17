@@ -1174,6 +1174,8 @@ fn installed_image_with(
         initial_term_id: TermId::new(9),
         term_length: 65_536,
         heartbeat_marks: [None; 4],
+        terminal: [None; 4],
+        dropped_past_terminal: [false; 4],
         last_fresh: 0,
         window: 32_768,
         schedule: crate::sm_schedule::SmSchedule::new(10_000_000, &[32_768]).unwrap(),
@@ -3566,4 +3568,146 @@ fn a_refused_path_heartbeat_is_tried_next_cycle() {
     );
     assert_eq!(beat(1), 1, "B sent once");
     assert_eq!(beat(0), 2, "A: the refused try and the retry");
+}
+
+/// A DATA frame of `payload` bytes at `term_offset` of term 9 on lane 0 of
+/// [`installed_image`], with EOS on it when `eos` (a header-only frame is
+/// a heartbeat).
+fn data_frame(term_offset: i32, payload: usize, eos: bool) -> Vec<u8> {
+    use karyos_protocol::frame::{Flags, FrameType, Lane, Word0};
+
+    let length = 32 + payload;
+    let word0 = Word0::new(
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, eos, false, Lane::ZERO),
+        FrameType::Data,
+    );
+    let mut bytes = vec![0u8; length.next_multiple_of(32)];
+    bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+    bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+    bytes[12..16].copy_from_slice(&5i32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&6i32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&9u32.to_le_bytes());
+    bytes.truncate(length);
+    bytes
+}
+
+/// Commits `bytes`, one DATA frame, into `image`.
+fn commit_bytes(
+    image: &mut super::Installed,
+    params: &karyos_sys::receive::ImageParams,
+    bytes: &[u8],
+) {
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let datagram = ValidatedDatagram::parse(bytes, params).unwrap();
+    let Some(Item::Frame(frame)) = datagram.items().next() else {
+        panic!("not a frame");
+    };
+    assert!(matches!(
+        image.owner.receive(&frame),
+        Ok(karyos_sys::log_buffer::Received::Committed { .. })
+    ));
+}
+
+/// EOS records a lane's terminal bound once: a repeat is idempotent,
+/// another bound, one below the complete prefix or one under covered data
+/// is refused; the image reaches its bound only through a complete prefix,
+/// so EOS ahead of a hole waits for the repair.
+#[test]
+fn eos_records_one_terminal_bound_reached_through_a_complete_prefix() {
+    use super::Terminal::{Recorded, Refused, Repeated};
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, params) = installed_image();
+    // Two frames of 96 bytes (aligned): 0..96 and 96..192; the second
+    // arrives first, so 0..96 is a hole.
+    commit_bytes(&mut image, &params, &data_frame(96, 64, false));
+    assert_eq!(super::record_terminal(&mut image, Lane::ZERO, 64), Refused);
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 192),
+        Recorded
+    );
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 192),
+        Repeated
+    );
+    assert_eq!(super::record_terminal(&mut image, Lane::ZERO, 224), Refused);
+    assert_eq!(image.terminal[0], Some(192));
+    assert!(!super::terminal_reached(&image), "ahead of a hole");
+    commit_bytes(&mut image, &params, &data_frame(0, 64, false));
+    assert!(super::terminal_reached(&image), "the hole repaired");
+}
+
+/// No bound below the complete prefix: EOS at a position the image already
+/// passed is refused.
+#[test]
+fn eos_below_the_complete_prefix_is_refused() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, params) = installed_image();
+    commit_bytes(&mut image, &params, &data_frame(0, 64, false));
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 32),
+        super::Terminal::Refused
+    );
+    assert_eq!(image.terminal[0], None);
+}
+
+/// Once the bound is known, a frame that ends past it is past the
+/// terminal; frames up to it are not.
+#[test]
+fn a_frame_past_the_terminal_bound_is_recognised() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    let past = |image: &super::Installed, bytes: &[u8]| {
+        let datagram = ValidatedDatagram::parse(bytes, &params).unwrap();
+        let Some(Item::Frame(frame)) = datagram.items().next() else {
+            panic!("not a frame");
+        };
+        super::past_terminal(image, &frame)
+    };
+    let second = data_frame(96, 64, false);
+    assert!(!past(&image, &second), "no bound yet");
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 96),
+        super::Terminal::Recorded
+    );
+    assert!(!past(&image, &data_frame(0, 64, false)));
+    assert!(past(&image, &second));
+}
+
+/// Once a lane's bound is recorded, nothing past it is marked or NAKed: a
+/// heartbeat beyond the bound raises the mark only to the bound, and the
+/// tail hole ends there.
+#[test]
+fn the_heartbeat_mark_and_a_tail_nak_stop_at_the_terminal_bound() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 96),
+        super::Terminal::Recorded
+    );
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(image.heartbeat_marks[0], Some(96));
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Stationary,
+        "capped at the bound"
+    );
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
+    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert_eq!((hole.start, hole.length), (0, 96));
 }

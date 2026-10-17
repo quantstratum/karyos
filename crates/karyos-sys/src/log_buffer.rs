@@ -2736,6 +2736,11 @@ pub enum SealReason {
     /// (`quantstratum-docs: karyos/design/network-sessions.md`, S1
     /// retirement). A local removal is [`SealReason::StreamRemoved`].
     ImageRetired,
+    /// The stream is the image of a remote publication that ended: every
+    /// lane's complete prefix reached the terminal bound its EOS named
+    /// (`quantstratum-docs: karyos/design/network-sessions.md`, Liveness
+    /// and terminal transitions). The clean end of an image.
+    EndOfStream,
 }
 
 impl SealReason {
@@ -2751,6 +2756,7 @@ impl SealReason {
             Self::GuardClosed => 5,
             Self::DeadlineMissed => 6,
             Self::ImageRetired => 7,
+            Self::EndOfStream => 8,
         }
     }
 
@@ -2772,6 +2778,7 @@ impl SealReason {
             5 => Self::GuardClosed,
             6 => Self::DeadlineMissed,
             7 => Self::ImageRetired,
+            8 => Self::EndOfStream,
             _ => Self::Unspecified,
         }
     }

@@ -3591,7 +3591,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         self.announce_image(endpoint, &handle, true);
                     }
                 }
-                crate::agents::images::ImageEvent::Retiring { slot } => {
+                crate::agents::images::ImageEvent::Retiring { slot, complete } => {
+                    // An image that reached its EOS bounds ends cleanly;
+                    // any other retirement may leave its prefix unresolved.
+                    let (seal, close) = if complete {
+                        (SealReason::EndOfStream, CloseReason::EndOfStream)
+                    } else {
+                        (SealReason::ImageRetired, CloseReason::ImageRetired)
+                    };
                     self.close_image_journals(slot);
                     let handle = self.net.as_ref().and_then(|net| net.image_aggregate(slot));
                     let endpoint = self.net.as_ref().and_then(|net| net.image_endpoint(slot));
@@ -3628,11 +3635,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                                     });
                                 }
                             }
-                            let _ = self.retire_lane_with(
-                                stream,
-                                SealReason::ImageRetired,
-                                CloseReason::ImageRetired,
-                            );
+                            let _ = self.retire_lane_with(stream, seal, close);
                         }
                     }
                     if let Some(net) = &mut self.net {
