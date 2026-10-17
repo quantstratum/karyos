@@ -30,6 +30,12 @@ const ALIAS: Alias = Alias {
     stream_id: 6,
 };
 
+/// A second publication on the same endpoints (rp-w7a).
+const OTHER_ALIAS: Alias = Alias {
+    session_id: 7,
+    stream_id: 6,
+};
+
 const TERM: TermParams = TermParams {
     term_length: 65_536,
     initial_term_id: 9,
@@ -73,7 +79,7 @@ fn path_rx(
             let Ok(Datagram::DataBatch(data)) = classify(datagram) else {
                 panic!("not a DATA datagram");
             };
-            assert_eq!(data.alias(), ALIAS);
+            assert!(data.alias() == ALIAS || data.alias() == OTHER_ALIAS);
             record.lock().unwrap().push(data.bytes().to_vec());
         }
     }));
@@ -1360,3 +1366,5 @@ fn a_shared_bottleneck_evicts_no_path() {
             .unwrap();
     }
 }
+
+mod validation;
