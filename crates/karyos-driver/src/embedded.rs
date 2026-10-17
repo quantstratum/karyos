@@ -45,7 +45,7 @@ use karyos_sys::log_buffer::{
     Conductor, DeadlineError, DeadlineReport, LogBuffer, LogBufferConfig, LossPolicy, Publication,
     Role, SealReason, SealState,
 };
-use karyos_sys::term::Generation;
+use karyos_sys::term::{Generation, TermId};
 #[cfg(target_os = "linux")]
 use karyos_sys::term_bytes::SharedTerms;
 use karyos_sys::term_bytes::{HeapTerms, TermBytes};
@@ -370,6 +370,13 @@ pub struct DriverConfig {
     /// with [`DriverError::DescriptorLimit`] below them, naming the soft and
     /// the hard limit.
     pub network: Option<crate::net::NetworkConfig>,
+    /// Tests only: the `initial_term_id` of every local publication, in
+    /// place of the draw. `None`, the default, draws a random one on the
+    /// control path for each publication (SPEC §4, initial state); network
+    /// publications take theirs from
+    /// [`crate::net::NetworkStreamDefaults::initial_term_id`].
+    #[doc(hidden)]
+    pub initial_term_id: Option<u32>,
 }
 
 impl Default for DriverConfig {
@@ -420,6 +427,7 @@ impl Default for DriverConfig {
             max_guard_senders: 64,
             guard_ack_timeout: 1_000_000_000,
             network: None,
+            initial_term_id: None,
         }
     }
 }
@@ -1962,13 +1970,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.guards.audit()
     }
 
-    /// Creates a stream (control path: allocates its log buffer).
+    /// Creates a stream (control path: allocates its log buffer). Its
+    /// `initial_term_id` is drawn at random in place of the configured one
+    /// (SPEC §4, initial state).
     ///
     /// # Errors
     ///
     /// Returns configuration and allocation errors; no stream is added on
     /// error, and the refusal is recorded in the error log.
+    /// [`DriverError::Sys`] when the random source fails, before anything
+    /// is validated.
     pub fn add_stream(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
+        // The first term id, drawn on the control path before the stream
+        // exists (SPEC §4, initial state); a failed draw refuses the add.
+        let mut config = config;
+        config.buffer.initial_term_id = self.draw_initial_term_id(self.config.initial_term_id)?;
         let key = [
             u64::from(config.buffer.stream_id.cast_unsigned()),
             u64::from(config.buffer.session_id.cast_unsigned()),
@@ -1995,7 +2011,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// karyos/design/aggregate-ownership.md`), on the control path: every
     /// lane is validated, sized and built first, privately, and only then
     /// are they all added in one step that cannot fail. Each lane is a
-    /// stream; every lane reports the aggregate's registration.
+    /// stream; every lane reports the aggregate's registration. Every lane
+    /// shares one `initial_term_id`, drawn as for a stream.
     ///
     /// # Errors
     ///
@@ -2003,6 +2020,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// for no lane, more than four, or a quantum below the largest charged
     /// frame. No lane is added on error.
     pub fn add_aggregate(
+        &mut self,
+        config: AggregateConfig,
+    ) -> Result<AggregateHandle, DriverError> {
+        // As for a stream, one draw shared by every lane.
+        let mut config = config;
+        config.stream.buffer.initial_term_id =
+            self.draw_initial_term_id(self.config.initial_term_id)?;
+        self.add_aggregate_drawn(config)
+    }
+
+    /// [`EmbeddedDriver::add_aggregate`] with the `initial_term_id` already
+    /// in `config`.
+    pub(crate) fn add_aggregate_drawn(
         &mut self,
         config: AggregateConfig,
     ) -> Result<AggregateHandle, DriverError> {
@@ -2031,6 +2061,24 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             );
         }
         added
+    }
+
+    /// A publication's `initial_term_id`: `forced`, a test override, or a
+    /// random draw.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Sys`] when the random source fails.
+    pub(crate) fn draw_initial_term_id(&self, forced: Option<u32>) -> Result<TermId, DriverError> {
+        if let Some(forced) = forced {
+            return Ok(TermId::new(forced));
+        }
+        let mut word = [0u64; 1];
+        karyos_sys::random::fill_u64s(&mut word)?;
+        let [value] = word;
+        // The high half.
+        let [a, b, c, d, ..] = value.to_be_bytes();
+        Ok(TermId::new(u32::from_be_bytes([a, b, c, d])))
     }
 
     /// Validates, stages and publishes the lanes `lanes` of an aggregate
@@ -4666,3 +4714,5 @@ mod tests {
 mod aggregate_subscriber_tests;
 #[cfg(test)]
 mod aggregate_tests;
+#[cfg(test)]
+mod initial_term_id_tests;

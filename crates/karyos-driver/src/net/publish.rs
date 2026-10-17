@@ -33,7 +33,6 @@ use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
 use karyos_sys::submission_frontier::SubmissionFrontier;
-use karyos_sys::term::TermId;
 use karyos_sys::term_bytes::HeapTerms;
 
 use super::NetworkPublicationState;
@@ -196,9 +195,13 @@ impl EmbeddedDriver<HeapTerms> {
         // The incarnation's first term id, drawn on the control path before
         // the publication and its SETUP exist (SPEC §4, initial state; §5),
         // shared by every lane; a failed draw refuses the add.
+        let forced = self
+            .config
+            .network
+            .and_then(|network| network.stream_defaults.initial_term_id);
         let mut config = config;
-        config.stream.buffer.initial_term_id = TermId::new(self.draw_initial_term_id()?);
-        let handle = self.add_aggregate(config)?;
+        config.stream.buffer.initial_term_id = self.draw_initial_term_id(forced)?;
+        let handle = self.add_aggregate_drawn(config)?;
         let added = self.attach_sender(
             &handle,
             destination,
@@ -212,28 +215,6 @@ impl EmbeddedDriver<HeapTerms> {
             return Err(error);
         }
         Ok(handle)
-    }
-
-    /// A network publication's `initial_term_id`: a random draw, or the
-    /// test override of `NetworkStreamDefaults::initial_term_id`.
-    ///
-    /// # Errors
-    ///
-    /// [`DriverError::Sys`] when the random source fails.
-    fn draw_initial_term_id(&self) -> Result<u32, DriverError> {
-        if let Some(forced) = self
-            .config
-            .network
-            .and_then(|network| network.stream_defaults.initial_term_id)
-        {
-            return Ok(forced);
-        }
-        let mut word = [0u64; 1];
-        karyos_sys::random::fill_u64s(&mut word)?;
-        let [value] = word;
-        // The high half.
-        let [a, b, c, d, ..] = value.to_be_bytes();
-        Ok(u32::from_be_bytes([a, b, c, d]))
     }
 
     /// The state of the network publication `aggregate`; `None` when it

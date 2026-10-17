@@ -294,6 +294,8 @@ impl<'s> Sim<'s> {
             max_retained_generations: 2,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             client_liveness_timeout: CLIENT_TIMEOUT,
+            // A replay must not depend on a random first term id.
+            initial_term_id: Some(7),
             ..DriverConfig::default()
         };
         let fail = |reason: String| Failure {

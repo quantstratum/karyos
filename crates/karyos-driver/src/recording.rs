@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_client::link::{Lease, LeaseEnd};
 use karyos_sys::SysError;
+use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
 use karyos_sys::term_bytes::HeapTerms;
 
@@ -29,9 +30,32 @@ use crate::error::DriverError;
 pub struct RecordingReader {
     reader: LaneReader,
     lease: RecordingLease,
+    format: RecordingFormat,
+}
+
+/// The recorded lane's format: what a host records with the recording, as
+/// the Archive's stream format, and gives the replay target. The stream's
+/// `initial_term_id` is drawn when it is added, so this is where a host
+/// learns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingFormat {
+    /// The recorded lane.
+    pub lane: Lane,
+    /// The stream's first term id, as `ReplayTargetConfig` takes it.
+    pub initial_term_id: i32,
+    /// Bytes of each term.
+    pub term_length: u32,
+    /// The stream's MTU.
+    pub mtu: u32,
 }
 
 impl RecordingReader {
+    /// The recorded lane's format.
+    #[must_use]
+    pub fn format(&self) -> RecordingFormat {
+        self.format
+    }
+
     /// The reader and the stream's lease.
     #[must_use]
     pub fn into_parts(self) -> (LaneReader, RecordingLease) {
@@ -89,6 +113,13 @@ impl EmbeddedDriver<HeapTerms> {
             .ok_or(DriverError::ExportIdsExhausted)?;
         let target = self.active_stream_mut(stream)?;
         target.issuing()?;
+        let buffer = target.buffer.config();
+        let format = RecordingFormat {
+            lane: buffer.lane,
+            initial_term_id: buffer.initial_term_id.get().cast_signed(),
+            term_length: buffer.term_length.get(),
+            mtu: buffer.mtu,
+        };
         let subscription = target
             .conductor
             .subscribe_as(role, role == Role::Required, occupant)?;
@@ -102,7 +133,11 @@ impl EmbeddedDriver<HeapTerms> {
         };
         self.next_export = next;
         self.update_stream_gauges();
-        Ok(RecordingReader { reader, lease })
+        Ok(RecordingReader {
+            reader,
+            lease,
+            format,
+        })
     }
 }
 

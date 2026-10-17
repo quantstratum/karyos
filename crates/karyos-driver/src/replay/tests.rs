@@ -25,7 +25,7 @@ use karyos_sys::term::TermId;
 use karyos_sys::term_bytes::HeapTerms;
 
 use super::*;
-use crate::embedded::StreamConfig;
+use crate::embedded::{StreamConfig, StreamHandle};
 
 const MESSAGE: usize = 1000;
 const INITIAL_TERM_ID: i32 = 7;
@@ -54,6 +54,16 @@ fn source() -> StreamConfig {
         on_required_loss: LossPolicy::Hold,
         conflation: None,
     }
+}
+
+/// A driver whose recorded streams start at [`INITIAL_TERM_ID`], the
+/// term id every replay target here is given, in place of a drawn one.
+fn pinned() -> EmbeddedDriver {
+    EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+        initial_term_id: Some(INITIAL_TERM_ID.cast_unsigned()),
+        ..crate::embedded::DriverConfig::default()
+    })
+    .unwrap()
 }
 
 /// A target on another stream than the recorded one, as SPEC §8.2 has.
@@ -90,11 +100,23 @@ impl Run {
 /// Publishes `count` messages, each holding its index, and records them
 /// as a recording reader reads them; returns the runs and the end.
 fn record(driver: &mut EmbeddedDriver<HeapTerms>, count: u32) -> (Vec<Run>, u64) {
+    let (runs, end, _) = record_format(driver, count);
+    (runs, end)
+}
+
+/// [`record`], with the recorded stream and the recording's format.
+fn record_format(
+    driver: &mut EmbeddedDriver<HeapTerms>,
+    count: u32,
+) -> (
+    Vec<Run>,
+    u64,
+    (StreamHandle, crate::recording::RecordingFormat),
+) {
     let handle = driver.add_stream(source()).unwrap();
-    let (mut reader, _lease) = driver
-        .recording_reader(handle, Role::Required)
-        .unwrap()
-        .into_parts();
+    let recording = driver.recording_reader(handle, Role::Required).unwrap();
+    let format = recording.format();
+    let (mut reader, _lease) = recording.into_parts();
     let mut publication: ClientPublication = driver.publication(handle).unwrap();
     let mut runs = Vec::new();
     let mut out = vec![0u8; usize::try_from(MIN_TERM_LENGTH).unwrap()];
@@ -127,7 +149,7 @@ fn record(driver: &mut EmbeddedDriver<HeapTerms>, count: u32) -> (Vec<Run>, u64)
         }
     }
     assert_eq!(sent, count);
-    (runs, reader.position())
+    (runs, reader.position(), (handle, format))
 }
 
 /// Feeds `runs` into `feed` and polls `reader` as it goes; the runs in
@@ -215,7 +237,7 @@ fn until_terminal<T: StreamTerms>(
 /// with a clean EOS.
 #[test]
 fn a_replay_target_delivers_the_recording_at_its_positions() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let count = 200;
     let (runs, end) = record(&mut driver, count);
     assert!(end > 3 * u64::from(MIN_TERM_LENGTH), "crosses terms: {end}");
@@ -248,11 +270,102 @@ fn a_replay_target_delivers_the_recording_at_its_positions() {
     assert!(terminal.terminal.unwrap().clean);
 }
 
+/// A replay target keeps the recording's `initial_term_id` from its
+/// config, on a driver that draws one for each local publication: the
+/// target is an image, never drawn. A recording made from that id
+/// replays exactly.
+#[test]
+fn a_replay_target_keeps_the_recordings_initial_term_id() {
+    const RECORDED: u32 = 0x1234_5678;
+    let mut recorder = EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+        initial_term_id: Some(RECORDED),
+        ..crate::embedded::DriverConfig::default()
+    })
+    .unwrap();
+    let count = 200;
+    let (runs, end) = record(&mut recorder, count);
+    // No override: this driver draws.
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let config = ReplayTargetConfig {
+        initial_term_id: RECORDED.cast_signed(),
+        ..target(2, 0)
+    };
+    let (handle, mut feed) = driver.replay_target(config).unwrap();
+    let lane = driver.stream_ref(handle.lane(Lane::ZERO).unwrap()).unwrap();
+    assert_eq!(lane.buffer.config().initial_term_id.get(), RECORDED);
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    let mut seen = Vec::new();
+    let mut polls = Vec::new();
+    replay(
+        &mut driver,
+        &mut feed,
+        &mut reader,
+        &runs,
+        None,
+        false,
+        &mut seen,
+        &mut polls,
+    );
+    assert_eq!(feed.position(), end);
+    assert!(driver.finish_replay(handle, feed, end).unwrap());
+    let terminal = until_terminal(&mut driver, &mut reader, &mut seen);
+    assert_eq!(seen, (0..count).collect::<Vec<_>>());
+    assert!(terminal.terminal.unwrap().clean);
+}
+
+/// A recording reader's format names the recorded lane as the driver
+/// built it, with its drawn `initial_term_id`, so a host learns the id
+/// there; a replay target built from that format replays the recording
+/// exactly.
+#[test]
+fn a_recordings_format_carries_the_drawn_initial_term_id() {
+    // No override: the recorded stream's id is drawn.
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let count = 200;
+    let (runs, end, (recorded, format)) = record_format(&mut driver, count);
+    let buffer = *driver.stream_ref(recorded).unwrap().buffer.config();
+    assert_eq!(
+        format,
+        crate::recording::RecordingFormat {
+            lane: Lane::ZERO,
+            initial_term_id: buffer.initial_term_id.get().cast_signed(),
+            term_length: MIN_TERM_LENGTH,
+            mtu: DEFAULT_MTU,
+        }
+    );
+    let config = ReplayTargetConfig {
+        term_length: format.term_length,
+        initial_term_id: format.initial_term_id,
+        mtu: format.mtu,
+        lane: format.lane,
+        ..target(2, 0)
+    };
+    let (handle, mut feed) = driver.replay_target(config).unwrap();
+    let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
+    let mut seen = Vec::new();
+    let mut polls = Vec::new();
+    replay(
+        &mut driver,
+        &mut feed,
+        &mut reader,
+        &runs,
+        None,
+        false,
+        &mut seen,
+        &mut polls,
+    );
+    assert_eq!(feed.position(), end);
+    assert!(driver.finish_replay(handle, feed, end).unwrap());
+    let terminal = until_terminal(&mut driver, &mut reader, &mut seen);
+    assert_eq!(seen, (0..count).collect::<Vec<_>>());
+    assert!(terminal.terminal.unwrap().clean);
+}
+
 /// A replay joined inside the recording starts there: a subscriber reads
 /// from the join on, at the recorded positions.
 #[test]
 fn a_replay_joins_at_its_first_position() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let (runs, end) = record(&mut driver, 100);
     let from = runs
         .iter()
@@ -287,7 +400,7 @@ fn a_replay_joins_at_its_first_position() {
 /// with EndOfStream, but the reader saw a loss, so its EOS is not clean.
 #[test]
 fn a_recorded_gap_is_a_local_gap_and_the_end_is_not_clean() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let (runs, end) = record(&mut driver, 40);
     let lost = runs
         .iter()
@@ -330,7 +443,7 @@ fn a_recorded_gap_is_a_local_gap_and_the_end_is_not_clean() {
 /// A replay that ends before its end seals ImageRetired: not clean.
 #[test]
 fn an_incomplete_replay_retires_its_target() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let (runs, end) = record(&mut driver, 20);
     let (handle, mut feed) = driver.replay_target(target(2, 0)).unwrap();
     let mut reader = driver.subscribe_aggregate(&handle, Role::Required).unwrap();
@@ -412,7 +525,7 @@ fn an_ipc_drivers_replay_target_lives_in_a_region() {
     use crate::clock::SystemClock;
     use crate::embedded::DriverConfig;
 
-    let mut heap = EmbeddedDriver::new().unwrap();
+    let mut heap = pinned();
     let (runs, end) = record(&mut heap, 60);
     let dir = std::env::temp_dir().join(format!("karyos-a5b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -467,7 +580,7 @@ fn an_ipc_drivers_replay_target_lives_in_a_region() {
 /// one local gap per term). Nothing is lost or written twice.
 #[test]
 fn a_term_not_ready_is_offered_again() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let count = 200;
     let (runs, end) = record(&mut driver, count);
     // Frames: everything, eagerly.
@@ -576,7 +689,7 @@ fn first_index(run: &Run) -> u32 {
 /// the driver's next duty; a frame of another source is refused.
 #[test]
 fn a_target_is_never_left_behind() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let (runs, _) = record(&mut driver, 40);
     let frames: Vec<&Run> = runs
         .iter()
@@ -659,7 +772,7 @@ fn joined(runs: &[Run]) -> Vec<Run> {
 /// may omit its alignment padding.
 #[test]
 fn a_run_of_several_frames_is_written_whole() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let count = 120;
     let (runs, end) = record(&mut driver, count);
     let runs = joined(&runs);
@@ -693,7 +806,7 @@ fn a_run_of_several_frames_is_written_whole() {
 /// goes on only because the feed cleans the terms its reader left.
 #[test]
 fn a_replay_longer_than_the_images_terms_cleans_as_it_goes() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let count = 400;
     let (runs, end) = record(&mut driver, count);
     assert!(
@@ -724,7 +837,7 @@ fn a_replay_longer_than_the_images_terms_cleans_as_it_goes() {
 /// and the target is freed only once its last reader drops.
 #[test]
 fn messages_read_at_their_recorded_positions_and_the_target_outlives_its_reader() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let count = 40;
     let (runs, end) = record(&mut driver, count);
     let recorded: Vec<(u32, u64)> = runs
@@ -791,7 +904,7 @@ fn messages_read_at_their_recorded_positions_and_the_target_outlives_its_reader(
 /// its extent; nothing is written.
 #[test]
 fn frames_and_fills_are_checked_against_their_positions_and_extents() {
-    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut driver = pinned();
     let (runs, _) = record(&mut driver, 80);
     let (handle, mut feed) = driver.replay_target(target(2, 0)).unwrap();
     let Run::Frames(_, frame) = &runs[0] else {
