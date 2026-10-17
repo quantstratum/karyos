@@ -111,7 +111,7 @@ pub enum FailKind {
 }
 
 impl StopReason {
-    const fn code(self) -> u8 {
+    pub(crate) const fn code(self) -> u8 {
         match self {
             Self::Normal => 1,
             Self::Recovered => 2,
@@ -125,7 +125,7 @@ impl StopReason {
         }
     }
 
-    const fn of(code: u8) -> Option<Self> {
+    pub(crate) const fn of(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::Normal),
             2 => Some(Self::Recovered),
