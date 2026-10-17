@@ -91,6 +91,14 @@ pub enum ViewClosed {
         /// The start of the unresolved interval.
         since: u64,
     },
+    /// The network image the view reads retired (`quantstratum-docs:
+    /// karyos/design/conflated-network-images.md`). Reserved: the view of
+    /// a network image reports it once that close is wired.
+    #[error("the conflated view closed: its image retired")]
+    ImageRetired {
+        /// The image's last position, when known.
+        since: Option<u64>,
+    },
     /// A reason code this client does not know.
     #[error("the conflated view closed (reason {reason}, stale since {since})")]
     Other {
