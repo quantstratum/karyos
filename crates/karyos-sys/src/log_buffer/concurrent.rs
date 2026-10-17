@@ -486,10 +486,11 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         self.offer_pausing(payload, options, &mut |_| {})
     }
 
-    /// [`ConcurrentPublication::offer`] that calls `pause` once, after
-    /// fragment `fragment` is written and before the next one: a writer
-    /// stopped in the middle of its copy (tests, and dependent crates'
-    /// tests through feature `test-hooks`).
+    /// [`ConcurrentPublication::offer`] that calls `pause` at most once:
+    /// after fragment `fragment` is written and before the next one, so
+    /// never for a message of fewer fragments. A writer stopped in the
+    /// middle of its copy (tests, and dependent crates' tests through
+    /// feature `test-hooks`).
     ///
     /// # Errors
     ///
