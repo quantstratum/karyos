@@ -217,9 +217,17 @@ struct NetSubscription {
     control: Option<EndpointId>,
     /// The receiver identity every handle of this key shares (MC-1).
     identity: Option<crate::membership::ReceiverIdentity>,
+    /// The endpoints of the channel's later redundant paths, each with its
+    /// own receiver entry (redundant-paths.md; the first path is
+    /// `endpoint`).
+    later: [Option<EndpointId>; LATER_PATHS],
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
+
+/// The later paths a network subscription holds beside its first: the
+/// channel URI allows four paths (karyos-protocol `channel.rs`).
+pub(crate) const LATER_PATHS: usize = 3;
 
 /// Guard senders released for the conductor to deregister: at most one
 /// per tracked publication (allocated at start). One past that is dropped
@@ -334,6 +342,12 @@ pub(crate) struct Network {
     /// Control group joins that failed: those keys run without peer
     /// suppression input (RC-15).
     control_join_failures: u64,
+    /// Whether the backend isolates redundant path sockets.
+    paths_isolated: bool,
+    /// Channels with `paths` refused because they cannot be isolated.
+    paths_refused: u64,
+    /// Later paths of subscriptions that could not be held.
+    path_failures: u64,
 }
 
 impl Network {
@@ -383,6 +397,9 @@ impl Network {
             guard_deregister_failures: 0,
             control_groups: config.nak_control_groups,
             control_join_failures: 0,
+            paths_isolated: <OsSocket as karyos_io::sockets::ops::SocketOps>::isolates_paths(),
+            paths_refused: 0,
+            path_failures: 0,
         })
     }
 
@@ -458,6 +475,7 @@ impl Network {
         stream_id: i32,
         bind: SocketAddr,
         multicast: Option<MulticastConfig>,
+        later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
         reliable: bool,
         identity: Option<crate::membership::ReceiverIdentity>,
@@ -524,15 +542,80 @@ impl Network {
             }
             return Err(DriverError::NetworkBusy);
         }
+        // Each later path is a receiver entry of its own endpoint; the
+        // receiver binds it to the image as a later path of the same
+        // publication (RP-1). A path that cannot open or be posted leaves
+        // the subscription with the paths it has, counted.
+        let mut held = [None; LATER_PATHS];
+        for (slot, (bind, config)) in held.iter_mut().zip(later) {
+            let Ok(path) = self.hold_endpoint(*bind, Some(*config)) else {
+                self.count_path_failure();
+                continue;
+            };
+            let posted = self
+                .links
+                .receiver
+                .post(|reply| AgentCommand::AddSubscription {
+                    reply,
+                    endpoint: path,
+                    stream_id,
+                    max_term_length,
+                    reliable,
+                    multicast: true,
+                    control_group: None,
+                    identity,
+                });
+            if posted.is_err() {
+                release(&mut self.send_endpoints, path);
+                self.count_path_failure();
+                continue;
+            }
+            *slot = Some(path);
+        }
         self.subscriptions.push(NetSubscription {
             endpoint,
             stream_id,
             reliable,
             control: control.map(|(control, _)| control),
             identity,
+            later: held,
             users: 1,
         });
         Ok(handle)
+    }
+
+    /// One later path of a subscription that could not be held.
+    fn count_path_failure(&mut self) {
+        if let Some(count) = self.path_failures.checked_add(1) {
+            self.path_failures = count;
+        }
+    }
+
+    /// Whether this driver can isolate the sockets of redundant paths
+    /// ([`SocketOps::isolates_paths`]); a channel with `paths` is refused
+    /// while it cannot.
+    pub(crate) fn paths_isolated(&self) -> bool {
+        self.paths_isolated
+    }
+
+    /// One channel with `paths` refused: the sockets cannot be isolated.
+    pub(crate) fn count_paths_refused(&mut self) {
+        if let Some(count) = self.paths_refused.checked_add(1) {
+            self.paths_refused = count;
+        }
+    }
+
+    /// Channels with `paths` refused, and later paths that could not be
+    /// held.
+    pub(crate) fn path_counters(&self) -> (u64, u64) {
+        (self.paths_refused, self.path_failures)
+    }
+
+    /// Lets channels with `paths` through, as if the backend isolated their
+    /// sockets (tests: on one interface every path sees every datagram).
+    #[cfg(test)]
+    pub(crate) fn assume_isolated_paths(&mut self) {
+        self.paths_isolated = true;
     }
 
     /// The endpoint joined to the NAK control group of the data group
@@ -597,6 +680,22 @@ impl Network {
                 }
             }
             _ => {
+                // The later paths first: a removal posted again for a path
+                // already removed is answered not found, which is harmless.
+                let later = self
+                    .subscriptions
+                    .get(index)
+                    .map_or([None; LATER_PATHS], |entry| entry.later);
+                for path in later.into_iter().flatten() {
+                    self.links
+                        .receiver
+                        .post(|reply| AgentCommand::RemoveSubscription {
+                            reply,
+                            endpoint: path,
+                            stream_id,
+                        })
+                        .map_err(|_| DriverError::NetworkBusy)?;
+                }
                 self.links
                     .receiver
                     .post(|reply| AgentCommand::RemoveSubscription {
@@ -608,6 +707,9 @@ impl Network {
                 let entry = self.subscriptions.swap_remove(index);
                 if let Some(control) = entry.control {
                     release(&mut self.send_endpoints, control);
+                }
+                for path in entry.later.into_iter().flatten() {
+                    release(&mut self.send_endpoints, path);
                 }
             }
         }
@@ -761,6 +863,28 @@ impl Network {
     #[cfg(test)]
     pub(crate) fn subscription_count(&self) -> usize {
         self.subscriptions.len()
+    }
+
+    /// The configured identity the receiver holds for each path endpoint
+    /// of the subscription to `stream_id`, the first path first (tests,
+    /// Shared mode only).
+    #[cfg(test)]
+    pub(crate) fn path_identities(
+        &self,
+        stream_id: i32,
+    ) -> Vec<Option<crate::membership::ReceiverIdentity>> {
+        let (Some(entry), Agents::Shared(agents)) = (
+            self.subscriptions
+                .iter()
+                .find(|entry| entry.stream_id == stream_id),
+            &self.agents,
+        ) else {
+            return Vec::new();
+        };
+        core::iter::once(entry.endpoint)
+            .chain(entry.later.into_iter().flatten())
+            .map(|endpoint| agents.receiver.configured_identity(endpoint, stream_id))
+            .collect()
     }
 
     /// Network publications tracked, for tests.

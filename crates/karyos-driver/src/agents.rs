@@ -896,6 +896,19 @@ pub struct ReceiverAgent<O: SocketOps> {
     sessions: chain::SessionEnd,
 }
 
+impl<O: SocketOps> ReceiverAgent<O> {
+    /// The configured identity of the key `(endpoint, stream_id)`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn configured_identity(
+        &self,
+        endpoint: EndpointId,
+        stream_id: i32,
+    ) -> Option<crate::membership::ReceiverIdentity> {
+        self.role.configured_identity(endpoint, stream_id)
+    }
+}
+
 impl<O: SocketOps> SenderAgent<O> {
     /// Drops every NAK unread from now on, as a sender that never repairs
     /// (tests).
