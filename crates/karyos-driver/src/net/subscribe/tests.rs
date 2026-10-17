@@ -1540,3 +1540,151 @@ fn eos_on_every_lane_ends_the_image_cleanly_after_the_last_message() {
 
 #[cfg(target_os = "linux")]
 mod ipc;
+
+/// Writes `command` to a remote client's ring.
+fn write_command(
+    producer: &mut karyos_sys::command_ring::RingProducer,
+    command: karyos_protocol::cnc::Command,
+) {
+    let mut bytes = [0u8; karyos_protocol::cnc::MAX_COMMAND_LENGTH];
+    let length = command.encode(&mut bytes).unwrap();
+    producer.write(command.type_id(), &bytes[..length]).unwrap();
+}
+
+/// The responses `observer` has not read yet.
+fn responses(
+    observer: &mut karyos_sys::broadcast::BroadcastReceiver,
+) -> Vec<karyos_protocol::cnc::Response> {
+    let mut out = Vec::new();
+    while let karyos_sys::broadcast::Received::Message {
+        type_id, payload, ..
+    } = observer.receive()
+    {
+        if let Ok(response) = karyos_protocol::cnc::Response::decode(type_id, payload) {
+            out.push(response);
+        }
+    }
+    out
+}
+
+/// Binding commands to images (`quantstratum-docs:
+/// karyos/design/per-source-images.md`, D2-2 and D2-3): with two images
+/// of one alias, `AddSubscription` by the alias grants the oldest and
+/// `AddImageSubscription` grants the image it names. A local stream's
+/// registration, a network publication's, a lane the image lacks and a
+/// retiring image are `UnknownStream`, the image registration its detail.
+#[test]
+fn commands_bind_by_alias_to_the_oldest_image_and_by_registration_to_one() {
+    use karyos_protocol::cnc::{Command, ErrorCode, Response, SubscriberRole};
+
+    let mut a = driver(ThreadingMode::Shared);
+    let mut c = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _first = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let _second = c
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| {
+        let _ = c.do_work().unwrap();
+        b.network_images(10).len() == 2
+    });
+    let [(oldest, _), (newest, _)] = b.network_images(10)[..] else {
+        panic!("two images");
+    };
+    let local = b.add_aggregate(aggregate(20, 1, 1)).unwrap();
+    let publication = b
+        .add_network_publication(aggregate(30, 1, 1), &channel(free_address()))
+        .unwrap();
+    let mut observer = b.broadcast.receiver();
+    let (client, mut producer) = remote_client(&mut b);
+    let serve = |b: &mut EmbeddedDriver| {
+        for _ in 0..20 {
+            let _ = b.do_work().unwrap();
+        }
+    };
+    let image_subscription = |sequence, image, lane| Command::AddImageSubscription {
+        sequence,
+        image,
+        lane: Lane::try_new(lane).unwrap(),
+        role: SubscriberRole::Required,
+    };
+    add_remote_subscription(&mut producer, 1, (10, 3), SubscriberRole::Required);
+    write_command(
+        &mut producer,
+        image_subscription(2, newest.registration(), 0),
+    );
+    serve(&mut b);
+    let streams: Vec<u64> = b
+        .ledger(client)
+        .unwrap()
+        .grants()
+        .iter()
+        .map(|grant| grant.stream)
+        .collect();
+    assert_eq!(
+        streams,
+        [oldest.registration(), newest.registration()],
+        "the alias reaches the oldest, the registration its image"
+    );
+    let _ = responses(&mut observer);
+    // None of these is an image's live lane.
+    let refused = [
+        (3, local.registration(), 0),
+        (4, publication.registration(), 0),
+        (5, newest.registration(), 1),
+    ];
+    for (sequence, image, lane) in refused {
+        write_command(&mut producer, image_subscription(sequence, image, lane));
+    }
+    serve(&mut b);
+    let mut events = b.broadcast.receiver();
+    assert!(b.remove_network_subscription(subscription).unwrap());
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_none());
+    // Each image's retirement closes its lane naming the image (D2-3).
+    let mut closed = Vec::new();
+    while let karyos_sys::broadcast::Received::Message {
+        type_id, payload, ..
+    } = events.receive()
+    {
+        if let Ok(karyos_protocol::cnc::Event::PublicationClosed { stream, image, .. }) =
+            karyos_protocol::cnc::Event::decode(type_id, payload)
+        {
+            closed.push((stream.stream_id, image));
+        }
+    }
+    closed.sort_unstable();
+    assert_eq!(
+        closed,
+        [(10, oldest.registration()), (10, newest.registration())]
+    );
+    write_command(
+        &mut producer,
+        image_subscription(6, oldest.registration(), 0),
+    );
+    serve(&mut b);
+    assert_eq!(grants(&b, client), 2, "nothing more granted");
+    let errors: Vec<(u64, ErrorCode, u64)> = responses(&mut observer)
+        .into_iter()
+        .filter_map(|response| match response {
+            Response::Error {
+                request,
+                code,
+                detail,
+            } => Some((request.sequence, code, detail)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            (3, ErrorCode::UnknownStream, local.registration()),
+            (4, ErrorCode::UnknownStream, publication.registration()),
+            (5, ErrorCode::UnknownStream, newest.registration()),
+            (6, ErrorCode::UnknownStream, oldest.registration()),
+        ]
+    );
+}

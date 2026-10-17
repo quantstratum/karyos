@@ -1746,6 +1746,7 @@ mod tests {
                 stream: STREAM,
                 lane: Lane::ZERO,
                 reason: karyos_protocol::cnc::CloseReason::RequiredParticipantLost,
+                image: 0,
             }],
             false,
         );

@@ -498,14 +498,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         handle: &AggregateHandle,
         available: bool,
     ) {
-        let Some(stream) = self
+        // The image is named by its registration, with its source
+        // (`quantstratum-docs: karyos/design/per-source-images.md`, D2-3).
+        let image = handle.registration();
+        let Some((stream, source)) = self
             .streams
             .iter()
-            .find(|stream| stream.id == handle.registration())
-            .map(|stream| StreamKey {
-                stream_id: stream.stream_id,
-                session_id: stream.session_id,
-            })
+            .find(|stream| stream.id == image)
+            .and_then(|stream| Some((stream.key(), stream.source?.source)))
         else {
             return;
         };
@@ -532,11 +532,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 DriverEvent::ImageAvailable {
                     stream,
                     registration,
+                    image,
+                    source,
                 }
             } else {
                 DriverEvent::ImageUnavailable {
                     stream,
                     registration,
+                    image,
                 }
             });
         }
@@ -575,21 +578,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 else {
                     continue;
                 };
-                let stream = self
+                let image = handle.registration();
+                let found = self
                     .streams
                     .iter()
-                    .find(|stream| stream.id == handle.registration() && !stream.retiring)
-                    .map(|stream| StreamKey {
-                        stream_id: stream.stream_id,
-                        session_id: stream.session_id,
-                    });
-                if let Some(stream) = stream
+                    .find(|stream| stream.id == image && !stream.retiring)
+                    .and_then(|stream| Some((stream.key(), stream.source?.source)));
+                if let Some((stream, source)) = found
                     && endpoint == subscription.endpoint()
                     && stream.stream_id == subscription.stream_id()
                 {
                     sent &= self.try_emit(&DriverEvent::ImageAvailable {
                         stream,
                         registration,
+                        image,
+                        source,
                     });
                 }
             }

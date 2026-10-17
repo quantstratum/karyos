@@ -716,6 +716,16 @@ impl<T: StreamTerms> Stream<T> {
         }
     }
 
+    /// The image registration a close of this lane names
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-3):
+    /// its aggregate's for an image's lane, 0 for any other stream.
+    pub(crate) const fn image_registration(&self) -> u64 {
+        match self.source {
+            Some(_) => self.aggregate.registration,
+            None => 0,
+        }
+    }
+
     /// A new generation link for a handle on the current mapping.
     pub(crate) fn join(&mut self, kind: MemberKind) -> (Arc<GenerationLink<T>>, u64) {
         let link = GenerationLink::new();
@@ -1549,6 +1559,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             target.conductor.seal_with_reason(seal)?;
             let key = target.key();
             let lane = target.config.lane;
+            let image = target.image_registration();
             if let Some(mut feeder) = target.feeder.take() {
                 feeder.writer.close();
             }
@@ -1564,6 +1575,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     stream: key,
                     lane,
                     reason: close,
+                    image,
                 });
             }
         }
@@ -2891,7 +2903,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     first_error.get_or_insert(DriverError::from(error));
                 }
                 if was_active && stream.conductor.seal_state() != SealState::Active {
-                    closed.push((stream.key(), stream.config.lane));
+                    closed.push((
+                        stream.key(),
+                        stream.config.lane,
+                        stream.image_registration(),
+                    ));
                 }
             }
             let Some(config) = stream.conflation else {
@@ -3044,7 +3060,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                             stream.aggregate.registration,
                             u64::from(stream.config.lane.get()),
                         ],
-                        (stream.key(), stream.config.lane),
+                        (
+                            stream.key(),
+                            stream.config.lane,
+                            stream.image_registration(),
+                        ),
                         error.cause.to_string(),
                         open,
                     ));
@@ -3080,7 +3100,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             // Only the seal that moved the stream out of `Active` reports it.
             if was_active && stream.conductor.seal_state() != SealState::Active {
-                closed.push((stream.key(), stream.config.lane));
+                closed.push((
+                    stream.key(),
+                    stream.config.lane,
+                    stream.image_registration(),
+                ));
             }
             // An end the stream did not reach (no terminal seal: the feeder
             // could not follow a cutover) is a lost feeder, never a silent
@@ -3091,7 +3115,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         stream.aggregate.registration,
                         u64::from(stream.config.lane.get()),
                     ],
-                    (stream.key(), stream.config.lane),
+                    (
+                        stream.key(),
+                        stream.config.lane,
+                        stream.image_registration(),
+                    ),
                     "the feeder ended before its stream".to_owned(),
                     true,
                 ));
@@ -3110,17 +3138,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
         }
-        for (stream, lane) in closed {
+        for (stream, lane, image) in closed {
             self.emit(&DriverEvent::PublicationClosed {
                 stream,
                 lane,
                 reason: CloseReason::ConflationVersionsExhausted,
+                image,
             });
         }
         // The loss is always logged; only a stream it closes is reported,
         // so a stream closed for good earlier gets no second closing.
         // The record names the aggregate's registration and the lane.
-        for (key, (stream, lane), cause, open) in lost {
+        for (key, (stream, lane, image), cause, open) in lost {
             self.diagnostics.error(
                 &mut self.counters,
                 crate::diagnostics::ErrorCode::ConflationFeederLost,
@@ -3132,6 +3161,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     stream,
                     lane,
                     reason: CloseReason::ConflationFeederLost,
+                    image,
                 });
             }
         }
@@ -4068,6 +4098,7 @@ mod tests {
                 },
                 lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::ConflationVersionsExhausted,
+                image: 0,
             }]
         );
         assert_eq!(
@@ -4140,6 +4171,7 @@ mod tests {
                 },
                 lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::ConflationFeederLost,
+                image: 0,
             }]
         );
         assert!(driver.streams[0].feeder.is_none());
@@ -4413,6 +4445,7 @@ mod tests {
                 },
                 lane: karyos_sys::frame::Lane::ZERO,
                 reason: CloseReason::RequiredParticipantLost,
+                image: 0,
             });
         }
         let _ = observer.poll(usize::MAX, |_| {});

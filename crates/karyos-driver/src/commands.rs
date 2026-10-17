@@ -350,6 +350,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let publication = target.aggregate.registration;
             let lane = target.config.lane.get();
             let closed_lane = target.config.lane;
+            let closed_image = target.image_registration();
             let key = StreamKey {
                 stream_id: target.stream_id,
                 session_id: target.session_id,
@@ -439,6 +440,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     stream: key,
                     lane: closed_lane,
                     reason: CloseReason::RequiredParticipantLost,
+                    image: closed_image,
                 }),
                 _ => {}
             }
@@ -703,6 +705,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map(|(index, _)| index)
     }
 
+    /// The lane stream `lane` of the live network image whose aggregate
+    /// registration is `image` (`quantstratum-docs:
+    /// karyos/design/per-source-images.md`, D2-3). Only an image: a local
+    /// stream or a network publication of that registration is not one.
+    fn find_image(&self, image: u64, lane: Lane) -> Option<usize> {
+        self.streams.iter().position(|s| {
+            !s.retiring
+                && s.source.is_some()
+                && s.aggregate.registration == image
+                && s.config.lane == lane
+        })
+    }
+
     /// Handed-over publications held for every client; `None` if the sum
     /// does not fit `usize` (checked, SPEC.md §14), which admission treats
     /// as over the hand-over limit.
@@ -869,13 +884,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             detail,
         };
         match command {
-            Command::AddPublication { stream, lane, .. }
-            | Command::AddConcurrentPublication { stream, lane, .. }
-            | Command::AddSubscription { stream, lane, .. } => {
-                let detail = u64::from(stream.stream_id.cast_unsigned());
+            Command::AddPublication { .. }
+            | Command::AddConcurrentPublication { .. }
+            | Command::AddSubscription { .. }
+            | Command::AddImageSubscription { .. } => {
                 // A lane the aggregate does not configure is an unknown
                 // stream (quantstratum-docs: karyos/design/aggregate-ownership.md).
-                let Some(index) = self.find_stream(stream, Some(lane)) else {
+                // An image is named by its registration (per-source-images.md,
+                // D2-3), its detail.
+                let (found, detail) = match command {
+                    Command::AddImageSubscription { image, lane, .. } => {
+                        (self.find_image(image, lane), image)
+                    }
+                    Command::AddPublication { stream, lane, .. }
+                    | Command::AddConcurrentPublication { stream, lane, .. }
+                    | Command::AddSubscription { stream, lane, .. } => (
+                        self.find_stream(stream, Some(lane)),
+                        u64::from(stream.stream_id.cast_unsigned()),
+                    ),
+                    _ => (None, 0),
+                };
+                let Some(index) = found else {
                     return refuse(ErrorCode::UnknownStream, detail);
                 };
                 // A guarded stream's publications are bound to the guard's
@@ -1914,7 +1943,9 @@ fn conflation_bytes(writer: &karyos_sys::conflation::ConflationWriter) -> Option
 /// other command (the callers only reach it for subscriptions).
 fn subscription_role(command: Command) -> Role {
     match command {
-        Command::AddSubscription { role, .. } => Role::from(role),
+        Command::AddSubscription { role, .. } | Command::AddImageSubscription { role, .. } => {
+            Role::from(role)
+        }
         _ => Role::Required,
     }
 }

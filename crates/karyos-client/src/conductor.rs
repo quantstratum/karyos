@@ -1790,6 +1790,7 @@ mod tests {
             },
             lane: Lane::ZERO,
             reason,
+            image: 0,
         };
         let known = closed(karyos_protocol::cnc::CloseReason::StreamRemoved);
         let mut payload = [0u8; karyos_protocol::cnc::MAX_EVENT_LENGTH];

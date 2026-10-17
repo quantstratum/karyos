@@ -1025,10 +1025,12 @@ impl<C: Connection> Client<C> {
             Event::ImageAvailable {
                 stream,
                 registration,
+                ..
             } => self.image_available(stream, registration),
             Event::ImageUnavailable {
                 stream,
                 registration,
+                ..
             } => self.image_unavailable(stream, registration),
             _ => {}
         }
