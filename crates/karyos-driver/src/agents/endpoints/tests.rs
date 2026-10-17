@@ -376,14 +376,20 @@ fn a_loopback_endpoint_opens_resets_and_retires() {
         settle(&mut agents, &links, &mut endpoints, 1),
         [EndpointEvent::Opened(id)]
     );
-    endpoints.reset(&links, id).unwrap();
-    assert_eq!(
-        settle(&mut agents, &links, &mut endpoints, 1),
-        [EndpointEvent::Reopened {
-            endpoint: id,
-            returned: 0
-        }]
-    );
+    // Port 0 resolved by the kernel: a reset keeps that port (ACS 15721).
+    let bound = endpoints.local_address(id).unwrap();
+    assert_ne!(bound.port(), 0);
+    for _ in 0..3 {
+        endpoints.reset(&links, id).unwrap();
+        assert_eq!(
+            settle(&mut agents, &links, &mut endpoints, 1),
+            [EndpointEvent::Reopened {
+                endpoint: id,
+                returned: 0
+            }]
+        );
+        assert_eq!(endpoints.local_address(id), Some(bound));
+    }
     endpoints.retire(&links, id).unwrap();
     assert_eq!(
         settle(&mut agents, &links, &mut endpoints, 1),
@@ -424,4 +430,37 @@ fn a_loopback_endpoint_opens_resets_and_retires() {
         let mut agents = runner.stop().into_agents().unwrap();
         assert_eq!(endpoints.reclaim(&links, &mut agents, |_| {}), 0);
     }
+}
+
+/// A reset that reopens at another local address (a rebind the kernel did
+/// not honour) fails the endpoint, reported, rather than move silently.
+#[test]
+fn a_reset_at_another_address_fails() {
+    use karyos_io::sockets::scripted::default_probes;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let id = endpoints.open(&links, config(), socket).unwrap();
+    assert_eq!(
+        settle(&mut agents, &links, &mut endpoints, 1),
+        [EndpointEvent::Opened(id)]
+    );
+    let bound = endpoints.local_address(id).unwrap();
+    let mut moved = default_probes(&config());
+    moved.local = std::net::SocketAddr::from(([127, 0, 0, 1], 49_999));
+    observer.push_open(Ok(moved));
+    endpoints.reset(&links, id).unwrap();
+    assert_eq!(
+        settle(&mut agents, &links, &mut endpoints, 1),
+        [EndpointEvent::Failed {
+            endpoint: id,
+            error: EndpointError::AddressChanged {
+                expected: bound,
+                found: moved.local,
+            },
+        }]
+    );
+    assert!(endpoints.is_empty());
 }
