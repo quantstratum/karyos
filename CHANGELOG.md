@@ -11,6 +11,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A recording reads a lane's log through the network sender's read
+  capability (phase 3, A4c-1). `SenderRead::for_recording` admits a
+  reserved required cell (a `required` recording) or an optional one (an
+  `async` recording), and `SenderRead::rejoin_at_head` moves a lapped
+  optional reader to the reserved head, a block boundary, as a lapped
+  optional subscription rejoins. `karyos-archive` implements its
+  `FrameSource` for `SenderRead`: a copy is padded to its frames' 32-byte
+  stride, so the segment holds the frames where the log does; a lap is
+  recorded as a gap up to where the reader rejoins, and a source busy at
+  the rejoin is retried on a later duty.
 - `karyos-archive` gains its recorder and agent (phase 3, A4b). A
   `Recorder` copies a lane's committed frames from a `FrameSource` into
   its recording's segment store: data, a padding or aborted block as a

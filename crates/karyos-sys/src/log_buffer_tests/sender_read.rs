@@ -1873,3 +1873,153 @@ fn sender_read_nak_refuses_an_uncommitted_block() {
     assert_eq!(reader.counters().nak_bad_request, 2);
     claim.abort();
 }
+
+// A4c-1 (quantstratum-docs: karyos/design/archive-gap-analysis.md, A4): the
+// read capability of an Archive recording.
+
+/// A recording's reader is a reserved required cell or an optional one;
+/// the network sender's constructor still takes only the former.
+#[test]
+fn a_recording_reader_is_required_or_optional() {
+    for (role, reserve, recording, sender) in [
+        (Role::Optional, false, true, false),
+        (Role::Observer, false, false, false),
+        (Role::Required, false, false, false),
+        (Role::Required, true, true, true),
+    ] {
+        let buffer = new_buffer(config(3, 2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let subscription = conductor.subscribe_as(role, reserve, 1).unwrap();
+        assert_eq!(
+            SenderRead::for_recording(subscription, DEFAULT_CORRUPT_RETRIES).is_ok(),
+            recording,
+            "{role:?} reserved {reserve}"
+        );
+        let subscription = conductor.subscribe_as(role, reserve, 2).unwrap();
+        assert_eq!(
+            SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES).is_ok(),
+            sender,
+            "{role:?} reserved {reserve}"
+        );
+    }
+}
+
+/// An optional recording reader the publisher lapped rejoins at the
+/// reserved head: the cursor, the registered position and the cell's
+/// position move there, and the next read starts there.
+#[test]
+fn a_lapped_optional_reader_rejoins_at_the_head() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = SenderRead::for_recording(
+        conductor.subscribe_as(Role::Optional, false, 1).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+    )
+    .unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut positions = Vec::new();
+    for value in 0..3u32 {
+        let AppendOutcome::Appended { position } = publication
+            .append(&sized_message(value, 100), AppendOptions::default())
+            .unwrap()
+        else {
+            panic!("not appended");
+        };
+        positions.push(position);
+    }
+    let head = buffer.head().unwrap().unwrap();
+    let mut out = sr_out();
+    // Before any lap, rejoining is refused and moves nothing.
+    assert_eq!(reader.rejoin_at_head(), Err(ReadError::Invariant));
+    assert_eq!(reader.position(), 0);
+    buffer.floor().store(positions[1] + 16, Ordering::Release);
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Err(ReadError::Unavailable {
+            lowest: positions[1] + 16
+        })
+    );
+    assert_eq!(reader.rejoin_at_head(), Ok(head));
+    assert_eq!((reader.position(), reader.sent_position()), (head, head));
+    let cell = &buffer.cells()[reader.subscription().cell()];
+    assert_eq!(cell.position.load(Ordering::Acquire), head);
+    assert_eq!(sr_read(&mut reader, &mut out), Ok(ReadOutcome::Pending));
+    let _ = publication
+        .append(&sized_message(9, 100), AppendOptions::default())
+        .unwrap();
+    assert!(matches!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Copied { .. })
+    ));
+    // Once read on, it is no longer lapped.
+    assert_eq!(reader.rejoin_at_head(), Err(ReadError::Invariant));
+}
+
+/// The floor can pass a rejoined reader once the publisher writes on: the
+/// next read returns `Unavailable` again, never a byte of the reclaimed
+/// range, and a second rejoin follows it.
+#[test]
+fn a_floor_passing_a_rejoined_reader_is_unavailable_again() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = SenderRead::for_recording(
+        conductor.subscribe_as(Role::Optional, false, 1).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+    )
+    .unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(0, 100), AppendOptions::default())
+        .unwrap();
+    let mut out = sr_out();
+    buffer.floor().store(32, Ordering::Release);
+    assert!(matches!(
+        sr_read(&mut reader, &mut out),
+        Err(ReadError::Unavailable { .. })
+    ));
+    let rejoined = reader.rejoin_at_head().unwrap();
+    for value in 1..3u32 {
+        let _ = publication
+            .append(&sized_message(value, 100), AppendOptions::default())
+            .unwrap();
+    }
+    let head = buffer.head().unwrap().unwrap();
+    assert!(head > rejoined);
+    // The conductor raises the floor past it before the next read's loan.
+    reader.inject(crate::log_buffer::sender_read::TestHook::FloorBeforeLoan(head));
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Err(ReadError::Unavailable { lowest: head })
+    );
+    assert_eq!(reader.rejoin_at_head(), Ok(head));
+}
+
+/// A revoked cell is not moved, and a required reader never rejoins.
+#[test]
+fn a_revoked_or_required_reader_does_not_resume() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut optional = SenderRead::for_recording(
+        conductor.subscribe_as(Role::Optional, false, 1).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+    )
+    .unwrap();
+    let mut required = SenderRead::for_recording(
+        conductor.subscribe_as(Role::Required, true, 2).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+    )
+    .unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 100), AppendOptions::default())
+        .unwrap();
+    let mut out = sr_out();
+    buffer.floor().store(32, Ordering::Release);
+    assert!(sr_read(&mut required, &mut out).is_err());
+    assert_eq!(required.rejoin_at_head(), Err(ReadError::Invariant));
+    assert!(sr_read(&mut optional, &mut out).is_err());
+    let cell = &buffer.cells()[optional.subscription().cell()];
+    cell.revoked.store(crate::loan::REVOKED, Ordering::SeqCst);
+    assert_eq!(optional.rejoin_at_head(), Err(ReadError::Revoked));
+    assert_eq!(optional.position(), 0);
+}

@@ -416,6 +416,9 @@ pub struct SenderRead<O: BufferOwner> {
     boundaries: VecDeque<u64>,
     /// The NAK checkpoints (S2 2.3).
     checkpoints: Checkpoints,
+    /// The last cursor read found the position below the floor: an
+    /// optional reader was lapped, and may rejoin at the head.
+    lapped: bool,
 }
 
 /// Block-boundary read ends a reader remembers until they are registered.
@@ -469,9 +472,39 @@ impl<O: BufferOwner> SenderRead<O> {
     /// stride that is not a power of two from
     /// [`MIN_NAK_CHECKPOINT_STRIDE`] to the term length.
     pub fn with_nak_stride(
+        subscription: Subscription<O>,
+        corrupt_retries: u32,
+        nak_checkpoint_stride: u32,
+    ) -> Result<Self, SysError> {
+        Self::build(subscription, corrupt_retries, nak_checkpoint_stride, false)
+    }
+
+    /// The read capability of an Archive recording (quantstratum-docs:
+    /// karyos/design/archive-gap-analysis.md, A4): over a cell admitted as
+    /// [`Role::Required`] with its reservation (a `required` recording,
+    /// which bounds the publisher), or as [`Role::Optional`] (an `async`
+    /// one, which the publisher may lap; see
+    /// [`SenderRead::rejoin_at_head`]). One read holds one loan, released
+    /// before it returns, so an optional reader's single admission credit
+    /// covers it.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::InvalidPublicationMode`] for an image, or for any other
+    /// cell.
+    pub fn for_recording(
+        subscription: Subscription<O>,
+        corrupt_retries: u32,
+    ) -> Result<Self, SysError> {
+        let stride = DEFAULT_NAK_CHECKPOINT_STRIDE.min(subscription.buffer.term_length);
+        Self::build(subscription, corrupt_retries, stride, true)
+    }
+
+    fn build(
         mut subscription: Subscription<O>,
         corrupt_retries: u32,
         nak_checkpoint_stride: u32,
+        recording: bool,
     ) -> Result<Self, SysError> {
         let term_length = subscription.buffer.term_length;
         if !nak_checkpoint_stride.is_power_of_two()
@@ -493,9 +526,15 @@ impl<O: BufferOwner> SenderRead<O> {
             .is_ok_and(|cell| {
                 participant::is_required_reserved(cell.state.load(Ordering::Acquire))
             });
-        if subscription.cursor.role != Role::Required || !reserved {
+        let admitted = match subscription.cursor.role {
+            Role::Required => reserved,
+            Role::Optional => recording,
+            Role::Observer | Role::Walker => false,
+        };
+        if !admitted {
             return Err(SysError::InvalidPublicationMode {
-                reason: "a sender read is a required participant with its L_send reservation",
+                reason: "a sender read is a required participant with its L_send reservation \
+                         (or, for a recording, an optional one)",
             });
         }
         if subscription.cursor.pending.take().is_some() {
@@ -517,7 +556,66 @@ impl<O: BufferOwner> SenderRead<O> {
             hook: HookSlot::default(),
             boundaries: VecDeque::with_capacity(BOUNDARIES),
             checkpoints,
+            lapped: false,
         })
+    }
+
+    /// Rejoins an optional reader the publisher lapped at the reserved
+    /// head, as a lapped optional subscription does (`rejoin_at_head`): its
+    /// last cursor read returned [`ReadError::Unavailable`]. The retention
+    /// floor of an optional-only lane need not be a frame boundary; the
+    /// reserved head always is a block boundary. The cursor and the
+    /// registered position move there, the boundary ring and any open block
+    /// are dropped, and the cell's position is stored with `Release`, as
+    /// [`SenderRead::sent`] stores it. Returns the head: everything from the
+    /// old cursor to it is lost to this reader.
+    ///
+    /// The floor is read before the head (the conductor publishes a floor
+    /// only from an earlier head snapshot), so the head is at or above it.
+    /// The floor may pass the head before the next read, once the publisher
+    /// writes on: that read checks it, before its loan and after, and
+    /// returns `Unavailable` again, so no byte of a reclaimed term is ever
+    /// read.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::Faulted`] once the reader is faulted;
+    /// [`ReadError::Revoked`] when its cell was revoked;
+    /// [`ReadError::Retry`] when no consistent head can be read now;
+    /// [`ReadError::Invariant`] for a required reader, or one whose last
+    /// read was not `Unavailable`. Nothing moves on an error.
+    pub fn rejoin_at_head(&mut self) -> Result<u64, ReadError> {
+        if let Some(position) = self.faulted {
+            return Err(ReadError::Faulted { position });
+        }
+        if self.subscription.cursor.role != Role::Optional || !self.lapped {
+            self.counters.bump(|c| &mut c.invariant, 1);
+            return Err(ReadError::Invariant);
+        }
+        let Ok(cell) = self.subscription.buffer.cell(self.subscription.cursor.cell) else {
+            self.counters.bump(|c| &mut c.invariant, 1);
+            return Err(ReadError::Invariant);
+        };
+        if cell.revoked.load(Ordering::SeqCst) != 0 {
+            return Err(ReadError::Revoked);
+        }
+        let buffer = &*self.subscription.buffer;
+        let floor = buffer.floor().load(Ordering::Acquire);
+        let head = match buffer.head() {
+            Ok(Some(head)) if head >= floor => head,
+            Ok(_) => return Err(ReadError::Retry),
+            Err(_) => return Err(ReadError::Invariant),
+        };
+        let cursor = &mut self.subscription.cursor;
+        let resume = head.max(cursor.position);
+        cursor.position = resume;
+        cursor.acknowledged = resume;
+        self.open = None;
+        self.boundaries.clear();
+        self.checkpoints.last = resume;
+        self.lapped = false;
+        cell.position.store(resume, Ordering::Release);
+        Ok(resume)
     }
 
     /// Injects `hook` into the next read (tests).
@@ -723,6 +821,7 @@ impl<O: BufferOwner> SenderRead<O> {
             return Err(ReadError::Faulted { position });
         }
         let result = self.read(from, out);
+        self.lapped = matches!(result, Err(ReadError::Unavailable { .. }));
         match result {
             Ok(ReadOutcome::Copied { len, .. }) => {
                 self.corrupt = None;

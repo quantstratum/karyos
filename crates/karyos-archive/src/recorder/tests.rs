@@ -44,6 +44,8 @@ struct Scripted {
     script: VecDeque<Script>,
     consumed: u64,
     resumed: Vec<u64>,
+    /// Resumes answered `Busy` before one succeeds.
+    busy: u32,
 }
 
 impl Scripted {
@@ -53,6 +55,7 @@ impl Scripted {
             script: script.into(),
             consumed: position,
             resumed: Vec::new(),
+            busy: 0,
         }
     }
 }
@@ -117,10 +120,14 @@ impl FrameSource for Scripted {
         Ok(())
     }
 
-    fn resume(&mut self, to: u64) -> Result<(), SourceError> {
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        if self.busy > 0 {
+            self.busy -= 1;
+            return Err(SourceError::Busy);
+        }
         self.resumed.push(to);
         self.position = to;
-        Ok(())
+        Ok(to)
     }
 }
 
@@ -388,4 +395,30 @@ fn every_crash_point_settles_the_recording() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A source busy at the resume after a lap is retried on later duties;
+/// nothing is recorded meanwhile, and nothing is recorded twice.
+#[test]
+fn a_busy_resume_is_retried() {
+    let script = vec![
+        Script::Data(data(0, 30)),
+        Script::Lost(100),
+        Script::Data(data(130, 20)),
+    ];
+    let mut recorder = recorder(
+        FaultDisk::default(),
+        Mode::Async {
+            on_lap: OnLap::Resume,
+        },
+        script,
+    );
+    recorder.source.busy = 2;
+    assert_eq!(recorder.duty(1).unwrap().recorded, 130);
+    assert_eq!(recorder.duty(2).unwrap().recorded, 0);
+    assert!(recorder.source.resumed.is_empty());
+    let _ = recorder.duty(3).unwrap();
+    assert_eq!(recorder.source.resumed, [130]);
+    assert_eq!(recorder.store.written(), 150);
+    assert_eq!(recorder.store.gaps(), [(30, 130)]);
 }

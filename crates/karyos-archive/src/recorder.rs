@@ -81,6 +81,9 @@ pub enum SourceError {
     /// buffer too small for a frame).
     #[error("the source broke its contract")]
     Invariant,
+    /// The source cannot resume now; a later duty tries again.
+    #[error("the source is busy")]
+    Busy,
 }
 
 /// A lane's committed frames, read in position order.
@@ -104,12 +107,14 @@ pub trait FrameSource {
     fn consumed(&mut self, position: u64) -> Result<(), SourceError>;
 
     /// After a [`Frames::Lost`], reads on from `to`, its lowest retained
-    /// position.
+    /// position, or from a later block boundary (the head, for a lapped
+    /// reader): returns where it resumed. [`SourceError::Busy`] asks to try
+    /// again on a later duty.
     ///
     /// # Errors
     ///
     /// [`SourceError`] when the source cannot resume.
-    fn resume(&mut self, to: u64) -> Result<(), SourceError>;
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError>;
 }
 
 /// What an async recording does when it is lapped.
@@ -190,6 +195,8 @@ pub struct Recorder<D: Disk, S> {
     budget: u64,
     incomplete: bool,
     ended: Option<Ended>,
+    /// A lap recorded up to this position, whose resume is still to do.
+    resume: Option<u64>,
 }
 
 impl<D: Disk, S: FrameSource> Recorder<D, S> {
@@ -221,6 +228,7 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
             budget,
             incomplete: false,
             ended: None,
+            resume: None,
         })
     }
 
@@ -228,6 +236,12 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
     #[must_use]
     pub const fn store(&self) -> &SegmentStore<D> {
         &self.store
+    }
+
+    /// The store, to read it back (tests).
+    #[cfg(test)]
+    pub(crate) fn store_mut(&mut self) -> &mut SegmentStore<D> {
+        &mut self.store
     }
 
     /// Whether the recording ended.
@@ -248,8 +262,14 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         if self.ended.is_some() {
             return Ok(duty);
         }
-        while duty.recorded < self.budget {
-            let before = self.store.written();
+        let start = self.store.written();
+        if let Some(to) = self.resume
+            && !self.resume_after_lap(to)?
+        {
+            self.store.tick(now_ns)?;
+            return Ok(duty);
+        }
+        while self.store.written().saturating_sub(start) < self.budget {
             match self.source.read(&mut self.buffer)? {
                 Frames::Copied {
                     position,
@@ -289,16 +309,39 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
                             duty.ended = Some(self.end(to, StopReason::Lapped));
                             break;
                         }
-                        OnLap::Resume => self.source.resume(to)?,
+                        OnLap::Resume => {
+                            if !self.resume_after_lap(to)? {
+                                break;
+                            }
+                        }
                     }
                 }
             }
-            duty.recorded = duty
-                .recorded
-                .saturating_add(self.store.written().saturating_sub(before));
         }
+        // Data, fills and gaps alike: the written position's advance.
+        duty.recorded = self.store.written().saturating_sub(start);
         self.store.tick(now_ns)?;
         Ok(duty)
+    }
+
+    /// Resumes the source after a lap recorded up to `to`: the range up to
+    /// where it resumes is lost too (a lapped reader rejoins at the head).
+    /// `false` when the source is busy: a later duty tries again.
+    fn resume_after_lap(&mut self, to: u64) -> Result<bool, RecorderError> {
+        match self.source.resume(to) {
+            Ok(resumed) => {
+                self.resume = None;
+                if resumed > to {
+                    self.store.append_gap(to, resumed)?;
+                }
+                Ok(true)
+            }
+            Err(SourceError::Busy) => {
+                self.resume = Some(to);
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn end(&mut self, position: u64, reason: StopReason) -> Ended {

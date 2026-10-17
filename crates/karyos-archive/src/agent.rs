@@ -297,7 +297,7 @@ impl FrameSource for Box<dyn FrameSource + Send> {
         (**self).consumed(position)
     }
 
-    fn resume(&mut self, to: u64) -> Result<(), crate::recorder::SourceError> {
+    fn resume(&mut self, to: u64) -> Result<u64, crate::recorder::SourceError> {
         (**self).resume(to)
     }
 }

@@ -69,9 +69,9 @@ impl FrameSource for Chunks {
         Ok(())
     }
 
-    fn resume(&mut self, to: u64) -> Result<(), SourceError> {
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
         self.position = to;
-        Ok(())
+        Ok(to)
     }
 }
 
