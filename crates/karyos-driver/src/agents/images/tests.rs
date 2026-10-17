@@ -3417,6 +3417,84 @@ fn a_gap_waits_the_skew_window_while_another_path_is_live() {
     assert_eq!(nak_wait(&mut single, slot), 0);
 }
 
+/// rp-w7b, ADR-0018's case end to end: one path fails (the later path,
+/// live and silent) while the other keeps delivering duplicates of earlier
+/// frames, every DATA datagram twice. The duplicates move nothing: the gap
+/// is NAKed at the skew deadline fixed at detection, one window (1 ms, one
+/// rig round) after it, not later.
+#[test]
+fn duplicates_on_one_path_do_not_delay_the_skew_deadline() {
+    let (wait, _) = skew_wait_under_duplicates(Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    });
+    let window = crate::paths::PathConfig::default().path_skew_window;
+    assert!(
+        (window..=window + MS).contains(&wait),
+        "NAK {wait} ns after detection, window {window} ns"
+    );
+}
+
+/// ADR-0018's case on multicast: the NAK fires at the skew deadline plus
+/// the cycle's NAK delay (here its bound, `rtt * nak_delay_scale / 16`, in
+/// place of the random draw).
+#[test]
+fn a_multicast_nak_fires_at_the_skew_deadline_plus_its_delay() {
+    let (wait, delay) = skew_wait_under_duplicates(Setup {
+        reliable: true,
+        repairs: false,
+        multicast: true,
+        nak_delay: Some(u64::MAX),
+        ..Setup::default()
+    });
+    let delay = delay.expect("the cycle drew its bound");
+    assert!(delay > 0);
+    let window = crate::paths::PathConfig::default().path_skew_window;
+    assert!(
+        (window + delay..=window + delay + MS).contains(&wait),
+        "NAK {wait} ns after detection, window {window} ns, delay {delay} ns"
+    );
+}
+
+/// The ns from a gap's detection to its first NAK, while the later path
+/// is live and silent and the founding path delivers every DATA datagram
+/// twice; and, on multicast, the last NAK delay bound drawn.
+fn skew_wait_under_duplicates(setup: Setup) -> (u64, Option<u64>) {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents.receiver.role.drop_data(&[1]);
+    rig.agents.receiver.role.repeat_data_from(0);
+    for i in 0..8u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|counters| counters.detected >= 1)
+    });
+    let detected = rig.now;
+    assert_eq!(rig.agents.receiver.counters().naks, 0, "within the window");
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    let wait = rig.now - detected;
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 2);
+    let counts = rig.agents.receiver.role.path_counts(slot, 0).unwrap();
+    assert!(
+        counts.stale + counts.duplicates > 0,
+        "the founding path delivered duplicates: {counts:?}"
+    );
+    (wait, rig.agents.receiver.role.last_nak_delay_bound())
+}
+
 /// rp-w3, RP-7: an image's SMs go on every bound path: the founding path
 /// in its reserved slot, each later path as a copy; the default control
 /// ring holds them all, so none is skipped.
