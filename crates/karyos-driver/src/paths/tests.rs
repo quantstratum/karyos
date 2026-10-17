@@ -347,7 +347,8 @@ fn reordering_on_a_path_counts_as_missing() {
 /// wins, duplicates and missing bytes.
 #[test]
 fn the_statistics_match_a_seeded_two_path_model() {
-    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let seed = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut state = seed;
     let mut next = move || {
         state ^= state << 13;
         state ^= state >> 7;
@@ -362,6 +363,8 @@ fn the_statistics_match_a_seeded_two_path_model() {
     stats.path_bound(1, &[(0, 0)]);
     let mut wins = [0u64; 2];
     let mut duplicates = [0u64; 2];
+    let mut conflicts = [0u64; 2];
+    let mut arrival = [[0u64; ARRIVAL_BUCKETS]; 2];
     let mut missing = [0u64; 2];
     let mut delivered = [0u64; 2];
     let mut committed = 0u64;
@@ -372,32 +375,47 @@ fn the_statistics_match_a_seeded_two_path_model() {
         let carried = [next() % 10 != 0, next() % 4 != 0];
         let first = usize::from(next() % 2 != 0);
         let order = [first, 1 - first];
-        let mut committed_by = None;
+        // One second copy in 16 carries other bytes: a conflict.
+        let conflicting = next() % 16 == 0;
+        let mut committed_by: Option<(usize, u64)> = None;
         for path in order {
             if !carried[path] {
                 continue;
             }
             now += 1 + next() % 1_000;
-            let arrival = if committed_by.is_none() {
-                committed_by = Some(path);
-                wins[path] += 1;
-                Arrival::First
-            } else {
-                duplicates[path] += 1;
-                Arrival::Duplicate
+            let kind = match committed_by {
+                None => {
+                    committed_by = Some((path, now));
+                    wins[path] += 1;
+                    Arrival::First
+                }
+                Some(_) if conflicting => {
+                    conflicts[path] += 1;
+                    Arrival::Conflict
+                }
+                Some((_, first)) => {
+                    duplicates[path] += 1;
+                    // The first arrival is always in the ring here: it came
+                    // just before.
+                    arrival[path][arrival_bucket(now - first)] += 1;
+                    Arrival::Duplicate
+                }
             };
-            delivered[path] += 64;
-            assert!(stats.arrived(
-                Delivered {
-                    path,
-                    lane: 0,
-                    term,
-                    position,
-                    length: 64,
-                    now,
-                },
-                arrival
-            ));
+            let delivery = Delivered {
+                path,
+                lane: 0,
+                term,
+                position,
+                length: 64,
+                now,
+            };
+            if kind == Arrival::Conflict {
+                // A conflict delivers nothing.
+                let _ = stats.arrived(delivery, kind);
+            } else {
+                delivered[path] += 64;
+                assert!(stats.arrived(delivery, kind), "seed {seed:#x}");
+            }
         }
         if committed_by.is_some() {
             committed += 64;
@@ -415,14 +433,17 @@ fn the_statistics_match_a_seeded_two_path_model() {
     }
     for path in 0..2 {
         let counts = stats.counts(path).unwrap();
-        assert_eq!(counts.wins, wins[path], "path {path}");
-        assert_eq!(counts.duplicates, duplicates[path], "path {path}");
-        assert_eq!(counts.missing_bytes, missing[path], "path {path}");
-        assert_eq!(
-            counts.arrival.iter().sum::<u64>() + counts.unmatched,
-            duplicates[path]
-        );
+        let at = format!("seed {seed:#x}, path {path}");
+        assert_eq!(counts.wins, wins[path], "{at}");
+        assert_eq!(counts.duplicates, duplicates[path], "{at}");
+        assert_eq!(counts.conflicts, conflicts[path], "{at}");
+        assert_eq!(counts.missing_bytes, missing[path], "{at}");
+        // rp-w7b: the arrival differences match the model, bucket by
+        // bucket; none is unmatched.
+        assert_eq!(counts.arrival, arrival[path], "{at}");
+        assert_eq!(counts.unmatched, 0, "{at}");
     }
     assert!(wins[0] > 0 && wins[1] > 0 && missing[1] > missing[0]);
+    assert!(conflicts[0] + conflicts[1] > 0, "the model makes conflicts");
     assert_eq!(stats.inconsistent(), 0);
 }
