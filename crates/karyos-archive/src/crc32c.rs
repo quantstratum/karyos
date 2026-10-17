@@ -8,30 +8,21 @@
 /// The reflected Castagnoli polynomial.
 const POLYNOMIAL: u32 = 0x82F6_3B78;
 
-/// The byte-wise table, built at compile time.
-const TABLE: [u32; 256] = table();
+/// The byte-wise table, built once on first use.
+static TABLE: std::sync::LazyLock<[u32; 256]> = std::sync::LazyLock::new(table);
 
-const fn table() -> [u32; 256] {
+fn table() -> [u32; 256] {
     let mut table = [0u32; 256];
-    let mut index = 0u32;
-    while index < 256 {
+    for (index, slot) in (0u32..).zip(table.iter_mut()) {
         let mut crc = index;
-        let mut bit = 0;
-        while bit < 8 {
+        for _ in 0..8 {
             crc = if crc & 1 == 1 {
                 (crc >> 1) ^ POLYNOMIAL
             } else {
                 crc >> 1
             };
-            bit += 1;
         }
-        // `index` is below 256, the table's length: the cast is exact and
-        // the index in range (a const fn cannot use `get_mut`).
-        #[allow(clippy::indexing_slicing, reason = "index < 256, in a const fn")]
-        {
-            table[index as usize] = crc;
-        }
-        index += 1;
+        *slot = crc;
     }
     table
 }
@@ -55,10 +46,12 @@ impl Crc32c {
 
     /// Adds `bytes`.
     pub fn update(&mut self, bytes: &[u8]) {
+        let table = &*TABLE;
         let mut crc = self.0;
         for &byte in bytes {
-            let index = usize::from((crc as u8) ^ byte);
-            crc = (crc >> 8) ^ TABLE.get(index).copied().unwrap_or(0);
+            let [low, ..] = crc.to_le_bytes();
+            let index = usize::from(low ^ byte);
+            crc = (crc >> 8) ^ table.get(index).copied().unwrap_or(0);
         }
         self.0 = crc;
     }

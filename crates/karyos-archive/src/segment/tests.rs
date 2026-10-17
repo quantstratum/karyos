@@ -89,14 +89,20 @@ fn run(
                     Err(error) => Err(error),
                 }
             }
-            Step::Sync => store.sync().map(|durable| reported.durable = durable),
-            Step::Tick(now) => store.tick(now).map(|durable| reported.durable = durable),
+            Step::Sync => store.sync().map(drop),
+            Step::Tick(now) => store.tick(now).map(drop),
         };
+        // What the store claims, failures included: a claim made before a
+        // failure must hold too.
+        reported.durable = store.durable();
         if result.is_err() {
             return reported;
         }
     }
-    if let Ok(durable) = store.close() {
+    let durable = store.durable();
+    if let Ok(closed) = store.close() {
+        reported.durable = closed;
+    } else {
         reported.durable = durable;
     }
     reported
@@ -180,7 +186,7 @@ fn crash_everywhere(
     for budget in 0..=free.used() {
         let disk = FaultDisk::with_budget(budget);
         let reported = run(disk.clone(), steps, policy, start, skip_index_sync);
-        for survives in [Survives::Everything, Survives::Synced] {
+        for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
             if let Err(failure) = check(&disk, survives, reported, policy, start, total) {
                 failures.push(format!("budget {budget}, {survives:?}: {failure}"));
             }
@@ -432,25 +438,42 @@ proptest! {
         let budget = (free.used() as f64 * at) as u64;
         let disk = FaultDisk::with_budget(budget);
         let reported = run(disk.clone(), &steps, SyncPolicy::PerSegment, start, false);
-        for survives in [Survives::Everything, Survives::Synced] {
+        for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
             let result = check(&disk, survives, reported, SyncPolicy::PerSegment, start, total);
             prop_assert!(result.is_ok(), "{survives:?}: {result:?}");
         }
     }
 }
 
+/// A temporary directory removed when dropped, a failing test included.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "karyos-archive-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// The real disk: a recording written, closed, recovered and read back.
 #[test]
 fn a_recording_survives_a_close_on_disk() {
-    let dir = std::env::temp_dir().join(format!(
-        "karyos-archive-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir(&dir).unwrap();
+    let temp = TempDir::new("close");
+    let dir = temp.0.clone();
     let geometry = Geometry::new(4096, 8192).unwrap();
     let bytes = stream(20_000);
     let mut store =
@@ -466,8 +489,6 @@ fn a_recording_survives_a_close_on_disk() {
     let mut read = vec![0u8; bytes.len()];
     store.read(100, &mut read).unwrap();
     assert_eq!(read, bytes);
-    drop(store);
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The cost of a sync on the real disk (`F_FULLFSYNC` on Apple targets,
@@ -477,8 +498,8 @@ fn a_recording_survives_a_close_on_disk() {
 #[ignore = "a measurement, run by hand"]
 #[allow(clippy::print_stderr, reason = "a measurement reports its numbers")]
 fn measure_the_sync_cost() {
-    let dir = std::env::temp_dir().join(format!("karyos-archive-sync-{}", std::process::id()));
-    std::fs::create_dir(&dir).unwrap();
+    let temp = TempDir::new("sync");
+    let dir = temp.0.clone();
     let geometry = Geometry::new(1 << 16, 1 << 26).unwrap();
     let mut store = SegmentStore::create(StdDisk, &dir, 1, geometry, SyncPolicy::None, 0).unwrap();
     let chunk = stream(4096);
@@ -498,8 +519,224 @@ fn measure_the_sync_cost() {
         write / rounds,
         sync / rounds
     );
-    drop(store);
-    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// #339 review P1: a valid header naming another geometry is a typed
+/// error, and recovery removes nothing.
+#[test]
+fn a_geometry_mismatch_is_refused_and_removes_nothing() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        dir,
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    store.append(0, &stream(300)).unwrap();
+    store.close().unwrap();
+    let mut raw = disk.clone();
+    let before = raw.list(dir).unwrap().len();
+    let other = Geometry::new(64, 256).unwrap();
+    assert!(matches!(
+        SegmentStore::recover(disk.clone(), dir, RECORDING, other, SyncPolicy::PerSegment),
+        Err(SegmentError::BadHeader {
+            problem: HeaderProblem::Mismatch,
+            ..
+        })
+    ));
+    assert_eq!(raw.list(dir).unwrap().len(), before, "nothing removed");
+    // With its own geometry it recovers whole.
+    let recovered =
+        SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::PerSegment).unwrap();
+    assert_eq!(recovered.store.written(), 300);
+}
+
+/// Writes `bytes` over the index header of the segment at `base`.
+fn overwrite_header(disk: &FaultDisk, base: u64, bytes: &[u8]) {
+    let mut raw = disk.clone();
+    let index = raw
+        .open(&Path::new(DIR).join(index_name(RECORDING, base)))
+        .unwrap();
+    raw.write_at(&index, 0, bytes).unwrap();
+}
+
+/// #339 review P1: a torn header before the last segment, another version
+/// under a valid CRC, and a start outside the segment are typed errors;
+/// only the last segment's torn header is a segment being created.
+#[test]
+fn bad_headers_are_typed_errors() {
+    let written = |disk: &FaultDisk| {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(300)).unwrap();
+        store.close().unwrap();
+    };
+    let recover = |disk: &FaultDisk| {
+        SegmentStore::recover(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+        )
+    };
+    // A torn first header, with later segments: an error, not a new start.
+    let disk = FaultDisk::default();
+    written(&disk);
+    overwrite_header(&disk, 0, &[0xFF; 8]);
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 0,
+            problem: HeaderProblem::Incomplete
+        })
+    ));
+    // Another version under a valid CRC.
+    let disk = FaultDisk::default();
+    written(&disk);
+    let mut header = Header {
+        recording: RECORDING,
+        base: 128,
+        start: 128,
+        segment_length: 128,
+        term_length: 64,
+    }
+    .encode();
+    header[4..8].copy_from_slice(&2u32.to_le_bytes());
+    let crc = crc32c(&header[..44]);
+    header[44..].copy_from_slice(&crc.to_le_bytes());
+    overwrite_header(&disk, 128, &header);
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 128,
+            problem: HeaderProblem::Foreign
+        })
+    ));
+    // A start outside its segment.
+    let disk = FaultDisk::default();
+    written(&disk);
+    let header = Header {
+        recording: RECORDING,
+        base: 128,
+        start: 500,
+        segment_length: 128,
+        term_length: 64,
+    }
+    .encode();
+    overwrite_header(&disk, 128, &header);
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 128,
+            problem: HeaderProblem::OutOfRange
+        })
+    ));
+    // The last segment's torn header: being created, removed, and the
+    // recording ends where the previous segment does.
+    let disk = FaultDisk::default();
+    written(&disk);
+    overwrite_header(&disk, 256, &[0u8; 48]);
+    let recovered = recover(&disk).unwrap();
+    assert_eq!(recovered.store.written(), 256);
+    assert_eq!(recovered.dropped_segments, 1);
+}
+
+/// #339 review P2: the interval policy does not sync at a roll; its next
+/// tick syncs the finished segment and the open one.
+#[test]
+fn the_interval_policy_syncs_a_roll_at_its_tick() {
+    let mut store = SegmentStore::create(
+        FaultDisk::default(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::Every { interval_ns: 100 },
+        0,
+    )
+    .unwrap();
+    store.append(0, &stream(200)).unwrap();
+    assert_eq!(store.durable(), 0, "no sync on the write path");
+    assert_eq!(store.finished.len(), 1);
+    assert_eq!(store.tick(100).unwrap(), 200);
+    assert!(store.finished.is_empty());
+}
+
+/// #339 review P3: an explicit sync restarts the interval at the next
+/// tick.
+#[test]
+fn an_explicit_sync_restarts_the_interval() {
+    let mut store = SegmentStore::create(
+        FaultDisk::default(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::Every { interval_ns: 100 },
+        0,
+    )
+    .unwrap();
+    store.append(0, &[1; 10]).unwrap();
+    assert_eq!(store.sync().unwrap(), 10);
+    assert_eq!(store.tick(500).unwrap(), 10);
+    store.append(10, &[2; 10]).unwrap();
+    assert_eq!(
+        store.tick(550).unwrap(),
+        10,
+        "within the restarted interval"
+    );
+    assert_eq!(store.tick(600).unwrap(), 20);
+}
+
+/// #339 review P2: a data range torn under a valid entry (its bytes
+/// changed, the file long enough) and a short data file are both cut at
+/// that entry, never read back.
+#[test]
+fn a_torn_range_under_a_valid_entry_is_cut() {
+    for short in [false, true] {
+        let disk = FaultDisk::default();
+        let dir = Path::new(DIR);
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            dir,
+            RECORDING,
+            geometry(),
+            SyncPolicy::None,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(40)).unwrap();
+        store.append(40, &stream(80)[40..]).unwrap();
+        drop(store);
+        let mut raw = disk.clone();
+        let data = raw.open(&dir.join(data_name(RECORDING, 0))).unwrap();
+        if short {
+            raw.set_len(&data, 60).unwrap();
+        } else {
+            raw.write_at(&data, 50, &[0xEE; 4]).unwrap();
+        }
+        let recovered =
+            SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::None).unwrap();
+        assert_eq!(
+            recovered.cut,
+            Some(Cut {
+                position: 40,
+                reason: CutReason::DataChecksum
+            }),
+            "short {short}"
+        );
+        assert_eq!(recovered.store.written(), 40);
+    }
 }
 
 /// A piece of a recording, for the workloads with fills and gaps.
@@ -720,7 +957,7 @@ fn every_crash_point_keeps_fills_and_gaps() {
     for budget in 0..=free.used() {
         let disk = FaultDisk::with_budget(budget);
         let reported = run_pieces(disk.clone(), &pieces(), 0);
-        for survives in [Survives::Everything, Survives::Synced] {
+        for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
             if let Err(failure) = check_pieces(&disk, survives, reported, &pieces(), 0) {
                 failures.push(format!("budget {budget}, {survives:?}: {failure}"));
             }

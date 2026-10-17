@@ -359,7 +359,7 @@ fn every_crash_point_settles_the_recording() {
     for budget in 0..=free.used() {
         let disk = FaultDisk::with_budget(budget);
         let durable = run(disk.clone());
-        for survives in [Survives::Everything, Survives::Synced] {
+        for survives in [Survives::Everything, Survives::Synced, Survives::TornData] {
             let restarted = disk.after_crash(survives);
             let Ok(opened) = Catalog::open(restarted.clone(), Path::new(DIR)) else {
                 failures.push(format!("{budget} {survives:?}: catalog"));
