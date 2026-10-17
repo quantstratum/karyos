@@ -764,9 +764,9 @@ fn a_publication_holds_every_lane_of_its_aggregate() {
     use karyos_sys::frame::Lane;
 
     let mut driver = EmbeddedDriver::new().unwrap();
-    let _ = driver.add_aggregate(heap_aggregate(2, 2)).unwrap();
+    let aggregate = driver.add_aggregate(heap_aggregate(2, 2)).unwrap();
     let mut client = Client::with_conductor(driver.connect().unwrap(), context());
-    serve(&mut driver, || {
+    let publication = serve(&mut driver, || {
         // A subscriber on lane 0 only.
         let _reading = client
             .add_subscription("karyos:ipc", StreamId::new(2))
@@ -776,11 +776,26 @@ fn a_publication_holds_every_lane_of_its_aggregate() {
             .unwrap();
         assert_eq!(publication.lane_count(), 2);
         assert_eq!(publication.offer(b"zero").unwrap().lane(), Lane::ZERO);
-        // Lane 1 has its own handle, with no subscriber.
+        // Lane 1 has its own handle, with no subscriber yet.
         assert_eq!(
             publication.offer_on(Lane::try_new(1).unwrap(), b"one"),
             Err(OfferError::NotConnected)
         );
+        publication
+    });
+    // A reader of lane 1: its offers are accepted on lane 1.
+    let _lane_one = driver
+        .subscribe(
+            aggregate.lane(Lane::try_new(1).unwrap()).unwrap(),
+            karyos_sys::log_buffer::Role::Required,
+        )
+        .unwrap();
+    let mut publication = publication;
+    let accepted = publication
+        .offer_on(Lane::try_new(1).unwrap(), b"one")
+        .unwrap();
+    assert_eq!(accepted.lane(), Lane::try_new(1).unwrap());
+    serve(&mut driver, || {
         assert!(matches!(
             publication.offer_on(Lane::try_new(2).unwrap(), b"two"),
             Err(OfferError::InvalidLane { .. })
@@ -843,18 +858,16 @@ fn a_refused_lane_releases_the_lanes_already_granted() {
     }
 }
 
-/// A URI that names `lanes` takes exactly that many: a stream with fewer
-/// refuses the publication, and the lanes granted are released; the
-/// named count, when the stream has it, is taken.
+/// A URI that names `lanes` takes exactly that many: the driver refuses
+/// another count with `LaneMismatch` before granting anything, so nothing
+/// is held and the stream's publication can be asked for again with the
+/// right count.
 #[test]
 fn a_named_lane_count_is_taken_exactly() {
     use karyos_sys::frame::Lane;
 
     let mut driver = EmbeddedDriver::new().unwrap();
     let aggregate = driver.add_aggregate(heap_aggregate(4, 2)).unwrap();
-    // An exclusive publication is issued once per stream incarnation: the
-    // accepted case has its own aggregate.
-    let _ = driver.add_aggregate(heap_aggregate(5, 2)).unwrap();
     let lanes = [Lane::ZERO, Lane::try_new(1).unwrap()].map(|lane| aggregate.lane(lane).unwrap());
     let mut client = Client::with_conductor(driver.connect().unwrap(), context());
     let refused = serve(&mut driver, || {
@@ -862,30 +875,19 @@ fn a_named_lane_count_is_taken_exactly() {
             .add_exclusive_publication("karyos:ipc?lanes=4", StreamId::new(4))
             .err()
     });
-    assert!(
-        matches!(
-            refused,
-            Some(ClientError::Refused {
-                code: karyos_protocol::cnc::ErrorCode::UnknownStream,
-                detail: 2,
-            })
-        ),
-        "{refused:?}"
+    assert_eq!(
+        refused,
+        Some(ClientError::Refused {
+            code: karyos_protocol::cnc::ErrorCode::LaneMismatch,
+            detail: 2,
+        })
     );
-    let start = Instant::now();
-    while lanes
-        .iter()
-        .any(|&lane| driver.live_leases(lane).unwrap() > 0)
-    {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "a lane is still held"
-        );
-        let _ = driver.do_work().unwrap();
-        let _ = client.poll();
+    for lane in lanes {
+        assert_eq!(driver.live_leases(lane).unwrap(), 0, "nothing was granted");
     }
+    // The incarnation was not spent: the right count is granted.
     let publication = serve(&mut driver, || {
-        client.add_exclusive_publication("karyos:ipc?lanes=2", StreamId::new(5))
+        client.add_exclusive_publication("karyos:ipc?lanes=2", StreamId::new(4))
     });
     assert_eq!(publication.unwrap().lane_count(), 2);
 }

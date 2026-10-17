@@ -32,12 +32,14 @@ pub struct Accepted {
 impl Accepted {
     /// The lane the message was appended to.
     #[must_use]
+    #[inline]
     pub fn lane(&self) -> Lane {
         self.lane
     }
 
     /// The message's position in that lane.
     #[must_use]
+    #[inline]
     pub fn position(&self) -> u64 {
         self.position
     }
@@ -95,7 +97,9 @@ pub enum OfferError {
         /// The lane asked for.
         lane: Lane,
     },
-    /// Another client error.
+    /// Another client error. SPEC §10's `MaxPositionExceeded`,
+    /// `ResourcesUnavailable` and `UnsupportedCapability` are reported
+    /// here until the publication returns them as their own outcomes.
     #[error(transparent)]
     Client(ClientError),
 }
@@ -112,7 +116,7 @@ impl From<ClientError> for OfferError {
 
 /// A message length of at least one byte (SPEC §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MessageLength(u32);
+pub struct MessageLength(core::num::NonZeroU32);
 
 impl MessageLength {
     /// The length `length`.
@@ -121,17 +125,17 @@ impl MessageLength {
     ///
     /// [`ClientError::EmptyMessage`] for 0.
     pub const fn try_new(length: u32) -> Result<Self, ClientError> {
-        if length == 0 {
-            Err(ClientError::EmptyMessage)
-        } else {
-            Ok(Self(length))
+        match core::num::NonZeroU32::new(length) {
+            Some(length) => Ok(Self(length)),
+            None => Err(ClientError::EmptyMessage),
         }
     }
 
     /// The length in bytes.
     #[must_use]
+    #[inline]
     pub const fn get(self) -> u32 {
-        self.0
+        self.0.get()
     }
 }
 
@@ -151,6 +155,26 @@ fn offered(outcome: OfferOutcome) -> Result<Accepted, OfferError> {
         OfferOutcome::Closed => Err(OfferError::Closed),
         OfferOutcome::Gated => Err(OfferError::Gated),
         OfferOutcome::RateLimited => Err(OfferError::RateLimited),
+    }
+}
+
+fn claimed<T: TermBytes>(outcome: ClaimOutcome<'_, T>) -> Result<Claim<'_, T>, OfferError> {
+    match outcome {
+        ClaimOutcome::Claimed(inner) => Ok(Claim { inner }),
+        ClaimOutcome::BackPressured => Err(OfferError::BackPressured),
+        ClaimOutcome::AdminAction => Err(OfferError::AdminAction),
+        ClaimOutcome::NotConnected => Err(OfferError::NotConnected),
+        ClaimOutcome::Aborted { lane, position } => Err(OfferError::Aborted { lane, position }),
+        ClaimOutcome::Closed => Err(OfferError::Closed),
+        ClaimOutcome::Gated => Err(OfferError::Gated),
+        ClaimOutcome::RateLimited => Err(OfferError::RateLimited),
+    }
+}
+
+fn committed(outcome: CommitOutcome) -> Result<Accepted, OfferError> {
+    match outcome {
+        CommitOutcome::Accepted { lane, position } => Ok(Accepted { lane, position }),
+        CommitOutcome::Aborted { lane, position } => Err(OfferError::Aborted { lane, position }),
     }
 }
 
@@ -228,16 +252,7 @@ impl<T: TermBytes> Publication<T> {
         lane: Lane,
         length: MessageLength,
     ) -> Result<Claim<'_, T>, OfferError> {
-        match self.lane(lane)?.try_claim(length.get())? {
-            ClaimOutcome::Claimed(inner) => Ok(Claim { inner }),
-            ClaimOutcome::BackPressured => Err(OfferError::BackPressured),
-            ClaimOutcome::AdminAction => Err(OfferError::AdminAction),
-            ClaimOutcome::NotConnected => Err(OfferError::NotConnected),
-            ClaimOutcome::Aborted { lane, position } => Err(OfferError::Aborted { lane, position }),
-            ClaimOutcome::Closed => Err(OfferError::Closed),
-            ClaimOutcome::Gated => Err(OfferError::Gated),
-            ClaimOutcome::RateLimited => Err(OfferError::RateLimited),
-        }
+        claimed(self.lane(lane)?.try_claim(length.get())?)
     }
 }
 
@@ -285,16 +300,107 @@ impl<T: TermBytes> Claim<'_, T> {
     /// [`OfferError::Aborted`] when an abort won.
     #[must_use = "a commit can lose to an abort"]
     pub fn commit(self) -> Result<Accepted, OfferError> {
-        match self.inner.commit() {
-            CommitOutcome::Accepted { lane, position } => Ok(Accepted { lane, position }),
-            CommitOutcome::Aborted { lane, position } => {
-                Err(OfferError::Aborted { lane, position })
-            }
-        }
+        committed(self.inner.commit())
     }
 
     /// Aborts the frame; subscribers skip it.
     pub fn abort(self) {
         self.inner.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+
+    use super::*;
+    use karyos_sys::term_bytes::HeapTerms;
+
+    fn lane(index: u8) -> Lane {
+        Lane::try_new(index).unwrap()
+    }
+
+    /// Every offer outcome maps to its own result: only an acceptance is
+    /// `Ok`, with its lane and position.
+    #[test]
+    fn every_offer_outcome_maps() {
+        assert_eq!(
+            offered(OfferOutcome::Accepted {
+                lane: lane(1),
+                position: 64
+            }),
+            Ok(Accepted {
+                lane: lane(1),
+                position: 64
+            })
+        );
+        for (outcome, error) in [
+            (OfferOutcome::BackPressured, OfferError::BackPressured),
+            (OfferOutcome::AdminAction, OfferError::AdminAction),
+            (OfferOutcome::NotConnected, OfferError::NotConnected),
+            (OfferOutcome::Closed, OfferError::Closed),
+            (OfferOutcome::Gated, OfferError::Gated),
+            (OfferOutcome::RateLimited, OfferError::RateLimited),
+        ] {
+            assert_eq!(offered(outcome), Err(error), "{outcome:?}");
+        }
+    }
+
+    /// Every claim refusal maps to its own error, an abort with its lane
+    /// and position.
+    #[test]
+    fn every_claim_refusal_maps() {
+        let refusals: [(ClaimOutcome<'_, HeapTerms>, OfferError); 7] = [
+            (ClaimOutcome::BackPressured, OfferError::BackPressured),
+            (ClaimOutcome::AdminAction, OfferError::AdminAction),
+            (ClaimOutcome::NotConnected, OfferError::NotConnected),
+            (
+                ClaimOutcome::Aborted {
+                    lane: lane(2),
+                    position: 128,
+                },
+                OfferError::Aborted {
+                    lane: lane(2),
+                    position: 128,
+                },
+            ),
+            (ClaimOutcome::Closed, OfferError::Closed),
+            (ClaimOutcome::Gated, OfferError::Gated),
+            (ClaimOutcome::RateLimited, OfferError::RateLimited),
+        ];
+        for (outcome, error) in refusals {
+            assert_eq!(claimed(outcome).err(), Some(error));
+        }
+    }
+
+    /// A commit is accepted or aborted, each with its lane and position.
+    #[test]
+    fn both_commit_outcomes_map() {
+        assert_eq!(
+            committed(CommitOutcome::Accepted {
+                lane: lane(3),
+                position: 32
+            }),
+            Ok(Accepted {
+                lane: lane(3),
+                position: 32
+            })
+        );
+        assert_eq!(
+            committed(CommitOutcome::Aborted {
+                lane: Lane::ZERO,
+                position: 96
+            }),
+            Err(OfferError::Aborted {
+                lane: Lane::ZERO,
+                position: 96
+            })
+        );
+    }
+
+    #[test]
+    fn a_message_length_is_never_zero() {
+        assert_eq!(MessageLength::try_new(0), Err(ClientError::EmptyMessage));
+        assert_eq!(MessageLength::try_new(64).unwrap().get(), 64);
     }
 }

@@ -95,6 +95,8 @@
 //! its endpoint and stream's existing one with `ReliabilityMismatch`.
 //! `ReceiverIdentityMismatch` (code 15) answers a subscription whose
 //! configured receiver identity differs from its key's existing one.
+//! `LaneMismatch` (code 16) answers an exclusive publication whose URI
+//! names `lanes` other than the stream configures, granting nothing.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -823,6 +825,10 @@ pub enum ErrorCode {
     /// A network subscription names another receiver identity than the
     /// one its endpoint and stream are already subscribed with (MC-1).
     ReceiverIdentityMismatch,
+    /// An exclusive publication's URI names `lanes` other than the stream
+    /// configures; nothing is granted (W8). The detail is the stream's lane
+    /// count.
+    LaneMismatch,
 }
 
 impl ErrorCode {
@@ -843,6 +849,7 @@ impl ErrorCode {
             Self::UnsupportedChannel => 13,
             Self::ReliabilityMismatch => 14,
             Self::ReceiverIdentityMismatch => 15,
+            Self::LaneMismatch => 16,
         }
     }
 
@@ -863,6 +870,7 @@ impl ErrorCode {
             13 => Self::UnsupportedChannel,
             14 => Self::ReliabilityMismatch,
             15 => Self::ReceiverIdentityMismatch,
+            16 => Self::LaneMismatch,
             _ => return None,
         })
     }
@@ -2398,6 +2406,11 @@ mod tests {
                 code: ErrorCode::ReliabilityMismatch,
                 detail: 10,
             },
+            Response::Error {
+                request,
+                code: ErrorCode::LaneMismatch,
+                detail: 2,
+            },
         ] {
             let mut out = [0u8; MAX_RESPONSE_LENGTH];
             let length = response.encode(&mut out).unwrap();
@@ -3240,7 +3253,7 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(16), None);
+        assert_eq!(ErrorCode::from_code(17), None);
     }
 
     #[test]
@@ -3353,9 +3366,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 16 is not defined.
+        // Error code 17 is not defined.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 16, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 17, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }
@@ -3803,6 +3816,7 @@ mod properties {
                 ErrorCode::UnsupportedChannel,
                 ErrorCode::ReliabilityMismatch,
                 ErrorCode::ReceiverIdentityMismatch,
+                ErrorCode::LaneMismatch,
             ][..],
         );
         prop_oneof![

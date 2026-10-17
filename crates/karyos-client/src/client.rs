@@ -747,8 +747,12 @@ impl<C: Connection> Client<C> {
     /// subscriber is connected.
     ///
     /// It holds every lane, all or nothing. A URI that names `lanes` takes
-    /// exactly that many: any lane refused, the stream configuring fewer
-    /// included, refuses the publication and releases the lanes granted.
+    /// exactly that many: the driver refuses a count other than the
+    /// stream's with `LaneMismatch` before granting anything, so the
+    /// publication can be asked for again. A lane refused or timed out
+    /// after lane 0 releases the lanes granted, but the stream's exclusive
+    /// publication is granted once per incarnation: it cannot be taken
+    /// again until the stream is configured anew.
     /// A URI that names none takes the lanes the stream configures, which
     /// the facade does not know (a driver's default, an IPC aggregate's
     /// configuration): lanes are taken until the driver refuses one with
@@ -790,9 +794,13 @@ impl<C: Connection> Client<C> {
                     // The stream configures no more lanes: the end of an
                     // unnamed count, a refusal of a named one.
                     Ok(None) if named.is_none() => break,
+                    // The driver checks a named count against the stream
+                    // before lane 0 (LaneMismatch); this is a stream that
+                    // changed meanwhile. The detail is the stream id, as
+                    // the driver's.
                     Ok(None) => ClientError::Refused {
                         code: ErrorCode::UnknownStream,
-                        detail: u64::from(index),
+                        detail: u64::from(stream.stream_id.cast_unsigned()),
                     },
                     Err(error) => error,
                 },
@@ -828,6 +836,20 @@ impl<C: Connection> Client<C> {
 
     /// Releases `publication`'s handles, as dropping it does not remove
     /// them from the driver at once.
+    ///
+    /// ```no_run
+    /// # #[cfg(target_os = "linux")]
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use karyos_client::{Client, Context, StreamId};
+    ///
+    /// let mut client = Client::connect(Context::builder().dir("/dev/shm/karyos").build()?)?;
+    /// let orders = client.add_exclusive_publication("karyos:ipc", StreamId::new(1001))?;
+    /// client.remove_publication(orders);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(target_os = "linux"))]
+    /// # fn main() {}
+    /// ```
     pub fn remove_publication(&mut self, publication: Publication<C::Terms>) {
         for lane in publication.into_lanes() {
             self.connection.release_publication(lane);
