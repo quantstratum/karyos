@@ -3653,6 +3653,156 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
     ));
 }
 
+/// T6 (contract-traceability-phase-2.md, "Receiver restart freshness",
+/// the trusted half; SPEC §13): a restarted receiver, here a fresh rig
+/// with a new boot id and no binding, challenge or quarantine state, while
+/// the publisher stays live. A replayed old SETUP_ANSWER, echoing the old
+/// boot id and nonce, is dropped and binds nothing; replayed old DATA is
+/// unbound and delivered nowhere; the replayed SETUP binds only through
+/// the fresh challenge's answer. Once bound, above a join point, old DATA
+/// below the join and every replayed copy of a committed frame are not
+/// delivered: each message reaches the subscriber once. The MAC cases
+/// need the authenticated profile (owner decision 5, ADR-0035).
+fn a_restarted_receiver_binds_only_through_a_fresh_challenge(multicast: bool) {
+    use karyos_protocol::network::{ChallengeBlock, Control, SetupAnswer};
+    use karyos_sys::log_buffer::{AppendOptions, PollOutcome, Role};
+
+    let (mut rig, b) = Rig::new(Setup {
+        multicast,
+        before: 2,
+        ..Setup::default()
+    });
+    // The subscription and the publication are added.
+    rig.round(true);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert_eq!(sessions.installed, 0);
+    // The answer the receiver got before its restart, replayed.
+    let old_answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: term(65_536),
+        challenge: ChallengeBlock {
+            receiver_boot_id: [0x0b00_7001, 1],
+            nonce: [0x0001_d001, 2],
+        },
+        joins: Lanes::new(&[0, 0]).unwrap(),
+    };
+    let unbound = rig.agents.receiver.counters().data_unbound;
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::SetupAnswer(old_answer),
+        rig.now,
+    );
+    // Old DATA of the alias, replayed: no image binds it.
+    receiver.role.inject_data(
+        &receiver.sessions,
+        b,
+        source,
+        alias(),
+        &stale_frame(9, 0, 32),
+        rig.now,
+    );
+    let after = rig.agents.receiver.role.session_counters();
+    assert_eq!(after.dropped, sessions.dropped + 1, "the old answer");
+    assert_eq!(after.installed, 0);
+    assert_eq!(rig.agents.receiver.counters().data_unbound, unbound + 1);
+    // The old SETUP, replayed, and the live one: the receiver challenges
+    // with its new boot id, and only that challenge's answer binds.
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::SetupAnnounce(announce(65_536)),
+        rig.now,
+    );
+    let slot = established(&mut rig);
+    let challenges: Vec<_> = rig
+        .agents
+        .receiver
+        .role
+        .posted_challenges()
+        .iter()
+        .filter_map(|(_, control)| match control {
+            Control::Challenge(challenge) => Some(challenge.challenge),
+            _ => None,
+        })
+        .collect();
+    // Every challenge carries the restarted receiver's own boot id.
+    let boot_id = challenges.first().unwrap().receiver_boot_id;
+    assert_ne!(boot_id, old_answer.challenge.receiver_boot_id);
+    assert!(
+        challenges
+            .iter()
+            .all(|challenge| challenge.receiver_boot_id == boot_id),
+        "{challenges:?}"
+    );
+    assert_eq!(rig.agents.receiver.role.session_counters().installed, 1);
+    // The image joins above 0: after the two messages appended first.
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let join = 2 * 1056;
+    // Every DATA datagram from here arrives twice, as replays would.
+    let dropped = rig.agents.receiver.counters().data_dropped;
+    rig.agents.receiver.role.drop_data(&[]);
+    rig.agents.receiver.role.repeat_data_from(0);
+    let log = rig.log.as_mut().unwrap();
+    for i in 0..3u8 {
+        let _ = log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let mut delivered = Vec::new();
+    let mut out = vec![0u8; 2048];
+    for _ in 0..200 {
+        rig.round(true);
+        while let PollOutcome::Message { position, .. } = subscriber.poll(&mut out).unwrap() {
+            subscriber.acknowledge();
+            delivered.push(position);
+        }
+        if delivered.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(delivered, [join, join + 1056, join + 2 * 1056]);
+    // Each frame's copy was dropped as a duplicate.
+    let copies = rig.agents.receiver.counters().data_dropped - dropped;
+    assert!(copies >= 3, "{copies} copies dropped");
+    // Old DATA below the join point, replayed.
+    let dropped = rig.agents.receiver.counters().data_dropped;
+    let committed = rig.agents.receiver.counters().data_committed;
+    for offset in [0, 1056] {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_data(
+            &receiver.sessions,
+            b,
+            source,
+            alias(),
+            &stale_frame(9, offset, 1000),
+            rig.now,
+        );
+    }
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.counters().data_committed, committed);
+    assert!(rig.agents.receiver.counters().data_dropped >= dropped + 2);
+    assert_eq!(subscriber.poll(&mut out).unwrap(), PollOutcome::Pending);
+}
+
+#[test]
+fn a_restarted_unicast_receiver_binds_only_through_a_fresh_challenge() {
+    a_restarted_receiver_binds_only_through_a_fresh_challenge(false);
+}
+
+#[test]
+fn a_restarted_multicast_receiver_binds_only_through_a_fresh_challenge() {
+    a_restarted_receiver_binds_only_through_a_fresh_challenge(true);
+}
+
 /// P2.12 step 3 PR 2: a hook that records the receiver's commits and its
 /// journals' opens and closes.
 /// What a [`CommitRecorder`] saw: the commits, the journals opened and
