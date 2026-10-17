@@ -327,7 +327,10 @@ pub struct NetworkViewCounters {
     /// Views built over an exposed image lane.
     pub built: u64,
     /// Installed images with a conflated lane that got no view because the
-    /// image was not exposed (interim keying).
+    /// image was not exposed: its alias is a local stream's key, the stream
+    /// table was full or its aggregate could not be built
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-6).
+    /// Images of one alias from several sources each get a view.
     pub unbuilt_unexposed: u64,
     /// Views that could not be built over an exposed lane (the lane, the
     /// configuration, the table or the feeder's subscription failed); the

@@ -1169,6 +1169,84 @@ fn a_conflated_network_view_reads_its_values_fresh() {
     });
 }
 
+/// Per-source images (`quantstratum-docs:
+/// karyos/design/per-source-images.md`, D2-6): two images of one alias
+/// get two views, each fed only by its own image.
+#[test]
+fn two_images_of_one_alias_get_a_view_each() {
+    use karyos_sys::freshness::Freshness;
+
+    let (mut a1, mut a2, mut b) = (
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    let address = free_address();
+    let _subscription = b
+        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .unwrap();
+    let publications = [
+        a1.add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+            .unwrap(),
+        a2.add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+            .unwrap(),
+    ];
+    pump(&mut [&mut a1, &mut a2, &mut b], |drivers| {
+        drivers[2].network_images(10).len() == 2
+    });
+    let views = b.network_view_counters();
+    assert_eq!((views.built, views.unbuilt_unexposed), (2, 0), "{views:?}");
+    let images = b.network_images(10);
+    let mut readers =
+        [images[0].0, images[1].0].map(|image| b.network_view_reader(&image, Lane::ZERO).unwrap());
+    let mut lanes = [
+        a1.publication(publications[0].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+        a2.publication(publications[1].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+    ];
+    // Publisher p offers 10 * (p + 1) + key under each key.
+    let mut offered = [0i64; 2];
+    let mut latest = [[None; 4]; 2];
+    let budget = karyos_sys::conflation::Budget {
+        keys: 16,
+        retries: 4,
+    };
+    pump(&mut [&mut a1, &mut a2, &mut b], |_| {
+        for (publisher, lane) in lanes.iter_mut().enumerate() {
+            let key = offered[publisher];
+            if key < 4 {
+                let options = karyos_sys::log_buffer::AppendOptions {
+                    reserved_value: key,
+                    ..karyos_sys::log_buffer::AppendOptions::default()
+                };
+                let value = u8::try_from(10 * (publisher + 1)).unwrap() + key as u8;
+                if matches!(
+                    lane.offer_with(&[value; 16], options).unwrap(),
+                    OfferOutcome::Accepted { .. }
+                ) {
+                    offered[publisher] += 1;
+                }
+            }
+        }
+        for (view, reader) in readers.iter_mut().enumerate() {
+            let _ = reader.poll_changed(budget, |key, _, value, freshness| {
+                latest[view][key as usize] = Some((value[0], freshness));
+            });
+        }
+        latest.iter().all(|view| view.iter().all(Option::is_some))
+    });
+    // Each view holds one publisher's values, all of them, Fresh.
+    let owners = latest.map(|view| view[0].map(|(value, _)| value / 10));
+    assert_ne!(owners[0], owners[1], "one publisher per view");
+    for (view, owner) in latest.iter().zip(owners) {
+        for (key, entry) in view.iter().enumerate() {
+            let expected = owner.unwrap() * 10 + key as u8;
+            assert_eq!(*entry, Some((expected, Freshness::Fresh)), "{latest:?}");
+        }
+    }
+}
+
 /// C4, GU-9 end to end: on an unreliable channel a lost update makes every
 /// key Stale since the gap's start once the receiver seals it, through the
 /// view's mailbox (the feeder acknowledges after recording the loss); an
