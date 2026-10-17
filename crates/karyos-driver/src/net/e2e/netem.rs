@@ -10,20 +10,29 @@
 //! - N2: a reliable channel delivers every message exactly once and in
 //!   order, through NAKs and the sender's repairs.
 //! - N3: N2 with 5% duplicated datagrams.
+//! - N4 to N7 (T4, quantstratum-docs:
+//!   karyos/testing/contract-traceability-phase-2.md, "Loss, reorder,
+//!   duplicate"): N2 in Dedicated mode, on two lanes, on a multicast group
+//!   with two subscribers, and across a blackout of the path.
 
 #![allow(
     clippy::print_stdout,
     reason = "the job's log records what the faults did (run with --nocapture)"
 )]
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
+
 use karyos_client::OfferOutcome;
+use karyos_protocol::channel::{Destination, Security, UdpConfig};
 use karyos_protocol::lanes::drr::Budget;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SkipReason};
 use karyos_sys::sizing::MIN_TERM_LENGTH;
 
-use super::{connected, driver, exchange, pump};
+use super::{BUDGET, aggregate, channel, connected, driver, exchange, free_address, pump};
 use crate::agents::ThreadingMode;
+use crate::embedded::EmbeddedDriver;
 
 /// The bytes a 1000-byte message takes in a term: its 32-byte header,
 /// aligned to 32.
@@ -132,7 +141,12 @@ fn n1_an_unreliable_channel_reports_every_loss_as_a_gap() {
 /// asserts it), with no loss reported on the lane. Prints what the faults
 /// cost.
 fn reliable_delivery(label: &str, count: u32) {
-    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    reliable_delivery_in(label, ThreadingMode::Shared, count);
+}
+
+/// [`reliable_delivery`] with both drivers in `threading`.
+fn reliable_delivery_in(label: &str, threading: ThreadingMode, count: u32) {
+    let (mut a, mut b) = (driver(threading), driver(threading));
     let (publication, image) = connected(&mut a, &mut b, true, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
     exchange(&mut a, &mut b, &publication, &mut reader, count);
@@ -162,6 +176,15 @@ struct Profile {
 }
 
 impl Profile {
+    /// Replaces the loopback's netem profile by `profile` until drop.
+    fn replace(profile: &str) -> Self {
+        let base = std::env::var("KARYOS_NETEM_PROFILE").unwrap();
+        let words: Vec<String> = profile.split_whitespace().map(str::to_owned).collect();
+        tc(&words);
+        println!("netem profile now: {profile}");
+        Self { base }
+    }
+
     /// Replaces the loopback's netem profile by the job's with
     /// `duplicate {percent}%`.
     fn duplicate(percent: u32) -> Self {
@@ -202,4 +225,268 @@ fn n3_a_reliable_channel_survives_five_percent_duplicates() {
     super::super::netem::require_netem();
     let _profile = Profile::duplicate(5);
     reliable_delivery("N3", 2000);
+}
+
+/// The NAKs B's receiver sent and the repairs A's sender made, in Shared
+/// mode: nonzero once netem cost datagrams on the path.
+fn repair_work(a: &EmbeddedDriver, b: &EmbeddedDriver) -> (u64, u64) {
+    let naks = b.net.as_ref().unwrap().receiver_counters().unwrap().naks;
+    let repairs = a.net.as_ref().unwrap().sender_counters().unwrap().repairs;
+    (naks, repairs)
+}
+
+/// N4 (T4): N2 with both drivers in Dedicated mode, each agent on its own
+/// thread: every message arrives exactly once and in order.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n4_a_reliable_channel_in_dedicated_mode_delivers_exactly_once_in_order() {
+    super::super::netem::require_netem();
+    reliable_delivery_in("N4", ThreadingMode::Dedicated, 2000);
+}
+
+/// N5 (T4): a reliable publication of two lanes under the job's faults:
+/// each lane delivers its own messages exactly once and in order, and
+/// neither reports a loss; the receiver NAKed and the sender repaired.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n5_two_reliable_lanes_each_deliver_exactly_once_in_order() {
+    super::super::netem::require_netem();
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let address = free_address();
+    let _ = b
+        .add_network_subscription(10, &channel(address, true))
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 2), &channel(address, true))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    let mut lanes = [
+        a.publication(publication.lane(Lane::ZERO).unwrap())
+            .unwrap(),
+        a.publication(publication.lane(Lane::try_new(1).unwrap()).unwrap())
+            .unwrap(),
+    ];
+    let count = 1000u32;
+    let (mut sent, mut seen) = ([0u32; 2], [0u32; 2]);
+    pump(&mut [&mut a, &mut b], |_| {
+        for (lane, publication) in lanes.iter_mut().enumerate() {
+            while sent[lane] < count {
+                let mut payload = [0u8; 1000];
+                payload[..4].copy_from_slice(&sent[lane].to_le_bytes());
+                match publication.offer(&payload).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent[lane] += 1,
+                    _ => break,
+                }
+            }
+        }
+        let _ = reader.poll(
+            |bytes, lane, _| {
+                let lane = usize::from(lane.get());
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen[lane], "lane {lane}: exactly once, in order");
+                seen[lane] += 1;
+            },
+            BUDGET,
+        );
+        seen == [count, count]
+    });
+    let poll = reader.poll(|_, _, _| {}, ONE);
+    for lane in 0..2 {
+        assert_eq!(poll.lanes[lane].first_loss, None, "lane {lane} lost data");
+    }
+    let (naks, repairs) = repair_work(&a, &b);
+    println!("N5: {count} on each of 2 lanes, in order; {naks} NAKs, {repairs} repairs");
+    assert!(naks > 0 && repairs > 0, "no repair: netem idle?");
+}
+
+/// Multicast groups in 239.255.0.0/16 carried by the loopback, which the
+/// job shapes: `lo` takes multicast and a route of the range. Without it a
+/// group's datagrams leave by the default route, unshaped. Undone on drop.
+struct MulticastOnLoopback;
+
+impl MulticastOnLoopback {
+    fn route() -> Self {
+        ip(&["link", "set", "lo", "multicast", "on"]);
+        ip(&["route", "add", "239.255.0.0/16", "dev", "lo"]);
+        Self
+    }
+}
+
+impl Drop for MulticastOnLoopback {
+    fn drop(&mut self) {
+        ip(&["route", "del", "239.255.0.0/16", "dev", "lo"]);
+        ip(&["link", "set", "lo", "multicast", "off"]);
+    }
+}
+
+/// `ip <args>`.
+fn ip(args: &[&str]) {
+    let status = std::process::Command::new("ip")
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "ip {args:?} failed: {status}");
+}
+
+/// N6 (T4): a reliable multicast publication with two subscribers, the
+/// group routed over the shaped loopback: each subscriber gets every
+/// message exactly once and in order, through its own NAKs and the
+/// sender's repairs.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
+    super::super::netem::require_netem();
+    let _route = MulticastOnLoopback::route();
+    let group = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(239, 255, 0, 9)),
+        free_address().port(),
+    );
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b, mut c) = (
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    for subscriber in [&mut b, &mut c] {
+        let _ = subscriber.add_network_subscription(10, &channel).unwrap();
+    }
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel)
+        .unwrap();
+    let mut images = (None, None);
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        images = (
+            drivers[1].network_image(10, 3),
+            drivers[2].network_image(10, 3),
+        );
+        images.0.is_some() && images.1.is_some()
+    });
+    let (Some(first), Some(second)) = images else {
+        unreachable!("pumped until both exist");
+    };
+    let mut readers = [
+        b.subscribe_aggregate(&first, Role::Required).unwrap(),
+        c.subscribe_aggregate(&second, Role::Required).unwrap(),
+    ];
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let count = 1000u32;
+    let (mut sent, mut seen) = (0u32, [0u32; 2]);
+    pump(&mut [&mut a, &mut b, &mut c], |_| {
+        while sent < count {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        for (reader, seen) in readers.iter_mut().zip(seen.iter_mut()) {
+            let _ = reader.poll(
+                |bytes, _, _| {
+                    let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                    assert_eq!(index, *seen, "exactly once, in order");
+                    *seen += 1;
+                },
+                BUDGET,
+            );
+        }
+        seen == [count, count]
+    });
+    for reader in &mut readers {
+        let poll = reader.poll(|_, _, _| {}, ONE);
+        assert_eq!(poll.lanes[0].first_loss, None, "a reliable lane lost data");
+    }
+    let naks = [&b, &c].map(|driver| {
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap()
+            .naks
+    });
+    let repairs = a.net.as_ref().unwrap().sender_counters().unwrap().repairs;
+    println!("N6: {count} to each of 2 subscribers, in order; NAKs {naks:?}, {repairs} repairs");
+    assert!(
+        naks.iter().all(|naks| *naks > 0) && repairs > 0,
+        "a subscriber never NAKed: the group is not on the shaped loopback?"
+    );
+}
+
+/// N7 (T4): a reliable channel across a blackout. After the first 200
+/// messages the loopback loses every datagram for 500 ms while the
+/// publisher keeps offering; then the job's profile is back. Every message
+/// still arrives exactly once and in order, with no loss reported.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n7_a_reliable_channel_recovers_from_a_blackout() {
+    super::super::netem::require_netem();
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let count = 2000u32;
+    let (mut sent, mut seen) = (0u32, 0u32);
+    let mut blackout: Option<(Profile, Instant)> = None;
+    let mut blacked_out = false;
+    let mut during = 0u32;
+    pump(&mut [&mut a, &mut b], |_| {
+        if !blacked_out && seen >= 200 {
+            blackout = Some((Profile::replace("loss 100%"), Instant::now()));
+            blacked_out = true;
+        }
+        if blackout
+            .as_ref()
+            .is_some_and(|(_, start)| start.elapsed() >= Duration::from_millis(500))
+        {
+            // The job's profile again.
+            blackout = None;
+        }
+        while sent < count {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "exactly once, in order");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        if blackout.is_some() {
+            during = seen;
+        }
+        seen == count
+    });
+    assert!(blacked_out && blackout.is_none());
+    let poll = reader.poll(|_, _, _| {}, ONE);
+    assert_eq!(poll.lanes[0].first_loss, None, "a reliable lane lost data");
+    let (naks, repairs) = repair_work(&a, &b);
+    println!(
+        "N7: {count} in order across a 500 ms blackout (up to {during} by its end); {naks} NAKs, {repairs} repairs"
+    );
+    assert!(naks > 0 && repairs > 0, "no repair after the blackout");
 }
