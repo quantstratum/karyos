@@ -3058,7 +3058,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// One cycle of the network agents and their events (wiring note
     /// W-c): their work, and the error of a failed agent.
-    fn serve_network(&mut self) -> (u32, Option<DriverError>) {
+    pub(crate) fn serve_network(&mut self) -> (u32, Option<DriverError>) {
         let Some(net) = &mut self.net else {
             return (0, None);
         };
