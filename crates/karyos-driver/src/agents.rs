@@ -158,7 +158,8 @@ pub struct AgentConfig {
     pub max_endpoints: usize,
     /// The receiver's session table (network-sessions.md S5).
     pub sessions: crate::sessions::receive::SessionConfig,
-    /// Publications the sender announces at once, at least 1.
+    /// Publications the sender announces at once, at least 1: SETUP
+    /// sessions, one per path of a routed publication.
     pub publications: usize,
     /// `setup_interval` in ns (default 100 ms).
     pub setup_interval: u64,

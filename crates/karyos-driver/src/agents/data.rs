@@ -657,6 +657,7 @@ impl Outbound {
     ) -> u32 {
         // Over redundant paths repair stays on the founding route, whose
         // queues `open_routes` opened: never a second route (#321 review).
+        // Repairs and step 8 ERRs on every path are RP-11, rp-w6.
         let open = match self.routed.as_deref() {
             Some(routed) => routed.founding_open(tx.capabilities().epoch),
             None => self.open(tx),

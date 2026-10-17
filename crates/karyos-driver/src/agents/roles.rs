@@ -4209,6 +4209,9 @@ impl SenderRole {
                     self.send(halves, endpoint, destination, &control),
                     Sent::Submitted
                 ) {
+                    if let Some(outbound) = self.publications.get_mut(index) {
+                        outbound.path_heartbeat_sent(endpoint, now);
+                    }
                     self.count(|c| &mut c.path_heartbeats_sent);
                     if let Some(next) = submitted.checked_add(1) {
                         submitted = next;
@@ -4430,7 +4433,7 @@ impl SenderRole {
             let Some(outbound) = self.publications.get(index) else {
                 break;
             };
-            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            let endpoint = outbound.endpoint();
             if !established(&self.sessions, outbound) {
                 // Not served yet, but a guard close still applies (the
                 // close acknowledgement waits for it).
@@ -4439,7 +4442,7 @@ impl SenderRole {
                 }
                 continue;
             }
-            let consumption = self.consumption(endpoint, alias);
+            let consumption = self.consumption(outbound);
             // A routed publication is served over every path's half
             // (redundant paths, RP-10).
             if let Some(outbound) = self.publications.get_mut(index)
@@ -4567,14 +4570,26 @@ impl SenderRole {
         self.ignore_naks = false;
     }
 
-    /// The least position every receiver bound to `alias` on `endpoint`
-    /// consumed, per lane: a reliable channel's bound (SPEC §4). A receiver
+    /// The least position every receiver bound to `outbound` on any of its
+    /// paths consumed, per lane: a reliable channel's bound (SPEC §4). A receiver
     /// answered but not yet heard from bounds at its join points. `None`
     /// with no bound receiver at all: a reliable lane then holds.
-    fn consumption(&self, endpoint: EndpointId, alias: Alias) -> Option<[u64; 4]> {
+    /// [`Self::consumption`] of the publication `alias` on `endpoint`, any
+    /// of its paths (tests).
+    #[cfg(test)]
+    fn consumption_at(&self, endpoint: EndpointId, alias: Alias) -> Option<[u64; 4]> {
+        self.publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            .and_then(|outbound| self.consumption(outbound))
+    }
+
+    fn consumption(&self, outbound: &Outbound) -> Option<[u64; 4]> {
         let mut least: Option<[u64; 4]> = None;
+        // A receiver bound on any of its paths bounds it: one whose founding
+        // path was lost still holds it at its consumption (#336 review).
         for binding in &self.bindings {
-            if binding.endpoint != endpoint || binding.alias != alias {
+            if !outbound.serves(binding.endpoint) || binding.alias != outbound.alias() {
                 continue;
             }
             let positions = least.get_or_insert([u64::MAX; 4]);
