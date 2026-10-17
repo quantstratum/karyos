@@ -754,7 +754,8 @@ fn the_sender_validates_sms_against_its_bindings() {
         &status([7, 8], 1, identity(), &at(0)),
         1,
     );
-    // Bound, but another identity or lane count: mismatch.
+    // Another incarnation has no binding of its own: unbound. Bound, but
+    // another lane count: mismatch.
     sender.status(endpoint, receiver, &status([7, 8], 1, other, &at(0)), 1);
     let two = [at(0)[0]; 2];
     sender.status(endpoint, receiver, &status([7, 8], 1, identity(), &two), 1);
@@ -800,7 +801,7 @@ fn the_sender_validates_sms_against_its_bindings() {
             counters.sm_accepted,
             counters.sm_stale
         ),
-        (3, 3, 3, 1)
+        (4, 2, 3, 1)
     );
 }
 
@@ -1380,7 +1381,7 @@ fn rttm_probes_measure_bound_paths() {
         other => panic!("{other:?}"),
     };
     // One REQUEST on the bound path, naming the image and this receiver.
-    assert_eq!(role.probe_paths(0, 0), 1);
+    assert_eq!(role.probe_paths(0, 0).unwrap(), 1);
     let (request, guard) = take(&mut sender);
     let receiver = Receiver {
         receiver_boot_id: role.sessions.boot_id(),
@@ -1393,8 +1394,11 @@ fn rttm_probes_measure_bound_paths() {
     );
     assert_ne!(request.probe_id, 0);
     // In the ring: none more, even past the interval.
-    assert_eq!(role.probe_paths(0, 2_000_000_000), 0);
-    guard.submitted(1_000);
+    assert_eq!(role.probe_paths(0, 2_000_000_000).unwrap(), 0);
+    // The sender is in its backend call, started at 1000.
+    let mut guard = guard;
+    guard.sending(1_000);
+    assert_eq!(role.probe_paths(0, 2_000_000_000).unwrap(), 0, "still busy");
     let reply = |probe_id| {
         Control::Rttm(Rttm {
             probe_id,
@@ -1432,30 +1436,36 @@ fn rttm_probes_measure_bound_paths() {
         }),
     );
     assert_eq!(role.counters().rttm_replies_unbound, 3);
-    // The REPLY before the report was collected still matches: 3 ms.
+    // A REPLY that overtakes the sender's final report proves the send:
+    // 3 ms from the start it published.
     intake(&mut role, &events, 0).control(key.source, reply(request.probe_id));
     assert_eq!(role.counters().rttm_samples, 1);
     assert_eq!(role.images[0].rtt.estimate(0), 3_000_000);
+    // The final report comes after; a later collection clears it.
+    guard.submitted();
+    assert!(!role.images[0].probes[0].slot.busy());
     // A duplicate gives none.
     intake(&mut role, &events, 0).control(key.source, reply(request.probe_id));
     assert_eq!(role.counters().rttm_replies_ignored, 1);
     // A REQUEST the sender drops yields no sample; the next waits an
     // interval.
-    assert_eq!(role.probe_paths(0, 4_000_000_000), 1);
+    assert_eq!(role.probe_paths(0, 4_000_000_000).unwrap(), 1);
     let (_, guard) = take(&mut sender);
     drop(guard);
-    assert_eq!(role.probe_paths(0, 4_500_000_000), 0);
+    assert_eq!(role.probe_paths(0, 4_500_000_000).unwrap(), 0);
     assert_eq!(role.images[0].rtt.counts().unsubmitted, 1);
     // A probe whose path is lost and bound again is not applied to the
     // new binding.
-    assert_eq!(role.probe_paths(0, 6_000_000_000), 1);
+    assert_eq!(role.probe_paths(0, 6_000_000_000).unwrap(), 1);
     let (request, guard) = take(&mut sender);
     role.images[0].evidence = 20_000_000_000;
     let _ = role
         .duty::<OsSocket>(&mut [], &events, 20_000_000_000)
         .unwrap();
     assert_eq!(role.sessions.paths().live(slot), 0, "the path is lost");
-    guard.submitted(6_000_000_000);
+    let mut guard = guard;
+    guard.sending(6_000_000_000);
+    guard.submitted();
     let rebound = role.sessions.paths_mut().offer_later(
         slot,
         key,
@@ -1522,7 +1532,10 @@ fn rttm_requests_are_reported_and_answered() {
     let observer = socket.observer();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&seen);
+    // Each backend call takes 400 ns on the sender's clock: a start read
+    // after the call would show it.
     observer.set_send_hook(Box::new(move |_, datagrams| {
+        SENDER_CLOCK.fetch_add(400, std::sync::atomic::Ordering::Relaxed);
         for datagram in datagrams {
             record.lock().unwrap().push(datagram.to_vec());
         }
@@ -1556,15 +1569,15 @@ fn rttm_requests_are_reported_and_answered() {
     SENDER_CLOCK.store(500, std::sync::atomic::Ordering::Relaxed);
     role.to_sender.try_post(outgoing(&slot)).unwrap();
     let _ = sender.duty(&mut halves, 600).unwrap();
-    assert_eq!(slot.collect(), Some(ProbeReport::Submitted(500)));
-    assert_eq!(slot.collect(), None, "collected once");
+    assert_eq!(slot.collect(false), Some(ProbeReport::Submitted(500)));
+    assert_eq!(slot.collect(false), None, "collected once");
     // One the kernel refused: not submitted.
     observer.push_send(SendResult::Error(
         karyos_io::sockets::ops::Errno::NETUNREACH,
     ));
     role.to_sender.try_post(outgoing(&slot)).unwrap();
     let _ = sender.duty(&mut halves, 700).unwrap();
-    assert_eq!(slot.collect(), Some(ProbeReport::NotSubmitted));
+    assert_eq!(slot.collect(false), Some(ProbeReport::NotSubmitted));
     // A REQUEST from no bound receiver is not answered.
     let incoming = |request: Rttm, seen| ControlItem::Incoming {
         endpoint: EndpointId(1),
@@ -1587,6 +1600,10 @@ fn rttm_requests_are_reported_and_answered() {
         },
         joins: Lanes::new(&[0]).unwrap(),
     };
+    // An earlier incarnation's binding from the same receiver, found first.
+    let mut old = answer;
+    old.identity.incarnation -= 1;
+    sender.bind(EndpointId(1), source, &old, 899);
     sender.bind(EndpointId(1), source, &answer, 900);
     let (path, _log) = outbound(EndpointId(1), source);
     sender.publications.push(*path);
@@ -1627,15 +1644,20 @@ fn rttm_requests_are_reported_and_answered() {
             ..request
         }]
     );
-    // Another receiver id, or another incarnation: not answered.
+    // Another receiver id: a mismatch. Another incarnation or receiver
+    // boot: no binding. None is answered.
     let mut stranger = request;
     stranger.receiver.receiver_id = 2;
     role.to_sender.try_post(incoming(stranger, 1_300)).unwrap();
     let mut other = request;
     other.identity.incarnation += 1;
     role.to_sender.try_post(incoming(other, 1_300)).unwrap();
+    let mut rebooted = request;
+    rebooted.receiver.receiver_boot_id = [7, 9];
+    role.to_sender.try_post(incoming(rebooted, 1_300)).unwrap();
     let _ = sender.duty(&mut halves, 1_300).unwrap();
-    assert_eq!(sender.counters().rttm_mismatch, 2);
+    assert_eq!(sender.counters().rttm_mismatch, 1);
+    assert_eq!(sender.counters().rttm_unbound, 3);
     // Over the reply rate (1 per second here): dropped.
     role.to_sender.try_post(incoming(request, 1_400)).unwrap();
     let _ = sender.duty(&mut halves, 1_400).unwrap();
@@ -1670,7 +1692,7 @@ fn rttm_probe_ids_are_restocked() {
     let interval = crate::rtt::RttConfig::default().rtt_probe_interval;
     let mut sent = 0;
     for cycle in 0..40u64 {
-        sent += role.probe_paths(0, cycle * interval);
+        sent += role.probe_paths(0, cycle * interval).unwrap();
         // The sender drops each: not submitted.
         while let Ok(Some(item)) = sender.from_receiver.try_take() {
             drop(item);

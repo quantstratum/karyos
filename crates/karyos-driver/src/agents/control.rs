@@ -72,14 +72,17 @@ impl Drop for SmGuard {
 }
 
 /// The submission report of one image path's RTTM REQUEST (RC-1): the
-/// sender reads the clock immediately before the backend call and reports
-/// whether the call submitted the probe; the receiver collects the report.
-/// At most one REQUEST per path is in the ring at a time.
+/// sender reads the clock immediately before the backend call, publishes
+/// it as sending, and then whether the call submitted the probe; the
+/// receiver collects the report. A REPLY proves the REQUEST went out, so
+/// one that overtakes the final report settles from the sending state. At
+/// most one REQUEST per path is in flight: a path waits while its slot is
+/// waiting or sending.
 #[derive(Debug, Default)]
 pub struct ProbeSlot {
     state: std::sync::atomic::AtomicU8,
     /// The time read before the submitting call; valid once `state` is
-    /// `PROBE_SUBMITTED` (published by its Release store).
+    /// `PROBE_SENDING` or later (published by its Release store).
     start: std::sync::atomic::AtomicU64,
 }
 
@@ -87,10 +90,12 @@ pub struct ProbeSlot {
 const PROBE_IDLE: u8 = 0;
 /// A REQUEST waits in the ring.
 const PROBE_WAITING: u8 = 1;
+/// The sender is in the backend call; `start` holds its start.
+const PROBE_SENDING: u8 = 2;
 /// The backend reported it submitted; `start` holds its start.
-const PROBE_SUBMITTED: u8 = 2;
+const PROBE_SUBMITTED: u8 = 3;
 /// It was not submitted: accepted only, failed, uncertain or dropped.
-const PROBE_NOT_SUBMITTED: u8 = 3;
+const PROBE_NOT_SUBMITTED: u8 = 4;
 
 /// What a [`ProbeSlot`] reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,18 +107,28 @@ pub enum ProbeReport {
 }
 
 impl ProbeSlot {
-    /// Whether a REQUEST of this path waits in the ring.
+    /// Whether a REQUEST of this path is still with the sender: waiting in
+    /// the ring or in its backend call.
     #[must_use]
     pub fn busy(&self) -> bool {
-        self.state.load(std::sync::atomic::Ordering::Acquire) == PROBE_WAITING
+        matches!(
+            self.state.load(std::sync::atomic::Ordering::Acquire),
+            PROBE_WAITING | PROBE_SENDING
+        )
     }
 
-    /// Takes the report of the last REQUEST, if the sender made one, and
-    /// frees the slot.
-    pub fn collect(&self) -> Option<ProbeReport> {
+    /// Takes the final report of the last REQUEST, if the sender made one,
+    /// and frees the slot. With `replied` (a REPLY to it arrived, proving
+    /// it went out), a REQUEST still in its backend call reports submitted
+    /// at its start; the slot then stays busy until the sender's final
+    /// report, which a later collection clears.
+    pub fn collect(&self, replied: bool) -> Option<ProbeReport> {
         use std::sync::atomic::Ordering;
 
         let report = match self.state.load(Ordering::Acquire) {
+            PROBE_SENDING if replied => {
+                return Some(ProbeReport::Submitted(self.start.load(Ordering::Relaxed)));
+            }
             PROBE_SUBMITTED => ProbeReport::Submitted(self.start.load(Ordering::Relaxed)),
             PROBE_NOT_SUBMITTED => ProbeReport::NotSubmitted,
             _ => return None,
@@ -137,14 +152,23 @@ impl ProbeGuard {
         Self(Some(std::sync::Arc::clone(slot)))
     }
 
-    /// The backend reported the REQUEST submitted; `start` was read
-    /// immediately before that call.
-    pub fn submitted(mut self, start: u64) {
+    /// The sender enters the backend call; `start` was read immediately
+    /// before it.
+    pub fn sending(&mut self, start: u64) {
         use std::sync::atomic::Ordering;
 
-        if let Some(slot) = self.0.take() {
+        if let Some(slot) = &self.0 {
             slot.start.store(start, Ordering::Relaxed);
-            slot.state.store(PROBE_SUBMITTED, Ordering::Release);
+            slot.state.store(PROBE_SENDING, Ordering::Release);
+        }
+    }
+
+    /// The backend reported the REQUEST submitted, at the start
+    /// [`ProbeGuard::sending`] published.
+    pub fn submitted(mut self) {
+        if let Some(slot) = self.0.take() {
+            slot.state
+                .store(PROBE_SUBMITTED, std::sync::atomic::Ordering::Release);
         }
     }
 }

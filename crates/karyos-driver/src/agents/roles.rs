@@ -214,10 +214,10 @@ pub struct SenderCounters {
     /// SMs accepted from a bound receiver.
     pub sm_accepted: u64,
     /// SMs from no receiver this sender answered on that endpoint (source,
-    /// alias and receiver boot id), ignored.
+    /// alias, receiver boot id and incarnation), ignored.
     pub sm_unbound: u64,
-    /// SMs from a bound receiver whose identity, lane count or receiver id
-    /// does not match, ignored.
+    /// SMs from a bound receiver whose lane count or receiver id does not
+    /// match, ignored.
     pub sm_mismatch: u64,
     /// Answered receivers not recorded: the binding table was full of
     /// confirmed bindings.
@@ -240,10 +240,11 @@ pub struct SenderCounters {
     pub reset_requests_full: u64,
     /// RTTM REPLYs sent (counted in `sent` too).
     pub rttm_replied: u64,
-    /// RTTM REQUESTs from no receiver this sender answered: ignored.
+    /// RTTM REQUESTs from no receiver this sender answered (source, alias,
+    /// receiver boot id and incarnation): ignored.
     pub rttm_unbound: u64,
-    /// RTTM REQUESTs from a bound receiver naming another identity or
-    /// receiver id: ignored.
+    /// RTTM REQUESTs from a bound receiver naming another receiver id:
+    /// ignored.
     pub rttm_mismatch: u64,
     /// RTTM REQUESTs over `rttm_reply_rate` or beyond the source table:
     /// dropped ([`SenderRole::rttm_reply_drops`] tells which).
@@ -510,9 +511,10 @@ fn tally(counters: &mut ReceiverCounters, field: fn(&mut ReceiverCounters) -> &m
     counters.overflowed = overflowed;
 }
 
-/// Settles `probe`'s report into `rtt`, if the sender made one.
-fn collect_probe(rtt: &mut RttProbes, probe: &mut PathProbe) {
-    let Some(report) = probe.slot.collect() else {
+/// Settles `probe`'s report into `rtt`, if the sender made one; `replied`
+/// as in [`ProbeSlot::collect`].
+fn collect_probe(rtt: &mut RttProbes, probe: &mut PathProbe, replied: bool) {
+    let Some(report) = probe.slot.collect(replied) else {
         return;
     };
     // A probe of an older binding generation is ignored by `rtt`.
@@ -1102,7 +1104,7 @@ impl ReceiverRole {
             }
             // Its RTTM REQUESTs follow its SM (reliable-transport.md).
             work = work
-                .checked_add(self.probe_paths(index, now))
+                .checked_add(self.probe_paths(index, now)?)
                 .ok_or(overflow.clone())?;
             index = index.checked_add(1).ok_or(overflow.clone())?;
         }
@@ -1114,7 +1116,11 @@ impl ReceiverRole {
     /// REQUEST per path and interval goes to the path's source, at most one
     /// per path in the ring. Its probe ids are restocked here, on the timer
     /// step, never per datagram. Returns the REQUESTs handed over.
-    fn probe_paths(&mut self, index: usize, now: u64) -> u32 {
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
+    fn probe_paths(&mut self, index: usize, now: u64) -> Result<u32, AgentError> {
         let Self {
             images,
             sessions,
@@ -1123,7 +1129,7 @@ impl ReceiverRole {
             ..
         } = self;
         let Some(image) = images.get_mut(index) else {
-            return 0;
+            return Ok(0);
         };
         if image.rtt.refill_ids() {
             tally(counters, |c| &mut c.rttm_id_draws);
@@ -1134,7 +1140,7 @@ impl ReceiverRole {
         };
         let mut sent = 0u32;
         for (path, probe) in image.probes.iter_mut().enumerate() {
-            collect_probe(&mut image.rtt, probe);
+            collect_probe(&mut image.rtt, probe, false);
             let Some(key) = sessions.paths().key(image.slot, path) else {
                 continue;
             };
@@ -1161,12 +1167,14 @@ impl ReceiverRole {
             match to_sender.try_post(item) {
                 Ok(()) => {
                     tally(counters, |c| &mut c.rttm_requests);
-                    sent = sent.saturating_add(1);
+                    sent = sent
+                        .checked_add(1)
+                        .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
                 }
                 Err(_) => tally(counters, |c| &mut c.ring_full_rttm),
             }
         }
-        sent
+        Ok(sent)
     }
 
     /// Retires `image` at `now`, in one transition: the binding goes, the
@@ -1394,7 +1402,7 @@ impl Intake<'_> {
             return;
         };
         if let Some(probe) = image.probes.get_mut(path) {
-            collect_probe(&mut image.rtt, probe);
+            collect_probe(&mut image.rtt, probe, true);
         }
         let outcome = match image.rtt.generation(path) {
             Some(generation) => image.rtt.reply(path, generation, rttm.probe_id, seen),
@@ -1936,9 +1944,10 @@ impl SenderRole {
                     control,
                     guard: Some(ItemGuard::Probe(guard)),
                 } => {
-                    let start = (self.clock)();
+                    let mut guard = guard;
+                    guard.sending((self.clock)());
                     if self.send(halves, endpoint, destination, &control) {
-                        guard.submitted(start);
+                        guard.submitted();
                     }
                 }
                 ControlItem::Outgoing {
@@ -2211,11 +2220,6 @@ impl SenderRole {
         }
     }
 
-    /// An SM from `source` on `endpoint` (network-control-schemas.md §6.1):
-    /// accepted only from a receiver this sender answered there, with the
-    /// answered identity, the publication's lane count and, after the first,
-    /// the same receiver id. The first accepted SM establishes the
-    /// publication: its SETUP stops.
     /// The REPLY to an RTTM `request` from `source`, seen at `seen` (RC-1):
     /// only for a receiver this sender answered on that endpoint, naming the
     /// publication's incarnation and its receiver id, within
@@ -2237,14 +2241,14 @@ impl SenderRole {
                 && binding.alias == request.alias
                 && binding.source == normal
                 && binding.boot_id == request.receiver.receiver_boot_id
+                && binding.identity == request.identity
         }) else {
             self.count(|c| &mut c.rttm_unbound);
             return None;
         };
-        let matches = binding.identity == request.identity
-            && binding
-                .receiver_id
-                .is_none_or(|id| id == request.receiver.receiver_id);
+        let matches = binding
+            .receiver_id
+            .is_none_or(|id| id == request.receiver.receiver_id);
         if !matches {
             self.count(|c| &mut c.rttm_mismatch);
             return None;
@@ -2268,6 +2272,11 @@ impl SenderRole {
         (self.replies.dropped(), self.replies.sources_full())
     }
 
+    /// An SM from `source` on `endpoint` (network-control-schemas.md §6.1):
+    /// accepted only from a receiver this sender answered there, with the
+    /// answered identity, the publication's lane count and, after the first,
+    /// the same receiver id. The first accepted SM establishes the
+    /// publication: its SETUP stops.
     fn status(
         &mut self,
         endpoint: EndpointId,
@@ -2282,11 +2291,14 @@ impl SenderRole {
             .iter()
             .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
             .and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
+        // The incarnation is part of the binding: an earlier incarnation's
+        // row from the same receiver never shadows the current one.
         let found = self.bindings.iter_mut().find(|binding| {
             binding.endpoint == endpoint
                 && binding.alias == status.alias
                 && binding.source == source
                 && binding.boot_id == status.receiver.receiver_boot_id
+                && binding.identity == status.identity
         });
         let Some(binding) = found else {
             self.count(|c| &mut c.sm_unbound);

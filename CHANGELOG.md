@@ -39,7 +39,11 @@ release may break APIs, wire formats and shared-memory layouts.
   id with its service delay. `AgentConfig::rtt` holds the settings.
   `OsProbeIds` is no longer `Copy` or `Clone`, `ProbeIds::refill` and
   `RttProbes::refill_ids` return whether they drew, and
-  `RttProbes::generation` and `PathBindings::key` are new.
+  `RttProbes::generation` and `PathBindings::key` are new. A REPLY that
+  overtakes the sender's final report settles from the start it
+  published while sending. The sender finds an SM's binding by its
+  incarnation too, so an earlier incarnation's binding from the same
+  receiver no longer shadows the current one (`sm_unbound`).
 - The driver's sender and receiver agents run multicast flow control. Each
   publication's `Outbound` holds a `Membership` (interim defaults: no
   roles, `Strategy::Min`, a minimum window of one maximum frame, a maximum
