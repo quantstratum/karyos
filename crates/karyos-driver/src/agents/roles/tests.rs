@@ -1347,13 +1347,13 @@ fn a_rebind_never_moves_a_reliable_position_back() {
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 0);
     sender.status(endpoint, receiver, &sm_status([7, 8], 8192), 1);
-    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    assert_eq!(sender.consumption_at(endpoint, alias()).unwrap()[0], 8192);
     // A new answer to the same receiver, at an older join: held.
     sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 2);
-    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    assert_eq!(sender.consumption_at(endpoint, alias()).unwrap()[0], 8192);
     // Its next SM, older still: held, counted stale.
     sender.status(endpoint, receiver, &sm_status([7, 8], 4096), 3);
-    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    assert_eq!(sender.consumption_at(endpoint, alias()).unwrap()[0], 8192);
     assert_eq!(sender.counters().sm_stale, 1);
 }
 
@@ -1363,21 +1363,21 @@ fn an_unconfirmed_receiver_bounds_at_its_joins() {
     let endpoint = EndpointId(1);
     let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
-    assert_eq!(sender.consumption(endpoint, alias()), None);
+    assert_eq!(sender.consumption_at(endpoint, alias()), None);
     sender.bind(endpoint, first, &sm_answer([7, 8], 0), 0);
     sender.status(endpoint, first, &sm_status([7, 8], 8192), 1);
     sender.bind(endpoint, second, &sm_answer([3, 4], 1024), 2);
     // The second is answered but silent: it bounds at its join.
-    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 1024);
+    assert_eq!(sender.consumption_at(endpoint, alias()).unwrap()[0], 1024);
     // Once heard from, at its consumption.
     sender.status(endpoint, second, &sm_status([3, 4], 16_384), 3);
-    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    assert_eq!(sender.consumption_at(endpoint, alias()).unwrap()[0], 8192);
     // Another alias has no bound receiver.
     let other = Alias {
         session_id: 99,
         ..alias()
     };
-    assert_eq!(sender.consumption(endpoint, other), None);
+    assert_eq!(sender.consumption_at(endpoint, other), None);
 }
 
 /// A publication that needs a reset asks for it once, then again only after
@@ -3352,4 +3352,77 @@ fn an_idle_path_sends_a_path_heartbeat() {
     assert_eq!(sender.counters().path_heartbeats_sent, sent);
     let _ = sender.duty(&mut halves, t + 2 * interval).unwrap();
     assert_eq!((beat(0), beat(1)), (base.0 + 2, base.1 + 2));
+}
+
+/// A routed publication over `routes` (A on endpoint 1, B on endpoint 2)
+/// posted to `sender`; returns the event and the log.
+fn add_routed(
+    sender: &mut super::SenderRole,
+) -> (
+    Option<AgentEvent<OsSocket>>,
+    super::super::data::testing::TestLog,
+) {
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let routes = [
+        (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
+        (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
+    ];
+    let (path, log) = super::super::data::testing::outbound_routed(
+        &routes,
+        alias(),
+        publication(EndpointId(1)).term,
+        1,
+        true,
+    );
+    let event = sender
+        .command(AgentCommand::<OsSocket>::AddPublication {
+            reply: replies.reserve().unwrap(),
+            publication: publication(EndpointId(1)),
+            outbound: path,
+            guard: None,
+            roles: None,
+        })
+        .map(|(_, event)| event);
+    (event, log)
+}
+
+/// #336 review P2 (M3): a routed publication's SETUP sides are added all
+/// or nothing. With room for one session, or with path B's alias already
+/// taken, it is refused and leaves no session on path A.
+#[test]
+fn a_refused_routed_publication_leaves_no_setup_side() {
+    let config = AgentConfig {
+        publications: 1,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let (event, _log) = add_routed(&mut sender);
+    assert!(matches!(event, Some(AgentEvent::PublicationRefused { .. })));
+    assert!(!sender.sessions.remove(EndpointId(1), alias()));
+
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    sender.sessions.add(publication(EndpointId(2))).unwrap();
+    let (event, _log) = add_routed(&mut sender);
+    assert!(matches!(event, Some(AgentEvent::PublicationRefused { .. })));
+    assert!(!sender.sessions.remove(EndpointId(1), alias()));
+    assert!(
+        sender.sessions.remove(EndpointId(2), alias()),
+        "the other's"
+    );
+}
+
+/// #336 review P2: a reliable routed publication is bounded by a receiver
+/// bound on any path. With only path B bound (path A lost), its consumption
+/// still holds the publication.
+#[test]
+fn a_receiver_on_a_later_path_bounds_the_publication() {
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (event, _log) = add_routed(&mut sender);
+    assert!(matches!(event, Some(AgentEvent::PublicationAdded { .. })));
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(2), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(2), receiver, &sm_status([7, 8], 0), 1);
+    let bound = sender.consumption(&sender.publications[0]);
+    assert_eq!(bound.map(|positions| positions[0]), Some(0));
 }

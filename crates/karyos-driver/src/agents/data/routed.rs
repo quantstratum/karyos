@@ -185,7 +185,6 @@ impl Routed {
                 continue;
             }
             if post(route.endpoint, route.destination) {
-                route.last_sent = Some(now);
                 // At most four routes: no overflow.
                 if let Some(next) = posted.checked_add(1) {
                     posted = next;
@@ -379,10 +378,12 @@ impl Outbound {
         }
     }
 
-    /// Over redundant paths, posts through `post` a PATH_HB toward each
-    /// path's destination that is open and submitted nothing for `interval`
-    /// ns at `now` (redundant-paths.md RP-3); `post` says whether it was
-    /// posted. None on one path. Returns the count posted.
+    /// Over redundant paths, names through `post` each path due a PATH_HB:
+    /// open, and submitted nothing for `interval` ns at `now`
+    /// (redundant-paths.md RP-3), with its destination; `post` says whether
+    /// it took it. The caller reports each one submitted
+    /// ([`Outbound::path_heartbeat_sent`]). None on one path. Returns the
+    /// count taken.
     pub fn path_heartbeats(
         &mut self,
         now: u64,
@@ -392,6 +393,21 @@ impl Outbound {
         self.routed
             .as_deref_mut()
             .map_or(0, |routed| routed.path_heartbeats(now, interval, post))
+    }
+
+    /// Records a PATH_HB submitted on the path on `endpoint` at `now`: the
+    /// path is not idle until `path_heartbeat_interval` later. Only a
+    /// submitted one counts (#336 review), so a refused send is tried again
+    /// next cycle.
+    pub fn path_heartbeat_sent(&mut self, endpoint: EndpointId, now: u64) {
+        if let Some(route) = self.routed.as_deref_mut().and_then(|routed| {
+            routed
+                .routes
+                .iter_mut()
+                .find(|route| route.endpoint == endpoint)
+        }) {
+            route.last_sent = Some(now);
+        }
     }
 
     /// Lane `lane`'s sent frontier (tests).
