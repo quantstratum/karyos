@@ -1388,8 +1388,9 @@ fn a_rate_limited_solicit_leaves_no_entry() {
         receiver.inject_data(&sessions, EndpointId(1), source, other, &bytes, at);
     }
     assert_eq!(sent(), 0);
+    // Only the SOLICIT sent counts; the refused ones were withdrawn.
     let counters = receiver.session_counters();
-    assert_eq!((counters.solicits, counters.solicits_withdrawn), (4, 3));
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (1, 3));
     assert_eq!(receiver.counters().rsp_setup_rate_limited, 3);
     // A second later the rate has refilled: the key is solicited.
     receiver.inject_data(
@@ -1401,7 +1402,8 @@ fn a_rate_limited_solicit_leaves_no_entry() {
         1_000_000_002,
     );
     assert_eq!(sent(), 1);
-    assert_eq!(receiver.session_counters().solicits_withdrawn, 3);
+    let counters = receiver.session_counters();
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (2, 3));
 }
 
 /// Mutants of the #275 review: DATA solicits only on a subscribed stream

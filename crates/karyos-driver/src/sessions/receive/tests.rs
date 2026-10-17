@@ -1349,3 +1349,26 @@ fn the_holdoff_table_reuses_rows_and_never_grows() {
         SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
     );
 }
+
+/// A holdoff for a new key while every row is unexpired records nothing:
+/// the table never grows past `max_pending_challenges`, and the new key
+/// is not held off.
+#[test]
+fn a_full_holdoff_table_records_nothing() {
+    let config = SessionConfig {
+        max_pending_challenges: 2,
+        max_pending_per_source: 2,
+        ..SessionConfig::default()
+    };
+    let mut sessions = table(config);
+    let capacity = sessions.holdoffs.capacity();
+    sessions.hold_off(key(1), 0);
+    sessions.hold_off(key(2), 0);
+    sessions.hold_off(key(3), MS);
+    assert_eq!(sessions.holdoffs.len(), 2);
+    assert_eq!(sessions.holdoffs.capacity(), capacity);
+    assert_eq!(sessions.held_off(&key(3), MS), (false, true));
+    // A held key's row is renewed in place.
+    sessions.hold_off(key(1), 2 * MS);
+    assert_eq!(sessions.holdoffs.len(), 2);
+}
