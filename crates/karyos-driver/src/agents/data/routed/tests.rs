@@ -379,11 +379,19 @@ fn a_failed_route_resets_only_its_endpoint() {
     assert_eq!(outbound.post_reset_requests(1, |_| true), (0, 0));
     let _rx_b = reset(&mut halves, 1, rx_b);
     sent(&observer_b, 32);
+    // B left on its fault (RP-8); after its backoff (10 ms) it returns on
+    // its new epoch (RP-9).
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 20_000_000)
+        .unwrap();
     let _ = log.publications[0]
         .append(&[9; 1000], AppendOptions::default())
         .unwrap();
     for _ in 0..4 {
-        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, 20_000_000)
+            .unwrap();
     }
     assert!(!outbound.needs_reset());
     assert_eq!(seen_a.lock().unwrap().len(), 3);
@@ -623,6 +631,7 @@ fn policy() -> super::super::PathPolicy {
         lag_limit: 1_000_000,
         skip_percent: 50,
         skip_min_bytes: 8 * FRAME,
+        ..super::super::PathPolicy::default()
     }
 }
 
@@ -846,6 +855,320 @@ fn a_close_after_a_leave_does_not_wait_on_the_left_path() {
     let applied = cell.try_read().unwrap();
     assert_eq!(applied.epoch, 3);
     assert_eq!(applied.in_flight, 0, "nothing waits on the left path");
+}
+
+/// RP-9 test policy: backoffs of 10 ns doubling to 40 ns, reset after
+/// 100 ns live; leaving by the hook only.
+fn return_policy() -> super::super::PathPolicy {
+    super::super::PathPolicy {
+        backoff_initial: 10,
+        backoff_max: 40,
+        backoff_reset: 100,
+        ..policy()
+    }
+}
+
+/// RP-9: a flapping path backs off 10, 20, 40 and then 40 again (the
+/// maximum), counting every exit and entry.
+#[test]
+fn a_flapping_path_backs_off_doubling_to_the_maximum() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, _log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    let mut now = 1000;
+    for wait in [10u64, 20, 40, 40] {
+        outbound.leave_before_serve(1);
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+        assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now + wait - 1)
+            .unwrap();
+        assert_eq!(
+            outbound.path_state(1).map(|state| state.0),
+            Some(false),
+            "still waiting at {wait} - 1"
+        );
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now + wait)
+            .unwrap();
+        assert_eq!(
+            outbound.path_state(1).map(|state| state.0),
+            Some(true),
+            "back after {wait}"
+        );
+        now += wait + 1;
+    }
+    let counters = outbound.path_counters(1).unwrap();
+    assert_eq!((counters.exits, counters.entries), (4, 4));
+}
+
+/// RP-9: a returning path bounds `sent_low` only from its first submit;
+/// live for `path_backoff_reset`, its wait starts over.
+#[test]
+fn a_returning_path_counts_from_its_first_submit() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    // B leaves before serve and holds out while A sends two datagrams.
+    outbound.leave_before_serve(1);
+    commit(&mut log, 0, 2);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1000)
+        .unwrap();
+    let a_front = outbound.sent_low(0).unwrap();
+    assert_eq!(a_front, 2 * FRAME, "A alone bounds it");
+    // Back after 10 ns, but nothing submitted yet: still A's frontier.
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1010)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    assert_eq!(outbound.sent_low(0), Some(a_front));
+    assert!(outbound.routed.as_deref().unwrap().routes[1].returning);
+    // B submits from the selection point on: it is live, and bounds it.
+    commit(&mut log, 2, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1020)
+        .unwrap();
+    assert!(!outbound.routed.as_deref().unwrap().routes[1].returning);
+    assert_eq!(outbound.sent_low(0), Some(3 * FRAME));
+    // Live past the reset, after a submit: its wait starts over.
+    assert_eq!(outbound.routed.as_deref().unwrap().routes[1].backoff, 10);
+    commit(&mut log, 3, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1200)
+        .unwrap();
+    assert_eq!(outbound.routed.as_deref().unwrap().routes[1].backoff, 0);
+}
+
+/// RP-8: a frame a path skipped counts as passed for its frontier, so
+/// `sent_low` is not held at a skipped position.
+#[test]
+fn a_skipped_frame_passes_the_paths_frontier() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 16);
+    sent(&observer_b, 16);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    outbound.withhold_route(1, 1);
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1000)
+        .unwrap();
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    assert_eq!(outbound.sent_low(0), Some(FRAME));
+}
+
+/// RP-8 and RP-9: a faulted route leaves while another is live; its queue
+/// is not retried until it returns after its backoff, through
+/// `retry_queue`, and then it sends again.
+#[test]
+fn a_faulted_route_leaves_and_returns_by_retry() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    observer_b.push_send(SendResult::Error(Errno::NETUNREACH));
+    sent(&observer_b, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1000)
+        .unwrap();
+    assert_eq!(
+        outbound.path_state(1).map(|state| state.0),
+        Some(false),
+        "B left"
+    );
+    let calls = observer_b.send_calls();
+    // During its backoff: no retry, no flush.
+    commit(&mut log, 1, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1005)
+        .unwrap();
+    assert_eq!(observer_b.send_calls(), calls);
+    assert_eq!(
+        outbound.routed_sender().unwrap().needs_control(0, 1),
+        Some(true),
+        "not retried while it is out"
+    );
+    // Back after 10 ns: retried, and its next copies go.
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1010)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    commit(&mut log, 2, 1);
+    for now in 1011..1015 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert!(observer_b.send_calls() > calls);
+    assert!(!seen_b.lock().unwrap().is_empty());
+    assert!(!outbound.needs_reset());
+}
+
+/// #350 review P2: a returning path that has not submitted is not live for
+/// the leave guard. B leaves and returns while its socket blocks, then A
+/// faults: A stays, the last path that can send, and `sent_low` keeps a
+/// frontier.
+#[test]
+fn a_returning_path_does_not_let_the_last_live_one_leave() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    outbound.leave_before_serve(1);
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1000)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    // Back after 10 ns; its socket blocks, so it submits nothing.
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1010)
+        .unwrap();
+    assert!(outbound.routed.as_deref().unwrap().routes[1].returning);
+    observer_a.push_send(SendResult::Error(Errno::NETUNREACH));
+    commit(&mut log, 1, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1011)
+        .unwrap();
+    assert_eq!(
+        outbound.path_state(0).map(|state| state.0),
+        Some(true),
+        "A is the last path that can send"
+    );
+    assert!(outbound.sent_low(0).is_some());
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    for now in 1012..1100 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+}
+
+/// RP-8: room is judged after the cycle's flushes, so a path whose socket
+/// takes everything never looks full, however the backend orders its
+/// queues: across many cycles it skips nothing and never leaves.
+#[test]
+fn a_healthy_path_never_looks_full() {
+    let (a, observer_a, seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 0);
+    sent(&observer_a, 256);
+    sent(&observer_b, 256);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    // Within one term of the test log (no conductor rotates it here).
+    for round in 0..4u8 {
+        commit(&mut log, round * 6, 6);
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, 1000 + u64::from(round))
+            .unwrap();
+    }
+    for _ in 0..8 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, 2000)
+            .unwrap();
+    }
+    let sender = outbound.routed_sender().unwrap();
+    assert_eq!(sender.counters(0).unwrap().skipped, 0);
+    assert_eq!(sender.counters(1).unwrap().skipped, 0);
+    assert_eq!(outbound.path_state(1), Some((true, false)));
+    assert_eq!(seen_a.lock().unwrap().len(), 24);
+    assert_eq!(seen_b.lock().unwrap().len(), 24);
+}
+
+/// ACS 17049: a path that leaves while its TX half is detached, and never
+/// comes back, does not keep a close from becoming effective: on the close
+/// its copies are forgotten through the guard gate. When it does come
+/// back, it comes back through a reset, and no forgotten copy is sent.
+#[test]
+fn a_close_does_not_wait_on_a_detached_left_path() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b, rx_b) = path_rx(2, 0);
+    for _ in 0..32 {
+        observer_b.push_send(SendResult::Error(Errno::AGAIN));
+    }
+    sent(&observer_a, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    outbound
+        .guard(
+            GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::clone(&cell),
+                epoch: 2,
+                rate: None,
+            },
+            0,
+        )
+        .unwrap();
+    // B blocks on its copies; then its half goes and it leaves detached.
+    commit(&mut log, 0, 4);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 10)
+        .unwrap();
+    assert!(outbound.routed_sender().unwrap().pending(0, 1).unwrap() > 0);
+    let b_half = halves.pop().unwrap();
+    outbound.leave_before_serve(1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 20)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    for now in 30..40 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    let applied = cell.try_read().unwrap();
+    assert_eq!(applied.epoch, 3);
+    assert_eq!(applied.in_flight, 0, "nothing waits on the detached path");
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    // The leave's cancel found B detached once; the close forgot its
+    // copies and attempted no more cancels on it (#350 review).
+    let counters = outbound.routed_sender().unwrap().counters(1).unwrap();
+    assert_eq!(counters.uncancelled, 1, "{counters:?}");
+    assert!(counters.forgotten > 0, "{counters:?}");
+    // B's half comes back: the route asks for a reset first.
+    let calls = observer_b.send_calls();
+    halves.push(b_half);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 40)
+        .unwrap();
+    assert!(outbound.needs_reset());
+    let _rx_b = reset(&mut halves, 1, rx_b);
+    for now in 50..60 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert!(!outbound.needs_reset());
+    assert_eq!(observer_b.send_calls(), calls, "no forgotten copy is sent");
 }
 
 /// #346 review P2-3: several paths can leave in one pass, and the last live

@@ -194,6 +194,19 @@ pub struct ReceiverCounters {
     pub heartbeats_stationary: u64,
     /// Heartbeats outside the image's receive window: rejected.
     pub heartbeats_rejected: u64,
+    /// Lane terminal bounds recorded from EOS: an EOS heartbeat, or an EOS
+    /// flag on a DATA frame's last fragment (network-sessions.md, Liveness
+    /// and terminal transitions).
+    pub eos_bounds: u64,
+    /// EOS naming a lane's bound again (repeated during the linger):
+    /// idempotent.
+    pub eos_repeated: u64,
+    /// EOS refused: another bound than the one recorded, below the lane's
+    /// complete prefix, under data already covered, or outside its receive
+    /// window.
+    pub eos_refused: u64,
+    /// DATA frames past their lane's terminal bound: dropped.
+    pub data_past_terminal: u64,
     /// DATA datagrams from no binding: dropped.
     pub data_unbound: u64,
     /// DATA datagrams that failed validation for their image: dropped.
@@ -289,6 +302,12 @@ pub struct ReceiverCounters {
     /// Images closed by a protocol fault (`range_invalid_limit`
     /// consecutive RANGE_INVALID).
     pub images_closed_protocol_fault: u64,
+    /// Images closed cleanly: every lane's complete prefix reached its
+    /// terminal bound.
+    pub images_closed_eos: u64,
+    /// Images whose every lane reached its terminal bound, yet a lane
+    /// dropped a frame past it: retired, not clean.
+    pub images_closed_eos_dropped: u64,
     /// Gaps sealed by the skip policy (unreliable timers, or `skip`).
     pub gaps_sealed: u64,
     /// Due holes of a conflated lane held by its seal gate in a duty
@@ -585,18 +604,18 @@ fn classify_heartbeat<T: StreamTerms>(
     heartbeat: &Heartbeat,
 ) -> HeartbeatClass {
     let lane = heartbeat.lane();
-    let Some(position) = heartbeat
-        .term_id()
-        .count_from(image.initial_term_id)
-        .ok()
-        .and_then(|count| u64::from(count.get()).checked_mul(u64::from(image.term_length)))
-        .and_then(|base| base.checked_add(u64::from(heartbeat.term_offset())))
-    else {
+    let Some(position) = heartbeat_position(image, heartbeat) else {
         return HeartbeatClass::Rejected;
     };
     if !image.owner.within_window(lane, position).unwrap_or(false) {
         return HeartbeatClass::Rejected;
     }
+    // Nothing past a recorded terminal bound is marked: the sender has
+    // nothing there to repair.
+    let position = match terminal_bound(image, lane) {
+        Some(bound) => position.min(bound),
+        None => position,
+    };
     let Some(mark) = image.heartbeat_marks.get_mut(usize::from(lane.get())) else {
         return HeartbeatClass::Rejected;
     };
@@ -608,6 +627,102 @@ fn classify_heartbeat<T: StreamTerms>(
             HeartbeatClass::Fresh
         }
     }
+}
+
+/// The stream position `heartbeat` names in `image`, or `None` for a term
+/// outside the incarnation.
+fn heartbeat_position<T: StreamTerms>(image: &Installed<T>, heartbeat: &Heartbeat) -> Option<u64> {
+    let count = heartbeat.term_id().count_from(image.initial_term_id).ok()?;
+    u64::from(count.get())
+        .checked_mul(u64::from(image.term_length))?
+        .checked_add(u64::from(heartbeat.term_offset()))
+}
+
+/// What recording an EOS bound did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Terminal {
+    /// The lane's bound is recorded.
+    Recorded,
+    /// The same bound again (the sender repeats it during its linger).
+    Repeated,
+    /// Refused: another bound than the recorded one, below the complete
+    /// prefix, or under data already covered.
+    Refused,
+}
+
+/// Records `bound` as `lane`'s terminal bound in `image`: the first EOS
+/// decides, a repeat of it is idempotent, and no bound is accepted below
+/// the lane's complete prefix or its covered data. EOS ahead of a hole is
+/// recorded; the hole is still repaired before the image completes.
+fn record_terminal<T: StreamTerms>(image: &mut Installed<T>, lane: Lane, bound: u64) -> Terminal {
+    let (Some(rebuild), Some(high)) = (
+        image.owner.rebuild_position(lane),
+        image.owner.high_water(lane),
+    ) else {
+        return Terminal::Refused;
+    };
+    let Some(slot) = image.terminal.get_mut(usize::from(lane.get())) else {
+        return Terminal::Refused;
+    };
+    match *slot {
+        Some(recorded) if recorded == bound => Terminal::Repeated,
+        Some(_) => Terminal::Refused,
+        None if bound < rebuild || bound < high => Terminal::Refused,
+        None => {
+            *slot = Some(bound);
+            Terminal::Recorded
+        }
+    }
+}
+
+/// Counts what recording an EOS bound did.
+fn tally_terminal(counters: &mut ReceiverCounters, outcome: Terminal) {
+    tally(
+        counters,
+        match outcome {
+            Terminal::Recorded => |c| &mut c.eos_bounds,
+            Terminal::Repeated => |c| &mut c.eos_repeated,
+            Terminal::Refused => |c| &mut c.eos_refused,
+        },
+    );
+}
+
+/// `lane`'s terminal bound in `image`, once an EOS named it.
+fn terminal_bound<T: StreamTerms>(image: &Installed<T>, lane: Lane) -> Option<u64> {
+    image
+        .terminal
+        .get(usize::from(lane.get()))
+        .copied()
+        .flatten()
+}
+
+/// Whether `frame` ends past its lane's terminal bound in `image`: no
+/// later position is accepted once EOS named the bound.
+fn past_terminal<T: StreamTerms>(image: &Installed<T>, frame: &ValidatedFrame<'_>) -> bool {
+    let Some(bound) = terminal_bound(image, frame.lane()) else {
+        return false;
+    };
+    frame_position(image, frame)
+        .and_then(|position| position.checked_add(u64::from(frame.extent())))
+        .is_none_or(|end| end > bound)
+}
+
+/// Whether every lane of `image` reached its terminal bound through its
+/// complete prefix: the image's end. It is clean only when no lane
+/// dropped a frame past its bound ([`dropped_past_terminal`]).
+fn terminal_reached<T: StreamTerms>(image: &Installed<T>) -> bool {
+    (0..image.lane_count).all(|lane| {
+        Lane::try_new(lane).ok().is_some_and(|lane| {
+            terminal_bound(image, lane)
+                .is_some_and(|bound| image.owner.rebuild_position(lane) == Some(bound))
+        })
+    })
+}
+
+/// Whether any lane of `image` dropped a frame past its terminal bound:
+/// data its subscriber never reads, so the image does not end clean.
+fn dropped_past_terminal<T: StreamTerms>(image: &Installed<T>) -> bool {
+    image.dropped_past_terminal.iter().any(|dropped| *dropped)
 }
 
 /// What the path statistics record of `frame` from `path`: its lane, term
@@ -934,6 +1049,13 @@ struct Installed<T: StreamTerms = HeapTerms> {
     term_length: u32,
     /// The highest heartbeat position seen per lane.
     heartbeat_marks: [Option<u64>; 4],
+    /// Per lane, the terminal bound its EOS named: no later position is
+    /// accepted, and the image closes cleanly once every lane's complete
+    /// prefix reaches its bound.
+    terminal: [Option<u64>; 4],
+    /// Per lane, whether a frame past its terminal bound was dropped: the
+    /// publisher wrote past its EOS, so the lane cannot end clean.
+    dropped_past_terminal: [bool; 4],
     /// The last fresh evidence: a committed frame or a fresh heartbeat.
     last_fresh: u64,
     /// The window each SM grants per lane.
@@ -1048,7 +1170,13 @@ fn tail_hole<T: StreamTerms>(
     use crate::repair::loss::RttSource;
 
     let rebuild = image.owner.rebuild_position(lane)?;
-    let mark = image.heartbeat_marks.get(at).copied().flatten();
+    // Never NAK past a recorded terminal bound.
+    let mark = image
+        .heartbeat_marks
+        .get(at)
+        .copied()
+        .flatten()
+        .map(|mark| terminal_bound(image, lane).map_or(mark, |bound| mark.min(bound)));
     let Some(mark) = mark.filter(|mark| *mark > rebuild) else {
         if let Some(since) = image.tail_since.get_mut(at) {
             *since = None;
@@ -2231,9 +2359,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 self.count(|c| &mut c.images_refused);
                 match retire {
                     Some(unit) => {
-                        let _ = sessions
-                            .events
-                            .post(unit, SessionEvent::RetireImage { slot: installed });
+                        let _ = sessions.events.post(
+                            unit,
+                            SessionEvent::RetireImage {
+                                slot: installed,
+                                complete: false,
+                            },
+                        );
                     }
                     None => self.count(|c| &mut c.chain_invariant),
                 }
@@ -2449,6 +2581,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
             initial_term_id: TermId::new(chain.initial_term_id.cast_unsigned()),
             term_length: chain.term_length,
             heartbeat_marks: [None; 4],
+            terminal: [None; 4],
+            dropped_past_terminal: [false; 4],
             last_fresh: now,
             window,
             schedule,
@@ -2530,7 +2664,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             }
             if unsubscribed || age_ns(now, evidence) >= self.liveness_timeout {
                 let image = self.images.swap_remove(index);
-                self.retire(sessions, image, now);
+                self.retire(sessions, image, false, now);
                 work = work.checked_add(1).ok_or(overflow.clone())?;
                 continue;
             }
@@ -2544,7 +2678,23 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 };
                 self.count(field);
                 let image = self.images.swap_remove(index);
-                self.retire(sessions, image, now);
+                self.retire(sessions, image, false, now);
+                work = work.checked_add(1).ok_or(overflow.clone())?;
+                continue;
+            }
+            // Every lane reached its EOS bound through a complete prefix:
+            // the image closes cleanly (network-sessions.md, Liveness and
+            // terminal transitions), unless a lane dropped a frame past its
+            // bound. Its local loans stay until released.
+            if self.images.get(index).is_some_and(terminal_reached) {
+                let clean = !self.images.get(index).is_some_and(dropped_past_terminal);
+                if clean {
+                    self.count(|c| &mut c.images_closed_eos);
+                } else {
+                    self.count(|c| &mut c.images_closed_eos_dropped);
+                }
+                let image = self.images.swap_remove(index);
+                self.retire(sessions, image, clean, now);
                 work = work.checked_add(1).ok_or(overflow.clone())?;
                 continue;
             }
@@ -3014,8 +3164,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
 
     /// Retires `image` at `now`, in one transition: the binding goes, the
     /// identity is quarantined, the receive owner is dropped, and
-    /// `RetireImage` is posted into its reserved unit.
-    fn retire(&mut self, sessions: &SessionEnd<T>, image: Installed<T>, now: u64) {
+    /// `RetireImage` is posted into its reserved unit, `complete` when
+    /// every lane reached its EOS bound through a complete prefix.
+    fn retire(&mut self, sessions: &SessionEnd<T>, image: Installed<T>, complete: bool, now: u64) {
         let Installed {
             slot,
             owner,
@@ -3038,7 +3189,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             Some(unit) => {
                 let _ = sessions
                     .events
-                    .post(unit, SessionEvent::RetireImage { slot });
+                    .post(unit, SessionEvent::RetireImage { slot, complete });
             }
             None => self.count(|c| &mut c.chain_invariant),
         }
@@ -3523,15 +3674,42 @@ impl<T: StreamTerms> Intake<'_, T> {
             return;
         };
         // Per item: committed, dropped, refused, then fresh, stale,
-        // stationary and rejected heartbeats. A datagram holds at most an
-        // MTU of 32-byte records: no overflow.
-        let mut outcomes = [0u32; 7];
+        // stationary and rejected heartbeats, then frames past their lane's
+        // terminal bound. A datagram holds at most an MTU of 32-byte
+        // records: no overflow.
+        let mut outcomes = [0u32; 8];
         let mut path_fresh = false;
         for item in datagram.items() {
             let (outcome, arrival) = match item {
+                // Past the bound EOS named: dropped before the receive
+                // owner, and neither image nor path evidence.
+                Item::Frame(frame) if past_terminal(image, &frame) => {
+                    if let Some(dropped) = image
+                        .dropped_past_terminal
+                        .get_mut(usize::from(frame.lane().get()))
+                    {
+                        *dropped = true;
+                    }
+                    (7, None)
+                }
                 Item::Frame(frame) => {
                     let delivered = delivered(image, &frame, path, self.now);
                     let received = image.owner.receive(&frame);
+                    // An EOS flag on a message's last fragment names the
+                    // lane's terminal bound, the frame's end, once the frame
+                    // is in the image: committed now, or a copy of a
+                    // committed frame. A dropped one names nothing.
+                    if frame.image_word0().flags().eos()
+                        && matches!(
+                            received,
+                            Ok(Received::Committed { .. } | Received::Duplicate)
+                        )
+                        && let Some(end) = frame_position(image, &frame)
+                            .and_then(|position| position.checked_add(u64::from(frame.extent())))
+                    {
+                        let outcome = record_terminal(image, frame.lane(), end);
+                        tally_terminal(&mut role.counters, outcome);
+                    }
                     // The skip policy's far-window clock (GU-6): a run of
                     // `Ahead` arrivals starts it, a committed one stops it.
                     if let Some(position) = frame_position(image, &frame) {
@@ -3597,12 +3775,34 @@ impl<T: StreamTerms> Intake<'_, T> {
                 // window and above the last one seen on its lane, so a
                 // replay keeps nothing alive (network-sessions.md, owner P2).
                 // It is never path evidence (RP-2: fresh frames and PATH_HB).
-                Item::Heartbeat(heartbeat) => match classify_heartbeat(image, &heartbeat) {
-                    HeartbeatClass::Fresh => (3, None),
-                    HeartbeatClass::Stale => (4, None),
-                    HeartbeatClass::Stationary => (5, None),
-                    HeartbeatClass::Rejected => (6, None),
-                },
+                Item::Heartbeat(heartbeat) => {
+                    // An EOS heartbeat names its lane's terminal bound, its
+                    // position, inside the receive window only. A refused
+                    // one is rejected: no evidence, and no heartbeat mark.
+                    let refused = heartbeat.flags().eos() && {
+                        let lane = heartbeat.lane();
+                        let outcome = match heartbeat_position(image, &heartbeat) {
+                            Some(bound)
+                                if image.owner.within_window(lane, bound).unwrap_or(false) =>
+                            {
+                                record_terminal(image, lane, bound)
+                            }
+                            _ => Terminal::Refused,
+                        };
+                        tally_terminal(&mut role.counters, outcome);
+                        outcome == Terminal::Refused
+                    };
+                    if refused {
+                        (6, None)
+                    } else {
+                        match classify_heartbeat(image, &heartbeat) {
+                            HeartbeatClass::Fresh => (3, None),
+                            HeartbeatClass::Stale => (4, None),
+                            HeartbeatClass::Stationary => (5, None),
+                            HeartbeatClass::Rejected => (6, None),
+                        }
+                    }
+                }
             };
             if let Some((Some(delivered), arrival)) = arrival {
                 let fresh = image.stats.arrived(delivered, arrival);
@@ -3615,7 +3815,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                 *count = next;
             }
         }
-        let fields: [fn(&mut ReceiverCounters) -> &mut u64; 7] = [
+        let fields: [fn(&mut ReceiverCounters) -> &mut u64; 8] = [
             |c| &mut c.data_committed,
             |c| &mut c.data_dropped,
             |c| &mut c.data_refused,
@@ -3623,6 +3823,7 @@ impl<T: StreamTerms> Intake<'_, T> {
             |c| &mut c.heartbeats_stale,
             |c| &mut c.heartbeats_stationary,
             |c| &mut c.heartbeats_rejected,
+            |c| &mut c.data_past_terminal,
         ];
         let fresh = outcomes.first().is_some_and(|committed| *committed > 0)
             || outcomes.get(3).is_some_and(|heartbeats| *heartbeats > 0);
@@ -3985,6 +4186,14 @@ impl<T: StreamTerms> RxHandler for Intake<'_, T> {
 }
 
 impl<T: StreamTerms> SenderRole<T> {
+    /// The sender's publication at `index` (tests).
+    #[cfg(test)]
+    pub(super) fn publication_mut(&mut self, index: usize) -> Option<&mut Outbound<T>> {
+        self.publications
+            .get_mut(index)
+            .map(|outbound| &mut **outbound)
+    }
+
     /// The counters.
     #[must_use]
     pub fn counters(&self) -> SenderCounters {

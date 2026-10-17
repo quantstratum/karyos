@@ -1558,7 +1558,7 @@ pub(crate) mod testing {
 
 mod routed;
 
-pub use routed::{PathCounters, PathPolicy};
+pub use routed::{MAX_PATH_BACKOFF, PathCounters, PathPolicy};
 
 #[cfg(test)]
 mod tests;
