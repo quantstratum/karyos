@@ -1810,9 +1810,10 @@ fn a_rate_limited_solicit_leaves_no_entry() {
         receiver.inject_data(&sessions, EndpointId(1), source, other, &bytes, at);
     }
     assert_eq!(sent(), 0);
-    // Only the SOLICIT sent counts; the refused ones were withdrawn.
+    // The rates are checked before any entry: nothing was created, so
+    // nothing was withdrawn (ACS 15956).
     let counters = receiver.session_counters();
-    assert_eq!((counters.solicits, counters.solicits_withdrawn), (1, 3));
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (1, 0));
     assert_eq!(receiver.counters().rsp_setup_rate_limited, 3);
     // A second later the rate has refilled: the key is solicited.
     receiver.inject_data(
@@ -1825,7 +1826,7 @@ fn a_rate_limited_solicit_leaves_no_entry() {
     );
     assert_eq!(sent(), 1);
     let counters = receiver.session_counters();
-    assert_eq!((counters.solicits, counters.solicits_withdrawn), (2, 3));
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (2, 0));
 }
 
 /// Mutants of the #275 review: DATA solicits only on a subscribed stream
@@ -1882,6 +1883,32 @@ fn solicits_need_a_subscription_an_answerable_source_and_a_term_bound() {
     );
     assert_eq!(receiver.counters().term_too_large, 1);
     assert_eq!(receiver.counters().create_image, 0);
+}
+
+/// ACS 15956: the per-driver total is checked before any entry too: a
+/// second source over `rsp_setup_rate` creates nothing.
+#[test]
+fn the_total_rsp_rate_is_checked_before_any_entry() {
+    let config = AgentConfig {
+        rsp_setup_rate: 1,
+        ..AgentConfig::default()
+    };
+    let (sender, mut receiver) = super::roles(&config).unwrap();
+    let (sessions, _link) = event_ring();
+    receiver.subscriptions.push((EndpointId(1), 6, 1 << 20));
+    let bytes = [0u8; 32];
+    let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    receiver.inject_data(&sessions, EndpointId(1), first, alias(), &bytes, 1);
+    receiver.inject_data(&sessions, EndpointId(1), second, alias(), &bytes, 2);
+    let mut sent = 0;
+    while let Ok(Some(_)) = sender.from_receiver.try_take() {
+        sent += 1;
+    }
+    assert_eq!(sent, 1);
+    let counters = receiver.session_counters();
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (1, 0));
+    assert_eq!(receiver.counters().rsp_setup_total_limited, 1);
 }
 
 /// ACS 15933: a confirmed binding keeps a publication established even

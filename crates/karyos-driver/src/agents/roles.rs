@@ -1630,6 +1630,24 @@ impl Intake<'_> {
             self.role.count(|c| &mut c.unanswerable_source);
             return;
         }
+        // §7.4 first, charging nothing: DATA arrives at line rate, and a
+        // SOLICIT the rates would refuse must not draw a nonce and create
+        // an entry per datagram only to withdraw it.
+        match self.role.rsp_destinations.would_admit(key.source, self.now) {
+            Ok(()) => {}
+            Err(RateRefused::Limited) => {
+                self.role.count(|c| &mut c.rsp_setup_rate_limited);
+                return;
+            }
+            Err(RateRefused::TableFull) => {
+                self.role.count(|c| &mut c.rsp_setup_destinations_full);
+                return;
+            }
+        }
+        if !self.role.rsp_total.would_admit(self.now) {
+            self.role.count(|c| &mut c.rsp_setup_total_limited);
+            return;
+        }
         let role = &mut *self.role;
         if let SolicitOutcome::Solicit(solicit) =
             role.sessions.solicit(key, self.now, &mut role.nonces)
