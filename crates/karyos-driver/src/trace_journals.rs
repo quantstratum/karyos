@@ -162,6 +162,10 @@ struct Held {
     /// For a subscriber journal, or a network journal that `covers`, that
     /// ended: the publisher journals noted at its end.
     notes: Option<Vec<Note>>,
+    /// The buffer those notes are written into, reserved for every table
+    /// entry when the journal is inserted, so noting allocates nothing on
+    /// the drain path.
+    spare: Vec<Note>,
     /// See [`Observed::covers`].
     covers: bool,
 }
@@ -233,6 +237,12 @@ pub(crate) struct TraceJournals {
     /// The notes of each recycle log entry the mirror shows, which decide
     /// when it is dropped.
     log: Vec<Option<Vec<Note>>>,
+    /// Note buffers of dropped recycle log entries, kept for the next
+    /// journals inserted, at most one per log entry.
+    spares: Vec<Vec<Note>>,
+    /// The drain progress of each journal [`TraceJournals::advance`]
+    /// reads, reserved for every table entry at start.
+    progress: Vec<(u64, Option<u64>, Option<u64>)>,
     cursor: usize,
     bytes: u64,
     max_bytes: u64,
@@ -270,10 +280,14 @@ impl TraceJournals {
         slots.resize_with(mirror.entries(), || None);
         let mut log = Vec::with_capacity(mirror.log_entries());
         log.resize_with(mirror.log_entries(), || None);
+        let spares = Vec::with_capacity(mirror.log_entries());
+        let progress = Vec::with_capacity(mirror.entries());
         Self {
             mirror,
             slots,
             log,
+            spares,
+            progress,
             cursor: 0,
             bytes: 0,
             max_bytes,
@@ -454,50 +468,69 @@ impl TraceJournals {
         // The high-water mark first (Release), then the log and the entry:
         // a tool reads it before the table and the log.
         self.mirror.assign_sequence(entry.sequence);
-        let Some(slot) = self.slots.get_mut(index) else {
+        let entries = self.slots.len();
+        let Some(old) = self.slots.get_mut(index).map(Option::take) else {
             return;
         };
         let oldest = self.mirror.bounds().first;
-        // The log entry before the table entry is reused, so a reader of
-        // the table and then the log never misses the recycled journal.
-        if let (Some(old), Some(log)) = (slot.take(), log)
-            && old.needs_log(oldest)
-            && let Some(free) = self.log.get_mut(log)
-        {
-            let notes = old.notes.unwrap_or_default();
-            let mut record = RecycledJournal {
-                journal: old.entry.journal,
-                stream: old.entry.stream,
-                lane: old.entry.lane,
-                incarnation: old.entry.incarnation,
-                state: old.entry.state,
-                boundary: old.entry.boundary,
-                pairs: [NotedPublisher::default(); MAX_RECYCLE_PAIRS],
-                pair_count: notes.len().min(MAX_RECYCLE_PAIRS),
-                sequence: old.entry.sequence,
-            };
-            for (pair, note) in record.pairs.iter_mut().zip(&notes) {
-                *pair = NotedPublisher {
-                    journal: note.journal,
-                    attempted: note.attempted,
+        let logged = log.filter(|_| old.as_ref().is_some_and(|old| old.needs_log(oldest)));
+        // The new journal's note buffer: the old journal's, else a dropped
+        // log entry's, else a new one, reserved for every table entry
+        // (control path).
+        let mut spare = None;
+        match (old, logged) {
+            // The log entry before the table entry is reused, so a reader
+            // of the table and then the log never misses the recycled
+            // journal.
+            (Some(old), Some(log)) if self.log.get(log).is_some() => {
+                spare = Some(old.spare);
+                let notes = old.notes.unwrap_or_default();
+                let mut record = RecycledJournal {
+                    journal: old.entry.journal,
+                    stream: old.entry.stream,
+                    lane: old.entry.lane,
+                    incarnation: old.entry.incarnation,
+                    state: old.entry.state,
+                    boundary: old.entry.boundary,
+                    pairs: [NotedPublisher::default(); MAX_RECYCLE_PAIRS],
+                    pair_count: notes.len().min(MAX_RECYCLE_PAIRS),
+                    sequence: old.entry.sequence,
                 };
+                for (pair, note) in record.pairs.iter_mut().zip(&notes) {
+                    *pair = NotedPublisher {
+                        journal: note.journal,
+                        attempted: note.attempted,
+                    };
+                }
+                self.mirror.write_log(log, Some(&record));
+                if let Some(free) = self.log.get_mut(log) {
+                    *free = Some(notes);
+                }
             }
-            self.mirror.write_log(log, Some(&record));
-            *free = Some(notes);
+            (Some(old), _) => spare = Some(old.notes.unwrap_or(old.spare)),
+            (None, _) => {}
         }
+        let mut spare = spare
+            .or_else(|| self.spares.pop())
+            .filter(|spare| spare.capacity() >= entries)
+            .unwrap_or_else(|| Vec::with_capacity(entries));
+        spare.clear();
         self.mirror.write_entry(index, Some(&entry));
         if network {
             self.net_bytes = total;
         } else {
             self.bytes = total;
         }
-        *slot = Some(Held {
-            entry,
-            drain: Some(drain),
-            bytes,
-            notes: None,
-            covers: observed.covers,
-        });
+        if let Some(slot) = self.slots.get_mut(index) {
+            *slot = Some(Held {
+                entry,
+                drain: Some(drain),
+                bytes,
+                notes: None,
+                spare,
+                covers: observed.covers,
+            });
+        }
     }
 
     /// Counts a refused network journal in the mirror's header word 7 and
@@ -561,7 +594,12 @@ impl TraceJournals {
             subscriber.entry.incarnation,
             subscriber.entry.lane,
         );
-        let mut notes = Vec::new();
+        // Its buffer holds a note for every table entry: no allocation.
+        let mut notes = match self.slots.get_mut(index) {
+            Some(Some(subscriber)) => core::mem::take(&mut subscriber.spare),
+            _ => return,
+        };
+        notes.clear();
         for held in self.slots.iter_mut().flatten().filter(|held| {
             held.entry.kind == JournalKind::Publisher
                 && held.entry.stream == stream
@@ -612,19 +650,18 @@ impl TraceJournals {
             .any(pending);
         if any {
             // Each journal still in the table: (number, released records
-            // or `None` once ended, last mirrored ring record).
-            let progress: Vec<(u64, Option<u64>, Option<u64>)> = self
-                .slots
-                .iter()
-                .flatten()
-                .map(|held| {
+            // or `None` once ended, last mirrored ring record), into the
+            // scratch reserved for every entry.
+            self.progress.clear();
+            self.progress
+                .extend(self.slots.iter().flatten().map(|held| {
                     (
                         held.entry.journal,
                         held.drain.as_ref().map(JournalDrain::consumed),
                         held.entry.last_record,
                     )
-                })
-                .collect();
+                }));
+            let progress = &self.progress;
             let notes = self
                 .slots
                 .iter_mut()
@@ -648,7 +685,12 @@ impl TraceJournals {
         for (index, slot) in self.log.iter_mut().enumerate() {
             if slot.as_deref().is_some_and(|notes| covered(notes, oldest)) {
                 self.mirror.write_log(index, None);
-                *slot = None;
+                // Its buffer is kept for a later journal, not freed here.
+                if let Some(notes) = slot.take()
+                    && self.spares.len() < self.spares.capacity()
+                {
+                    self.spares.push(notes);
+                }
             }
         }
     }

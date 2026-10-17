@@ -38,6 +38,13 @@ pub mod sm_schedule;
 pub mod timed_gate;
 mod trace_journals;
 
+/// The lib tests count allocations where a test arms the counter (the
+/// trace drain path); unarmed, it is the system allocator.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
+    karyos_sys::alloc_count::CountingAllocator;
+
 #[cfg(target_os = "linux")]
 pub use admission::{DEFAULT_MAX_TOOLS, IpcConfig};
 pub use clock::{MonotonicClock, SystemClock};
