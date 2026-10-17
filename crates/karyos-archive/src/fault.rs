@@ -45,6 +45,10 @@ pub(crate) enum Survives {
     /// Only what a sync made durable, as Linux promises: unsynced data is
     /// lost, and so is a name whose directory was not synced since.
     Synced,
+    /// Writeback in another order: every name and every index byte
+    /// written survive, but a segment's data file keeps only what was
+    /// synced. An entry can then outlive the data it covers.
+    TornData,
 }
 
 /// A shared handle on the in-memory disk.
@@ -80,19 +84,21 @@ impl FaultDisk {
     /// The disk a restart finds after the crash, under `survives`.
     pub(crate) fn after_crash(&self, survives: Survives) -> Self {
         let fs = self.0.borrow();
-        let (names, keep_data) = match survives {
-            Survives::Everything => (&fs.names, true),
-            Survives::Synced => (&fs.durable_names, false),
+        let names = match survives {
+            Survives::Everything | Survives::TornData => &fs.names,
+            Survives::Synced => &fs.durable_names,
         };
         let mut restarted = Fs::default();
         for (path, &inode) in names {
             let Some(old) = fs.inodes.get(inode) else {
                 continue;
             };
-            let data = if keep_data {
-                old.data.clone()
-            } else {
-                old.synced.clone()
+            let data_file = path.extension().is_some_and(|extension| extension == "seg");
+            let data = match survives {
+                Survives::Everything => old.data.clone(),
+                Survives::Synced => old.synced.clone(),
+                Survives::TornData if data_file => old.synced.clone(),
+                Survives::TornData => old.data.clone(),
             };
             restarted.inodes.push(Inode {
                 synced: data.clone(),
