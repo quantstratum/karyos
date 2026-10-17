@@ -641,3 +641,79 @@ fn a_fragment_retry_keeps_the_span() {
     assert_eq!(loss.due(lane(0), 1_010), None);
     assert_eq!(loss.counters().detected, 1);
 }
+
+/// #278 re-review P2: RANGE_UNAVAILABLE condemns only the range its reply
+/// answered. A fragment of the span retried alone and refused leaves the
+/// rest of the span the sender's to repair: it is NAKed again at once.
+#[test]
+fn only_the_answered_range_is_unrecoverable() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 1024), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    let _ = loss.observe(lane(0), hole(0, 256), 10);
+    let retry = loss.due(lane(0), 1_000).unwrap();
+    assert_eq!(retry.range.length, 256);
+    loss.submitted(&retry, 1_000, &rtt);
+    let unavailable = reply_to(
+        &retry,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: 128,
+        },
+    );
+    assert!(matches!(
+        loss.reply(&unavailable, WINDOW_END),
+        ReplyOutcome::Unrecoverable { .. }
+    ));
+    // The gap owner resolves [0, 256); [512, 1024) is retained: due.
+    assert_eq!(
+        loss.observe(lane(0), hole(512, 512), 1_100),
+        Observation::Nothing
+    );
+    let again = loss.due(lane(0), 1_100).unwrap();
+    assert_eq!((again.range.start, again.range.length), (512, 512));
+}
+
+/// An unrecoverable hole that shrinks again is reported once: the gap
+/// owner already has it.
+#[test]
+fn an_unrecoverable_hole_is_reported_once() {
+    let mut loss = image();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 1024), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 0, &rtt);
+    let _ = loss.observe(lane(0), hole(0, 256), 10);
+    let unavailable = reply_to(
+        &nak,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: 2048,
+        },
+    );
+    let _ = loss.reply(&unavailable, WINDOW_END);
+    assert!(matches!(
+        loss.observe(lane(0), hole(512, 512), 20),
+        Observation::Unrecoverable { .. }
+    ));
+    assert_eq!(
+        loss.observe(lane(0), hole(768, 256), 30),
+        Observation::Nothing
+    );
+    assert_eq!(loss.due(lane(0), 100_000), None);
+}
+
+/// The RttSource of RttProbes reads the asked path's estimate.
+#[test]
+fn rtt_probes_answer_for_the_asked_path() {
+    use crate::rtt::{RttConfig, RttProbes};
+
+    let config = RttConfig::default();
+    let mut probes = RttProbes::new(config, 2).unwrap();
+    let probe = probes.due(1, 0).unwrap();
+    probes.submitted(probe, 0);
+    let _ = probes.reply(1, probe.generation, probe.probe_id, 5_000_000);
+    assert_eq!(probes.rtt_snapshot(1), probes.estimate(1));
+    assert_eq!(probes.rtt_snapshot(0), config.rtt_initial);
+    assert_ne!(probes.rtt_snapshot(1), probes.rtt_snapshot(0));
+}
