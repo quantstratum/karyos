@@ -404,12 +404,12 @@ fn driver_with(change: impl FnOnce(&mut DriverConfig)) -> EmbeddedDriver {
     EmbeddedDriver::with_config(config).unwrap()
 }
 
-/// Runs `driver` until `done`, for at most 5 s: bounded by time, never
+/// Runs `driver` until `done`, for at most 30 s: bounded by time, never
 /// by a cycle count, which a loaded machine runs through first.
 fn eventually(driver: &mut EmbeddedDriver, mut done: impl FnMut(&EmbeddedDriver) -> bool) {
     let start = std::time::Instant::now();
     while !done(driver) {
-        assert!(start.elapsed() < Duration::from_secs(5), "not reached");
+        assert!(start.elapsed() < Duration::from_secs(30), "not reached");
         let _ = driver.do_work().unwrap();
         std::thread::sleep(Duration::from_micros(100));
     }
@@ -1042,8 +1042,10 @@ fn a_late_network_subscription_grant_is_removed() {
         Err(karyos_client::ClientError::Timeout)
     ));
     let start = std::time::Instant::now();
+    // A loaded machine may take a while to answer: the bound only ends a
+    // failing run.
     while client.late_grants_released() == 0 {
-        assert!(start.elapsed() < Duration::from_secs(5), "not released");
+        assert!(start.elapsed() < Duration::from_secs(30), "not released");
         let _ = driver.do_work().unwrap();
         let _ = client.poll();
     }
