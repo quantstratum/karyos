@@ -52,6 +52,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Network publications over redundant paths (rp-w4b2c): a multicast IPv4
+  channel with `paths` sends on one endpoint per path, each bound to its
+  path's interface address, as one routed publication; each path holds its
+  send endpoint and the receiver's published alias, released and retired
+  with the publication. Refused with `DriverError::UnsupportedChannel`, and
+  counted, while the sockets cannot be isolated per path
+  (`SocketOps::isolates_paths`, owner item 12); unicast `paths` stay
+  refused (owner item 11).
 - The sender over a routed publication's paths (redundant-paths.md, rp-w4b2b):
   a SETUP side on each path's endpoint, established on any path; SMs, NAKs
   and bindings found on any path (`Outbound::serves`,
