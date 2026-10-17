@@ -1380,9 +1380,13 @@ fn sr_nak_matches_walker(sizes: &[usize], abort: Option<usize>, stride: u32) {
             }
             None => assert_eq!(result, Err(ReadError::BadRequest), "at {position}"),
         }
-        // From a recorded checkpoint a scan stays within one stride.
-        if position >= u64::from(stride) {
-            assert!(loads <= stride / 32 + 1 + 64, "{loads} loads at {position}");
+        // From the checkpoint of its own stride, recorded when a frame
+        // starts in the stride or later in the term, a scan stays within
+        // one stride.
+        let stride_start = position - position % u64::from(stride);
+        let term_end = (position / TERM + 1) * TERM;
+        if frames.range(stride_start..term_end).next().is_some() {
+            assert!(loads <= stride / 32 + 1, "{loads} loads at {position}");
         }
         position += 32;
     }
@@ -1488,7 +1492,7 @@ fn sender_read_nak_ignores_another_terms_checkpoints() {
     let foreign = TermCount::try_new(3).unwrap();
     // The array of count 0's slot, retagged for count 3, entry 1 aimed at
     // the forged word 0 (term offset 4096 + 64).
-    reader.plant_checkpoint(zero, foreign, 1, (4096 + 64, 0));
+    reader.plant_checkpoint(zero, foreign, 1, (4096 + 64, 0, true));
     let mut out = sr_out();
     let (result, loads) = sr_nak(&mut reader, 4096 + 64, head, u32::MAX, &mut out);
     if frames.contains_key(&(4096 + 64)) {
@@ -1540,12 +1544,14 @@ fn sender_read_nak_corruption_never_faults() {
     let frames = sr_walk(&mut reader);
     let head = reader.position();
     let second = *frames.keys().nth(1).unwrap();
-    // Break the first frame's version after the cursor read it.
+    let third = *frames.keys().nth(2).unwrap();
+    // Break the second frame's type after the cursor read it: the walk to
+    // the third loads it (the first is passed by its recorded end).
     let bad = Word0::new(132, Flags::new(true, true, false, false, Lane::ZERO), FrameType::Pad);
-    word0_of_term0(&buffer, 0).store(bad.pack().to_le(), Ordering::Relaxed);
+    word0_of_term0(&buffer, second as u32).store(bad.pack().to_le(), Ordering::Relaxed);
     let mut out = sr_out();
     for _ in 0..(DEFAULT_CORRUPT_RETRIES + 2) {
-        let (result, _) = sr_nak(&mut reader, second, head, 99, &mut out);
+        let (result, _) = sr_nak(&mut reader, third, head, 99, &mut out);
         assert!(matches!(result, Err(ReadError::CorruptTerm { .. })), "{result:?}");
     }
     assert_eq!(reader.counters().nak_corrupt, u64::from(DEFAULT_CORRUPT_RETRIES) + 2);
@@ -1606,4 +1612,234 @@ fn sender_read_nak_reads_a_pad_record() {
             next: TERM,
         })
     );
+}
+
+/// A NAK inside a large block that starts at its stride's checkpoint walks
+/// only the fragments below it: one load for the second fragment, not one
+/// per fragment of the block.
+#[test]
+fn sender_read_nak_walks_a_large_block_from_its_checkpoint() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 7000), AppendOptions::default())
+        .unwrap();
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let starts: Vec<u64> = frames.keys().copied().collect();
+    assert_eq!(starts.len(), 6);
+    let mut out = sr_out();
+    let (result, loads) = sr_nak(&mut reader, starts[1], head, u32::MAX, &mut out);
+    assert_eq!(
+        result,
+        Ok(ReadOutcome::Copied {
+            len: frames[&starts[1]].len(),
+            next: starts[2],
+        })
+    );
+    assert_eq!(&out[..frames[&starts[1]].len()], &frames[&starts[1]][..]);
+    assert_eq!(loads, 1);
+    assert_eq!(reader.counters().nak_loads, 1);
+}
+
+/// A NAK inside a block that starts after its stride's checkpoint takes
+/// the block's end from the next stride's checkpoint, its first fragment
+/// there: the loads stop below it, never at the block's END.
+#[test]
+fn sender_read_nak_takes_a_blocks_end_from_the_next_checkpoint() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for (i, size) in [100, 7000].into_iter().enumerate() {
+        let _ = publication
+            .append(&sized_message(i as u32, size), AppendOptions::default())
+            .unwrap();
+    }
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    // 0, then the large block's fragments from 160: 1568 and 2976 lie in
+    // the first stride, 4384 is the next stride's first frame start.
+    let starts: Vec<u64> = frames.keys().copied().collect();
+    assert_eq!(&starts[..5], &[0, 160, 1568, 2976, 4384]);
+    let mut out = sr_out();
+    let (result, loads) = sr_nak(&mut reader, 1568, head, u32::MAX, &mut out);
+    assert_eq!(
+        result,
+        Ok(ReadOutcome::Copied {
+            len: frames[&1568].len(),
+            next: 2976,
+        })
+    );
+    assert_eq!(&out[..frames[&1568].len()], &frames[&1568][..]);
+    // The block's first word 0 and the fragments at 1568 and 2976.
+    assert_eq!(loads, 3);
+}
+
+/// A NAK inside the block the cursor stands in takes the block's end from
+/// the cursor's open block when the walk reaches the cursor's fragment.
+#[test]
+fn sender_read_nak_takes_a_blocks_end_from_the_cursor() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for (i, size) in [100, 7000].into_iter().enumerate() {
+        let _ = publication
+            .append(&sized_message(i as u32, size), AppendOptions::default())
+            .unwrap();
+    }
+    // One read of the first frame and the large block's first fragment:
+    // the cursor stands inside the block, at 1568.
+    let mut out = vec![0u8; 1568];
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Copied {
+            len: 1568,
+            next: 1568,
+        })
+    );
+    assert!(!reader.at_boundary());
+    let head = buffer.conductor_head().unwrap();
+    let mut nak_out = sr_out();
+    let (result, loads) = sr_nak(&mut reader, 1568, head, u32::MAX, &mut nak_out);
+    assert!(
+        matches!(result, Ok(ReadOutcome::Copied { next: 2976, .. })),
+        "{result:?}"
+    );
+    // Only the block's first word 0.
+    assert_eq!(loads, 1);
+    // The cursor's own read of the fragment is the same bytes.
+    let Ok(ReadOutcome::Copied { len, .. }) = sr_read(&mut reader, &mut out) else {
+        panic!("not copied");
+    };
+    assert_eq!(&nak_out[..len], &out[..len]);
+}
+
+/// A term slot reused by a later term starts with no checkpoints: the
+/// cursor stopped before the second stride of term `slots` leaves that
+/// entry empty, so a NAK at the offset term 0 recorded there walks from
+/// term `slots`'s own entry and never validates the word 0 forged in a
+/// payload at that offset.
+#[test]
+fn sender_read_nak_never_uses_a_reused_slots_checkpoints() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let slots = u64::from(buffer.slots);
+    let mut out = sr_out();
+    let mut append = |size: usize| {
+        let _ = append_retrying(
+            &mut publication,
+            &mut conductor,
+            &sized_message(1, size),
+            || {},
+        );
+        while let Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. }) =
+            sr_read(&mut reader, &mut out)
+        {}
+        sr_sent(&mut reader);
+    };
+    // Nine 7000-byte messages per term (7200 bytes each): in each term the
+    // first frame start at or after 4096 is the fragment at 4224. The
+    // last term ends with a 600-byte message, leaving 96 bytes.
+    for _ in 0..slots {
+        for _ in 0..9 {
+            append(7000);
+        }
+    }
+    append(600);
+    assert_eq!(reader.position(), slots * TERM - 96);
+    // Term `slots`, in term 0's slot: a frame at 0, then a block from 160
+    // whose fragment at 2976 runs past 4224.
+    let first = slots * TERM;
+    for size in [100, 7000] {
+        let _ = append_retrying(&mut publication, &mut conductor, &sized_message(2, size), || {});
+    }
+    let forged = Word0::new(64, Flags::new(false, false, false, false, Lane::ZERO), FrameType::Data);
+    word0_of_term0(&buffer, 4224).store(forged.pack().to_le(), Ordering::Relaxed);
+    // The PAD, then the frame at 0 alone: the cursor stops at 160.
+    assert!(matches!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Canonical { record: CanonicalKind::Pad, .. })
+    ));
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Copied {
+            len: 132,
+            next: first + 160,
+        })
+    );
+    let (result, _) = sr_nak(&mut reader, first + 4224, u64::MAX, u32::MAX, &mut out);
+    assert_eq!(result, Err(ReadError::BadRequest));
+}
+
+/// Each floor check of a NAK read refuses on its own: a floor raised
+/// after the loan is refused by the second; a floor the first saw is
+/// refused there, even when a test lowers it before the loan.
+#[test]
+fn sender_read_nak_checks_the_floor_before_and_after_the_loan() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for i in 0..2 {
+        let _ = publication
+            .append(&sized_message(i, 100), AppendOptions::default())
+            .unwrap();
+    }
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let second = *frames.keys().nth(1).unwrap();
+    let mut out = sr_out();
+    reader.inject(super::sender_read::TestHook::FloorAfterLoan(second));
+    assert_eq!(
+        sr_nak(&mut reader, 0, head, 99, &mut out).0,
+        Err(ReadError::Unavailable { lowest: second })
+    );
+    buffer.floor().store(second, Ordering::Release);
+    reader.inject(super::sender_read::TestHook::FloorBeforeLoan(0));
+    assert_eq!(
+        sr_nak(&mut reader, 0, head, 99, &mut out).0,
+        Err(ReadError::Unavailable { lowest: second })
+    );
+    // The hook is still pending: the next NAK read lowers the floor to 0
+    // before its loan, and the first check passed already.
+    buffer.floor().store(0, Ordering::Release);
+    assert!(matches!(
+        sr_nak(&mut reader, 0, head, 99, &mut out).0,
+        Ok(ReadOutcome::Copied { .. })
+    ));
+}
+
+/// A NAK at the start of an uncommitted block below the bound is
+/// `BadRequest`, counted: the sender never sent it.
+#[test]
+fn sender_read_nak_refuses_an_uncommitted_block() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 100), AppendOptions::default())
+        .unwrap();
+    let claim = claimed(publication.try_claim(100, AppendOptions::default()));
+    let _ = sr_walk(&mut reader);
+    let at = reader.position();
+    assert_eq!(at, 160);
+    let mut out = sr_out();
+    assert_eq!(
+        sr_nak(&mut reader, at, u64::MAX, 99, &mut out).0,
+        Err(ReadError::BadRequest)
+    );
+    // Past it as well: the walk cannot cross it.
+    assert_eq!(
+        sr_nak(&mut reader, at + 160, u64::MAX, 99, &mut out).0,
+        Err(ReadError::BadRequest)
+    );
+    assert_eq!(reader.counters().nak_bad_request, 2);
+    claim.abort();
 }

@@ -3343,12 +3343,8 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
         let mut offset = start;
         let mut word = word0;
         let mut length: u32 = 0;
-        let mut frames: u32 = 0;
         let end_of_stream;
         loop {
-            frames = frames
-                .checked_add(1)
-                .ok_or_else(|| corrupt(offset, "fragment count overflow"))?;
             let flags = word.flags();
             if flags.begin() != (offset == start) {
                 return Err(corrupt(offset, "BEGIN placement"));
@@ -3386,7 +3382,6 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             length,
             end_of_stream,
             ext: word0.flags().ext(),
-            frames,
         }))
     }
 
@@ -3408,7 +3403,6 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
             length,
             end_of_stream,
             ext,
-            ..
         } = block;
         if out.len() < length as usize {
             return Err(SysError::BufferTooShort {
@@ -3608,8 +3602,6 @@ struct Block {
     end_of_stream: bool,
     /// Whether the first fragment carries the trace extension.
     ext: bool,
-    /// Fragments: the word 0 loads the first pass made.
-    frames: u32,
 }
 
 #[derive(Debug)]

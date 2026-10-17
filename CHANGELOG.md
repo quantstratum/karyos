@@ -326,10 +326,14 @@ release may break APIs, wire formats and shared-memory layouts.
   position is proved a frame boundary by a word 0 walk from a checkpoint
   (`nak_checkpoint_stride`, default 64 KiB, `SenderRead::with_nak_stride`):
   every frame the cursor path copies records, per stride it passes, the
-  first frame start at or after the stride and its block's end when
-  interior, in arrays tagged with their term count and read only for it.
-  A scan spends at most `stride / 32 + 1` loads from a recorded entry and
-  returns the loads spent; it never reads a payload word. New
+  first frame start at or after the stride with its block's end, in arrays
+  tagged with their term count, cleared on a new count and read only for
+  it. The walk goes frame by frame, charging each load before it is made,
+  and takes the end of a block it enters from the cursor's open block, the
+  next stride's entry or its END: from the entry of its own stride a scan
+  spends at most `stride / 32 + 1` loads and returns the loads spent; it
+  never reads a payload word. A NAK at an uncommitted block is
+  `BadRequest`. New
   `ReadError::BadRequest` and `ReadError::Budget`, and NAK counters.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
