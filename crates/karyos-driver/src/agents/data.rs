@@ -176,8 +176,12 @@ pub struct OutboundCounters {
     /// Cycles whose first sends waited for a configured required member's
     /// join.
     pub not_joined: u64,
-    /// Traced frames not recorded: their EXT did not decode (NT-2).
+    /// Traced frames not recorded: their EXT did not decode or did not fit
+    /// their frame (NT-2).
     pub trace_invalid: u64,
+    /// Traced datagrams whose failed commit the lane could not remember
+    /// (it holds one range): their frames are never recorded.
+    pub trace_unpicked: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -297,9 +301,12 @@ impl Outbound {
             next_token: 1,
             counters: OutboundCounters::default(),
             traced: [None; 4],
-            picked: Vec::with_capacity(traced_frames_per_datagram(
-                usize::try_from(mtu).map_err(|_| OutboundError::Mtu)?,
-            )),
+            picked: Vec::with_capacity(
+                usize::try_from(mtu)
+                    .ok()
+                    .and_then(traced_frames_per_datagram)
+                    .ok_or(OutboundError::Mtu)?,
+            ),
         })
     }
 
@@ -384,6 +391,7 @@ impl Outbound {
             publication,
             start,
             boundary: start,
+            unpicked: None,
         });
         Some(start)
     }
@@ -725,22 +733,25 @@ impl Outbound {
                         break;
                     }
                 };
-            // One branch per datagram without a hook or a journal.
-            let traced = match (&hook, self.traced.get(lane).copied().flatten()) {
-                (Some(_), Some(traced)) if !record => {
+            // One branch per datagram without a hook.
+            let traced = if hook.is_some() {
+                self.traced.get(lane).copied().flatten()
+            } else {
+                None
+            };
+            if traced.is_some() {
+                if record {
+                    self.picked.clear();
+                } else {
                     let skipped = traced_frames(
                         frame.bytes_mut().get(..len).unwrap_or_default(),
                         from,
                         &mut self.picked,
-                    );
+                    )
+                    .ok_or(overflow.clone())?;
                     self.counters.bump(|c| &mut c.trace_invalid, skipped);
-                    Some(traced)
                 }
-                (_, traced) => {
-                    self.picked.clear();
-                    traced.filter(|_| hook.is_some())
-                }
-            };
+            }
             let token = SenderToken::new(self.next_token);
             self.next_token = self.next_token.checked_add(1).ok_or(overflow.clone())?;
             let Ok(ticket) = frame.commit(Commit {
@@ -749,8 +760,12 @@ impl Outbound {
                 options: TxOptions::none(),
             }) else {
                 // The cursor moved past a read that was not staged: a gap
-                // the receiver closes by repair or by its gap policy.
+                // the receiver closes by repair or by its gap policy. A
+                // resend after a reset is then these frames' first pickup.
                 self.counters.bump(|c| &mut c.queue_failures, 1);
+                if traced.is_some() && !remember_unpicked(&mut self.traced, lane, from, next) {
+                    self.counters.bump(|c| &mut c.trace_unpicked, 1);
+                }
                 break;
             };
             let charge = u32::try_from(len)
@@ -783,11 +798,18 @@ impl Outbound {
                 track.staged.push_back((ticket, next));
                 track.waiting = false;
             }
-            // The bytes are in TX storage (NT-2). Only a first send is
-            // recorded: what a reset rewinds and sends again lies below the
-            // boundary.
+            // The bytes are in TX storage (NT-2). Only a first pickup is
+            // recorded: what a reset rewinds and sends again was picked up
+            // before, unless its commit had failed.
             if let (Some(traced), Some(hook)) = (traced, hook.as_deref_mut()) {
-                pick_up(&self.picked, &mut self.traced, lane, traced, next, hook);
+                pick_up(
+                    &self.picked,
+                    &mut self.traced,
+                    lane,
+                    traced,
+                    from..next,
+                    hook,
+                );
             }
             self.counters.bump(
                 if record {
@@ -803,15 +825,36 @@ impl Outbound {
     }
 }
 
+/// Remembers that the datagram of `lane` read over `from..next` never
+/// reached TX storage. `false` when the lane already remembers a range
+/// this one does not touch.
+pub(super) fn remember_unpicked(
+    traced_lanes: &mut [Option<TracedLane>; 4],
+    lane: usize,
+    from: u64,
+    next: u64,
+) -> bool {
+    let Some(Some(traced)) = traced_lanes.get_mut(lane) else {
+        return true;
+    };
+    traced.unpicked = match traced.unpicked {
+        None => Some((from, next)),
+        Some((low, high)) if from <= high && low <= next => Some((low.min(from), high.max(next))),
+        Some(_) => return false,
+    };
+    true
+}
+
 /// Records the `SenderPickup` of each frame in `picked` from the datagram
-/// of `lane` that ends at `next`, and moves the lane's pickup boundary in
+/// of `lane` read over `span` that was never picked up before, then moves
+/// the lane's pickup boundary and shrinks its unpicked range in
 /// `traced_lanes`.
 pub(super) fn pick_up(
     picked: &[(TraceExtension, u64)],
     traced_lanes: &mut [Option<TracedLane>; 4],
     lane: usize,
     traced: TracedLane,
-    next: u64,
+    span: core::ops::Range<u64>,
     hook: &mut dyn NetworkTraceHook,
 ) {
     let Some(lane_id) = u8::try_from(lane)
@@ -821,7 +864,7 @@ pub(super) fn pick_up(
         return;
     };
     for (ext, position) in picked {
-        if *position < traced.boundary {
+        if !traced.first_pickup(*position) {
             continue;
         }
         hook.on_sender_pickup(
@@ -836,7 +879,12 @@ pub(super) fn pick_up(
         );
     }
     if let Some(Some(slot)) = traced_lanes.get_mut(lane) {
-        slot.boundary = slot.boundary.max(next);
+        slot.boundary = slot.boundary.max(span.end);
+        // A rewind resends in order: the range shrinks from its low end.
+        slot.unpicked = slot.unpicked.and_then(|(low, high)| {
+            let low = if span.contains(&low) { span.end } else { low };
+            (low < high).then_some((low, high))
+        });
     }
 }
 

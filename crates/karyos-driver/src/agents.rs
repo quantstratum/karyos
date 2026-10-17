@@ -520,8 +520,9 @@ pub enum AgentEvent<O: SocketOps> {
         /// The hook it replaced, dropped on the control path.
         previous: Option<net_trace::TraceHook>,
         /// Journals still open that it closed through the previous hook,
-        /// without facts.
-        closed: u32,
+        /// without facts; the conductor treats each as `Lost` (closed
+        /// without a boundary). `None` if the count overflowed.
+        closed: Option<u64>,
     },
     /// The agent writes the journal from `start`, its next position on the
     /// lane when the journal arrived (the start fact, trace-network.md §5).

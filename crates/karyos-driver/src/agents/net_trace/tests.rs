@@ -60,8 +60,8 @@ fn finds_each_traced_frame_at_its_position() {
     frame(&mut bytes, 40, None);
     let third = u64::try_from(bytes.len()).unwrap();
     frame(&mut bytes, 0, Some(ext(2)));
-    let mut out = Vec::with_capacity(traced_frames_per_datagram(bytes.len()));
-    assert_eq!(traced_frames(&bytes, 4096, &mut out), 0);
+    let mut out = Vec::with_capacity(traced_frames_per_datagram(bytes.len()).unwrap());
+    assert_eq!(traced_frames(&bytes, 4096, &mut out), Some(0));
     assert_eq!(out, vec![(ext(1), 4096), (ext(2), 4096 + third)]);
     assert!(second < third);
 }
@@ -74,7 +74,7 @@ fn an_extension_that_does_not_decode_is_counted_not_traced() {
     // A wrong extension version.
     bytes[header] = 0xff;
     let mut out = Vec::with_capacity(4);
-    assert_eq!(traced_frames(&bytes, 0, &mut out), 1);
+    assert_eq!(traced_frames(&bytes, 0, &mut out), Some(1));
     assert!(out.is_empty());
 }
 
@@ -85,7 +85,7 @@ fn never_grows_its_scratch() {
     frame(&mut bytes, 0, Some(ext(2)));
     let mut out = Vec::with_capacity(1);
     let capacity = out.capacity();
-    let skipped = traced_frames(&bytes, 0, &mut out);
+    let skipped = traced_frames(&bytes, 0, &mut out).unwrap();
     assert_eq!(out.capacity(), capacity);
     assert_eq!(out.len() + usize::try_from(skipped).unwrap(), 2);
 }
@@ -93,8 +93,8 @@ fn never_grows_its_scratch() {
 #[test]
 fn a_canonical_record_or_garbage_ends_the_scan() {
     let mut out = Vec::with_capacity(4);
-    assert_eq!(traced_frames(&[0u8; 32], 0, &mut out), 0);
-    assert_eq!(traced_frames(&[], 0, &mut out), 0);
+    assert_eq!(traced_frames(&[0u8; 32], 0, &mut out), Some(0));
+    assert_eq!(traced_frames(&[], 0, &mut out), Some(0));
     assert!(out.is_empty());
 }
 
@@ -305,6 +305,93 @@ mod sender {
         assert_eq!(pickups.len(), 1);
         assert_eq!((pickups[0].0, pickups[0].1.position), (ext(2), block));
         assert!(block >= start);
+        let facts = path.untrace(0, &identity()).unwrap();
+        assert_eq!(facts.start, start);
+        assert_eq!(facts.boundary, path.readers()[0].position());
+    }
+
+    /// Picks up `bytes`, read at `from`, on lane 0 of `lanes`.
+    fn pick(
+        bytes: &[u8],
+        from: u64,
+        lanes: &mut [Option<TracedLane>; 4],
+        hook: &mut Box<dyn NetworkTraceHook>,
+    ) {
+        let mut picked = Vec::with_capacity(8);
+        assert_eq!(traced_frames(bytes, from, &mut picked), Some(0));
+        let traced = lanes[0].unwrap();
+        let next = from + u64::try_from(bytes.len()).unwrap();
+        super::super::super::data::pick_up(&picked, lanes, 0, traced, from..next, &mut **hook);
+    }
+
+    fn traced_lane() -> TracedLane {
+        TracedLane {
+            publication: identity(),
+            start: 0,
+            boundary: 0,
+            unpicked: None,
+        }
+    }
+
+    /// NT-2: a resend after a reset rewind was picked up before and records
+    /// nothing.
+    #[test]
+    fn a_rewound_resend_records_nothing() {
+        let mut bytes = Vec::new();
+        super::frame(&mut bytes, 100, Some(ext(1)));
+        let recorder = Recorder::new();
+        let mut hook: Box<dyn NetworkTraceHook> = Box::new(recorder.clone());
+        let mut lanes = [Some(traced_lane()), None, None, None];
+        pick(&bytes, 0, &mut lanes, &mut hook);
+        assert_eq!(recorder.pickups().len(), 1);
+        pick(&bytes, 0, &mut lanes, &mut hook);
+        assert_eq!(recorder.pickups().len(), 1, "the resend is not recorded");
+    }
+
+    /// ACS 15882: a datagram whose commit failed never reached TX storage;
+    /// after the reset rewinds, its resend is the frames' first pickup and
+    /// is recorded once, even below the boundary; a datagram the failure
+    /// did not touch is not.
+    #[test]
+    fn a_failed_commit_is_picked_up_on_its_resend() {
+        use super::super::super::data::remember_unpicked;
+
+        let mut first = Vec::new();
+        super::frame(&mut first, 100, Some(ext(1)));
+        let len = u64::try_from(first.len()).unwrap();
+        let mut second = Vec::new();
+        super::frame(&mut second, 100, Some(ext(2)));
+        let recorder = Recorder::new();
+        let mut hook: Box<dyn NetworkTraceHook> = Box::new(recorder.clone());
+        let mut lanes = [Some(traced_lane()), None, None, None];
+        // The first datagram's commit fails; the second is picked up.
+        assert!(remember_unpicked(&mut lanes, 0, 0, len));
+        pick(&second, len, &mut lanes, &mut hook);
+        assert_eq!(recorder.pickups().len(), 1);
+        // A range the lane cannot also hold is refused, so it is counted.
+        assert!(!remember_unpicked(&mut lanes, 0, 4 * len, 5 * len));
+        // The rewind resends both.
+        pick(&first, 0, &mut lanes, &mut hook);
+        pick(&second, len, &mut lanes, &mut hook);
+        let pickups = recorder.pickups();
+        assert_eq!(pickups.len(), 2, "{pickups:?}");
+        assert_eq!((pickups[1].0, pickups[1].1.position), (ext(1), 0));
+        assert_eq!(lanes[0].unwrap().unpicked, None);
+        pick(&first, 0, &mut lanes, &mut hook);
+        assert_eq!(recorder.pickups().len(), 2, "picked up once");
+    }
+
+    /// A frame with EXT set but too short for its extension is counted, and
+    /// nothing is read past it.
+    #[test]
+    fn an_extension_past_its_frame_is_not_read() {
+        let mut bytes = Vec::new();
+        super::frame(&mut bytes, 100, Some(ext(1)));
+        // Frame length 40: the header and 8 bytes, EXT still set.
+        bytes[..4].copy_from_slice(&40i32.to_le_bytes());
+        let mut out = Vec::with_capacity(4);
+        assert_eq!(traced_frames(&bytes, 0, &mut out), Some(1));
+        assert!(out.is_empty());
     }
 
     /// Without a hook nothing is recorded and the boundary stays at the
@@ -329,13 +416,14 @@ mod sender {
         let mut bytes = Vec::new();
         super::frame(&mut bytes, 100, Some(ext(1)));
         super::frame(&mut bytes, 100, Some(ext(2)));
-        let mut picked = Vec::with_capacity(traced_frames_per_datagram(1408));
+        let mut picked = Vec::with_capacity(traced_frames_per_datagram(1408).unwrap());
         let recorder = Recorder::new();
         let mut hook: Box<dyn NetworkTraceHook> = Box::new(recorder.clone());
         let traced_lane = TracedLane {
             publication: identity(),
             start: 0,
             boundary: 0,
+            unpicked: None,
         };
         let mut lanes = [Some(traced_lane), None, None, None];
         // A first lock may allocate the mutex itself (macOS).
@@ -343,13 +431,13 @@ mod sender {
         let next = u64::try_from(bytes.len()).unwrap();
         let ((), made) = count(|| {
             let skipped = traced_frames(&bytes, 0, &mut picked);
-            assert_eq!(skipped, 0);
+            assert_eq!(skipped, Some(0));
             super::super::super::data::pick_up(
                 &picked,
                 &mut lanes,
                 0,
                 traced_lane,
-                next,
+                0..next,
                 &mut *hook,
             );
         });
@@ -414,7 +502,7 @@ mod sender {
             serve(&mut trace, set),
             AgentEvent::NetworkTraceSet {
                 previous: None,
-                closed: 0,
+                closed: Some(0),
                 ..
             }
         ));
@@ -483,7 +571,7 @@ mod sender {
             serve(&mut trace, remove),
             AgentEvent::NetworkTraceSet {
                 previous: Some(_),
-                closed: 1,
+                closed: Some(1),
                 ..
             }
         ));

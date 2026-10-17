@@ -46,6 +46,20 @@ pub(crate) struct TracedLane {
     /// The end of the highest datagram picked up for a first send since
     /// the start; the start while nothing was picked up.
     pub(crate) boundary: u64,
+    /// Positions read below the boundary whose datagram never reached TX
+    /// storage (its commit failed): a reset's resend of them is their
+    /// first pickup, so it is recorded (ACS 15882). One range per lane.
+    pub(crate) unpicked: Option<(u64, u64)>,
+}
+
+impl TracedLane {
+    /// Whether a frame at `position` was never picked up before.
+    pub(crate) fn first_pickup(&self, position: u64) -> bool {
+        position >= self.boundary
+            || self
+                .unpicked
+                .is_some_and(|(low, high)| low <= position && position < high)
+    }
 }
 
 /// The facts of a journal the agent closed (§5).
@@ -85,7 +99,7 @@ impl SenderTrace {
             AgentCommand::SetNetworkTrace { reply, hook } => {
                 // The conductor closes the journals first; any still open
                 // close here through the hook that holds them.
-                let mut closed = 0u32;
+                let mut closed = Some(0u64);
                 for outbound in publications.iter_mut() {
                     outbound.untrace_all(|lane, traced| {
                         if let (Some(previous), Some(lane)) = (self.hook.as_mut(), lane_of(lane)) {
@@ -93,7 +107,7 @@ impl SenderTrace {
                                 .0
                                 .close_journal(NetSide::Sender, &traced.publication, lane);
                         }
-                        closed = closed.saturating_add(1);
+                        closed = closed.and_then(|count| count.checked_add(1));
                     });
                 }
                 let previous = core::mem::replace(&mut self.hook, hook);
@@ -192,7 +206,7 @@ impl ReceiverTrace {
                 AgentEvent::NetworkTraceSet {
                     agent,
                     previous: core::mem::replace(&mut self.hook, hook),
-                    closed: 0,
+                    closed: Some(0),
                 },
             ),
             AgentCommand::OpenNetworkJournal { reply, journal, .. } => {
@@ -224,20 +238,26 @@ fn lane_of(lane: usize) -> Option<Lane> {
 }
 
 /// The most traced frames one datagram of `mtu` bytes can hold: each is
-/// at least a header and an extension.
-pub(crate) fn traced_frames_per_datagram(mtu: usize) -> usize {
-    let smallest = usize::try_from(HEADER_LENGTH + EXTENSION_LENGTH).unwrap_or(usize::MAX);
-    (mtu / smallest).saturating_add(1)
+/// at least a header and an extension. `None` if that does not fit.
+pub(crate) fn traced_frames_per_datagram(mtu: usize) -> Option<usize> {
+    let smallest = usize::try_from(HEADER_LENGTH.checked_add(EXTENSION_LENGTH)?).ok()?;
+    mtu.checked_div(smallest)?.checked_add(1)
 }
 
 /// Collects into `out`, within its capacity, the extension and position of
 /// each DATA frame with EXT in the datagram `bytes`, read at stream
-/// position `from`. Returns how many extensions did not decode or found no
-/// room; those frames are not traced.
-pub(crate) fn traced_frames(bytes: &[u8], from: u64, out: &mut Vec<(TraceExtension, u64)>) -> u64 {
+/// position `from`. Returns how many extensions did not decode, did not
+/// fit their frame or found no room; those frames are not traced. `None`
+/// when that count overflows.
+pub(crate) fn traced_frames(
+    bytes: &[u8],
+    from: u64,
+    out: &mut Vec<(TraceExtension, u64)>,
+) -> Option<u64> {
     out.clear();
-    let header = usize::try_from(HEADER_LENGTH).unwrap_or(usize::MAX);
-    let extension = usize::try_from(EXTENSION_LENGTH).unwrap_or(usize::MAX);
+    let header = usize::try_from(HEADER_LENGTH).ok()?;
+    let extension = usize::try_from(EXTENSION_LENGTH).ok()?;
+    let traced_length = header.checked_add(extension)?;
     let mut skipped = 0u64;
     let mut offset = 0usize;
     while let Some(word) = offset
@@ -257,8 +277,12 @@ pub(crate) fn traced_frames(bytes: &[u8], from: u64, out: &mut Vec<(TraceExtensi
             break;
         };
         if word0.frame_type_code() == FrameType::Data.code() && word0.flags().ext() {
+            // A frame too short for its extension has none to read.
+            let fits =
+                usize::try_from(word0.frame_length()).is_ok_and(|length| length >= traced_length);
             let ext = offset
                 .checked_add(header)
+                .filter(|_| fits)
                 .and_then(|start| bytes.get(start..start.checked_add(extension)?))
                 .and_then(|ext| TraceExtension::decode(ext).ok());
             let position = u64::try_from(offset)
@@ -268,7 +292,7 @@ pub(crate) fn traced_frames(bytes: &[u8], from: u64, out: &mut Vec<(TraceExtensi
                 (Some(ext), Some(position)) if out.len() < out.capacity() => {
                     out.push((ext, position));
                 }
-                _ => skipped = skipped.saturating_add(1),
+                _ => skipped = skipped.checked_add(1)?,
             }
         }
         let Some(next) = offset.checked_add(extent) else {
@@ -276,7 +300,7 @@ pub(crate) fn traced_frames(bytes: &[u8], from: u64, out: &mut Vec<(TraceExtensi
         };
         offset = next;
     }
-    skipped
+    Some(skipped)
 }
 
 #[cfg(test)]
