@@ -385,6 +385,7 @@ impl Network {
         max_term_length: u32,
         reliable: bool,
     ) -> Result<NetworkSubscription, DriverError> {
+        let group = multicast.is_some();
         let endpoint = self.hold_endpoint(bind, multicast)?;
         let handle = NetworkSubscription {
             endpoint,
@@ -422,6 +423,7 @@ impl Network {
                 stream_id,
                 max_term_length,
                 reliable,
+                multicast: group,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);

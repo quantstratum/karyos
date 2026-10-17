@@ -126,7 +126,13 @@ impl Default for MulticastConfig {
 }
 
 impl MulticastConfig {
-    fn validate(&self) -> Result<(), LossConfigError> {
+    /// Checks the ranges: `nak_delay_scale` 1 to 256, `repair_slack` at
+    /// most 1 s, `max_failed_suppressors` 1 to 4.
+    ///
+    /// # Errors
+    ///
+    /// [`LossConfigError::Multicast`].
+    pub fn validate(&self) -> Result<(), LossConfigError> {
         if !(1..=256).contains(&self.nak_delay_scale) {
             return Err(LossConfigError::Multicast(
                 "nak_delay_scale is not in 1..=256",

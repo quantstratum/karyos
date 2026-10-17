@@ -200,6 +200,11 @@ pub struct AgentConfig {
     /// The repair settings of reliable publications (reliable-transport.md;
     /// R4, R5, R7).
     pub repair: repair::RepairConfig,
+    /// A multicast image's NAK timing and suppression (reliable-transport.md,
+    /// "Timers, retries and suppression"; RC-2 to RC-5, RC-14), with the
+    /// design defaults: `nak_delay_scale` 16, `repair_linger` and
+    /// `repair_slack` 1 ms, the `group` response domain.
+    pub multicast: crate::repair::loss::MulticastConfig,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -232,6 +237,7 @@ impl Default for AgentConfig {
             idle_image_timeout: 60_000_000_000,
             rtt: crate::rtt::RttConfig::default(),
             repair: repair::RepairConfig::default(),
+            multicast: crate::repair::loss::MulticastConfig::default(),
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -285,6 +291,16 @@ impl AgentConfig {
         self.rtt
             .validate()
             .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
+        // The largest RTT snapshot: a sample never exceeds the probe
+        // timeout; before one, the initial RTT, never below the floor.
+        let max_rtt = self
+            .rtt
+            .rtt_probe_timeout
+            .max(self.rtt.rtt_initial)
+            .max(self.rtt.rtt_floor);
+        self.multicast
+            .validate_for(max_rtt)
+            .map_err(|_| AgentError::InvalidConfig("invalid multicast NAK timing"))?;
         // S1: the control ring holds every pending challenge's RSP_SETUP
         // and one SM slot per image, above a floor for forwarded controls
         // (one path per image until redundant paths, RP-1).
@@ -402,6 +418,10 @@ pub enum AgentCommand<O: SocketOps> {
         /// its liveness timeout. (The far-window close applies to
         /// unreliable images only, GU-6.)
         reliable: bool,
+        /// Whether the endpoint receives a multicast group: its images
+        /// time their NAKs by cycle (RC-2) with
+        /// [`AgentConfig::multicast`].
+        multicast: bool,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer

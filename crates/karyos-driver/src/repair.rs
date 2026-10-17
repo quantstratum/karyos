@@ -14,6 +14,7 @@
 //!   budget, with step 8 and the end proof at each head.
 
 pub mod admission;
+pub mod draw;
 pub mod jobs;
 pub mod loss;
 pub mod scheduler;
