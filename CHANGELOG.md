@@ -176,6 +176,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A recording group's journal on disk (phase 3, A7b).
+  `karyos_archive::group::journal::GroupJournal` keeps a group's records
+  back to back in a segment store named by the group (written and durable
+  positions, sync policies, CRC-32C, torn-write recovery of A2). Every
+  record appended is decoded and checked against the order rules first,
+  so a refusal writes nothing. A record never spans two store writes: a
+  segment's end is padded (a fill, or zero bytes under 32), so recovery
+  always cuts between records; it then reads every record kept and
+  checks it again.
 - A recording group's journal records, schema 3 version 1 (phase 3,
   A7a; SPEC §8.3, ADR-0024). `karyos_archive::group::record` holds the
   journal header (group, first `group_seq`, inline threshold, capture
