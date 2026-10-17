@@ -64,8 +64,10 @@
 //!   rejected (`Expired`) and counted, so stationary SMs of a paused member
 //!   cannot defeat `pause_timeout` by rejoining, and a delayed old SM
 //!   cannot rejoin at a lower point. The tombstone is cleared after
-//!   `receiver_timeout` without any SM of it, or when its slot is needed
-//!   for another receiver; a rejoin is a new membership with a new
+//!   `receiver_timeout` without any SM of it, or when a new establishment
+//!   ([`Membership::expect`]) or a configured required receiver needs its
+//!   slot; an SM-driven optional join never takes another receiver's
+//!   tombstone (ACS 15663). A rejoin is a new membership with a new
 //!   generation and join point.
 //!
 //! The table, the role lists and the event queue are sized at
@@ -426,8 +428,8 @@ pub struct MembershipCounters {
     pub lost_rejected: u64,
     /// SMs of an expired optional member refused by its tombstone.
     pub expired_rejected: u64,
-    /// Tombstones cleared after `receiver_timeout` of silence or for their
-    /// slot.
+    /// Tombstones cleared after `receiver_timeout` of silence or for
+    /// another receiver's slot (not its own receiver's rejoin).
     pub tombstones_cleared: u64,
     /// Newcomers refused for a full table.
     pub table_full: u64,
@@ -626,11 +628,13 @@ impl Membership {
         }
         let receiver = key.receiver;
         let required = self.is_required(receiver.receiver_id);
+        // A new establishment lifts the receiver's tombstone, once the
+        // pending and table limits pass: the next SM joins.
+        let mut lift = None;
         if let Some(slot) = self.find(receiver) {
             match self.entry(slot).map(|e| e.state) {
                 Some(State::LostRequired) => return Err(self.reject(StatusRejected::Lost)),
-                // A new establishment lifts the tombstone: the next SM joins.
-                Some(State::Tombstone) => self.free(slot),
+                Some(State::Tombstone) => lift = Some(slot),
                 _ => {
                     self.bind(slot, key);
                     return Ok(self.member_ref(slot));
@@ -648,7 +652,9 @@ impl Membership {
         if pending >= usize::from(self.config.max_pending) {
             return Err(self.reject(StatusRejected::PendingFull));
         }
-        let slot = self.allocate(required)?;
+        let slot = self
+            .allocate(required, true, lift)
+            .map_err(|reason| self.reject(reason))?;
         let tag = self.tag_of(receiver.receiver_id);
         if let Some(entry) = self.entries.get_mut(slot) {
             entry.state = State::Pending;
@@ -754,7 +760,7 @@ impl Membership {
                 Some(State::Active | State::Pending) => {}
                 Some(State::Tombstone) => {
                     found = None;
-                    tombstone = self.tombstone_admits(slot, sm, now)?;
+                    tombstone = Some(slot);
                 }
                 _ => found = None,
             }
@@ -808,12 +814,18 @@ impl Membership {
             }
         }
 
-        if let Some(slot) = tombstone {
-            self.free(slot);
-        }
+        // The credit checks above come first, so a doubly bad SM is counted
+        // for its credit fault; then the tombstone decides.
+        let lift = match tombstone {
+            Some(slot) => self.tombstone_admits(slot, sm, now)?,
+            None => None,
+        };
+        // An SM-driven join takes a free slot, or its own tombstone's; only a
+        // new establishment or a configured required receiver may take
+        // another receiver's tombstone.
         let slot = match found {
             Some(slot) => slot,
-            None => self.allocate(required)?,
+            None => self.allocate(required, required, lift)?,
         };
         let fresh = joining || advanced || caught_up;
         let tag = self.tag_of(id);
@@ -1110,11 +1122,18 @@ impl Membership {
         Err(StatusRejected::Expired)
     }
 
-    /// Takes a slot for a newcomer, raising its generation: a free one,
-    /// else the tombstone seen longest ago (cleared and counted). Optional
-    /// newcomers leave room for every required receiver not yet in the
-    /// table. Exhausted slots are retired and skipped.
-    fn allocate(&mut self, required: bool) -> Result<usize, StatusRejected> {
+    /// Takes a slot for a newcomer, raising its generation: `own` (the
+    /// newcomer's own tombstone) if given, else a free one, else, when
+    /// `tombstones` allows, the tombstone seen longest ago. A tombstone
+    /// taken is cleared and counted. Optional newcomers leave room for
+    /// every required receiver not yet in the table. Exhausted slots are
+    /// retired and skipped.
+    fn allocate(
+        &mut self,
+        required: bool,
+        tombstones: bool,
+        mut own: Option<usize>,
+    ) -> Result<usize, StatusRejected> {
         let reserved = if required {
             0
         } else {
@@ -1128,27 +1147,40 @@ impl Membership {
                 })
                 .count()
         };
-        let usable = |e: &Entry| !e.retired && matches!(e.state, State::Free | State::Tombstone);
-        let mut free = self.entries.iter().filter(|e| usable(e)).count();
+        let usable = |slot: usize, e: &Entry, own: Option<usize>| {
+            !e.retired
+                && (e.state == State::Free
+                    || (e.state == State::Tombstone && (tombstones || own == Some(slot))))
+        };
+        let mut free = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(slot, e)| usable(*slot, e, own))
+            .count();
         while free > reserved {
-            let slot = self
-                .entries
-                .iter()
-                .position(|e| e.state == State::Free && !e.retired)
+            let slot = own
+                .filter(|slot| self.entry(*slot).is_some_and(|e| usable(*slot, e, own)))
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .position(|e| e.state == State::Free && !e.retired)
+                })
                 .or_else(|| {
                     self.entries
                         .iter()
                         .enumerate()
-                        .filter(|(_, e)| usable(e))
+                        .filter(|(slot, e)| e.state == State::Tombstone && usable(*slot, e, own))
                         .min_by_key(|(_, e)| e.last_accepted)
                         .map(|(slot, _)| slot)
                 });
             let Some(slot) = slot else {
                 break;
             };
-            if self
-                .entry(slot)
-                .is_some_and(|e| e.state == State::Tombstone)
+            if own != Some(slot)
+                && self
+                    .entry(slot)
+                    .is_some_and(|e| e.state == State::Tombstone)
             {
                 self.counters.bump(|c| &mut c.tombstones_cleared);
             }
@@ -1168,6 +1200,9 @@ impl Membership {
                 ..*entry
             };
             entry.state = State::Free;
+            if own == Some(slot) {
+                own = None;
+            }
             self.counters.bump(|c| &mut c.retired_slots);
             let Some(left) = free.checked_sub(1) else {
                 break;

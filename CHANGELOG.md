@@ -224,7 +224,11 @@ release may break APIs, wire formats and shared-memory layouts.
   stays in `retention`. An expired optional member leaves a tombstone: it
   rejoins only with an SM fresh against its last consumption or after a
   new `expect`, so stationary SMs cannot defeat `pause_timeout` (ACS
-  15647). `timers` expires members within a bound with a fair
+  15647). Only an establishment (`expect`) or a configured required
+  receiver may take another receiver's tombstone slot, an `expect`
+  refused for its limits keeps the tombstone, and an SM's credit faults
+  are counted before the tombstone's (ACS 15663). `timers` expires members
+  within a bound with a fair
   cursor, and membership events are queued in a bounded queue. Not wired
   yet: the sender agent's SM handoff and gate.
 
