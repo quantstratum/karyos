@@ -10,13 +10,11 @@
 //! - N2: a reliable channel delivers every message exactly once and in
 //!   order, through NAKs and the sender's repairs.
 //! - N3: N2 with 5% duplicated datagrams.
-//! - N4 to N6 (T4, quantstratum-docs:
+//! - N4 to N7 (T4, quantstratum-docs:
 //!   karyos/testing/contract-traceability-phase-2.md, "Loss, reorder,
-//!   duplicate"): N2 in Dedicated mode, on two lanes, and on a multicast
-//!   group with two subscribers. A blackout of the path waits for an idle
-//!   DATA heartbeat on a single-path sender (SPEC §6; coordinator gap G1):
-//!   without one, an image whose sender has nothing new to send after the
-//!   blackout retires at liveness.
+//!   duplicate"): N2 in Dedicated mode, on two lanes, on a multicast group
+//!   with two subscribers, and across a blackout of the path, which the
+//!   sender's idle DATA heartbeat (SPEC §6) lets the receiver repair.
 
 #![allow(
     clippy::print_stdout,
@@ -24,6 +22,7 @@
 )]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::{Duration, Instant};
 
 use karyos_client::OfferOutcome;
 use karyos_protocol::channel::{Destination, Security, UdpConfig};
@@ -189,6 +188,15 @@ impl Profile {
         }
         tc(&words);
         println!("netem profile for this test: {}", words.join(" "));
+        Self { base }
+    }
+
+    /// Replaces the loopback's netem profile by `profile` until drop.
+    fn replace(profile: &str) -> Self {
+        let base = std::env::var("KARYOS_NETEM_PROFILE").unwrap();
+        let words: Vec<String> = profile.split_whitespace().map(str::to_owned).collect();
+        tc(&words);
+        println!("netem profile now: {profile}");
         Self { base }
     }
 }
@@ -440,5 +448,83 @@ fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
     assert!(
         naks.iter().all(|naks| *naks > 0) && repairs > 0,
         "a subscriber never NAKed: the group is not on the shaped loopback?"
+    );
+}
+
+/// N7 (T4): a reliable channel across a blackout of its tail. The first
+/// 200 messages arrive; then the loopback loses every datagram for 500 ms
+/// while the publisher offers its last 20, which fit the sender's window,
+/// so the sender sends them all into the blackout and then has nothing
+/// new to send. The tail is offered into the blackout so that only the
+/// sender's idle DATA heartbeat (SPEC §6, at the default 100 ms) can
+/// reveal it: with new DATA after the blackout, that DATA would show the
+/// receiver the hole instead. Once the job's profile is back, the
+/// receiver NAKs the tail the heartbeat shows and the sender repairs it:
+/// every message arrives exactly once and in order, with no loss
+/// reported. Without the heartbeat the tail never arrives.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n7_a_reliable_channel_recovers_from_a_blackout() {
+    super::super::netem::require_netem();
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // 20 frames of 1056 bytes fit the 32 KiB window of a 64 KiB term.
+    let (before, count) = (200u32, 220u32);
+    let (mut sent, mut seen) = (0u32, 0u32);
+    // Offers up to `upto` and reads what arrived: (sent, seen).
+    let mut step = |upto: u32| {
+        while sent < upto {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "exactly once, in order");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        (sent, seen)
+    };
+    pump(&mut [&mut a, &mut b], |_| step(before).1 == before);
+    let (naks_before, repairs_before) = repair_work(&a, &b);
+    let blackout = Profile::replace("loss 100%");
+    let start = Instant::now();
+    let mut tail = (0, 0);
+    pump(&mut [&mut a, &mut b], |_| {
+        tail = step(count);
+        start.elapsed() >= Duration::from_millis(500)
+    });
+    // The job's profile again.
+    drop(blackout);
+    let (offered, during) = tail;
+    assert_eq!(offered, count, "the tail was offered during the blackout");
+    pump(&mut [&mut a, &mut b], |_| step(count).1 == count);
+    let poll = reader.poll(|_, _, _| {}, ONE);
+    assert_eq!(poll.lanes[0].first_loss, None, "a reliable lane lost data");
+    let (naks, repairs) = repair_work(&a, &b);
+    let heartbeats = a
+        .net
+        .as_ref()
+        .unwrap()
+        .sender_counters()
+        .unwrap()
+        .heartbeats_sent;
+    println!(
+        "N7: {count} in order across a 500 ms blackout of the last {} (up to {during} by its end); {naks} NAKs, {repairs} repairs, {heartbeats} heartbeats",
+        count - before
+    );
+    assert!(
+        naks > naks_before && repairs > repairs_before && heartbeats > 0,
+        "no repair after the blackout"
     );
 }

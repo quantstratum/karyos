@@ -30,6 +30,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use karyos_protocol::channel::{Destination, Interface, UdpConfig};
 use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
 use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
+use karyos_sys::term::TermId;
 use karyos_sys::term_bytes::HeapTerms;
 
 use super::NetworkPublicationState;
@@ -182,6 +183,11 @@ impl EmbeddedDriver<HeapTerms> {
         }
         let (destination, binds) = route(channel)?;
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
+        // The incarnation's first term id, drawn on the control path before
+        // the publication and its SETUP exist (SPEC §4, initial state; §5),
+        // shared by every lane; a failed draw refuses the add.
+        let mut config = config;
+        config.stream.buffer.initial_term_id = TermId::new(self.draw_initial_term_id()?);
         let handle = self.add_aggregate(config)?;
         let added = self.attach_sender(
             &handle,
@@ -196,6 +202,27 @@ impl EmbeddedDriver<HeapTerms> {
             return Err(error);
         }
         Ok(handle)
+    }
+
+    /// A network publication's `initial_term_id`: a random draw, or the
+    /// test override of `NetworkStreamDefaults::initial_term_id`.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::Sys`] when the random source fails.
+    fn draw_initial_term_id(&self) -> Result<u32, DriverError> {
+        if let Some(forced) = self
+            .config
+            .network
+            .and_then(|network| network.stream_defaults.initial_term_id)
+        {
+            return Ok(forced);
+        }
+        let mut word = [0u64; 1];
+        karyos_sys::random::fill_u64s(&mut word)?;
+        let [value] = word;
+        // The high half: always fits.
+        Ok(u32::try_from(value >> 32).unwrap_or(0))
     }
 
     /// The state of the network publication `aggregate`; `None` when it

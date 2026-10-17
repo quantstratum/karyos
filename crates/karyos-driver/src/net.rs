@@ -151,6 +151,11 @@ pub struct NetworkStreamDefaults {
     /// ([`MAX_PUBLICATION_LINGER`]); a longer one is refused as
     /// `InvalidConfig`.
     pub publication_linger: u64,
+    /// Tests only: the `initial_term_id` of every network publication, in
+    /// place of the draw. `None`, the default, draws a random one on the
+    /// control path for each publication (SPEC §4, initial state; §5).
+    #[doc(hidden)]
+    pub initial_term_id: Option<u32>,
 }
 
 /// The longest `publication_linger` a network accepts (ns): 60 s. A
@@ -167,6 +172,7 @@ impl Default for NetworkStreamDefaults {
             max_subscribers: 8,
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
             publication_linger: 5_000_000_000,
+            initial_term_id: None,
         }
     }
 }

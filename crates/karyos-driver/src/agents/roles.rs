@@ -344,6 +344,10 @@ pub struct ReceiverCounters {
 pub struct SenderCounters {
     /// Controls sent.
     pub sent: u64,
+    /// Idle heartbeats submitted: header-only DATA frames of established
+    /// single-path lanes that sent nothing for `sender_heartbeat_interval`
+    /// (SPEC §6).
+    pub heartbeats_sent: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -1430,6 +1434,8 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     due: Vec<(EndpointId, SetupAnnounce)>,
     /// `path_heartbeat_interval` in ns (RP-3).
     path_heartbeat_interval: u64,
+    /// `sender_heartbeat_interval` in ns (SPEC §6).
+    sender_heartbeat_interval: u64,
     /// When a routed publication's path leaves the live set (RP-8).
     path_policy: super::data::PathPolicy,
     /// The receivers answered, at most `receiver_bindings` (allocated at
@@ -1570,6 +1576,7 @@ pub(super) fn roles<T: StreamTerms>(
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
             path_heartbeat_interval: config.path_heartbeat_interval,
+            sender_heartbeat_interval: config.sender_heartbeat_interval,
             path_policy: config.path_policy,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
@@ -4834,7 +4841,14 @@ impl<T: StreamTerms> SenderRole<T> {
                 self.trace.hook(),
             )?;
             work = work.checked_add(served).ok_or(overflow.clone())?;
-            if outbound.needs_reset() {
+            // An idle lane's heartbeat (SPEC §6), after its first sends.
+            let beats = outbound.serve_heartbeats(tx, now, self.sender_heartbeat_interval);
+            work = work.checked_add(beats).ok_or(overflow.clone())?;
+            let needs_reset = outbound.needs_reset();
+            for _ in 0..beats {
+                self.count(|c| &mut c.heartbeats_sent);
+            }
+            if needs_reset {
                 needing_reset = needing_reset.checked_add(1).ok_or(overflow.clone())?;
             }
         }
