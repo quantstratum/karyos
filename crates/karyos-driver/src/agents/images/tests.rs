@@ -3523,13 +3523,16 @@ fn stale_frame(term_id: u32, term_offset: u32, payload: usize) -> Vec<u8> {
 /// restart", the trusted half; SPEC §6): a sender driver restart reuses
 /// the alias, and DATA of the old incarnation is still in flight. The
 /// old image retires; the new incarnation binds a new image through its
-/// own challenge, with a fresh initial term id. Stale DATA of the old
-/// terms then commits nothing and reaches no subscriber. Of probes at
-/// every distance from the new window, only the window's own terms
-/// (`r` and `r + 1`) commit: a stale datagram is accepted only if its
-/// term id happens to fall there, a few chances in 2^32 with a random
-/// initial term id. The authenticated half (always rejected) needs the
-/// authenticated profile (owner decision 5, ADR-0035).
+/// own challenge, with another initial term id. Stale DATA of the old
+/// terms then commits nothing and reaches no subscriber. Of nine probes
+/// around and far from the new window, none commits; only the window's own
+/// terms (`r` and `r + 1`) do: a stale datagram is accepted only if its
+/// term id falls there. This proves the receiver's window. The rate SPEC
+/// asks for, about 3 in 2^32, also needs the restarted sender to draw its
+/// initial term id at random, which main does not do yet (a constant
+/// today; coordinator gap G2), so this test sets one by hand. The
+/// authenticated half (always rejected) needs the authenticated profile
+/// (owner decision 5, ADR-0035).
 #[test]
 fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
     use std::sync::Arc;
@@ -3538,8 +3541,8 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
     use karyos_sys::log_buffer::{PollOutcome, Role};
     use karyos_sys::sync::Ordering;
 
-    // The new incarnation's initial term id: half the term id space away
-    // from the old one, 9.
+    // The new incarnation's initial term id, set by hand (main does not
+    // draw one yet): half the term id space away from the old one, 9.
     const NEW: u32 = 9 + (1 << 31);
 
     let word = Arc::new(karyos_client::HeapWords::zeroed(1));
@@ -3609,8 +3612,9 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
         rig.round(true);
     };
     let committed = |rig: &Rig| rig.agents.receiver.counters().data_committed;
-    // Stale DATA of the old incarnation's terms, and probes at every
-    // distance outside the new window {r, r + 1} (r = NEW at the join).
+    // Nine probes outside the new window {r, r + 1} (r = NEW at the join):
+    // the old incarnation's terms, both sides of the window, and two
+    // quarters of the term id space away.
     let outside = [
         9,
         10,
@@ -3620,8 +3624,16 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
         NEW.wrapping_add(2),
         NEW.wrapping_add(3),
         NEW.wrapping_add(1 << 30),
-        NEW.wrapping_add(1 << 31),
+        NEW.wrapping_sub(1 << 30),
     ];
+    assert_eq!(
+        outside
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        outside.len(),
+        "the probes are distinct"
+    );
     let start = committed(&rig);
     for term_id in outside {
         inject(&mut rig, term_id);
