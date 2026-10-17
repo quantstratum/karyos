@@ -238,6 +238,8 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
 /// The receiver agent's network state.
 #[derive(Debug)]
 pub struct ReceiverRole {
+    /// The network trace hook (P2.12 step 3).
+    trace: super::net_trace::ReceiverTrace,
     sessions: ReceiveSessions,
     nonces: OsNonces,
     to_sender: RingSender<ControlItem>,
@@ -456,6 +458,8 @@ pub struct SenderRole {
     /// The driver's timing of each publication's membership.
     membership: MembershipTiming,
     counters: SenderCounters,
+    /// The network trace hook and journals (P2.12 step 3).
+    trace: super::net_trace::SenderTrace,
 }
 
 /// The driver settings a publication's membership follows: the receivers'
@@ -557,6 +561,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             cycle: 0,
             membership: MembershipTiming::of(config),
             counters: SenderCounters::default(),
+            trace: super::net_trace::SenderTrace::default(),
         },
         ReceiverRole {
             sessions,
@@ -581,6 +586,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
                 ..PathConfig::default()
             },
             counters: ReceiverCounters::default(),
+            trace: super::net_trace::ReceiverTrace::default(),
         },
     ))
 }
@@ -681,7 +687,7 @@ impl ReceiverRole {
                     alias: publication.alias,
                 },
             )),
-            _ => None,
+            command => self.trace.command(command),
         }
     }
 
@@ -1524,7 +1530,7 @@ impl SenderRole {
                     },
                 ));
             }
-            _ => return None,
+            command => return self.trace.command(&mut self.publications, command),
         };
         let mut outbound = outbound;
         let matches = outbound.endpoint() == publication.endpoint
@@ -1727,13 +1733,14 @@ impl SenderRole {
                 continue;
             };
             let lanes = outbound.readers().len();
-            let served = outbound.serve(
+            let served = outbound.serve_traced(
                 tx,
                 DATA_BUDGET,
                 consumption
                     .as_ref()
                     .and_then(|positions| positions.get(..lanes)),
                 now,
+                self.trace.hook(),
             )?;
             work = work.checked_add(served).ok_or(overflow.clone())?;
             if outbound.needs_reset() {

@@ -601,6 +601,10 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::PublicationAdded { .. }
             | AgentEvent::PublicationRefused { .. }
             | AgentEvent::Configured { .. }
+            | AgentEvent::NetworkTraceSet { .. }
+            | AgentEvent::NetworkJournalOpened { .. }
+            | AgentEvent::NetworkJournalRefused { .. }
+            | AgentEvent::NetworkJournalClosed { .. }
             | AgentEvent::Unsupported { .. }
             | AgentEvent::ResetRequested { .. } => return Some(event),
         };

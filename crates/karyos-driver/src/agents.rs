@@ -40,6 +40,7 @@ pub mod control;
 pub mod data;
 pub mod endpoints;
 pub mod images;
+pub mod net_trace;
 pub mod ring;
 pub mod roles;
 
@@ -404,6 +405,40 @@ pub enum AgentCommand<O: SocketOps> {
         /// the lane quanta, built by the conductor ([`data::Outbound::new`]).
         outbound: Box<data::Outbound>,
     },
+    /// Set the agent's network trace hook, or remove it with `None`
+    /// (P2.12 step 3). Journals still open close through the previous hook
+    /// first. Answer [`AgentEvent::NetworkTraceSet`].
+    SetNetworkTrace {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The new hook.
+        hook: Option<net_trace::TraceHook>,
+    },
+    /// Write `journal` for its publication and lane: on the sender, the
+    /// publication `alias` on `endpoint`. Answer
+    /// [`AgentEvent::NetworkJournalOpened`] with the start, or
+    /// [`AgentEvent::NetworkJournalRefused`] with the journal (no hook, the
+    /// wrong side, no such publication or lane, or a lane already traced).
+    OpenNetworkJournal {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
+        /// The journal the conductor created.
+        journal: karyos_protocol::trace_hook::NetJournal,
+    },
+    /// Close the journal of `lane` of `publication`. Answer
+    /// [`AgentEvent::NetworkJournalClosed`].
+    CloseNetworkJournal {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The publication.
+        publication: karyos_protocol::trace_hook::PublicationIdentity,
+        /// The lane.
+        lane: karyos_protocol::frame::Lane,
+    },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
     Panic,
@@ -477,6 +512,49 @@ pub enum AgentEvent<O: SocketOps> {
         agent: AgentKind,
         /// Whether the entry was added (or was already there).
         accepted: bool,
+    },
+    /// The agent holds the new network trace hook.
+    NetworkTraceSet {
+        /// The agent.
+        agent: AgentKind,
+        /// The hook it replaced, dropped on the control path.
+        previous: Option<net_trace::TraceHook>,
+        /// Journals still open that it closed through the previous hook,
+        /// without facts.
+        closed: u32,
+    },
+    /// The agent writes the journal from `start`, its next position on the
+    /// lane when the journal arrived (the start fact, trace-network.md §5).
+    NetworkJournalOpened {
+        /// The agent.
+        agent: AgentKind,
+        /// The publication.
+        publication: karyos_protocol::trace_hook::PublicationIdentity,
+        /// The lane.
+        lane: karyos_protocol::frame::Lane,
+        /// The journal number.
+        number: u64,
+        /// The start.
+        start: u64,
+    },
+    /// The agent cannot write the journal, which comes back.
+    NetworkJournalRefused {
+        /// The agent.
+        agent: AgentKind,
+        /// The journal.
+        journal: karyos_protocol::trace_hook::NetJournal,
+    },
+    /// The agent closed the journal; `facts` is `None` when it had none
+    /// open for the publication and lane.
+    NetworkJournalClosed {
+        /// The agent.
+        agent: AgentKind,
+        /// The publication.
+        publication: karyos_protocol::trace_hook::PublicationIdentity,
+        /// The lane.
+        lane: karyos_protocol::frame::Lane,
+        /// Its start and boundary.
+        facts: Option<net_trace::JournalFacts>,
     },
     /// The agent does not serve this command.
     Unsupported {
@@ -605,7 +683,10 @@ impl<O: SocketOps> AgentCore<O> {
                 }
                 command @ (AgentCommand::AddPublication { .. }
                 | AgentCommand::AddSubscription { .. }
-                | AgentCommand::AddPublishedAlias { .. }) => {
+                | AgentCommand::AddPublishedAlias { .. }
+                | AgentCommand::SetNetworkTrace { .. }
+                | AgentCommand::OpenNetworkJournal { .. }
+                | AgentCommand::CloseNetworkJournal { .. }) => {
                     if let Some((reply, event)) = role(command)
                         && self.reply(reply, event)?
                     {

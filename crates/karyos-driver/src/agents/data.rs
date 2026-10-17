@@ -62,10 +62,11 @@ use karyos_protocol::network::{Alias, Lanes, MAX_LANES};
 use karyos_sys::log_buffer::{LogBuffer, ReadError, ReadOrigin, ReadOutcome, SenderRead};
 use karyos_sys::sizing::align_frame;
 
-use karyos_protocol::frame::Lane;
-
+use super::net_trace::{TracedLane, traced_frames, traced_frames_per_datagram};
 use super::{AgentError, AgentKind, EndpointId};
 use crate::membership::{Admission, Limit, Membership};
+use karyos_protocol::frame::{Lane, TraceExtension};
+use karyos_protocol::trace_hook::{NetPickup, NetworkTraceHook};
 
 /// Membership timer actions per cycle.
 const MEMBERSHIP_TIMER_ACTIONS: u32 = 16;
@@ -175,6 +176,8 @@ pub struct OutboundCounters {
     /// Cycles whose first sends waited for a configured required member's
     /// join.
     pub not_joined: u64,
+    /// Traced frames not recorded: their EXT did not decode (NT-2).
+    pub trace_invalid: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -217,6 +220,11 @@ pub struct Outbound {
     report: TxReport,
     next_token: u64,
     counters: OutboundCounters,
+    /// Each lane's open network journal, if any (P2.12 step 3).
+    traced: [Option<TracedLane>; 4],
+    /// The traced frames of the datagram being staged (allocated at
+    /// construction, for the most one datagram can hold).
+    picked: Vec<(TraceExtension, u64)>,
 }
 
 /// Why an outbound publication was refused.
@@ -288,6 +296,10 @@ impl Outbound {
             report: TxReport::new(),
             next_token: 1,
             counters: OutboundCounters::default(),
+            traced: [None; 4],
+            picked: Vec::with_capacity(traced_frames_per_datagram(
+                usize::try_from(mtu).map_err(|_| OutboundError::Mtu)?,
+            )),
         })
     }
 
@@ -356,6 +368,49 @@ impl Outbound {
             *join = reader.position();
         }
         Lanes::new(joins.get(..self.readers.len())?).ok()
+    }
+
+    /// Starts tracing `lane` for `publication`'s journal from the lane's
+    /// next position, which it returns (the start fact, §5). `None` for a
+    /// lane it does not have or one already traced.
+    pub(crate) fn trace(
+        &mut self,
+        lane: usize,
+        publication: karyos_protocol::trace_hook::PublicationIdentity,
+    ) -> Option<u64> {
+        let start = self.readers.get(lane)?.position();
+        let slot = self.traced.get_mut(lane).filter(|slot| slot.is_none())?;
+        *slot = Some(TracedLane {
+            publication,
+            start,
+            boundary: start,
+        });
+        Some(start)
+    }
+
+    /// Stops tracing `lane` if `publication`'s journal observes it, and
+    /// returns its facts.
+    pub(crate) fn untrace(
+        &mut self,
+        lane: usize,
+        publication: &karyos_protocol::trace_hook::PublicationIdentity,
+    ) -> Option<TracedLane> {
+        let slot = self.traced.get_mut(lane)?;
+        if slot.is_some_and(|traced| traced.publication == *publication) {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// Stops tracing every lane, handing each one's lane and facts to
+    /// `closed`.
+    pub(crate) fn untrace_all(&mut self, mut closed: impl FnMut(usize, TracedLane)) {
+        for (lane, slot) in self.traced.iter_mut().enumerate() {
+            if let Some(traced) = slot.take() {
+                closed(lane, traced);
+            }
+        }
     }
 
     /// Opens the route and the lane queues on `tx` for its current epoch,
@@ -429,6 +484,23 @@ impl Outbound {
         consumption: Option<&[u64]>,
         now: u64,
     ) -> Result<u32, AgentError> {
+        self.serve_traced(tx, budget, consumption, now, None)
+    }
+
+    /// [`Outbound::serve`] with the sender's network trace `hook`, which
+    /// records a `SenderPickup` for each traced frame of a traced lane.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
+    pub(crate) fn serve_traced<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        budget: Budget,
+        consumption: Option<&[u64]>,
+        now: u64,
+        mut hook: Option<&mut (dyn NetworkTraceHook + 'static)>,
+    ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         if !self.open(tx) {
             return Ok(0);
@@ -464,7 +536,7 @@ impl Outbound {
         for lane in 0..self.readers.len() {
             let limit = limits.get(lane).copied().unwrap_or(Limit::Held);
             work = work
-                .checked_add(self.stage(tx, lane, limit)?)
+                .checked_add(self.stage(tx, lane, limit, hook.as_deref_mut())?)
                 .ok_or(overflow.clone())?;
         }
         let report = self.sender.serve(
@@ -607,6 +679,7 @@ impl Outbound {
         tx: &mut SocketsTx<O>,
         lane: usize,
         limit: Limit,
+        mut hook: Option<&mut (dyn NetworkTraceHook + 'static)>,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         let mut staged = 0u32;
@@ -652,6 +725,22 @@ impl Outbound {
                         break;
                     }
                 };
+            // One branch per datagram without a hook or a journal.
+            let traced = match (&hook, self.traced.get(lane).copied().flatten()) {
+                (Some(_), Some(traced)) if !record => {
+                    let skipped = traced_frames(
+                        frame.bytes_mut().get(..len).unwrap_or_default(),
+                        from,
+                        &mut self.picked,
+                    );
+                    self.counters.bump(|c| &mut c.trace_invalid, skipped);
+                    Some(traced)
+                }
+                (_, traced) => {
+                    self.picked.clear();
+                    traced.filter(|_| hook.is_some())
+                }
+            };
             let token = SenderToken::new(self.next_token);
             self.next_token = self.next_token.checked_add(1).ok_or(overflow.clone())?;
             let Ok(ticket) = frame.commit(Commit {
@@ -694,6 +783,12 @@ impl Outbound {
                 track.staged.push_back((ticket, next));
                 track.waiting = false;
             }
+            // The bytes are in TX storage (NT-2). Only a first send is
+            // recorded: what a reset rewinds and sends again lies below the
+            // boundary.
+            if let (Some(traced), Some(hook)) = (traced, hook.as_deref_mut()) {
+                pick_up(&self.picked, &mut self.traced, lane, traced, next, hook);
+            }
             self.counters.bump(
                 if record {
                     |c| &mut c.records
@@ -705,6 +800,43 @@ impl Outbound {
             staged = staged.checked_add(1).ok_or(overflow.clone())?;
         }
         Ok(staged)
+    }
+}
+
+/// Records the `SenderPickup` of each frame in `picked` from the datagram
+/// of `lane` that ends at `next`, and moves the lane's pickup boundary in
+/// `traced_lanes`.
+pub(super) fn pick_up(
+    picked: &[(TraceExtension, u64)],
+    traced_lanes: &mut [Option<TracedLane>; 4],
+    lane: usize,
+    traced: TracedLane,
+    next: u64,
+    hook: &mut dyn NetworkTraceHook,
+) {
+    let Some(lane_id) = u8::try_from(lane)
+        .ok()
+        .and_then(|lane| Lane::try_new(lane).ok())
+    else {
+        return;
+    };
+    for (ext, position) in picked {
+        if *position < traced.boundary {
+            continue;
+        }
+        hook.on_sender_pickup(
+            ext,
+            &NetPickup {
+                publication: traced.publication,
+                lane: lane_id,
+                position: *position,
+                path: 0,
+                attempt: 0,
+            },
+        );
+    }
+    if let Some(Some(slot)) = traced_lanes.get_mut(lane) {
+        slot.boundary = slot.boundary.max(next);
     }
 }
 
