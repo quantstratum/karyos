@@ -94,12 +94,22 @@ pub(crate) mod sealed {
         where
             Self: StreamTerms;
 
-        /// Exposes an installed image's heap lanes as an aggregate; `None`
+        /// An image lane for `config` at generation 0 from `source`
+        /// (network-shared-terms N-2): on the heap, or in a new region of
+        /// the driver's admission.
+        fn image_lane(
+            source: &mut crate::agents::images::LaneSource<'_>,
+            config: LogBufferConfig,
+        ) -> Result<LogBuffer<Self>, DriverError>
+        where
+            Self: StreamTerms;
+
+        /// Exposes an installed image's lanes as an aggregate; `None`
         /// where streams are not heap backed (D3: network streams over heap
         /// terms only, SPEC §18).
         fn expose_image(
             driver: &mut EmbeddedDriver<Self>,
-            lanes: &[std::sync::Arc<LogBuffer>],
+            lanes: &[std::sync::Arc<LogBuffer<Self>>],
         ) -> Option<crate::embedded::AggregateHandle>
         where
             Self: StreamTerms;
@@ -139,9 +149,16 @@ pub(crate) mod sealed {
             None
         }
 
+        fn image_lane(
+            _source: &mut crate::agents::images::LaneSource<'_>,
+            config: LogBufferConfig,
+        ) -> Result<LogBuffer<Self>, DriverError> {
+            Ok(LogBuffer::new(config)?)
+        }
+
         fn expose_image(
             driver: &mut EmbeddedDriver<Self>,
-            lanes: &[std::sync::Arc<LogBuffer>],
+            lanes: &[std::sync::Arc<LogBuffer<Self>>],
         ) -> Option<crate::embedded::AggregateHandle> {
             driver.add_image_aggregate(lanes)
         }
@@ -182,9 +199,23 @@ pub(crate) mod sealed {
             buffer.region()
         }
 
+        fn image_lane(
+            source: &mut crate::agents::images::LaneSource<'_>,
+            config: LogBufferConfig,
+        ) -> Result<LogBuffer<Self>, DriverError> {
+            // An IPC driver always lends its admission's region ids.
+            let (instance, region) = source.next_region().ok_or(DriverError::InvalidConfig)??;
+            Ok(LogBuffer::create_in(
+                instance,
+                region,
+                config,
+                Generation::default(),
+            )?)
+        }
+
         fn expose_image(
             _driver: &mut EmbeddedDriver<Self>,
-            _lanes: &[std::sync::Arc<LogBuffer>],
+            _lanes: &[std::sync::Arc<LogBuffer<Self>>],
         ) -> Option<crate::embedded::AggregateHandle> {
             None
         }
@@ -329,7 +360,12 @@ pub struct DriverConfig {
     /// karyos/design/driver-network-agents.md`); `None`, the default, for
     /// a driver without network channels. In
     /// [`crate::agents::ThreadingMode::Shared`] the duty cycle drives them
-    /// with the driver clock, which must then count nanoseconds.
+    /// with the driver clock, which must then count nanoseconds. An IPC
+    /// driver creates each image lane in a shared region that holds a
+    /// descriptor, so its start checks `RLIMIT_NOFILE` against its bounds
+    /// (`max_images` times four lanes, plus `max_streams` times one more
+    /// than `max_retained_generations`, plus two per client) and fails
+    /// with [`DriverError::DescriptorLimit`] below them.
     pub network: Option<crate::net::NetworkConfig>,
 }
 
@@ -905,7 +941,7 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     #[cfg(test)]
     pub(crate) guard_lane_fault: Option<usize>,
     /// The network agents and their tables, when configured.
-    pub(crate) net: Option<crate::net::Network>,
+    pub(crate) net: Option<crate::net::Network<T>>,
     /// What clients created by channel URI, owned by their registrations
     /// (W5b): at most `NetworkConfig::max_owned_per_client` per client,
     /// preallocated for every client.
@@ -1089,7 +1125,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         clock: Box<dyn MonotonicClock>,
         #[cfg(target_os = "linux")] ipc: Option<crate::admission::IpcConfig>,
         #[cfg(not(target_os = "linux"))] ipc: Option<core::convert::Infallible>,
-    ) -> Result<Self, DriverError> {
+    ) -> Result<Self, DriverError>
+    where
+        T: 'static,
+    {
         let needed = RESPONSE_EXTENT
             .checked_mul(2)
             .and_then(|n| n.checked_mul(config.command_budget))
@@ -1141,6 +1180,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         #[cfg(target_os = "linux")]
         let (broadcast, counters, client_counters, admission, diagnostics, mirror) = match ipc {
             Some(ipc) => {
+                // Fail fast: the image lanes of a network are regions too.
+                if let Some(network) = &config.network {
+                    crate::admission::check_descriptors(
+                        crate::admission::descriptors_needed(&config, network),
+                        karyos_sys::ipc::descriptor_limit(),
+                    )?;
+                }
                 let instance = crate::admission::instance_of(driver_id);
                 let mut admission = crate::admission::Admission::new(ipc, instance)?;
                 let broadcast = BroadcastTransmitter::create_in(
@@ -3282,7 +3328,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = &mut self.net else {
             return (0, None);
         };
-        let served = match net.duty() {
+        // The image table builds lanes from the admission's region ids, a
+        // sibling field lent for this duty (network-shared-terms N-2).
+        #[cfg(target_os = "linux")]
+        let mut lanes = lane_source(self.admission.as_mut());
+        #[cfg(not(target_os = "linux"))]
+        let mut lanes = crate::agents::images::LaneSource::heap();
+        let served = match net.duty(&mut lanes) {
             Ok(work) => (work, None),
             Err(error) => (0, Some(error)),
         };
@@ -3605,8 +3657,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// the driver does the same, then joins any agent thread that did not
     /// stop in time (blocking: such a thread exits once its rings are
     /// gone), so none is ever detached.
-    pub fn close_network(&mut self) -> Option<crate::net::NetworkShutdown> {
-        let mut shutdown = self.net.as_mut()?.close();
+    pub fn close_network(&mut self) -> Option<crate::net::NetworkShutdown<T>> {
+        let net = self.net.as_mut()?;
+        #[cfg(target_os = "linux")]
+        let mut lanes = lane_source(self.admission.as_mut());
+        #[cfg(not(target_os = "linux"))]
+        let mut lanes = crate::agents::images::LaneSource::heap();
+        let mut shutdown = net.close(&mut lanes);
         // The closed network released every tracked guard sender: none of
         // them stays in a close acknowledgement.
         shutdown.guard_senders_released = self.deregister_released_guards();
@@ -3640,6 +3697,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     pub(crate) fn clock_now(&mut self) -> u64 {
         self.clock.now()
     }
+}
+
+/// Where the image table builds lanes: new regions of an IPC driver's
+/// admission, or the heap without one.
+#[cfg(target_os = "linux")]
+fn lane_source<T: StreamTerms>(
+    admission: Option<&mut crate::admission::Admission<T>>,
+) -> crate::agents::images::LaneSource<'_> {
+    admission.map_or_else(crate::agents::images::LaneSource::heap, |admission| {
+        crate::agents::images::LaneSource::regions(admission.region_ids())
+    })
 }
 
 /// The trace mirror of a driver without IPC, on the heap.

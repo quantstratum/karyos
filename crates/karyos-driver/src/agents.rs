@@ -1638,7 +1638,9 @@ impl<O: SocketOps + Send + 'static, T: StreamTerms + 'static> AgentRunner<O, T> 
             stop_timeout: config.stop_timeout,
         })
     }
+}
 
+impl<O: SocketOps, T: StreamTerms> AgentRunner<O, T> {
     /// The agents whose thread failed (an error or a panic) so far.
     #[must_use]
     pub fn failed(&self) -> Vec<AgentKind> {

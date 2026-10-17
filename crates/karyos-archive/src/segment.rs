@@ -45,16 +45,13 @@
 //! A gap in the stream is not the store's: appends are contiguous, and
 //! the recorder (A4) records a gap as its own record.
 
-pub mod disk;
-#[cfg(test)]
-mod fault;
 #[cfg(test)]
 mod tests;
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub use disk::{Disk, StdDisk};
+pub use crate::disk::{Disk, StdDisk};
 
 use crate::crc32c::crc32c;
 
