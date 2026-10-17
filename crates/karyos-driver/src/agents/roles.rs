@@ -210,7 +210,10 @@ pub struct ReceiverCounters {
     /// DATA datagrams from no binding: dropped.
     pub data_unbound: u64,
     /// DATA datagrams of a multi-path image that a full path queue dropped
-    /// (redundant-paths.md section 5): that path's copy only.
+    /// (redundant-paths.md section 5): that path's copy only. It also
+    /// counts one longer than a queue buffer (`MAX_DATAGRAM`), which no
+    /// endpoint delivers; it is dropped rather than delivered past its
+    /// path's queued datagrams.
     pub path_queue_drops: u64,
     /// DATA datagrams of a multi-path image delivered at once, past the
     /// path queues, for lack of a free queue.
