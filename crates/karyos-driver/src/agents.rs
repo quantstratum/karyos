@@ -207,8 +207,8 @@ pub struct AgentConfig {
     /// binds a later path of an image (8 MiB by default), at most
     /// [`MAX_PATH_QUEUE_BYTES`]; a single-path receiver allocates none.
     /// At least `rx_datagrams` (the defaults: 256 and 64), one poll never
-    /// fills a queue, since every queue is drained after each poll; a
-    /// smaller queue drops a poll's excess.
+    /// fills a queue, since every queue is drained after each cycle's
+    /// polls; a smaller queue drops a poll's excess.
     pub path_queue_datagrams: u16,
     /// Subscribed streams and published aliases the receiver tracks, each
     /// at least 1.
