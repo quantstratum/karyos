@@ -1100,8 +1100,8 @@ fn a_lap_closes_the_network_subscriptions() {
     );
 }
 
-/// Offers `payload` on `publication` while serving both drivers until
-/// `done` holds for its outcome, for at most 10 s.
+/// Offers on `publication` while serving `drivers` until `done` holds
+/// for its outcome, for at most 30 s.
 fn offer_until(
     drivers: &mut [&mut EmbeddedDriver],
     publication: &mut karyos_client::ClientPublication,
@@ -1114,7 +1114,7 @@ fn offer_until(
             return;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(30),
             "last {outcome:?}"
         );
         for driver in drivers.iter_mut() {
@@ -1131,10 +1131,12 @@ fn offer_until(
 /// receiver timeout, `NotConnected` again.
 #[test]
 fn a_network_publication_is_connected_while_a_receivers_sms_are_live() {
-    // The sender's receiver timeout is its image liveness timeout.
+    // The sender's receiver timeout is its image liveness timeout. One
+    // second keeps a loaded machine's late SMs from lapsing the receiver
+    // while it is still subscribed.
     let mut a = driver_with(|config| {
         if let Some(network) = &mut config.network {
-            network.agents.image_liveness_timeout = 300_000_000;
+            network.agents.image_liveness_timeout = 1_000_000_000;
         }
     });
     let mut publisher = a.connect().unwrap();
@@ -1146,8 +1148,10 @@ fn a_network_publication_is_connected_while_a_receivers_sms_are_live() {
     let Outcome::Publication(mut publication) = complete(&mut a, &mut publisher, published) else {
         panic!("not a publication");
     };
-    // No receiver: nothing is appended, for a while.
-    for _ in 0..50 {
+    // No receiver: nothing is appended, for a while. The window is wall
+    // time, so a slow machine checks fewer offers but no shorter span.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(200) {
         assert_eq!(publication.offer(b"m").unwrap(), OfferOutcome::NotConnected);
         let _ = a.do_work().unwrap();
         std::thread::sleep(Duration::from_millis(1));

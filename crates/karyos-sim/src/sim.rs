@@ -823,11 +823,15 @@ impl<'s> Sim<'s> {
             return Ok(());
         };
         let mut errors = Vec::new();
-        let report = view.poll_changed_with(budget, |key, version, bytes| {
-            if let Err(error) = oracle.value(record, key, version, bytes) {
+        let polled = view.poll_changed_with(budget, |key, value| {
+            if let Err(error) = oracle.value(record, key, value.version(), value.payload()) {
                 errors.push(error);
             }
         });
+        let report = match polled {
+            Ok(report) => report,
+            Err(error) => return Err(self.failure(format!("conflated view {id}: {error}"))),
+        };
         if let Some(error) = errors.into_iter().next() {
             return Err(self.failure(format!("conflated view {id}: {error}")));
         }

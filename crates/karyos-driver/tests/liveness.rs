@@ -400,10 +400,10 @@ fn test_abort_seal_closes_conflation_table_after_feeder_reaches_end() {
     let (_client, _subscription) = lost_required_subscriber(&mut driver, &clock);
     assert_ne!(driver.seal_state(stream).unwrap(), SealState::Active);
 
-    let mut report = conflated.poll_changed(|_, _| {});
+    let mut report = conflated.poll_changed(|_, _| {}).unwrap();
     for _ in 0..8 {
         let _ = driver.do_work().unwrap();
-        report = conflated.poll_changed(|_, _| {});
+        report = conflated.poll_changed(|_, _| {}).unwrap();
         if report.closed {
             break;
         }
