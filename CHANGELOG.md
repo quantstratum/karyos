@@ -11,6 +11,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The Archive's control messages, version 1, written by hand (phase 3,
+  A1; ADR-0036). `karyos-codec` becomes the runtime of the minimum v1
+  schema: checked little-endian reads and writes, a 12-byte envelope
+  (schema, template, version, block length, message length written
+  last), top-level groups, bounded bytes and UTF-8, and a typed
+  `CodecError`; it drops its unused dependency on `karyos-protocol`.
+  `karyos_archive::control` holds the five requests and three responses
+  of schema 1, validated whole on decode and encoded into the caller's
+  buffer without allocating; an encoding that fails leaves no message
+  in the buffer, not even an earlier one.
 - The driver hands an Archive recording a lane's reader (phase 3,
   A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
   reserved required or an optional cell and returns a `RecordingReader`:

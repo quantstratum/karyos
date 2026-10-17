@@ -282,9 +282,6 @@ dependencies = [
 [[package]]
 name = "karyos-codec"
 version = "0.1.0-alpha.1"
-dependencies = [
- "karyos-protocol",
-]
 
 [[package]]
 name = "karyos-driver"
