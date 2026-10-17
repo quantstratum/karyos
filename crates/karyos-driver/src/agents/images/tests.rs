@@ -4271,7 +4271,7 @@ fn an_overloaded_cycle_keeps_every_per_cycle_bound() {
 /// reaches one image, bound on both paths, every message once.
 #[test]
 fn a_routed_publication_reaches_its_image_on_both_paths() {
-    use karyos_sys::log_buffer::AppendOptions;
+    use karyos_sys::log_buffer::{AppendOptions, Role};
 
     let setup = Setup {
         reliable: true,
@@ -4280,13 +4280,16 @@ fn a_routed_publication_reaches_its_image_on_both_paths() {
     let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
     let slot = established(&mut rig);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let mut reader = image_subscriber(&rig, slot, 0, Role::Optional);
     for i in 0..4u8 {
         let log = rig.log.as_mut().unwrap();
         let _ = log.publications[0]
             .append(&[i; 900], AppendOptions::default())
             .unwrap();
     }
-    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    // Each message arrives on both paths: the subscriber reads it once.
+    assert_eq!(read_messages(&mut rig, &mut reader, 4), [0, 1, 2, 3]);
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 2);
 }
 
 /// The image's conductor and lane 0 subscriber, kept by a test.
@@ -4373,6 +4376,64 @@ fn an_abandoned_copy_is_repaired_on_a_reliable_channel() {
     assert!(counters.repaired >= 1, "{counters:?}");
     assert!(rig.agents.sender.role.counters().naks >= 1);
     assert!(rig.agents.sender.role.counters().repairs >= 1);
+}
+
+/// rp-w6, RP-11, end to end: a datagram lost on both paths is NAKed on
+/// both paths; the sender absorbs the second copy, repairs once,
+/// on both paths, and the subscriber reads every message once, in order.
+#[test]
+fn a_repair_goes_on_both_paths_and_a_nak_copy_is_absorbed() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let append = |rig: &mut Rig, byte: u8| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[byte; 900], AppendOptions::default())
+            .unwrap();
+    };
+    append(&mut rig, 0);
+    rig.round(true);
+    // Both copies of the next datagram are lost.
+    rig.agents.receiver.role.drop_data(&[0, 1]);
+    for byte in 1..5 {
+        append(&mut rig, byte);
+    }
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() >= 5 {
+            break;
+        }
+    }
+    for _ in 0..50 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+    }
+    assert_eq!(seen, [0, 1, 2, 3, 4]);
+    let sender = rig.agents.sender.role.counters();
+    assert!(sender.nak_copies_absorbed >= 1, "{sender:?}");
+    // Absorbed copies are not NAKs admitted, nor budget drops.
+    assert_eq!(sender.nak_cycle_budget, 0, "{sender:?}");
+    assert!(sender.naks >= 1, "{sender:?}");
+    let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
+    let (a, b) = (
+        outbound.repair_route_counts(0).unwrap(),
+        outbound.repair_route_counts(1).unwrap(),
+    );
+    assert!(a.submitted >= 1 && b.submitted >= 1, "{a:?} {b:?}");
 }
 
 /// #16835, unreliable: the receiver's gap policy seals the gap the
