@@ -502,6 +502,27 @@ fn interrupted_and_peer_errors_keep_the_lane_eligible() {
     assert_eq!(report.failure, None);
 }
 
+/// `cancel` returns a lane's staged items, the one the kernel refused
+/// first included, through the gate as `Returned`, in order, and leaves
+/// the other lanes' items staged.
+#[test]
+fn cancel_returns_a_lanes_staged_items_through_the_gate() {
+    let mut f = Fixture::new(&[100, 100], 100);
+    let first = f.stage(0, 50, 64);
+    let second = f.stage(0, 50, 64);
+    f.stage(1, 50, 64);
+    // Unscripted: the kernel refuses the first offer (would block).
+    let mut gate = Gate::default();
+    let _ = f.serve(&mut gate, 1000);
+    assert_eq!(f.sender.pending(0), Some(2));
+    f.sender.cancel(&mut f.tx, 0, &mut gate).unwrap();
+    assert_eq!(f.sender.pending(0), Some(0));
+    assert_eq!(gate.left, [0, 2, 0]);
+    assert_eq!(gate.last_left, Some((0, second, Left::Returned)));
+    assert_ne!(first, second);
+    assert_eq!(f.sender.pending(1), Some(1), "another lane is untouched");
+}
+
 /// `ENOBUFS` is backpressure, as `EAGAIN`.
 #[test]
 fn no_buffers_is_backpressure() {

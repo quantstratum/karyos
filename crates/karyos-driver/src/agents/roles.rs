@@ -3308,13 +3308,14 @@ impl SenderRole {
         &mut self,
         command: AgentCommand<O>,
     ) -> Option<(Reservation, AgentEvent<O>)> {
-        let (reply, publication, outbound) =
+        let (reply, publication, outbound, guard) =
             match command {
                 AgentCommand::AddPublication {
                     reply,
                     publication,
                     outbound,
-                } => (reply, publication, outbound),
+                    guard,
+                } => (reply, publication, outbound, guard),
                 AgentCommand::RemovePublication {
                     reply,
                     endpoint,
@@ -3379,7 +3380,9 @@ impl SenderRole {
                             publication.identity,
                         )
                         .is_ok();
-                if repairs {
+                // A guarded publication's gate decides every exposure.
+                let guarded = guard.is_none_or(|spec| outbound.guard(spec, (self.clock)()).is_ok());
+                if repairs && guarded {
                     self.sessions.add(publication)
                 } else {
                     Err(SendSessionError::InvalidConfig)
@@ -3648,6 +3651,11 @@ impl SenderRole {
             };
             let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
             if !self.sessions.is_established(endpoint, alias) {
+                // Not served yet, but a guard close still applies (the
+                // close acknowledgement waits for it).
+                if let Some(outbound) = self.publications.get_mut(index) {
+                    outbound.guard_tick(now);
+                }
                 continue;
             }
             let consumption = self.consumption(endpoint, alias);
@@ -3655,7 +3663,15 @@ impl SenderRole {
                 Half::Tx(tx) if *held == endpoint => Some(tx),
                 _ => None,
             });
-            let (Some(tx), Some(outbound)) = (tx, self.publications.get_mut(index)) else {
+            let Some(tx) = tx else {
+                // No TX half this cycle (its endpoint is being reset): a
+                // guard close still applies.
+                if let Some(outbound) = self.publications.get_mut(index) {
+                    outbound.guard_tick(now);
+                }
+                continue;
+            };
+            let Some(outbound) = self.publications.get_mut(index) else {
                 continue;
             };
             let lanes = outbound.readers().len();
