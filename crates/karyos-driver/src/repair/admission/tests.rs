@@ -271,3 +271,66 @@ fn errs_linger_per_range() {
     let counts = admission.counts();
     assert_eq!((counts.err_linger, counts.err_table_full), (2, 1));
 }
+
+/// The floor is inclusive: a NAK starting at it passes; one straddling it
+/// within the NAK bound is RANGE_UNAVAILABLE with the floor (step 4 alone).
+#[test]
+fn the_floor_is_the_lowest_retained_byte() {
+    let mut admission = admission();
+    let joined = NakContext {
+        requester: Requester::Joined { join: 0 },
+        ..ctx()
+    };
+    assert!(matches!(
+        admission.admit(&nak(1, 0, 512, 64), &joined, 0),
+        Admitted::Pass(_)
+    ));
+    assert_eq!(
+        reason(admission.admit(&nak(1, 0, 480, 64), &joined, 0)),
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: 512
+        }
+    );
+}
+
+/// Step 3 before step 4: a range leaving its term is RANGE_INVALID even
+/// when it also starts below the floor.
+#[test]
+fn the_term_bound_comes_before_the_floor() {
+    let mut admission = admission();
+    let term = u64::from(TERM);
+    let high_floor = NakContext {
+        requester: Requester::Joined { join: 0 },
+        floor: term - 16,
+        nak_bound: u64::MAX,
+        ..ctx()
+    };
+    assert_eq!(
+        reason(admission.admit(&nak(1, 0, term - 32, 64), &high_floor, 0)),
+        NakReplyReason::RangeInvalid
+    );
+    assert_eq!(admission.counts().range_unavailable, 0);
+}
+
+/// Step 2 before step 3: a member's NAK beyond its window is dropped
+/// silently even when it also leaves its term (RC-10).
+#[test]
+fn the_window_comes_before_the_term_bound() {
+    let mut admission = admission();
+    let term = u64::from(TERM);
+    let member = NakContext {
+        requester: Requester::Member {
+            join: 0,
+            consumption: term - 64,
+            window: 32,
+        },
+        floor: 0,
+        nak_bound: u64::MAX,
+        ..ctx()
+    };
+    assert_eq!(
+        admission.admit(&nak(1, 0, term - 32, 64), &member, 0),
+        Admitted::Dropped(Dropped::BeyondWindow)
+    );
+    assert_eq!(admission.counts().range_invalid, 0);
+}

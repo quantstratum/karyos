@@ -630,7 +630,7 @@ fn a_required_loss_holds_the_incarnation() {
         StatusRejected::Lost
     );
     assert_eq!(
-        table.expect(&path(receiver(2, 1), 1), TIMEOUT + SECOND),
+        table.expect(&path(receiver(2, 1), 1), &[0], TIMEOUT + SECOND),
         Err(StatusRejected::Lost)
     );
     assert_eq!(
@@ -655,9 +655,9 @@ fn a_required_member_that_never_joins_is_reported_once() {
             tags: &[],
         },
     );
-    let pending = table.expect(&path(receiver(2, 1), 1), 0).unwrap();
+    let pending = table.expect(&path(receiver(2, 1), 1), &[0], 0).unwrap();
     assert_eq!(
-        table.expect(&path(receiver(2, 1), 1), SECOND),
+        table.expect(&path(receiver(2, 1), 1), &[0], SECOND),
         Ok(pending),
         "no extension"
     );
@@ -692,9 +692,9 @@ fn a_full_table_refuses_without_evicting() {
             tags: &[],
         },
     );
-    table.expect(&path(receiver(1, 1), 1), 0).unwrap();
+    table.expect(&path(receiver(1, 1), 1), &[0], 0).unwrap();
     assert_eq!(
-        table.expect(&path(receiver(2, 1), 1), 0),
+        table.expect(&path(receiver(2, 1), 1), &[0], 0),
         Err(StatusRejected::PendingFull)
     );
     accepted(status(&mut table, &sm(2, &[(0, 100)]), 0));
@@ -844,7 +844,7 @@ fn only_the_last_gone_binding_removes_a_member() {
     let counts = *table.counters();
     assert_eq!((counts.bindings_gone, counts.unbound), (3, 2));
     // An expected entry that loses its only binding is removed.
-    let pending = table.expect(&path(receiver(3, 1), 1), 0).unwrap();
+    let pending = table.expect(&path(receiver(3, 1), 1), &[0], 0).unwrap();
     assert_eq!(
         table.binding_gone(&path(receiver(3, 1), 1), 0),
         Gone::Removed
@@ -908,7 +908,9 @@ fn a_tombstone_lifts_on_silence_expect_or_need() {
     assert_eq!(table.counters().tombstones_cleared, 1);
     // A new expect lifts it.
     table.timers(4 * TIMEOUT, 64);
-    table.expect(&path(receiver(1, 1), 1), 4 * TIMEOUT).unwrap();
+    table
+        .expect(&path(receiver(1, 1), 1), &[0], 4 * TIMEOUT)
+        .unwrap();
     let (_, joined, _) = accepted(status(&mut table, &sm(1, &[(50, 100)]), 4 * TIMEOUT));
     assert!(joined);
     // Caught up: fresh against the tombstone.
@@ -919,7 +921,9 @@ fn a_tombstone_lifts_on_silence_expect_or_need() {
     // establishment takes the tombstone's slot.
     table.timers(6 * TIMEOUT, 64);
     accepted(status(&mut table, &sm(2, &[(0, 100)]), 6 * TIMEOUT));
-    table.expect(&path(receiver(3, 1), 1), 6 * TIMEOUT).unwrap();
+    table
+        .expect(&path(receiver(3, 1), 1), &[0], 6 * TIMEOUT)
+        .unwrap();
     accepted(status(&mut table, &sm(3, &[(0, 100)]), 6 * TIMEOUT));
     assert_eq!(table.counters().tombstones_cleared, 2);
 }
@@ -960,7 +964,7 @@ fn only_an_establishment_takes_another_tombstone() {
     // Its establishment may: it takes the free slot, and the required
     // receiver then takes the oldest tombstone, receiver 1's.
     table
-        .expect(&path(receiver(4, 1), 1), TIMEOUT + MS)
+        .expect(&path(receiver(4, 1), 1), &[0], TIMEOUT + MS)
         .unwrap();
     accepted(status(&mut table, &sm(4, &[(0, 100)]), TIMEOUT + MS));
     accepted(status(&mut table, &sm(9, &[(0, 100)]), TIMEOUT + MS));
@@ -996,9 +1000,11 @@ fn a_refused_expect_keeps_the_tombstone() {
     assert!(table.advance_sent(lane(0), 1000));
     accepted(status(&mut table, &sm(1, &[(10, 100)]), 0));
     table.timers(TIMEOUT, 64);
-    table.expect(&path(receiver(2, 1), 1), TIMEOUT).unwrap();
+    table
+        .expect(&path(receiver(2, 1), 1), &[0], TIMEOUT)
+        .unwrap();
     assert_eq!(
-        table.expect(&path(receiver(1, 1), 1), TIMEOUT),
+        table.expect(&path(receiver(1, 1), 1), &[0], TIMEOUT),
         Err(StatusRejected::PendingFull)
     );
     assert_eq!(
@@ -1169,25 +1175,73 @@ fn limits_match_the_reference_model() {
     }
 }
 
-/// R4 step 2 reads a live member's join, consumption and window; nothing
-/// for an expired member, an unknown receiver or a lane outside.
+/// R4 step 2: a live member's join, consumption and window; an expected
+/// entry's answered join before its first SM, kept at the join; nothing
+/// for an expired member, an unknown receiver or a lane outside; a rejoin
+/// starts a new join point.
 #[test]
-fn a_requester_window_is_a_live_members() {
+fn a_requester_is_what_a_nak_is_checked_against() {
     let mut table = table(config(2), &Roles::default());
     accepted(status(&mut table, &sm(1, &[(100, 200), (5, 300)]), 0));
     accepted(status(&mut table, &sm(1, &[(150, 200), (9, 300)]), MS));
     assert_eq!(
-        table.requester_window(receiver(1, 1), lane(0), MS),
-        Some((100, 150, 200))
+        table.requester(receiver(1, 1), lane(0), MS),
+        Requester::Member {
+            join: 100,
+            consumption: 150,
+            window: 200
+        }
     );
     assert_eq!(
-        table.requester_window(receiver(1, 1), lane(1), MS),
-        Some((5, 9, 300))
+        table.requester(receiver(1, 1), lane(1), MS),
+        Requester::Member {
+            join: 5,
+            consumption: 9,
+            window: 300
+        }
     );
-    assert_eq!(table.requester_window(receiver(1, 1), lane(2), MS), None);
-    assert_eq!(table.requester_window(receiver(2, 1), lane(0), MS), None);
     assert_eq!(
-        table.requester_window(receiver(1, 1), lane(0), MS + TIMEOUT),
-        None
+        table.requester(receiver(1, 1), lane(2), MS),
+        Requester::Unknown
+    );
+    assert_eq!(
+        table.requester(receiver(2, 1), lane(0), MS),
+        Requester::Unknown
+    );
+    // Expected with its answered joins, kept when its first SM is higher.
+    table
+        .expect(&path(receiver(2, 1), 1), &[40, 7], MS)
+        .unwrap();
+    assert_eq!(
+        table.requester(receiver(2, 1), lane(0), MS),
+        Requester::Joined { join: 40 }
+    );
+    accepted(status(&mut table, &sm(2, &[(60, 200), (8, 300)]), MS));
+    assert_eq!(
+        table.requester(receiver(2, 1), lane(1), MS),
+        Requester::Member {
+            join: 7,
+            consumption: 8,
+            window: 300
+        }
+    );
+    // Expired: unknown. A rejoin, fresh against the tombstone, joins anew.
+    assert_eq!(
+        table.requester(receiver(1, 1), lane(0), MS + TIMEOUT),
+        Requester::Unknown
+    );
+    table.timers(MS + TIMEOUT, 64);
+    accepted(status(
+        &mut table,
+        &sm(1, &[(400, 200), (9, 300)]),
+        MS + TIMEOUT,
+    ));
+    assert_eq!(
+        table.requester(receiver(1, 1), lane(0), MS + TIMEOUT),
+        Requester::Member {
+            join: 400,
+            consumption: 400,
+            window: 200
+        }
     );
 }

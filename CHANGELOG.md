@@ -253,8 +253,10 @@ release may break APIs, wire formats and shared-memory layouts.
   the floor answers `RANGE_UNAVAILABLE` with the floor, before the
   frontier check. At most one ERR goes per receiver, lane and range
   within `nak_reply_linger`, from a bounded table. A passing NAK is a
-  `Request` for the job table (R5). `Membership::requester_window` gives
-  a live member's join point, consumption and window.
+  `Request` for the job table (R5). `Membership::requester` gives what a
+  NAK is checked against: a live member's join point, consumption and
+  window, or an expected entry's answered join point before its first SM
+  (`expect` now takes the answer's joins).
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly

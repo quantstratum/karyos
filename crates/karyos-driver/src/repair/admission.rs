@@ -294,8 +294,16 @@ impl Admission {
     }
 
     /// The ERR for a request the job table later refused at its start
-    /// boundary (step 8), under the same linger.
+    /// boundary (step 8), under the same linger. A `RANGE_UNAVAILABLE`
+    /// names a lowest retained position above the request's start
+    /// (schemas 4.5).
     pub fn reply_to(&mut self, nak: &Nak, reason: NakReplyReason, now: u64) -> Admitted {
+        if let NakReplyReason::RangeUnavailable { lowest_retained } = reason {
+            debug_assert!(
+                lowest_retained > nak.range.start,
+                "RANGE_UNAVAILABLE must name a position above the request"
+            );
+        }
         self.reply(nak, reason, now)
     }
 
