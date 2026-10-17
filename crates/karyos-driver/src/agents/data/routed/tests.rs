@@ -1017,3 +1017,35 @@ fn a_faulted_route_leaves_and_returns_by_retry() {
     assert!(!seen_b.lock().unwrap().is_empty());
     assert!(!outbound.needs_reset());
 }
+
+/// RP-8: room is judged after the cycle's flushes, so a path whose socket
+/// takes everything never looks full, however the backend orders its
+/// queues: across many cycles it skips nothing and never leaves.
+#[test]
+fn a_healthy_path_never_looks_full() {
+    let (a, observer_a, seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 0);
+    sent(&observer_a, 256);
+    sent(&observer_b, 256);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    // Within one term of the test log (no conductor rotates it here).
+    for round in 0..4u8 {
+        commit(&mut log, round * 6, 6);
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, 1000 + u64::from(round))
+            .unwrap();
+    }
+    for _ in 0..8 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, 2000)
+            .unwrap();
+    }
+    let sender = outbound.routed_sender().unwrap();
+    assert_eq!(sender.counters(0).unwrap().skipped, 0);
+    assert_eq!(sender.counters(1).unwrap().skipped, 0);
+    assert_eq!(outbound.path_state(1), Some((true, false)));
+    assert_eq!(seen_a.lock().unwrap().len(), 24);
+    assert_eq!(seen_b.lock().unwrap().len(), 24);
+}
