@@ -1631,9 +1631,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Frees retiring streams with no live lease and no registration.
+    /// A network publication's lanes stay while its removal lingers: its
+    /// sender still reads them to their seals and serves repair from them,
+    /// with no lease (driver-network-agents.md §7). A stopped or failed
+    /// network holds nothing, so they free with no linger.
     pub(crate) fn free_retired_streams(&mut self) {
         let registrations = &self.registrations;
         let clients = &self.clients;
+        let net = self.net.as_ref();
         // A remote grant keeps its stream until it ends, even after its
         // registration was removed.
         let freed: Vec<Stream<T>> = self
@@ -1641,6 +1646,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .extract_if(.., |stream| {
                 stream.retiring
                     && stream.leases.live() == 0
+                    && !net.is_some_and(|net| net.holds_publication(stream.aggregate.registration))
                     && !registrations
                         .iter()
                         .any(|registration| registration.stream() == stream.id)

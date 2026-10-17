@@ -207,6 +207,9 @@ pub struct ReceiverCounters {
     pub eos_refused: u64,
     /// DATA frames past their lane's terminal bound: dropped.
     pub data_past_terminal: u64,
+    /// Heartbeats naming a position past their lane's terminal bound: the
+    /// sender moved past its EOS. Classified at the bound.
+    pub heartbeats_past_terminal: u64,
     /// DATA datagrams from no binding: dropped.
     pub data_unbound: u64,
     /// DATA datagrams that failed validation for their image: dropped.
@@ -341,6 +344,20 @@ pub struct ReceiverCounters {
 pub struct SenderCounters {
     /// Controls sent.
     pub sent: u64,
+    /// EOS frames a removed publication's lanes submitted at their seals
+    /// (driver-network-agents.md §7), repeats included.
+    pub eos_sent: u64,
+    /// Removals with a lane not drained to its seal by the drain bound,
+    /// `max(publication_linger, path_heartbeat_interval)` after the
+    /// removal's start: the lane sent no EOS and the session was reported
+    /// drained anyway. A lane its closed guard stopped is not counted here.
+    pub removals_undrained: u64,
+    /// Removals with a guarded lane whose guard closed: it sent no EOS
+    /// (GC-6), whether it drained or was given up at the drain bound.
+    pub removals_guard_closed: u64,
+    /// Removals with no established receiver: ended at once, with no
+    /// linger, since nobody would read their EOS.
+    pub removals_unestablished: u64,
     /// Controls not sent (encoding, route, queue or kernel).
     pub send_failures: u64,
     /// Controls for an endpoint whose TX half the sender does not hold.
@@ -1803,7 +1820,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 }
                 Some((reply, configured(found.is_some())))
             }
-            AgentCommand::RemovePublication { reply, .. } => Some((
+            AgentCommand::RemovePublication { reply, .. }
+            | AgentCommand::RemoveSenderSession { reply, .. } => Some((
                 reply,
                 AgentEvent::Unsupported {
                     agent: AgentKind::Receiver,
@@ -3798,6 +3816,13 @@ impl<T: StreamTerms> Intake<'_, T> {
                     if refused {
                         (6, None)
                     } else {
+                        if let (Some(bound), Some(position)) = (
+                            terminal_bound(image, heartbeat.lane()),
+                            heartbeat_position(image, &heartbeat),
+                        ) && position > bound
+                        {
+                            tally(&mut role.counters, |c| &mut c.heartbeats_past_terminal);
+                        }
                         match classify_heartbeat(image, &heartbeat) {
                             HeartbeatClass::Fresh => (3, None),
                             HeartbeatClass::Stale => (4, None),
@@ -4249,6 +4274,18 @@ impl<T: StreamTerms> SenderRole<T> {
                     endpoint,
                     alias,
                     registration,
+                    linger,
+                } => {
+                    return Some((
+                        reply,
+                        self.begin_remove(endpoint, alias, registration, linger),
+                    ));
+                }
+                AgentCommand::RemoveSenderSession {
+                    reply,
+                    endpoint,
+                    alias,
+                    registration,
                 } => return Some((reply, self.remove(endpoint, alias, registration))),
                 #[cfg(test)]
                 AgentCommand::ForceReset { endpoint, alias } => {
@@ -4351,6 +4388,58 @@ impl<T: StreamTerms> SenderRole<T> {
             },
         };
         Some((reply, event))
+    }
+
+    /// Starts removing the publication `alias` on `endpoint`
+    /// (driver-network-agents.md §7): it announces no SETUP and admits no
+    /// new receiver ([`SenderRole::route_of`]), while its incarnation,
+    /// bindings, membership and repair stay for the drain and the
+    /// `linger`. A repeated command keeps the first linger.
+    fn begin_remove<O: SocketOps>(
+        &mut self,
+        endpoint: EndpointId,
+        alias: Alias,
+        registration: u64,
+        linger: u64,
+    ) -> AgentEvent<O, T> {
+        let interval = self.path_heartbeat_interval;
+        let outbound = self
+            .publications
+            .iter_mut()
+            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias);
+        let found = outbound.is_some();
+        if let Some(outbound) = outbound {
+            outbound.begin_removal(registration, linger, interval);
+        }
+        AgentEvent::PublicationDraining {
+            endpoint,
+            alias,
+            registration,
+            found,
+        }
+    }
+
+    /// Posts, through `post` (which says whether it was posted), the
+    /// `SenderSessionDrained` of each publication whose linger is over,
+    /// once; one the ring refused is posted again next cycle.
+    pub(super) fn report_drained<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O, T>) -> bool,
+    ) {
+        for outbound in &mut self.publications {
+            let Some(registration) = outbound.drained_unreported() else {
+                continue;
+            };
+            let event = AgentEvent::SenderSessionDrained {
+                endpoint: outbound.endpoint(),
+                alias: outbound.alias(),
+                registration,
+            };
+            if !post(event) {
+                return;
+            }
+            outbound.drained_reported();
+        }
     }
 
     /// Stops the publication `alias` on `endpoint`: its SETUP side, its
@@ -4522,10 +4611,11 @@ impl<T: StreamTerms> SenderRole<T> {
 
     /// The publication's channel destination and join points.
     fn route_of(&self, endpoint: EndpointId, alias: Alias) -> Option<(SocketAddr, Lanes<u64>)> {
-        let outbound = self
-            .publications
-            .iter()
-            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)?;
+        // A removing publication announces nothing and admits no new
+        // receiver (driver-network-agents.md §7).
+        let outbound = self.publications.iter().find(|outbound| {
+            outbound.serves(endpoint) && outbound.alias() == alias && !outbound.removing()
+        })?;
         Some((outbound.destination_on(endpoint)?, outbound.joins()?))
     }
 
@@ -4749,6 +4839,11 @@ impl<T: StreamTerms> SenderRole<T> {
             }
         }
         self.counters.needs_reset = needing_reset;
+        // Removing publications: each lane drained to its seal sends its
+        // EOS, then the linger runs (driver-network-agents.md §7).
+        work = work
+            .checked_add(self.serve_removals(halves, now))
+            .ok_or(overflow.clone())?;
         // A routed publication's paths still idle after the first sends keep
         // their bindings live at the receivers with a PATH_HB, a heartbeat
         // of the control budget (RP-3).
@@ -4756,6 +4851,67 @@ impl<T: StreamTerms> SenderRole<T> {
             .checked_add(self.path_heartbeats(halves, now))
             .ok_or(overflow.clone())?;
         Ok(work)
+    }
+
+    /// The EOS frames and linger of every removing publication at `now`;
+    /// returns the EOS frames submitted. One with no established receiver
+    /// drains nothing and ends at once.
+    fn serve_removals<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+    ) -> u32 {
+        let mut sent = 0u32;
+        for index in 0..self.publications.len() {
+            let Some(outbound) = self.publications.get(index) else {
+                break;
+            };
+            if !outbound.removing() {
+                continue;
+            }
+            if !established(&self.sessions, outbound) {
+                if self
+                    .publications
+                    .get_mut(index)
+                    .is_some_and(|outbound| outbound.drain_now())
+                {
+                    self.count(|c| &mut c.removals_unestablished);
+                }
+                continue;
+            }
+            // TODO(rp-w5a/rp-w5b): a routed publication's EOS goes on every
+            // path through its routed lane sender (data/routed.rs); until
+            // then it lingers without EOS and its receivers fall back to
+            // their liveness timeout.
+            if outbound.is_routed() {
+                if let Some(outbound) = self.publications.get_mut(index) {
+                    outbound.linger_without_eos(now);
+                }
+                continue;
+            }
+            let endpoint = outbound.endpoint();
+            // Without its TX half (an endpoint being reset) the drain bound
+            // still runs: nothing waits for the half to come back.
+            let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                Half::Tx(tx) if *held == endpoint => Some(&mut **tx),
+                _ => None,
+            });
+            let Some(outbound) = self.publications.get_mut(index) else {
+                continue;
+            };
+            let step = outbound.serve_removal(tx, now);
+            sent = sent.checked_add(step.sent).unwrap_or(sent);
+            for _ in 0..step.sent {
+                self.count(|c| &mut c.eos_sent);
+            }
+            if step.gave_up {
+                self.count(|c| &mut c.removals_undrained);
+            }
+            if step.guard_closed {
+                self.count(|c| &mut c.removals_guard_closed);
+            }
+        }
+        sent
     }
 
     /// Asks for the reset of each endpoint a publication needs reset on,

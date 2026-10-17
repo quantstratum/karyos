@@ -308,6 +308,43 @@ fn a_multicast_answer_goes_to_the_group() {
     assert!(matches!(answer, Control::SetupAnswer(_)));
 }
 
+/// driver-network-agents.md §7: a publication being removed admits no new
+/// receiver: a challenge gets no answer and is counted refused, while the
+/// publication keeps its incarnation for the linger.
+#[test]
+fn a_removing_publication_admits_no_new_receiver() {
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let destination: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+    sender.sessions.add(publication(EndpointId(1))).unwrap();
+    let (path, _log) = outbound(EndpointId(1), destination);
+    sender.publications.push(path);
+    let challenge = || {
+        Control::Challenge(karyos_protocol::network::RspChallenge {
+            alias: alias(),
+            identity: identity(),
+            challenge: ChallengeBlock {
+                receiver_boot_id: [7, 8],
+                nonce: [9, 9],
+            },
+        })
+    };
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let draining = sender.begin_remove::<OsSocket>(EndpointId(1), alias(), 1, 0);
+    assert!(matches!(
+        draining,
+        AgentEvent::PublicationDraining { found: true, .. }
+    ));
+    let refused = sender.counters().refused;
+    assert!(
+        sender
+            .answer_for(EndpointId(1), source, 0, challenge())
+            .is_none()
+    );
+    assert_eq!(sender.counters().refused, refused + 1);
+    assert!(sender.sessions.identity(EndpointId(1), alias()).is_some());
+    assert!(sender.publications[0].removing());
+}
+
 /// Condition (1), §7.3: an RSP_SETUP answers only a unicast source with a
 /// nonzero port.
 #[test]
@@ -3262,8 +3299,8 @@ fn a_routed_publication_has_a_setup_side_per_path() {
         &sender.sessions,
         &sender.publications[0]
     ));
-    // Removing it ends both paths' SETUP sides.
-    let removed = sender.command(AgentCommand::<OsSocket>::RemovePublication {
+    // Removing it (its drained session) ends both paths' SETUP sides.
+    let removed = sender.command(AgentCommand::<OsSocket>::RemoveSenderSession {
         reply: replies.reserve().unwrap(),
         endpoint: EndpointId(1),
         alias: alias(),
@@ -3808,4 +3845,31 @@ fn a_path_that_lost_its_return_direction_keeps_the_member() {
     assert_eq!(counters.joins, 1, "{counters:?}");
     assert_eq!(counters.bindings_gone, 1, "{counters:?}");
     assert_eq!(counters.unbound, 0, "{counters:?}");
+}
+
+/// A plain heartbeat raises the mark first; a lower EOS bound recorded
+/// afterwards still caps the tail hole: nothing past the bound is NAKed.
+#[test]
+fn a_bound_below_the_heartbeat_mark_caps_the_tail_nak() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(image.heartbeat_marks[0], Some(4096));
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 96),
+        super::Terminal::Recorded
+    );
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
+    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert_eq!((hole.start, hole.length), (0, 96));
 }

@@ -94,6 +94,9 @@ struct Setup {
     roles: Option<fn() -> crate::membership::PublicationRoles>,
     /// The subscription's conflated lane (conflated-network-images.md).
     conflated: Option<Lane>,
+    /// Concurrent handles on each lane of the publication's log, in place
+    /// of the exclusive publication.
+    concurrent: Option<u8>,
 }
 
 impl Setup {
@@ -125,6 +128,7 @@ impl Default for Setup {
             identity: None,
             roles: None,
             conflated: None,
+            concurrent: None,
         }
     }
 }
@@ -252,15 +256,26 @@ impl Rig {
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
-        let (outbound, log) = super::super::data::testing::outbound_joined(
-            a,
-            alias(),
-            destination,
-            term(65_536),
-            2,
-            setup.reliable,
-            setup.before,
-        );
+        let (outbound, log) = match setup.concurrent {
+            Some(publishers) => super::super::data::testing::outbound_concurrent(
+                a,
+                alias(),
+                destination,
+                term(65_536),
+                2,
+                setup.reliable,
+                publishers,
+            ),
+            None => super::super::data::testing::outbound_joined(
+                a,
+                alias(),
+                destination,
+                term(65_536),
+                2,
+                setup.reliable,
+                setup.before,
+            ),
+        };
         rig.log = Some(log);
         rig.links
             .sender
@@ -1908,6 +1923,215 @@ fn a_lost_aborted_record_is_repaired_and_never_naked_past() {
 #[test]
 fn an_aborted_record_reaches_the_subscriber_of_the_image() {
     aborted_over_the_network(false);
+}
+
+/// One frame of the rig's publication, lane 0, at stream `position`, as a
+/// faulty peer would send it: `word0`, the header, then `payload`.
+fn peer_frame(
+    word0: karyos_protocol::frame::Word0,
+    position: u64,
+    reserved_value: i64,
+    payload: &[u8],
+) -> Vec<u8> {
+    let term_length = 65_536;
+    let term_id = 9 + u32::try_from(position / term_length).unwrap();
+    let term_offset = u32::try_from(position % term_length).unwrap();
+    let mut bytes = Vec::with_capacity(32 + payload.len());
+    bytes.extend_from_slice(&word0.pack().to_le_bytes());
+    bytes.extend_from_slice(&term_offset.to_le_bytes());
+    bytes.extend_from_slice(&alias().session_id.to_le_bytes());
+    bytes.extend_from_slice(&alias().stream_id.to_le_bytes());
+    bytes.extend_from_slice(&term_id.to_le_bytes());
+    bytes.extend_from_slice(&reserved_value.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// T3 (contract-traceability-phase-2.md, "Fragmented commit and abort
+/// (network)"; SPEC §13 and the assembler rule of §5): a faulty peer
+/// sends a BEGIN, an ABORTED record and a stray END, then a whole message,
+/// each in its own DATA datagram. The subscriber of the image gets the
+/// partial message discarded as `Interrupted` (the assembler's protocol
+/// error, counted as discarded partial bytes), the aborted extent, the
+/// stray END dropped as an `Orphan`, and then the next message, whole.
+#[test]
+fn an_injected_begin_aborted_end_is_discarded_and_the_next_frame_delivered() {
+    use karyos_protocol::frame::{Flags, FrameType, Word0};
+    use karyos_sys::log_buffer::{AppendOptions, PollOutcome, Role, SkipReason};
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&[1; 900], AppendOptions::default())
+        .unwrap();
+    assert!(matches!(
+        next_outcome(&mut rig, &mut subscriber),
+        PollOutcome::Message {
+            position: 0,
+            length: 900,
+            ..
+        }
+    ));
+    // 900 bytes after a 32-byte header, at 32-byte strides.
+    let at = 960;
+    let fragment = |begin: bool, end: bool| {
+        Word0::new(
+            64,
+            Flags::new(begin, end, false, false, Lane::ZERO),
+            FrameType::Data,
+        )
+    };
+    let aborted = Word0::new(32, Flags::NONE, FrameType::Aborted);
+    let datagrams = [
+        peer_frame(fragment(true, false), at, 0, &[2; 32]),
+        peer_frame(aborted, at + 64, 64, &[]),
+        peer_frame(fragment(false, true), at + 128, 0, &[3; 32]),
+        peer_frame(fragment(true, true), at + 192, 0, &[4; 32]),
+    ];
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    for bytes in &datagrams {
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_data(&receiver.sessions, b, source, alias(), bytes, rig.now);
+    }
+    let skipped = |position: u64, reason: SkipReason| PollOutcome::Skipped {
+        position,
+        extent: 64,
+        reason,
+    };
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        skipped(at, SkipReason::Interrupted)
+    );
+    assert_eq!(subscriber.loss_counters().discarded_partial_bytes, 64);
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        PollOutcome::Aborted {
+            position: at + 64,
+            extent: 64
+        }
+    );
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        skipped(at + 128, SkipReason::Orphan)
+    );
+    let mut out = vec![0u8; 64];
+    let PollOutcome::Message {
+        position, length, ..
+    } = subscriber.poll(&mut out).unwrap()
+    else {
+        panic!("the next frame is not delivered");
+    };
+    assert_eq!((position, length), (at + 192, 32));
+    assert_eq!(&out[..32], &[4; 32]);
+    // The stray END is dropped, not counted as a partial.
+    assert_eq!(subscriber.loss_counters().discarded_partial_bytes, 64);
+}
+
+/// T3, the writers' half (contract-traceability-phase-2.md, "Fragmented
+/// commit and abort (network)"; SPEC §13): two concurrent writers of
+/// fragmented messages on a reliable channel, the first stopped in the
+/// middle of its copy, after its first fragment. The second commits behind
+/// it, and nothing reaches the remote subscriber while the first block is
+/// open. The commit deadline aborts the first block: the subscriber of the
+/// image gets one aborted extent, then the second writer's message whole,
+/// and the stopped writer learns that its offer was aborted.
+#[test]
+fn a_fragmented_writer_aborted_mid_copy_reaches_a_remote_reader_as_one_extent() {
+    use karyos_sys::log_buffer::{
+        AppendOptions, ConcurrentOfferOutcome, DEFAULT_CLAIM_DEADLINE, PollOutcome, Role,
+    };
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        concurrent: Some(2),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let log = rig.log.as_mut().unwrap();
+    let mut handles = std::mem::take(&mut log.concurrent[0]);
+    let mut second = handles.pop().unwrap();
+    let mut first = handles.pop().unwrap();
+    // Both fragmented: more than one 1376-byte fragment each.
+    let tagged =
+        |tag: u8, length: usize| -> Vec<u8> { (0..length).map(|i| tag ^ (i as u8)).collect() };
+    let first_data = tagged(1, 4000);
+    let second_data = tagged(2, 3000);
+    /// Lets the stopped writer go on when dropped, so a failed assertion
+    /// fails the test instead of leaving the writer waiting.
+    struct Release(std::sync::mpsc::SyncSender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            first
+                .offer_pausing_after_fragment(&first_data, AppendOptions::default(), 0, &mut || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+                .unwrap()
+        });
+        // The first writer has copied one fragment of its block.
+        paused_rx.recv().unwrap();
+        let release = Release(resume_tx);
+        let ConcurrentOfferOutcome::Appended { position: behind } = second
+            .offer(&second_data, AppendOptions::default())
+            .unwrap()
+        else {
+            panic!("the second writer did not commit");
+        };
+        let mut out = vec![0u8; 8192];
+        for _ in 0..50 {
+            rig.round(true);
+            assert_eq!(
+                subscriber.poll(&mut out).unwrap(),
+                PollOutcome::Pending,
+                "a message got past the open block"
+            );
+        }
+        // The deadline aborts the first block.
+        let now = rig.now;
+        let conductor = &mut rig.log.as_mut().unwrap().conductors[0];
+        assert!(conductor.service_deadlines(&mut || now).unwrap().waiting);
+        let report = conductor
+            .service_deadlines(&mut || now + DEFAULT_CLAIM_DEADLINE + 1)
+            .unwrap();
+        assert_eq!(
+            (report.aborted, report.aborted_bytes),
+            (1, behind),
+            "{report:?}"
+        );
+        assert_eq!(
+            next_outcome(&mut rig, &mut subscriber),
+            PollOutcome::Aborted {
+                position: 0,
+                extent: u32::try_from(behind).unwrap(),
+            }
+        );
+        let PollOutcome::Message {
+            position, length, ..
+        } = subscriber.poll(&mut out).unwrap()
+        else {
+            panic!("the second message is not delivered");
+        };
+        assert_eq!((position, length), (behind, 3000));
+        assert_eq!(&out[..3000], &second_data[..]);
+        drop(release);
+        assert_eq!(
+            writer.join().unwrap(),
+            ConcurrentOfferOutcome::Aborted { position: 0 }
+        );
+    });
 }
 
 /// Phase 6 wiring: a RANGE_UNAVAILABLE that echoes the outstanding NAK
@@ -4788,17 +5012,24 @@ mod shared {
 /// header-only DATA frame with the EOS flag (network-sessions.md,
 /// Liveness and terminal transitions).
 fn eos_heartbeat(lane: u8, position: u64) -> Vec<u8> {
+    frame_at(lane, position, 0, true)
+}
+
+/// A DATA frame of the rig's image carrying `payload` bytes at `position`
+/// of `lane` (none: a heartbeat), with EOS on it when `eos`.
+fn frame_at(lane: u8, position: u64, payload: usize, eos: bool) -> Vec<u8> {
     use karyos_protocol::frame::{Flags, FrameType, Word0};
 
     let term = 65_536u64;
     let term_id = 9u32 + u32::try_from(position / term).unwrap();
     let term_offset = i32::try_from(position % term).unwrap();
+    let length = 32 + payload;
     let word0 = Word0::new(
-        32,
-        Flags::new(true, true, true, false, Lane::try_new(lane).unwrap()),
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, eos, false, Lane::try_new(lane).unwrap()),
         FrameType::Data,
     );
-    let mut bytes = vec![0u8; 32];
+    let mut bytes = vec![0u8; length];
     bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
     bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
     bytes[12..16].copy_from_slice(&alias().session_id.to_le_bytes());
@@ -5201,4 +5432,53 @@ fn a_different_eos_bound_is_refused_at_the_intake() {
     rig.until(true, Rig::closed_cleanly);
     let counters = rig.agents.receiver.counters();
     assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 1));
+}
+
+/// An EOS data frame the receive owner does not commit names no bound: a
+/// frame two terms ahead of the rebuild position reads `Received::Ahead`
+/// (beyond the window `{r, r + 1}`) and is dropped, and the lane's real
+/// bound is still recorded afterwards.
+#[test]
+fn an_eos_data_frame_ahead_of_the_window_names_no_bound() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![4; 300]], &mut subscriber);
+    let before = rig.agents.receiver.counters();
+    rig.inject(b, &frame_at(0, 2 * 65_536, 32, true));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.data_dropped, before.data_dropped + 1, "Ahead");
+    assert_eq!(after.eos_bounds, before.eos_bounds, "no bound");
+    rig.inject(b, &eos_heartbeat(0, end));
+    rig.inject(b, &eos_heartbeat(1, 0));
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 0));
+    rig.until(true, Rig::closed_cleanly);
+}
+
+/// A heartbeat past a lane's recorded bound is counted and classified at
+/// the bound: no fresh evidence beyond it.
+#[test]
+fn a_heartbeat_past_the_terminal_bound_is_counted() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![5; 300]], &mut subscriber);
+    rig.inject(b, &eos_heartbeat(0, end));
+    let before = rig.agents.receiver.counters();
+    rig.inject(b, &frame_at(0, end + 64, 0, false));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(
+        after.heartbeats_past_terminal,
+        before.heartbeats_past_terminal + 1
+    );
+    assert_eq!(
+        after.heartbeats, before.heartbeats,
+        "classified at the bound"
+    );
+    assert_eq!(after.eos_refused, before.eos_refused);
 }
