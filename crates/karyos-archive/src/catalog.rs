@@ -169,6 +169,24 @@ pub struct StreamFormat {
     pub initial_term_id: i32,
     /// The stream's mtu: its largest frame.
     pub mtu: u32,
+    /// The source's incarnation, which a live merge matches (SPEC §8.2).
+    pub source: SourceIncarnation,
+}
+
+/// Which publication a recording captured: the driver's id, the
+/// publication's registration and its incarnation. For a local stream,
+/// its `PublicationIdentity` (kept across mapping cutovers); for a network
+/// image, the sender's, from the image's identity. A driver restart is a
+/// new `driver`, so an incarnation number reused across restarts still
+/// names another source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceIncarnation {
+    /// The driver's random 128-bit id, two words.
+    pub driver: [u64; 2],
+    /// The publication's registration in that driver.
+    pub registration: u64,
+    /// The publication's incarnation.
+    pub incarnation: u64,
 }
 
 /// A recording the catalog lists.
@@ -401,6 +419,15 @@ impl Record {
                 payload.bytes(&[recording.format.lane.get()]);
                 payload.bytes(&recording.format.initial_term_id.to_le_bytes());
                 payload.bytes(&recording.format.mtu.to_le_bytes());
+                let source = recording.format.source;
+                for word in [
+                    source.driver[0],
+                    source.driver[1],
+                    source.registration,
+                    source.incarnation,
+                ] {
+                    payload.bytes(&word.to_le_bytes());
+                }
                 let channel = u16::try_from(recording.channel.len()).ok()?;
                 payload.bytes(&channel.to_le_bytes());
                 payload.bytes(&recording.channel);
@@ -450,6 +477,11 @@ impl Record {
                     lane: Lane::try_new(input.u8()?).ok()?,
                     initial_term_id: input.i32()?,
                     mtu: input.u32()?,
+                    source: SourceIncarnation {
+                        driver: [input.u64()?, input.u64()?],
+                        registration: input.u64()?,
+                        incarnation: input.u64()?,
+                    },
                 };
                 let channel = usize::from(input.u16()?);
                 if channel > MAX_CHANNEL {

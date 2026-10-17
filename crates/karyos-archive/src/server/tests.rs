@@ -135,6 +135,11 @@ impl ArchiveHost for Host {
                 lane: karyos_sys::frame::Lane::ZERO,
                 initial_term_id: 0,
                 mtu: 1408,
+                source: crate::catalog::SourceIncarnation {
+                    driver: [1, 2],
+                    registration: 3,
+                    incarnation: 1,
+                },
             },
         })
     }

@@ -22,8 +22,10 @@ release may break APIs, wire formats and shared-memory layouts.
   taking a step back (`ReplaySource::hold`) when a sink has no room, and
   describes and stops them (`ArchiveHandle::describe`, `replay`,
   `stop_replay`). The catalog becomes version 3: a recording's `Started`
-  keeps the recorded stream's lane, initial term id and mtu
-  (`StreamFormat`), which its replays need.
+  keeps the recorded stream's lane, initial term id and mtu, which its
+  replays need, and the source's incarnation (`SourceIncarnation`: the
+  driver id, registration and incarnation of the publication recorded),
+  which a live merge matches (`StreamFormat`).
 - An Archive replay's target stream (phase 3, A5b).
   `EmbeddedDriver::replay_target(ReplayTargetConfig)` makes a one-lane
   image with local gaps, joined at the replay's first position and

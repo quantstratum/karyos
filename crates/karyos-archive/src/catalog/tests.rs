@@ -44,6 +44,11 @@ fn format() -> StreamFormat {
         lane: karyos_sys::frame::Lane::ZERO,
         initial_term_id: -3,
         mtu: 1408,
+        source: crate::catalog::SourceIncarnation {
+            driver: [1, 2],
+            registration: 3,
+            incarnation: 1,
+        },
     }
 }
 
@@ -659,6 +664,11 @@ fn the_stream_format_is_kept() {
         lane,
         initial_term_id: i32::MIN,
         mtu: 9000,
+        source: crate::catalog::SourceIncarnation {
+            driver: [1, 2],
+            registration: 3,
+            incarnation: 1,
+        },
     };
     let channel = channel_of(1);
     let id = catalog

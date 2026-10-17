@@ -28,7 +28,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use karyos_archive::agent::{AgentConfig, ArchiveHandle, ReplaySink, SinkClosed};
-use karyos_archive::catalog::{Recording, StopReason, StreamFormat};
+use karyos_archive::catalog::{Recording, SourceIncarnation, StopReason, StreamFormat};
 use karyos_archive::control::{
     self, ControlMessage, ControlResponse, RecordingSignal, ReplayRate, ResponseCode, Signal,
 };
@@ -119,6 +119,12 @@ impl ArchiveHost for Host {
         if request.stream_id != DATA {
             return Err(HostRefusal("no such stream".to_owned()));
         }
+        // The source's incarnation, from the driver's identity of the
+        // stream recorded.
+        let identity = self
+            .driver
+            .trace_identity(self.data)
+            .map_err(|error| HostRefusal(error.to_string()))?;
         let (reader, lease) = self
             .driver
             .recording_reader(self.data, Role::Required)
@@ -131,6 +137,11 @@ impl ArchiveHost for Host {
                 lane: Lane::ZERO,
                 initial_term_id: INITIAL_TERM_ID,
                 mtu: DEFAULT_MTU,
+                source: SourceIncarnation {
+                    driver: identity.driver,
+                    registration: identity.registration,
+                    incarnation: identity.incarnation,
+                },
             },
         })
     }
@@ -440,6 +451,16 @@ fn a_recording_is_made_and_replayed_by_request() {
         }
     ));
     let end = stopped.position;
+    let recorded = rig.server.agent().describe(recording_id).unwrap().recording;
+    let identity = rig.driver().trace_identity(data).unwrap();
+    assert_eq!(
+        recorded.format.source,
+        SourceIncarnation {
+            driver: identity.driver,
+            registration: identity.registration,
+            incarnation: identity.incarnation,
+        }
+    );
     expected.retain(|(position, _)| *position <= end);
 
     // The whole recording.

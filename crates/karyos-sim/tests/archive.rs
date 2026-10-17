@@ -77,6 +77,11 @@ fn format() -> StreamFormat {
         lane: karyos_sys::frame::Lane::ZERO,
         initial_term_id: 7,
         mtu: karyos_sys::sizing::DEFAULT_MTU,
+        source: karyos_archive::catalog::SourceIncarnation {
+            driver: [1, 2],
+            registration: 3,
+            incarnation: 1,
+        },
     }
 }
 
