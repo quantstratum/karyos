@@ -170,7 +170,10 @@ release may break APIs, wire formats and shared-memory layouts.
   sizes each queue; the queues take `sessions.max_paths ×
   path_queue_datagrams × 8 KiB` (8 MiB by default, at most 64 MiB,
   validated), allocated when the first later path is bound and kept: a
-  single-path receiver allocates none.
+  single-path receiver allocates none. The queues are per local receive
+  endpoint and live in one slab; a control on an endpoint first delivers
+  that path's queued datagrams, so a reply never overtakes them; queued
+  datagrams are counted (`path_queued`) (rp-w8b).
 - The live set of a routed publication's paths (redundant-paths.md section
   7, RP-8; rp-w5a). Each path keeps a `path_lag_limit` window (100 ms) of
   bytes selected and skipped: one that skipped anything is `Degraded`, and
