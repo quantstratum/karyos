@@ -111,6 +111,9 @@ pub enum RepairReadError {
     Retry,
     /// The frame does not fit the backend storage: dropped, no ERR.
     TooSmall,
+    /// The word 0 loads this call may spend ran out before the head was
+    /// proved: the call ends, the job and the lane's deficit kept.
+    Budget,
 }
 
 /// The lane reads repair uses.
@@ -169,6 +172,8 @@ pub struct SchedulerCounts {
     pub invalid_heads: u64,
     /// Jobs ended by an uncertain submission.
     pub unresolved: u64,
+    /// Calls ended because a head read ran out of word 0 loads.
+    pub budget_suspended: u64,
     /// An increment did not apply (sticky).
     pub overflowed: bool,
 }
@@ -229,6 +234,10 @@ struct Source<'a, R, S> {
     held: [bool; karyos_protocol::lanes::drr::MAX_LANES],
     /// The largest valid charge.
     max_charge: u64,
+    /// A head read ran out of loads: the next service halts the call,
+    /// which keeps the visit and every lane's deficit (an ineligible probe
+    /// would forfeit it).
+    suspended: bool,
     now: u64,
 }
 
@@ -251,6 +260,9 @@ impl<R: RepairRead, S: RepairSubmit> LaneSource for Source<'_, R, S> {
         };
         if let Some(slot) = self.selected.get_mut(lane) {
             *slot = None;
+        }
+        if self.suspended {
+            return Probe::Eligible { charge: RECORD };
         }
         if self.held.get(lane).copied().unwrap_or(true) {
             return Probe::Ineligible;
@@ -302,6 +314,13 @@ impl<R: RepairRead, S: RepairSubmit> LaneSource for Source<'_, R, S> {
                     },
                 );
             }
+            // Out of loads: the job waits; the least charge reaches serve,
+            // which halts the call.
+            Err(RepairReadError::Budget) => {
+                self.suspended = true;
+                self.counts.bump(|c| &mut c.budget_suspended);
+                return Probe::Eligible { charge: RECORD };
+            }
             Err(
                 RepairReadError::CorruptTerm | RepairReadError::Retry | RepairReadError::TooSmall,
             ) => {
@@ -313,6 +332,7 @@ impl<R: RepairRead, S: RepairSubmit> LaneSource for Source<'_, R, S> {
     }
 
     fn serve(&mut self, lane: usize) -> Service {
+        // A suspended call selected nothing: its service halts here.
         let Some(selected) = self.selected.get_mut(lane).and_then(Option::take) else {
             return Service::Halt;
         };
@@ -395,6 +415,7 @@ impl Scheduler {
             selected: [None; karyos_protocol::lanes::drr::MAX_LANES],
             held: [false; karyos_protocol::lanes::drr::MAX_LANES],
             max_charge: self.drr.config().max_charge(),
+            suspended: false,
             now,
         };
         self.drr.run(
