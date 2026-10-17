@@ -42,6 +42,8 @@
 #[cfg(test)]
 mod tests;
 
+use karyos_sys::frame::Lane;
+
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -58,8 +60,9 @@ const TEMPORARY: &str = "catalog.kyc.tmp";
 const MAGIC: u32 = u32::from_le_bytes(*b"KYCT");
 /// The catalog format version.
 /// Version 2: `Stopped` carries the `incomplete` flag and the reasons of
-/// A4 (nothing of version 1 was released).
-const VERSION: u32 = 2;
+/// A4. Version 3: `Started` carries the recorded stream's format (A5),
+/// which a replay needs (nothing of versions 1 or 2 was released).
+const VERSION: u32 = 3;
 /// The header's length: magic, version, reserved, CRC.
 const HEADER: usize = 16;
 /// [`HEADER`] as a file offset.
@@ -155,6 +158,19 @@ pub struct Stop {
     pub incomplete: bool,
 }
 
+/// What a replay of a recording needs of the recorded stream's
+/// configuration: its frames name their lane and are laid out in terms
+/// numbered from the initial term id, each at most the mtu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFormat {
+    /// The recorded lane.
+    pub lane: Lane,
+    /// The stream's initial term id.
+    pub initial_term_id: i32,
+    /// The stream's mtu: its largest frame.
+    pub mtu: u32,
+}
+
 /// A recording the catalog lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recording {
@@ -174,6 +190,8 @@ pub struct Recording {
     pub geometry: Geometry,
     /// Its sync policy.
     pub policy: SyncPolicy,
+    /// The recorded stream's format.
+    pub format: StreamFormat,
     /// Where it stopped; `None` while it records.
     pub stop: Option<Stop>,
 }
@@ -195,6 +213,8 @@ pub struct NewRecording<'a> {
     pub geometry: Geometry,
     /// Its sync policy.
     pub policy: SyncPolicy,
+    /// The recorded stream's format.
+    pub format: StreamFormat,
 }
 
 /// The catalog's errors.
@@ -378,6 +398,9 @@ impl Record {
                 let (policy, interval) = policy_code(recording.policy);
                 payload.bytes(&[policy]);
                 payload.bytes(&interval.to_le_bytes());
+                payload.bytes(&[recording.format.lane.get()]);
+                payload.bytes(&recording.format.initial_term_id.to_le_bytes());
+                payload.bytes(&recording.format.mtu.to_le_bytes());
                 let channel = u16::try_from(recording.channel.len()).ok()?;
                 payload.bytes(&channel.to_le_bytes());
                 payload.bytes(&recording.channel);
@@ -423,6 +446,11 @@ impl Record {
                 let segment_length = input.u64()?;
                 let policy = input.u8()?;
                 let interval = input.u64()?;
+                let format = StreamFormat {
+                    lane: Lane::try_new(input.u8()?).ok()?,
+                    initial_term_id: input.i32()?,
+                    mtu: input.u32()?,
+                };
                 let channel = usize::from(input.u16()?);
                 if channel > MAX_CHANNEL {
                     return None;
@@ -437,6 +465,7 @@ impl Record {
                     start_time_ns,
                     geometry: Geometry::new(term_length, segment_length).ok()?,
                     policy: policy_of(policy, interval)?,
+                    format,
                     stop: None,
                 })
             }
@@ -696,6 +725,7 @@ impl<D: Disk> Catalog<D> {
             start_time_ns: new.start_time_ns,
             geometry: new.geometry,
             policy: new.policy,
+            format: new.format,
             stop: None,
         };
         self.append(&Record::Started(recording.clone()))?;

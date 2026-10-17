@@ -103,6 +103,14 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+fn format() -> crate::catalog::StreamFormat {
+    crate::catalog::StreamFormat {
+        lane: karyos_sys::frame::Lane::ZERO,
+        initial_term_id: 0,
+        mtu: 1408,
+    }
+}
+
 fn start(source: Chunks) -> StartRecording {
     StartRecording {
         stream_id: 10,
@@ -111,6 +119,7 @@ fn start(source: Chunks) -> StartRecording {
         geometry: Geometry::new(4096, 8192).unwrap(),
         policy: SyncPolicy::PerSegment,
         mode: Mode::Required,
+        format: format(),
         source: Box::new(source),
     }
 }
@@ -434,5 +443,242 @@ fn a_failed_stop_is_remembered() {
         Err(AgentError::RecordingFailed { id: failed }) if failed == id
     ));
     agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Frames of 96 bytes each (a multiple of the 32-byte alignment), with
+/// their length in their first word and `fill` after it.
+fn frames(count: usize, fill: u8) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for _ in 0..count {
+        let mut frame = vec![fill; 96];
+        frame[..4].copy_from_slice(&96i32.to_le_bytes());
+        bytes.extend_from_slice(&frame);
+    }
+    bytes
+}
+
+/// What a sink saw, shared with the test.
+#[derive(Default)]
+struct Seen {
+    bytes: Vec<u8>,
+    calls: usize,
+    finished: Option<(u64, bool)>,
+}
+
+/// A sink that refuses its first `refuse` steps for lack of room, then
+/// takes them while `open` is set; closed when `closed` is.
+struct Sink {
+    seen: Arc<std::sync::Mutex<Seen>>,
+    refuse: usize,
+    open: Arc<AtomicBool>,
+    closed: bool,
+}
+
+impl Sink {
+    fn new(seen: &Arc<std::sync::Mutex<Seen>>) -> Self {
+        Self {
+            seen: Arc::clone(seen),
+            refuse: 0,
+            open: Arc::new(AtomicBool::new(true)),
+            closed: false,
+        }
+    }
+
+    fn take(&mut self, position: u64, bytes: &[u8]) -> Result<bool, SinkClosed> {
+        if self.closed {
+            return Err(SinkClosed);
+        }
+        let mut seen = self.seen.lock().unwrap();
+        seen.calls += 1;
+        if self.refuse > 0 || !self.open.load(Ordering::Acquire) {
+            self.refuse = self.refuse.saturating_sub(1);
+            return Ok(false);
+        }
+        assert_eq!(position, seen.bytes.len() as u64);
+        seen.bytes.extend_from_slice(bytes);
+        Ok(true)
+    }
+}
+
+impl ReplaySink for Sink {
+    fn frames(&mut self, position: u64, bytes: &[u8]) -> Result<bool, SinkClosed> {
+        self.take(position, bytes)
+    }
+
+    fn fill(&mut self, position: u64, record: &[u8], _extent: u32) -> Result<bool, SinkClosed> {
+        self.take(position, record)
+    }
+
+    fn gap(&mut self, _from: u64, _to: u64) -> Result<bool, SinkClosed> {
+        panic!("no gap was recorded");
+    }
+
+    fn finish(&mut self, end: u64, complete: bool) {
+        self.seen.lock().unwrap().finished = Some((end, complete));
+    }
+}
+
+/// A recording of three chunks of two frames each, ended at its seal.
+fn sealed_recording(agent: &ArchiveHandle) -> (u64, Vec<u8>) {
+    let chunks: Vec<Vec<u8>> = (1..=3).map(|fill| frames(2, fill)).collect();
+    let all = chunks.concat();
+    let id = agent
+        .start(start(Chunks {
+            chunks: chunks.into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    (id, all)
+}
+
+fn replay_of(recording_id: u64, to: u64, sink: Sink) -> StartReplay {
+    StartReplay {
+        recording_id,
+        from: 0,
+        to,
+        rate: Rate::Full,
+        sink: Box::new(sink),
+    }
+}
+
+/// A recording replays into its sink byte for byte, in order, and the
+/// replay ends complete; a sink without room is given the same step again.
+#[test]
+fn a_recording_replays_into_its_sink() {
+    let dir = temp_dir("replay");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    let (recording, all) = sealed_recording(&agent);
+    let end = all.len() as u64;
+    assert_eq!(agent.describe(recording).unwrap().end, end);
+    for refuse in [0, 3] {
+        let seen = Arc::default();
+        let id = agent
+            .replay(replay_of(
+                recording,
+                end,
+                Sink {
+                    refuse,
+                    ..Sink::new(&seen)
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            agent.event(Duration::from_secs(5)).unwrap(),
+            Event::ReplayEnded {
+                id,
+                position: end,
+                outcome: ReplayOutcome::Complete
+            }
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.bytes, all, "refusing {refuse}");
+        assert_eq!(seen.finished, Some((end, true)));
+        assert!(seen.calls > refuse);
+    }
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A stopped replay finishes its sink incomplete where it is and reports
+/// no event; a closed sink fails its replay.
+#[test]
+fn a_replay_stops_by_command_or_when_its_sink_closes() {
+    let dir = temp_dir("replay-stop");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    let (recording, all) = sealed_recording(&agent);
+    let end = all.len() as u64;
+    let seen = Arc::default();
+    let sink = Sink::new(&seen);
+    sink.open.store(false, Ordering::Release);
+    let id = agent.replay(replay_of(recording, end, sink)).unwrap();
+    // Asked at least once, refused.
+    for _ in 0..5000 {
+        if seen.lock().unwrap().calls > 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(agent.stop_replay(id).unwrap(), 0);
+    assert_eq!(seen.lock().unwrap().finished, Some((0, false)));
+    assert!(matches!(
+        agent.stop_replay(id),
+        Err(AgentError::Unknown { .. })
+    ));
+    assert_eq!(agent.try_event(), None);
+
+    let seen = Arc::default();
+    let closed = Sink {
+        closed: true,
+        ..Sink::new(&seen)
+    };
+    let id = agent.replay(replay_of(recording, end, closed)).unwrap();
+    assert_eq!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::ReplayEnded {
+            id,
+            position: 0,
+            outcome: ReplayOutcome::Failed
+        }
+    );
+    assert_eq!(seen.lock().unwrap().finished, Some((0, false)));
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A replay of an unknown recording or an unreadable range is refused, its
+/// sink finished incomplete; an open recording ends at its written
+/// position; a shutdown finishes the replays that run.
+#[test]
+fn replays_are_refused_described_and_shut_down() {
+    let dir = temp_dir("replay-refused");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    let (recording, all) = sealed_recording(&agent);
+    let end = all.len() as u64;
+    let seen = Arc::default();
+    assert!(matches!(
+        agent.replay(replay_of(recording + 1, end, Sink::new(&seen))),
+        Err(AgentError::Unknown { .. })
+    ));
+    assert_eq!(seen.lock().unwrap().finished, Some((0, false)));
+    let seen = Arc::default();
+    assert!(matches!(
+        agent.replay(StartReplay {
+            from: 32,
+            ..replay_of(recording, end, Sink::new(&seen))
+        }),
+        Err(AgentError::Replay(ReplayError::NotAFrameBoundary { .. }))
+    ));
+    assert_eq!(seen.lock().unwrap().finished, Some((32, false)));
+    assert!(matches!(
+        agent.describe(recording + 1),
+        Err(AgentError::Unknown { .. })
+    ));
+
+    let drained = Arc::new(AtomicBool::new(false));
+    let open = agent
+        .start(start(Chunks {
+            position: 0,
+            chunks: vec![frames(1, 7)].into(),
+            drained: Arc::clone(&drained),
+            ..Chunks::default()
+        }))
+        .unwrap();
+    wait(&drained);
+    let described = agent.describe(open).unwrap();
+    assert_eq!(described.end, 96);
+    assert_eq!(described.recording.stop, None);
+
+    let seen = Arc::default();
+    let sink = Sink::new(&seen);
+    sink.open.store(false, Ordering::Release);
+    agent.replay(replay_of(recording, end, sink)).unwrap();
+    agent.shutdown().unwrap();
+    assert_eq!(seen.lock().unwrap().finished, Some((0, false)));
     std::fs::remove_dir_all(&dir).unwrap();
 }

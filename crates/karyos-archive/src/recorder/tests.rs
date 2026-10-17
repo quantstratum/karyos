@@ -326,6 +326,11 @@ fn settles_at_every_crash_point(policy: SyncPolicy) {
             start_time_ns: 0,
             geometry: geometry(),
             policy,
+            format: crate::catalog::StreamFormat {
+                lane: karyos_sys::frame::Lane::ZERO,
+                initial_term_id: 0,
+                mtu: 1408,
+            },
         }) else {
             return 0;
         };
