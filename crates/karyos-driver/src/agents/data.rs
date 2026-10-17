@@ -32,8 +32,18 @@
 //!   window is at least the largest datagram, so this never stalls. With
 //!   no receiver window ([`Limit::NoReceiverWindow`]) the lane stages
 //!   nothing; while a required loss is unresolved ([`Limit::Held`]) no lane
-//!   stages, and `admits` holds what was staged, in order. Each lane's
-//!   highest submitted position is the membership's `sent_high`.
+//!   stages, and `admits` holds what was staged, in order. While a
+//!   configured required member has not joined ([`Admission::NotJoined`])
+//!   no lane stages either. Each lane's highest submitted position is the
+//!   membership's `sent_high`; once a required member has joined, a lane's
+//!   registered position follows the least position the required members
+//!   consumed ([`Membership::retention`]), never above what was submitted.
+//!   A receiver is not expected at its SETUP answer: the answer names no
+//!   receiver id, so [`Membership::expect`] is not called and a NAK before
+//!   the receiver's first SM counts as context only; an optional member's
+//!   tombstone clears only after `receiver_timeout` of silence. This needs
+//!   no wire change (coordinator, ACS 15872); a schema that carries the
+//!   receiver id at the answer would change it.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -55,7 +65,7 @@ use karyos_sys::sizing::align_frame;
 use karyos_protocol::frame::Lane;
 
 use super::{AgentError, AgentKind, EndpointId};
-use crate::membership::{Limit, Membership};
+use crate::membership::{Admission, Limit, Membership};
 
 /// Membership timer actions per cycle.
 const MEMBERSHIP_TIMER_ACTIONS: u32 = 16;
@@ -126,6 +136,9 @@ struct LaneTrack {
     unsent: bool,
     /// A head left out of staging order, this call.
     mismatched: bool,
+    /// Staging stopped at the receivers' edge and has not staged since: a
+    /// wait is counted once, not once per idle cycle.
+    waiting: bool,
 }
 
 /// The counters of one outbound publication; checked, sticky on overflow.
@@ -154,10 +167,14 @@ pub struct OutboundCounters {
     pub send_failures: u64,
     /// Committed datagrams the lane sender refused to record.
     pub staged_refused: u64,
-    /// Lane stagings stopped at the receivers' edge or with no window.
+    /// Times a lane's staging came to a stop at the receivers' edge or with
+    /// no window, counted once per wait (not per cycle).
     pub window_waits: u64,
     /// Cycles held by an unresolved required loss.
     pub held: u64,
+    /// Cycles whose first sends waited for a configured required member's
+    /// join.
+    pub not_joined: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -250,6 +267,7 @@ impl Outbound {
                 high: 0,
                 unsent: false,
                 mismatched: false,
+                waiting: false,
             })
             .collect();
         Ok(Self {
@@ -304,8 +322,17 @@ impl Outbound {
     }
 
     /// Attaches its receivers' membership: from then on first sends follow
-    /// their limits (control path).
-    pub fn attach_membership(&mut self, membership: Box<Membership>) {
+    /// their limits (control path). Each lane's `sent_high` starts at its
+    /// reader's cursor, the join point receivers are answered with: a
+    /// reader that joined above 0 never sends below it, and a receiver's
+    /// first SM reports at least its join.
+    pub fn attach_membership(&mut self, mut membership: Box<Membership>) {
+        for (lane, (track, reader)) in self.tracks.iter_mut().zip(&self.readers).enumerate() {
+            track.high = track.high.max(reader.position());
+            if let Some(lane) = u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()) {
+                let _ = membership.advance_sent(lane, track.high);
+            }
+        }
         self.membership = Some(membership);
     }
 
@@ -407,20 +434,31 @@ impl Outbound {
             return Ok(0);
         }
         // The receivers' limits this cycle; with no membership attached,
-        // first sends are not gated.
+        // first sends are not gated. A lost required member holds every
+        // lane, staged heads included (MC-7); one not yet joined holds new
+        // staging only.
         let mut limits = [Limit::Edge(u64::MAX); MAX_LANES];
-        let mut held = false;
+        let mut admission = Admission::Open;
         if let Some(membership) = self.membership.as_deref_mut() {
+            // Its events (joins, losses) are not drained yet, deliberately:
+            // the conductor that reports them is not wired to the agents.
+            // The queue is bounded; overflow is counted (`events_dropped`).
             let _ = membership.timers(now, MEMBERSHIP_TIMER_ACTIONS);
+            admission = membership.admission(now);
             for (lane, limit) in limits.iter_mut().enumerate().take(self.readers.len()) {
                 if let Some(lane) = u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()) {
                     *limit = membership.limit(lane, now);
-                    held |= *limit == Limit::Held;
                 }
             }
         }
-        if held {
-            self.counters.bump(|c| &mut c.held, 1);
+        let held = admission == Admission::LostRequired;
+        match admission {
+            Admission::Open => {}
+            Admission::LostRequired => self.counters.bump(|c| &mut c.held, 1),
+            Admission::NotJoined => {
+                self.counters.bump(|c| &mut c.not_joined, 1);
+                limits = [Limit::Held; MAX_LANES];
+            }
         }
         let mut work = 0u32;
         for lane in 0..self.readers.len() {
@@ -450,14 +488,19 @@ impl Outbound {
                 track.high = track.high.max(submitted);
             }
             let submitted = track.high;
-            // The membership's sent frontier (one path: `sent_high`).
+            // The membership's sent frontier (one path: `sent_high`), and
+            // the required members' retention bound once one has joined.
+            let mut retention = None;
             if let (Some(membership), Some(lane)) = (
                 self.membership.as_deref_mut(),
                 u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()),
             ) {
                 let _ = membership.advance_sent(lane, submitted);
+                retention = membership.retention(lane);
             }
-            let target = if self.reliable {
+            let target = if let Some(retained) = retention {
+                submitted.min(retained)
+            } else if self.reliable {
                 // No bound receiver: the registered position holds (SPEC §4:
                 // never past what a required receiver consumed).
                 match consumption.and_then(|positions| positions.get(lane)) {
@@ -587,7 +630,11 @@ impl Outbound {
                 Limit::NoReceiverWindow | Limit::Held => false,
             };
             if !fits {
-                self.counters.bump(|c| &mut c.window_waits, 1);
+                if let Some(track) = self.tracks.get_mut(lane)
+                    && !std::mem::replace(&mut track.waiting, true)
+                {
+                    self.counters.bump(|c| &mut c.window_waits, 1);
+                }
                 break;
             }
             let Ok(mut frame) = tx.claim_tx(queue, self.mtu) else {
@@ -645,6 +692,7 @@ impl Outbound {
             }
             if let Some(track) = self.tracks.get_mut(lane) {
                 track.staged.push_back((ticket, next));
+                track.waiting = false;
             }
             self.counters.bump(
                 if record {
@@ -676,8 +724,8 @@ pub(crate) mod testing {
     use karyos_protocol::frame::Lane;
     use karyos_protocol::network::{Alias, Lanes, TermParams};
     use karyos_sys::log_buffer::{
-        Conductor, DEFAULT_CLAIM_DEADLINE, DEFAULT_CORRUPT_RETRIES, LogBuffer, LogBufferConfig,
-        Publication, PublicationMode, Role, SenderRead,
+        AppendOptions, Conductor, DEFAULT_CLAIM_DEADLINE, DEFAULT_CORRUPT_RETRIES, LogBuffer,
+        LogBufferConfig, Publication, PublicationMode, Role, SenderRead,
     };
     use karyos_sys::sizing::TermLength;
     use karyos_sys::term::TermId;
@@ -700,6 +748,20 @@ pub(crate) mod testing {
         term: TermParams,
         lanes: u8,
         reliable: bool,
+    ) -> (Box<Outbound>, TestLog) {
+        outbound_joined(endpoint, alias, destination, term, lanes, reliable, 0)
+    }
+
+    /// [`outbound`], with `before` 1000-byte messages appended on each lane
+    /// before its reader subscribes: the reader joins above 0.
+    pub(crate) fn outbound_joined(
+        endpoint: EndpointId,
+        alias: Alias,
+        destination: SocketAddr,
+        term: TermParams,
+        lanes: u8,
+        reliable: bool,
+        before: u8,
     ) -> (Box<Outbound>, TestLog) {
         let mut log = TestLog {
             lanes: Vec::new(),
@@ -727,6 +789,12 @@ pub(crate) mod testing {
                 .unwrap(),
             );
             let mut conductor = buffer.conductor_owned().unwrap();
+            let mut publication = buffer.publication_owned().unwrap().unwrap();
+            for i in 0..before {
+                let _ = publication
+                    .append(&[i; 1000], AppendOptions::default())
+                    .unwrap();
+            }
             // A required participant on every channel, with its L_send
             // reservation (S2 2.1).
             readers.push(
@@ -736,8 +804,7 @@ pub(crate) mod testing {
                 )
                 .unwrap(),
             );
-            log.publications
-                .push(buffer.publication_owned().unwrap().unwrap());
+            log.publications.push(publication);
             log.conductors.push(conductor);
             log.lanes.push(buffer);
         }

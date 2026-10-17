@@ -453,7 +453,50 @@ pub struct SenderRole {
     confirmed_timeout: u64,
     /// Duty cycles run, for the reset request cadence.
     cycle: u64,
+    /// The driver's timing of each publication's membership.
+    membership: MembershipTiming,
     counters: SenderCounters,
+}
+
+/// The driver settings a publication's membership follows: the receivers'
+/// SM cadence and the liveness that the receive side applies to images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MembershipTiming {
+    /// The receivers' `sm_interval`.
+    pub sm_interval: u64,
+    /// A member silent this long expires: `image_liveness_timeout`, after
+    /// which its binding and image are gone too.
+    pub receiver_timeout: u64,
+    /// A member whose SMs are stationary expires after this long:
+    /// `idle_image_timeout`, as stationary heartbeats keep an image.
+    pub pause_timeout: u64,
+}
+
+impl MembershipTiming {
+    /// The timing of `config`.
+    pub(super) const fn of(config: &AgentConfig) -> Self {
+        Self {
+            sm_interval: config.sm_interval,
+            receiver_timeout: config.image_liveness_timeout,
+            pause_timeout: config.idle_image_timeout,
+        }
+    }
+
+    /// A publication's membership settings with this timing; a required
+    /// member's join waits one `receiver_timeout`.
+    pub(super) const fn config(
+        &self,
+        lane_count: u8,
+        min_window: u32,
+        max_window: u32,
+    ) -> MembershipConfig {
+        let mut config = MembershipConfig::new(lane_count, min_window, max_window);
+        config.sm_interval = self.sm_interval;
+        config.receiver_timeout = self.receiver_timeout;
+        config.pause_timeout = self.pause_timeout;
+        config.join_timeout = self.receiver_timeout;
+        config
+    }
 }
 
 /// Both roles and the control ring between them, sized by `config`.
@@ -512,6 +555,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             unconfirmed_timeout: config.sessions.setup_challenge_timeout,
             confirmed_timeout: config.image_liveness_timeout,
             cycle: 0,
+            membership: MembershipTiming::of(config),
             counters: SenderCounters::default(),
         },
         ReceiverRole {
@@ -1015,7 +1059,8 @@ impl ReceiverRole {
             control: Control::Status(status),
             guard: Some(SmGuard::take(&image.sm)),
         };
-        // The sender gone: the driver is stopping.
+        // The sender gone: the driver is stopping. The SM is then recorded
+        // as sent all the same: nothing will send another.
         let _ = self.to_sender.post(slot, item);
         if let Some(image) = self.images.get_mut(index) {
             image.schedule.sent(due, now);
@@ -1486,16 +1531,18 @@ impl SenderRole {
             && outbound.alias() == publication.alias
             && outbound.readers().len() == usize::from(publication.lane_count);
         // Its receivers' membership (multicast-flow-control.md): windows
-        // from the largest datagram to half a term, as receivers grant;
-        // roles and tags are not configurable yet, so no required member and
-        // the creation time (it only times a required member's join) is 0.
+        // from the largest datagram to half a term, as receivers grant, and
+        // the driver's SM cadence and liveness; roles and tags are not
+        // configurable yet, so no required member and the creation time (it
+        // only times a required member's join) is 0.
         let max_window =
             (publication.term.term_length / 2).min(MAX_WINDOW) & !(FRAME_ALIGNMENT - 1);
         let membership = u32::try_from(outbound.max_frame())
             .ok()
             .and_then(|min_window| {
                 Membership::new(
-                    MembershipConfig::new(publication.lane_count, min_window, max_window),
+                    self.membership
+                        .config(publication.lane_count, min_window, max_window),
                     publication.identity,
                     publication.alias,
                     &Roles::default(),
@@ -1808,8 +1855,13 @@ impl SenderRole {
                 self.count(|c| &mut c.bindings_full);
                 return;
             };
-            let _ = self.bindings.swap_remove(index);
+            let evicted = self.bindings.swap_remove(index);
             self.count(|c| &mut c.bindings_evicted);
+            // A reset row keeps its former receiver id until its next SM:
+            // that membership ends with the row (ACS 15648).
+            if let Some(receiver_id) = evicted.receiver_id.or(evicted.former) {
+                self.binding_gone(&evicted, receiver_id, now);
+            }
         }
         self.bindings.push(binding);
     }
@@ -1834,8 +1886,9 @@ impl SenderRole {
             }
             let binding = self.bindings.swap_remove(index);
             self.count(|c| &mut c.bindings_expired);
-            // Synchronously, at the removal (ACS 15648).
-            if let Some(receiver_id) = binding.receiver_id {
+            // Synchronously, at the removal (ACS 15648); a reset row that
+            // expires before its next SM ends its former receiver's.
+            if let Some(receiver_id) = binding.receiver_id.or(binding.former) {
                 self.binding_gone(&binding, receiver_id, now);
             }
         }

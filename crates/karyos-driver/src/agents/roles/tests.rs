@@ -880,10 +880,115 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
         member(&mut sender, 2, 3),
         Requester::Member { .. }
     ));
-    // Its SMs stop: the binding expires, and the member with it, at once.
-    sender.expire_bindings(3 + config.image_liveness_timeout);
+    // A new answer resets the row; it expires before its next SM, and the
+    // former receiver's membership goes with it.
+    sender.bind(endpoint, receiver, &answer, 4);
+    assert!(matches!(
+        member(&mut sender, 2, 4),
+        Requester::Member { .. }
+    ));
+    sender.expire_bindings(4 + config.sessions.setup_challenge_timeout);
     assert!(sender.bindings.is_empty());
-    assert_eq!(member(&mut sender, 2, 4), Requester::Unknown);
+    assert_eq!(member(&mut sender, 2, 5), Requester::Unknown);
+    // Confirmed, then its SMs stop: the binding expires, and the member
+    // with it, at once.
+    sender.bind(endpoint, receiver, &answer, 6);
+    sender.status(endpoint, receiver, &status(3, 0), 7);
+    sender.expire_bindings(7 + config.image_liveness_timeout);
+    assert!(sender.bindings.is_empty());
+    assert_eq!(member(&mut sender, 3, 8), Requester::Unknown);
+    // A reset row evicted for a newcomer ends its former receiver's too.
+    let t = 8 + config.image_liveness_timeout;
+    sender.bind(endpoint, receiver, &answer, t);
+    sender.status(endpoint, receiver, &status(4, 0), t + 1);
+    sender.bind(endpoint, receiver, &answer, t + 2);
+    for boot in 1..u64::try_from(config.receiver_bindings).unwrap() {
+        let mut stranger = answer;
+        stranger.challenge.receiver_boot_id = [boot, 99];
+        let port = 6000 + u16::try_from(boot).unwrap();
+        sender.bind(
+            endpoint,
+            SocketAddr::from(([10, 0, 0, 8], port)),
+            &stranger,
+            t + 3,
+        );
+    }
+    assert!(matches!(
+        member(&mut sender, 4, t + 3),
+        Requester::Member { .. }
+    ));
+    let mut newcomer = answer;
+    newcomer.challenge.receiver_boot_id = [1, 1];
+    sender.bind(
+        endpoint,
+        SocketAddr::from(([10, 0, 0, 7], 7000)),
+        &newcomer,
+        t + 4,
+    );
+    assert_eq!(sender.counters().bindings_evicted, 1);
+    assert_eq!(member(&mut sender, 4, t + 4), Requester::Unknown);
+}
+
+/// A publication's membership follows the driver's SM cadence and image
+/// liveness, and a configuration they cannot satisfy is refused.
+#[test]
+fn a_publication_membership_follows_the_driver_timing() {
+    let config = AgentConfig {
+        sm_interval: 20_000_000,
+        image_liveness_timeout: 20_000_000_000,
+        idle_image_timeout: 90_000_000_000,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let endpoint = EndpointId(1);
+    let (path, _log) = outbound(endpoint, "10.0.0.9:5000".parse().unwrap());
+    let command = AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(endpoint),
+        outbound: path,
+    };
+    assert!(matches!(
+        sender.command(command),
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    let held = *sender.publications[0].membership_mut().unwrap().config();
+    assert_eq!(
+        (
+            held.sm_interval,
+            held.receiver_timeout,
+            held.pause_timeout,
+            held.join_timeout
+        ),
+        (20_000_000, 20_000_000_000, 90_000_000_000, 20_000_000_000)
+    );
+    let short = AgentConfig {
+        image_liveness_timeout: 9 * config.sm_interval,
+        ..config
+    };
+    assert!(matches!(
+        short.validate(),
+        Err(super::AgentError::InvalidConfig(_))
+    ));
+}
+
+/// An SM skipped because the image's previous one still waits stays due;
+/// only a posted SM is recorded as sent.
+#[test]
+fn a_skipped_sm_stays_due() {
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (image, _) = installed_image();
+    role.images.push(image);
+    let due = role.images[0].schedule.due(0, &[0]).unwrap();
+    let waiting = super::SmGuard::take(&role.images[0].sm);
+    role.send_sm(0, &due, 0);
+    assert_eq!(role.counters().sm_skipped, 1);
+    assert!(role.images[0].schedule.due(1, &[0]).is_some(), "still due");
+    drop(waiting);
+    role.send_sm(0, &due, 1);
+    assert_eq!(role.counters().sm_sent, 1);
+    assert!(role.images[0].schedule.due(2, &[0]).is_none(), "sent");
 }
 
 /// P1: a flood of answered strangers cannot hold the binding table. An
