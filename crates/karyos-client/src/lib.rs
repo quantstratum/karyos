@@ -17,6 +17,7 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
     karyos_sys::alloc_count::CountingAllocator;
 
 pub mod aggregate;
+pub mod client;
 pub mod concurrent;
 pub mod conductor;
 pub mod conflated_subscription;
@@ -36,6 +37,10 @@ pub mod subscription;
 pub mod tool;
 pub mod trace;
 
+pub use client::{
+    Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES, DEFAULT_MAX_PENDING,
+    DEFAULT_TIMEOUT, IdleStrategy, ImageStop, Subscription, SubscriptionError, SubscriptionPoll,
+};
 pub use concurrent::{
     ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,
     ConcurrentOfferOutcome,
@@ -52,6 +57,7 @@ pub use error::ClientError;
 pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
+pub use karyos_protocol::cnc::StreamId;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
