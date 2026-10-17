@@ -797,3 +797,77 @@ fn a_partial_walker_failure_leaves_nothing() {
     );
     driver.remove_aggregate(&handle).unwrap();
 }
+
+/// rp-w4b2c: a channel with `paths` is refused, and counted, while the
+/// sockets cannot be isolated per path (owner item 12), as subscriptions
+/// are; nothing is held.
+#[test]
+fn a_publication_with_paths_is_refused_until_paths_are_isolated() {
+    let mut driver = driver();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 7, 9, 21)), free_port());
+    let channel = UdpConfig {
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(LOOPBACK),
+        ],
+        ..channel(Destination::Multicast { group, ttl: None })
+    };
+    assert_eq!(
+        driver.add_network_publication(aggregate(10, 1), &channel),
+        Err(DriverError::UnsupportedChannel)
+    );
+    assert_eq!(driver.network_path_counters(), (1, 0));
+    assert_eq!(driver.net.as_ref().unwrap().send_endpoints(), 0);
+    // Nothing was configured: the stream key is still free.
+    assert!(driver.add_aggregate(aggregate(10, 1)).is_ok());
+}
+
+/// rp-w4b2c: with isolated paths (assumed here), a multicast publication
+/// with two paths holds one send endpoint per path and becomes active; its
+/// removal releases both. Unicast `paths` stay refused (owner item 11).
+#[test]
+fn a_publication_holds_a_send_endpoint_per_path() {
+    let mut driver = driver();
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 7, 9, 22)), free_port());
+    let paths = vec![
+        Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        Interface::Address(LOOPBACK),
+    ];
+    let routed = UdpConfig {
+        interface: None,
+        paths: paths.clone(),
+        ..channel(Destination::Multicast { group, ttl: None })
+    };
+    let handle = driver
+        .add_network_publication(aggregate(10, 1), &routed)
+        .unwrap();
+    assert_eq!(driver.net.as_ref().unwrap().send_endpoints(), 2);
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    driver.remove_aggregate(&handle).unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle).is_none()
+            && driver.net.as_ref().unwrap().send_endpoints() == 0
+    });
+    let unicast = UdpConfig {
+        interface: None,
+        paths,
+        ..channel(Destination::Unicast(SocketAddr::new(LOOPBACK, free_port())))
+    };
+    assert_eq!(
+        driver.add_network_publication(aggregate(11, 1), &unicast),
+        Err(DriverError::UnsupportedChannel)
+    );
+}
+
+/// A port no socket holds now, for a group or destination of a test.
+fn free_port() -> u16 {
+    UdpSocket::bind(SocketAddr::new(LOOPBACK, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}

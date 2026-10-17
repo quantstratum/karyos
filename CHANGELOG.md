@@ -92,6 +92,11 @@ release may break APIs, wire formats and shared-memory layouts.
   walker, which holds one spare-slot credit for the stream's life, finds no
   credit (`WalkerUnavailable::NoSpareCredit`) or no reader cell
   (`WalkerUnavailable::NoReaderCell`).
+- Documented image admission: at the default `ImageTemplate::spare_slots`
+  of 5, each image lane admits one optional or observer reader, since the
+  receive owner holds three of its four spare-slot credits; another is
+  refused with `ResourcesUnavailable`. Raising `spare_slots` by one admits
+  one more, at one term per lane of image storage.
 - Driver positions are absolute stream positions after a guard close and
   reopen: `EmbeddedDriver::seal_state` reports the current mapping's base
   plus its seal (`DriverError::PositionsExhausted` past the position
@@ -108,6 +113,14 @@ release may break APIs, wire formats and shared-memory layouts.
   `SkipPolicy::duty_observed` and `range_unavailable_observed` tell a
   callback of each committed seal; `duty`, `duty_gated`,
   `range_unavailable` and `range_unavailable_gated` delegate to them.
+- Network publications over redundant paths (rp-w4b2c): a multicast IPv4
+  channel with `paths` sends on one endpoint per path, each bound to its
+  path's interface address, as one routed publication; each path holds its
+  send endpoint and the receiver's published alias, released and retired
+  with the publication. Refused with `DriverError::UnsupportedChannel`, and
+  counted, while the sockets cannot be isolated per path
+  (`SocketOps::isolates_paths`, owner item 12); unicast `paths` stay
+  refused (owner item 11).
 - The sender over a routed publication's paths (redundant-paths.md, rp-w4b2b):
   a SETUP side on each path's endpoint, established on any path; SMs, NAKs
   and bindings found on any path (`Outbound::serves`,

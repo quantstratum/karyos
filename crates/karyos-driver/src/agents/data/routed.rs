@@ -77,13 +77,6 @@ pub(super) struct RoutedTrack {
 
 /// One to [`MAX_ROUTES`] routes, each on its own endpoint: each route's TX
 /// half is found by its endpoint.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "test-only until rp-w4b2b wires routed publications (#321 interlock)"
-    )
-)]
 fn check_routes(routes: &[(EndpointId, SocketAddr)]) -> Result<(), OutboundError> {
     let shared = (0..routes.len()).any(|index| {
         let (seen, rest) = routes.split_at(index);
@@ -109,13 +102,6 @@ pub(super) struct Routed {
 impl Routed {
     /// The routed part of a publication of `lanes` lanes over `routes`,
     /// served under `config`, reading datagrams of at most `mtu` bytes.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "test-only until rp-w4b2b wires routed publications (#321 interlock)"
-        )
-    )]
     pub(super) fn new(
         routes: &[(EndpointId, SocketAddr)],
         lanes: usize,
@@ -199,7 +185,6 @@ impl Routed {
                 continue;
             }
             if post(route.endpoint, route.destination) {
-                route.last_sent = Some(now);
                 // At most four routes: no overflow.
                 if let Some(next) = posted.checked_add(1) {
                     posted = next;
@@ -329,7 +314,7 @@ impl LaneGate for RoutedGate<'_> {
     }
 }
 
-impl Outbound {
+impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// The data path of the publication `alias` over redundant paths:
     /// `routes` names each path's endpoint and destination, the founding
     /// path first. Otherwise as [`Outbound::new`].
@@ -337,19 +322,12 @@ impl Outbound {
     /// # Errors
     ///
     /// [`OutboundError`].
-    /// Driver-internal until rp-w4b2b wires routed publications: only tests
-    /// construct one (the #321 interlock).
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "test-only until rp-w4b2b wires routed publications (#321 interlock)"
-        )
-    )]
+    /// Driver-internal: `net/publish.rs` builds one for a channel with
+    /// `paths`, behind `SocketOps::isolates_paths` (rp-w4b2c).
     pub(crate) fn new_routed(
         routes: &[(EndpointId, SocketAddr)],
         alias: karyos_protocol::network::Alias,
-        readers: Vec<super::LaneReader>,
+        readers: Vec<super::LaneReader<T>>,
         quanta: &karyos_protocol::network::Lanes<u64>,
         mtu: u32,
         reliable: bool,
@@ -400,10 +378,12 @@ impl Outbound {
         }
     }
 
-    /// Over redundant paths, posts through `post` a PATH_HB toward each
-    /// path's destination that is open and submitted nothing for `interval`
-    /// ns at `now` (redundant-paths.md RP-3); `post` says whether it was
-    /// posted. None on one path. Returns the count posted.
+    /// Over redundant paths, names through `post` each path due a PATH_HB:
+    /// open, and submitted nothing for `interval` ns at `now`
+    /// (redundant-paths.md RP-3), with its destination; `post` says whether
+    /// it took it. The caller reports each one submitted
+    /// ([`Outbound::path_heartbeat_sent`]). None on one path. Returns the
+    /// count taken.
     pub fn path_heartbeats(
         &mut self,
         now: u64,
@@ -413,6 +393,21 @@ impl Outbound {
         self.routed
             .as_deref_mut()
             .map_or(0, |routed| routed.path_heartbeats(now, interval, post))
+    }
+
+    /// Records a PATH_HB submitted on the path on `endpoint` at `now`: the
+    /// path is not idle until `path_heartbeat_interval` later. Only a
+    /// submitted one counts (#336 review), so a refused send is tried again
+    /// next cycle.
+    pub fn path_heartbeat_sent(&mut self, endpoint: EndpointId, now: u64) {
+        if let Some(route) = self.routed.as_deref_mut().and_then(|routed| {
+            routed
+                .routes
+                .iter_mut()
+                .find(|route| route.endpoint == endpoint)
+        }) {
+            route.last_sent = Some(now);
+        }
     }
 
     /// Lane `lane`'s sent frontier (tests).

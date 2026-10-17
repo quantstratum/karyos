@@ -122,7 +122,9 @@ pub trait FrameSource {
 pub enum OnLap {
     /// It records the gap and stops there.
     Stop,
-    /// It records the gap and resumes at the lowest retained position.
+    /// It records the gap up to where the source resumes (the head, for a
+    /// lapped reader; see [`FrameSource::resume`]) and records on from
+    /// there.
     Resume,
 }
 
