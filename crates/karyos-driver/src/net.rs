@@ -39,7 +39,7 @@
 //!   joined) and posts `AddSubscription`; removing it posts
 //!   `RemoveSubscription`, which retires its images. The image table's
 //!   events go to the conductor, which exposes an installed image as the
-//!   lane streams of one aggregate (interim keying, ACS 15937) and seals
+//!   lane streams of one aggregate (per-source images, D2) and seals
 //!   and retires them with the image. An image it cannot expose is still
 //!   fed: its lane conductors are driven here until it retires.
 

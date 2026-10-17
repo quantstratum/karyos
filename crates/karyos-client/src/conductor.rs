@@ -151,8 +151,12 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
     /// Cross-process views).
     FetchableConflated(FetchableConflated),
     /// A network subscription (W5): the driver announces each of its
-    /// images with `ImageAvailable` naming `registration`; a subscriber
-    /// attaches to one with [`ClientConductor::add_subscription`].
+    /// images with `ImageAvailable` naming `registration`, the image's
+    /// aggregate registration and its source. A subscriber attaches to an
+    /// image by its registration with `AddImageSubscription`, as the
+    /// client facade does, or with [`ClientConductor::add_subscription`]
+    /// naming the alias, which reaches the oldest live image of it
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-2).
     NetworkSubscription {
         /// The network subscription's registration.
         registration: u64,

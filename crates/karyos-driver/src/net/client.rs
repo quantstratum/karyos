@@ -16,8 +16,11 @@
 //!   grants lane 0 as `AddPublication` does.
 //! - **Subscription.** `karyos:udp` subscribes the stream (W3) and answers
 //!   `NetworkSubscriptionReady`; each image is then announced with
-//!   `ImageAvailable`, and the client attaches with `AddSubscription`
-//!   naming its alias. `karyos:ipc` is `AddSubscription`'s, refused here.
+//!   `ImageAvailable`, naming its registration and its source, and the
+//!   client attaches with `AddImageSubscription` naming the image, or with
+//!   `AddSubscription` naming its alias, which reaches the oldest image of
+//!   it (`quantstratum-docs: karyos/design/per-source-images.md`).
+//!   `karyos:ipc` is `AddSubscription`'s, refused here.
 //! - **Ownership.** What a client creates is owned by its registration:
 //!   one reconcile pass, run every cycle, removes a network publication
 //!   whose registration ended (removed, dropped or its client gone) and a

@@ -45,11 +45,15 @@
 //!
 //! A `karyos:ipc` subscription reads the only stream of its id. A
 //! `karyos:udp` subscription reads the images the driver announces for it
-//! (`ImageAvailable`), each attached as it arrives and dropped when it
-//! retires (`ImageUnavailable`), and polls them in turn: a client-side
-//! fan-in until the driver aggregates images (D2). At most
-//! [`Context::max_images`] images are attached; another is refused and
-//! counted ([`Subscription::images_refused`]), never dropped silently.
+//! (`ImageAvailable`), each attached by its registration as it arrives
+//! and dropped when it retires (`ImageUnavailable`), and polls them in
+//! turn: a fan-in over every image of the stream, images of one alias
+//! from several sources included (`quantstratum-docs:
+//! karyos/design/per-source-images.md`, D2-4). Two images of one alias
+//! share their session id, which is all a stop or a failed poll names of
+//! its image. At most [`Context::max_images`] images are attached;
+//! another is refused and counted ([`Subscription::images_refused`]),
+//! never dropped silently.
 //! Every subscription takes the role `required` for now; role and rejoin
 //! policy by URI are a follow-up.
 //!

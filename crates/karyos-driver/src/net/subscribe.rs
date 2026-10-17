@@ -4,13 +4,15 @@
 //! coordinator ACS 15937): a stream subscribed on a UDP channel, whose
 //! images become streams of this driver.
 //!
-//! - **Interim keying (D2).** Each installed image is exposed as one
-//!   aggregate keyed by its alias, `StreamKey { stream_id, session_id }`,
-//!   which local subscribers and the client's `AddSubscription` attach to
-//!   as to a local stream. A second image of an alias in use is installed
-//!   and fed but not exposed, and counted. The SPEC semantics, one
-//!   subscription over every image of a stream, and an image-availability
-//!   notification are the D2 target, not this step.
+//! - **Per-source images (D2).** Each installed image is exposed as one
+//!   aggregate named by its registration, with its source
+//!   (`quantstratum-docs: karyos/design/per-source-images.md`): images of
+//!   one alias from several sources are each exposed and announced. A
+//!   client attaches to one by its registration (`AddImageSubscription`);
+//!   its alias, `StreamKey { stream_id, session_id }`, reaches the oldest
+//!   live image of it. An image whose alias is a local stream's key, or
+//!   one the stream table has no room for, is installed and fed but not
+//!   exposed, and counted.
 //! - **Retirement.** A retiring image's streams are sealed with
 //!   [`SealReason::ImageRetired`](karyos_sys::log_buffer::SealReason) and
 //!   retired; they free once no lease holds them, and only then does the
