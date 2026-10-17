@@ -471,3 +471,78 @@ fn a_unicast_subscription_is_not_multicast() {
         Some(false)
     );
 }
+
+/// Redundant paths (owner item 12): while the backend cannot isolate path
+/// sockets, a channel with `paths` is refused and counted, and nothing is
+/// held.
+#[test]
+fn a_channel_with_paths_is_refused_until_paths_are_isolated() {
+    let mut driver = driver(ThreadingMode::Shared);
+    let group = SocketAddr::from(([239, 7, 9, 1], free_port()));
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(LOOPBACK),
+        ],
+        ..channel(group)
+    };
+    assert_eq!(
+        driver.add_network_subscription(6, &channel),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert_eq!(driver.network_path_counters(), (1, 0));
+    assert_eq!(driver.network_held_endpoints(), 0);
+}
+
+/// rp-w1: with isolated paths (assumed here), a multicast subscription
+/// with two paths holds one endpoint per path, each joined to the group on
+/// its interface and with its own receiver entry; a path whose join fails
+/// is counted and the subscription keeps the others. Removal releases
+/// every path's endpoint.
+#[test]
+fn a_subscription_holds_an_endpoint_per_path() {
+    let mut driver = driver(ThreadingMode::Shared);
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    let group = SocketAddr::from(([239, 7, 9, 2], free_port()));
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(LOOPBACK),
+        ],
+        ..channel(group)
+    };
+    // A host without multicast on its default interface cannot join the
+    // first path either: nothing to check there.
+    let Ok(subscription) = driver.add_network_subscription(6, &channel) else {
+        return;
+    };
+    let (refused, failed) = driver.network_path_counters();
+    assert_eq!(refused, 0);
+    assert_eq!(
+        driver.network_held_endpoints(),
+        2 - usize::try_from(failed).unwrap()
+    );
+    assert!(driver.remove_network_subscription(subscription).unwrap());
+    assert_eq!(driver.network_held_endpoints(), 0);
+}
+
+/// Unicast `paths` need a destination per path (owner item 11): refused.
+#[test]
+fn unicast_paths_are_refused() {
+    let mut driver = driver(ThreadingMode::Shared);
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    let address = free_address();
+    let channel = UdpConfig {
+        interface: None,
+        paths: vec![Interface::Address(LOOPBACK), Interface::Address(LOOPBACK)],
+        ..channel(address)
+    };
+    assert_eq!(
+        driver.add_network_subscription(6, &channel),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+}

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use karyos_io::sockets::OsSocket;
 use karyos_io::sockets::endpoint::SocketsConfig;
-use karyos_protocol::network::{Alias, Identity, Lanes, TermParams};
+use karyos_protocol::network::{Alias, Identity, Lanes, SetupAnnounce, TermParams};
 
 use super::super::endpoints::{EndpointEvent, Endpoints};
 use super::super::{AgentCommand, AgentConfig, AgentLinks, NetworkAgents, network_agents};
@@ -257,6 +257,105 @@ impl Rig {
                 .poll(&self.links.sessions, |image| events.push(image));
         }
         std::thread::sleep(Duration::from_micros(200));
+    }
+
+    /// A second receiving endpoint B2 subscribed to the stream, and the
+    /// publication's ANNOUNCE delivered on it from A, as a redundant path
+    /// would carry it: B2 challenges A and binds a later path of the image
+    /// (RP-1). `announce` is what B2 receives. Returns B2.
+    fn second_path(
+        &mut self,
+        setup: &Setup,
+        announce: SetupAnnounce,
+        joins: Option<Lanes<u64>>,
+    ) -> EndpointId {
+        let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let b2 = self
+            .endpoints
+            .open(&self.links, loopback, OsSocket::new())
+            .unwrap();
+        let mut opened = false;
+        for _ in 0..100 {
+            self.agents.do_work(self.now).unwrap();
+            self.endpoints.poll(
+                &self.links,
+                self.now,
+                |event| opened |= matches!(event, EndpointEvent::Opened(_)),
+                |_| {},
+            );
+            if opened {
+                break;
+            }
+        }
+        assert!(opened);
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::AddSubscription {
+                reply,
+                endpoint: b2,
+                stream_id: alias().stream_id,
+                max_term_length: setup.max_term_length,
+                reliable: setup.reliable,
+                multicast: false,
+                control_group: None,
+            })
+            .unwrap();
+        self.round(true);
+        let source = self.endpoints.local_address(self.publisher).unwrap();
+        let receiver = &mut self.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            b2,
+            source,
+            karyos_protocol::network::Control::SetupAnnounce(announce),
+            self.now,
+        );
+        // The sender answers toward its one destination, B (sender paths
+        // are rp-w4): the answer a multicast path would carry is handed
+        // to B2 here, echoing B2's challenge, at the joins `joins`.
+        let challenge = self
+            .agents
+            .receiver
+            .role
+            .posted_challenges()
+            .iter()
+            .rev()
+            .find_map(|(endpoint, control)| match control {
+                karyos_protocol::network::Control::Challenge(challenge) if *endpoint == b2 => {
+                    Some(*challenge)
+                }
+                _ => None,
+            });
+        if let Some(challenge) = challenge {
+            let answer = karyos_protocol::network::SetupAnswer {
+                alias: announce.alias,
+                identity: announce.identity,
+                term: announce.term,
+                challenge: challenge.challenge,
+                joins: joins.unwrap_or_else(|| Lanes::new(&[0, 0]).unwrap()),
+            };
+            let receiver = &mut self.agents.receiver;
+            receiver.role.inject_control(
+                &receiver.sessions,
+                b2,
+                source,
+                karyos_protocol::network::Control::SetupAnswer(answer),
+                self.now,
+            );
+        }
+        b2
+    }
+
+    /// Removes the subscription of the stream on `endpoint`.
+    fn unsubscribe(&mut self, endpoint: EndpointId) {
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::RemoveSubscription {
+                reply,
+                endpoint,
+                stream_id: alias().stream_id,
+            })
+            .unwrap();
     }
 
     /// Free units of the session rings: (receiver to conductor, conductor
@@ -2151,4 +2250,202 @@ fn group_nak_validation_is_ordered_and_bound_to_its_control_group() {
     assert_eq!(counters.group_nak_own, 1, "{counters:?}");
     assert_eq!(counters.group_nak_range, 0, "{counters:?}");
     assert_eq!(counters.group_naks, 0, "{counters:?}");
+}
+
+/// The ANNOUNCE of the rig's publication, as a later path receives it.
+fn announce(term_length: u32) -> SetupAnnounce {
+    SetupAnnounce {
+        alias: alias(),
+        identity: identity(),
+        term: term(term_length),
+        lane_count: 2,
+    }
+}
+
+/// rp-w1, RP-1 and RP-2: a later path of the publication binds to the
+/// image through its own challenge, with the image's identity, terms and
+/// lanes; the image stays while either path's subscription remains, and
+/// retires with the last.
+#[test]
+fn a_later_path_binds_and_keeps_the_image() {
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut rig);
+    let b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    // The founding path's subscription goes: the later path keeps it.
+    rig.unsubscribe(b);
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    assert!(rig.agents.receiver.role.has_image(slot));
+    // The last path's subscription goes: the image retires.
+    rig.unsubscribe(b2);
+    rig.until(true, |rig| !rig.agents.receiver.role.has_image(slot));
+}
+
+/// rp-w1, RP-1: a later path whose announcement does not match the
+/// image (another lane count) binds nothing: the image keeps one path.
+#[test]
+fn a_mismatched_later_path_is_refused() {
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(
+        &setup,
+        SetupAnnounce {
+            lane_count: 1,
+            ..announce(setup.term_length)
+        },
+        None,
+    );
+    for _ in 0..100 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1);
+}
+
+/// rp-w1, RP-1: a later path joins at the sender's current positions,
+/// above the image's join; the binding moves no position, so a
+/// subscriber of the image keeps reading every message once, in order.
+#[test]
+fn a_later_path_join_moves_no_position() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let mut seen = Vec::new();
+    let send = |rig: &mut Rig, from: u8, to: u8| {
+        for i in from..to {
+            let log = rig.log.as_mut().unwrap();
+            let _ = log.publications[0]
+                .append(&[i; 600], AppendOptions::default())
+                .unwrap();
+        }
+    };
+    send(&mut rig, 0, 4);
+    for _ in 0..200 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() == 4 {
+            break;
+        }
+    }
+    // The later path joins where the sender is now: four 600-byte
+    // messages (640 aligned bytes each) above the image's join.
+    let joins = Lanes::new(&[4 * 640, 0]).unwrap();
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), Some(joins));
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    send(&mut rig, 4, 8);
+    for _ in 0..200 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() == 8 {
+            break;
+        }
+    }
+    assert_eq!(seen, (0..8).collect::<Vec<u8>>());
+}
+
+/// rp-w1, RP-2: a path with no fresh evidence times out at the path
+/// liveness timeout and is removed; the image stays while the other path
+/// keeps delivering, and no path loss retires it.
+#[test]
+fn losing_one_path_keeps_the_image() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    // Data comes only on the founding path; the later one hears nothing.
+    let mut lost = false;
+    for i in 0..15u8 {
+        rig.now += 1_000_000_000;
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..5 {
+            rig.round(true);
+        }
+        if rig.agents.receiver.role.live_paths(slot) == 1 {
+            lost = true;
+            break;
+        }
+    }
+    assert!(lost, "the silent path never timed out");
+    assert!(rig.agents.receiver.role.has_image(slot));
+}
+
+/// rp-w1, RP-6: once the lane's rebuild position passes a term's end, the
+/// term is complete and each bound path is charged what it did not deliver
+/// fresh in it, from the term after its join's: the founding path
+/// delivered all of term 1, the silent later path is missing all of it.
+#[test]
+fn a_complete_term_charges_each_path_its_missing_bytes() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    // A little over two 64 KiB terms on lane 0, each message offered
+    // again while the publication is back-pressured.
+    let mut sent = 0u8;
+    for _ in 0..20_000 {
+        let log = rig.log.as_mut().unwrap();
+        let outcome = log.publications[0]
+            .append(&[sent; 900], AppendOptions::default())
+            .unwrap();
+        if matches!(
+            outcome,
+            karyos_sys::log_buffer::AppendOutcome::Appended { .. }
+        ) {
+            sent += 1;
+            if sent == 140 {
+                break;
+            }
+        }
+        rig.round(true);
+    }
+    assert_eq!(sent, 140);
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .path_counts(slot, 1)
+            .is_some_and(|counts| counts.missing_bytes > 0)
+    });
+    let founding = rig.agents.receiver.role.path_counts(slot, 0).unwrap();
+    let later = rig.agents.receiver.role.path_counts(slot, 1).unwrap();
+    assert_eq!(
+        later.missing_bytes,
+        u64::from(setup.term_length),
+        "{later:?}"
+    );
+    assert_eq!(founding.missing_bytes, 0, "{founding:?}");
 }

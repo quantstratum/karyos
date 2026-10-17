@@ -204,6 +204,18 @@ pub trait SocketOps: Sized {
     /// Receives one datagram into `buffer`.
     fn recv(&mut self, buffer: &mut [u8]) -> RecvResult;
 
+    /// Whether the sockets of a channel's redundant paths are isolated per
+    /// interface: a datagram arriving on one path's interface is never
+    /// received by another path's socket (`quantstratum-docs:
+    /// karyos/design/redundant-paths.md`). Without it every datagram would
+    /// count on every path, so the driver refuses a channel with `paths`.
+    /// `false` until a backend can guarantee it (owner item 12: on Linux,
+    /// `IP_MULTICAST_ALL` off per path socket).
+    #[must_use]
+    fn isolates_paths() -> bool {
+        false
+    }
+
     /// Creates, configures and binds the socket for `config` (4.1) and
     /// runs the probes of 8.2. A failure leaves no socket open.
     ///
