@@ -11,6 +11,21 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A conflated network view closes on its own. Its image retiring publishes
+  the terminal reason `TERMINAL_IMAGE_RETIRED` (4) with an empty interval;
+  exhausted versions or a feeder that cannot read on publish
+  `TERMINAL_FRESHNESS_EXHAUSTED` or the new `TERMINAL_FEEDER_LOST` (5), and
+  the image lane stays open for its other subscribers.
+  `NetworkViewCounters` splits `unbuilt` into `unbuilt_unexposed` and
+  `unbuilt_failed` with `last_build_failure` (`ViewBuildFailure`), and adds
+  `closed_retired` and `feeders_lost`. A view's configuration is also found
+  for an image on a subscription's later path.
+- `ViewClosed` maps reason 4 to `ImageRetired { since: None }` and reason 5
+  to the new `FeederLost { since }`.
+- A conflation reader that sees its table closed reads the terminal cell
+  again, so a terminal published before the close is in that poll's
+  report. `ConflationWriter::seed_version` is available to dependent
+  crates' tests under `test-hooks`.
 - `AgentConfig::control_capacity` defaults to 512 (was 256). Configuration
   now refuses a receiver control ring below `max_pending_challenges +
   max_images × max_paths + 32`, since an image's SM goes on each of its
@@ -37,6 +52,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The conductor hands network trace hooks and journals to the agents
+  (P2.12 step 3, PR 3a). `set_network_trace_hook` gives the hook to its
+  side's agent; a journal opens per lane of a publication once the sender
+  added it and of an image once it is installed, including those already
+  there when a hook is set. The agent's start and close facts go to the
+  trace mirror. A publication's sender journals close before the sender
+  removes it, and an image's when it retires. `CloseNetworkJournal` names
+  the journal number, so a stale close never answers a later journal of a
+  reinstalled identity. A journal the agent refuses is closed and counted
+  as refused; one a hook change closes is counted in the new driver counter
+  `network trace journals unhooked`.
 - Receiver network trace points (P2.12 step 3, trace-network.md section 4,
   section 5, NT-2 to NT-4). The receiver agent writes one journal per lane
   of an installed image: `OpenNetworkJournal` starts it at the lane's next
@@ -107,7 +133,8 @@ release may break APIs, wire formats and shared-memory layouts.
   uncancelled copies per route. `StageError::OutOfOrder` refuses a copy
   not above its route's last one.
 - A publication over redundant paths (redundant-paths.md section 7, RP-10):
-  `Outbound::new_routed` takes one endpoint and destination per path, and
+  `Outbound::new_routed` (crate-internal: test-only until the publication
+  wiring) takes one endpoint and destination per path, and
   `Outbound::serve_routes` sends each committed datagram once on every
   path, debited once (`karyos_io::lanes::routes::RoutedLaneSender`). Repair
   stays on the founding path, on its queues. A route's failure resets only

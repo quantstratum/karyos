@@ -178,7 +178,7 @@ pub enum NetworkPublicationState {
 }
 
 /// A network publication of this driver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NetPublication {
     /// The aggregate's registration.
     registration: u64,
@@ -191,6 +191,13 @@ struct NetPublication {
     /// A guarded publication's sender gate, registered with the guard's
     /// owner; released once the sender refused or returned it.
     guard_sender: Option<crate::guard_ack::GuardSenderId>,
+    /// The identity its trace journals name (trace-network.md §5).
+    traced: karyos_protocol::trace_hook::PublicationIdentity,
+    /// Its lane count.
+    lanes: u8,
+    /// Its open sender journals to close before `RemovePublication`, in the
+    /// same ring (P2.12 step 3): `(lane, journal number)`.
+    trace_closes: Vec<(Lane, u64)>,
 }
 
 /// An endpoint shared by the publications and subscriptions bound to one
@@ -249,22 +256,48 @@ impl NetSubscription {
 /// What the conflated views of network images did
 /// (conflated-network-images.md). Increments are checked: one that would
 /// overflow keeps its value.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NetworkViewCounters {
     /// Views built over an exposed image lane.
     pub built: u64,
-    /// Installed images with a conflated lane that got no view: unexposed
-    /// (interim keying), or a table that could not be built.
-    pub unbuilt: u64,
+    /// Installed images with a conflated lane that got no view because the
+    /// image was not exposed (interim keying).
+    pub unbuilt_unexposed: u64,
+    /// Views that could not be built over an exposed lane (the lane, the
+    /// configuration, the table or the feeder's subscription failed); the
+    /// cause of the last is kept in `last_build_failure`.
+    pub unbuilt_failed: u64,
+    /// The cause of the last view that could not be built.
+    pub last_build_failure: Option<ViewBuildFailure>,
     /// Seal requests acknowledged after the loss was recorded.
     pub acked: u64,
     /// Seal requests whose acknowledgement was withheld while the barrier
     /// was full.
     pub withheld: u64,
-    /// Gaps met in the log and recorded there (sealed before the attach).
+    /// Ranges met in the log and recorded there as losses: a gap sealed
+    /// before the attach, or any other range the poll skipped (every
+    /// skip reason counts as a loss, conservatively).
     pub caught_up: u64,
-    /// Views closed because their terminal cell was published.
+    /// Views closed because their terminal cell was published (a timeout,
+    /// exhaustion, a loss below the frontier or a lost feeder).
     pub closed_terminal: u64,
+    /// Views closed because their image retired.
+    pub closed_retired: u64,
+    /// Feeders that could not read on: their view closed, the image stayed.
+    pub feeders_lost: u64,
+}
+
+/// Why a conflated view of a network image could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewBuildFailure {
+    /// The image has no stream for the conflated lane.
+    NoLane,
+    /// The subscription's view configuration is gone.
+    NoConfiguration,
+    /// The table could not be created.
+    Table(karyos_sys::conflation::ConflationError),
+    /// The feeder's subscription of the lane could not be made.
+    Subscription,
 }
 
 impl NetworkViewCounters {
@@ -327,6 +360,10 @@ struct NetImage {
     slot: SlotRef,
     /// The endpoint it arrived on, which its subscription names.
     endpoint: EndpointId,
+    /// The publication it receives, as its trace journals name it.
+    traced: karyos_protocol::trace_hook::PublicationIdentity,
+    /// Its lane count.
+    lanes: usize,
     exposed: Option<crate::embedded::AggregateHandle>,
     /// An unexposed image's lane conductors, driven here so its terms are
     /// still prepared and it keeps being fed (ACS 15937); dropped when it
@@ -361,6 +398,9 @@ pub(crate) struct Network {
     net_images: Vec<NetImage>,
     /// The image table's events of the last cycle, for the conductor.
     image_events: Vec<ImageEvent>,
+    /// The agents' network trace answers of the last cycle, and the
+    /// publications that became active, for the conductor (P2.12 step 3).
+    trace_events: Vec<trace::TraceEvent>,
     /// Endpoint resets completed (`EndpointEvent::Reopened`), for tests.
     #[cfg(test)]
     reopened: u64,
@@ -403,6 +443,9 @@ pub(crate) struct Network {
     /// What the conflated views of network images did
     /// (conflated-network-images.md).
     views: NetworkViewCounters,
+    /// Conflated views built from now on are not attached (tests).
+    #[cfg(test)]
+    defer_view_attach: bool,
 }
 
 impl Network {
@@ -438,6 +481,15 @@ impl Network {
             subscription_refusals: 0,
             net_images: Vec::with_capacity(config.agents.sessions.max_images),
             image_events: Vec::with_capacity(config.agents.sessions.max_images),
+            // An answer per lane of every publication and image at once.
+            trace_events: Vec::with_capacity(
+                config
+                    .agents
+                    .publications
+                    .checked_add(config.agents.sessions.max_images)
+                    .and_then(|count| count.checked_mul(usize::from(Lane::COUNT)))
+                    .unwrap_or(config.agents.publications),
+            ),
             images_unexposed: 0,
             #[cfg(test)]
             reopened: 0,
@@ -456,6 +508,8 @@ impl Network {
             paths_refused: 0,
             path_failures: 0,
             views: NetworkViewCounters::default(),
+            #[cfg(test)]
+            defer_view_attach: false,
         })
     }
 
@@ -879,6 +933,7 @@ impl Network {
 
     /// The conflated lane of the installed image `slot` and a clone of the
     /// link its view shares with the receiver's seal gate.
+    #[must_use]
     pub(crate) fn image_freshness(
         &self,
         slot: SlotRef,
@@ -895,6 +950,7 @@ impl Network {
         &mut self,
         slot: SlotRef,
         endpoint: EndpointId,
+        traced: karyos_protocol::trace_hook::PublicationIdentity,
         exposed: Option<crate::embedded::AggregateHandle>,
         lanes: &[Arc<LogBuffer>],
     ) {
@@ -911,6 +967,8 @@ impl Network {
         self.net_images.push(NetImage {
             slot,
             endpoint,
+            traced,
+            lanes: lanes.len(),
             exposed,
             conductors,
         });
@@ -993,7 +1051,6 @@ impl Network {
         self.subscription_refusals
     }
 
-    /// Distinct network subscription keys held, for tests.
     /// Drops the receiver's DATA datagrams numbered `nth` (from 0) from
     /// now on, as a lossy path would (tests, Shared mode only).
     #[cfg(test)]
@@ -1003,7 +1060,23 @@ impl Network {
         }
     }
 
+    /// Holds back the attach of the conflated views built from now on, as
+    /// if their feeders attached late (tests).
+    #[cfg(test)]
+    pub(crate) fn defer_view_attach(&mut self) {
+        self.defer_view_attach = true;
+    }
+
+    /// Whether views are attached late (always `false` outside tests).
+    pub(crate) fn defers_view_attach(&self) -> bool {
+        #[cfg(test)]
+        return self.defer_view_attach;
+        #[cfg(not(test))]
+        false
+    }
+
     /// What the conflated views of network images did.
+    #[must_use]
     pub(crate) fn view_counters(&self) -> NetworkViewCounters {
         self.views
     }
@@ -1015,6 +1088,10 @@ impl Network {
 
     /// The conflated lane and table configuration of the subscription to
     /// `stream_id` on `endpoint`, the view an image of that key gets.
+    ///
+    /// An image installed on a later path's endpoint (its first path lost,
+    /// then a path challenge) finds its subscription there too.
+    #[must_use]
     pub(crate) fn conflation_of(
         &self,
         endpoint: EndpointId,
@@ -1022,7 +1099,7 @@ impl Network {
     ) -> Option<(Lane, karyos_sys::conflation::ConflationConfig)> {
         self.subscriptions
             .iter()
-            .find(|entry| (entry.endpoint, entry.stream_id) == (endpoint, stream_id))
+            .find(|entry| entry.serves(endpoint, stream_id))
             .and_then(|entry| entry.conflated)
     }
 
@@ -1043,9 +1120,25 @@ impl Network {
         }
     }
 
+    /// Distinct network subscription keys held, for tests.
     #[cfg(test)]
     pub(crate) fn subscription_count(&self) -> usize {
         self.subscriptions.len()
+    }
+
+    /// The endpoint of each path of the subscription to `stream_id`, the
+    /// first path first (tests).
+    #[cfg(test)]
+    pub(crate) fn subscription_endpoints(&self, stream_id: i32) -> Vec<EndpointId> {
+        self.subscriptions
+            .iter()
+            .find(|entry| entry.stream_id == stream_id)
+            .map(|entry| {
+                core::iter::once(entry.endpoint)
+                    .chain(entry.later.into_iter().flatten())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The configured identity the receiver holds for each path endpoint
@@ -1122,6 +1215,10 @@ impl Network {
     ) -> Result<(), DriverError> {
         let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
         let (endpoint, alias) = (publication.endpoint, publication.alias);
+        let (traced, lanes) = (
+            trace::identity(&publication.identity, alias),
+            publication.lane_count,
+        );
         // One tracked publication per key: the sender's answers then name
         // exactly one entry, and a key freed locally while its old
         // publication is still being removed waits for it (#279 P1).
@@ -1193,6 +1290,9 @@ impl Network {
             state: NetworkPublicationState::Adding,
             remove_posted: false,
             guard_sender,
+            traced,
+            lanes,
+            trace_closes: Vec::new(),
         });
         Ok(())
     }
@@ -1204,7 +1304,11 @@ impl Network {
 
     /// Starts removing the publication `registration`; `false` when it is
     /// not a network publication. Its data path comes back later.
-    pub(crate) fn remove_publication(&mut self, registration: u64) -> bool {
+    pub(crate) fn remove_publication(
+        &mut self,
+        registration: u64,
+        trace_closes: Vec<(Lane, u64)>,
+    ) -> bool {
         let Some(entry) = self
             .publications
             .iter_mut()
@@ -1212,6 +1316,9 @@ impl Network {
         else {
             return false;
         };
+        // Its sender journals close first, in the same ring; a repeated
+        // removal adds to the closes still pending, never replaces them.
+        entry.trace_closes.extend(trace_closes);
         if entry.state == NetworkPublicationState::Refused {
             // Nothing reached the sender; its endpoint is released.
             self.publications
@@ -1301,10 +1408,11 @@ impl Network {
         #[cfg(test)]
         let mut reopened = Some(self.reopened);
         let mut refusals = self.subscription_refusals;
-        let (publications, send_endpoints, released) = (
+        let (publications, send_endpoints, released, trace_events) = (
             &mut self.publications,
             &mut self.send_endpoints,
             &mut self.released_guards,
+            &mut self.trace_events,
         );
         let mut stale = Stale {
             queue: &mut self.stale_aliases,
@@ -1335,7 +1443,41 @@ impl Network {
                 {
                     refusals = count;
                 }
+                let Some(event) =
+                    trace::TraceEvent::route(event, |traced| trace_events.push(traced))
+                else {
+                    return;
+                };
+                // What the trace journals need of a publication's answer:
+                // its activation, and its identity once it is gone.
+                let added = match &event {
+                    AgentEvent::PublicationAdded { registration, .. } => Some(*registration),
+                    _ => None,
+                };
+                if let AgentEvent::PublicationRemoved {
+                    endpoint,
+                    alias,
+                    registration,
+                    ..
+                } = &event
+                    && let Some(entry) = publications.iter().find(|entry| {
+                        (entry.endpoint, entry.alias, entry.registration)
+                            == (*endpoint, *alias, *registration)
+                    })
+                {
+                    trace_events.push(trace::TraceEvent::PublicationRemoved {
+                        traced: entry.traced,
+                    });
+                }
                 publication_answer(publications, send_endpoints, &mut stale, released, event);
+                if let Some(registration) = added
+                    && publications.iter().any(|entry| {
+                        entry.registration == registration
+                            && entry.state == NetworkPublicationState::Active
+                    })
+                {
+                    trace_events.push(trace::TraceEvent::PublicationActive { registration });
+                }
             },
         );
         #[cfg(test)]
@@ -1561,18 +1703,33 @@ fn release(table: &mut [SendEndpoint], endpoint: EndpointId) {
 }
 
 /// Posts `RemovePublication` for every publication being removed that
-/// is not posted yet, queueing its alias as stale, then
-/// `RemovePublishedAlias` for every stale alias; a full ring leaves the
-/// rest for the next cycle.
+/// is not posted yet, after its sender journals' closes, queueing its
+/// alias as stale, then `RemovePublishedAlias` for every stale alias; a
+/// full ring leaves the rest for the next cycle.
 fn post_removals(
     links: &AgentLinks<OsSocket>,
     publications: &mut [NetPublication],
     stale: &mut Stale<'_>,
 ) {
-    for entry in publications
+    'entries: for entry in publications
         .iter_mut()
         .filter(|entry| entry.state == NetworkPublicationState::Removing && !entry.remove_posted)
     {
+        let publication = entry.traced;
+        while let Some(&(lane, number)) = entry.trace_closes.last() {
+            let posted = links
+                .sender
+                .post(|reply| AgentCommand::CloseNetworkJournal {
+                    reply,
+                    publication,
+                    lane,
+                    number,
+                });
+            if posted.is_err() {
+                break 'entries;
+            }
+            let _ = entry.trace_closes.pop();
+        }
         let (endpoint, alias, registration) = (entry.endpoint, entry.alias, entry.registration);
         let posted = links.sender.post(|reply| AgentCommand::RemovePublication {
             reply,
@@ -1748,6 +1905,7 @@ pub(crate) fn e2e_config(stream_id: i32) -> crate::embedded::StreamConfig {
 pub mod control_group;
 mod publish;
 mod subscribe;
+pub(crate) mod trace;
 
 #[cfg(test)]
 mod e2e;

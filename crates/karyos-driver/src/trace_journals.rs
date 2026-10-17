@@ -194,10 +194,6 @@ fn release(held: u64, bytes: u64, counters: &DriverCounters) -> u64 {
 /// Counts a refused network journal in the driver counters, and an
 /// overflow when the mirror's header count could not rise (`header_rose`
 /// false): the refusal is never silent (ACS 15639).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the agents in P2.12 step 3")
-)]
 fn count_refusal(header_rose: bool, counters: &DriverCounters) {
     if !header_rose {
         counters.add(Event::CounterOverflows, 1);
@@ -350,10 +346,6 @@ impl TraceJournals {
 
     /// [`TraceJournals::preflight`] for a network journal, against
     /// `max_network_journal_bytes`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the agents in P2.12 step 3")
-    )]
     pub(crate) fn preflight_network(&self, layout: &JournalLayout) -> Result<Reserved, Refusal> {
         self.preflight_for(layout, true)
     }
@@ -536,12 +528,25 @@ impl TraceJournals {
     /// Counts a refused network journal in the mirror's header word 7 and
     /// in the driver counters; a header count that cannot rise is counted
     /// as an overflow, never silently (ACS 15639).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "called by the agents in P2.12 step 3")
-    )]
     pub(crate) fn refuse_network(&mut self, counters: &DriverCounters) {
         count_refusal(self.mirror.refuse_network_journal(), counters);
+    }
+
+    /// Whether a table entry still names a network journal of
+    /// `publication`: until then its refused count may still be needed by
+    /// a report (§5).
+    #[must_use]
+    pub(crate) fn names_network(
+        &self,
+        publication: &karyos_protocol::trace_hook::PublicationIdentity,
+    ) -> bool {
+        self.slots.iter().flatten().any(|held| {
+            held.entry
+                .network
+                .is_some_and(|facts| facts.sender_driver == publication.driver)
+                && (held.entry.stream, held.entry.incarnation)
+                    == (publication.registration, publication.incarnation)
+        })
     }
 
     /// Updates the facts of network journal `journal` with `update` and

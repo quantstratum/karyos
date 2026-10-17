@@ -1141,6 +1141,7 @@ fn journal_facts(
 ) -> super::net_trace::JournalFacts {
     super::net_trace::JournalFacts {
         publication: traced.publication,
+        number: traced.number,
         start: traced.start,
         boundary: owner
             .and_then(|owner| owner.rebuild_position(traced.lane))
@@ -1675,6 +1676,7 @@ impl ReceiverRole {
                                     slot: image.slot,
                                     lane: journal.lane,
                                     publication,
+                                    number: journal.number,
                                     start,
                                 }
                             })
@@ -1702,9 +1704,10 @@ impl ReceiverRole {
                 reply,
                 publication,
                 lane,
+                number,
             } => {
                 let images = &self.images;
-                let facts = self.trace.close(&publication, lane, |traced| {
+                let facts = self.trace.close(number, |traced| {
                     let owner = images
                         .iter()
                         .find(|image| image.slot == traced.slot)
@@ -1717,6 +1720,7 @@ impl ReceiverRole {
                         agent,
                         publication,
                         lane,
+                        number,
                         facts,
                     },
                 ))
@@ -1746,6 +1750,7 @@ impl ReceiverRole {
                 agent: AgentKind::Receiver,
                 publication: facts.publication,
                 lane,
+                number: facts.number,
                 facts: Some(facts),
             })
         });
@@ -4050,7 +4055,7 @@ impl SenderRole {
         alias: Alias,
         registration: u64,
     ) -> AgentEvent<O> {
-        let outbound = self
+        let mut outbound = self
             .publications
             .iter()
             .position(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
@@ -4070,6 +4075,26 @@ impl SenderRole {
                 self.bindings
                     .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
             }
+        }
+        // Lanes still traced (their close found no room before the removal)
+        // close through the hook, so it closes their writers; the conductor
+        // counts them `Lost`.
+        if let Some(outbound) = outbound.as_mut() {
+            let hook = &mut self.trace;
+            outbound.untrace_all(|lane, traced| {
+                if let (Some(hook), Some(lane)) = (
+                    hook.hook(),
+                    u8::try_from(lane)
+                        .ok()
+                        .and_then(|lane| Lane::try_new(lane).ok()),
+                ) {
+                    hook.close_journal(
+                        karyos_protocol::trace_hook::NetSide::Sender,
+                        &traced.publication,
+                        lane,
+                    );
+                }
+            });
         }
         AgentEvent::PublicationRemoved {
             endpoint,

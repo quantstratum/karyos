@@ -434,6 +434,12 @@ impl Outbound {
             return false;
         };
         let mut open = false;
+        // The routes that can send, as this pass starts: opened and not
+        // waiting for a reset.
+        let mut live = [false; MAX_ROUTES];
+        for (live, route) in live.iter_mut().zip(&routed.routes) {
+            *live = route.opened.is_some() && !route.needs_reset;
+        }
         for (index, slot) in routed.routes.iter_mut().enumerate() {
             let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
                 Half::Tx(tx) if *held == slot.endpoint => Some(&mut **tx),
@@ -485,8 +491,11 @@ impl Outbound {
             // or below its debited position go as catch-up, debiting nothing.
             let reopened = slot.opened.is_some();
             for (lane, reader) in self.readers.iter_mut().enumerate() {
+                // Only a route that can still send them holds copies: one
+                // resetting or never opened will drop its own (#331 review).
                 let others = (0..MAX_ROUTES)
                     .filter(|route| *route != index)
+                    .filter(|route| live.get(*route).is_some_and(|live| *live))
                     .filter_map(|route| routed.sender.pending(lane, route))
                     .any(|held| held > 0);
                 if reopened && self.reliable && !others {
@@ -802,9 +811,12 @@ impl Outbound {
         // failure resets only its route's endpoint; a faulted queue is
         // retried, keeping its copies; an unknown copy waits for the reset.
         let mut failed = routed.sender.take_failures();
-        if let Some(first) = failed.first_mut() {
-            // One route: its failure stopped the call, as on one path.
-            *first = first.or(report.failure).or(caught.failure);
+        // A failure of the call itself is one route's when there is one
+        // route, or the whole publication's (a DRR error): every route
+        // resets, never only the founding one (#331 review).
+        let whole = report.failure.or(caught.failure);
+        for slot in failed.iter_mut().take(routed.routes.len()) {
+            *slot = slot.or(whole);
         }
         for (index, slot) in routed.routes.iter_mut().enumerate() {
             // A route that submitted DATA this call is not idle (RP-3).

@@ -3,14 +3,19 @@
 //! `karyos-bench`: runs the embedded workloads and reports them.
 //!
 //! ```text
-//! karyos-bench [--workload <name>] [--iterations <n>] [--rate <messages/s>]
+//! karyos-bench [--workload <name>] [--backing heap|shared|region]
+//!              [--iterations <n>] [--rate <messages/s>]
 //!              [--record <dir>] [--compare <dir>]
 //! ```
 //!
 //! `--record` appends to `<dir>/history.jsonl`; `--compare` prints the
 //! change against the last record with the same workload, configuration,
 //! host and profile. `--rate` changes the scheduled rate for `open-loop`.
-//! Comparisons report, they never fail.
+//! `--backing` runs the default configurations of that term backing:
+//! every workload that runs on it, or with `--workload` that workload's
+//! default configurations moved to it, which a workload that does not run
+//! on it refuses. A region exists on Linux only. Comparisons report, they
+//! never fail.
 //!
 //! ```text
 //! karyos-bench inventory --out <dir> [--records <dir>]
@@ -54,7 +59,7 @@ use karyos_bench::inventory::{self, Eligibility, Inventory, Scope};
 use karyos_bench::manifest::{ILLUSTRATIVE_E_MAX, MtuRule, primary};
 use karyos_bench::plan::{self, PlanOptions};
 use karyos_bench::wire::process::Cores;
-use karyos_bench::{Workload, analyze, defaults, measure, report, run};
+use karyos_bench::{Backing, Config, Workload, analyze, defaults, measure, report, run};
 
 /// The allocation build counts allocations with this allocator; it never
 /// measures timing (`alloc-count`, M-9).
@@ -65,6 +70,7 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
 
 struct Options {
     workload: Option<Workload>,
+    backing: Option<Backing>,
     iterations: u64,
     rate: Option<u64>,
     record: Option<PathBuf>,
@@ -74,6 +80,7 @@ struct Options {
 fn parse() -> Result<Options, String> {
     let mut options = Options {
         workload: None,
+        backing: None,
         iterations: 20_000,
         rate: None,
         record: None,
@@ -87,6 +94,13 @@ fn parse() -> Result<Options, String> {
                 let name = value()?;
                 options.workload =
                     Some(Workload::parse(&name).ok_or(format!("unknown workload {name}"))?);
+            }
+            "--backing" => {
+                let name = value()?;
+                options.backing = Some(
+                    Backing::parse(&name)
+                        .ok_or(format!("unknown backing {name}: heap, shared or region"))?,
+                );
             }
             "--iterations" => {
                 options.iterations = value()?
@@ -104,6 +118,29 @@ fn parse() -> Result<Options, String> {
         }
     }
     Ok(options)
+}
+
+/// The default configurations `options` select.
+fn selected(options: &Options) -> Vec<Config> {
+    let configs = defaults(options.iterations)
+        .into_iter()
+        .filter(|config| options.workload.is_none_or(|w| w == config.workload));
+    match (options.backing, options.workload) {
+        (None, _) => configs.collect(),
+        (Some(backing), None) => configs.filter(|config| config.backing == backing).collect(),
+        // The workload's default configurations on `backing`: `run`
+        // refuses a backing the workload does not run on.
+        (Some(backing), Some(workload)) => {
+            let mut moved: Vec<Config> = Vec::new();
+            for config in configs.filter(|config| config.backing == workload.default_backing()) {
+                let config = Config { backing, ..config };
+                if !moved.contains(&config) {
+                    moved.push(config);
+                }
+            }
+            moved
+        }
+    }
 }
 
 fn inventory_command(args: &[String]) -> Result<String, String> {
@@ -392,10 +429,16 @@ fn main() -> ExitCode {
         .and_then(|dir| std::fs::read_to_string(history(dir)).ok())
         .unwrap_or_default();
     let mut lines = Vec::new();
-    for mut config in defaults(options.iterations)
-        .into_iter()
-        .filter(|config| options.workload.is_none_or(|w| w == config.workload))
-    {
+    let configs = selected(&options);
+    if configs.is_empty() {
+        let _ = writeln!(
+            err,
+            "karyos-bench: no default configuration runs on backing {} here",
+            options.backing.map_or("heap", Backing::name)
+        );
+        return ExitCode::from(2);
+    }
+    for mut config in configs {
         if config.workload == Workload::OpenLoop
             && let Some(rate) = options.rate
         {
