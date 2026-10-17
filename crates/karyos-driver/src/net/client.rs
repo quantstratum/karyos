@@ -206,10 +206,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let udp = match channel.media {
             Media::Ipc => {
-                return match self.ipc_stream(stream_id) {
-                    Some(stream) => grant(self, stream),
-                    None => refuse(ErrorCode::UnknownStream, detail),
+                let Some(stream) = self.ipc_stream(stream_id) else {
+                    return refuse(ErrorCode::UnknownStream, detail);
                 };
+                // A URI that names `lanes` must name the stream's: checked
+                // before lane 0 is granted, as an exclusive publication is
+                // granted once per incarnation (W8).
+                if let Some(named) = channel.common.lanes {
+                    let configured = self
+                        .streams
+                        .iter()
+                        .find(|found| {
+                            !found.retiring
+                                && (found.stream_id, found.session_id)
+                                    == (stream.stream_id, stream.session_id)
+                        })
+                        .map(|found| found.aggregate.lanes);
+                    if let Some(configured) = configured
+                        && configured != named
+                    {
+                        return refuse(ErrorCode::LaneMismatch, u64::from(configured));
+                    }
+                }
+                return grant(self, stream);
             }
             Media::Udp(udp) => udp,
         };

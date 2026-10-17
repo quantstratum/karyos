@@ -38,8 +38,9 @@ pub mod tool;
 pub mod trace;
 
 pub use client::{
-    Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES, DEFAULT_MAX_PENDING,
-    DEFAULT_TIMEOUT, IdleStrategy, ImageStop, Subscription, SubscriptionError, SubscriptionPoll,
+    Accepted, Claim, Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES,
+    DEFAULT_MAX_PENDING, DEFAULT_TIMEOUT, IdleStrategy, ImageStop, MessageLength, OfferError,
+    Publication, Subscription, SubscriptionError, SubscriptionPoll,
 };
 pub use concurrent::{
     ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,
@@ -58,6 +59,7 @@ pub use generation::{GenerationLink, LinkStatus, Successor};
 pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
 pub use karyos_protocol::cnc::StreamId;
+pub use karyos_sys::frame::Lane;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
