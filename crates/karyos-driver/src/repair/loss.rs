@@ -143,6 +143,24 @@ impl MulticastConfig {
         Ok(())
     }
 
+    /// Checks that the timing of an RTT up to `max_rtt` (the image's
+    /// `rtt_probe_timeout`, which bounds every sample) fits in `u64`: the
+    /// delay bound `max_rtt * scale / 16` and the window `max_rtt +
+    /// repair_linger + repair_slack`.
+    ///
+    /// # Errors
+    ///
+    /// [`LossConfigError::Multicast`].
+    pub fn validate_for(&self, max_rtt: u64) -> Result<(), LossConfigError> {
+        self.validate()?;
+        if self.delay_bound(max_rtt).is_none() || self.window(max_rtt).is_none() {
+            return Err(LossConfigError::Multicast(
+                "the NAK timing of rtt_probe_timeout does not fit in u64",
+            ));
+        }
+        Ok(())
+    }
+
     /// The delay bound of a cycle with `rtt`: `rtt * scale / 16`.
     fn delay_bound(&self, rtt: u64) -> Option<u64> {
         rtt.checked_mul(self.nak_delay_scale)?.checked_div(16)
@@ -311,25 +329,28 @@ impl LaneLoss {
     };
 }
 
-/// Marks `peer` as a failed suppressor of `state`'s hole (RC-14): kept
-/// while the hole remembers fewer than `max`; a further one disables peer
-/// suppression for the hole. Returns the counter to bump.
-fn fail_suppressor(state: &mut LaneLoss, peer: Receiver, max: usize) -> Option<Counter> {
+/// Marks `peer` as a failed suppressor of `state`'s hole (RC-14); the
+/// `max`-th one disables peer suppression for the hole, so its own NAK
+/// goes within `max + 1` cycles (coordinator ruling, ACS 16108). Returns
+/// the counters to bump.
+fn fail_suppressor(state: &mut LaneLoss, peer: Receiver, max: usize) -> [Option<Counter>; 2] {
+    let mut events: [Option<Counter>; 2] = [None; 2];
     if state.no_peer {
-        return None;
+        return events;
     }
-    if state.failed_count < max
-        && let (Some(slot), Some(next)) = (
-            state.failed.get_mut(state.failed_count),
-            state.failed_count.checked_add(1),
-        )
-    {
+    if let (Some(slot), Some(next)) = (
+        state.failed.get_mut(state.failed_count),
+        state.failed_count.checked_add(1),
+    ) {
         *slot = Some(peer);
         state.failed_count = next;
-        return Some(|c| &mut c.failed_suppressors_marked);
+        events[0] = Some(|c| &mut c.failed_suppressors_marked);
     }
-    state.no_peer = true;
-    Some(|c| &mut c.peer_suppression_disabled)
+    if state.failed_count >= max {
+        state.no_peer = true;
+        events[1] = Some(|c| &mut c.peer_suppression_disabled);
+    }
+    events
 }
 
 /// What an observation found that the gap owner must act on.
@@ -449,6 +470,10 @@ pub struct LossCounters {
     pub peer_suppression_disabled: u64,
     /// The most consecutive suppressed cycles of any hole (a gauge).
     pub max_suppressed_run: u64,
+    /// Multicast timings past `u64` (an RTT beyond what
+    /// [`MulticastConfig::validate_for`] admitted): the cycle's NAK went
+    /// at once, or its window was the RTT alone.
+    pub timing_overflows: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -551,7 +576,7 @@ impl ImageLoss {
             return;
         }
         let snapshot = rtt.rtt_snapshot(self.path);
-        let mut events: [Option<Counter>; 2] = [None; 2];
+        let mut events: [Option<Counter>; 3] = [None; 3];
         let mut run = None;
         let mut overflowed = false;
         let Some(state) = self.lane_mut(lane) else {
@@ -566,7 +591,10 @@ impl ImageLoss {
                     .is_some_and(|at| age_ns(now, at) >= cycle.window);
                 if ended {
                     if let (Some(peer), false) = (cycle.by, cycle.progress) {
-                        events[0] = fail_suppressor(state, peer, config.max_failed_suppressors);
+                        let [marked, disabled] =
+                            fail_suppressor(state, peer, config.max_failed_suppressors);
+                        events[0] = marked;
+                        events[1] = disabled;
                     }
                     match state.suppressed_run.checked_add(1) {
                         Some(next) => state.suppressed_run = next,
@@ -593,12 +621,24 @@ impl ImageLoss {
             }
             _ => false,
         };
+        let mut timing_overflowed = false;
         if start {
-            // A timing past `u64` NAKs at once, with the RTT as window.
-            let delay = config
-                .delay_bound(snapshot)
-                .map_or(0, |bound| draw.draw(bound));
-            let window = config.window(snapshot).unwrap_or(snapshot);
+            // A timing past `u64` NAKs at once, with the RTT as window,
+            // and is counted.
+            let delay = match config.delay_bound(snapshot) {
+                Some(bound) => draw.draw(bound).min(bound),
+                None => {
+                    timing_overflowed = true;
+                    0
+                }
+            };
+            let window = match config.window(snapshot) {
+                Some(window) => window,
+                None => {
+                    timing_overflowed = true;
+                    snapshot
+                }
+            };
             state.cycle = Some(Cycle {
                 start: now,
                 delay,
@@ -607,10 +647,13 @@ impl ImageLoss {
                 by: None,
                 progress: false,
             });
-            events[1] = Some(|c| &mut c.cycles);
+            events[2] = Some(|c| &mut c.cycles);
         }
         for field in events.into_iter().flatten() {
             self.counters.bump(field);
+        }
+        if timing_overflowed {
+            self.counters.bump(|c| &mut c.timing_overflows);
         }
         self.counters.overflowed |= overflowed;
         if let Some(run) = run
@@ -878,19 +921,31 @@ impl ImageLoss {
         })
     }
 
-    /// `nak`, from [`ImageLoss::due`], was submitted at `now`: its retry
-    /// is due one RTT later, the snapshot copied now from `rtt`.
+    /// `nak`, from [`ImageLoss::due`], was submitted at `now`. On a
+    /// unicast image its retry is due one RTT later, the snapshot copied
+    /// now from `rtt`; on a multicast image it opens its cycle's window
+    /// `W`, computed from the RTT copied at the cycle's start, and the next
+    /// cycle starts when the window ends with the hole still there.
     pub fn submitted(&mut self, nak: &Nak, now: u64, rtt: &impl RttSource) {
-        let rtt = self.interval(rtt.rtt_snapshot(self.path));
+        let rtt = self.interval(nak.range.lane, rtt.rtt_snapshot(self.path));
         self.record_submission(nak, now, rtt);
     }
 
-    /// The wait after a submission: one RTT for unicast; for multicast the
-    /// cycle's window `W` (a timing past `u64` falls back to the RTT).
-    fn interval(&self, rtt: u64) -> u64 {
-        self.multicast
-            .and_then(|config| config.window(rtt))
-            .unwrap_or(rtt)
+    /// The wait after a submission of `lane`'s NAK: one RTT for unicast;
+    /// for multicast the current cycle's window `W` (without a cycle, `W`
+    /// over `rtt`; a timing past `u64` falls back to the RTT and is
+    /// counted).
+    fn interval(&mut self, lane: Lane, rtt: u64) -> u64 {
+        let Some(config) = self.multicast else {
+            return rtt;
+        };
+        if let Some(cycle) = self.lane_mut(lane).and_then(|state| state.cycle) {
+            return cycle.window;
+        }
+        config.window(rtt).unwrap_or_else(|| {
+            self.counters.bump(|c| &mut c.timing_overflows);
+            rtt
+        })
     }
 
     /// `nak` could not be submitted (budget or backend): it stays due.
@@ -919,7 +974,7 @@ impl ImageLoss {
         }
         self.uncertain = true;
         self.counters.bump(|c| &mut c.uncertain);
-        let rtt = self.interval(rtt.rtt_snapshot(self.path));
+        let rtt = self.interval(nak.range.lane, rtt.rtt_snapshot(self.path));
         self.record_submission(nak, now, rtt);
         Ok(())
     }
