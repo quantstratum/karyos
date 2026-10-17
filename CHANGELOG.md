@@ -37,7 +37,10 @@ release may break APIs, wire formats and shared-memory layouts.
   terminal cell published, or while the ring is full), writes values with
   their freshness (`write_at`, `FreshSlotWords::write_with_freshness`),
   reconciles the slots in bounded passes and retires the records
-  (`reconcile`), and counts the work (`FreshCounters`). The reader
+  (`reconcile`), and counts the work (`FreshCounters`). It refuses a value
+  without its position (`ConflationError::PositionRequired`) or below its
+  frontier (`ConflationError::BehindFrontier`), and a terminal close also
+  closes the table. The reader
   classifies each copied value against the barrier and the terminal cell:
   `ConflationReader::poll_changed`'s handler gets the `Freshness` as a
   fourth argument, a new loss serves every written key again, and after the

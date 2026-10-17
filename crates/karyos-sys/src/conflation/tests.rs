@@ -1067,7 +1067,8 @@ fn a_loss_below_the_frontier_closes_the_view() {
             reason: crate::freshness::TERMINAL_BELOW_FRONTIER
         }
     );
-    assert_eq!(writer.write_at(1, &[2], 64), Ok(2));
+    // The table closed with the terminal cell.
+    assert_eq!(writer.write_at(1, &[2], 64), Err(ConflationError::Closed));
     let (seen, report) = drain_fresh(&mut reader);
     assert!(seen.is_empty(), "{seen:?}");
     assert_eq!(report.terminal, Some(terminal));
@@ -1126,6 +1127,8 @@ fn an_exhausted_loss_sequence_closes_the_view() {
     let (mut writer, link) = fresh_table(1);
     writer.seed_loss_seq(crate::freshness::STALE - 1);
     assert_eq!(writer.record_loss(0, 32), Err(LossError::Exhausted));
+    assert_eq!(writer.fresh_counters().unwrap().exhausted, 1);
+    assert_eq!(writer.write_at(0, &[1], 32), Err(ConflationError::Closed));
     assert_eq!(
         TerminalCell::read(&link.terminal_words()).map(|t| t.reason),
         Some(crate::freshness::TERMINAL_FRESHNESS_EXHAUSTED)
@@ -1146,4 +1149,57 @@ fn a_table_without_a_barrier_reads_fresh() {
     let (seen, report) = drain_fresh(&mut reader);
     assert_eq!(seen, [(0, 2, Freshness::Fresh)]);
     assert_eq!(report.terminal, None);
+}
+
+/// #318 review: a value's freshness needs its position. A table with a
+/// barrier refuses a plain write, and a value below the frontier, whose
+/// gaps behind may be retired already: record_loss(200, 300), passed(400),
+/// write_at(100) would otherwise read Fresh where GU-9 says Stale since
+/// 200. Nothing is stored either way.
+#[test]
+fn a_value_without_its_position_or_behind_the_frontier_is_refused() {
+    let (mut writer, _link) = fresh_table(2);
+    let mut reader = writer.reader();
+    assert_eq!(
+        writer.write(0, &[1]),
+        Err(ConflationError::PositionRequired)
+    );
+    assert_eq!(writer.record_loss(200, 300), Ok(1));
+    writer.passed(400);
+    assert_eq!(
+        writer.write_at(0, &[1], 100),
+        Err(ConflationError::BehindFrontier {
+            position: 100,
+            frontier: 400
+        })
+    );
+    let (seen, _) = drain_fresh(&mut reader);
+    assert!(seen.is_empty(), "{seen:?}");
+    // At the frontier, after the gap: Fresh.
+    assert_eq!(writer.write_at(0, &[2], 400), Ok(2));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(0, 2, Freshness::Fresh)]);
+}
+
+/// #318 review (M2): the terminal cell is checked again after each copy.
+/// A terminal published during a poll, by the handler of its first value,
+/// stops the poll before the second key's value is delivered.
+#[test]
+fn a_terminal_published_during_a_poll_stops_it() {
+    let (mut writer, link) = fresh_table(2);
+    let mut reader = writer.reader();
+    assert_eq!(writer.write_at(0, &[1], 0), Ok(2));
+    assert_eq!(writer.write_at(1, &[2], 0), Ok(2));
+    let terminal = Terminal {
+        start: 64,
+        end: 128,
+        reason: crate::freshness::TERMINAL_BARRIER_TIMEOUT,
+    };
+    let mut delivered = Vec::new();
+    let report = reader.poll_changed(BUDGET, |key, _, _, _| {
+        delivered.push(key);
+        let _ = link.terminal().unwrap().publish(terminal);
+    });
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert_eq!(report.terminal, Some(terminal));
 }
