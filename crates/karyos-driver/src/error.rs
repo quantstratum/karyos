@@ -79,6 +79,14 @@ pub enum DriverError {
         /// The stream.
         stream: u64,
     },
+    /// A stream an Archive recording reads cannot be reconfigured yet: the
+    /// recording's reader follows one mapping, and would end at the old
+    /// mapping's seal.
+    #[error("stream {stream} is being recorded; it cannot be reconfigured")]
+    RecordingCutover {
+        /// The stream.
+        stream: u64,
+    },
     /// The stream handle does not name a live stream of this driver.
     #[error("unknown stream {stream}")]
     UnknownStream {

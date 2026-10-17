@@ -80,11 +80,18 @@ pub enum Workload {
     /// The first term of a freshly installed one-lane image is filled with
     /// received frames: the first touch of its memory (N-5).
     ImageFirstFill,
+    /// Appends to an Archive segment store on a real disk, never synced
+    /// (`crate::archive`): `(warmup + iterations) × message` bytes written
+    /// to the run directory, removed afterwards.
+    ArchiveAppend,
+    /// Appends to an Archive segment store and syncs each append, data
+    /// then index (`crate::archive`).
+    ArchiveSync,
 }
 
 impl Workload {
     /// Every workload.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::OfferPoll,
         Self::Claim,
         Self::PingPong,
@@ -101,6 +108,8 @@ impl Workload {
         Self::SenderNak,
         Self::ImageInstall,
         Self::ImageFirstFill,
+        Self::ArchiveAppend,
+        Self::ArchiveSync,
     ];
 
     /// Its name on the command line and in the history.
@@ -123,6 +132,8 @@ impl Workload {
             Self::SenderNak => "sender-nak",
             Self::ImageInstall => "image-install",
             Self::ImageFirstFill => "image-first-fill",
+            Self::ArchiveAppend => "archive-append",
+            Self::ArchiveSync => "archive-sync",
         }
     }
 
@@ -151,7 +162,10 @@ impl Workload {
             | Self::OpenLoop
             | Self::CleanerThroughput
             | Self::TraceOff
-            | Self::TraceOn => &[Backing::Heap],
+            | Self::TraceOn
+            // No term memory: the backing is nominal.
+            | Self::ArchiveAppend
+            | Self::ArchiveSync => &[Backing::Heap],
         }
     }
 
@@ -352,6 +366,8 @@ pub struct Measurement {
     pub cleaned_slots_per_second: Option<f64>,
     /// Term boundaries crossed per second, for the cleaner workload.
     pub term_rotations_per_second: Option<f64>,
+    /// Where an archive workload wrote and how it synced.
+    pub archive: Option<crate::archive::ArchiveRun>,
 }
 
 /// A failed run.
@@ -470,6 +486,7 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
         Workload::SenderNak => crate::terms::sender_nak(config),
         Workload::ImageInstall => crate::terms::image_install(config),
         Workload::ImageFirstFill => crate::terms::image_first_fill(config),
+        Workload::ArchiveAppend | Workload::ArchiveSync => crate::archive::run(config),
         #[cfg(target_os = "linux")]
         Workload::IpcPingPong => crate::ipc::ping_pong(config),
         #[cfg(target_os = "linux")]
@@ -626,6 +643,7 @@ fn receive_frames<T: TermBytes>(
         resolution,
         cleaned_slots_per_second: None,
         term_rotations_per_second: None,
+        archive: None,
     })
 }
 
@@ -741,6 +759,7 @@ fn single_thread(config: Config, traced: bool) -> Result<Measurement, BenchError
         resolution,
         cleaned_slots_per_second: None,
         term_rotations_per_second: None,
+        archive: None,
     })
 }
 
@@ -877,6 +896,7 @@ fn ping_pong(config: Config) -> Result<Measurement, BenchError> {
         resolution,
         cleaned_slots_per_second: None,
         term_rotations_per_second: None,
+        archive: None,
     })
 }
 
@@ -988,6 +1008,7 @@ fn throughput(config: Config) -> Result<Measurement, BenchError> {
         resolution: 0,
         cleaned_slots_per_second: None,
         term_rotations_per_second: None,
+        archive: None,
     })
 }
 
@@ -1126,6 +1147,7 @@ fn cleaner_throughput(config: Config) -> Result<Measurement, BenchError> {
         resolution: 0,
         cleaned_slots_per_second: Some(cleaned_slots as f64 / seconds),
         term_rotations_per_second: Some(measured_rotations as f64 / seconds),
+        archive: None,
     })
 }
 
@@ -1284,6 +1306,7 @@ fn open_loop(config: Config) -> Result<Measurement, BenchError> {
         resolution,
         cleaned_slots_per_second: None,
         term_rotations_per_second: None,
+        archive: None,
     })
 }
 
