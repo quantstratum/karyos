@@ -269,6 +269,22 @@ release may break APIs, wire formats and shared-memory layouts.
   (256) are bounded: a full table drops and counts. Jobs keep their
   unsent cursor and a checked slot generation; requester lists are
   allocated at construction.
+- Repair scheduling (phase 6 R7, reliable-transport.md, RC-12 and RC-13,
+  owner decision P3, ACS 15597 and 15701):
+  `karyos_driver::repair::scheduler::Scheduler` serves the pending jobs
+  with its own protocol `Drr` over the lanes, with the data path's quanta,
+  within the repair budget (64 KiB, 4096 word 0 loads), so a budget too
+  small for a head keeps the lane's deficit. Each lane serves its oldest
+  job from its cursor, one whole frame at a time, read through
+  `RepairRead` (a DATA frame charged its aligned length, PAD and ABORTED
+  32 bytes) and submitted through `RepairSubmit`. At each head, step 8 and
+  the end proof: `BadRequest` or an extent crossing the end answers
+  `RANGE_INVALID`, `Unavailable` or `Revoked` answers `RANGE_UNAVAILABLE`
+  with the floor read after, both to every requester; `CorruptTerm`,
+  `Retry` and `TooSmall` drop the job with no ERR. A submitted last frame
+  ends the job and starts its linger; an uncertain one ends it
+  unresolved; no room stops the call as backpressure. Not wired yet, and
+  the NAK read origin in karyos-sys comes separately.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly
