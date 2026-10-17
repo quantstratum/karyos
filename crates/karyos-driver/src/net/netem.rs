@@ -7,10 +7,8 @@
 //! refuses to run without that variable, so a run over a plain loopback is
 //! never taken for a netem pass.
 //!
-//! The driver's own fault tests (unreliable gaps reported, reliable
-//! delivery exactly once and in order through repair) join this module
-//! with the two-driver harness of the end-to-end tests and the repair
-//! wiring.
+//! The driver's own fault tests over this shaping live with the
+//! two-driver harness of the end-to-end tests, in `net::e2e::netem`.
 
 #![allow(
     clippy::unwrap_used,
@@ -27,7 +25,7 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 /// Fails a test run outside `scripts/netem-test.sh`.
-fn require_netem() {
+pub(super) fn require_netem() {
     assert_eq!(
         std::env::var("KARYOS_NETEM_ACTIVE").as_deref(),
         Ok("1"),

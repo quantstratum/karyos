@@ -35,7 +35,10 @@ release may break APIs, wire formats and shared-memory layouts.
   duplicate; `KARYOS_NETEM` sets another). The log names the kernel and
   the profile. Without the capability the run prints SKIPPED and fails,
   and it fails if no netem test ran; the tests refuse to run outside the
-  job. A first test checks that the shaping takes effect.
+  job. A first test checks that the shaping takes effect. The first
+  driver fault test, N1 (`net::e2e::netem`), checks over these faults that
+  an unreliable channel delivers each message at most once and in order
+  and reports every lost one as a local gap.
 - The receiver's controls report a third send outcome. `ReportSlot` and
   `ReportGuard` (formerly `ProbeSlot` and `ProbeGuard`) carry an RTTM
   REQUEST's or a NAK's submission back to the receiver: submitted at the
