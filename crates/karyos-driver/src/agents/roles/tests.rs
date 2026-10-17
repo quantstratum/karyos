@@ -862,3 +862,97 @@ fn unconfirmed_bindings_never_hold_the_table() {
     sender.expire_bindings(later + config.image_liveness_timeout);
     assert!(sender.bindings.is_empty());
 }
+
+/// The heartbeat rule of the trusted profile (coordinator decision): above
+/// the lane's highest seen position is fresh, at it stationary, below it
+/// stale, outside the image's window rejected.
+#[test]
+fn heartbeats_are_classified_against_the_window_and_the_mark() {
+    use std::sync::Arc;
+
+    use karyos_protocol::frame::{Flags, FrameType, Lane, Word0};
+    use karyos_sys::log_buffer::{
+        DEFAULT_CLAIM_DEADLINE, LogBuffer, LogBufferConfig, PublicationMode, ReceiveOwner,
+    };
+    use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
+    use karyos_sys::sizing::TermLength;
+    use karyos_sys::term::TermId;
+
+    let term_length = TermLength::try_new(65_536).unwrap();
+    let lane = Arc::new(
+        LogBuffer::new(LogBufferConfig {
+            term_length,
+            spare_slots: 5,
+            max_subscribers: 2,
+            mtu: 1408,
+            max_reserved: 8192,
+            initial_term_id: TermId::new(9),
+            lane: Lane::ZERO,
+            session_id: 5,
+            stream_id: 6,
+            publication: PublicationMode::Image {
+                join: 0,
+                local_gaps: true,
+            },
+            claim_deadline: DEFAULT_CLAIM_DEADLINE,
+            schedule_capacity: 0,
+        })
+        .unwrap(),
+    );
+    let params = ImageParams::new(5, 6, 1, term_length, 1408).unwrap();
+    let owner = ReceiveOwner::new(params, vec![Arc::clone(&lane)]).unwrap();
+    let mut image = super::Installed {
+        slot: super::SlotRef {
+            slot: 0,
+            generation: 1,
+        },
+        owner: Box::new(owner),
+        retire: None,
+        key: super::BindingKey {
+            endpoint: EndpointId(1),
+            source: "10.0.0.9:5000".parse().unwrap(),
+            alias: alias(),
+        },
+        identity: identity(),
+        lane_count: 1,
+        params,
+        stats: crate::paths::stats::PathStats::new(&crate::paths::PathConfig::default(), 1, 8),
+        initial_term_id: TermId::new(9),
+        term_length: 65_536,
+        heartbeat_marks: [None; 4],
+        last_fresh: 0,
+        window: 32_768,
+        sm_last: None,
+        sm_slot: None,
+        sm: Arc::new(super::SmSlot::default()),
+        evidence: 0,
+    };
+    let heartbeat = |term_id: u32, term_offset: i32| {
+        let mut bytes = [0u8; 32];
+        let word0 = Word0::new(
+            32,
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Data,
+        );
+        bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+        bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+        bytes[12..16].copy_from_slice(&5i32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&6i32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&term_id.to_le_bytes());
+        bytes
+    };
+    let mut classify = |bytes: [u8; 32]| {
+        let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+        let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+            panic!("not a heartbeat");
+        };
+        super::classify_heartbeat(&mut image, &heartbeat)
+    };
+    use super::HeartbeatClass::{Fresh, Rejected, Stale, Stationary};
+    assert_eq!(classify(heartbeat(9, 64)), Fresh);
+    assert_eq!(classify(heartbeat(9, 64)), Stationary);
+    assert_eq!(classify(heartbeat(9, 32)), Stale);
+    assert_eq!(classify(heartbeat(9, 128)), Fresh);
+    // Three terms ahead: outside the window.
+    assert_eq!(classify(heartbeat(12, 0)), Rejected);
+}

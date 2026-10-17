@@ -89,3 +89,88 @@ fn the_data_path_emits_only_data() {
     assert_eq!(path.counters().records, 1);
     assert!(path.readers()[0].sent_position() > 0);
 }
+
+/// A scripted endpoint with `max_queues` queues and two routes, the
+/// observer, and a one-lane outbound path with three messages committed.
+fn scripted(
+    max_queues: u16,
+    lanes: u8,
+) -> (
+    karyos_io::sockets::endpoint::SocketsTx<ScriptedSocket>,
+    ScriptedSocket,
+    Box<super::Outbound>,
+    super::testing::TestLog,
+) {
+    use std::num::NonZeroU16;
+
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let mut local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    local.max_queues = NonZeroU16::new(max_queues).unwrap();
+    local.max_routes = NonZeroU16::new(2).unwrap();
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (path, mut log) = outbound(EndpointId(1), alias, destination, term, lanes, false);
+    for i in 0..3u8 {
+        let _ = log.publications[0]
+            .append(&[i; 300], AppendOptions::default())
+            .unwrap();
+    }
+    (tx, observer, path, log)
+}
+
+/// P2-4: a send fault is retried on its queue, which keeps its items; the
+/// lane is not wedged and nothing needs a reset.
+#[test]
+fn a_send_fault_is_retried() {
+    use karyos_io::sockets::ops::Errno;
+
+    let (mut tx, observer, mut path, _log) = scripted(4, 1);
+    observer.push_send(SendResult::Error(Errno::NETUNREACH));
+    for _ in 0..16 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    for _ in 0..6 {
+        let _ = path.serve(&mut tx, budget, None).unwrap();
+    }
+    let counters = path.counters();
+    assert_eq!(counters.send_faults, 1);
+    assert!(counters.submitted >= 1, "{counters:?}");
+    assert!(!path.needs_reset());
+    let reader = &path.readers()[0];
+    assert_eq!(reader.sent_position(), reader.position());
+}
+
+/// P2-5: an open that fails part way closes what it opened, so retrying
+/// every cycle never exhausts the endpoint's routes.
+#[test]
+fn a_failed_open_leaks_nothing() {
+    // Two lanes, one queue allowed: the second queue always fails.
+    let (mut tx, _observer, mut path, _log) = scripted(1, 2);
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    for _ in 0..5 {
+        assert_eq!(path.serve(&mut tx, budget, None).unwrap(), 0);
+    }
+    let counters = path.counters();
+    assert_eq!((counters.queue_failures, counters.route_failures), (5, 0));
+}

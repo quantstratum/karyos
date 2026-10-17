@@ -22,8 +22,9 @@
 //!   on the first cycle of an endpoint epoch and handed to the lane sender
 //!   with `reopen`, which allocates nothing.
 //! - **Resets.** A new endpoint epoch drops what was staged and not
-//!   submitted: the receiver sees a gap, which repair (phase 6) or the
-//!   gap policy closes. The reader's cursor does not move back.
+//!   submitted. A reliable lane rewinds its reader to the registered
+//!   position, which is only ever a block boundary, and sends it again; an
+//!   unreliable lane leaves the gap to the receiver's gap policy.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -32,9 +33,9 @@ use std::sync::Arc;
 
 use karyos_io::backend::{
     Authority, BackendEpoch, Commit, Exposure, GateDecision, SenderGate, SenderToken, TxBackend,
-    TxFrame, TxOptions, TxQueueConfig, TxQueueId, TxTicket,
+    TxFrame, TxOptions, TxQueueConfig, TxQueueId, TxReport, TxTicket,
 };
-use karyos_io::lanes::{LaneGate, LaneSender, Left, Staged};
+use karyos_io::lanes::{LaneGate, LaneSender, Left, SenderFailure, Staged};
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::lanes::drr::{Budget, DrrConfig};
@@ -79,8 +80,11 @@ impl LaneGate for DataGate<'_> {
         };
         // Heads leave in staging order.
         match track.staged.pop_front() {
-            Some((ticket, next)) if ticket == staged.ticket => match how {
-                Left::Submitted => track.submitted = Some(next),
+            Some((ticket, next, boundary)) if ticket == staged.ticket => match how {
+                // Only a block boundary is registered: it is a valid restart
+                // after a reset (`SenderRead::rewind`).
+                Left::Submitted if boundary => track.submitted = Some(next),
+                Left::Submitted => {}
                 Left::Returned | Left::Unknown => track.unsent = true,
             },
             _ => track.mismatched = true,
@@ -91,8 +95,9 @@ impl LaneGate for DataGate<'_> {
 /// One lane's staged heads, in order, and what left.
 #[derive(Debug)]
 struct LaneTrack {
-    /// Ticket and the stream position after it, per staged datagram.
-    staged: VecDeque<(TxTicket, u64)>,
+    /// Ticket, the stream position after it, and whether that position is
+    /// a block boundary, per staged datagram.
+    staged: VecDeque<(TxTicket, u64, bool)>,
     /// The position the last submitted head reached, this call.
     submitted: Option<u64>,
     /// The highest position any submitted head reached: a reliable lane's
@@ -121,8 +126,16 @@ pub struct OutboundCounters {
     pub mismatched: u64,
     /// Read errors other than `Pending` (see the reader's counters).
     pub read_errors: u64,
-    /// Queue or route setup failures.
+    /// Queue setup failures (the partial open is closed again).
     pub queue_failures: u64,
+    /// Route setup failures.
+    pub route_failures: u64,
+    /// Send faults reported for a lane's head.
+    pub send_faults: u64,
+    /// Invariant, sender or DRR failures.
+    pub send_failures: u64,
+    /// Committed datagrams the lane sender refused to record.
+    pub staged_refused: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -152,6 +165,10 @@ pub struct Outbound {
     tracks: Vec<LaneTrack>,
     /// The endpoint epoch its queues were opened in.
     opened: Option<BackendEpoch>,
+    /// See [`Outbound::needs_reset`].
+    needs_reset: bool,
+    /// Report storage for closing queues (allocated at construction).
+    report: TxReport,
     next_token: u64,
     counters: OutboundCounters,
 }
@@ -217,6 +234,8 @@ impl Outbound {
             queues,
             tracks,
             opened: None,
+            needs_reset: false,
+            report: TxReport::new(),
             next_token: 1,
             counters: OutboundCounters::default(),
         })
@@ -271,10 +290,12 @@ impl Outbound {
             return true;
         }
         let Ok(route) = tx.add_route(self.destination) else {
-            self.counters.bump(|c| &mut c.queue_failures, 1);
+            self.counters.bump(|c| &mut c.route_failures, 1);
             return false;
         };
-        for (lane, queue) in self.queues.iter_mut().enumerate() {
+        // All or nothing: a partial open is closed again, so a failing
+        // endpoint does not leak a route and queues every cycle.
+        for lane in 0..self.queues.len() {
             let opened = tx.open_queue(TxQueueConfig {
                 authority: Authority::FIRST,
                 route,
@@ -282,15 +303,34 @@ impl Outbound {
             });
             let Ok(opened) = opened else {
                 self.counters.bump(|c| &mut c.queue_failures, 1);
+                for queue in self.queues.iter().take(lane) {
+                    let _ = tx.close_queue(*queue, &mut self.report);
+                    while self.report.pop_front().is_some() {}
+                }
+                let _ = tx.remove_route(route);
                 return false;
             };
-            *queue = opened;
-            self.sender.reopen(lane, opened);
+            if let Some(queue) = self.queues.get_mut(lane) {
+                *queue = opened;
+            }
+        }
+        for (lane, queue) in self.queues.iter().enumerate() {
+            self.sender.reopen(lane, *queue);
         }
         for track in &mut self.tracks {
             track.staged.clear();
         }
+        // A reset returned what was staged and not submitted. A reliable
+        // lane reads it again from its registered position (a block
+        // boundary, never below the floor); an unreliable one leaves the
+        // gap to the receiver's gap policy (LaneSender::reopen).
+        if self.opened.is_some() && self.reliable {
+            for reader in &mut self.readers {
+                reader.rewind();
+            }
+        }
         self.opened = Some(epoch);
+        self.needs_reset = false;
         true
     }
 
@@ -319,15 +359,14 @@ impl Outbound {
                 .checked_add(self.stage(tx, lane)?)
                 .ok_or(overflow.clone())?;
         }
-        // Stops (back pressure, failures) are retried on a later cycle; a
-        // faulted queue is reopened with its endpoint's next epoch.
-        let _report = self.sender.serve(
+        let report = self.sender.serve(
             tx,
             &mut DataGate {
                 lanes: &mut self.tracks,
             },
             budget,
         );
+        self.handle_failure(tx, report.failure);
         for (lane, (track, reader)) in self.tracks.iter_mut().zip(&mut self.readers).enumerate() {
             if std::mem::take(&mut track.unsent) {
                 self.counters.bump(|c| &mut c.unsent, 1);
@@ -341,9 +380,12 @@ impl Outbound {
             }
             let submitted = track.high;
             let target = if self.reliable {
-                consumption
-                    .and_then(|positions| positions.get(lane))
-                    .map_or(submitted, |consumed| submitted.min(*consumed))
+                // No bound receiver: the registered position holds (SPEC §4:
+                // never past what a required receiver consumed).
+                match consumption.and_then(|positions| positions.get(lane)) {
+                    Some(consumed) => submitted.min(*consumed),
+                    None => continue,
+                }
             } else {
                 submitted
             };
@@ -352,6 +394,71 @@ impl Outbound {
             }
         }
         Ok(work)
+    }
+
+    /// The control path of a send failure (lane-sender.md, outcome
+    /// table): a send fault is retried on its queue, which keeps its items;
+    /// a queue that needs a reset, an invariant, a sender bug or an item of
+    /// unknown exposure marks the publication as needing an endpoint reset,
+    /// which the conductor reads ([`Outbound::needs_reset`]).
+    fn handle_failure<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        failure: Option<SenderFailure>,
+    ) {
+        match failure {
+            None => {}
+            Some(SenderFailure::Backend { lane, .. }) => {
+                self.counters.bump(|c| &mut c.send_faults, 1);
+                let retried = self
+                    .queues
+                    .get(lane)
+                    .is_some_and(|queue| tx.retry_queue(*queue).is_ok());
+                if retried {
+                    self.sender.retry(lane);
+                } else {
+                    self.needs_reset = true;
+                }
+            }
+            Some(
+                SenderFailure::Invariant { .. }
+                | SenderFailure::Sender { .. }
+                | SenderFailure::Drr(_),
+            ) => {
+                self.counters.bump(|c| &mut c.send_failures, 1);
+                self.needs_reset = true;
+            }
+        }
+        for lane in 0..self.queues.len() {
+            // An item of unknown exposure waits for the control path: only
+            // an endpoint reset resolves it.
+            if self.sender.suspended(lane) == Some(true) {
+                self.needs_reset = true;
+                continue;
+            }
+            // A faulted queue the report did not name (the fault left the
+            // head pending): retried the same way.
+            if self.sender.needs_control(lane) == Some(true) {
+                self.counters.bump(|c| &mut c.send_faults, 1);
+                let retried = self
+                    .queues
+                    .get(lane)
+                    .is_some_and(|queue| tx.retry_queue(*queue).is_ok());
+                if retried {
+                    self.sender.retry(lane);
+                } else {
+                    self.needs_reset = true;
+                }
+            }
+        }
+    }
+
+    /// Whether the endpoint needs a reset before this publication can send
+    /// again (a send fault that cannot be retried, an invariant, or an item
+    /// of unknown exposure). A new endpoint epoch clears it.
+    #[must_use]
+    pub fn needs_reset(&self) -> bool {
+        self.needs_reset
     }
 
     /// Stages `lane`'s committed frames, one datagram per claimed TX frame,
@@ -408,6 +515,10 @@ impl Outbound {
             let (Some(charge), Ok(len16)) = (charge, u16::try_from(len)) else {
                 break;
             };
+            // Unreachable: the lane's pending count was checked below its
+            // bound and the charge is one aligned datagram of at most the
+            // MTU. Counted if it ever happens; the committed item then
+            // leaves unrecorded and shows as `mismatched`.
             if self
                 .sender
                 .staged(
@@ -420,10 +531,11 @@ impl Outbound {
                 )
                 .is_err()
             {
+                self.counters.bump(|c| &mut c.staged_refused, 1);
                 break;
             }
             if let Some(track) = self.tracks.get_mut(lane) {
-                track.staged.push_back((ticket, next));
+                track.staged.push_back((ticket, next, reader.at_boundary()));
             }
             self.counters.bump(
                 if record {

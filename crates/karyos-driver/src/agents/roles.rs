@@ -50,7 +50,7 @@ use karyos_protocol::network::{
 use karyos_sys::host_clock::age_ns;
 use karyos_sys::log_buffer::ReceiveError;
 use karyos_sys::log_buffer::Received;
-use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram, ValidatedFrame};
+use karyos_sys::receive::{Heartbeat, ImageParams, Item, ValidatedDatagram, ValidatedFrame};
 use karyos_sys::term::TermId;
 
 use crate::paths::PathConfig;
@@ -130,8 +130,16 @@ pub struct ReceiverCounters {
     pub data_dropped: u64,
     /// DATA frames the receive owner refused for a protocol rule.
     pub data_refused: u64,
-    /// Heartbeats received from a bound sender.
+    /// Fresh heartbeats (above the lane's highest seen position).
     pub heartbeats: u64,
+    /// Heartbeats below the lane's highest seen position: replays,
+    /// refreshing nothing.
+    pub heartbeats_stale: u64,
+    /// Heartbeats at the lane's highest seen position (an idle sender):
+    /// alive only until `idle_image_timeout` after the last fresh evidence.
+    pub heartbeats_stationary: u64,
+    /// Heartbeats outside the image's receive window: rejected.
+    pub heartbeats_rejected: u64,
     /// DATA datagrams from no binding: dropped.
     pub data_unbound: u64,
     /// DATA datagrams that failed validation for their image: dropped.
@@ -199,6 +207,8 @@ struct ReceiverBinding {
     receiver_id: Option<u64>,
     /// Its highest reported status per lane (consumption and window).
     lanes: Option<Lanes<LaneStatus>>,
+    /// The join points it was answered with: its bound until its first SM.
+    joins: Lanes<u64>,
     /// When it was last answered.
     answered_at: u64,
     /// When it last sent an accepted SM: `None` while unconfirmed.
@@ -239,6 +249,7 @@ pub struct ReceiverRole {
     sm_slots: Vec<Arc<SmSlot>>,
     sm_interval: u64,
     liveness_timeout: u64,
+    idle_timeout: u64,
     /// The path statistics' configuration (redundant-paths.md section 5).
     path_config: PathConfig,
     counters: ReceiverCounters,
@@ -257,6 +268,48 @@ fn path_joins(joins: &Lanes<u64>, term_length: u32) -> [(u64, u64); 4] {
         *slot = (*join, term);
     }
     out
+}
+
+/// What a heartbeat is to its image's liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatClass {
+    /// Above the lane's highest seen position: fresh evidence.
+    Fresh,
+    /// At the lane's highest seen position: an idle sender.
+    Stationary,
+    /// Below it: a replay.
+    Stale,
+    /// Outside the image's receive window.
+    Rejected,
+}
+
+/// Classifies `heartbeat` against the image's receive window and the
+/// highest heartbeat position seen on its lane, which a fresh one raises.
+fn classify_heartbeat(image: &mut Installed, heartbeat: &Heartbeat) -> HeartbeatClass {
+    let lane = heartbeat.lane();
+    let Some(position) = heartbeat
+        .term_id()
+        .count_from(image.initial_term_id)
+        .ok()
+        .and_then(|count| u64::from(count.get()).checked_mul(u64::from(image.term_length)))
+        .and_then(|base| base.checked_add(u64::from(heartbeat.term_offset())))
+    else {
+        return HeartbeatClass::Rejected;
+    };
+    if !image.owner.within_window(lane, position).unwrap_or(false) {
+        return HeartbeatClass::Rejected;
+    }
+    let Some(mark) = image.heartbeat_marks.get_mut(usize::from(lane.get())) else {
+        return HeartbeatClass::Rejected;
+    };
+    match *mark {
+        Some(seen) if position < seen => HeartbeatClass::Stale,
+        Some(seen) if position == seen => HeartbeatClass::Stationary,
+        _ => {
+            *mark = Some(position);
+            HeartbeatClass::Fresh
+        }
+    }
 }
 
 /// What the path statistics record of `frame` from `path`: its lane, term
@@ -325,6 +378,10 @@ struct Installed {
     /// count and stream position.
     initial_term_id: TermId,
     term_length: u32,
+    /// The highest heartbeat position seen per lane.
+    heartbeat_marks: [Option<u64>; 4],
+    /// The last fresh evidence: a committed frame or a fresh heartbeat.
+    last_fresh: u64,
     /// The window each SM grants per lane.
     window: u32,
     /// When the last SM was due; `None` before the first.
@@ -438,6 +495,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
                 .collect(),
             sm_interval: config.sm_interval,
             liveness_timeout: config.image_liveness_timeout,
+            idle_timeout: config.idle_image_timeout,
             path_config: PathConfig {
                 max_paths: config.sessions.max_paths,
                 ..PathConfig::default()
@@ -711,6 +769,8 @@ impl ReceiverRole {
             stats,
             initial_term_id: TermId::new(chain.initial_term_id.cast_unsigned()),
             term_length: chain.term_length,
+            heartbeat_marks: [None; 4],
+            last_fresh: now,
             window,
             sm_last: None,
             sm_slot: Some(sm_slot),
@@ -869,7 +929,26 @@ impl ReceiverRole {
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
-        let mut work = self.sessions.timers(now);
+        // A lost path stops being charged in its image's statistics from
+        // the terms it was lost in (RP-6).
+        let images = &mut self.images;
+        let mut work = self.sessions.timers_with(now, |slot, path, _| {
+            if let Some(image) = images.iter_mut().find(|image| image.slot == slot) {
+                let mut terms = [0u64; 4];
+                for (lane, term) in terms.iter_mut().enumerate() {
+                    *term = u8::try_from(lane)
+                        .ok()
+                        .and_then(|lane| Lane::try_new(lane).ok())
+                        .and_then(|lane| image.owner.rebuild_position(lane))
+                        .and_then(|position| position.checked_div(u64::from(image.term_length)))
+                        .unwrap_or(0);
+                }
+                let lanes = usize::from(image.lane_count);
+                image
+                    .stats
+                    .path_lost(path, terms.get(..lanes).unwrap_or(&[]));
+            }
+        });
         work = work
             .checked_add(self.image_timers(sessions, now)?)
             .ok_or(overflow.clone())?;
@@ -932,14 +1011,15 @@ impl Intake<'_> {
             alias,
         };
         let role = &mut *self.role;
-        // The first path's key, or a later path bound to the image (RP-1).
+        // The session table's admission rule (a live path's key, or the
+        // founding key of an image with no path rows), then the path's
+        // index for its statistics.
+        let bound = role.sessions.lookup(&key);
         let path = role.sessions.paths().lookup(key);
-        let found = role.images.iter().position(|image| {
-            let bound = match path {
-                Some((slot, _)) => image.slot == slot,
-                None => image.key == key,
-            };
-            bound && role.sessions.is_active(image.slot)
+        let found = bound.and_then(|slot| {
+            role.images
+                .iter()
+                .position(|image| image.slot == slot && role.sessions.is_active(slot))
         });
         let Some(image) = found.and_then(|index| role.images.get_mut(index)) else {
             role.count(|c| &mut c.data_unbound);
@@ -949,9 +1029,10 @@ impl Intake<'_> {
             role.count(|c| &mut c.data_invalid);
             return;
         };
-        // Per item: committed, dropped, refused, heartbeat. A datagram
-        // holds at most an MTU of 32-byte records: no overflow.
-        let mut outcomes = [0u32; 4];
+        // Per item: committed, dropped, refused, then fresh, stale,
+        // stationary and rejected heartbeats. A datagram holds at most an
+        // MTU of 32-byte records: no overflow.
+        let mut outcomes = [0u32; 7];
         let mut path_fresh = false;
         for item in datagram.items() {
             let (outcome, arrival) = match item {
@@ -968,14 +1049,21 @@ impl Intake<'_> {
                         Err(_) => (2, None),
                     }
                 }
-                Item::Heartbeat(_) => {
-                    // A heartbeat on a bound path is fresh evidence for it.
-                    path_fresh = true;
-                    (3, None)
-                }
+                // A heartbeat is image evidence only inside the receive
+                // window and above the last one seen on its lane, so a
+                // replay keeps nothing alive (network-sessions.md, owner P2).
+                // It is never path evidence (RP-2: fresh frames and PATH_HB).
+                Item::Heartbeat(heartbeat) => match classify_heartbeat(image, &heartbeat) {
+                    HeartbeatClass::Fresh => (3, None),
+                    HeartbeatClass::Stale => (4, None),
+                    HeartbeatClass::Stationary => (5, None),
+                    HeartbeatClass::Rejected => (6, None),
+                },
             };
             if let Some((Some(delivered), arrival)) = arrival {
-                path_fresh |= image.stats.arrived(delivered, arrival);
+                let fresh = image.stats.arrived(delivered, arrival);
+                // A conflicting copy is recorded, never path evidence.
+                path_fresh |= fresh && arrival != Arrival::Conflict;
             }
             if let Some(count) = outcomes.get_mut(outcome)
                 && let Some(next) = count.checked_add(1)
@@ -983,17 +1071,29 @@ impl Intake<'_> {
                 *count = next;
             }
         }
-        let fields: [fn(&mut ReceiverCounters) -> &mut u64; 4] = [
+        let fields: [fn(&mut ReceiverCounters) -> &mut u64; 7] = [
             |c| &mut c.data_committed,
             |c| &mut c.data_dropped,
             |c| &mut c.data_refused,
             |c| &mut c.heartbeats,
+            |c| &mut c.heartbeats_stale,
+            |c| &mut c.heartbeats_stationary,
+            |c| &mut c.heartbeats_rejected,
         ];
         let fresh = outcomes.first().is_some_and(|committed| *committed > 0)
             || outcomes.get(3).is_some_and(|heartbeats| *heartbeats > 0);
-        // Only fresh evidence (a committed frame or a heartbeat) keeps the
-        // image alive: a replayed duplicate does not.
+        // Image liveness, trusted profile (coordinator decision; an
+        // authenticated channel still needs its profile's freshness proof):
+        // fresh evidence (a committed frame or a heartbeat above the lane's
+        // highest seen position) keeps the image alive; an idle sender's
+        // stationary heartbeats keep it alive only until
+        // `idle_image_timeout` after the last fresh evidence; a replay keeps
+        // nothing alive.
+        let stationary = outcomes.get(5).is_some_and(|count| *count > 0);
         if fresh {
+            image.evidence = self.now;
+            image.last_fresh = self.now;
+        } else if stationary && age_ns(self.now, image.last_fresh) < role.idle_timeout {
             image.evidence = self.now;
         }
         if path_fresh && let Some((slot, path)) = path {
@@ -1213,6 +1313,12 @@ impl SenderRole {
         self.sessions.counters()
     }
 
+    /// The data path of its `index`-th publication (tests).
+    #[cfg(test)]
+    pub(crate) fn outbound(&self, index: usize) -> Option<&Outbound> {
+        self.publications.get(index)
+    }
+
     fn count(&mut self, field: fn(&mut SenderCounters) -> &mut u64) {
         let mut overflowed = self.counters.overflowed;
         bump(field(&mut self.counters), &mut overflowed);
@@ -1343,6 +1449,8 @@ impl SenderRole {
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.prune(halves);
+        // Bindings past their lifetime go even when nothing arrives.
+        self.expire_bindings(now);
         let mut work = 0u32;
         for _ in 0..self.budget {
             let Ok(Some(item)) = self.from_receiver.try_take() else {
@@ -1429,20 +1537,27 @@ impl SenderRole {
     }
 
     /// The least position every receiver bound to `alias` on `endpoint`
-    /// reported consumed, per lane: a reliable channel's bound (SPEC §4).
-    /// `None` before any SM.
+    /// consumed, per lane: a reliable channel's bound (SPEC §4). A receiver
+    /// answered but not yet heard from bounds at its join points. `None`
+    /// with no bound receiver at all: a reliable lane then holds.
     fn consumption(&self, endpoint: EndpointId, alias: Alias) -> Option<[u64; 4]> {
         let mut least: Option<[u64; 4]> = None;
         for binding in &self.bindings {
             if binding.endpoint != endpoint || binding.alias != alias {
                 continue;
             }
-            let Some(lanes) = binding.lanes else {
-                continue;
-            };
             let positions = least.get_or_insert([u64::MAX; 4]);
-            for (position, status) in positions.iter_mut().zip(lanes.as_slice()) {
-                *position = (*position).min(status.consumption);
+            match binding.lanes {
+                Some(lanes) => {
+                    for (position, status) in positions.iter_mut().zip(lanes.as_slice()) {
+                        *position = (*position).min(status.consumption);
+                    }
+                }
+                None => {
+                    for (position, join) in positions.iter_mut().zip(binding.joins.as_slice()) {
+                        *position = (*position).min(*join);
+                    }
+                }
             }
         }
         least
@@ -1465,6 +1580,7 @@ impl SenderRole {
             identity: answer.identity,
             receiver_id: None,
             lanes: None,
+            joins: answer.joins,
             answered_at: now,
             last_sm: None,
         };
@@ -1482,7 +1598,9 @@ impl SenderRole {
             .iter_mut()
             .find(|held| tuple(held) == tuple(&binding))
         {
-            *held = binding;
+            // The same receiver again: its consumption never moves back.
+            let lanes = held.lanes;
+            *held = ReceiverBinding { lanes, ..binding };
             return;
         }
         if self.bindings.len() >= self.max_bindings {

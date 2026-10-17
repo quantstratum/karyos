@@ -630,12 +630,22 @@ impl ReceiveSessions {
     /// and with none left its own liveness decides). Returns how many
     /// actions were taken.
     pub fn timers(&mut self, now: u64) -> u32 {
+        self.timers_with(now, |_, _, _| {})
+    }
+
+    /// [`ReceiveSessions::timers`], reporting each lost path binding to
+    /// `lost` (image, path, key), for its owner's path statistics.
+    pub fn timers_with(
+        &mut self,
+        now: u64,
+        lost: impl FnMut(SlotRef, usize, super::paths::PathKey),
+    ) -> u32 {
         let budget = self.config.timer_actions;
         let freed = self.sweep(now, budget);
         // The sweep frees at most `budget`; whatever is left goes to the
         // paths.
         let lost = match budget.checked_sub(freed) {
-            Some(left) if left > 0 => self.paths.timers(now, left, |_, _, _| {}),
+            Some(left) if left > 0 => self.paths.timers(now, left, lost),
             _ => 0,
         };
         freed.checked_add(lost).unwrap_or(budget)

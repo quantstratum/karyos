@@ -65,6 +65,9 @@ struct Setup {
     /// Whether the channel is reliable: the sender is then a required
     /// participant of its log.
     reliable: bool,
+    /// Bind the publishing endpoint to a fixed port, so a reset reopens it
+    /// at the same address.
+    fixed_publisher: bool,
 }
 
 impl Default for Setup {
@@ -74,6 +77,7 @@ impl Default for Setup {
             max_term_length: DEFAULT_MAX_IMAGE_TERM_LENGTH,
             template: ImageTemplate::default(),
             reliable: false,
+            fixed_publisher: false,
         }
     }
 }
@@ -108,9 +112,20 @@ impl Rig {
             now: 0,
         };
         let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let publishing = if setup.fixed_publisher {
+            // A free port, released for the endpoint to bind.
+            let port = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], port)))
+        } else {
+            loopback
+        };
         let a = rig
             .endpoints
-            .open(&rig.links, loopback, OsSocket::new())
+            .open(&rig.links, publishing, OsSocket::new())
             .unwrap();
         let b = rig
             .endpoints
@@ -770,4 +785,90 @@ fn two_lanes_are_both_served() {
     }
     assert_eq!(got0, (0..10).collect::<Vec<u8>>());
     assert_eq!(got1, (100..110).collect::<Vec<u8>>());
+}
+
+/// P1-1 of the #255 review: on a reliable channel the sender's registered
+/// position never passes what a bound receiver consumed. When the only
+/// receiver's binding expires (its SMs stopped), the position holds; it
+/// never jumps to what was submitted.
+#[test]
+fn a_reliable_position_holds_when_its_receiver_goes() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    established(&mut rig);
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    let sent = |rig: &Rig| rig.agents.sender.role.outbound(0).unwrap().readers()[0].sent_position();
+    let held = sent(&rig);
+    // The receiver stops: no more SMs. Past the image liveness timeout the
+    // confirmed binding expires.
+    rig.now += 11_000 * MS;
+    let data = vec![3u8; 992];
+    for _ in 0..200 {
+        let log = rig.log.as_mut().unwrap();
+        match log.publications[0]
+            .append(&data, AppendOptions::default())
+            .unwrap()
+        {
+            AppendOutcome::Appended { .. } | AppendOutcome::AdminAction => {}
+            AppendOutcome::BackPressured => break,
+            other => panic!("{other:?}"),
+        }
+        for conductor in &mut rig.log.as_mut().unwrap().conductors {
+            let _ = conductor.duty_cycle().unwrap();
+        }
+        rig.now += MS;
+        rig.agents.sender.do_work(rig.now).unwrap();
+    }
+    assert!(rig.agents.sender.role.counters().bindings_expired >= 1);
+    assert_eq!(
+        sent(&rig),
+        held,
+        "the position moved with no bound receiver"
+    );
+}
+
+/// P2-6 of the #255 review: a reset of the sending endpoint while data is
+/// in flight on a reliable lane loses nothing: the lane rewinds to its
+/// registered position (a block boundary) and sends again, and the
+/// receive owner drops what it already had.
+#[test]
+fn a_reliable_lane_resends_after_a_reset() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        fixed_publisher: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let messages: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i; 900]).collect();
+    for message in &messages {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(message, AppendOptions::default())
+            .unwrap();
+    }
+    rig.round(true);
+    let publisher = rig.publisher;
+    let before = rig.endpoints.local_address(publisher);
+    rig.endpoints.reset(&rig.links, publisher).unwrap();
+    let mut delivered = Vec::new();
+    for _ in 0..3000 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            delivered.push(message);
+        }
+        if delivered.len() == messages.len() {
+            break;
+        }
+    }
+    assert_eq!(delivered, messages);
+    assert_eq!(rig.endpoints.local_address(publisher), before);
 }
