@@ -83,6 +83,8 @@ struct Setup {
     control_group: bool,
     /// The receiver's `group_nak_budget`, when not the default.
     group_nak_budget: Option<u32>,
+    /// Further changes to the agents' configuration.
+    tune: Option<fn(&mut AgentConfig)>,
     /// Messages on each lane before the sender's reader subscribes: the
     /// image then joins above 0.
     before: u8,
@@ -118,6 +120,7 @@ impl Default for Setup {
             guard: None,
             control_group: false,
             group_nak_budget: None,
+            tune: None,
             before: 0,
             identity: None,
             roles: None,
@@ -163,6 +166,9 @@ impl Rig {
         }
         if let Some(budget) = setup.group_nak_budget {
             config.group_nak_budget = budget;
+        }
+        if let Some(tune) = setup.tune {
+            tune(&mut config);
         }
         let (mut agents, links) = network_agents::<OsSocket>(config).unwrap();
         VIRTUAL_NOW.with(|now| now.set(0));
@@ -3461,4 +3467,110 @@ fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
         rig.agents.receiver.role.session_counters().challenges,
         challenges + 1
     );
+}
+
+/// T8 (contract-traceability-phase-2.md, "Bounded scheduling"): one whole
+/// receiver and sender cycle under overload keeps every per-cycle bound at
+/// once. With small bounds, both lanes publish as fast as the log takes
+/// them and lose datagrams, so each lane's earliest hole is NAKed and two
+/// NAKs can reach the sender in one cycle. Both lanes are needed: the
+/// receiver keeps one NAK in flight per lane, so a single lane never
+/// exceeds a sender budget of one NAK a cycle. Every single cycle reads at most
+/// `rx_datagrams` per endpoint, admits at most `naks_per_cycle` NAKs and
+/// repairs within the repair byte budget; the excess waits (counted), and
+/// every message still arrives, in order.
+#[test]
+fn an_overloaded_cycle_keeps_every_per_cycle_bound() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, Role};
+
+    const RX: u32 = 4;
+    const NAKS: u32 = 1;
+    const REPAIR_BYTES: u64 = 4_096;
+    /// The rig's endpoints: A and B.
+    const ENDPOINTS: u64 = 2;
+    /// The largest datagram a repair submits.
+    const DATAGRAM: u64 = 1_408;
+    const MESSAGES: u8 = 48;
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        tune: Some(|config| {
+            config.rx_datagrams = RX;
+            config.repair.naks_per_cycle = NAKS;
+            config.repair.budget.bytes = REPAIR_BYTES;
+        }),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let mut subscribers = [
+        image_subscriber(&rig, slot, 0, Role::Optional),
+        image_subscriber(&rig, slot, 1, Role::Optional),
+    ];
+    rig.agents
+        .receiver
+        .role
+        .drop_data(&[1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23]);
+    let mut appended = [0u8; 2];
+    let mut delivered = [Vec::new(), Vec::new()];
+    let mut fullest_read = 0u64;
+    let mut before = (rig.agents.receiver.counters(), rig.agents.sender.counters());
+    for _ in 0..4_000 {
+        for (lane, count) in appended.iter_mut().enumerate() {
+            while *count < MESSAGES {
+                let log = rig.log.as_mut().unwrap();
+                match log.publications[lane]
+                    .append(&[*count; 900], AppendOptions::default())
+                    .unwrap()
+                {
+                    AppendOutcome::Appended { .. } => *count += 1,
+                    _ => break,
+                }
+            }
+        }
+        rig.round(true);
+        let after = (rig.agents.receiver.counters(), rig.agents.sender.counters());
+        let read = after.0.datagrams - before.0.datagrams;
+        let admitted = after.1.naks - before.1.naks;
+        let repairs = after.1.repairs - before.1.repairs;
+        assert!(
+            read <= u64::from(RX) * ENDPOINTS,
+            "{read} datagrams in a cycle"
+        );
+        assert!(
+            admitted <= u64::from(NAKS),
+            "{admitted} NAKs admitted in a cycle"
+        );
+        // A repair is admitted while budget remains, so the last one may
+        // overrun it by at most one datagram.
+        assert!(
+            repairs
+                .checked_sub(1)
+                .is_none_or(|full| full * DATAGRAM <= REPAIR_BYTES),
+            "{repairs} repairs in a cycle"
+        );
+        fullest_read = fullest_read.max(read);
+        before = after;
+        for (lane, (_, subscriber)) in subscribers.iter_mut().enumerate() {
+            while let Some(message) = poll_message(subscriber) {
+                delivered[lane].push(message[0]);
+            }
+        }
+        if delivered
+            .iter()
+            .all(|lane| lane.len() == usize::from(MESSAGES))
+        {
+            break;
+        }
+    }
+    for lane in &delivered {
+        assert_eq!(
+            lane,
+            &(0..MESSAGES).collect::<Vec<_>>(),
+            "every message, in order"
+        );
+    }
+    // The bounds were reached, not merely unchallenged.
+    assert!(fullest_read > u64::from(RX), "{fullest_read}");
+    let sender = rig.agents.sender.counters();
+    assert!(sender.nak_cycle_budget >= 1, "{sender:?}");
+    assert!(sender.repairs >= 12, "{sender:?}");
 }

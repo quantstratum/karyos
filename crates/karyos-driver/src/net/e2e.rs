@@ -918,3 +918,388 @@ fn multicast_cycles_run_on_the_network_clock() {
 }
 
 mod netem;
+
+/// The table of the conflated views below: four keys of 16 bytes.
+const VIEW: karyos_sys::conflation::ConflationConfig = karyos_sys::conflation::ConflationConfig {
+    keys: 4,
+    value_capacity: 16,
+    journal_capacity: 1024,
+};
+
+/// Offers `value` under `key` on `lane`, pumping both drivers until it is
+/// accepted.
+fn offer_keyed(
+    a: &mut EmbeddedDriver,
+    b: &mut EmbeddedDriver,
+    lane: &mut karyos_client::ClientPublication<HeapTerms>,
+    key: i64,
+    value: u8,
+) {
+    let options = karyos_sys::log_buffer::AppendOptions {
+        reserved_value: key,
+        ..karyos_sys::log_buffer::AppendOptions::default()
+    };
+    pump(&mut [a, b], |_| {
+        matches!(
+            lane.offer_with(&[value; 16], options).unwrap(),
+            OfferOutcome::Accepted { .. }
+        )
+    });
+}
+
+/// Polls `reader` while pumping both drivers until `done` holds for the
+/// latest `(value, freshness)` of each key.
+fn view_until(
+    a: &mut EmbeddedDriver,
+    b: &mut EmbeddedDriver,
+    reader: &mut karyos_sys::conflation::ConflationReader,
+    latest: &mut [Option<(u8, karyos_sys::freshness::Freshness)>; 4],
+    mut done: impl FnMut(&[Option<(u8, karyos_sys::freshness::Freshness)>; 4]) -> bool,
+) {
+    let budget = karyos_sys::conflation::Budget {
+        keys: 16,
+        retries: 4,
+    };
+    pump(&mut [a, b], |_| {
+        let _ = reader.poll_changed(budget, |key, _, value, freshness| {
+            latest[key as usize] = Some((value[0], freshness));
+        });
+        done(latest)
+    });
+}
+
+/// C4 (conflated-network-images.md (a)): a conflated subscription's image
+/// gets a view fed from its lane; its values read Fresh.
+#[test]
+fn a_conflated_network_view_reads_its_values_fresh() {
+    use karyos_sys::freshness::Freshness;
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let address = free_address();
+    let _subscription = b
+        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    assert_eq!(b.network_view_counters().built, 1);
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    for key in 0..4 {
+        offer_keyed(&mut a, &mut b, &mut lane, key, 10 + key as u8);
+    }
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        (0..4).all(|key| latest[key] == Some((10 + key as u8, Freshness::Fresh)))
+    });
+}
+
+/// C4, GU-9 end to end: on an unreliable channel a lost update makes every
+/// key Stale since the gap's start once the receiver seals it, through the
+/// view's mailbox (the feeder acknowledges after recording the loss); an
+/// update past the gap restores its own key, Fresh.
+#[test]
+fn a_lost_update_stales_the_view_until_replaced() {
+    use karyos_sys::freshness::Freshness;
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let address = free_address();
+    let _subscription = b
+        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    for key in 0..4 {
+        offer_keyed(&mut a, &mut b, &mut lane, key, 10 + key as u8);
+    }
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest.iter().all(Option::is_some)
+    });
+    // The next DATA datagram, key 1's update, is lost; key 2's arrives.
+    b.net.as_mut().unwrap().drop_receiver_data(&[0]);
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 21);
+    offer_keyed(&mut a, &mut b, &mut lane, 2, 22);
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0].is_some_and(|(_, freshness)| freshness != Freshness::Fresh)
+            && latest[2] == Some((22, Freshness::Fresh))
+    });
+    let since = match latest[0] {
+        Some((10, Freshness::Stale { since })) => since,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(latest[1], Some((11, Freshness::Stale { since })));
+    assert_eq!(latest[3], Some((13, Freshness::Stale { since })));
+    // A replacement of key 1 past the gap is Fresh; key 0 stays Stale.
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 31);
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[1] == Some((31, Freshness::Fresh))
+    });
+    assert_eq!(latest[0], Some((10, Freshness::Stale { since })));
+    let views = b.network_view_counters();
+    assert!(views.acked >= 1, "{views:?}");
+    let counters = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert!(
+        counters.barrier_acks >= 1 && counters.gaps_sealed >= 1,
+        "{counters:?}"
+    );
+    assert_eq!(counters.barrier_timeouts, 0);
+}
+
+/// C4, design (c): once the view's terminal cell is published (here by the
+/// receive owner's side of the link), the conductor closes the feeder on
+/// its next duty, and the reader delivers nothing more and reports it.
+#[test]
+fn a_published_terminal_cell_closes_the_network_view() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let address = free_address();
+    let _subscription = b
+        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let link = b.network_view_link(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
+    let terminal = karyos_sys::freshness::Terminal {
+        start: 0,
+        end: 64,
+        reason: karyos_sys::freshness::TERMINAL_BARRIER_TIMEOUT,
+    };
+    assert!(link.terminal().unwrap().publish(terminal));
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_view_counters().closed_terminal == 1
+    });
+    let budget = karyos_sys::conflation::Budget {
+        keys: 16,
+        retries: 4,
+    };
+    let mut delivered = 0;
+    let report = reader.poll_changed(budget, |_, _, _, _| delivered += 1);
+    assert_eq!((delivered, report.terminal), (0, Some(terminal)));
+    assert!(
+        b.network_view_link(&image, Lane::ZERO).is_none(),
+        "feeder closed"
+    );
+}
+
+/// Offers numbered messages on `lane` up to `until`, runs A and B once and
+/// reads B's `reader`, checking order (T9).
+#[cfg(target_os = "linux")]
+fn offer_and_read(
+    [a, b]: [&mut EmbeddedDriver; 2],
+    lane: &mut karyos_client::ClientPublication<HeapTerms>,
+    reader: &mut AggregateSubscription<HeapTerms>,
+    (sent, seen): (&mut u32, &mut u32),
+    until: u32,
+) {
+    while *sent < until {
+        let mut payload = [0u8; 1000];
+        payload[..4].copy_from_slice(&sent.to_le_bytes());
+        match lane.offer(&payload).unwrap() {
+            OfferOutcome::Accepted { .. } => *sent += 1,
+            _ => break,
+        }
+    }
+    let _ = a.do_work().unwrap();
+    let _ = b.do_work().unwrap();
+    let _ = reader.poll(
+        |bytes, _, _| {
+            let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(index, *seen, "B in order, exactly once");
+            *seen += 1;
+        },
+        BUDGET,
+    );
+}
+
+/// T9 (contract-traceability-phase-2.md, "Retention floor"), end to end on
+/// a reliable multicast publication with B required (receiver 77) and C
+/// optional. While the sender holds NAKs back, C loses a datagram and the
+/// sender, bound by B alone, sends `total` messages, B reading them all;
+/// then NAKs flow. Returns C's closes `(unrecoverable, cannot_resume)`, and
+/// with `repair_b`, checks that B's own hole above the floor is repaired.
+/// `None` without multicast on this host.
+#[cfg(target_os = "linux")]
+fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
+    use std::io::Write as _;
+
+    use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(std::io::stderr(), "SKIPPED T9 retention floor: {why}");
+        return None;
+    }
+    let port = free_address().port();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), port);
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b, mut c) = (
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    let required = ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+        group_tag: 0,
+    };
+    let _ = b
+        .add_network_subscription_as(10, &channel, required)
+        .unwrap();
+    let _ = c.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication_with_roles(
+            aggregate(10, 3, 1),
+            &channel,
+            PublicationRoles {
+                strategy: Strategy::Max,
+                required: vec![77],
+                tags: Vec::new(),
+            },
+        )
+        .unwrap();
+    let mut images = (None, None);
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        images = (
+            drivers[1].network_image(10, 3),
+            drivers[2].network_image(10, 3),
+        );
+        images.0.is_some() && images.1.is_some()
+    });
+    let (Some(on_b), Some(_on_c)) = images else {
+        unreachable!("pumped until both exist");
+    };
+    let mut reader = b.subscribe_aggregate(&on_b, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // The sender holds NAKs back; C loses its third DATA datagram.
+    a.net.as_mut().unwrap().sender_ignores_naks(true);
+    c.net.as_mut().unwrap().drop_receiver_data(&[2]);
+    let (mut sent, mut seen) = (0u32, 0u32);
+    for _ in 0..40_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        let _ = c.do_work().unwrap();
+        if seen == total {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert_eq!(seen, total, "B is required and reads everything");
+    // NAKs flow again: C's hole is below the floor.
+    a.net.as_mut().unwrap().sender_ignores_naks(false);
+    let closes = |c: &EmbeddedDriver| {
+        c.net.as_ref().unwrap().receiver_counters().map(|counters| {
+            (
+                counters.images_closed_unrecoverable,
+                counters.images_closed_cannot_resume,
+            )
+        })
+    };
+    for _ in 0..40_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        let _ = c.do_work().unwrap();
+        if closes(&c).is_some_and(|(unrecoverable, cannot)| unrecoverable + cannot >= 1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    let on_c = c.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert!(on_c.naks >= 1, "{on_c:?}");
+    if repair_b {
+        // The sender answered C's NAK below its floor (RANGE_UNAVAILABLE).
+        let sender = a.net.as_ref().unwrap().sender_counters().unwrap();
+        assert!(sender.naks >= 1 && sender.nak_replies >= 1, "{sender:?}");
+        // A hole above the floor, B's, is repaired.
+        b.net.as_mut().unwrap().drop_receiver_data(&[1]);
+        let more = total + 8;
+        for _ in 0..40_000 {
+            offer_and_read(
+                [&mut a, &mut b],
+                &mut lane,
+                &mut reader,
+                (&mut sent, &mut seen),
+                more,
+            );
+            if seen == more {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        assert_eq!(seen, more, "B's lost datagram was repaired");
+        let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+        assert!(receiver.naks >= 1, "{receiver:?}");
+        assert_eq!(receiver.images_closed_unrecoverable, 0);
+    }
+    closes(&c)
+}
+
+/// T9: a term and a half, so the floor, bound by B alone, passes C's hole
+/// but stays inside C's window `{r, r + 1}`. C's NAK below the floor is
+/// answered RANGE_UNAVAILABLE and C's image closes as unrecoverable
+/// (`on_unrecoverable = close`); B's own hole above the floor is repaired.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_optional_receivers_hole_below_the_floor_is_unrecoverable() {
+    if let Some(closes) = optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true) {
+        assert_eq!(closes, (1, 0), "C closed as unrecoverable");
+    }
+}
+
+/// T9, the expected other outcome (GU-6): three terms, so the floor is
+/// beyond C's window when its NAK flows. There is no far-window catch-up,
+/// so C's image closes as GapCannotResume, not as unrecoverable.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_optional_receivers_hole_past_its_window_cannot_resume() {
+    if let Some(closes) = optional_receiver_closes(3 * (MIN_TERM_LENGTH / 1000) + 8, false) {
+        assert_eq!(closes, (0, 1), "C closed as GapCannotResume");
+    }
+}
