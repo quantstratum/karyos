@@ -165,6 +165,7 @@ fn add_publication(
             max_term_length: super::super::images::DEFAULT_MAX_IMAGE_TERM_LENGTH,
             reliable: true,
             multicast: false,
+            control_group: None,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -722,6 +723,7 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             // Reliable if any subscription of the stream is.
             reliable: max_term_length == 2 << 20,
             multicast: false,
+            control_group: None,
         };
         assert!(matches!(
             role.command(command),
@@ -1198,6 +1200,7 @@ fn installed_image_with(
         closing: None,
         tail_since: [None; 4],
         reset_requested: None,
+        control_group: None,
     };
     (image, params)
 }

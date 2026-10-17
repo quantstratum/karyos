@@ -205,6 +205,9 @@ pub struct AgentConfig {
     /// design defaults: `nak_delay_scale` 16, `repair_linger` and
     /// `repair_slack` 1 ms, the `group` response domain.
     pub multicast: crate::repair::loss::MulticastConfig,
+    /// `group_nak_budget`: control group datagrams the receiver reads per
+    /// cycle, at least 1 (default 64, provisional, RC-15).
+    pub group_nak_budget: u32,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -238,6 +241,7 @@ impl Default for AgentConfig {
             rtt: crate::rtt::RttConfig::default(),
             repair: repair::RepairConfig::default(),
             multicast: crate::repair::loss::MulticastConfig::default(),
+            group_nak_budget: 64,
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -291,16 +295,17 @@ impl AgentConfig {
         self.rtt
             .validate()
             .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
-        // The largest RTT snapshot: a sample never exceeds the probe
-        // timeout; before one, the initial RTT, never below the floor.
-        let max_rtt = self
-            .rtt
-            .rtt_probe_timeout
-            .max(self.rtt.rtt_initial)
-            .max(self.rtt.rtt_floor);
+        // RTT snapshots lie between the floor and the probe timeout (the
+        // RTT configuration checks `rtt_floor <= rtt_initial <=
+        // rtt_probe_timeout` above).
         self.multicast
-            .validate_for(max_rtt)
+            .validate_for(self.rtt.rtt_floor, self.rtt.rtt_probe_timeout)
             .map_err(|_| AgentError::InvalidConfig("invalid multicast NAK timing"))?;
+        if self.group_nak_budget == 0 {
+            return Err(AgentError::InvalidConfig(
+                "group_nak_budget must be at least 1",
+            ));
+        }
         // S1: the control ring holds every pending challenge's RSP_SETUP
         // and one SM slot per image, above a floor for forwarded controls
         // (one path per image until redundant paths, RP-1).
@@ -422,6 +427,11 @@ pub enum AgentCommand<O: SocketOps> {
         /// time their NAKs by cycle (RC-2) with
         /// [`AgentConfig::multicast`].
         multicast: bool,
+        /// The endpoint joined to the data group's NAK control group, and
+        /// the group's address (RC-7, RC-15): its images send a copy of
+        /// each NAK there and read their peers' NAKs from it. `None`
+        /// without one: no peer suppression input.
+        control_group: Option<(EndpointId, std::net::SocketAddr)>,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer
@@ -995,6 +1005,17 @@ impl<O: SocketOps> ReceiverAgent<O> {
     #[must_use]
     pub fn counters(&self) -> roles::ReceiverCounters {
         self.role.counters()
+    }
+
+    /// Whether the receiver's entry for `stream_id` on `endpoint` is
+    /// multicast, if it has one (tests).
+    #[cfg(test)]
+    pub(crate) fn subscription_multicast(
+        &self,
+        endpoint: EndpointId,
+        stream_id: i32,
+    ) -> Option<bool> {
+        self.role.subscription_multicast(endpoint, stream_id)
     }
 
     /// Whether the agent stopped: its flag was set or its conductor is

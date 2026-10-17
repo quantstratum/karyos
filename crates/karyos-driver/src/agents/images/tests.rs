@@ -76,6 +76,11 @@ struct Setup {
     multicast: bool,
     /// A fixed multicast NAK delay in place of the random draw.
     nak_delay: Option<u64>,
+    /// Whether the subscription has a NAK control group: a third loopback
+    /// endpoint C stands for it, its own address as the group.
+    control_group: bool,
+    /// The receiver's `group_nak_budget`, when not the default.
+    group_nak_budget: Option<u32>,
 }
 
 impl Default for Setup {
@@ -89,6 +94,8 @@ impl Default for Setup {
             repairs: true,
             multicast: false,
             nak_delay: None,
+            control_group: false,
+            group_nak_budget: None,
         }
     }
 }
@@ -106,6 +113,8 @@ fn virtual_now() -> u64 {
 struct Rig {
     /// The publishing endpoint A.
     publisher: EndpointId,
+    /// The control group endpoint C, with `Setup::control_group`.
+    control: Option<EndpointId>,
     /// The publication's log on A (64 KiB terms, whatever is announced).
     log: Option<super::super::data::testing::TestLog>,
     agents: Agents,
@@ -124,6 +133,9 @@ impl Rig {
         if let Some(quarantine) = setup.alias_quarantine {
             config.sessions.alias_quarantine = quarantine;
         }
+        if let Some(budget) = setup.group_nak_budget {
+            config.group_nak_budget = budget;
+        }
         let (mut agents, links) = network_agents::<OsSocket>(config).unwrap();
         VIRTUAL_NOW.with(|now| now.set(0));
         agents.sender.role.set_clock(virtual_now);
@@ -136,6 +148,7 @@ impl Rig {
         }
         let mut rig = Self {
             publisher: EndpointId(u32::MAX),
+            control: None,
             log: None,
             agents,
             links,
@@ -153,6 +166,12 @@ impl Rig {
             .endpoints
             .open(&rig.links, loopback, OsSocket::new())
             .unwrap();
+        let control = setup.control_group.then(|| {
+            rig.endpoints
+                .open(&rig.links, loopback, OsSocket::new())
+                .unwrap()
+        });
+        let endpoints = 2 + usize::from(control.is_some());
         let mut opened = 0;
         for _ in 0..100 {
             rig.agents.do_work(0).unwrap();
@@ -162,12 +181,15 @@ impl Rig {
                 |event| opened += usize::from(matches!(event, EndpointEvent::Opened(_))),
                 |_| {},
             );
-            if opened == 2 {
+            if opened == endpoints {
                 break;
             }
         }
-        assert_eq!(opened, 2);
+        assert_eq!(opened, endpoints);
         rig.publisher = a;
+        rig.control = control;
+        let control_group =
+            control.map(|control| (control, rig.endpoints.local_address(control).unwrap()));
         let destination = rig.endpoints.local_address(b).unwrap();
         rig.links
             .receiver
@@ -186,6 +208,7 @@ impl Rig {
                 max_term_length: setup.max_term_length,
                 reliable: setup.reliable,
                 multicast: setup.multicast,
+                control_group,
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
@@ -1856,4 +1879,222 @@ fn a_lost_multicast_datagram_is_repaired() {
         rig.round(true);
     }
     assert_eq!(rig.agents.receiver.counters().naks, naks);
+}
+
+/// The setup of the control group tests: a reliable multicast image with
+/// a control group (C), whose sender does not repair, so holes persist.
+fn control_setup(nak_delay: u64) -> Setup {
+    Setup {
+        reliable: true,
+        multicast: true,
+        nak_delay: Some(nak_delay),
+        repairs: false,
+        control_group: true,
+        ..Setup::default()
+    }
+}
+
+/// Loses datagram 1 of four 900-byte messages on lane 0.
+fn lose_one(rig: &mut Rig) {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+}
+
+/// The encoded bytes of `control`.
+fn encoded(control: karyos_protocol::network::Control) -> Vec<u8> {
+    let mut bytes = vec![0u8; 2048];
+    let length = control.encode(&mut bytes).unwrap();
+    bytes.truncate(length);
+    bytes
+}
+
+/// A peer receiver's NAK of `range` on `slot`'s image.
+fn peer_nak(range: karyos_protocol::network::NakRange) -> karyos_protocol::network::Nak {
+    karyos_protocol::network::Nak {
+        alias: alias(),
+        identity: identity(),
+        receiver: karyos_protocol::network::Receiver {
+            receiver_boot_id: [7, 7],
+            receiver_id: 99,
+        },
+        range,
+    }
+}
+
+/// mc-w2, RC-7: each NAK of a multicast image with a control group goes
+/// to the sender and, once, to the control group, after the unicast copy
+/// and with no report. The receiver's own copy comes back on the group
+/// (here C sends to itself) and is dropped: it never suppresses.
+#[test]
+fn a_nak_copy_goes_to_the_control_group() {
+    let (mut rig, _b) = Rig::new(control_setup(0));
+    let _slot = established(&mut rig);
+    lose_one(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().group_nak_own >= 1
+    });
+    let receiver = rig.agents.receiver.counters();
+    assert_eq!(receiver.group_nak_copies, receiver.naks, "{receiver:?}");
+    assert_eq!(receiver.group_nak_suppressions, 0);
+    assert!(rig.agents.sender.counters().group_nak_copies_sent >= 1);
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    assert_eq!(nak.range, HOLE);
+}
+
+/// The hole `lose_one` leaves: the second 960-byte frame of lane 0.
+const HOLE: karyos_protocol::network::NakRange = karyos_protocol::network::NakRange {
+    lane: karyos_protocol::frame::Lane::ZERO,
+    length: 960,
+    start: 960,
+};
+
+/// mc-w2, B: a peer's group NAK covering the hole before the cycle's
+/// drawn delay cancels the local NAK; the window runs from it, and when it
+/// ends with the hole still there the next cycle NAKs.
+#[test]
+fn a_peer_group_nak_suppresses_the_cycle() {
+    let (mut rig, _b) = Rig::new(control_setup(u64::MAX));
+    let _slot = established(&mut rig);
+    let control = rig.control.unwrap();
+    lose_one(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.counters().nak_cycles >= 1);
+    assert_eq!(rig.agents.receiver.counters().naks, 0);
+    let bytes = encoded(karyos_protocol::network::Control::Nak(peer_nak(HOLE)));
+    rig.agents
+        .receiver
+        .role
+        .inject_group(control, &bytes, rig.now);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(counters.group_naks, 1, "{counters:?}");
+    assert_eq!(counters.group_nak_suppressions, 1, "{counters:?}");
+    // Past the drawn delay (at most one RTT): still no local NAK.
+    let bound = rig.agents.receiver.role.last_nak_delay_bound().unwrap();
+    let until = rig.now + bound;
+    while rig.now <= until {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.counters().naks, 0);
+    // The window ends, the hole persists: the next cycle NAKs.
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    assert!(rig.agents.receiver.counters().nak_cycles >= 2);
+}
+
+/// mc-w2, RC-15 validation, in order: a datagram that is not a NAK; a
+/// NAK of another incarnation or of a lane past the image's; this
+/// receiver's own NAK; a range that breaks the term rule. Each is dropped
+/// and counted, and suppresses nothing.
+#[test]
+fn group_naks_are_validated() {
+    use karyos_protocol::network::{Control, NakRange, NakReply, NakReplyReason};
+
+    let (mut rig, _b) = Rig::new(control_setup(u64::MAX));
+    let slot = established(&mut rig);
+    let control = rig.control.unwrap();
+    lose_one(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.counters().nak_cycles >= 1);
+    let mut other_alias = peer_nak(HOLE);
+    other_alias.alias.session_id += 1;
+    let mut own = peer_nak(HOLE);
+    own.receiver = rig.agents.receiver.role.receiver_of(slot);
+    let past_lane = peer_nak(NakRange {
+        lane: karyos_protocol::frame::Lane::try_new(3).unwrap(),
+        ..HOLE
+    });
+    // Across the end of the first 64 KiB term.
+    let across = peer_nak(NakRange {
+        start: 65_536 - 32,
+        length: 64,
+        ..HOLE
+    });
+    let reply = Control::NakReply(NakReply::answering(
+        &peer_nak(HOLE),
+        NakReplyReason::RangeInvalid,
+    ));
+    for control_bytes in [
+        encoded(reply),
+        encoded(Control::Nak(other_alias)),
+        encoded(Control::Nak(past_lane)),
+        encoded(Control::Nak(own)),
+        encoded(Control::Nak(across)),
+    ] {
+        rig.agents
+            .receiver
+            .role
+            .inject_group(control, &control_bytes, rig.now);
+    }
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(counters.group_nak_not_nak, 1, "{counters:?}");
+    assert_eq!(counters.group_nak_unbound, 2, "{counters:?}");
+    assert_eq!(counters.group_nak_own, 1, "{counters:?}");
+    assert_eq!(counters.group_nak_range, 1, "{counters:?}");
+    assert_eq!(counters.group_naks, 0, "{counters:?}");
+    assert_eq!(counters.group_nak_suppressions, 0, "{counters:?}");
+}
+
+/// mc-w2, loop rule and inbound budget: real datagrams on the control
+/// group are read at most `group_nak_budget` per receiver cycle, change
+/// only suppression state, and never reach the sender.
+#[test]
+fn group_naks_are_budgeted_and_never_reach_the_sender() {
+    use std::net::UdpSocket;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        group_nak_budget: Some(1),
+        ..control_setup(u64::MAX)
+    });
+    let _slot = established(&mut rig);
+    let control = rig.control.unwrap();
+    let group = rig.endpoints.local_address(control).unwrap();
+    lose_one(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.counters().nak_cycles >= 1);
+    let sender_naks = rig.agents.sender.counters().naks;
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bytes = encoded(karyos_protocol::network::Control::Nak(peer_nak(HOLE)));
+    for _ in 0..3 {
+        peer.send_to(&bytes, group).unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().group_naks >= 1);
+    // One per cycle.
+    assert_eq!(rig.agents.receiver.counters().group_naks, 1);
+    rig.until(true, |rig| rig.agents.receiver.counters().group_naks >= 3);
+    let counters = rig.agents.receiver.counters();
+    assert!(counters.group_nak_budget_full >= 3, "{counters:?}");
+    assert_eq!(counters.group_nak_suppressions, 1, "{counters:?}");
+    assert_eq!(rig.agents.sender.counters().naks, sender_naks);
+}
+
+/// #296 review: with the delay pool empty and its refill failing, a
+/// multicast cycle draws the bound; the failed refill and the empty draw
+/// are each counted, the draw in the step that made it. A later refill
+/// that succeeds is counted as a draw from the system.
+#[test]
+fn an_empty_delay_pool_is_counted_in_its_step() {
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        multicast: true,
+        repairs: false,
+        ..Setup::default()
+    });
+    let _slot = established(&mut rig);
+    rig.agents.receiver.role.drain_nak_delays(true);
+    lose_one(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.counters().nak_cycles >= 1);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        counters.nak_delay_empty, counters.nak_cycles,
+        "{counters:?}"
+    );
+    assert!(counters.nak_delay_refill_failures >= 1, "{counters:?}");
+    let draws = counters.nak_delay_draws;
+    rig.agents.receiver.role.drain_nak_delays(false);
+    rig.round(true);
+    assert_eq!(rig.agents.receiver.counters().nak_delay_draws, draws + 1);
 }

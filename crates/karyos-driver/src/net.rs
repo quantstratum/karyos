@@ -43,10 +43,12 @@
 //!   and retires them with the image. An image it cannot expose is still
 //!   fed: its lane conductors are driven here until it retires.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use karyos_io::sockets::OsSocket;
-use karyos_io::sockets::endpoint::{MulticastConfig, SocketsConfig};
+use karyos_io::sockets::endpoint::{InterfaceSel, MulticastConfig, SocketsConfig};
+
+pub use control_group::{ControlGroup, ControlGroups, MAX_CONTROL_GROUPS};
 use karyos_protocol::network::Alias;
 
 use crate::agents::data::Outbound;
@@ -76,6 +78,10 @@ pub struct NetworkConfig {
     /// The log of a network publication a client creates by channel URI
     /// (W5b): the URI's `term-length`, `mtu` and `lanes` override these.
     pub stream_defaults: NetworkStreamDefaults,
+    /// The NAK control group of each multicast data group (RC-15; an
+    /// interim driver-side table until a URI key, ACS 16103). Empty by
+    /// default: multicast images then have no peer suppression input.
+    pub nak_control_groups: ControlGroups,
 }
 
 impl Default for NetworkConfig {
@@ -85,6 +91,7 @@ impl Default for NetworkConfig {
             threading: ThreadingMode::Dedicated,
             images: ImageTemplate::default(),
             stream_defaults: NetworkStreamDefaults::default(),
+            nak_control_groups: [None; MAX_CONTROL_GROUPS],
         }
     }
 }
@@ -192,6 +199,9 @@ struct NetSubscription {
     stream_id: i32,
     /// The channel's reliability, which every handle of this key shares.
     reliable: bool,
+    /// The endpoint joined to the data group's NAK control group, if the
+    /// table names one and its join succeeded (RC-15).
+    control: Option<EndpointId>,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
@@ -276,6 +286,11 @@ pub(crate) struct Network {
     /// The network's time base, the agents' role clock: `host_monotonic_ns`
     /// (module documentation, Duty).
     clock: fn() -> u64,
+    /// The NAK control groups of multicast data groups (RC-15).
+    control_groups: ControlGroups,
+    /// Control group joins that failed: those keys run without peer
+    /// suppression input (RC-15).
+    control_join_failures: u64,
 }
 
 impl Network {
@@ -287,6 +302,7 @@ impl Network {
     /// [`DriverError::InvalidConfig`] for an agent configuration the agents
     /// refuse; [`DriverError::NetworkStart`] when a thread cannot start.
     pub(crate) fn start(config: &NetworkConfig) -> Result<Self, DriverError> {
+        control_group::validate(&config.nak_control_groups)?;
         let (agents, links) =
             network_agents::<OsSocket>(config.agents).map_err(|_| DriverError::InvalidConfig)?;
         let agents = match config.threading {
@@ -317,6 +333,8 @@ impl Network {
             capacity: config.agents.publications,
             stale_overflows: 0,
             clock: karyos_sys::host_clock::host_monotonic_ns,
+            control_groups: config.nak_control_groups,
+            control_join_failures: 0,
         })
     }
 
@@ -421,6 +439,13 @@ impl Network {
             release(&mut self.send_endpoints, endpoint);
             return Err(DriverError::NetworkSubscriptionsFull);
         }
+        // The first subscriber of a multicast key joins its NAK control
+        // group, if the table names one (RC-15). A failed join leaves the
+        // key without peer suppression input, counted; it refuses nothing.
+        let control = match (reliable, multicast) {
+            (true, Some(config)) => self.hold_control_group(bind, config),
+            _ => None,
+        };
         let posted = self
             .links
             .receiver
@@ -431,18 +456,58 @@ impl Network {
                 max_term_length,
                 reliable,
                 multicast: group,
+                control_group: control,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
+            if let Some((control, _)) = control {
+                release(&mut self.send_endpoints, control);
+            }
             return Err(DriverError::NetworkBusy);
         }
         self.subscriptions.push(NetSubscription {
             endpoint,
             stream_id,
             reliable,
+            control: control.map(|(control, _)| control),
             users: 1,
         });
         Ok(handle)
+    }
+
+    /// The endpoint joined to the NAK control group of the data group
+    /// `config` on `bind`'s port, and the group's address: `None` when the
+    /// table names none, or when the join failed (counted, RC-15). The
+    /// endpoint loops its own sends back, so co-hosted receivers see each
+    /// other's NAKs; a receiver drops its own.
+    fn hold_control_group(
+        &mut self,
+        bind: SocketAddr,
+        config: MulticastConfig,
+    ) -> Option<(EndpointId, SocketAddr)> {
+        let data_group = SocketAddr::new(config.group, bind.port());
+        let interface = match config.interface {
+            InterfaceSel::Address(address) if !address.is_unspecified() => {
+                Some(IpAddr::V4(address))
+            }
+            _ => None,
+        };
+        let group = control_group::lookup(&self.control_groups, data_group, interface)?;
+        let control = MulticastConfig {
+            group: group.ip(),
+            loopback: true,
+            ..config
+        };
+        let local = SocketAddr::new(bind.ip(), group.port());
+        match self.hold_endpoint(local, Some(control)) {
+            Ok(endpoint) => Some((endpoint, group)),
+            Err(_) => {
+                if let Some(count) = self.control_join_failures.checked_add(1) {
+                    self.control_join_failures = count;
+                }
+                None
+            }
+        }
     }
 
     /// Stops `subscription`: its images retire and its endpoint is
@@ -480,7 +545,10 @@ impl Network {
                         stream_id,
                     })
                     .map_err(|_| DriverError::NetworkBusy)?;
-                self.subscriptions.swap_remove(index);
+                let entry = self.subscriptions.swap_remove(index);
+                if let Some(control) = entry.control {
+                    release(&mut self.send_endpoints, control);
+                }
             }
         }
         release(&mut self.send_endpoints, endpoint);
@@ -612,6 +680,21 @@ impl Network {
     /// Images installed but not exposed so far.
     pub(crate) fn images_unexposed(&self) -> u64 {
         self.images_unexposed
+    }
+
+    /// NAK control group joins that failed (RC-15): those keys run
+    /// without peer suppression input.
+    pub(crate) fn control_join_failures(&self) -> u64 {
+        self.control_join_failures
+    }
+
+    /// Endpoints some publication or subscription holds (tests).
+    #[cfg(test)]
+    pub(crate) fn held_endpoints(&self) -> usize {
+        self.send_endpoints
+            .iter()
+            .filter(|entry| entry.users > 0)
+            .count()
     }
 
     /// One publication less holds `endpoint`; the last one retires it.
@@ -928,6 +1011,18 @@ impl Network {
         }
     }
 
+    /// Whether the Shared receiver's entry of `subscription` is multicast,
+    /// once it has read the command (tests).
+    #[cfg(test)]
+    pub(crate) fn receiver_multicast(&self, subscription: NetworkSubscription) -> Option<bool> {
+        match &self.agents {
+            Agents::Shared(agents) => agents
+                .receiver
+                .subscription_multicast(subscription.endpoint, subscription.stream_id),
+            _ => None,
+        }
+    }
+
     /// The Shared receiver agent's counters, for tests.
     #[cfg(test)]
     pub(crate) fn receiver_counters(&self) -> Option<crate::agents::roles::ReceiverCounters> {
@@ -1168,6 +1263,7 @@ pub(crate) fn e2e_config(stream_id: i32) -> crate::embedded::StreamConfig {
         conflation: None,
     }
 }
+pub mod control_group;
 mod publish;
 mod subscribe;
 
