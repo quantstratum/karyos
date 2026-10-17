@@ -6,27 +6,42 @@
 //!
 //! The packetizer commits each datagram of a lane once per route, a copy
 //! in that route's own frame pool, and records each copy with its stream
-//! `position` ([`RoutedLaneSender::staged`]). A route that cannot take a
-//! copy skips it ([`RoutedLaneSender::skipped`], counted per route): its
-//! next copy is a later position. The DRR selects a lane once. Its head is
-//! the lowest position staged on any route and not yet debited. Every route
-//! whose queue holds that head flushes its copy, in route order, each
-//! through the gate at its own exposure. The first route that reports it
-//! `Submitted` debits the lane, once, by its charge; a copy submitted on a
-//! later route, or later, debits nothing.
+//! `position` ([`RoutedLaneSender::staged`]), in increasing order per
+//! route. A route that cannot take a copy skips it
+//! ([`RoutedLaneSender::skipped`], counted per route): its next copy is a
+//! later position.
+//!
+//! The DRR selects a lane once. Its head is the lowest position not yet
+//! debited that any route still holds, and the lane is eligible only when
+//! some route can send that head now: the copy is at the front of the
+//! route's queue, and the route is not waiting for the control path,
+//! paused, blocked or inactive for the call. Every such route flushes its
+//! copy, in route order, each through the gate at its own exposure. The
+//! first route that reports it `Submitted` debits the lane, once, by its
+//! charge; a copy submitted on a later route, or later, debits nothing.
+//! The head never moves past a position no route submitted: while the
+//! only copies of the lowest position wait on their routes (denied, held
+//! or suspended), the lane waits too, as one route's lane would.
 //!
 //! - **No route submitted.** An `Unknown` copy suspends its route only,
 //!   and the head is uncertain only when no route served it; a route
 //!   without room makes the call stop as backpressure only when no route
-//!   served it either. A copy the gate denies pauses its route for the
-//!   call. So a lane stays eligible while one route can still send its
-//!   head.
+//!   served it either. A copy the gate denies pauses its route's queue for
+//!   the call.
+//! - **Per socket.** Each route is its own endpoint. A route that would
+//!   block, or whose endpoint is resetting or retired, takes no more
+//!   flushes in the call, on any lane; the call reports
+//!   [`SenderReport::inactive`] once every route is inactive.
+//! - **Failures.** Mapped as [`super::LaneSender`] maps them
+//!   ([`SenderFailure`]). A failure after another route submitted the head
+//!   still debits it, then stops the call.
 //! - **Catching up.** A route behind the debited position (its copy was
 //!   kept pending while another route submitted) flushes its older copies
 //!   in [`RoutedLaneSender::catch_up`], one per route and lane per call,
 //!   which debits nothing.
 //! - **One route.** With one route the sender takes the same DRR steps as
-//!   [`super::LaneSender`]: the tests run both side by side.
+//!   [`super::LaneSender`] and reports the same failures: the tests run
+//!   both side by side.
 //!
 //! Every allocation happens in [`RoutedLaneSender::new`]; the data calls do
 //! not allocate.
@@ -74,8 +89,20 @@ pub struct RouteCounters {
     pub skipped: u64,
     /// Copies this route submitted after another had debited them.
     pub late: u64,
+    /// Cancels this route could not run: its TX half was detached, so its
+    /// copies stay recorded until [`RoutedLaneSender::reopen`].
+    pub uncancelled: u64,
     /// An increment did not apply.
     pub overflowed: bool,
+}
+
+/// What one [`RoutedLaneSender::catch_up`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CatchUp {
+    /// Copies submitted.
+    pub submitted: u32,
+    /// Set when the call stopped on a failure.
+    pub failure: Option<SenderFailure>,
 }
 
 #[derive(Debug)]
@@ -90,6 +117,21 @@ struct RouteLane {
     paused: bool,
 }
 
+impl RouteLane {
+    /// Whether this queue may flush now, its route not blocked or inactive.
+    fn sendable(&self) -> bool {
+        !(self.suspended || self.control || self.paused)
+    }
+
+    /// Its lowest copy above `debited`. Positions increase along the queue.
+    fn undebited(&self, debited: Option<u64>) -> Option<&RoutedStaged> {
+        let first = self
+            .staged
+            .partition_point(|copy| debited.is_some_and(|debited| copy.position <= debited));
+        self.staged.get(first)
+    }
+}
+
 #[derive(Debug)]
 struct Lane {
     routes: Vec<RouteLane>,
@@ -99,20 +141,23 @@ struct Lane {
 }
 
 impl Lane {
-    /// The lowest position not yet debited, among the routes that may send
-    /// now, with its charge.
-    fn head(&self) -> Option<(u64, u64)> {
+    /// The head (module docs): the lowest position not yet debited on any
+    /// route, with its charge, when a route not in `out` holds it at its
+    /// front and may send it now.
+    fn head(&self, out: &[bool; MAX_ROUTES]) -> Option<(u64, u64)> {
+        let lowest = self
+            .routes
+            .iter()
+            .filter_map(|route| route.undebited(self.debited))
+            .map(|copy| copy.position)
+            .min()?;
         self.routes
             .iter()
-            .filter(|route| !(route.suspended || route.control || route.paused))
-            .filter_map(|route| {
-                route
-                    .staged
-                    .iter()
-                    .find(|copy| self.debited.is_none_or(|debited| copy.position > debited))
-            })
+            .zip(out)
+            .filter(|(route, out)| route.sendable() && !**out)
+            .filter_map(|(route, _)| route.staged.front())
+            .find(|copy| copy.position == lowest)
             .map(|copy| (copy.position, copy.staged.charge))
-            .min_by_key(|(position, _)| *position)
     }
 }
 
@@ -121,6 +166,7 @@ impl Lane {
 pub struct RoutedLaneSender {
     drr: Drr,
     lanes: Vec<Lane>,
+    routes: usize,
     max_charge: u64,
     report: TxReport,
     counters: [RouteCounters; MAX_ROUTES],
@@ -163,6 +209,7 @@ impl RoutedLaneSender {
         Ok(Self {
             drr: Drr::new(config),
             lanes,
+            routes: queues.len(),
             max_charge,
             report: TxReport::new(),
             counters: [RouteCounters::default(); MAX_ROUTES],
@@ -182,7 +229,7 @@ impl RoutedLaneSender {
     }
 
     /// Records a copy the packetizer committed to `lane`'s queue on
-    /// `route`, at its tail.
+    /// `route`, at its tail, above the route's last copy.
     ///
     /// # Errors
     ///
@@ -218,18 +265,22 @@ impl RoutedLaneSender {
         if queue.staged.len() >= bound {
             return Err(StageError::Full { lane });
         }
+        if queue
+            .staged
+            .back()
+            .is_some_and(|last| last.position >= copy.position)
+        {
+            return Err(StageError::OutOfOrder { lane });
+        }
         queue.staged.push_back(copy);
         Ok(())
     }
 
-    /// `route` could not take a copy of `lane`'s next datagram (no room):
+    /// `route` could not take a copy of a lane's next datagram (no room):
     /// the route skips it, counted (RP-8).
     pub fn skipped(&mut self, route: usize) {
         if let Some(counters) = self.counters.get_mut(route) {
-            match counters.skipped.checked_add(1) {
-                Some(next) => counters.skipped = next,
-                None => counters.overflowed = true,
-            }
+            bump(&mut counters.skipped, &mut counters.overflowed);
         }
     }
 
@@ -287,28 +338,47 @@ impl RoutedLaneSender {
     /// Returns the pending copies of `lane` that were never exposed, on
     /// every route, for a lane its gate aborted (as
     /// [`super::LaneSender::cancel`] does for one route): each leaves
-    /// through `gate` as [`Left::Returned`], in staging order.
+    /// through `gate` as [`Left::Returned`], in staging order. A route whose
+    /// TX half is detached keeps its copies, counted
+    /// ([`RouteCounters::uncancelled`]).
     ///
     /// # Errors
     ///
     /// The first route's [`QueueError`] from
-    /// [`TxBackend::cancel_pending`]; the routes after it are not cancelled.
+    /// [`TxBackend::cancel_pending`]; every other route is still cancelled.
     pub fn cancel<R: Routes, G: LaneGate>(
         &mut self,
         routes: &mut R,
         lane: usize,
         gate: &mut G,
     ) -> Result<(), QueueError> {
-        let Self { lanes, report, .. } = self;
+        let Self {
+            lanes,
+            report,
+            counters,
+            ..
+        } = self;
         let Some(entry) = lanes.get_mut(lane) else {
             return Ok(());
         };
+        let mut first = None;
         for (index, queue) in entry.routes.iter_mut().enumerate() {
             let Some(backend) = routes.route(index) else {
+                if !queue.staged.is_empty()
+                    && let Some(counters) = counters.get_mut(index)
+                {
+                    bump(&mut counters.uncancelled, &mut counters.overflowed);
+                }
                 continue;
             };
             'route: loop {
-                let outcome = backend.cancel_pending(queue.queue, report)?;
+                let outcome = match backend.cancel_pending(queue.queue, report) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        first = first.or(Some(error));
+                        break;
+                    }
+                };
                 while let Some(item) = report.pop_front() {
                     match queue.staged.front().copied() {
                         Some(head) if head.staged.ticket == item.ticket => {
@@ -326,26 +396,29 @@ impl RoutedLaneSender {
                 }
             }
         }
-        Ok(())
+        first.map_or(Ok(()), Err)
     }
 
-    /// Flushes, on each route, at most one copy of each lane that another
-    /// route already debited (a route that fell behind). It debits nothing
-    /// and asks `gate` at each exposure. Returns the copies submitted.
-    pub fn catch_up<R: Routes, G: LaneGate>(&mut self, routes: &mut R, gate: &mut G) -> u32 {
+    /// Flushes, on each route, at most one copy of each lane at or below
+    /// the position another route already debited (a route that fell
+    /// behind). It debits nothing and asks `gate` at each exposure. A route
+    /// that would block or is inactive takes no more flushes in the call;
+    /// a failure stops it.
+    pub fn catch_up<R: Routes, G: LaneGate>(&mut self, routes: &mut R, gate: &mut G) -> CatchUp {
         let Self {
             lanes,
             report,
             counters,
             ..
         } = self;
-        let mut submitted = 0u32;
+        let mut done = CatchUp::default();
+        let mut out = [false; MAX_ROUTES];
         for (lane, entry) in lanes.iter_mut().enumerate() {
             let Some(debited) = entry.debited else {
                 continue;
             };
-            for (index, queue) in entry.routes.iter_mut().enumerate() {
-                if queue.suspended || queue.control {
+            for ((index, queue), out) in entry.routes.iter_mut().enumerate().zip(&mut out) {
+                if *out || queue.suspended || queue.control {
                     continue;
                 }
                 let Some(head) = queue.staged.front().copied() else {
@@ -363,14 +436,11 @@ impl RoutedLaneSender {
                         queue.staged.pop_front();
                         gate.left(lane, head.staged, Left::Submitted);
                         // At most one copy per route and lane: no overflow.
-                        if let Some(next) = submitted.checked_add(1) {
-                            submitted = next;
+                        if let Some(next) = done.submitted.checked_add(1) {
+                            done.submitted = next;
                         }
                         if let Some(counters) = counters.get_mut(index) {
-                            match counters.late.checked_add(1) {
-                                Some(next) => counters.late = next,
-                                None => counters.overflowed = true,
-                            }
+                            bump(&mut counters.late, &mut counters.overflowed);
                         }
                     }
                     Flushed::Returned => {
@@ -383,12 +453,17 @@ impl RoutedLaneSender {
                         gate.left(lane, head.staged, Left::Unknown);
                     }
                     // Tried again on the next call.
-                    Flushed::Denied | Flushed::Blocked | Flushed::Again | Flushed::Inactive => {}
-                    Flushed::Hold | Flushed::Fail(_) => queue.control = true,
+                    Flushed::Denied | Flushed::Again => {}
+                    Flushed::Blocked | Flushed::Inactive => *out = true,
+                    Flushed::Hold => queue.control = true,
+                    Flushed::Fail(failure) => {
+                        done.failure = Some(failure.at(lane));
+                        return done;
+                    }
                 }
             }
         }
-        submitted
+        done
     }
 
     /// Serves the lanes within `budget` over `routes`, asking `gate` at
@@ -410,10 +485,13 @@ impl RoutedLaneSender {
             lanes: &mut self.lanes,
             report: &mut self.report,
             counters: &mut self.counters,
+            count: self.routes,
+            out: [false; MAX_ROUTES],
+            inactive: [false; MAX_ROUTES],
             failure: None,
-            inactive: false,
         };
         let drr: Report = self.drr.run(budget, &mut source);
+        let inactive = source.all_inactive();
         let failure = source.failure.or(match drr.stop {
             Stop::Failed(error) => Some(SenderFailure::Drr(error)),
             _ => None,
@@ -421,7 +499,33 @@ impl RoutedLaneSender {
         SenderReport {
             drr,
             failure,
-            inactive: source.inactive,
+            inactive,
+        }
+    }
+}
+
+/// Adds one to `counter`, or records the overflow.
+fn bump(counter: &mut u64, overflowed: &mut bool) {
+    match counter.checked_add(1) {
+        Some(next) => *counter = next,
+        None => *overflowed = true,
+    }
+}
+
+/// The kind of a [`SenderFailure`], before its lane is known.
+#[derive(Clone, Copy)]
+enum Failure {
+    Backend(FlushStop),
+    Invariant(FlushStop),
+    Sender(FlushStop),
+}
+
+impl Failure {
+    fn at(self, lane: usize) -> SenderFailure {
+        match self {
+            Self::Backend(stop) => SenderFailure::Backend { lane, stop },
+            Self::Invariant(stop) => SenderFailure::Invariant { lane, stop },
+            Self::Sender(stop) => SenderFailure::Sender { lane, stop },
         }
     }
 }
@@ -442,10 +546,11 @@ enum Flushed {
     /// The endpoint is resetting or retired.
     Inactive,
     /// The sender or the backend broke.
-    Fail(FlushStop),
+    Fail(Failure),
 }
 
-/// Flushes `head`, the front copy of `queue`, through `backend`.
+/// Flushes `head`, the front copy of `queue`, through `backend`. The
+/// outcomes map as [`super::LaneSender`]'s (lane-sender.md, outcome table).
 fn flush_one<B: TxBackend, G: LaneGate>(
     backend: &mut B,
     gate: &mut G,
@@ -471,11 +576,15 @@ fn flush_one<B: TxBackend, G: LaneGate>(
             )
             | FlushStop::Faulted(_)
             | FlushStop::Failed(BackendFailure::Invariant { .. }) => Flushed::Hold,
-            _ => Flushed::Fail(stop),
+            FlushStop::ReportNotEmpty | FlushStop::GateError { .. } => {
+                Flushed::Fail(Failure::Sender(stop))
+            }
+            FlushStop::Failed(_) => Flushed::Fail(Failure::Backend(stop)),
+            _ => Flushed::Fail(Failure::Invariant(stop)),
         };
     };
     if extra || item.ticket != head.staged.ticket {
-        return Flushed::Fail(stop);
+        return Flushed::Fail(Failure::Invariant(stop));
     }
     match item.outcome {
         TxItemOutcome::Submitted { .. } => Flushed::Submitted,
@@ -488,9 +597,10 @@ fn flush_one<B: TxBackend, G: LaneGate>(
             PendingCause::Faulted(_) | PendingCause::Failed(BackendFailure::Invariant { .. }) => {
                 Flushed::Hold
             }
-            PendingCause::ErrorLost | PendingCause::NotAttempted | PendingCause::Failed(_) => {
-                Flushed::Fail(stop)
+            PendingCause::ErrorLost | PendingCause::NotAttempted => {
+                Flushed::Fail(Failure::Invariant(stop))
             }
+            PendingCause::Failed(_) => Flushed::Fail(Failure::Backend(stop)),
         },
     }
 }
@@ -502,16 +612,31 @@ struct Source<'a, R, G> {
     lanes: &'a mut [Lane],
     report: &'a mut TxReport,
     counters: &'a mut [RouteCounters; MAX_ROUTES],
+    /// The sender's routes.
+    count: usize,
+    /// Routes that take no more flushes in the call: blocked or inactive.
+    out: [bool; MAX_ROUTES],
+    /// Routes whose endpoint was resetting or retired in the call.
+    inactive: [bool; MAX_ROUTES],
     failure: Option<SenderFailure>,
-    inactive: bool,
+}
+
+impl<R, G> Source<'_, R, G> {
+    /// Whether every route was inactive in the call.
+    fn all_inactive(&self) -> bool {
+        self.inactive
+            .iter()
+            .take(self.count)
+            .all(|inactive| *inactive)
+    }
 }
 
 impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
     fn probe(&mut self, lane: usize) -> Probe {
-        if self.failure.is_some() || self.inactive {
+        if self.failure.is_some() || self.all_inactive() {
             return Probe::Ineligible;
         }
-        let Some((_, charge)) = self.lanes.get(lane).and_then(Lane::head) else {
+        let Some((_, charge)) = self.lanes.get(lane).and_then(|entry| entry.head(&self.out)) else {
             return Probe::Ineligible;
         };
         if self.gate.admits(lane) {
@@ -525,12 +650,17 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
         let Some(entry) = self.lanes.get_mut(lane) else {
             return Service::NotServed;
         };
-        let Some((position, _)) = entry.head() else {
+        let Some((position, _)) = entry.head(&self.out) else {
             return Service::NotServed;
         };
         let (mut served, mut uncertain, mut blocked) = (false, false, false);
         for (index, queue) in entry.routes.iter_mut().enumerate() {
-            if queue.suspended || queue.control || queue.paused {
+            let (Some(out), Some(inactive)) =
+                (self.out.get_mut(index), self.inactive.get_mut(index))
+            else {
+                continue;
+            };
+            if *out || !queue.sendable() {
                 continue;
             }
             let Some(head) = queue.staged.front().copied() else {
@@ -548,10 +678,7 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
                     queue.staged.pop_front();
                     self.gate.left(lane, head.staged, Left::Submitted);
                     if served && let Some(counters) = self.counters.get_mut(index) {
-                        match counters.late.checked_add(1) {
-                            Some(next) => counters.late = next,
-                            None => counters.overflowed = true,
-                        }
+                        bump(&mut counters.late, &mut counters.overflowed);
                     }
                     served = true;
                 }
@@ -565,19 +692,27 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
                     self.gate.left(lane, head.staged, Left::Unknown);
                     uncertain = true;
                 }
+                // The probe raced the exposure-time gate.
                 Flushed::Denied => queue.paused = true,
-                Flushed::Blocked => {
-                    queue.paused = true;
-                    blocked = true;
-                }
                 Flushed::Again => {}
-                Flushed::Hold => queue.control = true,
-                Flushed::Inactive => {
-                    queue.paused = true;
+                // Per socket (LS-4): this route takes no more in the call.
+                Flushed::Blocked => {
+                    *out = true;
                     blocked = true;
                 }
-                Flushed::Fail(stop) => {
-                    self.failure = Some(SenderFailure::Invariant { lane, stop });
+                Flushed::Inactive => {
+                    *out = true;
+                    *inactive = true;
+                    blocked = true;
+                }
+                Flushed::Hold => queue.control = true,
+                Flushed::Fail(failure) => {
+                    self.failure = Some(failure.at(lane));
+                    if served {
+                        // Debited first: the next probe stops the call.
+                        entry.debited = Some(position);
+                        return Service::Served;
+                    }
                     return Service::Halt;
                 }
             }

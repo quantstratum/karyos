@@ -489,8 +489,8 @@ impl Outbound {
         };
         let report = routed.sender.serve(&mut lent, &mut gate, budget);
         let caught = routed.sender.catch_up(&mut lent, &mut gate);
-        work = work.checked_add(caught).ok_or(overflow.clone())?;
-        if report.failure.is_some() {
+        work = work.checked_add(caught.submitted).ok_or(overflow.clone())?;
+        if report.failure.is_some() || caught.failure.is_some() {
             self.needs_reset = true;
         }
         let Some(routed) = self.routed.as_deref_mut() else {

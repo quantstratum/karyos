@@ -117,6 +117,13 @@ pub enum StageError {
         /// The charge given.
         charge: u64,
     },
+    /// A routed copy's position is not above the route's last copy
+    /// ([`routes::RoutedLaneSender::staged`]).
+    #[error("lane {lane}: copy out of position order")]
+    OutOfOrder {
+        /// The lane named.
+        lane: usize,
+    },
 }
 
 /// A call that could not go on: the queue, the half or the sender itself
