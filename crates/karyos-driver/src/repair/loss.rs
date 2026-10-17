@@ -149,16 +149,23 @@ impl MulticastConfig {
         Ok(())
     }
 
-    /// Checks that the timing of an RTT up to `max_rtt` (the image's
-    /// `rtt_probe_timeout`, which bounds every sample) fits in `u64`: the
-    /// delay bound `max_rtt * scale / 16` and the window `max_rtt +
-    /// repair_linger + repair_slack`.
+    /// Checks the timing of every RTT snapshot from `min_rtt` (the
+    /// `rtt_floor`, below which no sample counts) to `max_rtt` (the
+    /// `rtt_probe_timeout`, which bounds every sample): the delay bound
+    /// `rtt * scale / 16` is nonzero at `min_rtt`, so the delay is random
+    /// (#296 review), and the bound and the window `rtt + repair_linger +
+    /// repair_slack` fit in `u64` at `max_rtt`.
     ///
     /// # Errors
     ///
     /// [`LossConfigError::Multicast`].
-    pub fn validate_for(&self, max_rtt: u64) -> Result<(), LossConfigError> {
+    pub fn validate_for(&self, min_rtt: u64, max_rtt: u64) -> Result<(), LossConfigError> {
         self.validate()?;
+        if self.delay_bound(min_rtt).is_none_or(|bound| bound == 0) {
+            return Err(LossConfigError::Multicast(
+                "the NAK delay bound of rtt_floor is zero",
+            ));
+        }
         if self.delay_bound(max_rtt).is_none() || self.window(max_rtt).is_none() {
             return Err(LossConfigError::Multicast(
                 "the NAK timing of rtt_probe_timeout does not fit in u64",

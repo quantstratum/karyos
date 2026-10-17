@@ -1090,9 +1090,9 @@ fn repeated_peer_naks_do_not_extend_the_window() {
 #[test]
 fn a_timing_past_u64_is_refused_and_counted() {
     let config = MulticastConfig::default();
-    assert!(config.validate_for(10_000_000_000).is_ok());
+    assert!(config.validate_for(1, 10_000_000_000).is_ok());
     assert_eq!(
-        config.validate_for(u64::MAX / 2),
+        config.validate_for(1, u64::MAX / 2),
         Err(LossConfigError::Multicast(
             "the NAK timing of rtt_probe_timeout does not fit in u64"
         ))
@@ -1122,4 +1122,21 @@ fn a_draw_above_its_bound_is_clamped() {
     loss.cycle(lane(0), 0, &rtt, &mut Wild);
     assert_eq!(loss.due(lane(0), RTT - 1), None);
     assert!(loss.due(lane(0), RTT).is_some());
+}
+
+/// #296 review: a delay bound of zero at the RTT floor is refused, since
+/// every receiver would NAK at once; one of 1 is accepted.
+#[test]
+fn a_zero_delay_bound_is_refused() {
+    let config = MulticastConfig {
+        nak_delay_scale: 1,
+        ..MulticastConfig::default()
+    };
+    assert_eq!(
+        config.validate_for(15, 1_000_000),
+        Err(LossConfigError::Multicast(
+            "the NAK delay bound of rtt_floor is zero"
+        ))
+    );
+    assert!(config.validate_for(16, 1_000_000).is_ok());
 }

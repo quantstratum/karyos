@@ -100,7 +100,7 @@ use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
 use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
 use crate::repair::admission::Requester;
-use crate::repair::draw::OsDelayDraw;
+use crate::repair::draw::{OsDelayDraw, Refill};
 use crate::repair::loss::{
     Hole, ImageLoss, LossConfig, MulticastConfig, Observation, ReplyOutcome as NakOutcome,
 };
@@ -214,8 +214,12 @@ pub struct ReceiverCounters {
     /// NAK delay pool refills that drew from the operating system, on the
     /// timer step like `rttm_id_draws` (RC-2).
     pub nak_delay_draws: u64,
+    /// NAK delay pool refills whose system call failed: the pool stays as
+    /// it was, and an empty one draws the bound.
+    pub nak_delay_refill_failures: u64,
     /// Multicast NAK delays drawn from an empty pool: the cycle's bound was
-    /// used, so the NAK went at its latest deadline (RC-2).
+    /// used, so the NAK went at its latest deadline (RC-2). Counted in the
+    /// timer step that drew them.
     pub nak_delay_empty: u64,
     /// Multicast NAK cycles started (RC-2): a hole's first, and each one
     /// after a window ended with the hole still there.
@@ -921,6 +925,12 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
         config.answer_rate,
     )
     .map_err(|_| AgentError::InvalidConfig("invalid sender session configuration"))?;
+    // A step starts at most one multicast cycle per lane of each image.
+    let delays = OsDelayDraw::new(
+        config.sessions.max_images,
+        karyos_protocol::network::MAX_LANES,
+    )
+    .ok_or(AgentError::InvalidConfig("max_images too large"))?;
     let datagrams = config.rx_datagrams;
     let bytes = u64::from(datagrams)
         .checked_mul(u64::from(karyos_io::sockets::endpoint::MAX_DATAGRAM))
@@ -1005,7 +1015,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             },
             rtt: config.rtt,
             multicast: config.multicast,
-            delays: OsDelayDraw::new(),
+            delays,
             clock: karyos_sys::host_clock::host_monotonic_ns,
             counters: ReceiverCounters::default(),
             trace: super::net_trace::ReceiverTrace::default(),
@@ -1359,6 +1369,27 @@ impl ReceiverRole {
         self.delays.fix(delay);
     }
 
+    /// Whether the entry for `stream_id` on `endpoint` is multicast, if
+    /// there is one (tests).
+    #[cfg(test)]
+    pub(super) fn subscription_multicast(
+        &self,
+        endpoint: EndpointId,
+        stream_id: i32,
+    ) -> Option<bool> {
+        self.subscriptions
+            .iter()
+            .find(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id))
+            .map(|(.., multicast)| *multicast)
+    }
+
+    /// Empties the multicast NAK delay pool, and makes later refills fail
+    /// or not (tests).
+    #[cfg(test)]
+    pub(super) fn drain_nak_delays(&mut self, fail_refills: bool) {
+        self.delays.drain(fail_refills);
+    }
+
     /// The bound of the last multicast NAK delay drawn (tests).
     #[cfg(test)]
     pub(super) fn last_nak_delay_bound(&self) -> Option<u64> {
@@ -1676,14 +1707,12 @@ impl ReceiverRole {
     fn image_timers(&mut self, sessions: &SessionEnd, now: u64) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
         let mut work = 0u32;
-        // The multicast NAK delays: restocked here, never per datagram.
-        if self.delays.refill() {
-            self.count(|c| &mut c.nak_delay_draws);
-        }
-        let (empty, overflowed) = self.delays.take_empty();
-        match self.counters.nak_delay_empty.checked_add(empty) {
-            Some(total) if !overflowed => self.counters.nak_delay_empty = total,
-            _ => self.counters.overflowed = true,
+        // The multicast NAK delays: restocked here, before this step's
+        // draws, never per datagram.
+        match self.delays.refill() {
+            Refill::Full => {}
+            Refill::Drew => self.count(|c| &mut c.nak_delay_draws),
+            Refill::Failed => self.count(|c| &mut c.nak_delay_refill_failures),
         }
         let mut index = 0usize;
         while let Some(image) = self.images.get(index) {
@@ -1754,6 +1783,12 @@ impl ReceiverRole {
                 .checked_add(self.repair(index, now)?)
                 .ok_or(overflow.clone())?;
             index = index.checked_add(1).ok_or(overflow.clone())?;
+        }
+        // This step's draws from an empty pool, reported in this step.
+        let (empty, overflowed) = self.delays.take_empty();
+        match self.counters.nak_delay_empty.checked_add(empty) {
+            Some(total) if !overflowed => self.counters.nak_delay_empty = total,
+            _ => self.counters.overflowed = true,
         }
         Ok(work)
     }

@@ -2070,3 +2070,31 @@ fn group_naks_are_budgeted_and_never_reach_the_sender() {
     assert_eq!(counters.group_nak_suppressions, 1, "{counters:?}");
     assert_eq!(rig.agents.sender.counters().naks, sender_naks);
 }
+
+/// #296 review: with the delay pool empty and its refill failing, a
+/// multicast cycle draws the bound; the failed refill and the empty draw
+/// are each counted, the draw in the step that made it. A later refill
+/// that succeeds is counted as a draw from the system.
+#[test]
+fn an_empty_delay_pool_is_counted_in_its_step() {
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        multicast: true,
+        repairs: false,
+        ..Setup::default()
+    });
+    let _slot = established(&mut rig);
+    rig.agents.receiver.role.drain_nak_delays(true);
+    lose_one(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.counters().nak_cycles >= 1);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        counters.nak_delay_empty, counters.nak_cycles,
+        "{counters:?}"
+    );
+    assert!(counters.nak_delay_refill_failures >= 1, "{counters:?}");
+    let draws = counters.nak_delay_draws;
+    rig.agents.receiver.role.drain_nak_delays(false);
+    rig.round(true);
+    assert_eq!(rig.agents.receiver.counters().nak_delay_draws, draws + 1);
+}

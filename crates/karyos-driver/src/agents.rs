@@ -295,15 +295,11 @@ impl AgentConfig {
         self.rtt
             .validate()
             .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
-        // The largest RTT snapshot: a sample never exceeds the probe
-        // timeout; before one, the initial RTT, never below the floor.
-        let max_rtt = self
-            .rtt
-            .rtt_probe_timeout
-            .max(self.rtt.rtt_initial)
-            .max(self.rtt.rtt_floor);
+        // RTT snapshots lie between the floor and the probe timeout (the
+        // RTT configuration checks `rtt_floor <= rtt_initial <=
+        // rtt_probe_timeout` above).
         self.multicast
-            .validate_for(max_rtt)
+            .validate_for(self.rtt.rtt_floor, self.rtt.rtt_probe_timeout)
             .map_err(|_| AgentError::InvalidConfig("invalid multicast NAK timing"))?;
         if self.group_nak_budget == 0 {
             return Err(AgentError::InvalidConfig(
@@ -1009,6 +1005,17 @@ impl<O: SocketOps> ReceiverAgent<O> {
     #[must_use]
     pub fn counters(&self) -> roles::ReceiverCounters {
         self.role.counters()
+    }
+
+    /// Whether the receiver's entry for `stream_id` on `endpoint` is
+    /// multicast, if it has one (tests).
+    #[cfg(test)]
+    pub(crate) fn subscription_multicast(
+        &self,
+        endpoint: EndpointId,
+        stream_id: i32,
+    ) -> Option<bool> {
+        self.role.subscription_multicast(endpoint, stream_id)
     }
 
     /// Whether the agent stopped: its flag was set or its conductor is

@@ -1011,6 +1011,18 @@ impl Network {
         }
     }
 
+    /// Whether the Shared receiver's entry of `subscription` is multicast,
+    /// once it has read the command (tests).
+    #[cfg(test)]
+    pub(crate) fn receiver_multicast(&self, subscription: NetworkSubscription) -> Option<bool> {
+        match &self.agents {
+            Agents::Shared(agents) => agents
+                .receiver
+                .subscription_multicast(subscription.endpoint, subscription.stream_id),
+            _ => None,
+        }
+    }
+
     /// The Shared receiver agent's counters, for tests.
     #[cfg(test)]
     pub(crate) fn receiver_counters(&self) -> Option<crate::agents::roles::ReceiverCounters> {

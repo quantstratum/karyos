@@ -432,6 +432,14 @@ fn a_multicast_subscription_joins_its_control_group() {
     };
     let failed = driver.network_control_join_failures();
     let held = driver.network_held_endpoints();
+    // The receiver's entry is multicast: its images time NAKs by cycle.
+    for _ in 0..20 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        driver.net.as_ref().unwrap().receiver_multicast(reliable),
+        Some(true)
+    );
     assert_eq!(held, before + 2 - usize::try_from(failed).unwrap());
     // Its own data group, whose table entry it does not join.
     let unreliable = driver
@@ -442,4 +450,24 @@ fn a_multicast_subscription_joins_its_control_group() {
     assert!(driver.remove_network_subscription(unreliable).unwrap());
     assert!(driver.remove_network_subscription(reliable).unwrap());
     assert_eq!(driver.network_held_endpoints(), before);
+}
+
+/// A unicast subscription's receiver entry is not multicast.
+#[test]
+fn a_unicast_subscription_is_not_multicast() {
+    let mut driver = driver(ThreadingMode::Shared);
+    let subscription = driver
+        .add_network_subscription(9, &channel(free_address()))
+        .unwrap();
+    for _ in 0..20 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        driver
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_multicast(subscription),
+        Some(false)
+    );
 }
