@@ -257,6 +257,18 @@ release may break APIs, wire formats and shared-memory layouts.
   NAK is checked against: a live member's join point, consumption and
   window, or an expected entry's answered join point before its first SM
   (`expect` now takes the answer's joins).
+- Repair jobs and coalescing (phase 6 R5, reliable-transport.md, RC-11,
+  ACS 15597 and 15701): `karyos_driver::repair::jobs::Jobs`, steps 6 and
+  7 of NAK admission. The key is the lane, the exact range and the
+  response domain (`Group`, or `Requester` with the receiver and its
+  membership generation); an exact duplicate joins the pending job and
+  adds its requester, and nothing wider merges. The linger
+  (`repair_linger`, 1 ms) starts at the last frame's submission and drops
+  duplicates without extending; a known failure or an uncertain
+  submission starts none. `repair_jobs` (64) and `repair_linger_entries`
+  (256) are bounded: a full table drops and counts. Jobs keep their
+  unsent cursor and a checked slot generation; requester lists are
+  allocated at construction.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly

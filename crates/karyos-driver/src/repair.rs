@@ -8,5 +8,8 @@
 //!   the ERR NAK_REPLY linger. A NAK that passes goes to the job table
 //!   (R5), which applies steps 6 and 7; step 8 runs when the job is first
 //!   served (R7).
+//! - [`jobs`] (R5): the job table, with exact-interval coalescing, the
+//!   repair linger and capacity: steps 6 and 7.
 
 pub mod admission;
+pub mod jobs;
