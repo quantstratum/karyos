@@ -104,9 +104,11 @@ pub(crate) mod sealed {
         where
             Self: StreamTerms;
 
-        /// Exposes an installed image's lanes as an aggregate; `None`
-        /// where streams are not heap backed (D3: network streams over heap
-        /// terms only, SPEC §18).
+        /// Exposes an installed image's lanes as an aggregate, on either
+        /// backing (network-shared-terms n3): on an IPC driver its lanes
+        /// are regions, so remote clients may subscribe to the image and
+        /// fetch them. `None` when the key is in use or the stream table
+        /// is full ([`EmbeddedDriver::add_image_aggregate`]).
         fn expose_image(
             driver: &mut EmbeddedDriver<Self>,
             lanes: &[std::sync::Arc<LogBuffer<Self>>],
@@ -214,10 +216,10 @@ pub(crate) mod sealed {
         }
 
         fn expose_image(
-            _driver: &mut EmbeddedDriver<Self>,
-            _lanes: &[std::sync::Arc<LogBuffer<Self>>],
+            driver: &mut EmbeddedDriver<Self>,
+            lanes: &[std::sync::Arc<LogBuffer<Self>>],
         ) -> Option<crate::embedded::AggregateHandle> {
-            None
+            driver.add_image_aggregate(lanes)
         }
 
         fn network_publication(
@@ -364,8 +366,9 @@ pub struct DriverConfig {
     /// driver creates each image lane in a shared region that holds a
     /// descriptor, so its start checks `RLIMIT_NOFILE` against its bounds
     /// (`max_images` times four lanes, plus `max_streams` times one more
-    /// than `max_retained_generations`, plus two per client) and fails
-    /// with [`DriverError::DescriptorLimit`] below them.
+    /// than `max_retained_generations`, plus three per client) and fails
+    /// with [`DriverError::DescriptorLimit`] below them, naming the soft and
+    /// the hard limit.
     pub network: Option<crate::net::NetworkConfig>,
 }
 
@@ -959,7 +962,7 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
 /// stream registration, kept across mapping cutovers.
 pub const FIRST_INCARNATION: u64 = 1;
 
-impl EmbeddedDriver<HeapTerms> {
+impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Exposes the lanes of an installed image as the lane streams of one
     /// aggregate, keyed by the image's alias (wiring note W-e, W3; the
     /// interim D2 step, ACS 15937). Each lane's conductor is issued here,
@@ -971,7 +974,7 @@ impl EmbeddedDriver<HeapTerms> {
     /// stays unexposed for its whole life (interim D2, #283 P3).
     pub(crate) fn add_image_aggregate(
         &mut self,
-        lanes: &[Arc<LogBuffer>],
+        lanes: &[Arc<LogBuffer<T>>],
     ) -> Option<AggregateHandle> {
         let first = lanes.first()?.config();
         let key = (first.stream_id, first.session_id);
@@ -1188,7 +1191,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if let Some(network) = &config.network {
                     crate::admission::check_descriptors(
                         crate::admission::descriptors_needed(&config, network),
-                        karyos_sys::ipc::descriptor_limit(),
+                        karyos_sys::ipc::descriptor_limits(),
                     )?;
                 }
                 let instance = crate::admission::instance_of(driver_id);
@@ -3667,16 +3670,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Stops the network agents and reclaims their endpoints and images
-    /// (wiring note W-g); `None` without a network or once closed. Dropping
+    /// (wiring note W-g); `None` without a network or once closed. An image
+    /// whose `CreateImage` is still queued is refused, on either backing,
+    /// before any lane is built (no region, memfd or heap). Dropping
     /// the driver does the same, then joins any agent thread that did not
     /// stop in time (blocking: such a thread exits once its rings are
     /// gone), so none is ever detached.
     pub fn close_network(&mut self) -> Option<crate::net::NetworkShutdown<T>> {
         let net = self.net.as_mut()?;
-        #[cfg(target_os = "linux")]
-        let mut lanes = lane_source(self.admission.as_mut());
-        #[cfg(not(target_os = "linux"))]
-        let mut lanes = crate::agents::images::LaneSource::heap();
+        // An image still asked for at the close is refused: no region or
+        // memory is spent on a network that stops.
+        let mut lanes = crate::agents::images::LaneSource::closing();
         let mut shutdown = net.close(&mut lanes);
         // The closed network released every tracked guard sender: none of
         // them stays in a close acknowledgement.

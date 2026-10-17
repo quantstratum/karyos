@@ -32,8 +32,14 @@
 //!   publication.
 //! - **Scope.** Unicast (the channel's `endpoint` is the local receive
 //!   address) and IPv4 multicast (the group's port, joined on `interface`
-//!   or any); interface names and IPv6 groups are refused. Heap terms only
-//!   (D3).
+//!   or any); interface names and IPv6 groups are refused.
+//! - **Backings (network-shared-terms n3).** An image is exposed on either
+//!   backing: on an IPC driver its lanes are shared regions, so in-process
+//!   subscribers read it as any stream of the driver and remote clients
+//!   subscribe to its stream key and fetch its regions. The public calls
+//!   here stay on heap drivers until an IPC driver serves network channels
+//!   (n4); meanwhile the driver reaches an IPC driver's subscriptions
+//!   through the generic calls below (`subscribe_network`).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -43,7 +49,7 @@ use karyos_sys::term_bytes::HeapTerms;
 
 use super::{LATER_PATHS, NetworkSubscription};
 use crate::agents::images::DEFAULT_MAX_IMAGE_TERM_LENGTH;
-use crate::embedded::{AggregateHandle, EmbeddedDriver};
+use crate::embedded::{AggregateHandle, EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
 use crate::membership::ReceiverIdentity;
 
@@ -181,37 +187,6 @@ impl EmbeddedDriver<HeapTerms> {
         self.subscribe_network(stream_id, channel, (None, Some((lane, config))))
     }
 
-    fn subscribe_network(
-        &mut self,
-        stream_id: i32,
-        channel: &UdpConfig,
-        options: (
-            Option<ReceiverIdentity>,
-            Option<(
-                karyos_sys::frame::Lane,
-                karyos_sys::conflation::ConflationConfig,
-            )>,
-        ),
-    ) -> Result<NetworkSubscription, DriverError> {
-        let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
-        // Redundant paths need sockets isolated per interface; without
-        // that every datagram would count on every path (owner item 12).
-        if !channel.paths.is_empty() && !net.paths_isolated() {
-            net.count_paths_refused();
-            return Err(DriverError::UnsupportedChannel);
-        }
-        let route = receive_route(channel)?;
-        let later = later_routes(channel)?;
-        net.add_subscription(
-            stream_id,
-            route,
-            &later,
-            DEFAULT_MAX_IMAGE_TERM_LENGTH,
-            channel.reliable,
-            options,
-        )
-    }
-
     /// Stops `subscription`: its images retire, which seals their streams
     /// with `ImageRetired`. `false` when it is not a subscription of this
     /// driver.
@@ -223,23 +198,14 @@ impl EmbeddedDriver<HeapTerms> {
         &mut self,
         subscription: NetworkSubscription,
     ) -> Result<bool, DriverError> {
-        match &mut self.net {
-            Some(net) => net.remove_subscription(subscription),
-            None => Ok(false),
-        }
+        self.unsubscribe_network(subscription)
     }
 
     /// The aggregate exposing the image of `stream_id` and `session_id`,
     /// if one is installed and exposed (interim keying, D2).
     #[must_use]
     pub fn network_image(&self, stream_id: i32, session_id: i32) -> Option<AggregateHandle> {
-        self.net.as_ref()?.exposed_image(|handle| {
-            self.streams.iter().any(|stream| {
-                stream.aggregate.registration == handle.registration()
-                    && !stream.retiring
-                    && (stream.stream_id, stream.session_id) == (stream_id, session_id)
-            })
-        })
+        self.exposed_network_image(stream_id, session_id)
     }
 
     /// Network subscriptions the receiver refused although the conductor's
@@ -292,6 +258,74 @@ impl EmbeddedDriver<HeapTerms> {
         self.net
             .as_ref()
             .map_or(0, crate::net::Network::images_unexposed)
+    }
+}
+
+/// The network subscriptions of either backing, for the driver itself:
+/// the public calls above stay on heap drivers until an IPC driver serves
+/// network channels (network-shared-terms n4); an IPC driver's images
+/// are reached through these meanwhile (its tests).
+impl<T: StreamTerms> EmbeddedDriver<T> {
+    pub(crate) fn subscribe_network(
+        &mut self,
+        stream_id: i32,
+        channel: &UdpConfig,
+        options: (
+            Option<ReceiverIdentity>,
+            Option<(
+                karyos_sys::frame::Lane,
+                karyos_sys::conflation::ConflationConfig,
+            )>,
+        ),
+    ) -> Result<NetworkSubscription, DriverError> {
+        let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
+        // Redundant paths need sockets isolated per interface; without
+        // that every datagram would count on every path (owner item 12).
+        if !channel.paths.is_empty() && !net.paths_isolated() {
+            net.count_paths_refused();
+            return Err(DriverError::UnsupportedChannel);
+        }
+        let route = receive_route(channel)?;
+        let later = later_routes(channel)?;
+        net.add_subscription(
+            stream_id,
+            route,
+            &later,
+            DEFAULT_MAX_IMAGE_TERM_LENGTH,
+            channel.reliable,
+            options,
+        )
+    }
+
+    /// Stops `subscription`, as [`EmbeddedDriver::remove_network_subscription`].
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NetworkBusy`]; nothing changes then.
+    pub(crate) fn unsubscribe_network(
+        &mut self,
+        subscription: NetworkSubscription,
+    ) -> Result<bool, DriverError> {
+        match &mut self.net {
+            Some(net) => net.remove_subscription(subscription),
+            None => Ok(false),
+        }
+    }
+
+    /// The aggregate exposing the image of `stream_id` and `session_id`,
+    /// as [`EmbeddedDriver::network_image`].
+    pub(crate) fn exposed_network_image(
+        &self,
+        stream_id: i32,
+        session_id: i32,
+    ) -> Option<AggregateHandle> {
+        self.net.as_ref()?.exposed_image(|handle| {
+            self.streams.iter().any(|stream| {
+                stream.aggregate.registration == handle.registration()
+                    && !stream.retiring
+                    && (stream.stream_id, stream.session_id) == (stream_id, session_id)
+            })
+        })
     }
 }
 

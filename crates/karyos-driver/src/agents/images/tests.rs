@@ -5152,6 +5152,23 @@ fn a_lane_that_cannot_be_created_refuses_the_whole_image() {
     );
 }
 
+/// A CreateImage still queued when the network closes is refused, with no
+/// lane built: the closing source lends neither memory nor regions.
+#[test]
+fn a_closing_network_refuses_a_queued_image() {
+    let mut chain = Chain::<karyos_sys::term_bytes::HeapTerms>::new(ImageTemplate::default());
+    chain.create(1, 4);
+    chain.poll(&mut LaneSource::closing());
+    assert!(matches!(
+        chain.end.commands.try_take().unwrap(),
+        Some(SessionCommand::RefuseImage { .. })
+    ));
+    let counters = chain.images.counters();
+    assert_eq!((counters.refused_storage, counters.offered), (1, 0));
+    assert_eq!(chain.images.charged(), 0);
+    assert!(chain.images.last_lanes.is_empty(), "no lane was built");
+}
+
 #[cfg(target_os = "linux")]
 mod shared {
     //! The image table over the shared lane source (network-shared-terms
@@ -5305,6 +5322,85 @@ mod shared {
         chain.create(1, 1);
         chain.poll(&mut LaneSource::heap());
         assert_eq!(chain.images.counters().refused_storage, 1);
+    }
+
+    /// The marker of the child that runs out of descriptors.
+    const EMFILE_CHILD: &str = "KARYOS_IMAGES_EMFILE_CHILD";
+
+    /// A real `Region::create` failure, not a test hook: a child of this
+    /// test binary, under a small `RLIMIT_NOFILE`, runs
+    /// [`a_region_that_cannot_be_created_refuses_the_image_child`]. The
+    /// limit is the child's own, so no other test runs short.
+    #[test]
+    fn a_region_that_cannot_be_created_refuses_the_image() {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("ulimit -n 64 && exec \"$0\" \"$@\"")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "agents::images::tests::shared::a_region_that_cannot_be_created_refuses_the_image_child",
+                "--test-threads=1",
+            ])
+            .env(EMFILE_CHILD, "1")
+            .output()
+            .unwrap();
+        // A filter that matches nothing also exits 0: the child must have
+        // run its one test.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+    }
+
+    /// The child: every descriptor but one is taken, so a four-lane image
+    /// creates its first lane's region and fails the second's `memfd`
+    /// (`EMFILE`) in `LogBuffer::create_in`. The image is refused as
+    /// storage, and the first region is dropped: its descriptor is free
+    /// again. A no-op outside the child.
+    #[test]
+    #[ignore = "run by a_region_that_cannot_be_created_refuses_the_image"]
+    fn a_region_that_cannot_be_created_refuses_the_image_child() {
+        if std::env::var_os(EMFILE_CHILD).is_none() {
+            return;
+        }
+        let mut next = 1u64;
+        let mut chain = Chain::<SharedTerms>::new(ImageTemplate::default());
+        chain.create(1, 4);
+        let mut held = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(file) => held.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(24), "EMFILE");
+                    break;
+                }
+            }
+        }
+        // One descriptor free: the first lane's region takes it.
+        drop(held.pop());
+        chain.poll(&mut LaneSource::regions(RegionIds::new(
+            INSTANCE, &mut next,
+        )));
+        assert!(matches!(
+            chain.end.commands.try_take().unwrap(),
+            Some(SessionCommand::RefuseImage { .. })
+        ));
+        let counters = chain.images.counters();
+        assert_eq!((counters.refused_storage, counters.offered), (1, 0));
+        assert_eq!(chain.images.charged(), 0);
+        assert_eq!(chain.images.last_lanes.len(), 1, "one region was created");
+        assert!(
+            chain
+                .images
+                .last_lanes
+                .iter()
+                .all(|lane| lane.upgrade().is_none())
+        );
+        // Its descriptor came back with the dropped region, and only it.
+        held.push(std::fs::File::open("/dev/null").unwrap());
+        assert!(std::fs::File::open("/dev/null").is_err());
+        assert_eq!(next, 3, "two region ids were taken, none reused");
     }
 }
 
