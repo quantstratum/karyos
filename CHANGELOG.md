@@ -37,6 +37,21 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The receiver gates a conflated network image lane's seals
+  (conflated-network-images.md, C3). `AddSubscription` carries the
+  conflated lane (driver-internal entry
+  `EmbeddedDriver::add_network_subscription_conflated`; subscriptions sharing
+  a receiver entry agree on it, `DriverError::ConflationMismatch`). At
+  install the receiver allocates the image's `FreshnessLink`, hands it to the
+  conductor with `ImageInstalled` (`ImageTable::freshness`) and seals that
+  lane through a gate over its barrier mailbox: at once while no feeder is
+  attached, after the feeder's acknowledgement once one is, and past
+  `AgentConfig::barrier_ack_timeout` (default 100 ms, at least 10 ms) after
+  publishing the view's terminal cell, waiting while a feeder's claimed cell
+  is unpublished. New receiver counters: `seals_gated`, `barrier_posts`,
+  `barrier_acks`, `seals_unattached`, `barrier_timeouts`,
+  `barrier_claim_waits`, `barrier_post_failures` and
+  `conflated_lane_out_of_range`.
 - Conflation freshness for network images' views (conflated-network-images.md,
   C2): `conflation_fresh` builds a heap table with a loss barrier over the
   terminal cell of a `FreshnessLink` (a seal mailbox and a terminal cell in

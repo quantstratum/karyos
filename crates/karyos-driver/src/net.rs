@@ -43,6 +43,7 @@
 //!   and retires them with the image. An image it cannot expose is still
 //!   fed: its lane conductors are driven here until it retires.
 
+use karyos_sys::frame::Lane;
 use std::net::{IpAddr, SocketAddr};
 
 use karyos_io::sockets::OsSocket;
@@ -217,6 +218,9 @@ struct NetSubscription {
     control: Option<EndpointId>,
     /// The receiver identity every handle of this key shares (MC-1).
     identity: Option<crate::membership::ReceiverIdentity>,
+    /// The conflated lane every handle of this key shares
+    /// (conflated-network-images.md (a)).
+    conflated: Option<Lane>,
     /// The endpoints of the channel's later redundant paths, each with its
     /// own receiver entry (redundant-paths.md; the first path is
     /// `endpoint`).
@@ -479,14 +483,16 @@ impl Network {
     /// shares the first's receiver entry, so it must ask for the same
     /// reliability ([`DriverError::ReliabilityMismatch`] otherwise), and
     /// the same receiver `identity`, configured or not
-    /// ([`DriverError::ReceiverIdentityMismatch`] otherwise).
+    /// ([`DriverError::ReceiverIdentityMismatch`] otherwise), and the same
+    /// `conflated` lane ([`DriverError::ConflationMismatch`] otherwise).
     ///
     /// # Errors
     ///
     /// [`DriverError::NetworkSubscriptionsFull`],
     /// [`DriverError::NetworkEndpoint`], [`DriverError::NetworkBusy`],
     /// [`DriverError::ReliabilityMismatch`],
-    /// [`DriverError::ReceiverIdentityMismatch`].
+    /// [`DriverError::ReceiverIdentityMismatch`],
+    /// [`DriverError::ConflationMismatch`].
     pub(crate) fn add_subscription(
         &mut self,
         stream_id: i32,
@@ -494,7 +500,7 @@ impl Network {
         later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
         reliable: bool,
-        identity: Option<crate::membership::ReceiverIdentity>,
+        (identity, conflated): (Option<crate::membership::ReceiverIdentity>, Option<Lane>),
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
         let endpoint = self.hold_endpoint(bind, multicast)?;
@@ -531,6 +537,11 @@ impl Network {
             if entry.identity != identity {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::ReceiverIdentityMismatch);
+            }
+            // Its images gate one lane's seals for one view.
+            if entry.conflated != conflated {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::ConflationMismatch);
             }
             let Some(users) = entry.users.checked_add(1) else {
                 release(&mut self.send_endpoints, endpoint);
@@ -581,6 +592,7 @@ impl Network {
                 multicast: group,
                 control_group: control,
                 identity,
+                conflated,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
@@ -629,6 +641,7 @@ impl Network {
                     multicast: true,
                     control_group: None,
                     identity,
+                    conflated,
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
@@ -643,6 +656,7 @@ impl Network {
             reliable,
             control: control.map(|(control, _)| control),
             identity,
+            conflated,
             later: held,
             later_routes,
             users: 1,

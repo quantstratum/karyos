@@ -49,6 +49,12 @@ pub enum DriverError {
     /// entry, whose images name one identity (MC-1).
     #[error("the stream is already subscribed with another receiver identity")]
     ReceiverIdentityMismatch,
+    /// A second subscription of one endpoint and stream asks for another
+    /// conflated lane than the first, or one where the first has none, or
+    /// none where the first has one: they would share one receiver entry,
+    /// whose images gate one lane's seals (conflated-network-images.md).
+    #[error("the stream is already subscribed with another conflated lane")]
+    ConflationMismatch,
     /// A network endpoint could not be opened or its table is full.
     #[error("network endpoint unavailable")]
     NetworkEndpoint,
