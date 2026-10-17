@@ -561,12 +561,18 @@ fn a_repair_goes_on_every_live_path() {
     let (mut outbound, _log, mut halves, [seen_a, seen_b], observer_b) = repair_rig();
     sent(&observer_b, 1);
     assert_eq!(
-        outbound.nak_on(&first_nak(), MEMBER, 1, 10),
+        outbound.nak_on(&first_nak(), MEMBER, (1, true), 10),
         NakOutcome::Queued
     );
     let mut budget = crate::repair::scheduler::RepairBudget::default();
     let served = outbound.serve_repair_routes(&mut halves, &mut budget, 20);
     assert_eq!(served, 1, "one datagram, debited once");
+    // The budget is spent once, whatever the paths it went on (#355 review).
+    assert_eq!(
+        budget.bytes,
+        crate::repair::scheduler::RepairBudget::default().bytes - FRAME,
+        "debited once"
+    );
     assert_eq!(seen_a.lock().unwrap().len(), 2);
     assert_eq!(seen_b.lock().unwrap().len(), 2);
     assert_eq!(outbound.repair_route_counts(0).unwrap().submitted, 1);
@@ -587,7 +593,7 @@ fn a_full_path_skips_a_repair_and_the_job_completes() {
 
     let (mut outbound, _log, mut halves, [seen_a, _seen_b], _observer_b) = repair_rig();
     assert_eq!(
-        outbound.nak_on(&first_nak(), MEMBER, 0, 10),
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
         NakOutcome::Queued
     );
     let mut budget = crate::repair::scheduler::RepairBudget::default();
@@ -617,7 +623,7 @@ fn a_left_path_takes_no_repair() {
     let _ = outbound.serve_routes(&mut halves, BUDGET, None, 5).unwrap();
     assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
     assert_eq!(
-        outbound.nak_on(&first_nak(), MEMBER, 0, 10),
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
         NakOutcome::Queued
     );
     let mut budget = crate::repair::scheduler::RepairBudget::default();
@@ -637,7 +643,10 @@ fn a_step_8_err_goes_on_the_requesters_path() {
     let mut nak = first_nak();
     nak.range.start = 32;
     nak.range.length = 64;
-    assert_eq!(outbound.nak_on(&nak, MEMBER, 1, 10), NakOutcome::Queued);
+    assert_eq!(
+        outbound.nak_on(&nak, MEMBER, (1, true), 10),
+        NakOutcome::Queued
+    );
     let mut budget = crate::repair::scheduler::RepairBudget::default();
     assert_eq!(
         outbound.serve_repair_routes(&mut halves, &mut budget, 20),
@@ -654,6 +663,63 @@ fn a_step_8_err_goes_on_the_requesters_path() {
     );
 }
 
+/// #355 review: a NAK that joins a job is recorded too. Two receivers ask
+/// for the same interval on path A; the second one's copy on B is
+/// absorbed.
+#[test]
+fn a_joining_naks_copy_is_absorbed() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, _halves, _seen, _observer_b) = repair_rig();
+    let mut second = first_nak();
+    second.receiver.receiver_id = 2;
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
+        NakOutcome::Queued
+    );
+    assert_eq!(
+        outbound.nak_on(&second, MEMBER, (0, true), 11),
+        NakOutcome::Queued
+    );
+    assert!(outbound.absorbs(&second, 1, 12));
+}
+
+/// #355 review: a NAK whose receiver id is not validated yet takes no part
+/// in absorption: it records nothing, so its copy is served.
+#[test]
+fn an_unvalidated_nak_records_nothing() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, _halves, _seen, _observer_b) = repair_rig();
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, false), 10),
+        NakOutcome::Queued
+    );
+    assert!(!outbound.absorbs(&first_nak(), 1, 11));
+}
+
+/// #355 review: a path in the live set that cannot take a repair (here
+/// detached: no TX half) skips it, counted.
+#[test]
+fn a_detached_live_path_counts_its_skipped_repairs() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, mut halves, _seen, _observer_b) = repair_rig();
+    let b_half = halves.pop().unwrap();
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
+        NakOutcome::Queued
+    );
+    let mut budget = crate::repair::scheduler::RepairBudget::default();
+    assert_eq!(
+        outbound.serve_repair_routes(&mut halves, &mut budget, 20),
+        1
+    );
+    let b = outbound.repair_route_counts(1).unwrap();
+    assert_eq!((b.submitted, b.skipped), (0, 1), "{b:?}");
+    halves.push(b_half);
+}
+
 /// RP-11: the copy of a NAK on the other path within `path_skew_window` is
 /// absorbed; on the same path it is a retry; past the window it is not.
 #[test]
@@ -664,7 +730,7 @@ fn a_nak_copy_on_the_other_path_is_absorbed() {
     let window = super::super::PathPolicy::default().skew_window;
     assert!(!outbound.absorbs(&first_nak(), 0, 10));
     assert_eq!(
-        outbound.nak_on(&first_nak(), MEMBER, 0, 10),
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
         NakOutcome::Queued
     );
     assert!(outbound.absorbs(&first_nak(), 1, 10 + window));

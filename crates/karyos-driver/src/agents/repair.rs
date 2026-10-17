@@ -280,6 +280,17 @@ impl RepairPath {
         self.route_counts.get(route).copied()
     }
 
+    /// Counts `count` repair datagrams that `route`, in the live set but
+    /// unable to take repairs, skipped.
+    pub fn count_skipped(&mut self, route: usize, count: u32) {
+        if let Some(counts) = self.route_counts.get_mut(route) {
+            match counts.skipped.checked_add(u64::from(count)) {
+                Some(total) => counts.skipped = total,
+                None => counts.overflowed = true,
+            }
+        }
+    }
+
     /// The endpoint epoch changed: `queue` is the new repair queue (or none
     /// could be opened). Nothing staged in the old one survives.
     pub fn reopened(&mut self, queue: Option<TxQueueId>) {
@@ -308,7 +319,14 @@ impl RepairPath {
         lane_count: u8,
         now: u64,
     ) -> NakOutcome {
-        self.nak_on(nak, (requester, 0), reader, sent_high, lane_count, now)
+        self.nak_on(
+            nak,
+            (requester, 0, true),
+            reader,
+            sent_high,
+            lane_count,
+            now,
+        )
     }
 
     /// [`RepairPath::nak`] for a NAK that arrived on route `route`: one
@@ -317,7 +335,7 @@ impl RepairPath {
     pub fn nak_on<T: StreamTerms>(
         &mut self,
         nak: &Nak,
-        (requester, route): (Requester, usize),
+        (requester, route, validated): (Requester, usize, bool),
         reader: Option<&LaneReader<T>>,
         sent_high: u64,
         lane_count: u8,
@@ -341,12 +359,16 @@ impl RepairPath {
                 {
                     Joined::Created(_) => {
                         self.counts.bump(|c| &mut c.jobs_created);
-                        self.absorb.record(&copy_key(nak), route, now);
+                        if validated {
+                            self.absorb.record(&copy_key(nak), route, now);
+                        }
                         NakOutcome::Queued
                     }
                     Joined::Joined(_) => {
                         self.counts.bump(|c| &mut c.jobs_joined);
-                        self.absorb.record(&copy_key(nak), route, now);
+                        if validated {
+                            self.absorb.record(&copy_key(nak), route, now);
+                        }
                         NakOutcome::Queued
                     }
                     Joined::Lingering => {
@@ -719,10 +741,17 @@ impl<O: SocketOps> RepairSubmit for SubmitView<'_, '_, O> {
         };
         let mut best: Option<Submit> = None;
         for (index, tx) in self.routes.iter_mut().enumerate() {
-            let (Some(tx), Some(Some(queue))) = (tx.as_deref_mut(), self.queues.get(index)) else {
+            let queue = self.queues.get(index).copied().flatten();
+            let (Some(tx), Some(queue)) = (tx.as_deref_mut(), queue) else {
+                // A lent route whose repair queue did not open skips it.
+                if tx.is_some()
+                    && let Some(counts) = self.route_counts.get_mut(index)
+                {
+                    counts.bump(|c| &mut c.skipped);
+                }
                 continue;
             };
-            let outcome = submit_on(tx, *queue, bytes, self.report, self.counts);
+            let outcome = submit_on(tx, queue, bytes, self.report, self.counts);
             if let Some(counts) = self.route_counts.get_mut(index) {
                 match outcome {
                     Submit::Submitted => counts.bump(|c| &mut c.submitted),

@@ -5090,11 +5090,22 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.nak_unbound);
             return;
         };
+        // Absorption keys on the receiver id, so only one the binding has
+        // validated takes part: a copy that fails validation never absorbs
+        // a real NAK (RP-11).
+        let validated = self.bindings.iter().any(|binding| {
+            binding.endpoint == endpoint
+                && binding.alias == nak.alias
+                && binding.source == normal
+                && binding.boot_id == nak.receiver.receiver_boot_id
+                && binding.identity == nak.identity
+                && binding.receiver_id == Some(nak.receiver.receiver_id)
+        });
         let Some(outbound) = self.publications.get_mut(index) else {
             return;
         };
         let route = outbound.route_of(endpoint);
-        if outbound.absorbs(nak, route, now) {
+        if validated && outbound.absorbs(nak, route, now) {
             self.count(|c| &mut c.nak_copies_absorbed);
             return;
         }
@@ -5117,7 +5128,7 @@ impl<T: StreamTerms> SenderRole<T> {
             .map_or(Requester::Unknown, |membership| {
                 membership.requester(nak.receiver, nak.range.lane, now)
             });
-        if let NakIntake::Reply(reply) = outbound.nak_on(nak, requester, route, now)
+        if let NakIntake::Reply(reply) = outbound.nak_on(nak, requester, (route, validated), now)
             && self
                 .send(halves, endpoint, source, &Control::NakReply(reply))
                 .submitted()

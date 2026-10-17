@@ -77,7 +77,7 @@ pub struct PathPolicy {
 pub const MAX_PATH_BACKOFF: u64 = 60_000_000_000;
 
 /// The largest `path_copy_entries`.
-pub const MAX_PATH_COPY_ENTRIES: usize = 65_536;
+pub const MAX_PATH_COPY_ENTRIES: usize = 4_096;
 
 impl Default for PathPolicy {
     fn default() -> Self {
@@ -756,10 +756,24 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 *slot = Some(&mut **tx);
             }
         }
+        // A route in the live set that cannot take repairs now (not open
+        // at its epoch, resetting, or detached) skips them, counted.
+        let mut passed = [false; MAX_ROUTES];
+        for ((passed, route), lent) in passed.iter_mut().zip(&routed.routes).zip(&routes) {
+            *passed = !route.left && lent.is_none();
+        }
         if routes.iter().all(Option::is_none) {
             return 0;
         }
-        self.serve_repair_with(&mut routes, budget, now)
+        let served = self.serve_repair_with(&mut routes, budget, now);
+        if let Some(repair) = self.repair.as_deref_mut() {
+            for (route, passed) in passed.iter().enumerate() {
+                if *passed {
+                    repair.count_skipped(route, served);
+                }
+            }
+        }
+        served
     }
 
     /// What its repair path counted on `route` (RP-11); `None` on one path,

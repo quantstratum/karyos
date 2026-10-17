@@ -4276,6 +4276,9 @@ fn a_repair_goes_on_both_paths_and_a_nak_copy_is_absorbed() {
     assert_eq!(seen, [0, 1, 2, 3, 4]);
     let sender = rig.agents.sender.role.counters();
     assert!(sender.nak_copies_absorbed >= 1, "{sender:?}");
+    // Absorbed copies are not NAKs admitted, nor budget drops.
+    assert_eq!(sender.nak_cycle_budget, 0, "{sender:?}");
+    assert!(sender.naks >= 1, "{sender:?}");
     let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
     let (a, b) = (
         outbound.repair_route_counts(0).unwrap(),

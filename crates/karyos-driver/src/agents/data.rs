@@ -633,16 +633,18 @@ impl<T: StreamTerms> Outbound<T> {
     /// on the lane is `requester`, at `now`. A publication with no repair
     /// path drops it.
     pub fn nak(&mut self, nak: &Nak, requester: Requester, now: u64) -> NakOutcome {
-        self.nak_on(nak, requester, 0, now)
+        self.nak_on(nak, requester, (0, true), now)
     }
 
     /// [`Outbound::nak`] for a NAK that arrived on route `route` (0 on one
-    /// path), which absorbs the copies of it on other routes (RP-11).
+    /// path). One from a `validated` receiver id is recorded to absorb its
+    /// copies on other routes (RP-11); one whose receiver id is not
+    /// validated yet takes no part in absorption.
     pub fn nak_on(
         &mut self,
         nak: &Nak,
         requester: Requester,
-        route: usize,
+        (route, validated): (usize, bool),
         now: u64,
     ) -> NakOutcome {
         let lane = usize::from(nak.range.lane.get());
@@ -651,7 +653,7 @@ impl<T: StreamTerms> Outbound<T> {
         match self.repair.as_deref_mut() {
             Some(repair) => repair.nak_on(
                 nak,
-                (requester, route),
+                (requester, route, validated),
                 self.readers.get(lane),
                 sent_high,
                 lanes,
