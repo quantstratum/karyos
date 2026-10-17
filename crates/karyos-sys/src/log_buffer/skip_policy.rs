@@ -26,6 +26,15 @@
 //! The caller passes a monotonic time in nanoseconds and the outcomes of
 //! its arrivals; closing the image is the caller's ordered session
 //! transition. Every allocation happens in [`SkipPolicy::new`].
+//!
+//! A [`SealGate`] is asked before each seal (`quantstratum-docs:
+//! karyos/design/conflated-network-images.md`, (b)): a conflated lane's
+//! gate holds the seal until the view's feeder recorded the loss. While it
+//! answers [`GateAnswer::Pending`], the hole stays due and is posted to the
+//! receive owner ([`ReceiveOwner::post_seal`]), so nothing lands in it
+//! before its seal. [`SkipPolicy::duty`] and
+//! [`SkipPolicy::range_unavailable`] use [`Ungated`], which always permits:
+//! an unconflated lane seals as before.
 
 use super::receive_owner::{ReceiveError, ReceiveOwner, Received};
 use crate::frame::Lane;
@@ -98,6 +107,34 @@ impl SkipConfig {
     }
 }
 
+/// What a [`SealGate`] answers before a seal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateAnswer {
+    /// Seal now.
+    Permit,
+    /// Not yet: the hole stays due, posted to the receive owner, and the
+    /// gate is asked again on a later call.
+    Pending,
+}
+
+/// Asked before each seal of a hole: whether it may be sealed now.
+pub trait SealGate {
+    /// Whether `[position, position + extent)` of `lane` may be sealed at
+    /// `now`. Never blocks: a seal that must wait answers
+    /// [`GateAnswer::Pending`].
+    fn before_seal(&mut self, lane: Lane, position: u64, extent: u32, now: u64) -> GateAnswer;
+}
+
+/// The gate of an unconflated lane: always permits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Ungated;
+
+impl SealGate for Ungated {
+    fn before_seal(&mut self, _lane: Lane, _position: u64, _extent: u32, _now: u64) -> GateAnswer {
+        GateAnswer::Permit
+    }
+}
+
 /// Why the image must close (GU-5, GU-6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseCause {
@@ -136,6 +173,9 @@ pub struct SkipReport {
     /// the caller never seals that interval again, and the call stopped
     /// there.
     pub committed_failure: Option<ReceiveError>,
+    /// Due holes whose gate answered [`GateAnswer::Pending`]: posted, not
+    /// sealed.
+    pub gated: u32,
 }
 
 impl SkipReport {
@@ -277,12 +317,26 @@ impl SkipPolicy {
         owner: &mut ReceiveOwner<T>,
         now: u64,
     ) -> Result<SkipReport, ReceiveError> {
+        self.duty_gated(owner, now, &mut Ungated)
+    }
+
+    /// [`SkipPolicy::duty`], asking `gate` before each seal.
+    ///
+    /// # Errors
+    ///
+    /// As [`SkipPolicy::duty`].
+    pub fn duty_gated<T: TermBytes, G: SealGate + ?Sized>(
+        &mut self,
+        owner: &mut ReceiveOwner<T>,
+        now: u64,
+        gate: &mut G,
+    ) -> Result<SkipReport, ReceiveError> {
         let mut report = SkipReport::default();
         for index in 0..self.lanes.len() {
             let Some(lane) = u8::try_from(index).ok().and_then(|l| Lane::try_new(l).ok()) else {
                 continue;
             };
-            self.seal_due(owner, lane, now, &mut report)?;
+            self.seal_due(owner, lane, now, gate, &mut report)?;
             if report.committed_failure.is_some() {
                 break;
             }
@@ -316,6 +370,22 @@ impl SkipPolicy {
         floor: u64,
         now: u64,
     ) -> Result<SkipReport, ReceiveError> {
+        self.range_unavailable_gated(owner, lane, floor, now, &mut Ungated)
+    }
+
+    /// [`SkipPolicy::range_unavailable`], asking `gate` before each seal.
+    ///
+    /// # Errors
+    ///
+    /// As [`SkipPolicy::range_unavailable`].
+    pub fn range_unavailable_gated<T: TermBytes, G: SealGate + ?Sized>(
+        &mut self,
+        owner: &mut ReceiveOwner<T>,
+        lane: Lane,
+        floor: u64,
+        now: u64,
+        gate: &mut G,
+    ) -> Result<SkipReport, ReceiveError> {
         let mut report = SkipReport::default();
         let Some(state) = self.lanes.get_mut(usize::from(lane.get())) else {
             return Err(ReceiveError::Foreign);
@@ -348,7 +418,7 @@ impl SkipPolicy {
             }
             Unrecoverable::Skip => {
                 state.unrecoverable_to = state.unrecoverable_to.max(floor);
-                self.seal_due(owner, lane, now, &mut report)?;
+                self.seal_due(owner, lane, now, gate, &mut report)?;
             }
         }
         Ok(report)
@@ -356,11 +426,12 @@ impl SkipPolicy {
 
     /// Seals the holes of `lane` that are due: expired on an unreliable
     /// channel, proven unrecoverable on a reliable one under `skip`.
-    fn seal_due<T: TermBytes>(
+    fn seal_due<T: TermBytes, G: SealGate + ?Sized>(
         &mut self,
         owner: &mut ReceiveOwner<T>,
         lane: Lane,
         now: u64,
+        gate: &mut G,
         report: &mut SkipReport,
     ) -> Result<(), ReceiveError> {
         let config = self.config;
@@ -397,6 +468,14 @@ impl SkipPolicy {
             } else {
                 return Ok(());
             };
+            if gate.before_seal(lane, position, extent, now) == GateAnswer::Pending {
+                // Posted: nothing lands in it until the gate permits.
+                owner.post_seal(lane, position, extent)?;
+                if let Some(gated) = report.gated.checked_add(1) {
+                    report.gated = gated;
+                }
+                return Ok(());
+            }
             match owner.seal_gap(lane, position, extent, reason) {
                 Ok(Received::Committed { extent, .. }) => report.count(extent),
                 // Published, then a later step failed: count it, report it

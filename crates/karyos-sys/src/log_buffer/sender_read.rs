@@ -100,7 +100,7 @@ use super::{
 use crate::error::SysError;
 use crate::frame::{Flags, FrameType, HEADER_LENGTH, Word0};
 use crate::loan::{LoanOutcome, release_loan, take_loan};
-use crate::participant::CELL_REQUIRED_RESERVED;
+use crate::participant;
 use crate::publication::{load_interior, observe_block};
 use crate::sizing::align_frame;
 use crate::term::TermCount;
@@ -490,7 +490,9 @@ impl<O: BufferOwner> SenderRead<O> {
         let reserved = subscription
             .buffer
             .cell(subscription.cursor.cell)
-            .is_ok_and(|cell| cell.state.load(Ordering::Acquire) == CELL_REQUIRED_RESERVED);
+            .is_ok_and(|cell| {
+                participant::is_required_reserved(cell.state.load(Ordering::Acquire))
+            });
         if subscription.cursor.role != Role::Required || !reserved {
             return Err(SysError::InvalidPublicationMode {
                 reason: "a sender read is a required participant with its L_send reservation",
@@ -548,6 +550,19 @@ impl<O: BufferOwner> SenderRead<O> {
     #[must_use]
     pub fn subscription(&self) -> &Subscription<O> {
         &self.subscription
+    }
+
+    /// Makes the reader's cell count for the publication's connection
+    /// while a receiver's status messages are live (`live`), or not
+    /// (SPEC.md §4): `participant::set_sender_counts` on its own cell. The
+    /// bound and the credit are the same either way. Returns whether the
+    /// cell moved: `false` when it already was so, or when it was revoked
+    /// or left.
+    pub fn set_receivers_live(&self, live: bool) -> bool {
+        self.subscription
+            .buffer
+            .cell(self.subscription.cursor.cell)
+            .is_ok_and(|cell| participant::set_sender_counts(&cell.state, live))
     }
 
     /// The read cursor: where the next read starts, a frame boundary.

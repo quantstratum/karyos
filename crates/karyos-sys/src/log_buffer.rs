@@ -89,9 +89,9 @@ pub use sender_read::{
     SenderReadCounters,
 };
 pub use skip_policy::{
-    Close, CloseCause, DEFAULT_FAR_WINDOW_TIMEOUT_NS, DEFAULT_REORDER_TIMEOUT_NS,
-    MAX_REORDER_TIMEOUT_NS, SkipConfig, SkipConfigError, SkipCounters, SkipPolicy, SkipReport,
-    Unrecoverable,
+    Close, CloseCause, DEFAULT_FAR_WINDOW_TIMEOUT_NS, DEFAULT_REORDER_TIMEOUT_NS, GateAnswer,
+    MAX_REORDER_TIMEOUT_NS, SealGate, SkipConfig, SkipConfigError, SkipCounters, SkipPolicy,
+    SkipReport, Ungated, Unrecoverable,
 };
 pub(crate) mod storage;
 
@@ -131,7 +131,8 @@ pub const CLEANING_HEADROOM: u8 = 1;
 use crate::participant::{
     self, CELL_FREE, CELL_LOST, CELL_LOST_HOLDING, CELL_LOST_RESERVED, CELL_OBSERVER,
     CELL_OPTIONAL, CELL_PUBLICATION, CELL_REQUIRED, CELL_REQUIRED_RESERVED, CELL_WALKER, bounds,
-    counts_for_connection, is_observer_like, is_reader, visible_as_subscriber,
+    counts_for_connection, is_observer_like, is_reader, is_required_reserved,
+    visible_as_subscriber,
 };
 
 /// Whether a subscriber cell in `state` keeps the publication connected.
@@ -143,7 +144,7 @@ const fn connected(state: u64) -> bool {
 
 /// Whether a subscriber cell in `state` holds a spare-slot credit.
 const fn holds_credit(state: u64) -> bool {
-    is_observer_like(state) || matches!(state, CELL_REQUIRED_RESERVED | CELL_LOST_RESERVED)
+    is_observer_like(state) || is_required_reserved(state) || state == CELL_LOST_RESERVED
 }
 
 /// The seal position bits of the seal word (`quantstratum-docs: karyos/design/publication-seal.md`):
@@ -4129,10 +4130,24 @@ impl<O: BufferOwner> Conductor<O> {
         let state = found.state.load(Ordering::Acquire);
         let target = match (state, policy) {
             (reader, _) if is_observer_like(reader) => CELL_LOST_RESERVED,
-            (CELL_REQUIRED_RESERVED, LossPolicy::Continue) => CELL_LOST_RESERVED,
+            // A sender reader, silent or not, is a reserved required
+            // reader; a toggle that wins the race leaves this call stale,
+            // and the next scan revokes it from the state it found.
+            (reserved, LossPolicy::Continue) if is_required_reserved(reserved) => {
+                CELL_LOST_RESERVED
+            }
             (CELL_REQUIRED, LossPolicy::Hold) => CELL_LOST_HOLDING,
-            (CELL_REQUIRED | CELL_REQUIRED_RESERVED, LossPolicy::Abort) => CELL_LOST,
-            (CELL_REQUIRED, LossPolicy::Continue) | (CELL_REQUIRED_RESERVED, LossPolicy::Hold) => {
+            (reserved, LossPolicy::Abort)
+                if reserved == CELL_REQUIRED || is_required_reserved(reserved) =>
+            {
+                CELL_LOST
+            }
+            (CELL_REQUIRED, LossPolicy::Continue) => {
+                return Err(SysError::Protocol {
+                    reason: "the loss policy does not match the reader's admission",
+                });
+            }
+            (reserved, LossPolicy::Hold) if is_required_reserved(reserved) => {
                 return Err(SysError::Protocol {
                     reason: "the loss policy does not match the reader's admission",
                 });

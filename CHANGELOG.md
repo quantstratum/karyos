@@ -37,6 +37,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A seal gate on the skip policy (conflated-network-images.md (b)):
+  `SkipPolicy::duty_gated` and `SkipPolicy::range_unavailable_gated` ask a
+  `SealGate` before each seal. While it answers `GateAnswer::Pending`, the
+  hole stays due, `SkipReport::gated` counts it, and the hole is posted to
+  the receive owner (`ReceiveOwner::post_seal`, `ReceiveOwner::posted`): a
+  frame overlapping a posted interval is not committed and reads
+  `Received::LateAfterSkip`, so the interval is sealed whole. `duty` and
+  `range_unavailable` use `Ungated`, which always permits, and seal as
+  before.
 - `karyos_sys::freshness::BarrierMailbox` (`MAILBOX_WORDS`,
   `SealRequest`, `FreshnessError::UnknownRequest`): one lane image's seal
   mailbox between its receive owner and its conflated view's feeder,

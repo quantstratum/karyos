@@ -1878,3 +1878,46 @@ fn gap_counters_never_wrap() {
     assert_eq!(counters.range_unavailable_skips, 1);
     assert!(counters.overflowed, "sticky");
 }
+
+/// A posted interval refuses every frame overlapping it, before its seal:
+/// late after the skip, counted, not written. A frame beside it commits. A
+/// seal from its start releases what it covers and keeps the rest posted;
+/// the seal of the rest clears it. Errors post nothing.
+#[test]
+fn a_posted_interval_takes_no_frame_until_it_is_sealed() {
+    let buffer = gap_image(0);
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 256, 64, 1)), committed(256, 64));
+    // Errors: a lane the image does not have, an empty interval.
+    let lane1 = Lane::try_new(1).unwrap();
+    assert_eq!(owner.post_seal(lane1, 0, 64), Err(ReceiveError::Foreign));
+    assert!(matches!(
+        owner.post_seal(Lane::ZERO, 0, 0),
+        Err(ReceiveError::InvalidGap { .. })
+    ));
+    assert_eq!(owner.posted(Lane::ZERO), None);
+    owner.post_seal(Lane::ZERO, 64, 128).unwrap();
+    assert_eq!(owner.posted(Lane::ZERO), Some((64, 192)));
+    // Overlapping its start, its end and inside: refused.
+    for offset in [32, 64, 128, 160] {
+        assert_eq!(
+            recv(&mut owner, &data(0, offset, 64, 2)),
+            Ok(Received::LateAfterSkip),
+            "at {offset}"
+        );
+    }
+    assert_eq!(owner.counters().frames_late_after_skip, 4);
+    // Beside it: committed.
+    assert_eq!(recv(&mut owner, &data(0, 0, 64, 3)), committed(0, 64));
+    assert_eq!(recv(&mut owner, &data(0, 192, 64, 4)), committed(192, 64));
+    // A seal of its first half keeps the second posted.
+    assert_eq!(seal(&mut owner, 64, 64), committed(64, 64));
+    assert_eq!(owner.posted(Lane::ZERO), Some((128, 192)));
+    assert_eq!(
+        recv(&mut owner, &data(0, 128, 64, 5)),
+        Ok(Received::LateAfterSkip)
+    );
+    assert_eq!(seal(&mut owner, 128, 64), committed(128, 64));
+    assert_eq!(owner.posted(Lane::ZERO), None);
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(320));
+}

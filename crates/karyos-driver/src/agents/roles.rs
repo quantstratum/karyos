@@ -361,6 +361,9 @@ pub struct SenderCounters {
     /// RTTM REQUESTs over `rttm_reply_rate` or beyond the source table:
     /// dropped ([`SenderRole::rttm_reply_drops`] tells which).
     pub rttm_refused: u64,
+    /// Publications whose receivers' status messages became live or
+    /// lapsed: their connection changed (SPEC.md §4).
+    pub connection_changes: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -3897,15 +3900,27 @@ impl SenderRole {
             }
         }
         // A publication with no live receiver (no live member and no
-        // confirmed binding) announces again (ACS 15933).
-        for outbound in &self.publications {
+        // confirmed binding) announces again (ACS 15933), and is not
+        // connected: its readers' cells stop counting for the connection
+        // (SPEC.md §4) until a receiver's SMs are live again.
+        let mut changes = 0u64;
+        for outbound in &mut self.publications {
             let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
             let bound = self.bindings.iter().any(|binding| {
                 binding.endpoint == endpoint && binding.alias == alias && binding.last_sm.is_some()
             });
-            if !bound && !outbound.connected(now) {
+            let live = bound || outbound.connected(now);
+            if outbound.set_receivers_live(live)
+                && let Some(next) = changes.checked_add(1)
+            {
+                changes = next;
+            }
+            if !live {
                 let _ = self.sessions.disconnected(endpoint, alias);
             }
+        }
+        for _ in 0..changes {
+            self.count(|c| &mut c.connection_changes);
         }
         let mut due = std::mem::take(&mut self.due);
         self.sessions
