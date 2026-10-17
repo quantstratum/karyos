@@ -474,9 +474,7 @@ impl SkipPolicy {
                 // its first Pending: no later hole is posted while this one
                 // waits.
                 debug_assert!(
-                    owner
-                        .posted(lane)
-                        .is_none_or(|posted| posted.0 == position),
+                    owner.posted(lane).is_none_or(|posted| posted.0 == position),
                     "a second posted interval on one lane"
                 );
                 owner.post_seal(lane, position, extent)?;
