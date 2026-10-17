@@ -993,7 +993,7 @@ impl<O: SocketOps> Endpoints<O> {
     pub fn reclaim<T: StreamTerms>(
         &mut self,
         links: &AgentLinks<O, T>,
-        agents: &mut NetworkAgents<O>,
+        agents: &mut NetworkAgents<O, T>,
         mut on_event: impl FnMut(EndpointEvent),
     ) -> usize {
         let mut halves = Vec::new();

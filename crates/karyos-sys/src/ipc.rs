@@ -864,6 +864,13 @@ pub fn own_uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
+/// This process's soft limit of open descriptors (`RLIMIT_NOFILE`);
+/// `None` when it is unlimited.
+#[must_use]
+pub fn descriptor_limit() -> Option<u64> {
+    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+}
+
 /// Checks that `path` is a directory (not a symbolic link) owned by this
 /// uid with mode `0700`.
 fn check_private_dir(path: &std::path::Path) -> Result<(), SysError> {

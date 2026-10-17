@@ -13,6 +13,7 @@ use karyos_sys::frame::Lane;
 use super::{Network, NetworkPublicationState};
 use crate::agents::net_trace::{JournalFacts, TraceHook};
 use crate::agents::{AgentCommand, AgentEvent, AgentLink, EndpointId};
+use crate::embedded::StreamTerms;
 use crate::sessions::receive::SlotRef;
 
 /// The identity a trace journal names for the publication `identity`
@@ -70,10 +71,10 @@ pub(crate) enum TraceEvent {
 impl TraceEvent {
     /// Hands the trace event `event` is to `trace`; any other event comes
     /// back.
-    pub(crate) fn route(
-        event: AgentEvent<OsSocket>,
+    pub(crate) fn route<T: StreamTerms>(
+        event: AgentEvent<OsSocket, T>,
         trace: impl FnOnce(Self),
-    ) -> Option<AgentEvent<OsSocket>> {
+    ) -> Option<AgentEvent<OsSocket, T>> {
         let traced = match event {
             AgentEvent::NetworkTraceSet { previous, .. } => {
                 // The agent closed the journals the previous hook held; the
@@ -122,8 +123,8 @@ pub(crate) struct Traced {
     pub(crate) registration: u64,
 }
 
-impl Network {
-    fn link(&self, side: NetSide) -> &AgentLink<OsSocket> {
+impl<T: StreamTerms> Network<T> {
+    fn link(&self, side: NetSide) -> &AgentLink<OsSocket, T> {
         match side {
             NetSide::Sender => &self.links.sender,
             NetSide::Receiver => &self.links.receiver,
