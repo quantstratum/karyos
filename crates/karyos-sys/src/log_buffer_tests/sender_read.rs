@@ -1884,6 +1884,7 @@ fn a_recording_reader_is_required_or_optional() {
     for (role, reserve, recording, sender) in [
         (Role::Optional, false, true, false),
         (Role::Observer, false, false, false),
+        (Role::Walker, false, false, false),
         (Role::Required, false, false, false),
         (Role::Required, true, true, true),
     ] {
@@ -1997,7 +1998,7 @@ fn a_floor_passing_a_rejoined_reader_is_unavailable_again() {
 /// A revoked cell is not moved, and a required reader never rejoins.
 #[test]
 fn a_revoked_or_required_reader_does_not_resume() {
-    let buffer = new_buffer(config(3, 2)).unwrap();
+    let buffer = new_buffer(config(4, 3)).unwrap();
     let mut conductor = buffer.conductor().unwrap();
     let mut optional = SenderRead::for_recording(
         conductor.subscribe_as(Role::Optional, false, 1).unwrap(),
@@ -2022,4 +2023,66 @@ fn a_revoked_or_required_reader_does_not_resume() {
     cell.revoked.store(crate::loan::REVOKED, Ordering::SeqCst);
     assert_eq!(optional.rejoin_at_head(), Err(ReadError::Revoked));
     assert_eq!(optional.position(), 0);
+}
+
+/// A recording never reads an image: its constructor refuses an image's
+/// cell whatever the role.
+#[test]
+fn a_recording_reader_refuses_an_image() {
+    let buffer = new_buffer(LogBufferConfig {
+        publication: PublicationMode::Image {
+            join: 0,
+            local_gaps: true,
+        },
+        // The receive owner's three cells, a credit each reader, and the
+        // cleaning headroom.
+        ..config(6, 3)
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    for (role, reserve, occupant) in [(Role::Optional, false, 1), (Role::Required, true, 2)] {
+        let subscription = conductor.subscribe_as(role, reserve, occupant).unwrap();
+        assert!(matches!(
+            SenderRead::for_recording(subscription, DEFAULT_CORRUPT_RETRIES),
+            Err(SysError::InvalidPublicationMode { .. })
+        ));
+    }
+}
+
+/// An optional recording reader holds at most one loan, released before
+/// each read returns, across many reads and a term end: its single
+/// admission credit covers it (`sr_read` checks the loan word after each).
+#[test]
+fn an_optional_recording_reader_holds_one_loan_at_most() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = SenderRead::for_recording(
+        conductor.subscribe_as(Role::Optional, false, 1).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+    )
+    .unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut out = sr_out();
+    let mut copied = 0u32;
+    let mut sequence = 0u32;
+    // Past a term end: the reader crosses into the next term's loan.
+    while copied < MIN_TERM_LENGTH + 4096 {
+        if let AppendOutcome::Appended { .. } = publication
+            .append(&sized_message(sequence, 900), AppendOptions::default())
+            .unwrap()
+        {
+            sequence += 1;
+        }
+        let _ = conductor.duty_cycle().unwrap();
+        loop {
+            match sr_read(&mut reader, &mut out) {
+                Ok(ReadOutcome::Copied { len, .. }) => {
+                    copied += u32::try_from(len).unwrap();
+                    sr_sent(&mut reader);
+                }
+                Ok(ReadOutcome::Canonical { .. }) => sr_sent(&mut reader),
+                Ok(ReadOutcome::Pending) | Err(_) => break,
+            }
+        }
+    }
 }
