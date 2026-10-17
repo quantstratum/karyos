@@ -360,6 +360,15 @@ impl Outbound {
         self.membership.as_deref_mut()
     }
 
+    /// Whether its membership has a live member at `now` (`false` with no
+    /// membership attached).
+    #[must_use]
+    pub fn connected(&self, now: u64) -> bool {
+        self.membership
+            .as_deref()
+            .is_some_and(|membership| membership.connected(now))
+    }
+
     /// The largest datagram's aligned charge: the least join window.
     #[must_use]
     pub fn max_frame(&self) -> u64 {
