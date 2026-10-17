@@ -1910,6 +1910,112 @@ fn an_aborted_record_reaches_the_subscriber_of_the_image() {
     aborted_over_the_network(false);
 }
 
+/// One frame of the rig's publication, lane 0, at stream `position`, as a
+/// faulty peer would send it: `word0`, the header, then `payload`.
+fn peer_frame(
+    word0: karyos_protocol::frame::Word0,
+    position: u64,
+    reserved_value: i64,
+    payload: &[u8],
+) -> Vec<u8> {
+    let term_length = 65_536;
+    let term_id = 9 + u32::try_from(position / term_length).unwrap();
+    let term_offset = u32::try_from(position % term_length).unwrap();
+    let mut bytes = Vec::with_capacity(32 + payload.len());
+    bytes.extend_from_slice(&word0.pack().to_le_bytes());
+    bytes.extend_from_slice(&term_offset.to_le_bytes());
+    bytes.extend_from_slice(&alias().session_id.to_le_bytes());
+    bytes.extend_from_slice(&alias().stream_id.to_le_bytes());
+    bytes.extend_from_slice(&term_id.to_le_bytes());
+    bytes.extend_from_slice(&reserved_value.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// T3 (contract-traceability-phase-2.md, "Fragmented commit and abort
+/// (network)"; SPEC §13 and the assembler rule of §5): a faulty peer
+/// sends a BEGIN, an ABORTED record and a stray END, then a whole message,
+/// each in its own DATA datagram. The subscriber of the image gets the
+/// partial message discarded as `Interrupted` (the assembler's protocol
+/// error, counted as discarded partial bytes), the aborted extent, the
+/// stray END dropped as an `Orphan`, and then the next message, whole.
+#[test]
+fn an_injected_begin_aborted_end_is_discarded_and_the_next_frame_delivered() {
+    use karyos_protocol::frame::{Flags, FrameType, Word0};
+    use karyos_sys::log_buffer::{AppendOptions, PollOutcome, Role, SkipReason};
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&[1; 900], AppendOptions::default())
+        .unwrap();
+    assert!(matches!(
+        next_outcome(&mut rig, &mut subscriber),
+        PollOutcome::Message {
+            position: 0,
+            length: 900,
+            ..
+        }
+    ));
+    // 900 bytes after a 32-byte header, at 32-byte strides.
+    let at = 960;
+    let fragment = |begin: bool, end: bool| {
+        Word0::new(
+            64,
+            Flags::new(begin, end, false, false, Lane::ZERO),
+            FrameType::Data,
+        )
+    };
+    let aborted = Word0::new(32, Flags::NONE, FrameType::Aborted);
+    let datagrams = [
+        peer_frame(fragment(true, false), at, 0, &[2; 32]),
+        peer_frame(aborted, at + 64, 64, &[]),
+        peer_frame(fragment(false, true), at + 128, 0, &[3; 32]),
+        peer_frame(fragment(true, true), at + 192, 0, &[4; 32]),
+    ];
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    for bytes in &datagrams {
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_data(&receiver.sessions, b, source, alias(), bytes, rig.now);
+    }
+    let skipped = |position: u64, reason: SkipReason| PollOutcome::Skipped {
+        position,
+        extent: 64,
+        reason,
+    };
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        skipped(at, SkipReason::Interrupted)
+    );
+    assert_eq!(subscriber.loss_counters().discarded_partial_bytes, 64);
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        PollOutcome::Aborted {
+            position: at + 64,
+            extent: 64
+        }
+    );
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        skipped(at + 128, SkipReason::Orphan)
+    );
+    let mut out = vec![0u8; 64];
+    let PollOutcome::Message {
+        position, length, ..
+    } = subscriber.poll(&mut out).unwrap()
+    else {
+        panic!("the next frame is not delivered");
+    };
+    assert_eq!((position, length), (at + 192, 32));
+    assert_eq!(&out[..32], &[4; 32]);
+    // The stray END is dropped, not counted as a partial.
+    assert_eq!(subscriber.loss_counters().discarded_partial_bytes, 64);
+}
+
 /// Phase 6 wiring: a RANGE_UNAVAILABLE that echoes the outstanding NAK
 /// proves the hole unrecoverable; under the default `on_unrecoverable =
 /// close` the image closes and is retired.
