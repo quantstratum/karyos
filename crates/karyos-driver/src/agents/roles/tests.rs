@@ -1174,6 +1174,8 @@ fn installed_image_with(
         initial_term_id: TermId::new(9),
         term_length: 65_536,
         heartbeat_marks: [None; 4],
+        terminal: [None; 4],
+        dropped_past_terminal: [false; 4],
         last_fresh: 0,
         window: 32_768,
         schedule: crate::sm_schedule::SmSchedule::new(10_000_000, &[32_768]).unwrap(),
@@ -3427,4 +3429,258 @@ fn a_receiver_on_a_later_path_bounds_the_publication() {
     sender.status(EndpointId(2), receiver, &sm_status([7, 8], 0), 1);
     let bound = sender.consumption(&sender.publications[0]);
     assert_eq!(bound.map(|positions| positions[0]), Some(0));
+}
+
+/// #343 review P3: a PATH_HB the kernel refuses does not mark its path: it
+/// is tried again the next cycle, not an interval later.
+#[test]
+fn a_refused_path_heartbeat_is_tried_next_cycle() {
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+    use karyos_protocol::network::{Datagram, classify};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    use super::super::Half;
+
+    let interval = AgentConfig::default().path_heartbeat_interval;
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let routes = [
+        (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
+        (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
+    ];
+    let (path, mut log) = super::super::data::testing::outbound_routed(
+        &routes,
+        alias(),
+        publication(EndpointId(1)).term,
+        1,
+        false,
+    );
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let event = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    assert!(matches!(
+        event,
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    let mut halves = Vec::new();
+    let mut beats = Vec::new();
+    for id in 1..=2u32 {
+        let socket = ScriptedSocket::new();
+        let observer = socket.observer();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        observer.set_send_hook(Box::new(move |_, datagrams| {
+            for datagram in datagrams {
+                match classify(datagram) {
+                    Ok(Datagram::Control(Control::PathHeartbeat(_))) => {
+                        seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(Datagram::DataBatch(_)) => {
+                        seen.fetch_add(1000, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }));
+        if id == 1 {
+            // Its DATA, then the first PATH_HB refused.
+            observer.push_send(SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+            observer.push_send(SendResult::Error(
+                karyos_io::sockets::ops::Errno::NETUNREACH,
+            ));
+        }
+        for _ in 0..32 {
+            observer.push_send(SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+        }
+        let instance = InstanceId::new(NonZeroU32::new(id).unwrap());
+        let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
+        let (tx, _rx) = endpoint.split().unwrap();
+        halves.push((EndpointId(id), Half::Tx(Box::new(tx))));
+        beats.push(count);
+    }
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    let _ = log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    // Each count holds PATH_HBs in its units and DATA in its thousands.
+    // Each count holds PATH_HBs in its units and DATA in its thousands.
+    let beat = |at: usize| beats[at].load(Ordering::Relaxed) % 1000;
+    for now in 2..6 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    let t = 6 + interval;
+    // Path A's PATH_HB is refused at t (the hook still sees the attempt);
+    // path B's goes. At t + 1, A is tried again and goes.
+    let _ = sender.duty(&mut halves, t).unwrap();
+    let sent = sender.counters().path_heartbeats_sent;
+    let _ = sender.duty(&mut halves, t + 1).unwrap();
+    assert_eq!(
+        sender.counters().path_heartbeats_sent,
+        sent + 1,
+        "A retried"
+    );
+    assert_eq!(beat(1), 1, "B sent once");
+    assert_eq!(beat(0), 2, "A: the refused try and the retry");
+}
+
+/// A DATA frame of `payload` bytes at `term_offset` of term 9 on lane 0 of
+/// [`installed_image`], with EOS on it when `eos` (a header-only frame is
+/// a heartbeat).
+fn data_frame(term_offset: i32, payload: usize, eos: bool) -> Vec<u8> {
+    use karyos_protocol::frame::{Flags, FrameType, Lane, Word0};
+
+    let length = 32 + payload;
+    let word0 = Word0::new(
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, eos, false, Lane::ZERO),
+        FrameType::Data,
+    );
+    let mut bytes = vec![0u8; length.next_multiple_of(32)];
+    bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+    bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+    bytes[12..16].copy_from_slice(&5i32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&6i32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&9u32.to_le_bytes());
+    bytes.truncate(length);
+    bytes
+}
+
+/// Commits `bytes`, one DATA frame, into `image`.
+fn commit_bytes(
+    image: &mut super::Installed,
+    params: &karyos_sys::receive::ImageParams,
+    bytes: &[u8],
+) {
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let datagram = ValidatedDatagram::parse(bytes, params).unwrap();
+    let Some(Item::Frame(frame)) = datagram.items().next() else {
+        panic!("not a frame");
+    };
+    assert!(matches!(
+        image.owner.receive(&frame),
+        Ok(karyos_sys::log_buffer::Received::Committed { .. })
+    ));
+}
+
+/// EOS records a lane's terminal bound once: a repeat is idempotent,
+/// another bound, one below the complete prefix or one under covered data
+/// is refused; the image reaches its bound only through a complete prefix,
+/// so EOS ahead of a hole waits for the repair.
+#[test]
+fn eos_records_one_terminal_bound_reached_through_a_complete_prefix() {
+    use super::Terminal::{Recorded, Refused, Repeated};
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, params) = installed_image();
+    // Two frames of 96 bytes (aligned): 0..96 and 96..192; the second
+    // arrives first, so 0..96 is a hole.
+    commit_bytes(&mut image, &params, &data_frame(96, 64, false));
+    assert_eq!(super::record_terminal(&mut image, Lane::ZERO, 64), Refused);
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 192),
+        Recorded
+    );
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 192),
+        Repeated
+    );
+    assert_eq!(super::record_terminal(&mut image, Lane::ZERO, 224), Refused);
+    assert_eq!(image.terminal[0], Some(192));
+    assert!(!super::terminal_reached(&image), "ahead of a hole");
+    commit_bytes(&mut image, &params, &data_frame(0, 64, false));
+    assert!(super::terminal_reached(&image), "the hole repaired");
+}
+
+/// No bound below the complete prefix: EOS at a position the image already
+/// passed is refused.
+#[test]
+fn eos_below_the_complete_prefix_is_refused() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, params) = installed_image();
+    commit_bytes(&mut image, &params, &data_frame(0, 64, false));
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 32),
+        super::Terminal::Refused
+    );
+    assert_eq!(image.terminal[0], None);
+}
+
+/// Once the bound is known, a frame that ends past it is past the
+/// terminal; frames up to it are not.
+#[test]
+fn a_frame_past_the_terminal_bound_is_recognised() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    let past = |image: &super::Installed, bytes: &[u8]| {
+        let datagram = ValidatedDatagram::parse(bytes, &params).unwrap();
+        let Some(Item::Frame(frame)) = datagram.items().next() else {
+            panic!("not a frame");
+        };
+        super::past_terminal(image, &frame)
+    };
+    let second = data_frame(96, 64, false);
+    assert!(!past(&image, &second), "no bound yet");
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 96),
+        super::Terminal::Recorded
+    );
+    assert!(!past(&image, &data_frame(0, 64, false)));
+    assert!(past(&image, &second));
+}
+
+/// Once a lane's bound is recorded, nothing past it is marked or NAKed: a
+/// heartbeat beyond the bound raises the mark only to the bound, and the
+/// tail hole ends there.
+#[test]
+fn the_heartbeat_mark_and_a_tail_nak_stop_at_the_terminal_bound() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 96),
+        super::Terminal::Recorded
+    );
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(image.heartbeat_marks[0], Some(96));
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Stationary,
+        "capped at the bound"
+    );
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
+    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert_eq!((hole.start, hole.length), (0, 96));
 }

@@ -171,6 +171,10 @@ pub struct AgentConfig {
     /// DATA for this long sends a PATH_HB, so it stays live at its
     /// receivers while another path carries the stream.
     pub path_heartbeat_interval: u64,
+    /// When a routed publication's path leaves the live set
+    /// (redundant-paths.md section 7, RP-8): `path_lag_limit` (100 ms),
+    /// `path_skip_ratio` in percent (50) and `path_skip_min_bytes` (64 KiB).
+    pub path_policy: crate::agents::data::PathPolicy,
     /// `setup_answer_rate` and its source table.
     pub answer_rate: crate::sessions::send::AnswerRate,
     /// Entries of the receiver-to-sender control ring, at least 1.
@@ -242,6 +246,7 @@ impl Default for AgentConfig {
             publications: 64,
             setup_interval: 100_000_000,
             path_heartbeat_interval: 100_000_000,
+            path_policy: crate::agents::data::PathPolicy::default(),
             answer_rate: crate::sessions::send::AnswerRate::default(),
             control_capacity: 512,
             control_routes: 8,
@@ -270,6 +275,19 @@ impl AgentConfig {
         let commands = NonZeroUsize::new(self.command_capacity).ok_or(
             AgentError::InvalidConfig("command_capacity must be at least 1"),
         )?;
+        let policy = self.path_policy;
+        if policy.lag_limit < 2
+            || !(1..=100).contains(&policy.skip_percent)
+            || policy.skip_min_bytes == 0
+            || policy.backoff_initial == 0
+            || policy.backoff_max < policy.backoff_initial
+            || policy.backoff_max > data::MAX_PATH_BACKOFF
+            || policy.backoff_reset == 0
+        {
+            return Err(AgentError::InvalidConfig(
+                "path_policy needs a lag limit of 2 ns or more, a skip ratio of 1 to 100 percent, a minimum of 1 byte, and backoffs of 1 ns or more with the maximum at least the initial one and at most 60 s",
+            ));
+        }
         if self.path_heartbeat_interval == 0 {
             return Err(AgentError::InvalidConfig(
                 "path_heartbeat_interval must be at least 1",
@@ -939,6 +957,16 @@ pub struct ReceiverAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
 }
 
 impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
+    /// Whether `alias` is published on `endpoint` (tests).
+    #[cfg(test)]
+    pub(crate) fn is_published(
+        &self,
+        endpoint: EndpointId,
+        alias: karyos_protocol::network::Alias,
+    ) -> bool {
+        self.role.is_published(endpoint, alias)
+    }
+
     /// The configured identity of the key `(endpoint, stream_id)`
     /// (tests).
     #[cfg(test)]
@@ -952,6 +980,17 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
 }
 
 impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
+    /// The receivers bound to `alias` on `endpoint` whose SMs arrived
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn confirmed_bindings(
+        &self,
+        endpoint: EndpointId,
+        alias: karyos_protocol::network::Alias,
+    ) -> usize {
+        self.role.confirmed_bindings(endpoint, alias)
+    }
+
     /// Drops every NAK unread from now on, as a sender that never repairs
     /// (tests).
     #[cfg(test)]

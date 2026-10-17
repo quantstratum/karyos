@@ -121,6 +121,34 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The live set of a routed publication's paths (redundant-paths.md section
+  7, RP-8; rp-w5a). Each path keeps a `path_lag_limit` window (100 ms) of
+  bytes selected and skipped: one that skipped anything is `Degraded`, and
+  one whose skipped share passes `path_skip_ratio` (50%, once
+  `path_skip_min_bytes`, 64 KiB, were selected), or that the lane waited on
+  alone for longer than `path_lag_limit`, leaves the live set while another
+  path remains (`AgentConfig::path_policy`, validated at start). A path out
+  of it takes no copy and no flush and holds no head back
+  (`RoutedLaneSender::set_live`); its never-exposed copies come back
+  (`RoutedLaneSender::cancel_route`) through the guard gate; those it held
+  alone are counted (`PathCounters::copies_abandoned`) and reach receivers
+  by NAK or close as gaps. `Outbound::path_state` and
+  `Outbound::path_counters` report it. A faulted route leaves too, while
+  another path is live.
+- A left path returns (RP-9; rp-w5b) after its backoff
+  (`PathPolicy::backoff_initial`, 10 ms, doubling to `backoff_max`, 1 s
+  and at most `MAX_PATH_BACKOFF`, 60 s, and starting over after
+  `backoff_reset`, 10 s, live): on its open queue,
+  or by `retry_queue` after a fault, from the current selection point,
+  counted (`PathCounters::entries`). It bounds `Outbound::sent_low`, the
+  least frontier over the live paths, from its first submit; a frame a
+  path skipped counts as passed for its frontier.
+- A close no longer waits on a detached path (rp-w5b; ACS 17049). On a
+  guarded lane's abort, the copies of a route whose TX half is detached
+  are forgotten through the guard gate (`RoutedLaneSender::forget`), so
+  the close can become effective if the path never comes back, and counted
+  (`RouteCounters::forgotten`). The route then returns only through an
+  endpoint reset.
 - Receiver trace journals keep their sealed gaps (P2.12 step 3, PR 3b,
   trace-network.md section 5): the first `FACT_GAP_INTERVALS` (16) gaps of
   each traced lane, in order, with an overflow flag, carried in

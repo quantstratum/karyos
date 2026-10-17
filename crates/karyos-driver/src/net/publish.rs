@@ -17,11 +17,13 @@
 //!   routed publication. Refused while the sockets cannot be isolated per
 //!   path ([`SocketOps::isolates_paths`], owner item 12), as subscriptions
 //!   are, and unicast `paths` need a destination per path (owner item 11).
-//!
-//! [`SocketOps::isolates_paths`]: karyos_io::sockets::ops::SocketOps::isolates_paths
+//!   Item 12 also covers the sending side: each path's socket must pick its
+//!   multicast interface (`IP_MULTICAST_IF`), not only bind its address.
 //! - **Readers.** Each lane's sender reader is a required participant of
 //!   its log with an L_send reservation (S2 2.1), so a publisher never
 //!   overruns what the sender has not sent.
+//!
+//! [`SocketOps::isolates_paths`]: karyos_io::sockets::ops::SocketOps::isolates_paths
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 

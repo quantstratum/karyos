@@ -1005,3 +1005,298 @@ fn a_failed_route_is_flushed_once_per_call_and_keeps_its_first_failure() {
     );
     assert_eq!(failures[1], None);
 }
+
+/// rp-w5a, RP-8: a route out of the live set takes no flush and holds no
+/// head back. Route 0 alone holds position 0; once it leaves, 128 on route 1
+/// is the head and is served. That closes the #317 interim.
+#[test]
+fn a_left_route_holds_no_head_back() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    f.routes[0].accept(2);
+    f.routes[1].accept(1);
+    assert_eq!(f.sender.exclusive(0, 0), 1, "position 0 is route 0's alone");
+    f.sender.set_live(0, false);
+    assert_eq!(f.sender.is_live(0), Some(false));
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [100]);
+    assert_eq!(
+        f.routes[0].socket.send_calls(),
+        0,
+        "a left route takes no flush"
+    );
+    assert_eq!(f.routes[1].socket.send_calls(), 1);
+    assert_eq!(f.sender.debited(0), Some(128));
+    // Its copies leave with cancel_route, on every lane, that route only.
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    assert_eq!(gate.left, [0, 2, 0]);
+    assert_eq!(f.sender.pending(0, 0), Some(0));
+    // Back in the live set, it flushes again.
+    f.sender.set_live(0, true);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    f.routes[1].accept(1);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [100]);
+    assert_eq!(f.routes[0].socket.send_calls(), 1);
+}
+
+/// `cancel_route` cancels one route's copies of every lane, leaving the
+/// other route's.
+#[test]
+fn cancel_route_leaves_the_other_routes() {
+    let mut f = Fixture::new(&[100, 100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(1, 0, 100, 100, &[0, 1]);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+    assert_eq!(gate.left, [0, 2, 0]);
+    assert_eq!(
+        (f.sender.pending(0, 1), f.sender.pending(1, 1)),
+        (Some(0), Some(0))
+    );
+    assert_eq!(
+        (f.sender.pending(0, 0), f.sender.pending(1, 0)),
+        (Some(1), Some(1))
+    );
+    assert_eq!(f.sender.exclusive(0, 0), 1, "route 1 no longer holds it");
+}
+
+/// A left route takes no flush even when it holds the head at its front;
+/// and a position it shares with a live route is that route's alone once
+/// the sharer leaves.
+#[test]
+fn a_left_route_takes_no_flush_of_a_shared_head() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    f.routes[1].accept(1);
+    assert_eq!(f.sender.exclusive(0, 0), 0, "route 1 holds it too");
+    f.sender.set_live(1, false);
+    assert_eq!(f.sender.exclusive(0, 0), 1, "a left route holds nothing");
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [100]);
+    assert_eq!(f.routes[1].socket.send_calls(), 0);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// ACS 16856: `sole_holder` names the route that alone holds a lane's head
+/// at its front while another live route waits with a later copy.
+#[test]
+fn the_sole_holder_of_a_waiting_lane_is_named() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    assert_eq!(f.sender.sole_holder(0), Some(0));
+    // Shared, or nobody waiting: none.
+    let mut g = Fixture::new(&[100], 100, 2);
+    g.stage(0, 0, 100, 100, &[0, 1]);
+    assert_eq!(g.sender.sole_holder(0), None);
+    let mut h = Fixture::new(&[100], 100, 2);
+    h.stage(0, 0, 100, 100, &[0]);
+    assert_eq!(h.sender.sole_holder(0), None, "no other route waits");
+    // Out of the live set, route 0 holds nothing.
+    f.sender.set_live(0, false);
+    assert_eq!(f.sender.sole_holder(0), None);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+    let Fixture { routes, sender, .. } = &mut g;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+    let Fixture { routes, sender, .. } = &mut h;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+}
+
+/// #346 review P2-1: a lone head behind the route's own catch-up copy is
+/// still held alone: routes 0 and 1 stage p0; only route 0 takes p128;
+/// both take p256; route 1 submits p0 while route 0 blocks. Route 0 holds
+/// p128 alone behind p0, and route 1 waits with p256, ready.
+#[test]
+fn a_lone_head_behind_a_catch_up_copy_is_held_alone() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    f.routes[1].accept(1);
+    let _ = f.serve(&mut Gate::default(), 100);
+    assert_eq!(f.sender.debited(0), Some(0));
+    assert_eq!(f.sender.pending(0, 0), Some(3), "p0 lags on route 0");
+    assert_eq!(f.sender.sole_holder(0), Some(0));
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// #346 review P2-2: a shared bottleneck is no stall. Route 1 lags on p0
+/// (its socket would block); route 0 holds p128 alone, route 1 waits with
+/// p256 but its last flush would block: no ready route waits, so the lane
+/// waits on no one route. Once route 1 submits again, it is ready.
+#[test]
+fn a_blocked_waiting_route_is_not_ready() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    let _ = f.serve(&mut Gate::default(), 100);
+    assert_eq!(f.sender.debited(0), Some(0));
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    // Route 0 would block on p128 now; route 1 blocked on p0.
+    let _ = f.serve(&mut Gate::default(), 1000);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    let _ = sender.catch_up(&mut Lent(routes), &mut gate);
+    assert_eq!(f.sender.sole_holder(0), None, "no ready route waits");
+    // Route 1 catches p0 up: ready, waiting with p256.
+    f.routes[1].accept(1);
+    let Fixture { routes, sender, .. } = &mut f;
+    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate).submitted, 1);
+    assert_eq!(f.sender.sole_holder(0), Some(0));
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// ACS 17049: `forget` returns a route's staged copies of a lane through
+/// the gate, in staging order, with no backend call; the other route and
+/// the other lanes keep theirs.
+#[test]
+fn forget_returns_one_routes_copies_without_the_backend() {
+    let mut f = Fixture::new(&[1000, 1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    f.stage(1, 0, 100, 100, &[1]);
+    let calls = f.routes[1].socket.send_calls();
+    let mut gate = Gate::default();
+    assert_eq!(f.sender.forget(0, 1, &mut gate), 2);
+    assert_eq!(f.routes[1].socket.send_calls(), calls, "no backend call");
+    assert_eq!(gate.left[1], 2, "returned through the gate");
+    assert_eq!(f.sender.pending(0, 1), Some(0));
+    assert_eq!(f.sender.counters(1).unwrap().forgotten, 2);
+    assert_eq!(f.sender.pending(0, 0), Some(2), "route 0 keeps its copies");
+    assert_eq!(f.sender.pending(1, 1), Some(1), "lane 1 keeps its copy");
+    assert_eq!(f.sender.forget(0, 1, &mut gate), 0, "nothing left");
+    assert_eq!(f.sender.forget(0, 9, &mut gate), 0, "past the routes");
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// #346 delta review: a blocked route that leaves, its copies cancelled,
+/// is ready again when it returns.
+#[test]
+fn a_returning_route_is_ready_again() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(f.sender.debited(0), Some(0), "route 1 blocked on p0");
+    let mut gate = Gate::default();
+    f.sender.set_live(1, false);
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+    f.sender.set_live(1, true);
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    assert_eq!(f.sender.sole_holder(0), Some(0), "route 1 is ready again");
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// #346 delta review: a blocked route whose blocking copy goes with a
+/// reopen has nothing left to retry, so it is ready again.
+#[test]
+fn a_reopened_route_is_ready_again() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(f.sender.debited(0), Some(0), "route 1 blocked on p0");
+    let queue = f.routes[1].queues[0];
+    f.sender.reopen(0, 1, queue);
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    assert_eq!(f.sender.sole_holder(0), Some(0), "route 1 is ready again");
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// #346 review P2-2: a blocked route that submits in a serve is ready
+/// again, so a lone holder waits on it.
+#[test]
+fn a_route_that_submits_is_ready_again() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(f.sender.debited(0), None, "both routes blocked on p0");
+    f.routes[0].accept(1);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(f.sender.debited(0), Some(0));
+    f.stage(0, 128, 100, 100, &[1]);
+    f.sender.skipped(0);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    assert_eq!(f.sender.sole_holder(0), Some(1), "route 0 is ready again");
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
