@@ -21,6 +21,7 @@ pub mod error;
 pub mod histogram;
 pub mod ids;
 pub mod journal;
+pub mod network_agent;
 pub mod record;
 pub mod report;
 pub mod sampling;
@@ -38,6 +39,7 @@ pub use ids::{BufferedIds, OsRandom, RandomSource};
 pub use journal::{
     Collected, ObserverId, TraceCollector, TraceWriter, trace_journal, trace_writer,
 };
+pub use network_agent::{NetworkCounter, NetworkCounts, NetworkTraceAgent};
 pub use record::{
     MAX_LANE, NetworkPath, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId,
     RECORD_VERSION, RECORD_VERSION_1, RECORD_VERSION_2, RECORD_WORDS, SubscriberId, TraceIds,

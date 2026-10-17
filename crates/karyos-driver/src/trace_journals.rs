@@ -155,7 +155,9 @@ struct Held {
     /// `None` once the journal ended: drained to its close, faulted, or
     /// its writer gone.
     drain: Option<JournalDrain>,
-    /// Bytes charged to `max_trace_journal_bytes` while `drain` lives.
+    /// Bytes charged to its kind's budget while `drain` lives:
+    /// `max_trace_journal_bytes` for a client journal,
+    /// `max_network_journal_bytes` for a network journal.
     bytes: u64,
     /// For a subscriber journal, or a network journal that `covers`, that
     /// ended: the publisher journals noted at its end.

@@ -1689,3 +1689,41 @@ fn a_refusal_the_header_cannot_count_is_an_overflow() {
     assert_eq!(counter(&driver, "network trace journals refused"), 2);
     assert_eq!(counter(&driver, "counter overflows"), 1);
 }
+
+/// Closing a network journal releases its bytes to the network budget once
+/// it is drained to its end, and leaves the client journals' total as it
+/// was (#257 review).
+#[test]
+fn a_closed_network_journal_releases_its_network_bytes() {
+    let one = journal_bytes(&NET_LAYOUT).unwrap();
+    let mut driver = net_driver(4, 64, one);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let _client = journal(&mut driver, &mut conductor, publication);
+    let client_bytes = driver.trace_journals.bytes;
+    assert!(client_bytes > 0);
+    let id = identity(driver.driver_id(), 3);
+    let side = NetSide::Sender;
+    let _hook = hooked(&mut driver, side);
+    assert!(
+        driver
+            .open_network_journal(side, id, lane(0), 3, Some(0))
+            .is_some()
+    );
+    assert_eq!(driver.trace_journals.net_bytes, one);
+    // The budget holds one: a second is refused while the first lives.
+    assert_eq!(
+        driver.open_network_journal(side, id, lane(1), 3, Some(0)),
+        None
+    );
+    assert!(driver.close_network_journal(side, &id, lane(0), Some(0), None));
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.trace_journals.net_bytes, 0);
+    assert_eq!(driver.trace_journals.bytes, client_bytes);
+    assert!(
+        driver
+            .open_network_journal(side, id, lane(1), 3, Some(0))
+            .is_some()
+    );
+    assert_eq!(driver.trace_journals.net_bytes, one);
+    assert_eq!(driver.trace_journals.bytes, client_bytes);
+}

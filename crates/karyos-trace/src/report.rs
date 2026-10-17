@@ -59,6 +59,23 @@
 //! `Complete` only if a root-flagged `Publish` of it was observed. Single
 //! messages can be declared out of scope with
 //! [`TraceReport::out_of_scope_message`] (a tool's missed journals, T7).
+//!
+//! **Network journals (`quantstratum-docs: karyos/design/trace-network.md`
+//! §5).** A network sender or receiver journal
+//! ([`TraceReport::add_network_source`]) observes one lane of one
+//! publication with its facts: the pickup start or image join, at its close
+//! the pickup or commit boundary, and a receiver's recorded gaps. Its
+//! records name their own frame, so each is tied to the message with the
+//! same publication, lane, trace id and `message_id`; it never creates a
+//! message of its own. A fragment drained before its message's `Publish`
+//! or `SubscriberPoll` is parked until one names the message's position:
+//! at most [`MAX_PARKED`] fragments, an overflow counted and putting the
+//! publication's non-final traces out of scope, and a fragment parked
+//! longer than the window `D` aged out and counted. A network journal is
+//! expected for a message at or above its start, below its boundary and
+//! outside its recorded gaps, or whenever it holds a record of the
+//! message. A publication with refused network journals
+//! ([`TraceReport::network_refused`]) never has a final `Complete`.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -68,9 +85,15 @@ use crate::clocks::{Calibration, ClockKey, Observation, latency};
 use crate::error::TraceError;
 use crate::histogram::{Histogram, HistogramError};
 use crate::journal::{Collected, ObserverId, TraceCollector};
-use crate::record::{ObservedTime, Point, PublicationId};
+use crate::record::{NetworkPath, ObservedTime, Point, PublicationId};
 use crate::source::{JournalSource, SourceState};
 use crate::trace_clock::ClockProvenance;
+use karyos_protocol::trace_hook::NetSide;
+
+/// Network fragments a report parks while waiting for their message's
+/// position (`trace-network.md` §5): past it, a fragment is counted and its
+/// publication's non-final traces are out of scope.
+pub const MAX_PARKED: usize = 4096;
 
 /// A journal registered with a [`TraceReport`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -141,7 +164,15 @@ impl From<ClockProvenance> for JournalClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Publisher,
-    Subscriber { join: u64 },
+    Subscriber {
+        join: u64,
+    },
+    /// A network journal of one lane, expected from `start` on.
+    Network {
+        side: NetSide,
+        lane: u8,
+        start: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -155,9 +186,12 @@ struct Journal {
     publication: PublicationKey,
     clock: JournalClock,
     /// The owner closed the handle (its writer is closed); for a
-    /// subscription, with its final delivery boundary.
+    /// subscription, with its final delivery boundary; for a network
+    /// journal, its pickup or commit boundary.
     owner_closed: bool,
     boundary: Option<u64>,
+    /// A network receiver journal's recorded gaps, `[from, to)`.
+    gaps: Vec<(u64, u64)>,
     /// The source is [`SourceState::Lost`].
     lost: bool,
     /// The collector reported `Closed`.
@@ -179,14 +213,44 @@ impl Journal {
         self.finals.is_some()
     }
 
-    /// For a subscription journal of `publication`, whether it is expected
-    /// for a message at `position`: `Some` once decided. A lost journal is
-    /// expected for every message from its join on.
-    fn eligible(&self, publication: &PublicationKey, position: u64) -> Option<bool> {
-        let Kind::Subscriber { join } = self.kind else {
+    /// For a subscription or network journal, whether it is expected for
+    /// the message at `position` of `lane` of `publication`, given whether
+    /// it `observed` the message: `Some` once decided. A lost journal is
+    /// expected for every message from its join or start on; a network
+    /// journal holding part of the message always is (§5).
+    fn eligible(
+        &self,
+        publication: &PublicationKey,
+        lane: u8,
+        position: u64,
+        observed: bool,
+    ) -> Option<bool> {
+        if self.publication != *publication {
             return Some(false);
+        }
+        let from = match self.kind {
+            Kind::Publisher => return Some(false),
+            Kind::Subscriber { join } => join,
+            Kind::Network {
+                lane: own, start, ..
+            } => {
+                if own != lane {
+                    return Some(false);
+                }
+                if observed {
+                    return Some(true);
+                }
+                if self
+                    .gaps
+                    .iter()
+                    .any(|(gap_from, gap_to)| *gap_from <= position && position < *gap_to)
+                {
+                    return Some(false);
+                }
+                start
+            }
         };
-        if self.publication != *publication || join > position {
+        if from > position {
             return Some(false);
         }
         if self.lost {
@@ -235,6 +299,55 @@ struct Message {
     /// Its `Publish` record carries the `root` flag.
     root: bool,
     polls: Vec<(JournalId, ObservedTime)>,
+    /// Network observations of its fragments: journal, point, frame
+    /// position, path and time.
+    network: Vec<NetworkObservation>,
+}
+
+impl Message {
+    /// Whether journal `index` observed this message.
+    fn observed_by(&self, index: usize) -> bool {
+        self.polls
+            .iter()
+            .any(|(JournalId(journal), _)| *journal == index)
+            || self
+                .network
+                .iter()
+                .any(|observation| observation.journal.0 == index)
+    }
+}
+
+/// One network observation of one fragment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NetworkObservation {
+    journal: JournalId,
+    point: Point,
+    /// The fragment's frame position.
+    position: u64,
+    path: NetworkPath,
+    observed: ObservedTime,
+}
+
+/// The key a network record shares with its message: publication, lane,
+/// trace id and `message_id`.
+type FragmentKey = (PublicationKey, u8, [u64; 2], u64);
+
+/// A fragment waiting for its message's position.
+#[derive(Debug, Clone, Copy)]
+struct Parked {
+    key: FragmentKey,
+    observation: NetworkObservation,
+    /// Its collection time, in its journal's collection clock.
+    collected: u64,
+}
+
+/// What became of the network fragments the report parked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParkedCounts {
+    /// Fragments that found the parking area full.
+    pub overflowed: u64,
+    /// Fragments parked longer than the window `D`.
+    pub aged: u64,
 }
 
 /// The key of a [`Message`]: the publication as T4 names it (so records
@@ -357,6 +470,19 @@ pub struct TraceReport {
     excluded_messages: HashSet<MessageKey>,
     /// A trace can be `Complete` only with a root `Publish` observed (T6).
     roots_required: bool,
+    /// The message each fragment key names, once known.
+    fragments: HashMap<FragmentKey, MessageKey>,
+    /// Fragments waiting for their message's position (at most
+    /// [`MAX_PARKED`]).
+    parked: Vec<Parked>,
+    parked_counts: ParkedCounts,
+    /// Publications whose parking overflowed: their traces that were not
+    /// final then are out of scope.
+    parking_lost: Vec<PublicationKey>,
+    /// Final answers of those traces, kept as they were.
+    pinned: HashMap<[u64; 2], Verdict>,
+    /// Publications with refused network journals: never `Complete`.
+    refused: Vec<PublicationKey>,
     /// Set when [`TraceReport::trace`] first returns a final answer: from
     /// then on the registered journals are frozen, so no later journal can
     /// widen an expected set a final answer was given for.
@@ -377,6 +503,12 @@ impl TraceReport {
             excluded: Vec::new(),
             excluded_messages: HashSet::new(),
             roots_required: false,
+            fragments: HashMap::new(),
+            parked: Vec::new(),
+            parked_counts: ParkedCounts::default(),
+            parking_lost: Vec::new(),
+            pinned: HashMap::new(),
+            refused: Vec::new(),
             frozen: Cell::new(false),
         }
     }
@@ -402,6 +534,7 @@ impl TraceReport {
             clock,
             owner_closed: false,
             boundary: None,
+            gaps: Vec::new(),
             lost: false,
             drained: false,
             first_position: None,
@@ -486,15 +619,99 @@ impl TraceReport {
         )
     }
 
+    /// Registers a network journal (`trace-network.md` §5) of `side` for
+    /// `lane` of `publication`, read through `source` and stamped by
+    /// `clock`: its records are expected from `start` on (the pickup start
+    /// or the image join; from 0 when unknown). Its boundary comes with its
+    /// close, and a receiver's gaps from [`TraceReport::network_gaps`].
+    ///
+    /// # Errors
+    ///
+    /// As [`TraceReport::add_publisher`].
+    pub fn add_network_source(
+        &mut self,
+        source: impl JournalSource + 'static,
+        clock: JournalClock,
+        publication: PublicationKey,
+        side: NetSide,
+        lane: u8,
+        start: Option<u64>,
+    ) -> Result<JournalId, TraceError> {
+        self.add(
+            Box::new(source),
+            clock,
+            Kind::Network {
+                side,
+                lane,
+                start: start.unwrap_or(0),
+            },
+            publication,
+        )
+    }
+
+    /// [`TraceReport::add_network_source`] for an in-process collector.
+    ///
+    /// # Errors
+    ///
+    /// As [`TraceReport::add_publisher`].
+    pub fn add_network(
+        &mut self,
+        collector: TraceCollector,
+        provenance: ClockProvenance,
+        publication: PublicationId,
+        side: NetSide,
+        lane: u8,
+        start: Option<u64>,
+    ) -> Result<JournalId, TraceError> {
+        self.add_network_source(
+            collector,
+            provenance.into(),
+            publication.into(),
+            side,
+            lane,
+            start,
+        )
+    }
+
+    /// Records the sealed gaps `[from, to)` of a network receiver journal's
+    /// image, as far as known: frames in them are not expected. A gap list
+    /// that overflowed passes the gaps it kept; frames past them stay
+    /// expected.
+    pub fn network_gaps(&mut self, journal: JournalId, gaps: &[(u64, u64)]) {
+        if let Some(journal) = self.journals.get_mut(journal.0)
+            && matches!(journal.kind, Kind::Network { .. })
+        {
+            journal.gaps.clear();
+            journal.gaps.extend_from_slice(gaps);
+        }
+    }
+
+    /// Records that `count` network journals of `publication` were refused
+    /// (`trace-network.md` §5): no trace with a message of it is then a
+    /// final `Complete`, since its network observations were never
+    /// recorded.
+    pub fn network_refused(&mut self, publication: PublicationKey, count: u64) {
+        if count > 0 && !self.refused.contains(&publication) {
+            self.refused.push(publication);
+        }
+    }
+
+    /// What became of the parked network fragments.
+    #[must_use]
+    pub fn parked(&self) -> ParkedCounts {
+        self.parked_counts
+    }
+
     /// Records the terminal close of a journal's handle, after its writer
     /// closed and every observation it will make was made. A subscription
     /// passes its final delivery boundary, which decides the messages it is
-    /// expected for; a publication passes `None`. A source that knows its
-    /// terminal state ([`JournalSource::state`]) needs no call.
+    /// expected for, and a network journal its pickup or commit boundary;
+    /// a publication passes `None`. A source that knows its terminal state
+    /// ([`JournalSource::state`]) needs no call.
     pub fn closed(&mut self, journal: JournalId, boundary: Option<u64>) {
         if let Some(journal) = self.journals.get_mut(journal.0) {
             journal.owner_closed = true;
-            if matches!(journal.kind, Kind::Subscriber { .. }) {
+            if matches!(journal.kind, Kind::Subscriber { .. } | Kind::Network { .. }) {
                 journal.boundary = boundary;
             }
         }
@@ -564,7 +781,7 @@ impl TraceReport {
             SourceState::Open => {}
             SourceState::Closed { boundary } => {
                 journal.owner_closed = true;
-                if matches!(journal.kind, Kind::Subscriber { .. }) {
+                if matches!(journal.kind, Kind::Subscriber { .. } | Kind::Network { .. }) {
                     journal.boundary = boundary;
                 }
             }
@@ -574,6 +791,10 @@ impl TraceReport {
             }
         }
         let start = journal.start;
+        // The newest collection time of a network fragment this drain, and
+        // the publications whose fragments found the parking area full.
+        let mut newest: Option<u64> = None;
+        let mut lost_parking: Vec<PublicationKey> = Vec::new();
         loop {
             let item = rebased(journal.source.take(), start);
             if let crate::attribution::Observed::Untracked { trace_id } =
@@ -582,7 +803,9 @@ impl TraceReport {
                 journal.untracked.push(trace_id);
             }
             match item {
-                Collected::Record { record, .. } => {
+                Collected::Record {
+                    record, collected, ..
+                } => {
                     let observed = record.observed;
                     let clock = journal
                         .clocks
@@ -596,17 +819,51 @@ impl TraceReport {
                     {
                         journal.first_position = Some(record.position);
                     }
-                    let message = self
-                        .messages
-                        .entry((
-                            PublicationKey::from(record.publication),
-                            record.lane,
-                            record.position,
-                        ))
-                        .or_insert_with(|| Message {
-                            publication: record.publication,
-                            ..Message::default()
-                        });
+                    let publication = PublicationKey::from(record.publication);
+                    let fragment: FragmentKey = (
+                        publication,
+                        record.lane,
+                        record.ids.trace_id,
+                        record.ids.message_id,
+                    );
+                    // A network record names its own frame: it joins its
+                    // message, or waits for it (§5), never creating one.
+                    if matches!(record.point, Point::SenderPickup | Point::ReceiverCommit)
+                        && let Some(path) = record.network
+                    {
+                        let observation = NetworkObservation {
+                            journal: id,
+                            point: record.point,
+                            position: record.position,
+                            path,
+                            observed,
+                        };
+                        newest = Some(newest.map_or(collected.time, |n| n.max(collected.time)));
+                        let known = self
+                            .fragments
+                            .get(&fragment)
+                            .and_then(|key| self.messages.get_mut(key));
+                        match known {
+                            Some(message) => message.network.push(observation),
+                            None if self.parked.len() < MAX_PARKED => self.parked.push(Parked {
+                                key: fragment,
+                                observation,
+                                collected: collected.time,
+                            }),
+                            None => {
+                                count(&mut self.parked_counts.overflowed);
+                                if !lost_parking.contains(&publication) {
+                                    lost_parking.push(publication);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let key = (publication, record.lane, record.position);
+                    let message = self.messages.entry(key).or_insert_with(|| Message {
+                        publication: record.publication,
+                        ..Message::default()
+                    });
                     message.trace_id = record.ids.trace_id;
                     match record.point {
                         Point::Publish => {
@@ -615,6 +872,19 @@ impl TraceReport {
                         }
                         Point::SubscriberPoll => message.polls.push((id, observed)),
                         _ => {}
+                    }
+                    // Both name the message's block: its fragments join it.
+                    if matches!(record.point, Point::Publish | Point::SubscriberPoll) {
+                        self.fragments.entry(fragment).or_insert(key);
+                        let mut index = 0;
+                        while let Some(parked) = self.parked.get(index) {
+                            if parked.key == fragment {
+                                let parked = self.parked.swap_remove(index);
+                                message.network.push(parked.observation);
+                            } else {
+                                index += 1;
+                            }
+                        }
                     }
                 }
                 Collected::Corrupt { .. } => {}
@@ -632,7 +902,56 @@ impl TraceReport {
             let finals = journal.attributor.close(attempted)?.collect();
             journal.finals = Some(finals);
         }
+        // Fragments of this journal parked longer than `D` before its
+        // newest one: their message is not coming within the window.
+        if let Some(newest) = newest {
+            let span = self.attribution.span;
+            let before = self.parked.len();
+            self.parked.retain(|parked| {
+                parked.observation.journal != id
+                    || newest
+                        .checked_sub(parked.collected)
+                        .is_none_or(|age| age <= span)
+            });
+            let aged = before - self.parked.len();
+            for _ in 0..aged {
+                count(&mut self.parked_counts.aged);
+            }
+        }
+        for publication in lost_parking {
+            self.lose_parking(publication);
+        }
         Ok(())
+    }
+
+    /// The parking area overflowed for `publication`: its traces that are
+    /// final keep their answer, and the others are out of scope from now
+    /// on (§5).
+    fn lose_parking(&mut self, publication: PublicationKey) {
+        if self.parking_lost.contains(&publication) {
+            return;
+        }
+        let mut traces: HashMap<[u64; 2], Vec<(&MessageKey, &Message)>> = HashMap::new();
+        for (key, message) in &self.messages {
+            if message.trace_id != [0, 0] {
+                traces
+                    .entry(message.trace_id)
+                    .or_default()
+                    .push((key, message));
+            }
+        }
+        let pinned: Vec<([u64; 2], Verdict)> = traces
+            .iter()
+            .filter(|(_, messages)| messages.iter().any(|(key, _)| key.0 == publication))
+            .filter_map(
+                |(trace_id, messages)| match self.decide(*trace_id, messages) {
+                    TraceAnswer::Final(verdict) => Some((*trace_id, verdict)),
+                    _ => None,
+                },
+            )
+            .collect();
+        self.pinned.extend(pinned);
+        self.parking_lost.push(publication);
     }
 
     /// What the report can say about the trace `trace_id` now. A final
@@ -660,7 +979,13 @@ impl TraceReport {
 
     /// Whether a message at `position` of `publication` could have an
     /// observation the report cannot see.
-    fn out_of_reach(&self, publication: &PublicationKey, position: u64, message: &Message) -> bool {
+    fn out_of_reach(
+        &self,
+        publication: &PublicationKey,
+        lane: u8,
+        position: u64,
+        message: &Message,
+    ) -> bool {
         if self.excluded.iter().any(|(excluded, through)| {
             excluded == publication && through.is_none_or(|through| position <= through)
         }) {
@@ -672,12 +997,10 @@ impl TraceReport {
             }
             match journal.kind {
                 Kind::Publisher => message.publish.is_none(),
-                Kind::Subscriber { .. } => {
-                    journal.eligible(publication, position) != Some(false)
-                        && !message
-                            .polls
-                            .iter()
-                            .any(|(JournalId(polled), _)| *polled == index)
+                Kind::Subscriber { .. } | Kind::Network { .. } => {
+                    let observed = message.observed_by(index);
+                    journal.eligible(publication, lane, position, observed) != Some(false)
+                        && !observed
                 }
             }
         })
@@ -687,10 +1010,14 @@ impl TraceReport {
         if messages.is_empty() {
             return TraceAnswer::Unknown;
         }
+        if let Some(verdict) = self.pinned.get(&trace_id) {
+            return TraceAnswer::Final(*verdict);
+        }
         if messages.iter().any(|(key, message)| {
-            let (publication, _lane, position) = key;
+            let (publication, lane, position) = key;
             self.excluded_messages.contains(*key)
-                || self.out_of_reach(publication, *position, message)
+                || self.parking_lost.contains(publication)
+                || self.out_of_reach(publication, *lane, *position, message)
         }) {
             return TraceAnswer::OutOfScope;
         }
@@ -702,7 +1029,7 @@ impl TraceReport {
         // even if the journal holds the trace for another message. So does
         // a missing Publish that a lost publisher journal could have held.
         let mut poll_missing = false;
-        for ((publication, _lane, position), message) in messages {
+        for ((publication, lane, position), message) in messages {
             let publication = *publication;
             match message.publish {
                 Some((JournalId(journal), _)) => expected.push(journal),
@@ -716,14 +1043,11 @@ impl TraceReport {
                     poll_missing |= journal.lost && message.publish.is_none();
                     continue;
                 }
-                match journal.eligible(&publication, *position) {
+                let observed = message.observed_by(index);
+                match journal.eligible(&publication, *lane, *position, observed) {
                     Some(true) => {
                         expected.push(index);
-                        let polled = message
-                            .polls
-                            .iter()
-                            .any(|(JournalId(journal), _)| *journal == index);
-                        if journal.terminal() && !polled {
+                        if journal.terminal() && !observed {
                             poll_missing = true;
                         }
                     }
@@ -763,6 +1087,14 @@ impl TraceReport {
         if verdict == Verdict::Complete
             && self.roots_required
             && !messages.iter().any(|(_, message)| message.root)
+        {
+            return TraceAnswer::OutOfScope;
+        }
+        // A refused network journal never recorded its observations (§5).
+        if verdict == Verdict::Complete
+            && messages
+                .iter()
+                .any(|((publication, _, _), _)| self.refused.contains(publication))
         {
             return TraceAnswer::OutOfScope;
         }
@@ -941,6 +1273,13 @@ impl TraceReport {
             }
         }
         Ok(out)
+    }
+}
+
+/// Adds one to a report count; a count that cannot rise keeps its value.
+fn count(value: &mut u64) {
+    if let Some(next) = value.checked_add(1) {
+        *value = next;
     }
 }
 
