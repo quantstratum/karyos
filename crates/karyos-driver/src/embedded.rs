@@ -3133,6 +3133,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         self.serve_images();
         self.announce_existing_images();
+        // The guarded publications the sender refused or returned: their
+        // gates are gone, so their senders leave the close acknowledgement.
+        while let Some(id) = self
+            .net
+            .as_mut()
+            .and_then(crate::net::Network::pop_released_guard)
+        {
+            let _ = self.deregister_guard_sender(id);
+        }
         served
     }
 

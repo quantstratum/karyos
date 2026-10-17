@@ -39,6 +39,15 @@ release may break APIs, wire formats and shared-memory layouts.
   driver fault test, N1 (`net::e2e::netem`), checks over these faults that
   an unreliable channel delivers each message at most once and in order
   and reports every lost one as a local gap.
+- `EmbeddedDriver::add_guarded_network_publication(config, channel,
+  NetworkGuard { guard, messages, rate })`: a network publication whose
+  lane streams are guarded before its sender exists, and whose sender
+  gate is registered with the guard's owner, so it takes part in the
+  close acknowledgement from its first send. It is deregistered when the
+  sender refuses or returns the publication, or when the add fails. A
+  guarded publication needs a spare slot for its walker beyond the
+  sender's reservation (`GuardWalkerUnavailable` otherwise).
+  `add_network_publication` is unchanged.
 - The receiver's controls report a third send outcome. `ReportSlot` and
   `ReportGuard` (formerly `ProbeSlot` and `ProbeGuard`) carry an RTTM
   REQUEST's or a NAK's submission back to the receiver: submitted at the

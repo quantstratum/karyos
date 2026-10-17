@@ -408,3 +408,272 @@ fn a_refused_publication_releases_its_endpoint_and_alias() {
     assert_eq!(driver.net.as_ref().unwrap().stale_queued(), 0);
     assert!(driver.network_publication_state(&again).is_some());
 }
+
+/// A guard named `name`, open at epoch 2.
+fn open_guard(driver: &mut EmbeddedDriver, name: &str) -> crate::guards::GuardHandle {
+    let guard = driver.add_guard(name).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1).unwrap(), 2);
+    guard
+}
+
+/// A guarded network publication registers its sender gate with the
+/// guard's owner: a close becomes effective at it once the sender applied
+/// it, and its removal deregisters it.
+#[test]
+fn a_guarded_network_publication_takes_part_in_the_close_acknowledgement() {
+    use karyos_sys::guard::Closed;
+
+    use crate::net::NetworkGuard;
+
+    let mut driver = driver();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    // Spare slots for the sender's reservation and the guard's walker.
+    let mut config = aggregate(10, 2);
+    config.stream.buffer.spare_slots = 4;
+    let handle = driver
+        .add_guarded_network_publication(
+            config,
+            &channel(destination),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    until(&mut driver, |driver| {
+        driver.close_guard_ack(guard, epoch).unwrap().effective() == Some(true)
+    });
+    assert_eq!(
+        driver.close_guard_ack(guard, epoch).unwrap().senders.len(),
+        1
+    );
+    // Removed: its gate leaves the acknowledgement.
+    driver.remove_aggregate(&handle).unwrap();
+    until(&mut driver, |driver| {
+        driver
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .senders
+            .is_empty()
+    });
+}
+
+/// A guard the lanes refuse leaves nothing configured: no aggregate, no
+/// guard sender.
+#[test]
+fn a_refused_guard_leaves_nothing() {
+    use karyos_sys::guard::Closed;
+
+    use crate::net::NetworkGuard;
+
+    let mut driver = driver();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let refused = driver.add_guarded_network_publication(
+        aggregate(10, 1),
+        &channel(destination.clone()),
+        NetworkGuard {
+            guard,
+            messages: 0,
+            rate: None,
+        },
+    );
+    assert!(matches!(refused, Err(DriverError::InvalidConfig)));
+    // The key is free again once the rolled-back streams are freed, and no
+    // sender was registered.
+    driver.free_retired_streams();
+    let handle = driver
+        .add_network_publication(aggregate(10, 1), &channel(destination))
+        .unwrap();
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    assert!(
+        driver
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .senders
+            .is_empty()
+    );
+    driver.remove_aggregate(&handle).unwrap();
+}
+
+/// A guarded network publication needs a spare slot for its walker beyond
+/// the sender's reservation: short of one, it says so.
+#[test]
+fn a_guarded_publication_short_of_spare_slots_says_so() {
+    use crate::net::NetworkGuard;
+
+    let mut driver = driver();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let refused = driver.add_guarded_network_publication(
+        aggregate(10, 1),
+        &channel(destination),
+        NetworkGuard {
+            guard,
+            messages: 2,
+            rate: None,
+        },
+    );
+    assert!(matches!(
+        refused,
+        Err(DriverError::GuardWalkerUnavailable { .. })
+    ));
+}
+
+/// A guarded publication refused after its guard sender was registered
+/// (here, a full publication table) deregisters it: nothing waits on it.
+#[test]
+fn a_guarded_publication_refused_late_deregisters_its_sender() {
+    use karyos_sys::guard::Closed;
+
+    use crate::net::NetworkGuard;
+
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.agents.publications = 1;
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let first = driver
+        .add_network_publication(aggregate(10, 1), &channel(destination.clone()))
+        .unwrap();
+    let mut config = aggregate(11, 1);
+    config.stream.buffer.spare_slots = 4;
+    assert_eq!(
+        driver
+            .add_guarded_network_publication(
+                config,
+                &channel(destination),
+                NetworkGuard {
+                    guard,
+                    messages: 2,
+                    rate: None,
+                },
+            )
+            .map(|_| ()),
+        Err(DriverError::NetworkPublicationsFull)
+    );
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    assert!(
+        driver
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .senders
+            .is_empty()
+    );
+    driver.remove_aggregate(&first).unwrap();
+}
+
+/// A guarded publication the sender refuses (its table is full) releases
+/// its guard sender with its endpoint: nothing waits on it.
+#[test]
+fn a_guarded_publication_the_sender_refuses_releases_its_guard_sender() {
+    use karyos_protocol::network::{Alias, Identity, TermParams};
+    use karyos_sys::guard::Closed;
+
+    use crate::net::NetworkGuard;
+
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.agents.publications = 1;
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    // The sender's only entry, which the conductor does not track.
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let foreign = Alias {
+        session_id: 99,
+        stream_id: 99,
+    };
+    let endpoint = crate::agents::EndpointId(999);
+    let (outbound, _log) = crate::agents::data::testing::outbound(
+        endpoint,
+        foreign,
+        socket.local_addr().unwrap(),
+        term,
+        1,
+        false,
+    );
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|reply| crate::agents::AgentCommand::AddPublication {
+            reply,
+            publication: crate::sessions::send::Publication {
+                endpoint,
+                alias: foreign,
+                identity: Identity {
+                    driver_id: [0, 0],
+                    registration_id: 999,
+                    incarnation: 1,
+                },
+                term,
+                lane_count: 1,
+            },
+            outbound,
+            guard: None,
+        })
+        .unwrap();
+    let mut config = aggregate(11, 1);
+    config.stream.buffer.spare_slots = 4;
+    let refused = driver
+        .add_guarded_network_publication(
+            config,
+            &channel(destination),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&refused) == Some(NetworkPublicationState::Refused)
+    });
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    assert!(
+        driver
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .senders
+            .is_empty()
+    );
+}
