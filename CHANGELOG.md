@@ -42,8 +42,10 @@ release may break APIs, wire formats and shared-memory layouts.
   RP-10). A lane's head is selected once, submitted on every route that
   holds it at its front, and debited once; `catch_up` sends the copies of
   routes that fell behind, debiting nothing, and reports a failure in
-  `CatchUp`. `RouteCounters` count skipped, late and uncancelled copies
-  per route. `StageError::OutOfOrder` refuses a copy not above its route's
+  `CatchUp`. With several routes a failure stops only its route, kept
+  for the control path (`take_failures`), and a route without a TX half
+  this call is out for the call. `RouteCounters` count skipped, late and
+  uncancelled copies per route. `StageError::OutOfOrder` refuses a copy not above its route's
   last one.
 - A seal gate on the skip policy (conflated-network-images.md (b)):
   `SkipPolicy::duty_gated` and `SkipPolicy::range_unavailable_gated` ask a
