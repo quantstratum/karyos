@@ -16,9 +16,10 @@
 //! Per lane the highest position submitted on any route is its sent
 //! frontier (`sent_high`, monotonic): it moves the reader's registered
 //! position and the membership's sent bound exactly as on one path. Repair
-//! stays on the founding route (RP-11 is rp-w6). A guard is refused on a
-//! routed publication ([`GateError::Routed`]) until every route's exposure
-//! passes the guard gate (rp-w4b2), so no path can bypass a close.
+//! stays on the founding route (RP-11 is rp-w6). A guarded publication's
+//! gate passes every copy's exposure on every route ([`GuardGate`], module
+//! docs: Routes), so no path can bypass a close; a close cancels the
+//! aborted lanes' copies on every route.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -36,7 +37,8 @@ use karyos_protocol::lanes::drr::{Budget, DrrConfig};
 use karyos_sys::log_buffer::{ReadError, ReadOrigin, ReadOutcome};
 
 use super::super::{AgentError, AgentKind, EndpointId, Half};
-use super::{Limit, Outbound, OutboundError, STAGED_PER_LANE, align_frame};
+use super::{Limit, Outbound, OutboundError, STAGED_PER_LANE, align_frame, messages_started};
+use crate::guard_gate::{GateHead, GuardGate};
 
 /// One path of a routed publication.
 #[derive(Debug)]
@@ -186,7 +188,6 @@ impl Routed {
     }
 
     /// The routed sender, for diagnostics and tests.
-    #[cfg(test)]
     pub(super) fn sender(&self) -> &RoutedLaneSender {
         &self.sender
     }
@@ -210,17 +211,21 @@ impl<O: SocketOps> Routes for HalfRoutes<'_, O> {
     }
 }
 
-/// The routed data gate: every candidate is permitted (a routed
-/// publication has no guard yet), and the lanes are held while a required
-/// loss is unresolved. It records, per lane, the highest position a
-/// submitted copy reached.
+/// The routed data gate: a guarded publication's gate decides every
+/// exposure on every route; an unguarded one permits every candidate. The
+/// lanes are held while a required loss is unresolved. It records, per
+/// lane, the highest position a submitted copy reached.
 struct RoutedGate<'a> {
     tracks: &'a mut [RoutedTrack],
     held: bool,
+    guard: Option<&'a mut GuardGate>,
 }
 
 impl SenderGate for RoutedGate<'_> {
     fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            return guard.check(candidate);
+        }
         match u16::try_from(candidate.tokens.len())
             .ok()
             .and_then(NonZeroU16::new)
@@ -232,11 +237,31 @@ impl SenderGate for RoutedGate<'_> {
 }
 
 impl LaneGate for RoutedGate<'_> {
-    fn admits(&mut self, _lane: usize) -> bool {
-        !self.held
+    fn admits(&mut self, lane: usize) -> bool {
+        // The guard is asked even while held, so a close is seen at once.
+        let guarded = self
+            .guard
+            .as_deref_mut()
+            .is_none_or(|guard| guard.admits(lane));
+        guarded && !self.held
+    }
+
+    fn aborting(&self, lane: usize) -> bool {
+        self.guard
+            .as_deref()
+            .is_some_and(|guard| guard.aborting(lane))
+    }
+
+    fn flushing(&mut self, lane: usize) {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.flushing(lane);
+        }
     }
 
     fn left(&mut self, lane: usize, staged: Staged, how: Left) {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.left(lane, staged, how);
+        }
         let Some(track) = self.tracks.get_mut(lane) else {
             return;
         };
@@ -336,6 +361,12 @@ impl Outbound {
             return false;
         };
         let mut open = false;
+        // The routes that can send, as this pass starts: opened and not
+        // waiting for a reset.
+        let mut live = [false; MAX_ROUTES];
+        for (live, route) in live.iter_mut().zip(&routed.routes) {
+            *live = route.opened.is_some() && !route.needs_reset;
+        }
         for (index, slot) in routed.routes.iter_mut().enumerate() {
             let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
                 Half::Tx(tx) if *held == slot.endpoint => Some(&mut **tx),
@@ -387,8 +418,11 @@ impl Outbound {
             // or below its debited position go as catch-up, debiting nothing.
             let reopened = slot.opened.is_some();
             for (lane, reader) in self.readers.iter_mut().enumerate() {
+                // Only a route that can still send them holds copies: one
+                // resetting or never opened will drop its own (#331 review).
                 let others = (0..MAX_ROUTES)
                     .filter(|route| *route != index)
+                    .filter(|route| live.get(*route).is_some_and(|live| *live))
                     .filter_map(|route| routed.sender.pending(lane, route))
                     .any(|held| held > 0);
                 if reopened && self.reliable && !others {
@@ -414,7 +448,12 @@ impl Outbound {
                 repair.reopened(queue);
             }
             for (lane, queue) in slot.queues.iter().enumerate() {
-                routed.sender.reopen(lane, index, *queue);
+                // A guarded lane reopens through its gate, which refunds what
+                // only this route held.
+                match self.guard.as_deref_mut() {
+                    Some(guard) => guard.reopen_route(&mut routed.sender, lane, index, *queue),
+                    None => routed.sender.reopen(lane, index, *queue),
+                }
                 if let Some(track) = routed.tracks.get_mut(lane) {
                     if let Some(copies) = track.staged.get_mut(index) {
                         copies.clear();
@@ -449,6 +488,7 @@ impl Outbound {
             next_token,
             max_frame,
             mtu,
+            guard,
             ..
         } = self
         else {
@@ -528,6 +568,12 @@ impl Outbound {
             else {
                 break;
             };
+            // The messages it starts: a guard's message charge.
+            let messages = if record || guard.is_none() {
+                0
+            } else {
+                messages_started(bytes)
+            };
             let mut copies = 0u32;
             for (route, frame) in frames.iter_mut().enumerate().take(routed.routes.len()) {
                 // A route without a claimed frame skips this datagram (RP-8).
@@ -558,7 +604,26 @@ impl Outbound {
                     },
                     position: from,
                 };
-                if routed.sender.staged(lane, route, copy).is_err() {
+                // A guarded lane stages through its gate, which records the
+                // copy in step with the sender.
+                let refused = match guard.as_deref_mut() {
+                    Some(guard) => guard
+                        .stage_copy(
+                            &mut routed.sender,
+                            lane,
+                            route,
+                            copy,
+                            GateHead {
+                                token,
+                                length: u64::from(len16),
+                                messages,
+                                end: next,
+                            },
+                        )
+                        .is_err(),
+                    None => routed.sender.staged(lane, route, copy).is_err(),
+                };
+                if refused {
                     // Committed to the queue but not recorded: the route's
                     // records are out of step, and only its reset returns the
                     // item. It takes nothing more until then.
@@ -613,6 +678,8 @@ impl Outbound {
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         if !self.open_routes(halves) {
+            // No route this cycle, but a guard close still applies.
+            self.guard_tick(now);
             return Ok(0);
         }
         let (limits, held) = self.limits(now);
@@ -622,6 +689,9 @@ impl Outbound {
             work = work
                 .checked_add(self.stage_routes(halves, lane, limit)?)
                 .ok_or(overflow.clone())?;
+        }
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.set_now(now);
         }
         let Some(routed) = self.routed.as_deref_mut() else {
             return Ok(work);
@@ -634,17 +704,46 @@ impl Outbound {
         let mut gate = RoutedGate {
             tracks: &mut routed.tracks,
             held,
+            guard: self.guard.as_deref_mut(),
         };
         let report = routed.sender.serve(&mut lent, &mut gate, budget);
         let caught = routed.sender.catch_up(&mut lent, &mut gate);
+        // Once a cycle, even with nothing flushed, so a close becomes
+        // effective with no pending traffic (DN 3.1 step 10); then the
+        // aborted lanes' copies come back on every route.
+        if let Some(guard) = gate.guard.as_deref_mut() {
+            guard.between_gates();
+        }
+        let mut cancelled = false;
+        for lane in 0..self.readers.len() {
+            let pending = (0..MAX_ROUTES)
+                .filter_map(|route| routed.sender.pending(lane, route))
+                .any(|held| held > 0);
+            if !gate.aborting(lane) || !pending {
+                continue;
+            }
+            match routed.sender.cancel(&mut lent, lane, &mut gate) {
+                Ok(()) => cancelled = true,
+                Err(_) => {
+                    cancelled = true;
+                    self.counters.bump(|c| &mut c.queue_failures, 1);
+                }
+            }
+        }
+        if cancelled && let Some(guard) = gate.guard.as_deref_mut() {
+            guard.between_gates();
+        }
         work = work.checked_add(caught.submitted).ok_or(overflow.clone())?;
         // The control path per route (lane-sender.md, outcome table): a
         // failure resets only its route's endpoint; a faulted queue is
         // retried, keeping its copies; an unknown copy waits for the reset.
         let mut failed = routed.sender.take_failures();
-        if let Some(first) = failed.first_mut() {
-            // One route: its failure stopped the call, as on one path.
-            *first = first.or(report.failure).or(caught.failure);
+        // A failure of the call itself is one route's when there is one
+        // route, or the whole publication's (a DRR error): every route
+        // resets, never only the founding one (#331 review).
+        let whole = report.failure.or(caught.failure);
+        for slot in failed.iter_mut().take(routed.routes.len()) {
+            *slot = slot.or(whole);
         }
         for (index, slot) in routed.routes.iter_mut().enumerate() {
             if failed.get(index).copied().flatten().is_some() {

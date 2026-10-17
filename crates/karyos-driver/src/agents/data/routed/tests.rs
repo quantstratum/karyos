@@ -24,7 +24,6 @@ use karyos_sys::log_buffer::AppendOptions;
 use super::super::super::{EndpointId, Half};
 use super::super::testing::{TestLog, outbound_routed};
 use super::super::{GuardSpec, Outbound};
-use crate::guard_gate::GateError;
 
 const ALIAS: Alias = Alias {
     session_id: 5,
@@ -162,27 +161,6 @@ const BUDGET: Budget = Budget {
     bytes: 1 << 20,
 };
 
-/// A routed publication refuses a guard until rp-w4b2 gates every
-/// route's exposure (ACS 16423): no path can bypass a close.
-#[test]
-fn a_guard_on_a_routed_publication_is_refused() {
-    use karyos_sys::applied_epoch::AppliedEpoch;
-    use karyos_sys::sync::Ordering;
-
-    let (mut outbound, _log) = routed(0);
-    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
-    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
-    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
-    let spec = GuardSpec {
-        word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
-        cell: Arc::new(AppliedEpoch::new()),
-        epoch: 2,
-        rate: None,
-    };
-    assert_eq!(outbound.guard(spec, 0), Err(GateError::Routed));
-    assert!(outbound.guard_gate().is_none());
-}
-
 /// Each committed datagram goes out once on each path, in order; the
 /// lane is debited once per datagram and the sent frontier is the
 /// highest position submitted.
@@ -272,6 +250,55 @@ fn a_missing_path_does_not_stop_the_other() {
     let sender = outbound.routed_sender().unwrap();
     assert_eq!(sender.counters(1).unwrap().skipped, 2);
     assert_eq!(outbound.readers()[0].sent_position(), 2 * FRAME);
+}
+
+/// rp-w4b2a: a guard on a routed publication gates every path. A close
+/// that lands while path A sends stops path B's copy, and the aborted
+/// copies come back on every path, so nothing stays in flight.
+#[test]
+fn a_guard_close_stops_every_path() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (a, observer_a, seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 0);
+    sent(&observer_a, 16);
+    sent(&observer_b, 16);
+    let mut halves = vec![a, b];
+    let (mut outbound, _log) = routed(1);
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    let spec = GuardSpec {
+        word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+        cell: Arc::clone(&cell),
+        epoch: 2,
+        rate: None,
+    };
+    outbound.guard(spec, 0).unwrap();
+    // The close lands as path A's socket sends.
+    let closing = Arc::clone(&word);
+    observer_a.set_send_hook(Box::new(move |_, _| {
+        let _ = karyos_sys::guard::close(&closing.words()[0]);
+    }));
+    for _ in 0..4 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    assert!(
+        seen_a.lock().unwrap().is_empty(),
+        "the hook replaced the recorder"
+    );
+    assert_eq!(observer_a.send_calls(), 1);
+    assert!(seen_b.lock().unwrap().is_empty());
+    let applied = cell.try_read().unwrap();
+    assert_eq!(applied.positions[0], FRAME);
+    assert_eq!(applied.in_flight, 0);
+    let sender = outbound.routed_sender().unwrap();
+    assert_eq!(
+        (sender.pending(0, 0), sender.pending(0, 1)),
+        (Some(0), Some(0))
+    );
 }
 
 /// #321 review P1: with path B absent and path A blocked, no frame is read
@@ -496,4 +523,95 @@ fn routes_need_their_own_endpoints() {
     assert_eq!(super::check_routes(&[]), Err(OutboundError::Routes));
     let five: Vec<_> = (1..=5).map(|id| at(id, 1)).collect();
     assert_eq!(super::check_routes(&five), Err(OutboundError::Routes));
+}
+
+/// #331 review (M4): a route waiting for its reset takes no new copies;
+/// the datagram is skipped there and goes on the other route.
+#[test]
+fn a_route_waiting_for_its_reset_takes_no_copy() {
+    let (a, observer_a, seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 16);
+    sent(&observer_b, 16);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(1);
+    // Opened on both, then route B waits for its reset.
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    assert_eq!(seen_a.lock().unwrap().len(), 1);
+    outbound.routed.as_deref_mut().unwrap().routes[1].needs_reset = true;
+    let skipped = outbound
+        .routed_sender()
+        .unwrap()
+        .counters(1)
+        .unwrap()
+        .skipped;
+    let _ = log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    let sender = outbound.routed_sender().unwrap();
+    assert_eq!(sender.pending(0, 1), Some(0));
+    assert_eq!(sender.counters(1).unwrap().skipped, skipped + 1);
+    assert_eq!(seen_a.lock().unwrap().len(), 2);
+}
+
+/// #331 review (M6): a copy committed but refused by the sender's record
+/// (here a datagram read again below the route's last copy) marks its route
+/// for a reset, which then takes nothing more.
+#[test]
+fn a_refused_copy_marks_its_route_for_a_reset() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, _observer_b, _seen_b, rx_b) = path_rx(2, 4);
+    sent(&observer_a, 16);
+    let mut halves = vec![a, b];
+    let routes = [
+        (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
+        (EndpointId(2), SocketAddr::from(([127, 0, 0, 2], 41_000))),
+    ];
+    let (mut outbound, mut log) = outbound_routed(&routes, ALIAS, TERM, 1, true);
+    let _ = log.publications[0]
+        .append(&[0; 1000], AppendOptions::default())
+        .unwrap();
+    // A sends it; B blocks and keeps its copy at position 0.
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(1));
+    assert!(!outbound.needs_reset());
+    // The lane reads position 0 again: B's copy of it is out of order.
+    outbound.readers_mut()[0].rewind().unwrap();
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    assert_eq!(outbound.counters().staged_refused, 1);
+    assert!(outbound.routed.as_deref().unwrap().routes[1].needs_reset);
+    assert!(outbound.needs_reset());
+    // The reset returns the unrecorded item.
+    let _rx_b = reset(&mut halves, 1, rx_b);
+}
+
+/// #331 review P3-3: a route waiting for its reset holds no copies that
+/// count against a rewind: they will be dropped. A reset of the other route
+/// then rewinds the reliable lane, as if it were alone.
+#[test]
+fn a_resetting_routes_copies_do_not_block_a_rewind() {
+    let (a, observer_a, seen_a, rx_a) = path_rx(1, 2);
+    let (b, _observer_b, _seen_b, rx_b) = path_rx(2, 8);
+    let mut halves = vec![a, b];
+    let routes = [
+        (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
+        (EndpointId(2), SocketAddr::from(([127, 0, 0, 2], 41_000))),
+    ];
+    let (mut outbound, mut log) = outbound_routed(&routes, ALIAS, TERM, 1, true);
+    let _ = log.publications[0]
+        .append(&[0; 1000], AppendOptions::default())
+        .unwrap();
+    // Staged on both; both block. Then B waits for its reset.
+    for _ in 0..2 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    outbound.routed.as_deref_mut().unwrap().routes[1].needs_reset = true;
+    let _rx_a = reset(&mut halves, 0, rx_a);
+    sent(&observer_a, 32);
+    for _ in 0..4 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    assert_eq!(seen_a.lock().unwrap().len(), 1, "A sends it again");
+    let _rx_b = reset(&mut halves, 1, rx_b);
 }

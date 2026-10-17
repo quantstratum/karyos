@@ -18,7 +18,10 @@ fn smoke(config: Config) -> Config {
     // A heap image install zeroes every term: four 64 MiB lanes take about
     // a quarter of a second each, so the smoke run installs 1 MiB terms
     // at most; the bench binary measures the large terms.
-    let term_length = if config.workload == Workload::ImageInstall {
+    let term_length = if matches!(
+        config.workload,
+        Workload::ImageInstall | Workload::ImageFirstFill
+    ) {
         config.term_length.min(1 << 20)
     } else {
         config.term_length
@@ -302,7 +305,8 @@ fn runs_with_latency(config: Config) {
 /// The network-term workloads run to completion on every backing they
 /// take here (network-shared-terms.md, N-5): staging single and
 /// fragmented messages, NAK ranges that cross terms, the receive owner's
-/// write, and image installs of one and four lanes.
+/// write, image installs of one and four lanes, and first fills of a
+/// fresh image's term.
 #[test]
 fn network_term_workloads_run_on_every_backing() {
     for backing in backings_here(Workload::SenderRead) {
@@ -342,6 +346,10 @@ fn network_term_workloads_run_on_every_backing() {
                 ..tiny(Workload::ImageInstall, backing)
             });
         }
+        runs_with_latency(Config {
+            message: 1376,
+            ..tiny(Workload::ImageFirstFill, backing)
+        });
     }
 }
 
@@ -388,6 +396,7 @@ fn unsupported_backings_are_refused() {
         (Workload::OfferPoll, Backing::Shared),
         (Workload::PingPong, Backing::Region),
         (Workload::ImageInstall, Backing::Shared),
+        (Workload::ImageFirstFill, Backing::Shared),
         (Workload::IpcPingPong, Backing::Heap),
     ] {
         let config = tiny(workload, backing);
@@ -404,6 +413,7 @@ fn unsupported_backings_are_refused() {
             Workload::SenderNak,
             Workload::Receive,
             Workload::ImageInstall,
+            Workload::ImageFirstFill,
         ] {
             let config = tiny(workload, Backing::Region);
             assert_eq!(
@@ -418,6 +428,12 @@ fn unsupported_backings_are_refused() {
         message: 2048,
         nak_frames: Some(1),
         ..tiny(Workload::SenderNak, Backing::Heap)
+    };
+    assert!(run(fragmented).is_err());
+    // A first fill takes only messages of one frame.
+    let fragmented = Config {
+        message: 2048,
+        ..tiny(Workload::ImageFirstFill, Backing::Heap)
     };
     assert!(run(fragmented).is_err());
     // Each knob is required where it applies.
