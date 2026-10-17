@@ -130,6 +130,14 @@ fn a_udp_publication_reaches_a_udp_subscription() {
             StreamId::new(7),
         )
         .unwrap();
+    // The image joins at the position it is attached at: messages offered
+    // before it is attached are not delivered to it. A network
+    // publication counts its sender as a subscriber, so offers are
+    // accepted before any receiver attaches.
+    until(&mut [&mut subscriber, &mut publisher], || {
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        reading.image_count() == 1
+    });
     let (mut sent, mut seen) = (0u32, 0u32);
     let start = Instant::now();
     while seen < 64 {
