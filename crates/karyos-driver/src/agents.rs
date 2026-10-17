@@ -446,6 +446,9 @@ pub enum AgentCommand<O: SocketOps> {
         /// Its data path: one reader per lane, the channel destination and
         /// the lane quanta, built by the conductor ([`data::Outbound::new`]).
         outbound: Box<data::Outbound>,
+        /// A guarded publication's guard ([`data::Outbound::guard`]);
+        /// `None` for an unguarded one.
+        guard: Option<data::GuardSpec>,
     },
     /// Set the agent's network trace hook, or remove it with `None`
     /// (P2.12 step 3). Journals still open close through the previous hook

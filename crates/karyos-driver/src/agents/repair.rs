@@ -289,18 +289,21 @@ impl RepairPath {
 
     /// Serves its pending jobs on `tx` within `budget`, which it spends
     /// (bytes and word 0 loads), reading `readers` below each lane's NAK
-    /// bound in `sent_high`, at `now`. Returns the DRR report.
+    /// bound in `sent_high`, at `now`. A lane in `closed` (its guard closed:
+    /// nothing more leaves the sender, GC-6) reads nothing: its jobs are
+    /// dropped, with no ERR. Returns the DRR report.
     pub fn serve<O: SocketOps>(
         &mut self,
         tx: &mut SocketsTx<O>,
         readers: &mut [LaneReader],
-        sent_high: &[u64],
+        (sent_high, closed): (&[u64], &[bool]),
         budget: &mut RepairBudget,
         now: u64,
     ) -> Report {
         let mut read = ReadView {
             readers,
             sent_high,
+            closed,
             scratch: &self.scratch,
             loads: budget.loads,
         };
@@ -344,6 +347,8 @@ impl RepairPath {
 struct ReadView<'a> {
     readers: &'a mut [LaneReader],
     sent_high: &'a [u64],
+    /// Lanes whose guard closed.
+    closed: &'a [bool],
     scratch: &'a RefCell<Scratch>,
     /// Word 0 loads left in the cycle.
     loads: u32,
@@ -352,6 +357,9 @@ struct ReadView<'a> {
 impl RepairRead for ReadView<'_> {
     fn head(&mut self, lane: u8, from: u64) -> Result<Head, RepairReadError> {
         let index = usize::from(lane);
+        if self.closed.get(index).copied().unwrap_or(false) {
+            return Err(RepairReadError::Retry);
+        }
         let (Some(reader), Some(bound)) = (
             self.readers.get_mut(index),
             self.sent_high.get(index).copied(),

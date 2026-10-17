@@ -13,10 +13,19 @@
 //! bound receiver consumed (SPEC §4 flow control), on an unreliable one to
 //! what was submitted.
 //!
-//! - **Gate.** Every flush passes `DataGate`, which permits every
-//!   candidate until the guard gate of phase 7. It is private to this
-//!   module, and only [`Outbound::serve`] uses it; control traffic has its
-//!   own gate in [`super::control`].
+//! - **Gate.** Every flush passes `DataGate`, private to this module, and
+//!   only [`Outbound::serve`] uses it; control traffic has its own gate in
+//!   [`super::control`]. An unguarded publication's gate permits every
+//!   candidate. A guarded one ([`Outbound::guard`]) runs its guard's
+//!   [`GuardGate`] (G-e2): the probe and the exposure both ask it, every
+//!   head is staged and reopened through it, its between gates step runs
+//!   once a cycle, and it publishes the applied epoch for the close
+//!   acknowledgement. A close is local on sockets (guards-and-abort.md,
+//!   "Trusted sockets in Phase 2", O-11 and GC-6): nothing more leaves the
+//!   sender, first sends and repairs alike; no abort is sent, and the
+//!   receivers' images end at their liveness timeout. There is no channel
+//!   option asking for a remote abort; one would be refused fail-closed
+//!   until decision 5.
 //! - **Allocation.** The lane sender and the per-lane records are
 //!   allocated when the publication is added. Queues and routes are opened
 //!   on the first cycle of an endpoint epoch and handed to the lane sender
@@ -65,6 +74,7 @@ use karyos_sys::sizing::align_frame;
 use super::net_trace::{TracedLane, traced_frames, traced_frames_per_datagram};
 use super::repair::{NakOutcome, RepairConfig, RepairConfigError, RepairPath};
 use super::{AgentError, AgentKind, EndpointId};
+use crate::guard_gate::{GateError, GateHead, GateLane, GuardGate};
 use crate::membership::{Admission, Limit, Membership};
 use crate::repair::admission::Requester;
 use crate::repair::scheduler::RepairBudget;
@@ -86,10 +96,15 @@ struct DataGate<'a> {
     lanes: &'a mut [LaneTrack],
     /// A required loss is unresolved: staged heads stay queued (MC-7).
     held: bool,
+    /// A guarded publication's gate, which decides every exposure.
+    guard: Option<&'a mut GuardGate>,
 }
 
 impl SenderGate for DataGate<'_> {
     fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            return guard.check(candidate);
+        }
         match u16::try_from(candidate.tokens.len())
             .ok()
             .and_then(NonZeroU16::new)
@@ -101,11 +116,33 @@ impl SenderGate for DataGate<'_> {
 }
 
 impl LaneGate for DataGate<'_> {
-    fn admits(&mut self, _lane: usize) -> bool {
-        !self.held
+    fn admits(&mut self, lane: usize) -> bool {
+        // The guard is asked even while held, so a close is seen at once.
+        let guarded = self
+            .guard
+            .as_deref_mut()
+            .is_none_or(|guard| guard.admits(lane));
+        guarded && !self.held
+    }
+
+    // Read by a gate that wraps this one (a timed gate, G7); the lane
+    // sender itself does not ask.
+    fn aborting(&self, lane: usize) -> bool {
+        self.guard
+            .as_deref()
+            .is_some_and(|guard| guard.aborting(lane))
+    }
+
+    fn flushing(&mut self, lane: usize) {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.flushing(lane);
+        }
     }
 
     fn left(&mut self, lane: usize, staged: Staged, how: Left) {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.left(lane, staged, how);
+        }
         let Some(track) = self.lanes.get_mut(lane) else {
             return;
         };
@@ -217,6 +254,9 @@ pub struct Outbound {
     drr: DrrConfig,
     /// A reliable publication's repair path, once enabled.
     repair: Option<Box<RepairPath>>,
+    /// A guarded publication's gate (guards-and-abort.md; local close only
+    /// on sockets, O-11 and GC-6).
+    guard: Option<Box<GuardGate>>,
     sender: LaneSender,
     queues: Vec<TxQueueId>,
     tracks: Vec<LaneTrack>,
@@ -236,6 +276,71 @@ pub struct Outbound {
     /// The traced frames of the datagram being staged (allocated at
     /// construction, for the most one datagram can hold).
     picked: Vec<(TraceExtension, u64)>,
+}
+
+/// The guard of a guarded publication, as the conductor hands it to the
+/// sender agent: its guard word, the applied-epoch cell registered with
+/// the guard's owner (`EmbeddedDriver::register_guard_sender`), the open
+/// epoch its incarnation was admitted under and its rate policy.
+#[derive(Clone)]
+pub struct GuardSpec {
+    /// The guard word (word 0).
+    pub word: Arc<dyn karyos_client::SharedWords>,
+    /// The cell this publication's gate alone writes.
+    pub cell: Arc<karyos_sys::applied_epoch::AppliedEpoch>,
+    /// The open epoch.
+    pub epoch: u64,
+    /// The publication's rate policy.
+    pub rate: Option<karyos_sys::rate_limit::RatePolicy>,
+}
+
+impl std::fmt::Debug for GuardSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardSpec")
+            .field("epoch", &self.epoch)
+            .field("rate", &self.rate)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The messages a datagram of whole frames starts: its DATA frames with the
+/// begin flag. A malformed header ends the count (the read validated every
+/// frame, so it does not happen).
+fn messages_started(bytes: &[u8]) -> u64 {
+    use karyos_sys::frame::{FrameType, Word0};
+
+    let mut count = 0u64;
+    let mut at = 0usize;
+    while let Some(raw) = bytes
+        .get(at..)
+        .and_then(|rest| rest.get(..8))
+        .and_then(|word| <[u8; 8]>::try_from(word).ok())
+    {
+        let Ok(word) = Word0::unpack(u64::from_le_bytes(raw)) else {
+            break;
+        };
+        let Some(length) = u32::try_from(word.frame_length())
+            .ok()
+            .and_then(|length| align_frame(length).ok())
+            .and_then(|aligned| usize::try_from(aligned).ok())
+            .filter(|aligned| *aligned >= 32)
+        else {
+            break;
+        };
+        let data = FrameType::try_from_code(word.frame_type_code()) == Ok(FrameType::Data);
+        if data && word.flags().begin() {
+            // At most one per 32 bytes of the datagram.
+            let Some(next) = count.checked_add(1) else {
+                break;
+            };
+            count = next;
+        }
+        let Some(next) = at.checked_add(length) else {
+            break;
+        };
+        at = next;
+    }
+    count
 }
 
 /// Why an outbound publication was refused.
@@ -301,6 +406,7 @@ impl Outbound {
             membership: None,
             drr,
             repair: None,
+            guard: None,
             sender,
             queues,
             tracks,
@@ -398,6 +504,53 @@ impl Outbound {
         Ok(())
     }
 
+    /// Guards it with `spec` at `now` (control path, allocates): from then
+    /// on its guard's gate decides every exposure, and a close stops every
+    /// submission, first sends and repairs alike. Nothing is sent to the
+    /// receivers: on sockets a close is local (guards-and-abort.md,
+    /// "Trusted sockets in Phase 2", O-11 and GC-6).
+    ///
+    /// # Errors
+    ///
+    /// [`GateError`].
+    pub fn guard(&mut self, spec: GuardSpec, now: u64) -> Result<(), GateError> {
+        let lanes: Vec<GateLane> = (0..self.readers.len())
+            .filter_map(|lane| u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()))
+            .map(|lane| GateLane {
+                lane,
+                epoch: spec.epoch,
+                bound: usize::from(STAGED_PER_LANE),
+            })
+            .collect();
+        let gate = GuardGate::new(
+            spec.word,
+            spec.cell,
+            &lanes,
+            &self.sender,
+            spec.rate,
+            self.max_frame,
+            now,
+        )?;
+        self.guard = Some(Box::new(gate));
+        Ok(())
+    }
+
+    /// The guard's between gates step at `now`, for a publication not
+    /// served this cycle (not established yet): a close applies and its
+    /// applied epoch is published all the same.
+    pub fn guard_tick(&mut self, now: u64) {
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.set_now(now);
+            guard.between_gates();
+        }
+    }
+
+    /// Its guard's gate, if guarded.
+    #[must_use]
+    pub fn guard_gate(&self) -> Option<&GuardGate> {
+        self.guard.as_deref()
+    }
+
     /// Its repair path, if enabled.
     #[must_use]
     pub fn repair(&self) -> Option<&RepairPath> {
@@ -440,10 +593,17 @@ impl Outbound {
         for (high, track) in sent_high.iter_mut().zip(&self.tracks) {
             *high = track.high;
         }
+        // A guard's close stops repairs too: they are submissions (GC-6).
+        let mut closed = [false; MAX_LANES];
+        if let Some(guard) = self.guard.as_deref() {
+            for (lane, closed) in closed.iter_mut().enumerate() {
+                *closed = guard.aborting(lane);
+            }
+        }
         let Some(repair) = self.repair.as_deref_mut() else {
             return 0;
         };
-        let report = repair.serve(tx, &mut self.readers, &sent_high, budget, now);
+        let report = repair.serve(tx, &mut self.readers, (&sent_high, &closed), budget, now);
         let frames = report
             .lanes
             .iter()
@@ -569,7 +729,12 @@ impl Outbound {
             }
         }
         for (lane, queue) in self.queues.iter().enumerate() {
-            self.sender.reopen(lane, *queue);
+            // A guarded lane reopens through its gate, which refunds what
+            // the old queue held.
+            match self.guard.as_deref_mut() {
+                Some(guard) => guard.reopen(&mut self.sender, lane, *queue),
+                None => self.sender.reopen(lane, *queue),
+            }
         }
         // The repair queue, on the same route and outside the lane sender:
         // without it the publication sends first sends only, and its jobs
@@ -678,14 +843,23 @@ impl Outbound {
                 .checked_add(self.stage(tx, lane, limit, hook.as_deref_mut())?)
                 .ok_or(overflow.clone())?;
         }
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.set_now(now);
+        }
         let report = self.sender.serve(
             tx,
             &mut DataGate {
                 lanes: &mut self.tracks,
                 held,
+                guard: self.guard.as_deref_mut(),
             },
             budget,
         );
+        // Once a cycle, even with nothing flushed, so a close becomes
+        // effective with no pending traffic (DN 3.1 step 10).
+        if let Some(guard) = self.guard.as_deref_mut() {
+            guard.between_gates();
+        }
         self.handle_failure(tx, report.failure);
         for (lane, (track, reader)) in self.tracks.iter_mut().zip(&mut self.readers).enumerate() {
             if std::mem::take(&mut track.unsent) {
@@ -832,6 +1006,15 @@ impl Outbound {
             .pending(lane)
             .is_some_and(|pending| pending < usize::from(STAGED_PER_LANE))
         {
+            // A lane its guard closed reads nothing more: its cursor stays
+            // where the close found it.
+            if self
+                .guard
+                .as_deref()
+                .is_some_and(|guard| guard.aborting(lane))
+            {
+                break;
+            }
             // The receivers' edge, before the read (it cannot be undone):
             // a whole maximum frame from the cursor must fit.
             let from = reader.position();
@@ -883,6 +1066,12 @@ impl Outbound {
                     self.counters.bump(|c| &mut c.trace_invalid, skipped);
                 }
             }
+            // The messages it starts: a guard's message charge.
+            let messages = if record || self.guard.is_none() {
+                0
+            } else {
+                messages_started(frame.bytes_mut().get(..len).unwrap_or_default())
+            };
             let token = SenderToken::new(self.next_token);
             self.next_token = self.next_token.checked_add(1).ok_or(overflow.clone())?;
             let Ok(ticket) = frame.commit(Commit {
@@ -910,18 +1099,30 @@ impl Outbound {
             // bound and the charge is one aligned datagram of at most the
             // MTU. Counted if it ever happens; the committed item then
             // leaves unrecorded and shows as `mismatched`.
-            if self
-                .sender
-                .staged(
-                    lane,
-                    Staged {
-                        ticket,
-                        charge,
-                        len: len16,
-                    },
-                )
-                .is_err()
-            {
+            let staged_head = Staged {
+                ticket,
+                charge,
+                len: len16,
+            };
+            // A guarded lane stages through its gate, which records the head
+            // in step with the sender.
+            let refused = match self.guard.as_deref_mut() {
+                Some(guard) => guard
+                    .stage(
+                        &mut self.sender,
+                        lane,
+                        staged_head,
+                        GateHead {
+                            token,
+                            length: u64::from(len16),
+                            messages,
+                            end: next,
+                        },
+                    )
+                    .is_err(),
+                None => self.sender.staged(lane, staged_head).is_err(),
+            };
+            if refused {
                 self.counters.bump(|c| &mut c.staged_refused, 1);
                 break;
             }

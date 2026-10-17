@@ -174,6 +174,7 @@ fn add_publication(
             reply,
             publication: publication(a),
             outbound,
+            guard: None,
         })
         .unwrap();
     log
@@ -993,6 +994,7 @@ fn a_publication_membership_follows_the_driver_timing() {
         reply: replies.reserve().unwrap(),
         publication: publication(endpoint),
         outbound: path,
+        guard: None,
     };
     assert!(matches!(
         sender.command(command),
@@ -1945,6 +1947,7 @@ impl RepairRig {
                 reply: replies.reserve().unwrap(),
                 publication,
                 outbound: path,
+                guard: None,
             };
             assert!(matches!(
                 sender.command(command),
@@ -2670,4 +2673,42 @@ fn a_route_fault_asks_for_a_reset_at_its_cadence() {
     });
     assert_eq!(later, [EndpointId(1)]);
     assert_eq!(receiver.counters().reset_requests, 3);
+}
+
+/// A guarded publication with no receiver yet is not served, but its
+/// sender still applies a guard close each cycle, so the close
+/// acknowledgement does not wait on it.
+#[test]
+fn an_unestablished_guarded_publication_applies_a_close() {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (mut sender, _role) = receiver_with(AgentConfig::default());
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let (path, _log) = outbound(EndpointId(1), "10.0.0.9:5000".parse().unwrap());
+    let command = AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::clone(&cell),
+            epoch: 2,
+            rate: None,
+        }),
+    };
+    assert!(matches!(
+        sender.command(command),
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    let _ = sender.duty::<OsSocket>(&mut [], 1).unwrap();
+    assert_eq!(cell.try_read().unwrap().epoch, 3);
 }

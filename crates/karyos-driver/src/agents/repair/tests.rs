@@ -306,3 +306,240 @@ fn an_unsent_repair_is_cancelled_and_retried() {
     assert_eq!(rig.path.repair().unwrap().counts().submitted, 1);
     rig.finish();
 }
+
+/// An open guard word at epoch 2, the guard's first open epoch after
+/// creation.
+fn open_guard() -> Arc<karyos_client::HeapWords> {
+    use karyos_sys::sync::Ordering;
+
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    let cell = &word.words()[0];
+    cell.store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(cell, 1), Ok(2));
+    word
+}
+
+/// A guarded network publication runs the local close only (O-11, GC-6):
+/// until the close it sends as before; after it, nothing at all leaves the
+/// sender, first sends and repairs alike, no control is sent, and its
+/// applied epoch, with the last positions submitted, reaches the close
+/// acknowledgement's cell.
+#[test]
+fn a_guard_close_stops_every_submission() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+
+    let mut rig = Rig::new(&RepairConfig::default());
+    let word = open_guard();
+    let cell = Arc::new(AppliedEpoch::new());
+    rig.path
+        .guard(
+            super::super::data::GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::clone(&cell),
+                epoch: 2,
+                rate: None,
+            },
+            0,
+        )
+        .unwrap();
+    rig.publish(2);
+    assert_eq!(rig.datagrams().len(), 2, "open: sent as before");
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    // More is published, and a NAK names a frame already sent.
+    for i in 0..2u8 {
+        let _ = rig.log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    rig.scripted(4);
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 1).unwrap();
+    assert_eq!(rig.nak(0, 1056, 2), NakOutcome::Queued);
+    assert_eq!(rig.repair(&mut RepairBudget::default(), 3), 0);
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 4).unwrap();
+    assert_eq!(rig.datagrams().len(), 2, "closed: nothing at all left");
+    let mut replies = Vec::new();
+    rig.path.drain_repair_replies(|reply| replies.push(*reply));
+    assert!(replies.is_empty(), "no ERR either");
+    let gate = rig.path.guard_gate().unwrap();
+    assert!(gate.abort_cause(0).is_some());
+    let applied = cell.try_read().unwrap();
+    assert_eq!(applied.epoch, 3, "the closed epoch is applied");
+    assert_eq!(applied.positions[0], 2 * FRAME);
+    assert_eq!(applied.in_flight, 0);
+    rig.finish();
+}
+
+/// A guard word that closes itself right after its next `armed` Acquire
+/// loads: a close that lands between a lane's probe and its exposure.
+#[derive(Debug)]
+struct ClosingWords {
+    words: karyos_client::HeapWords,
+    armed: karyos_sys::sync::AtomicU64,
+}
+
+impl karyos_sys::load_words::LoadWords for ClosingWords {
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+
+    fn load(&self, index: usize) -> Option<u64> {
+        self.words.load(index)
+    }
+
+    fn load_acquire(&self, index: usize) -> Option<u64> {
+        use karyos_sys::sync::Ordering;
+
+        let value = self.words.load_acquire(index);
+        if self.armed.load(Ordering::Relaxed) == 1 {
+            let _ = karyos_sys::guard::close(&self.words.words()[0]);
+        }
+        let armed = self.armed.load(Ordering::Relaxed);
+        if armed > 0 {
+            self.armed.store(armed - 1, Ordering::Relaxed);
+        }
+        value
+    }
+}
+
+fn guard_spec(
+    word: &Arc<impl karyos_client::SharedWords + 'static>,
+    rate: Option<karyos_sys::rate_limit::RatePolicy>,
+) -> (
+    super::super::data::GuardSpec,
+    Arc<karyos_sys::applied_epoch::AppliedEpoch>,
+) {
+    let cell = Arc::new(karyos_sys::applied_epoch::AppliedEpoch::new());
+    (
+        super::super::data::GuardSpec {
+            word: Arc::clone(word) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::clone(&cell),
+            epoch: 2,
+            rate,
+        },
+        cell,
+    )
+}
+
+/// The gate decides the exposure too, not only the probe: a close that
+/// lands after the lane was found eligible still sends nothing; and a lane
+/// found closed at its probe is never offered for exposure at all.
+#[test]
+fn a_close_between_probe_and_exposure_sends_nothing() {
+    use karyos_sys::sync::Ordering;
+
+    let mut rig = Rig::new(&RepairConfig::default());
+    let word = Arc::new(ClosingWords {
+        words: karyos_client::HeapWords::zeroed(1),
+        armed: karyos_sys::sync::AtomicU64::new(0),
+    });
+    word.words.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words.words()[0], 1), Ok(2));
+    let (spec, _cell) = guard_spec(&word, None);
+    rig.path.guard(spec, 0).unwrap();
+    let _ = rig.log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    rig.scripted(1);
+    // The probe's load sees the guard open; the exposure's sees it closed.
+    word.armed.store(1, Ordering::Relaxed);
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 1).unwrap();
+    assert!(rig.datagrams().is_empty());
+    let counts = rig.path.guard_gate().unwrap().counts();
+    assert_eq!((counts.checks, counts.guard_denied), (1, 1));
+    // Closed now: later probes find it closed and offer nothing.
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 2).unwrap();
+    assert_eq!(rig.path.guard_gate().unwrap().counts().checks, 1);
+    rig.finish();
+}
+
+/// The guard's rate is the publication's: a datagram starting a message
+/// costs one message token, and one over the bucket waits.
+#[test]
+fn a_guard_rate_holds_messages() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mut rig = Rig::new(&RepairConfig::default());
+    let word = open_guard();
+    let (spec, _cell) = guard_spec(
+        &word,
+        Some(RatePolicy {
+            messages: Rate {
+                per_second: 1,
+                burst: 1,
+            },
+            bytes: None,
+        }),
+    );
+    rig.path.guard(spec, 0).unwrap();
+    rig.publish(2);
+    assert_eq!(rig.datagrams().len(), 1, "one message token");
+    rig.finish();
+}
+
+/// After an endpoint reset a guarded lane reopens through its gate: the
+/// heads the old queue held are settled there too, so the lane stages and
+/// sends again.
+#[test]
+fn a_guarded_lane_sends_again_after_a_reset() {
+    let rig = Rig::new(&RepairConfig::default());
+    let Rig {
+        tx,
+        rx,
+        observer,
+        mut path,
+        mut log,
+        sent,
+    } = rig;
+    let word = open_guard();
+    let (spec, _cell) = guard_spec(&word, None);
+    path.guard(spec, 0).unwrap();
+    let _ = log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    let mut tx = tx;
+    // The kernel would block: the head stays pending in the old queue.
+    let _ = path.serve(&mut tx, BUDGET, None, 1).unwrap();
+    assert_eq!(path.counters().submitted, 0);
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    let _ = endpoint.reopen(&local).unwrap();
+    let (tx, rx) = endpoint.split().unwrap();
+    let mut rig = Rig {
+        tx,
+        rx,
+        observer,
+        path,
+        log,
+        sent,
+    };
+    rig.scripted(1);
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 2).unwrap();
+    assert_eq!(
+        rig.observer.remaining_sends(),
+        0,
+        "sent again after the reset"
+    );
+    assert_eq!(rig.path.counters().submitted, 1);
+    assert_eq!(rig.path.counters().staged_refused, 0);
+    rig.finish();
+}
+
+/// A guarded publication not served yet still applies a close: its applied
+/// epoch reaches the close acknowledgement's cell.
+#[test]
+fn an_unserved_guarded_publication_applies_a_close() {
+    let mut rig = Rig::new(&RepairConfig::default());
+    let word = open_guard();
+    let (spec, cell) = guard_spec(&word, None);
+    rig.path.guard(spec, 0).unwrap();
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    rig.path.guard_tick(1);
+    let applied = cell.try_read().unwrap();
+    assert_eq!((applied.epoch, applied.in_flight), (3, 0));
+    rig.finish();
+}
