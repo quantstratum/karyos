@@ -45,6 +45,24 @@ const MAX_TERMS: u64 = 1 << 31;
 /// A frame's alignment and the shortest NAK.
 const FRAME: u64 = 32;
 
+/// Whether a NAK range of `length` bytes from `start` satisfies the term
+/// rule of schemas 3.4 for `term_length` (step 3): `start + length` by
+/// checked addition, at most `2^31 × term_length`, with `start` and
+/// `start + length - 32` in one term. A receiver checks a peer's group
+/// NAK with the same rule (RC-15).
+#[must_use]
+pub fn in_one_term(start: u64, length: u32, term_length: u32) -> bool {
+    let term = u64::from(term_length);
+    let end = start.checked_add(u64::from(length));
+    let limit = MAX_TERMS.checked_mul(term);
+    match (end, end.and_then(|end| end.checked_sub(FRAME)), limit) {
+        (Some(end), Some(last), Some(limit)) if term > 0 && end <= limit => {
+            start.checked_div(term) == last.checked_div(term)
+        }
+        _ => false,
+    }
+}
+
 /// What the sender knows of the requester on the NAK's lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Requester {
@@ -259,15 +277,7 @@ impl Admission {
             }
         }
         // 3. Term bound.
-        let term = u64::from(ctx.term_length);
-        let limit = MAX_TERMS.checked_mul(term);
-        let in_term = match (end, end.and_then(|end| end.checked_sub(FRAME)), limit) {
-            (Some(end), Some(last), Some(limit)) if term > 0 && end <= limit => {
-                start.checked_div(term) == last.checked_div(term)
-            }
-            _ => false,
-        };
-        if !in_term {
+        if !in_one_term(start, length, ctx.term_length) {
             return self.reply(nak, NakReplyReason::RangeInvalid, now);
         }
         // 4. Floor.

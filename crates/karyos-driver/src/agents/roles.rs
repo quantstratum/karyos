@@ -220,6 +220,26 @@ pub struct ReceiverCounters {
     /// Multicast NAK cycles started (RC-2): a hole's first, and each one
     /// after a window ended with the hole still there.
     pub nak_cycles: u64,
+    /// Group NAKs from the control group that passed validation (RC-15).
+    pub group_naks: u64,
+    /// Of those, the ones that suppressed a cycle's local NAK (B).
+    pub group_nak_suppressions: u64,
+    /// Control group datagrams dropped: not a NAK (validation 1).
+    pub group_nak_not_nak: u64,
+    /// Group NAKs dropped: no image of this receiver has that incarnation
+    /// or lane (validation 2).
+    pub group_nak_unbound: u64,
+    /// Group NAKs dropped: this receiver's own, looped back (validation 3).
+    pub group_nak_own: u64,
+    /// Group NAKs dropped: the range breaks the term rule (validation 4).
+    pub group_nak_range: u64,
+    /// Receiver cycles that read the whole `group_nak_budget`: datagrams
+    /// past it wait for the next cycle, or the socket drops them.
+    pub group_nak_budget_full: u64,
+    /// NAK copies posted to the control group (RC-7).
+    pub group_nak_copies: u64,
+    /// NAK copies skipped: the control ring was full; never retried.
+    pub group_nak_copies_skipped: u64,
     /// NAKs handed to the sender (phase 6, reliable images).
     pub naks: u64,
     /// NAKs not handed over: the control ring was full (each stays due).
@@ -303,6 +323,11 @@ pub struct SenderCounters {
     pub nak_replies_unbound: u64,
     /// Repair datagrams submitted.
     pub repairs: u64,
+    /// NAK copies sent to a control group (RC-7; counted in `sent` too).
+    pub group_nak_copies_sent: u64,
+    /// NAK copies to a control group that failed or were uncertain:
+    /// counted, never retried, no route fault.
+    pub group_nak_copies_failed: u64,
     /// RTTM REPLYs sent (counted in `sent` too).
     pub rttm_replied: u64,
     /// RTTM REQUESTs from no receiver this sender answered (source, alias,
@@ -388,6 +413,12 @@ pub struct ReceiverRole {
     unsubscribed: bool,
     /// Aliases published per endpoint.
     published: Vec<(EndpointId, Alias)>,
+    /// The NAK control groups of subscriptions (RC-15): the data
+    /// endpoint, the stream, the endpoint joined to the control group and
+    /// the group's address.
+    groups: Vec<(EndpointId, i32, EndpointId, SocketAddr)>,
+    /// `group_nak_budget`.
+    group_budget: u32,
     max_entries: usize,
     rsp_destinations: EndpointRates,
     rsp_total: TotalRate,
@@ -614,6 +645,9 @@ struct Installed {
     /// The receiver cycle its last endpoint reset request was posted in,
     /// while a route fault holds its NAKs (RC-6).
     reset_requested: Option<u64>,
+    /// Its subscription's NAK control group: the endpoint joined to it and
+    /// the group's address (RC-7, RC-15).
+    control_group: Option<(EndpointId, SocketAddr)>,
 }
 
 /// One lane's NAK in flight: its report slot (the RTTM probe's contract:
@@ -950,6 +984,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             to_sender,
             budget: Budget::new(datagrams, bytes, ops),
             subscriptions: Vec::with_capacity(config.subscriptions),
+            groups: Vec::with_capacity(config.subscriptions),
+            group_budget: config.group_nak_budget,
             unsubscribed: false,
             published: Vec::with_capacity(config.subscriptions),
             max_entries: config.subscriptions,
@@ -1031,6 +1067,7 @@ impl ReceiverRole {
                 max_term_length,
                 reliable,
                 multicast,
+                control_group,
             } => {
                 let held = self
                     .subscriptions
@@ -1054,6 +1091,9 @@ impl ReceiverRole {
                             reliable,
                             multicast,
                         ));
+                        if let Some((control, group)) = control_group {
+                            self.groups.push((endpoint, stream_id, control, group));
+                        }
                         true
                     }
                     None => false,
@@ -1092,6 +1132,13 @@ impl ReceiverRole {
                 if let Some(index) = found {
                     self.subscriptions.swap_remove(index);
                     self.unsubscribed = true;
+                }
+                if let Some(index) = self
+                    .groups
+                    .iter()
+                    .position(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id))
+                {
+                    self.groups.swap_remove(index);
                 }
                 Some((reply, configured(found.is_some())))
             }
@@ -1168,6 +1215,29 @@ impl ReceiverRole {
             work: 0,
         };
         intake.control(source, control);
+    }
+
+    /// Hands the receiver `bytes` as a datagram of the control group
+    /// endpoint `endpoint` at `now` (tests).
+    #[cfg(test)]
+    pub(super) fn inject_group(&mut self, endpoint: EndpointId, bytes: &[u8], now: u64) {
+        let mut intake = GroupIntake {
+            endpoint,
+            now,
+            role: self,
+            work: 0,
+        };
+        intake.bytes(bytes);
+    }
+
+    /// The receiver block this receiver puts in the NAKs of the image at
+    /// `slot` (tests).
+    #[cfg(test)]
+    pub(super) fn receiver_of(&self, slot: SlotRef) -> Receiver {
+        Receiver {
+            receiver_boot_id: self.sessions.boot_id(),
+            receiver_id: receiver_id(slot),
+        }
     }
 
     /// Hands the receiver `bytes` as a DATA datagram from `source` on
@@ -1521,6 +1591,11 @@ impl ReceiverRole {
             .find(|(held, stream, ..)| (*held, *stream) == (key.endpoint, key.alias.stream_id));
         let reliable = subscription.is_none_or(|(_, _, _, reliable, _)| *reliable);
         let multicast = subscription.is_some_and(|(.., multicast)| *multicast);
+        let control_group = self
+            .groups
+            .iter()
+            .find(|(held, stream, ..)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
+            .map(|(_, _, control, group)| (*control, *group));
         let receiver = Receiver {
             receiver_boot_id: self.sessions.boot_id(),
             receiver_id: receiver_id(installed),
@@ -1587,6 +1662,7 @@ impl ReceiverRole {
             closing: None,
             tail_since: [None; 4],
             reset_requested: None,
+            control_group,
         });
         Ok(())
     }
@@ -1747,7 +1823,8 @@ impl ReceiverRole {
     /// hole's NAK is due only once its cycle's drawn delay has passed
     /// (RC-2), and the next cycle starts when the window ends with the hole
     /// still there; the delays come from a pool restocked on the timer
-    /// step. Then the skip policy runs
+    /// step. With a control group, each NAK handed over is followed by
+    /// one copy to the group (RC-7). Then the skip policy runs
     /// on every image: timer seals on an unreliable one, the far-window
     /// close. A close is carried out by the next timer step. Returns the
     /// NAKs handed over.
@@ -1852,6 +1929,22 @@ impl ReceiverRole {
                     sent = sent
                         .checked_add(1)
                         .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
+                    // RC-7: on a trusted channel, one copy to the control
+                    // group, after the unicast copy and with no report: it
+                    // is never retried and raises no route fault. A full
+                    // ring skips it, counted.
+                    if let Some((control, group)) = image.control_group {
+                        let copy = ControlItem::Outgoing {
+                            endpoint: control,
+                            destination: group,
+                            control: Control::Nak(nak),
+                            guard: None,
+                        };
+                        match to_sender.try_post(copy) {
+                            Ok(()) => tally(counters, |c| &mut c.group_nak_copies),
+                            Err(_) => tally(counters, |c| &mut c.group_nak_copies_skipped),
+                        }
+                    }
                 }
                 Err(_) => {
                     tally(counters, |c| &mut c.ring_full_nak);
@@ -2086,10 +2179,43 @@ impl ReceiverRole {
                 self.rx_epoch(*endpoint, rx.capabilities().epoch);
             }
         }
+        // Control group datagrams share one `group_nak_budget` per cycle.
+        let mut group_left = self.group_budget;
         for (endpoint, half) in halves.iter_mut() {
             let Half::Rx(rx) = half else {
                 continue;
             };
+            if self
+                .groups
+                .iter()
+                .any(|(.., control, _)| *control == *endpoint)
+            {
+                if group_left == 0 {
+                    continue;
+                }
+                let budget = Budget::new(
+                    group_left,
+                    u64::from(group_left)
+                        .checked_mul(u64::from(karyos_io::sockets::endpoint::MAX_DATAGRAM))
+                        .ok_or(overflow.clone())?,
+                    group_left.checked_add(1).ok_or(overflow.clone())?,
+                );
+                let mut intake = GroupIntake {
+                    endpoint: *endpoint,
+                    now,
+                    role: self,
+                    work: 0,
+                };
+                let _ = rx.poll_rx(budget, &mut intake);
+                let read = intake.work;
+                // A poll reads at most its budget's datagrams.
+                group_left = group_left.checked_sub(read).ok_or(overflow.clone())?;
+                if group_left == 0 {
+                    self.count(|c| &mut c.group_nak_budget_full);
+                }
+                work = work.checked_add(read).ok_or(overflow.clone())?;
+                continue;
+            }
             let budget = self.budget;
             let mut intake = Intake {
                 endpoint: *endpoint,
@@ -2102,6 +2228,92 @@ impl ReceiverRole {
             work = work.checked_add(intake.work).ok_or(overflow.clone())?;
         }
         Ok(work)
+    }
+}
+
+/// The receiver's handler of a control group endpoint's datagrams
+/// (RC-15): only peer NAKs, validated in order and handed to the images'
+/// suppression state. A group NAK never causes a send, a repair or a
+/// reply, and never reaches the sender (loop rule).
+struct GroupIntake<'a> {
+    endpoint: EndpointId,
+    now: u64,
+    role: &'a mut ReceiverRole,
+    /// Datagrams read; one poll reads at most its budget's.
+    work: u32,
+}
+
+impl GroupIntake<'_> {
+    /// Validation 1: a NAK, and nothing else.
+    fn bytes(&mut self, bytes: &[u8]) {
+        match classify(bytes) {
+            Ok(Datagram::Control(Control::Nak(nak))) => self.nak(&nak),
+            Ok(_) => self.role.count(|c| &mut c.group_nak_not_nak),
+            Err(_) => self.role.count(|c| &mut c.decode_errors),
+        }
+    }
+
+    /// Validation 2 to 4 of a group NAK, then B with C on its image.
+    fn nak(&mut self, nak: &Nak) {
+        let endpoint = self.endpoint;
+        let role = &mut *self.role;
+        let own = Receiver {
+            receiver_boot_id: role.sessions.boot_id(),
+            receiver_id: 0,
+        };
+        // 2. An image of this receiver bound to that incarnation, through
+        // this control group, with that lane.
+        let Some(image) = role.images.iter_mut().find(|image| {
+            image
+                .control_group
+                .is_some_and(|(control, _)| control == endpoint)
+                && image.key.alias == nak.alias
+                && image.identity == nak.identity
+        }) else {
+            role.count(|c| &mut c.group_nak_unbound);
+            return;
+        };
+        if nak.range.lane.get() >= image.lane_count {
+            role.count(|c| &mut c.group_nak_unbound);
+            return;
+        }
+        // 3. Never this receiver's own copy, looped back.
+        let mine = Receiver {
+            receiver_id: receiver_id(image.slot),
+            ..own
+        };
+        if nak.receiver == mine {
+            role.count(|c| &mut c.group_nak_own);
+            return;
+        }
+        // 4. The term rule for the bound term length.
+        if !crate::repair::admission::in_one_term(
+            nak.range.start,
+            nak.range.length,
+            image.term_length,
+        ) {
+            role.count(|c| &mut c.group_nak_range);
+            return;
+        }
+        let suppressed = image.loss.peer_nak(nak, self.now);
+        role.count(|c| &mut c.group_naks);
+        if suppressed {
+            role.count(|c| &mut c.group_nak_suppressions);
+        }
+    }
+}
+
+impl RxHandler for GroupIntake<'_> {
+    fn datagram(&mut self, datagram: RxDatagram<'_>) -> ControlFlow<()> {
+        // At most the poll budget's datagrams: no overflow.
+        self.work += 1;
+        self.role.count(|c| &mut c.datagrams);
+        self.bytes(datagram.bytes());
+        ControlFlow::Continue(())
+    }
+
+    fn dropped(&mut self, _drop: RxDrop) {
+        self.role.count(|c| &mut c.backend_drops);
     }
 }
 
@@ -2944,7 +3156,16 @@ impl SenderRole {
                     control,
                     guard,
                 } => {
-                    let _ = self.send(halves, endpoint, destination, &control);
+                    let sent = self.send(halves, endpoint, destination, &control);
+                    // A NAK without a report is a receiver's copy to its
+                    // control group (RC-7): its unicast NAKs carry one.
+                    if matches!(control, Control::Nak(_)) {
+                        if sent.submitted() {
+                            self.count(|c| &mut c.group_nak_copies_sent);
+                        } else {
+                            self.count(|c| &mut c.group_nak_copies_failed);
+                        }
+                    }
                     drop(guard);
                 }
                 ControlItem::Incoming {
