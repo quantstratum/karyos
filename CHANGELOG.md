@@ -48,14 +48,18 @@ release may break APIs, wire formats and shared-memory layouts.
   start read before the call, not submitted, or uncertain, when the
   backend left its exposure unknown (RC-6). `ControlSendError::Uncertain`
   reports it, and an uncertain RTT probe yields no sample.
-- Guarded network publications. `AgentCommand::AddPublication` takes an
-  optional `GuardSpec` (the guard word, the applied-epoch cell registered
-  with the guard's owner, the open epoch and the rate policy), and the
-  publication's `Outbound` then runs its `GuardGate`: the probe and the
-  exposure both ask it, heads are staged and reopened through it, and the
-  applied epoch reaches the close acknowledgement. A close is local on
+- The sender agent can run a guard gate for a network publication (the
+  embedded driver wires it in a later change). `AgentCommand::AddPublication`
+  takes an optional `GuardSpec` (the guard word, the applied-epoch cell
+  registered with the guard's owner, the open epoch and the rate policy),
+  and the publication's `Outbound` then runs its `GuardGate`: the probe and
+  the exposure both ask it, heads are staged and reopened through it, and
+  the applied epoch reaches the close acknowledgement. A close is local on
   sockets (O-11, GC-6): nothing more leaves the sender, first sends and
-  repairs alike, and no abort is sent.
+  repairs alike (repairs load the word each cycle), and no abort is sent.
+  An aborted lane's staged items are returned (`LaneSender::cancel`), so
+  the close's work drains, and a close applies without a usable endpoint
+  too.
 - The sender agent repairs reliable publications (R4, R5, R7 wired).
   `agents::repair::RepairPath` admits a bound receiver's NAK against the
   lane's retention floor and submitted frontier, coalesces it into a

@@ -442,8 +442,10 @@ struct SubmitView<'a, O: SocketOps> {
     now: u64,
 }
 
-/// The gate of repair traffic: every candidate is permitted (the guard
-/// gate is phase 7).
+/// The gate of repair traffic: every candidate is permitted. A guarded
+/// publication's close holds its repairs before this gate: the lanes in
+/// `closed`, read from a fresh load of the guard word each cycle, read
+/// nothing (GC-6).
 struct RepairGate;
 
 impl SenderGate for RepairGate {

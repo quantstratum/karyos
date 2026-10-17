@@ -2150,6 +2150,39 @@ fn a_step_8_err_needs_its_binding_at_the_send() {
     }
 }
 
+/// #301 review P2: an established guarded publication whose endpoint has
+/// no TX half this cycle (it is being reset) still applies a guard close,
+/// so the close acknowledgement does not wait for the reset.
+#[test]
+fn a_guard_close_applies_without_a_tx_half() {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let mut rig = RepairRig::new(AgentConfig::default(), &[alias()], 2);
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    rig.sender.publications[0]
+        .guard(
+            super::super::data::GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::clone(&cell),
+                epoch: 2,
+                rate: None,
+            },
+            0,
+        )
+        .unwrap();
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    let mut halves = std::mem::take(&mut rig.halves);
+    halves.retain(|(_, half)| !matches!(half, super::super::Half::Tx(_)));
+    let _ = rig.sender.duty(&mut halves, 3).unwrap();
+    assert_eq!(cell.try_read().unwrap().epoch, 3);
+}
+
 /// At most `naks_per_cycle` NAKs reach admission in a cycle; the rest are
 /// dropped and counted.
 #[test]

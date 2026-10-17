@@ -458,6 +458,75 @@ fn a_guard_close_stops_every_submission() {
     rig.finish();
 }
 
+/// The rig's publication guarded by a fresh open guard at epoch 2: the
+/// word and the applied-epoch cell.
+fn guarded(
+    rig: &mut Rig,
+) -> (
+    Arc<karyos_client::HeapWords>,
+    Arc<karyos_sys::applied_epoch::AppliedEpoch>,
+) {
+    let word = open_guard();
+    let cell = Arc::new(karyos_sys::applied_epoch::AppliedEpoch::new());
+    rig.path
+        .guard(
+            super::super::data::GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::clone(&cell),
+                epoch: 2,
+                rate: None,
+            },
+            0,
+        )
+        .unwrap();
+    (word, cell)
+}
+
+/// #301 review P1: a head the kernel refused (would block) before a close
+/// is exposed and pending; the aborted lane is never flushed again, so its
+/// staged items are returned through the gate and the close's work drains
+/// (in flight 0), with nothing more sent.
+#[test]
+fn a_close_after_a_refused_send_drains_its_work() {
+    let mut rig = Rig::new(&RepairConfig::default());
+    let (word, cell) = guarded(&mut rig);
+    for i in 0..2u8 {
+        let _ = rig.log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    // No scripted send: the first head is exposed and refused, and stays
+    // pending in its queue.
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 1).unwrap();
+    assert_eq!(rig.path.guard_gate().unwrap().in_flight(), Some(1));
+    let offered = rig.datagrams().len();
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 2).unwrap();
+    assert_eq!(rig.datagrams().len(), offered, "nothing more is offered");
+    assert_eq!(rig.path.guard_gate().unwrap().in_flight(), Some(0));
+    let applied = cell.try_read().unwrap();
+    assert_eq!((applied.epoch, applied.in_flight), (3, 0));
+    rig.finish();
+}
+
+/// #301 review P2: a close that lands between cycles holds the next
+/// cycle's repairs, which load the word before they run, not only the
+/// close the last first sends saw.
+#[test]
+fn a_close_between_cycles_holds_the_next_repairs() {
+    let mut rig = Rig::new(&RepairConfig::default());
+    let (word, cell) = guarded(&mut rig);
+    rig.publish(2);
+    let sent = rig.datagrams().len();
+    assert_eq!(rig.nak(0, 1056, 1), NakOutcome::Queued);
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    rig.scripted(1);
+    assert_eq!(rig.repair(&mut RepairBudget::default(), 2), 0);
+    assert_eq!(rig.datagrams().len(), sent, "no repair after the close");
+    assert_eq!(cell.try_read().unwrap().epoch, 3);
+    rig.finish();
+}
+
 /// A guard word that closes itself right after its next `armed` Acquire
 /// loads: a close that lands between a lane's probe and its exposure.
 #[derive(Debug)]

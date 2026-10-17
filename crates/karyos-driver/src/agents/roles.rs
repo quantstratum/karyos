@@ -3304,7 +3304,15 @@ impl SenderRole {
                 Half::Tx(tx) if *held == endpoint => Some(tx),
                 _ => None,
             });
-            let (Some(tx), Some(outbound)) = (tx, self.publications.get_mut(index)) else {
+            let Some(tx) = tx else {
+                // No TX half this cycle (its endpoint is being reset): a
+                // guard close still applies.
+                if let Some(outbound) = self.publications.get_mut(index) {
+                    outbound.guard_tick(now);
+                }
+                continue;
+            };
+            let Some(outbound) = self.publications.get_mut(index) else {
                 continue;
             };
             let lanes = outbound.readers().len();

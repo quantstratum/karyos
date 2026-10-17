@@ -305,6 +305,52 @@ impl LaneSender {
         }
     }
 
+    /// Returns the pending items of `lane`'s queue that were never exposed
+    /// to the kernel, for a lane its gate aborted: such a lane is never
+    /// flushed again, so an item the kernel refused (would block) before
+    /// the close would stay staged, and counted in flight, for good. Each
+    /// returned item leaves through `gate` as [`Left::Returned`], in staging
+    /// order, with its staged record. Returns the items returned; a report
+    /// that names another item than the lane's next one stops the call
+    /// (drained), leaving the rest staged.
+    ///
+    /// # Errors
+    ///
+    /// The queue's [`QueueError`] from
+    /// [`TxBackend::cancel_pending`](crate::backend::TxBackend::cancel_pending).
+    pub fn cancel<B: TxBackend, G: LaneGate>(
+        &mut self,
+        backend: &mut B,
+        lane: usize,
+        gate: &mut G,
+    ) -> Result<usize, QueueError> {
+        let Self { lanes, report, .. } = self;
+        let Some(entry) = lanes.get_mut(lane) else {
+            return Ok(0);
+        };
+        let staged = entry.staged.len();
+        // The staged count only falls in this call, so this never saturates.
+        let returned = |entry: &Lane| staged.saturating_sub(entry.staged.len());
+        loop {
+            let outcome = backend.cancel_pending(entry.queue, report)?;
+            while let Some(item) = report.pop_front() {
+                match entry.staged.front().copied() {
+                    Some(head) if head.ticket == item.ticket => {
+                        entry.staged.pop_front();
+                        gate.left(lane, head, Left::Returned);
+                    }
+                    _ => {
+                        while report.pop_front().is_some() {}
+                        return Ok(returned(entry));
+                    }
+                }
+            }
+            if !outcome.more {
+                return Ok(returned(entry));
+            }
+        }
+    }
+
     /// Serves the lanes within `budget` through `backend`, asking `gate`
     /// at each probe and at each exposure.
     pub fn serve<B: TxBackend, G: LaneGate>(
