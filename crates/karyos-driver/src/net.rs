@@ -192,7 +192,8 @@ pub(crate) struct Network {
     net_images: Vec<NetImage>,
     /// The image table's events of the last cycle, for the conductor.
     image_events: Vec<ImageEvent>,
-    /// Endpoint resets completed (`EndpointEvent::Reopened`).
+    /// Endpoint resets completed (`EndpointEvent::Reopened`), for tests.
+    #[cfg(test)]
     reopened: u64,
     /// Images installed but not exposed: their alias is in use (interim
     /// keying, ACS 15937) or the stream table is full.
@@ -241,6 +242,7 @@ impl Network {
             net_images: Vec::with_capacity(config.agents.sessions.max_images),
             image_events: Vec::with_capacity(config.agents.sessions.max_images),
             images_unexposed: 0,
+            #[cfg(test)]
             reopened: 0,
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
@@ -657,6 +659,7 @@ impl Network {
         // sender's reset requests at the driver clock (W-f); publication
         // answers update the publications.
         let mut events = Some(0u32);
+        #[cfg(test)]
         let mut reopened = Some(self.reopened);
         let (publications, send_endpoints) = (&mut self.publications, &mut self.send_endpoints);
         let mut stale = Stale {
@@ -667,16 +670,20 @@ impl Network {
             &self.links,
             now,
             |event| {
+                #[cfg(test)]
                 if matches!(
                     event,
                     crate::agents::endpoints::EndpointEvent::Reopened { .. }
                 ) {
                     reopened = reopened.and_then(|count| count.checked_add(1));
                 }
+                #[cfg(not(test))]
+                let _ = event;
                 events = events.and_then(|count| count.checked_add(1));
             },
             |event| publication_answer(publications, send_endpoints, &mut stale, event),
         );
+        #[cfg(test)]
         if let Some(count) = reopened {
             self.reopened = count;
         }
@@ -774,6 +781,15 @@ impl Network {
                 self.images.counters()
             ),
             _ => String::new(),
+        }
+    }
+
+    /// The Shared receiver agent's counters, for tests.
+    #[cfg(test)]
+    pub(crate) fn receiver_counters(&self) -> Option<crate::agents::roles::ReceiverCounters> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.receiver.counters()),
+            _ => None,
         }
     }
 

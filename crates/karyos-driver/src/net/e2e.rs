@@ -181,8 +181,21 @@ fn exchange_on(
     reader: &mut AggregateSubscription<HeapTerms>,
     range: core::ops::Range<u32>,
 ) {
+    exchange_from(a, b, lane, reader, range.start, range);
+}
+
+/// [`exchange_on`] whose messages from `range.start` up to `sent` were
+/// already offered.
+fn exchange_from(
+    a: &mut EmbeddedDriver,
+    b: &mut EmbeddedDriver,
+    lane: &mut karyos_client::ClientPublication<HeapTerms>,
+    reader: &mut AggregateSubscription<HeapTerms>,
+    sent: u32,
+    range: core::ops::Range<u32>,
+) {
     let count = range.end;
-    let (mut sent, mut seen) = (range.start, range.start);
+    let (mut sent, mut seen) = (sent, range.start);
     pump(&mut [a, b], |_| {
         while sent < count {
             let mut payload = [0u8; 1000];
@@ -327,6 +340,11 @@ fn closing_and_failing_one_side_leaves_the_other_clean() {
     for _ in 0..100 {
         let _ = a.do_work().unwrap();
     }
+    // A still serves: a fresh subscriber of a new publication reads it.
+    let mut d = driver(ThreadingMode::Shared);
+    let (publication, image) = connected(&mut a, &mut d, true, 12);
+    let mut reader = d.subscribe_aggregate(&image, Role::Required).unwrap();
+    exchange(&mut a, &mut d, &publication, &mut reader, 32);
 }
 
 /// E5: in steady state, a network cycle on either side allocates nothing.
@@ -339,15 +357,41 @@ fn a_steady_network_cycle_allocates_nothing() {
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
     let (publication, image) = connected(&mut a, &mut b, true, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
-    exchange(&mut a, &mut b, &publication, &mut reader, 64);
-    for _ in 0..200 {
-        let _ = (a.serve_network(), b.serve_network());
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // Warm up: every buffer the path keeps is sized by real traffic.
+    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..128);
+    // Then traffic keeps flowing while only the network cycles are counted:
+    // the client's offers and polls, and the streams' duty, stay outside.
+    let (mut sent, mut seen, mut work) = (128u32, 128u32, [0u64; 2]);
+    for _ in 0..2_000 {
+        while sent < 384 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        for (side, driver) in [&mut a, &mut b].into_iter().enumerate() {
+            let ((units, error), made) = count(|| driver.serve_network());
+            assert!(error.is_none());
+            assert_eq!(made, 0, "side {side}: {units} units allocated");
+            work[side] += u64::from(units);
+        }
+        let _ = (a.do_work().unwrap(), b.do_work().unwrap());
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        if seen == 384 {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(50));
     }
-    for (side, driver) in [("publisher", &mut a), ("subscriber", &mut b)] {
-        let ((work, error), made) = count(|| driver.serve_network());
-        assert!(error.is_none());
-        assert_eq!(made, 0, "{side}: {work} units");
-    }
+    assert_eq!(seen, 384);
+    assert!(
+        work[0] > 0 && work[1] > 0,
+        "counted cycles did work: {work:?}"
+    );
 }
 
 /// E2: a send fault that needs an endpoint reset, end to end: the sender
@@ -363,6 +407,25 @@ fn an_endpoint_reset_loses_nothing_on_a_reliable_channel() {
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();
     exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..64);
+    // The subscriber holds: its consumption, and so the sender's
+    // registered position, stays at 64 while 16 more are sent and
+    // committed.
+    let committed =
+        |driver: &EmbeddedDriver| driver.net.as_ref().unwrap().receiver_counters().unwrap();
+    let before = committed(&b).data_committed;
+    let mut sent = 64u32;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        while sent < 80 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        committed(drivers[1]).data_committed >= before + 16
+    });
+    let dropped = committed(&b).data_dropped;
     let (endpoint, alias) = a
         .net
         .as_ref()
@@ -376,12 +439,16 @@ fn an_endpoint_reset_loses_nothing_on_a_reliable_channel() {
         .sender
         .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
         .unwrap();
-    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 64..320);
+    // The reset reopens the endpoint and the reliable lane rewinds to its
+    // registered position: what it already sent arrives again, and the
+    // receiver drops those copies as duplicates.
     pump(&mut [&mut a, &mut b], |drivers| {
         drivers[0].net.as_ref().unwrap().reopened() >= 1
+            && committed(drivers[1]).data_dropped > dropped
     });
-    // Traffic after the reset still flows.
-    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 320..384);
+    // The subscriber still reads every message exactly once, in order, and
+    // traffic after the reset flows.
+    exchange_from(&mut a, &mut b, &mut lane, &mut reader, sent, 64..320);
 }
 
 /// E3, Linux: one multicast publication reaches two subscribing drivers
@@ -401,6 +468,13 @@ fn a_multicast_publication_reaches_every_subscriber() {
             "SKIPPED a_multicast_publication_reaches_every_subscriber: {why}"
         );
     };
+    // Probe the host with plain sockets first: only a host that cannot
+    // carry loopback multicast skips; after a good probe, any driver
+    // failure fails the test.
+    if let Err(why) = multicast_probe() {
+        skip(&why);
+        return;
+    }
     let port = free_address().port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 1)), port);
     let channel = UdpConfig {
@@ -417,31 +491,21 @@ fn a_multicast_publication_reaches_every_subscriber() {
         driver(ThreadingMode::Shared),
     );
     for subscriber in [&mut b, &mut c] {
-        if let Err(error) = subscriber.add_network_subscription(10, &channel) {
-            skip(&format!("cannot subscribe to {group}: {error}"));
-            return;
-        }
+        let _ = subscriber.add_network_subscription(10, &channel).unwrap();
     }
     let publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel)
         .unwrap();
-    // A bounded wait: without a multicast route nothing ever arrives.
     let mut images = (None, None);
-    for _ in 0..20_000 {
-        for driver in [&mut a, &mut b, &mut c] {
-            let _ = driver.do_work().unwrap();
-        }
-        images = (b.network_image(10, 3), c.network_image(10, 3));
-        if images.0.is_some() && images.1.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_micros(100));
-    }
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        images = (
+            drivers[1].network_image(10, 3),
+            drivers[2].network_image(10, 3),
+        );
+        images.0.is_some() && images.1.is_some()
+    });
     let (Some(first), Some(second)) = images else {
-        skip(&format!(
-            "no image within 2 s on {group}: no multicast route?"
-        ));
-        return;
+        unreachable!("pumped until both exist");
     };
     let mut readers = [
         b.subscribe_aggregate(&first, Role::Required).unwrap(),
@@ -472,4 +536,87 @@ fn a_multicast_publication_reaches_every_subscriber() {
         }
         seen == [128, 128]
     });
+}
+
+/// Whether this host carries IPv4 multicast on its default route back to
+/// itself: a group joined on one plain socket receives what another sends.
+#[cfg(target_os = "linux")]
+fn multicast_probe() -> Result<(), String> {
+    let group = Ipv4Addr::new(239, 255, 0, 2);
+    let receiver = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        .map_err(|error| format!("probe bind: {error}"))?;
+    receiver
+        .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
+        .map_err(|error| format!("probe join: {error}"))?;
+    receiver
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .map_err(|error| format!("probe timeout: {error}"))?;
+    let port = receiver
+        .local_addr()
+        .map_err(|error| format!("probe address: {error}"))?
+        .port();
+    let sender = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        .map_err(|error| format!("probe sender: {error}"))?;
+    sender
+        .send_to(b"probe", SocketAddr::new(IpAddr::V4(group), port))
+        .map_err(|error| format!("probe send: {error}"))?;
+    let mut buffer = [0u8; 8];
+    match receiver.recv(&mut buffer) {
+        Ok(5) if &buffer[..5] == b"probe" => Ok(()),
+        Ok(_) => Err("probe received something else".into()),
+        Err(error) => Err(format!("no loopback multicast: {error}")),
+    }
+}
+
+/// E1 on two lanes: each lane delivers its own messages in order, on both
+/// channel kinds.
+#[test]
+fn two_lanes_deliver_in_order_on_either_kind() {
+    for reliable in [true, false] {
+        let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+        let address = free_address();
+        let _ = b
+            .add_network_subscription(10, &channel(address, reliable))
+            .unwrap();
+        let publication = a
+            .add_network_publication(aggregate(10, 3, 2), &channel(address, reliable))
+            .unwrap();
+        let mut image = None;
+        pump(&mut [&mut a, &mut b], |drivers| {
+            image = drivers[1].network_image(10, 3);
+            image.is_some()
+        });
+        let mut reader = b
+            .subscribe_aggregate(&image.unwrap(), Role::Required)
+            .unwrap();
+        let mut lanes = [
+            a.publication(publication.lane(Lane::ZERO).unwrap())
+                .unwrap(),
+            a.publication(publication.lane(Lane::try_new(1).unwrap()).unwrap())
+                .unwrap(),
+        ];
+        let (mut sent, mut seen) = ([0u32; 2], [0u32; 2]);
+        pump(&mut [&mut a, &mut b], |_| {
+            for (lane, publication) in lanes.iter_mut().enumerate() {
+                while sent[lane] < 96 {
+                    let mut payload = [0u8; 1000];
+                    payload[..4].copy_from_slice(&sent[lane].to_le_bytes());
+                    match publication.offer(&payload).unwrap() {
+                        OfferOutcome::Accepted { .. } => sent[lane] += 1,
+                        _ => break,
+                    }
+                }
+            }
+            let _ = reader.poll(
+                |bytes, lane, _| {
+                    let lane = usize::from(lane.get());
+                    let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                    assert_eq!(index, seen[lane], "lane {lane} in order");
+                    seen[lane] += 1;
+                },
+                BUDGET,
+            );
+            seen == [96, 96]
+        });
+    }
 }
