@@ -43,13 +43,18 @@ fn interval(histogram: &Histogram, numerator: u64, denominator: u64) -> String {
 }
 
 /// The comparison key: workload, canonical configuration, host and
-/// profile. Records are compared only under the same key.
+/// profile, and for an archive workload the filesystem written to.
+/// Records are compared only under the same key.
 #[must_use]
 pub fn key(measurement: &Measurement, labels: &Labels) -> String {
-    format!(
+    let mut key = format!(
         "{}|host={}|cpu={}|profile={}",
         measurement.config, labels.host, labels.cpu, labels.profile
-    )
+    );
+    if let Some(archive) = &measurement.archive {
+        key.push_str(&format!("|fs={}", archive.filesystem));
+    }
+    key
 }
 
 /// The text report of one measurement.
@@ -124,6 +129,19 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
     if let Some(cleaned) = measurement.cleaned_slots_per_second {
         out.push_str(&format!("  cleaner {cleaned:.0} slots/s\n"));
     }
+    if let Some(archive) = &measurement.archive {
+        out.push_str(&format!(
+            "  archive dir {} ({}), policy {}, {}\n",
+            archive.dir,
+            archive.filesystem,
+            archive.policy,
+            if archive.full_fsync {
+                "F_FULLFSYNC"
+            } else {
+                "fdatasync or none"
+            }
+        ));
+    }
     out
 }
 
@@ -186,6 +204,12 @@ pub fn history_line(measurement: &Measurement, labels: &Labels) -> String {
     }
     if let Some(value) = measurement.cleaned_slots_per_second {
         fields.push(format!("\"cleaned_slots_per_second\":{value:.6}"));
+    }
+    if let Some(archive) = &measurement.archive {
+        fields.push(format!("\"dir\":\"{}\"", archive.dir));
+        fields.push(format!("\"filesystem\":\"{}\"", archive.filesystem));
+        fields.push(format!("\"policy\":\"{}\"", archive.policy));
+        fields.push(format!("\"full_fsync\":{}", archive.full_fsync));
     }
     format!("{{{}}}", fields.join(","))
 }
