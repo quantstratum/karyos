@@ -22,17 +22,26 @@ use crate::sockets::scripted::ScriptedSocket;
 /// Copies each lane queue may hold.
 const BOUND: u16 = 4;
 
-/// A gate that permits every candidate unless it denies exposures.
+/// A gate that permits every candidate unless it denies exposures: all of
+/// them, the first `deny_first`, or every one from `deny_from` on.
 #[derive(Debug, Default)]
 struct Gate {
     deny_exposure: bool,
+    deny_first: u32,
+    deny_from: Option<u32>,
+    exposures: u32,
     /// Copies reported gone, by kind (submitted, returned, unknown).
     left: [u32; 3],
 }
 
 impl SenderGate for Gate {
     fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
-        if self.deny_exposure {
+        let seen = self.exposures;
+        self.exposures += 1;
+        if self.deny_exposure
+            || seen < self.deny_first
+            || self.deny_from.is_some_and(|from| seen >= from)
+        {
             GateDecision::Deny
         } else {
             GateDecision::Permit {
@@ -331,7 +340,7 @@ fn a_blocked_route_catches_up_without_a_second_debit() {
     f.routes[0].accept(1);
     let mut gate = Gate::default();
     let Fixture { routes, sender, .. } = &mut f;
-    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate), 1);
+    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate).submitted, 1);
     assert_eq!(f.sender.pending(0, 0), Some(0));
     assert_eq!(f.sender.drr().deficit(0), deficit);
     assert_eq!(f.sender.counters(0).unwrap().late, 1);
@@ -436,4 +445,388 @@ fn a_lagging_copy_is_never_debited_twice() {
     let report = f.serve(&mut Gate::default(), 1000);
     assert_eq!(served(&report, 1), [0]);
     assert_eq!(f.sender.pending(0, 0), Some(1));
+}
+
+/// #317 review P1: a head at no route's front is not a head. Route 0 holds
+/// `[0 (debited), 128]` behind a blocked socket and route 1 skipped 128:
+/// lane 0 is ineligible, so lane 1's ready copy on route 1 is served and
+/// no work is burnt on lane 0.
+#[test]
+fn a_head_at_no_routes_front_leaves_the_lane_ineligible() {
+    let mut f = Fixture::new(&[100, 100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[1].accept(1);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 2), [100, 0]);
+    assert_eq!(f.sender.pending(0, 0), Some(1));
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(1, 0, 100, 100, &[1]);
+    f.sender.skipped(0);
+    f.routes[1].accept(1);
+    let calls = f.routes[0].socket.send_calls();
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 2), [0, 100]);
+    assert_eq!(report.drr.lanes[0].failed, 0);
+    assert_eq!(f.routes[0].socket.send_calls(), calls);
+    // Route 0 catches up 0, then sends 128 as the head, debited.
+    f.routes[0].accept(2);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate).submitted, 1);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 2), [100, 0]);
+    assert_eq!(f.sender.debited(0), Some(128));
+}
+
+/// #317 review P2: the head never moves past a position no route
+/// submitted. Route 0 alone holds 0 and the gate denies it: 128 on route 1
+/// waits, and 0 is debited when route 0 sends it.
+#[test]
+fn a_denied_lowest_copy_holds_the_lane() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    f.routes[0].accept(2);
+    f.routes[1].accept(1);
+    let mut gate = Gate {
+        deny_first: 1,
+        ..Gate::default()
+    };
+    let report = f.serve(&mut gate, 1000);
+    assert_eq!(served(&report, 1), [0]);
+    assert_eq!(f.routes[1].socket.send_calls(), 0);
+    assert_eq!(f.sender.debited(0), None);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 1), [200]);
+    assert_eq!(f.sender.debited(0), Some(128));
+    assert_eq!(f.routes[1].socket.send_calls(), 1);
+}
+
+/// #317 review P2: a failure after another route submitted the head still
+/// debits it, then stops the call.
+#[test]
+fn a_failure_after_a_submitted_copy_still_debits() {
+    let mut f = Fixture::new(&[100, 100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(1, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    f.routes[1]
+        .socket
+        .push_send(SendResult::Error(crate::sockets::ops::Errno::BADF));
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 2), [100, 0]);
+    assert_eq!(f.sender.debited(0), Some(0));
+    assert!(
+        matches!(
+            report.failure,
+            Some(SenderFailure::Backend {
+                lane: 0,
+                stop: FlushStop::Failed(_)
+            })
+        ),
+        "{:?}",
+        report.failure
+    );
+    assert_eq!(f.routes[0].socket.send_calls(), 1, "lane 1 is not tried");
+}
+
+/// #317 review P2: a cancel goes on past a route's error and returns the
+/// first error; a detached route keeps its copies, counted.
+#[test]
+fn a_cancel_covers_every_route() {
+    let mut f = Fixture::new(&[100], 100, 3);
+    f.stage(0, 0, 100, 100, &[0, 1, 2]);
+    let mut report = TxReport::new();
+    let queue = f.routes[0].queues[0];
+    f.routes[0].tx.close_queue(queue, &mut report).unwrap();
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    let result = sender.cancel(&mut Lent(&mut routes[..2]), 0, &mut gate);
+    assert_eq!(result, Err(QueueError::UnknownQueue));
+    assert_eq!(f.sender.pending(0, 1), Some(0));
+    assert_eq!(gate.left, [0, 1, 0]);
+    assert_eq!(f.sender.pending(0, 2), Some(1));
+    assert_eq!(f.sender.counters(2).unwrap().uncancelled, 1);
+    assert_eq!(f.sender.counters(1).unwrap().uncancelled, 0);
+}
+
+/// #317 review (M2): a close that lands between route 0's exposure and
+/// route 1's stops route 1 only: the head is debited once, and route 1's
+/// copy stays for the close's cancel.
+#[test]
+fn a_close_between_routes_stops_the_later_route() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    f.routes[1].accept(1);
+    let mut gate = Gate {
+        deny_from: Some(1),
+        ..Gate::default()
+    };
+    let report = f.serve(&mut gate, 1000);
+    assert_eq!(served(&report, 1), [100]);
+    assert_eq!(f.routes[1].socket.send_calls(), 0);
+    assert_eq!(f.sender.pending(0, 1), Some(1));
+    assert_eq!(gate.left, [1, 0, 0]);
+    let Fixture { routes, sender, .. } = &mut f;
+    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate).submitted, 0);
+    assert_eq!(f.sender.pending(0, 1), Some(1));
+}
+
+/// #317 review (M3): `catch_up` sends only copies at or below the debited
+/// position.
+#[test]
+fn catch_up_never_sends_above_the_debited_position() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    f.routes[0].accept(2);
+    f.routes[1].accept(2);
+    // The budget covers one head: 0, on both routes.
+    let report = f.serve(&mut Gate::default(), 100);
+    assert_eq!(served(&report, 1), [100]);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate).submitted, 0);
+    assert_eq!(
+        (f.sender.pending(0, 0), f.sender.pending(0, 1)),
+        (Some(1), Some(1))
+    );
+}
+
+/// A blocked socket takes no more flushes in the call, on any lane: the
+/// other route serves both lanes.
+#[test]
+fn a_blocked_route_is_out_for_the_call() {
+    let mut f = Fixture::new(&[100, 100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(1, 0, 100, 100, &[0, 1]);
+    f.routes[1].accept(2);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 2), [100, 100]);
+    assert_eq!(f.routes[0].socket.send_calls(), 1);
+}
+
+/// #317 review P3: a failure in `catch_up` is reported.
+#[test]
+fn a_catch_up_failure_is_reported() {
+    let mut f = Fixture::new(&[100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[1].accept(1);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    f.routes[0]
+        .socket
+        .push_send(SendResult::Error(crate::sockets::ops::Errno::BADF));
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    let done = sender.catch_up(&mut Lent(routes), &mut gate);
+    assert_eq!(done.submitted, 0);
+    assert!(
+        matches!(done.failure, Some(SenderFailure::Backend { lane: 0, .. })),
+        "{:?}",
+        done.failure
+    );
+}
+
+/// #317 review P3: copies are staged in position order per route.
+#[test]
+fn a_copy_out_of_order_is_refused() {
+    let mut f = Fixture::new(&[100], 100, 1);
+    f.stage(0, 128, 100, 100, &[0]);
+    let ticket = f.routes[0].commit(0, 100, 99);
+    let copy = RoutedStaged {
+        staged: Staged {
+            ticket,
+            charge: 100,
+            len: 100,
+        },
+        position: 128,
+    };
+    assert_eq!(
+        f.sender.staged(0, 0, copy),
+        Err(StageError::OutOfOrder { lane: 0 })
+    );
+    assert_eq!(f.sender.pending(0, 0), Some(1));
+    let mut report = TxReport::new();
+    let queue = f.routes[0].queues[0];
+    while let Ok(outcome) = f.routes[0].tx.cancel_pending(queue, &mut report) {
+        while report.pop_front().is_some() {}
+        if !outcome.more {
+            break;
+        }
+    }
+}
+
+/// Fake routes: one scripted backend per route.
+struct Faked(Vec<crate::lanes::tests::fake::Fake>);
+
+impl Routes for Faked {
+    type Backend = crate::lanes::tests::fake::Fake;
+
+    fn route(&mut self, route: usize) -> Option<&mut Self::Backend> {
+        self.0.get_mut(route)
+    }
+}
+
+/// #317 review P2, single-route parity: for every flush outcome of the
+/// outcome table, one route reports what `LaneSender` reports: the same
+/// failure, stop, inactivity, flushes, service and pending records.
+#[test]
+fn one_route_reports_every_outcome_as_the_lane_sender() {
+    use crate::backend::Release;
+    use crate::lanes::tests::fake::{self, Fake, Reply};
+
+    let pending = |cause| Some((TxItemOutcome::Pending { cause }, fake::ticket(0)));
+    let os = BackendFailure::Os {
+        operation: "sendmmsg",
+        errno: 9,
+    };
+    let invariant = BackendFailure::Invariant {
+        operation: "sendmmsg",
+    };
+    let rows: Vec<Reply> = vec![
+        (None, FlushStop::Queue(QueueError::NotActive)),
+        (None, FlushStop::Queue(QueueError::UnknownQueue)),
+        (None, FlushStop::Queue(QueueError::NeedsReset)),
+        (None, FlushStop::Failed(os)),
+        (None, FlushStop::Failed(invariant)),
+        (None, FlushStop::QueueEmpty),
+        (None, FlushStop::HeadExceedsBudget { head_len: 50 }),
+        (None, FlushStop::ReportNotEmpty),
+        (
+            None,
+            FlushStop::GateError {
+                permitted: 2,
+                offered: 1,
+            },
+        ),
+        (
+            Some((
+                TxItemOutcome::Submitted {
+                    release: Release::AtSubmission,
+                },
+                fake::ticket(9),
+            )),
+            FlushStop::Exposed,
+        ),
+        (Some((fake::RETURNED, fake::ticket(0))), FlushStop::Exposed),
+        (
+            Some((TxItemOutcome::Unknown, fake::ticket(0))),
+            FlushStop::Exposed,
+        ),
+        (pending(PendingCause::GateDenied), FlushStop::Exposed),
+        (pending(PendingCause::WouldBlock), FlushStop::Exposed),
+        (pending(PendingCause::NoBuffers), FlushStop::Exposed),
+        (pending(PendingCause::Interrupted), FlushStop::Exposed),
+        (pending(PendingCause::PeerError), FlushStop::Exposed),
+        (pending(PendingCause::ErrorLost), FlushStop::Exposed),
+        (pending(PendingCause::NotAttempted), FlushStop::Exposed),
+        (pending(PendingCause::Failed(os)), FlushStop::Exposed),
+        (pending(PendingCause::Failed(invariant)), FlushStop::Exposed),
+    ];
+    let budget = Budget {
+        work: 16,
+        bytes: 1000,
+    };
+    for reply in rows {
+        // As `faked`: two lanes, tickets 0 and 2 on lane 0, 1 on lane 1.
+        let config = DrrConfig::new(&[100, 100], 100).unwrap();
+        let queues = [fake::queue(0), fake::queue(1)];
+        let mut plain = LaneSender::new(config, &queues, 4).unwrap();
+        let mut routed = RoutedLaneSender::new(config, &[&queues], 4).unwrap();
+        for (position, (lane, slot)) in [(0, 0), (0, 2), (1, 1)].into_iter().enumerate() {
+            let staged = Staged {
+                ticket: fake::ticket(slot),
+                charge: 64,
+                len: 50,
+            };
+            plain.staged(lane, staged).unwrap();
+            let position = u64::try_from(position).unwrap() * 64;
+            routed
+                .staged(lane, 0, RoutedStaged { staged, position })
+                .unwrap();
+        }
+        let mut backend = Fake {
+            replies: vec![reply].into(),
+            flushes: 0,
+        };
+        let a = plain.serve(&mut backend, &mut Gate::default(), budget);
+        let mut routes = Faked(vec![Fake {
+            replies: vec![reply].into(),
+            flushes: 0,
+        }]);
+        let b = routed.serve(&mut routes, &mut Gate::default(), budget);
+        assert_eq!(a.failure, b.failure, "{reply:?}");
+        assert_eq!(a.drr.stop, b.drr.stop, "{reply:?}");
+        assert_eq!(a.inactive, b.inactive, "{reply:?}");
+        assert_eq!(backend.flushes, routes.0[0].flushes, "{reply:?}");
+        for lane in 0..2 {
+            assert_eq!(
+                a.drr.lanes[lane], b.drr.lanes[lane],
+                "{reply:?} lane {lane}"
+            );
+            assert_eq!(plain.pending(lane), routed.pending(lane, 0), "{reply:?}");
+        }
+    }
+}
+
+/// One route's endpoint inactive does not make the call inactive while
+/// another route serves.
+#[test]
+fn one_inactive_route_does_not_stop_the_others() {
+    use crate::backend::Release;
+    use crate::lanes::tests::fake::{self, Fake};
+
+    let config = DrrConfig::new(&[100], 100).unwrap();
+    let queues = [fake::queue(0)];
+    let mut routed = RoutedLaneSender::new(config, &[&queues, &queues], 4).unwrap();
+    for route in 0..2 {
+        let staged = Staged {
+            ticket: fake::ticket(u32::try_from(route).unwrap()),
+            charge: 64,
+            len: 50,
+        };
+        routed
+            .staged(
+                0,
+                route,
+                RoutedStaged {
+                    staged,
+                    position: 0,
+                },
+            )
+            .unwrap();
+    }
+    let mut routes = Faked(vec![
+        Fake {
+            replies: vec![(None, FlushStop::Queue(QueueError::NotActive))].into(),
+            flushes: 0,
+        },
+        Fake {
+            replies: vec![(
+                Some((
+                    TxItemOutcome::Submitted {
+                        release: Release::AtSubmission,
+                    },
+                    fake::ticket(1),
+                )),
+                FlushStop::Exposed,
+            )]
+            .into(),
+            flushes: 0,
+        },
+    ]);
+    let report = routed.serve(
+        &mut routes,
+        &mut Gate::default(),
+        Budget {
+            work: 16,
+            bytes: 1000,
+        },
+    );
+    assert!(!report.inactive);
+    assert_eq!(report.drr.lanes[0].served_bytes, 64);
+    assert_eq!(routed.debited(0), Some(0));
 }
