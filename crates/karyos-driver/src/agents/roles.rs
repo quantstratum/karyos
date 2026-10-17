@@ -200,6 +200,13 @@ pub struct ReceiverCounters {
     pub naks: u64,
     /// NAKs not handed over: the control ring was full (each stays due).
     pub ring_full_nak: u64,
+    /// NAK retries: a hole NAKed again (a reliable image whose sender
+    /// never repairs, such as a `reliable=false` publication, shows here).
+    pub nak_retries: u64,
+    /// Endpoint resets requested for a route fault (RC-6).
+    pub reset_requests: u64,
+    /// Reset requests not posted: the event ring was full.
+    pub reset_requests_full: u64,
     /// A second uncertain NAK of an image while one is unresolved (RC-6):
     /// its NAKs stop until the endpoint reset resolves them.
     pub nak_route_faults: u64,
@@ -326,6 +333,8 @@ pub struct ReceiverRole {
     rx_epochs: Vec<(EndpointId, karyos_io::backend::BackendEpoch)>,
     /// The most endpoints the agent holds (`max_endpoints`).
     max_endpoints: usize,
+    /// Duty cycles run, for the reset request cadence.
+    cycle: u64,
     /// The network trace hook (P2.12 step 3).
     trace: super::net_trace::ReceiverTrace,
     sessions: ReceiveSessions,
@@ -443,6 +452,20 @@ fn classify_heartbeat(image: &mut Installed, heartbeat: &Heartbeat) -> Heartbeat
 /// What the path statistics record of `frame` from `path`: its lane, term
 /// count, stream position and extent. `None` off any bound path or for a
 /// term outside the incarnation.
+/// The stream position of `frame` in `image`, or `None` for a term outside
+/// the incarnation.
+fn frame_position(image: &Installed, frame: &ValidatedFrame<'_>) -> Option<u64> {
+    let term = u64::from(
+        frame
+            .term_id()
+            .count_from(image.initial_term_id)
+            .ok()?
+            .get(),
+    );
+    term.checked_mul(u64::from(image.term_length))?
+        .checked_add(u64::from(frame.term_offset()))
+}
+
 fn delivered(
     image: &Installed,
     frame: &ValidatedFrame<'_>,
@@ -543,6 +566,9 @@ struct Installed {
     /// Per lane, when a tail loss was first seen (the heartbeat mark above
     /// a rebuild position with nothing covered above it).
     tail_since: [Option<u64>; 4],
+    /// The receiver cycle its last endpoint reset request was posted in,
+    /// while a route fault holds its NAKs (RC-6).
+    reset_requested: Option<u64>,
 }
 
 /// One lane's NAK in flight: its report slot (the RTTM probe's contract:
@@ -854,6 +880,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             posted_naks: Vec::new(),
             rx_epochs: Vec::with_capacity(config.max_endpoints),
             max_endpoints: config.max_endpoints,
+            cycle: 0,
             sessions,
             nonces: OsNonces,
             to_sender,
@@ -1067,6 +1094,57 @@ impl ReceiverRole {
             work: 0,
         };
         intake.data(source, alias, bytes);
+    }
+
+    /// Hands the receiver a DATA frame of `payload` bytes on lane 0 of the
+    /// image at `slot`, at stream position `position`, from `source` on
+    /// `endpoint` at `now` (tests).
+    #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a test helper naming the frame's whole context"
+    )]
+    pub(super) fn inject_frame(
+        &mut self,
+        sessions: &SessionEnd,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        slot: SlotRef,
+        position: u64,
+        payload: usize,
+        now: u64,
+    ) {
+        use karyos_protocol::frame::{Flags, FrameType, Word0};
+
+        let image = self.images.iter().find(|image| image.slot == slot).unwrap();
+        let term_length = u64::from(image.term_length);
+        let term_id = image
+            .initial_term_id
+            .get()
+            .checked_add(u32::try_from(position / term_length).unwrap())
+            .unwrap();
+        let term_offset = u32::try_from(position % term_length).unwrap();
+        let alias = image.key.alias;
+        let length = 32 + payload;
+        let mut bytes = vec![0u8; length];
+        let word0 = Word0::new(
+            i32::try_from(length).unwrap(),
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Data,
+        );
+        bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+        bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+        bytes[12..16].copy_from_slice(&alias.session_id.to_le_bytes());
+        bytes[16..20].copy_from_slice(&alias.stream_id.to_le_bytes());
+        bytes[20..24].copy_from_slice(&term_id.to_le_bytes());
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        intake.data(source, alias, &bytes);
     }
 
     /// Drops the DATA datagrams numbered `nth` (from 0) from now on at the
@@ -1389,6 +1467,7 @@ impl ReceiverRole {
             naks,
             closing: None,
             tail_since: [None; 4],
+            reset_requested: None,
         });
         Ok(())
     }
@@ -1471,6 +1550,36 @@ impl ReceiverRole {
         Ok(work)
     }
 
+    /// Asks for the reset of each endpoint whose image a route fault holds
+    /// (RC-6), through `post` (which returns whether the request was
+    /// posted): at most once per `RESET_REQUEST_CYCLES` per image while the
+    /// fault holds; the reset's new epoch resolves it. Nothing allocates.
+    pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
+        let cycle = self.cycle;
+        let Self {
+            images, counters, ..
+        } = self;
+        for image in images.iter_mut() {
+            if !image.loss.is_faulted() {
+                continue;
+            }
+            let due = image.reset_requested.is_none_or(|at| {
+                cycle
+                    .checked_sub(at)
+                    .is_none_or(|age| age >= super::data::RESET_REQUEST_CYCLES)
+            });
+            if !due {
+                continue;
+            }
+            if post(image.key.endpoint) {
+                image.reset_requested = Some(cycle);
+                tally(counters, |c| &mut c.reset_requests);
+            } else {
+                tally(counters, |c| &mut c.reset_requests_full);
+            }
+        }
+    }
+
     /// Records the epoch of `endpoint`'s RX half: a new one (the endpoint
     /// was reset and both halves reopened) resolves the uncertain NAKs of
     /// its images (RC-6), and their NAKs resume.
@@ -1487,6 +1596,7 @@ impl ReceiverRole {
                 for image in &mut self.images {
                     if image.key.endpoint == endpoint {
                         image.loss.uncertain_resolved();
+                        image.reset_requested = None;
                     }
                 }
             }
@@ -1531,6 +1641,7 @@ impl ReceiverRole {
                 && let Some(settled) = report.slot.collect(false)
                 && let Some(nak) = report.pending.take()
             {
+                let retries = image.loss.counters().retries;
                 match settled {
                     SendReport::Submitted(start) => image.loss.submitted(&nak, start, &image.rtt),
                     SendReport::NotSubmitted => image.loss.not_submitted(&nak),
@@ -1542,17 +1653,27 @@ impl ReceiverRole {
                         }
                     }
                 }
+                if image.loss.counters().retries > retries {
+                    tally(counters, |c| &mut c.nak_retries);
+                }
             }
             if !image.reliable {
                 continue;
             }
-            let hole = image
+            let first = image
                 .owner
                 .first_hole(lane)
                 .ok()
                 .flatten()
-                .map(|(start, length)| Hole { start, length })
-                .or_else(|| tail_hole(image, lane, at, now));
+                .map(|(start, length)| Hole { start, length });
+            // A covered hole ends any tail wait: a later tail waits its RTT
+            // afresh.
+            if first.is_some()
+                && let Some(since) = image.tail_since.get_mut(at)
+            {
+                *since = None;
+            }
+            let hole = first.or_else(|| tail_hole(image, lane, at, now));
             if let Observation::Unrecoverable {
                 hole,
                 lowest_retained,
@@ -1594,6 +1715,9 @@ impl ReceiverRole {
                 }
             }
         }
+        // The skip policy's duty: timer seals and the far-window close on
+        // an unreliable image; on a reliable one under `skip`, the holes
+        // left below an unrecoverable range (at most a few per call).
         if image.closing.is_none() {
             match image.skip.duty(&mut image.owner, now) {
                 Ok(report) => {
@@ -1809,6 +1933,7 @@ impl ReceiverRole {
                 image.rtt.rebind(path);
             }
         });
+        self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         work = work
             .checked_add(self.image_timers(sessions, now)?)
             .ok_or(overflow.clone())?;
@@ -1974,7 +2099,15 @@ impl Intake<'_> {
             let (outcome, arrival) = match item {
                 Item::Frame(frame) => {
                     let delivered = delivered(image, &frame, path, self.now);
-                    match image.owner.receive(&frame) {
+                    let received = image.owner.receive(&frame);
+                    // The skip policy's far-window clock (GU-6): a run of
+                    // `Ahead` arrivals starts it, a committed one stops it.
+                    if let Some(position) = frame_position(image, &frame) {
+                        image
+                            .skip
+                            .arrived(frame.lane(), &received, position, self.now);
+                    }
+                    match received {
                         Ok(Received::Committed { position, extent }) => {
                             // The heartbeat mark rises with committed data
                             // too: a replayed older heartbeat after a data
@@ -2167,12 +2300,12 @@ impl Intake<'_> {
                 lane,
                 hole,
                 lowest_retained,
-            }
-            | NakOutcome::GapCannotResume {
-                lane,
-                hole,
-                lowest_retained,
             } => unrecoverable(image, counters, lane, hole, lowest_retained, now),
+            // A floor beyond the window closes the image whatever the skip
+            // policy (RC-9): its repair state is terminal already.
+            NakOutcome::GapCannotResume { .. } => {
+                image.closing = Some(CloseReason::CannotResume);
+            }
             NakOutcome::ProtocolFault { .. } => {
                 image.closing = Some(CloseReason::ProtocolFault);
             }

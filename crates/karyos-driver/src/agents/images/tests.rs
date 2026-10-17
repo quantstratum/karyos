@@ -1414,13 +1414,14 @@ fn a_nak_retry_waits_one_rtt() {
 }
 
 /// Phase 6 wiring, RC-6: a route fault (a second uncertain NAK while one
-/// is unresolved) stops the image's NAKs; the endpoint's reset, a new
-/// epoch of its halves, resolves them and the NAKs resume.
+/// is unresolved) stops the image's NAKs, and the receiver asks for its
+/// endpoint's reset (#284 review P2-2); the reset's new epoch resolves
+/// them and the NAKs resume.
 #[test]
-fn an_endpoint_reset_resolves_uncertain_naks() {
+fn a_route_fault_resets_its_endpoint_and_naks_resume() {
     use karyos_sys::log_buffer::AppendOptions;
 
-    let (mut rig, b) = Rig::new(Setup {
+    let (mut rig, _b) = Rig::new(Setup {
         reliable: true,
         ..Setup::default()
     });
@@ -1439,14 +1440,138 @@ fn an_endpoint_reset_resolves_uncertain_naks() {
     let nak = rig.agents.receiver.role.posted_naks()[0];
     rig.agents.receiver.role.fault_naks(slot, &nak);
     let naks = rig.agents.receiver.counters().naks;
-    for _ in 0..50 {
+    rig.until(true, |rig| rig.endpoints.counters().resets >= 1);
+    assert!(rig.agents.receiver.counters().reset_requests >= 1);
+    rig.until(true, |rig| rig.agents.receiver.counters().naks > naks);
+}
+
+/// #284 review P2-1 (GU-6): on an unreliable image, arrivals that all land
+/// beyond the receive window for `far_window_timeout` (1 s), with nothing
+/// committed meanwhile, close the image with `GapCannotResume`.
+#[test]
+fn far_ahead_arrivals_close_an_unreliable_image() {
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    // Three terms ahead of the join: beyond the window {r, r + 1}.
+    let ahead = 3 * 65_536;
+    for _ in 0..13 {
+        rig.now += 100 * MS;
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_frame(&receiver.sessions, b, source, slot, ahead, 32, rig.now);
+        rig.round(true);
+        if !rig.agents.receiver.role.has_image(slot) {
+            break;
+        }
+    }
+    assert!(!rig.agents.receiver.role.has_image(slot));
+    assert_eq!(
+        rig.agents.receiver.counters().images_closed_cannot_resume,
+        1
+    );
+}
+
+/// #284 review P2-3: a RANGE_UNAVAILABLE whose floor lies beyond the
+/// receive window closes the image with `GapCannotResume`, whatever the
+/// skip policy.
+#[test]
+fn a_floor_beyond_the_window_closes_the_image() {
+    use karyos_protocol::network::{Control, NakReply, NakReplyReason};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    for _ in 0..5 {
         rig.round(true);
     }
-    assert_eq!(
-        rig.agents.receiver.counters().naks,
-        naks,
-        "NAKs during the fault"
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    // Two terms past the hole's term: beyond {r, r + 1}.
+    let beyond = (nak.range.start / 65_536 + 2) * 65_536;
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::NakReply(NakReply::answering(
+            &nak,
+            NakReplyReason::RangeUnavailable {
+                lowest_retained: beyond,
+            },
+        )),
+        rig.now,
     );
-    rig.endpoints.reset(&rig.links, b).unwrap();
-    rig.until(true, |rig| rig.agents.receiver.counters().naks > naks);
+    rig.until(true, |rig| !rig.agents.receiver.role.has_image(slot));
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        (
+            counters.images_closed_cannot_resume,
+            counters.images_closed_unrecoverable
+        ),
+        (1, 0)
+    );
+}
+
+/// The receive window is the pair {r, r + 1}: a floor in the next term is
+/// inside it, so RANGE_UNAVAILABLE there proves the hole unrecoverable and
+/// `close` closes the image as unrecoverable, not as `GapCannotResume`.
+#[test]
+fn a_floor_in_the_next_term_is_inside_the_window() {
+    use karyos_protocol::network::{Control, NakReply, NakReplyReason};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    let next_term = (nak.range.start / 65_536 + 1) * 65_536 + 64;
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::NakReply(NakReply::answering(
+            &nak,
+            NakReplyReason::RangeUnavailable {
+                lowest_retained: next_term,
+            },
+        )),
+        rig.now,
+    );
+    rig.until(true, |rig| !rig.agents.receiver.role.has_image(slot));
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        (
+            counters.images_closed_unrecoverable,
+            counters.images_closed_cannot_resume
+        ),
+        (1, 0)
+    );
 }

@@ -1192,6 +1192,7 @@ fn installed_image_with(
         }],
         closing: None,
         tail_since: [None; 4],
+        reset_requested: None,
     };
     (image, params)
 }
@@ -2216,4 +2217,155 @@ fn uncertain_naks_are_bounded_per_image() {
     let naks = receiver.counters().naks;
     receiver.repair(0, 10 * rtt).unwrap();
     assert_eq!(receiver.counters().naks, naks);
+}
+
+/// #284 review P3: a NAK the sender did not submit is due again at once.
+#[test]
+fn a_nak_not_submitted_is_due_again() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    // The sender drops it unsubmitted: its guard reports NotSubmitted.
+    drop(sender.from_receiver.try_take().unwrap());
+    receiver.repair(0, 2).unwrap();
+    assert_eq!(receiver.counters().naks, 2);
+    assert_eq!(receiver.images[0].loss.counters().not_submitted, 1);
+}
+
+/// #284 review P3: on a reliable image under `skip`, the skip policy's
+/// duty seals the holes left below an unrecoverable range that its reply
+/// could not seal in one call (at most a few per call).
+#[test]
+fn the_skip_duty_seals_what_one_reply_could_not() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::log_buffer::{SkipConfig, Unrecoverable};
+
+    let (mut image, params) = installed_image_with(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    // Ten 64-byte holes, each after a 64-byte frame.
+    for k in 0..11u32 {
+        commit_frame(&mut image, &params, 128 * k, 32);
+    }
+    let (_sender, mut receiver) = repairing(image);
+    let hole = crate::repair::loss::Hole {
+        start: 64,
+        length: 64,
+    };
+    super::unrecoverable(
+        &mut receiver.images[0],
+        &mut receiver.counters,
+        Lane::ZERO,
+        hole,
+        2048,
+        1,
+    );
+    let sealed = receiver.counters().gaps_sealed;
+    assert!(sealed < 10, "one call sealed {sealed}");
+    receiver.repair(0, 2).unwrap();
+    assert_eq!(receiver.counters().gaps_sealed, 10);
+    assert_eq!(
+        receiver.images[0].owner.first_hole(Lane::ZERO).unwrap(),
+        None
+    );
+}
+
+/// #284 review P3: a covered hole ends a tail wait, so a later tail waits
+/// its RTT afresh instead of NAKing at once.
+#[test]
+fn a_covered_hole_restarts_the_tail_wait() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    image.heartbeat_marks[0] = Some(4096);
+    let (sender, mut receiver) = repairing(image);
+    let rtt = crate::rtt::RttConfig::default().rtt_initial;
+    // The tail is seen at 1: it waits one RTT.
+    receiver.repair(0, 1).unwrap();
+    assert_eq!(receiver.counters().naks, 0);
+    // A frame further on leaves a covered hole [64, 1024): it is NAKed.
+    commit_frame(&mut receiver.images[0], &params, 1024, 32);
+    receiver.repair(0, 2).unwrap();
+    assert_eq!(receiver.counters().naks, 1);
+    drop(sender.from_receiver.try_take().unwrap());
+    // The hole fills; the tail is back, and waits one RTT from now.
+    commit_frame(&mut receiver.images[0], &params, 64, 928);
+    receiver.repair(0, 1 + rtt).unwrap();
+    assert_eq!(receiver.counters().naks, 1);
+    receiver.repair(0, 1 + 2 * rtt).unwrap();
+    assert_eq!(receiver.counters().naks, 2);
+}
+
+/// #284 review P3: NAK retries reach the receiver's counters, where a
+/// reliable image whose sender never repairs is visible.
+#[test]
+fn nak_retries_are_counted_by_the_receiver() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (sender, mut receiver) = repairing(image);
+    let rtt = crate::rtt::RttConfig::default().rtt_initial;
+    receiver.repair(0, 1).unwrap();
+    submit_nak(&sender, 1);
+    receiver.repair(0, 2).unwrap();
+    assert_eq!(receiver.counters().nak_retries, 0);
+    receiver.repair(0, 1 + rtt).unwrap();
+    submit_nak(&sender, 1 + rtt);
+    receiver.repair(0, 2 + rtt).unwrap();
+    assert_eq!(receiver.counters().nak_retries, 1);
+}
+
+/// #284 review P2-2: a route fault asks for the endpoint's reset at once,
+/// then once per `RESET_REQUEST_CYCLES` while it holds; the reset's new
+/// epoch resolves it, and a later fault asks again at once.
+#[test]
+fn a_route_fault_asks_for_a_reset_at_its_cadence() {
+    use super::super::data::RESET_REQUEST_CYCLES;
+    use karyos_io::backend::BackendEpoch;
+
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (_sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    let nak = receiver.posted_naks()[0];
+    let slot = receiver.images[0].slot;
+    receiver.fault_naks(slot, &nak);
+    let mut asked = Vec::new();
+    let mut ask = |receiver: &mut super::ReceiverRole, cycle| {
+        receiver.cycle = cycle;
+        receiver.request_resets(|endpoint| {
+            asked.push((cycle, endpoint));
+            true
+        });
+    };
+    ask(&mut receiver, 10);
+    ask(&mut receiver, 10 + RESET_REQUEST_CYCLES - 1);
+    ask(&mut receiver, 10 + RESET_REQUEST_CYCLES);
+    assert_eq!(
+        asked,
+        [
+            (10, EndpointId(1)),
+            (10 + RESET_REQUEST_CYCLES, EndpointId(1))
+        ]
+    );
+    // The reset: a new epoch of the endpoint's RX half resolves the fault.
+    receiver.rx_epoch(EndpointId(1), BackendEpoch::FIRST);
+    receiver.rx_epoch(
+        EndpointId(1),
+        BackendEpoch::new(std::num::NonZeroU32::new(2).unwrap()),
+    );
+    assert!(!receiver.images[0].loss.is_faulted());
+    // A later fault asks again at once.
+    receiver.fault_naks(slot, &nak);
+    let mut later = Vec::new();
+    receiver.cycle = 11 + RESET_REQUEST_CYCLES;
+    receiver.request_resets(|endpoint| {
+        later.push(endpoint);
+        true
+    });
+    assert_eq!(later, [EndpointId(1)]);
+    assert_eq!(receiver.counters().reset_requests, 3);
 }
