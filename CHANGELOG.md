@@ -170,6 +170,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Per-path datagram and byte counts (RP-10; rp-w9). Each route of a
+  routed publication counts the datagrams and bytes it submitted,
+  catch-up copies included (`RouteCounters::datagrams`, `bytes`), and
+  `Outbound::path_counters` reports them (`PathCounters::datagrams`,
+  `bytes`) for capacity planning. The DRR still charges a frame once,
+  however many paths take it.
 - Receive path queues (redundant-paths.md section 5; rp-w8). A multi-path
   image's DATA datagrams and heartbeats wait in their path's queue between
   the endpoint's receive poll and the image, and the receiver serves the

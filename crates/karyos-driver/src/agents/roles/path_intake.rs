@@ -32,7 +32,8 @@
 //! single-path receiver allocates none. Once allocated it stays until the
 //! receiver stops. With `path_queue_datagrams` at least `rx_datagrams` (the
 //! defaults: 256 and 64), one poll never fills a queue, since every queue
-//! is drained after each poll; a smaller queue drops a poll's excess.
+//! is drained after each cycle's polls; a smaller queue drops a poll's
+//! excess.
 
 use std::net::SocketAddr;
 
@@ -68,7 +69,7 @@ pub(super) enum Queue {
     Bypass,
 }
 
-/// The receiver's path queues and their buffers.
+/// The receiver's path queues and the slab that holds their datagrams.
 #[derive(Debug)]
 pub(super) struct PathIntake {
     queues: PathQueues<Queued>,
@@ -143,6 +144,7 @@ impl PathIntake {
                 queue
             }
         };
+        debug_assert!(!self.slab.is_empty(), "a push while the slab is out");
         let len = bytes.len();
         // Longer than a slot (never: a slot holds the largest datagram an
         // endpoint delivers) is dropped, not delivered past the path's
@@ -201,7 +203,9 @@ impl PathIntake {
     /// The slab, taken out while the receiver delivers from it (an empty
     /// one is left: nothing is queued meanwhile); [`PathIntake::put_slab`]
     /// gives it back.
+    #[must_use = "the slab must be given back with put_slab, or every later push drops"]
     pub(super) fn take_slab(&mut self) -> Vec<u8> {
+        debug_assert!(!self.slab.is_empty(), "the slab is already out");
         std::mem::take(&mut self.slab)
     }
 

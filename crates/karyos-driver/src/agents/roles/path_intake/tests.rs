@@ -182,3 +182,43 @@ fn one_paths_datagrams_are_taken_out_of_turn() {
     assert!(intake.holds(b), "B keeps its datagram");
     let _ = drain(&mut intake);
 }
+
+/// #372 review: slots are `MAX_DATAGRAM` apart. Two full-size datagrams
+/// live at once keep their own bytes; and a push one byte too long, given
+/// the free slot just before a live full-size one, is dropped and leaves
+/// that slot intact.
+#[test]
+fn slots_keep_their_own_bytes_at_full_size() {
+    use karyos_io::sockets::endpoint::MAX_DATAGRAM;
+
+    let full = usize::from(MAX_DATAGRAM);
+    let mut intake = intake(1, 2);
+    let a = EndpointId(1);
+    // Slots are taken lowest first: slot 0, then slot 1.
+    assert_eq!(
+        intake.push(a, (from(1), ALIAS, 0), &vec![1u8; full]),
+        Queue::Queued
+    );
+    assert_eq!(
+        intake.push(a, (from(1), ALIAS, 0), &vec![2u8; full]),
+        Queue::Queued
+    );
+    let slab = intake.take_slab();
+    let (_, first) = intake.pop().unwrap();
+    assert_eq!(PathIntake::bytes(&first, &slab), vec![1u8; full].as_slice());
+    intake.release(first);
+    intake.put_slab(slab);
+    // Slot 0 is free again, just before the live slot 1.
+    assert_eq!(
+        intake.push(a, (from(1), ALIAS, 0), &vec![3u8; full + 1]),
+        Queue::Dropped
+    );
+    let slab = intake.take_slab();
+    let (_, second) = intake.pop().unwrap();
+    assert_eq!(
+        PathIntake::bytes(&second, &slab),
+        vec![2u8; full].as_slice()
+    );
+    intake.release(second);
+    intake.put_slab(slab);
+}

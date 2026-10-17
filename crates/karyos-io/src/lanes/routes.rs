@@ -104,8 +104,22 @@ pub struct RouteCounters {
     /// Copies [`RoutedLaneSender::forget`] returned while the route was
     /// detached.
     pub forgotten: u64,
+    /// Datagrams this route submitted, catch-up copies included: each path
+    /// keeps its own count for capacity planning (RP-10).
+    pub datagrams: u64,
+    /// Bytes this route submitted, catch-up copies included (RP-10).
+    pub bytes: u64,
     /// An increment did not apply.
     pub overflowed: bool,
+}
+
+/// Counts one datagram of `len` bytes that `counters`' route submitted.
+fn count_submitted(counters: &mut RouteCounters, len: u16) {
+    bump(&mut counters.datagrams, &mut counters.overflowed);
+    match counters.bytes.checked_add(u64::from(len)) {
+        Some(total) => counters.bytes = total,
+        None => counters.overflowed = true,
+    }
 }
 
 /// What one [`RoutedLaneSender::catch_up`] call did.
@@ -706,6 +720,7 @@ impl RoutedLaneSender {
                         }
                         if let Some(counters) = counters.get_mut(index) {
                             bump(&mut counters.late, &mut counters.overflowed);
+                            count_submitted(counters, head.staged.len);
                         }
                     }
                     Flushed::Returned => {
@@ -983,8 +998,11 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
                     if let Some(route) = self.blocked.get_mut(index) {
                         *route = false;
                     }
-                    if served && let Some(counters) = self.counters.get_mut(index) {
-                        bump(&mut counters.late, &mut counters.overflowed);
+                    if let Some(counters) = self.counters.get_mut(index) {
+                        if served {
+                            bump(&mut counters.late, &mut counters.overflowed);
+                        }
+                        count_submitted(counters, head.staged.len);
                     }
                     served = true;
                 }
