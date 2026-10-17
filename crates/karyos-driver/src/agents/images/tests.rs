@@ -85,6 +85,16 @@ struct Setup {
     group_nak_budget: Option<u32>,
 }
 
+impl Setup {
+    /// The same setup without its guard, for a second rig or path.
+    fn again(&self) -> Self {
+        Self {
+            guard: None,
+            ..*self
+        }
+    }
+}
+
 impl Default for Setup {
     fn default() -> Self {
         Self {
@@ -2338,7 +2348,7 @@ fn a_later_path_binds_and_keeps_the_image() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, b) = Rig::new(Setup { ..setup });
+    let (mut rig, b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
@@ -2361,7 +2371,7 @@ fn a_mismatched_later_path_is_refused() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let _b2 = rig.second_path(
         &setup,
@@ -2388,7 +2398,7 @@ fn a_later_path_join_moves_no_position() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
     let mut seen = Vec::new();
@@ -2439,7 +2449,7 @@ fn losing_one_path_keeps_the_image() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
@@ -2475,7 +2485,7 @@ fn a_complete_term_charges_each_path_its_missing_bytes() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
