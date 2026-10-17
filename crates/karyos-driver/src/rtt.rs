@@ -180,8 +180,11 @@ pub trait ProbeIds {
     /// A fresh nonzero id, on the duty path; `None` when none is at hand.
     fn probe_id(&mut self) -> Option<u64>;
 
-    /// Restocks the source, on the control path. The default does nothing.
-    fn refill(&mut self) {}
+    /// Restocks the source, on the control path; returns whether it drew
+    /// from its own source. The default does nothing.
+    fn refill(&mut self) -> bool {
+        false
+    }
 }
 
 /// Probe ids the pool holds: a probe per path per `rtt_probe_interval`
@@ -195,8 +198,9 @@ const ID_LOW_WATER: usize = ID_POOL / 2;
 /// Probe ids from the operating system (`karyos_sys::random::fill_u64s`),
 /// drawn into a pool on the control path ([`ProbeIds::refill`]); taking
 /// one makes no system call, and a refill draws only once the pool is at
-/// or below half full.
-#[derive(Debug, Clone, Copy)]
+/// or below half full. Neither `Copy` nor `Clone`: a copied pool would
+/// hand out the same ids twice.
+#[derive(Debug)]
 pub struct OsProbeIds {
     pool: [u64; ID_POOL],
     len: usize,
@@ -210,7 +214,7 @@ impl OsProbeIds {
             pool: [0; ID_POOL],
             len: 0,
         };
-        ids.refill();
+        let _ = ids.refill();
         ids
     }
 
@@ -241,15 +245,15 @@ impl ProbeIds for OsProbeIds {
         Some(id)
     }
 
-    fn refill(&mut self) {
+    fn refill(&mut self) -> bool {
         if self.len > ID_LOW_WATER {
-            return;
+            return false;
         }
         let Some(missing) = self.pool.get_mut(self.len..) else {
-            return;
+            return false;
         };
         if karyos_sys::random::fill_u64s(missing).is_err() {
-            return;
+            return true;
         }
         // Zero draws are left out: an id is nonzero.
         let drawn = self.pool;
@@ -264,6 +268,7 @@ impl ProbeIds for OsProbeIds {
             len = count;
         }
         self.len = len;
+        true
     }
 }
 
@@ -357,9 +362,16 @@ impl<I: ProbeIds> RttProbes<I> {
     /// Restocks the probe ids, on the control path: the duty path only
     /// takes them. With [`OsProbeIds`] it draws only once the pool is at or
     /// below half full, so calling it every control cycle is free in steady
-    /// state.
-    pub fn refill_ids(&mut self) {
-        self.ids.refill();
+    /// state. Returns whether it drew from the source (a system call with
+    /// [`OsProbeIds`]).
+    pub fn refill_ids(&mut self) -> bool {
+        self.ids.refill()
+    }
+
+    /// `path`'s binding generation, `None` for a path beyond the image's.
+    #[must_use]
+    pub fn generation(&self, path: usize) -> Option<u64> {
+        self.paths.get(path).map(|state| state.generation)
     }
 
     /// What the probes counted.

@@ -25,13 +25,31 @@
 //!   - SM is dropped and counted: it can only be validated against an
 //!     installed binding and its receiver (§6.1), which phase 4b-2 brings.
 //!   - DATA waits for phase 5.
+//!   - RTT (reliable-transport.md, "RTT observations"; RC-1; ACS 15868).
+//!     Each installed image probes its bound paths: after its SM, one
+//!     RTTM REQUEST per path and `rtt_probe_interval`, at most one per path
+//!     in the ring, with a report slot ([`ProbeSlot`]) the sender settles
+//!     with the time it read before the submitting call. A REPLY counts
+//!     only from a bound path, naming the image's identity and this
+//!     receiver; the path's report is settled first, and the sample ends
+//!     at the clock read at validation. A lost path is rebound in
+//!     [`RttProbes`], so a late report of its probe is ignored. Probe ids
+//!     are restocked on the image timer step, never per datagram: a
+//!     `getrandom` call on the agent thread about once per 16 probes, a
+//!     known deviation until the agents have a control thread
+//!     (`rttm_id_draws`). A REQUEST for a published alias goes to the
+//!     sender, stamped with when it was taken from the backend.
 //! - **Sender.** It holds the publications it announces
 //!   ([`SendSessions`]), their channel destinations and join points. Each
 //!   cycle it sends the controls the receiver handed over, answers the
 //!   challenges and solicits for its publications toward the channel
 //!   destination (never a payload's address), and sends the announcements
 //!   due. Its control routes are kept per endpoint in a table allocated at
-//!   creation and forgotten when the endpoint is handed back.
+//!   creation and forgotten when the endpoint is handed back. It answers
+//!   an RTTM REQUEST from a receiver it answered on that endpoint, naming
+//!   the publication's incarnation and its receiver id, within
+//!   `rttm_reply_rate` per source ([`RttReplies`]); the REPLY echoes the
+//!   probe id with the service delay since the request was taken.
 //!
 //! Every queue and table is allocated when the agents are created; drops
 //! are counted, each under its own counter.
@@ -44,8 +62,8 @@ use karyos_io::backend::{Budget, RxBackend, RxDatagram, RxDrop, RxHandler};
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::frame::{FRAME_ALIGNMENT, Lane};
 use karyos_protocol::network::{
-    Alias, Control, Datagram, Identity, LaneStatus, Lanes, MAX_WINDOW, Receiver, SetupAnnounce,
-    SetupAnswer, StatusMessage, classify,
+    Alias, Control, Datagram, Identity, LaneStatus, Lanes, MAX_WINDOW, Receiver, Rttm, RttmKind,
+    SetupAnnounce, SetupAnswer, StatusMessage, classify,
 };
 use karyos_sys::host_clock::age_ns;
 use karyos_sys::log_buffer::ReceiveError;
@@ -58,7 +76,10 @@ use crate::paths::stats::{Arrival, Delivered, PathStats};
 use karyos_sys::sizing::TermLength;
 
 use super::chain::{ImageChain, SessionCommand, SessionEnd, SessionEvent};
-use super::control::{ControlItem, ControlRoutes, RouteSlot, SmGuard, SmSlot};
+use super::control::{
+    ControlItem, ControlRoutes, ItemGuard, ProbeGuard, ProbeReport, ProbeSlot, RouteSlot, SmGuard,
+    SmSlot,
+};
 use super::data::Outbound;
 
 /// The data DRR's budget per publication and cycle: probes and bytes.
@@ -69,6 +90,7 @@ const DATA_BUDGET: karyos_protocol::lanes::drr::Budget = karyos_protocol::lanes:
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
 use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
+use crate::rtt::{Probe, ReplyOutcome, RttConfig, RttProbes, RttReplies};
 use crate::sessions::OsNonces;
 use crate::sessions::rate::{EndpointRates, RateRefused, TotalRate, normalized};
 use crate::sessions::receive::{
@@ -154,6 +176,24 @@ pub struct ReceiverCounters {
     pub create_image: u64,
     /// Later paths bound to installed images (RP-1): no image asked.
     pub paths_bound: u64,
+    /// RTTM REQUESTs handed to the sender (RC-1).
+    pub rttm_requests: u64,
+    /// RTTM REQUESTs dropped with the control ring full: not submitted.
+    pub ring_full_rttm: u64,
+    /// RTTM REPLYs that gave a sample.
+    pub rttm_samples: u64,
+    /// RTTM REPLYs for a bound path that gave no sample (duplicate,
+    /// unmatched, late or invalid; the image's RTT counts tell which).
+    pub rttm_replies_ignored: u64,
+    /// RTTM REPLYs from no bound path, or naming another identity or
+    /// receiver: dropped.
+    pub rttm_replies_unbound: u64,
+    /// RTTM REQUESTs forwarded to the sender dropped with the ring full.
+    pub ring_full_rttm_request: u64,
+    /// Probe id refills that drew from the operating system: a system call
+    /// on the receiver agent's timer step, a known deviation until the
+    /// agents have a control thread (ACS 15868).
+    pub rttm_id_draws: u64,
     /// Data and controls this phase does not handle yet.
     pub unhandled: u64,
     /// An increment did not apply.
@@ -174,10 +214,10 @@ pub struct SenderCounters {
     /// SMs accepted from a bound receiver.
     pub sm_accepted: u64,
     /// SMs from no receiver this sender answered on that endpoint (source,
-    /// alias and receiver boot id), ignored.
+    /// alias, receiver boot id and incarnation), ignored.
     pub sm_unbound: u64,
-    /// SMs from a bound receiver whose identity, lane count or receiver id
-    /// does not match, ignored.
+    /// SMs from a bound receiver whose lane count or receiver id does not
+    /// match, ignored.
     pub sm_mismatch: u64,
     /// Answered receivers not recorded: the binding table was full of
     /// confirmed bindings.
@@ -198,6 +238,17 @@ pub struct SenderCounters {
     pub reset_requests: u64,
     /// Reset requests not posted: the event ring was full.
     pub reset_requests_full: u64,
+    /// RTTM REPLYs sent (counted in `sent` too).
+    pub rttm_replied: u64,
+    /// RTTM REQUESTs from no receiver this sender answered (source, alias,
+    /// receiver boot id and incarnation): ignored.
+    pub rttm_unbound: u64,
+    /// RTTM REQUESTs from a bound receiver naming another receiver id:
+    /// ignored.
+    pub rttm_mismatch: u64,
+    /// RTTM REQUESTs over `rttm_reply_rate` or beyond the source table:
+    /// dropped ([`SenderRole::rttm_reply_drops`] tells which).
+    pub rttm_refused: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -267,6 +318,10 @@ pub struct ReceiverRole {
     idle_timeout: u64,
     /// The path statistics' configuration (redundant-paths.md section 5).
     path_config: PathConfig,
+    /// Each image's RTT probes' settings.
+    rtt: RttConfig,
+    /// The clock read when a REPLY is validated.
+    clock: fn() -> u64,
     counters: ReceiverCounters,
 }
 
@@ -429,6 +484,46 @@ struct Installed {
     /// The last fresh evidence from the binding (DATA and heartbeats, phase
     /// 5c; until then, the install).
     evidence: u64,
+    /// Its paths' RTT probes (RC-1), one entry per path index.
+    rtt: RttProbes,
+    /// Each path's REQUEST report slot and the probe it reports on.
+    probes: Vec<PathProbe>,
+}
+
+/// One path's RTTM REQUEST in flight: its report slot (at most one
+/// REQUEST per path in the ring) and the probe the report belongs to.
+#[derive(Debug)]
+struct PathProbe {
+    slot: Arc<ProbeSlot>,
+    pending: Option<Probe>,
+}
+
+/// The receiver id of the image at `slot` in its SMs and RTTM REQUESTs:
+/// nonzero, since an installed generation is at least 1.
+fn receiver_id(slot: SlotRef) -> u64 {
+    (u64::from(slot.slot) << 32) | u64::from(slot.generation)
+}
+
+/// Adds one to a receiver counter; sticky on overflow.
+fn tally(counters: &mut ReceiverCounters, field: fn(&mut ReceiverCounters) -> &mut u64) {
+    let mut overflowed = counters.overflowed;
+    bump(field(counters), &mut overflowed);
+    counters.overflowed = overflowed;
+}
+
+/// Settles `probe`'s report into `rtt`, if the sender made one; `replied`
+/// as in [`ProbeSlot::collect`].
+fn collect_probe(rtt: &mut RttProbes, probe: &mut PathProbe, replied: bool) {
+    let Some(report) = probe.slot.collect(replied) else {
+        return;
+    };
+    // A probe of an older binding generation is ignored by `rtt`.
+    if let Some(pending) = probe.pending.take() {
+        match report {
+            ProbeReport::Submitted(start) => rtt.submitted(pending, start),
+            ProbeReport::NotSubmitted => rtt.not_submitted(pending),
+        }
+    }
 }
 
 /// The sender agent's network state.
@@ -457,6 +552,10 @@ pub struct SenderRole {
     cycle: u64,
     /// The driver's timing of each publication's membership.
     membership: MembershipTiming,
+    /// The RTTM reply rate per source endpoint (RC-1).
+    replies: RttReplies,
+    /// The clock read immediately before a REQUEST's backend call.
+    clock: fn() -> u64,
     counters: SenderCounters,
     /// The network trace hook and journals (P2.12 step 3).
     trace: super::net_trace::SenderTrace,
@@ -540,6 +639,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
     .ok_or(AgentError::InvalidConfig("rsp_setup rate or table is zero"))?;
     let rsp_total = TotalRate::new(config.rsp_setup_rate, 0)
         .ok_or(AgentError::InvalidConfig("rsp_setup_rate is zero"))?;
+    let replies = RttReplies::new(&config.rtt)
+        .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
     let routes = (0..config.max_endpoints)
         .map(|_| RouteSlot {
             endpoint: None,
@@ -560,6 +661,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             confirmed_timeout: config.image_liveness_timeout,
             cycle: 0,
             membership: MembershipTiming::of(config),
+            replies,
+            clock: karyos_sys::host_clock::host_monotonic_ns,
             counters: SenderCounters::default(),
             trace: super::net_trace::SenderTrace::default(),
         },
@@ -585,6 +688,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
                 max_paths: config.sessions.max_paths,
                 ..PathConfig::default()
             },
+            rtt: config.rtt,
+            clock: karyos_sys::host_clock::host_monotonic_ns,
             counters: ReceiverCounters::default(),
             trace: super::net_trace::ReceiverTrace::default(),
         },
@@ -910,6 +1015,17 @@ impl ReceiverRole {
         else {
             return Err(Some(chain.retire));
         };
+        // Its RTT probes, ids drawn now, on the session command path.
+        let paths = usize::from(self.path_config.max_paths);
+        let Ok(rtt) = RttProbes::new(self.rtt, paths) else {
+            return Err(Some(chain.retire));
+        };
+        let probes = (0..paths)
+            .map(|_| PathProbe {
+                slot: Arc::new(ProbeSlot::default()),
+                pending: None,
+            })
+            .collect();
         // The table holds a slot for every session, so it has room for
         // every installed image.
         self.images.push(Installed {
@@ -930,6 +1046,8 @@ impl ReceiverRole {
             sm_slot: Some(sm_slot),
             sm,
             evidence: now,
+            rtt,
+            probes,
         });
         Ok(())
     }
@@ -984,9 +1102,79 @@ impl ReceiverRole {
                 self.send_sm(index, &due, now);
                 work = work.checked_add(1).ok_or(overflow.clone())?;
             }
+            // Its RTTM REQUESTs follow its SM (reliable-transport.md).
+            work = work
+                .checked_add(self.probe_paths(index, now)?)
+                .ok_or(overflow.clone())?;
             index = index.checked_add(1).ok_or(overflow.clone())?;
         }
         Ok(work)
+    }
+
+    /// The RTTM REQUESTs due on the bound paths of the image at `index` at
+    /// `now` (RC-1): each path's last report is settled first, then one
+    /// REQUEST per path and interval goes to the path's source, at most one
+    /// per path in the ring. Its probe ids are restocked here, on the timer
+    /// step, never per datagram. Returns the REQUESTs handed over.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
+    fn probe_paths(&mut self, index: usize, now: u64) -> Result<u32, AgentError> {
+        let Self {
+            images,
+            sessions,
+            to_sender,
+            counters,
+            ..
+        } = self;
+        let Some(image) = images.get_mut(index) else {
+            return Ok(0);
+        };
+        if image.rtt.refill_ids() {
+            tally(counters, |c| &mut c.rttm_id_draws);
+        }
+        let receiver = Receiver {
+            receiver_boot_id: sessions.boot_id(),
+            receiver_id: receiver_id(image.slot),
+        };
+        let mut sent = 0u32;
+        for (path, probe) in image.probes.iter_mut().enumerate() {
+            collect_probe(&mut image.rtt, probe, false);
+            let Some(key) = sessions.paths().key(image.slot, path) else {
+                continue;
+            };
+            if probe.slot.busy() {
+                continue;
+            }
+            let Some(due) = image.rtt.due(path, now) else {
+                continue;
+            };
+            probe.pending = Some(due);
+            let item = ControlItem::Outgoing {
+                endpoint: key.endpoint,
+                destination: key.source,
+                control: Control::Rttm(Rttm {
+                    alias: image.key.alias,
+                    identity: image.identity,
+                    receiver,
+                    probe_id: due.probe_id,
+                    kind: RttmKind::Request,
+                }),
+                guard: Some(ItemGuard::Probe(ProbeGuard::take(&probe.slot))),
+            };
+            // A dropped item drops its guard: reported not submitted.
+            match to_sender.try_post(item) {
+                Ok(()) => {
+                    tally(counters, |c| &mut c.rttm_requests);
+                    sent = sent
+                        .checked_add(1)
+                        .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
+                }
+                Err(_) => tally(counters, |c| &mut c.ring_full_rttm),
+            }
+        }
+        Ok(sent)
     }
 
     /// Retires `image` at `now`, in one transition: the binding goes, the
@@ -1036,8 +1224,7 @@ impl ReceiverRole {
         else {
             return;
         };
-        // Nonzero: an installed generation is at least 1.
-        let receiver_id = (u64::from(image.slot.slot) << 32) | u64::from(image.slot.generation);
+        let receiver_id = receiver_id(image.slot);
         let status = StatusMessage {
             alias: image.key.alias,
             identity: image.identity,
@@ -1063,7 +1250,7 @@ impl ReceiverRole {
             endpoint: image.key.endpoint,
             destination: image.key.source,
             control: Control::Status(status),
-            guard: Some(SmGuard::take(&image.sm)),
+            guard: Some(ItemGuard::Sm(SmGuard::take(&image.sm))),
         };
         // The sender gone: the driver is stopping. The SM is then recorded
         // as sent all the same: nothing will send another.
@@ -1118,6 +1305,9 @@ impl ReceiverRole {
                 image
                     .stats
                     .path_lost(path, terms.get(..lanes).unwrap_or(&[]));
+                // A path bound again starts from `rtt_initial`; a report
+                // of the lost binding's probe no longer matches.
+                image.rtt.rebind(path);
             }
         });
         work = work
@@ -1162,11 +1352,65 @@ impl Intake<'_> {
                 control: Control::Solicit(_),
                 ..
             } => |c| &mut c.ring_full_solicit,
+            ControlItem::Incoming {
+                control: Control::Rttm(_),
+                ..
+            } => |c| &mut c.ring_full_rttm_request,
             ControlItem::Incoming { .. } => |c| &mut c.ring_full_challenge,
         };
         match self.role.to_sender.try_post(item) {
             Ok(()) => self.role.count(|c| &mut c.forwarded),
             Err(_) => self.role.count(full),
+        }
+    }
+
+    /// An RTTM REPLY from `source` (RC-1): only from a bound path of an
+    /// image it names exactly (identity and this receiver). The path's
+    /// last REQUEST report is settled first, so a REPLY that overtakes the
+    /// collection still matches; the sample ends at the clock read here,
+    /// at validation.
+    fn rttm_reply(&mut self, source: SocketAddr, rttm: &Rttm) {
+        let key = BindingKey {
+            endpoint: self.endpoint,
+            source,
+            alias: rttm.alias,
+        };
+        let boot_id = self.role.sessions.boot_id();
+        let found = self
+            .role
+            .sessions
+            .paths()
+            .lookup(key)
+            .and_then(|(slot, path)| {
+                let index = self.role.images.iter().position(|image| {
+                    image.slot == slot
+                        && image.identity == rttm.identity
+                        && rttm.receiver
+                            == Receiver {
+                                receiver_boot_id: boot_id,
+                                receiver_id: receiver_id(slot),
+                            }
+                })?;
+                Some((index, path))
+            });
+        let Some((index, path)) = found else {
+            self.role.count(|c| &mut c.rttm_replies_unbound);
+            return;
+        };
+        let seen = (self.role.clock)();
+        let Some(image) = self.role.images.get_mut(index) else {
+            return;
+        };
+        if let Some(probe) = image.probes.get_mut(path) {
+            collect_probe(&mut image.rtt, probe, true);
+        }
+        let outcome = match image.rtt.generation(path) {
+            Some(generation) => image.rtt.reply(path, generation, rttm.probe_id, seen),
+            None => ReplyOutcome::Ignored,
+        };
+        match outcome {
+            ReplyOutcome::Sample(_) => self.role.count(|c| &mut c.rttm_samples),
+            ReplyOutcome::Ignored => self.role.count(|c| &mut c.rttm_replies_ignored),
         }
     }
 
@@ -1450,8 +1694,25 @@ impl Intake<'_> {
                     endpoint,
                     source,
                     control,
+                    seen: now,
                 });
             }
+            Control::Rttm(rttm) => match rttm.kind {
+                // A REQUEST for a local publication: the sender replies.
+                RttmKind::Request => {
+                    if !self.role.published.contains(&(endpoint, rttm.alias)) {
+                        self.role.count(|c| &mut c.not_published);
+                        return;
+                    }
+                    self.forward(ControlItem::Incoming {
+                        endpoint,
+                        source,
+                        control,
+                        seen: now,
+                    });
+                }
+                RttmKind::Reply { .. } => self.rttm_reply(source, &rttm),
+            },
             _ => self.role.count(|c| &mut c.unhandled),
         }
     }
@@ -1607,14 +1868,14 @@ impl SenderRole {
         endpoint: EndpointId,
         destination: SocketAddr,
         control: &Control,
-    ) {
+    ) -> bool {
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
             _ => None,
         });
         let Some(tx) = tx else {
             self.count(|c| &mut c.no_endpoint);
-            return;
+            return false;
         };
         let index = self
             .routes
@@ -1625,12 +1886,18 @@ impl SenderRole {
             // More held halves than slots: the agent holds at most
             // `max_endpoints`, so this does not happen.
             self.count(|c| &mut c.no_endpoint);
-            return;
+            return false;
         };
         slot.endpoint = Some(endpoint);
         match slot.routes.send(tx, destination, control) {
-            Ok(()) => self.count(|c| &mut c.sent),
-            Err(_) => self.count(|c| &mut c.send_failures),
+            Ok(()) => {
+                self.count(|c| &mut c.sent);
+                true
+            }
+            Err(_) => {
+                self.count(|c| &mut c.send_failures);
+                false
+            }
         }
     }
 
@@ -1669,29 +1936,57 @@ impl SenderRole {
                 // §7.3: an RSP_SETUP to the trigger's validated source,
                 // checked by the receiver.
                 // An SM's guard drops after the send, freeing its slot.
+                // An RTTM REQUEST's start is read immediately before the
+                // backend call, and reported only if it submitted (RC-1).
+                ControlItem::Outgoing {
+                    endpoint,
+                    destination,
+                    control,
+                    guard: Some(ItemGuard::Probe(guard)),
+                } => {
+                    let mut guard = guard;
+                    guard.sending((self.clock)());
+                    if self.send(halves, endpoint, destination, &control) {
+                        guard.submitted();
+                    }
+                }
                 ControlItem::Outgoing {
                     endpoint,
                     destination,
                     control,
                     guard,
                 } => {
-                    self.send(halves, endpoint, destination, &control);
+                    let _ = self.send(halves, endpoint, destination, &control);
                     drop(guard);
                 }
                 ControlItem::Incoming {
                     endpoint,
                     source,
                     control: Control::Status(status),
+                    ..
                 } => self.status(endpoint, source, &status, now),
                 ControlItem::Incoming {
                     endpoint,
                     source,
+                    control: Control::Rttm(request),
+                    seen,
+                } => {
+                    if let Some(reply) = self.rttm_request(endpoint, source, &request, seen, now)
+                        && self.send(halves, endpoint, source, &Control::Rttm(reply))
+                    {
+                        self.count(|c| &mut c.rttm_replied);
+                    }
+                }
+                ControlItem::Incoming {
+                    endpoint,
+                    source,
                     control,
+                    ..
                 } => {
                     if let Some((destination, answer)) =
                         self.answer_for(endpoint, source, now, control)
                     {
-                        self.send(halves, endpoint, destination, &answer);
+                        let _ = self.send(halves, endpoint, destination, &answer);
                     }
                 }
             }
@@ -1704,7 +1999,7 @@ impl SenderRole {
             // (§6.2).
             if let Some((destination, _)) = self.route_of(endpoint, announce.alias) {
                 work = work.checked_add(1).ok_or(overflow.clone())?;
-                self.send(
+                let _ = self.send(
                     halves,
                     endpoint,
                     destination,
@@ -1925,6 +2220,58 @@ impl SenderRole {
         }
     }
 
+    /// The REPLY to an RTTM `request` from `source`, seen at `seen` (RC-1):
+    /// only for a receiver this sender answered on that endpoint, naming the
+    /// publication's incarnation and its receiver id, within
+    /// `rttm_reply_rate` per source. It echoes the probe id; its
+    /// `service_delay_ns` is a bounded diagnostic the receiver never
+    /// subtracts. The reply goes back to the REQUEST's source.
+    fn rttm_request(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        request: &Rttm,
+        seen: u64,
+        now: u64,
+    ) -> Option<Rttm> {
+        self.expire_bindings(now);
+        let normal = normalized(source);
+        let Some(binding) = self.bindings.iter().find(|binding| {
+            binding.endpoint == endpoint
+                && binding.alias == request.alias
+                && binding.source == normal
+                && binding.boot_id == request.receiver.receiver_boot_id
+                && binding.identity == request.identity
+        }) else {
+            self.count(|c| &mut c.rttm_unbound);
+            return None;
+        };
+        let matches = binding
+            .receiver_id
+            .is_none_or(|id| id == request.receiver.receiver_id);
+        if !matches {
+            self.count(|c| &mut c.rttm_mismatch);
+            return None;
+        }
+        if !self.replies.admit(normal, now) {
+            self.count(|c| &mut c.rttm_refused);
+            return None;
+        }
+        Some(Rttm {
+            kind: RttmKind::Reply {
+                service_delay_ns: RttReplies::service_delay(seen, (self.clock)()),
+            },
+            ..*request
+        })
+    }
+
+    /// RTTM REQUESTs dropped over their source's rate, and dropped with the
+    /// source table full.
+    #[must_use]
+    pub fn rttm_reply_drops(&self) -> (u64, u64) {
+        (self.replies.dropped(), self.replies.sources_full())
+    }
+
     /// An SM from `source` on `endpoint` (network-control-schemas.md §6.1):
     /// accepted only from a receiver this sender answered there, with the
     /// answered identity, the publication's lane count and, after the first,
@@ -1944,11 +2291,14 @@ impl SenderRole {
             .iter()
             .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
             .and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
+        // The incarnation is part of the binding: an earlier incarnation's
+        // row from the same receiver never shadows the current one.
         let found = self.bindings.iter_mut().find(|binding| {
             binding.endpoint == endpoint
                 && binding.alias == status.alias
                 && binding.source == source
                 && binding.boot_id == status.receiver.receiver_boot_id
+                && binding.identity == status.identity
         });
         let Some(binding) = found else {
             self.count(|c| &mut c.sm_unbound);
