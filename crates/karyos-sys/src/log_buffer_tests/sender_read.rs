@@ -32,6 +32,14 @@ fn sr_loan_released(reader: &SenderRead<&LogBuffer<Terms>>) -> bool {
         == 0
 }
 
+/// Registers the highest block boundary read so far, as the sender does
+/// on a submission reaching the cursor.
+fn sr_sent(reader: &mut SenderRead<&LogBuffer<Terms>>) {
+    if let Some(boundary) = reader.boundary_at_or_below(reader.position()) {
+        reader.sent(boundary).unwrap();
+    }
+}
+
 /// Reads at the cursor and checks that the loan was released.
 fn sr_read(
     reader: &mut SenderRead<&LogBuffer<Terms>>,
@@ -211,7 +219,7 @@ fn sender_read_turns_padding_into_its_canonical_record() {
                 Err(error) => panic!("{error:?} at {}", reader.position()),
             }
         }
-        reader.sent(reader.position()).unwrap();
+        sr_sent(&mut reader);
     }
     assert_eq!(records, [(CanonicalKind::Pad, TERM)]);
     assert_eq!(reader.counters().canonical_records, 1);
@@ -475,7 +483,7 @@ fn sender_read_sent_position_bounds_the_publisher() {
         assert!(appended < 1000, "never back pressured");
     }
     // The submission moves the bound.
-    reader.sent(reader.position()).unwrap();
+    sr_sent(&mut reader);
     let _ = conductor.duty_cycle().unwrap();
     assert!(matches!(
         publication.append(&data, AppendOptions::default()).unwrap(),
@@ -590,7 +598,7 @@ fn probe_drain(
             }
             Err(error) => panic!("{error:?} at {before}"),
         }
-        reader.sent(reader.position()).unwrap();
+        sr_sent(reader);
     }
 }
 
@@ -701,7 +709,7 @@ fn sender_read_probe_exact_term_end() {
                     Ok(ReadOutcome::Pending) => break,
                     other => panic!("{other:?} size {size}"),
                 }
-                reader.sent(reader.position()).unwrap();
+                sr_sent(&mut reader);
             }
         }
         assert!(ends.contains(&TERM), "size {size} out {out_len}: no copy ended at the term end");
@@ -891,7 +899,7 @@ fn probe_to_end(reader: &mut SenderRead<&LogBuffer<Terms>>) -> Vec<Result<ReadOu
         if !matches!(r, Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. })) {
             break;
         }
-        reader.sent(reader.position()).unwrap();
+        sr_sent(reader);
     }
     seen
 }
@@ -997,9 +1005,150 @@ fn sender_read_runs_beside_a_publisher_and_its_conductor() {
                 }
                 Err(error) => panic!("{error:?} at {}", reader.position()),
             }
-            reader.sent(reader.position()).unwrap();
+            sr_sent(&mut reader);
         }
         done.store(true, Ordering::Release);
     });
     assert_eq!(sink.messages, expected);
+}
+
+/// `rewind` restarts at the registered position, a block boundary the
+/// caller registered: what was read past it is read again, whole.
+#[test]
+fn sender_read_rewinds_to_the_registered_boundary() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let messages = [sized_message(1, 3000), sized_message(2, 3000)];
+    for message in &messages {
+        let _ = publication.append(message, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    // The first message, three one-frame datagrams: a boundary at its end.
+    let mut first = ProbeSink::default();
+    for _ in 0..3 {
+        let Ok(ReadOutcome::Copied { len, .. }) = sr_read(&mut reader, &mut out) else {
+            panic!("not copied");
+        };
+        first.datagram(&out[..len]);
+    }
+    assert!(reader.at_boundary());
+    sr_sent(&mut reader);
+    // Part of the second, inside its block, then a reset drops it.
+    let _ = sr_read(&mut reader, &mut out).unwrap();
+    assert!(!reader.at_boundary());
+    reader.rewind().unwrap();
+    assert_eq!(reader.position(), reader.sent_position());
+    let mut second = ProbeSink::default();
+    while let Ok(ReadOutcome::Copied { len, .. }) = sr_read(&mut reader, &mut out) {
+        second.datagram(&out[..len]);
+    }
+    assert_eq!(first.messages, [messages[0].clone()]);
+    assert_eq!(second.messages, [messages[1].clone()]);
+}
+
+/// The #263 review probe: a forged DATA word 0 inside a payload is never a
+/// restart. `sent` refuses a position that is not a block boundary the
+/// reader returned, so `rewind` restarts only at a real block start, and
+/// the application bytes are never sent as a frame.
+#[test]
+fn sender_read_never_restarts_inside_a_payload() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // A 200-byte payload holding, at payload byte 32 (term offset 64), a
+    // plausible DATA word 0 of BEGIN|END and length 64.
+    let mut message = sized_message(1, 200);
+    let forged = Word0::new(64, Flags::new(true, true, false, false, Lane::ZERO), FrameType::Data);
+    message[32..40].copy_from_slice(&forged.pack().to_le_bytes());
+    let _ = publication.append(&message, AppendOptions::default()).unwrap();
+    let mut out = sr_out();
+    let Ok(ReadOutcome::Copied { next, .. }) = sr_read(&mut reader, &mut out) else {
+        panic!("not copied");
+    };
+    assert_eq!(next, 256);
+    // 64 is on the 32-byte grid but no boundary: refused, nothing moves.
+    assert_eq!(reader.sent(64), Err(ReadError::Invariant));
+    assert_eq!(reader.sent_position(), 0);
+    reader.rewind().unwrap();
+    // The restart is the real block start: the whole message again.
+    let mut sink = ProbeSink::default();
+    let Ok(ReadOutcome::Copied { len, next }) = sr_read(&mut reader, &mut out) else {
+        panic!("not copied");
+    };
+    sink.datagram(&out[..len]);
+    assert_eq!((next, sink.messages), (256, vec![message]));
+}
+
+/// `rewind` keeps the C-9 count: rewinding onto a corrupt block does not
+/// restore its retries, and a faulted reader refuses to rewind.
+#[test]
+fn sender_read_rewind_keeps_the_corrupt_count() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 3000), AppendOptions::default())
+        .unwrap();
+    let (offset, word) = frames(&buffer)[1];
+    word0_of_term0(&buffer, offset).store(
+        Word0::new(word.frame_length(), word.flags(), FrameType::Pad)
+            .pack()
+            .to_le(),
+        Ordering::Relaxed,
+    );
+    let mut out = sr_out();
+    for failures in 1..=DEFAULT_CORRUPT_RETRIES {
+        assert_eq!(
+            sr_read(&mut reader, &mut out),
+            Err(ReadError::CorruptTerm { failures })
+        );
+        reader.rewind().unwrap();
+    }
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Err(ReadError::Faulted { position: 0 })
+    );
+    assert_eq!(reader.rewind(), Err(ReadError::Faulted { position: 0 }));
+}
+
+/// A reliable lane read far ahead of its registered position (one window
+/// of the smallest frames is more than the boundary ring holds): the ring
+/// is thinned, never emptied below a position, so the registered position
+/// keeps advancing in small steps as consumption advances, up to the
+/// cursor.
+#[test]
+fn sender_read_keeps_registering_far_ahead() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // One-byte messages: 64-byte frames, until the window presses back.
+    let mut appended = 0u32;
+    while let AppendOutcome::Appended { .. } = publication
+        .append(&[7u8], AppendOptions::default())
+        .unwrap()
+    {
+        appended += 1;
+    }
+    assert!(appended > 300, "{appended} frames: fewer than the ring holds");
+    // Read all of it in small datagrams, registering nothing.
+    let mut out = vec![0u8; 64];
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    let cursor = reader.position();
+    assert_eq!(cursor, u64::from(appended) * 64);
+    // Consumption advances one frame at a time: the registered position
+    // follows within a few frames and reaches the cursor.
+    let mut lag_max = 0u64;
+    for consumed in (64..=cursor).step_by(64) {
+        if let Some(boundary) = reader.boundary_at_or_below(consumed) {
+            reader.sent(boundary).unwrap();
+        }
+        lag_max = lag_max.max(consumed - reader.sent_position());
+    }
+    assert_eq!(reader.sent_position(), cursor);
+    assert!(lag_max <= 4 * 64, "registered lag reached {lag_max} bytes");
 }

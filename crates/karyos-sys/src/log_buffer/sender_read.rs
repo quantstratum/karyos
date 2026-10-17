@@ -57,10 +57,12 @@
 //! reads them). Only committed DATA bytes are read; an aborted extent is
 //! never read past its word 0.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{Ordering, fence};
+use std::collections::VecDeque;
 
 use super::{
-    BufferOwner, Lookup, Role, SealWord, Subscription, SubscriptionContext, Validated, decode_seal,
+    BufferOwner, Cursor, LogBuffer, Lookup, Role, SealWord, Subscription, SubscriptionContext,
+    Validated, decode_seal,
 };
 use crate::error::SysError;
 use crate::frame::{Flags, FrameType, HEADER_LENGTH, Word0};
@@ -228,10 +230,23 @@ pub struct SenderRead<O: BufferOwner> {
     corrupt_retries: u32,
     faulted: Option<u64>,
     counters: SenderReadCounters,
-    /// An interleaving injected by tests.
-    #[cfg(test)]
-    hook: Option<TestHook>,
+    /// An interleaving injected by tests; nothing outside them.
+    hook: HookSlot,
+    /// The block-boundary `next` values of reads not yet registered, oldest
+    /// first, at most `BOUNDARIES` (allocated at construction), thinned
+    /// when full: the only positions [`SenderRead::sent`] accepts, so the
+    /// registered position is always a block start that
+    /// [`SenderRead::rewind`] can restart at.
+    boundaries: VecDeque<u64>,
 }
+
+/// Block-boundary read ends a reader remembers until they are registered.
+const BOUNDARIES: usize = 256;
+
+#[cfg(test)]
+type HookSlot = Option<TestHook>;
+#[cfg(not(test))]
+type HookSlot = ();
 
 /// An interleaving a test injects into the next read: what another party
 /// does at that point of the read.
@@ -284,8 +299,8 @@ impl<O: BufferOwner> SenderRead<O> {
             corrupt_retries,
             faulted: None,
             counters: SenderReadCounters::default(),
-            #[cfg(test)]
-            hook: None,
+            hook: HookSlot::default(),
+            boundaries: VecDeque::with_capacity(BOUNDARIES),
         })
     }
 
@@ -313,6 +328,68 @@ impl<O: BufferOwner> SenderRead<O> {
         self.subscription.cursor.acknowledged
     }
 
+    /// Whether the cursor stands at a block boundary: the last read left
+    /// no block open.
+    #[must_use]
+    pub fn at_boundary(&self) -> bool {
+        self.open.is_none()
+    }
+
+    /// The highest block boundary this reader returned above the registered
+    /// position and at or below `position`: what [`SenderRead::sent`]
+    /// accepts for a submission (or a consumption bound) reaching
+    /// `position`. `None` when there is none.
+    #[must_use]
+    pub fn boundary_at_or_below(&self, position: u64) -> Option<u64> {
+        let registered = self.subscription.cursor.acknowledged;
+        self.boundaries
+            .iter()
+            .rev()
+            .copied()
+            .find(|boundary| *boundary > registered && *boundary <= position)
+    }
+
+    /// Moves the cursor back to the registered position, dropping what was
+    /// read past it and not submitted (an endpoint reset returned it): the
+    /// next read starts there again. The registered position is a block
+    /// start by construction (the join, or a boundary [`SenderRead::sent`]
+    /// accepted), and never below the floor, so nothing it rereads is
+    /// reclaimed. The C-9 count is kept: a rewind onto a corrupt block does
+    /// not restore its retries.
+    ///
+    /// # Errors
+    ///
+    /// [`ReadError::Faulted`] once the reader is faulted; nothing moves.
+    pub fn rewind(&mut self) -> Result<(), ReadError> {
+        if let Some(position) = self.faulted {
+            return Err(ReadError::Faulted { position });
+        }
+        let cursor = &mut self.subscription.cursor;
+        cursor.position = cursor.acknowledged;
+        self.open = None;
+        self.boundaries.clear();
+        Ok(())
+    }
+
+    /// Remembers `next`, a block boundary a read just returned. A full
+    /// ring is thinned in place to every second entry, the newest kept, so
+    /// it still spans everything read above the registered position: a
+    /// lane read far ahead (many small frames within one window) keeps a
+    /// registrable boundary within a bounded distance below any position,
+    /// never none.
+    fn remember(boundaries: &mut VecDeque<u64>, next: u64) {
+        if boundaries.len() >= BOUNDARIES {
+            // Every second entry, from the second: the newest stays (the
+            // ring is full, so of even length).
+            let mut keep = false;
+            boundaries.retain(|_| {
+                keep = !keep;
+                !keep
+            });
+        }
+        boundaries.push_back(next);
+    }
+
     /// The counters.
     #[must_use]
     pub fn counters(&self) -> SenderReadCounters {
@@ -331,23 +408,29 @@ impl<O: BufferOwner> SenderRead<O> {
 
     /// Records the backend's submission up to `position`: the registered
     /// position, which bounds the publisher and the retention floor, moves
-    /// there. The caller passes the `next` of a read it submitted (a frame
-    /// boundary); a position off the 32-byte grid is refused, any other
-    /// one in range is taken as given.
+    /// there. Only a block boundary this reader returned is accepted (see
+    /// [`SenderRead::boundary_at_or_below`]), so the registered position is
+    /// always a valid restart; the registered position itself is a no-op.
     ///
     /// # Errors
     ///
-    /// [`ReadError::Invariant`] for a position behind the registered one,
-    /// past the cursor, or not 32-byte aligned; nothing moves.
+    /// [`ReadError::Invariant`] for any other position; nothing moves.
     pub fn sent(&mut self, position: u64) -> Result<(), ReadError> {
-        let cursor = &mut self.subscription.cursor;
-        if position < cursor.acknowledged
-            || position > cursor.position
-            || !position.is_multiple_of(u64::from(crate::frame::FRAME_ALIGNMENT))
-        {
+        if position == self.subscription.cursor.acknowledged {
+            return Ok(());
+        }
+        if !self.boundaries.contains(&position) {
             self.counters.bump(|c| &mut c.invariant, 1);
             return Err(ReadError::Invariant);
         }
+        while self
+            .boundaries
+            .front()
+            .is_some_and(|boundary| *boundary <= position)
+        {
+            let _ = self.boundaries.pop_front();
+        }
+        let cursor = &mut self.subscription.cursor;
         let cell = self
             .subscription
             .buffer
@@ -420,10 +503,20 @@ impl<O: BufferOwner> SenderRead<O> {
 
     fn read(&mut self, from: u64, out: &mut [u8]) -> Result<ReadOutcome, ReadError> {
         let invariant = |_| ReadError::Invariant;
-        if from != self.subscription.cursor.position {
+        // Split borrows: the buffer (and the cell taken from it) stays
+        // borrowed across the copy, so the loan is released through the
+        // very cell it was taken in.
+        let Self {
+            subscription,
+            open: open_block,
+            hook,
+            boundaries,
+            ..
+        } = self;
+        if from != subscription.cursor.position {
             return Err(ReadError::Invariant);
         }
-        let buffer = &*self.subscription.buffer;
+        let buffer = &*subscription.buffer;
         // Step 1: the retention floor, before any loan.
         let floor = buffer.floor().load(Ordering::Acquire);
         if from < floor {
@@ -452,18 +545,16 @@ impl<O: BufferOwner> SenderRead<O> {
             }
         };
         // Step 3: the SPEC §4 acquisition on the exact term.
-        let cell = buffer
-            .cell(self.subscription.cursor.cell)
-            .map_err(invariant)?;
+        let cell = buffer.cell(subscription.cursor.cell).map_err(invariant)?;
         let descriptor = buffer.descriptor(slot).map_err(invariant)?;
         #[cfg(test)]
-        match self.hook {
+        match *hook {
             Some(TestHook::FloorBeforeLoan(floor)) => {
-                self.hook = None;
+                *hook = None;
                 buffer.floor().store(floor, Ordering::Release);
             }
             Some(TestHook::DescriptorBeforeLoan(raw)) => {
-                self.hook = None;
+                *hook = None;
                 descriptor.store(raw, Ordering::Release);
             }
             _ => {}
@@ -487,25 +578,36 @@ impl<O: BufferOwner> SenderRead<O> {
             release_loan(&cell.loan);
             return Err(ReadError::Unavailable { lowest: floor });
         }
-        // Steps 4 and 5 under the loan; step 6 releases it.
-        let copied = self.copy(slot, count, offset, out);
-        let buffer = &*self.subscription.buffer;
-        if let Ok(cell) = buffer.cell(self.subscription.cursor.cell) {
-            release_loan(&cell.loan);
-        }
+        // Steps 4 and 5 under the loan; step 6 releases it, on every path,
+        // through the cell it was taken in.
+        let copied = Self::copy(
+            buffer,
+            &mut subscription.cursor,
+            *open_block,
+            hook,
+            slot,
+            count,
+            offset,
+            out,
+        );
+        release_loan(&cell.loan);
         let next = |end: u32| buffer.position(count, end);
         match copied {
             Ok(Copy::Frames { len, end, open }) => {
                 let next = next(end);
-                self.subscription.cursor.position = next;
-                self.open = open.map(|end| OpenBlock { count, end });
+                subscription.cursor.position = next;
+                *open_block = open.map(|end| OpenBlock { count, end });
+                if open.is_none() {
+                    Self::remember(boundaries, next);
+                }
                 Ok(ReadOutcome::Copied { len, next })
             }
             Ok(Copy::Pending) => Ok(ReadOutcome::Pending),
             Ok(Copy::Canonical { record, end }) => {
                 let next = next(end);
-                self.subscription.cursor.position = next;
-                self.open = None;
+                subscription.cursor.position = next;
+                *open_block = None;
+                Self::remember(boundaries, next);
                 Ok(ReadOutcome::Canonical { record, next })
             }
             Err(CopyError::Corrupt) => Err(ReadError::CorruptTerm { failures: 0 }),
@@ -516,20 +618,23 @@ impl<O: BufferOwner> SenderRead<O> {
 
     /// Steps 4 and 5: under the caller's loan of `count` in `slot`, copies
     /// whole committed frames from `start` into `out`.
+    #[allow(clippy::too_many_arguments, reason = "the split borrows of one read")]
     fn copy(
-        &mut self,
+        buffer: &LogBuffer<O::Terms>,
+        cursor: &mut Cursor,
+        open: Option<OpenBlock>,
+        hook: &mut HookSlot,
         slot: u8,
         count: TermCount,
         start: u32,
         out: &mut [u8],
     ) -> Result<Copy, CopyError> {
-        let buffer = &*self.subscription.buffer;
+        let _ = &hook;
         let term_length = buffer.term_length;
         let lane = buffer.config.lane;
         // A block resumed at an interior frame: its first word 0 was
         // observed with Acquire by an earlier call under a loan of this term.
-        let mut open = self
-            .open
+        let mut open = open
             .filter(|block| block.count == count && block.end > start)
             .map(|block| block.end);
         let mut at = start;
@@ -543,17 +648,31 @@ impl<O: BufferOwner> SenderRead<O> {
                 None => {
                     let context = SubscriptionContext {
                         buffer,
-                        cursor: &mut self.subscription.cursor,
+                        cursor: &mut *cursor,
                     };
                     match context.validate_block(slot, at) {
                         Ok(Validated::Block(block)) => (block.end, true),
                         Ok(Validated::Pending) => break,
                         Ok(Validated::Pad) if len == 0 => {
                             let extent = term_length.checked_sub(at).ok_or(CopyError::Invariant)?;
-                            return self.canonical(CanonicalKind::Pad, count, at, extent, out);
+                            return Self::canonical(
+                                buffer,
+                                CanonicalKind::Pad,
+                                count,
+                                at,
+                                extent,
+                                out,
+                            );
                         }
                         Ok(Validated::Aborted { extent }) if len == 0 => {
-                            return self.canonical(CanonicalKind::Aborted, count, at, extent, out);
+                            return Self::canonical(
+                                buffer,
+                                CanonicalKind::Aborted,
+                                count,
+                                at,
+                                extent,
+                                out,
+                            );
                         }
                         // A record ends a copy; it is the next read, alone.
                         Ok(Validated::Pad | Validated::Aborted { .. }) => break,
@@ -600,14 +719,16 @@ impl<O: BufferOwner> SenderRead<O> {
                 // inside the validated block (`check_frame`).
                 unsafe { buffer.regions.read_bytes(slot, body_at, body) };
                 #[cfg(test)]
-                if let Some(TestHook::Word0BetweenLoads { offset, raw }) = self.hook
+                if let Some(TestHook::Word0BetweenLoads { offset, raw }) = *hook
                     && offset == at
                 {
-                    self.hook = None;
+                    *hook = None;
                     word.store(raw.to_le(), Ordering::Relaxed);
                 }
                 // The second load: a changed word 0 means the copy may mix
-                // two values; it is not sent.
+                // two values; it is not sent. The fence keeps the copy's
+                // plain reads before it.
+                fence(Ordering::Acquire);
                 if load_interior(word) != raw {
                     if len > 0 {
                         return Ok(Copy::Frames { len, end: at, open });
@@ -637,14 +758,13 @@ impl<O: BufferOwner> SenderRead<O> {
 
     /// Step 5: the canonical record of the PAD or ABORTED block at `at`.
     fn canonical(
-        &self,
+        buffer: &LogBuffer<O::Terms>,
         record: CanonicalKind,
         count: TermCount,
         at: u32,
         extent: u32,
         out: &mut [u8],
     ) -> Result<Copy, CopyError> {
-        let buffer = &*self.subscription.buffer;
         let out = out
             .get_mut(..CANONICAL_LENGTH)
             .ok_or(CopyError::TooSmall(CANONICAL_LENGTH))?;
