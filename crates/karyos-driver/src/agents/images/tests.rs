@@ -2522,3 +2522,38 @@ fn an_sm_goes_on_every_bound_path() {
     assert!(counters.sm_copies >= 3, "{counters:?}");
     assert_eq!(counters.sm_copies_skipped, 0, "{counters:?}");
 }
+
+/// rp-w3, RP-7: a NAK goes on every bound path, the founding path first
+/// and a copy on each later one, and the copies anchor it once: the loss
+/// state records one submission per NAK handed over, not one per copy.
+#[test]
+fn a_nak_goes_on_every_bound_path() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 2);
+    for _ in 0..10 {
+        rig.round(true);
+    }
+    let counters = rig.agents.receiver.counters();
+    let loss = rig.agents.receiver.role.loss_counters(slot).unwrap();
+    assert!(counters.nak_copies >= counters.naks - 1, "{counters:?}");
+    assert_eq!(counters.nak_copies_skipped, 0, "{counters:?}");
+    assert!(loss.submitted <= counters.naks, "{loss:?} {counters:?}");
+    assert_eq!(loss.retries, loss.submitted - 1, "{loss:?}");
+}
