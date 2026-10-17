@@ -125,6 +125,16 @@ impl EmbeddedDriver<HeapTerms> {
         })
     }
 
+    /// Network subscriptions the receiver refused although the conductor's
+    /// mirror of its table had room: a drift between the two, never
+    /// expected (ACS 16077).
+    #[must_use]
+    pub fn network_subscription_refusals(&self) -> u64 {
+        self.net
+            .as_ref()
+            .map_or(0, crate::net::Network::subscription_refusals)
+    }
+
     /// Images installed but not exposed so far: their alias was in use.
     #[must_use]
     pub fn network_images_unexposed(&self) -> u64 {

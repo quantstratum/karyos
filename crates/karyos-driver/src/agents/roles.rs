@@ -959,6 +959,7 @@ impl ReceiverRole {
         let configured = |accepted| AgentEvent::Configured {
             agent: AgentKind::Receiver,
             accepted,
+            subscription: None,
         };
         match command {
             AgentCommand::AddSubscription {
@@ -989,7 +990,14 @@ impl ReceiverRole {
                     }
                     None => false,
                 };
-                Some((reply, configured(accepted)))
+                Some((
+                    reply,
+                    AgentEvent::Configured {
+                        agent: AgentKind::Receiver,
+                        accepted,
+                        subscription: Some((endpoint, stream_id)),
+                    },
+                ))
             }
             AgentCommand::AddPublishedAlias {
                 reply,
