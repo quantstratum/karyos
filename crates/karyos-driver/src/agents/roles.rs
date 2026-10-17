@@ -207,6 +207,9 @@ pub struct ReceiverCounters {
     pub eos_refused: u64,
     /// DATA frames past their lane's terminal bound: dropped.
     pub data_past_terminal: u64,
+    /// Heartbeats naming a position past their lane's terminal bound: the
+    /// sender moved past its EOS. Classified at the bound.
+    pub heartbeats_past_terminal: u64,
     /// DATA datagrams from no binding: dropped.
     pub data_unbound: u64,
     /// DATA datagrams that failed validation for their image: dropped.
@@ -3803,6 +3806,13 @@ impl<T: StreamTerms> Intake<'_, T> {
                     if refused {
                         (6, None)
                     } else {
+                        if let (Some(bound), Some(position)) = (
+                            terminal_bound(image, heartbeat.lane()),
+                            heartbeat_position(image, &heartbeat),
+                        ) && position > bound
+                        {
+                            tally(&mut role.counters, |c| &mut c.heartbeats_past_terminal);
+                        }
                         match classify_heartbeat(image, &heartbeat) {
                             HeartbeatClass::Fresh => (3, None),
                             HeartbeatClass::Stale => (4, None),

@@ -3721,3 +3721,30 @@ fn the_heartbeat_mark_and_a_tail_nak_stop_at_the_terminal_bound() {
     let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
     assert_eq!((hole.start, hole.length), (0, 96));
 }
+
+/// A plain heartbeat raises the mark first; a lower EOS bound recorded
+/// afterwards still caps the tail hole: nothing past the bound is NAKed.
+#[test]
+fn a_bound_below_the_heartbeat_mark_caps_the_tail_nak() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(image.heartbeat_marks[0], Some(4096));
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 96),
+        super::Terminal::Recorded
+    );
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
+    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert_eq!((hole.start, hole.length), (0, 96));
+}
