@@ -67,24 +67,30 @@ pub(crate) enum TraceEvent {
 }
 
 impl TraceEvent {
-    /// The trace event `event` is, or `event` back.
-    pub(crate) fn of(event: AgentEvent<OsSocket>) -> Result<Self, AgentEvent<OsSocket>> {
-        match event {
+    /// Hands the trace event `event` is to `trace`; any other event comes
+    /// back.
+    pub(crate) fn route(
+        event: AgentEvent<OsSocket>,
+        trace: impl FnOnce(Self),
+    ) -> Option<AgentEvent<OsSocket>> {
+        let traced = match event {
             AgentEvent::NetworkTraceSet { previous, .. } => {
                 // The agent closed the journals the previous hook held; the
                 // conductor counted them when it set the new one.
                 drop(previous);
-                Ok(Self::Set)
+                Self::Set
             }
             AgentEvent::NetworkJournalOpened { number, start, .. } => {
-                Ok(Self::Opened { number, start })
+                Self::Opened { number, start }
             }
-            AgentEvent::NetworkJournalRefused { journal, .. } => Ok(Self::Refused { journal }),
+            AgentEvent::NetworkJournalRefused { journal, .. } => Self::Refused { journal },
             AgentEvent::NetworkJournalClosed { number, facts, .. } => {
-                Ok(Self::Closed { number, facts })
+                Self::Closed { number, facts }
             }
-            other => Err(other),
-        }
+            other => return Some(other),
+        };
+        trace(traced);
+        None
     }
 }
 

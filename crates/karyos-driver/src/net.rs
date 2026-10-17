@@ -1367,12 +1367,10 @@ impl Network {
                 {
                     refusals = count;
                 }
-                let event = match trace::TraceEvent::of(event) {
-                    Ok(traced) => {
-                        trace_events.push(traced);
-                        return;
-                    }
-                    Err(event) => event,
+                let Some(event) =
+                    trace::TraceEvent::route(event, |traced| trace_events.push(traced))
+                else {
+                    return;
                 };
                 // What the trace journals need of a publication's answer:
                 // its activation, and its identity once it is gone.
