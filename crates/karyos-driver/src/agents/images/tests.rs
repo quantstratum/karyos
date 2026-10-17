@@ -55,7 +55,7 @@ fn term(term_length: u32) -> TermParams {
 }
 
 /// What a rig announces and accepts.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Setup {
     /// The publication's term length.
     term_length: u32,
@@ -76,11 +76,23 @@ struct Setup {
     multicast: bool,
     /// A fixed multicast NAK delay in place of the random draw.
     nak_delay: Option<u64>,
+    /// A guarded publication's guard.
+    guard: Option<super::super::data::GuardSpec>,
     /// Whether the subscription has a NAK control group: a third loopback
     /// endpoint C stands for it, its own address as the group.
     control_group: bool,
     /// The receiver's `group_nak_budget`, when not the default.
     group_nak_budget: Option<u32>,
+}
+
+impl Setup {
+    /// The same setup without its guard, for a second rig or path.
+    fn again(&self) -> Self {
+        Self {
+            guard: None,
+            ..*self
+        }
+    }
 }
 
 impl Default for Setup {
@@ -94,6 +106,7 @@ impl Default for Setup {
             repairs: true,
             multicast: false,
             nak_delay: None,
+            guard: None,
             control_group: false,
             group_nak_budget: None,
         }
@@ -233,6 +246,7 @@ impl Rig {
                     lane_count: 2,
                 },
                 outbound,
+                guard: setup.guard,
             })
             .unwrap();
         (rig, b)
@@ -1277,6 +1291,68 @@ fn unbound_data_solicits_a_new_image() {
     assert!(rig.agents.receiver.counters().data_committed > committed);
 }
 
+/// A guard close on a network publication is local (O-11, GC-6): the
+/// sender sends nothing more, the receiver gets no abort, and its image
+/// ends as an interrupted session at its liveness timeout.
+#[test]
+fn a_guard_closed_publication_ends_its_image_at_liveness() {
+    use std::sync::Arc;
+
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::log_buffer::AppendOptions;
+    use karyos_sys::sync::Ordering;
+
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let (mut rig, _b) = Rig::new(Setup {
+        guard: Some(super::super::data::GuardSpec {
+            word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+            cell: Arc::new(AppliedEpoch::new()),
+            epoch: 2,
+            rate: None,
+        }),
+        ..Setup::default()
+    });
+    rig.until(true, |rig| {
+        rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Installed { .. }))
+    });
+    let append = |rig: &mut Rig| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[1; 100], AppendOptions::default())
+            .unwrap();
+    };
+    append(&mut rig);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().data_committed >= 1
+    });
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    // Let the sender apply the close, then publish more.
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let committed = rig.agents.receiver.counters().data_committed;
+    append(&mut rig);
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    assert_eq!(
+        rig.agents.receiver.counters().data_committed,
+        committed,
+        "nothing after the close"
+    );
+    rig.now += 11_000 * MS;
+    rig.until(true, |rig| {
+        rig.events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Retiring { .. }))
+    });
+    assert_eq!(rig.agents.receiver.counters().images_retired, 1);
+}
+
 /// ACS 15933: a sender whose only receiver is gone past
 /// `image_liveness_timeout` (no live member, no confirmed binding)
 /// announces SETUP again; the receiver binds a new image through a fresh
@@ -2272,7 +2348,7 @@ fn a_later_path_binds_and_keeps_the_image() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, b) = Rig::new(Setup { ..setup });
+    let (mut rig, b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
@@ -2295,7 +2371,7 @@ fn a_mismatched_later_path_is_refused() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let _b2 = rig.second_path(
         &setup,
@@ -2322,7 +2398,7 @@ fn a_later_path_join_moves_no_position() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
     let mut seen = Vec::new();
@@ -2373,7 +2449,7 @@ fn losing_one_path_keeps_the_image() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
@@ -2409,7 +2485,7 @@ fn a_complete_term_charges_each_path_its_missing_bytes() {
         reliable: true,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
