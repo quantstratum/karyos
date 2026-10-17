@@ -2573,31 +2573,41 @@ impl SenderRole {
         &mut self,
         command: AgentCommand<O>,
     ) -> Option<(Reservation, AgentEvent<O>)> {
-        let (reply, publication, outbound) = match command {
-            AgentCommand::AddPublication {
-                reply,
-                publication,
-                outbound,
-            } => (reply, publication, outbound),
-            AgentCommand::RemovePublication {
-                reply,
-                endpoint,
-                alias,
-                registration,
-            } => return Some((reply, self.remove(endpoint, alias, registration))),
-            AgentCommand::AddSubscription { reply, .. }
-            | AgentCommand::AddPublishedAlias { reply, .. }
-            | AgentCommand::RemovePublishedAlias { reply, .. }
-            | AgentCommand::RemoveSubscription { reply, .. } => {
-                return Some((
+        let (reply, publication, outbound) =
+            match command {
+                AgentCommand::AddPublication {
                     reply,
-                    AgentEvent::Unsupported {
-                        agent: AgentKind::Sender,
-                    },
-                ));
-            }
-            command => return self.trace.command(&mut self.publications, command),
-        };
+                    publication,
+                    outbound,
+                } => (reply, publication, outbound),
+                AgentCommand::RemovePublication {
+                    reply,
+                    endpoint,
+                    alias,
+                    registration,
+                } => return Some((reply, self.remove(endpoint, alias, registration))),
+                #[cfg(test)]
+                AgentCommand::ForceReset { endpoint, alias } => {
+                    if let Some(outbound) = self.publications.iter_mut().find(|outbound| {
+                        outbound.endpoint() == endpoint && outbound.alias() == alias
+                    }) {
+                        outbound.force_needs_reset();
+                    }
+                    return None;
+                }
+                AgentCommand::AddSubscription { reply, .. }
+                | AgentCommand::AddPublishedAlias { reply, .. }
+                | AgentCommand::RemovePublishedAlias { reply, .. }
+                | AgentCommand::RemoveSubscription { reply, .. } => {
+                    return Some((
+                        reply,
+                        AgentEvent::Unsupported {
+                            agent: AgentKind::Sender,
+                        },
+                    ));
+                }
+                command => return self.trace.command(&mut self.publications, command),
+            };
         let mut outbound = outbound;
         let matches = outbound.endpoint() == publication.endpoint
             && outbound.alias() == publication.alias

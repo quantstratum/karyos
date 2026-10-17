@@ -192,6 +192,9 @@ pub(crate) struct Network {
     net_images: Vec<NetImage>,
     /// The image table's events of the last cycle, for the conductor.
     image_events: Vec<ImageEvent>,
+    /// Endpoint resets completed (`EndpointEvent::Reopened`), for tests.
+    #[cfg(test)]
+    reopened: u64,
     /// Images installed but not exposed: their alias is in use (interim
     /// keying, ACS 15937) or the stream table is full.
     images_unexposed: u64,
@@ -239,6 +242,8 @@ impl Network {
             net_images: Vec::with_capacity(config.agents.sessions.max_images),
             image_events: Vec::with_capacity(config.agents.sessions.max_images),
             images_unexposed: 0,
+            #[cfg(test)]
+            reopened: 0,
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
             stale_overflows: 0,
@@ -654,6 +659,8 @@ impl Network {
         // sender's reset requests at the driver clock (W-f); publication
         // answers update the publications.
         let mut events = Some(0u32);
+        #[cfg(test)]
+        let mut reopened = Some(self.reopened);
         let (publications, send_endpoints) = (&mut self.publications, &mut self.send_endpoints);
         let mut stale = Stale {
             queue: &mut self.stale_aliases,
@@ -662,9 +669,24 @@ impl Network {
         self.endpoints.poll(
             &self.links,
             now,
-            |_| events = events.and_then(|count| count.checked_add(1)),
+            |event| {
+                #[cfg(test)]
+                if matches!(
+                    event,
+                    crate::agents::endpoints::EndpointEvent::Reopened { .. }
+                ) {
+                    reopened = reopened.and_then(|count| count.checked_add(1));
+                }
+                #[cfg(not(test))]
+                let _ = event;
+                events = events.and_then(|count| count.checked_add(1));
+            },
             |event| publication_answer(publications, send_endpoints, &mut stale, event),
         );
+        #[cfg(test)]
+        if let Some(count) = reopened {
+            self.reopened = count;
+        }
         // A send endpoint no publication holds any more retires; one not
         // active yet is tried again next cycle.
         let (endpoints, links) = (&mut self.endpoints, &self.links);
@@ -736,6 +758,45 @@ impl Network {
     #[cfg(test)]
     pub(crate) fn is_running(&self) -> bool {
         !matches!(self.agents, Agents::Closed)
+    }
+
+    /// The endpoint and alias of the network publication `registration`,
+    /// for tests.
+    #[cfg(test)]
+    pub(crate) fn publication_route(&self, registration: u64) -> Option<(EndpointId, Alias)> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| (entry.endpoint, entry.alias))
+    }
+
+    /// The Shared agents' counters, for test diagnostics.
+    #[cfg(test)]
+    pub(crate) fn agent_counters(&self) -> String {
+        match &self.agents {
+            Agents::Shared(agents) => format!(
+                "sender {:?} receiver {:?} images {:?}",
+                agents.sender.counters(),
+                agents.receiver.counters(),
+                self.images.counters()
+            ),
+            _ => String::new(),
+        }
+    }
+
+    /// The Shared receiver agent's counters, for tests.
+    #[cfg(test)]
+    pub(crate) fn receiver_counters(&self) -> Option<crate::agents::roles::ReceiverCounters> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.receiver.counters()),
+            _ => None,
+        }
+    }
+
+    /// Endpoint resets completed so far, for tests.
+    #[cfg(test)]
+    pub(crate) fn reopened(&self) -> u64 {
+        self.reopened
     }
 
     /// Images in the image table, for tests.
@@ -937,7 +998,8 @@ mod publish;
 mod subscribe;
 
 #[cfg(test)]
+mod e2e;
+#[cfg(test)]
 mod netem;
-
 #[cfg(test)]
 mod tests;
