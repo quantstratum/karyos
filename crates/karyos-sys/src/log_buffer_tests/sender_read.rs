@@ -1114,3 +1114,41 @@ fn sender_read_rewind_keeps_the_corrupt_count() {
     );
     assert_eq!(reader.rewind(), Err(ReadError::Faulted { position: 0 }));
 }
+
+/// A reliable lane read far ahead of its registered position (one window
+/// of the smallest frames is more than the boundary ring holds): the ring
+/// is thinned, never emptied below a position, so the registered position
+/// keeps advancing in small steps as consumption advances, up to the
+/// cursor.
+#[test]
+fn sender_read_keeps_registering_far_ahead() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // One-byte messages: 64-byte frames, until the window presses back.
+    let mut appended = 0u32;
+    while let AppendOutcome::Appended { .. } = publication
+        .append(&[7u8], AppendOptions::default())
+        .unwrap()
+    {
+        appended += 1;
+    }
+    assert!(appended > 300, "{appended} frames: fewer than the ring holds");
+    // Read all of it in small datagrams, registering nothing.
+    let mut out = vec![0u8; 64];
+    while let Ok(ReadOutcome::Copied { .. }) = sr_read(&mut reader, &mut out) {}
+    let cursor = reader.position();
+    assert_eq!(cursor, u64::from(appended) * 64);
+    // Consumption advances one frame at a time: the registered position
+    // follows within a few frames and reaches the cursor.
+    let mut lag_max = 0u64;
+    for consumed in (64..=cursor).step_by(64) {
+        if let Some(boundary) = reader.boundary_at_or_below(consumed) {
+            reader.sent(boundary).unwrap();
+        }
+        lag_max = lag_max.max(consumed - reader.sent_position());
+    }
+    assert_eq!(reader.sent_position(), cursor);
+    assert!(lag_max <= 4 * 64, "registered lag reached {lag_max} bytes");
+}

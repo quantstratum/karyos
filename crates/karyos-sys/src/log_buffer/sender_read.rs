@@ -233,9 +233,10 @@ pub struct SenderRead<O: BufferOwner> {
     /// An interleaving injected by tests; nothing outside them.
     hook: HookSlot,
     /// The block-boundary `next` values of reads not yet registered, oldest
-    /// first, at most `BOUNDARIES` (allocated at construction): the only
-    /// positions [`SenderRead::sent`] accepts, so the registered position
-    /// is always a block start that [`SenderRead::rewind`] can restart at.
+    /// first, at most `BOUNDARIES` (allocated at construction), thinned
+    /// when full: the only positions [`SenderRead::sent`] accepts, so the
+    /// registered position is always a block start that
+    /// [`SenderRead::rewind`] can restart at.
     boundaries: VecDeque<u64>,
 }
 
@@ -370,10 +371,21 @@ impl<O: BufferOwner> SenderRead<O> {
         Ok(())
     }
 
-    /// Remembers `next`, a block boundary a read just returned.
+    /// Remembers `next`, a block boundary a read just returned. A full
+    /// ring is thinned in place to every second entry, the newest kept, so
+    /// it still spans everything read above the registered position: a
+    /// lane read far ahead (many small frames within one window) keeps a
+    /// registrable boundary within a bounded distance below any position,
+    /// never none.
     fn remember(boundaries: &mut VecDeque<u64>, next: u64) {
         if boundaries.len() >= BOUNDARIES {
-            let _ = boundaries.pop_front();
+            // Every second entry, from the second: the newest stays (the
+            // ring is full, so of even length).
+            let mut keep = false;
+            boundaries.retain(|_| {
+                keep = !keep;
+                !keep
+            });
         }
         boundaries.push_back(next);
     }
