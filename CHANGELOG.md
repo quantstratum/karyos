@@ -289,6 +289,18 @@ release may break APIs, wire formats and shared-memory layouts.
   DRR would refuse is dropped and counted (ACS 15773). The round robin
   across incarnations is the wiring's. Not wired yet, and the NAK read
   origin in karyos-sys comes separately.
+- Repair simulator scenarios (phase 6, ACS 15767): karyos-sim's
+  `tests/repair.rs` runs NAK admission, the job table and the repair
+  scheduler together on virtual time against a scripted two-lane log and
+  backend, 40 seeds each. `repair-mixed` has receivers NAKing identical,
+  overlapping and malformed ranges with duplicates and reorder, a floor
+  that moves, random budgets and every submission outcome; it checks that
+  every job ends exactly once and is never served after, that no
+  duplicate within `repair_linger` creates a job, that no ERR repeats
+  within `nak_reply_linger` (step 8 ERRs included), and that
+  `RANGE_UNAVAILABLE` names the floor of that moment. `repair-fair` checks
+  that two backlogged lanes stay within `Q + 2 F` of each other. Each
+  oracle fails under a mutant of the components.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly

@@ -44,7 +44,7 @@ fn settle<O: SocketOps>(
     let mut events = Vec::new();
     for _ in 0..1000 {
         agents.do_work(0).unwrap();
-        endpoints.poll(links, |event| events.push(event), |_| {});
+        endpoints.poll(links, 0, |event| events.push(event), |_| {});
         if events.len() >= want {
             return events;
         }
@@ -107,10 +107,10 @@ fn opened_needs_both_answers() {
     let id = endpoints.open(&links, config(), S::new()).unwrap();
     let mut events = Vec::new();
     agents.sender.do_work(0).unwrap();
-    endpoints.poll(&links, |event| events.push(event), |_| {});
+    endpoints.poll(&links, 0, |event| events.push(event), |_| {});
     assert!(events.is_empty() && !endpoints.is_active(id));
     agents.receiver.do_work(0).unwrap();
-    endpoints.poll(&links, |event| events.push(event), |_| {});
+    endpoints.poll(&links, 0, |event| events.push(event), |_| {});
     assert_eq!(events, [EndpointEvent::Opened(id)]);
 }
 
@@ -330,7 +330,7 @@ fn a_stop_reclaims_work_in_flight() {
     agents.do_work(0).unwrap();
     links.sender.ping(1).unwrap();
     links.sender.ping(2).unwrap();
-    endpoints.poll(&links, |_| {}, |_| {});
+    endpoints.poll(&links, 0, |_| {}, |_| {});
     assert!(!endpoints.is_active(held));
     // `detached`: retire; the agents answer, nobody polls.
     endpoints.retire(&links, detached).unwrap_err();
@@ -407,7 +407,7 @@ fn a_loopback_endpoint_opens_resets_and_retires() {
         let wait = |endpoints: &mut Endpoints<OsSocket>, want: usize| {
             let mut events = Vec::new();
             for _ in 0..10_000 {
-                endpoints.poll(&links, |event| events.push(event), |_| {});
+                endpoints.poll(&links, 0, |event| events.push(event), |_| {});
                 if events.len() >= want {
                     return events;
                 }
@@ -463,4 +463,116 @@ fn a_reset_at_another_address_fails() {
         }]
     );
     assert!(endpoints.is_empty());
+}
+
+/// A reset whose reopen finds the address in use fails the endpoint with
+/// the open error, reported and counted (#265 P3).
+#[test]
+fn a_reset_into_a_used_address_fails() {
+    use karyos_io::sockets::ops::Errno;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let id = endpoints.open(&links, config(), socket).unwrap();
+    assert_eq!(
+        settle(&mut agents, &links, &mut endpoints, 1),
+        [EndpointEvent::Opened(id)]
+    );
+    let in_use = OpenError::Os {
+        operation: "bind",
+        errno: Errno::ADDRINUSE.raw(),
+    };
+    observer.push_open(Err(in_use));
+    endpoints.reset(&links, id).unwrap();
+    assert_eq!(
+        settle(&mut agents, &links, &mut endpoints, 1),
+        [EndpointEvent::Failed {
+            endpoint: id,
+            error: EndpointError::Open(in_use),
+        }]
+    );
+    assert!(endpoints.is_empty());
+    assert_eq!(endpoints.counters().failed, 1);
+}
+
+/// Requested resets are bounded: a request within the endpoint's interval
+/// is deferred, the reset after a deferral doubles the interval (to at
+/// most 60 s), and one after a clean interval starts over at 1 s. Requests
+/// for an endpoint that is not active are ignored.
+#[test]
+fn requested_resets_back_off_while_the_fault_recurs() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    assert_eq!(
+        settle(&mut agents, &links, &mut endpoints, 1),
+        [EndpointEvent::Opened(id)]
+    );
+    let reset_at = |endpoints: &mut Endpoints<S>, agents: &mut NetworkAgents<S>, now| {
+        let resets = endpoints.counters().resets;
+        endpoints.requested(&links, id, now);
+        let started = endpoints.counters().resets > resets;
+        if started {
+            // A duplicate while the reset is in flight is ignored.
+            let ignored = endpoints.counters().requests_ignored;
+            endpoints.requested(&links, id, now);
+            assert_eq!(endpoints.counters().requests_ignored, ignored + 1);
+            let events = settle(agents, &links, endpoints, 1);
+            assert!(
+                matches!(events.as_slice(), [EndpointEvent::Reopened { endpoint, .. }] if *endpoint == id),
+                "{events:?}"
+            );
+        }
+        started
+    };
+    assert!(reset_at(&mut endpoints, &mut agents, 0));
+    // The fault recurs at once: deferred until 1 s, then the interval
+    // doubles: 2 s, 4 s, ... up to 60 s.
+    let mut last = 0;
+    let mut interval = SEC;
+    for _ in 0..8 {
+        assert!(!reset_at(&mut endpoints, &mut agents, last + interval / 2));
+        assert!(reset_at(&mut endpoints, &mut agents, last + interval));
+        last += interval;
+        interval = (interval * 2).min(60 * SEC);
+    }
+    assert_eq!(interval, 60 * SEC);
+    let counters = endpoints.counters();
+    assert_eq!((counters.resets, counters.resets_deferred), (9, 8));
+    // A clean interval: the next fault resets at once and starts over.
+    let clean = last + 2 * interval;
+    assert!(reset_at(&mut endpoints, &mut agents, clean));
+    assert!(!reset_at(&mut endpoints, &mut agents, clean + SEC - 1));
+    assert!(reset_at(&mut endpoints, &mut agents, clean + SEC));
+    // An unknown endpoint is ignored.
+    let ignored = endpoints.counters().requests_ignored;
+    endpoints.requested(&links, EndpointId(u32::MAX - 1), clean);
+    assert_eq!(endpoints.counters().requests_ignored, ignored + 1);
+}
+
+/// A clock stepped back behind the last requested reset does not defer
+/// requests until it catches up: the interval counts as elapsed.
+#[test]
+fn a_clock_stepped_back_does_not_defer_resets() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    endpoints.requested(&links, id, 100 * SEC);
+    assert_eq!(endpoints.counters().resets, 1);
+    settle(&mut agents, &links, &mut endpoints, 1);
+    // The clock steps back 50 s: the next request resets at once.
+    endpoints.requested(&links, id, 50 * SEC);
+    assert_eq!(endpoints.counters().resets, 2);
+    assert_eq!(endpoints.counters().resets_deferred, 0);
 }
