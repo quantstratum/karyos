@@ -317,36 +317,41 @@ fn a_nak_below_the_registered_position_is_served() {
     rig.finish();
 }
 
-/// Repairs go on the publication's repair queue, outside the lane's: a
-/// repair served while new frames wait on the lane leaves the lane's read
-/// position as it was, and the lane then sends its next frames once each,
-/// in order.
+/// Repairs go on the publication's repair queue, outside the lane's: with
+/// two lane frames staged in the lane's queue (the kernel refused them),
+/// a repair call offers only the repaired frame and leaves the lane's read
+/// position as it was; the lane's next send offers its two frames, in
+/// order, and the repair is not among them.
 #[test]
 fn a_repair_leaves_the_lane_alone() {
     let mut rig = Rig::new(&RepairConfig::default());
     rig.publish(2);
-    let first = rig.datagrams();
     for i in 2..4u8 {
         let _ = rig.log.publications[0]
             .append(&[i; 1000], AppendOptions::default())
             .unwrap();
     }
+    // No scripted send: frames 2 and 3 are staged, the first offer refused.
+    let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 0).unwrap();
     let position = rig.path.readers()[0].position();
+    assert_eq!(position, 4 * FRAME);
+    // The message number each datagram from `from` on carries.
+    let offered = |rig: &Rig, from: usize| -> Vec<u8> {
+        rig.datagrams()[from..]
+            .iter()
+            .map(|bytes| bytes[32])
+            .collect()
+    };
+    let before = rig.datagrams().len();
     assert_eq!(rig.nak(0, 1056, 1), NakOutcome::Queued);
     rig.scripted(1);
     assert_eq!(rig.repair(&mut RepairBudget::default(), 2), 1);
-    assert_eq!(rig.datagrams().last(), first.first());
+    assert_eq!(offered(&rig, before), [0]);
     assert_eq!(rig.path.readers()[0].position(), position);
+    let before = rig.datagrams().len();
     rig.scripted(2);
     let _ = rig.path.serve(&mut rig.tx, BUDGET, None, 0).unwrap();
-    let all = rig.datagrams();
-    assert_eq!(all.len(), 5);
-    for (datagram, byte) in all[3..].iter().zip([2u8, 3]) {
-        assert!(
-            datagram[32..1032].iter().all(|b| *b == byte),
-            "frame {byte}"
-        );
-    }
+    assert_eq!(offered(&rig, before), [2, 3]);
     rig.finish();
 }
 

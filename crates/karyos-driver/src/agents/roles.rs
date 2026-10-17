@@ -3340,17 +3340,18 @@ impl SenderRole {
             };
             submitted = total;
             let capacity = replies.capacity();
-            let mut dropped = 0u32;
+            let mut dropped: Option<u64> = Some(0);
             outbound.drain_repair_replies(|reply| {
                 // Bounded by the list each path keeps, the same capacity.
                 if replies.len() < capacity {
                     replies.push((endpoint, *reply));
                 } else {
-                    dropped = dropped.saturating_add(1);
+                    dropped = dropped.and_then(|count| count.checked_add(1));
                 }
             });
-            for _ in 0..dropped {
-                self.count(|c| &mut c.nak_replies_dropped);
+            match dropped.and_then(|count| self.counters.nak_replies_dropped.checked_add(count)) {
+                Some(total) => self.counters.nak_replies_dropped = total,
+                None => self.counters.overflowed = true,
             }
             for (endpoint, reply) in replies.drain(..) {
                 self.reply_nak(halves, endpoint, &reply);
