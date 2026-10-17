@@ -16,7 +16,15 @@
 //!   retired; they free once no lease holds them, and only then does the
 //!   image table reclaim the image. An image whose every lane reached the
 //!   terminal bound its EOS named, through a complete prefix, is sealed
-//!   with `SealReason::EndOfStream` instead: its clean end.
+//!   with `SealReason::EndOfStream` instead: its clean end. A lane that
+//!   dropped a frame past its bound does not end clean; that image is
+//!   sealed with `ImageRetired`.
+//! - **EOS today.** Until the sender's removal linger (the linger PR),
+//!   EOS reaches the wire only as the application's per-message EOS flag,
+//!   and the sender sends no EOS heartbeat. A removed network publication
+//!   therefore still ends its receivers' images unclean, at their liveness
+//!   timeout, and an aggregate with an unused lane (one that never carries
+//!   an EOS message) cannot end clean.
 //! - **Scope.** Unicast (the channel's `endpoint` is the local receive
 //!   address) and IPv4 multicast (the group's port, joined on `interface`
 //!   or any); interface names and IPv6 groups are refused. Heap terms only

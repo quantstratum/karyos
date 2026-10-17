@@ -1175,6 +1175,7 @@ fn installed_image_with(
         term_length: 65_536,
         heartbeat_marks: [None; 4],
         terminal: [None; 4],
+        dropped_past_terminal: [false; 4],
         last_fresh: 0,
         window: 32_768,
         schedule: crate::sm_schedule::SmSchedule::new(10_000_000, &[32_768]).unwrap(),
@@ -3649,4 +3650,37 @@ fn a_frame_past_the_terminal_bound_is_recognised() {
     );
     assert!(!past(&image, &data_frame(0, 64, false)));
     assert!(past(&image, &second));
+}
+
+/// Once a lane's bound is recorded, nothing past it is marked or NAKed: a
+/// heartbeat beyond the bound raises the mark only to the bound, and the
+/// tail hole ends there.
+#[test]
+fn the_heartbeat_mark_and_a_tail_nak_stop_at_the_terminal_bound() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 96),
+        super::Terminal::Recorded
+    );
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(image.heartbeat_marks[0], Some(96));
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Stationary,
+        "capped at the bound"
+    );
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
+    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert_eq!((hole.start, hole.length), (0, 96));
 }

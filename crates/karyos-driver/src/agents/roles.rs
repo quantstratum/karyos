@@ -305,6 +305,9 @@ pub struct ReceiverCounters {
     /// Images closed cleanly: every lane's complete prefix reached its
     /// terminal bound.
     pub images_closed_eos: u64,
+    /// Images whose every lane reached its terminal bound, yet a lane
+    /// dropped a frame past it: retired, not clean.
+    pub images_closed_eos_dropped: u64,
     /// Gaps sealed by the skip policy (unreliable timers, or `skip`).
     pub gaps_sealed: u64,
     /// Due holes of a conflated lane held by its seal gate in a duty
@@ -607,6 +610,12 @@ fn classify_heartbeat<T: StreamTerms>(
     if !image.owner.within_window(lane, position).unwrap_or(false) {
         return HeartbeatClass::Rejected;
     }
+    // Nothing past a recorded terminal bound is marked: the sender has
+    // nothing there to repair.
+    let position = match terminal_bound(image, lane) {
+        Some(bound) => position.min(bound),
+        None => position,
+    };
     let Some(mark) = image.heartbeat_marks.get_mut(usize::from(lane.get())) else {
         return HeartbeatClass::Rejected;
     };
@@ -678,15 +687,19 @@ fn tally_terminal(counters: &mut ReceiverCounters, outcome: Terminal) {
     );
 }
 
+/// `lane`'s terminal bound in `image`, once an EOS named it.
+fn terminal_bound<T: StreamTerms>(image: &Installed<T>, lane: Lane) -> Option<u64> {
+    image
+        .terminal
+        .get(usize::from(lane.get()))
+        .copied()
+        .flatten()
+}
+
 /// Whether `frame` ends past its lane's terminal bound in `image`: no
 /// later position is accepted once EOS named the bound.
 fn past_terminal<T: StreamTerms>(image: &Installed<T>, frame: &ValidatedFrame<'_>) -> bool {
-    let Some(bound) = image
-        .terminal
-        .get(usize::from(frame.lane().get()))
-        .copied()
-        .flatten()
-    else {
+    let Some(bound) = terminal_bound(image, frame.lane()) else {
         return false;
     };
     frame_position(image, frame)
@@ -695,18 +708,21 @@ fn past_terminal<T: StreamTerms>(image: &Installed<T>, frame: &ValidatedFrame<'_
 }
 
 /// Whether every lane of `image` reached its terminal bound through its
-/// complete prefix: the image's clean end.
+/// complete prefix: the image's end. It is clean only when no lane
+/// dropped a frame past its bound ([`dropped_past_terminal`]).
 fn terminal_reached<T: StreamTerms>(image: &Installed<T>) -> bool {
     (0..image.lane_count).all(|lane| {
         Lane::try_new(lane).ok().is_some_and(|lane| {
-            image
-                .terminal
-                .get(usize::from(lane.get()))
-                .copied()
-                .flatten()
+            terminal_bound(image, lane)
                 .is_some_and(|bound| image.owner.rebuild_position(lane) == Some(bound))
         })
     })
+}
+
+/// Whether any lane of `image` dropped a frame past its terminal bound:
+/// data its subscriber never reads, so the image does not end clean.
+fn dropped_past_terminal<T: StreamTerms>(image: &Installed<T>) -> bool {
+    image.dropped_past_terminal.iter().any(|dropped| *dropped)
 }
 
 /// What the path statistics record of `frame` from `path`: its lane, term
@@ -1037,6 +1053,9 @@ struct Installed<T: StreamTerms = HeapTerms> {
     /// accepted, and the image closes cleanly once every lane's complete
     /// prefix reaches its bound.
     terminal: [Option<u64>; 4],
+    /// Per lane, whether a frame past its terminal bound was dropped: the
+    /// publisher wrote past its EOS, so the lane cannot end clean.
+    dropped_past_terminal: [bool; 4],
     /// The last fresh evidence: a committed frame or a fresh heartbeat.
     last_fresh: u64,
     /// The window each SM grants per lane.
@@ -1151,7 +1170,13 @@ fn tail_hole<T: StreamTerms>(
     use crate::repair::loss::RttSource;
 
     let rebuild = image.owner.rebuild_position(lane)?;
-    let mark = image.heartbeat_marks.get(at).copied().flatten();
+    // Never NAK past a recorded terminal bound.
+    let mark = image
+        .heartbeat_marks
+        .get(at)
+        .copied()
+        .flatten()
+        .map(|mark| terminal_bound(image, lane).map_or(mark, |bound| mark.min(bound)));
     let Some(mark) = mark.filter(|mark| *mark > rebuild) else {
         if let Some(since) = image.tail_since.get_mut(at) {
             *since = None;
@@ -2557,6 +2582,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             term_length: chain.term_length,
             heartbeat_marks: [None; 4],
             terminal: [None; 4],
+            dropped_past_terminal: [false; 4],
             last_fresh: now,
             window,
             schedule,
@@ -2658,11 +2684,17 @@ impl<T: StreamTerms> ReceiverRole<T> {
             }
             // Every lane reached its EOS bound through a complete prefix:
             // the image closes cleanly (network-sessions.md, Liveness and
-            // terminal transitions). Its local loans stay until released.
+            // terminal transitions), unless a lane dropped a frame past its
+            // bound. Its local loans stay until released.
             if self.images.get(index).is_some_and(terminal_reached) {
-                self.count(|c| &mut c.images_closed_eos);
+                let clean = !self.images.get(index).is_some_and(dropped_past_terminal);
+                if clean {
+                    self.count(|c| &mut c.images_closed_eos);
+                } else {
+                    self.count(|c| &mut c.images_closed_eos_dropped);
+                }
                 let image = self.images.swap_remove(index);
-                self.retire(sessions, image, true, now);
+                self.retire(sessions, image, clean, now);
                 work = work.checked_add(1).ok_or(overflow.clone())?;
                 continue;
             }
@@ -3651,14 +3683,27 @@ impl<T: StreamTerms> Intake<'_, T> {
             let (outcome, arrival) = match item {
                 // Past the bound EOS named: dropped before the receive
                 // owner, and neither image nor path evidence.
-                Item::Frame(frame) if past_terminal(image, &frame) => (7, None),
+                Item::Frame(frame) if past_terminal(image, &frame) => {
+                    if let Some(dropped) = image
+                        .dropped_past_terminal
+                        .get_mut(usize::from(frame.lane().get()))
+                    {
+                        *dropped = true;
+                    }
+                    (7, None)
+                }
                 Item::Frame(frame) => {
                     let delivered = delivered(image, &frame, path, self.now);
                     let received = image.owner.receive(&frame);
                     // An EOS flag on a message's last fragment names the
-                    // lane's terminal bound: the frame's end.
+                    // lane's terminal bound, the frame's end, once the frame
+                    // is in the image: committed now, or a copy of a
+                    // committed frame. A dropped one names nothing.
                     if frame.image_word0().flags().eos()
-                        && received.is_ok()
+                        && matches!(
+                            received,
+                            Ok(Received::Committed { .. } | Received::Duplicate)
+                        )
                         && let Some(end) = frame_position(image, &frame)
                             .and_then(|position| position.checked_add(u64::from(frame.extent())))
                     {
@@ -3732,8 +3777,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                 // It is never path evidence (RP-2: fresh frames and PATH_HB).
                 Item::Heartbeat(heartbeat) => {
                     // An EOS heartbeat names its lane's terminal bound, its
-                    // position, inside the receive window only.
-                    if heartbeat.flags().eos() {
+                    // position, inside the receive window only. A refused
+                    // one is rejected: no evidence, and no heartbeat mark.
+                    let refused = heartbeat.flags().eos() && {
                         let lane = heartbeat.lane();
                         let outcome = match heartbeat_position(image, &heartbeat) {
                             Some(bound)
@@ -3744,12 +3790,17 @@ impl<T: StreamTerms> Intake<'_, T> {
                             _ => Terminal::Refused,
                         };
                         tally_terminal(&mut role.counters, outcome);
-                    }
-                    match classify_heartbeat(image, &heartbeat) {
-                        HeartbeatClass::Fresh => (3, None),
-                        HeartbeatClass::Stale => (4, None),
-                        HeartbeatClass::Stationary => (5, None),
-                        HeartbeatClass::Rejected => (6, None),
+                        outcome == Terminal::Refused
+                    };
+                    if refused {
+                        (6, None)
+                    } else {
+                        match classify_heartbeat(image, &heartbeat) {
+                            HeartbeatClass::Fresh => (3, None),
+                            HeartbeatClass::Stale => (4, None),
+                            HeartbeatClass::Stationary => (5, None),
+                            HeartbeatClass::Rejected => (6, None),
+                        }
                     }
                 }
             };

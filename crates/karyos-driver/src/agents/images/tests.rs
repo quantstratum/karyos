@@ -4435,9 +4435,11 @@ fn eos_ahead_of_a_hole_waits_for_its_repair() {
 }
 
 /// After the bound, no later position is accepted for that lane: a frame
-/// past it is dropped and counted, and never reaches a subscriber.
+/// past it is dropped and counted, and never reaches a subscriber. The
+/// publisher wrote past its EOS, so the image does not end clean: once
+/// every lane reaches its bound it is retired, not complete.
 #[test]
-fn a_frame_past_the_terminal_bound_is_dropped_and_counted() {
+fn a_frame_past_the_terminal_bound_is_dropped_and_ends_the_image_unclean() {
     use karyos_sys::log_buffer::{AppendOptions, Role};
 
     let (mut rig, b) = Rig::new(Setup::default());
@@ -4455,8 +4457,17 @@ fn a_frame_past_the_terminal_bound_is_dropped_and_counted() {
     });
     assert_eq!(poll_message(&mut subscriber), None);
     rig.inject(b, &eos_heartbeat(1, 0));
-    rig.until(true, Rig::closed_cleanly);
+    rig.until(true, Rig::closed_otherwise);
+    assert!(!rig.closed_cleanly(), "{:?}", rig.events);
     assert_eq!(poll_message(&mut subscriber), None);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        (
+            counters.images_closed_eos,
+            counters.images_closed_eos_dropped
+        ),
+        (0, 1)
+    );
 }
 
 /// The sender repeats its EOS heartbeat during its linger: a repeat is
@@ -4522,4 +4533,156 @@ fn eos_on_a_last_fragment_closes_the_image_like_an_eos_heartbeat() {
     assert!(rig.closed_cleanly(), "{:?}", rig.events);
     let counters = rig.agents.receiver.counters();
     assert_eq!((counters.eos_bounds, counters.images_closed_eos), (2, 1));
+}
+
+/// EOS on one lane, then silence: completion never comes, so the image
+/// ends by liveness, retired and not complete.
+#[test]
+fn liveness_after_eos_before_completion_ends_the_image_unclean() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![6; 500]], &mut subscriber);
+    // Lane 1 never names its bound.
+    rig.inject(b, &eos_heartbeat(0, end));
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    assert!(!rig.closed_cleanly() && !rig.closed_otherwise());
+    rig.now += 11_000 * MS;
+    rig.until(true, Rig::closed_otherwise);
+    assert!(!rig.closed_cleanly(), "{:?}", rig.events);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.eos_bounds, counters.images_closed_eos), (1, 0));
+    assert_eq!(counters.images_retired, 1);
+}
+
+/// An unreliable loss sealed as a local gap, then EOS: the receiver's
+/// complete prefix passes the gap, so the image reaches its bounds and
+/// its lanes end at `EndOfStream`, yet the aggregate's terminal is not
+/// clean, since lane 0 keeps its first loss.
+#[test]
+fn a_sealed_local_gap_then_eos_gives_an_unclean_aggregate() {
+    use karyos_client::aggregate::{AggregateSubscription, LaneEnd};
+    use karyos_client::subscription::ClientSubscription;
+    use karyos_protocol::lanes::drr::{Budget, DrrConfig};
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, Role, SealReason};
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (mut first, lane0) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let (mut second, lane1) = image_subscriber(&rig, slot, 1, Role::Optional);
+    let mut aggregate = AggregateSubscription::new(
+        DrrConfig::new(&[1408, 1408], 1408).unwrap(),
+        vec![
+            (Lane::ZERO, ClientSubscription::new(lane0)),
+            (Lane::try_new(1).unwrap(), ClientSubscription::new(lane1)),
+        ],
+    )
+    .unwrap();
+    rig.agents.receiver.role.drop_data(&[1]);
+    let mut end = 0;
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let outcome = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+        let AppendOutcome::Appended { position } = outcome else {
+            panic!("{outcome:?}");
+        };
+        end = position + 960;
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+    rig.inject(b, &eos_heartbeat(0, end));
+    rig.inject(b, &eos_heartbeat(1, 0));
+    rig.until(true, Rig::closed_cleanly);
+    // The lanes seal as the driver's image service seals them.
+    for conductor in [&mut first, &mut second] {
+        conductor.seal_with_reason(SealReason::EndOfStream).unwrap();
+    }
+    let mut delivered = Vec::new();
+    let mut terminal = None;
+    for _ in 0..200 {
+        for conductor in [&mut first, &mut second] {
+            let _ = conductor.duty_cycle().unwrap();
+        }
+        let poll = aggregate.poll(
+            |bytes, _, _| delivered.push(bytes[0]),
+            Budget {
+                work: 16,
+                bytes: 16 * 1408,
+            },
+        );
+        if poll.terminal.is_some() {
+            terminal = Some(poll);
+            break;
+        }
+    }
+    let poll = terminal.expect("no terminal");
+    assert_eq!(delivered, [0, 2, 3]);
+    assert!(!poll.terminal.unwrap().clean, "{poll:?}");
+    assert!(poll.lanes[0].first_loss.is_some(), "{poll:?}");
+    for lane in &poll.lanes {
+        assert!(
+            matches!(
+                lane.end,
+                Some(LaneEnd::Closed {
+                    reason: SealReason::EndOfStream,
+                    ..
+                })
+            ),
+            "{lane:?}"
+        );
+    }
+}
+
+/// An EOS heartbeat outside the receive window, through the intake: it is
+/// refused and counted, records no bound, and is no liveness evidence.
+#[test]
+fn an_eos_heartbeat_outside_the_window_is_refused_at_the_intake() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![2; 300]], &mut subscriber);
+    let before = rig.agents.receiver.counters();
+    rig.inject(b, &eos_heartbeat(0, 8 * 65_536));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.eos_refused, before.eos_refused + 1);
+    assert_eq!(after.eos_bounds, before.eos_bounds);
+    assert_eq!(after.heartbeats_rejected, before.heartbeats_rejected + 1);
+    assert_eq!(after.heartbeats, before.heartbeats, "no evidence");
+    // The lane's bound is still open: the real one is recorded.
+    rig.inject(b, &eos_heartbeat(0, end));
+    rig.inject(b, &eos_heartbeat(1, 0));
+    rig.until(true, Rig::closed_cleanly);
+    assert_eq!(rig.agents.receiver.counters().eos_bounds, 2);
+}
+
+/// A second EOS heartbeat naming a different bound, inside the window,
+/// through the intake: the first EOS decides, the other is refused and
+/// counted and is no liveness evidence, and the image closes at the first
+/// bound.
+#[test]
+fn a_different_eos_bound_is_refused_at_the_intake() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![3; 300]], &mut subscriber);
+    rig.inject(b, &eos_heartbeat(0, end));
+    let before = rig.agents.receiver.counters();
+    rig.inject(b, &eos_heartbeat(0, end + 64));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.eos_refused, before.eos_refused + 1);
+    assert_eq!(after.heartbeats_rejected, before.heartbeats_rejected + 1);
+    assert_eq!(after.heartbeats, before.heartbeats, "no evidence");
+    rig.inject(b, &eos_heartbeat(1, 0));
+    rig.until(true, Rig::closed_cleanly);
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 1));
 }
