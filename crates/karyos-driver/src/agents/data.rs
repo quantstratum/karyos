@@ -532,11 +532,6 @@ impl Outbound {
     ///
     /// [`GateError`].
     pub fn guard(&mut self, spec: GuardSpec, now: u64) -> Result<(), GateError> {
-        // Until every route's exposure passes the guard gate (rp-w4b2), a
-        // close could not stop a later path: refused.
-        if self.routed.is_some() {
-            return Err(GateError::Routed);
-        }
         let lanes: Vec<GateLane> = (0..self.readers.len())
             .filter_map(|lane| u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()))
             .map(|lane| GateLane {
@@ -545,15 +540,26 @@ impl Outbound {
                 bound: usize::from(STAGED_PER_LANE),
             })
             .collect();
-        let gate = GuardGate::new(
-            spec.word,
-            spec.cell,
-            &lanes,
-            &self.sender,
-            spec.rate,
-            self.max_frame,
-            now,
-        )?;
+        let gate = match self.routed.as_deref() {
+            Some(routed) => GuardGate::new_routed(
+                spec.word,
+                spec.cell,
+                &lanes,
+                routed.sender(),
+                spec.rate,
+                self.max_frame,
+                now,
+            )?,
+            None => GuardGate::new(
+                spec.word,
+                spec.cell,
+                &lanes,
+                &self.sender,
+                spec.rate,
+                self.max_frame,
+                now,
+            )?,
+        };
         self.guard = Some(Box::new(gate));
         Ok(())
     }

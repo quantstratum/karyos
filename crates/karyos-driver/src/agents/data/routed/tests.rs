@@ -23,7 +23,6 @@ use karyos_sys::log_buffer::AppendOptions;
 use super::super::super::{EndpointId, Half};
 use super::super::testing::{TestLog, outbound_routed};
 use super::super::{GuardSpec, Outbound};
-use crate::guard_gate::GateError;
 
 const ALIAS: Alias = Alias {
     session_id: 5,
@@ -102,27 +101,6 @@ const BUDGET: Budget = Budget {
     work: 64,
     bytes: 1 << 20,
 };
-
-/// A routed publication refuses a guard until rp-w4b2 gates every
-/// route's exposure (ACS 16423): no path can bypass a close.
-#[test]
-fn a_guard_on_a_routed_publication_is_refused() {
-    use karyos_sys::applied_epoch::AppliedEpoch;
-    use karyos_sys::sync::Ordering;
-
-    let (mut outbound, _log) = routed(0);
-    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
-    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
-    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
-    let spec = GuardSpec {
-        word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
-        cell: Arc::new(AppliedEpoch::new()),
-        epoch: 2,
-        rate: None,
-    };
-    assert_eq!(outbound.guard(spec, 0), Err(GateError::Routed));
-    assert!(outbound.guard_gate().is_none());
-}
 
 /// Each committed datagram goes out once on each path, in order; the
 /// lane is debited once per datagram and the sent frontier is the
@@ -213,4 +191,53 @@ fn a_missing_path_does_not_stop_the_other() {
     let sender = outbound.routed_sender().unwrap();
     assert_eq!(sender.counters(1).unwrap().skipped, 2);
     assert_eq!(outbound.readers()[0].sent_position(), 2 * FRAME);
+}
+
+/// rp-w4b2a: a guard on a routed publication gates every path. A close
+/// that lands while path A sends stops path B's copy, and the aborted
+/// copies come back on every path, so nothing stays in flight.
+#[test]
+fn a_guard_close_stops_every_path() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (a, observer_a, seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 0);
+    sent(&observer_a, 16);
+    sent(&observer_b, 16);
+    let mut halves = vec![a, b];
+    let (mut outbound, _log) = routed(1);
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    let spec = GuardSpec {
+        word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+        cell: Arc::clone(&cell),
+        epoch: 2,
+        rate: None,
+    };
+    outbound.guard(spec, 0).unwrap();
+    // The close lands as path A's socket sends.
+    let closing = Arc::clone(&word);
+    observer_a.set_send_hook(Box::new(move |_, _| {
+        let _ = karyos_sys::guard::close(&closing.words()[0]);
+    }));
+    for _ in 0..4 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, 0).unwrap();
+    }
+    assert!(
+        seen_a.lock().unwrap().is_empty(),
+        "the hook replaced the recorder"
+    );
+    assert_eq!(observer_a.send_calls(), 1);
+    assert!(seen_b.lock().unwrap().is_empty());
+    let applied = cell.try_read().unwrap();
+    assert_eq!(applied.positions[0], FRAME);
+    assert_eq!(applied.in_flight, 0);
+    let sender = outbound.routed_sender().unwrap();
+    assert_eq!(
+        (sender.pending(0, 0), sender.pending(0, 1)),
+        (Some(0), Some(0))
+    );
 }

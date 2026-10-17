@@ -34,14 +34,28 @@
 //!   heads, in order, is a sender fault: denied, and the lane aborts for
 //!   good with [`AbortCause::Fault`] for the control path to report.
 //!
+//! - **Routes.** A publication over redundant paths (redundant-paths.md
+//!   RP-10; rp-w4b2a) has one gate over a [`RoutedLaneSender`]: each lane
+//!   keeps one ring of heads per route, in that route's order, and an
+//!   exposure is placed on the route whose next head carries its first
+//!   token (tokens are unique across a publication's routes). Every
+//!   exposure on every route loads the guard, so a close between two
+//!   routes' exposures denies the later one. A position is charged once,
+//!   at its first permitted copy, and its tokens come back only when no
+//!   copy of it is left on any route and none was sent. The submitted
+//!   positions are the highest position submitted on any route, and the
+//!   work in flight counts every route's.
+//!
 //! The gate and its sender stay in step through [`GuardGate::stage`] and
-//! [`GuardGate::reopen`], which act on both; the sender reports each head
-//! that left its queue through [`LaneGate::left`]
+//! [`GuardGate::reopen`] (or [`GuardGate::stage_copy`] and
+//! [`GuardGate::reopen_route`] over routes), which act on both; the sender
+//! reports each head that left its queue through [`LaneGate::left`]
 //! ([`LaneSender::reopen`] alone does not, so a reopen goes through the
 //! gate). The gate allocates only in [`GuardGate::new`].
 //!
 //! [`LaneSender`]: karyos_io::lanes::LaneSender
 //! [`LaneSender::reopen`]: karyos_io::lanes::LaneSender::reopen
+//! [`RoutedLaneSender`]: karyos_io::lanes::routes::RoutedLaneSender
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -50,6 +64,7 @@ use core::num::NonZeroU16;
 
 use karyos_client::SharedWords;
 use karyos_io::backend::{Exposure, GateDecision, SenderGate, SenderToken, TxQueueId, TxTicket};
+use karyos_io::lanes::routes::{MAX_ROUTES, RoutedLaneSender, RoutedStaged};
 use karyos_io::lanes::{LaneGate, LaneSender, Left, StageError, Staged};
 use karyos_sys::applied_epoch::{Applied, AppliedEpoch};
 use karyos_sys::frame::Lane;
@@ -96,11 +111,6 @@ pub enum GateError {
         /// The gate's lane count.
         gate: usize,
     },
-    /// The publication sends over redundant paths, whose exposures the
-    /// gate does not pass yet (redundant-paths.md; rp-w4b2): a close could
-    /// not stop a later path, so the guard is refused.
-    #[error("a guard on a publication over redundant paths is not supported yet")]
-    Routed,
 }
 
 /// Why [`GuardGate::stage`] refused a head; nothing is recorded on error.
@@ -174,35 +184,75 @@ fn bump(count: &mut u64, overflows: &mut u64) {
     }
 }
 
+/// One copy of a datagram on one route.
 #[derive(Debug, Clone, Copy)]
 struct Head {
     head: GateHead,
     ticket: TxTicket,
-    /// Its tokens are reserved: it was permitted and has not left.
-    charged: bool,
     /// It was permitted: backend work in flight until it leaves.
     exposed: bool,
+}
+
+/// One position of a lane, as its copies on the routes hold it: charged
+/// once, whichever copy is permitted first.
+#[derive(Debug, Clone, Copy)]
+struct Charge {
+    /// The first copy's head: its length, messages and end are every
+    /// copy's.
+    head: GateHead,
+    /// Copies staged and not yet left.
+    holders: usize,
+    /// Its tokens are reserved.
+    charged: bool,
+    /// A copy left submitted or unknown: the tokens stay.
+    sent: bool,
 }
 
 #[derive(Debug)]
 struct State {
     lane: Lane,
     epoch: u64,
-    heads: VecDeque<Head>,
+    /// One ring per route, in that route's order.
+    heads: Vec<VecDeque<Head>>,
+    /// The positions the rings hold, in position order.
+    charges: VecDeque<Charge>,
     bound: usize,
     aborting: Option<AbortCause>,
-    /// Heads that left with an unproven exposure (`Unknown`), in flight
-    /// until the control path resolves them with a reopen.
-    unknown: u64,
+    /// Per route, heads that left with an unproven exposure (`Unknown`), in
+    /// flight until the control path resolves them with a reopen.
+    unknown: Vec<u64>,
 }
 
-fn refund(limiter: &mut Option<RateLimiter>, entry: &mut Head) {
-    if entry.charged
+fn refund(limiter: &mut Option<RateLimiter>, charge: &mut Charge) {
+    if charge.charged
         && let Some(limiter) = limiter
     {
-        limiter.refund_datagram(entry.head.length, entry.head.messages);
+        limiter.refund_datagram(charge.head.length, charge.head.messages);
     }
-    entry.charged = false;
+    charge.charged = false;
+}
+
+/// A copy ending at `end` left its ring, `sent` or not: once no copy of
+/// its position is left, the position goes, refunded unless one was sent.
+fn settle(limiter: &mut Option<RateLimiter>, charges: &mut VecDeque<Charge>, end: u64, sent: bool) {
+    let Some(index) = charges.iter().position(|charge| charge.head.end == end) else {
+        return;
+    };
+    let Some(charge) = charges.get_mut(index) else {
+        return;
+    };
+    charge.sent |= sent;
+    // Each ring entry was counted as a holder when staged: never zero here.
+    let Some(left) = charge.holders.checked_sub(1) else {
+        return;
+    };
+    charge.holders = left;
+    if left == 0 {
+        if !charge.sent {
+            refund(limiter, charge);
+        }
+        let _ = charges.remove(index);
+    }
 }
 
 /// The gate of one guard over one lane sender's lanes.
@@ -253,22 +303,73 @@ impl GuardGate {
         if !matches {
             return Err(GateError::LaneCount { gate });
         }
+        Self::build(word, cell, lanes, 1, rate, max_datagram, now)
+    }
+
+    /// [`GuardGate::new`] for a publication over redundant paths: the gate
+    /// of `sender`'s lanes on each of its routes (module docs).
+    ///
+    /// # Errors
+    ///
+    /// [`GateError::InvalidRatePolicy`] and [`GateError::LaneCount`].
+    pub fn new_routed(
+        word: Arc<dyn SharedWords>,
+        cell: Arc<AppliedEpoch>,
+        lanes: &[GateLane],
+        sender: &RoutedLaneSender,
+        rate: Option<RatePolicy>,
+        max_datagram: u64,
+        now: u64,
+    ) -> Result<Self, GateError> {
+        let gate = lanes.len();
+        let matches = (0..gate).all(|lane| sender.pending(lane, 0).is_some())
+            && sender.pending(gate, 0).is_none();
+        if !matches {
+            return Err(GateError::LaneCount { gate });
+        }
+        let routes = (0..MAX_ROUTES)
+            .filter(|route| sender.pending(0, *route).is_some())
+            .count();
+        Self::build(word, cell, lanes, routes, rate, max_datagram, now)
+    }
+
+    fn build(
+        word: Arc<dyn SharedWords>,
+        cell: Arc<AppliedEpoch>,
+        lanes: &[GateLane],
+        routes: usize,
+        rate: Option<RatePolicy>,
+        max_datagram: u64,
+        now: u64,
+    ) -> Result<Self, GateError> {
         if let Some(policy) = rate {
             policy
                 .validate(max_datagram)
                 .map_err(GateError::InvalidRatePolicy)?;
         }
+        let gate = lanes.len();
         let lanes = lanes
             .iter()
-            .map(|lane| State {
-                lane: lane.lane,
-                epoch: lane.epoch,
-                heads: VecDeque::with_capacity(lane.bound),
-                bound: lane.bound,
-                aborting: None,
-                unknown: 0,
+            .map(|lane| {
+                // Each route's ring holds at most a bound: the positions held
+                // on all routes together, at most the bound times the routes.
+                let held = lane
+                    .bound
+                    .checked_mul(routes)
+                    .ok_or(GateError::LaneCount { gate })?;
+                Ok(State {
+                    lane: lane.lane,
+                    epoch: lane.epoch,
+                    heads: (0..routes)
+                        .map(|_| VecDeque::with_capacity(lane.bound))
+                        .collect(),
+                    charges: VecDeque::with_capacity(held),
+                    bound: lane.bound,
+                    aborting: None,
+                    unknown: vec![0; routes],
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, GateError>>()?;
         Ok(Self {
             word,
             cell,
@@ -341,21 +442,55 @@ impl GuardGate {
             .lanes
             .get_mut(lane)
             .ok_or(GateStageError::UnknownLane { lane })?;
-        if state.heads.len() >= state.bound {
+        let ring = state
+            .heads
+            .first()
+            .ok_or(GateStageError::UnknownLane { lane })?;
+        if ring.len() >= state.bound {
             return Err(GateStageError::Full { lane });
         }
-        if sender.pending(lane) != Some(state.heads.len()) {
+        if sender.pending(lane) != Some(ring.len()) {
             return Err(GateStageError::OutOfStep { lane });
         }
         sender
             .staged(lane, staged)
             .map_err(GateStageError::Sender)?;
-        state.heads.push_back(Head {
-            head,
-            ticket: staged.ticket,
-            charged: false,
-            exposed: false,
-        });
+        state.record(0, staged.ticket, head);
+        Ok(())
+    }
+
+    /// Records a copy committed to `lane`'s queue on `route`, at its tail,
+    /// in both `sender` ([`RoutedLaneSender::staged`]) and the gate.
+    ///
+    /// # Errors
+    ///
+    /// See [`GateStageError`]; nothing is recorded on error.
+    pub fn stage_copy(
+        &mut self,
+        sender: &mut RoutedLaneSender,
+        lane: usize,
+        route: usize,
+        copy: RoutedStaged,
+        head: GateHead,
+    ) -> Result<(), GateStageError> {
+        let state = self
+            .lanes
+            .get_mut(lane)
+            .ok_or(GateStageError::UnknownLane { lane })?;
+        let ring = state
+            .heads
+            .get(route)
+            .ok_or(GateStageError::UnknownLane { lane })?;
+        if ring.len() >= state.bound {
+            return Err(GateStageError::Full { lane });
+        }
+        if sender.pending(lane, route) != Some(ring.len()) {
+            return Err(GateStageError::OutOfStep { lane });
+        }
+        sender
+            .staged(lane, route, copy)
+            .map_err(GateStageError::Sender)?;
+        state.record(route, copy.staged.ticket, head);
         Ok(())
     }
 
@@ -365,12 +500,41 @@ impl GuardGate {
     /// unsent.
     pub fn reopen(&mut self, sender: &mut LaneSender, lane: usize, queue: TxQueueId) {
         sender.reopen(lane, queue);
-        if let Some(state) = self.lanes.get_mut(lane) {
-            while let Some(mut entry) = state.heads.pop_front() {
-                refund(&mut self.limiter, &mut entry);
+        self.drop_route(lane, 0);
+    }
+
+    /// [`GuardGate::reopen`] for `lane` on one `route` of `sender`
+    /// ([`RoutedLaneSender::reopen`]): that route's records go; a position
+    /// another route still holds keeps its charge.
+    pub fn reopen_route(
+        &mut self,
+        sender: &mut RoutedLaneSender,
+        lane: usize,
+        route: usize,
+        queue: TxQueueId,
+    ) {
+        sender.reopen(lane, route, queue);
+        self.drop_route(lane, route);
+    }
+
+    fn drop_route(&mut self, lane: usize, route: usize) {
+        let Some(state) = self.lanes.get_mut(lane) else {
+            return;
+        };
+        let State {
+            heads,
+            charges,
+            unknown,
+            ..
+        } = state;
+        if let Some(ring) = heads.get_mut(route) {
+            while let Some(entry) = ring.pop_front() {
+                settle(&mut self.limiter, charges, entry.head.end, false);
             }
-            // The reset settled every item of the old queue.
-            state.unknown = 0;
+        }
+        // The reset settled every item of the old queue.
+        if let Some(unknown) = unknown.get_mut(route) {
+            *unknown = 0;
         }
     }
 
@@ -381,8 +545,10 @@ impl GuardGate {
             && state.aborting.is_none()
         {
             state.aborting = Some(cause);
-            for entry in &mut state.heads {
-                refund(&mut self.limiter, entry);
+            for charge in &mut state.charges {
+                if !charge.sent {
+                    refund(&mut self.limiter, charge);
+                }
             }
             bump(&mut self.counts.aborted, &mut self.counts.overflows);
         }
@@ -404,8 +570,8 @@ impl GuardGate {
 
     /// Backend work in flight: heads exposed and not yet left, and heads
     /// that left unproven (or whose report contradicted the record) until a
-    /// reopen resolves them (DN-7). `None` only past `u64`, which would take
-    /// 2^64 unresolved reports.
+    /// reopen resolves them (DN-7), on every route. `None` only past `u64`,
+    /// which would take 2^64 unresolved reports.
     ///
     /// The count errs high, never low: the matching prefix of a
     /// contradicted exposure, a permitted head the backend keeps pending,
@@ -415,11 +581,17 @@ impl GuardGate {
     #[must_use]
     pub fn in_flight(&self) -> Option<u64> {
         self.lanes.iter().try_fold(0u64, |total, state| {
-            let exposed = state.heads.iter().filter(|entry| entry.exposed).count();
-            u64::try_from(exposed)
-                .ok()?
-                .checked_add(state.unknown)?
-                .checked_add(total)
+            state
+                .heads
+                .iter()
+                .zip(&state.unknown)
+                .try_fold(total, |total, (ring, unknown)| {
+                    let exposed = ring.iter().filter(|entry| entry.exposed).count();
+                    u64::try_from(exposed)
+                        .ok()?
+                        .checked_add(*unknown)?
+                        .checked_add(total)
+                })
         })
     }
 
@@ -494,6 +666,34 @@ impl GuardGate {
     }
 }
 
+impl State {
+    /// Records a staged copy on `route` and its position.
+    fn record(&mut self, route: usize, ticket: TxTicket, head: GateHead) {
+        if let Some(ring) = self.heads.get_mut(route) {
+            ring.push_back(Head {
+                head,
+                ticket,
+                exposed: false,
+            });
+        }
+        // Copies of one position are staged together on every route, in
+        // position order: a held position is at the back or not held.
+        match self.charges.back_mut() {
+            Some(charge) if charge.head.end == head.end => {
+                if let Some(holders) = charge.holders.checked_add(1) {
+                    charge.holders = holders;
+                }
+            }
+            _ => self.charges.push_back(Charge {
+                head,
+                holders: 1,
+                charged: false,
+                sent: false,
+            }),
+        }
+    }
+}
+
 impl SenderGate for GuardGate {
     fn check(&mut self, candidate: &Exposure<'_>) -> GateDecision {
         bump(&mut self.counts.checks, &mut self.counts.overflows);
@@ -518,32 +718,48 @@ impl SenderGate for GuardGate {
             self.deny_guard(index, observed);
             return GateDecision::Deny;
         }
-        // Each candidate must be the lane's next head, in order; the
+        // Each candidate must be its route's next head, in order; the
         // prefix whose tokens are reserved is permitted.
         let limiter = &mut self.limiter;
         let Some(state) = self.lanes.get_mut(index) else {
             return self.fault(None);
         };
-        if candidate.tokens.is_empty() || candidate.tokens.len() > state.heads.len() {
+        let State { heads, charges, .. } = state;
+        let ring = candidate.tokens.first().and_then(|first| {
+            heads
+                .iter_mut()
+                .find(|ring| ring.front().is_some_and(|entry| entry.head.token == *first))
+        });
+        let Some(ring) = ring else {
+            return self.fault(Some(index));
+        };
+        if candidate.tokens.len() > ring.len() {
             return self.fault(Some(index));
         }
         let mut permitted: u16 = 0;
         let mut mismatch = false;
         let mut held = false;
-        for (entry, token) in state.heads.iter_mut().zip(candidate.tokens) {
+        for (entry, token) in ring.iter_mut().zip(candidate.tokens) {
             if entry.head.token != *token {
                 mismatch = true;
                 break;
             }
-            if !entry.charged {
+            let Some(charge) = charges
+                .iter_mut()
+                .find(|charge| charge.head.end == entry.head.end)
+            else {
+                mismatch = true;
+                break;
+            };
+            if !charge.charged {
                 let paid = limiter.as_mut().is_none_or(|limiter| {
-                    limiter.try_admit_datagram(entry.head.length, entry.head.messages)
+                    limiter.try_admit_datagram(charge.head.length, charge.head.messages)
                 });
                 if !paid {
                     held = true;
                     break;
                 }
-                entry.charged = true;
+                charge.charged = true;
             }
             entry.exposed = true;
             let Some(next) = permitted.checked_add(1) else {
@@ -580,12 +796,13 @@ impl LaneGate for GuardGate {
             self.deny_guard(lane, observed);
             return false;
         }
-        let Some(entry) = self.lanes.get(lane).and_then(|state| state.heads.front()) else {
+        // The lowest position held: the lane's next head on some route.
+        let Some(charge) = self.lanes.get(lane).and_then(|state| state.charges.front()) else {
             return true;
         };
-        let affordable = entry.charged
+        let affordable = charge.charged
             || self.limiter.as_ref().is_none_or(|limiter| {
-                limiter.admits_datagram(entry.head.length, entry.head.messages)
+                limiter.admits_datagram(charge.head.length, charge.head.messages)
             });
         if !affordable {
             bump(&mut self.counts.rate_held, &mut self.counts.overflows);
@@ -608,7 +825,27 @@ impl LaneGate for GuardGate {
             bump(&mut self.counts.faults, &mut self.counts.overflows);
             return;
         };
-        let Some(mut entry) = state.heads.pop_front() else {
+        let State {
+            heads,
+            charges,
+            unknown,
+            lane: publication_lane,
+            ..
+        } = state;
+        // The route whose next head left; with one route, its ring.
+        let route = heads
+            .iter()
+            .position(|ring| {
+                ring.front()
+                    .is_some_and(|entry| entry.ticket == staged.ticket)
+            })
+            .or_else(|| (heads.len() == 1).then_some(0));
+        let Some((route, entry)) = route.and_then(|route| {
+            heads
+                .get_mut(route)
+                .and_then(VecDeque::pop_front)
+                .map(|entry| (route, entry))
+        }) else {
             bump(&mut self.counts.faults, &mut self.counts.overflows);
             return;
         };
@@ -616,25 +853,36 @@ impl LaneGate for GuardGate {
             // The records diverged: the lane cannot be trusted any more, and
             // the item's fate is unknown, so it stays in flight until a
             // reopen, as an `Unknown` one does.
-            refund(&mut self.limiter, &mut entry);
-            bump(&mut state.unknown, &mut self.counts.overflows);
+            settle(&mut self.limiter, charges, entry.head.end, false);
+            if let Some(count) = unknown.get_mut(route) {
+                bump(count, &mut self.counts.overflows);
+            }
             self.fault(Some(lane));
             return;
         }
         match how {
             Left::Submitted => {
-                if let Some(slot) = self.submitted.get_mut(usize::from(state.lane.get())) {
+                if let Some(slot) = self.submitted.get_mut(usize::from(publication_lane.get())) {
                     *slot = (*slot).max(entry.head.end);
                 }
+                settle(&mut self.limiter, charges, entry.head.end, true);
             }
             // It may have been sent: its charge stays, its position is not
             // counted as submitted, and it stays in flight until a reopen.
-            Left::Unknown => bump(&mut state.unknown, &mut self.counts.overflows),
+            Left::Unknown => {
+                if let Some(count) = unknown.get_mut(route) {
+                    bump(count, &mut self.counts.overflows);
+                }
+                settle(&mut self.limiter, charges, entry.head.end, true);
+            }
             // It left without exposure: not a send.
-            Left::Returned => refund(&mut self.limiter, &mut entry),
+            Left::Returned => settle(&mut self.limiter, charges, entry.head.end, false),
         }
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod routed_tests;
