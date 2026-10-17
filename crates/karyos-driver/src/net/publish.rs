@@ -107,7 +107,11 @@ impl EmbeddedDriver<HeapTerms> {
     /// [`DriverError::UnsupportedChannel`], [`DriverError::NetworkEndpoint`],
     /// [`DriverError::NetworkBusy`], [`DriverError::ExportIdsExhausted`] and
     /// the errors of [`EmbeddedDriver::add_aggregate`]. Nothing is left
-    /// configured on error.
+    /// configured on error. The key of a removed network publication stays
+    /// in use while its removal lingers, for up to `publication_linger`
+    /// ([`NetworkStreamDefaults::publication_linger`](crate::net::NetworkStreamDefaults)):
+    /// [`DriverError::DuplicateStream`] until then, and a retry after it
+    /// succeeds.
     pub fn add_network_publication(
         &mut self,
         config: AggregateConfig,

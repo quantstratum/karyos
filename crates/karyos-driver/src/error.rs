@@ -106,6 +106,11 @@ pub enum DriverError {
         stream: u64,
     },
     /// A stream with the same wire stream id and session already exists.
+    /// That includes a removed network publication's lanes while its
+    /// removal lingers (driver-network-agents.md §7): the key is refused
+    /// for up to `publication_linger` after the removal, and a retry once
+    /// the removal has ended succeeds. A client that asks by channel URI
+    /// sees `ErrorCode::ResourcesUnavailable`.
     #[error("stream {stream_id} session {session_id} already exists")]
     DuplicateStream {
         /// Wire stream id.

@@ -195,8 +195,11 @@ fn journals_follow_a_publication_and_its_image(threading: ThreadingMode) {
     });
     assert_eq!(sender.closed(), [sent]);
     assert_eq!(counter(&a, "network trace journals refused"), 0);
-    // The receiver journal is still open: its image has not retired.
-    assert!(entry(&b, received).is_some_and(|entry| entry.state == JournalState::Open));
+    // The image then ends at its EOS (driver-network-agents.md §7), which
+    // closes its receiver journal too.
+    pump(&mut [&mut a, &mut b], |drivers| {
+        entry(drivers[1], received).is_some_and(|entry| entry.state == JournalState::Closed)
+    });
 }
 
 #[test]

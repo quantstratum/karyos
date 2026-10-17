@@ -283,15 +283,17 @@ fn a_stalled_receiver_holds_either_channel_at_its_window() {
 
 /// E4: a publication that goes silent retires its image at liveness; the
 /// reader sees the image's seal, and the image is reclaimed once it drops.
+/// Its driver's network stops, which sends no EOS and lingers for nothing
+/// (driver-network-agents.md §7); a removal would end it at its EOS.
 #[test]
 fn a_silent_publication_retires_its_image_at_liveness() {
     let (mut a, mut b) = (
         fast_driver(ThreadingMode::Shared),
         fast_driver(ThreadingMode::Shared),
     );
-    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let (_publication, image) = connected(&mut a, &mut b, true, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Optional).unwrap();
-    a.remove_aggregate(&publication).unwrap();
+    let _ = a.close_network();
     let mut end = None;
     pump(&mut [&mut a, &mut b], |_| {
         let poll = reader.poll(|_, _, _| {}, BUDGET);
@@ -916,6 +918,8 @@ fn multicast_cycles_run_on_the_network_clock() {
     let b = counters(&b);
     assert!(b.group_nak_copies >= 2, "{b:?}");
 }
+
+mod linger;
 
 mod netem;
 

@@ -19,12 +19,17 @@
 //!   with `SealReason::EndOfStream` instead: its clean end. A lane that
 //!   dropped a frame past its bound does not end clean; that image is
 //!   sealed with `ImageRetired`.
-//! - **EOS today.** Until the sender's removal linger (the linger PR),
-//!   EOS reaches the wire only as the application's per-message EOS flag,
-//!   and the sender sends no EOS heartbeat. A removed network publication
-//!   therefore still ends its receivers' images unclean, at their liveness
-//!   timeout, and an aggregate with an unused lane (one that never carries
-//!   an EOS message) cannot end clean.
+//! - **EOS on the wire.** EOS reaches a receiver as the application's
+//!   per-message EOS flag, or as the EOS heartbeat a removed publication's
+//!   sender sends at each lane's seal once the lane drained to it, repeated
+//!   through `publication_linger` (driver-network-agents.md §7). A removal
+//!   therefore ends its receivers' images cleanly, every lane at its seal,
+//!   an unused lane included, once each lane's complete prefix reaches it.
+//!   No EOS is sent, so the images end unclean at their liveness timeout,
+//!   for a lane not drained within the linger's drain bound, a lane whose
+//!   guard closed, a driver stop or a sender failure, and, until the routed
+//!   sender's follow-up, every lane of a routed (redundant paths)
+//!   publication.
 //! - **Scope.** Unicast (the channel's `endpoint` is the local receive
 //!   address) and IPv4 multicast (the group's port, joined on `interface`
 //!   or any); interface names and IPv6 groups are refused. Heap terms only
