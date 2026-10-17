@@ -1400,3 +1400,65 @@ fn the_solicit_path_does_not_sweep() {
     sessions.timers(2 * SECOND);
     solicited(sessions.solicit(key(3), 2 * SECOND, &mut nonces));
 }
+
+/// T10 (contract-traceability-phase-2.md, "Challenge lifecycle"): two live
+/// challenges, on two keys of two publications, answered in reverse order.
+/// Each answer is checked against its own challenge, both images install
+/// with their own slots, and a copy of either answer after its install is
+/// dropped and counted once, with no second image.
+#[test]
+fn two_live_challenges_answered_out_of_order_both_install() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let other = Identity {
+        registration_id: 4,
+        ..identity(1)
+    };
+    let first = challenged(sessions.announce(key(1), &announce(1), 0, &mut nonces));
+    let second = challenged(sessions.announce(
+        key(2),
+        &SetupAnnounce {
+            identity: other,
+            ..announce(1)
+        },
+        MS,
+        &mut nonces,
+    ));
+    assert_ne!(first.challenge.nonce, second.challenge.nonce);
+    assert_eq!(sessions.counters().challenges, 2);
+    let first_answer = answer(1, first.challenge.nonce);
+    let second_answer = SetupAnswer {
+        identity: other,
+        ..answer(1, second.challenge.nonce)
+    };
+    // Crossed nonces answer neither challenge.
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, second.challenge.nonce), 2 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::Mismatch)
+    );
+    // Answered in reverse order.
+    let pending_second = accepted(sessions.answer(key(2), &second_answer, 3 * MS, || true));
+    let pending_first = accepted(sessions.answer(key(1), &first_answer, 4 * MS, || true));
+    assert_ne!(pending_first.slot, pending_second.slot);
+    let ReadyOutcome::Installed(installed_second) = sessions.image_ready(pending_second, 5 * MS)
+    else {
+        panic!("the second did not install");
+    };
+    let ReadyOutcome::Installed(installed_first) = sessions.image_ready(pending_first, 6 * MS)
+    else {
+        panic!("the first did not install");
+    };
+    assert_eq!(sessions.lookup(&key(1)), Some(installed_first));
+    assert_eq!(sessions.lookup(&key(2)), Some(installed_second));
+    // A copy of each answer after its install: dropped, counted once each.
+    let dropped = sessions.counters().dropped;
+    for (key, copy) in [(key(1), &first_answer), (key(2), &second_answer)] {
+        assert!(matches!(
+            sessions.answer(key, copy, 7 * MS, || true),
+            AnswerOutcome::Dropped(_)
+        ));
+    }
+    assert_eq!(sessions.counters().dropped, dropped + 2);
+    assert_eq!(sessions.counters().installed, 2);
+    assert_eq!(sessions.counters().challenges, 2, "no new challenge");
+}
