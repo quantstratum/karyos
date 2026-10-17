@@ -198,7 +198,7 @@ fn latest(reader: &mut ConflationReader) -> Vec<(u32, Vec<u8>)> {
                 keys: 16,
                 retries: 4,
             },
-            |key, _, value| {
+            |key, _, value, _| {
                 seen.retain(|(seen, _)| *seen != key);
                 seen.push((key, value.to_vec()));
             },
@@ -321,7 +321,7 @@ fn a_fetched_conflated_view_reads_the_table_read_only() {
             keys: 16,
             retries: 4,
         },
-        |_, _, _| {},
+        |_, _, _, _| {},
     );
     assert!(report.closed);
     // The view unmapped the table: then it detaches, which ends the grant.
@@ -404,7 +404,7 @@ fn a_conflated_view_survives_a_cutover() {
                     keys: 16,
                     retries: 4
                 },
-                |_, _, _| {}
+                |_, _, _, _| {}
             )
             .closed
     );

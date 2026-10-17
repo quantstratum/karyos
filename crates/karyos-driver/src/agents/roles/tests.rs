@@ -167,6 +167,7 @@ fn add_publication(
             multicast: false,
             control_group: None,
             identity: None,
+            conflated: None,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -728,6 +729,7 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             multicast: false,
             control_group: None,
             identity: None,
+            conflated: None,
         };
         assert!(matches!(
             role.command(command),
@@ -1204,6 +1206,7 @@ fn installed_image_with(
             pending: None,
         }],
         closing: None,
+        gate: None,
         tail_since: [None; 4],
         reset_requested: None,
         next_clean: [0; 4],
