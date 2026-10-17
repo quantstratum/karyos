@@ -915,12 +915,120 @@ fn a_tombstone_lifts_on_silence_expect_or_need() {
     table.timers(5 * TIMEOUT, 64);
     let (_, joined, _) = accepted(status(&mut table, &sm(1, &[(100, 100)]), 5 * TIMEOUT));
     assert!(joined);
-    // Need: with the table full of a member and a tombstone, a newcomer
-    // takes the tombstone's slot.
+    // Need: with the table full of a member and a tombstone, a newcomer's
+    // establishment takes the tombstone's slot.
     table.timers(6 * TIMEOUT, 64);
     accepted(status(&mut table, &sm(2, &[(0, 100)]), 6 * TIMEOUT));
+    table.expect(&path(receiver(3, 1), 1), 6 * TIMEOUT).unwrap();
     accepted(status(&mut table, &sm(3, &[(0, 100)]), 6 * TIMEOUT));
     assert_eq!(table.counters().tombstones_cleared, 2);
+}
+
+/// ACS 15663 (a): an SM-driven optional join never takes another
+/// receiver's tombstone, so a member whose tombstone was taken cannot come
+/// back through a second one; a new establishment, or a configured
+/// required receiver, may take it.
+#[test]
+fn only_an_establishment_takes_another_tombstone() {
+    let mut table = Membership::new(
+        MembershipConfig {
+            max_receivers: 4,
+            max_pending: 4,
+            ..config(1)
+        },
+        identity(1),
+        alias(),
+        &Roles {
+            required: &[9],
+            tags: &[],
+        },
+        0,
+    )
+    .unwrap();
+    assert!(table.advance_sent(lane(0), 1000));
+    // 1 and 2 expire into tombstones; 3 stays.
+    accepted(status(&mut table, &sm(1, &[(10, 100)]), 0));
+    accepted(status(&mut table, &sm(2, &[(10, 100)]), MS));
+    accepted(status(&mut table, &sm(3, &[(10, 100)]), TIMEOUT));
+    table.timers(TIMEOUT + MS, 64);
+    assert_eq!(table.counters().expired, 2);
+    // A newcomer's SM finds only the slot reserved for 9 and tombstones.
+    assert_eq!(
+        rejected(status(&mut table, &sm(4, &[(0, 100)]), TIMEOUT + MS)),
+        StatusRejected::TableFull
+    );
+    // Its establishment may: it takes the free slot, and the required
+    // receiver then takes the oldest tombstone, receiver 1's.
+    table
+        .expect(&path(receiver(4, 1), 1), TIMEOUT + MS)
+        .unwrap();
+    accepted(status(&mut table, &sm(4, &[(0, 100)]), TIMEOUT + MS));
+    accepted(status(&mut table, &sm(9, &[(0, 100)]), TIMEOUT + MS));
+    // Receiver 1, its tombstone gone, cannot come back through 2's.
+    assert_eq!(
+        rejected(status(&mut table, &sm(1, &[(10, 100)]), TIMEOUT + 2 * MS)),
+        StatusRejected::TableFull
+    );
+    assert_eq!(
+        rejected(status(&mut table, &sm(2, &[(10, 100)]), TIMEOUT + 2 * MS)),
+        StatusRejected::Expired,
+        "2's tombstone still holds"
+    );
+    assert_eq!(table.counters().tombstones_cleared, 1);
+}
+
+/// ACS 15663 (b): an establishment refused for the pending or table limit
+/// leaves the tombstone in place.
+#[test]
+fn a_refused_expect_keeps_the_tombstone() {
+    let mut table = Membership::new(
+        MembershipConfig {
+            max_receivers: 2,
+            max_pending: 1,
+            ..config(1)
+        },
+        identity(1),
+        alias(),
+        &Roles::default(),
+        0,
+    )
+    .unwrap();
+    assert!(table.advance_sent(lane(0), 1000));
+    accepted(status(&mut table, &sm(1, &[(10, 100)]), 0));
+    table.timers(TIMEOUT, 64);
+    table.expect(&path(receiver(2, 1), 1), TIMEOUT).unwrap();
+    assert_eq!(
+        table.expect(&path(receiver(1, 1), 1), TIMEOUT),
+        Err(StatusRejected::PendingFull)
+    );
+    assert_eq!(
+        rejected(status(&mut table, &sm(1, &[(10, 100)]), TIMEOUT + MS)),
+        StatusRejected::Expired,
+        "the tombstone holds"
+    );
+    assert_eq!(table.counters().tombstones_cleared, 0);
+}
+
+/// ACS 15663 (c): an SM that breaks credit is counted for that first, even
+/// for an expired member.
+#[test]
+fn credit_faults_count_before_the_tombstone() {
+    let mut table = table(config(1), &Roles::default());
+    accepted(status(&mut table, &sm(1, &[(10, 100)]), 0));
+    table.timers(TIMEOUT, 64);
+    assert_eq!(
+        rejected(status(&mut table, &sm(1, &[(10, 1)]), TIMEOUT + MS)),
+        StatusRejected::Window
+    );
+    assert_eq!(
+        rejected(status(&mut table, &sm(1, &[(1 << 31, 100)]), TIMEOUT + MS)),
+        StatusRejected::Beyond
+    );
+    assert_eq!(table.counters().expired_rejected, 0);
+    assert_eq!(
+        rejected(status(&mut table, &sm(1, &[(10, 100)]), TIMEOUT + MS)),
+        StatusRejected::Expired
+    );
 }
 
 /// The timers stop at their limit and resume from their cursor.
