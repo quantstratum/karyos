@@ -37,6 +37,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyos_sys::freshness::BarrierMailbox` (`MAILBOX_WORDS`,
+  `SealRequest`, `FreshnessError::UnknownRequest`): one lane image's seal
+  mailbox between its receive owner and its conflated view's feeder,
+  words `[request, start, end, ack, attached]` (conflated-network-images.md
+  (b)). The owner posts the interval it intends to seal and seals after
+  the acknowledgement; the feeder acknowledges only after its barrier
+  published the loss. The Loom model `tests/loom_barrier_mailbox.rs`
+  checks it with the barrier, a fresh slot and the terminal cell: four
+  scenarios (acknowledgement, timeout, ring-full race, attach race) and
+  seven negative controls.
 - Receiver roles and tags reach the network agents, driver-internal (MC-1,
   MC-2; the public way in is owner item 7). A network publication can
   carry `PublicationRoles` (its strategy, required receiver ids and tagged
@@ -50,7 +60,6 @@ release may break APIs, wire formats and shared-memory layouts.
   declared tag is not the one configured for its receiver is dropped whole
   before the sender's binding (`SenderCounters::sm_tag_mismatch`), so it
   never establishes a session or holds retention (MC-2).
-
 - `make netem` (`scripts/netem-test.sh`, W6): the network fault tests in
   Linux Docker with `NET_ADMIN`, under tc netem on the container's own
   loopback (default profile: 2% loss, 10% reorder, 1 ms delay, 1%

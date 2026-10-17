@@ -268,3 +268,89 @@ fn the_terminal_cell_is_one_shot() {
     assert_eq!(TerminalCell::read(&w.as_slice()), None);
     assert!(!cell.publish(terminal));
 }
+
+fn mailbox_words() -> Vec<AtomicU64> {
+    (0..MAILBOX_WORDS).map(|_| AtomicU64::new(0)).collect()
+}
+
+#[test]
+fn a_mailbox_holds_one_request_until_it_is_acknowledged() {
+    let w = mailbox_words();
+    let mailbox = BarrierMailbox::new(&w).unwrap();
+    assert!(BarrierMailbox::new(&w[..4]).is_err());
+    assert_eq!(mailbox.pending(), None);
+    let first = mailbox.post(8, 16).unwrap();
+    assert_eq!(first, 1);
+    assert!(!mailbox.is_acknowledged(first));
+    // One request at a time: the second waits for the first's ack.
+    assert_eq!(mailbox.post(24, 32), Err(FreshnessError::Busy));
+    assert_eq!(
+        mailbox.pending(),
+        Some(SealRequest {
+            request: first,
+            start: 8,
+            end: 16
+        })
+    );
+    mailbox.acknowledge(first).unwrap();
+    assert!(mailbox.is_acknowledged(first));
+    assert_eq!(mailbox.pending(), None);
+    let second = mailbox.post(24, 32).unwrap();
+    assert_eq!(second, 2);
+    assert!(!mailbox.is_acknowledged(second));
+    assert_eq!(
+        mailbox.pending(),
+        Some(SealRequest {
+            request: second,
+            start: 24,
+            end: 32
+        })
+    );
+}
+
+#[test]
+fn a_mailbox_refuses_what_it_cannot_hold() {
+    let w = mailbox_words();
+    let mailbox = BarrierMailbox::new(&w).unwrap();
+    assert_eq!(
+        mailbox.post(8, 8),
+        Err(FreshnessError::InvalidInterval { start: 8, end: 8 })
+    );
+    assert_eq!(mailbox.pending(), None, "nothing stored");
+    // Only the outstanding request is acknowledged, once.
+    assert_eq!(
+        mailbox.acknowledge(1),
+        Err(FreshnessError::UnknownRequest { request: 1 })
+    );
+    let request = mailbox.post(8, 16).unwrap();
+    assert_eq!(
+        mailbox.acknowledge(request + 1),
+        Err(FreshnessError::UnknownRequest {
+            request: request + 1
+        })
+    );
+    mailbox.acknowledge(request).unwrap();
+    assert_eq!(
+        mailbox.acknowledge(request),
+        Err(FreshnessError::UnknownRequest { request })
+    );
+    // An exhausted request number stores nothing.
+    w[0].store(u64::MAX, Ordering::Relaxed);
+    w[3].store(u64::MAX, Ordering::Relaxed);
+    assert_eq!(mailbox.post(8, 16), Err(FreshnessError::Exhausted));
+    assert_eq!(w[1].load(Ordering::Relaxed), 8);
+    assert_eq!(w[2].load(Ordering::Relaxed), 16);
+    assert_eq!(mailbox.pending(), None);
+}
+
+#[test]
+fn a_mailbox_knows_when_its_feeder_attached() {
+    let w = mailbox_words();
+    let mailbox = BarrierMailbox::new(&w).unwrap();
+    assert!(!mailbox.is_attached());
+    mailbox.attach();
+    assert!(mailbox.is_attached());
+    // Attaching writes only the feeder's word.
+    assert_eq!(w[4].load(Ordering::Relaxed), 1);
+    assert!(w[..4].iter().all(|word| word.load(Ordering::Relaxed) == 0));
+}
