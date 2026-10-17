@@ -94,8 +94,8 @@ pub enum ClientError {
     #[error("the driver did not answer in time")]
     Timeout,
     /// The driver does not serve this channel on this connection: a
-    /// network channel of a remote client (D3), no network, or a feature
-    /// not wired yet.
+    /// network channel on a driver with no network, or a feature not wired
+    /// yet.
     #[error("the driver does not serve this channel (detail {detail})")]
     UnsupportedChannel {
         /// The refusal's detail.

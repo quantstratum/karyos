@@ -428,7 +428,24 @@ mod remote {
     /// An IPC driver on its own thread, with one stream of id 3, whose
     /// admission socket is in the returned directory.
     fn ipc_driver(name: &str) -> (Driven, std::path::PathBuf) {
-        let (driven, dir, _) = ipc_driver_with(name, 16);
+        let (driven, dir, _) = ipc_driver_with(name, 16, DriverConfig::default());
+        (driven, dir)
+    }
+
+    /// As [`ipc_driver`], with a network whose receiver retires an image
+    /// `image_liveness` ns after its sender goes silent.
+    fn ipc_network_driver(name: &str, image_liveness: u64) -> (Driven, std::path::PathBuf) {
+        let mut network = NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        };
+        network.stream_defaults.term_length = 64 * 1024;
+        network.agents.image_liveness_timeout = image_liveness;
+        let config = DriverConfig {
+            network: Some(network),
+            ..DriverConfig::default()
+        };
+        let (driven, dir, _) = ipc_driver_with(name, 16, config);
         (driven, dir)
     }
 
@@ -455,8 +472,12 @@ mod remote {
     }
 
     /// As [`ipc_driver`], with at most `max_exports` grants per client,
-    /// and a pause switch.
-    fn ipc_driver_with(name: &str, max_exports: usize) -> (Driven, std::path::PathBuf, Pause) {
+    /// the driver `config`, and a pause switch.
+    fn ipc_driver_with(
+        name: &str,
+        max_exports: usize,
+        config: DriverConfig,
+    ) -> (Driven, std::path::PathBuf, Pause) {
         let paused = Pause {
             asked: Arc::new(AtomicBool::new(false)),
             holding: Arc::new(AtomicBool::new(false)),
@@ -470,7 +491,7 @@ mod remote {
         let path = dir.clone();
         let thread = std::thread::spawn(move || {
             let mut driver: EmbeddedDriver<SharedTerms> = EmbeddedDriver::with_ipc(
-                DriverConfig::default(),
+                config,
                 IpcConfig {
                     dir: path,
                     max_pending_hellos: 2,
@@ -587,23 +608,71 @@ mod remote {
         ));
     }
 
-    /// A remote client's `karyos:udp` is refused with `UnsupportedChannel`:
-    /// the driver serves network channels on heap terms only (D3).
+    /// SPEC §10 remote over the network (network-shared-terms n4): on two
+    /// IPC drivers, a remote client publishes by `karyos:udp` and another
+    /// subscribes by it; the subscriber reads the exact sequence from the
+    /// image, whose lanes it fetched as regions, and drops the image once
+    /// its publication goes.
     #[test]
-    fn a_remote_udp_channel_is_unsupported() {
-        let (_driver, dir) = ipc_driver("udp");
-        let mut client = connect(&dir);
-        let uri = "karyos:udp?endpoint=127.0.0.1:40777";
-        assert!(matches!(
-            client
-                .add_exclusive_publication(uri, StreamId::new(3))
-                .err(),
-            Some(ClientError::UnsupportedChannel { .. })
-        ));
-        assert!(matches!(
-            client.add_subscription(uri, StreamId::new(3)).err(),
-            Some(ClientError::UnsupportedChannel { .. })
-        ));
+    fn a_remote_udp_publication_reaches_a_remote_udp_subscription() {
+        let (_a, a_dir) = ipc_network_driver("udp-pub", 500_000_000);
+        // The receiver retires an image half a second after its sender goes.
+        let (_b, b_dir) = ipc_network_driver("udp-sub", 500_000_000);
+        let mut publisher = connect(&a_dir);
+        let mut subscriber = connect(&b_dir);
+        let port = port();
+        let mut reading = subscriber
+            .add_subscription(
+                &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+                StreamId::new(7),
+            )
+            .unwrap();
+        assert!(reading.registration().is_some());
+        let mut publication = publisher
+            .add_exclusive_publication(
+                &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+                StreamId::new(7),
+            )
+            .unwrap();
+        until(&mut [&mut subscriber, &mut publisher], || {
+            let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+            reading.image_count() == 1
+        });
+        let (mut sent, mut seen) = (0u32, 0u32);
+        let start = Instant::now();
+        while seen < 64 {
+            assert!(start.elapsed() < Duration::from_secs(20), "seen {seen}");
+            let _ = publisher.poll();
+            let _ = subscriber.poll();
+            while sent < 64 {
+                match publication.offer(&sent.to_le_bytes()) {
+                    Ok(_) => sent += 1,
+                    Err(
+                        OfferError::BackPressured
+                        | OfferError::AdminAction
+                        | OfferError::NotConnected,
+                    ) => break,
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            let _ = reading
+                .poll(
+                    |bytes, _| {
+                        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                        seen += 1;
+                    },
+                    MessageLimit::new(16),
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        assert_eq!(reading.image_count(), 1);
+        assert_eq!(reading.images_refused(), 0);
+        drop(publication);
+        until(&mut [&mut subscriber, &mut publisher], || {
+            let _ = reading.poll(|_, _| {}, MessageLimit::new(16));
+            reading.image_count() == 0
+        });
     }
 
     /// `connect` needs the driver's directory.
@@ -620,7 +689,7 @@ mod remote {
     /// per client, the next subscription is granted.
     #[test]
     fn a_remote_late_grant_is_released() {
-        let (_driver, dir, paused) = ipc_driver_with("late", 1);
+        let (_driver, dir, paused) = ipc_driver_with("late", 1, DriverConfig::default());
         let mut client = Client::connect(
             Context::builder()
                 .dir(&dir)

@@ -26,9 +26,8 @@
 //!
 //! - **Remote** (`Client::connect`, Linux): it attaches to the driver
 //!   whose admission socket is in the context's directory. Its streams are
-//!   shared terms, and the driver serves network channels on heap terms
-//!   only (D3), so a `karyos:udp` URI is refused with
-//!   [`ClientError::UnsupportedChannel`] until shared-term network streams.
+//!   shared terms, `karyos:udp` ones included: the driver's network
+//!   publications and images are regions the client fetches.
 //! - **In process** ([`Client::with_conductor`]): a conductor of an
 //!   embedded driver that the application drives itself, on another
 //!   thread (`EmbeddedDriver::do_work` or its agents). A driver driven on
