@@ -449,6 +449,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         {
             return Err(DriverError::NetworkCutover { stream: id });
         }
+        // A recording's reader follows one mapping too; following
+        // successors is a later step (A4c-2 review).
+        let target = self.active_stream_mut(stream)?;
+        if target.recordings.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            return Err(DriverError::RecordingCutover { stream: id });
+        }
         let target = self.active_stream_mut(stream)?;
         // An image's lane is written by the receive owner through the
         // mapping it was given, at the remote sender's geometry; a successor

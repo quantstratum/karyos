@@ -20,6 +20,23 @@ release may break APIs, wire formats and shared-memory layouts.
   `karyos_archive::control` holds the five requests and three responses
   of schema 1, validated whole on decode and encoded into the caller's
   buffer without allocating.
+- The driver hands an Archive recording a lane's reader (phase 3,
+  A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
+  reserved required or an optional cell and returns a `RecordingReader`:
+  the reader and a lease on its stream, so a removed stream lives until
+  its seal is positioned and read; while it lives the stream refuses a
+  cutover (`DriverError::RecordingCutover`), since the reader follows
+  one mapping. `karyos_archive::source::Guarded`
+  keeps the lease with the reader and drops the reader first. The host
+  wires the two (SPEC section 14); `karyos-sim` records driver streams end
+  to end.
+- `karyos-bench` measures the Archive's write and sync cost on a real disk
+  (phase 3 follow-up): `archive-append` appends to a segment store that
+  never syncs, `archive-sync` syncs after every append. They run only
+  when named with `--workload`, in a removed temporary directory or under
+  `KARYOS_BENCH_DIR`. Their records name the directory, its filesystem,
+  the policy and whether syncs are `F_FULLFSYNC`, and compare only under
+  the same host and filesystem; no gate reads them.
 - A recording reads a lane's log through the network sender's read
   capability (phase 3, A4c-1). `SenderRead::for_recording` admits a
   reserved required cell (a `required` recording) or an optional one (an

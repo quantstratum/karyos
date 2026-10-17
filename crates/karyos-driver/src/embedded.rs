@@ -555,6 +555,9 @@ pub(crate) struct Stream<T: StreamTerms> {
     pub(crate) buffer: Arc<LogBuffer<T>>,
     pub(crate) conductor: Conductor<Arc<LogBuffer<T>>>,
     pub(crate) leases: Arc<StreamLeases>,
+    /// Recording readers holding the stream (`recording_reader`): a
+    /// cutover waits until there are none.
+    pub(crate) recordings: Arc<std::sync::atomic::AtomicU64>,
     allow_unconnected: bool,
     /// The stream's `on_required_loss` policy.
     pub(crate) policy: LossPolicy,
@@ -1025,6 +1028,7 @@ impl EmbeddedDriver<HeapTerms> {
                 buffer: Arc::clone(buffer),
                 conductor,
                 leases: Arc::new(StreamLeases::default()),
+                recordings: Arc::default(),
                 allow_unconnected: true,
                 policy: LossPolicy::Hold,
                 stream_id: key.0,
@@ -2179,6 +2183,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             buffer,
             conductor,
             leases: Arc::new(StreamLeases::default()),
+            recordings: Arc::default(),
             allow_unconnected: config.allow_unconnected,
             policy: config.on_required_loss,
             stream_id: key.0,
