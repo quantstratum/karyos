@@ -126,6 +126,8 @@ struct Rig {
     control: Option<EndpointId>,
     /// The publication's log on A (64 KiB terms, whatever is announced).
     log: Option<super::super::data::testing::TestLog>,
+    /// A second publisher's log, with [`Rig::second_publisher`].
+    second: Option<super::super::data::testing::TestLog>,
     agents: Agents,
     links: Links,
     endpoints: Endpoints<OsSocket>,
@@ -159,6 +161,7 @@ impl Rig {
             publisher: EndpointId(u32::MAX),
             control: None,
             log: None,
+            second: None,
             agents,
             links,
             endpoints: Endpoints::new(&config),
@@ -256,7 +259,7 @@ impl Rig {
         self.now += MS;
         VIRTUAL_NOW.with(|now| now.set(self.now));
         // The publication's conductor: rotation, floor and limit.
-        if let Some(log) = &mut self.log {
+        for log in [&mut self.log, &mut self.second].into_iter().flatten() {
             for conductor in &mut log.conductors {
                 let _ = conductor.duty_cycle().unwrap();
             }
@@ -269,6 +272,59 @@ impl Rig {
                 .poll(&self.links.sessions, |image| events.push(image));
         }
         std::thread::sleep(Duration::from_micros(200));
+    }
+
+    /// A second publisher on its own loopback endpoint A2, announcing the
+    /// same alias as A with another identity to B (`destination`), two
+    /// lanes of 64 KiB terms. Returns A2.
+    fn second_publisher(&mut self, destination: SocketAddr, identity: Identity) -> EndpointId {
+        let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let a2 = self
+            .endpoints
+            .open(&self.links, loopback, OsSocket::new())
+            .unwrap();
+        let mut opened = false;
+        for _ in 0..100 {
+            self.agents.do_work(self.now).unwrap();
+            self.endpoints.poll(
+                &self.links,
+                self.now,
+                |event| opened |= matches!(event, EndpointEvent::Opened(_)),
+                |_| {},
+            );
+            if opened {
+                break;
+            }
+        }
+        assert!(opened);
+        self.links
+            .receiver
+            .post(|reply| AgentCommand::AddPublishedAlias {
+                reply,
+                endpoint: a2,
+                alias: alias(),
+            })
+            .unwrap();
+        let (outbound, log) =
+            super::super::data::testing::outbound(a2, alias(), destination, term(65_536), 2, true);
+        self.second = Some(log);
+        self.links
+            .sender
+            .post(|reply| AgentCommand::AddPublication {
+                reply,
+                publication: Publication {
+                    endpoint: a2,
+                    alias: alias(),
+                    identity,
+                    term: term(65_536),
+                    lane_count: 2,
+                },
+                outbound,
+                guard: None,
+                roles: None,
+            })
+            .unwrap();
+        a2
     }
 
     /// Free units of the session rings: (receiver to conductor, conductor
@@ -2151,7 +2207,9 @@ fn group_naks_are_budgeted_and_never_reach_the_sender() {
     let counters = rig.agents.receiver.counters();
     assert_eq!(counters.group_naks, 3, "{counters:?}");
     assert!(counters.group_nak_budget_full >= 3, "{counters:?}");
-    assert_eq!(counters.group_nak_suppressions, 1, "{counters:?}");
+    // Whether a peer NAK suppresses depends on its arrival against the
+    // drawn delay; a_peer_group_nak_suppresses_the_cycle asserts it
+    // through inject_group, which no kernel delivery can delay.
     assert_eq!(rig.agents.sender.counters().naks, sender_naks);
 }
 
@@ -2353,4 +2411,76 @@ fn an_identity_knows_its_own_group_copy() {
             .receiver_id,
         77
     );
+}
+
+/// SPEC §13 phase 2, alias collision: two publishers on different source
+/// endpoints announce the same `session_id` and stream, with different
+/// identities, to one receiving endpoint. The receiver keeps two images,
+/// keyed by source; each image's subscriber reads only its own
+/// publisher's messages, in order, and no frame crosses between them.
+#[test]
+fn test_receiver_alias_collision_keeps_two_images_apart() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let first = established(&mut rig);
+    let destination = rig.endpoints.local_address(b).unwrap();
+    let other = Identity {
+        driver_id: [8, 9],
+        registration_id: 4,
+        incarnation: 1,
+    };
+    let _a2 = rig.second_publisher(destination, other);
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established == 2
+    });
+    rig.until(true, |rig| {
+        rig.events
+            .iter()
+            .filter(|event| matches!(event, ImageEvent::Installed { .. }))
+            .count()
+            == 2
+    });
+    let second = rig
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ImageEvent::Installed { slot, .. } if *slot != first => Some(*slot),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(first, second);
+    let (_c1, mut one) = image_subscriber(&rig, first, 0, Role::Optional);
+    let (_c2, mut two) = image_subscriber(&rig, second, 0, Role::Optional);
+    // Publisher A writes 1s, A2 writes 2s, each with its own sequence.
+    for i in 0..8u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[1, i, 0, 0], AppendOptions::default())
+            .unwrap();
+        let log = rig.second.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[2, i, 0, 0], AppendOptions::default())
+            .unwrap();
+    }
+    let (mut seen_one, mut seen_two) = (Vec::new(), Vec::new());
+    for _ in 0..2000 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut one) {
+            seen_one.push((message[0], message[1]));
+        }
+        while let Some(message) = poll_message(&mut two) {
+            seen_two.push((message[0], message[1]));
+        }
+        if seen_one.len() >= 8 && seen_two.len() >= 8 {
+            break;
+        }
+    }
+    let expect = |publisher| (0..8u8).map(|i| (publisher, i)).collect::<Vec<_>>();
+    // The first image is A's, the second A2's: established in that order.
+    assert_eq!(seen_one, expect(1));
+    assert_eq!(seen_two, expect(2));
 }
