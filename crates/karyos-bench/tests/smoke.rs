@@ -514,8 +514,11 @@ fn one_early_f2_receiver_stops_the_sender() {
     };
     let (error, took) = faulty_f2("f2-early", 1_000_000, early);
     let error = error.unwrap_or_default();
+    // The outcome proves the stop: without it the parent ends the sender
+    // as outlived (the second run below). The bound only rules out a
+    // hang, with room for a loaded machine (2.03 s was seen in a gate).
     assert!(error.contains("tx child failed"), "{error}");
-    assert!(took < std::time::Duration::from_millis(2_000), "{took:?}");
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     let (error, took) = faulty_f2(
         "f2-early-silent",
         1_000_000,
