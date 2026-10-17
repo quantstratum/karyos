@@ -170,7 +170,9 @@ pub struct DriverConfig {
     /// Duty cycles whose responses may fall between the ends of two
     /// consecutive drains by a client (`m`); the application's promise.
     pub cycles_between_drains: usize,
-    /// Bytes of each client's command ring.
+    /// Bytes of each client's command ring, a power of two whose largest
+    /// record (an eighth of it) carries the largest command with its
+    /// header: at least 8192 bytes (a URI command, W5a).
     pub ring_capacity: usize,
     /// Bytes of the broadcast buffer; at least `2 * B * R * m`, `R` being
     /// the largest response record.
@@ -287,7 +289,9 @@ impl Default for DriverConfig {
             max_hand_over: 64,
             command_budget: 64,
             cycles_between_drains: 2,
-            ring_capacity: 1024,
+            // The smallest power of two whose largest record carries a
+            // command with a 512-byte channel URI (W5a, SPEC §18).
+            ring_capacity: 8192,
             // Room for two cycles of `command_budget` responses of the
             // largest extent (`ConflatedReady`), with headroom.
             broadcast_capacity: 32 * 1024,
@@ -1026,6 +1030,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             && config.cycles_between_drains > 0
             && config.ring_capacity >= karyos_sys::command_ring::MIN_CAPACITY
             && config.ring_capacity.is_power_of_two()
+            && karyos_protocol::cnc::MAX_COMMAND_LENGTH
+                .checked_add(HEADER_LENGTH as usize)
+                .is_some_and(|record| config.ring_capacity / 8 >= record)
             && config.broadcast_capacity >= needed
             && config.guard_ack_timeout > 0;
         if !valid {

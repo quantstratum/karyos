@@ -249,8 +249,11 @@ fn driver_stream(driver: &mut EmbeddedDriver) -> StreamHandle {
 
 #[test]
 fn remove_on_a_full_ring_returns_the_handle() {
+    // More pending requests than the default 8192-byte ring holds, so the
+    // ring fills first.
     let config = DriverConfig {
-        max_pending_per_client: 64,
+        max_pending_per_client: 512,
+        max_hand_over: 512,
         ..DriverConfig::default()
     };
     let (mut driver, stream) = driver_with(config);
@@ -265,8 +268,8 @@ fn remove_on_a_full_ring_returns_the_handle() {
     let (handle, error) = client.remove_publication(handle).unwrap_err();
     assert_eq!(error, ConductorError::Full);
     assert_eq!(driver.live_leases(stream).unwrap(), 1);
-    // Drain, then retry.
-    for _ in 0..64 {
+    // Drain (one command per ring and cycle), then retry.
+    for _ in 0..512 {
         let _ = cycle(&mut driver, &mut client);
     }
     let removed = client.remove_publication(handle).unwrap();

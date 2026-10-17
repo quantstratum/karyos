@@ -1480,7 +1480,12 @@ fn write_uri_command(
 ) -> Result<usize, CncError> {
     let head = write_words(&words, out)?;
     let tail = uri.padded();
-    let required = head + tail.len();
+    let required = head
+        .checked_add(tail.len())
+        .ok_or(CncError::BufferTooShort {
+            required: usize::MAX,
+            available: out.len(),
+        })?;
     let available = out.len();
     out.get_mut(head..required)
         .ok_or(CncError::BufferTooShort {
@@ -1505,7 +1510,10 @@ fn read_uri_command(
         .ok()
         .filter(|length| (1..=MAX_COMMAND_URI).contains(length))
         .ok_or(CncError::Reserved { type_id })?;
-    let expected = head + length.next_multiple_of(8);
+    let expected = length
+        .checked_next_multiple_of(8)
+        .and_then(|padded| head.checked_add(padded))
+        .ok_or(CncError::Reserved { type_id })?;
     if bytes.len() != expected {
         return Err(CncError::WrongLength {
             type_id,

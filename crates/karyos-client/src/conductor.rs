@@ -89,10 +89,37 @@ pub enum ConductorError {
     /// journal number 0.
     #[error("invalid trace journal request")]
     InvalidJournal,
-    /// A channel URI is empty or longer than the 512 bytes a command
-    /// carries (`karyos_protocol::cnc::MAX_COMMAND_URI`, SPEC §18).
-    #[error("channel URI empty or longer than 512 bytes")]
+    /// A channel URI is longer than the 512 bytes a command carries
+    /// (`karyos_protocol::cnc::MAX_COMMAND_URI`, SPEC §18).
+    #[error("channel URI longer than 512 bytes")]
     UriTooLong,
+    /// A channel URI is empty.
+    #[error("empty channel URI")]
+    EmptyUri,
+    /// A channel URI does not parse; `code` is the parse error's code
+    /// (`karyos_protocol::channel::ChannelError::code`).
+    #[error("invalid channel URI (code {code})")]
+    InvalidChannel {
+        /// The parse error's code.
+        code: u64,
+    },
+    /// The command ring cannot carry the command: it is smaller than the
+    /// driver's minimum (`DriverConfig::ring_capacity`).
+    #[error("command larger than the command ring carries")]
+    CommandTooLarge,
+}
+
+/// The channel URI `uri` for a command: it parses (SPEC §5) and fits.
+fn channel_uri(uri: &str) -> Result<ChannelUri, ConductorError> {
+    if uri.is_empty() {
+        return Err(ConductorError::EmptyUri);
+    }
+    if uri.len() > karyos_protocol::cnc::MAX_COMMAND_URI {
+        return Err(ConductorError::UriTooLong);
+    }
+    karyos_protocol::channel::ChannelConfig::parse(uri)
+        .map_err(|error| ConductorError::InvalidChannel { code: error.code() })?;
+    ChannelUri::new(uri).ok_or(ConductorError::UriTooLong)
 }
 
 /// How a request ended.
@@ -625,15 +652,16 @@ impl<T: TermBytes> ClientConductor<T> {
     ///
     /// # Errors
     ///
-    /// [`ConductorError::UriTooLong`] for an empty URI or one over 512
-    /// bytes, and see [`ConductorError`]; nothing is submitted on error.
+    /// [`ConductorError::EmptyUri`], [`ConductorError::UriTooLong`] over 512
+    /// bytes, [`ConductorError::InvalidChannel`] for a URI that does not
+    /// parse, and see [`ConductorError`]; nothing is submitted on error.
     pub fn add_network_publication(
         &mut self,
         uri: &str,
         stream_id: i32,
         allow_unconnected: bool,
     ) -> Result<u64, ConductorError> {
-        let uri = ChannelUri::new(uri).ok_or(ConductorError::UriTooLong)?;
+        let uri = channel_uri(uri)?;
         self.submit(Kind::AddPublication, None, |sequence| {
             Command::AddNetworkPublication {
                 sequence,
@@ -659,7 +687,7 @@ impl<T: TermBytes> ClientConductor<T> {
         stream_id: i32,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
-        let uri = ChannelUri::new(uri).ok_or(ConductorError::UriTooLong)?;
+        let uri = channel_uri(uri)?;
         self.submit(Kind::AddNetworkSubscription, None, |sequence| {
             Command::AddNetworkSubscription {
                 sequence,
@@ -1196,6 +1224,9 @@ impl<T: TermBytes> ClientConductor<T> {
                 Ok(sequence)
             }
             Err(RingError::Full) => Err(ConductorError::Full),
+            // Only a ring smaller than the driver's validated minimum
+            // refuses a command for its size.
+            Err(RingError::MessageTooLarge { .. }) => Err(ConductorError::CommandTooLarge),
             Err(_) => Err(ConductorError::Closed),
         }
     }

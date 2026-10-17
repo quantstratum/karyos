@@ -2713,6 +2713,25 @@ mod tests {
         assert_eq!(driver.clients(), 0);
     }
 
+    /// #289 P1: a command ring whose largest record cannot carry a command
+    /// with the longest URI is refused at start; 8192 bytes is the smallest
+    /// power of two that can, and the default.
+    #[test]
+    fn a_ring_too_small_for_the_largest_command_is_refused() {
+        use crate::embedded::DriverConfig;
+        assert_eq!(DriverConfig::default().ring_capacity, 8192);
+        for ring_capacity in [1024, 4096] {
+            assert!(matches!(
+                EmbeddedDriver::with_config(DriverConfig {
+                    ring_capacity,
+                    ..DriverConfig::default()
+                }),
+                Err(DriverError::InvalidConfig)
+            ));
+        }
+        assert!(EmbeddedDriver::with_config(DriverConfig::default()).is_ok());
+    }
+
     /// W5a: a client's URI commands reach the driver, which refuses them
     /// until W5b serves them; a URI over the command cap is refused by the
     /// client, with nothing submitted.
@@ -2726,11 +2745,29 @@ mod tests {
         ));
         assert!(matches!(
             client.add_network_subscription("", 10, SubscriberRole::Optional),
-            Err(karyos_client::ConductorError::UriTooLong)
+            Err(karyos_client::ConductorError::EmptyUri)
         ));
-        let publication = client
-            .add_network_publication("karyos:udp?endpoint=127.0.0.1:40123", 10, false)
-            .unwrap();
+        assert!(matches!(
+            client.add_network_subscription("karyos:tcp", 10, SubscriberRole::Optional),
+            Err(karyos_client::ConductorError::InvalidChannel { .. })
+        ));
+        // The longest URI a command carries reaches the driver on the
+        // default ring (#289 P1): a valid one of exactly 512 bytes.
+        let mut long = String::from("karyos:udp?destinations=");
+        let mut port = 40_000u32;
+        // Destinations until a guard name of 1 to 64 bytes completes 512.
+        while long.len() < 512 - "|guard=".len() - 64 {
+            if !long.ends_with('=') {
+                long.push(';');
+            }
+            long.push_str(&format!("127.0.0.1:{port}"));
+            port += 1;
+        }
+        long.push_str("|guard=");
+        let guard = 512 - long.len();
+        long.push_str(&"g".repeat(guard));
+        assert_eq!(long.len(), 512);
+        let publication = client.add_network_publication(&long, 10, false).unwrap();
         let subscription = client
             .add_network_subscription(
                 "karyos:udp?endpoint=127.0.0.1:40124",

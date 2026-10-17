@@ -106,6 +106,26 @@ pub enum ChannelError {
     },
 }
 
+impl ChannelError {
+    /// A stable code for the error, never reused: the detail of a client's
+    /// `InvalidChannel` refusal (`cnc::ErrorCode`, W5).
+    #[must_use]
+    pub const fn code(&self) -> u64 {
+        match self {
+            Self::TooLong { .. } => 1,
+            Self::UnknownMedia => 2,
+            Self::Malformed { .. } => 3,
+            Self::UnknownParameter { .. } => 4,
+            Self::Repeated { .. } => 5,
+            Self::NotApplicable { .. } => 6,
+            Self::InvalidValue { .. } => 7,
+            Self::Destination => 8,
+            Self::Conflict { .. } => 9,
+            Self::SecurityUnsupported { .. } => 10,
+        }
+    }
+}
+
 /// A local interface: an address to bind, or a name the driver resolves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Interface {
