@@ -454,6 +454,16 @@ pub struct TerminalCell<'a> {
 
 /// Words of a [`TerminalCell`].
 pub const TERMINAL_WORDS: usize = 4;
+/// Terminal close reason: the receive owner's seal waited past its bound
+/// for the feeder's acknowledgement (conflated-network-images.md (c)).
+pub const TERMINAL_BARRIER_TIMEOUT: u64 = 1;
+/// Terminal close reason: the loss sequence or a slot's versions are
+/// exhausted (GU-11).
+pub const TERMINAL_FRESHNESS_EXHAUSTED: u64 = 2;
+/// Terminal close reason: a loss below the feeder's frontier, which breaks
+/// the invariant the readers' classification rests on.
+pub const TERMINAL_BELOW_FRONTIER: u64 = 3;
+
 /// A terminal cell's states.
 const EMPTY: u64 = 0;
 const CLAIMED: u64 = 1;
@@ -667,6 +677,67 @@ impl<'a> BarrierMailbox<'a> {
         }
         ack.store(request, Ordering::Release);
         Ok(())
+    }
+}
+
+/// Words of a [`FreshnessLink`]: a mailbox, then a terminal cell.
+pub const LINK_WORDS: usize = MAILBOX_WORDS + TERMINAL_WORDS;
+
+/// The words a lane image's receive owner and its conflated view share
+/// (`quantstratum-docs: karyos/design/conflated-network-images.md`, (b)
+/// and (c)): the seal mailbox and the view's terminal cell, in one heap
+/// allocation both hold. The receive owner allocates it when it installs
+/// the image (control path) and hands a clone to the conductor, which
+/// builds the view's table over the same terminal cell, so the owner can
+/// publish the fail-safe without being a second table writer.
+#[derive(Debug, Clone)]
+pub struct FreshnessLink {
+    words: std::sync::Arc<[AtomicU64]>,
+}
+
+impl FreshnessLink {
+    /// Allocates a zeroed link: no request, nothing acknowledged, no
+    /// feeder attached, an empty terminal cell.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            words: (0..LINK_WORDS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// The seal mailbox.
+    ///
+    /// # Errors
+    ///
+    /// None in practice: the layout is fixed at allocation.
+    pub fn mailbox(&self) -> Result<BarrierMailbox<'_>, FreshnessError> {
+        BarrierMailbox::new(
+            self.words
+                .get(..MAILBOX_WORDS)
+                .ok_or(FreshnessError::InvalidLayout)?,
+        )
+    }
+
+    /// The view's terminal cell words, for [`TerminalCell::new`] and
+    /// [`TerminalCell::read`].
+    #[must_use]
+    pub fn terminal_words(&self) -> &[AtomicU64] {
+        self.words.get(MAILBOX_WORDS..).unwrap_or(&[])
+    }
+
+    /// The view's terminal cell.
+    ///
+    /// # Errors
+    ///
+    /// None in practice: the layout is fixed at allocation.
+    pub fn terminal(&self) -> Result<TerminalCell<'_>, FreshnessError> {
+        TerminalCell::new(self.terminal_words())
+    }
+}
+
+impl Default for FreshnessLink {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

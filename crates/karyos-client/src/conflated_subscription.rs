@@ -126,7 +126,9 @@ impl ConflatedSubscription {
     pub fn poll_changed(&mut self, mut handler: impl FnMut(u32, &[u8])) -> PollReport {
         let report = self
             .reader
-            .poll_changed(self.budget, |key, _version, value| handler(key, value));
+            .poll_changed(self.budget, |key, _version, value, _freshness| {
+                handler(key, value);
+            });
         self.account(report)
     }
 
@@ -137,9 +139,13 @@ impl ConflatedSubscription {
     pub fn poll_changed_with(
         &mut self,
         budget: Budget,
-        handler: impl FnMut(u32, u64, &[u8]),
+        mut handler: impl FnMut(u32, u64, &[u8]),
     ) -> PollReport {
-        let report = self.reader.poll_changed(budget, handler);
+        let report = self
+            .reader
+            .poll_changed(budget, |key, version, value, _freshness| {
+                handler(key, version, value);
+            });
         self.account(report)
     }
 }
