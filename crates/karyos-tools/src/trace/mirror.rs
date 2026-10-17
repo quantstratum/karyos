@@ -68,6 +68,22 @@
 //!   created between the two reads would count as missed, which is only
 //!   conservative.
 //!
+//! - **Network journals (`trace-network.md` §5).** A network sender or
+//!   receiver entry (kinds 3 and 4) is read as a network source of its
+//!   lane, named by its sender's `driver_id`, expected from its start
+//!   (word 72) and up to its boundary (word 73) once it closed; a closed one
+//!   without a boundary is lost. Gaps are not mirrored, so every frame of a
+//!   receiver journal stays expected, and one lost to a gap makes its trace
+//!   `Incomplete`, never a false `Complete`.
+//! - **Refused network journals.** Header word 7 counts the network
+//!   journals the driver refused, read before and again after the table;
+//!   a rise since the last scan (any count at the attach) puts every held
+//!   message whose trace was not final out of scope, as for a missed
+//!   journal. The word does not name the publication, and a refused journal
+//!   never exists, so a message published later would not expect it: from
+//!   the first refusal on, the tool reports no final `Complete` for its
+//!   life, each such trace out of scope and counted (ACS 15805).
+//!
 //! The tool cannot bound a trace's span in a journal, so the report's
 //! attribution uses `D = u64::MAX` (`quantstratum-docs:
 //! karyos/design/trace-attribution.md`): any loss in a journal makes every
@@ -76,6 +92,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use karyos_protocol::journal::{DropRange, JournalError};
+use karyos_protocol::trace_hook::NetSide;
 use karyos_sys::trace_mirror::{
     EntryRead, JournalEntry, JournalKind, JournalState, LogRead, RecycledJournal, TimeNamespace,
     TraceMirrorReader,
@@ -224,10 +241,18 @@ impl Tracked {
             JournalState::WriterLost => SourceState::Lost,
             // Records mirrored after the scan are still to come.
             JournalState::Closed if !self.caught_up(cursor) => SourceState::Open,
-            JournalState::Closed => match (self.entry.kind, boundary) {
-                // J3: no boundary, no decided membership.
-                (JournalKind::Subscriber, None) => SourceState::Lost,
-                (_, boundary) => SourceState::Closed { boundary },
+            JournalState::Closed => match self.entry.network {
+                // A network journal's boundary is in its facts (word 73);
+                // without one its membership is undecided: lost.
+                Some(facts) => match facts.boundary {
+                    None => SourceState::Lost,
+                    boundary => SourceState::Closed { boundary },
+                },
+                None => match (self.entry.kind, boundary) {
+                    // J3: no boundary, no decided membership.
+                    (JournalKind::Subscriber, None) => SourceState::Lost,
+                    (_, boundary) => SourceState::Closed { boundary },
+                },
             },
         }
     }
@@ -383,6 +408,13 @@ pub struct MirrorTool {
     missed_scope: HashSet<(PublicationKey, u8, u64)>,
     /// Messages whose trace had a final answer after the last scan.
     finals: HashSet<(PublicationKey, u8, u64)>,
+    /// The mirror's count of refused network journals as the last scan
+    /// read it; `None` before the first scan.
+    refused: Option<u64>,
+    /// Scans that saw that count rise.
+    refused_rises: u64,
+    /// That count of scans could not rise further.
+    refused_rises_overflowed: bool,
 }
 
 impl MirrorTool {
@@ -403,6 +435,9 @@ impl MirrorTool {
             missed_numbers: 0,
             missed_scope: HashSet::new(),
             finals: HashSet::new(),
+            refused: None,
+            refused_rises: 0,
+            refused_rises_overflowed: false,
         }
     }
 
@@ -413,6 +448,7 @@ impl MirrorTool {
         self.scans += 1;
         // T7: the high-water mark before the table and the log.
         let assigned = reader.assigned_sequence();
+        let refused = reader.network_journals_refused();
         let mut delivered: Vec<(u64, u64, Vec<u64>)> = Vec::new();
         let scan = reader.scan(&mut self.cursor, |record| {
             delivered.push((record.journal, record.sequence, record.payload.to_vec()));
@@ -480,9 +516,24 @@ impl MirrorTool {
         if missed > 0 {
             self.missed_events = self.missed_events.saturating_add(1);
             self.missed_numbers = self.missed_numbers.saturating_add(missed);
+        }
+        // Read again after the table and the log: a refusal during the scan
+        // counts in this scan, not the next.
+        let refused = refused.max(reader.network_journals_refused());
+        // Any refusal at the attach, or a rise since the last scan.
+        let rose = refused > self.refused.unwrap_or(0);
+        self.refused = Some(refused);
+        if rose {
+            match self.refused_rises.checked_add(1) {
+                Some(rises) => self.refused_rises = rises,
+                None => self.refused_rises_overflowed = true,
+            }
+        }
+        if missed > 0 || rose {
             // Every held message whose trace was not final after the last
-            // scan, with those this scan delivered: the missed journal may
-            // have been expected for any of them, of any publication.
+            // scan, with those this scan delivered: the missed or refused
+            // journal may have been expected for any of them, of any
+            // publication.
             if let Ok(report) = self.report() {
                 for held in report.messages() {
                     let key = (held.publication, held.lane, held.position);
@@ -529,6 +580,19 @@ impl MirrorTool {
         self.highest = Some(assigned);
         let seen = shown.range(previous + 1..=assigned).count() as u64;
         (assigned - previous).saturating_sub(seen)
+    }
+
+    /// Scans that saw the mirror's count of refused network journals rise
+    /// (any count at the attach), and that count as last read.
+    #[must_use]
+    pub fn network_refused(&self) -> (u64, u64) {
+        (self.refused_rises, self.refused.unwrap_or(0))
+    }
+
+    /// Whether the count of scans that saw a rise stopped rising.
+    #[must_use]
+    pub fn network_refused_overflowed(&self) -> bool {
+        self.refused_rises_overflowed
     }
 
     /// Scans that found missed journals, and the journal numbers missed
@@ -635,11 +699,21 @@ impl MirrorTool {
                     let join = tracked.entry.join.unwrap_or(0);
                     report.add_subscriber_source(source, clock, publication, join)?;
                 }
-                // Network journals are not read yet (P2.12 N1c): their
-                // publication's traces are out of scope, so a missing
-                // network observation never yields a false `Complete`.
                 JournalKind::NetworkSender | JournalKind::NetworkReceiver => {
-                    report.out_of_scope(publication, None);
+                    let side = if tracked.entry.kind == JournalKind::NetworkSender {
+                        NetSide::Sender
+                    } else {
+                        NetSide::Receiver
+                    };
+                    let start = tracked.entry.network.and_then(|facts| facts.start);
+                    report.add_network_source(
+                        source,
+                        clock,
+                        publication,
+                        side,
+                        tracked.entry.lane.get(),
+                        start,
+                    )?;
                 }
             }
         }
@@ -661,6 +735,10 @@ impl MirrorTool {
             report.out_of_scope_message(*publication, *lane, *position);
         }
         report.require_roots();
+        // The mirror's count does not name the refused publication.
+        if let Some(refused) = self.refused {
+            report.withhold_complete(refused);
+        }
         report.drain()?;
         Ok(report)
     }

@@ -81,7 +81,7 @@
 //! boundary is. A publication with refused network journals
 //! ([`TraceReport::network_refused`]) never has a final `Complete`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::attribution::{AttributionConfig, Attributor, Verdict, combine};
@@ -500,6 +500,12 @@ pub struct TraceReport {
     pinned: HashMap<[u64; 2], Verdict>,
     /// Publications with refused network journals: never `Complete`.
     refused: Vec<PublicationKey>,
+    /// Network journals refused where the report cannot tell which
+    /// publication (a tool reads only the mirror's global count): no trace
+    /// is `Complete`.
+    withheld: Option<u64>,
+    /// The traces whose `Complete` that withheld.
+    withheld_traces: RefCell<HashSet<[u64; 2]>>,
     /// Set when [`TraceReport::trace`] first returns a final answer: from
     /// then on the registered journals are frozen, so no later journal can
     /// widen an expected set a final answer was given for.
@@ -526,6 +532,8 @@ impl TraceReport {
             parking_lost: Vec::new(),
             pinned: HashMap::new(),
             refused: Vec::new(),
+            withheld: None,
+            withheld_traces: RefCell::new(HashSet::new()),
             frozen: Cell::new(false),
         }
     }
@@ -714,6 +722,26 @@ impl TraceReport {
         if count > 0 && !self.refused.contains(&publication) {
             self.refused.push(publication);
         }
+    }
+
+    /// Records that `count` network journals were refused somewhere the
+    /// report cannot name (`trace-network.md` §5, "Header", ACS 15805): a
+    /// tool learns only the mirror's global count, so it cannot tell which
+    /// publication lacks its network observations. No trace is a final
+    /// `Complete` from then on; each that would be is `OutOfScope`, and
+    /// counted ([`TraceReport::withheld_complete`]).
+    pub fn withhold_complete(&mut self, count: u64) {
+        if count > 0 {
+            self.withheld = Some(self.withheld.map_or(count, |held| held.max(count)));
+        }
+    }
+
+    /// The refused count [`TraceReport::withhold_complete`] recorded, and
+    /// the traces whose `Complete` it withheld so far.
+    #[must_use]
+    pub fn withheld_complete(&self) -> Option<(u64, usize)> {
+        self.withheld
+            .map(|count| (count, self.withheld_traces.borrow().len()))
     }
 
     /// What became of the parked network fragments.
@@ -1117,6 +1145,11 @@ impl TraceReport {
                 .iter()
                 .any(|((publication, _, _), _)| self.refused.contains(publication))
         {
+            return TraceAnswer::OutOfScope;
+        }
+        // Refused somewhere the report cannot name: no Complete at all.
+        if verdict == Verdict::Complete && self.withheld.is_some() {
+            self.withheld_traces.borrow_mut().insert(trace_id);
             return TraceAnswer::OutOfScope;
         }
         TraceAnswer::Final(verdict)

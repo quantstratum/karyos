@@ -7,6 +7,7 @@
 // `tests/karyos_trace.rs` run the same cases against a real driver.
 
 use karyos_protocol::journal::{Append, DropRange, Stamp, Taken, record_journal};
+use karyos_protocol::trace_hook::NetSide;
 use karyos_sys::trace_mirror::{
     JournalEntry, JournalKind, JournalState, MAX_RECYCLE_PAIRS, NetworkFacts, NotedPublisher,
     RecycledJournal, TimeNamespace, TraceMirror, trace_mirror,
@@ -413,57 +414,219 @@ fn the_mirror_report_is_complete_without_loss() {
     assert_eq!((tool.overwritten(), tool.mirror_lost()), (0, 0));
 }
 
-/// Until P2.12 N1c reads network journals (kinds 3 and 4), a network
-/// entry puts its publication's traces out of scope, so a missing network
-/// observation never yields a false `Complete`; a record of the other
-/// side's point in it is a contradiction.
+/// A network entry of `kind` for `PUBLICATION` (this driver's), expected
+/// from `start`.
+fn network_entry(driver: &mut Driver, index: usize, journal: u64, kind: JournalKind, start: u64) {
+    let mut network = JournalEntry::open(journal, 0, kind, RECORD_WORDS as u64, 8);
+    network.registration = PUBLICATION.registration;
+    network.stream = PUBLICATION.registration;
+    network.incarnation = PUBLICATION.incarnation;
+    network.time_namespace = TimeNamespace::Same;
+    network.provenance = ClockProvenance::HostMonotonic.word();
+    network.network = Some(NetworkFacts {
+        sender_driver: PUBLICATION.driver,
+        start: Some(start),
+        boundary: None,
+        first_gap: None,
+    });
+    network.sequence = driver.assign();
+    driver.entries[index] = Some(network);
+    driver.write(index);
+}
+
+/// The network entry at `index` closes with `boundary` in its facts.
+fn end_network(driver: &mut Driver, index: usize, boundary: Option<u64>) {
+    let entry = driver.entry(index);
+    entry.state = JournalState::Closed;
+    if let Some(facts) = entry.network.as_mut() {
+        facts.boundary = boundary;
+    }
+    driver.write(index);
+}
+
+/// The network record of message `position` at `point`.
+fn network_record(point: Point, position: u64, trace: u64, time: u64) -> TraceRecord {
+    TraceRecord {
+        network: Some(karyos_trace::NetworkPath {
+            path: 0,
+            attempt: 0,
+        }),
+        ..observation(PUBLICATION, point, position, trace, time)
+    }
+}
+
+/// Network journals (kinds 3 and 4) are read as network sources: an
+/// expected one that holds the message completes its trace, one closed
+/// without it makes it Incomplete, and one closed without a boundary is
+/// lost; a record of the other side's point contradicts the entry.
 #[test]
-fn a_network_journal_puts_its_publication_out_of_scope_until_read() {
-    for kind in [JournalKind::NetworkSender, JournalKind::NetworkReceiver] {
+fn network_journals_are_read_as_network_sources() {
+    for (kind, point) in [
+        (JournalKind::NetworkSender, Point::SenderPickup),
+        (JournalKind::NetworkReceiver, Point::ReceiverCommit),
+    ] {
+        for (holds, boundary, expected) in [
+            (true, Some(1), TraceAnswer::Final(Verdict::Complete)),
+            (false, Some(1), TraceAnswer::Final(Verdict::Incomplete)),
+            (true, None, TraceAnswer::Final(Verdict::Incomplete)),
+            // The message lies beyond the boundary: not expected.
+            (false, Some(0), TraceAnswer::Final(Verdict::Complete)),
+        ] {
+            let mut driver = Driver::new(4, 2, 64);
+            driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+            driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+            network_entry(&mut driver, 2, 3, kind, 0);
+            driver.store(0, &publish(0, 1, 1_000));
+            driver.store(1, &poll(0, 1, 1_400));
+            if holds {
+                driver.store(2, &network_record(point, 0, 1, 1_200));
+            }
+            driver.end(0, JournalState::Closed, None);
+            driver.end(1, JournalState::Closed, Some(1));
+            end_network(&mut driver, 2, boundary);
+            let mut tool = MirrorTool::new(INSTANCE);
+            let _ = driver.scan(&mut tool);
+            let report = tool.report().unwrap();
+            assert_eq!(
+                answer(&report, 1),
+                expected,
+                "{kind:?} {holds} {boundary:?}"
+            );
+        }
+        let mut driver = Driver::new(4, 2, 64);
+        network_entry(&mut driver, 0, 3, kind, 0);
+        let mut tool = MirrorTool::new(INSTANCE);
+        let _ = driver.scan(&mut tool);
+        let tracked = &tool.journals[&3];
+        assert!(!tracked.contradicts(&network_record(point, 0, 1, 1_000), [1, 2]));
+        assert!(tracked.contradicts(&publish(0, 1, 1_000), [1, 2]));
+    }
+}
+
+/// A network sender journal mirrored and the same records collected in
+/// process give the same verdicts: without loss, and with a network journal
+/// that dropped records.
+#[test]
+fn a_mirror_and_a_collector_agree_on_network_journals() {
+    let messages = [(0, 1, 1_000, 1_300), (64, 2, 2_000, 2_500)];
+    for network_capacity in [8, 1] {
         let mut driver = Driver::new(4, 2, 64);
         driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
         driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
-        let mut network = JournalEntry::open(3, 0, kind, RECORD_WORDS as u64, 8);
-        network.registration = PUBLICATION.registration;
-        network.stream = PUBLICATION.registration;
-        network.incarnation = PUBLICATION.incarnation;
-        network.time_namespace = TimeNamespace::Same;
-        network.provenance = ClockProvenance::HostMonotonic.word();
-        network.network = Some(NetworkFacts {
-            sender_driver: PUBLICATION.driver,
-            start: Some(0),
-            boundary: None,
-            first_gap: None,
-        });
-        network.sequence = driver.assign();
-        driver.entries[2] = Some(network);
-        driver.write(2);
-        driver.store(0, &publish(0, 1, 1_000));
-        driver.store(1, &poll(0, 1, 1_400));
-        driver.end(0, JournalState::Closed, None);
-        driver.end(1, JournalState::Closed, Some(1));
+        network_entry(&mut driver, 2, 3, JournalKind::NetworkSender, 0);
+        let mut publishing = Pair::new(1, 8);
+        let mut polling = Pair::new(2, 8);
+        let mut sending = Pair::new(3, network_capacity);
+        for &(position, trace, published, polled) in &messages {
+            publishing.record(&publish(position, trace, published));
+            sending.record(&network_record(
+                Point::SenderPickup,
+                position,
+                trace,
+                published + 100,
+            ));
+            polling.record(&poll(position, trace, polled));
+        }
+        let boundary = 65;
+        publishing.close_and_mirror(&mut driver, 0, None);
+        polling.close_and_mirror(&mut driver, 1, Some(boundary));
+        sending.close_and_mirror(&mut driver, 2, None);
+        end_network(&mut driver, 2, Some(boundary));
+
+        let mut collected = TraceReport::new(
+            AttributionConfig {
+                span: u64::MAX,
+                max_traces: 64,
+                max_intervals: MAX_INTERVALS,
+            },
+            HISTOGRAM,
+        );
+        let host = ClockProvenance::HostMonotonic;
+        let ids = [
+            collected
+                .add_publisher(publishing.collector.take().unwrap(), host, PUBLICATION)
+                .unwrap(),
+            collected
+                .add_subscriber(polling.collector.take().unwrap(), host, PUBLICATION, 0)
+                .unwrap(),
+            collected
+                .add_network(
+                    sending.collector.take().unwrap(),
+                    host,
+                    PUBLICATION,
+                    NetSide::Sender,
+                    0,
+                    Some(0),
+                )
+                .unwrap(),
+        ];
+        collected.closed(ids[0], None);
+        collected.closed(ids[1], Some(boundary));
+        collected.closed(ids[2], Some(boundary));
+        collected.drain().unwrap();
+
         let mut tool = MirrorTool::new(INSTANCE);
         let _ = driver.scan(&mut tool);
-        let report = tool.report().unwrap();
-        assert_eq!(answer(&report, 1), TraceAnswer::OutOfScope, "{kind:?}");
-        // A record of its own point fits; a client point contradicts it.
-        let tracked = &tool.journals[&3];
-        assert!(!tracked.contradicts(
-            &observation(
-                PUBLICATION,
-                if kind == JournalKind::NetworkSender {
-                    Point::SenderPickup
-                } else {
-                    Point::ReceiverCommit
-                },
-                0,
-                1,
-                1_000
-            ),
-            [1, 2]
-        ));
-        assert!(tracked.contradicts(&publish(0, 1, 1_000), [1, 2]));
+        let mirrored = tool.report().unwrap();
+        for &(_, trace, _, _) in &messages {
+            assert_eq!(
+                answer(&collected, trace),
+                answer(&mirrored, trace),
+                "capacity {network_capacity}, trace {trace}"
+            );
+        }
+        let expected = if network_capacity == 8 {
+            TraceAnswer::Final(Verdict::Complete)
+        } else {
+            TraceAnswer::Final(Verdict::Incomplete)
+        };
+        assert_eq!(answer(&mirrored, 1), expected);
+        assert_eq!(collected.summary(), mirrored.summary());
     }
+}
+
+/// A rise in the mirror's count of refused network journals (header word
+/// 7), or any count at the attach, puts every held message whose trace was
+/// not final out of scope; a final trace keeps its answer.
+#[test]
+fn refused_network_journals_put_held_messages_out_of_scope() {
+    let mut driver = Driver::new(4, 2, 64);
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+    driver.store(0, &publish(0, 1, 1_000));
+    driver.store(1, &poll(0, 1, 1_400));
+    // The subscriber never polls trace 2: Incomplete once it closes.
+    driver.store(0, &publish(64, 2, 1_100));
+    driver.end(0, JournalState::Closed, None);
+    let mut tool = MirrorTool::new(INSTANCE);
+    let _ = driver.scan(&mut tool);
+    assert_eq!(tool.network_refused(), (0, 0));
+    assert_eq!(answer(&tool.report().unwrap(), 1), TraceAnswer::Provisional);
+    assert!(driver.mirror.refuse_network_journal());
+    driver.end(1, JournalState::Closed, Some(65));
+    let _ = driver.scan(&mut tool);
+    assert_eq!(tool.network_refused(), (1, 1));
+    let report = tool.report().unwrap();
+    // Provisional at the rise: out of scope for the tool's life.
+    assert_eq!(answer(&report, 1), TraceAnswer::OutOfScope);
+    assert_eq!(answer(&report, 2), TraceAnswer::OutOfScope);
+    // No further rise: no further scope loss.
+    let _ = driver.scan(&mut tool);
+    assert_eq!(tool.network_refused(), (1, 1));
+
+    // A count already there at the attach: nothing held is final yet.
+    let mut driver = Driver::new(4, 2, 64);
+    assert!(driver.mirror.refuse_network_journal());
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+    driver.store(0, &publish(0, 1, 1_000));
+    driver.store(1, &poll(0, 1, 1_400));
+    driver.end(0, JournalState::Closed, None);
+    driver.end(1, JournalState::Closed, Some(1));
+    let mut tool = MirrorTool::new(INSTANCE);
+    let _ = driver.scan(&mut tool);
+    assert_eq!(tool.network_refused(), (1, 1));
+    assert_eq!(answer(&tool.report().unwrap(), 1), TraceAnswer::OutOfScope);
 }
 
 /// Batch C of #121 at unit level: the report reads the drop ranges and
@@ -1013,4 +1176,127 @@ fn a_final_answer_survives_a_missed_journal() {
         answer(&tool.report().unwrap(), 1),
         TraceAnswer::Final(Verdict::Complete)
     );
+}
+
+/// From the first refused network journal on, no trace is reported a
+/// final Complete, also one published after the refusal, which never
+/// expected the journal that was never created (ACS 15805).
+#[test]
+fn complete_is_withheld_after_a_refusal() {
+    let mut driver = Driver::new(4, 2, 64);
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+    let mut tool = MirrorTool::new(INSTANCE);
+    let _ = driver.scan(&mut tool);
+    assert!(driver.mirror.refuse_network_journal());
+    let _ = driver.scan(&mut tool);
+    // Published and polled after the refusal.
+    driver.store(0, &publish(0, 3, 1_000));
+    driver.store(1, &poll(0, 3, 1_400));
+    driver.end(0, JournalState::Closed, None);
+    driver.end(1, JournalState::Closed, Some(1));
+    let _ = driver.scan(&mut tool);
+    let report = tool.report().unwrap();
+    assert_eq!(answer(&report, 3), TraceAnswer::OutOfScope);
+    assert_eq!(report.withheld_complete(), Some((1, 1)));
+    // Without a refusal the same trace is Complete.
+    let mut driver = Driver::new(4, 2, 64);
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+    driver.store(0, &publish(0, 3, 1_000));
+    driver.store(1, &poll(0, 3, 1_400));
+    driver.end(0, JournalState::Closed, None);
+    driver.end(1, JournalState::Closed, Some(1));
+    let mut tool = MirrorTool::new(INSTANCE);
+    let _ = driver.scan(&mut tool);
+    let report = tool.report().unwrap();
+    assert_eq!(answer(&report, 3), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(report.withheld_complete(), None);
+}
+
+/// A network entry's start comes from word 72: a receiver journal whose
+/// image joined after the message is not expected for it.
+#[test]
+fn a_network_journal_is_expected_from_its_start() {
+    for (start, expected) in [
+        (128, TraceAnswer::Final(Verdict::Complete)),
+        (0, TraceAnswer::Final(Verdict::Incomplete)),
+    ] {
+        let mut driver = Driver::new(4, 2, 64);
+        driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+        driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+        network_entry(&mut driver, 2, 3, JournalKind::NetworkReceiver, start);
+        driver.store(0, &publish(0, 1, 1_000));
+        driver.store(1, &poll(0, 1, 1_400));
+        driver.end(0, JournalState::Closed, None);
+        driver.end(1, JournalState::Closed, Some(1));
+        end_network(&mut driver, 2, Some(1 << 20));
+        let mut tool = MirrorTool::new(INSTANCE);
+        let _ = driver.scan(&mut tool);
+        assert_eq!(
+            answer(&tool.report().unwrap(), 1),
+            expected,
+            "start {start}"
+        );
+    }
+}
+
+/// A network entry's lane comes from word 69: on lane 1, with messages on
+/// lane 1, a journal closed without the message makes it Incomplete.
+#[test]
+fn a_network_journal_observes_its_lane() {
+    let on_lane = |record: TraceRecord| TraceRecord { lane: 1, ..record };
+    let mut driver = Driver::new(4, 2, 64);
+    driver.open(0, 1, JournalKind::Publisher, PUBLICATION);
+    driver.open(1, 2, JournalKind::Subscriber, PUBLICATION);
+    network_entry(&mut driver, 2, 3, JournalKind::NetworkSender, 0);
+    for index in 0..3 {
+        driver.entry(index).lane = karyos_sys::frame::Lane::try_new(1).unwrap();
+        driver.write(index);
+    }
+    driver.store(0, &on_lane(publish(0, 1, 1_000)));
+    driver.store(1, &on_lane(poll(0, 1, 1_400)));
+    driver.end(0, JournalState::Closed, None);
+    driver.end(1, JournalState::Closed, Some(1));
+    end_network(&mut driver, 2, Some(1 << 20));
+    let mut tool = MirrorTool::new(INSTANCE);
+    let _ = driver.scan(&mut tool);
+    assert_eq!(
+        answer(&tool.report().unwrap(), 1),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
+}
+
+/// A receiver journal of a remote publication names it by its sender's
+/// driver (word 70 and 71), not this one: its records do not contradict
+/// the entry (`trace-network.md` §8).
+#[test]
+fn a_remote_receiver_journal_names_its_sender_driver() {
+    let remote = PublicationId {
+        driver: [9, 9],
+        ..PUBLICATION
+    };
+    let mut driver = Driver::new(4, 2, 64);
+    network_entry(&mut driver, 0, 3, JournalKind::NetworkReceiver, 0);
+    let entry = driver.entry(0);
+    entry.network = Some(NetworkFacts {
+        sender_driver: remote.driver,
+        ..entry.network.unwrap()
+    });
+    driver.write(0);
+    driver.store(
+        0,
+        &TraceRecord {
+            network: Some(karyos_trace::NetworkPath {
+                path: 0,
+                attempt: 0,
+            }),
+            ..observation(remote, Point::ReceiverCommit, 0, 1, 1_000)
+        },
+    );
+    end_network(&mut driver, 0, Some(1 << 20));
+    let mut tool = MirrorTool::new(INSTANCE);
+    let _ = driver.scan(&mut tool);
+    assert!(tool.malformed().is_empty(), "{:?}", tool.malformed());
+    let _ = tool.report().unwrap();
 }

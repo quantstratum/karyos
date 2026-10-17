@@ -141,6 +141,14 @@ pub fn render(tool: &MirrorTool, report: &TraceReport) -> Result<String, Histogr
         out,
         "missed journals: {events} scans found {numbers} journal numbers in neither the table nor the recycle log"
     );
+    // Why no trace is complete any more (ACS 15805).
+    if let Some((count, withheld)) = report.withheld_complete() {
+        let (rises, _) = tool.network_refused();
+        let _ = writeln!(
+            out,
+            "network journals refused: {count} ({rises} scans saw the count rise); no trace is reported complete, {withheld} withheld as out of scope"
+        );
+    }
     let _ = writeln!(
         out,
         "mirror loss: {} ring records overwritten, {} journal sequences; journals excluded as malformed: {malformed}",
