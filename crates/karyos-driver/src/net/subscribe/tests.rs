@@ -322,3 +322,39 @@ fn a_subscription_with_another_reliability_is_refused() {
         "the other reliability is accepted once the first is gone"
     );
 }
+
+/// W5b B5: the conductor mirrors the receiver's subscription table, so a
+/// new key beyond it is refused at once; a key already held still shares
+/// its entry, and the receiver never refuses one the mirror admitted.
+#[test]
+fn the_receivers_subscription_table_is_mirrored() {
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.agents.subscriptions = 1;
+    let mut b = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let address = free_address();
+    let first = b.add_network_subscription(10, &channel(address)).unwrap();
+    let shared = b.add_network_subscription(10, &channel(address)).unwrap();
+    assert_eq!(
+        b.add_network_subscription(11, &channel(address)),
+        Err(crate::error::DriverError::NetworkSubscriptionsFull)
+    );
+    for _ in 0..50 {
+        let _ = b.do_work().unwrap();
+    }
+    assert_eq!(b.network_subscription_refusals(), 0);
+    // Removing every handle of the key frees its entry.
+    assert!(b.remove_network_subscription(first).unwrap());
+    assert!(b.remove_network_subscription(shared).unwrap());
+    let _other = b.add_network_subscription(11, &channel(address)).unwrap();
+    for _ in 0..50 {
+        let _ = b.do_work().unwrap();
+    }
+    assert_eq!(b.network_subscription_refusals(), 0);
+}

@@ -103,6 +103,26 @@ pub(crate) mod sealed {
         ) -> Option<crate::embedded::AggregateHandle>
         where
             Self: StreamTerms;
+
+        /// A network publication a client asked for by URI (W5b);
+        /// `UnsupportedChannel` where streams are not heap backed (D3).
+        fn network_publication(
+            driver: &mut EmbeddedDriver<Self>,
+            config: crate::embedded::AggregateConfig,
+            channel: &karyos_protocol::channel::UdpConfig,
+        ) -> Result<crate::embedded::AggregateHandle, DriverError>
+        where
+            Self: StreamTerms;
+
+        /// A network subscription a client asked for by URI (W5b), as
+        /// [`Create::network_publication`].
+        fn network_subscription(
+            driver: &mut EmbeddedDriver<Self>,
+            stream_id: i32,
+            channel: &karyos_protocol::channel::UdpConfig,
+        ) -> Result<crate::net::NetworkSubscription, DriverError>
+        where
+            Self: StreamTerms;
     }
 
     impl Create for karyos_sys::term_bytes::HeapTerms {
@@ -124,6 +144,22 @@ pub(crate) mod sealed {
             lanes: &[std::sync::Arc<LogBuffer>],
         ) -> Option<crate::embedded::AggregateHandle> {
             driver.add_image_aggregate(lanes)
+        }
+
+        fn network_publication(
+            driver: &mut EmbeddedDriver<Self>,
+            config: crate::embedded::AggregateConfig,
+            channel: &karyos_protocol::channel::UdpConfig,
+        ) -> Result<crate::embedded::AggregateHandle, DriverError> {
+            driver.client_network_publication(config, channel)
+        }
+
+        fn network_subscription(
+            driver: &mut EmbeddedDriver<Self>,
+            stream_id: i32,
+            channel: &karyos_protocol::channel::UdpConfig,
+        ) -> Result<crate::net::NetworkSubscription, DriverError> {
+            driver.client_network_subscription(stream_id, channel)
         }
     }
 
@@ -151,6 +187,22 @@ pub(crate) mod sealed {
             _lanes: &[std::sync::Arc<LogBuffer>],
         ) -> Option<crate::embedded::AggregateHandle> {
             None
+        }
+
+        fn network_publication(
+            _driver: &mut EmbeddedDriver<Self>,
+            _config: crate::embedded::AggregateConfig,
+            _channel: &karyos_protocol::channel::UdpConfig,
+        ) -> Result<crate::embedded::AggregateHandle, DriverError> {
+            Err(DriverError::UnsupportedChannel)
+        }
+
+        fn network_subscription(
+            _driver: &mut EmbeddedDriver<Self>,
+            _stream_id: i32,
+            _channel: &karyos_protocol::channel::UdpConfig,
+        ) -> Result<crate::net::NetworkSubscription, DriverError> {
+            Err(DriverError::UnsupportedChannel)
         }
     }
 }
@@ -821,6 +873,9 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) guard_senders: crate::guard_ack::GuardSenders,
     /// The network agents and their tables, when configured.
     pub(crate) net: Option<crate::net::Network>,
+    /// What clients created by channel URI, owned by their registrations
+    /// (W5b).
+    pub(crate) net_owned: Vec<crate::net::client::OwnedNetwork>,
 }
 
 /// The incarnation of a stream's publication in the embedded driver: one per
@@ -1152,6 +1207,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             network: crate::network_journals::NetworkTracing::new(config.max_trace_journals),
             guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
+            net_owned: Vec::new(),
             // Last: a driver that fails to build starts no agent.
             net: config
                 .network
@@ -2534,6 +2590,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.retire_closed_clients();
         let alive = self.serve_liveness();
         self.sweep_ended_registrations();
+        // What ended registrations owned goes with them (W5b).
+        self.reconcile_network_owned();
         self.free_retired_streams();
         let mut work = self.serve_commands();
         let mut first_error = None;
@@ -3069,11 +3127,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = &mut self.net else {
             return (0, None);
         };
-        let served = match net.duty(self.clock.now()) {
+        let served = match net.duty() {
             Ok(work) => (work, None),
             Err(error) => (0, Some(error)),
         };
         self.serve_images();
+        self.announce_existing_images();
         served
     }
 
@@ -3091,18 +3150,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         for event in &events {
             match *event {
-                crate::agents::images::ImageEvent::Installed { slot, .. } => {
+                crate::agents::images::ImageEvent::Installed { slot, endpoint, .. } => {
                     let Some(lanes) = self.net.as_ref().and_then(|net| net.image_lanes(slot))
                     else {
                         continue;
                     };
                     let exposed = <T as sealed::Create>::expose_image(self, &lanes);
                     if let Some(net) = &mut self.net {
-                        net.record_image(slot, exposed, &lanes);
+                        net.record_image(slot, endpoint, exposed, &lanes);
+                    }
+                    if let Some(handle) = exposed {
+                        self.announce_image(endpoint, &handle, true);
                     }
                 }
                 crate::agents::images::ImageEvent::Retiring { slot } => {
                     let handle = self.net.as_ref().and_then(|net| net.image_aggregate(slot));
+                    let endpoint = self.net.as_ref().and_then(|net| net.image_endpoint(slot));
+                    if let (Some(handle), Some(endpoint)) = (handle, endpoint) {
+                        // Announced while its streams still name the alias.
+                        self.announce_image(endpoint, &handle, false);
+                    }
                     if let Some(handle) = handle {
                         for stream in handle.streams() {
                             let _ = self.retire_lane_with(
@@ -3136,7 +3203,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// gone), so none is ever detached.
     pub fn close_network(&mut self) -> Option<crate::net::NetworkShutdown> {
         let mut net = self.net.take()?;
-        Some(net.close(self.clock.now()))
+        Some(net.close())
     }
 
     pub(crate) fn clock_now(&mut self) -> u64 {

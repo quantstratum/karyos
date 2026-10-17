@@ -164,6 +164,7 @@ fn add_publication(
             stream_id: alias().stream_id,
             max_term_length: super::super::images::DEFAULT_MAX_IMAGE_TERM_LENGTH,
             reliable: true,
+            multicast: false,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -720,13 +721,17 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             max_term_length,
             // Reliable if any subscription of the stream is.
             reliable: max_term_length == 2 << 20,
+            multicast: false,
         };
         assert!(matches!(
             role.command(command),
             Some((_, AgentEvent::Configured { accepted: true, .. }))
         ));
     }
-    assert_eq!(role.subscriptions, [(EndpointId(1), 6, 512 << 10, true)]);
+    assert_eq!(
+        role.subscriptions,
+        [(EndpointId(1), 6, 512 << 10, true, false)]
+    );
 }
 
 /// The sender accepts an SM only from a receiver it answered on that
@@ -2209,7 +2214,7 @@ fn a_rate_limited_solicit_leaves_no_entry() {
     let (sessions, _link) = event_ring();
     receiver
         .subscriptions
-        .push((EndpointId(1), 6, 1 << 20, true));
+        .push((EndpointId(1), 6, 1 << 20, true, false));
     let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let other = Alias {
         session_id: 50,
@@ -2266,7 +2271,7 @@ fn solicits_need_a_subscription_an_answerable_source_and_a_term_bound() {
     assert!(sender.from_receiver.try_take().unwrap().is_none());
     receiver
         .subscriptions
-        .push((EndpointId(1), 6, 65_536, true));
+        .push((EndpointId(1), 6, 65_536, true, false));
     // A group source cannot be answered: no entry is created.
     let group: SocketAddr = "239.1.1.1:5000".parse().unwrap();
     receiver.inject_data(&sessions, EndpointId(1), group, alias(), &bytes, 2);
@@ -2319,7 +2324,7 @@ fn the_total_rsp_rate_is_checked_before_any_entry() {
     let (sessions, _link) = event_ring();
     receiver
         .subscriptions
-        .push((EndpointId(1), 6, 1 << 20, true));
+        .push((EndpointId(1), 6, 1 << 20, true, false));
     let bytes = [0u8; 32];
     let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();

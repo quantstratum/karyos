@@ -621,4 +621,74 @@ fn two_lanes_deliver_in_order_on_either_kind() {
     }
 }
 
+/// The shared agents of `driver`.
+fn shared(
+    driver: &mut EmbeddedDriver,
+) -> &mut crate::agents::NetworkAgents<karyos_io::sockets::OsSocket> {
+    match &mut driver.net.as_mut().unwrap().agents {
+        super::Agents::Shared(agents) => agents,
+        _ => panic!("not shared"),
+    }
+}
+
+/// A driver clock that never moves.
+#[derive(Debug)]
+struct Frozen;
+
+impl crate::clock::MonotonicClock for Frozen {
+    fn now(&mut self) -> u64 {
+        0
+    }
+}
+
+/// The network keeps its own time base (`host_monotonic_ns`) in the
+/// shared mode, whatever the driver's injectable clock says (here frozen
+/// at 0). A NAK left unanswered is asked again one RTT after its
+/// submission, which compares the NAK's start (the role clock) with the
+/// cycle's `now`; an RTTM round trip yields a sample, which needs the
+/// probe's issue, its start and the reply's arrival on one clock.
+#[test]
+fn the_network_keeps_its_own_clock() {
+    let frozen = || {
+        EmbeddedDriver::with_clock(
+            DriverConfig {
+                network: Some(NetworkConfig {
+                    threading: ThreadingMode::Shared,
+                    ..NetworkConfig::default()
+                }),
+                ..DriverConfig::default()
+            },
+            Box::new(Frozen),
+        )
+        .unwrap()
+    };
+    let (mut a, mut b) = (frozen(), frozen());
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // The second DATA datagram is lost, and the sender never repairs.
+    shared(&mut b).receiver.drop_data(&[1]);
+    shared(&mut a).sender.ignore_naks();
+    let mut sent = 0u32;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        while sent < 8
+            && matches!(
+                lane.offer(&[7u8; 1000]).unwrap(),
+                OfferOutcome::Accepted { .. }
+            )
+        {
+            sent += 1;
+        }
+        let _ = reader.poll(|_, _, _| {}, BUDGET);
+        drivers[1]
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .is_some_and(|counters| counters.nak_retries >= 1 && counters.rttm_samples >= 1)
+    });
+}
+
 mod netem;

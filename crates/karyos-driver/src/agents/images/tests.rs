@@ -70,6 +70,12 @@ struct Setup {
     /// Whether the sender answers NAKs; tests of the receiver's loss
     /// handling answer them by hand instead.
     repairs: bool,
+    /// Whether the subscription's endpoint receives a multicast group: its
+    /// images time their NAKs by cycle (the rig still runs on loopback
+    /// unicast).
+    multicast: bool,
+    /// A fixed multicast NAK delay in place of the random draw.
+    nak_delay: Option<u64>,
 }
 
 impl Default for Setup {
@@ -81,6 +87,8 @@ impl Default for Setup {
             reliable: false,
             alias_quarantine: None,
             repairs: true,
+            multicast: false,
+            nak_delay: None,
         }
     }
 }
@@ -122,6 +130,9 @@ impl Rig {
         agents.receiver.role.set_clock(virtual_now);
         if !setup.repairs {
             agents.sender.role.ignore_naks();
+        }
+        if let Some(delay) = setup.nak_delay {
+            agents.receiver.role.fix_nak_delay(delay);
         }
         let mut rig = Self {
             publisher: EndpointId(u32::MAX),
@@ -174,6 +185,7 @@ impl Rig {
                 stream_id: alias().stream_id,
                 max_term_length: setup.max_term_length,
                 reliable: setup.reliable,
+                multicast: setup.multicast,
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
@@ -1245,6 +1257,8 @@ fn a_lost_datagram_is_naked() {
     // Unrepaired: asked again after one RTT (rtt_initial, 1 ms).
     rig.until(true, |rig| rig.agents.receiver.counters().naks >= 2);
     assert_eq!(rig.agents.receiver.role.posted_naks()[1].range, nak.range);
+    // A unicast image runs no multicast cycles.
+    assert_eq!(rig.agents.receiver.counters().nak_cycles, 0);
 }
 
 /// Phase 6, both sides: a DATA datagram lost on a reliable channel is
@@ -1625,4 +1639,221 @@ fn a_floor_in_the_next_term_is_inside_the_window() {
         ),
         (1, 0)
     );
+}
+
+/// mc-w1, RC-2: on a multicast image a hole's NAK is not sent at once:
+/// its cycle draws a delay over `[0, rtt * nak_delay_scale / 16]` (here
+/// the bound itself), and the NAK goes once the delay has passed.
+#[test]
+fn a_multicast_nak_waits_for_its_drawn_delay() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        multicast: true,
+        nak_delay: Some(u64::MAX),
+        repairs: false,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().nak_cycles >= 1);
+    let started = rig.now;
+    assert_eq!(rig.agents.receiver.counters().naks, 0);
+    let bound = rig.agents.receiver.role.last_nak_delay_bound().unwrap();
+    // The default scale is 16: the bound is one RTT snapshot.
+    assert!(bound > 0, "{bound}");
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    assert!(
+        rig.now - started >= bound,
+        "{} < {bound}",
+        rig.now - started
+    );
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    assert_eq!(nak.alias, alias());
+    assert_eq!(
+        nak.receiver.receiver_id,
+        (u64::from(slot.slot) << 32) | u64::from(slot.generation)
+    );
+}
+
+/// mc-w1, RC-3: a multicast NAK opens its cycle's window, `W = rtt +
+/// repair_linger + repair_slack`; only when it ends with the hole still
+/// there does the next cycle draw again. So the hole is asked once per
+/// cycle, and two NAKs are at least `repair_linger + repair_slack` (2 ms
+/// by default) apart.
+#[test]
+fn a_multicast_hole_is_asked_once_per_cycle() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        multicast: true,
+        nak_delay: Some(0),
+        repairs: false,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    let first = rig.now;
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 2);
+    assert!(rig.now - first >= 2 * MS, "{}", rig.now - first);
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    let counters = rig.agents.receiver.counters();
+    let loss = rig.agents.receiver.role.loss_counters(slot).unwrap();
+    assert_eq!(counters.nak_cycles, loss.cycles, "{loss:?}");
+    // One NAK per cycle; the last cycle's may still be waiting.
+    assert!(
+        (counters.nak_cycles - 1..=counters.nak_cycles).contains(&counters.naks),
+        "{counters:?}"
+    );
+    let posted = rig.agents.receiver.role.posted_naks();
+    assert!(posted.iter().all(|nak| nak.range == posted[0].range));
+}
+
+/// Phase 6 wiring, ACS 15957 note 2: the sender's step 8 sends the whole
+/// frames before a failing head, then its RANGE_INVALID, in one cycle. A
+/// receiver that handles the ERR before its repair step observes the
+/// shrink counts one RANGE_INVALID, and the partial repair then starts the
+/// count over: two more RANGE_INVALID for the smaller hole stay below the
+/// limit of three, and the image stays open.
+#[test]
+fn a_partial_repair_after_a_step_8_err_resets_its_count() {
+    use karyos_protocol::network::{Control, NakReply, NakReplyReason};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    // Two frames lost: one hole of two frames.
+    rig.agents.receiver.role.drop_data(&[1, 2]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    // One aligned 900-byte frame is 960 bytes: the hole holds two.
+    assert_eq!(nak.range.length, 2 * 960, "{nak:?}");
+    // The ERR first, then the frame the sender sent before it.
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::NakReply(NakReply::answering(&nak, NakReplyReason::RangeInvalid)),
+        rig.now,
+    );
+    receiver.role.inject_frame(
+        &receiver.sessions,
+        b,
+        source,
+        slot,
+        nak.range.start,
+        900,
+        rig.now,
+    );
+    assert_eq!(
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .unwrap()
+            .range_invalid,
+        1
+    );
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|counters| counters.partial_repairs >= 1)
+    });
+    // The smaller hole's NAK, answered RANGE_INVALID twice.
+    let naks = rig.agents.receiver.counters().naks;
+    rig.until(true, |rig| rig.agents.receiver.counters().naks > naks);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let retry = *rig.agents.receiver.role.posted_naks().last().unwrap();
+    assert_eq!(retry.range.start, nak.range.start + 960, "{retry:?}");
+    for _ in 0..2 {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            b,
+            source,
+            Control::NakReply(NakReply::answering(&retry, NakReplyReason::RangeInvalid)),
+            rig.now,
+        );
+    }
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    assert!(rig.agents.receiver.role.has_image(slot));
+    assert_eq!(
+        rig.agents.receiver.counters().images_closed_protocol_fault,
+        0
+    );
+}
+
+/// mc-w1 with the sender's repair: a datagram lost on a multicast image is
+/// NAKed after its drawn delay, repaired, and asked no more.
+#[test]
+fn a_lost_multicast_datagram_is_repaired() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        multicast: true,
+        nak_delay: Some(0),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|counters| counters.repaired >= 1)
+    });
+    let counters = rig.agents.receiver.role.loss_counters(slot).unwrap();
+    assert_eq!(counters.detected, counters.repaired, "{counters:?}");
+    assert!(counters.cycles >= 1, "{counters:?}");
+    let naks = rig.agents.receiver.counters().naks;
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.counters().naks, naks);
 }

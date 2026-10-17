@@ -91,7 +91,8 @@
 //! alias, and returns it with the grant; the lanes are the URI's `lanes`.
 //! A URI that does not parse is refused with `Error` and `InvalidChannel`
 //! (the detail names the parse error), one the driver cannot serve with
-//! `UnsupportedChannel`.
+//! `UnsupportedChannel`, and a subscription whose reliability differs from
+//! its endpoint and stream's existing one with `ReliabilityMismatch`.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -795,6 +796,9 @@ pub enum ErrorCode {
     /// The driver does not serve this channel: no network, a feature not
     /// wired yet, or shared terms (W5).
     UnsupportedChannel,
+    /// A network subscription asks for another reliability than the one
+    /// its endpoint and stream are already subscribed with (W5b).
+    ReliabilityMismatch,
 }
 
 impl ErrorCode {
@@ -813,6 +817,7 @@ impl ErrorCode {
             Self::NotAuthorized => 11,
             Self::InvalidChannel => 12,
             Self::UnsupportedChannel => 13,
+            Self::ReliabilityMismatch => 14,
         }
     }
 
@@ -831,6 +836,7 @@ impl ErrorCode {
             11 => Self::NotAuthorized,
             12 => Self::InvalidChannel,
             13 => Self::UnsupportedChannel,
+            14 => Self::ReliabilityMismatch,
             _ => return None,
         })
     }
@@ -2361,6 +2367,11 @@ mod tests {
                 code: ErrorCode::UnsupportedChannel,
                 detail: 10,
             },
+            Response::Error {
+                request,
+                code: ErrorCode::ReliabilityMismatch,
+                detail: 10,
+            },
         ] {
             let mut out = [0u8; MAX_RESPONSE_LENGTH];
             let length = response.encode(&mut out).unwrap();
@@ -3203,7 +3214,7 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(14), None);
+        assert_eq!(ErrorCode::from_code(15), None);
     }
 
     #[test]
@@ -3316,9 +3327,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 14 is not defined.
+        // Error code 15 is not defined.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 14, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 15, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }
@@ -3764,6 +3775,7 @@ mod properties {
                 ErrorCode::NotAuthorized,
                 ErrorCode::InvalidChannel,
                 ErrorCode::UnsupportedChannel,
+                ErrorCode::ReliabilityMismatch,
             ][..],
         );
         prop_oneof![

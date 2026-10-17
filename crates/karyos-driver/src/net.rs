@@ -10,9 +10,12 @@
 //!   own threads in the other modes ([`AgentRunner`]).
 //! - **Duty (W-c).** Each conductor cycle runs the agents when they share
 //!   its thread, then drains their events into the endpoint and image
-//!   tables. In `Shared` mode the agents get the driver clock's reading;
-//!   their threads read `host_monotonic_ns`. An agent compares only its own
-//!   timestamps, so the two never mix.
+//!   tables. The network's time base is `host_monotonic_ns` in every
+//!   mode: a shared cycle passes it to the agents and the endpoint table,
+//!   as runner threads do. The agents also read it directly (their role
+//!   clocks: an RTTM REQUEST's or a NAK's start, a reply's `seen`) and
+//!   compare those with their cycles' `now`, so one base is required. The
+//!   driver's injectable clock times claim deadlines only.
 //! - **Failure (W-g, DN-9).** An agent that fails or panics is fatal for
 //!   the driver: the duty cycle returns [`DriverError::NetworkAgent`] from
 //!   then on, and the failed agents never run again. In `Shared` mode each
@@ -70,6 +73,9 @@ pub struct NetworkConfig {
     pub threading: ThreadingMode,
     /// The image log buffers.
     pub images: ImageTemplate,
+    /// The log of a network publication a client creates by channel URI
+    /// (W5b): the URI's `term-length`, `mtu` and `lanes` override these.
+    pub stream_defaults: NetworkStreamDefaults,
 }
 
 impl Default for NetworkConfig {
@@ -78,6 +84,38 @@ impl Default for NetworkConfig {
             agents: AgentConfig::default(),
             threading: ThreadingMode::Dedicated,
             images: ImageTemplate::default(),
+            stream_defaults: NetworkStreamDefaults::default(),
+        }
+    }
+}
+
+/// The log of a network publication a client creates by URI (W5b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetworkStreamDefaults {
+    /// Term length in bytes, a power of two the log accepts, unless the
+    /// URI names one.
+    pub term_length: u32,
+    /// Frame bytes per datagram, unless the URI names them.
+    pub mtu: u32,
+    /// Lanes, unless the URI names them.
+    pub lanes: u8,
+    /// Spare term slots.
+    pub spare_slots: u8,
+    /// Subscribers of each lane, the sender's reader included.
+    pub max_subscribers: u8,
+    /// How long a claim may stay open, in the driver clock's unit.
+    pub claim_deadline: u64,
+}
+
+impl Default for NetworkStreamDefaults {
+    fn default() -> Self {
+        Self {
+            term_length: 1 << 20,
+            mtu: karyos_sys::sizing::DEFAULT_MTU,
+            lanes: 1,
+            spare_slots: 3,
+            max_subscribers: 8,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
         }
     }
 }
@@ -165,10 +203,24 @@ pub struct NetworkSubscription {
     stream_id: i32,
 }
 
+impl NetworkSubscription {
+    /// The endpoint it receives on.
+    pub(crate) fn endpoint(&self) -> EndpointId {
+        self.endpoint
+    }
+
+    /// The stream it subscribes.
+    pub(crate) fn stream_id(&self) -> i32 {
+        self.stream_id
+    }
+}
+
 /// An installed image and the aggregate that exposes it, if any.
 #[derive(Debug)]
 struct NetImage {
     slot: SlotRef,
+    /// The endpoint it arrived on, which its subscription names.
+    endpoint: EndpointId,
     exposed: Option<crate::embedded::AggregateHandle>,
     /// An unexposed image's lane conductors, driven here so its terms are
     /// still prepared and it keeps being fed (ACS 15937); dropped when it
@@ -188,6 +240,17 @@ pub(crate) struct Network {
     publications: Vec<NetPublication>,
     send_endpoints: Vec<SendEndpoint>,
     subscriptions: Vec<NetSubscription>,
+    /// Subscriptions whose removal found the receiver's ring full: retried
+    /// each cycle.
+    pending_unsubscribe: Vec<NetworkSubscription>,
+    /// The receiver's subscription table size (`AgentConfig::subscriptions`):
+    /// the conductor, its only producer of `AddSubscription`, keeps no more
+    /// distinct keys, so a full table is refused here, synchronously
+    /// (ACS 16077).
+    subscription_capacity: usize,
+    /// `AddSubscription` answers the receiver refused anyway: a drift
+    /// between the two tables, never expected.
+    subscription_refusals: u64,
     /// Installed images, at most `max_images`.
     net_images: Vec<NetImage>,
     /// The image table's events of the last cycle, for the conductor.
@@ -210,6 +273,9 @@ pub(crate) struct Network {
     /// Stale aliases that found the queue full: never, by construction;
     /// counted if it happens.
     stale_overflows: u64,
+    /// The network's time base, the agents' role clock: `host_monotonic_ns`
+    /// (module documentation, Duty).
+    clock: fn() -> u64,
 }
 
 impl Network {
@@ -239,6 +305,9 @@ impl Network {
             publications: Vec::with_capacity(config.agents.publications),
             send_endpoints: Vec::with_capacity(config.agents.max_endpoints),
             subscriptions: Vec::with_capacity(config.agents.subscriptions),
+            subscription_capacity: config.agents.subscriptions,
+            pending_unsubscribe: Vec::with_capacity(config.agents.subscriptions),
+            subscription_refusals: 0,
             net_images: Vec::with_capacity(config.agents.sessions.max_images),
             image_events: Vec::with_capacity(config.agents.sessions.max_images),
             images_unexposed: 0,
@@ -247,6 +316,7 @@ impl Network {
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
             stale_overflows: 0,
+            clock: karyos_sys::host_clock::host_monotonic_ns,
         })
     }
 
@@ -299,11 +369,9 @@ impl Network {
     /// Subscribes `stream_id` on the endpoint bound to `bind` (joined to
     /// `multicast`): the receiver challenges its announcements and
     /// installs its images (control path). A second subscription of the
-    /// same endpoint and stream shares the receiver's entry. The
-    /// receiver's answer is not awaited: a receiver whose subscription
-    /// table is full (`AgentConfig::subscriptions`) answers
-    /// `Configured { accepted: false }` and never challenges the stream,
-    /// so no image appears for it.
+    /// same endpoint and stream shares the receiver's entry. The receiver's
+    /// table is mirrored here: a new key beyond `AgentConfig::subscriptions`
+    /// is refused before anything is posted.
     ///
     /// `reliable` is the channel's `reliable` parameter: the receiver
     /// repairs its images' losses with NAKs, otherwise its skip policy
@@ -313,6 +381,7 @@ impl Network {
     ///
     /// # Errors
     ///
+    /// [`DriverError::NetworkSubscriptionsFull`],
     /// [`DriverError::NetworkEndpoint`], [`DriverError::NetworkBusy`],
     /// [`DriverError::ReliabilityMismatch`].
     pub(crate) fn add_subscription(
@@ -323,6 +392,7 @@ impl Network {
         max_term_length: u32,
         reliable: bool,
     ) -> Result<NetworkSubscription, DriverError> {
+        let group = multicast.is_some();
         let endpoint = self.hold_endpoint(bind, multicast)?;
         let handle = NetworkSubscription {
             endpoint,
@@ -346,6 +416,11 @@ impl Network {
             entry.users = users;
             return Ok(handle);
         }
+        // A new key: the receiver's table must have room for it.
+        if self.subscriptions.len() >= self.subscription_capacity {
+            release(&mut self.send_endpoints, endpoint);
+            return Err(DriverError::NetworkSubscriptionsFull);
+        }
         let posted = self
             .links
             .receiver
@@ -355,6 +430,7 @@ impl Network {
                 stream_id,
                 max_term_length,
                 reliable,
+                multicast: group,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
@@ -411,6 +487,14 @@ impl Network {
         Ok(true)
     }
 
+    /// Removes `subscription` now, or once the receiver's ring has room
+    /// (a client's subscription ending with its client, W5b).
+    pub(crate) fn remove_subscription_later(&mut self, subscription: NetworkSubscription) {
+        if self.remove_subscription(subscription).is_err() {
+            self.pending_unsubscribe.push(subscription);
+        }
+    }
+
     /// The image events of the last cycle, for the conductor to apply;
     /// hand the buffer back with [`Network::return_image_events`].
     pub(crate) fn take_image_events(&mut self) -> Vec<ImageEvent> {
@@ -434,6 +518,7 @@ impl Network {
     pub(crate) fn record_image(
         &mut self,
         slot: SlotRef,
+        endpoint: EndpointId,
         exposed: Option<crate::embedded::AggregateHandle>,
         lanes: &[Arc<LogBuffer>],
     ) {
@@ -449,9 +534,27 @@ impl Network {
         }
         self.net_images.push(NetImage {
             slot,
+            endpoint,
             exposed,
             conductors,
         });
+    }
+
+    /// The exposed images, with the endpoint each arrived on.
+    pub(crate) fn exposed_images(
+        &self,
+    ) -> impl Iterator<Item = (EndpointId, crate::embedded::AggregateHandle)> + '_ {
+        self.net_images
+            .iter()
+            .filter_map(|image| image.exposed.map(|handle| (image.endpoint, handle)))
+    }
+
+    /// The endpoint of the image `slot`.
+    pub(crate) fn image_endpoint(&self, slot: SlotRef) -> Option<EndpointId> {
+        self.net_images
+            .iter()
+            .find(|image| image.slot == slot)
+            .map(|image| image.endpoint)
     }
 
     /// Drops the conductors of the unexposed image `slot`, which retires.
@@ -486,6 +589,24 @@ impl Network {
             .iter()
             .filter_map(|image| image.exposed)
             .find(|handle| matches(handle))
+    }
+
+    /// `AddSubscription` answers the receiver refused despite the mirror:
+    /// a drift between the tables, never expected.
+    pub(crate) fn subscription_refusals(&self) -> u64 {
+        self.subscription_refusals
+    }
+
+    /// Distinct network subscription keys held, for tests.
+    #[cfg(test)]
+    pub(crate) fn subscription_count(&self) -> usize {
+        self.subscriptions.len()
+    }
+
+    /// Network publications tracked, for tests.
+    #[cfg(test)]
+    pub(crate) fn publication_count(&self) -> usize {
+        self.publications.len()
     }
 
     /// Images installed but not exposed so far.
@@ -618,15 +739,16 @@ impl Network {
             .map(|entry| entry.state)
     }
 
-    /// One conductor cycle of network work at `now`, in driver clock
-    /// nanoseconds: the agents when they share this thread, then their
-    /// events. Returns the work done.
+    /// One conductor cycle of network work at the network clock's reading:
+    /// the agents when they share this thread, then their events. Returns
+    /// the work done.
     ///
     /// # Errors
     ///
     /// [`DriverError::NetworkAgent`] once an agent failed (DN-9), and on
     /// every later cycle; [`DriverError::WorkCountOverflow`].
-    pub(crate) fn duty(&mut self, now: u64) -> Result<u32, DriverError> {
+    pub(crate) fn duty(&mut self) -> Result<u32, DriverError> {
+        let now = (self.clock)();
         if let Some(agent) = self.failed {
             return Err(DriverError::NetworkAgent { agent });
         }
@@ -649,6 +771,14 @@ impl Network {
             self.failed = Some(agent);
             DriverError::NetworkAgent { agent }
         })?;
+        // Unsubscriptions the full ring refused earlier.
+        // (None in steady state: nothing is taken or freed then.)
+        if !self.pending_unsubscribe.is_empty() {
+            let pending = core::mem::take(&mut self.pending_unsubscribe);
+            for subscription in pending {
+                self.remove_subscription_later(subscription);
+            }
+        }
         // Removals the full ring refused earlier.
         let mut stale = Stale {
             queue: &mut self.stale_aliases,
@@ -656,11 +786,12 @@ impl Network {
         };
         post_removals(&self.links, &mut self.publications, &mut stale);
         // Answers about endpoints go to the table, which also serves the
-        // sender's reset requests at the driver clock (W-f); publication
+        // sender's reset requests at the network clock (W-f); publication
         // answers update the publications.
         let mut events = Some(0u32);
         #[cfg(test)]
         let mut reopened = Some(self.reopened);
+        let mut refusals = self.subscription_refusals;
         let (publications, send_endpoints) = (&mut self.publications, &mut self.send_endpoints);
         let mut stale = Stale {
             queue: &mut self.stale_aliases,
@@ -681,12 +812,24 @@ impl Network {
                 let _ = event;
                 events = events.and_then(|count| count.checked_add(1));
             },
-            |event| publication_answer(publications, send_endpoints, &mut stale, event),
+            |event| {
+                if let AgentEvent::Configured {
+                    accepted: false,
+                    subscription: Some(_),
+                    ..
+                } = event
+                    && let Some(count) = refusals.checked_add(1)
+                {
+                    refusals = count;
+                }
+                publication_answer(publications, send_endpoints, &mut stale, event);
+            },
         );
         #[cfg(test)]
         if let Some(count) = reopened {
             self.reopened = count;
         }
+        self.subscription_refusals = refusals;
         // A send endpoint no publication holds any more retires; one not
         // active yet is tried again next cycle.
         let (endpoints, links) = (&mut self.endpoints, &self.links);
@@ -716,9 +859,10 @@ impl Network {
     }
 
     /// Stops the agents, reclaims every endpoint and drains the image
-    /// table at `now`, the driver clock's reading (control path; at most
-    /// once, later calls report nothing).
-    pub(crate) fn close(&mut self, now: u64) -> NetworkShutdown {
+    /// table at the network clock's reading (control path; at most once,
+    /// later calls report nothing).
+    pub(crate) fn close(&mut self) -> NetworkShutdown {
+        let now = (self.clock)();
         let mut shutdown = NetworkShutdown::default();
         let agents = match core::mem::replace(&mut self.agents, Agents::Closed) {
             Agents::Shared(mut agents) => {
@@ -994,6 +1138,36 @@ impl Stop for crate::agents::ReceiverAgent<OsSocket> {
     }
 }
 
+pub(crate) mod client;
+
+/// A stream configuration for tests (`net` submodules).
+#[cfg(test)]
+pub(crate) fn e2e_config(stream_id: i32) -> crate::embedded::StreamConfig {
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    crate::embedded::StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap_or_else(|_| unreachable!()),
+            spare_slots: 3,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: 100,
+            publication: PublicationMode::Exclusive,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    }
+}
 mod publish;
 mod subscribe;
 

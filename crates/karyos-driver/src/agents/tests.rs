@@ -114,7 +114,8 @@ fn reservations_keep_room_for_replies() {
 }
 
 /// Zero capacities and a zero budget are refused at creation, and so are
-/// session rings below three units per image (S1).
+/// session rings below three units per image (S1) and multicast NAK
+/// timings out of range or past `u64`.
 #[test]
 fn the_configuration_is_checked() {
     for config in [
@@ -136,6 +137,22 @@ fn the_configuration_is_checked() {
         },
         AgentConfig {
             max_endpoints: 0,
+            ..AgentConfig::default()
+        },
+        // A multicast NAK delay scale out of range.
+        AgentConfig {
+            multicast: crate::repair::loss::MulticastConfig {
+                nak_delay_scale: 0,
+                ..crate::repair::loss::MulticastConfig::default()
+            },
+            ..AgentConfig::default()
+        },
+        // A multicast window past `u64` at the probe timeout.
+        AgentConfig {
+            multicast: crate::repair::loss::MulticastConfig {
+                repair_linger_ns: u64::MAX,
+                ..crate::repair::loss::MulticastConfig::default()
+            },
             ..AgentConfig::default()
         },
     ] {
