@@ -26,6 +26,7 @@ mod guard_streams;
 pub mod guards;
 mod ledger;
 pub mod membership;
+mod network_journals;
 pub mod paths;
 mod positions;
 mod remote_generations;

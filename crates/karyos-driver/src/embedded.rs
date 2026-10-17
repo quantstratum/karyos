@@ -219,6 +219,14 @@ pub struct DriverConfig {
     /// counted as its whole region (header included); a `TraceJournal`
     /// beyond it is refused with `ResourcesUnavailable`.
     pub max_trace_journal_bytes: u64,
+    /// Bytes of every network trace journal the driver holds at once
+    /// (`quantstratum-docs: karyos/design/trace-network.md`, NT-3), each
+    /// counted as its whole region; a network journal beyond it is refused
+    /// and counted, never created.
+    pub max_network_journal_bytes: u64,
+    /// Records of each network trace journal, a power of two; each record
+    /// is `karyos_protocol::trace_hook::TRACE_RECORD_WORDS` wide.
+    pub network_journal_records: usize,
     /// Journal records the driver copies into the trace mirror per duty
     /// cycle, over all journals.
     pub trace_drain_budget: usize,
@@ -277,6 +285,8 @@ impl Default for DriverConfig {
             trace_recycle_log_entries: 64,
             // Provisional until the trace overhead numbers of P11.
             max_trace_journal_bytes: 64 * 1024 * 1024,
+            max_network_journal_bytes: 64 * 1024 * 1024,
+            network_journal_records: 4096,
             trace_drain_budget: 1024,
             trace_mirror_records: 4096,
             max_guards: 16,
@@ -763,6 +773,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) diagnostics: crate::diagnostics::Diagnostics,
     /// The client trace journals and the trace mirror.
     pub(crate) trace_journals: crate::trace_journals::TraceJournals,
+    /// The network trace hooks and their journals.
+    pub(crate) network: crate::network_journals::NetworkTracing,
     /// The guard registry and its audit ring.
     pub(crate) guards: crate::guards::Guards,
     /// The sender gates registered with their guards (G-e4).
@@ -859,6 +871,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             && config.max_trace_journals > 0
             && config.trace_recycle_log_entries > 0
             && config.max_trace_journal_bytes > 0
+            && config.max_network_journal_bytes > 0
+            && config.network_journal_records.is_power_of_two()
             && config.trace_drain_budget > 0
             && config.trace_mirror_records > 0
             && config.cutover_deadline > 0
@@ -986,8 +1000,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             trace_journals: crate::trace_journals::TraceJournals::new(
                 mirror,
                 config.max_trace_journal_bytes,
+                config.max_network_journal_bytes,
                 config.trace_drain_budget,
             ),
+            network: crate::network_journals::NetworkTracing::new(config.max_trace_journals),
             guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
         })
@@ -1158,6 +1174,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         self.counters
             .set(Event::TraceJournalsOpen, gauge(self.trace_journals.open()));
+        self.counters.set(
+            Event::NetworkTraceJournalsOpen,
+            gauge(self.trace_journals.network_open()),
+        );
     }
 
     /// Runs a positions sampling pass when `position_sample_interval` has
