@@ -77,11 +77,14 @@ pub enum Workload {
     /// The lanes of one image and their receive owner are created, as the
     /// conductor's image table does at `CreateImage` (N-5).
     ImageInstall,
+    /// The first term of a freshly installed one-lane image is filled with
+    /// received frames: the first touch of its memory (N-5).
+    ImageFirstFill,
 }
 
 impl Workload {
     /// Every workload.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::OfferPoll,
         Self::Claim,
         Self::PingPong,
@@ -97,6 +100,7 @@ impl Workload {
         Self::SenderRead,
         Self::SenderNak,
         Self::ImageInstall,
+        Self::ImageFirstFill,
     ];
 
     /// Its name on the command line and in the history.
@@ -118,6 +122,7 @@ impl Workload {
             Self::SenderRead => "sender-read",
             Self::SenderNak => "sender-nak",
             Self::ImageInstall => "image-install",
+            Self::ImageFirstFill => "image-first-fill",
         }
     }
 
@@ -136,7 +141,7 @@ impl Workload {
             Self::Receive | Self::ReceiveDuplicate | Self::SenderRead | Self::SenderNak => {
                 &[Backing::Heap, Backing::Shared, Backing::Region]
             }
-            Self::ImageInstall => &[Backing::Heap, Backing::Region],
+            Self::ImageInstall | Self::ImageFirstFill => &[Backing::Heap, Backing::Region],
             // Every stream of an IPC driver is in a shared region.
             Self::IpcPingPong | Self::IpcThroughput => &[Backing::Region],
             Self::OfferPoll
@@ -464,6 +469,7 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
         Workload::SenderRead => crate::terms::sender_read(config),
         Workload::SenderNak => crate::terms::sender_nak(config),
         Workload::ImageInstall => crate::terms::image_install(config),
+        Workload::ImageFirstFill => crate::terms::image_first_fill(config),
         #[cfg(target_os = "linux")]
         Workload::IpcPingPong => crate::ipc::ping_pong(config),
         #[cfg(target_os = "linux")]
@@ -624,7 +630,7 @@ fn receive_frames<T: TermBytes>(
 }
 
 /// The header of a frame of the receive workloads' image.
-fn header(word0: Word0, term: TermId, offset: u32, reserved_value: i64) -> FrameHeader {
+pub(crate) fn header(word0: Word0, term: TermId, offset: u32, reserved_value: i64) -> FrameHeader {
     FrameHeader {
         word0,
         term_offset: offset.cast_signed(),
