@@ -200,7 +200,10 @@ fn a_lapped_async_recording_rejoins_at_the_head() {
 }
 
 /// Records its name when dropped.
-struct Noisy(&'static str, std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+struct Noisy(
+    &'static str,
+    std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+);
 
 impl Drop for Noisy {
     fn drop(&mut self) {
