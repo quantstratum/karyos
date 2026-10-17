@@ -25,6 +25,14 @@ pub trait Disk {
     /// The operating system's error.
     fn open(&mut self, path: &Path) -> io::Result<Self::File>;
 
+    /// Opens the existing `path` for reading only, so a read-only archive
+    /// directory can be replayed.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's error.
+    fn open_read(&mut self, path: &Path) -> io::Result<Self::File>;
+
     /// Writes all of `bytes` at `offset`, extending the file as needed.
     ///
     /// # Errors
@@ -117,6 +125,10 @@ impl Disk for StdDisk {
             .read(true)
             .write(true)
             .open(path)
+    }
+
+    fn open_read(&mut self, path: &Path) -> io::Result<Self::File> {
+        std::fs::OpenOptions::new().read(true).open(path)
     }
 
     fn write_at(&mut self, file: &Self::File, offset: u64, bytes: &[u8]) -> io::Result<()> {

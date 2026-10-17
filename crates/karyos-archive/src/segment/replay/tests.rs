@@ -11,6 +11,7 @@
     reason = "test helpers, as ADR-0007 allows in tests"
 )]
 
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use super::*;
@@ -328,23 +329,15 @@ fn a_paced_replay_waits_for_each_record_time() {
     assert!(matches!(seen(paced.poll(2050).unwrap()), Seen::Gap(..)));
     assert!(matches!(seen(paced.poll(3050).unwrap()), Seen::Frames(..)));
     // Twice as fast: half the gaps.
-    let mut fast = open_source(&disk, 0, end, Rate::Scaled { ppm: 2_000_000 }, 4096);
+    let mut fast = open_source(&disk, 0, end, scaled(2_000_000), 4096);
     assert!(matches!(seen(fast.poll(0).unwrap()), Seen::Frames(0, _)));
     assert_eq!(seen(fast.poll(1).unwrap()), Seen::Wait(500));
-    // A scale of 0 is refused.
-    assert!(matches!(
-        ReplaySource::open(
-            disk.clone(),
-            Path::new(DIR),
-            RECORDING,
-            geometry(),
-            0,
-            end,
-            Rate::Scaled { ppm: 0 },
-            4096
-        ),
-        Err(ReplayError::InvalidScale)
-    ));
+}
+
+fn scaled(ppm: u32) -> Rate {
+    Rate::Scaled {
+        ppm: NonZeroU32::new(ppm).unwrap(),
+    }
 }
 
 #[test]
@@ -361,7 +354,7 @@ fn entries_without_a_record_time_refuse_a_paced_replay() {
     .unwrap();
     let end = store.append(0, &frames(&[100], 0xD4)).unwrap();
     store.close().unwrap();
-    for rate in [Rate::AsRecorded, Rate::Scaled { ppm: 1 }] {
+    for rate in [Rate::AsRecorded, scaled(1)] {
         let mut paced = open_source(&disk, 0, end, rate, 4096);
         assert!(matches!(
             paced.poll(0),
@@ -406,5 +399,336 @@ fn a_damaged_fill_record_is_reported() {
     assert!(matches!(
         source.poll(0),
         Err(ReplayError::Corrupt { position }) if position == fill_at
+    ));
+}
+
+/// Writes `byte` over the data file of the segment at `base`, at
+/// `position`.
+fn damage(disk: &FaultDisk, base: u64, position: u64, byte: u8) {
+    let mut raw = disk.clone();
+    let data = raw
+        .open(&Path::new(DIR).join(data_name(RECORDING, base)))
+        .unwrap();
+    raw.write_at(&data, position - base, &[byte]).unwrap();
+}
+
+/// Every step until the end or an error.
+fn until_error(source: &mut ReplaySource<FaultDisk>) -> (Vec<Seen>, Option<ReplayError>) {
+    let mut steps = Vec::new();
+    loop {
+        match source.poll(0) {
+            Ok(step) => {
+                let step = seen(step);
+                let done = matches!(step, Seen::End(_));
+                steps.push(step);
+                if done {
+                    return (steps, None);
+                }
+            }
+            Err(error) => return (steps, Some(error)),
+        }
+    }
+}
+
+/// #364 review P1: a range that starts or stops inside an entry still has
+/// the entry's CRC checked, before any of its bytes is delivered.
+#[test]
+fn damage_inside_an_entry_is_caught_wherever_the_range_starts_or_stops() {
+    // Starts at the first entry's second frame; damage after it.
+    let (disk, _, _, end) = recorded();
+    damage(&disk, 0, 150, 0xEE);
+    let inside = open_source_result(&disk, 128, end, 4096);
+    assert!(
+        matches!(inside, Err(ReplayError::Corrupt { position: 0 })),
+        "{inside:?}"
+    );
+    // Starts at the entry; stops inside it; damage in what is delivered.
+    let (disk, _, _, _) = recorded();
+    damage(&disk, 0, 50, 0xEE);
+    let mut source = open_source(&disk, 0, 150, Rate::Full, 4096);
+    let (steps, error) = until_error(&mut source);
+    assert_eq!(steps, []);
+    assert!(matches!(error, Some(ReplayError::Corrupt { position: 0 })));
+    // And damage in what is not delivered.
+    let (disk, _, _, _) = recorded();
+    damage(&disk, 0, 140, 0xEE);
+    let mut source = open_source(&disk, 0, 120, Rate::Full, 4096);
+    let (steps, error) = until_error(&mut source);
+    assert_eq!(steps, []);
+    assert!(matches!(error, Some(ReplayError::Corrupt { position: 0 })));
+}
+
+fn open_source_result(
+    disk: &FaultDisk,
+    from: u64,
+    to: u64,
+    buffer: usize,
+) -> Result<ReplaySource<FaultDisk>, ReplayError> {
+    ReplaySource::open(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        from,
+        to,
+        Rate::Full,
+        buffer,
+    )
+}
+
+/// #364 review P2: an entry read in pieces yields none of them before its
+/// CRC holds, wherever the damage is.
+#[test]
+fn no_piece_comes_before_its_entry_is_checked() {
+    for offset in [10, 100, 300] {
+        let (disk, _, last, end) = recorded();
+        let last_at = end - u64::try_from(last.len()).unwrap();
+        damage(&disk, 0, last_at + offset, 0xEE);
+        let mut source = open_source(&disk, last_at, end, Rate::Full, 256);
+        let (steps, error) = until_error(&mut source);
+        assert_eq!(steps, [], "damage at {offset}");
+        assert!(
+            matches!(error, Some(ReplayError::Corrupt { position }) if position == last_at),
+            "damage at {offset}: {error:?}"
+        );
+    }
+}
+
+/// A recording in the store, of `terms` terms of two 512-byte frames, as
+/// `a_replay_crosses_segments` writes it; the store stays open.
+fn open_store(terms: usize) -> (FaultDisk, SegmentStore<FaultDisk>, Vec<u8>, u64) {
+    let disk = FaultDisk::default();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    let term = frames(&[512, 512], 0xC3);
+    let mut position = 0;
+    for _ in 0..terms {
+        position = store.append(position, &term).unwrap();
+    }
+    (disk, store, term, position)
+}
+
+/// #364 review P2: what a replay reads is fixed at open. Entries written
+/// after, in the same segment or past a roll, are not delivered, and do not
+/// make the replay fail; a `to` past what the recording held is clamped.
+#[test]
+fn a_replay_reads_what_the_recording_held_at_open() {
+    for (terms, more) in [(1, 1), (1, 3), (2, 2), (3, 1)] {
+        let (disk, mut store, term, held) = open_store(terms);
+        let mut source = open_source(&disk, 0, u64::MAX, Rate::Full, 4096);
+        let mut position = held;
+        for _ in 0..more {
+            position = store.append(position, &term).unwrap();
+        }
+        let steps = drain(&mut source, 0);
+        let delivered: u64 = steps
+            .iter()
+            .map(|step| match step {
+                Seen::Frames(_, bytes) => u64::try_from(bytes.len()).unwrap(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(delivered, held, "{terms} terms, {more} more");
+        assert_eq!(steps.last(), Some(&Seen::End(held)));
+        store.close().unwrap();
+    }
+}
+
+/// #364 review P3: a segment missing inside the range is reported, not
+/// taken for the recording's end.
+#[test]
+fn a_missing_segment_is_not_the_end() {
+    let (disk, mut store, term, mut position) = open_store(6);
+    for _ in 0..2 {
+        position = store.append(position, &term).unwrap();
+    }
+    store.close().unwrap();
+    let mut raw = disk.clone();
+    raw.remove(&Path::new(DIR).join(data_name(RECORDING, 2048)))
+        .unwrap();
+    raw.remove(&Path::new(DIR).join(index_name(RECORDING, 2048)))
+        .unwrap();
+    assert!(matches!(
+        open_source_result(&disk, 0, position, 4096),
+        Err(ReplayError::MissingSegment { base: 2048 })
+    ));
+    // Removed after open: found when the replay reaches it.
+    let (disk, mut store, term, mut position) = open_store(6);
+    for _ in 0..2 {
+        position = store.append(position, &term).unwrap();
+    }
+    store.close().unwrap();
+    let mut source = open_source(&disk, 0, position, Rate::Full, 4096);
+    let mut raw = disk.clone();
+    raw.remove(&Path::new(DIR).join(index_name(RECORDING, 4096)))
+        .unwrap();
+    let (_, error) = until_error(&mut source);
+    assert!(
+        matches!(error, Some(ReplayError::MissingSegment { base: 4096 })),
+        "{error:?}"
+    );
+}
+
+/// #364 review P3: a version 1 index is foreign, as recovery says.
+#[test]
+fn a_version_1_index_is_foreign() {
+    let (disk, store, _, end) = open_store(1);
+    drop(store);
+    let mut raw = disk.clone();
+    let index = raw
+        .open(&Path::new(DIR).join(index_name(RECORDING, 0)))
+        .unwrap();
+    let mut header = [0u8; 48];
+    raw.read_at(&index, 0, &mut header).unwrap();
+    // Version 1 (u32 at 4), with the header's CRC (at 44) redone.
+    header[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let crc = crate::crc32c::crc32c(&header[..44]);
+    header[44..48].copy_from_slice(&crc.to_le_bytes());
+    raw.write_at(&index, 0, &header).unwrap();
+    assert!(matches!(
+        open_source_result(&disk, 0, end, 4096),
+        Err(ReplayError::Segment(SegmentError::BadHeader {
+            problem: HeaderProblem::Foreign,
+            ..
+        }))
+    ));
+}
+
+/// #364 review P3: pacing applies only to entries that deliver, and its
+/// arithmetic fails typed.
+#[test]
+fn pacing_applies_to_delivered_entries_and_fails_typed() {
+    // A frame stamped 0 past the end of a paced replay: the end, not
+    // RecordTimeUnknown.
+    let disk = FaultDisk::default();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    store.stamp(10);
+    let mut position = store.append(0, &frames(&[64], 0xE5)).unwrap();
+    let unstamped = position;
+    store.stamp(0);
+    position = store.append(position, &frames(&[64, 64], 0xE6)).unwrap();
+    store.close().unwrap();
+    let mut paced = open_source(&disk, 0, unstamped + 32, Rate::AsRecorded, 4096);
+    assert!(matches!(
+        paced.poll(0),
+        Ok(Step::Frames { position: 0, .. })
+    ));
+    assert!(matches!(paced.poll(0), Ok(Step::End { position }) if position == unstamped));
+    // Stamped 0 is written as 1: before 10, so recorded backward.
+    let mut backward = open_source(&disk, 0, position, Rate::AsRecorded, 4096);
+    assert!(matches!(backward.poll(0), Ok(Step::Frames { .. })));
+    assert!(matches!(
+        backward.poll(0),
+        Err(ReplayError::RecordTimeBackward { position }) if position == unstamped
+    ));
+    // A gap of nearly the clock's range at the slowest scale.
+    let disk = FaultDisk::default();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    store.stamp(1);
+    let mut position = store.append(0, &frames(&[64], 0xE7)).unwrap();
+    let late = position;
+    store.stamp(20_000_000_000_000);
+    position = store.append(position, &frames(&[64], 0xE8)).unwrap();
+    store.close().unwrap();
+    let mut slow = open_source(&disk, 0, position, scaled(1), 4096);
+    assert!(matches!(slow.poll(0), Ok(Step::Frames { .. })));
+    assert!(matches!(
+        slow.poll(0),
+        Err(ReplayError::PacingOverflow { position }) if position == late
+    ));
+}
+
+/// A frame length that does not hold, under a valid CRC (the recorder
+/// wrote what its source gave), is caught before any frame of the entry
+/// goes out.
+#[test]
+fn a_frame_that_does_not_hold_is_caught_before_delivery() {
+    let disk = FaultDisk::default();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    // Two good frames, then one whose length passes the entry's end.
+    let mut bytes = frames(&[64, 64], 0xF1);
+    let mut bad = vec![0xF2u8; 64];
+    bad[..4].copy_from_slice(&1000i32.to_le_bytes());
+    bytes.extend_from_slice(&bad);
+    let end = store.append(0, &bytes).unwrap();
+    store.close().unwrap();
+    let mut source = open_source(&disk, 0, end, Rate::Full, 64);
+    let (steps, error) = until_error(&mut source);
+    assert_eq!(steps, []);
+    assert!(
+        matches!(error, Some(ReplayError::Corrupt { position: 128 })),
+        "{error:?}"
+    );
+}
+
+/// An index whose next entry does not start where the last ended is
+/// corrupt, not a jump.
+#[test]
+fn entries_that_do_not_follow_each_other_are_corrupt() {
+    let (disk, _, _, end) = recorded();
+    let mut raw = disk.clone();
+    let index = raw
+        .open(&Path::new(DIR).join(index_name(RECORDING, 0)))
+        .unwrap();
+    // The fill (entry 1) moved 32 bytes on, its own CRC redone.
+    let at = entry_offset(1).unwrap();
+    let mut bytes = [0u8; ENTRY as usize];
+    raw.read_at(&index, at, &mut bytes).unwrap();
+    let Some(Ok(mut entry)) = Entry::decode(&bytes) else {
+        panic!("entry 1");
+    };
+    let fill_at = entry.start;
+    entry.start += 32;
+    raw.write_at(&index, at, &entry.encode()).unwrap();
+    let mut source = open_source(&disk, 0, end, Rate::Full, 4096);
+    assert!(matches!(source.poll(0), Ok(Step::Frames { .. })));
+    assert!(matches!(
+        source.poll(0),
+        Err(ReplayError::Corrupt { position }) if position == fill_at
+    ));
+}
+
+/// A due time past the caller's clock range is an error, not a wait that
+/// never ends.
+#[test]
+fn a_due_time_past_the_clock_is_an_error() {
+    let (disk, _, _, end) = recorded();
+    let mut paced = open_source(&disk, 0, end, Rate::AsRecorded, 4096);
+    let late = u64::MAX - 10;
+    assert!(matches!(paced.poll(late), Ok(Step::Frames { .. })));
+    assert!(matches!(
+        paced.poll(late),
+        Err(ReplayError::PacingOverflow { .. })
     ));
 }
