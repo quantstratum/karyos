@@ -591,7 +591,8 @@ fn bad_headers_are_typed_errors() {
             SyncPolicy::PerSegment,
         )
     };
-    // A torn first header, with later segments: an error, not a new start.
+    // A torn first header, with later segments and data behind it:
+    // corruption, not a new start.
     let disk = FaultDisk::default();
     written(&disk);
     overwrite_header(&disk, 0, &[0xFF; 8]);
@@ -599,9 +600,24 @@ fn bad_headers_are_typed_errors() {
         recover(&disk),
         Err(SegmentError::BadHeader {
             base: 0,
-            problem: HeaderProblem::Incomplete
+            problem: HeaderProblem::Corrupt
         })
     ));
+    // A torn header on the last segment that holds data: corruption too,
+    // and its files stay.
+    let disk = FaultDisk::default();
+    written(&disk);
+    overwrite_header(&disk, 256, &[0xFF; 8]);
+    let mut raw = disk.clone();
+    let before = raw.list(Path::new(DIR)).unwrap().len();
+    assert!(matches!(
+        recover(&disk),
+        Err(SegmentError::BadHeader {
+            base: 256,
+            problem: HeaderProblem::Corrupt
+        })
+    ));
+    assert_eq!(raw.list(Path::new(DIR)).unwrap().len(), before);
     // Another version under a valid CRC.
     let disk = FaultDisk::default();
     written(&disk);
@@ -643,10 +659,24 @@ fn bad_headers_are_typed_errors() {
             problem: HeaderProblem::OutOfRange
         })
     ));
-    // The last segment's torn header: being created, removed, and the
-    // recording ends where the previous segment does.
+    // The last segment's zeroed header with nothing behind it: being
+    // created, removed, and the recording ends where the previous segment
+    // does.
     let disk = FaultDisk::default();
-    written(&disk);
+    {
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        store.append(0, &stream(256)).unwrap();
+        store.roll(256).unwrap();
+        store.close().unwrap();
+    }
     overwrite_header(&disk, 256, &[0u8; 48]);
     let recovered = recover(&disk).unwrap();
     assert_eq!(recovered.store.written(), 256);
