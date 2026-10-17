@@ -2731,15 +2731,20 @@ pub enum SealReason {
     /// and ended the incarnation (guards-and-abort.md, G7 and GC-8).
     /// Reported as [`AppendOutcome::Gated`], as a guard close is.
     DeadlineMissed,
-    /// The stream is the image of a remote publication that the receiver
-    /// retired: its publisher timed out, or its subscription was removed
-    /// (`quantstratum-docs: karyos/design/network-sessions.md`, S1
-    /// retirement). A local removal is [`SealReason::StreamRemoved`].
+    /// The stream is an image retired without a complete end: a remote
+    /// publication's image the receiver retired (its publisher timed out,
+    /// or its subscription was removed; `quantstratum-docs:
+    /// karyos/design/network-sessions.md`, S1 retirement), or an Archive
+    /// replay stopped or failed before its end. A local removal is
+    /// [`SealReason::StreamRemoved`].
     ImageRetired,
-    /// The stream is the image of a remote publication that ended: every
-    /// lane's complete prefix reached the terminal bound its EOS named
-    /// (`quantstratum-docs: karyos/design/network-sessions.md`, Liveness
-    /// and terminal transitions). The clean end of an image.
+    /// The stream is an image whose source ended cleanly: a remote
+    /// publication's EOS, every lane's complete prefix having reached the
+    /// terminal bound it named (`quantstratum-docs:
+    /// karyos/design/network-sessions.md`, Liveness and terminal
+    /// transitions), or an Archive replay that reached its end
+    /// (publication-seal.md). The clean end of an image; a reader that met
+    /// a loss on the way (a replay's local gap) still has no clean EOS.
     EndOfStream,
 }
 
