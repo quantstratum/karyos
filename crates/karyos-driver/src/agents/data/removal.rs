@@ -12,8 +12,9 @@
 //! submitted), the lane sends a header-only DATA frame with the EOS flag at
 //! the seal, which names the lane's terminal bound to its receivers
 //! (network-sessions.md, Liveness and terminal transitions), and repeats it
-//! every `interval`. The linger always runs in full, whatever the receivers
-//! acknowledge.
+//! every `interval`. Once a receiver is established, the linger always
+//! runs in full, whatever the receivers acknowledge (see "No established
+//! receiver" below for the one early end).
 //!
 //! **Bound.** One timer, `linger` from the removal's start (its first duty),
 //! bounds the drain: a lane may never drain (its receivers gone, so the
@@ -32,6 +33,12 @@
 //!
 //! A guarded lane whose guard closed sends no EOS: nothing more leaves the
 //! sender (GC-6) and its receivers' images end at their liveness timeout.
+//! Its linger runs as if it had sent one, and the removal is counted once
+//! as guard closed (`removals_guard_closed`), not as undrained.
+//!
+//! **No established receiver.** A removal with no established receiver
+//! ends at once, with no linger: it drains nothing and nobody would read
+//! its EOS. It is counted once (`removals_unestablished`).
 
 use std::num::NonZeroU16;
 
@@ -72,6 +79,9 @@ pub(crate) struct Removal {
     abandoned: [bool; 4],
     /// Whether a lane was given up, so the removal counts once.
     undrained: bool,
+    /// Whether a lane's closed guard withheld its EOS, so the removal
+    /// counts once.
+    guard_closed: bool,
     /// Whether the linger is over.
     drained: bool,
     /// Whether the drained publication was reported to the conductor.
@@ -88,6 +98,9 @@ pub(crate) struct RemovalStep {
     /// A lane was given up undrained at the bound, for the first time in
     /// this removal.
     pub(crate) gave_up: bool,
+    /// A lane's closed guard withheld its EOS (it drained, or was given up
+    /// at the bound), for the first time in this removal.
+    pub(crate) guard_closed: bool,
 }
 
 /// What sending a lane's EOS did.
@@ -131,6 +144,7 @@ impl<T: StreamTerms> Outbound<T> {
                 start: None,
                 abandoned: [false; 4],
                 undrained: false,
+                guard_closed: false,
                 drained: false,
                 reported: false,
             }));
@@ -187,12 +201,16 @@ impl<T: StreamTerms> Outbound<T> {
                 (None, _) => false,
             };
             if eos.is_none() && !due && age >= bound {
-                // Not drained by the bound: no EOS, ever.
+                // Not drained by the bound: no EOS, ever. A lane its closed
+                // guard stopped is counted as such, not as undrained.
+                let closed = self.guard_closed(lane);
                 if let Some(removal) = self.removal.as_deref_mut() {
                     if let Some(abandoned) = removal.abandoned.get_mut(lane) {
                         *abandoned = true;
                     }
-                    if !removal.undrained {
+                    if closed {
+                        step.guard_closed |= !std::mem::replace(&mut removal.guard_closed, true);
+                    } else if !removal.undrained {
                         removal.undrained = true;
                         step.gave_up = true;
                     }
@@ -204,7 +222,11 @@ impl<T: StreamTerms> Outbound<T> {
             };
             match self.send_eos(tx, lane, seal) {
                 EosSent::NotSent => continue,
-                EosSent::Closed => {}
+                EosSent::Closed => {
+                    if let Some(removal) = self.removal.as_deref_mut() {
+                        step.guard_closed |= !std::mem::replace(&mut removal.guard_closed, true);
+                    }
+                }
                 EosSent::Submitted => {
                     if let Some(next) = step.sent.checked_add(1) {
                         step.sent = next;
@@ -275,11 +297,12 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Ends the linger at once: a removing publication with no established
-    /// receiver drains nothing, so nobody waits for its EOS.
-    pub(crate) fn drain_now(&mut self) {
-        if let Some(removal) = self.removal.as_deref_mut() {
-            removal.drained = true;
-        }
+    /// receiver drains nothing, and nobody would read its EOS. Returns
+    /// whether this ended it (the first call).
+    pub(crate) fn drain_now(&mut self) -> bool {
+        self.removal
+            .as_deref_mut()
+            .is_some_and(|removal| !std::mem::replace(&mut removal.drained, true))
     }
 
     /// Records that the conductor was told the publication is drained.
@@ -297,6 +320,14 @@ impl<T: StreamTerms> Outbound<T> {
         let track = self.tracks.get(lane)?;
         let idle = track.staged.is_empty() && self.sender.pending(lane).unwrap_or(0) == 0;
         (idle && track.high >= seal && self.readers.get(lane)?.position() >= seal).then_some(seal)
+    }
+
+    /// Whether `lane`'s guard closed: the gate, asked, aborts the lane for
+    /// good (GC-6). A lane held only by its rate is not closed.
+    fn guard_closed(&mut self, lane: usize) -> bool {
+        self.guard
+            .as_deref_mut()
+            .is_some_and(|guard| !LaneGate::admits(guard, lane) && LaneGate::aborting(guard, lane))
     }
 
     /// Sends `lane`'s EOS, a header-only DATA frame at `seal`, on the lane's

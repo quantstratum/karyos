@@ -129,22 +129,33 @@ pub struct NetworkStreamDefaults {
     /// `publication_linger` in ns (default 5 s; driver-level, for every
     /// network publication of the driver): how long a removed publication
     /// keeps its incarnation after each lane's EOS at its seal, repeating
-    /// the EOS and serving repair (driver-network-agents.md §7). The
-    /// linger always runs in full. It also bounds the drain, as one timer
-    /// from the removal's start: a lane not drained to its seal by then (a
-    /// seal never positioned, a faulted reader, a closed flow-control
-    /// window, a blocked socket or a detached route) sends no EOS, the
-    /// removal is counted (`removals_undrained`) and the session is
-    /// reported drained anyway. The removal ends at the later of `start +
-    /// linger` and the latest first EOS plus `linger`; the drain bound is
-    /// never below one EOS interval (`AgentConfig::path_heartbeat_interval`),
-    /// so a tail can drain when the linger is 0: 0 sends one EOS on a lane
-    /// drained within one heartbeat interval, then frees; a lost EOS then
-    /// falls back to the receivers' liveness timeout. While a
-    /// removal lingers, its stream key stays in use: re-adding it is
-    /// refused with `DuplicateStream` until the removal ends.
+    /// the EOS and serving repair (driver-network-agents.md §7). With an
+    /// established receiver the linger always runs in full; a removal with
+    /// none ends at once (`removals_unestablished`), since nobody would
+    /// read its EOS. It also bounds the drain, as one timer from the
+    /// removal's start, `max(linger, interval)` with the interval
+    /// `AgentConfig::path_heartbeat_interval`: a lane not drained to its
+    /// seal by then (a seal never positioned, a faulted reader, a closed
+    /// flow-control window, a blocked socket or a detached route) sends no
+    /// EOS, the removal is counted (`removals_undrained`, or
+    /// `removals_guard_closed` for a lane its guard closed) and the session
+    /// is reported drained anyway. The removal ends at the later of `start +
+    /// linger` and the latest first EOS plus `linger`, so at worst at
+    /// `start + max(linger, interval) + linger`. A linger of 0 still lets a
+    /// tail drain within one interval: it sends one EOS on each lane
+    /// drained by then, then frees; a lost EOS then falls back to the
+    /// receivers' liveness timeout. While a removal lingers, its stream key
+    /// stays in use: re-adding it is refused with `DuplicateStream` until
+    /// the removal ends, at worst `max(linger, interval) + linger` after it
+    /// starts (about 10 s at the defaults). At most 60 s
+    /// ([`MAX_PUBLICATION_LINGER`]); a longer one is refused as
+    /// `InvalidConfig`.
     pub publication_linger: u64,
 }
+
+/// The longest `publication_linger` a network accepts (ns): 60 s. A
+/// removal holds its stream key for up to about twice its linger.
+pub const MAX_PUBLICATION_LINGER: u64 = 60_000_000_000;
 
 impl Default for NetworkStreamDefaults {
     fn default() -> Self {
@@ -503,11 +514,15 @@ impl<T: StreamTerms> Network<T> {
     /// # Errors
     ///
     /// [`DriverError::InvalidConfig`] for an agent configuration the agents
-    /// refuse; [`DriverError::NetworkStart`] when a thread cannot start.
+    /// refuse or a `publication_linger` above [`MAX_PUBLICATION_LINGER`];
+    /// [`DriverError::NetworkStart`] when a thread cannot start.
     pub(crate) fn start(config: &NetworkConfig) -> Result<Self, DriverError>
     where
         T: 'static,
     {
+        if config.stream_defaults.publication_linger > MAX_PUBLICATION_LINGER {
+            return Err(DriverError::InvalidConfig);
+        }
         control_group::validate(&config.nak_control_groups)?;
         let (agents, links) = network_agents_over::<OsSocket, T>(config.agents)
             .map_err(|_| DriverError::InvalidConfig)?;

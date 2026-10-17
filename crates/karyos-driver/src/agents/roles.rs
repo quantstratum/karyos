@@ -347,10 +347,17 @@ pub struct SenderCounters {
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
-    /// Removals with a lane not drained to its seal within
-    /// `publication_linger` of the removal's start: the lane sent no EOS
-    /// and the session was reported drained anyway.
+    /// Removals with a lane not drained to its seal by the drain bound,
+    /// `max(publication_linger, path_heartbeat_interval)` after the
+    /// removal's start: the lane sent no EOS and the session was reported
+    /// drained anyway. A lane its closed guard stopped is not counted here.
     pub removals_undrained: u64,
+    /// Removals with a guarded lane whose guard closed: it sent no EOS
+    /// (GC-6), whether it drained or was given up at the drain bound.
+    pub removals_guard_closed: u64,
+    /// Removals with no established receiver: ended at once, with no
+    /// linger, since nobody would read their EOS.
+    pub removals_unestablished: u64,
     /// Controls not sent (encoding, route, queue or kernel).
     pub send_failures: u64,
     /// Controls for an endpoint whose TX half the sender does not hold.
@@ -4860,8 +4867,12 @@ impl<T: StreamTerms> SenderRole<T> {
                 continue;
             }
             if !established(&self.sessions, outbound) {
-                if let Some(outbound) = self.publications.get_mut(index) {
-                    outbound.drain_now();
+                if self
+                    .publications
+                    .get_mut(index)
+                    .is_some_and(|outbound| outbound.drain_now())
+                {
+                    self.count(|c| &mut c.removals_unestablished);
                 }
                 continue;
             }
@@ -4892,6 +4903,9 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             if step.gave_up {
                 self.count(|c| &mut c.removals_undrained);
+            }
+            if step.guard_closed {
+                self.count(|c| &mut c.removals_guard_closed);
             }
         }
         sent

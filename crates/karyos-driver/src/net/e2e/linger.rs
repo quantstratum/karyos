@@ -406,3 +406,132 @@ fn a_key_is_refused_during_the_linger_and_accepted_after_it() {
             .is_ok()
     );
 }
+
+fn sender_counters(driver: &EmbeddedDriver) -> crate::agents::roles::SenderCounters {
+    driver
+        .net
+        .as_ref()
+        .and_then(|net| net.sender_counters())
+        .unwrap()
+}
+
+/// A guarded lane whose guard closed sends no EOS (GC-6): the publication
+/// submitted everything and its reader read it, the guard closes, the
+/// publication is removed, and no EOS leaves it. The removal is counted as
+/// guard closed, not undrained, and the stream is still freed after the
+/// linger.
+#[test]
+fn a_closed_guard_sends_no_eos_at_removal() {
+    use karyos_sys::guard::Closed;
+
+    use crate::net::NetworkGuard;
+
+    let (mut a, mut b) = (lingering(100 * MS), lingering(100 * MS));
+    let guard = a.add_guard("linger").unwrap();
+    assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
+    let address = free_address();
+    let _ = b
+        .add_network_subscription(10, &channel(address, true))
+        .unwrap();
+    // Spare slots for the sender's reservation and the guard's walker.
+    let mut config = aggregate(10, 3, 1);
+    config.stream.buffer.spare_slots = 4;
+    let publication = a
+        .add_guarded_network_publication(
+            config,
+            &channel(address, true),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    offer_all(&mut a, &publication, 1, 2);
+    let mut seen = 0;
+    pump(&mut [&mut a, &mut b], |_| {
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        seen == 2
+    });
+    let Closed::Now { epoch } = a.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0]
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .effective()
+            == Some(true)
+    });
+    a.remove_aggregate(&publication).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        stream_state(drivers[0], &publication, 0) == StreamState::Freed
+    });
+    let counters = sender_counters(&a);
+    assert_eq!(counters.eos_sent, 0, "{counters:?}");
+    assert_eq!(
+        (counters.removals_guard_closed, counters.removals_undrained),
+        (1, 0),
+        "{counters:?}"
+    );
+    assert_eq!(eos_bounds_received(&mut b), 0);
+}
+
+/// A removal with no established receiver ends at once, with no linger:
+/// nobody would read its EOS. It is counted, and sends none.
+#[test]
+fn a_removal_with_no_established_receiver_ends_at_once() {
+    let mut a = lingering(60_000 * MS);
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(free_address(), true))
+        .unwrap();
+    for _ in 0..20 {
+        let _ = a.do_work().unwrap();
+    }
+    let removed = Instant::now();
+    a.remove_aggregate(&publication).unwrap();
+    pump(&mut [&mut a], |drivers| {
+        stream_state(drivers[0], &publication, 0) == StreamState::Freed
+    });
+    assert!(removed.elapsed() < Duration::from_secs(10), "no linger");
+    let counters = sender_counters(&a);
+    assert_eq!(
+        (counters.removals_unestablished, counters.eos_sent),
+        (1, 0),
+        "{counters:?}"
+    );
+}
+
+/// `publication_linger` is at most 60 s: 60 s is accepted, a nanosecond
+/// more is refused as `InvalidConfig`.
+#[test]
+fn a_linger_above_sixty_seconds_is_refused() {
+    let with = |linger| {
+        EmbeddedDriver::with_config(DriverConfig {
+            network: Some(NetworkConfig {
+                threading: ThreadingMode::Shared,
+                agents: AgentConfig::default(),
+                stream_defaults: NetworkStreamDefaults {
+                    publication_linger: linger,
+                    ..NetworkStreamDefaults::default()
+                },
+                ..NetworkConfig::default()
+            }),
+            ..DriverConfig::default()
+        })
+    };
+    assert_eq!(crate::net::MAX_PUBLICATION_LINGER, 60_000_000_000);
+    assert!(with(crate::net::MAX_PUBLICATION_LINGER).is_ok());
+    assert!(matches!(
+        with(crate::net::MAX_PUBLICATION_LINGER + 1),
+        Err(crate::error::DriverError::InvalidConfig)
+    ));
+}

@@ -84,8 +84,10 @@ fn random_word() -> Option<u64> {
 
 /// The refusal code of a network operation's error. A key still held by
 /// a removed publication's linger (`DuplicateStream`) is
-/// `ResourcesUnavailable`, as every other refusal not listed: a retry after
-/// `publication_linger` succeeds.
+/// `ResourcesUnavailable`, as every other refusal not listed: a retry once
+/// the removal ended succeeds, at worst `max(publication_linger,
+/// path_heartbeat_interval) + publication_linger` after it started (about
+/// 10 s at the defaults).
 fn refusal(error: DriverError) -> ErrorCode {
     match error {
         DriverError::NetworkUnavailable | DriverError::UnsupportedChannel => {
