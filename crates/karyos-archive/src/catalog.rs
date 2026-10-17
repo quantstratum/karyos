@@ -14,14 +14,30 @@
 //!   watermark a compaction writes (`NextId`), so an id is never reused,
 //!   even once its recording is forgotten and compacted away.
 //! - **Compaction.** The live records are written to `catalog.kyc.tmp`,
-//!   synced, renamed over `catalog.kyc`, and the directory synced (Linux).
+//!   synced, renamed over `catalog.kyc`, and the directory synced.
 //!   A crash leaves the old catalog or the new one, never a mix: both hold
 //!   the same recordings.
 //! - **Recovery.** [`Catalog::open`] removes a leftover temporary file
-//!   (its rename never happened), cuts the log at the first torn or
-//!   inconsistent record and reports where. [`Catalog::settle`] then stops
-//!   every recording a crash left open, at its recovered written position,
-//!   with the reason recorded.
+//!   (its rename never happened) and cuts a torn last record, reporting
+//!   where: one that reaches the end of the log, or with only zeros after
+//!   its start. Every append is synced before the next, so any other
+//!   damage is corruption: a record that fails its CRC with more of the
+//!   log behind it, a checked record that does not decode or contradicts
+//!   those before it, or a whole header that is not this format's. The
+//!   open then refuses with [`CatalogError::Corrupt`] or
+//!   [`CatalogError::UnsupportedVersion`] and changes nothing, so no id is
+//!   ever handed out twice. Only a header shorter than its length (a
+//!   creation that did not complete) is written anew.
+//! - **Settling.** [`Catalog::settle`] stops every recording a crash left
+//!   open, at its recovered written position, with the reason recorded.
+//! - **Segment files.** SPEC §8.1 lists a recording's segment files in
+//!   the catalog; here they are derived from its id and geometry (the
+//!   segment store names them by recording id and base position), so no
+//!   record names them.
+//! - **Bounds.** The open reads one record at a time (at most 64 KiB). The
+//!   recordings held in memory, and the vectors `settle` returns, grow
+//!   with the live recordings: one per `Started` not forgotten, which a
+//!   host bounds by forgetting and compacting.
 
 #[cfg(test)]
 mod tests;
@@ -44,6 +60,8 @@ const MAGIC: u32 = u32::from_le_bytes(*b"KYCT");
 const VERSION: u32 = 1;
 /// The header's length: magic, version, reserved, CRC.
 const HEADER: usize = 16;
+/// [`HEADER`] as a file offset.
+const HEADER_LEN: u64 = 16;
 /// A record's head: kind and payload length.
 const HEAD: usize = 4;
 /// A record's tail: its CRC.
@@ -171,6 +189,27 @@ pub enum CatalogError {
     /// No id is left.
     #[error("recording ids exhausted")]
     IdsExhausted,
+    /// A record does not encode: a field is beyond its encoded width.
+    #[error("a catalog record does not encode")]
+    Unencodable,
+    /// The log would pass the largest position a file offset holds.
+    #[error("the catalog log is full")]
+    LogFull,
+    /// The catalog is damaged at `offset`: a header with another magic or
+    /// a failing CRC (offset 0), a record that fails its CRC or does not
+    /// decode with more of the log behind it, or a whole record
+    /// inconsistent with those before it. Nothing is changed.
+    #[error("the catalog is corrupt at offset {offset}")]
+    Corrupt {
+        /// Where.
+        offset: u64,
+    },
+    /// The catalog's format version is not this one's. Nothing is changed.
+    #[error("catalog format version {version} is not supported")]
+    UnsupportedVersion {
+        /// The version found.
+        version: u32,
+    },
     /// An earlier write failed: the catalog's state on disk is unknown
     /// until it is opened again.
     #[error("the catalog failed earlier and must be opened again")]
@@ -474,7 +513,7 @@ impl<D: Disk> Catalog<D> {
                 disk,
                 dir: dir.to_path_buf(),
                 file,
-                end: HEADER as u64,
+                end: HEADER_LEN,
                 recordings: Vec::new(),
                 next_id: 1,
                 failed: false,
@@ -486,30 +525,35 @@ impl<D: Disk> Catalog<D> {
             });
         }
         let file = disk.open(&path)?;
-        let length = usize::try_from(disk.len(&file)?).map_err(io::Error::other)?;
-        let mut bytes = vec![0u8; length];
-        disk.read_at(&file, 0, &mut bytes)?;
+        let length = disk.len(&file)?;
         let mut state = State::default();
-        let mut offset = HEADER;
         let mut cut = None;
-        if bytes.get(..HEADER) != Some(&header()[..]) {
-            // A torn header: the catalog's creation did not complete, so no
-            // record of it was ever reported.
+        let mut offset = HEADER_LEN;
+        if length < HEADER_LEN {
+            // A short header: the catalog's creation did not complete (it is
+            // synced before its name is), so no record of it was reported.
             disk.truncate(&file, 0)?;
             disk.write_at(&file, 0, &header())?;
             cut = Some(0);
         } else {
+            let mut found = [0u8; HEADER];
+            disk.read_at(&file, 0, &mut found)?;
+            check_header(&found)?;
+            let mut buf = Vec::new();
             while offset < length {
-                let Some(next) = parse(&bytes, offset) else {
-                    cut = Some(offset as u64);
-                    break;
-                };
-                let (record, end) = next;
-                if !state.apply(record) {
-                    cut = Some(offset as u64);
-                    break;
+                match parse(&mut disk, &file, offset, length, &mut buf)? {
+                    Parsed::Record(record, end) => {
+                        if !state.apply(record) {
+                            return Err(CatalogError::Corrupt { offset });
+                        }
+                        offset = end;
+                    }
+                    Parsed::Torn => {
+                        cut = Some(offset);
+                        break;
+                    }
+                    Parsed::Corrupt => return Err(CatalogError::Corrupt { offset }),
                 }
-                offset = end;
             }
         }
         if let Some(at) = cut.filter(|at| *at > 0) {
@@ -520,9 +564,9 @@ impl<D: Disk> Catalog<D> {
             disk.sync_dir(dir)?;
         }
         let end = match cut {
-            Some(0) => HEADER as u64,
+            Some(0) => HEADER_LEN,
             Some(at) => at,
-            None => offset as u64,
+            None => offset,
         };
         let next_id = state.next_id().ok_or(CatalogError::IdsExhausted)?;
         Ok(Opened {
@@ -569,12 +613,9 @@ impl<D: Disk> Catalog<D> {
         if self.failed {
             return Err(CatalogError::Failed);
         }
-        let bytes = record.encode().ok_or(CatalogError::IdsExhausted)?;
+        let bytes = record.encode().ok_or(CatalogError::Unencodable)?;
         let length = u64::try_from(bytes.len()).map_err(io::Error::other)?;
-        let end = self
-            .end
-            .checked_add(length)
-            .ok_or(CatalogError::IdsExhausted)?;
+        let end = self.end.checked_add(length).ok_or(CatalogError::LogFull)?;
         let written = self
             .disk
             .write_at(&self.file, self.end, &bytes)
@@ -707,14 +748,14 @@ impl<D: Disk> Catalog<D> {
         let mut bytes = header().to_vec();
         let next = Record::NextId(self.next_id)
             .encode()
-            .ok_or(CatalogError::IdsExhausted)?;
+            .ok_or(CatalogError::Unencodable)?;
         bytes.extend_from_slice(&next);
         for recording in &self.recordings {
             let mut started = recording.clone();
             started.stop = None;
             let record = Record::Started(started)
                 .encode()
-                .ok_or(CatalogError::IdsExhausted)?;
+                .ok_or(CatalogError::Unencodable)?;
             bytes.extend_from_slice(&record);
             if let Some(stop) = recording.stop {
                 let record = Record::Stopped {
@@ -722,7 +763,7 @@ impl<D: Disk> Catalog<D> {
                     stop,
                 }
                 .encode()
-                .ok_or(CatalogError::IdsExhausted)?;
+                .ok_or(CatalogError::Unencodable)?;
                 bytes.extend_from_slice(&record);
             }
         }
@@ -783,17 +824,115 @@ impl<D: Disk + Clone> Catalog<D> {
 
 /// The record at `offset` of `bytes` and the offset after it, if it is
 /// whole and its CRC holds.
-fn parse(bytes: &[u8], offset: usize) -> Option<(Record, usize)> {
-    let head = bytes.get(offset..offset.checked_add(HEAD)?)?;
-    let kind = u16::from_le_bytes(head.get(0..2)?.try_into().ok()?);
-    let length = usize::from(u16::from_le_bytes(head.get(2..4)?.try_into().ok()?));
-    let body_end = offset.checked_add(HEAD)?.checked_add(length)?;
-    let end = body_end.checked_add(TAIL)?;
-    let checked = bytes.get(offset..body_end)?;
-    let crc = u32::from_le_bytes(bytes.get(body_end..end)?.try_into().ok()?);
-    if crc32c(checked) != crc {
-        return None;
+/// What the log holds at an offset.
+enum Parsed {
+    /// A whole, checked record, and the offset after it.
+    Record(Record, u64),
+    /// A record cut by a crash: it reaches the end of the log, or only
+    /// zeros follow its start. Every append is synced before the next, so
+    /// only the last record can be torn.
+    Torn,
+    /// A record that fails its CRC or does not decode, with more of the
+    /// log behind it.
+    Corrupt,
+}
+
+/// Validates a whole header.
+fn check_header(found: &[u8; HEADER]) -> Result<(), CatalogError> {
+    let corrupt = CatalogError::Corrupt { offset: 0 };
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(found.get(at..at + 4)?.try_into().ok()?))
+    };
+    let (Some(magic), Some(version), Some(crc)) = (word(0), word(4), word(12)) else {
+        return Err(corrupt);
+    };
+    if magic != MAGIC || crc32c(found.get(..12).unwrap_or_default()) != crc {
+        return Err(corrupt);
     }
-    let payload = bytes.get(offset.checked_add(HEAD)?..body_end)?;
-    Some((Record::decode(kind, payload)?, end))
+    if version != VERSION {
+        return Err(CatalogError::UnsupportedVersion { version });
+    }
+    if found != &header() {
+        return Err(corrupt);
+    }
+    Ok(())
+}
+
+/// Reads the record at `offset` of a log `length` bytes long, through
+/// `buf`.
+fn parse<D: Disk>(
+    disk: &mut D,
+    file: &D::File,
+    offset: u64,
+    length: u64,
+    buf: &mut Vec<u8>,
+) -> Result<Parsed, CatalogError> {
+    let available = length - offset;
+    let head_len = u64::try_from(HEAD).map_err(io::Error::other)?;
+    if available < head_len {
+        return Ok(Parsed::Torn);
+    }
+    let mut head = [0u8; HEAD];
+    disk.read_at(file, offset, &mut head)?;
+    let [kind_low, kind_high, length_low, length_high] = head;
+    let kind = u16::from_le_bytes([kind_low, kind_high]);
+    let body = usize::from(u16::from_le_bytes([length_low, length_high]));
+    let whole = HEAD + body + TAIL;
+    let whole_len = u64::try_from(whole).map_err(io::Error::other)?;
+    if whole_len >= available {
+        // Reaching the end of the log, even exactly: a crash may leave the
+        // length extended over bytes never written.
+        if whole_len > available || !checks(disk, file, offset, whole, buf)? {
+            return Ok(Parsed::Torn);
+        }
+    } else if !checks(disk, file, offset, whole, buf)? {
+        return if zeros_from(disk, file, offset, length)? {
+            Ok(Parsed::Torn)
+        } else {
+            Ok(Parsed::Corrupt)
+        };
+    }
+    let payload = buf.get(HEAD..HEAD + body).unwrap_or_default();
+    match Record::decode(kind, payload) {
+        Some(record) => Ok(Parsed::Record(record, offset + whole_len)),
+        // A valid CRC over a record that does not decode: never a tear.
+        None => Ok(Parsed::Corrupt),
+    }
+}
+
+/// Reads the `whole` record at `offset` into `buf`; whether its CRC holds.
+fn checks<D: Disk>(
+    disk: &mut D,
+    file: &D::File,
+    offset: u64,
+    whole: usize,
+    buf: &mut Vec<u8>,
+) -> Result<bool, CatalogError> {
+    buf.clear();
+    buf.resize(whole, 0);
+    disk.read_at(file, offset, buf)?;
+    let (checked, tail) = buf.split_at(whole - TAIL);
+    let crc = u32::from_le_bytes(tail.try_into().map_err(io::Error::other)?);
+    Ok(crc32c(checked) == crc)
+}
+
+/// Whether the log holds only zeros from `offset` to `length`.
+fn zeros_from<D: Disk>(
+    disk: &mut D,
+    file: &D::File,
+    offset: u64,
+    length: u64,
+) -> Result<bool, CatalogError> {
+    let mut chunk = [0u8; 4096];
+    let mut at = offset;
+    while at < length {
+        let take = usize::try_from((length - at).min(4096)).map_err(io::Error::other)?;
+        let part = chunk.get_mut(..take).unwrap_or_default();
+        disk.read_at(file, at, part)?;
+        if part.iter().any(|&byte| byte != 0) {
+            return Ok(false);
+        }
+        at += u64::try_from(take).map_err(io::Error::other)?;
+    }
+    Ok(true)
 }

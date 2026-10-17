@@ -63,9 +63,9 @@ pub trait Disk {
     /// The operating system's error.
     fn sync(&mut self, file: &Self::File) -> io::Result<()>;
 
-    /// Makes the entries of `dir` durable: a file created there survives a
-    /// crash only after this (Linux). Elsewhere it does nothing, and a new
-    /// file's entry is made durable with its first `F_FULLFSYNC`.
+    /// Makes the entries of `dir` durable: a file created, renamed or
+    /// removed there survives a crash only after this. It syncs the
+    /// directory on every unix target (`F_FULLFSYNC` on Apple ones).
     ///
     /// # Errors
     ///
@@ -141,11 +141,13 @@ impl Disk for StdDisk {
     }
 
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
+        // `fsync` of the directory on Linux; `F_FULLFSYNC` of it on Apple
+        // targets, where the standard library issues it for `sync_all`.
+        #[cfg(unix)]
         {
             std::fs::File::open(dir)?.sync_all()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             let _ = dir;
             Ok(())
