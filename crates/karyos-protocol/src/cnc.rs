@@ -93,6 +93,8 @@
 //! (the detail names the parse error), one the driver cannot serve with
 //! `UnsupportedChannel`, and a subscription whose reliability differs from
 //! its endpoint and stream's existing one with `ReliabilityMismatch`.
+//! `ReceiverIdentityMismatch` (code 15) answers a subscription whose
+//! configured receiver identity differs from its key's existing one.
 //!
 //! `AllocateCounter` (`quantstratum-docs:
 //! karyos/design/observability-and-tools.md`, "Client counters") continues
@@ -799,6 +801,9 @@ pub enum ErrorCode {
     /// A network subscription asks for another reliability than the one
     /// its endpoint and stream are already subscribed with (W5b).
     ReliabilityMismatch,
+    /// A network subscription names another receiver identity than the
+    /// one its endpoint and stream are already subscribed with (MC-1).
+    ReceiverIdentityMismatch,
 }
 
 impl ErrorCode {
@@ -818,6 +823,7 @@ impl ErrorCode {
             Self::InvalidChannel => 12,
             Self::UnsupportedChannel => 13,
             Self::ReliabilityMismatch => 14,
+            Self::ReceiverIdentityMismatch => 15,
         }
     }
 
@@ -837,6 +843,7 @@ impl ErrorCode {
             12 => Self::InvalidChannel,
             13 => Self::UnsupportedChannel,
             14 => Self::ReliabilityMismatch,
+            15 => Self::ReceiverIdentityMismatch,
             _ => return None,
         })
     }
@@ -3214,7 +3221,7 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(15), None);
+        assert_eq!(ErrorCode::from_code(16), None);
     }
 
     #[test]
@@ -3327,9 +3334,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 15 is not defined.
+        // Error code 16 is not defined.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 15, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 16, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }
@@ -3776,6 +3783,7 @@ mod properties {
                 ErrorCode::InvalidChannel,
                 ErrorCode::UnsupportedChannel,
                 ErrorCode::ReliabilityMismatch,
+                ErrorCode::ReceiverIdentityMismatch,
             ][..],
         );
         prop_oneof![

@@ -538,6 +538,134 @@ fn a_multicast_publication_reaches_every_subscriber() {
     });
 }
 
+/// MC-1, the "required receiver precedence" row: a live required
+/// receiver bounds the sender under every strategy. On one multicast group
+/// B (receiver 77) stalls its subscriber and C reads everything. Under
+/// `max` with no required receiver, the sender follows C and is not held;
+/// with B required it is held at B's window, under `max` and under a
+/// `tagged` group that C alone is in. The channel is unreliable, so only the
+/// strategy limit bounds the sender (no retention hold). Linux, after the
+/// multicast probe.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_required_receiver_bounds_every_strategy() {
+    use std::io::Write as _;
+
+    use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED a_required_receiver_bounds_every_strategy: {why}"
+        );
+        return;
+    }
+    let identity = |id: u64, group_tag: u64| ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(id).unwrap(),
+        group_tag,
+    };
+    let cases = [
+        ("max", Strategy::Max, Vec::new(), Vec::new(), None, false),
+        (
+            "max, B required",
+            Strategy::Max,
+            vec![77],
+            Vec::new(),
+            None,
+            true,
+        ),
+        (
+            "tagged C, B required",
+            Strategy::Tagged(9),
+            vec![77],
+            vec![(88, 9)],
+            Some(identity(88, 9)),
+            true,
+        ),
+    ];
+    for (name, strategy, required, tags, c_identity, held) in cases {
+        let port = free_address().port();
+        let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), port);
+        let channel = UdpConfig {
+            destination: Destination::Multicast { group, ttl: None },
+            interface: None,
+            paths: Vec::new(),
+            reliable: false,
+            flow_control: None,
+            security: Security::Trusted,
+        };
+        let (mut a, mut b, mut c) = (
+            driver(ThreadingMode::Shared),
+            driver(ThreadingMode::Shared),
+            driver(ThreadingMode::Shared),
+        );
+        let _ = b
+            .add_network_subscription_as(10, &channel, identity(77, 0))
+            .unwrap();
+        let _ = match c_identity {
+            Some(identity) => c.add_network_subscription_as(10, &channel, identity),
+            None => c.add_network_subscription(10, &channel),
+        }
+        .unwrap();
+        let publication = a
+            .add_network_publication_with_roles(
+                aggregate(10, 3, 1),
+                &channel,
+                PublicationRoles {
+                    strategy,
+                    required,
+                    tags,
+                },
+            )
+            .unwrap();
+        let mut images = (None, None);
+        pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+            images = (
+                drivers[1].network_image(10, 3),
+                drivers[2].network_image(10, 3),
+            );
+            images.0.is_some() && images.1.is_some()
+        });
+        let (Some(stalled), Some(fast)) = images else {
+            unreachable!("pumped until both exist");
+        };
+        // B's subscriber never reads; C's reads everything.
+        let _stalled = b.subscribe_aggregate(&stalled, Role::Required).unwrap();
+        let mut reader = c.subscribe_aggregate(&fast, Role::Required).unwrap();
+        let mut lane = a
+            .publication(publication.lane(Lane::ZERO).unwrap())
+            .unwrap();
+        let (mut accepted, mut delivered) = (0u32, 0u32);
+        for _ in 0..4000 {
+            if matches!(
+                lane.offer(&[7u8; 1000]).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                accepted += 1;
+            }
+            let _ = a.do_work().unwrap();
+            let _ = b.do_work().unwrap();
+            let _ = c.do_work().unwrap();
+            let _ = reader.poll(|_, _, _| delivered += 1, BUDGET);
+        }
+        if held {
+            assert!(
+                accepted < 1024,
+                "{name}: {accepted} accepted while B stalls"
+            );
+            // Held at B's window, not before any send: B joined as the
+            // required receiver (one that never joins holds every first
+            // send).
+            assert!(delivered > 0, "{name}: nothing sent");
+        } else {
+            assert!(
+                accepted >= 1024,
+                "{name}: held at {accepted} with no required receiver"
+            );
+        }
+    }
+}
+
 /// Whether this host carries IPv4 multicast on its default route back to
 /// itself: a group joined on one plain socket receives what another sends.
 #[cfg(target_os = "linux")]

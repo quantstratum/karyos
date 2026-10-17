@@ -29,6 +29,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Receiver roles and tags reach the network agents, driver-internal (MC-1,
+  MC-2; the public way in is owner item 7). A network publication can
+  carry `PublicationRoles` (its strategy, required receiver ids and tagged
+  ones), which build its membership, now created at the add's time so a
+  required receiver's join is timed from it. A network subscription can
+  carry a `ReceiverIdentity` (a configured `receiver_id` and its
+  `group_tag`), which its images name in every RB block (SMs, NAKs, RTTM
+  requests and reply matching) instead of the id derived from their slot.
+  Subscriptions sharing a receiver entry must agree on its identity
+  (`DriverError::ReceiverIdentityMismatch`, `ErrorCode` 15). An SM whose
+  declared tag is not the one configured for its receiver is dropped whole
+  before the sender's binding (`SenderCounters::sm_tag_mismatch`), so it
+  never establishes a session or holds retention (MC-2).
+
 - `make netem` (`scripts/netem-test.sh`, W6): the network fault tests in
   Linux Docker with `NET_ADMIN`, under tc netem on the container's own
   loopback (default profile: 2% loss, 10% reorder, 1 ms delay, 1%

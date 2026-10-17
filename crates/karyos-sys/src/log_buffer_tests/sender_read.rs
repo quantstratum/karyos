@@ -6,6 +6,7 @@
 
 use crate::receive::{FrameKind, ImageParams, Item, ValidatedDatagram};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use crate::term::TermCount;
 
@@ -13,6 +14,11 @@ use crate::term::TermCount;
 fn sr_out() -> Vec<u8> {
     vec![0u8; DEFAULT_MTU as usize]
 }
+
+/// How long a threaded reader may see no new frame before it fails: a
+/// time bound rather than a spin count, so a loaded machine slows the
+/// publisher without failing the test.
+const NO_PROGRESS: Duration = Duration::from_secs(10);
 
 /// The read capability over a new reserved required subscriber of
 /// `conductor` (S2 2.1).
@@ -984,6 +990,10 @@ fn sender_read_runs_beside_a_publisher_and_its_conductor() {
                     match publication.append(message, AppendOptions::default()).unwrap() {
                         AppendOutcome::Appended { .. } => break,
                         AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
+                            // The reader stopped (a failed check): stop too.
+                            if done.load(Ordering::Acquire) {
+                                return;
+                            }
                             let _ = conductor.duty_cycle().unwrap();
                             std::thread::yield_now();
                         }
@@ -996,18 +1006,29 @@ fn sender_read_runs_beside_a_publisher_and_its_conductor() {
                 std::thread::yield_now();
             }
         });
+        // Ends the publisher's loop on a reader panic too.
+        struct Done<'a>(&'a AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _done = Done(done);
         let mut out = sr_out();
-        let mut spins = 0u64;
+        let mut progress = Instant::now();
         while sink.messages.len() < messages.len() {
             match sr_read(&mut reader, &mut out) {
-                Ok(ReadOutcome::Copied { len, .. }) => sink.datagram(&out[..len]),
+                Ok(ReadOutcome::Copied { len, .. }) => {
+                    sink.datagram(&out[..len]);
+                    progress = Instant::now();
+                }
                 Ok(ReadOutcome::Canonical { record, .. }) => {
                     assert_eq!(record, CanonicalKind::Pad);
                     sink.pads += 1;
+                    progress = Instant::now();
                 }
                 Ok(ReadOutcome::Pending) | Err(ReadError::Retry) => {
-                    spins += 1;
-                    assert!(spins < 50_000_000, "no progress");
+                    assert!(progress.elapsed() < NO_PROGRESS, "no progress");
                     std::thread::yield_now();
                 }
                 Err(error) => panic!("{error:?} at {}", reader.position()),
@@ -1077,6 +1098,7 @@ fn sender_read_nak_runs_beside_a_publisher_and_its_conductor() {
         let mut nak_out = sr_out();
         let mut recent: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
         let mut spins = 0u64;
+        let mut progress = Instant::now();
         while sink.messages.len() < messages.len() {
             let from = reader.position();
             match sr_read(&mut reader, &mut out) {
@@ -1086,12 +1108,16 @@ fn sender_read_nak_runs_beside_a_publisher_and_its_conductor() {
                         recent.pop_front();
                     }
                     recent.push_back((from, out[..len].to_vec()));
+                    progress = Instant::now();
                 }
-                Ok(ReadOutcome::Canonical { .. }) => sink.pads += 1,
+                Ok(ReadOutcome::Canonical { .. }) => {
+                    sink.pads += 1;
+                    progress = Instant::now();
+                }
                 Ok(ReadOutcome::Pending) | Err(ReadError::Retry) => {
                     spins += 1;
                     assert!(
-                        spins < 200_000,
+                        progress.elapsed() < NO_PROGRESS,
                         "no progress: position {} sent {} messages {}",
                         reader.position(),
                         reader.sent_position(),

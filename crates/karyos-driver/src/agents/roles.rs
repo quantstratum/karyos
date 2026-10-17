@@ -98,7 +98,7 @@ const DATA_BUDGET: karyos_protocol::lanes::drr::Budget = karyos_protocol::lanes:
 use super::repair::{NakOutcome as NakIntake, RepairConfig};
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
-use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
+use crate::membership::{Membership, MembershipConfig, PublicationRoles, Roles, SmKey};
 use crate::repair::admission::Requester;
 use crate::repair::draw::{OsDelayDraw, Refill};
 use crate::repair::loss::{
@@ -330,6 +330,9 @@ pub struct SenderCounters {
     /// NAKs from no receiver bound on that endpoint (source, alias, boot
     /// id, incarnation and receiver id), or for no reliable publication.
     pub nak_unbound: u64,
+    /// SMs whose declared tag is not the one configured for their receiver
+    /// (MC-2): dropped whole before the binding.
+    pub sm_tag_mismatch: u64,
     /// ERR NAK_REPLYs sent (admission's and step 8's).
     pub nak_replies: u64,
     /// Step 8 ERRs whose requester has no bound source: not sent.
@@ -427,6 +430,10 @@ pub struct ReceiverRole {
     /// whether the channel is reliable (its `reliable` parameter), and
     /// whether the endpoint receives a multicast group.
     subscriptions: Vec<(EndpointId, i32, u32, bool, bool)>,
+    /// The configured receiver identities of subscribed keys (MC-1, MC-2;
+    /// at most one per key, allocated at start): their images name the
+    /// configured `receiver_id` and declare its `group_tag`.
+    identities: Vec<(EndpointId, i32, crate::membership::ReceiverIdentity)>,
     /// Whether a subscription was ever removed: from then on each cycle
     /// retires the images of streams no longer subscribed (bounded by the
     /// subscription table).
@@ -823,6 +830,11 @@ struct Installed {
     /// Its subscription's NAK control group: the endpoint joined to it and
     /// the group's address (RC-7, RC-15).
     control_group: Option<(EndpointId, SocketAddr)>,
+    /// The `receiver_id` it names in every RB block: its key's configured
+    /// identity, else derived from its slot.
+    receiver_id: u64,
+    /// The `group_tag` its SMs declare (0 without a configured identity).
+    group_tag: u64,
 }
 
 /// One lane's NAK in flight: its report slot (the RTTM probe's contract:
@@ -1170,6 +1182,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             groups: Vec::with_capacity(config.subscriptions),
             group_budget: config.group_nak_budget,
             group_start: 0,
+            identities: Vec::with_capacity(config.subscriptions),
             unsubscribed: false,
             published: Vec::with_capacity(config.subscriptions),
             max_entries: config.subscriptions,
@@ -1231,6 +1244,20 @@ fn answerable(source: SocketAddr) -> bool {
 }
 
 impl ReceiverRole {
+    /// The configured identity of the key `(endpoint, stream_id)`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn configured_identity(
+        &self,
+        endpoint: EndpointId,
+        stream_id: i32,
+    ) -> Option<crate::membership::ReceiverIdentity> {
+        self.identities
+            .iter()
+            .find(|(held, stream, _)| (*held, *stream) == (endpoint, stream_id))
+            .map(|(.., identity)| *identity)
+    }
+
     /// The receiver's commands: `AddSubscription` and `AddPublishedAlias`;
     /// the sender's are refused.
     pub(super) fn command<O: SocketOps>(
@@ -1252,6 +1279,7 @@ impl ReceiverRole {
                 reliable,
                 multicast,
                 control_group,
+                identity,
             } => {
                 let held = self
                     .subscriptions
@@ -1277,6 +1305,11 @@ impl ReceiverRole {
                         ));
                         if let Some((control, group)) = control_group {
                             self.groups.push((endpoint, stream_id, control, group));
+                        }
+                        // A shared key's identity is its first
+                        // subscription's: the conductor refuses another.
+                        if let Some(identity) = identity {
+                            self.identities.push((endpoint, stream_id, identity));
                         }
                         true
                     }
@@ -1315,6 +1348,8 @@ impl ReceiverRole {
                     .position(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id));
                 if let Some(index) = found {
                     self.subscriptions.swap_remove(index);
+                    self.identities
+                        .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
                     self.unsubscribed = true;
                 }
                 if let Some(index) = self
@@ -1418,9 +1453,14 @@ impl ReceiverRole {
     /// `slot` (tests).
     #[cfg(test)]
     pub(super) fn receiver_of(&self, slot: SlotRef) -> Receiver {
+        let named = self
+            .images
+            .iter()
+            .find(|image| image.slot == slot)
+            .map_or(receiver_id(slot), |image| image.receiver_id);
         Receiver {
             receiver_boot_id: self.sessions.boot_id(),
-            receiver_id: receiver_id(slot),
+            receiver_id: named,
         }
     }
 
@@ -1820,9 +1860,19 @@ impl ReceiverRole {
             .iter()
             .find(|(held, stream, ..)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
             .map(|(_, _, control, group)| (*control, *group));
+        // The configured identity of its key, else an id derived from the
+        // slot and tag 0.
+        let configured = self
+            .identities
+            .iter()
+            .find(|(held, stream, _)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
+            .map(|(.., identity)| *identity);
+        let (named, group_tag) = configured.map_or((receiver_id(installed), 0), |identity| {
+            (identity.receiver_id.get(), identity.group_tag)
+        });
         let receiver = Receiver {
             receiver_boot_id: self.sessions.boot_id(),
-            receiver_id: receiver_id(installed),
+            receiver_id: named,
         };
         // A multicast image times its NAKs by cycle (RC-2).
         let loss = ImageLoss::new(
@@ -1920,6 +1970,8 @@ impl ReceiverRole {
             routes: vec![CopyRoute::default(); paths],
             anchored: [None; 4],
             control_group,
+            receiver_id: named,
+            group_tag,
         });
         Ok(())
     }
@@ -2323,7 +2375,7 @@ impl ReceiverRole {
         }
         let receiver = Receiver {
             receiver_boot_id: sessions.boot_id(),
-            receiver_id: receiver_id(image.slot),
+            receiver_id: image.receiver_id,
         };
         let mut sent = 0u32;
         for (path, probe) in image.probes.iter_mut().enumerate() {
@@ -2411,7 +2463,7 @@ impl ReceiverRole {
         else {
             return;
         };
-        let receiver_id = receiver_id(image.slot);
+        let receiver_id = image.receiver_id;
         let status = StatusMessage {
             alias: image.key.alias,
             identity: image.identity,
@@ -2419,7 +2471,7 @@ impl ReceiverRole {
                 receiver_boot_id: boot_id,
                 receiver_id,
             },
-            group_tag: 0,
+            group_tag: image.group_tag,
             lanes,
         };
         // One slot per image (S1): a period whose previous SM still waits
@@ -2673,7 +2725,7 @@ impl GroupIntake<'_> {
         }
         // 3. Never this receiver's own copy, looped back.
         let mine = Receiver {
-            receiver_id: receiver_id(image.slot),
+            receiver_id: image.receiver_id,
             ..own
         };
         if nak.receiver == mine {
@@ -2779,7 +2831,7 @@ impl Intake<'_> {
                         && rttm.receiver
                             == Receiver {
                                 receiver_boot_id: boot_id,
-                                receiver_id: receiver_id(slot),
+                                receiver_id: image.receiver_id,
                             }
                 })?;
                 Some((index, path))
@@ -3308,14 +3360,15 @@ impl SenderRole {
         &mut self,
         command: AgentCommand<O>,
     ) -> Option<(Reservation, AgentEvent<O>)> {
-        let (reply, publication, outbound, guard) =
+        let (reply, publication, outbound, guard, roles) =
             match command {
                 AgentCommand::AddPublication {
                     reply,
                     publication,
                     outbound,
                     guard,
-                } => (reply, publication, outbound, guard),
+                    roles,
+                } => (reply, publication, outbound, guard, roles),
                 AgentCommand::RemovePublication {
                     reply,
                     endpoint,
@@ -3350,21 +3403,29 @@ impl SenderRole {
             && outbound.readers().len() == usize::from(publication.lane_count);
         // Its receivers' membership (multicast-flow-control.md): windows
         // from the largest datagram to half a term, as receivers grant, and
-        // the driver's SM cadence and liveness; roles and tags are not
-        // configurable yet, so no required member and the creation time (it
-        // only times a required member's join) is 0.
+        // the driver's SM cadence and liveness; its configured roles, tags
+        // and strategy (MC-1; none: `min` with no required or tagged
+        // receiver), created now, which times the required set's join.
         let max_window =
             (publication.term.term_length / 2).min(MAX_WINDOW) & !(FRAME_ALIGNMENT - 1);
+        let created = (self.clock)();
         let membership = u32::try_from(outbound.max_frame())
             .ok()
             .and_then(|min_window| {
-                Membership::new(
+                let mut config =
                     self.membership
-                        .config(publication.lane_count, min_window, max_window),
+                        .config(publication.lane_count, min_window, max_window);
+                if let Some(roles) = roles.as_deref() {
+                    config.strategy = roles.strategy;
+                }
+                Membership::new(
+                    config,
                     publication.identity,
                     publication.alias,
-                    &Roles::default(),
-                    0,
+                    &roles
+                        .as_deref()
+                        .map_or_else(Roles::default, PublicationRoles::roles),
+                    created,
                 )
                 .ok()
             });
@@ -3722,6 +3783,26 @@ impl SenderRole {
     #[cfg(test)]
     pub(super) fn set_clock(&mut self, clock: fn() -> u64) {
         self.clock = clock;
+    }
+
+    /// The receiver ids the bindings of `alias` learned from their SMs
+    /// (tests).
+    #[cfg(test)]
+    pub(super) fn bound_receivers(&self, alias: Alias) -> Vec<Option<u64>> {
+        self.bindings
+            .iter()
+            .filter(|binding| binding.alias == alias)
+            .map(|binding| binding.receiver_id)
+            .collect()
+    }
+
+    /// The membership of the publication `alias` (tests).
+    #[cfg(test)]
+    pub(super) fn membership_of(&self, alias: Alias) -> Option<&Membership> {
+        self.publications
+            .iter()
+            .find(|outbound| outbound.alias() == alias)
+            .and_then(|outbound| outbound.membership())
     }
 
     /// Drops every NAK unread from now on, as a sender that never repairs
@@ -4127,11 +4208,25 @@ impl SenderRole {
     ) {
         self.expire_bindings(now);
         let source = normalized(source);
-        let lane_count = self
+        let publication = self
             .publications
             .iter()
-            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
-            .and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
+            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias);
+        let lane_count =
+            publication.and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
+        // MC-2: an SM whose declared tag is not the one configured for its
+        // receiver is rejected whole before it touches the binding, so it
+        // neither refreshes nor pins it, establishes the session, nor holds
+        // retention through its consumption.
+        let tag_ok = publication
+            .and_then(|outbound| outbound.membership())
+            .is_none_or(|membership| {
+                membership.configured_tag(status.receiver.receiver_id) == status.group_tag
+            });
+        if !tag_ok {
+            self.count(|c| &mut c.sm_tag_mismatch);
+            return;
+        }
         // The incarnation is part of the binding: an earlier incarnation's
         // row from the same receiver never shadows the current one.
         let found = self.bindings.iter_mut().find(|binding| {

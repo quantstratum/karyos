@@ -215,6 +215,8 @@ struct NetSubscription {
     /// The endpoint joined to the data group's NAK control group, if the
     /// table names one and its join succeeded (RC-15).
     control: Option<EndpointId>,
+    /// The receiver identity every handle of this key shares (MC-1).
+    identity: Option<crate::membership::ReceiverIdentity>,
     /// The endpoints of the channel's later redundant paths, each with its
     /// own receiver entry (redundant-paths.md; the first path is
     /// `endpoint`).
@@ -458,21 +460,24 @@ impl Network {
     /// repairs its images' losses with NAKs, otherwise its skip policy
     /// seals them. A second subscription of the same endpoint and stream
     /// shares the first's receiver entry, so it must ask for the same
-    /// reliability ([`DriverError::ReliabilityMismatch`] otherwise).
+    /// reliability ([`DriverError::ReliabilityMismatch`] otherwise), and
+    /// the same receiver `identity`, configured or not
+    /// ([`DriverError::ReceiverIdentityMismatch`] otherwise).
     ///
     /// # Errors
     ///
     /// [`DriverError::NetworkSubscriptionsFull`],
     /// [`DriverError::NetworkEndpoint`], [`DriverError::NetworkBusy`],
-    /// [`DriverError::ReliabilityMismatch`].
+    /// [`DriverError::ReliabilityMismatch`],
+    /// [`DriverError::ReceiverIdentityMismatch`].
     pub(crate) fn add_subscription(
         &mut self,
         stream_id: i32,
-        bind: SocketAddr,
-        multicast: Option<MulticastConfig>,
+        (bind, multicast): (SocketAddr, Option<MulticastConfig>),
         later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
         reliable: bool,
+        identity: Option<crate::membership::ReceiverIdentity>,
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
         let endpoint = self.hold_endpoint(bind, multicast)?;
@@ -490,6 +495,12 @@ impl Network {
             if entry.reliable != reliable {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::ReliabilityMismatch);
+            }
+            // Its images name one receiver identity: a subscriber must not
+            // be counted under another's, nor under a derived one.
+            if entry.identity != identity {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::ReceiverIdentityMismatch);
             }
             let Some(users) = entry.users.checked_add(1) else {
                 release(&mut self.send_endpoints, endpoint);
@@ -521,6 +532,7 @@ impl Network {
                 reliable,
                 multicast: group,
                 control_group: control,
+                identity,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
@@ -550,6 +562,7 @@ impl Network {
                     reliable,
                     multicast: true,
                     control_group: None,
+                    identity,
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
@@ -563,6 +576,7 @@ impl Network {
             stream_id,
             reliable,
             control: control.map(|(control, _)| control),
+            identity,
             later: held,
             users: 1,
         });
@@ -850,6 +864,28 @@ impl Network {
         self.subscriptions.len()
     }
 
+    /// The configured identity the receiver holds for each path endpoint
+    /// of the subscription to `stream_id`, the first path first (tests,
+    /// Shared mode only).
+    #[cfg(test)]
+    pub(crate) fn path_identities(
+        &self,
+        stream_id: i32,
+    ) -> Vec<Option<crate::membership::ReceiverIdentity>> {
+        let (Some(entry), Agents::Shared(agents)) = (
+            self.subscriptions
+                .iter()
+                .find(|entry| entry.stream_id == stream_id),
+            &self.agents,
+        ) else {
+            return Vec::new();
+        };
+        core::iter::once(entry.endpoint)
+            .chain(entry.later.into_iter().flatten())
+            .map(|endpoint| agents.receiver.configured_identity(endpoint, stream_id))
+            .collect()
+    }
+
     /// Network publications tracked, for tests.
     #[cfg(test)]
     pub(crate) fn publication_count(&self) -> usize {
@@ -898,6 +934,7 @@ impl Network {
             crate::agents::data::GuardSpec,
             crate::guard_ack::GuardSenderId,
         )>,
+        roles: Option<Box<crate::membership::PublicationRoles>>,
     ) -> Result<(), DriverError> {
         let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
         let (endpoint, alias) = (publication.endpoint, publication.alias);
@@ -953,6 +990,7 @@ impl Network {
                 publication,
                 outbound,
                 guard: spec,
+                roles,
             });
         if posted.is_err() {
             // The receiver learned the alias: it is stale now. The capacity
