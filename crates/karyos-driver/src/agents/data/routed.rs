@@ -77,13 +77,6 @@ pub(super) struct RoutedTrack {
 
 /// One to [`MAX_ROUTES`] routes, each on its own endpoint: each route's TX
 /// half is found by its endpoint.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "test-only until rp-w4b2b wires routed publications (#321 interlock)"
-    )
-)]
 fn check_routes(routes: &[(EndpointId, SocketAddr)]) -> Result<(), OutboundError> {
     let shared = (0..routes.len()).any(|index| {
         let (seen, rest) = routes.split_at(index);
@@ -109,13 +102,6 @@ pub(super) struct Routed {
 impl Routed {
     /// The routed part of a publication of `lanes` lanes over `routes`,
     /// served under `config`, reading datagrams of at most `mtu` bytes.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "test-only until rp-w4b2b wires routed publications (#321 interlock)"
-        )
-    )]
     pub(super) fn new(
         routes: &[(EndpointId, SocketAddr)],
         lanes: usize,
@@ -337,15 +323,8 @@ impl Outbound {
     /// # Errors
     ///
     /// [`OutboundError`].
-    /// Driver-internal until rp-w4b2b wires routed publications: only tests
-    /// construct one (the #321 interlock).
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "test-only until rp-w4b2b wires routed publications (#321 interlock)"
-        )
-    )]
+    /// Driver-internal: `net/publish.rs` builds one for a channel with
+    /// `paths`, behind `SocketOps::isolates_paths` (rp-w4b2c).
     pub(crate) fn new_routed(
         routes: &[(EndpointId, SocketAddr)],
         alias: karyos_protocol::network::Alias,

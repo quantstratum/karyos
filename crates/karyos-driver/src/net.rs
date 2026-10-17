@@ -183,6 +183,9 @@ struct NetPublication {
     /// The aggregate's registration.
     registration: u64,
     endpoint: EndpointId,
+    /// The endpoints of its later paths (redundant-paths.md): each holds a
+    /// send endpoint and the receiver's published alias, as `endpoint` does.
+    later: [Option<EndpointId>; LATER_PATHS],
     alias: Alias,
     state: NetworkPublicationState,
     /// Whether `RemovePublication` is posted; retried while the ring is
@@ -1215,6 +1218,14 @@ impl Network {
     ) -> Result<(), DriverError> {
         let (spec, guard_sender) = guard.map_or((None, None), |(spec, id)| (Some(spec), Some(id)));
         let (endpoint, alias) = (publication.endpoint, publication.alias);
+        // Its later paths: each endpoint publishes the alias, so the
+        // receiver hands that path's SMs and NAKs to the sender.
+        let mut later = [None; LATER_PATHS];
+        for (slot, path) in later.iter_mut().zip(outbound.route_endpoints().skip(1)) {
+            *slot = Some(path);
+        }
+        let paths = || core::iter::once(endpoint).chain(later.into_iter().flatten());
+        let mine = |key: &(EndpointId, Alias)| key.1 == alias && paths().any(|path| path == key.0);
         let (traced, lanes) = (
             trace::identity(&publication.identity, alias),
             publication.lane_count,
@@ -1222,47 +1233,64 @@ impl Network {
         // One tracked publication per key: the sender's answers then name
         // exactly one entry, and a key freed locally while its old
         // publication is still being removed waits for it (#279 P1).
-        if self
-            .publications
-            .iter()
-            .any(|entry| (entry.endpoint, entry.alias) == (endpoint, alias))
-        {
+        if self.publications.iter().any(|entry| {
+            entry.alias == alias && entry.paths().any(|held| paths().any(|path| path == held))
+        }) {
             return Err(DriverError::NetworkBusy);
         }
-        // A queued alias of this key is superseded by the add below, so it
-        // takes no room.
+        // Each path's alias takes room, held or stale. A queued alias of
+        // one of its keys is superseded by the add below, so it takes none.
+        let held = self.publications.iter().try_fold(0usize, |held, entry| {
+            held.checked_add(entry.paths().count())
+        });
         let stale_only = self
             .stale_aliases
             .iter()
             .filter(|key| {
-                **key != (endpoint, alias)
-                    && !self
-                        .publications
-                        .iter()
-                        .any(|entry| (entry.endpoint, entry.alias) == **key)
+                !mine(key)
+                    && !self.publications.iter().any(|entry| {
+                        entry.alias == key.1 && entry.paths().any(|path| path == key.0)
+                    })
             })
             .count();
-        if self
-            .publications
-            .len()
-            .checked_add(stale_only)
-            .is_none_or(|held| held >= self.capacity)
-        {
+        let total = held
+            .and_then(|held| held.checked_add(stale_only))
+            .and_then(|held| held.checked_add(paths().count()));
+        if total.is_none_or(|total| total > self.capacity) {
             return Err(DriverError::NetworkPublicationsFull);
         }
-        self.links
-            .receiver
-            .post(|reply| AgentCommand::AddPublishedAlias {
-                reply,
-                endpoint,
-                alias,
-            })
-            .map_err(|_| DriverError::NetworkBusy)?;
+        let mut published = 0usize;
+        for path in paths() {
+            let posted = self
+                .links
+                .receiver
+                .post(|reply| AgentCommand::AddPublishedAlias {
+                    reply,
+                    endpoint: path,
+                    alias,
+                });
+            if posted.is_err() {
+                // The paths already published are stale now; the capacity
+                // check above leaves room for them.
+                let mut stale = Stale {
+                    queue: &mut self.stale_aliases,
+                    overflows: &mut self.stale_overflows,
+                };
+                for path in paths().take(published) {
+                    stale.queue_alias(path, alias);
+                }
+                return Err(DriverError::NetworkBusy);
+            }
+            // At most four paths: no overflow.
+            if let Some(next) = published.checked_add(1) {
+                published = next;
+            }
+        }
         // A key reused before its stale alias was posted: the new
         // `AddPublishedAlias`, now in the ring, supersedes it, and a removal
         // posted later would drop the new publication's alias. One posted
         // earlier precedes the add in the ring.
-        self.stale_aliases.retain(|key| *key != (endpoint, alias));
+        self.stale_aliases.retain(|key| !mine(key));
         let posted = self
             .links
             .sender
@@ -1274,18 +1302,21 @@ impl Network {
                 roles,
             });
         if posted.is_err() {
-            // The receiver learned the alias: it is stale now. The capacity
-            // check above leaves room for it.
-            Stale {
+            // The receiver learned the aliases: they are stale now. The
+            // capacity check above leaves room for them.
+            let mut stale = Stale {
                 queue: &mut self.stale_aliases,
                 overflows: &mut self.stale_overflows,
+            };
+            for path in paths() {
+                stale.queue_alias(path, alias);
             }
-            .queue_alias(endpoint, alias);
             return Err(DriverError::NetworkBusy);
         }
         self.publications.push(NetPublication {
             registration,
             endpoint,
+            later,
             alias,
             state: NetworkPublicationState::Adding,
             remove_posted: false,
@@ -1741,7 +1772,9 @@ fn post_removals(
             break;
         }
         entry.remove_posted = true;
-        stale.queue_alias(endpoint, alias);
+        for path in entry.paths() {
+            stale.queue_alias(path, alias);
+        }
     }
     while let Some((endpoint, alias)) = stale.queue.last().copied() {
         let posted = links
@@ -1776,6 +1809,13 @@ impl Stale<'_> {
         } else if let Some(count) = self.overflows.checked_add(1) {
             *self.overflows = count;
         }
+    }
+}
+
+impl NetPublication {
+    /// The endpoint of each of its paths, the founding one first.
+    fn paths(&self) -> impl Iterator<Item = EndpointId> + '_ {
+        core::iter::once(self.endpoint).chain(self.later.into_iter().flatten())
     }
 }
 
@@ -1821,12 +1861,15 @@ fn publication_answer(
             registration,
         } => {
             if let Some(index) = find(publications, endpoint, alias, registration) {
-                release(send_endpoints, endpoint);
                 if let Some(entry) = publications.get_mut(index) {
                     release_guard(entry);
+                    // Every path: its send endpoint, and the alias the
+                    // receiver learned before the refusal.
+                    for path in entry.paths() {
+                        release(send_endpoints, path);
+                        stale.queue_alias(path, alias);
+                    }
                 }
-                // The receiver learned the alias before the refusal.
-                stale.queue_alias(endpoint, alias);
                 match publications.get_mut(index) {
                     // Removed before the answer: nothing is left to remove.
                     Some(entry) if entry.state == NetworkPublicationState::Removing => {
@@ -1848,7 +1891,9 @@ fn publication_answer(
             if let Some(index) = find(publications, endpoint, alias, registration) {
                 let mut entry = publications.swap_remove(index);
                 release_guard(&mut entry);
-                release(send_endpoints, endpoint);
+                for path in entry.paths() {
+                    release(send_endpoints, path);
+                }
             }
         }
         _ => {}

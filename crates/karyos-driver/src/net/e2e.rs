@@ -1552,3 +1552,77 @@ fn an_optional_receivers_hole_past_its_window_cannot_resume() {
         assert_eq!(closes, (0, 1), "C closed as GapCannotResume");
     }
 }
+
+/// rp-w4b2c: a publication over two paths reaches a subscription over the
+/// same two paths, with the isolated-paths switch assumed on both drivers
+/// (owner item 12 keeps it off on real sockets): every message once, in
+/// order, though each path carries a copy. The second path is loopback,
+/// which some hosts cannot carry multicast on; the founding path alone
+/// then delivers, and the test still checks exactly-once order. Linux,
+/// after the multicast probe.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_two_path_publication_reaches_a_two_path_subscription() {
+    use std::io::Write as _;
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED a_two_path_publication_reaches_a_two_path_subscription: {why}"
+        );
+        return;
+    }
+    let port = free_address().port();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), port);
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ],
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    for side in [&mut a, &mut b] {
+        side.net.as_mut().unwrap().assume_isolated_paths();
+    }
+    let _ = b.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 4, 1), &channel)
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 4);
+        image.is_some()
+    });
+    let Some(image) = image else {
+        unreachable!("pumped until it exists");
+    };
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    pump(&mut [&mut a, &mut b], |_| {
+        while sent < 128 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 128
+    });
+}
