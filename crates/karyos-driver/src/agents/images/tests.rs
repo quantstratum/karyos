@@ -2500,3 +2500,25 @@ fn a_gap_waits_the_skew_window_while_another_path_is_live() {
     let slot = established(&mut single);
     assert_eq!(nak_wait(&mut single, slot), 0);
 }
+
+/// rp-w3, RP-7: an image's SMs go on every bound path: the founding path
+/// in its reserved slot, each later path as a copy; the default control
+/// ring holds them all, so none is skipped.
+#[test]
+fn an_sm_goes_on_every_bound_path() {
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let sent = rig.agents.receiver.counters().sm_sent;
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().sm_sent >= sent + 3
+    });
+    let counters = rig.agents.receiver.counters();
+    assert!(counters.sm_copies >= 3, "{counters:?}");
+    assert_eq!(counters.sm_copies_skipped, 0, "{counters:?}");
+}

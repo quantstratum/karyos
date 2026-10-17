@@ -154,6 +154,11 @@ pub struct ReceiverCounters {
     pub sm_sent: u64,
     /// Periodic SMs skipped: the control ring had no slot for them.
     pub sm_skipped: u64,
+    /// SM copies sent on a later path of an image (RP-7).
+    pub sm_copies: u64,
+    /// SM copies skipped: the control ring was full (a fault signal, since
+    /// configuration sizes the ring for every path's copy).
+    pub sm_copies_skipped: u64,
     /// Images retired at their liveness timeout.
     pub images_retired: u64,
     /// Installed images not kept (no SM slot, or no binding): retired at
@@ -2264,6 +2269,32 @@ impl ReceiverRole {
         // The sender gone: the driver is stopping. The SM is then recorded
         // as sent all the same: nothing will send another.
         let _ = self.to_sender.post(slot, item);
+        // RP-7: a copy on every other bound path, so a path that lost its
+        // return direction does not cost the membership. A copy has no
+        // slot of its own: one the ring cannot take is skipped and
+        // counted, never deferred.
+        let Some(image) = self.images.get(index) else {
+            return;
+        };
+        let (slot_ref, founding) = (image.slot, image.key);
+        for path in 0..usize::from(self.path_config.max_paths) {
+            let Some(key) = self.sessions.paths().key(slot_ref, path) else {
+                continue;
+            };
+            if key == founding {
+                continue;
+            }
+            let copy = ControlItem::Outgoing {
+                endpoint: key.endpoint,
+                destination: key.source,
+                control: Control::Status(status),
+                guard: None,
+            };
+            match self.to_sender.try_post(copy) {
+                Ok(()) => self.count(|c| &mut c.sm_copies),
+                Err(_) => self.count(|c| &mut c.sm_copies_skipped),
+            }
+        }
         if let Some(image) = self.images.get_mut(index) {
             image.schedule.sent(due, now);
         }

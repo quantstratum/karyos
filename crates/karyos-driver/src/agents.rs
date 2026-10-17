@@ -227,7 +227,7 @@ impl Default for AgentConfig {
             publications: 64,
             setup_interval: 100_000_000,
             answer_rate: crate::sessions::send::AnswerRate::default(),
-            control_capacity: 256,
+            control_capacity: 512,
             control_routes: 8,
             rx_datagrams: 64,
             subscriptions: 64,
@@ -307,17 +307,18 @@ impl AgentConfig {
             ));
         }
         // S1: the control ring holds every pending challenge's RSP_SETUP
-        // and one SM slot per image, above a floor for forwarded controls
-        // (one path per image until redundant paths, RP-1).
+        // and an SM copy per path of every image (RP-7: an SM goes on each
+        // live path), above a floor for forwarded controls.
         let control = self
             .sessions
             .max_images
-            .checked_add(self.sessions.max_pending_challenges)
+            .checked_mul(usize::from(self.sessions.max_paths))
+            .and_then(|units| units.checked_add(self.sessions.max_pending_challenges))
             .and_then(|units| units.checked_add(CONTROL_FLOOR))
             .ok_or(AgentError::InvalidConfig("max_images too large"))?;
         if self.control_capacity < control {
             return Err(AgentError::InvalidConfig(
-                "control_capacity below max_pending_challenges + max_images + 32",
+                "control_capacity below max_pending_challenges + max_images * max_paths + 32",
             ));
         }
         if self.idle_image_timeout < self.image_liveness_timeout {
