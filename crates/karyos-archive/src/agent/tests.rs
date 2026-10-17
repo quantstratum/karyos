@@ -374,8 +374,8 @@ impl FrameSource for Panics {
         Ok(())
     }
 
-    fn resume(&mut self, _to: u64) -> Result<(), SourceError> {
-        Ok(())
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        Ok(to)
     }
 }
 
