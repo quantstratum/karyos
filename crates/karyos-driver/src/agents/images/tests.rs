@@ -2762,3 +2762,50 @@ fn a_nak_goes_on_every_bound_path() {
     assert!(loss.submitted <= counters.naks, "{loss:?} {counters:?}");
     assert_eq!(loss.retries, loss.submitted - 1, "{loss:?}");
 }
+
+/// #307 review P2-3: once the founding path's subscription is removed and
+/// a later path keeps the image, its control still flows, on the later
+/// path only: NAK copies anchor the NAK (the loss state records the
+/// submission), and SM copies keep going.
+#[test]
+fn control_flows_on_the_later_path_after_the_founding_one_goes() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    };
+    let (mut rig, b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.unsubscribe(b);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    assert!(rig.agents.receiver.role.has_image(slot));
+    let before = rig.agents.receiver.counters();
+    let founding = rig.agents.receiver.role.founding_naks();
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|loss| loss.submitted >= 1)
+    });
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().sm_copies > before.sm_copies + 2
+    });
+    let after = rig.agents.receiver.counters();
+    assert!(after.nak_copies > before.nak_copies, "{after:?}");
+    // Nothing went on the founding path.
+    assert_eq!(rig.agents.receiver.role.founding_naks(), founding);
+}

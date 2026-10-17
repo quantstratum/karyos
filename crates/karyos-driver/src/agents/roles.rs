@@ -409,6 +409,9 @@ pub struct ReceiverRole {
     /// Test only: every RSP_SETUP handed to the sender, with its endpoint.
     #[cfg(test)]
     posted_challenges: Vec<(EndpointId, Control)>,
+    /// Test only: NAKs handed over on an image's founding path.
+    #[cfg(test)]
+    founding_naks: u64,
     /// The epoch of each endpoint's RX half last seen, at most
     /// `max_endpoints` (allocated at creation): a new one is the endpoint's
     /// reset, which resolves its images' uncertain NAKs (RC-6).
@@ -820,6 +823,9 @@ struct Installed {
     routes: Vec<CopyRoute>,
     /// Per lane, the NAK whose submission round a copy already anchored.
     anchored: [Option<Nak>; 4],
+    /// The founding path's subscription is gone while a later path keeps
+    /// the image: control goes on the later paths only (#307 review P2-3).
+    founding_gone: bool,
     /// Its subscription's NAK control group: the endpoint joined to it and
     /// the group's address (RC-7, RC-15).
     control_group: Option<(EndpointId, SocketAddr)>,
@@ -1159,6 +1165,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             posted_naks: Vec::new(),
             #[cfg(test)]
             posted_challenges: Vec::new(),
+            #[cfg(test)]
+            founding_naks: 0,
             rx_epochs: Vec::with_capacity(config.max_endpoints),
             max_endpoints: config.max_endpoints,
             cycle: 0,
@@ -1543,6 +1551,12 @@ impl ReceiverRole {
             .and_then(|image| image.stats.counts(path).copied())
     }
 
+    /// NAKs handed over on an image's founding path (tests).
+    #[cfg(test)]
+    pub(super) fn founding_naks(&self) -> u64 {
+        self.founding_naks
+    }
+
     /// Every RSP_SETUP handed to the sender, with its endpoint (tests).
     #[cfg(test)]
     pub(super) fn posted_challenges(&self) -> &[(EndpointId, Control)] {
@@ -1919,6 +1933,7 @@ impl ReceiverRole {
                 .collect(),
             routes: vec![CopyRoute::default(); paths],
             anchored: [None; 4],
+            founding_gone: false,
             control_group,
         });
         Ok(())
@@ -1945,23 +1960,30 @@ impl ReceiverRole {
             // An image stays while any of its bound paths' endpoints still
             // subscribes its stream (RP-2: removing one path's subscription
             // does not retire an image another path keeps).
-            let unsubscribed = self.unsubscribed && {
-                let stream_id = image.key.alias.stream_id;
-                let subscribed = |endpoint: EndpointId| {
-                    self.subscriptions
-                        .iter()
-                        .any(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id))
-                };
-                let paths = usize::from(self.path_config.max_paths);
-                !subscribed(image.key.endpoint)
-                    && !(0..paths).any(|path| {
-                        self.sessions
-                            .paths()
-                            .key(image.slot, path)
-                            .is_some_and(|key| subscribed(key.endpoint))
-                    })
+            let stream_id = image.key.alias.stream_id;
+            let subscribed = |endpoint: EndpointId| {
+                self.subscriptions
+                    .iter()
+                    .any(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id))
             };
-            if unsubscribed || age_ns(now, image.evidence) >= self.liveness_timeout {
+            let founding = !self.unsubscribed || subscribed(image.key.endpoint);
+            let unsubscribed = !founding && {
+                let paths = usize::from(self.path_config.max_paths);
+                !(0..paths).any(|path| {
+                    self.sessions
+                        .paths()
+                        .key(image.slot, path)
+                        .is_some_and(|key| subscribed(key.endpoint))
+                })
+            };
+            let (evidence, closing) = (image.evidence, image.closing);
+            // A later path keeps the image after the founding path's
+            // subscription went: its control goes on the live paths only,
+            // never to the released founding endpoint (#307 review P2-3).
+            if let Some(image) = self.images.get_mut(index) {
+                image.founding_gone = !founding;
+            }
+            if unsubscribed || age_ns(now, evidence) >= self.liveness_timeout {
                 let image = self.images.swap_remove(index);
                 self.retire(sessions, image, now);
                 work = work.checked_add(1).ok_or(overflow.clone())?;
@@ -1969,7 +1991,7 @@ impl ReceiverRole {
             }
             // A close repair decided (an ERR reply in the intake, or the
             // skip policy below on an earlier step).
-            if let Some(reason) = image.closing {
+            if let Some(reason) = closing {
                 let field: fn(&mut ReceiverCounters) -> &mut u64 = match reason {
                     CloseReason::Unrecoverable => |c| &mut c.images_closed_unrecoverable,
                     CloseReason::CannotResume => |c| &mut c.images_closed_cannot_resume,
@@ -2047,7 +2069,9 @@ impl ReceiverRole {
             images, counters, ..
         } = self;
         for image in images.iter_mut() {
-            if !image.loss.is_faulted() {
+            // The founding route faulted; once its subscription went, its
+            // endpoint is released and asks for no reset.
+            if !image.loss.is_faulted() || image.founding_gone {
                 continue;
             }
             let due = image.reset_requested.is_none_or(|at| {
@@ -2131,6 +2155,8 @@ impl ReceiverRole {
             delays,
             #[cfg(test)]
             posted_naks,
+            #[cfg(test)]
+            founding_naks,
             ..
         } = self;
         let Some(image) = images.get_mut(index) else {
@@ -2232,6 +2258,22 @@ impl ReceiverRole {
             let Some(nak) = image.loss.due(lane, now) else {
                 continue;
             };
+            // The founding path's subscription gone (P2-3): the NAK goes on
+            // the later paths only, and their first copy submitted anchors
+            // it.
+            if image.founding_gone {
+                if let Some(anchor) = image.anchored.get_mut(at) {
+                    *anchor = None;
+                }
+                #[cfg(test)]
+                posted_naks.push(nak);
+                tally(counters, |c| &mut c.naks);
+                post_copies(image, sessions, to_sender, counters, at, nak);
+                sent = sent
+                    .checked_add(1)
+                    .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
+                continue;
+            }
             let item = ControlItem::Outgoing {
                 endpoint: image.key.endpoint,
                 destination: image.key.source,
@@ -2245,6 +2287,10 @@ impl ReceiverRole {
                     report.pending = Some(nak);
                     #[cfg(test)]
                     posted_naks.push(nak);
+                    #[cfg(test)]
+                    {
+                        *founding_naks += 1;
+                    }
                     tally(counters, |c| &mut c.naks);
                     // A new submission round: its first copy submitted
                     // anchors it. Then a copy on every other bound path
@@ -2422,26 +2468,30 @@ impl ReceiverRole {
             group_tag: 0,
             lanes,
         };
-        // One slot per image (S1): a period whose previous SM still waits
-        // is skipped, never given a second slot.
-        if image.sm.busy() {
-            self.count(|c| &mut c.sm_skipped);
-            return;
+        // The founding path's subscription gone (P2-3): only the later
+        // paths' copies go.
+        if !image.founding_gone {
+            // One slot per image (S1): a period whose previous SM still
+            // waits is skipped, never given a second slot.
+            if image.sm.busy() {
+                self.count(|c| &mut c.sm_skipped);
+                return;
+            }
+            let slot = image.sm_slot.take().or_else(|| self.to_sender.reserve());
+            let Some(slot) = slot else {
+                self.count(|c| &mut c.sm_skipped);
+                return;
+            };
+            let item = ControlItem::Outgoing {
+                endpoint: image.key.endpoint,
+                destination: image.key.source,
+                control: Control::Status(status),
+                guard: Some(ItemGuard::Sm(SmGuard::take(&image.sm))),
+            };
+            // The sender gone: the driver is stopping. The SM is then
+            // recorded as sent all the same: nothing will send another.
+            let _ = self.to_sender.post(slot, item);
         }
-        let slot = image.sm_slot.take().or_else(|| self.to_sender.reserve());
-        let Some(slot) = slot else {
-            self.count(|c| &mut c.sm_skipped);
-            return;
-        };
-        let item = ControlItem::Outgoing {
-            endpoint: image.key.endpoint,
-            destination: image.key.source,
-            control: Control::Status(status),
-            guard: Some(ItemGuard::Sm(SmGuard::take(&image.sm))),
-        };
-        // The sender gone: the driver is stopping. The SM is then recorded
-        // as sent all the same: nothing will send another.
-        let _ = self.to_sender.post(slot, item);
         // RP-7: a copy on every other bound path, so a path that lost its
         // return direction does not cost the membership. A copy has no
         // slot of its own: one the ring cannot take is skipped and

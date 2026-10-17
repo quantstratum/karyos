@@ -1206,6 +1206,7 @@ fn installed_image_with(
         copies: Vec::new(),
         routes: Vec::new(),
         anchored: [None; 4],
+        founding_gone: false,
         control_group: None,
     };
     (image, params)
