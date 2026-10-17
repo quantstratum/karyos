@@ -485,6 +485,71 @@ fn a_closed_guard_sends_no_eos_at_removal() {
     assert_eq!(eos_bounds_received(&mut b), 0);
 }
 
+/// #354 review: a guarded lane whose guard closed before its committed
+/// messages left cannot drain (its first sends never reach the seal), so
+/// it is given up at the drain bound. It sends no EOS, the removal is
+/// counted as guard closed, not undrained, and the stream is still freed,
+/// no earlier than the linger.
+#[test]
+fn a_closed_guard_lane_is_given_up_at_the_drain_bound() {
+    use karyos_sys::guard::Closed;
+
+    use crate::net::NetworkGuard;
+
+    let linger = 200 * MS;
+    let (mut a, mut b) = (lingering(linger), lingering(linger));
+    let guard = a.add_guard("give-up").unwrap();
+    assert_eq!(a.reopen_guard(guard, 1, 1).unwrap(), 2);
+    let address = free_address();
+    let _ = b
+        .add_network_subscription(10, &channel(address, true))
+        .unwrap();
+    let mut config = aggregate(10, 3, 1);
+    config.stream.buffer.spare_slots = 4;
+    let publication = a
+        .add_guarded_network_publication(
+            config,
+            &channel(address, true),
+            NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        )
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    // Committed, then closed before any cycle of A could send them: the
+    // sender is shared, so it runs only in A's duty.
+    offer_all(&mut a, &publication, 1, 2);
+    let Closed::Now { .. } = a.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    let removed = Instant::now();
+    a.remove_aggregate(&publication).unwrap();
+    let mut seen = 0;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+        stream_state(drivers[0], &publication, 0) == StreamState::Freed
+    });
+    assert!(removed.elapsed() >= Duration::from_nanos(linger));
+    assert_eq!(seen, 0, "a message left after the close");
+    let counters = sender_counters(&a);
+    assert_eq!(counters.eos_sent, 0, "{counters:?}");
+    assert_eq!(
+        (counters.removals_guard_closed, counters.removals_undrained),
+        (1, 0),
+        "{counters:?}"
+    );
+    assert_eq!(eos_bounds_received(&mut b), 0);
+}
+
 /// A removal with no established receiver ends at once, with no linger:
 /// nobody would read its EOS. It is counted, and sends none.
 #[test]
