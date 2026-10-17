@@ -12,7 +12,10 @@
 //!   and leaves occupant 2's state, flag and bound untouched, once with a
 //!   local occupant 1 and a remote occupant 2 and once the reverse;
 //! - detach racing the loss transition: either order ends `FREE` with no
-//!   bound left.
+//!   bound left;
+//! - a network sender's connection toggle racing its revocation: the
+//!   revocation is never undone, and the cell bounds the publisher at
+//!   every step.
 //!
 //! Each has a negative control that drops the rule it checks and must fail.
 //!
@@ -22,8 +25,9 @@
 
 use karyos_sys::loan::{LoanOutcome, LoanTarget, release_loan, take_loan};
 use karyos_sys::participant::{
-    CELL_FREE, CELL_LOST, CELL_LOST_HOLDING, CELL_REQUIRED, admit, bounds, leave, revoke_cell,
-    withdraw, withdraw_if_quiescent,
+    CELL_FREE, CELL_LOST, CELL_LOST_HOLDING, CELL_LOST_RESERVED, CELL_REQUIRED,
+    CELL_REQUIRED_RESERVED, CELL_SENDER_SILENT, admit, bounds, leave, revoke_cell,
+    set_sender_counts, withdraw, withdraw_if_quiescent,
 };
 use karyos_sys::slot::{Descriptor, SlotIndex, SlotState};
 use karyos_sys::sync::{AtomicU64, Ordering};
@@ -286,4 +290,86 @@ fn a_detach_racing_the_loss_ends_free_with_no_bound() {
 #[should_panic(expected = "the cell did not end free")]
 fn control_a_loss_with_a_plain_store() {
     detach_versus_loss_model(Loss::PlainStore);
+}
+
+#[derive(Clone, Copy)]
+enum Toggle {
+    Correct,
+    /// Moves the sender's cell with a plain store instead of the
+    /// compare-exchange from the other state.
+    PlainStore,
+}
+
+fn toggle_versus_revocation_model(variant: Toggle) {
+    builder().check(move || {
+        let shared = cell(CELL_REQUIRED_RESERVED, LOCAL);
+        // The sender: its receivers went silent, then came back.
+        let sender = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                for counts in [false, true] {
+                    match variant {
+                        Toggle::Correct => {
+                            let _ = set_sender_counts(&shared.state, counts);
+                        }
+                        Toggle::PlainStore => {
+                            let state = if counts {
+                                CELL_REQUIRED_RESERVED
+                            } else {
+                                CELL_SENDER_SILENT
+                            };
+                            shared.state.store(state, Ordering::Release);
+                        }
+                    }
+                    let seen = shared.state.load(Ordering::Acquire);
+                    assert!(
+                        bounds(seen) || seen == CELL_LOST_RESERVED,
+                        "the sender's cell stopped bounding before its revocation"
+                    );
+                }
+            })
+        };
+        // The driver revokes it under `continue`, from the state it found:
+        // a toggle that wins makes the attempt stale, and the next scan
+        // tries again.
+        let mut revoked = false;
+        for _ in 0..2 {
+            let found = shared.state.load(Ordering::Acquire);
+            if !matches!(found, CELL_REQUIRED_RESERVED | CELL_SENDER_SILENT) {
+                break;
+            }
+            if revoke_cell(
+                &shared.state,
+                &shared.revoked,
+                &shared.loan,
+                found,
+                CELL_LOST_RESERVED,
+            )
+            .unwrap()
+            .is_some()
+            {
+                revoked = true;
+                break;
+            }
+        }
+        sender.join().unwrap();
+        if revoked {
+            assert_eq!(
+                shared.state.load(Ordering::Acquire),
+                CELL_LOST_RESERVED,
+                "a revocation was undone"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_sender_toggle_never_undoes_a_revocation() {
+    toggle_versus_revocation_model(Toggle::Correct);
+}
+
+#[test]
+#[should_panic(expected = "a revocation was undone")]
+fn control_a_sender_toggle_with_a_plain_store() {
+    toggle_versus_revocation_model(Toggle::PlainStore);
 }

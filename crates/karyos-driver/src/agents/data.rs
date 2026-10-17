@@ -250,6 +250,9 @@ pub struct Outbound {
     max_frame: u64,
     /// Its receivers, once attached (multicast-flow-control.md).
     membership: Option<Box<Membership>>,
+    /// Whether a receiver's status messages are live: its readers' cells
+    /// then count for the publication's connection (SPEC.md §4).
+    receivers_live: bool,
     /// The data DRR's configuration, which repair reuses.
     drr: DrrConfig,
     /// A reliable publication's repair path, once enabled.
@@ -354,6 +357,17 @@ pub enum OutboundError {
     Mtu,
 }
 
+/// A sender that goes leaves its readers' cells not counting for the
+/// connection before they are released (SPEC.md §4): the publication is
+/// unconnected from then on, whatever its receivers did.
+impl Drop for Outbound {
+    fn drop(&mut self) {
+        for reader in &self.readers {
+            let _ = reader.set_receivers_live(false);
+        }
+    }
+}
+
 impl Outbound {
     /// The data path of the publication `alias` on `endpoint` toward
     /// `destination`, reading `readers` (one per lane, in lane order) into
@@ -401,6 +415,7 @@ impl Outbound {
             destination,
             readers,
             reliable,
+            receivers_live: false,
             mtu: usize::try_from(mtu).map_err(|_| OutboundError::Mtu)?,
             max_frame: u64::from(max_charge),
             membership: None,
@@ -671,6 +686,26 @@ impl Outbound {
     #[must_use]
     pub fn membership(&self) -> Option<&Membership> {
         self.membership.as_deref()
+    }
+
+    /// Records whether a receiver's status messages are live and, on a
+    /// change only, makes its readers' cells count for the publication's
+    /// connection or not (SPEC.md §4). Returns whether it changed.
+    pub fn set_receivers_live(&mut self, live: bool) -> bool {
+        if self.receivers_live == live {
+            return false;
+        }
+        self.receivers_live = live;
+        for reader in &self.readers {
+            let _ = reader.set_receivers_live(live);
+        }
+        true
+    }
+
+    /// Whether a receiver's status messages were live at the last cycle.
+    #[must_use]
+    pub fn receivers_live(&self) -> bool {
+        self.receivers_live
     }
 
     /// Whether its membership has a live member at `now` (`false` with no

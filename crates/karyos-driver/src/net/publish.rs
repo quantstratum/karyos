@@ -267,10 +267,12 @@ impl EmbeddedDriver<HeapTerms> {
                 .conductor
                 .subscribe_as(Role::Required, true, occupant)
                 .map_err(|_| DriverError::InvalidConfig)?;
-            readers.push(
-                SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES)
-                    .map_err(|_| DriverError::InvalidConfig)?,
-            );
+            let reader = SenderRead::new(subscription, DEFAULT_CORRUPT_RETRIES)
+                .map_err(|_| DriverError::InvalidConfig)?;
+            // Unconnected until a receiver's status messages are live
+            // (SPEC.md §4): before any client is granted the publication.
+            let _ = reader.set_receivers_live(false);
+            readers.push(reader);
             occupant = next;
         }
         self.next_export = occupant;
