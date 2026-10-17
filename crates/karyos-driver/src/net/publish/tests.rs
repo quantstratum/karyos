@@ -377,6 +377,7 @@ fn a_refused_publication_releases_its_endpoint_and_alias() {
             },
             outbound,
             guard: None,
+            roles: None,
         })
         .unwrap();
     let first = driver
@@ -648,6 +649,7 @@ fn a_guarded_publication_the_sender_refuses_releases_its_guard_sender() {
             },
             outbound,
             guard: None,
+            roles: None,
         })
         .unwrap();
     let mut config = aggregate(11, 1);

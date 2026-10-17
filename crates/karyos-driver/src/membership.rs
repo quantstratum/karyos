@@ -239,6 +239,44 @@ pub enum MembershipConfigError {
     Roles,
 }
 
+/// A publication's configured receiver roles (MC-1): its strategy, the
+/// required `receiver_id`s and the `(receiver_id, tag)` pairs, owned and
+/// handed to the sender agent with the publication. Driver-internal: no
+/// public way in yet (owner item 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationRoles {
+    /// The strategy.
+    pub strategy: Strategy,
+    /// The required `receiver_id`s.
+    pub required: Vec<u64>,
+    /// `(receiver_id, tag)` pairs; a receiver absent here has tag 0.
+    pub tags: Vec<(u64, u64)>,
+}
+
+impl PublicationRoles {
+    /// The borrowed roles [`Membership::new`] takes.
+    #[must_use]
+    pub fn roles(&self) -> Roles<'_> {
+        Roles {
+            required: &self.required,
+            tags: &self.tags,
+        }
+    }
+}
+
+/// A subscription's receiver identity (MC-1, MC-2): the configured
+/// `receiver_id` its images name in every RB block, stable across
+/// restarts, and the `group_tag` their SMs declare (0 for none). Without
+/// one an image names a `receiver_id` derived from its slot.
+/// Driver-internal: no public way in yet (owner item 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverIdentity {
+    /// The configured receiver id.
+    pub receiver_id: core::num::NonZeroU64,
+    /// The declared group tag.
+    pub group_tag: u64,
+}
+
 /// The configured roles and tags of an incarnation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Roles<'a> {
@@ -593,6 +631,15 @@ impl Membership {
     #[must_use]
     pub const fn config(&self) -> &MembershipConfig {
         &self.config
+    }
+
+    /// The tag configured for `receiver_id` (MC-2): 0 when none is.
+    #[must_use]
+    pub fn configured_tag(&self, receiver_id: u64) -> u64 {
+        self.tags
+            .iter()
+            .find(|(id, _)| *id == receiver_id)
+            .map_or(0, |(_, tag)| *tag)
     }
 
     /// The counters.
