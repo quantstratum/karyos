@@ -3323,6 +3323,80 @@ fn a_faulted_founding_route_that_goes_leaves_the_later_path_naking() {
     assert_eq!(rig.agents.receiver.counters().reset_requests, resets);
 }
 
+/// #315 review P3: the founding route faulted while its subscription
+/// stays and a later route is healthy. The NAK goes on the later path's
+/// copy only; the faulted founding route takes none.
+#[test]
+fn a_faulted_founding_route_naks_on_the_later_path_only() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    rig.agents.receiver.role.fault_naks(slot, &nak);
+    let founding = rig.agents.receiver.role.founding_naks();
+    let copies = rig.agents.receiver.counters().nak_copies;
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().nak_copies > copies
+    });
+    assert_eq!(rig.agents.receiver.role.founding_naks(), founding);
+}
+
+/// #315 review P3: with the founding subscription gone and the later
+/// route faulted, no copy can go. The NAK is not counted as sent; it
+/// stays due.
+#[test]
+fn a_nak_with_no_copy_posted_is_not_counted() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    };
+    let (mut rig, b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    rig.unsubscribe(b);
+    rig.agents.receiver.role.fault_route(slot, 1);
+    let naks = rig.agents.receiver.counters().naks;
+    let mut rounds = 0;
+    while rig.agents.receiver.role.route_faulted(slot, 1) && rounds < 40 {
+        rig.now += 10_000_000;
+        rig.round(true);
+        assert_eq!(rig.agents.receiver.counters().naks, naks);
+        rounds += 1;
+    }
+    assert!(rounds > 3, "{rounds} rounds while the route was faulted");
+}
+
 /// T10 (contract-traceability-phase-2.md, "Challenge lifecycle"): a SETUP
 /// replayed through the liveness timeout neither keeps the image alive nor
 /// blocks a rebind. With the publication silent (its guard closed), the

@@ -725,6 +725,40 @@ fn settle_copies(image: &mut Installed, counters: &mut ReceiverCounters, at: usi
     }
 }
 
+/// Settles lane `at`'s NAK on the founding path: RC-6 on the image's own
+/// route. A NAK another path's copy already anchored records nothing more
+/// (RP-7: the anchor is the first copy submitted).
+fn settle_founding(image: &mut Installed, counters: &mut ReceiverCounters, at: usize) {
+    let Some(report) = image.naks.get_mut(at) else {
+        return;
+    };
+    let (Some(settled), Some(nak)) = (report.slot.collect(false), report.pending) else {
+        return;
+    };
+    report.pending = None;
+    let anchored = image.anchored.get(at).copied().flatten() == Some(nak);
+    match (settled, anchored) {
+        (SendReport::Submitted(start), false) => {
+            image.loss.submitted(&nak, start, &image.rtt);
+            if let Some(slot) = image.anchored.get_mut(at) {
+                *slot = Some(nak);
+            }
+        }
+        (SendReport::NotSubmitted, false) => image.loss.not_submitted(&nak),
+        // RC-6 on the founding route: a second uncertain NAK while one is
+        // unresolved is a route fault. An uncertain copy anchors only if no
+        // copy of its round is submitted ([`anchor_uncertain`]).
+        (SendReport::Uncertain(start), anchored) => {
+            if image.loss.route_uncertain().is_err() {
+                tally(counters, |c| &mut c.nak_route_faults);
+            } else if !anchored {
+                uncertain_candidate(image, at, nak, start);
+            }
+        }
+        (SendReport::Submitted(_) | SendReport::NotSubmitted, true) => {}
+    }
+}
+
 /// Once every copy of lane `at`'s round has reported and none was
 /// submitted, anchors its NAK at the earliest uncertain copy, counted as
 /// submitted at its start (RC-6; #310 review).
@@ -2643,36 +2677,7 @@ impl ReceiverRole {
                 continue;
             };
             let retries = image.loss.counters().retries;
-            // The founding path's copy: RC-6 on the image's own route. A
-            // NAK another path's copy already anchored records nothing
-            // more (RP-7: the anchor is the first copy submitted).
-            if let Some(report) = image.naks.get_mut(at)
-                && let Some(settled) = report.slot.collect(false)
-                && let Some(nak) = report.pending.take()
-            {
-                let anchored = image.anchored.get(at).copied().flatten() == Some(nak);
-                match (settled, anchored) {
-                    (SendReport::Submitted(start), false) => {
-                        image.loss.submitted(&nak, start, &image.rtt);
-                        if let Some(slot) = image.anchored.get_mut(at) {
-                            *slot = Some(nak);
-                        }
-                    }
-                    (SendReport::NotSubmitted, false) => image.loss.not_submitted(&nak),
-                    // RC-6 on the founding route: a second uncertain NAK
-                    // while one is unresolved is a route fault. An
-                    // uncertain copy anchors only if no copy of its round
-                    // is submitted (below).
-                    (SendReport::Uncertain(start), anchored) => {
-                        if image.loss.route_uncertain().is_err() {
-                            tally(counters, |c| &mut c.nak_route_faults);
-                        } else if !anchored {
-                            uncertain_candidate(image, at, nak, start);
-                        }
-                    }
-                    (SendReport::Submitted(_) | SendReport::NotSubmitted, true) => {}
-                }
-            }
+            settle_founding(image, counters, at);
             // The later paths' copies (RP-7): the first submitted anchors
             // the NAK; uncertainty and route faults count per path route.
             settle_copies(image, counters, at);
@@ -4292,6 +4297,26 @@ impl SenderRole {
                 continue;
             }
             let consumption = self.consumption(endpoint, alias);
+            // A routed publication is served over every path's half
+            // (redundant paths, RP-10).
+            if let Some(outbound) = self.publications.get_mut(index)
+                && outbound.is_routed()
+            {
+                let lanes = outbound.readers().len();
+                let served = outbound.serve_routes(
+                    halves,
+                    DATA_BUDGET,
+                    consumption
+                        .as_ref()
+                        .and_then(|positions| positions.get(..lanes)),
+                    now,
+                )?;
+                work = work.checked_add(served).ok_or(overflow.clone())?;
+                if outbound.needs_reset() {
+                    needing_reset = needing_reset.checked_add(1).ok_or(overflow.clone())?;
+                }
+                continue;
+            }
             let tx = halves.iter_mut().find_map(|(held, half)| match half {
                 Half::Tx(tx) if *held == endpoint => Some(tx),
                 _ => None,

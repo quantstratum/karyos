@@ -1040,6 +1040,11 @@ impl ImageLoss {
     /// `nak`'s submission is uncertain, reported at `now` (RC-6): it is
     /// treated as submitted then, and its retry is a new NAK.
     ///
+    /// The receiver role no longer calls this: an uncertain copy is only an
+    /// anchor candidate there ([`ImageLoss::route_uncertain`], then
+    /// [`ImageLoss::submitted`] once no copy of its round was submitted;
+    /// #310 review). It stays for single-path callers and tests.
+    ///
     /// # Errors
     ///
     /// [`RouteFault`] when another uncertain NAK of the image is

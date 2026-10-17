@@ -279,6 +279,8 @@ pub struct Outbound {
     /// The traced frames of the datagram being staged (allocated at
     /// construction, for the most one datagram can hold).
     picked: Vec<(TraceExtension, u64)>,
+    /// The redundant paths of a routed publication ([`Outbound::new_routed`]).
+    routed: Option<Box<routed::Routed>>,
 }
 
 /// The guard of a guarded publication, as the conductor hands it to the
@@ -438,6 +440,7 @@ impl Outbound {
                     .and_then(traced_frames_per_datagram)
                     .ok_or(OutboundError::Mtu)?,
             ),
+            routed: None,
         })
     }
 
@@ -529,6 +532,11 @@ impl Outbound {
     ///
     /// [`GateError`].
     pub fn guard(&mut self, spec: GuardSpec, now: u64) -> Result<(), GateError> {
+        // Until every route's exposure passes the guard gate (rp-w4b2), a
+        // close could not stop a later path: refused.
+        if self.routed.is_some() {
+            return Err(GateError::Routed);
+        }
         let lanes: Vec<GateLane> = (0..self.readers.len())
             .filter_map(|lane| u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()))
             .map(|lane| GateLane {
@@ -891,33 +899,7 @@ impl Outbound {
             self.guard_tick(now);
             return Ok(0);
         }
-        // The receivers' limits this cycle; with no membership attached,
-        // first sends are not gated. A lost required member holds every
-        // lane, staged heads included (MC-7); one not yet joined holds new
-        // staging only.
-        let mut limits = [Limit::Edge(u64::MAX); MAX_LANES];
-        let mut admission = Admission::Open;
-        if let Some(membership) = self.membership.as_deref_mut() {
-            // Its events (joins, losses) are not drained yet, deliberately:
-            // the conductor that reports them is not wired to the agents.
-            // The queue is bounded; overflow is counted (`events_dropped`).
-            let _ = membership.timers(now, MEMBERSHIP_TIMER_ACTIONS);
-            admission = membership.admission(now);
-            for (lane, limit) in limits.iter_mut().enumerate().take(self.readers.len()) {
-                if let Some(lane) = u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()) {
-                    *limit = membership.limit(lane, now);
-                }
-            }
-        }
-        let held = admission == Admission::LostRequired;
-        match admission {
-            Admission::Open => {}
-            Admission::LostRequired => self.counters.bump(|c| &mut c.held, 1),
-            Admission::NotJoined => {
-                self.counters.bump(|c| &mut c.not_joined, 1);
-                limits = [Limit::Held; MAX_LANES];
-            }
-        }
+        let (limits, held) = self.limits(now);
         let mut work = 0u32;
         for lane in 0..self.readers.len() {
             let limit = limits.get(lane).copied().unwrap_or(Limit::Held);
@@ -944,7 +926,7 @@ impl Outbound {
         }
         self.cancel_aborted(tx);
         self.handle_failure(tx, report.failure);
-        for (lane, (track, reader)) in self.tracks.iter_mut().zip(&mut self.readers).enumerate() {
+        for track in &mut self.tracks {
             if std::mem::take(&mut track.unsent) {
                 self.counters.bump(|c| &mut c.unsent, 1);
             }
@@ -955,6 +937,48 @@ impl Outbound {
                 self.counters.bump(|c| &mut c.submitted, 1);
                 track.high = track.high.max(submitted);
             }
+        }
+        self.advance_registered(consumption);
+        Ok(work)
+    }
+
+    /// The receivers' limits this cycle, and whether a required loss holds
+    /// every lane. With no membership attached, first sends are not gated.
+    /// A lost required member holds every lane, staged heads included
+    /// (MC-7); one not yet joined holds new staging only.
+    fn limits(&mut self, now: u64) -> ([Limit; MAX_LANES], bool) {
+        let mut limits = [Limit::Edge(u64::MAX); MAX_LANES];
+        let mut admission = Admission::Open;
+        if let Some(membership) = self.membership.as_deref_mut() {
+            // Its events (joins, losses) are not drained yet, deliberately:
+            // the conductor that reports them is not wired to the agents.
+            // The queue is bounded; overflow is counted (`events_dropped`).
+            let _ = membership.timers(now, MEMBERSHIP_TIMER_ACTIONS);
+            admission = membership.admission(now);
+            for (lane, limit) in limits.iter_mut().enumerate().take(self.readers.len()) {
+                if let Some(lane) = u8::try_from(lane).ok().and_then(|l| Lane::try_new(l).ok()) {
+                    *limit = membership.limit(lane, now);
+                }
+            }
+        }
+        let held = admission == Admission::LostRequired;
+        match admission {
+            Admission::Open => {}
+            Admission::LostRequired => self.counters.bump(|c| &mut c.held, 1),
+            Admission::NotJoined => {
+                self.counters.bump(|c| &mut c.not_joined, 1);
+                limits = [Limit::Held; MAX_LANES];
+            }
+        }
+        (limits, held)
+    }
+
+    /// Moves each lane's registered position from its sent frontier: on a
+    /// reliable channel to the lesser of what was submitted and what the
+    /// bound receivers consumed, on an unreliable one to what was
+    /// submitted; and tells the membership its sent bound.
+    fn advance_registered(&mut self, consumption: Option<&[u64]>) {
+        for (lane, (track, reader)) in self.tracks.iter_mut().zip(&mut self.readers).enumerate() {
             let submitted = track.high;
             // The membership's sent frontier (one path: `sent_high`), and
             // the required members' retention bound once one has joined.
@@ -984,7 +1008,6 @@ impl Outbound {
                 let _ = reader.sent(boundary);
             }
         }
-        Ok(work)
     }
 
     /// The control path of a send failure (lane-sender.md, outcome
@@ -1358,6 +1381,29 @@ pub(crate) mod testing {
         reliable: bool,
         before: u8,
     ) -> (Box<Outbound>, TestLog) {
+        build(
+            endpoint,
+            alias,
+            destination,
+            term,
+            lanes,
+            reliable,
+            before,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "a test helper")]
+    fn build(
+        endpoint: EndpointId,
+        alias: Alias,
+        destination: SocketAddr,
+        term: TermParams,
+        lanes: u8,
+        reliable: bool,
+        before: u8,
+        routes: Option<&[(EndpointId, SocketAddr)]>,
+    ) -> (Box<Outbound>, TestLog) {
         let mut log = TestLog {
             lanes: Vec::new(),
             publications: Vec::new(),
@@ -1404,19 +1450,53 @@ pub(crate) mod testing {
             log.lanes.push(buffer);
         }
         let quanta = vec![u64::from(term.mtu) * 4; usize::from(lanes)];
-        let outbound = Outbound::new(
-            endpoint,
-            alias,
-            destination,
-            readers,
-            &Lanes::new(&quanta).unwrap(),
-            term.mtu,
-            reliable,
-        )
+        let outbound = match routes {
+            Some(routes) => Outbound::new_routed(
+                routes,
+                alias,
+                readers,
+                &Lanes::new(&quanta).unwrap(),
+                term.mtu,
+                reliable,
+            ),
+            None => Outbound::new(
+                endpoint,
+                alias,
+                destination,
+                readers,
+                &Lanes::new(&quanta).unwrap(),
+                term.mtu,
+                reliable,
+            ),
+        }
         .unwrap();
         (Box::new(outbound), log)
     }
+
+    /// [`outbound`] over redundant paths: `routes` names each path's
+    /// endpoint and destination, the founding path first.
+    pub(crate) fn outbound_routed(
+        routes: &[(EndpointId, SocketAddr)],
+        alias: Alias,
+        term: TermParams,
+        lanes: u8,
+        reliable: bool,
+    ) -> (Box<Outbound>, TestLog) {
+        let (endpoint, destination) = routes[0];
+        build(
+            endpoint,
+            alias,
+            destination,
+            term,
+            lanes,
+            reliable,
+            0,
+            Some(routes),
+        )
+    }
 }
+
+mod routed;
 
 #[cfg(test)]
 mod tests;
