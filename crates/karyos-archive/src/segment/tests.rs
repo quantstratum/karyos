@@ -16,8 +16,8 @@ use std::path::Path;
 
 use proptest::prelude::*;
 
-use super::fault::{FaultDisk, Survives};
 use super::*;
+use crate::fault::{FaultDisk, Survives};
 
 const DIR: &str = "/archive";
 const RECORDING: u64 = 7;

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The file operations the segment store uses, behind a trait so that the
-//! torn-write and restart tests can crash it at any point.
+//! The file operations of the Archive's stores, behind a trait so that the
+//! torn-write and restart tests can crash them at any point.
 
 use std::io;
 use std::path::Path;
 
-/// The file operations of the segment store.
+/// The file operations of the Archive's stores.
 pub trait Disk {
     /// An open file.
     type File: core::fmt::Debug;
@@ -85,6 +85,14 @@ pub trait Disk {
     ///
     /// The operating system's error.
     fn remove(&mut self, path: &Path) -> io::Result<()>;
+
+    /// Renames `from` to `to`, replacing `to` atomically. The new name is
+    /// durable only after [`Disk::sync_dir`].
+    ///
+    /// # Errors
+    ///
+    /// The operating system's error.
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()>;
 }
 
 /// The operating system's files, through the standard library.
@@ -156,5 +164,9 @@ impl Disk for StdDisk {
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
     }
 }
