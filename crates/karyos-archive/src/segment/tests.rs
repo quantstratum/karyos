@@ -626,7 +626,7 @@ fn bad_headers_are_typed_errors() {
     let data = raw
         .open(&Path::new(DIR).join(data_name(RECORDING, 256)))
         .unwrap();
-    raw.truncate(&data, 0).unwrap();
+    raw.set_len(&data, 0).unwrap();
     overwrite_header(&disk, 256, &[0xFF; 8]);
     assert!(matches!(
         recover(&disk),
