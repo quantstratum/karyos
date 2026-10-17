@@ -36,6 +36,15 @@
 //! budget, and pending keys are served in FIFO order, so a slot that stays
 //! unstable cannot stall a poll or starve the other keys.
 //!
+//! A heap table built with [`conflation_fresh`] (a network image's view)
+//! has a loss barrier: its writer records losses before the receive owner
+//! seals them, reconciles the slots and retires the records, and its
+//! readers deliver each value with its [`crate::freshness::Freshness`]. A
+//! reader keeps the newest loss sequence it saw and serves every written
+//! key again after a new one, so a freshness change reaches it without a
+//! new value version. A table without a barrier, every IPC table included
+//! (an IPC stream has no loss), delivers every value Fresh.
+//!
 //! [`SlotWords`] (the version-1 slot, which the record journal keeps),
 //! [`FreshSlotWords`] and their functions are the protocols over any atomic
 //! words (also checked with Loom); [`conflation`] builds the owned, safe API
@@ -82,6 +91,22 @@ pub enum ConflationError {
     /// The table is closed; no further writes are accepted.
     #[error("conflation table closed")]
     Closed,
+    /// A value of a table with a loss barrier written without its stream
+    /// position: its freshness cannot be told (use
+    /// `ConflationWriter::write_at`). Nothing is stored.
+    #[error("a table with a loss barrier needs each value's position")]
+    PositionRequired,
+    /// A value below the writer's frontier: a gap behind the frontier may
+    /// already be retired, so its freshness cannot be told. A feeder writes
+    /// in log order: `passed(position)`, then `write_at` at that position.
+    /// Nothing is stored.
+    #[error("value at {position} below the frontier {frontier}")]
+    BehindFrontier {
+        /// The value's position.
+        position: u64,
+        /// The writer's frontier.
+        frontier: u64,
+    },
 }
 
 /// Configuration shared by a conflated publication and its table.
@@ -389,6 +414,43 @@ impl<'a> FreshSlotWords<'a> {
     /// [`ConflationError::ValueTooLarge`] and
     /// [`ConflationError::VersionsExhausted`]; nothing is stored on error.
     pub fn write(&self, value: &[u8]) -> Result<u64, ConflationError> {
+        self.write_value(value, None)
+    }
+
+    /// Writes `value` and the freshness words together, in one seqlock
+    /// write: a replacement and the freshness it restores or keeps are
+    /// never seen apart (GU-8). Returns the new value version.
+    ///
+    /// # Errors
+    ///
+    /// As [`FreshSlotWords::write`]; nothing is stored on error.
+    pub fn write_with_freshness(
+        &self,
+        value: &[u8],
+        freshness: SlotFreshness,
+    ) -> Result<u64, ConflationError> {
+        self.write_value(value, Some(freshness))
+    }
+
+    /// The freshness words, as the single writer last stored them
+    /// (Relaxed: the writer's own words).
+    #[must_use]
+    pub fn freshness(&self) -> SlotFreshness {
+        let load = |index| {
+            self.word(index)
+                .map_or(0, |word| word.load(Ordering::Relaxed))
+        };
+        SlotFreshness {
+            loss_applied: load(FRESH_APPLIED),
+            stale_since: load(FRESH_STALE_SINCE),
+        }
+    }
+
+    fn write_value(
+        &self,
+        value: &[u8],
+        freshness: Option<SlotFreshness>,
+    ) -> Result<u64, ConflationError> {
         if value.len() > self.capacity() {
             return Err(ConflationError::ValueTooLarge {
                 length: value.len(),
@@ -416,6 +478,14 @@ impl<'a> FreshSlotWords<'a> {
                 }
                 if let Some(word) = self.word(FRESH_VALUE + index) {
                     word.store(u64::from_le_bytes(bytes), Ordering::Relaxed);
+                }
+            }
+            if let Some(freshness) = freshness {
+                if let Some(word) = self.word(FRESH_APPLIED) {
+                    word.store(freshness.loss_applied, Ordering::Relaxed);
+                }
+                if let Some(word) = self.word(FRESH_STALE_SINCE) {
+                    word.store(freshness.stale_since, Ordering::Relaxed);
                 }
             }
         })?;
@@ -529,7 +599,10 @@ pub fn read_fresh_slot<W: LoadWords>(words: &W, out: &mut [u8]) -> FreshRead {
 }
 
 #[cfg(not(loom))]
-pub use owned::{Budget, ConflationReader, ConflationWriter, PollReport, conflation};
+pub use owned::{
+    Budget, ConflationReader, ConflationWriter, FreshCounters, LossError, PollReport, conflation,
+    conflation_fresh,
+};
 
 #[cfg(all(not(loom), target_os = "linux"))]
 pub use owned::{LAYOUT_VERSION, conflation_in};
@@ -545,6 +618,11 @@ mod owned {
     use crate::atomic_view::HeapWords;
     use crate::broadcast::{
         BroadcastError, BroadcastReader, BroadcastWords, MIN_CAPACITY, Receive, TRAILER_WORDS,
+    };
+    use crate::freshness::{
+        BarrierSnapshot, BarrierWords, DEFAULT_RING, Freshness, FreshnessError, FreshnessLink,
+        STALE, SlotFreshness, TERMINAL_BELOW_FRONTIER, TERMINAL_FRESHNESS_EXHAUSTED, Terminal,
+        TerminalCell, barrier_words,
     };
     use crate::load_words::LoadWords;
     use crate::sync::AtomicU64;
@@ -743,13 +821,38 @@ mod owned {
         Mapped(crate::ipc::Region),
     }
 
+    /// The loss barrier of a heap table and the link it shares with the
+    /// image's receive owner (`quantstratum-docs:
+    /// karyos/design/conflated-network-images.md`). A mapped table has
+    /// none: an IPC stream has no loss, so its values read Fresh.
+    #[derive(Debug)]
+    struct Barrier {
+        words: HeapWords,
+        link: FreshnessLink,
+    }
+
     #[derive(Debug)]
     struct Table {
         store: Store,
         geometry: Geometry,
+        barrier: Option<Barrier>,
     }
 
     impl Table {
+        /// The barrier's words, with a barrier.
+        fn barrier_words(&self) -> Option<&[AtomicU64]> {
+            self.barrier
+                .as_ref()
+                .map(|barrier| barrier.words.words().as_slice())
+        }
+
+        /// The view's terminal cell words, with a barrier.
+        fn terminal_words(&self) -> Option<&[AtomicU64]> {
+            self.barrier
+                .as_ref()
+                .map(|barrier| barrier.link.terminal_words())
+        }
+
         /// The slots, the journal data area and the journal trailer.
         fn parts(&self) -> (&[AtomicU64], &[AtomicU64], &[AtomicU64]) {
             match &self.store {
@@ -825,6 +928,30 @@ mod owned {
         ReadOnly(ReadOnlyTable),
     }
 
+    impl Source {
+        /// The barrier's and the terminal cell's words of a heap table
+        /// with a barrier; `None` otherwise (an IPC table has no loss, so
+        /// its values read Fresh).
+        fn barrier(&self) -> Option<(&[AtomicU64], &[AtomicU64])> {
+            match self {
+                Source::Local(table) => Some((table.barrier_words()?, table.terminal_words()?)),
+                #[cfg(target_os = "linux")]
+                Source::ReadOnly(_) => None,
+            }
+        }
+    }
+
+    /// A delivered value's freshness, as a reader records it: [`FRESH`] or
+    /// the stale start.
+    const FRESH: u64 = u64::MAX;
+
+    fn freshness_code(freshness: Freshness) -> u64 {
+        match freshness {
+            Freshness::Stale { since } => since,
+            Freshness::Fresh | Freshness::Retry => FRESH,
+        }
+    }
+
     /// Runs `$body` with `$view` bound to the source's view (an `Option`),
     /// whatever words it loads.
     macro_rules! with_view {
@@ -845,11 +972,100 @@ mod owned {
 
     fn writer(table: Table) -> ConflationWriter {
         let value_capacity = table.geometry.value_capacity;
+        let fresh = table.barrier.is_some().then(|| {
+            Box::new(FreshState {
+                frontier: 0,
+                ahead: Vec::with_capacity(DEFAULT_RING),
+                unretired: Vec::with_capacity(DEFAULT_RING),
+                pass: None,
+                counters: FreshCounters::default(),
+            })
+        });
         ConflationWriter {
             table: Arc::new(table),
             value_capacity,
             closed: false,
+            fresh,
         }
+    }
+
+    /// Why [`ConflationWriter::record_loss`] recorded nothing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+    pub enum LossError {
+        /// The table has no loss barrier ([`conflation`], or a region).
+        #[error("the table has no loss barrier")]
+        NoBarrier,
+        /// An empty or reversed interval.
+        #[error("invalid loss interval [{start}, {end})")]
+        InvalidInterval {
+            /// The interval start.
+            start: u64,
+            /// The interval end.
+            end: u64,
+        },
+        /// The loss ring or the gaps ahead of the frontier are full: retry
+        /// after a reconciliation retires records. A feeder withholds its
+        /// acknowledgement meanwhile.
+        #[error("loss records full")]
+        Full,
+        /// The interval starts below the writer's frontier: every value
+        /// already written would not lie below it, which readers'
+        /// classification assumes. The terminal cell was published (if no
+        /// other publisher won it) and the view is done.
+        #[error("loss at {start} below the frontier {frontier}")]
+        BelowFrontier {
+            /// The interval start.
+            start: u64,
+            /// The writer's frontier.
+            frontier: u64,
+        },
+        /// The loss sequence or the barrier version is exhausted: the
+        /// terminal cell was published (if no other publisher won it).
+        #[error("loss sequence exhausted")]
+        Exhausted,
+    }
+
+    /// The freshness work of a writer (GU-11). Increments are checked: one
+    /// that would overflow keeps its value.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct FreshCounters {
+        /// Losses recorded in the barrier.
+        pub losses: u64,
+        /// Losses refused while the ring or the gaps ahead were full.
+        pub full: u64,
+        /// Losses below the frontier, each closing the view terminally.
+        pub below_frontier: u64,
+        /// Slot reconciliations written.
+        pub reconciled: u64,
+        /// Retirements published, each after a full pass over the slots.
+        pub retirements: u64,
+        /// Losses refused because the loss sequence or the barrier version
+        /// was exhausted, and slot sequences exhausted by a reconciliation,
+        /// each closing the view terminally.
+        pub exhausted: u64,
+    }
+
+    fn bump(counter: &mut u64) {
+        if let Some(next) = counter.checked_add(1) {
+            *counter = next;
+        }
+    }
+
+    /// The writer's freshness state: the frontier, the recorded gaps still
+    /// ahead of it and the records not yet retired, each bounded by the
+    /// ring.
+    #[derive(Debug)]
+    struct FreshState {
+        /// The stream position below which the feeder consumed the log.
+        frontier: u64,
+        /// Recorded gaps `[start, end)` whose end is above the frontier.
+        ahead: Vec<(u64, u64)>,
+        /// Recorded losses not yet retired, as `(seq, start)`.
+        unretired: Vec<(u64, u64)>,
+        /// The reconciliation pass in progress: through which sequence, and
+        /// the next key.
+        pass: Option<(u64, u32)>,
+        counters: FreshCounters,
     }
 
     /// Creates a table of `keys` slots of `value_capacity` bytes each, with
@@ -865,9 +1081,44 @@ mod owned {
         value_capacity: usize,
         journal_capacity: usize,
     ) -> Result<ConflationWriter, ConflationError> {
+        heap(keys, value_capacity, journal_capacity, None)
+    }
+
+    /// Creates a table as [`conflation`] with a loss barrier of
+    /// [`DEFAULT_RING`] records over the terminal cell of `link`: the view
+    /// of a network image's lane (`quantstratum-docs:
+    /// karyos/design/conflated-network-images.md`). Its writer records
+    /// losses ([`ConflationWriter::record_loss`]), and its readers report
+    /// each value's freshness.
+    ///
+    /// # Errors
+    ///
+    /// As [`conflation`].
+    pub fn conflation_fresh(
+        keys: u32,
+        value_capacity: usize,
+        journal_capacity: usize,
+        link: FreshnessLink,
+    ) -> Result<ConflationWriter, ConflationError> {
+        heap(keys, value_capacity, journal_capacity, Some(link))
+    }
+
+    fn heap(
+        keys: u32,
+        value_capacity: usize,
+        journal_capacity: usize,
+        link: Option<FreshnessLink>,
+    ) -> Result<ConflationWriter, ConflationError> {
         let invalid = ConflationError::InvalidConfig;
         let geometry = Geometry::new(keys, value_capacity, journal_capacity).ok_or(invalid)?;
         let zeroed = |count| HeapWords::zeroed(count).map_err(|_| invalid);
+        let barrier = match link {
+            Some(link) => Some(Barrier {
+                words: zeroed(barrier_words(DEFAULT_RING).ok_or(invalid)?)?,
+                link,
+            }),
+            None => None,
+        };
         let table = Table {
             store: Store::Heap {
                 slots: zeroed(geometry.slots_words)?,
@@ -875,6 +1126,7 @@ mod owned {
                 trailer: zeroed(TRAILER_WORDS)?,
             },
             geometry,
+            barrier,
         };
         table.view().ok_or(invalid)?;
         Ok(writer(table))
@@ -929,6 +1181,7 @@ mod owned {
         let table = Table {
             store: Store::Mapped(mapped),
             geometry,
+            barrier: None,
         };
         table.view().ok_or(invalid)?;
         Ok(writer(table))
@@ -940,6 +1193,8 @@ mod owned {
         table: Arc<Table>,
         value_capacity: usize,
         closed: bool,
+        /// The freshness state of a table with a barrier.
+        fresh: Option<Box<FreshState>>,
     }
 
     impl ConflationWriter {
@@ -968,7 +1223,70 @@ mod owned {
         /// [`ConflationError::ValueTooLarge`] (nothing is stored),
         /// [`ConflationError::VersionsExhausted`] (nothing is stored; the
         /// table is closed) and [`ConflationError::Closed`].
+        ///
+        /// A table with a loss barrier refuses it with
+        /// [`ConflationError::PositionRequired`]: its values go through
+        /// [`ConflationWriter::write_at`].
         pub fn write(&mut self, key: u32, value: &[u8]) -> Result<u64, ConflationError> {
+            if self.fresh.is_some() {
+                return Err(ConflationError::PositionRequired);
+            }
+            self.write_slot(key, value, None)
+        }
+
+        /// Writes the value of `key` that starts at stream `position`, with
+        /// its freshness (GU-9): Stale since the earliest recorded gap still
+        /// ahead whose end lies above `position`, else Fresh, through the
+        /// newest loss. A replacement past every gap restores its key; it
+        /// restores no other. Without a barrier, as [`ConflationWriter::write`].
+        ///
+        /// The value lies at or above the frontier: a feeder calls
+        /// [`ConflationWriter::passed`] with a value's position, then this.
+        ///
+        /// # Errors
+        ///
+        /// As [`ConflationWriter::write`], and
+        /// [`ConflationError::BehindFrontier`] for a value below the
+        /// frontier. Nothing is stored on error.
+        pub fn write_at(
+            &mut self,
+            key: u32,
+            value: &[u8],
+            position: u64,
+        ) -> Result<u64, ConflationError> {
+            let freshness = match (&self.fresh, self.table.barrier_words()) {
+                (Some(fresh), Some(words)) => {
+                    if position < fresh.frontier {
+                        return Err(ConflationError::BehindFrontier {
+                            position,
+                            frontier: fresh.frontier,
+                        });
+                    }
+                    let barrier = BarrierWords::new(words, DEFAULT_RING)
+                        .map_err(|_| ConflationError::InvalidConfig)?;
+                    let since = fresh
+                        .ahead
+                        .iter()
+                        .filter(|&&(_, end)| end > position)
+                        .map(|&(start, _)| start)
+                        .min();
+                    Some(SlotFreshness {
+                        loss_applied: since
+                            .map_or(barrier.loss_seq(), |_| barrier.loss_seq() | STALE),
+                        stale_since: since.unwrap_or(0),
+                    })
+                }
+                _ => None,
+            };
+            self.write_slot(key, value, freshness)
+        }
+
+        fn write_slot(
+            &mut self,
+            key: u32,
+            value: &[u8],
+            freshness: Option<SlotFreshness>,
+        ) -> Result<u64, ConflationError> {
             if self.closed {
                 return Err(ConflationError::Closed);
             }
@@ -992,7 +1310,11 @@ mod owned {
                 self.close();
                 return Err(ConflationError::VersionsExhausted);
             }
-            let version = match slot.write(value) {
+            let written = match freshness {
+                Some(freshness) => slot.write_with_freshness(value, freshness),
+                None => slot.write(value),
+            };
+            let version = match written {
                 Ok(version) => version,
                 Err(ConflationError::VersionsExhausted) => {
                     self.close();
@@ -1021,11 +1343,214 @@ mod owned {
             }
         }
 
+        /// Records the loss of `[start, end)` (GU-8 step 1): appends it to
+        /// the barrier and publishes it, so readers classify every value
+        /// below its end Stale before any slot is reconciled. Call before
+        /// the receive owner seals the gap, then [`ConflationWriter::reconcile`]
+        /// until done. Returns the loss sequence.
+        ///
+        /// The interval must start at or above the frontier
+        /// ([`ConflationWriter::passed`]): readers classify a value against
+        /// a record it has not applied without its position, which is exact
+        /// only because every value already written lies below a new gap.
+        /// A loss below the frontier publishes the terminal cell instead.
+        ///
+        /// # Errors
+        ///
+        /// [`LossError::NoBarrier`], [`LossError::InvalidInterval`],
+        /// [`LossError::Full`] (retry later; nothing stored),
+        /// [`LossError::BelowFrontier`] and [`LossError::Exhausted`] (the
+        /// terminal cell published).
+        pub fn record_loss(&mut self, start: u64, end: u64) -> Result<u64, LossError> {
+            if start >= end {
+                return Err(LossError::InvalidInterval { start, end });
+            }
+            let (Some(fresh), Some(words)) = (self.fresh.as_mut(), self.table.barrier_words())
+            else {
+                return Err(LossError::NoBarrier);
+            };
+            if start < fresh.frontier {
+                bump(&mut fresh.counters.below_frontier);
+                let frontier = fresh.frontier;
+                self.close_terminally(start, end, TERMINAL_BELOW_FRONTIER);
+                return Err(LossError::BelowFrontier { start, frontier });
+            }
+            if fresh.ahead.len() >= DEFAULT_RING || fresh.unretired.len() >= DEFAULT_RING {
+                bump(&mut fresh.counters.full);
+                return Err(LossError::Full);
+            }
+            let barrier =
+                BarrierWords::new(words, DEFAULT_RING).map_err(|_| LossError::NoBarrier)?;
+            match barrier.append_loss(start, end) {
+                Ok(seq) => {
+                    fresh.ahead.push((start, end));
+                    fresh.unretired.push((seq, start));
+                    bump(&mut fresh.counters.losses);
+                    Ok(seq)
+                }
+                Err(FreshnessError::RingFull { .. }) => {
+                    bump(&mut fresh.counters.full);
+                    Err(LossError::Full)
+                }
+                Err(FreshnessError::Exhausted) => {
+                    bump(&mut fresh.counters.exhausted);
+                    self.close_terminally(start, end, TERMINAL_FRESHNESS_EXHAUSTED);
+                    Err(LossError::Exhausted)
+                }
+                Err(_) => Err(LossError::NoBarrier),
+            }
+        }
+
+        /// Publishes the terminal cell and closes the table: its readers
+        /// deliver nothing more and report the terminal close and the
+        /// closed table.
+        fn close_terminally(&mut self, start: u64, end: u64, reason: u64) {
+            let _ = self.publish_terminal(start, end, reason);
+            self.close();
+        }
+
+        /// Whether `[start, end)` is a recorded gap still ahead of the
+        /// frontier: a feeder that met a gap it already recorded through
+        /// the mailbox records it once.
+        #[must_use]
+        pub fn recorded(&self, start: u64, end: u64) -> bool {
+            self.fresh
+                .as_ref()
+                .is_some_and(|fresh| fresh.ahead.contains(&(start, end)))
+        }
+
+        /// The feeder consumed the log below `position`: recorded gaps
+        /// ending at or below it are behind, so a value written past them
+        /// is Fresh with respect to them. The frontier never moves back.
+        pub fn passed(&mut self, position: u64) {
+            if let Some(fresh) = self.fresh.as_mut() {
+                fresh.frontier = fresh.frontier.max(position);
+                let frontier = fresh.frontier;
+                fresh.ahead.retain(|&(_, end)| end > frontier);
+            }
+        }
+
+        /// Reconciles up to `budget` slots of the pass in progress (GU-8
+        /// step 2): each slot not yet through the pass's sequence becomes
+        /// Stale since the earliest start among the records it had not
+        /// applied, or its own earlier start. A pass that reaches the last
+        /// key retires its records (step 3). Returns the slots written.
+        ///
+        /// # Errors
+        ///
+        /// [`ConflationError::VersionsExhausted`] for a slot whose sequence
+        /// is exhausted: the table closes and the terminal cell is
+        /// published.
+        pub fn reconcile(&mut self, budget: u32) -> Result<u32, ConflationError> {
+            let keys = self.table.geometry.keys;
+            let (Some(fresh), Some(words)) = (self.fresh.as_mut(), self.table.barrier_words())
+            else {
+                return Ok(0);
+            };
+            let barrier = BarrierWords::new(words, DEFAULT_RING)
+                .map_err(|_| ConflationError::InvalidConfig)?;
+            let (through, mut key) = match fresh.pass {
+                Some(pass) => pass,
+                None if fresh.unretired.is_empty() => return Ok(0),
+                None => (barrier.loss_seq(), 0),
+            };
+            let mut written = 0u32;
+            let mut steps = 0u32;
+            while steps < budget && key < keys {
+                let slot = self.table.slot(key).ok_or(ConflationError::InvalidConfig)?;
+                let current = slot.freshness();
+                if current.applied() < through {
+                    let since = fresh
+                        .unretired
+                        .iter()
+                        .filter(|&&(seq, _)| seq > current.applied() && seq <= through)
+                        .map(|&(_, start)| start)
+                        .chain(current.is_stale().then_some(current.stale_since))
+                        .min();
+                    let reconciled = SlotFreshness {
+                        loss_applied: since.map_or(through, |_| through | STALE),
+                        stale_since: since.unwrap_or(0),
+                    };
+                    if let Err(error) = slot.set_freshness(reconciled) {
+                        fresh.pass = Some((through, key));
+                        bump(&mut fresh.counters.exhausted);
+                        self.close_terminally(0, through, TERMINAL_FRESHNESS_EXHAUSTED);
+                        return Err(error);
+                    }
+                    bump(&mut fresh.counters.reconciled);
+                    written += 1;
+                }
+                key += 1;
+                steps += 1;
+            }
+            if key < keys {
+                fresh.pass = Some((through, key));
+                return Ok(written);
+            }
+            // Every slot's Release fence precedes this in program order.
+            barrier
+                .retire_through(through)
+                .map_err(|_| ConflationError::InvalidConfig)?;
+            fresh.unretired.retain(|&(seq, _)| seq > through);
+            fresh.pass = None;
+            bump(&mut fresh.counters.retirements);
+            Ok(written)
+        }
+
+        /// Whether recorded losses wait for reconciliation and retirement.
+        #[must_use]
+        pub fn reconciling(&self) -> bool {
+            self.fresh
+                .as_ref()
+                .is_some_and(|fresh| !fresh.unretired.is_empty())
+        }
+
+        /// Publishes the view's terminal cell (GU-8): readers classify every
+        /// value below `end` Stale since `start` and the view closes with
+        /// `reason`. Returns whether this publisher won the one-shot cell;
+        /// `false` without a barrier.
+        pub fn publish_terminal(&self, start: u64, end: u64, reason: u64) -> bool {
+            self.table
+                .terminal_words()
+                .and_then(|words| TerminalCell::new(words).ok())
+                .is_some_and(|cell| cell.publish(Terminal { start, end, reason }))
+        }
+
+        /// The freshness counters; `None` without a barrier.
+        #[must_use]
+        pub fn fresh_counters(&self) -> Option<FreshCounters> {
+            self.fresh.as_ref().map(|fresh| fresh.counters)
+        }
+
         /// A new reader (control path: allocates its private state). It
         /// starts with a full scan, so it delivers every key already written.
         #[must_use]
         pub fn reader(&self) -> ConflationReader {
             ConflationReader::new(Source::Local(Arc::clone(&self.table)), self.table.geometry)
+        }
+
+        /// The barrier's retired-through sequence (tests).
+        #[cfg(test)]
+        pub(super) fn retired_through(&self) -> Option<u64> {
+            let words = self.table.barrier_words()?;
+            Some(
+                BarrierWords::new(words, DEFAULT_RING)
+                    .ok()?
+                    .retired_through(),
+            )
+        }
+
+        /// Seeds the barrier's loss and retired sequences (tests).
+        #[cfg(test)]
+        pub(super) fn seed_loss_seq(&self, seq: u64) {
+            use crate::sync::Ordering;
+            if let Some(words) = self.table.barrier_words() {
+                for index in [1, 2] {
+                    if let Some(word) = words.get(index) {
+                        word.store(seq, Ordering::Relaxed);
+                    }
+                }
+            }
         }
 
         #[cfg(test)]
@@ -1105,6 +1630,16 @@ mod owned {
         /// that does not read the journal, such as a zero-key poll, reports
         /// `false` again.
         pub finished: bool,
+        /// The view's published terminal invalidation (GU-8): every value
+        /// below its end is stale since its start, and the view delivers
+        /// nothing more. Its reason is a `TERMINAL_*` code of
+        /// [`crate::freshness`]. A poll that sees it returns before reading
+        /// the journal: `closed` reports the writer's close only once seen
+        /// before (a writer that publishes the cell closes the table, and
+        /// the conductor's feeder closes it when the receive owner
+        /// published), and `finished` stays `false`, since the reader
+        /// stopped before the last values.
+        pub terminal: Option<Terminal>,
     }
 
     /// A reader with private delivered versions, queue and value buffer.
@@ -1124,6 +1659,17 @@ mod owned {
         scan_remaining: u32,
         closed_seen: bool,
         value: Box<[u8]>,
+        /// The freshness delivered with each key's value ([`FRESH`] or the
+        /// stale start).
+        delivered_freshness: Box<[u64]>,
+        /// The newest loss sequence this reader observed.
+        loss_seen: u64,
+        /// Keys left in the sweep a new loss started: every written key is
+        /// served again, so a freshness change reaches the reader even
+        /// though no value version changed (GU-8).
+        loss_scan: u32,
+        /// The terminal invalidation, once observed.
+        terminal: Option<Terminal>,
     }
 
     impl ConflationReader {
@@ -1146,6 +1692,10 @@ mod owned {
                 scan_remaining: geometry.keys,
                 closed_seen: false,
                 value: vec![0; geometry.value_capacity].into_boxed_slice(),
+                delivered_freshness: vec![FRESH; keys].into_boxed_slice(),
+                loss_seen: 0,
+                loss_scan: 0,
+                terminal: None,
             }
         }
 
@@ -1286,8 +1836,13 @@ mod owned {
         }
 
         /// Delivers the latest value of changed keys to `handler(key,
-        /// version, value)`, within `budget`. The value borrows this
-        /// reader's private copy.
+        /// version, value, freshness)`, within `budget`. The value borrows
+        /// this reader's private copy; its freshness (never
+        /// [`Freshness::Retry`]) was classified with that copy (GU-8): a
+        /// key whose freshness changed is delivered again with the same
+        /// version. A table without a barrier delivers every value Fresh.
+        /// Once the view's terminal cell is published, nothing more is
+        /// delivered and the report carries it.
         ///
         /// If the handler panics, its key is not marked delivered: the next
         /// poll queues it again (at the back, behind keys already pending) and
@@ -1295,11 +1850,14 @@ mod owned {
         pub fn poll_changed(
             &mut self,
             budget: Budget,
-            mut handler: impl FnMut(u32, u64, &[u8]),
+            mut handler: impl FnMut(u32, u64, &[u8], Freshness),
         ) -> PollReport {
             let mut report = PollReport::default();
             if let Some(key) = self.in_flight.take() {
                 self.push(key);
+            }
+            if self.observe_barrier() {
+                return self.report(report);
             }
             // Once closed, the journal may lack the last record: scan every
             // slot once.
@@ -1328,8 +1886,9 @@ mod owned {
 
         fn report(&self, mut report: PollReport) -> PollReport {
             report.pending = u32::try_from(self.len).unwrap_or(u32::MAX);
-            report.scanning = self.scan_remaining > 0;
+            report.scanning = self.scan_remaining > 0 || self.loss_scan > 0;
             report.closed = self.closed_seen;
+            report.terminal = self.terminal;
             report.finished = self.closed_seen
                 && report.journal_drained
                 && self.len == 0
@@ -1378,10 +1937,35 @@ mod owned {
             }
         }
 
+        /// Reads the terminal cell and the newest loss sequence: a new loss
+        /// starts a sweep that serves every written key again. Returns
+        /// whether the terminal cell is published (the view delivers
+        /// nothing more).
+        fn observe_barrier(&mut self) -> bool {
+            if self.terminal.is_some() {
+                return true;
+            }
+            let Some((words, terminal)) = self.source.barrier() else {
+                return false;
+            };
+            if let Some(published) = TerminalCell::read(&terminal) {
+                self.terminal = Some(published);
+                return true;
+            }
+            if let Ok(snapshot) = BarrierSnapshot::take(&words, DEFAULT_RING)
+                && snapshot.loss_seq() > self.loss_seen
+            {
+                self.loss_seen = snapshot.loss_seq();
+                self.loss_scan = self.keys;
+            }
+            false
+        }
+
         /// Checks the versions of up to `limit` slots from the persistent
         /// cursor, on every poll: this finds values whose journal record was
         /// lost, or not yet appended when the journal was read. Counts down
-        /// a full pass when one is in progress.
+        /// a full pass when one is in progress, and a loss sweep, which
+        /// queues every written key.
         fn sweep(&mut self, limit: u32) {
             let keys = self.keys;
             for _ in 0..limit.min(keys) {
@@ -1392,7 +1976,11 @@ mod owned {
                 }
                 let (version, unsettled) = with_view!(&self.source, view => view
                     .map_or((0, false), |view| (view.version(key), view.unsettled(key))));
-                if unsettled || (version != 0 && self.changed(key, version)) {
+                let loss = self.loss_scan > 0;
+                if loss {
+                    self.loss_scan -= 1;
+                }
+                if unsettled || (version != 0 && (loss || self.changed(key, version))) {
                     self.push(key);
                 }
             }
@@ -1402,30 +1990,72 @@ mod owned {
             &mut self,
             key: u32,
             retries: u32,
-            handler: &mut impl FnMut(u32, u64, &[u8]),
+            handler: &mut impl FnMut(u32, u64, &[u8], Freshness),
             report: &mut PollReport,
         ) {
             for _ in 0..retries.max(1) {
+                // The barrier snapshot comes before the slot copy, which
+                // the classification then checks against it (GU-8).
+                let snapshot = match self.source.barrier() {
+                    Some((words, _)) => match BarrierSnapshot::take(&words, DEFAULT_RING) {
+                        Ok(snapshot) => Some(snapshot),
+                        Err(_) => continue,
+                    },
+                    None => None,
+                };
                 let read = with_view!(&self.source, view => view
                     .and_then(|view| view.read(key, &mut self.value)));
                 match read {
                     None => return,
                     Some(FreshRead::Unstable) => continue,
                     Some(FreshRead::Empty) => return,
-                    // Freshness reaches readers in a later step (GU-8).
                     Some(FreshRead::Value {
-                        version, length, ..
+                        version,
+                        length,
+                        freshness,
                     }) => {
+                        // Every record the slot has not applied starts at or
+                        // above the writer's frontier, which `record_loss`
+                        // enforces, so every value written before it lies
+                        // below its end: classifying at position 0 marks
+                        // exactly the values GU-9 marks.
+                        let classified = match (snapshot, self.source.barrier()) {
+                            (Some(snapshot), Some((words, _))) => {
+                                snapshot.classify(&words, freshness, 0)
+                            }
+                            _ => Freshness::Fresh,
+                        };
+                        if classified == Freshness::Retry {
+                            continue;
+                        }
+                        // A terminal publication after the copy: nothing
+                        // more is delivered.
+                        if self.observe_barrier() {
+                            return;
+                        }
                         let delivered = self.delivered.get(key as usize).copied().unwrap_or(0);
-                        if version <= delivered {
+                        let code = freshness_code(classified);
+                        let same = self
+                            .delivered_freshness
+                            .get(key as usize)
+                            .is_some_and(|&delivered| delivered == code);
+                        if version < delivered || (version == delivered && same) {
                             report.skipped += 1;
                             return;
                         }
                         self.in_flight = Some(key);
-                        handler(key, version, self.value.get(..length).unwrap_or(&[]));
+                        handler(
+                            key,
+                            version,
+                            self.value.get(..length).unwrap_or(&[]),
+                            classified,
+                        );
                         self.in_flight = None;
                         if let Some(entry) = self.delivered.get_mut(key as usize) {
                             *entry = version;
+                        }
+                        if let Some(entry) = self.delivered_freshness.get_mut(key as usize) {
+                            *entry = code;
                         }
                         report.delivered += 1;
                         return;

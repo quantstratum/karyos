@@ -37,6 +37,25 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Conflation freshness for network images' views (conflated-network-images.md,
+  C2): `conflation_fresh` builds a heap table with a loss barrier over the
+  terminal cell of a `FreshnessLink` (a seal mailbox and a terminal cell in
+  one allocation, shared with the image's receive owner). Its writer
+  records a loss (`record_loss`, refused below the frontier with the
+  terminal cell published, or while the ring is full), writes values with
+  their freshness (`write_at`, `FreshSlotWords::write_with_freshness`),
+  reconciles the slots in bounded passes and retires the records
+  (`reconcile`), and counts the work (`FreshCounters`). It refuses a value
+  without its position (`ConflationError::PositionRequired`) or below its
+  frontier (`ConflationError::BehindFrontier`), and a terminal close also
+  closes the table. The reader
+  classifies each copied value against the barrier and the terminal cell:
+  `ConflationReader::poll_changed`'s handler gets the `Freshness` as a
+  fourth argument, a new loss serves every written key again, and after the
+  terminal cell nothing is delivered (`PollReport::terminal`). Terminal
+  reasons are `TERMINAL_BARRIER_TIMEOUT`, `TERMINAL_FRESHNESS_EXHAUSTED` and
+  `TERMINAL_BELOW_FRONTIER`. Tables without a barrier deliver every value
+  Fresh; the client's `ConflatedSubscription` keeps its signatures.
 - A seal gate on the skip policy (conflated-network-images.md (b)):
   `SkipPolicy::duty_gated` and `SkipPolicy::range_unavailable_gated` ask a
   `SealGate` before each seal. While it answers `GateAnswer::Pending`, the

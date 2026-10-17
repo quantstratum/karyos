@@ -33,8 +33,8 @@ fn conflation_write_poll(c: &mut Criterion) {
                         keys: 1,
                         retries: 3,
                     },
-                    |key, version, value| {
-                        black_box((key, version, value));
+                    |key, version, value, freshness| {
+                        black_box((key, version, value, freshness));
                     },
                 );
                 black_box((write, poll));
