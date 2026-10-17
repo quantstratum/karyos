@@ -93,6 +93,16 @@ pub(crate) mod sealed {
         fn region(buffer: &LogBuffer<Self>) -> Option<&karyos_sys::ipc::Region>
         where
             Self: StreamTerms;
+
+        /// Exposes an installed image's heap lanes as an aggregate; `None`
+        /// where streams are not heap backed (D3: network streams over heap
+        /// terms only, SPEC §18).
+        fn expose_image(
+            driver: &mut EmbeddedDriver<Self>,
+            lanes: &[std::sync::Arc<LogBuffer>],
+        ) -> Option<crate::embedded::AggregateHandle>
+        where
+            Self: StreamTerms;
     }
 
     impl Create for karyos_sys::term_bytes::HeapTerms {
@@ -107,6 +117,13 @@ pub(crate) mod sealed {
         #[cfg(target_os = "linux")]
         fn region(_buffer: &LogBuffer<Self>) -> Option<&karyos_sys::ipc::Region> {
             None
+        }
+
+        fn expose_image(
+            driver: &mut EmbeddedDriver<Self>,
+            lanes: &[std::sync::Arc<LogBuffer>],
+        ) -> Option<crate::embedded::AggregateHandle> {
+            driver.add_image_aggregate(lanes)
         }
     }
 
@@ -127,6 +144,13 @@ pub(crate) mod sealed {
 
         fn region(buffer: &LogBuffer<Self>) -> Option<&karyos_sys::ipc::Region> {
             buffer.region()
+        }
+
+        fn expose_image(
+            _driver: &mut EmbeddedDriver<Self>,
+            _lanes: &[std::sync::Arc<LogBuffer>],
+        ) -> Option<crate::embedded::AggregateHandle> {
+            None
         }
     }
 }
@@ -800,6 +824,107 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
 pub const FIRST_INCARNATION: u64 = 1;
 
 impl EmbeddedDriver<HeapTerms> {
+    /// Exposes the lanes of an installed image as the lane streams of one
+    /// aggregate, keyed by the image's alias (wiring note W-e, W3; the
+    /// interim D2 step, ACS 15937). Each lane's conductor is issued here,
+    /// so the duty cycle prepares the image's terms as for a local stream.
+    /// Returns `None`, with nothing added, when the key is in use (a local
+    /// stream or an earlier image of the alias), the stream table is full
+    /// or a conductor was already issued. A retiring stream keeps its key
+    /// until it frees, so a new image of that alias installed meanwhile
+    /// stays unexposed for its whole life (interim D2, #283 P3).
+    pub(crate) fn add_image_aggregate(
+        &mut self,
+        lanes: &[Arc<LogBuffer>],
+    ) -> Option<AggregateHandle> {
+        let first = lanes.first()?.config();
+        let key = (first.stream_id, first.session_id);
+        let count = u8::try_from(lanes.len()).ok()?;
+        if self
+            .streams
+            .iter()
+            .any(|stream| (stream.stream_id, stream.session_id) == key)
+            || self
+                .streams
+                .len()
+                .checked_add(lanes.len())
+                .is_none_or(|total| total > self.config.max_streams)
+        {
+            return None;
+        }
+        // Each lane's quantum is four of its largest frames, as for a
+        // sender's lanes.
+        let quanta = lanes
+            .iter()
+            .map(|lane| u64::from(lane.config().mtu).checked_mul(4))
+            .collect::<Option<Vec<u64>>>()?;
+        let charge = largest_charge(&StreamConfig {
+            buffer: *first,
+            allow_unconnected: true,
+            on_required_loss: LossPolicy::Hold,
+            conflation: None,
+        })
+        .ok()?;
+        let profile = DrrConfig::new(&quanta, charge).ok()?;
+        let registration = self.next_stream;
+        let next = registration.checked_add(u64::from(count))?;
+        let aggregate = Aggregate {
+            registration,
+            lanes: count,
+            profile,
+        };
+        let mut staged = Vec::with_capacity(lanes.len());
+        let mut handle = AggregateHandle {
+            driver: self.id,
+            registration,
+            lanes: [None; MAX_LANES],
+        };
+        for (id, buffer) in (registration..next).zip(lanes) {
+            let config = *buffer.config();
+            let conductor = buffer.conductor_owned()?;
+            if let Some(slot) = handle.lanes.get_mut(usize::from(config.lane.get())) {
+                *slot = Some(id);
+            }
+            staged.push(Stream {
+                id,
+                aggregate,
+                retiring: false,
+                buffer: Arc::clone(buffer),
+                conductor,
+                leases: Arc::new(StreamLeases::default()),
+                allow_unconnected: true,
+                policy: LossPolicy::Hold,
+                stream_id: key.0,
+                session_id: key.1,
+                claim_waiting: false,
+                config,
+                conflation: None,
+                generation: Generation::default(),
+                base: 0,
+                members: Vec::new(),
+                cutover: None,
+                retained: Vec::new(),
+                spare: None,
+                feeder: None,
+                conflation_terminal: None,
+                feeder_counters: None,
+                guarded: None,
+                incarnation: FIRST_INCARNATION,
+                replaced: Vec::new(),
+                schedule: None,
+                schedule_issued: false,
+                schedule_clock: None,
+                timed_counters: None,
+            });
+        }
+        self.next_stream = next;
+        self.streams.extend(staged);
+        self.update_stream_gauges();
+        Some(handle)
+    }
+}
+
+impl EmbeddedDriver<HeapTerms> {
     /// An empty driver.
     ///
     /// # Errors
@@ -1298,14 +1423,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Seals one lane stream and marks it retiring, once.
     fn retire_lane(&mut self, stream: StreamHandle) -> Result<(), DriverError> {
+        self.retire_lane_with(
+            stream,
+            SealReason::StreamRemoved,
+            CloseReason::StreamRemoved,
+        )
+    }
+
+    /// Seals one lane stream with `seal` and marks it retiring, once,
+    /// reporting `close` to clients.
+    pub(crate) fn retire_lane_with(
+        &mut self,
+        stream: StreamHandle,
+        seal: SealReason,
+        close: CloseReason,
+    ) -> Result<(), DriverError> {
         let target = self.stream(stream)?;
         if !target.retiring {
             // A stream an earlier seal closed keeps that reason and was
             // reported then.
             let was_active = target.conductor.seal_state() == SealState::Active;
-            target
-                .conductor
-                .seal_with_reason(SealReason::StreamRemoved)?;
+            target.conductor.seal_with_reason(seal)?;
             let key = target.key();
             let lane = target.config.lane;
             if let Some(mut feeder) = target.feeder.take() {
@@ -1322,7 +1460,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 self.emit(&DriverEvent::PublicationClosed {
                     stream: key,
                     lane,
-                    reason: CloseReason::StreamRemoved,
+                    reason: close,
                 });
             }
         }
@@ -2924,9 +3062,63 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = &mut self.net else {
             return (0, None);
         };
-        match net.duty(self.clock.now()) {
+        let served = match net.duty(self.clock.now()) {
             Ok(work) => (work, None),
             Err(error) => (0, Some(error)),
+        };
+        self.serve_images();
+        served
+    }
+
+    /// Applies the image table's events (W3): an installed image becomes
+    /// the lane streams of one aggregate, or is driven unexposed; a
+    /// retiring one has its streams sealed and retired, so they free once
+    /// no lease holds them and the image table can reclaim the image.
+    fn serve_images(&mut self) {
+        let Some(events) = self
+            .net
+            .as_mut()
+            .map(crate::net::Network::take_image_events)
+        else {
+            return;
+        };
+        for event in &events {
+            match *event {
+                crate::agents::images::ImageEvent::Installed { slot, .. } => {
+                    let Some(lanes) = self.net.as_ref().and_then(|net| net.image_lanes(slot))
+                    else {
+                        continue;
+                    };
+                    let exposed = <T as sealed::Create>::expose_image(self, &lanes);
+                    if let Some(net) = &mut self.net {
+                        net.record_image(slot, exposed, &lanes);
+                    }
+                }
+                crate::agents::images::ImageEvent::Retiring { slot } => {
+                    let handle = self.net.as_ref().and_then(|net| net.image_aggregate(slot));
+                    if let Some(handle) = handle {
+                        for stream in handle.streams() {
+                            let _ = self.retire_lane_with(
+                                stream,
+                                SealReason::ImageRetired,
+                                CloseReason::ImageRetired,
+                            );
+                        }
+                    }
+                    if let Some(net) = &mut self.net {
+                        net.retire_unexposed(slot);
+                    }
+                }
+                crate::agents::images::ImageEvent::Reclaimed { slot } => {
+                    if let Some(net) = &mut self.net {
+                        net.forget_image(slot);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(net) = &mut self.net {
+            net.return_image_events(events);
         }
     }
 

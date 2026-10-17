@@ -446,6 +446,17 @@ pub enum AgentCommand<O: SocketOps> {
         /// The lane.
         lane: karyos_protocol::frame::Lane,
     },
+    /// Receiver only: stop subscribing `stream_id` on `endpoint`: no new
+    /// image is challenged for it, and its images retire. Answer
+    /// [`AgentEvent::Configured`], `accepted` when it was subscribed.
+    RemoveSubscription {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The stream.
+        stream_id: i32,
+    },
     /// Receiver only: `alias` on `endpoint` is no longer a local
     /// publication, so the pre-filter stops admitting its controls.
     /// Answer [`AgentEvent::Configured`], `accepted` when it was there.
@@ -732,6 +743,7 @@ impl<O: SocketOps> AgentCore<O> {
                 command @ (AgentCommand::AddPublication { .. }
                 | AgentCommand::RemovePublication { .. }
                 | AgentCommand::RemovePublishedAlias { .. }
+                | AgentCommand::RemoveSubscription { .. }
                 | AgentCommand::AddSubscription { .. }
                 | AgentCommand::AddPublishedAlias { .. }
                 | AgentCommand::SetNetworkTrace { .. }
