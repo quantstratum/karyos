@@ -71,6 +71,7 @@ fn the_duty_cycle_serves_the_agents_in_every_mode() {
         assert!(driver.net.as_ref().unwrap().is_running());
         open_endpoint(&mut driver);
         let shutdown = driver.close_network().unwrap();
+        assert!(shutdown.agents_stopped, "{mode:?}");
         assert_eq!(shutdown.endpoints_retired, 1, "{mode:?}");
         assert!(shutdown.failures.is_empty(), "{mode:?}: {shutdown:?}");
         assert!(shutdown.late.is_empty(), "{mode:?}");
@@ -110,6 +111,73 @@ fn a_failed_agent_fails_the_duty_cycle() {
     let shutdown = driver.close_network().unwrap();
     assert!(!shutdown.failures.is_empty());
     assert!(shutdown.late.is_empty());
+}
+
+/// DN-9 in `Shared` mode: an agent that panics on the conductor's thread
+/// is caught as on a runner thread, the error is latched, the failed agent
+/// never runs again, and closing and dropping the driver do not panic.
+#[test]
+fn a_shared_agent_panic_is_a_driver_error() {
+    let mut driver = driver(ThreadingMode::Shared);
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| AgentCommand::Panic)
+        .unwrap();
+    let failed = Err(DriverError::NetworkAgent {
+        agent: AgentKind::Sender,
+    });
+    assert_eq!(driver.do_work(), failed);
+    assert_eq!(driver.do_work(), failed, "latched");
+    let shutdown = driver.close_network().unwrap();
+    assert!(shutdown.late.is_empty());
+    drop(driver);
+}
+
+/// Dropping a driver whose agent thread does not stop in time joins it
+/// instead of detaching it (wiring note W-g).
+#[test]
+fn dropping_the_driver_joins_a_late_agent() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Dedicated,
+        ..NetworkConfig::default()
+    };
+    network.agents.stop_timeout = Duration::from_millis(1);
+    let driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let blocked = Arc::new(AtomicBool::new(true));
+    let command = Arc::clone(&blocked);
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| AgentCommand::Block(command))
+        .unwrap();
+    let release = Arc::clone(&blocked);
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        release.store(false, Ordering::Release);
+    });
+    // Let the agent take the command before the driver stops it.
+    std::thread::sleep(Duration::from_millis(20));
+    let started = Instant::now();
+    drop(driver);
+    let waited = started.elapsed();
+    releaser.join().unwrap();
+    assert!(waited >= Duration::from_millis(50), "{waited:?}");
+    assert_eq!(Arc::strong_count(&blocked), 1, "the agent was dropped");
 }
 
 /// Dropping a driver with running agent threads stops them.

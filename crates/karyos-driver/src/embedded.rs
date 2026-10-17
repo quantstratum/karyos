@@ -2379,8 +2379,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let mut work = self.serve_commands();
         let mut first_error = None;
         add_step(&self.counters, &mut work, &mut first_error, admitted);
-        let network = self.serve_network();
-        add_step(&self.counters, &mut work, &mut first_error, network);
+        // An agent failure is an error, not a counter overflow.
+        let (network, failure) = self.serve_network();
+        add_work(&self.counters, &mut work, &mut first_error, network);
+        if let Some(error) = failure {
+            first_error.get_or_insert(error);
+        }
         add_work(&self.counters, &mut work, &mut first_error, alive);
         let charged = self.charged_generations();
         let mut opened = Vec::new();
@@ -2914,10 +2918,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// Stops the network agents and reclaims their endpoints and images
     /// (wiring note W-g); `None` without a network or once closed. Dropping
-    /// the driver does the same and discards the report.
+    /// the driver does the same, then joins any agent thread that did not
+    /// stop in time (blocking: such a thread exits once its rings are
+    /// gone), so none is ever detached.
     pub fn close_network(&mut self) -> Option<crate::net::NetworkShutdown> {
         let mut net = self.net.take()?;
-        Some(net.close())
+        Some(net.close(self.clock.now()))
     }
 
     pub(crate) fn clock_now(&mut self) -> u64 {

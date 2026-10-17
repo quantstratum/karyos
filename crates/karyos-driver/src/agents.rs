@@ -999,7 +999,7 @@ enum Work<O: SocketOps> {
 
 /// Runs one agent's duty cycle, turning a panic into
 /// [`AgentError::Panicked`] for that agent.
-fn guarded(
+pub(crate) fn guarded(
     kind: AgentKind,
     cycle: impl FnOnce() -> Result<u32, AgentError>,
 ) -> Result<u32, AgentError> {
