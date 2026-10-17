@@ -6,10 +6,12 @@
 //! value is a number or a string of [`crate::env::clean`] characters, so a
 //! field can be read back by name without a JSON library.
 
+use std::borrow::Cow;
+
 use karyos_trace::histogram::{Histogram, Quantile};
 
 use crate::env::Labels;
-use crate::workloads::{Measurement, Workload};
+use crate::workloads::{Backing, Measurement, Workload};
 
 /// The reported quantiles, as `(name, numerator, denominator)`.
 pub const QUANTILES: [(&str, u64, u64); 5] = [
@@ -69,6 +71,8 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
         let what = match measurement.config.workload {
             Workload::PingPong | Workload::IpcPingPong => "round trip",
             Workload::OpenLoop => "scheduled latency (due time to delivery)",
+            Workload::SenderNak => "latency per NAK range",
+            Workload::ImageInstall => "install time per image",
             _ => "latency",
         };
         out.push_str(&format!(
@@ -107,7 +111,12 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
         }
         out.push('\n');
     }
-    out.push_str(&format!("  rate {:.0} messages/s\n", measurement.rate));
+    let unit = match measurement.config.workload {
+        Workload::SenderNak => "NAK ranges",
+        Workload::ImageInstall => "images",
+        _ => "messages",
+    };
+    out.push_str(&format!("  rate {:.0} {unit}/s\n", measurement.rate));
     if let Some(rotations) = measurement.term_rotations_per_second {
         out.push_str(&format!("  term production {rotations:.0} rotations/s\n"));
     }
@@ -135,6 +144,19 @@ pub fn history_line(measurement: &Measurement, labels: &Labels) -> String {
                 .target_rate
                 .map_or_else(|| "null".into(), |rate| rate.to_string())
         ),
+        format!(
+            "\"nak_frames\":{}",
+            config
+                .nak_frames
+                .map_or_else(|| "null".into(), |frames| frames.to_string())
+        ),
+        format!(
+            "\"lanes\":{}",
+            config
+                .lanes
+                .map_or_else(|| "null".into(), |lanes| lanes.to_string())
+        ),
+        format!("\"backing\":\"{}\"", config.backing.name()),
         format!("\"host\":\"{}\"", labels.host),
         format!("\"cpu\":\"{}\"", labels.cpu),
         format!("\"os\":\"{}\"", labels.os),
@@ -180,15 +202,34 @@ pub fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     Some(value)
 }
 
+/// `key` with its configuration's backing: a key written before the
+/// backing was part of the canonical configuration has none, and reads as
+/// its workload's default backing, so its records stay comparable with
+/// the same configuration on that backing and with no other.
+#[must_use]
+pub fn normalized_key(key: &str) -> Cow<'_, str> {
+    let config = key.split('|').next().unwrap_or_default();
+    if config.split(' ').any(|word| word.starts_with("backing=")) {
+        return Cow::Borrowed(key);
+    }
+    let backing = config
+        .split(' ')
+        .next()
+        .and_then(Workload::parse)
+        .map_or(Backing::Heap, Workload::default_backing);
+    let rest = key.get(config.len()..).unwrap_or_default();
+    Cow::Owned(format!("{config} backing={}{rest}", backing.name()))
+}
+
 /// The comparison of `line` against the last earlier line with the same
-/// key in `history`, or `None` when there is none. Reports only.
+/// key in `history`, or `None` when there is none. Reports only. Keys are
+/// compared as [`normalized_key`] reads them.
 #[must_use]
 pub fn compare(history: &str, line: &str) -> Option<String> {
-    let key = field(line, "key")?;
-    let previous = history
-        .lines()
-        .rev()
-        .find(|earlier| field(earlier, "key") == Some(key))?;
+    let key = normalized_key(field(line, "key")?);
+    let previous = history.lines().rev().find(|earlier| {
+        field(earlier, "key").is_some_and(|earlier| normalized_key(earlier) == key)
+    })?;
     let mut out = format!(
         "  against commit {}:",
         field(previous, "commit").unwrap_or("unknown")

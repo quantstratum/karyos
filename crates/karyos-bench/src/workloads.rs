@@ -24,12 +24,15 @@ use karyos_sys::log_buffer::{
 use karyos_sys::receive::{ImageParams, Item, ValidatedDatagram};
 use karyos_sys::sizing::{DEFAULT_MTU, TermLength};
 use karyos_sys::term::{TermCount, TermId};
+use karyos_sys::term_bytes::TermBytes;
 use karyos_trace::clocks::Latency;
 use karyos_trace::histogram::Histogram;
 use karyos_trace::{
     BufferedIds, MonotonicClock, ObserverId, OsRandom, Sampling, TraceAgent, TraceCollector,
     trace_journal,
 };
+
+use crate::terms;
 
 /// A named workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,11 +67,21 @@ pub enum Workload {
     /// One publisher and a subscriber in another process, over an IPC
     /// driver (Linux).
     IpcThroughput,
+    /// A sender read stages each committed message into a datagram buffer
+    /// of one MTU, as the network sender's `Outbound` does; no socket
+    /// (`quantstratum-docs: karyos/design/network-shared-terms.md`, N-5).
+    SenderRead,
+    /// A sender read answers a NAK of `nak_frames` already sent frames by
+    /// NAK reads into a datagram buffer of one MTU (N-5).
+    SenderNak,
+    /// The lanes of one image and their receive owner are created, as the
+    /// conductor's image table does at `CreateImage` (N-5).
+    ImageInstall,
 }
 
 impl Workload {
     /// Every workload.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 15] = [
         Self::OfferPoll,
         Self::Claim,
         Self::PingPong,
@@ -81,6 +94,9 @@ impl Workload {
         Self::TraceOn,
         Self::IpcPingPong,
         Self::IpcThroughput,
+        Self::SenderRead,
+        Self::SenderNak,
+        Self::ImageInstall,
     ];
 
     /// Its name on the command line and in the history.
@@ -99,6 +115,9 @@ impl Workload {
             Self::TraceOn => "trace-on",
             Self::IpcPingPong => "ipc-ping-pong",
             Self::IpcThroughput => "ipc-throughput",
+            Self::SenderRead => "sender-read",
+            Self::SenderNak => "sender-nak",
+            Self::ImageInstall => "image-install",
         }
     }
 
@@ -108,6 +127,128 @@ impl Workload {
         Self::ALL
             .into_iter()
             .find(|workload| workload.name() == name)
+    }
+
+    /// The term backings it runs on, its default first.
+    #[must_use]
+    pub const fn backings(self) -> &'static [Backing] {
+        match self {
+            Self::Receive | Self::ReceiveDuplicate | Self::SenderRead | Self::SenderNak => {
+                &[Backing::Heap, Backing::Shared, Backing::Region]
+            }
+            Self::ImageInstall => &[Backing::Heap, Backing::Region],
+            // Every stream of an IPC driver is in a shared region.
+            Self::IpcPingPong | Self::IpcThroughput => &[Backing::Region],
+            Self::OfferPoll
+            | Self::Claim
+            | Self::PingPong
+            | Self::Throughput
+            | Self::OpenLoop
+            | Self::CleanerThroughput
+            | Self::TraceOff
+            | Self::TraceOn => &[Backing::Heap],
+        }
+    }
+
+    /// The backing of its records written before the backing was part of
+    /// the canonical configuration, and of its default configurations.
+    #[must_use]
+    pub const fn default_backing(self) -> Backing {
+        match self.backings() {
+            [first, ..] => *first,
+            [] => Backing::Heap,
+        }
+    }
+
+    /// Whether it runs on `backing`.
+    #[must_use]
+    pub fn supports(self, backing: Backing) -> bool {
+        self.backings().contains(&backing)
+    }
+}
+
+/// What a workload's term memory is
+/// (`quantstratum-docs: karyos/design/network-shared-terms.md`, N-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backing {
+    /// `HeapTerms`: private heap memory moved with plain copies.
+    Heap,
+    /// `SharedTerms` on heap words of this process (`LogBuffer::new_shared`):
+    /// every byte moved as an aligned atomic word.
+    Shared,
+    /// `SharedTerms` in a real shared region (`LogBuffer::create_in`), as an
+    /// IPC driver creates every stream (Linux).
+    Region,
+}
+
+impl Backing {
+    /// Every backing.
+    pub const ALL: [Self; 3] = [Self::Heap, Self::Shared, Self::Region];
+
+    /// Its name on the command line and in the history.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Heap => "heap",
+            Self::Shared => "shared",
+            Self::Region => "region",
+        }
+    }
+
+    /// The backing named `name`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|backing| backing.name() == name)
+    }
+}
+
+/// Why a configuration cannot run on its backing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackingRefused {
+    /// The workload does not run on this backing.
+    Unsupported {
+        /// The workload.
+        workload: Workload,
+        /// The backing it was given.
+        backing: Backing,
+    },
+    /// A region is created only on Linux, where the driver's IPC mode
+    /// exists.
+    NeedsLinux {
+        /// The workload.
+        workload: Workload,
+    },
+}
+
+impl fmt::Display for BackingRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported { workload, backing } => write!(
+                f,
+                "{} does not run on backing {}; it runs on {}",
+                workload.name(),
+                backing.name(),
+                workload
+                    .backings()
+                    .iter()
+                    .map(|backing| backing.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::NeedsLinux { workload } => write!(
+                f,
+                "{} on backing region needs Linux: shared regions exist there only",
+                workload.name()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BackingRefused {}
+
+impl From<BackingRefused> for BenchError {
+    fn from(refused: BackingRefused) -> Self {
+        Self(refused.to_string())
     }
 }
 
@@ -129,6 +270,36 @@ pub struct Config {
     pub term_length: u32,
     /// Scheduled messages per second for `open-loop`.
     pub target_rate: Option<u64>,
+    /// Frames of each NAK range for `sender-nak`.
+    pub nak_frames: Option<u32>,
+    /// Lanes of each image for `image-install`.
+    pub lanes: Option<u8>,
+    /// The term memory.
+    pub backing: Backing,
+}
+
+impl Config {
+    /// Whether the workload runs on the configured backing here.
+    ///
+    /// # Errors
+    ///
+    /// [`BackingRefused::Unsupported`] for a backing the workload does not
+    /// run on, and [`BackingRefused::NeedsLinux`] for a region on any other
+    /// target.
+    pub fn check_backing(&self) -> Result<(), BackingRefused> {
+        if !self.workload.supports(self.backing) {
+            return Err(BackingRefused::Unsupported {
+                workload: self.workload,
+                backing: self.backing,
+            });
+        }
+        if self.backing == Backing::Region && !cfg!(target_os = "linux") {
+            return Err(BackingRefused::NeedsLinux {
+                workload: self.workload,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for Config {
@@ -146,7 +317,15 @@ impl fmt::Display for Config {
         if let Some(rate) = self.target_rate {
             write!(f, " target_rate={rate}")?;
         }
-        Ok(())
+        if let Some(frames) = self.nak_frames {
+            write!(f, " nak_frames={frames}")?;
+        }
+        if let Some(lanes) = self.lanes {
+            write!(f, " lanes={lanes}")?;
+        }
+        // Last, so a record written before the backing existed reads as
+        // its workload's default backing (`report::compare`).
+        write!(f, " backing={}", self.backing.name())
     }
 }
 
@@ -272,6 +451,7 @@ fn receive(
 ///
 /// Returns the first driver or client error.
 pub fn run(config: Config) -> Result<Measurement, BenchError> {
+    config.check_backing()?;
     match config.workload {
         Workload::OfferPoll | Workload::Claim | Workload::TraceOff => single_thread(config, false),
         Workload::TraceOn => single_thread(config, true),
@@ -279,8 +459,11 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
         Workload::Throughput => throughput(config),
         Workload::OpenLoop => open_loop(config),
         Workload::CleanerThroughput => cleaner_throughput(config),
-        Workload::Receive => receive_frames(config, false),
-        Workload::ReceiveDuplicate => receive_frames(config, true),
+        Workload::Receive => receive_on(config, false),
+        Workload::ReceiveDuplicate => receive_on(config, true),
+        Workload::SenderRead => crate::terms::sender_read(config),
+        Workload::SenderNak => crate::terms::sender_nak(config),
+        Workload::ImageInstall => crate::terms::image_install(config),
         #[cfg(target_os = "linux")]
         Workload::IpcPingPong => crate::ipc::ping_pong(config),
         #[cfg(target_os = "linux")]
@@ -293,37 +476,50 @@ pub fn run(config: Config) -> Result<Measurement, BenchError> {
     }
 }
 
+/// [`receive_frames`] on the configured backing.
+fn receive_on(config: Config, duplicate: bool) -> Result<Measurement, BenchError> {
+    let term_length =
+        TermLength::try_new(config.term_length).map_err(|cause| error("term length", cause))?;
+    let lane = LogBufferConfig {
+        term_length,
+        spare_slots: 6,
+        max_subscribers: 2,
+        mtu: DEFAULT_MTU,
+        max_reserved: config.term_length / 8,
+        initial_term_id: TermId::new(7),
+        lane: Lane::ZERO,
+        session_id: 1,
+        stream_id: 1,
+        claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+        publication: PublicationMode::Image {
+            join: 0,
+            local_gaps: false,
+        },
+        schedule_capacity: 0,
+    };
+    match config.backing {
+        Backing::Heap => receive_frames(config, duplicate, terms::heap(lane)?),
+        Backing::Shared => receive_frames(config, duplicate, terms::shared(lane)?),
+        Backing::Region => receive_frames(config, duplicate, terms::region(lane)?),
+    }
+}
+
 /// One thread: validate a datagram of one frame and hand it to the image's
 /// receive owner, measuring only the owner's call: the commit, or with
 /// `duplicate` the comparison of a second copy. Parsing and validation
 /// happen before the timer starts. A PAD closes each term and the conductor
 /// prepares the next; neither is measured.
-fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchError> {
+fn receive_frames<T: TermBytes>(
+    config: Config,
+    duplicate: bool,
+    buffer: LogBuffer<T>,
+) -> Result<Measurement, BenchError> {
     let resolution = resolution();
     let term_length =
         TermLength::try_new(config.term_length).map_err(|cause| error("term length", cause))?;
     let params = ImageParams::new(1, 1, 1, term_length, DEFAULT_MTU)
         .map_err(|cause| error("image params", cause))?;
-    let buffer = Arc::new(
-        LogBuffer::new(LogBufferConfig {
-            term_length,
-            spare_slots: 6,
-            max_subscribers: 2,
-            mtu: DEFAULT_MTU,
-            max_reserved: config.term_length / 8,
-            initial_term_id: TermId::new(7),
-            lane: Lane::ZERO,
-            session_id: 1,
-            stream_id: 1,
-            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
-            publication: PublicationMode::Image {
-                join: 0,
-                local_gaps: false,
-            },
-            schedule_capacity: 0,
-        })
-        .map_err(|cause| error("image", cause))?,
-    );
+    let buffer = Arc::new(buffer);
     let mut conductor = buffer
         .conductor()
         .ok_or_else(|| BenchError("the image's conductor was taken".into()))?;
@@ -338,7 +534,7 @@ fn receive_frames(config: Config, duplicate: bool) -> Result<Measurement, BenchE
     let mut latencies = histogram()?;
     let (mut term, mut offset) = (0u32, 0u32);
     let mut measured_from = Instant::now();
-    let handle = |owner: &mut ReceiveOwner, bytes: &[u8]| -> Result<Received, BenchError> {
+    let handle = |owner: &mut ReceiveOwner<T>, bytes: &[u8]| -> Result<Received, BenchError> {
         let datagram =
             ValidatedDatagram::parse(bytes, &params).map_err(|cause| error("parse", cause))?;
         let Some(Item::Frame(frame)) = datagram.items().next() else {
