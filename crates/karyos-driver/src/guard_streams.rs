@@ -22,13 +22,27 @@
 //!   is anyway (a broken invariant), the bound handle's outcome stream is
 //!   abandoned with an unknown lost count, and the handle ends with
 //!   `OutcomesLost`.
+//! - **Network lanes.** A guarded network publication's lane is submitted
+//!   by its sender gate, not at commit ("Trusted sockets in Phase 2"). The
+//!   gate publishes its submission frontier
+//!   (`karyos_sys::submission_frontier`), and the walker decides each
+//!   message by it: `Submitted` once a backend took every frame of it,
+//!   `Unknown` when one may have left unproven, and, once the gate will
+//!   decide nothing more, `Aborted` for what never left. A message not
+//!   decided yet waits, with everything after it, so records stay in
+//!   position order; `Ended` waits for the gate's final word too. A
+//!   message's reservation is therefore released at its network
+//!   submission, so the publisher holds at most `C_m` messages committed
+//!   and not yet sent.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use karyos_client::HeapWords;
+use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SealReason, Subscription};
 use karyos_sys::outcome_ring::{Kind, LOST_UNKNOWN, OutcomeError, OutcomeWriter, Produced, Record};
+use karyos_sys::submission_frontier::{Final, SubmissionFrontier};
 use karyos_sys::sync::AtomicU64;
 use karyos_sys::term_bytes::TermBytes;
 
@@ -79,6 +93,25 @@ pub(crate) struct GuardedStream<T: TermBytes> {
     /// those `GUARD_CLOSED`, every other aborted block `WRITER_ABORTED`
     /// (G4), whatever the seal state when it walks.
     guard_aborted: Vec<u64>,
+    /// A network lane's submission frontier and its lane in it.
+    network: Option<(Arc<SubmissionFrontier>, Lane)>,
+    /// The block read and not decided yet: the walk resumes with it.
+    pending: Option<Block>,
+}
+
+/// One block the walker read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Block {
+    /// A committed message, `[position, end)`.
+    Message { position: u64, end: u64 },
+    /// An aborted block and its reason.
+    Aborted {
+        position: u64,
+        end: u64,
+        reason: u64,
+    },
+    /// The seal.
+    Closed { position: u64, seal: SealReason },
 }
 
 /// What one walk did.
@@ -111,7 +144,67 @@ impl<T: TermBytes> GuardedStream<T> {
             bounds: VecDeque::new(),
             ended: false,
             guard_aborted: Vec::new(),
+            network: None,
+            pending: None,
         }
+    }
+
+    /// From now on its messages are decided by `frontier`'s `lane`: the
+    /// lane is a guarded network publication's (control path, before the
+    /// sender is posted).
+    pub(crate) fn submit_through(&mut self, frontier: Arc<SubmissionFrontier>, lane: Lane) {
+        self.network = Some((frontier, lane));
+    }
+
+    /// `block`'s record, `(position, end, kind, reason)`; `None` while a
+    /// network lane's gate has not decided it.
+    fn decide(&self, block: Block) -> Option<(u64, u64, Kind, u64)> {
+        let decided = match (block, &self.network) {
+            (
+                Block::Aborted {
+                    position,
+                    end,
+                    reason,
+                },
+                _,
+            ) => (position, end, Kind::Aborted, reason),
+            (Block::Message { position, end }, None) => (position, end, Kind::Submitted, 0),
+            (Block::Closed { position, seal }, None) => {
+                (position, position, Kind::Ended, end_reason(seal))
+            }
+            (Block::Message { position, end }, Some((frontier, lane))) => {
+                let (state, at) = frontier.read(*lane);
+                let unknown = position < at.unknown_hi;
+                if end <= at.resolved {
+                    let kind = if unknown {
+                        Kind::Unknown
+                    } else {
+                        Kind::Submitted
+                    };
+                    (position, end, kind, 0)
+                } else {
+                    match state {
+                        Final::Open => return None,
+                        Final::Finished { reason } if !unknown => {
+                            (position, end, Kind::Aborted, reason)
+                        }
+                        Final::Superseded { reason } if !unknown && end > at.staged_hi => {
+                            (position, end, Kind::Aborted, reason)
+                        }
+                        Final::Finished { .. } | Final::Superseded { .. } => {
+                            (position, end, Kind::Unknown, 0)
+                        }
+                    }
+                }
+            }
+            (Block::Closed { position, seal }, Some((frontier, lane))) => {
+                if frontier.read(*lane).0 == Final::Open {
+                    return None;
+                }
+                (position, position, Kind::Ended, end_reason(seal))
+            }
+        };
+        Some(decided)
     }
 
     /// Whether the walker reached the seal and wrote `Ended`, or was
@@ -182,45 +275,53 @@ impl<T: TermBytes> GuardedStream<T> {
             return Ok(walked);
         }
         for _ in 0..budget {
-            let polled = self.walker.poll(&mut self.scratch)?;
-            let (position, end, kind, reason) = match polled {
-                PollOutcome::Message { position, .. } => {
-                    (position, self.walker.position(), Kind::Submitted, 0)
-                }
-                PollOutcome::Aborted { position, extent } => {
-                    let by_close = self.guard_aborted.iter().position(|&at| at == position);
-                    let reason = match by_close {
-                        Some(index) => {
-                            let _ = self.guard_aborted.swap_remove(index);
-                            REASON_GUARD_CLOSED
-                        }
-                        None => REASON_WRITER_ABORTED,
-                    };
-                    // Positions stay below 2^63 (the stream position range).
-                    (
+            let block = match self.pending.take() {
+                Some(block) => block,
+                None => match self.walker.poll(&mut self.scratch)? {
+                    PollOutcome::Message { position, .. } => Block::Message {
                         position,
-                        position + u64::from(extent),
-                        Kind::Aborted,
-                        reason,
-                    )
-                }
-                PollOutcome::Closed {
-                    position,
-                    reason: seal,
-                } => {
-                    self.ended = true;
-                    (position, position, Kind::Ended, end_reason(seal))
-                }
-                PollOutcome::Overrun { .. } => {
-                    walked.overrun = true;
-                    self.abandon_all()?;
-                    return Ok(walked);
-                }
-                // An image's skipped range carries no message; a revoked
-                // walker reads nothing more.
-                PollOutcome::Skipped { .. } => continue,
-                PollOutcome::Pending | PollOutcome::Revoked { .. } => return Ok(walked),
+                        end: self.walker.position(),
+                    },
+                    PollOutcome::Aborted { position, extent } => {
+                        let by_close = self.guard_aborted.iter().position(|&at| at == position);
+                        let reason = match by_close {
+                            Some(index) => {
+                                let _ = self.guard_aborted.swap_remove(index);
+                                REASON_GUARD_CLOSED
+                            }
+                            None => REASON_WRITER_ABORTED,
+                        };
+                        // Positions stay below 2^63 (the stream position
+                        // range).
+                        Block::Aborted {
+                            position,
+                            end: position + u64::from(extent),
+                            reason,
+                        }
+                    }
+                    PollOutcome::Closed {
+                        position,
+                        reason: seal,
+                    } => Block::Closed { position, seal },
+                    PollOutcome::Overrun { .. } => {
+                        walked.overrun = true;
+                        self.abandon_all()?;
+                        return Ok(walked);
+                    }
+                    // An image's skipped range carries no message; a revoked
+                    // walker reads nothing more.
+                    PollOutcome::Skipped { .. } => continue,
+                    PollOutcome::Pending | PollOutcome::Revoked { .. } => return Ok(walked),
+                },
             };
+            // Not decided yet: it waits, and so does everything after it.
+            let Some((position, end, kind, reason)) = self.decide(block) else {
+                self.pending = Some(block);
+                return Ok(walked);
+            };
+            if kind == Kind::Ended {
+                self.ended = true;
+            }
             let (Some(start), Some(end)) = (base.checked_add(position), base.checked_add(end))
             else {
                 return Err(crate::error::DriverError::PositionsExhausted);
@@ -368,6 +469,121 @@ mod tests {
         assert_eq!(
             (seen[0].kind, seen[0].lost),
             (Kind::OutcomesLost, LOST_UNKNOWN)
+        );
+    }
+
+    fn guarded() -> GuardedStream<karyos_sys::term_bytes::HeapTerms> {
+        let buffer = Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 3,
+                max_subscribers: 3,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: karyos_sys::frame::Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            })
+            .unwrap(),
+        );
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let walker = conductor.subscribe(Role::Walker).unwrap();
+        let guard = GuardHandle {
+            driver: 1,
+            guard: 1,
+        };
+        GuardedStream::new(guard, 2, None, walker, 64)
+    }
+
+    fn message(position: u64, end: u64) -> Block {
+        Block::Message { position, end }
+    }
+
+    /// Records plan v2: a network lane's message is `Submitted` only below
+    /// `resolved` and clear of every hole, `Unknown` when it may have left,
+    /// waits while the gate may still decide it, and is `Aborted` once the
+    /// gate will not; `Ended` waits for the final word. A local stream's
+    /// message is submitted at commit, as before.
+    #[test]
+    fn a_network_lanes_message_is_decided_by_its_frontier() {
+        use karyos_sys::submission_frontier::{Frontier, SubmissionFrontier};
+
+        let closed = Block::Closed {
+            position: 192,
+            seal: SealReason::GuardClosed,
+        };
+        let local = guarded();
+        assert_eq!(
+            local.decide(message(0, 64)),
+            Some((0, 64, Kind::Submitted, 0))
+        );
+        assert_eq!(local.decide(closed), Some((192, 192, Kind::Ended, 1)));
+
+        let frontier = Arc::new(SubmissionFrontier::new());
+        let mut network = guarded();
+        network.submit_through(Arc::clone(&frontier), Lane::ZERO);
+        frontier.publish(
+            Lane::ZERO,
+            Frontier {
+                resolved: 128,
+                unknown_hi: 64,
+                staged_hi: 192,
+            },
+        );
+        assert_eq!(
+            network.decide(message(0, 64)),
+            Some((0, 64, Kind::Unknown, 0))
+        );
+        assert_eq!(
+            network.decide(message(64, 128)),
+            Some((64, 128, Kind::Submitted, 0))
+        );
+        assert_eq!(network.decide(message(128, 192)), None, "not decided");
+        assert_eq!(network.decide(closed), None, "Ended waits");
+        let aborted = Block::Aborted {
+            position: 128,
+            end: 192,
+            reason: REASON_WRITER_ABORTED,
+        };
+        assert_eq!(
+            network.decide(aborted),
+            Some((128, 192, Kind::Aborted, REASON_WRITER_ABORTED))
+        );
+        assert_eq!(frontier.finish(Lane::ZERO, REASON_GUARD_CLOSED), Ok(true));
+        assert_eq!(
+            network.decide(message(128, 192)),
+            Some((128, 192, Kind::Aborted, REASON_GUARD_CLOSED))
+        );
+        assert_eq!(network.decide(closed), Some((192, 192, Kind::Ended, 1)));
+
+        // Superseded: the gate never ran again, so what it staged may have
+        // left; nothing above it ever did.
+        let frontier = Arc::new(SubmissionFrontier::new());
+        let mut network = guarded();
+        network.submit_through(Arc::clone(&frontier), Lane::ZERO);
+        frontier.publish(
+            Lane::ZERO,
+            Frontier {
+                resolved: 128,
+                unknown_hi: 0,
+                staged_hi: 192,
+            },
+        );
+        assert_eq!(
+            frontier.supersede(Lane::ZERO, REASON_DRIVER_SHUTDOWN),
+            Ok(true)
+        );
+        assert_eq!(
+            network.decide(message(128, 192)),
+            Some((128, 192, Kind::Unknown, 0))
+        );
+        assert_eq!(
+            network.decide(message(192, 256)),
+            Some((192, 256, Kind::Aborted, REASON_DRIVER_SHUTDOWN))
         );
     }
 

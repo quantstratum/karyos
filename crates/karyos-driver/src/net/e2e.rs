@@ -1809,7 +1809,8 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
 /// SPEC.md §15 "Guarded session abort", the trusted half
 /// (guards-and-abort.md "Trusted sockets in Phase 2", O-11 and GC-6): a
 /// guard close on a trusted socket channel is local. Messages written but
-/// not sent before it never leave; the sender then sends nothing, no
+/// not sent before it never leave and are recorded `Aborted`; the sender
+/// then sends nothing, no
 /// DATA, repair, control, `SESSION_ABORT` or EOS; the close
 /// acknowledgement names the last position submitted under the old epoch;
 /// and the remote image ends at its liveness timeout with the messages
@@ -1909,21 +1910,27 @@ fn a_guard_close_on_a_trusted_channel_ends_the_remote_image_at_liveness() {
     let mut ended = Vec::new();
     pump(&mut [&mut a, &mut b], |drivers| {
         let _ = lane
-            .poll_outcomes(64, |_, record| ended.push(record.kind))
+            .poll_outcomes(64, |_, record| ended.push((record.kind, record.reason)))
             .unwrap();
         drivers[0]
             .close_guard_ack(guard, epoch)
             .unwrap()
             .effective()
             == Some(true)
-            && ended.last() == Some(&Kind::Ended)
+            && ended.last().is_some_and(|(kind, _)| *kind == Kind::Ended)
     });
-    // One final record each, then `Ended`. The three never left: the
-    // design gives them `Aborted`, but the walker records a committed
-    // message `Submitted` (the log as the backend), so their kind is not
-    // checked here; the acknowledgement below says they were not sent.
-    assert_eq!(ended.len(), 4, "{ended:?}");
-    assert_eq!(ended.last(), Some(&Kind::Ended));
+    // The three never left: each is `Aborted` by the close, then `Ended`
+    // (records from the sender gate's submissions, not at commit).
+    let closed = (Kind::Aborted, crate::guard_streams::REASON_GUARD_CLOSED);
+    assert_eq!(
+        ended,
+        [
+            closed,
+            closed,
+            closed,
+            (Kind::Ended, crate::guard_streams::REASON_GUARD_CLOSED)
+        ]
+    );
     let ack = a.close_guard_ack(guard, epoch).unwrap();
     let [(_, SenderAck::Applied { positions, .. })] = ack.senders[..] else {
         panic!("{ack:?}");

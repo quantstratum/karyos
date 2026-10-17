@@ -11,6 +11,24 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A guarded network publication's outcome records come from its sender
+  gate's submissions, not from the commit (guards-and-abort.md, "Trusted
+  sockets in Phase 2"). A message is `Submitted` once a backend took
+  every frame of it, `Unknown` when one may have left unproven (an
+  `Unknown` report, an exposure a reset or a removal cut short, or a
+  position no first send took, which a reliable lane may still repair),
+  and `Aborted` when it never leaves: committed and not sent when a
+  close, a removal or a network close ends the lane. A message's
+  reservation is therefore released at its network submission, so the
+  publisher holds at most `C_m` messages committed and not yet sent: the
+  effective window is the smaller of the receivers' and `C_m` messages.
+  The close acknowledgement's `positions` are each lane's prefix-closed
+  frontier: below it every message was handed to a backend or is
+  reported `Unknown` (before, the highest position submitted, which an
+  unproven or skipped one could sit below). `GateHead` gains `start`,
+  and `GuardGate::reopen` and `reopen_route` take whether the lane is
+  rewound; `GuardSpec` gains `frontier`. Code that names every field in
+  a struct literal must add them.
 - `RouteCounters` (`karyos-io`) and `PathCounters` (`karyos-driver`)
   gained the public fields `datagrams` and `bytes` (rp-w9). Neither
   struct is `#[non_exhaustive]`, so a struct literal that names every
@@ -176,6 +194,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- `karyos_sys::submission_frontier::SubmissionFrontier`: a guarded
+  network lane's submission frontier, which its sender gate publishes
+  for the driver's outcome walker. Per lane, `resolved` (Release),
+  `unknown_hi` and `staged_hi` (Relaxed, stored before it), all
+  monotone and written by the gate alone, and a final word that the gate
+  (`finish`) or, once the gate stopped for good, the conductor
+  (`supersede`) sets once, by compare-exchange. A Loom model
+  (`loom_submission_frontier`) checks the orders and the race of the two
+  final writers, with three negative controls.
 - Per-path datagram and byte counts (RP-10; rp-w9). Each route of a
   routed publication counts the datagrams and bytes it submitted,
   catch-up copies included (`RouteCounters::datagrams`, `bytes`), and

@@ -203,6 +203,7 @@ impl Fixture {
                         token,
                         length: u64::from(FRAME),
                         messages: 1,
+                        start: position,
                         end,
                     },
                 )
@@ -399,7 +400,7 @@ fn a_route_reopen_keeps_the_other_routes_charge() {
             break;
         }
     }
-    f.gate.reopen_route(&mut f.sender, 0, 1, queue);
+    f.gate.reopen_route(&mut f.sender, 0, 1, queue, false);
     assert_eq!(f.gate.message_tokens(), Some(0));
     assert_eq!(f.sender.pending(0, 1), Some(0));
     assert_eq!(f.sender.pending(0, 0), Some(1));
@@ -459,4 +460,49 @@ fn a_report_of_no_routes_head_faults_the_lane() {
     assert_eq!(f.gate.abort_cause(0), Some(AbortCause::Fault));
     assert_eq!(f.gate.in_flight(), Some(1));
     f.cancel();
+}
+
+/// Records plan v2 (s-88's review): a position skipped on route 0 and
+/// returned by route 1's reset leaves no copy. Without a rewind no first
+/// send takes it again: a hole, `Unknown` below the later position route 0
+/// submits. With one (no other route held the lane's copies), it holds the
+/// frontier until it is staged again.
+#[test]
+fn a_position_no_route_sent_is_a_hole_unless_rewound() {
+    use karyos_sys::submission_frontier::{Frontier, SubmissionFrontier};
+
+    for rewound in [false, true] {
+        let mut f = Fixture::new(None);
+        let frontier = Arc::new(SubmissionFrontier::new());
+        f.gate.set_frontier(Arc::clone(&frontier));
+        let first = f.stage(&[1]);
+        f.sender.skipped(0);
+        let second = f.stage(&[0, 1]);
+        let queue = f.routes[1].queue;
+        let mut report = TxReport::new();
+        while let Ok(outcome) = f.routes[1].tx.cancel_pending(queue, &mut report) {
+            while report.pop_front().is_some() {}
+            if !outcome.more {
+                break;
+            }
+        }
+        f.gate.reopen_route(&mut f.sender, 0, 1, queue, rewound);
+        f.routes[0].accept(1);
+        let _ = f.serve();
+        f.gate.between_gates();
+        let expected = if rewound {
+            Frontier {
+                resolved: 0,
+                unknown_hi: 0,
+                staged_hi: second,
+            }
+        } else {
+            Frontier {
+                resolved: second,
+                unknown_hi: first,
+                staged_hi: second,
+            }
+        };
+        assert_eq!(frontier.read(Lane::ZERO).1, expected, "rewound {rewound}");
+    }
 }

@@ -216,6 +216,7 @@ impl Fixture {
                     token,
                     length: u64::from(len),
                     messages,
+                    start: end - u64::from(len),
                     end,
                 },
             )
@@ -652,6 +653,7 @@ fn the_gate_and_its_sender_stay_paired() {
         token: SenderToken::new(51),
         length: u64::from(FRAME),
         messages: 1,
+        start: 0,
         end: 64,
     };
     assert_eq!(
@@ -670,7 +672,7 @@ fn the_gate_and_its_sender_stay_paired() {
         }
     }
     let queue = f.queues[1];
-    f.gate.reopen(&mut f.sender, 1, queue);
+    f.gate.reopen(&mut f.sender, 1, queue, false);
     assert_eq!(f.gate.message_tokens(), Some(2), "a reopen refunds");
     assert_eq!(f.sender.pending(1), Some(0));
     f.stage(1);
@@ -738,7 +740,7 @@ fn the_work_in_flight_is_published_as_it_drains() {
             break;
         }
     }
-    f.gate.reopen(&mut f.sender, 0, queue);
+    f.gate.reopen(&mut f.sender, 0, queue, false);
     f.gate.between_gates();
     let drained = f.cell.try_read().unwrap();
     assert_eq!((drained.epoch, drained.in_flight), (3, 0));
@@ -765,6 +767,219 @@ fn a_contradicted_report_stays_in_flight_until_a_reopen() {
             break;
         }
     }
-    f.gate.reopen(&mut f.sender, 0, queue);
+    f.gate.reopen(&mut f.sender, 0, queue, false);
     assert_eq!(f.gate.in_flight(), Some(0));
+}
+
+impl Fixture {
+    /// The walker's submission frontier, published by the gate from now on.
+    fn frontier(&mut self) -> Arc<SubmissionFrontier> {
+        let frontier = Arc::new(SubmissionFrontier::new());
+        self.gate.set_frontier(Arc::clone(&frontier));
+        frontier
+    }
+
+    /// An endpoint reset of `lane`'s queue: the backend returns what it
+    /// held, and the gate reopens it, `rewound` or not.
+    fn reset(&mut self, lane: usize, rewound: bool) {
+        let queue = self.queues[lane];
+        let mut report = TxReport::new();
+        while let Ok(outcome) = self.tx.cancel_pending(queue, &mut report) {
+            while report.pop_front().is_some() {}
+            if !outcome.more {
+                break;
+            }
+        }
+        self.gate.reopen(&mut self.sender, lane, queue, rewound);
+    }
+}
+
+use karyos_sys::submission_frontier::{Final, Frontier, SubmissionFrontier};
+
+fn at(resolved: u64, unknown_hi: u64, staged_hi: u64) -> Frontier {
+    Frontier {
+        resolved,
+        unknown_hi,
+        staged_hi,
+    }
+}
+
+/// Records plan v2 (s-88's review): the frontier is prefix-closed. A head
+/// whose exposure is unknown stays a hole below a later submitted one:
+/// `resolved` passes both, `unknown_hi` covers the first.
+#[test]
+fn an_unknown_head_below_a_later_submission_stays_unknown() {
+    let mut f = Fixture::new(1, None);
+    let frontier = f.frontier();
+    let (first, first_end, first_staged) = f.stage(0);
+    let (second, second_end, second_staged) = f.stage(0);
+    assert_eq!(check(&mut f.gate, 0, &[first, second]), permit(2));
+    f.gate.between_gates();
+    assert_eq!(frontier.read(lane(0)), (Final::Open, at(0, 0, second_end)));
+    f.gate.left(0, first_staged, Left::Unknown);
+    f.gate.left(0, second_staged, Left::Submitted);
+    f.gate.between_gates();
+    assert_eq!(
+        frontier.read(lane(0)),
+        (Final::Open, at(second_end, first_end, second_end))
+    );
+    // `submitted` is the max the acknowledgement used to carry.
+    assert_eq!(f.gate.last_submitted(lane(0)), second_end);
+}
+
+/// A reset keeps an unknown head unknown: the reopen settles the in-flight
+/// count, never the frontier. An exposure the reset cut short may have
+/// left too, even when the lane rewinds.
+#[test]
+fn a_reset_never_unsends_what_may_have_left() {
+    let mut f = Fixture::new(1, None);
+    let frontier = f.frontier();
+    let (first, first_end, first_staged) = f.stage(0);
+    let (second, second_end, _) = f.stage(0);
+    assert_eq!(check(&mut f.gate, 0, &[first, second]), permit(2));
+    f.gate.left(0, first_staged, Left::Unknown);
+    f.reset(0, true);
+    f.gate.between_gates();
+    assert_eq!(f.gate.in_flight(), Some(0));
+    let (_, read) = frontier.read(lane(0));
+    assert_eq!(read.unknown_hi, second_end, "the cut exposure");
+    assert!(read.unknown_hi > first_end);
+    assert_eq!(read.resolved, second_end);
+}
+
+/// A rewound reset: what it returned unexposed is staged again, so it holds
+/// the frontier until a copy of it is submitted; without the rewind it is a
+/// hole no first send fills, `Unknown` (decision 1 of the records plan).
+#[test]
+fn a_rewound_reset_holds_its_returned_heads_until_they_go_again() {
+    for rewound in [true, false] {
+        let mut f = Fixture::new(1, None);
+        let frontier = f.frontier();
+        let (first, first_end, first_staged) = f.stage(0);
+        let _ = f.stage(0);
+        let (_, third_end, _) = f.stage(0);
+        assert_eq!(check(&mut f.gate, 0, &[first]), permit(1));
+        f.gate.left(0, first_staged, Left::Submitted);
+        f.reset(0, rewound);
+        f.gate.between_gates();
+        if !rewound {
+            assert_eq!(
+                frontier.read(lane(0)).1,
+                at(third_end, third_end, third_end)
+            );
+            continue;
+        }
+        assert_eq!(frontier.read(lane(0)).1, at(first_end, 0, third_end));
+        // Read again from the first returned head, and sent.
+        f.next_position[0] = first_end;
+        let (second, _, second_staged) = f.stage(0);
+        let (third, _, third_staged) = f.stage(0);
+        f.gate.between_gates();
+        assert_eq!(frontier.read(lane(0)).1.resolved, first_end);
+        assert_eq!(check(&mut f.gate, 0, &[second, third]), permit(2));
+        f.gate.left(0, second_staged, Left::Submitted);
+        f.gate.left(0, third_staged, Left::Submitted);
+        f.gate.between_gates();
+        assert_eq!(frontier.read(lane(0)).1, at(third_end, 0, third_end));
+    }
+}
+
+/// A close finishes the lane once no exposure is unreported: what was
+/// staged and never exposed stays above `resolved`, and the walker aborts
+/// it. The acknowledgement's position is `resolved` (decision D).
+#[test]
+fn a_close_finishes_the_lane_once_its_exposures_are_reported() {
+    let mut f = Fixture::new(1, None);
+    let frontier = f.frontier();
+    let (first, first_end, first_staged) = f.stage(0);
+    let (second, second_end, second_staged) = f.stage(0);
+    let (_, third_end, _) = f.stage(0);
+    assert_eq!(check(&mut f.gate, 0, &[first]), permit(1));
+    f.gate.left(0, first_staged, Left::Submitted);
+    assert_eq!(check(&mut f.gate, 0, &[second]), permit(1));
+    close(&f.word);
+    f.gate.between_gates();
+    assert_eq!(frontier.read(lane(0)).0, Final::Open, "one unreported");
+    f.gate.left(0, second_staged, Left::Submitted);
+    f.gate.between_gates();
+    assert_eq!(
+        frontier.read(lane(0)),
+        (
+            Final::Finished {
+                reason: REASON_GUARD_CLOSED
+            },
+            at(second_end, 0, third_end)
+        )
+    );
+    assert_eq!(f.cell.try_read().unwrap().positions[0], second_end);
+    assert!(first_end < second_end);
+}
+
+/// A removal is final at once: an exposure not reported yet may have left,
+/// so it is `Unknown`; what was never exposed is aborted.
+#[test]
+fn a_removal_makes_an_unreported_exposure_unknown() {
+    let mut f = Fixture::new(1, None);
+    let frontier = f.frontier();
+    let (first, first_end, first_staged) = f.stage(0);
+    let (second, second_end, _) = f.stage(0);
+    let (_, third_end, _) = f.stage(0);
+    assert_eq!(check(&mut f.gate, 0, &[first, second]), permit(2));
+    f.gate.left(0, first_staged, Left::Submitted);
+    f.gate.finish_removed();
+    assert_eq!(
+        frontier.read(lane(0)),
+        (
+            Final::Finished {
+                reason: REASON_DRIVER_SHUTDOWN
+            },
+            at(first_end, second_end, third_end)
+        )
+    );
+}
+
+/// Positions read and never staged (a failed commit) are a gap no first
+/// send covers: `Unknown`, never `Submitted`.
+#[test]
+fn a_gap_in_the_staged_positions_is_unknown() {
+    let mut f = Fixture::new(1, None);
+    let frontier = f.frontier();
+    let (first, first_end, first_staged) = f.stage(0);
+    f.next_position[0] += u64::from(FRAME);
+    let (second, second_end, second_staged) = f.stage(0);
+    assert_eq!(check(&mut f.gate, 0, &[first, second]), permit(2));
+    f.gate.left(0, first_staged, Left::Submitted);
+    f.gate.left(0, second_staged, Left::Submitted);
+    f.gate.between_gates();
+    assert_eq!(
+        frontier.read(lane(0)).1,
+        at(second_end, second_end - u64::from(FRAME), second_end)
+    );
+    assert!(first_end < second_end - u64::from(FRAME));
+}
+
+/// A contradicted report leaves nothing the lane staged trusted as unsent:
+/// `unknown_hi` reaches its highest staged end, and the faulted lane, whose
+/// contradicted head left its ring, is finished; a reset changes neither.
+#[test]
+fn a_contradiction_makes_the_lane_unknown_and_finishes_it() {
+    let mut f = Fixture::new(2, None);
+    let frontier = f.frontier();
+    let (token, _, _) = f.stage(0);
+    let (_, end, _) = f.stage(0);
+    let (_, _, other) = f.stage(1);
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
+    f.gate.left(0, other, Left::Submitted);
+    f.gate.between_gates();
+    let faulted = (
+        Final::Finished {
+            reason: REASON_PUBLICATION_FAULT,
+        },
+        at(end - u64::from(FRAME), end, end),
+    );
+    assert_eq!(frontier.read(lane(0)), faulted);
+    f.reset(0, false);
+    f.gate.between_gates();
+    assert_eq!(frontier.read(lane(0)), faulted);
+    assert_eq!(frontier.read(lane(1)).0, Final::Open);
 }

@@ -64,6 +64,7 @@ pub mod record_journal;
 pub mod registration;
 pub mod sizing;
 pub mod slot;
+pub mod submission_frontier;
 pub mod sync;
 pub mod term;
 #[cfg(not(loom))]
