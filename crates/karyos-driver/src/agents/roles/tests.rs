@@ -163,6 +163,7 @@ fn add_publication(
             endpoint: b,
             stream_id: alias().stream_id,
             max_term_length: super::super::images::DEFAULT_MAX_IMAGE_TERM_LENGTH,
+            reliable: true,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -682,13 +683,15 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             endpoint: EndpointId(1),
             stream_id: 6,
             max_term_length,
+            // Reliable if any subscription of the stream is.
+            reliable: max_term_length == 2 << 20,
         };
         assert!(matches!(
             role.command(command),
             Some((_, AgentEvent::Configured { accepted: true, .. }))
         ));
     }
-    assert_eq!(role.subscriptions, [(EndpointId(1), 6, 512 << 10)]);
+    assert_eq!(role.subscriptions, [(EndpointId(1), 6, 512 << 10, true)]);
 }
 
 /// The sender accepts an SM only from a receiver it answered on that
@@ -1789,7 +1792,9 @@ fn a_rate_limited_solicit_leaves_no_entry() {
     };
     let (sender, mut receiver) = super::roles(&config).unwrap();
     let (sessions, _link) = event_ring();
-    receiver.subscriptions.push((EndpointId(1), 6, 1 << 20));
+    receiver
+        .subscriptions
+        .push((EndpointId(1), 6, 1 << 20, true));
     let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let other = Alias {
         session_id: 50,
@@ -1843,7 +1848,9 @@ fn solicits_need_a_subscription_an_answerable_source_and_a_term_bound() {
     // Not subscribed: nothing.
     receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 1);
     assert!(sender.from_receiver.try_take().unwrap().is_none());
-    receiver.subscriptions.push((EndpointId(1), 6, 65_536));
+    receiver
+        .subscriptions
+        .push((EndpointId(1), 6, 65_536, true));
     // A group source cannot be answered: no entry is created.
     let group: SocketAddr = "239.1.1.1:5000".parse().unwrap();
     receiver.inject_data(&sessions, EndpointId(1), group, alias(), &bytes, 2);

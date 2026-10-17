@@ -297,7 +297,9 @@ pub struct ReceiverRole {
     budget: Budget,
     /// Subscribed streams per endpoint, with their largest accepted image
     /// term length.
-    subscriptions: Vec<(EndpointId, i32, u32)>,
+    /// Subscribed streams: endpoint, stream, largest image term length,
+    /// and whether the channel is reliable (its `reliable` parameter).
+    subscriptions: Vec<(EndpointId, i32, u32, bool)>,
     /// Aliases published per endpoint.
     published: Vec<(EndpointId, Alias)>,
     max_entries: usize,
@@ -747,22 +749,25 @@ impl ReceiverRole {
                 endpoint,
                 stream_id,
                 max_term_length,
+                reliable,
             } => {
                 let held = self
                     .subscriptions
                     .iter()
-                    .position(|(held, stream, _)| (*held, *stream) == (endpoint, stream_id));
+                    .position(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id));
                 let full = self.subscriptions.len() >= max;
                 let accepted = match held.and_then(|index| self.subscriptions.get_mut(index)) {
                     // Two subscribers of one stream on one endpoint: the
-                    // stricter limit holds for both.
+                    // stricter limit and the stricter reliability (repair)
+                    // hold for both.
                     Some(entry) => {
                         entry.2 = entry.2.min(max_term_length);
+                        entry.3 |= reliable;
                         true
                     }
                     None if !full => {
                         self.subscriptions
-                            .push((endpoint, stream_id, max_term_length));
+                            .push((endpoint, stream_id, max_term_length, reliable));
                         true
                     }
                     None => false,
@@ -1622,7 +1627,7 @@ impl Intake<'_> {
             .role
             .subscriptions
             .iter()
-            .any(|(held, stream, _)| (*held, *stream) == (key.endpoint, key.alias.stream_id));
+            .any(|(held, stream, ..)| (*held, *stream) == (key.endpoint, key.alias.stream_id));
         if !subscribed {
             return;
         }
@@ -1655,10 +1660,10 @@ impl Intake<'_> {
                     .role
                     .subscriptions
                     .iter()
-                    .find(|(held, stream, _)| {
+                    .find(|(held, stream, ..)| {
                         (*held, *stream) == (endpoint, announce.alias.stream_id)
                     })
-                    .map(|(.., max)| *max)
+                    .map(|(_, _, max, _)| *max)
                 else {
                     self.role.count(|c| &mut c.unsubscribed);
                     return;
@@ -1690,10 +1695,10 @@ impl Intake<'_> {
                     .role
                     .subscriptions
                     .iter()
-                    .find(|(held, stream, _)| {
+                    .find(|(held, stream, ..)| {
                         (*held, *stream) == (endpoint, answer.alias.stream_id)
                     })
-                    .map(|(.., max)| *max)
+                    .map(|(_, _, max, _)| *max)
                 else {
                     self.role.count(|c| &mut c.unsubscribed);
                     return;

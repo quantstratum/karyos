@@ -387,6 +387,15 @@ pub enum AgentCommand<O: SocketOps> {
         /// subscription of the same stream on the same endpoint keeps the
         /// smaller of the two limits.
         max_term_length: u32,
+        /// Whether the channel is reliable (its `reliable` URI parameter,
+        /// SPEC §5, default true): its images repair losses with NAKs;
+        /// otherwise the skip policy seals them. Two subscriptions of one
+        /// stream on one endpoint are reliable if either is. A reliable
+        /// subscription to a `reliable=false` publication is a
+        /// configuration error: the sender drops its NAKs, and a loss
+        /// stalls the image with counted NAK retries until its liveness or
+        /// far-window close.
+        reliable: bool,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer

@@ -153,6 +153,7 @@ impl Rig {
                 endpoint: b,
                 stream_id: alias().stream_id,
                 max_term_length: setup.max_term_length,
+                reliable: setup.reliable,
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
