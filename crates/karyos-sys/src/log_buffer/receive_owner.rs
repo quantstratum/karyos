@@ -405,6 +405,21 @@ impl<T: TermBytes> ReceiveOwner<T> {
         self.lanes.get(usize::from(lane.get())).map(|l| l.rebuild)
     }
 
+    /// What `lane` reports as consumed (SPEC §4): its rebuild position,
+    /// lowered to the least required subscriber's position when the image
+    /// has one, so a stopped required subscriber holds a reliable sender.
+    /// Optional subscribers bound nothing.
+    #[must_use]
+    pub fn consumption(&self, lane: Lane) -> Option<u64> {
+        let owner = self.lanes.get(usize::from(lane.get()))?;
+        Some(
+            owner
+                .buffer
+                .required_position()
+                .map_or(owner.rebuild, |required| required.min(owner.rebuild)),
+        )
+    }
+
     /// The covered end of `lane`: the highest end of any covered extent,
     /// a real frame or a local gap, which loss detection compares the
     /// rebuild position against.

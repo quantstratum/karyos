@@ -759,6 +759,23 @@ impl<T: TermBytes> LogBuffer<T> {
         &self.control().floor.word
     }
 
+    /// The least position of the subscribers that bound the publication
+    /// (required, reserved and lost-holding cells), each loaded with
+    /// Acquire after a SeqCst fence; `None` with none. Called by an image's
+    /// receive owner after it published its head: a cell admitted
+    /// concurrently is either counted, or joins at or above that head
+    /// ([`participant::join_after_admit`]). A stale position only lowers the
+    /// minimum.
+    #[must_use]
+    pub fn required_position(&self) -> Option<u64> {
+        participant::required_minimum(
+            self.cells()
+                .iter()
+                .skip(self.first_subscriber_cell())
+                .map(|cell| (&cell.state, &cell.position)),
+        )
+    }
+
     fn seal(&self) -> &AtomicU64 {
         &self.control().seal.word
     }
@@ -4670,7 +4687,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         // The Acquire load above observed the previous holder's FREE, so its
         // loan release happens before this reuse; its loan word is zero.
         debug_assert_eq!(cell.loan.load(Ordering::Relaxed), 0);
-        let start = buffer.conductor_head()?;
+        let mut start = buffer.conductor_head()?;
         cell.position.store(start, Ordering::Relaxed);
         let state = match (role, reserve) {
             (Role::Required, false) => CELL_REQUIRED,
@@ -4686,6 +4703,17 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             occupant,
             state,
         );
+        // An image's head is published by its receive owner, which samples
+        // the required cells for its SMs: recheck the head after the
+        // admission, so a sample that missed this cell never reports past
+        // its join.
+        if buffer.image() {
+            let join = participant::join_after_admit(buffer.reserved_head(), start);
+            if join > start {
+                cell.position.store(join, Ordering::Release);
+                start = join;
+            }
+        }
         Ok(Cursor {
             cell: index,
             role,
