@@ -886,3 +886,63 @@ fn a_data_heartbeat_does_not_refresh_its_path() {
     assert_eq!(after.data_unbound, before.data_unbound + 2);
     assert!(rig.agents.receiver.role.has_image(slot));
 }
+
+/// Test 3, subscriber side (§5): the image's SMs report its least required
+/// subscriber's position. With a required subscriber stopped and both
+/// agents running, the reliable publisher meets back pressure; once the
+/// subscriber reads, it resumes. An optional subscriber bounds nothing.
+#[test]
+fn a_stopped_required_subscriber_back_pressures_a_reliable_publisher() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (mut conductor, mut required) = image_subscriber(&rig, slot, 0, Role::Required);
+    let _optional = conductor.subscribe(Role::Optional).unwrap();
+    let data = vec![7u8; 992];
+    let append = |rig: &mut Rig| {
+        let log = rig.log.as_mut().unwrap();
+        match log.publications[0]
+            .append(&data, AppendOptions::default())
+            .unwrap()
+        {
+            AppendOutcome::Appended { .. } => true,
+            AppendOutcome::BackPressured | AppendOutcome::AdminAction => false,
+            other => panic!("{other:?}"),
+        }
+    };
+    let mut pressed = false;
+    for _ in 0..4000 {
+        if !append(&mut rig) {
+            // Back pressure persists across rounds, not one admin action.
+            let mut held = true;
+            for _ in 0..50 {
+                rig.round(true);
+                held &= !append(&mut rig);
+            }
+            if held {
+                pressed = true;
+                break;
+            }
+        }
+        rig.round(true);
+    }
+    assert!(pressed, "never back pressured");
+    // The subscriber reads: the image's SMs move the sender's position.
+    let mut resumed = false;
+    for _ in 0..4000 {
+        while poll_message(&mut required).is_some() {}
+        rig.round(true);
+        if append(&mut rig) {
+            resumed = true;
+            break;
+        }
+    }
+    assert!(resumed, "never resumed");
+    // The sender stopped at the subscriber: the image refused nothing.
+    let receiver = rig.agents.receiver.counters();
+    assert_eq!(receiver.data_refused, 0, "{receiver:?}");
+}

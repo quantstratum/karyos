@@ -920,7 +920,8 @@ impl ReceiverRole {
     }
 
     /// Sends the SM of the image at `index`: every lane's consumption (its
-    /// rebuild position) and window, from the receiver block of this boot.
+    /// rebuild position, or its least required subscriber's position below
+    /// it) and window, from the receiver block of this boot.
     fn send_sm(&mut self, index: usize, now: u64) {
         let boot_id = self.sessions.boot_id();
         let Some(image) = self.images.get_mut(index) else {
@@ -933,7 +934,7 @@ impl ReceiverRole {
             let consumption = u8::try_from(lane)
                 .ok()
                 .and_then(|lane| Lane::try_new(lane).ok())
-                .and_then(|lane| image.owner.rebuild_position(lane))
+                .and_then(|lane| image.owner.consumption(lane))
                 .unwrap_or(0);
             *entry = LaneStatus {
                 consumption,

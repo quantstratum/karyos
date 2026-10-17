@@ -759,6 +759,21 @@ impl<T: TermBytes> LogBuffer<T> {
         &self.control().floor.word
     }
 
+    /// The least position of the subscribers that bound the publication
+    /// (required, reserved and lost-holding cells), each loaded with
+    /// Acquire; `None` with none. A stale load gives a lower minimum, never
+    /// one above a subscriber.
+    #[must_use]
+    pub fn required_position(&self) -> Option<u64> {
+        participant::reader_minima(
+            self.cells()
+                .iter()
+                .skip(self.first_subscriber_cell())
+                .map(|cell| (&cell.state, &cell.position)),
+        )
+        .0
+    }
+
     fn seal(&self) -> &AtomicU64 {
         &self.control().seal.word
     }
