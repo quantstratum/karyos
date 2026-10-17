@@ -1368,6 +1368,54 @@ fn a_close_does_not_wait_on_a_detached_left_path() {
     assert_eq!(observer_b.send_calls(), calls, "no forgotten copy is sent");
 }
 
+/// #355 review (2): on a close, `forget` runs before `cancel`, and only on
+/// a detached route. A lent route that still holds its copies (its socket
+/// blocks) is cancelled through its backend, never forgotten, and is not
+/// sent to a reset.
+#[test]
+fn a_close_never_forgets_a_lent_routes_copies() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, _observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    outbound
+        .guard(
+            GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::clone(&cell),
+                epoch: 2,
+                rate: None,
+            },
+            0,
+        )
+        .unwrap();
+    commit(&mut log, 0, 4);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 10)
+        .unwrap();
+    assert!(outbound.routed_sender().unwrap().pending(0, 1).unwrap() > 0);
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    for now in 20..30 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    let counters = outbound.routed_sender().unwrap().counters(1).unwrap();
+    assert_eq!(counters.forgotten, 0, "{counters:?}");
+    assert!(!outbound.needs_reset(), "a healthy path is not reset");
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    assert_eq!(cell.try_read().unwrap().in_flight, 0);
+}
+
 /// #346 review P2-3: several paths can leave in one pass, and the last live
 /// one never does. Three paths each take one datagram of three (the others'
 /// halves are away): each skipped two thirds, so A and B leave and C stays.

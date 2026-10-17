@@ -4122,7 +4122,7 @@ fn an_overloaded_cycle_keeps_every_per_cycle_bound() {
 /// reaches one image, bound on both paths, every message once.
 #[test]
 fn a_routed_publication_reaches_its_image_on_both_paths() {
-    use karyos_sys::log_buffer::AppendOptions;
+    use karyos_sys::log_buffer::{AppendOptions, Role};
 
     let setup = Setup {
         reliable: true,
@@ -4131,13 +4131,16 @@ fn a_routed_publication_reaches_its_image_on_both_paths() {
     let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
     let slot = established(&mut rig);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let mut reader = image_subscriber(&rig, slot, 0, Role::Optional);
     for i in 0..4u8 {
         let log = rig.log.as_mut().unwrap();
         let _ = log.publications[0]
             .append(&[i; 900], AppendOptions::default())
             .unwrap();
     }
-    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    // Each message arrives on both paths: the subscriber reads it once.
+    assert_eq!(read_messages(&mut rig, &mut reader, 4), [0, 1, 2, 3]);
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 2);
 }
 
 /// The image's conductor and lane 0 subscriber, kept by a test.
