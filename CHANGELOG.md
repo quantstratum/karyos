@@ -234,6 +234,14 @@ release may break APIs, wire formats and shared-memory layouts.
   within a bound with a fair
   cursor, and membership events are queued in a bounded queue. Not wired
   yet: the sender agent's SM handoff and gate.
+- Receiver SM schedule (P2.7, multicast-flow-control.md M3 and MC-6, ACS
+  15689): `karyos_driver::sm_schedule::SmSchedule`, one per image. It
+  makes the first SM due at once, then one every `sm_interval` (by
+  `age_ns`), and one as soon as a lane's consumption advances by a quarter
+  of its window. The SM reports, per lane, the larger of the given and the
+  last reported consumption, so it is never stale at the sender; a lower
+  value is counted as a regression. An SM is recorded only once sent, so
+  an unsent one stays due. Not wired yet: the receiver agent's SM path.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly
