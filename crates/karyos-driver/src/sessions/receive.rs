@@ -289,6 +289,9 @@ pub struct SessionCounters {
     pub solicits_expired: u64,
     /// Solicited answers accepted (an image created or a path bound).
     pub solicits_answered: u64,
+    /// Solicit entries withdrawn: never sent, or answered with no command
+    /// chain; freed with no holdoff.
+    pub solicits_withdrawn: u64,
     /// Announcements and answers dropped, all reasons.
     pub dropped: u64,
     /// Images installed.
@@ -719,6 +722,20 @@ impl ReceiveSessions {
         (held, full)
     }
 
+    /// Frees `key`'s solicit entry with no holdoff: its SOLICIT was never
+    /// sent (an RSP_SETUP limit or the control ring refused it), and it is
+    /// never resent.
+    pub fn withdraw_solicit(&mut self, key: &BindingKey) {
+        let found = self
+            .slots
+            .iter_mut()
+            .find(|slot| matches!(slot.state, State::Solicited { key: held, .. } if held == *key));
+        if let Some(slot) = found {
+            slot.state = State::Free;
+            self.counters.bump(|c| &mut c.solicits_withdrawn);
+        }
+    }
+
     /// DATA, PAD, ABORTED or a heartbeat from `key`, a key with no binding,
     /// on a subscribed stream, at `now` (network-control-schemas.md §6.3):
     /// a solicit entry and one SOLICIT, unless the key is bound, has a
@@ -752,8 +769,10 @@ impl ReceiveSessions {
                 || table.pending(Some(key.source)) >= table.config.max_pending_per_source
                 || !table.slots.iter().any(|slot| slot.state == State::Free)
         };
+        // DATA comes at line rate: the sweep here is bounded by the timer
+        // budget (the timer duty frees the rest).
         if full(self) {
-            self.sweep(now, u32::MAX);
+            self.sweep(now, self.config.timer_actions);
         }
         if self.pending(None) >= self.config.max_pending_challenges
             || self.pending(Some(key.source)) >= self.config.max_pending_per_source
@@ -1131,9 +1150,8 @@ impl ReceiveSessions {
         now: u64,
         reserve: impl FnOnce() -> bool,
     ) -> AnswerOutcome {
-        if answer.alias != key.alias {
-            return AnswerOutcome::Dropped(self.ignore(Ignored::AliasMismatch));
-        }
+        // The caller builds the key from the answer's alias.
+        debug_assert_eq!(answer.alias, key.alias);
         if answer.challenge.receiver_boot_id != self.boot_id || answer.challenge.nonce != nonce {
             return AnswerOutcome::Dropped(self.ignore(Ignored::Mismatch));
         }
@@ -1173,6 +1191,13 @@ impl ReceiveSessions {
             return outcome;
         }
         if !reserve() {
+            // The publisher answers a SOLICIT once: keeping the entry would
+            // wait for its expiry and a holdoff. It goes, with no holdoff,
+            // and the next DATA asks again under the limits.
+            if let Some(entry) = self.slots.get_mut(index) {
+                entry.state = State::Free;
+            }
+            self.counters.bump(|c| &mut c.solicits_withdrawn);
             return AnswerOutcome::Dropped(self.ignore(Ignored::NoCommandCredit));
         }
         let Some(slot_ref) = Self::slot_ref(index, slot) else {

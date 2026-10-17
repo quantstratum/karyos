@@ -656,6 +656,28 @@ impl ReceiverRole {
             .map(|image| image.evidence)
     }
 
+    /// Hands the receiver `bytes` as a DATA datagram from `source` on
+    /// `endpoint` at `now` (tests).
+    #[cfg(test)]
+    pub(super) fn inject_data(
+        &mut self,
+        sessions: &SessionEnd,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        alias: Alias,
+        bytes: &[u8],
+        now: u64,
+    ) {
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        intake.data(source, alias, bytes);
+    }
+
     /// Hands the receiver a DATA heartbeat on lane 0 of the image at
     /// `slot`, `ahead` bytes above its contiguous prefix, as if it came
     /// from `source` on `endpoint` at `now` (tests).
@@ -1078,7 +1100,7 @@ struct Intake<'a> {
 impl Intake<'_> {
     /// Hands `item` to the sender; a full ring drops it, counted per kind
     /// so that a flood of one kind does not hide another.
-    fn forward(&mut self, item: ControlItem) {
+    fn forward(&mut self, item: ControlItem) -> bool {
         let full: fn(&mut ReceiverCounters) -> &mut u64 = match item {
             ControlItem::Outgoing { .. } => |c| &mut c.ring_full_rsp_setup,
             ControlItem::Incoming {
@@ -1088,8 +1110,14 @@ impl Intake<'_> {
             ControlItem::Incoming { .. } => |c| &mut c.ring_full_challenge,
         };
         match self.role.to_sender.try_post(item) {
-            Ok(()) => self.role.count(|c| &mut c.forwarded),
-            Err(_) => self.role.count(full),
+            Ok(()) => {
+                self.role.count(|c| &mut c.forwarded);
+                true
+            }
+            Err(_) => {
+                self.role.count(full);
+                false
+            }
         }
     }
 
@@ -1211,35 +1239,36 @@ impl Intake<'_> {
     }
 
     /// Sends `challenge` toward `source` if §7.3 and §7.4 allow it.
-    fn challenge(&mut self, source: SocketAddr, control: Control) {
+    /// Returns whether it was handed to the sender.
+    fn challenge(&mut self, source: SocketAddr, control: Control) -> bool {
         // §7.3: an RSP_SETUP goes only to the trigger's validated source
         // endpoint, through the socket it arrived on.
         if !answerable(source) {
             self.role.count(|c| &mut c.unanswerable_source);
-            return;
+            return false;
         }
         // §7.4: per destination, then per driver.
         match self.role.rsp_destinations.admit(source, self.now) {
             Ok(()) => {}
             Err(RateRefused::Limited) => {
                 self.role.count(|c| &mut c.rsp_setup_rate_limited);
-                return;
+                return false;
             }
             Err(RateRefused::TableFull) => {
                 self.role.count(|c| &mut c.rsp_setup_destinations_full);
-                return;
+                return false;
             }
         }
         if !self.role.rsp_total.admit(self.now) {
             self.role.count(|c| &mut c.rsp_setup_total_limited);
-            return;
+            return false;
         }
         self.forward(ControlItem::Outgoing {
             endpoint: self.endpoint,
             destination: source,
             control,
             guard: None,
-        });
+        })
     }
 
     /// DATA for `key`, which has no active binding, on a subscribed stream
@@ -1262,8 +1291,12 @@ impl Intake<'_> {
         let role = &mut *self.role;
         if let SolicitOutcome::Solicit(solicit) =
             role.sessions.solicit(key, self.now, &mut role.nonces)
+            && !self.challenge(key.source, Control::Solicit(solicit))
         {
-            self.challenge(key.source, Control::Solicit(solicit));
+            // Never sent (a rate or the ring refused it): a SOLICIT is
+            // never resent, so the entry goes, with no holdoff, and the
+            // next DATA asks again under the limits.
+            self.role.sessions.withdraw_solicit(&key);
         }
     }
 

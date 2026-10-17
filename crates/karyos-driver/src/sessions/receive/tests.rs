@@ -1036,7 +1036,8 @@ fn a_solicit_answer_must_match_before_expiry() {
         sessions.answer(key(1), &answer(1, nonce), SECOND, || true),
         AnswerOutcome::Dropped(Ignored::Expired)
     );
-    // Without a command credit the entry stays for the next answer.
+    // Without a command credit the entry goes with no holdoff: the
+    // publisher answers once, and the next DATA solicits again.
     let mut sessions = table(SessionConfig::default());
     let nonce = solicited(sessions.solicit(key(1), 0, &mut nonces))
         .challenge
@@ -1045,7 +1046,28 @@ fn a_solicit_answer_must_match_before_expiry() {
         sessions.answer(key(1), &answer(1, nonce), MS, || false),
         AnswerOutcome::Dropped(Ignored::NoCommandCredit)
     );
-    accepted(sessions.answer(key(1), &answer(1, nonce), 2 * MS, || true));
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, nonce), 2 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::NoChallenge)
+    );
+    let nonce = solicited(sessions.solicit(key(1), 3 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    accepted(sessions.answer(key(1), &answer(1, nonce), 4 * MS, || true));
+    assert_eq!(sessions.counters().solicits_withdrawn, 1);
+}
+
+/// A withdrawn solicit (never sent) leaves no entry and no holdoff.
+#[test]
+fn a_withdrawn_solicit_leaves_nothing() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    solicited(sessions.solicit(key(1), 0, &mut nonces));
+    sessions.withdraw_solicit(&key(1));
+    // Withdrawing a key with no solicit entry changes nothing.
+    sessions.withdraw_solicit(&key(2));
+    solicited(sessions.solicit(key(1), MS, &mut nonces));
+    assert_eq!(sessions.counters().solicits_withdrawn, 1);
 }
 
 /// A solicited answer naming a quarantined identity consumes the entry,

@@ -1131,3 +1131,51 @@ fn a_reset_request_is_repeated_at_its_cadence() {
         (2, 1)
     );
 }
+
+/// #275 review P2: a SOLICIT the RSP_SETUP limits refuse leaves no entry,
+/// so the next DATA for the key asks again once the rate refills, instead
+/// of waiting out an entry that was never sent and its holdoff.
+#[test]
+fn a_rate_limited_solicit_leaves_no_entry() {
+    let config = AgentConfig {
+        rsp_setup_per_destination: 1,
+        ..AgentConfig::default()
+    };
+    let (sender, mut receiver) = super::roles(&config).unwrap();
+    let (sessions, _link) = event_ring();
+    receiver.subscriptions.push((EndpointId(1), 6, 1 << 20));
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let other = Alias {
+        session_id: 50,
+        stream_id: 6,
+    };
+    let sent = || {
+        let mut count = 0;
+        while let Ok(Some(_)) = sender.from_receiver.try_take() {
+            count += 1;
+        }
+        count
+    };
+    let bytes = [0u8; 32];
+    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 1);
+    assert_eq!(sent(), 1);
+    // The destination's rate is spent: refused, and withdrawn.
+    for at in 2..5 {
+        receiver.inject_data(&sessions, EndpointId(1), source, other, &bytes, at);
+    }
+    assert_eq!(sent(), 0);
+    let counters = receiver.session_counters();
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (4, 3));
+    assert_eq!(receiver.counters().rsp_setup_rate_limited, 3);
+    // A second later the rate has refilled: the key is solicited.
+    receiver.inject_data(
+        &sessions,
+        EndpointId(1),
+        source,
+        other,
+        &bytes,
+        1_000_000_002,
+    );
+    assert_eq!(sent(), 1);
+    assert_eq!(receiver.session_counters().solicits_withdrawn, 3);
+}
