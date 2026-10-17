@@ -162,9 +162,11 @@ struct LaneLoss {
     /// The range of the decision's first NAK: a later hole inside it is
     /// the same decision, with the same anchors, after late data split it.
     span: Option<Hole>,
-    /// `RANGE_UNAVAILABLE` answered the span, with this lowest retained
-    /// position: a later hole inside it is unrecoverable at once (RC-9).
-    unavailable: Option<u64>,
+    /// The range a `RANGE_UNAVAILABLE` answered (the NAK it echoed), with
+    /// its lowest retained position: a later hole inside that range is
+    /// unrecoverable at once (RC-9). A hole outside it, even inside the
+    /// span, is still the sender's to repair.
+    unavailable: Option<(Hole, u64)>,
     /// The decision's hole was found unnameable (counted once).
     unnameable: bool,
 }
@@ -413,22 +415,40 @@ impl ImageLoss {
             }
             (Some(held), Some(seen)) if held == seen => {}
             (Some(held), Some(seen)) if held.contains(seen) || in_span(seen) => {
-                if let Some(lowest_retained) = state.unavailable {
-                    state.decision = Decision::Unrecoverable { hole: seen };
-                    observation = Observation::Unrecoverable {
-                        lane,
-                        hole: seen,
-                        lowest_retained,
-                    };
-                } else {
+                let answered = state
+                    .unavailable
+                    .filter(|(answered, _)| answered.contains(seen));
+                let was_unrecoverable = matches!(state.decision, Decision::Unrecoverable { .. });
+                match answered {
+                    // Inside the answered range: unrecoverable, reported to
+                    // the gap owner once. A shrink of the hole it already
+                    // has only narrows it; another part is reported.
+                    Some((_, lowest_retained)) => {
+                        state.decision = Decision::Unrecoverable { hole: seen };
+                        if !(was_unrecoverable && held.contains(seen)) {
+                            observation = Observation::Unrecoverable {
+                                lane,
+                                hole: seen,
+                                lowest_retained,
+                            };
+                        }
+                    }
+                    // Outside it, after the answered part was resolved: the
+                    // sender retains it, so it is due again at once.
+                    None if was_unrecoverable => {
+                        state.decision = Decision::NakDue {
+                            hole: seen,
+                            detected_at: now,
+                        };
+                    }
                     // A partial repair, or late data split the span: the
                     // remainder keeps its anchors.
-                    match &mut state.decision {
+                    None => match &mut state.decision {
                         Decision::NakDue { hole, .. }
                         | Decision::AwaitRepair { hole, .. }
                         | Decision::Unrecoverable { hole } => *hole = seen,
                         Decision::NoGap => {}
-                    }
+                    },
                 }
                 // Another interval: RANGE_INVALID counts start over.
                 state.invalid = 0;
@@ -640,7 +660,7 @@ impl ImageLoss {
             }
             NakReplyReason::RangeUnavailable { lowest_retained } => {
                 state.decision = Decision::Unrecoverable { hole };
-                state.unavailable = Some(lowest_retained);
+                state.unavailable = Some((requested, lowest_retained));
                 self.counters.bump(|c| &mut c.range_unavailable);
                 // A floor at or below the hole's start contradicts the
                 // refusal: still unrecoverable, and counted.
