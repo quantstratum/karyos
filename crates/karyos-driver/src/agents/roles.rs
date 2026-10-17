@@ -67,11 +67,12 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use karyos_io::backend::{Budget, RxBackend, RxDatagram, RxDrop, RxHandler};
+use karyos_io::lanes::routes::MAX_ROUTES;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::frame::{FRAME_ALIGNMENT, Lane};
 use karyos_protocol::network::{
-    Alias, Control, Datagram, Identity, LaneStatus, Lanes, MAX_WINDOW, Nak, NakReply, Receiver,
-    Rttm, RttmKind, SetupAnnounce, SetupAnswer, StatusMessage, classify,
+    Alias, Control, Datagram, Identity, LaneStatus, Lanes, MAX_WINDOW, Nak, NakReply,
+    PathHeartbeat, Receiver, Rttm, RttmKind, SetupAnnounce, SetupAnswer, StatusMessage, classify,
 };
 use karyos_sys::host_clock::age_ns;
 use karyos_sys::log_buffer::ReceiveError;
@@ -352,6 +353,8 @@ pub struct SenderCounters {
     pub reset_requests: u64,
     /// Reset requests not posted: the event ring was full.
     pub reset_requests_full: u64,
+    /// PATH_HBs submitted on idle paths of routed publications (RP-3).
+    pub path_heartbeats_sent: u64,
     /// NAKs that reached admission (at most `naks_per_cycle` per cycle).
     pub naks: u64,
     /// NAKs dropped over `naks_per_cycle`: the receiver retries.
@@ -1236,6 +1239,8 @@ pub struct SenderRole {
     budget: u32,
     /// The announcements due this cycle (allocated at creation).
     due: Vec<(EndpointId, SetupAnnounce)>,
+    /// `path_heartbeat_interval` in ns (RP-3).
+    path_heartbeat_interval: u64,
     /// The receivers answered, at most `receiver_bindings` (allocated at
     /// creation).
     bindings: Vec<ReceiverBinding>,
@@ -1371,6 +1376,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             routes,
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
+            path_heartbeat_interval: config.path_heartbeat_interval,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
             unconfirmed_timeout: config.sessions.setup_challenge_timeout,
@@ -4089,6 +4095,54 @@ impl SenderRole {
     }
 
     /// Sends `control` on `endpoint` to `destination`.
+    /// Sends a PATH_HB on each idle path of every established routed
+    /// publication; returns the count submitted.
+    fn path_heartbeats<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+    ) -> u32 {
+        let interval = self.path_heartbeat_interval;
+        let mut submitted = 0u32;
+        for index in 0..self.publications.len() {
+            let Some(outbound) = self.publications.get(index) else {
+                break;
+            };
+            let alias = outbound.alias();
+            let identity = self.sessions.identity(outbound.endpoint(), alias);
+            let (true, true, Some(identity)) = (
+                outbound.is_routed(),
+                established(&self.sessions, outbound),
+                identity,
+            ) else {
+                continue;
+            };
+            let control = Control::PathHeartbeat(PathHeartbeat { alias, identity });
+            let mut due = [None; MAX_ROUTES];
+            let mut held = due.iter_mut();
+            if let Some(outbound) = self.publications.get_mut(index) {
+                let _ = outbound.path_heartbeats(now, interval, |endpoint, destination| {
+                    held.next().is_some_and(|slot| {
+                        *slot = Some((endpoint, destination));
+                        true
+                    })
+                });
+            }
+            for (endpoint, destination) in due.into_iter().flatten() {
+                if matches!(
+                    self.send(halves, endpoint, destination, &control),
+                    Sent::Submitted
+                ) {
+                    self.count(|c| &mut c.path_heartbeats_sent);
+                    if let Some(next) = submitted.checked_add(1) {
+                        submitted = next;
+                    }
+                }
+            }
+        }
+        submitted
+    }
+
     fn send<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
@@ -4361,6 +4415,12 @@ impl SenderRole {
             }
         }
         self.counters.needs_reset = needing_reset;
+        // A routed publication's paths still idle after the first sends keep
+        // their bindings live at the receivers with a PATH_HB, a heartbeat
+        // of the control budget (RP-3).
+        work = work
+            .checked_add(self.path_heartbeats(halves, now))
+            .ok_or(overflow.clone())?;
         Ok(work)
     }
 
