@@ -692,13 +692,89 @@ fn a_frame_that_does_not_hold_is_caught_before_delivery() {
     bytes.extend_from_slice(&bad);
     let end = store.append(0, &bytes).unwrap();
     store.close().unwrap();
-    let mut source = open_source(&disk, 0, end, Rate::Full, 64);
-    let (steps, error) = until_error(&mut source);
-    assert_eq!(steps, []);
-    assert!(
-        matches!(error, Some(ReplayError::Corrupt { position: 128 })),
-        "{error:?}"
-    );
+    // Read in pieces (64, 128) or whole (192, 4096): refused either way.
+    for buffer in [64, 128, 192, 4096] {
+        let mut source = open_source(&disk, 0, end, Rate::Full, buffer);
+        let (steps, error) = until_error(&mut source);
+        assert_eq!(steps, [], "buffer {buffer}");
+        assert!(
+            matches!(error, Some(ReplayError::Corrupt { position: 128 })),
+            "buffer {buffer}: {error:?}"
+        );
+    }
+}
+
+/// #364 re-check P1: valid entries replay whole whatever the buffer, down
+/// to one frame: a frame that does not fit what is left of a window waits
+/// for the next one, never reads as corrupt.
+#[test]
+fn valid_entries_replay_whatever_the_buffer() {
+    for (lengths, buffer) in [
+        (&[512u32, 512][..], 512usize),
+        (&[128, 128, 128, 128][..], 256),
+        (&[32, 32, 32, 32][..], 64),
+        (&[32, 32, 32, 32][..], 98),
+        (&[100, 60, 40][..], 128),
+    ] {
+        let disk = FaultDisk::default();
+        let mut store = SegmentStore::create(
+            disk.clone(),
+            Path::new(DIR),
+            RECORDING,
+            geometry(),
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .unwrap();
+        let bytes = frames(lengths, 0xAB);
+        let end = store.append(0, &bytes).unwrap();
+        store.close().unwrap();
+        let mut source = open_source(&disk, 0, end, Rate::Full, buffer);
+        let (steps, error) = until_error(&mut source);
+        assert!(error.is_none(), "{lengths:?}/{buffer}: {error:?}");
+        let mut replayed = Vec::new();
+        for step in &steps {
+            if let Seen::Frames(position, frames) = step {
+                assert_eq!(*position, replayed.len() as u64);
+                replayed.extend_from_slice(frames);
+            }
+        }
+        assert_eq!(replayed, bytes, "{lengths:?}/{buffer}");
+        assert_eq!(steps.last(), Some(&Seen::End(end)));
+    }
+}
+
+/// #364 re-check P3: an error is final; the next poll does not carry on.
+#[test]
+fn an_error_is_final() {
+    let (disk, mut store, term, mut position) = open_store(6);
+    for _ in 0..2 {
+        position = store.append(position, &term).unwrap();
+    }
+    store.close().unwrap();
+    let mut source = open_source(&disk, 0, position, Rate::Full, 4096);
+    let mut raw = disk.clone();
+    raw.remove(&Path::new(DIR).join(index_name(RECORDING, 4096)))
+        .unwrap();
+    let (_, error) = until_error(&mut source);
+    assert!(matches!(error, Some(ReplayError::MissingSegment { .. })));
+    for _ in 0..3 {
+        assert!(matches!(source.poll(0), Err(ReplayError::Failed)));
+    }
+}
+
+/// #364 re-check P3: a paced replay that ends inside a fill ends there,
+/// with no wait for the fill it does not deliver.
+#[test]
+fn a_paced_replay_ending_in_a_fill_does_not_wait_for_it() {
+    let (disk, first, _, _) = recorded();
+    let first_len = u64::try_from(first.len()).unwrap();
+    let mut paced = open_source(&disk, 0, first_len + 50, Rate::AsRecorded, 4096);
+    assert!(matches!(
+        paced.poll(0),
+        Ok(Step::Frames { position: 0, .. })
+    ));
+    assert_eq!(seen(paced.poll(0).unwrap()), Seen::End(first_len));
 }
 
 /// An index whose next entry does not start where the last ended is
@@ -740,4 +816,33 @@ fn a_due_time_past_the_clock_is_an_error() {
         paced.poll(late),
         Err(ReplayError::PacingOverflow { .. })
     ));
+}
+
+/// An entry whose last frame's length word is cut by the entry's end is
+/// corrupt, read whole or in pieces, before any of it goes out.
+#[test]
+fn a_frame_cut_by_its_entry_end_is_caught_before_delivery() {
+    let disk = FaultDisk::default();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    let mut bytes = frames(&[128], 0xC1);
+    bytes.extend_from_slice(&[0x10, 0x00]);
+    let end = store.append(0, &bytes).unwrap();
+    store.close().unwrap();
+    for buffer in [64, 4096] {
+        let mut source = open_source(&disk, 0, end, Rate::Full, buffer);
+        let (steps, error) = until_error(&mut source);
+        assert_eq!(steps, [], "buffer {buffer}");
+        assert!(
+            matches!(error, Some(ReplayError::Corrupt { position: 128 })),
+            "buffer {buffer}: {error:?}"
+        );
+    }
 }

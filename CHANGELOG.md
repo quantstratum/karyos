@@ -34,9 +34,10 @@ release may break APIs, wire formats and shared-memory layouts.
   segment index becomes version 2: each entry carries its record time
   (the Archive's write time on its monotonic clock, 0 when unknown),
   stamped by `SegmentStore::stamp` each recorder duty; a paced replay of
-  entries without one is refused, and a version 1 index is foreign, so
-  a recording an earlier build left open fails the agent's start, whose
-  settle recovers it.
+  entries without one is refused, and a version 1 index is foreign: an
+  archive directory where an earlier build left a recording open fails
+  every agent start, since each start's settle recovers that recording.
+  A replay's error is final.
 - The driver hands an Archive recording a lane's reader (phase 3,
   A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
   reserved required or an optional cell and returns a `RecordingReader`:

@@ -19,6 +19,11 @@
 //!   read up to what it held at open, never further; following it live is
 //!   the live merge's work (A6). A segment missing between `from` and that
 //!   end is [`ReplayError::MissingSegment`], never the recording's end.
+//! - **Immutable entries.** The store only appends: an entry, once in the
+//!   index, and the data it covers never change. What open found is what
+//!   the replay reads, and a CRC checked once holds for the whole replay.
+//! - **Errors.** An error is final: every later poll is
+//!   [`ReplayError::Failed`].
 //! - **Integrity.** No byte is delivered before its entry's CRC holds. An
 //!   entry delivered whole in one read is checked as it is read; any
 //!   other (one larger than the buffer, or one the range starts or stops
@@ -126,6 +131,9 @@ pub enum ReplayError {
         /// The entry or frame's start.
         position: u64,
     },
+    /// An earlier poll failed: a replay's error is final.
+    #[error("the replay failed earlier")]
+    Failed,
     /// A frame is longer than the replay's buffer, or the buffer is shorter
     /// than one alignment unit.
     #[error("a frame of {length} bytes does not fit the buffer")]
@@ -133,6 +141,15 @@ pub enum ReplayError {
         /// The frame's aligned length.
         length: u64,
     },
+}
+
+/// A step, its bytes left in the buffer.
+enum Next {
+    Frames { position: u64, length: usize },
+    Fill { position: u64, extent: u32 },
+    Gap { from: u64, to: u64 },
+    Wait { until_ns: u64 },
+    End { position: u64 },
 }
 
 /// What a poll yields.
@@ -213,6 +230,8 @@ pub struct ReplaySource<D: Disk> {
     /// The first paced entry's record time and the caller's clock then.
     origin: Option<(u64, u64)>,
     ended: bool,
+    /// An earlier poll failed.
+    failed: bool,
 }
 
 impl<D: Disk> ReplaySource<D> {
@@ -262,6 +281,7 @@ impl<D: Disk> ReplaySource<D> {
             current: None,
             origin: None,
             ended: false,
+            failed: false,
         };
         let held = source.held(from, to)?;
         source.to = to.min(held);
@@ -560,8 +580,38 @@ impl<D: Disk> ReplaySource<D> {
     /// [`ReplayError::Corrupt`], [`ReplayError::MissingSegment`],
     /// [`ReplayError::BufferTooSmall`], and the store's errors.
     pub fn poll(&mut self, now_ns: u64) -> Result<Step<'_>, ReplayError> {
+        if self.failed {
+            return Err(ReplayError::Failed);
+        }
+        let next = match self.next(now_ns) {
+            Ok(next) => next,
+            Err(error) => {
+                // An error is final: the replay's state may be anywhere.
+                self.failed = true;
+                self.current = None;
+                return Err(error);
+            }
+        };
+        Ok(match next {
+            Next::Frames { position, length } => Step::Frames {
+                position,
+                bytes: self.buffer.get(..length).ok_or(SegmentError::Failed)?,
+            },
+            Next::Fill { position, extent } => Step::Fill {
+                position,
+                record: self.buffer.get(..FILL_RECORD).ok_or(SegmentError::Failed)?,
+                extent,
+            },
+            Next::Gap { from, to } => Step::Gap { from, to },
+            Next::Wait { until_ns } => Step::Wait { until_ns },
+            Next::End { position } => Step::End { position },
+        })
+    }
+
+    /// The next step, its bytes left in the buffer.
+    fn next(&mut self, now_ns: u64) -> Result<Next, ReplayError> {
         if self.ended {
-            return Ok(Step::End {
+            return Ok(Next::End {
                 position: self.position,
             });
         }
@@ -590,12 +640,12 @@ impl<D: Disk> ReplaySource<D> {
                 if self.paces(&current)
                     && let Some(until_ns) = self.pace(entry, now_ns)?
                 {
-                    return Ok(Step::Wait { until_ns });
+                    return Ok(Next::Wait { until_ns });
                 }
                 let to = entry_end.min(self.to);
                 let from = current.at;
                 self.advance(to, entry_end);
-                Ok(Step::Gap { from, to })
+                Ok(Next::Gap { from, to })
             }
             EntryKind::Fill => {
                 if entry_end > self.to {
@@ -604,14 +654,12 @@ impl<D: Disk> ReplaySource<D> {
                 if self.paces(&current)
                     && let Some(until_ns) = self.pace(entry, now_ns)?
                 {
-                    return Ok(Step::Wait { until_ns });
+                    return Ok(Next::Wait { until_ns });
                 }
                 self.read_fill(entry)?;
                 self.advance(entry_end, entry_end);
-                let record = self.buffer.get(..FILL_RECORD).ok_or(SegmentError::Failed)?;
-                Ok(Step::Fill {
+                Ok(Next::Fill {
                     position: entry.start,
-                    record,
                     extent: entry.length,
                 })
             }
@@ -619,10 +667,10 @@ impl<D: Disk> ReplaySource<D> {
         }
     }
 
-    fn end(&mut self) -> Step<'static> {
+    fn end(&mut self) -> Next {
         self.ended = true;
         self.current = None;
-        Step::End {
+        Next::End {
             position: self.position,
         }
     }
@@ -667,7 +715,7 @@ impl<D: Disk> ReplaySource<D> {
         mut current: Current,
         entry_end: u64,
         now_ns: u64,
-    ) -> Result<Step<'_>, ReplayError> {
+    ) -> Result<Next, ReplayError> {
         let room = u64::try_from(self.buffer.len()).map_err(|_| SegmentError::PositionOverflow)?;
         let left = entry_end
             .checked_sub(current.at)
@@ -684,7 +732,7 @@ impl<D: Disk> ReplaySource<D> {
         if self.paces(&current)
             && let Some(until_ns) = self.pace(current.entry, now_ns)?
         {
-            return Ok(Step::Wait { until_ns });
+            return Ok(Next::Wait { until_ns });
         }
         let open = self.open.as_ref().ok_or(SegmentError::Failed)?;
         let span = current
@@ -704,33 +752,25 @@ impl<D: Disk> ReplaySource<D> {
             .at
             .checked_add(span)
             .ok_or(SegmentError::PositionOverflow)?;
-        let end = if whole {
-            if crate::crc32c::crc32c(window) != current.entry.data_crc {
-                return Err(ReplayError::Corrupt {
-                    position: current.entry.start,
-                });
-            }
-            window_end
-        } else if window_end == current.limit {
+        if whole && crate::crc32c::crc32c(window) != current.entry.data_crc {
+            return Err(ReplayError::Corrupt {
+                position: current.entry.start,
+            });
+        }
+        let end = if !whole && window_end == current.limit {
             // The limit is a verified frame boundary.
             window_end
         } else {
-            // The whole frames in the window; their lengths are verified.
-            let mut frame = current.at;
-            loop {
-                let corrupt = ReplayError::Corrupt { position: frame };
-                let length = frame_length(window, current.at, frame, entry_end).ok_or(corrupt)?;
-                let next = frame
-                    .checked_add(length)
-                    .ok_or(SegmentError::PositionOverflow)?;
-                if next > window_end {
-                    if frame == current.at {
-                        return Err(ReplayError::BufferTooSmall { length });
-                    }
-                    break frame;
-                }
-                frame = next;
+            // The whole frames in the window. An entry read whole has its
+            // lengths checked here: they must end exactly at its end.
+            let (end, first) = whole_frames(window, current.at, entry_end)?;
+            if whole && end != window_end {
+                return Err(ReplayError::Corrupt { position: end });
             }
+            if end == current.at {
+                return Err(ReplayError::BufferTooSmall { length: first });
+            }
+            end
         };
         let position = current.at;
         let length = usize::try_from(
@@ -739,8 +779,7 @@ impl<D: Disk> ReplaySource<D> {
         )
         .map_err(|_| SegmentError::PositionOverflow)?;
         self.advance(end, entry_end);
-        let bytes = self.buffer.get(..length).ok_or(SegmentError::Failed)?;
-        Ok(Step::Frames { position, bytes })
+        Ok(Next::Frames { position, length })
     }
 }
 
@@ -764,6 +803,42 @@ fn read<'b, D: Disk>(
     disk.read_at(data, offset, bytes)
         .map_err(SegmentError::from)?;
     Ok(bytes)
+}
+
+/// The end of the whole frames of `window` (an entry's bytes from
+/// `window_start`), and the length of its first frame. A frame whose
+/// length word or extent is outside the window does not fit and ends the
+/// scan; a length that does not hold is [`ReplayError::Corrupt`].
+fn whole_frames(
+    window: &[u8],
+    window_start: u64,
+    entry_end: u64,
+) -> Result<(u64, u64), ReplayError> {
+    let window_end = u64::try_from(window.len())
+        .ok()
+        .and_then(|length| window_start.checked_add(length))
+        .ok_or(SegmentError::PositionOverflow)?;
+    let mut frame = window_start;
+    let mut first = 0;
+    loop {
+        // Its length word is not in the window: it does not fit.
+        let word_end = frame.checked_add(4).ok_or(SegmentError::PositionOverflow)?;
+        if word_end > window_end {
+            return Ok((frame, first));
+        }
+        let length = frame_length(window, window_start, frame, entry_end)
+            .ok_or(ReplayError::Corrupt { position: frame })?;
+        if frame == window_start {
+            first = length;
+        }
+        let next = frame
+            .checked_add(length)
+            .ok_or(SegmentError::PositionOverflow)?;
+        if next > window_end {
+            return Ok((frame, first));
+        }
+        frame = next;
+    }
 }
 
 /// The length the frame at `frame` takes in its entry, read from `window`
