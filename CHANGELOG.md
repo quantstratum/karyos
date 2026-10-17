@@ -231,6 +231,17 @@ release may break APIs, wire formats and shared-memory layouts.
   within a bound with a fair
   cursor, and membership events are queued in a bounded queue. Not wired
   yet: the sender agent's SM handoff and gate.
+- Membership simulator scenarios (P2.7 C preparation, ACS 15661):
+  karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
+  40 seeds each. `membership-required-loss` stops admission exactly
+  `receiver_timeout` after a dead required receiver's last SM, holds every
+  lane and keeps its consumption in retention. `membership-optional-pause`
+  checks that a paused optional receiver past `pause_timeout` does not
+  rejoin on stationary SMs, that the sender moves past its edge, and that
+  it rejoins once it advances. `membership-two-paths` checks that SM
+  copies over a second path, and that path's bindings coming and going,
+  match a one-path shadow table at every step. On every step the sent
+  position stays within each required member's edge.
 
 ## [0.1.0-alpha.1]: 2026-10-15
 
