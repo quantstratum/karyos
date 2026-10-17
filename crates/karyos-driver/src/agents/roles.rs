@@ -1060,22 +1060,33 @@ fn tail_hole(image: &mut Installed, lane: Lane, at: usize, now: u64) -> Option<H
 fn unrecoverable(
     image: &mut Installed,
     counters: &mut ReceiverCounters,
+    trace: &mut super::net_trace::ReceiverTrace,
     lane: Lane,
     hole: Hole,
     lowest_retained: u64,
     now: u64,
 ) {
+    let slot = image.slot;
     let floor = hole
         .start
         .checked_add(u64::from(hole.length))
         .map_or(lowest_retained, |end| lowest_retained.max(end));
+    // Each committed seal reaches the lane's trace journal, if any (§5).
+    let sealed = |lane, position, extent| trace.sealed(slot, lane, position, extent);
     let unavailable = match image.gate.as_deref_mut() {
-        Some(gate) => image
-            .skip
-            .range_unavailable_gated(&mut image.owner, lane, floor, now, gate),
-        None => image
-            .skip
-            .range_unavailable(&mut image.owner, lane, floor, now),
+        Some(gate) => {
+            image
+                .skip
+                .range_unavailable_observed(&mut image.owner, lane, floor, now, gate, sealed)
+        }
+        None => image.skip.range_unavailable_observed(
+            &mut image.owner,
+            lane,
+            floor,
+            now,
+            &mut karyos_sys::log_buffer::Ungated,
+            sealed,
+        ),
     };
     tally_gate(
         counters,
@@ -1146,6 +1157,7 @@ fn journal_facts(
         first_gap: owner
             .and_then(|owner| owner.first_loss(traced.lane))
             .flatten(),
+        gaps: traced.gaps,
     }
 }
 
@@ -1672,6 +1684,7 @@ impl ReceiverRole {
                                     publication,
                                     number: journal.number,
                                     start,
+                                    gaps: super::net_trace::GapIntervals::default(),
                                 }
                             })
                         })
@@ -2647,6 +2660,7 @@ impl ReceiverRole {
             to_sender,
             counters,
             delays,
+            trace,
             #[cfg(test)]
             posted_naks,
             #[cfg(test)]
@@ -2711,7 +2725,7 @@ impl ReceiverRole {
                 ..
             } = image.loss.observe(lane, hole, now)
             {
-                unrecoverable(image, counters, lane, hole, lowest_retained, now);
+                unrecoverable(image, counters, trace, lane, hole, lowest_retained, now);
             }
             // A multicast hole's NAK waits for its cycle's drawn delay; a
             // no-op on a unicast image.
@@ -2830,9 +2844,20 @@ impl ReceiverRole {
         // an unreliable image; on a reliable one under `skip`, the holes
         // left below an unrecoverable range (at most a few per call).
         if image.closing.is_none() {
+            // Each committed seal reaches the lane's trace journal, if any
+            // (§5).
+            let slot = image.slot;
+            let sealed = |lane, position, extent| trace.sealed(slot, lane, position, extent);
             let duty = match image.gate.as_deref_mut() {
-                Some(gate) => image.skip.duty_gated(&mut image.owner, now, gate),
-                None => image.skip.duty(&mut image.owner, now),
+                Some(gate) => image
+                    .skip
+                    .duty_observed(&mut image.owner, now, gate, sealed),
+                None => image.skip.duty_observed(
+                    &mut image.owner,
+                    now,
+                    &mut karyos_sys::log_buffer::Ungated,
+                    sealed,
+                ),
             };
             tally_gate(
                 counters,
@@ -3654,7 +3679,10 @@ impl Intake<'_> {
             return;
         };
         let ReceiverRole {
-            images, counters, ..
+            images,
+            counters,
+            trace,
+            ..
         } = role;
         let Some(image) = images.iter_mut().find(|image| image.slot == slot) else {
             tally(counters, |c| &mut c.nak_replies_unbound);
@@ -3670,7 +3698,7 @@ impl Intake<'_> {
                 lane,
                 hole,
                 lowest_retained,
-            } => unrecoverable(image, counters, lane, hole, lowest_retained, now),
+            } => unrecoverable(image, counters, trace, lane, hole, lowest_retained, now),
             // A floor beyond the window closes the image whatever the skip
             // policy (RC-9): its repair state is terminal already.
             NakOutcome::GapCannotResume { .. } => {

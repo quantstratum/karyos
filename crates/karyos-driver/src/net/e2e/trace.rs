@@ -122,12 +122,21 @@ fn extension(message_id: u64) -> TraceExtension {
     }
 }
 
-/// Offers one traced message on lane 0 of `publication`, pumping both
-/// drivers until it is accepted.
+/// The client publication of lane 0 of `publication`.
+fn lane_zero(
+    a: &mut EmbeddedDriver,
+    publication: &crate::embedded::AggregateHandle,
+) -> karyos_client::ClientPublication<karyos_sys::term_bytes::HeapTerms> {
+    a.publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap()
+}
+
+/// Offers one traced message on `lane`, pumping both drivers until it is
+/// accepted.
 fn offer_traced(
     a: &mut EmbeddedDriver,
     b: &mut EmbeddedDriver,
-    publication: &crate::embedded::AggregateHandle,
+    lane: &mut karyos_client::ClientPublication<karyos_sys::term_bytes::HeapTerms>,
     message_id: u64,
 ) {
     let mut bytes = [0u8; 64];
@@ -136,9 +145,6 @@ fn offer_traced(
         extension: Some(bytes),
         ..karyos_sys::log_buffer::AppendOptions::default()
     };
-    let mut lane = a
-        .publication(publication.lane(Lane::ZERO).unwrap())
-        .unwrap();
     pump(&mut [a, b], |_| {
         matches!(
             lane.offer_with(&[9u8; 100], options).unwrap(),
@@ -165,7 +171,9 @@ fn journals_follow_a_publication_and_its_image(threading: ThreadingMode) {
             && start(drivers[1], received[0]).is_some()
     });
     let (sent, received) = (sender.opened()[0], receiver.opened()[0]);
-    offer_traced(&mut a, &mut b, &publication, 7);
+    let mut lane = lane_zero(&mut a, &publication);
+    offer_traced(&mut a, &mut b, &mut lane, 7);
+    drop(lane);
     pump(&mut [&mut a, &mut b], |_| {
         !sender.pickups().is_empty() && !receiver.commits().is_empty()
     });
@@ -245,7 +253,9 @@ fn a_retired_image_closes_its_receiver_journal_with_its_facts() {
     });
     let number = receiver.opened()[0];
     let joined = start(&b, number).unwrap();
-    offer_traced(&mut a, &mut b, &publication, 3);
+    let mut lane = lane_zero(&mut a, &publication);
+    offer_traced(&mut a, &mut b, &mut lane, 3);
+    drop(lane);
     pump(&mut [&mut a, &mut b], |_| !receiver.commits().is_empty());
     let position = receiver.commits()[0].1.position;
     a.remove_aggregate(&publication).unwrap();
@@ -256,4 +266,47 @@ fn a_retired_image_closes_its_receiver_journal_with_its_facts() {
     assert_eq!(facts.start, Some(joined));
     assert!(facts.boundary > Some(position), "{facts:?}");
     assert_eq!(receiver.closed(), [number]);
+}
+
+/// PR 3b, end to end: a gap sealed on a traced image lane is kept, and the
+/// control path returns it with the journal's close.
+#[test]
+fn a_closed_receiver_journal_returns_its_gaps() {
+    let (mut a, mut b) = (
+        fast_driver(ThreadingMode::Shared),
+        fast_driver(ThreadingMode::Shared),
+    );
+    let receiver = hook(&mut b, NetSide::Receiver);
+    let (publication, _image) = connected(&mut a, &mut b, false, 10);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        receiver
+            .opened()
+            .first()
+            .is_some_and(|number| start(drivers[1], *number).is_some())
+    });
+    let number = receiver.opened()[0];
+    // The first message is lost; the second arrives: a gap is sealed.
+    b.net.as_mut().unwrap().drop_receiver_data(&[0]);
+    let mut lane = lane_zero(&mut a, &publication);
+    offer_traced(&mut a, &mut b, &mut lane, 1);
+    offer_traced(&mut a, &mut b, &mut lane, 2);
+    drop(lane);
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1]
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .is_some_and(|counters| counters.gaps_sealed >= 1)
+    });
+    assert_eq!(b.network_journal_gaps(number), None, "still open");
+    a.remove_aggregate(&publication).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_journal_gaps(number).is_some()
+    });
+    let gaps = b.network_journal_gaps(number).unwrap();
+    let first_gap = entry(&b, number).unwrap().network.unwrap().first_gap;
+    assert_eq!(gaps.intervals().len(), 1, "{gaps:?}");
+    assert_eq!(Some(gaps.intervals()[0].0), first_gap);
+    assert!(!gaps.overflowed());
 }

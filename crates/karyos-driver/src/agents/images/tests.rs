@@ -3745,6 +3745,40 @@ fn a_repaired_traced_frame_records_once_and_its_copies_never() {
     assert_eq!(commits, expected, "each traced frame once, at its position");
 }
 
+/// P2.12 step 3 PR 3b (§5): each gap the skip policy seals on a traced
+/// lane is kept in its journal's facts, in order; the first is the first
+/// gap fact.
+#[test]
+fn a_receiver_journal_keeps_its_sealed_gaps() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let _slot = established(&mut rig);
+    let recorder = CommitRecorder::default();
+    rig.trace_receiver(Some(recorder.clone()), b, 9);
+    // The second and fourth datagrams are lost: two holes.
+    rig.agents.receiver.role.drop_data(&[1, 3]);
+    let mut positions = Vec::new();
+    for i in 0..5u8 {
+        let log = rig.log.as_mut().unwrap();
+        let AppendOutcome::Appended { position } = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap()
+        else {
+            panic!("not appended");
+        };
+        positions.push(position);
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 2);
+    let facts = rig.close_receiver_journal(9).expect("facts");
+    let gaps = facts.gaps.intervals();
+    assert_eq!(gaps.len(), 2, "{gaps:?}");
+    assert_eq!((gaps[0].0, gaps[1].0), (positions[1], positions[3]));
+    assert!(gaps.iter().all(|(start, end)| end > start));
+    assert_eq!(facts.first_gap, Some(positions[1]));
+    assert!(!facts.gaps.overflowed());
+}
+
 /// P2.12 step 3 PR 2 (Q2, ACS 16519): an image that retires closes its
 /// lanes' journals at once and posts their facts to the conductor
 /// unsolicited; a later close answers the same facts once.

@@ -39,7 +39,7 @@
 //!   closes the writer ([`NetworkTraceHook::close_journal`]) and the driver
 //!   drains the journal to its end, as for a client journal.
 
-use crate::agents::net_trace::TraceHook;
+use crate::agents::net_trace::{GapIntervals, TraceHook};
 use crate::embedded::StreamTerms;
 use crate::net::trace::{Handed, TraceEvent, Traced};
 use crate::sessions::receive::SlotRef;
@@ -79,6 +79,10 @@ pub(crate) struct NetworkTracing {
     refused: Vec<(PublicationIdentity, u64)>,
     /// Refusals of publications the full table could not hold.
     untracked: u64,
+    /// The sealed gaps of the latest closed receiver journals, by journal
+    /// number, for an in-process report (§5): at most its reserved
+    /// capacity, the oldest dropped first.
+    gaps: Vec<(u64, GapIntervals)>,
 }
 
 impl core::fmt::Debug for NetworkTracing {
@@ -89,6 +93,7 @@ impl core::fmt::Debug for NetworkTracing {
             .field("open", &self.open)
             .field("refused", &self.refused)
             .field("untracked", &self.untracked)
+            .field("gaps", &self.gaps.len())
             .finish()
     }
 }
@@ -109,8 +114,21 @@ impl NetworkTracing {
             pending: [None, None],
             open: Vec::new(),
             refused: Vec::with_capacity(publications),
+            gaps: Vec::with_capacity(publications),
             untracked: 0,
         }
+    }
+
+    /// Keeps the sealed gaps of closed receiver journal `number`, dropping
+    /// the oldest kept when the reserved room is full.
+    fn keep_gaps(&mut self, number: u64, gaps: GapIntervals) {
+        if self.gaps.capacity() == 0 {
+            return;
+        }
+        if self.gaps.len() >= self.gaps.capacity() {
+            self.gaps.remove(0);
+        }
+        self.gaps.push((number, gaps));
     }
 
     /// Whether journals of `side` can open now: its agent holds a hook.
@@ -235,6 +253,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let open = self.network.open.swap_remove(index);
                 if let Some(facts) = facts {
                     let receiver = open.side == NetSide::Receiver;
+                    if receiver {
+                        self.network.keep_gaps(number, facts.gaps);
+                    }
                     let _ = self.trace_journals.update_network(number, |recorded| {
                         recorded.boundary = Some(facts.boundary);
                         if receiver && recorded.first_gap.is_none() {
@@ -370,6 +391,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 self.network.open.swap_remove(index);
             }
         }
+    }
+
+    /// The sealed gaps of the closed receiver journal `number` (§5), for an
+    /// in-process report with its facts: the first
+    /// [`FACT_GAP_INTERVALS`](crate::agents::net_trace::FACT_GAP_INTERVALS)
+    /// and an overflow flag. `None` for a journal that is not a receiver
+    /// journal closed with facts, or one among the oldest whose gaps are no
+    /// longer kept (as many are kept as `max_trace_journals`); a report
+    /// then treats every frame at or after its first gap as unknown.
+    #[must_use]
+    pub fn network_journal_gaps(&self, number: u64) -> Option<GapIntervals> {
+        self.network
+            .gaps
+            .iter()
+            .find(|(kept, _)| *kept == number)
+            .map(|(_, gaps)| *gaps)
     }
 
     /// Network journals of `publication` refused so far (§5): a report

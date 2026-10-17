@@ -64,6 +64,53 @@ impl TracedLane {
     }
 }
 
+/// How many sealed gaps a receiver journal's facts keep in process
+/// (trace-network.md §5, `fact_gap_intervals`).
+pub const FACT_GAP_INTERVALS: usize = 16;
+
+/// A receiver journal's sealed local gaps (§5): the first
+/// [`FACT_GAP_INTERVALS`], each `[start, end)`, and whether more were
+/// sealed. A report expects the journal for frames after the last kept gap
+/// when the list overflowed, so a missing commit there is never a false
+/// `Complete`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GapIntervals {
+    intervals: [(u64, u64); FACT_GAP_INTERVALS],
+    len: u8,
+    overflowed: bool,
+}
+
+impl GapIntervals {
+    /// Keeps the gap of `extent` bytes at `position`. A full list, or a gap
+    /// whose end does not fit, sets the overflow flag instead, so a report
+    /// stays conservative.
+    pub(crate) fn push(&mut self, position: u64, extent: u32) {
+        let end = position.checked_add(u64::from(extent));
+        let next = self.len.checked_add(1);
+        match (self.intervals.get_mut(usize::from(self.len)), end, next) {
+            (Some(slot), Some(end), Some(next)) => {
+                *slot = (position, end);
+                self.len = next;
+            }
+            _ => self.overflowed = true,
+        }
+    }
+
+    /// The kept gaps, lowest first as sealed.
+    #[must_use]
+    pub fn intervals(&self) -> &[(u64, u64)] {
+        self.intervals
+            .get(..usize::from(self.len))
+            .unwrap_or_default()
+    }
+
+    /// Whether gaps beyond the kept ones were sealed.
+    #[must_use]
+    pub fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
 /// The facts of a journal the agent closed (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalFacts {
@@ -77,6 +124,8 @@ pub struct JournalFacts {
     pub boundary: u64,
     /// A receiver's first sealed gap; `None` on the sender.
     pub first_gap: Option<u64>,
+    /// A receiver's sealed gaps; empty on the sender.
+    pub gaps: GapIntervals,
 }
 
 /// The sender agent's hook and its journal commands.
@@ -178,6 +227,7 @@ impl SenderTrace {
                     start: traced.start,
                     boundary: traced.boundary,
                     first_gap: None,
+                    gaps: GapIntervals::default(),
                 });
                 Some((
                     reply,
@@ -209,6 +259,8 @@ pub(crate) struct TracedImageLane {
     /// The journal's start: the lane's next commit position when it
     /// arrived (the image join fact of §5).
     pub(crate) start: u64,
+    /// The gaps sealed on the lane since the journal opened.
+    pub(crate) gaps: GapIntervals,
 }
 
 /// A journal its image's retirement closed: posted to the conductor
@@ -262,6 +314,24 @@ impl ReceiverTrace {
     /// Whether any lane has a journal: the data path's one branch.
     pub(crate) fn any(&self) -> bool {
         !self.lanes.is_empty()
+    }
+
+    /// The gap `[position, position + extent)` was sealed on `lane` of the
+    /// image at `slot`: its journal, if any, keeps it.
+    pub(crate) fn sealed(
+        &mut self,
+        slot: crate::sessions::receive::SlotRef,
+        lane: Lane,
+        position: u64,
+        extent: u32,
+    ) {
+        if let Some(traced) = self
+            .lanes
+            .iter_mut()
+            .find(|traced| traced.slot == slot && traced.lane == lane)
+        {
+            traced.gaps.push(position, extent);
+        }
     }
 
     /// Replaces the hook; every journal still open closes through the
