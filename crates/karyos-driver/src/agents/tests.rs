@@ -208,12 +208,52 @@ fn the_configuration_is_checked() {
             path_heartbeat_interval: 0,
             ..AgentConfig::default()
         },
+        // RP-9's backoffs: at least 1 ns, the maximum at least the initial.
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                backoff_initial: 0,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                backoff_max: 1,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                backoff_reset: 0,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        // A maximum past 60 s could keep a left path out for good.
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                backoff_max: crate::agents::data::MAX_PATH_BACKOFF + 1,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
     ] {
         assert!(matches!(
             network_agents::<S>(config),
             Err(AgentError::InvalidConfig(_))
         ));
     }
+    assert!(
+        network_agents::<S>(AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                backoff_max: crate::agents::data::MAX_PATH_BACKOFF,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        })
+        .is_ok()
+    );
 }
 
 /// A command is refused, with nothing posted, when its reply could not be
@@ -440,7 +480,8 @@ fn the_receiver_runs_before_the_sender() {
 
 /// The redundant-path defaults are redundant-paths.md section 7's:
 /// `path_lag_limit` 100 ms, `path_skip_ratio` 50%, `path_skip_min_bytes`
-/// 64 KiB; and RP-3's interim heartbeat, 100 ms.
+/// 64 KiB, and RP-9's backoffs 10 ms, 1 s and 10 s; and RP-3's interim
+/// heartbeat, 100 ms.
 #[test]
 fn the_path_defaults_are_section_sevens() {
     let config = AgentConfig::default();
@@ -450,6 +491,9 @@ fn the_path_defaults_are_section_sevens() {
             lag_limit: 100_000_000,
             skip_percent: 50,
             skip_min_bytes: 64 * 1024,
+            backoff_initial: 10_000_000,
+            backoff_max: 1_000_000_000,
+            backoff_reset: 10_000_000_000,
         }
     );
     assert_eq!(config.path_heartbeat_interval, 100_000_000);

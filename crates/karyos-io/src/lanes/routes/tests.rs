@@ -1193,6 +1193,35 @@ fn a_blocked_waiting_route_is_not_ready() {
         .unwrap();
 }
 
+/// ACS 17049: `forget` returns a route's staged copies of a lane through
+/// the gate, in staging order, with no backend call; the other route and
+/// the other lanes keep theirs.
+#[test]
+fn forget_returns_one_routes_copies_without_the_backend() {
+    let mut f = Fixture::new(&[1000, 1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    f.stage(1, 0, 100, 100, &[1]);
+    let calls = f.routes[1].socket.send_calls();
+    let mut gate = Gate::default();
+    assert_eq!(f.sender.forget(0, 1, &mut gate), 2);
+    assert_eq!(f.routes[1].socket.send_calls(), calls, "no backend call");
+    assert_eq!(gate.left[1], 2, "returned through the gate");
+    assert_eq!(f.sender.pending(0, 1), Some(0));
+    assert_eq!(f.sender.counters(1).unwrap().forgotten, 2);
+    assert_eq!(f.sender.pending(0, 0), Some(2), "route 0 keeps its copies");
+    assert_eq!(f.sender.pending(1, 1), Some(1), "lane 1 keeps its copy");
+    assert_eq!(f.sender.forget(0, 1, &mut gate), 0, "nothing left");
+    assert_eq!(f.sender.forget(0, 9, &mut gate), 0, "past the routes");
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
 /// #346 delta review: a blocked route that leaves, its copies cancelled,
 /// is ready again when it returns.
 #[test]
