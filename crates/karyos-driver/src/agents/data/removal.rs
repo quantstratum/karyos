@@ -98,7 +98,7 @@ pub(crate) struct RemovalStep {
 
 /// What sending a lane's EOS did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EosSent {
+pub(super) enum EosSent {
     /// Submitted.
     Submitted,
     /// Not taken now: tried again at the next cycle.
@@ -143,6 +143,25 @@ impl<T: StreamTerms> Outbound<T> {
         mut tx: Option<&mut SocketsTx<O>>,
         now: u64,
     ) -> RemovalStep {
+        self.serve_removal_with(
+            now,
+            |outbound, lane| outbound.drained_seal(lane),
+            |outbound, lane, seal| match tx.as_deref_mut() {
+                Some(tx) => outbound.send_eos(tx, lane, seal),
+                None => EosSent::NotSent,
+            },
+        )
+    }
+
+    /// [`Outbound::serve_removal`] with how a lane is drained (`drained`,
+    /// its seal once its first sends reached it) and how its EOS is sent
+    /// (`send`): one path, or every live path of a routed publication.
+    pub(super) fn serve_removal_with(
+        &mut self,
+        now: u64,
+        drained: impl Fn(&Self, usize) -> Option<u64>,
+        mut send: impl FnMut(&mut Self, usize, u64) -> EosSent,
+    ) -> RemovalStep {
         let mut step = RemovalStep::default();
         let lanes = self.readers.len();
         let Some(removal) = self.removal.as_deref_mut() else {
@@ -168,7 +187,7 @@ impl<T: StreamTerms> Outbound<T> {
             if removal.abandoned.get(lane).copied().unwrap_or(true) {
                 continue;
             }
-            let seal = self.drained_seal(lane);
+            let seal = drained(self, lane);
             let due = match (seal, eos) {
                 // A first EOS only within the drain bound.
                 (Some(_), None) => age <= bound,
@@ -194,10 +213,10 @@ impl<T: StreamTerms> Outbound<T> {
                 }
                 continue;
             }
-            let (Some(seal), true, Some(tx)) = (seal, due, tx.as_deref_mut()) else {
+            let (Some(seal), true) = (seal, due) else {
                 continue;
             };
-            match self.send_eos(tx, lane, seal) {
+            match send(self, lane, seal) {
                 EosSent::NotSent => continue,
                 EosSent::Closed => {
                     if let Some(removal) = self.removal.as_deref_mut() {
@@ -253,26 +272,6 @@ impl<T: StreamTerms> Outbound<T> {
             .map(|removal| removal.registration)
     }
 
-    /// Runs the linger from `now` with no EOS, as on every lane of a
-    /// publication that cannot send one yet (a routed one).
-    pub(crate) fn linger_without_eos(&mut self, now: u64) {
-        let lanes = self.readers.len();
-        let Some(removal) = self.removal.as_deref_mut() else {
-            return;
-        };
-        for slot in removal.eos.iter_mut().take(lanes) {
-            slot.get_or_insert(LaneEos {
-                seal: 0,
-                first: now,
-                last: now,
-            });
-        }
-        let first = removal.eos.iter().flatten().map(|eos| eos.first).max();
-        let linger = removal.linger;
-        removal.drained |=
-            first.is_some_and(|first| now.checked_sub(first).is_some_and(|age| age >= linger));
-    }
-
     /// Ends the linger at once: a removing publication with no established
     /// receiver drains nothing, and nobody would read its EOS. Returns
     /// whether this ended it (the first call).
@@ -310,11 +309,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// Sends `lane`'s EOS, a header-only DATA frame at `seal`, on the lane's
     /// queue. A lane whose guard closed sends none.
     fn send_eos<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, lane: usize, seal: u64) -> EosSent {
-        if self
-            .guard
-            .as_deref_mut()
-            .is_some_and(|guard| !LaneGate::admits(guard, lane))
-        {
+        if self.eos_closed(lane) {
             return EosSent::Closed;
         }
         if self.write_heartbeat(tx, lane, seal, true) {
@@ -322,5 +317,12 @@ impl<T: StreamTerms> Outbound<T> {
         } else {
             EosSent::NotSent
         }
+    }
+
+    /// Whether `lane`'s guard closed: then no EOS leaves it (GC-6).
+    pub(super) fn eos_closed(&mut self, lane: usize) -> bool {
+        self.guard
+            .as_deref_mut()
+            .is_some_and(|guard| !LaneGate::admits(guard, lane))
     }
 }

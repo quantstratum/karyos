@@ -6297,7 +6297,8 @@ fn a_path_lost_and_bound_again_moves_no_cursor() {
         }
     }
     assert_eq!(rig.agents.receiver.role.live_paths(slot), 1, "B2 lost");
-    // Bound again, at the sender's position now.
+    // Bound again: `second_path(None)` joins at 0, not at the sender's
+    // position.
     let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
     for _ in 0..4 {
