@@ -100,6 +100,11 @@ release may break APIs, wire formats and shared-memory layouts.
   counted (`PathCounters::entries`). It bounds `Outbound::sent_low`, the
   least frontier over the live paths, from its first submit; a frame a
   path skipped counts as passed for its frontier.
+- A close no longer waits on a detached path (rp-w5b; ACS 17049). On a
+  guarded lane's abort, the copies of a route whose TX half is detached
+  are forgotten through the guard gate (`RoutedLaneSender::forget`), so
+  the close can become effective if the path never comes back. The route
+  then returns only through an endpoint reset.
 - Receiver trace journals keep their sealed gaps (P2.12 step 3, PR 3b,
   trace-network.md section 5): the first `FACT_GAP_INTERVALS` (16) gaps of
   each traced lane, in order, with an overflow flag, carried in

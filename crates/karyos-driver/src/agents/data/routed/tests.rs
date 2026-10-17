@@ -1052,6 +1052,74 @@ fn a_healthy_path_never_looks_full() {
     assert_eq!(seen_b.lock().unwrap().len(), 24);
 }
 
+/// ACS 17049: a path that leaves while its TX half is detached, and never
+/// comes back, does not keep a close from becoming effective: on the close
+/// its copies are forgotten through the guard gate. When it does come
+/// back, it comes back through a reset, and no forgotten copy is sent.
+#[test]
+fn a_close_does_not_wait_on_a_detached_left_path() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b, rx_b) = path_rx(2, 0);
+    for _ in 0..32 {
+        observer_b.push_send(SendResult::Error(Errno::AGAIN));
+    }
+    sent(&observer_a, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    outbound
+        .guard(
+            GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::clone(&cell),
+                epoch: 2,
+                rate: None,
+            },
+            0,
+        )
+        .unwrap();
+    // B blocks on its copies; then its half goes and it leaves detached.
+    commit(&mut log, 0, 4);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 10)
+        .unwrap();
+    assert!(outbound.routed_sender().unwrap().pending(0, 1).unwrap() > 0);
+    let b_half = halves.pop().unwrap();
+    outbound.leave_before_serve(1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 20)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    for now in 30..40 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    let applied = cell.try_read().unwrap();
+    assert_eq!(applied.epoch, 3);
+    assert_eq!(applied.in_flight, 0, "nothing waits on the detached path");
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    // B's half comes back: the route asks for a reset first.
+    let calls = observer_b.send_calls();
+    halves.push(b_half);
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 40).unwrap();
+    assert!(outbound.needs_reset());
+    let _rx_b = reset(&mut halves, 1, rx_b);
+    for now in 50..60 {
+        let _ = outbound.serve_routes(&mut halves, BUDGET, None, now).unwrap();
+    }
+    assert!(!outbound.needs_reset());
+    assert_eq!(observer_b.send_calls(), calls, "no forgotten copy is sent");
+}
+
 /// #346 review P2-3: several paths can leave in one pass, and the last live
 /// one never does. Three paths each take one datagram of three (the others'
 /// halves are away): each skipped two thirds, so A and B leave and C stays.

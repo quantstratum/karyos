@@ -557,6 +557,30 @@ impl RoutedLaneSender {
         first.map_or(Ok(()), Err)
     }
 
+    /// Forgets `route`'s pending copies of `lane` while that route's TX
+    /// half is detached, for a lane its gate aborted: each leaves through
+    /// `gate` as [`Left::Returned`], in staging order, with no backend
+    /// call. None was submitted (a submitted copy leaves the record), so
+    /// none can reach the wire unless flushed, and a forgotten copy is
+    /// never flushed: the detached queue keeps the items until the route's
+    /// reopen replaces it. A close then does not wait on a route that may
+    /// never come back (ACS 17049). Returns how many it forgot.
+    pub fn forget<G: LaneGate>(&mut self, lane: usize, route: usize, gate: &mut G) -> usize {
+        let Some(queue) = self
+            .lanes
+            .get_mut(lane)
+            .and_then(|entry| entry.routes.get_mut(route))
+        else {
+            return 0;
+        };
+        // At most the queue's bound: `len` before the drain cannot overflow.
+        let forgotten = queue.staged.len();
+        while let Some(head) = queue.staged.pop_front() {
+            gate.left(lane, head.staged, Left::Returned);
+        }
+        forgotten
+    }
+
     /// Returns `route`'s pending copies of every lane that were never
     /// exposed, for a route leaving the live set (RP-8): only that route's
     /// queues, as [`RoutedLaneSender::cancel`] does per lane; each leaves

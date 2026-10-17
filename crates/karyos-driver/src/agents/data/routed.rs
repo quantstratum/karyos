@@ -1247,6 +1247,29 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     self.counters.bump(|c| &mut c.queue_failures, 1);
                 }
             }
+            // A detached route cannot cancel, and may never come back: its
+            // copies are forgotten, so the close does not wait for its
+            // reopen (ACS 17049). Its queue still holds them, so it comes
+            // back only through a reset, whose reopen replaces the queue.
+            for (index, slot) in routed.routes.iter_mut().enumerate() {
+                let held = routed
+                    .sender
+                    .pending(lane, index)
+                    .is_some_and(|held| held > 0);
+                if !held || lent.route(index).is_some() {
+                    continue;
+                }
+                if routed.sender.forget(lane, index, &mut gate) > 0 {
+                    slot.needs_reset = true;
+                }
+                if let Some(copies) = gate
+                    .tracks
+                    .get_mut(lane)
+                    .and_then(|track| track.staged.get_mut(index))
+                {
+                    copies.clear();
+                }
+            }
         }
         if cancelled && let Some(guard) = gate.guard.as_deref_mut() {
             guard.between_gates();
