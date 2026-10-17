@@ -1193,6 +1193,60 @@ fn a_blocked_waiting_route_is_not_ready() {
         .unwrap();
 }
 
+/// #346 delta review: a blocked route that leaves, its copies cancelled,
+/// is ready again when it returns.
+#[test]
+fn a_returning_route_is_ready_again() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(f.sender.debited(0), Some(0), "route 1 blocked on p0");
+    let mut gate = Gate::default();
+    f.sender.set_live(1, false);
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+    f.sender.set_live(1, true);
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    assert_eq!(f.sender.sole_holder(0), Some(0), "route 1 is ready again");
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// #346 delta review: a blocked route whose blocking copy goes with a
+/// reopen has nothing left to retry, so it is ready again.
+#[test]
+fn a_reopened_route_is_ready_again() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(f.sender.debited(0), Some(0), "route 1 blocked on p0");
+    let queue = f.routes[1].queues[0];
+    f.sender.reopen(0, 1, queue);
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    assert_eq!(f.sender.sole_holder(0), Some(0), "route 1 is ready again");
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
 /// #346 review P2-2: a blocked route that submits in a serve is ready
 /// again, so a lone holder waits on it.
 #[test]

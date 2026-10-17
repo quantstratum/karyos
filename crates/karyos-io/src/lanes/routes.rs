@@ -188,8 +188,11 @@ pub struct RoutedLaneSender {
     /// it takes no flush and holds no head back.
     live: [bool; MAX_ROUTES],
     /// The routes whose last flush would block (no room) or found the
-    /// endpoint inactive, until a copy of theirs is submitted again: not
-    /// ready. A route that has not tried since its last submit counts as
+    /// endpoint inactive: not ready. The copy that blocked stays staged
+    /// and is tried again on every call that reaches it, so the flag lasts
+    /// only while the socket keeps blocking: any other answer (submitted,
+    /// returned, unknown, interrupted) clears it, and so does a reopen,
+    /// which drops that copy. A route that has not tried since counts as
     /// ready: nothing probes a socket without a copy to send.
     blocked: [bool; MAX_ROUTES],
 }
@@ -294,6 +297,12 @@ impl RoutedLaneSender {
             && let Some(slot) = self.live.get_mut(route)
         {
             *slot = live;
+        }
+        // A route entering or leaving the set starts with no blocked flag:
+        // the copy that blocked it was cancelled when it left (RP-8), so a
+        // returning route counts as ready until it tries (RP-9).
+        if let Some(blocked) = self.blocked.get_mut(route) {
+            *blocked = false;
         }
     }
 
@@ -512,6 +521,11 @@ impl RoutedLaneSender {
             entry.suspended = false;
             entry.control = false;
         }
+        // The copy that blocked went with the old queue: nothing would
+        // retry it, so the route counts as ready again.
+        if let Some(blocked) = self.blocked.get_mut(route) {
+            *blocked = false;
+        }
     }
 
     /// Returns the pending copies of `lane` that were never exposed, on
@@ -681,14 +695,26 @@ impl RoutedLaneSender {
                     Flushed::Returned => {
                         queue.staged.pop_front();
                         gate.left(lane, head.staged, Left::Returned);
+                        if let Some(route) = blocked.get_mut(index) {
+                            *route = false;
+                        }
                     }
                     Flushed::Unknown => {
                         queue.staged.pop_front();
                         queue.suspended = true;
                         gate.left(lane, head.staged, Left::Unknown);
+                        if let Some(route) = blocked.get_mut(index) {
+                            *route = false;
+                        }
                     }
                     // Tried again on the next call.
-                    Flushed::Denied | Flushed::Again => {}
+                    Flushed::Denied => {}
+                    // The socket answered without blocking.
+                    Flushed::Again => {
+                        if let Some(route) = blocked.get_mut(index) {
+                            *route = false;
+                        }
+                    }
                     Flushed::Blocked | Flushed::Inactive => {
                         *out = true;
                         if let Some(route) = blocked.get_mut(index) {
@@ -949,16 +975,27 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
                 Flushed::Returned => {
                     queue.staged.pop_front();
                     self.gate.left(lane, head.staged, Left::Returned);
+                    if let Some(route) = self.blocked.get_mut(index) {
+                        *route = false;
+                    }
                 }
                 Flushed::Unknown => {
                     queue.staged.pop_front();
                     queue.suspended = true;
                     self.gate.left(lane, head.staged, Left::Unknown);
                     uncertain = true;
+                    if let Some(route) = self.blocked.get_mut(index) {
+                        *route = false;
+                    }
                 }
                 // The probe raced the exposure-time gate.
                 Flushed::Denied => queue.paused = true,
-                Flushed::Again => {}
+                // The socket answered without blocking.
+                Flushed::Again => {
+                    if let Some(route) = self.blocked.get_mut(index) {
+                        *route = false;
+                    }
+                }
                 // Per socket (LS-4): this route takes no more in the call.
                 Flushed::Blocked => {
                     *out = true;
