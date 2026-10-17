@@ -257,6 +257,8 @@ pub struct ReceiverCounters {
     pub nak_copies: u64,
     /// NAK copies skipped: the control ring was full; never deferred.
     pub nak_copies_skipped: u64,
+    /// NAK copies on a later path reported uncertain (RC-6 per route).
+    pub nak_copies_uncertain: u64,
     /// NAK retries: a hole NAKed again (a reliable image whose sender
     /// never repairs, such as a `reliable=false` publication, shows here).
     pub nak_retries: u64,
@@ -628,9 +630,10 @@ fn copies_busy(image: &Installed, at: usize) -> bool {
 }
 
 /// Settles the reports of lane `at`'s NAK copies on the later paths
-/// (RP-7): the first submitted, or uncertain (RC-6: then counted as
-/// submitted at its start), anchors the NAK unless another copy already
-/// did; a copy not submitted leaves the NAK due unless one anchored it.
+/// (RP-7): the first submitted anchors the NAK unless another copy already
+/// did; an uncertain one becomes the round's anchor candidate, used only
+/// if no copy is submitted once all have reported; a copy not submitted
+/// leaves the NAK due unless one anchored it.
 /// Uncertainty counts per path route: a second uncertain copy on one
 /// route while its first is unresolved faults that route, which then
 /// takes no copy until its endpoint is reset.
@@ -648,9 +651,12 @@ fn settle_copies(image: &mut Installed, counters: &mut ReceiverCounters, at: usi
         let Some(nak) = copy.pending.take() else {
             continue;
         };
+        let mut route_ok = true;
         if let (SendReport::Uncertain(_), Some(route)) = (settled, image.routes.get_mut(path)) {
+            tally(counters, |c| &mut c.nak_copies_uncertain);
             if route.uncertain {
                 route.faulted = true;
+                route_ok = false;
                 tally(counters, |c| &mut c.nak_route_faults);
             } else {
                 route.uncertain = true;
@@ -658,14 +664,48 @@ fn settle_copies(image: &mut Installed, counters: &mut ReceiverCounters, at: usi
         }
         let anchored = image.anchored.get(at).copied().flatten() == Some(nak);
         match (settled, anchored) {
-            (SendReport::Submitted(start) | SendReport::Uncertain(start), false) => {
+            (SendReport::Submitted(start), false) => {
                 image.loss.submitted(&nak, start, &image.rtt);
                 if let Some(anchor) = image.anchored.get_mut(at) {
                     *anchor = Some(nak);
                 }
+                if let Some(candidate) = image.uncertain_at.get_mut(at) {
+                    *candidate = None;
+                }
+            }
+            (SendReport::Uncertain(start), false) if route_ok => {
+                uncertain_candidate(image, at, nak, start);
             }
             (SendReport::NotSubmitted, false) => image.loss.not_submitted(&nak),
             _ => {}
+        }
+    }
+}
+
+/// Once every copy of lane `at`'s round has reported and none was
+/// submitted, anchors its NAK at the earliest uncertain copy, counted as
+/// submitted at its start (RC-6; #310 review).
+fn anchor_uncertain(image: &mut Installed, at: usize) {
+    let reported =
+        !copies_busy(image, at) && image.naks.get(at).is_none_or(|report| !report.slot.busy());
+    if reported
+        && let Some((nak, start)) = image.uncertain_at.get_mut(at).and_then(Option::take)
+        && image.anchored.get(at).copied().flatten() != Some(nak)
+    {
+        image.loss.submitted(&nak, start, &image.rtt);
+        if let Some(slot) = image.anchored.get_mut(at) {
+            *slot = Some(nak);
+        }
+    }
+}
+
+/// Records an uncertain copy of `nak` started at `start` as lane `at`'s
+/// anchor candidate, keeping the earliest start of its round.
+fn uncertain_candidate(image: &mut Installed, at: usize, nak: Nak, start: u64) {
+    if let Some(candidate) = image.uncertain_at.get_mut(at) {
+        match candidate {
+            Some((held, earlier)) if *held == nak && *earlier <= start => {}
+            _ => *candidate = Some((nak, start)),
         }
     }
 }
@@ -674,16 +714,22 @@ fn settle_copies(image: &mut Installed, counters: &mut ReceiverCounters, at: usi
 /// founding path, on every other bound path whose route is not faulted
 /// (RP-7). A copy the control ring cannot take is skipped and counted,
 /// never deferred.
+///
+/// Copies draw from the control ring's unreserved units, as forwarded
+/// controls do: a burst of copies can leave a later image's founding NAK
+/// without room, which counts as `ring_full_nak` and stays due. A copy
+/// still in the ring delays the lane's next NAK on every path
+/// (`copies_busy`) until the sender reports it.
 fn post_copies(
     image: &mut Installed,
-    sessions: &ReceiveSessions,
+    key_of: impl Fn(usize) -> Option<BindingKey>,
     to_sender: &mut RingSender<ControlItem>,
     counters: &mut ReceiverCounters,
     at: usize,
     nak: Nak,
 ) {
     for path in 0..image.routes.len() {
-        let Some(key) = sessions.paths().key(image.slot, path) else {
+        let Some(key) = key_of(path) else {
             continue;
         };
         if key == image.key || image.routes.get(path).is_some_and(|route| route.faulted) {
@@ -746,6 +792,9 @@ struct CopyRoute {
     /// A second uncertain copy came while one was unresolved: the route
     /// takes no copy until its endpoint is reset.
     faulted: bool,
+    /// The receiver cycle its last endpoint reset request was posted in,
+    /// while it is faulted.
+    reset_requested: Option<u64>,
 }
 
 /// An answered challenge waiting for the conductor's reply.
@@ -836,6 +885,9 @@ struct Installed {
     routes: Vec<CopyRoute>,
     /// Per lane, the NAK whose submission round a copy already anchored.
     anchored: [Option<Nak>; 4],
+    /// Per lane, the earliest uncertain copy of the round, with its start:
+    /// it anchors the NAK only if no copy is submitted (#310 review).
+    uncertain_at: [Option<(Nak, u64)>; 4],
     /// The founding path's subscription is gone while a later path keeps
     /// the image: control goes on the later paths only (#307 review P2-3).
     founding_gone: bool,
@@ -1597,6 +1649,28 @@ impl ReceiverRole {
             .and_then(|image| image.stats.counts(path).copied())
     }
 
+    /// Faults route `path` of the image at `slot`, as two uncertain NAK
+    /// copies on it would (tests).
+    #[cfg(test)]
+    pub(super) fn fault_route(&mut self, slot: SlotRef, path: usize) {
+        let image = self
+            .images
+            .iter_mut()
+            .find(|image| image.slot == slot)
+            .unwrap();
+        image.routes[path].uncertain = true;
+        image.routes[path].faulted = true;
+    }
+
+    /// Whether route `path` of the image at `slot` is faulted (tests).
+    #[cfg(test)]
+    pub(super) fn route_faulted(&self, slot: SlotRef, path: usize) -> bool {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .is_some_and(|image| image.routes[path].faulted)
+    }
+
     /// NAKs handed over on an image's founding path (tests).
     #[cfg(test)]
     pub(super) fn founding_naks(&self) -> u64 {
@@ -1989,6 +2063,7 @@ impl ReceiverRole {
                 .collect(),
             routes: vec![CopyRoute::default(); paths],
             anchored: [None; 4],
+            uncertain_at: [None; 4],
             founding_gone: false,
             control_group,
             receiver_id: named,
@@ -2124,9 +2199,38 @@ impl ReceiverRole {
     pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
         let cycle = self.cycle;
         let Self {
-            images, counters, ..
+            images,
+            counters,
+            sessions,
+            ..
         } = self;
+        let due_at = |requested: Option<u64>| {
+            requested.is_none_or(|at| {
+                cycle
+                    .checked_sub(at)
+                    .is_none_or(|age| age >= super::data::RESET_REQUEST_CYCLES)
+            })
+        };
         for image in images.iter_mut() {
+            // A faulted later route asks for its own endpoint's reset,
+            // which resolves it (RC-6 per route; #310 review).
+            for path in 0..image.routes.len() {
+                let Some(key) = sessions.paths().key(image.slot, path) else {
+                    continue;
+                };
+                let Some(route) = image.routes.get_mut(path) else {
+                    continue;
+                };
+                if key == image.key || !route.faulted || !due_at(route.reset_requested) {
+                    continue;
+                }
+                if post(key.endpoint) {
+                    route.reset_requested = Some(cycle);
+                    tally(counters, |c| &mut c.reset_requests);
+                } else {
+                    tally(counters, |c| &mut c.reset_requests_full);
+                }
+            }
             // The founding route faulted; once its subscription went, its
             // endpoint is released and asks for no reset.
             if !image.loss.is_faulted() || image.founding_gone {
@@ -2223,6 +2327,17 @@ impl ReceiverRole {
         // RP-5: a gap detected now waits the skew window only with two or
         // more live paths.
         image.loss.set_live_paths(sessions.paths().live(image.slot));
+        // RC-6 per route: with a later route healthy, a fault of the
+        // founding route silences only the founding copy.
+        let healthy = (0..image.routes.len()).any(|path| {
+            sessions
+                .paths()
+                .key(image.slot, path)
+                .is_some_and(|key| key != image.key)
+                && image.routes.get(path).is_some_and(|route| !route.faulted)
+        });
+        image.loss.set_other_route_healthy(healthy);
+        let slot = image.slot;
         let mut sent = 0u32;
         let lanes = usize::from(image.lane_count);
         for at in 0..lanes {
@@ -2241,32 +2356,32 @@ impl ReceiverRole {
                 match (settled, anchored) {
                     (SendReport::Submitted(start), false) => {
                         image.loss.submitted(&nak, start, &image.rtt);
-                    }
-                    (SendReport::NotSubmitted, false) => image.loss.not_submitted(&nak),
-                    // RC-6: counts as submitted at its start; a second
-                    // while one is unresolved is a route fault.
-                    (SendReport::Uncertain(start), false) => {
-                        if image.loss.uncertain(&nak, start, &image.rtt).is_err() {
-                            tally(counters, |c| &mut c.nak_route_faults);
+                        if let Some(slot) = image.anchored.get_mut(at) {
+                            *slot = Some(nak);
                         }
                     }
-                    (SendReport::Uncertain(_), true) => {
+                    (SendReport::NotSubmitted, false) => image.loss.not_submitted(&nak),
+                    // RC-6 on the founding route: a second uncertain NAK
+                    // while one is unresolved is a route fault. An
+                    // uncertain copy anchors only if no copy of its round
+                    // is submitted (below).
+                    (SendReport::Uncertain(start), anchored) => {
                         if image.loss.route_uncertain().is_err() {
                             tally(counters, |c| &mut c.nak_route_faults);
+                        } else if !anchored {
+                            uncertain_candidate(image, at, nak, start);
                         }
                     }
                     (SendReport::Submitted(_) | SendReport::NotSubmitted, true) => {}
                 }
-                if let (SendReport::Submitted(_) | SendReport::Uncertain(_), Some(slot)) =
-                    (settled, image.anchored.get_mut(at))
-                {
-                    *slot = Some(nak);
-                }
             }
-            // The later paths' copies (RP-7): the first submitted, or
-            // uncertain, anchors the NAK; uncertainty and route faults
-            // count per path route.
+            // The later paths' copies (RP-7): the first submitted anchors
+            // the NAK; uncertainty and route faults count per path route.
             settle_copies(image, counters, at);
+            // Every copy of the round reported and none submitted: the
+            // earliest uncertain one anchors it, counted as submitted at its
+            // start (RC-6; #310 review).
+            anchor_uncertain(image, at);
             if image.loss.counters().retries > retries {
                 tally(counters, |c| &mut c.nak_retries);
             }
@@ -2316,17 +2431,28 @@ impl ReceiverRole {
             let Some(nak) = image.loss.due(lane, now) else {
                 continue;
             };
-            // The founding path's subscription gone (P2-3): the NAK goes on
-            // the later paths only, and their first copy submitted anchors
-            // it.
-            if image.founding_gone {
+            // The founding path's subscription gone (P2-3), or its route
+            // faulted while a later one is healthy (#310 review): the NAK
+            // goes on the later paths only, and their first copy submitted
+            // anchors it.
+            if image.founding_gone || image.loss.is_faulted() {
                 if let Some(anchor) = image.anchored.get_mut(at) {
                     *anchor = None;
+                }
+                if let Some(candidate) = image.uncertain_at.get_mut(at) {
+                    *candidate = None;
                 }
                 #[cfg(test)]
                 posted_naks.push(nak);
                 tally(counters, |c| &mut c.naks);
-                post_copies(image, sessions, to_sender, counters, at, nak);
+                post_copies(
+                    image,
+                    |path| sessions.paths().key(slot, path),
+                    to_sender,
+                    counters,
+                    at,
+                    nak,
+                );
                 sent = sent
                     .checked_add(1)
                     .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
@@ -2356,7 +2482,17 @@ impl ReceiverRole {
                     if let Some(anchor) = image.anchored.get_mut(at) {
                         *anchor = None;
                     }
-                    post_copies(image, sessions, to_sender, counters, at, nak);
+                    if let Some(candidate) = image.uncertain_at.get_mut(at) {
+                        *candidate = None;
+                    }
+                    post_copies(
+                        image,
+                        |path| sessions.paths().key(slot, path),
+                        to_sender,
+                        counters,
+                        at,
+                        nak,
+                    );
                     sent = sent
                         .checked_add(1)
                         .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
@@ -2629,6 +2765,10 @@ impl ReceiverRole {
                 // A path bound again starts from `rtt_initial`; a report
                 // of the lost binding's probe no longer matches.
                 image.rtt.rebind(path);
+                // A path bound again starts with a clean route (#310 review).
+                if let Some(route) = image.routes.get_mut(path) {
+                    *route = CopyRoute::default();
+                }
             }
         });
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
@@ -3293,6 +3433,11 @@ impl Intake<'_> {
                         self.role.images.iter_mut().find(|held| held.slot == image),
                     ) {
                         let joins = path_joins(&joins, installed.term_length);
+                        // A rebound path does not inherit its old route's
+                        // fault (#310 review).
+                        if let Some(route) = installed.routes.get_mut(path) {
+                            *route = CopyRoute::default();
+                        }
                         installed.stats.path_bound(
                             path,
                             joins

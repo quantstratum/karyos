@@ -1204,3 +1204,19 @@ fn a_skew_window_above_one_second_is_refused() {
         Some(LossConfigError::SkewWindow)
     );
 }
+
+/// #310 review, RC-6 per route: a fault of the image's own route stops its
+/// NAKs only while no other route is healthy.
+#[test]
+fn an_own_route_fault_spares_healthy_routes() {
+    let rtt = FakeRtt::new(RTT);
+    let mut loss = image();
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    let _ = loss.uncertain(&nak, 0, &rtt);
+    let _ = loss.uncertain(&nak, 0, &rtt);
+    assert!(loss.is_faulted());
+    assert_eq!(loss.due(lane(0), 10 * RTT), None);
+    loss.set_other_route_healthy(true);
+    assert!(loss.due(lane(0), 10 * RTT).is_some());
+}

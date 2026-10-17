@@ -11,6 +11,14 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `AgentConfig::control_capacity` defaults to 512 (was 256). Configuration
+  now refuses a receiver control ring below `max_pending_challenges +
+  max_images × max_paths + 32`, since an image's SM goes on each of its
+  bound paths (redundant paths, RP-7).
+- The receiver counts its control copies on redundant paths:
+  `ReceiverCounters::sm_copies`, `sm_copies_skipped`, `nak_copies`,
+  `nak_copies_skipped` and `nak_copies_uncertain`.
+
 - The admission `Manifest` carries the stream position where the fetched
   mapping starts (its base), within admission protocol version 2. A remote
   client maps a grant at that base, so its positions, loss reports and

@@ -551,6 +551,9 @@ pub struct ImageLoss {
     /// ([`ImageLoss::set_live_paths`]): a gap detected with two or more
     /// waits the skew window.
     live_paths: usize,
+    /// Another path route of the image is healthy
+    /// ([`ImageLoss::set_other_route_healthy`]).
+    other_route_healthy: bool,
     counters: LossCounters,
 }
 
@@ -591,8 +594,16 @@ impl ImageLoss {
             faulted: false,
             multicast: None,
             live_paths: 1,
+            other_route_healthy: false,
             counters: LossCounters::default(),
         })
+    }
+
+    /// Whether another path route than the image's own is healthy now
+    /// (redundant paths, RP-7): then a fault of the own route stops only
+    /// that route, and NAKs stay due for the others.
+    pub fn set_other_route_healthy(&mut self, healthy: bool) {
+        self.other_route_healthy = healthy;
     }
 
     /// The image's live path bindings now (RP-5): the caller reports them
@@ -932,7 +943,9 @@ impl ImageLoss {
     /// Nothing changes until the caller reports the submission. `None`
     /// also while a route fault holds the image.
     pub fn due(&mut self, lane: Lane, now: u64) -> Option<Nak> {
-        if self.faulted || self.closed {
+        // RC-6 per route: a fault of the image's own route stops only that
+        // route while another is healthy (redundant paths, #310 review).
+        if (self.faulted && !self.other_route_healthy) || self.closed {
             return None;
         }
         let (alias, identity, receiver) = (self.alias, self.identity, self.receiver);
