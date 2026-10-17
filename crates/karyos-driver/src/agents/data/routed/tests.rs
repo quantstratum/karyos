@@ -30,6 +30,12 @@ const ALIAS: Alias = Alias {
     stream_id: 6,
 };
 
+/// A second publication on the same endpoints (rp-w7a).
+const OTHER_ALIAS: Alias = Alias {
+    session_id: 7,
+    stream_id: 6,
+};
+
 const TERM: TermParams = TermParams {
     term_length: 65_536,
     initial_term_id: 9,
@@ -56,6 +62,20 @@ fn path_rx(
     Seen,
     SocketsRx<ScriptedSocket>,
 ) {
+    path_carrying(id, blocked, &[ALIAS])
+}
+
+/// [`path_rx`] for a socket that carries the publications of `aliases`.
+fn path_carrying(
+    id: u32,
+    blocked: usize,
+    aliases: &'static [Alias],
+) -> (
+    (EndpointId, Half<ScriptedSocket>),
+    ScriptedSocket,
+    Seen,
+    SocketsRx<ScriptedSocket>,
+) {
     let socket = ScriptedSocket::new();
     let observer = socket.observer();
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
@@ -73,7 +93,7 @@ fn path_rx(
             let Ok(Datagram::DataBatch(data)) = classify(datagram) else {
                 panic!("not a DATA datagram");
             };
-            assert_eq!(data.alias(), ALIAS);
+            assert!(aliases.contains(&data.alias()), "{:?}", data.alias());
             record.lock().unwrap().push(data.bytes().to_vec());
         }
     }));
@@ -1671,3 +1691,5 @@ fn a_shared_bottleneck_evicts_no_path() {
             .unwrap();
     }
 }
+
+mod validation;
