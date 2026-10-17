@@ -497,6 +497,15 @@ pub enum AgentCommand<O: SocketOps> {
     /// Test only: block the duty cycle until the flag is cleared.
     #[cfg(test)]
     Block(Arc<AtomicBool>),
+    /// Test only, sender: mark the publication `alias` on `endpoint` as
+    /// needing an endpoint reset, as a send fault would (W4 E2).
+    #[cfg(test)]
+    ForceReset {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
+    },
 }
 
 /// An agent's event to the conductor.
@@ -778,6 +787,10 @@ impl<O: SocketOps> AgentCore<O> {
                     while flag.load(Ordering::Acquire) {
                         std::thread::yield_now();
                     }
+                }
+                #[cfg(test)]
+                command @ AgentCommand::ForceReset { .. } => {
+                    let _ = role(command);
                 }
             }
         }
