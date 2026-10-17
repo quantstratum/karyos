@@ -497,3 +497,30 @@ fn a_reset_while_another_route_holds_the_copies_does_not_rewind() {
     assert_eq!(seen_a.lock().unwrap().len(), 1);
     assert!(seen_b.lock().unwrap().is_empty(), "no rewind onto B");
 }
+
+/// #321 merge review: two paths on one endpoint are refused, since each
+/// route's TX half is found by its endpoint; so are no path and more than
+/// four.
+#[test]
+fn routes_need_their_own_endpoints() {
+    use super::super::OutboundError;
+
+    let at = |id: u32, host: u8| {
+        (
+            EndpointId(id),
+            SocketAddr::from(([127, 0, 0, host], 41_000)),
+        )
+    };
+    assert_eq!(super::check_routes(&[at(1, 1), at(2, 2)]), Ok(()));
+    assert_eq!(
+        super::check_routes(&[at(1, 1), at(1, 2)]),
+        Err(OutboundError::Routes)
+    );
+    assert_eq!(
+        super::check_routes(&[at(1, 1), at(2, 2), at(1, 3)]),
+        Err(OutboundError::Routes)
+    );
+    assert_eq!(super::check_routes(&[]), Err(OutboundError::Routes));
+    let five: Vec<_> = (1..=5).map(|id| at(id, 1)).collect();
+    assert_eq!(super::check_routes(&five), Err(OutboundError::Routes));
+}

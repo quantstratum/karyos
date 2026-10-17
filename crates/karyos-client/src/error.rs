@@ -113,6 +113,10 @@ pub enum ClientError {
     /// answered with a grant of another kind.
     #[error("the request ended without a usable answer")]
     Unknown,
+    /// A conflated view closed for good (SPEC.md §7.1): its table published
+    /// a terminal invalidation.
+    #[error(transparent)]
+    ViewClosed(#[from] crate::conflated_subscription::ViewClosed),
     /// Driver events were lost, so a network subscription can no longer
     /// know its images: it is closed.
     #[error("driver events were lost; the subscription is closed")]

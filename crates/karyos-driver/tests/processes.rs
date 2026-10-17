@@ -1137,7 +1137,8 @@ fn conflated_view(dir: &Path, timeout: Duration) {
     let start = Instant::now();
     while values.iter().any(|value| value[1] != last) {
         assert!(start.elapsed() < Duration::from_secs(20), "saw {values:?}");
-        let _ = view.poll_changed_with(budget, |key, version, value| {
+        let _ = view.poll_changed_with(budget, |key, found| {
+            let (version, value) = (found.version(), found.payload());
             let key = key as usize;
             assert!(version > versions[key], "key {key} went back");
             versions[key] = version;
@@ -1150,7 +1151,7 @@ fn conflated_view(dir: &Path, timeout: Duration) {
     }
     report("latest");
     let start = Instant::now();
-    while !view.poll_changed(|_, _| {}).closed {
+    while !view.poll_changed(|_, _| {}).unwrap().closed {
         assert!(start.elapsed() < Duration::from_secs(10), "never closed");
         std::thread::yield_now();
     }
