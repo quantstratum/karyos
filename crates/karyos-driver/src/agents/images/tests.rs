@@ -901,33 +901,49 @@ fn a_publication_needing_a_reset_gets_one() {
     });
     let slot = established(&mut rig);
     let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
-    rig.agents
-        .sender
-        .role
-        .outbound_mut(0)
-        .unwrap()
-        .force_needs_reset();
+    // Messages sent when the need arises all arrive after the reset (the
+    // rewind itself is tested over the scripted socket, where the reset
+    // returns what loopback would already have sent).
+    let messages: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i; 900]).collect();
+    for message in &messages {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(message, AppendOptions::default())
+            .unwrap();
+    }
+    rig.round(true);
+    let force = |rig: &mut Rig| {
+        rig.agents
+            .sender
+            .role
+            .outbound_mut(0)
+            .unwrap()
+            .force_needs_reset();
+    };
+    force(&mut rig);
     rig.until(true, |rig| rig.endpoints.counters().resets == 1);
     rig.until(true, |rig| {
         !rig.agents.sender.role.outbound(0).unwrap().needs_reset()
             && rig.agents.sender.counters().needs_reset == 0
     });
-    assert!(rig.agents.sender.counters().reset_requests >= 1);
-    let message = vec![5u8; 700];
-    let log = rig.log.as_mut().unwrap();
-    let _ = log.publications[0]
-        .append(&message, AppendOptions::default())
-        .unwrap();
-    let mut delivered = None;
-    for _ in 0..2000 {
+    let mut delivered = Vec::new();
+    for _ in 0..3000 {
         rig.round(true);
-        if let Some(got) = poll_message(&mut subscriber) {
-            delivered = Some(got);
+        while let Some(message) = poll_message(&mut subscriber) {
+            delivered.push(message);
+        }
+        if delivered.len() == messages.len() {
             break;
         }
     }
-    assert_eq!(delivered, Some(message));
+    assert_eq!(delivered, messages);
     assert_eq!(rig.endpoints.counters().resets, 1);
+    // A second need right after the reset is asked for on the next cycle:
+    // the new epoch cleared the last request's record.
+    let requests = rig.agents.sender.counters().reset_requests;
+    force(&mut rig);
+    rig.round(true);
+    assert_eq!(rig.agents.sender.counters().reset_requests, requests + 1);
 }
 
 /// Test 3, subscriber side (§5): the image's SMs report its least required

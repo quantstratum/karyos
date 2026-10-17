@@ -553,7 +553,11 @@ impl<O: SocketOps> Endpoints<O> {
             self.counters.bump(|c| &mut c.requests_ignored);
             return;
         };
+        // A clock behind the last reset (stepped back) counts as an
+        // elapsed interval: deferring until it catches up would break the
+        // interval's bound.
         if let Some(at) = entry.last_reset
+            && now >= at
             && age_ns(now, at) < entry.backoff
         {
             entry.deferred = true;

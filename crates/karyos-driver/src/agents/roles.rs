@@ -1651,8 +1651,11 @@ impl SenderRole {
 
     /// Asks for the reset of each endpoint a publication needs reset on,
     /// through `post` (which returns whether the request was posted): at
-    /// most once per [`RESET_REQUEST_CYCLES`](super::data::RESET_REQUEST_CYCLES) per publication while the
-    /// need holds. Nothing allocates.
+    /// most once per [`RESET_REQUEST_CYCLES`](super::data::RESET_REQUEST_CYCLES)
+    /// per publication while the need holds. The cadence is per
+    /// publication, so `N` publications on one endpoint post up to `N`
+    /// requests per period; the endpoint table resets once and ignores the
+    /// others while the reset is in flight. Nothing allocates.
     pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
         let cycle = self.cycle;
         for index in 0..self.publications.len() {

@@ -89,12 +89,12 @@ impl LaneGate for DataGate<'_> {
     }
 }
 
-/// One lane's staged heads, in order, and what left.
 /// Sender cycles between two reset requests of a publication that still
 /// needs a reset: one lost to a full event ring, or ignored while its
 /// endpoint was busy, is asked again.
 pub const RESET_REQUEST_CYCLES: u64 = 64;
 
+/// One lane's staged heads, in order, and what left.
 #[derive(Debug)]
 struct LaneTrack {
     /// Ticket and the stream position after it, per staged datagram.

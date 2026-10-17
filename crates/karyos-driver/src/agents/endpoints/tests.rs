@@ -555,3 +555,24 @@ fn requested_resets_back_off_while_the_fault_recurs() {
     endpoints.requested(&links, EndpointId(u32::MAX - 1), clean);
     assert_eq!(endpoints.counters().requests_ignored, ignored + 1);
 }
+
+/// A clock stepped back behind the last requested reset does not defer
+/// requests until it catches up: the interval counts as elapsed.
+#[test]
+fn a_clock_stepped_back_does_not_defer_resets() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    endpoints.requested(&links, id, 100 * SEC);
+    assert_eq!(endpoints.counters().resets, 1);
+    settle(&mut agents, &links, &mut endpoints, 1);
+    // The clock steps back 50 s: the next request resets at once.
+    endpoints.requested(&links, id, 50 * SEC);
+    assert_eq!(endpoints.counters().resets, 2);
+    assert_eq!(endpoints.counters().resets_deferred, 0);
+}

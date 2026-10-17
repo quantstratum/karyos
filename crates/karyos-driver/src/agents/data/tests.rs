@@ -230,3 +230,69 @@ fn a_failed_open_leaks_nothing() {
     let counters = path.counters();
     assert_eq!((counters.queue_failures, counters.route_failures), (5, 0));
 }
+
+/// P2-6, mutant M7 of the #270 review: a reliable lane rewinds to its
+/// registered position on a new endpoint epoch. With no bound receiver its
+/// registered position holds at the join, so after the reset every frame
+/// it had submitted goes out again.
+#[test]
+fn a_reliable_lane_resends_from_its_registered_position_after_a_reset() {
+    use karyos_io::backend::TxReport;
+
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let seen = Arc::new(Mutex::new(0usize));
+    let record = Arc::clone(&seen);
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        *record.lock().unwrap() += datagrams.len();
+    }));
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (mut path, mut log) = outbound(EndpointId(1), alias, destination, term, 1, true);
+    for i in 0..3u8 {
+        let _ = log.publications[0]
+            .append(&[i; 300], AppendOptions::default())
+            .unwrap();
+    }
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, budget, None).unwrap();
+    }
+    let first = *seen.lock().unwrap();
+    assert!(first >= 1, "nothing sent");
+    assert_eq!(path.readers()[0].sent_position(), 0, "held: no receiver");
+    // The endpoint is reset and reopened at its next epoch.
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    let _ = endpoint.reopen(&local).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, budget, None).unwrap();
+    }
+    assert_eq!(*seen.lock().unwrap(), 2 * first, "the lane did not resend");
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    while !matches!(
+        endpoint.retire(&mut report),
+        karyos_io::sockets::endpoint::Retired::Complete { .. }
+    ) {
+        while report.pop_front().is_some() {}
+    }
+}
