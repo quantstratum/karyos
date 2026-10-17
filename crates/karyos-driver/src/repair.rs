@@ -10,6 +10,9 @@
 //!   served (R7).
 //! - [`jobs`] (R5): the job table, with exact-interval coalescing, the
 //!   repair linger and capacity: steps 6 and 7.
+//! - [`scheduler`] (R7): the repair DRR over the lanes within the repair
+//!   budget, with step 8 and the end proof at each head.
 
 pub mod admission;
 pub mod jobs;
+pub mod scheduler;
