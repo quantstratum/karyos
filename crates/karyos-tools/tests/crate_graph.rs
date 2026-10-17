@@ -18,7 +18,9 @@ use std::process::Command;
 /// The normal dependencies of `package`, one crate per line.
 fn dependencies(package: &str) -> String {
     // The cargo running the tests, at run time; every feature, so no
-    // feature can bring the crate in.
+    // feature can bring the crate in. The host target only: `--target all`
+    // needs other targets' dependencies, which an offline build does not
+    // have.
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let output = Command::new(cargo)
         .args([
@@ -28,8 +30,6 @@ fn dependencies(package: &str) -> String {
             "-e",
             "normal",
             "--all-features",
-            "--target",
-            "all",
             "--prefix",
             "none",
             "--offline",
