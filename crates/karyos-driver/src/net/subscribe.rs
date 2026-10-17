@@ -75,8 +75,10 @@ impl EmbeddedDriver<HeapTerms> {
     /// # Errors
     ///
     /// [`DriverError::NetworkUnavailable`] without a network,
-    /// [`DriverError::UnsupportedChannel`], [`DriverError::NetworkEndpoint`]
-    /// and [`DriverError::NetworkBusy`].
+    /// [`DriverError::UnsupportedChannel`], [`DriverError::NetworkEndpoint`],
+    /// [`DriverError::NetworkBusy`], and
+    /// [`DriverError::ReliabilityMismatch`] for a stream already subscribed
+    /// on the endpoint with another reliability.
     pub fn add_network_subscription(
         &mut self,
         stream_id: i32,

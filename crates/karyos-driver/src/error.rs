@@ -38,6 +38,11 @@ pub enum DriverError {
     /// destination, redundant paths, an interface name).
     #[error("unsupported network channel")]
     UnsupportedChannel,
+    /// A second subscription of one endpoint and stream asks for another
+    /// reliability than the first: they would share one receiver entry,
+    /// and a reliable subscriber must not get gap-tolerant delivery.
+    #[error("the stream is already subscribed with another reliability")]
+    ReliabilityMismatch,
     /// A network endpoint could not be opened or its table is full.
     #[error("network endpoint unavailable")]
     NetworkEndpoint,

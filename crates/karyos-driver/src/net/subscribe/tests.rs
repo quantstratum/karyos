@@ -285,3 +285,40 @@ fn subscriptions_of_one_key_are_counted() {
     pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_none());
     assert!(!b.remove_network_subscription(second).unwrap(), "gone");
 }
+
+/// ACS 16071: a second subscription of one endpoint and stream with
+/// another reliability is refused, not given the first's; the refusal
+/// holds nothing, and once the first goes the other reliability is
+/// accepted.
+#[test]
+fn a_subscription_with_another_reliability_is_refused() {
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let reliable = channel(address);
+    let unreliable = UdpConfig {
+        reliable: false,
+        ..channel(address)
+    };
+    let first = b.add_network_subscription(10, &reliable).unwrap();
+    assert_eq!(
+        b.add_network_subscription(10, &unreliable),
+        Err(crate::DriverError::ReliabilityMismatch)
+    );
+    // The same reliability shares the entry.
+    let second = b.add_network_subscription(10, &reliable).unwrap();
+    assert!(b.remove_network_subscription(first).unwrap());
+    assert!(b.remove_network_subscription(second).unwrap());
+    // The endpoint retires over a few cycles; then it opens again.
+    let mut added = false;
+    for _ in 0..500 {
+        let _ = b.do_work().unwrap();
+        if b.add_network_subscription(10, &unreliable).is_ok() {
+            added = true;
+            break;
+        }
+    }
+    assert!(
+        added,
+        "the other reliability is accepted once the first is gone"
+    );
+}
