@@ -1187,3 +1187,69 @@ fn an_unknown_entry_kind_is_refused() {
         })
     ));
 }
+
+/// #341 review P3: a fill's extent lies in the data file before its entry
+/// is written; a data file shorter than the extent is cut at the fill.
+#[test]
+fn a_fill_whose_extent_is_not_in_the_file_is_cut() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        dir,
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    store.append(0, &[1; 10]).unwrap();
+    store.append_fill(10, &fill_record(10), 64).unwrap();
+    store.close().unwrap();
+    // The record is whole, but the extent's end is not in the file.
+    let mut raw = disk.clone();
+    let data = raw.open(&dir.join(data_name(RECORDING, 0))).unwrap();
+    raw.set_len(&data, 10 + 40).unwrap();
+    let recovered =
+        SegmentStore::recover(disk, dir, RECORDING, geometry(), SyncPolicy::PerSegment).unwrap();
+    assert_eq!(recovered.store.written(), 10);
+    assert_eq!(
+        recovered.cut,
+        Some(Cut {
+            position: 10,
+            reason: CutReason::DataChecksum
+        })
+    );
+}
+
+/// #341 review P3: a store records at most `MAX_GAPS` lost ranges; one
+/// more is refused before anything is written, and one that joins the
+/// last still fits.
+#[test]
+fn the_gaps_are_bounded() {
+    let mut store = SegmentStore::create(
+        FaultDisk::default(),
+        Path::new(DIR),
+        RECORDING,
+        Geometry::new(64, 64 * 1024).unwrap(),
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    let mut position = 0;
+    for _ in 0..MAX_GAPS {
+        position = store.append(position, &[1]).unwrap();
+        position = store.append_gap(position, position + 1).unwrap();
+    }
+    assert_eq!(store.gaps().len(), MAX_GAPS);
+    assert!(store.gap_fits(), "joining the last gap still fits");
+    position = store.append_gap(position, position + 1).unwrap();
+    position = store.append(position, &[1]).unwrap();
+    assert!(!store.gap_fits());
+    assert!(matches!(
+        store.append_gap(position, position + 1),
+        Err(SegmentError::TooManyGaps)
+    ));
+    assert_eq!(store.written(), position, "nothing was written");
+    assert!(store.append(position, &[1]).is_ok(), "the store is whole");
+}

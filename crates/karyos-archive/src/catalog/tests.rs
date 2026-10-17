@@ -360,8 +360,8 @@ fn a_whole_header_that_does_not_match_is_refused() {
         (13, 0xFF, |error| {
             matches!(error, CatalogError::Corrupt { offset: 0 })
         }),
-        (4, 2, |error| {
-            matches!(error, CatalogError::UnsupportedVersion { version: 2 })
+        (4, 3, |error| {
+            matches!(error, CatalogError::UnsupportedVersion { version: 3 })
         }),
     ];
     for (at, byte, expected) in cases {

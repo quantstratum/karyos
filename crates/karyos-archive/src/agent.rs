@@ -21,11 +21,13 @@
 //!   idle interval, so an idle agent does not spin.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::catalog::{Catalog, CatalogError, NewRecording, Recording};
+use crate::catalog::{Catalog, CatalogError, NewRecording, Recording, StopReason};
 use crate::disk::Disk;
 use crate::recorder::{Ended, FrameSource, Mode, Recorder, RecorderError};
 use crate::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
@@ -33,9 +35,12 @@ use crate::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 /// The agent's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentConfig {
-    /// Commands queued at most.
+    /// Commands queued at most. A handle waits for each command's reply
+    /// before it sends another, so one is always enough; a send waits for
+    /// room.
     pub command_capacity: usize,
-    /// Events queued at most; a full queue drops the newest, counted.
+    /// Events queued at most; a full queue drops the newest, counted by
+    /// [`ArchiveHandle::dropped_events`].
     pub event_capacity: usize,
     /// The copy buffer of each recorder: at least the largest frame.
     pub buffer: usize,
@@ -95,14 +100,25 @@ pub enum Event {
         /// Where and why.
         ended: Ended,
     },
-    /// A recording failed; it stays open in the catalog until the next
-    /// start settles it.
+    /// A recording's store or catalog failed: the recording stays open in
+    /// the catalog until the next start settles it, at what its segments
+    /// recover. (A source that fails ends the recording instead, with
+    /// [`StopReason::Failed`].)
     Failed {
         /// The recording.
         id: u64,
         /// What failed.
-        error: String,
+        failure: Failure,
     },
+}
+
+/// What failed when a recording could not be stopped in the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// Its segment store, while recording.
+    Store,
+    /// Closing its store or appending its `Stopped` record.
+    Stop,
 }
 
 /// The agent's errors.
@@ -123,9 +139,12 @@ pub enum AgentError {
         /// The id.
         id: u64,
     },
-    /// The command queue is full.
-    #[error("the agent is busy")]
-    Busy,
+    /// The recording failed ([`Event::Failed`]); the next start settles it.
+    #[error("recording {id} failed")]
+    RecordingFailed {
+        /// The id.
+        id: u64,
+    },
     /// The agent's thread is gone.
     #[error("the agent stopped")]
     Gone,
@@ -148,6 +167,7 @@ enum Command {
 pub struct ArchiveHandle {
     commands: SyncSender<Command>,
     events: Receiver<Event>,
+    dropped: Arc<AtomicU64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -178,13 +198,19 @@ impl ArchiveHandle {
         let (outbox, events) = mpsc::sync_channel(config.event_capacity);
         let (ready, started) = mpsc::sync_channel(1);
         let dir = dir.to_path_buf();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let events_out = Outbox {
+            sender: outbox,
+            dropped: Arc::clone(&dropped),
+        };
         let thread = std::thread::Builder::new()
             .name("karyos-archive".to_owned())
-            .spawn(move || run(disk, dir, config, &inbox, &outbox, &ready))?;
+            .spawn(move || run(disk, dir, config, &inbox, &events_out, &ready))?;
         match started.recv() {
             Ok(Ok(())) => Ok(Self {
                 commands,
                 events,
+                dropped,
                 thread: Some(thread),
             }),
             Ok(Err(error)) => {
@@ -200,11 +226,9 @@ impl ArchiveHandle {
 
     fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Command) -> Result<T, AgentError> {
         let (reply, answer) = mpsc::sync_channel(1);
-        match self.commands.try_send(make(reply)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => return Err(AgentError::Busy),
-            Err(TrySendError::Disconnected(_)) => return Err(AgentError::Gone),
-        }
+        self.commands
+            .send(make(reply))
+            .map_err(|_| AgentError::Gone)?;
         answer.recv().map_err(|_| AgentError::Gone)?
     }
 
@@ -213,19 +237,19 @@ impl ArchiveHandle {
     ///
     /// # Errors
     ///
-    /// The catalog's and the store's errors, [`AgentError::Busy`] and
-    /// [`AgentError::Gone`].
+    /// The catalog's and the store's errors, and [`AgentError::Gone`].
     pub fn start(&self, start: StartRecording) -> Result<u64, AgentError> {
         self.call(|reply| Command::Start(Box::new(start), reply))
     }
 
-    /// Stops recording `id` where it is: its store is closed, then its
-    /// `Stopped` is durable.
+    /// Stops recording `id` where it is: its store is closed with
+    /// everything durable, then its `Stopped` (reason
+    /// [`StopReason::Stopped`]) is durable.
     ///
     /// # Errors
     ///
-    /// [`AgentError::NotRecording`], the store's and the catalog's errors,
-    /// [`AgentError::Busy`] and [`AgentError::Gone`].
+    /// [`AgentError::NotRecording`], [`AgentError::RecordingFailed`], the
+    /// store's and the catalog's errors, and [`AgentError::Gone`].
     pub fn stop(&self, id: u64) -> Result<Ended, AgentError> {
         self.call(|reply| Command::Stop(id, reply))
     }
@@ -234,7 +258,7 @@ impl ArchiveHandle {
     ///
     /// # Errors
     ///
-    /// [`AgentError::Busy`] and [`AgentError::Gone`].
+    /// [`AgentError::Gone`].
     pub fn recordings(&self) -> Result<Vec<Recording>, AgentError> {
         self.call(Command::List)
     }
@@ -245,13 +269,20 @@ impl ArchiveHandle {
         self.events.try_recv().ok()
     }
 
+    /// Events dropped because the event queue was full.
+    #[must_use]
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
     /// The next event, waiting up to `timeout`.
     #[must_use]
     pub fn event(&self, timeout: Duration) -> Option<Event> {
         self.events.recv_timeout(timeout).ok()
     }
 
-    /// Stops every recording where it is and ends the agent's thread.
+    /// Stops every recording where it is (reason [`StopReason::Shutdown`])
+    /// and ends the agent's thread.
     ///
     /// # Errors
     ///
@@ -271,6 +302,21 @@ impl Drop for ArchiveHandle {
             let (reply, _answer) = mpsc::sync_channel(1);
             let _ = self.commands.send(Command::Shutdown(reply));
             let _ = thread.join();
+        }
+    }
+}
+
+/// The agent's side of the event queue: a full queue drops the event and
+/// counts it.
+struct Outbox {
+    sender: SyncSender<Event>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Outbox {
+    fn send(&self, event: Event) {
+        if self.sender.try_send(event).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -308,7 +354,7 @@ fn run<D>(
     dir: PathBuf,
     config: AgentConfig,
     inbox: &Receiver<Command>,
-    outbox: &SyncSender<Event>,
+    outbox: &Outbox,
     ready: &SyncSender<Result<(), AgentError>>,
 ) where
     D: Disk + Clone,
@@ -330,6 +376,9 @@ fn run<D>(
         return;
     }
     let mut active: Vec<Active<D>> = Vec::new();
+    // Recordings whose store failed: open in the catalog until the next
+    // start settles them.
+    let mut failed: Vec<u64> = Vec::new();
     loop {
         let mut worked = false;
         loop {
@@ -346,6 +395,7 @@ fn run<D>(
                 &config,
                 &mut catalog,
                 &mut active,
+                &failed,
                 now(),
             ) {
                 return;
@@ -358,21 +408,37 @@ fn run<D>(
                     worked |= duty.recorded > 0;
                     if duty.ended.is_some() {
                         let recording = active.swap_remove(index);
-                        let event = finish(recording, &mut catalog, now());
-                        let _ = outbox.try_send(event);
+                        // The reason it ended for (the seal, a lap).
+                        let event = finish(recording, &mut catalog, StopReason::Normal, now());
+                        if let Event::Failed { id, .. } = event {
+                            failed.push(id);
+                        }
+                        outbox.send(event);
                         continue;
                     }
                 }
                 Err(error) => {
+                    worked = true;
                     let recording = active.swap_remove(index);
-                    let _ = outbox.try_send(Event::Failed {
-                        id: recording.id,
-                        error: error.to_string(),
-                    });
+                    let event = match error.fail_kind() {
+                        // The store is whole: close it and stop the
+                        // recording, typed.
+                        Some(kind) => {
+                            finish(recording, &mut catalog, StopReason::Failed(kind), now())
+                        }
+                        None => Event::Failed {
+                            id: recording.id,
+                            failure: Failure::Store,
+                        },
+                    };
+                    if let Event::Failed { id, .. } = event {
+                        failed.push(id);
+                    }
+                    outbox.send(event);
                     continue;
                 }
             }
-            index = index.saturating_add(1);
+            index += 1;
         }
         if !worked {
             match inbox.recv_timeout(config.idle) {
@@ -384,6 +450,7 @@ fn run<D>(
                         &config,
                         &mut catalog,
                         &mut active,
+                        &failed,
                         now(),
                     ) {
                         return;
@@ -396,30 +463,43 @@ fn run<D>(
     }
 }
 
-/// Closes an ended recording's store and stops it in the catalog.
-fn finish<D: Disk>(recording: Active<D>, catalog: &mut Catalog<D>, now: u64) -> Event {
+/// Closes a recording's store and stops it in the catalog, with the
+/// reason it ended for or else `reason`.
+fn finish<D: Disk>(
+    recording: Active<D>,
+    catalog: &mut Catalog<D>,
+    reason: StopReason,
+    now: u64,
+) -> Event {
     let id = recording.id;
-    match stop(recording, catalog, now) {
+    match stop(recording, catalog, reason, now) {
         Ok(ended) => Event::Ended { id, ended },
-        Err(error) => Event::Failed {
+        Err(_) => Event::Failed {
             id,
-            error: error.to_string(),
+            failure: Failure::Stop,
         },
     }
 }
 
+/// Closes the store with everything durable, then appends `Stopped` at
+/// the durable position.
 fn stop<D: Disk>(
     recording: Active<D>,
     catalog: &mut Catalog<D>,
+    reason: StopReason,
     now: u64,
 ) -> Result<Ended, AgentError> {
     let id = recording.id;
-    let ended = recording.recorder.close()?;
+    let ended = recording.recorder.close(reason)?;
     catalog.stop(id, ended.position, now, ended.reason, ended.incomplete)?;
     Ok(ended)
 }
 
 /// Serves one command; `true` when it was the shutdown.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one command against the agent's state: its disk, catalog and recordings"
+)]
 fn serve<D: Disk + Clone>(
     command: Command,
     disk: &D,
@@ -427,6 +507,7 @@ fn serve<D: Disk + Clone>(
     config: &AgentConfig,
     catalog: &mut Catalog<D>,
     active: &mut Vec<Active<D>>,
+    failed: &[u64],
     now: u64,
 ) -> bool {
     match command {
@@ -437,7 +518,8 @@ fn serve<D: Disk + Clone>(
         }
         Command::Stop(id, reply) => {
             let result = match active.iter().position(|recording| recording.id == id) {
-                Some(index) => stop(active.swap_remove(index), catalog, now),
+                Some(index) => stop(active.swap_remove(index), catalog, StopReason::Stopped, now),
+                None if failed.contains(&id) => Err(AgentError::RecordingFailed { id }),
                 None => Err(AgentError::NotRecording { id }),
             };
             let _ = reply.send(result);
@@ -450,7 +532,7 @@ fn serve<D: Disk + Clone>(
         Command::Shutdown(reply) => {
             let mut first = Ok(());
             for recording in active.drain(..) {
-                if let Err(error) = stop(recording, catalog, now)
+                if let Err(error) = stop(recording, catalog, StopReason::Shutdown, now)
                     && first.is_ok()
                 {
                     first = Err(error);
