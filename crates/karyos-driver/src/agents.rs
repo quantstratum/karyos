@@ -262,6 +262,16 @@ impl AgentConfig {
                 "max_endpoints must be at least 1",
             ));
         }
+        // Each publication's membership follows the SM cadence and the
+        // image liveness (multicast-flow-control.md MC-6).
+        roles::MembershipTiming::of(self)
+            .config(1, 32, 32)
+            .validate()
+            .map_err(|_| {
+                AgentError::InvalidConfig(
+                    "image_liveness_timeout below ten sm_interval, or idle_image_timeout below it",
+                )
+            })?;
         // S1: the control ring holds every pending challenge's RSP_SETUP
         // and one SM slot per image, above a floor for forwarded controls
         // (one path per image until redundant paths, RP-1).
