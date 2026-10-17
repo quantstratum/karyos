@@ -316,8 +316,7 @@ impl LaneSender {
     ///
     /// # Errors
     ///
-    /// The queue's [`QueueError`] from
-    /// [`TxBackend::cancel_pending`](crate::backend::TxBackend::cancel_pending).
+    /// The queue's [`QueueError`] from [`TxBackend::cancel_pending`].
     pub fn cancel<B: TxBackend, G: LaneGate>(
         &mut self,
         backend: &mut B,
