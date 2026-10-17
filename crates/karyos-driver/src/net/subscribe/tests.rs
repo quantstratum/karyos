@@ -809,3 +809,58 @@ fn a_first_path_never_shares_a_later_paths_entry() {
     );
     assert_eq!(driver.network_held_endpoints(), held);
 }
+
+/// #312 review: a later path on the same endpoint as the subscription's
+/// own first path (`paths=[any, any]`) would share its receiver entry: it
+/// is skipped and counted, and only one endpoint is held.
+#[test]
+fn a_later_path_aliasing_the_first_is_skipped() {
+    let mut driver = driver(ThreadingMode::Shared);
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    let group = SocketAddr::from(([239, 7, 9, 5], free_port()));
+    let any = Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let Ok(_subscription) =
+        driver.add_network_subscription(6, &path_channel(group, vec![any.clone(), any]))
+    else {
+        return;
+    };
+    assert_eq!(driver.network_path_counters().1, 1);
+    assert_eq!(driver.network_held_endpoints(), 1);
+}
+
+/// #312 review: a new key's later paths count toward the mirror's room:
+/// with one entry held and room for two, a key with a later path does not
+/// fit, though its first path alone would.
+#[test]
+fn a_new_keys_later_paths_need_room() {
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.agents.subscriptions = 2;
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    driver
+        .net
+        .as_mut()
+        .unwrap()
+        .subscriptions
+        .push(entry(300, 9, &[]));
+    let group = SocketAddr::from(([239, 7, 9, 6], free_port()));
+    let any = Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let refused = driver.add_network_subscription(
+        6,
+        &path_channel(group, vec![any, Interface::Address(LOOPBACK)]),
+    );
+    // A host that cannot join the first path refuses it earlier.
+    if !matches!(refused, Err(crate::error::DriverError::NetworkEndpoint)) {
+        assert_eq!(
+            refused,
+            Err(crate::error::DriverError::NetworkSubscriptionsFull)
+        );
+    }
+}

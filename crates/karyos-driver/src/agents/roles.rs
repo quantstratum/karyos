@@ -417,6 +417,9 @@ pub struct ReceiverRole {
     /// Test only: NAKs handed over on an image's founding path.
     #[cfg(test)]
     founding_naks: u64,
+    /// Test only: SMs handed over on an image's founding path.
+    #[cfg(test)]
+    founding_sms: u64,
     /// The epoch of each endpoint's RX half last seen, at most
     /// `max_endpoints` (allocated at creation): a new one is the endpoint's
     /// reset, which resolves its images' uncertain NAKs (RC-6).
@@ -727,7 +730,8 @@ fn post_copies(
     counters: &mut ReceiverCounters,
     at: usize,
     nak: Nak,
-) {
+) -> u32 {
+    let mut posted = 0u32;
     for path in 0..image.routes.len() {
         let Some(key) = key_of(path) else {
             continue;
@@ -751,10 +755,15 @@ fn post_copies(
             Ok(()) => {
                 copy.pending = Some(nak);
                 tally(counters, |c| &mut c.nak_copies);
+                // At most one copy per route: no overflow.
+                if let Some(next) = posted.checked_add(1) {
+                    posted = next;
+                }
             }
             Err(_) => tally(counters, |c| &mut c.nak_copies_skipped),
         }
     }
+    posted
 }
 
 fn delivered(
@@ -1237,6 +1246,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             posted_challenges: Vec::new(),
             #[cfg(test)]
             founding_naks: 0,
+            #[cfg(test)]
+            founding_sms: 0,
             rx_epochs: Vec::with_capacity(config.max_endpoints),
             max_endpoints: config.max_endpoints,
             cycle: 0,
@@ -1669,6 +1680,12 @@ impl ReceiverRole {
             .iter()
             .find(|image| image.slot == slot)
             .is_some_and(|image| image.routes[path].faulted)
+    }
+
+    /// SMs handed over on an image's founding path (tests).
+    #[cfg(test)]
+    pub(super) fn founding_sms(&self) -> u64 {
+        self.founding_sms
     }
 
     /// NAKs handed over on an image's founding path (tests).
@@ -2442,10 +2459,7 @@ impl ReceiverRole {
                 if let Some(candidate) = image.uncertain_at.get_mut(at) {
                     *candidate = None;
                 }
-                #[cfg(test)]
-                posted_naks.push(nak);
-                tally(counters, |c| &mut c.naks);
-                post_copies(
+                let posted = post_copies(
                     image,
                     |path| sessions.paths().key(slot, path),
                     to_sender,
@@ -2453,9 +2467,16 @@ impl ReceiverRole {
                     at,
                     nak,
                 );
-                sent = sent
-                    .checked_add(1)
-                    .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
+                // Counted only when a copy went: none posted leaves the NAK
+                // due (#312 review).
+                if posted > 0 {
+                    #[cfg(test)]
+                    posted_naks.push(nak);
+                    tally(counters, |c| &mut c.naks);
+                    sent = sent
+                        .checked_add(1)
+                        .ok_or(AgentError::CountOverflow(AgentKind::Receiver))?;
+                }
                 continue;
             }
             let item = ControlItem::Outgoing {
@@ -2485,7 +2506,7 @@ impl ReceiverRole {
                     if let Some(candidate) = image.uncertain_at.get_mut(at) {
                         *candidate = None;
                     }
-                    post_copies(
+                    let _ = post_copies(
                         image,
                         |path| sessions.paths().key(slot, path),
                         to_sender,
@@ -2685,6 +2706,10 @@ impl ReceiverRole {
             // The sender gone: the driver is stopping. The SM is then
             // recorded as sent all the same: nothing will send another.
             let _ = self.to_sender.post(slot, item);
+            #[cfg(test)]
+            {
+                self.founding_sms += 1;
+            }
         }
         // RP-7: a copy on every other bound path, so a path that lost its
         // return direction does not cost the membership. A copy has no

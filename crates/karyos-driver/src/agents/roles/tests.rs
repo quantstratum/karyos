@@ -3031,7 +3031,7 @@ fn a_skipped_copy_leaves_its_slot_free() {
         guard: None,
     };
     assert!(to_sender.try_post(filler).is_ok());
-    super::post_copies(
+    let _ = super::post_copies(
         &mut image,
         |path| (path == 1).then_some(later),
         &mut to_sender,
