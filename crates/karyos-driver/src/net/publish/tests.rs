@@ -20,7 +20,9 @@ use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
 use crate::agents::ThreadingMode;
-use crate::embedded::{AggregateConfig, DriverConfig, EmbeddedDriver, StreamConfig};
+use crate::embedded::{
+    AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, StreamConfig,
+};
 use crate::error::DriverError;
 use crate::net::{NetworkConfig, NetworkPublicationState};
 
@@ -870,4 +872,178 @@ fn free_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+/// A driver whose agents hold `publications` sessions and `commands` ring
+/// entries, with isolated paths assumed (rp-w4b2c follow-ups, #343 review).
+fn paths_driver(publications: usize, commands: usize) -> EmbeddedDriver {
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.agents.publications = publications;
+    network.agents.command_capacity = commands;
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    driver
+}
+
+/// A two-path multicast channel on a free group.
+fn two_paths(last: u8) -> UdpConfig {
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 7, 9, last)), free_port());
+    UdpConfig {
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(LOOPBACK),
+        ],
+        ..channel(Destination::Multicast { group, ttl: None })
+    }
+}
+
+/// #343 review: each path's alias takes room in the network table, so a
+/// two-path publication does not fit a table of one; nothing is held.
+#[test]
+fn a_two_path_publication_needs_room_for_each_path() {
+    let mut driver = paths_driver(1, 64);
+    assert_eq!(
+        driver.add_network_publication(aggregate(10, 1), &two_paths(30)),
+        Err(DriverError::NetworkPublicationsFull)
+    );
+    until(&mut driver, |driver| {
+        driver.net.as_ref().unwrap().send_endpoints() == 0
+    });
+    assert!(driver.add_aggregate(aggregate(10, 1)).is_ok());
+}
+
+/// #343 review: a two-path publication the sender refuses (its session
+/// table has room for one path only) releases both paths' endpoints and
+/// leaves both aliases stale.
+#[test]
+fn a_refused_two_path_publication_releases_every_path() {
+    use karyos_protocol::network::{Alias, Identity, TermParams};
+
+    let mut driver = paths_driver(2, 64);
+    // One session of the sender's table the conductor does not track.
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let foreign = Alias {
+        session_id: 99,
+        stream_id: 99,
+    };
+    let endpoint = crate::agents::EndpointId(999);
+    let socket = receiver();
+    let (outbound, _log) = crate::agents::data::testing::outbound(
+        endpoint,
+        foreign,
+        socket.local_addr().unwrap(),
+        term,
+        1,
+        false,
+    );
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|reply| crate::agents::AgentCommand::AddPublication {
+            reply,
+            publication: crate::sessions::send::Publication {
+                endpoint,
+                alias: foreign,
+                identity: Identity {
+                    driver_id: [0, 0],
+                    registration_id: 999,
+                    incarnation: 1,
+                },
+                term,
+                lane_count: 1,
+            },
+            outbound,
+            guard: None,
+            roles: None,
+        })
+        .unwrap();
+    let refused = driver
+        .add_network_publication(aggregate(10, 1), &two_paths(31))
+        .unwrap();
+    assert_eq!(driver.net.as_ref().unwrap().send_endpoints(), 2);
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&refused) == Some(NetworkPublicationState::Refused)
+            && driver.net.as_ref().unwrap().send_endpoints() == 0
+    });
+}
+
+/// Opens the send endpoints of `channel`'s paths with a first publication
+/// (stream 20), so a later one on the same binds posts no endpoint command;
+/// then leaves `room` free entries in `link`'s ring.
+fn leave_room(
+    driver: &mut EmbeddedDriver,
+    channel: &UdpConfig,
+    receiver: bool,
+    room: usize,
+) -> AggregateHandle {
+    let first = driver
+        .add_network_publication(aggregate(20, 1), channel)
+        .unwrap();
+    until(driver, |driver| {
+        driver.network_publication_state(&first) == Some(NetworkPublicationState::Active)
+    });
+    let ping = |driver: &EmbeddedDriver| {
+        let links = driver.net.as_ref().unwrap().links();
+        let link = if receiver {
+            &links.receiver
+        } else {
+            &links.sender
+        };
+        link.ping(1).is_ok()
+    };
+    let mut capacity = 0usize;
+    while ping(driver) {
+        capacity += 1;
+    }
+    for _ in 0..20 {
+        let _ = driver.do_work().unwrap();
+    }
+    for _ in 0..capacity - room {
+        assert!(ping(driver));
+    }
+    first
+}
+
+/// #343 review: a failed post leaves nothing held. With room for one
+/// receiver command, the second path's alias cannot be posted: the first
+/// path's alias is queued stale, and the new publication holds nothing.
+#[test]
+fn a_failed_alias_post_stales_the_paths_already_published() {
+    let mut driver = paths_driver(8, 64);
+    let channel = two_paths(32);
+    let _first = leave_room(&mut driver, &channel, true, 1);
+    assert_eq!(
+        driver.add_network_publication(aggregate(10, 1), &channel),
+        Err(DriverError::NetworkBusy)
+    );
+    assert_eq!(driver.net.as_ref().unwrap().stale_queued(), 1);
+}
+
+/// #343 review: with the sender's ring full, the publication cannot be
+/// posted: both paths' aliases are queued stale.
+#[test]
+fn a_failed_sender_post_stales_every_paths_alias() {
+    let mut driver = paths_driver(8, 64);
+    let channel = two_paths(33);
+    let _first = leave_room(&mut driver, &channel, false, 0);
+    assert_eq!(
+        driver.add_network_publication(aggregate(10, 1), &channel),
+        Err(DriverError::NetworkBusy)
+    );
+    assert_eq!(driver.net.as_ref().unwrap().stale_queued(), 2);
 }
