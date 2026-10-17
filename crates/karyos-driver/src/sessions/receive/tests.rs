@@ -1372,3 +1372,31 @@ fn a_full_holdoff_table_records_nothing() {
     sessions.hold_off(key(1), 2 * MS);
     assert_eq!(sessions.holdoffs.len(), 2);
 }
+
+/// ACS 15956: the solicit path does not sweep (its scan is not bounded by
+/// what it frees). With the pending limit reached by expired entries, DATA
+/// is refused until the timer duty frees them.
+#[test]
+fn the_solicit_path_does_not_sweep() {
+    let config = SessionConfig {
+        max_pending_challenges: 2,
+        max_pending_per_source: 2,
+        ..SessionConfig::default()
+    };
+    let mut sessions = table(config);
+    let mut nonces = Counter::default();
+    solicited(sessions.solicit(key(1), 0, &mut nonces));
+    challenged(sessions.announce(key(2), &announce(2), 0, &mut nonces));
+    // Both expired, not yet freed.
+    assert_eq!(
+        sessions.solicit(key(3), 2 * SECOND, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::ChallengeCapacity)
+    );
+    let counters = sessions.counters();
+    assert_eq!(
+        (counters.solicits_expired, counters.challenges_expired),
+        (0, 0)
+    );
+    sessions.timers(2 * SECOND);
+    solicited(sessions.solicit(key(3), 2 * SECOND, &mut nonces));
+}

@@ -380,6 +380,11 @@ impl AggregateHandle {
         })
     }
 
+    /// The aggregate's registration: lane 0's stream id.
+    pub(crate) fn registration(&self) -> u64 {
+        self.registration
+    }
+
     /// The streams of every lane, lane 0 first.
     pub(crate) fn streams(&self) -> impl Iterator<Item = StreamHandle> + '_ {
         self.lanes.iter().flatten().map(|stream| StreamHandle {
@@ -1227,7 +1232,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if target.aggregate.lanes > 1 {
             return Err(DriverError::LaneOfAggregate { stream: target.id });
         }
+        let registration = target.aggregate.registration;
         self.retire_lane(stream)?;
+        if let Some(net) = &mut self.net {
+            let _ = net.remove_publication(registration);
+        }
         self.update_stream_gauges();
         Ok(())
     }
@@ -1277,6 +1286,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         for stream in aggregate.streams() {
             self.retire_lane(stream)?;
+        }
+        // A network publication's data path comes back to drop its lane
+        // readers (wiring note W-d).
+        if let Some(net) = &mut self.net {
+            let _ = net.remove_publication(aggregate.registration());
         }
         self.update_stream_gauges();
         Ok(())
@@ -2756,7 +2770,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
-    fn stream(&mut self, stream: StreamHandle) -> Result<&mut Stream<T>, DriverError> {
+    pub(crate) fn stream(&mut self, stream: StreamHandle) -> Result<&mut Stream<T>, DriverError> {
         let unknown = DriverError::UnknownStream {
             stream: stream.stream,
         };

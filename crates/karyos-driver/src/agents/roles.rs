@@ -28,7 +28,7 @@
 //!   - RTT (reliable-transport.md, "RTT observations"; RC-1; ACS 15868).
 //!     Each installed image probes its bound paths: after its SM, one
 //!     RTTM REQUEST per path and `rtt_probe_interval`, at most one per path
-//!     in the ring, with a report slot ([`ProbeSlot`]) the sender settles
+//!     in the ring, with a report slot ([`ReportSlot`]) the sender settles
 //!     with the time it read before the submitting call. A REPLY counts
 //!     only from a bound path, naming the image's identity and this
 //!     receiver; the path's report is settled first, and the sample ends
@@ -77,8 +77,8 @@ use karyos_sys::sizing::TermLength;
 
 use super::chain::{ImageChain, SessionCommand, SessionEnd, SessionEvent};
 use super::control::{
-    ControlItem, ControlRoutes, ItemGuard, ProbeGuard, ProbeReport, ProbeSlot, RouteSlot, SmGuard,
-    SmSlot,
+    ControlItem, ControlRoutes, ControlSendError, ItemGuard, ReportGuard, ReportSlot, RouteSlot,
+    SendReport, SmGuard, SmSlot,
 };
 use super::data::Outbound;
 
@@ -646,7 +646,7 @@ fn window_end(owner: &ReceiveOwner, lane: Lane, term_length: u32) -> Option<u64>
 /// REQUEST per path in the ring) and the probe the report belongs to.
 #[derive(Debug)]
 struct PathProbe {
-    slot: Arc<ProbeSlot>,
+    slot: Arc<ReportSlot>,
     pending: Option<Probe>,
 }
 
@@ -664,7 +664,7 @@ fn tally(counters: &mut ReceiverCounters, field: fn(&mut ReceiverCounters) -> &m
 }
 
 /// Settles `probe`'s report into `rtt`, if the sender made one; `replied`
-/// as in [`ProbeSlot::collect`].
+/// as in [`ReportSlot::collect`].
 fn collect_probe(rtt: &mut RttProbes, probe: &mut PathProbe, replied: bool) {
     let Some(report) = probe.slot.collect(replied) else {
         return;
@@ -672,9 +672,27 @@ fn collect_probe(rtt: &mut RttProbes, probe: &mut PathProbe, replied: bool) {
     // A probe of an older binding generation is ignored by `rtt`.
     if let Some(pending) = probe.pending.take() {
         match report {
-            ProbeReport::Submitted(start) => rtt.submitted(pending, start),
-            ProbeReport::NotSubmitted => rtt.not_submitted(pending),
+            SendReport::Submitted(start) => rtt.submitted(pending, start),
+            // An uncertain probe yields no sample (RC-1).
+            SendReport::NotSubmitted | SendReport::Uncertain(_) => rtt.not_submitted(pending),
         }
+    }
+}
+
+/// What one control send did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    /// The backend submitted it.
+    Submitted,
+    /// It was not submitted.
+    NotSubmitted,
+    /// Its exposure is unknown.
+    Uncertain,
+}
+
+impl Sent {
+    fn submitted(self) -> bool {
+        self == Self::Submitted
     }
 }
 
@@ -685,7 +703,7 @@ pub struct SenderRole {
     from_receiver: RingReceiver<ControlItem>,
     /// Each publication's data path: readers, channel destination, lane
     /// queues (at most `publications`, allocated at creation).
-    publications: Vec<Outbound>,
+    publications: Vec<Box<Outbound>>,
     /// Control routes, one slot per endpoint the agent can hold.
     routes: Vec<RouteSlot>,
     budget: u32,
@@ -943,6 +961,24 @@ impl ReceiverRole {
                     });
                 Some((reply, configured(accepted)))
             }
+            AgentCommand::RemovePublishedAlias {
+                reply,
+                endpoint,
+                alias,
+            } => {
+                let entry = (endpoint, alias);
+                let found = self.published.iter().position(|held| *held == entry);
+                if let Some(index) = found {
+                    self.published.swap_remove(index);
+                }
+                Some((reply, configured(found.is_some())))
+            }
+            AgentCommand::RemovePublication { reply, .. } => Some((
+                reply,
+                AgentEvent::Unsupported {
+                    agent: AgentKind::Receiver,
+                },
+            )),
             AgentCommand::AddPublication {
                 reply, publication, ..
             } => Some((
@@ -951,6 +987,7 @@ impl ReceiverRole {
                     agent: AgentKind::Receiver,
                     endpoint: publication.endpoint,
                     alias: publication.alias,
+                    registration: publication.identity.registration_id,
                 },
             )),
             command => self.trace.command(command),
@@ -1255,7 +1292,7 @@ impl ReceiverRole {
         };
         let probes = (0..paths)
             .map(|_| PathProbe {
-                slot: Arc::new(ProbeSlot::default()),
+                slot: Arc::new(ReportSlot::default()),
                 pending: None,
             })
             .collect();
@@ -1559,7 +1596,7 @@ impl ReceiverRole {
                     probe_id: due.probe_id,
                     kind: RttmKind::Request,
                 }),
-                guard: Some(ItemGuard::Probe(ProbeGuard::take(&probe.slot))),
+                guard: Some(ItemGuard::Report(ReportGuard::take(&probe.slot))),
             };
             // A dropped item drops its guard: reported not submitted.
             match to_sender.try_post(item) {
@@ -1995,6 +2032,24 @@ impl Intake<'_> {
             self.role.count(|c| &mut c.unanswerable_source);
             return;
         }
+        // §7.4 first, charging nothing: DATA arrives at line rate, and a
+        // SOLICIT the rates would refuse must not draw a nonce and create
+        // an entry per datagram only to withdraw it.
+        match self.role.rsp_destinations.would_admit(key.source, self.now) {
+            Ok(()) => {}
+            Err(RateRefused::Limited) => {
+                self.role.count(|c| &mut c.rsp_setup_rate_limited);
+                return;
+            }
+            Err(RateRefused::TableFull) => {
+                self.role.count(|c| &mut c.rsp_setup_destinations_full);
+                return;
+            }
+        }
+        if !self.role.rsp_total.would_admit(self.now) {
+            self.role.count(|c| &mut c.rsp_setup_total_limited);
+            return;
+        }
         let role = &mut *self.role;
         if let SolicitOutcome::Solicit(solicit) =
             role.sessions.solicit(key, self.now, &mut role.nonces)
@@ -2269,13 +2324,15 @@ impl SenderRole {
     /// The data path of its `index`-th publication (tests).
     #[cfg(test)]
     pub(crate) fn outbound(&self, index: usize) -> Option<&Outbound> {
-        self.publications.get(index)
+        self.publications.get(index).map(|outbound| &**outbound)
     }
 
     /// The data path of its `index`-th publication, mutable (tests).
     #[cfg(test)]
     pub(crate) fn outbound_mut(&mut self, index: usize) -> Option<&mut Outbound> {
-        self.publications.get_mut(index)
+        self.publications
+            .get_mut(index)
+            .map(|outbound| &mut **outbound)
     }
 
     fn count(&mut self, field: fn(&mut SenderCounters) -> &mut u64) {
@@ -2296,8 +2353,15 @@ impl SenderRole {
                 publication,
                 outbound,
             } => (reply, publication, outbound),
+            AgentCommand::RemovePublication {
+                reply,
+                endpoint,
+                alias,
+                registration,
+            } => return Some((reply, self.remove(endpoint, alias, registration))),
             AgentCommand::AddSubscription { reply, .. }
-            | AgentCommand::AddPublishedAlias { reply, .. } => {
+            | AgentCommand::AddPublishedAlias { reply, .. }
+            | AgentCommand::RemovePublishedAlias { reply, .. } => {
                 return Some((
                     reply,
                     AgentEvent::Unsupported {
@@ -2341,10 +2405,12 @@ impl SenderRole {
         let event = match added {
             Ok(()) => {
                 // `add` refuses past `publications` entries, the capacity.
-                self.publications.push(*outbound);
+                // Kept boxed: removal hands the box back without allocating.
+                self.publications.push(outbound);
                 AgentEvent::PublicationAdded {
                     endpoint: publication.endpoint,
                     alias: publication.alias,
+                    registration: publication.identity.registration_id,
                 }
             }
             Err(
@@ -2355,9 +2421,34 @@ impl SenderRole {
                 agent: AgentKind::Sender,
                 endpoint: publication.endpoint,
                 alias: publication.alias,
+                registration: publication.identity.registration_id,
             },
         };
         Some((reply, event))
+    }
+
+    /// Stops the publication `alias` on `endpoint`: its SETUP side, its
+    /// bindings and its data path, which goes back to the conductor.
+    fn remove<O: SocketOps>(
+        &mut self,
+        endpoint: EndpointId,
+        alias: Alias,
+        registration: u64,
+    ) -> AgentEvent<O> {
+        let _ = self.sessions.remove(endpoint, alias);
+        self.bindings
+            .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
+        let outbound = self
+            .publications
+            .iter()
+            .position(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
+            .map(|index| self.publications.swap_remove(index));
+        AgentEvent::PublicationRemoved {
+            endpoint,
+            alias,
+            registration,
+            outbound,
+        }
     }
 
     /// Frees the route slots of endpoints the agent no longer holds: their
@@ -2382,14 +2473,14 @@ impl SenderRole {
         endpoint: EndpointId,
         destination: SocketAddr,
         control: &Control,
-    ) -> bool {
+    ) -> Sent {
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
             _ => None,
         });
         let Some(tx) = tx else {
             self.count(|c| &mut c.no_endpoint);
-            return false;
+            return Sent::NotSubmitted;
         };
         let index = self
             .routes
@@ -2400,17 +2491,21 @@ impl SenderRole {
             // More held halves than slots: the agent holds at most
             // `max_endpoints`, so this does not happen.
             self.count(|c| &mut c.no_endpoint);
-            return false;
+            return Sent::NotSubmitted;
         };
         slot.endpoint = Some(endpoint);
         match slot.routes.send(tx, destination, control) {
             Ok(()) => {
                 self.count(|c| &mut c.sent);
-                true
+                Sent::Submitted
+            }
+            Err(ControlSendError::Uncertain) => {
+                self.count(|c| &mut c.send_failures);
+                Sent::Uncertain
             }
             Err(_) => {
                 self.count(|c| &mut c.send_failures);
-                false
+                Sent::NotSubmitted
             }
         }
     }
@@ -2456,12 +2551,15 @@ impl SenderRole {
                     endpoint,
                     destination,
                     control,
-                    guard: Some(ItemGuard::Probe(guard)),
+                    guard: Some(ItemGuard::Report(guard)),
                 } => {
                     let mut guard = guard;
                     guard.sending((self.clock)());
-                    if self.send(halves, endpoint, destination, &control) {
-                        guard.submitted();
+                    match self.send(halves, endpoint, destination, &control) {
+                        Sent::Submitted => guard.submitted(),
+                        Sent::Uncertain => guard.uncertain(),
+                        // Dropped unsettled: not submitted.
+                        Sent::NotSubmitted => drop(guard),
                     }
                 }
                 ControlItem::Outgoing {
@@ -2486,7 +2584,9 @@ impl SenderRole {
                     seen,
                 } => {
                     if let Some(reply) = self.rttm_request(endpoint, source, &request, seen, now)
-                        && self.send(halves, endpoint, source, &Control::Rttm(reply))
+                        && self
+                            .send(halves, endpoint, source, &Control::Rttm(reply))
+                            .submitted()
                     {
                         self.count(|c| &mut c.rttm_replied);
                     }
@@ -2745,7 +2845,7 @@ impl SenderRole {
             .publications
             .iter_mut()
             .find(|outbound| outbound.endpoint() == key.endpoint && outbound.alias() == key.alias)
-            .and_then(Outbound::membership_mut)
+            .and_then(|outbound| outbound.membership_mut())
         {
             let _ = membership.binding_gone(&key, now);
         }
@@ -2898,7 +2998,7 @@ impl SenderRole {
             .publications
             .iter_mut()
             .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
-            .and_then(Outbound::membership_mut)
+            .and_then(|outbound| outbound.membership_mut())
         {
             let _ = membership.status(&key, status, now);
         }

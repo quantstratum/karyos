@@ -285,7 +285,7 @@ fn a_multicast_answer_goes_to_the_group() {
     };
     sender.sessions.add(publication).unwrap();
     let (path, _log) = outbound(EndpointId(1), group);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let challenge = Control::Challenge(karyos_protocol::network::RspChallenge {
         alias: alias(),
         identity: identity(),
@@ -670,6 +670,41 @@ fn control_routes_survive_a_reset() {
     assert_eq!(after.send_failures, before.send_failures);
 }
 
+/// A removed publication's alias leaves the receiver's pre-filter, once
+/// (wiring note W-d, ACS 15929).
+#[test]
+fn a_published_alias_is_removed() {
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let add = AgentCommand::<OsSocket>::AddPublishedAlias {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias,
+    };
+    assert!(matches!(
+        role.command(add),
+        Some((_, AgentEvent::Configured { accepted: true, .. }))
+    ));
+    assert_eq!(role.published, [(EndpointId(1), alias)]);
+    for accepted in [true, false] {
+        let remove = AgentCommand::<OsSocket>::RemovePublishedAlias {
+            reply: replies.reserve().unwrap(),
+            endpoint: EndpointId(1),
+            alias,
+        };
+        assert!(matches!(
+            role.command(remove),
+            Some((_, AgentEvent::Configured { accepted: found, .. })) if found == accepted
+        ));
+    }
+    assert!(role.published.is_empty());
+}
+
 /// Two subscriptions of one stream on one endpoint: the stricter
 /// `max_image_term_length` holds, whatever their order.
 #[test]
@@ -708,7 +743,7 @@ fn the_sender_validates_sms_against_its_bindings() {
     sender.sessions.add(publication(endpoint)).unwrap();
     let group: SocketAddr = "10.0.0.2:4000".parse().unwrap();
     let (path, _log) = outbound(endpoint, group);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // The answer to the receiver's challenge binds it.
     let answer = |boot_id| SetupAnswer {
@@ -836,7 +871,7 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
         )
         .unwrap(),
     ));
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let answer = SetupAnswer {
         alias: alias(),
         identity: identity(),
@@ -1044,7 +1079,7 @@ fn unconfirmed_bindings_never_hold_the_table() {
         .unwrap(),
     };
     let (path, _log) = outbound(endpoint, receiver);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     sender.status(endpoint, receiver, &status, 2);
     assert_eq!(sender.sessions.counters().established, 1);
     assert_eq!(sender.counters().bindings_evicted, 1);
@@ -1133,7 +1168,7 @@ fn installed_image_with(
         rtt: crate::rtt::RttProbes::new(crate::rtt::RttConfig::default(), 4).unwrap(),
         probes: (0..4)
             .map(|_| super::PathProbe {
-                slot: Arc::new(super::ProbeSlot::default()),
+                slot: Arc::new(super::ReportSlot::default()),
                 pending: None,
             })
             .collect(),
@@ -1238,7 +1273,7 @@ fn sm_sender() -> super::SenderRole {
     let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
     sender.sessions.add(publication(EndpointId(1))).unwrap();
     let (path, _log) = outbound(EndpointId(1), "10.0.0.2:4000".parse().unwrap());
-    sender.publications.push(*path);
+    sender.publications.push(path);
     sender
 }
 
@@ -1403,7 +1438,7 @@ fn rttm_probes_measure_bound_paths() {
             endpoint,
             destination,
             control: Control::Rttm(request),
-            guard: Some(ItemGuard::Probe(guard)),
+            guard: Some(ItemGuard::Report(guard)),
         })) => {
             assert_eq!((endpoint, destination), (key.endpoint, key.source));
             (request, guard)
@@ -1484,6 +1519,13 @@ fn rttm_probes_measure_bound_paths() {
     drop(guard);
     assert_eq!(role.probe_paths(0, 4_500_000_000).unwrap(), 0);
     assert_eq!(role.images[0].rtt.counts().unsubmitted, 1);
+    // An uncertain REQUEST yields no sample either.
+    assert_eq!(role.probe_paths(0, 5_000_000_000).unwrap(), 1);
+    let (_, mut guard) = take(&mut sender);
+    guard.sending(5_000_000_000);
+    guard.uncertain();
+    assert_eq!(role.probe_paths(0, 5_500_000_000).unwrap(), 0);
+    assert_eq!(role.images[0].rtt.counts().unsubmitted, 2);
     // A probe whose path is lost and bound again is not applied to the
     // new binding.
     assert_eq!(role.probe_paths(0, 6_000_000_000).unwrap(), 1);
@@ -1547,7 +1589,7 @@ fn rttm_requests_are_reported_and_answered() {
     };
 
     use super::super::Half;
-    use super::super::control::{ControlItem, ItemGuard, ProbeGuard, ProbeReport, ProbeSlot};
+    use super::super::control::{ControlItem, ItemGuard, ReportGuard, ReportSlot, SendReport};
 
     let config = AgentConfig {
         rtt: crate::rtt::RttConfig {
@@ -1575,7 +1617,7 @@ fn rttm_requests_are_reported_and_answered() {
     let mut halves = vec![(EndpointId(1), Half::Tx(Box::new(tx)))];
     let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // A REQUEST submitted: its start is the clock before the call.
-    let slot = Arc::new(ProbeSlot::default());
+    let slot = Arc::new(ReportSlot::default());
     let request = Rttm {
         alias: alias(),
         identity: identity(),
@@ -1586,11 +1628,11 @@ fn rttm_requests_are_reported_and_answered() {
         probe_id: 77,
         kind: RttmKind::Request,
     };
-    let outgoing = |slot: &Arc<ProbeSlot>| ControlItem::Outgoing {
+    let outgoing = |slot: &Arc<ReportSlot>| ControlItem::Outgoing {
         endpoint: EndpointId(1),
         destination: source,
         control: Control::Rttm(request),
-        guard: Some(ItemGuard::Probe(ProbeGuard::take(slot))),
+        guard: Some(ItemGuard::Report(ReportGuard::take(slot))),
     };
     observer.push_send(SendResult::Sent {
         sent: 1,
@@ -1599,7 +1641,7 @@ fn rttm_requests_are_reported_and_answered() {
     SENDER_CLOCK.store(500, std::sync::atomic::Ordering::Relaxed);
     role.to_sender.try_post(outgoing(&slot)).unwrap();
     let _ = sender.duty(&mut halves, 600).unwrap();
-    assert_eq!(slot.collect(false), Some(ProbeReport::Submitted(500)));
+    assert_eq!(slot.collect(false), Some(SendReport::Submitted(500)));
     assert_eq!(slot.collect(false), None, "collected once");
     // One the kernel refused: not submitted.
     observer.push_send(SendResult::Error(
@@ -1607,7 +1649,14 @@ fn rttm_requests_are_reported_and_answered() {
     ));
     role.to_sender.try_post(outgoing(&slot)).unwrap();
     let _ = sender.duty(&mut halves, 700).unwrap();
-    assert_eq!(slot.collect(false), Some(ProbeReport::NotSubmitted));
+    assert_eq!(slot.collect(false), Some(SendReport::NotSubmitted));
+    // A result outside the backend's ABI: exposure unknown, reported
+    // uncertain at the start read before the call (RC-6).
+    observer.push_send(SendResult::OutOfAbi { proven: 0 });
+    SENDER_CLOCK.store(750, std::sync::atomic::Ordering::Relaxed);
+    role.to_sender.try_post(outgoing(&slot)).unwrap();
+    let _ = sender.duty(&mut halves, 760).unwrap();
+    assert_eq!(slot.collect(false), Some(SendReport::Uncertain(750)));
     // A REQUEST from no bound receiver is not answered.
     let incoming = |request: Rttm, seen| ControlItem::Incoming {
         endpoint: EndpointId(1),
@@ -1636,7 +1685,7 @@ fn rttm_requests_are_reported_and_answered() {
     sender.bind(EndpointId(1), source, &old, 899);
     sender.bind(EndpointId(1), source, &answer, 900);
     let (path, _log) = outbound(EndpointId(1), source);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let status = StatusMessage {
         alias: alias(),
         identity: identity(),
@@ -1842,9 +1891,10 @@ fn a_rate_limited_solicit_leaves_no_entry() {
         receiver.inject_data(&sessions, EndpointId(1), source, other, &bytes, at);
     }
     assert_eq!(sent(), 0);
-    // Only the SOLICIT sent counts; the refused ones were withdrawn.
+    // The rates are checked before any entry: nothing was created, so
+    // nothing was withdrawn (ACS 15956).
     let counters = receiver.session_counters();
-    assert_eq!((counters.solicits, counters.solicits_withdrawn), (1, 3));
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (1, 0));
     assert_eq!(receiver.counters().rsp_setup_rate_limited, 3);
     // A second later the rate has refilled: the key is solicited.
     receiver.inject_data(
@@ -1857,7 +1907,7 @@ fn a_rate_limited_solicit_leaves_no_entry() {
     );
     assert_eq!(sent(), 1);
     let counters = receiver.session_counters();
-    assert_eq!((counters.solicits, counters.solicits_withdrawn), (2, 3));
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (2, 0));
 }
 
 /// Mutants of the #275 review: DATA solicits only on a subscribed stream
@@ -1916,6 +1966,32 @@ fn solicits_need_a_subscription_an_answerable_source_and_a_term_bound() {
     );
     assert_eq!(receiver.counters().term_too_large, 1);
     assert_eq!(receiver.counters().create_image, 0);
+}
+
+/// ACS 15956: the per-driver total is checked before any entry too: a
+/// second source over `rsp_setup_rate` creates nothing.
+#[test]
+fn the_total_rsp_rate_is_checked_before_any_entry() {
+    let config = AgentConfig {
+        rsp_setup_rate: 1,
+        ..AgentConfig::default()
+    };
+    let (sender, mut receiver) = super::roles(&config).unwrap();
+    let (sessions, _link) = event_ring();
+    receiver.subscriptions.push((EndpointId(1), 6, 1 << 20));
+    let bytes = [0u8; 32];
+    let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    receiver.inject_data(&sessions, EndpointId(1), first, alias(), &bytes, 1);
+    receiver.inject_data(&sessions, EndpointId(1), second, alias(), &bytes, 2);
+    let mut sent = 0;
+    while let Ok(Some(_)) = sender.from_receiver.try_take() {
+        sent += 1;
+    }
+    assert_eq!(sent, 1);
+    let counters = receiver.session_counters();
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (1, 0));
+    assert_eq!(receiver.counters().rsp_setup_total_limited, 1);
 }
 
 /// ACS 15933: a confirmed binding keeps a publication established even

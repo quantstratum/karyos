@@ -62,6 +62,38 @@ impl EndpointRates {
         })
     }
 
+    /// Whether one message to `endpoint` would be admitted at `now`,
+    /// charging nothing: its bucket is refilled to `now` and checked, and an
+    /// endpoint with no entry needs room in the table (a free or idle one).
+    ///
+    /// # Errors
+    ///
+    /// [`RateRefused`], as [`EndpointRates::admit`] would answer.
+    pub fn would_admit(&mut self, endpoint: SocketAddr, now: u64) -> Result<(), RateRefused> {
+        let endpoint = normalized(endpoint);
+        let room = self.entries.len() < self.max
+            || self
+                .entries
+                .iter()
+                .any(|entry| age_ns(now, entry.last) >= SECOND);
+        match self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.endpoint == endpoint)
+        {
+            Some(entry) => {
+                entry.limiter.refill_at(now);
+                if entry.limiter.admits(0, true) {
+                    Ok(())
+                } else {
+                    Err(RateRefused::Limited)
+                }
+            }
+            None if room => Ok(()),
+            None => Err(RateRefused::TableFull),
+        }
+    }
+
     /// Charges one message to `endpoint` at `now`.
     ///
     /// # Errors
@@ -139,6 +171,13 @@ impl TotalRate {
     pub fn admit(&mut self, now: u64) -> bool {
         self.limiter.admit_frame(now, 0, true)
     }
+
+    /// Whether one message would be admitted at `now`, charging nothing
+    /// (the bucket is refilled to `now`).
+    pub fn would_admit(&mut self, now: u64) -> bool {
+        self.limiter.refill_at(now);
+        self.limiter.admits(0, true)
+    }
 }
 
 /// An endpoint as rates and §7.3 see it: an IPv4-mapped IPv6 endpoint is
@@ -151,5 +190,42 @@ pub fn normalized(endpoint: SocketAddr) -> SocketAddr {
             .to_ipv4_mapped()
             .map_or(endpoint, |v4| SocketAddr::from((v4, v6.port()))),
         SocketAddr::V4(_) => endpoint,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test helpers, as ADR-0007 allows in tests"
+    )]
+
+    use super::*;
+
+    /// `would_admit` charges nothing and answers as `admit` would.
+    #[test]
+    fn would_admit_charges_nothing() {
+        let a: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:1".parse().unwrap();
+        let mut rates = EndpointRates::new(1, 1).unwrap();
+        for _ in 0..3 {
+            assert_eq!(rates.would_admit(a, 0), Ok(()));
+        }
+        rates.admit(a, 0).unwrap();
+        assert_eq!(rates.would_admit(a, 1), Err(RateRefused::Limited));
+        assert_eq!(rates.admit(a, 1), Err(RateRefused::Limited));
+        // The table holds one endpoint, busy within the second.
+        assert_eq!(rates.would_admit(b, 1), Err(RateRefused::TableFull));
+        assert_eq!(rates.admit(b, 1), Err(RateRefused::TableFull));
+        // A second after the last charge attempt (a refused one counts as
+        // use) the bucket refilled and the entry is idle.
+        assert_eq!(rates.would_admit(a, SECOND + 1), Ok(()));
+        assert_eq!(rates.would_admit(b, SECOND + 1), Ok(()));
+        let mut total = TotalRate::new(1, 0).unwrap();
+        assert!(total.would_admit(0));
+        assert!(total.would_admit(0));
+        assert!(total.admit(0));
+        assert!(!total.would_admit(1));
+        assert!(total.would_admit(SECOND));
     }
 }

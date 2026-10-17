@@ -776,16 +776,8 @@ impl ReceiveSessions {
             (false, true) => return SolicitOutcome::Dropped(self.ignore(Ignored::HoldoffFull)),
             (false, false) => {}
         }
-        let full = |table: &Self| {
-            table.pending(None) >= table.config.max_pending_challenges
-                || table.pending(Some(key.source)) >= table.config.max_pending_per_source
-                || !table.slots.iter().any(|slot| slot.state == State::Free)
-        };
-        // DATA comes at line rate: the sweep here is bounded by the timer
-        // budget (the timer duty frees the rest).
-        if full(self) {
-            self.sweep(now, self.config.timer_actions);
-        }
+        // DATA comes at line rate: no sweep here, whose scan is not bounded
+        // by what it frees. The timer duty frees expired entries.
         if self.pending(None) >= self.config.max_pending_challenges
             || self.pending(Some(key.source)) >= self.config.max_pending_per_source
         {

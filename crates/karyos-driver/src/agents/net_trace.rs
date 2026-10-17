@@ -91,7 +91,7 @@ impl SenderTrace {
     /// other command.
     pub(crate) fn command<O: SocketOps>(
         &mut self,
-        publications: &mut [Outbound],
+        publications: &mut [Box<Outbound>],
         command: AgentCommand<O>,
     ) -> Option<(Reservation, AgentEvent<O>)> {
         let agent = AgentKind::Sender;

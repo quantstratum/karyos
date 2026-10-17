@@ -9,7 +9,7 @@
 //!   and controls it received for a local publication (RSP_SETUP CHALLENGE
 //!   and SOLICIT, SM, RTTM REQUEST). A full ring drops the item and counts
 //!   it per kind. An outgoing SM carries its image's slot ([`SmGuard`]); an
-//!   RTTM REQUEST carries its path's report ([`ProbeGuard`]), which the
+//!   RTTM REQUEST carries its path's report ([`ReportGuard`]), which the
 //!   sender settles with the time read before the submitting call, or
 //!   which reports not submitted when dropped unsettled.
 //! - **Control TX.** The sender sends controls through a small cache of
@@ -71,84 +71,91 @@ impl Drop for SmGuard {
     }
 }
 
-/// The submission report of one image path's RTTM REQUEST (RC-1): the
-/// sender reads the clock immediately before the backend call, publishes
-/// it as sending, and then whether the call submitted the probe; the
-/// receiver collects the report. A REPLY proves the REQUEST went out, so
-/// one that overtakes the final report settles from the sending state. At
-/// most one REQUEST per path is in flight: a path waits while its slot is
-/// waiting or sending.
+/// The submission report of one control the receiver hands to the sender
+/// (an RTTM REQUEST, RC-1; a NAK, RC-6): the sender reads the clock
+/// immediately before the backend call, publishes it as sending, and then
+/// whether the call submitted the control, did not, or left its exposure
+/// unknown; the receiver collects the report. A reply proves the control
+/// went out, so one that overtakes the final report settles from the
+/// sending state. At most one control per slot is in flight: its owner
+/// waits while the slot is waiting or sending.
 #[derive(Debug, Default)]
-pub struct ProbeSlot {
+pub struct ReportSlot {
     state: std::sync::atomic::AtomicU8,
     /// The time read before the submitting call; valid once `state` is
-    /// `PROBE_SENDING` or later (published by its Release store).
+    /// `REPORT_SENDING` or later (published by its Release store).
     start: std::sync::atomic::AtomicU64,
 }
 
-/// No REQUEST in the ring and no report to collect.
-const PROBE_IDLE: u8 = 0;
-/// A REQUEST waits in the ring.
-const PROBE_WAITING: u8 = 1;
+/// No control in the ring and no report to collect.
+const REPORT_IDLE: u8 = 0;
+/// A control waits in the ring.
+const REPORT_WAITING: u8 = 1;
 /// The sender is in the backend call; `start` holds its start.
-const PROBE_SENDING: u8 = 2;
+const REPORT_SENDING: u8 = 2;
 /// The backend reported it submitted; `start` holds its start.
-const PROBE_SUBMITTED: u8 = 3;
-/// It was not submitted: accepted only, failed, uncertain or dropped.
-const PROBE_NOT_SUBMITTED: u8 = 4;
+const REPORT_SUBMITTED: u8 = 3;
+/// It was not submitted: refused, failed or dropped.
+const REPORT_NOT_SUBMITTED: u8 = 4;
+/// Its exposure is unknown (a backend result outside its documented
+/// range); `start` holds its start.
+const REPORT_UNCERTAIN: u8 = 5;
 
-/// What a [`ProbeSlot`] reported.
+/// What a [`ReportSlot`] reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProbeReport {
+pub enum SendReport {
     /// Submitted; the time read before the submitting call.
     Submitted(u64),
     /// Not submitted.
     NotSubmitted,
+    /// Its exposure is unknown; the time read before the call.
+    Uncertain(u64),
 }
 
-impl ProbeSlot {
-    /// Whether a REQUEST of this path is still with the sender: waiting in
-    /// the ring or in its backend call.
+impl ReportSlot {
+    /// Whether the slot's control is still with the sender: waiting in the
+    /// ring or in its backend call.
     #[must_use]
     pub fn busy(&self) -> bool {
         matches!(
             self.state.load(std::sync::atomic::Ordering::Acquire),
-            PROBE_WAITING | PROBE_SENDING
+            REPORT_WAITING | REPORT_SENDING
         )
     }
 
-    /// Takes the final report of the last REQUEST, if the sender made one,
-    /// and frees the slot. With `replied` (a REPLY to it arrived, proving
-    /// it went out), a REQUEST still in its backend call reports submitted
+    /// Takes the final report of the last control, if the sender made one,
+    /// and frees the slot. With `replied` (a reply to it arrived, proving
+    /// it went out), a control still in its backend call reports submitted
     /// at its start; the slot then stays busy until the sender's final
     /// report, which a later collection clears.
-    pub fn collect(&self, replied: bool) -> Option<ProbeReport> {
+    pub fn collect(&self, replied: bool) -> Option<SendReport> {
         use std::sync::atomic::Ordering;
 
         let report = match self.state.load(Ordering::Acquire) {
-            PROBE_SENDING if replied => {
-                return Some(ProbeReport::Submitted(self.start.load(Ordering::Relaxed)));
+            REPORT_SENDING if replied => {
+                return Some(SendReport::Submitted(self.start.load(Ordering::Relaxed)));
             }
-            PROBE_SUBMITTED => ProbeReport::Submitted(self.start.load(Ordering::Relaxed)),
-            PROBE_NOT_SUBMITTED => ProbeReport::NotSubmitted,
+            REPORT_SUBMITTED => SendReport::Submitted(self.start.load(Ordering::Relaxed)),
+            REPORT_NOT_SUBMITTED => SendReport::NotSubmitted,
+            REPORT_UNCERTAIN => SendReport::Uncertain(self.start.load(Ordering::Relaxed)),
             _ => return None,
         };
-        self.state.store(PROBE_IDLE, Ordering::Relaxed);
+        self.state.store(REPORT_IDLE, Ordering::Relaxed);
         Some(report)
     }
 }
 
-/// The guard a REQUEST carries through the ring: the sender reports its
+/// The guard a control carries through the ring: the sender reports its
 /// submission through it; dropped unreported, it reports not submitted.
 #[derive(Debug)]
-pub struct ProbeGuard(Option<std::sync::Arc<ProbeSlot>>);
+pub struct ReportGuard(Option<std::sync::Arc<ReportSlot>>);
 
-impl ProbeGuard {
-    /// Takes `slot` for one REQUEST.
+impl ReportGuard {
+    /// Takes `slot` for one control.
     #[must_use]
-    pub fn take(slot: &std::sync::Arc<ProbeSlot>) -> Self {
+    pub fn take(slot: &std::sync::Arc<ReportSlot>) -> Self {
         slot.state
-            .store(PROBE_WAITING, std::sync::atomic::Ordering::Release);
+            .store(REPORT_WAITING, std::sync::atomic::Ordering::Release);
         Self(Some(std::sync::Arc::clone(slot)))
     }
 
@@ -159,25 +166,34 @@ impl ProbeGuard {
 
         if let Some(slot) = &self.0 {
             slot.start.store(start, Ordering::Relaxed);
-            slot.state.store(PROBE_SENDING, Ordering::Release);
+            slot.state.store(REPORT_SENDING, Ordering::Release);
         }
     }
 
-    /// The backend reported the REQUEST submitted, at the start
-    /// [`ProbeGuard::sending`] published.
+    /// The backend reported the control submitted, at the start
+    /// [`ReportGuard::sending`] published.
     pub fn submitted(mut self) {
         if let Some(slot) = self.0.take() {
             slot.state
-                .store(PROBE_SUBMITTED, std::sync::atomic::Ordering::Release);
+                .store(REPORT_SUBMITTED, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// The backend left the control's exposure unknown, at the start
+    /// [`ReportGuard::sending`] published.
+    pub fn uncertain(mut self) {
+        if let Some(slot) = self.0.take() {
+            slot.state
+                .store(REPORT_UNCERTAIN, std::sync::atomic::Ordering::Release);
         }
     }
 }
 
-impl Drop for ProbeGuard {
+impl Drop for ReportGuard {
     fn drop(&mut self) {
         if let Some(slot) = self.0.take() {
             slot.state
-                .store(PROBE_NOT_SUBMITTED, std::sync::atomic::Ordering::Release);
+                .store(REPORT_NOT_SUBMITTED, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -187,8 +203,8 @@ impl Drop for ProbeGuard {
 pub enum ItemGuard {
     /// An SM's slot, freed once the SM was sent.
     Sm(SmGuard),
-    /// An RTTM REQUEST's submission report.
-    Probe(ProbeGuard),
+    /// A control's submission report (an RTTM REQUEST, a NAK).
+    Report(ReportGuard),
 }
 
 /// A control handed from the receiver agent to the sender agent.
@@ -247,6 +263,9 @@ pub enum ControlSendError {
     Claim,
     /// The kernel did not take it.
     Unsent,
+    /// Its exposure is unknown: the backend reported a result outside its
+    /// documented range (it may have left).
+    Uncertain,
 }
 
 /// One cached control destination.
@@ -433,9 +452,10 @@ impl ControlRoutes {
             &mut ControlGate,
             &mut self.report,
         );
-        let mut sent = false;
+        let (mut sent, mut unknown) = (false, false);
         while let Some(entry) = self.report.pop_front() {
             sent |= matches!(entry.outcome, TxItemOutcome::Submitted { .. });
+            unknown |= matches!(entry.outcome, TxItemOutcome::Unknown);
         }
         if sent {
             return Ok(());
@@ -443,7 +463,11 @@ impl ControlRoutes {
         // Not taken now: a control is not worth a retry; dropping the
         // queue drops it, so no stale control waits.
         self.evict(tx, queue);
-        Err(ControlSendError::Unsent)
+        Err(if unknown {
+            ControlSendError::Uncertain
+        } else {
+            ControlSendError::Unsent
+        })
     }
 }
 
