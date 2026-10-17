@@ -17,11 +17,11 @@ release may break APIs, wire formats and shared-memory layouts.
   exposed as an aggregate of lane streams as a network image is (n3), on
   the heap or, on an IPC driver, in a region with a fresh id. Its
   `ReplayFeed`, the image's only writer, takes a recording's whole frames
-  and PAD or ABORTED records at their recorded positions (each frame's
-  session id written as the target's) and seals a lost range as a local
-  gap (`GapReason::RangeUnavailable`); a term not ready yet is offered
-  again later. `EmbeddedDriver::finish_replay` seals the target with
-  `EndOfStream` when the feed reached the replay's end, else
+  and PAD or ABORTED records at their recorded positions, each frame's
+  session and stream ids written as the target's, and seals a lost range
+  as a local gap (`GapReason::RangeUnavailable`); a term not ready yet is
+  offered again later. `EmbeddedDriver::finish_replay` seals the target
+  with `EndOfStream` when the feed reached the replay's end, else
   `ImageRetired`. Only lane 0 is replayed (`DriverError::ReplayLane`).
   The `EndOfStream` and `ImageRetired` docs now cover a replay's end.
 - The Archive's control messages, version 1, written by hand (phase 3,

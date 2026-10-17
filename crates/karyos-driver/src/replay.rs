@@ -29,9 +29,10 @@
 //!
 //! The target is keyed by `(stream_id, session_id)` like any stream: a key
 //! in use (a local stream, an image, another replay) is refused, so a
-//! caller picks a distinct session id per replay. A replay is a new
-//! session of the recorded stream: each frame's session id (header bytes
-//! 12 to 15) is written as the target's, and nothing else of it changes.
+//! caller picks a distinct session id per replay. A replay goes onto a new
+//! stream (SPEC §8.2) as a new session: each frame's session id and stream
+//! id (header bytes 12 to 15 and 16 to 19) are written as the target's,
+//! and nothing else of it changes. The recorded ids stay in the catalog.
 //!
 //! Limitation: only a recording of lane 0 is replayed. Recorded frames
 //! name their lane and a target has one lane, so another lane is refused
@@ -109,14 +110,16 @@ pub struct ReplayFeed<T: StreamTerms> {
     owner: ReceiveOwner<T>,
     params: ImageParams,
     term_length: u64,
-    /// One frame, its session id rewritten: allocated once, of the mtu.
+    /// One frame, its ids rewritten: allocated once, of the mtu.
     scratch: Vec<u8>,
     registration: u64,
     finished: bool,
 }
 
-/// The session id's offset in a frame header.
+/// The session id's offset in a frame header; the stream id follows it.
 const SESSION_OFFSET: usize = 12;
+/// The end of the stream id in a frame header.
+const STREAM_END: usize = 20;
 
 /// Whether one frame or record was taken.
 enum Taken {
@@ -218,10 +221,12 @@ impl<T: StreamTerms> ReplayFeed<T> {
             .get_mut(..frame.len())
             .ok_or_else(|| invalid(position, "a frame larger than the mtu"))?;
         copy.copy_from_slice(frame);
-        let session = copy
-            .get_mut(SESSION_OFFSET..SESSION_OFFSET + 4)
+        let ids = copy
+            .get_mut(SESSION_OFFSET..STREAM_END)
             .ok_or_else(|| invalid(position, "a frame shorter than its header"))?;
+        let (session, stream) = ids.split_at_mut(4);
         session.copy_from_slice(&self.params.session_id().to_le_bytes());
+        stream.copy_from_slice(&self.params.stream_id().to_le_bytes());
         let frame = &*copy;
         let datagram = ValidatedDatagram::parse(frame, &self.params)
             .map_err(|error| invalid(position, &error.to_string()))?;

@@ -56,9 +56,10 @@ fn source() -> StreamConfig {
     }
 }
 
+/// A target on another stream than the recorded one, as SPEC §8.2 has.
 fn target(session_id: i32, join: u64) -> ReplayTargetConfig {
     ReplayTargetConfig {
-        stream_id: 42,
+        stream_id: 43,
         session_id,
         term_length: MIN_TERM_LENGTH,
         initial_term_id: INITIAL_TERM_ID,
@@ -370,7 +371,10 @@ fn replay_targets_are_refused_typed() {
         Err(DriverError::ReplayLane { lane: 1 })
     ));
     assert!(matches!(
-        driver.replay_target(target(1, 0)),
+        driver.replay_target(ReplayTargetConfig {
+            stream_id: 42,
+            ..target(1, 0)
+        }),
         Err(DriverError::DuplicateStream {
             stream_id: 42,
             session_id: 1
