@@ -11,6 +11,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- An Archive recording is read back for replay (phase 3, A5a).
+  `karyos_archive::replay::ReplaySource` reads a recording's range
+  without changing it: whole frames, fills and gaps in order, from a
+  frame boundary to the last whole frame below the range's end, through
+  one buffer and with each entry's CRC checked. It paces at full speed,
+  as recorded or scaled. The segment index becomes version 2: each entry
+  carries its record time (the Archive's write time on its monotonic
+  clock, 0 when unknown), stamped by `SegmentStore::stamp` each recorder
+  duty; a paced replay of entries without one is refused.
 - The driver hands an Archive recording a lane's reader (phase 3,
   A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
   reserved required or an optional cell and returns a `RecordingReader`:
