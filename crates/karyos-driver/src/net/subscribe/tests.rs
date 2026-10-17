@@ -975,3 +975,304 @@ fn a_new_keys_later_paths_need_room() {
         );
     }
 }
+
+/// N-4a (network streams over shared terms, resolution 2): an exposed
+/// image's lanes follow the remote sender's geometry and the receive
+/// owner writes the mapping it was given, so neither the aggregate nor
+/// one of its lanes may be reconfigured, and the image stays at its first
+/// generation.
+/// Before this refusal `reconfigure_aggregate` returned
+/// `Ok(Generation(1))`: the lane was sealed for a cutover while the
+/// receiver kept writing the old mapping.
+#[test]
+fn reconfiguring_an_exposed_image_is_refused() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let mut image = None;
+    pump(&mut a, &mut b, |_, b| {
+        image = b.network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    let lane = image.lane(Lane::ZERO).unwrap();
+    // A reconfiguration any local stream of this geometry accepts.
+    let reconfiguration = crate::generations::Reconfiguration {
+        term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+        spare_slots: 5,
+    };
+    let refused = b.reconfigure_aggregate(&image, reconfiguration);
+    assert!(
+        matches!(refused, Err(crate::error::DriverError::ImageCutover { .. })),
+        "{refused:?}"
+    );
+    let refused = b.reconfigure_stream(lane, reconfiguration);
+    assert!(
+        matches!(refused, Err(crate::error::DriverError::ImageCutover { .. })),
+        "{refused:?}"
+    );
+    let generations = b.generations(lane).unwrap();
+    assert_eq!(generations.len(), 1, "{generations:?}");
+    assert_eq!(
+        generations[0].generation,
+        karyos_sys::term::Generation::default()
+    );
+    let _ = (a.close_network(), b.close_network());
+}
+
+/// A driver of `spare_slots` image spares, on the shared threading mode.
+fn image_driver(spare_slots: u8) -> EmbeddedDriver {
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.images.spare_slots = spare_slots;
+    EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap()
+}
+
+/// A remote client of `driver`, admitted with its export ledger.
+fn remote_client(driver: &mut EmbeddedDriver) -> (u64, karyos_sys::command_ring::RingProducer) {
+    let (producer, consumer) = karyos_sys::command_ring::command_ring(1024).unwrap();
+    let link = std::sync::Arc::new(karyos_client::link::ClientLink::new());
+    let client = driver
+        .admit(
+            consumer,
+            link,
+            Some(crate::ledger::Ledger::new(4, 4, 1 << 30)),
+        )
+        .unwrap();
+    (client, producer)
+}
+
+/// Writes an `AddSubscription` of `role` on lane 0 of `(stream_id,
+/// session_id)`.
+fn add_remote_subscription(
+    producer: &mut karyos_sys::command_ring::RingProducer,
+    sequence: u64,
+    (stream_id, session_id): (i32, i32),
+    role: karyos_protocol::cnc::SubscriberRole,
+) {
+    use karyos_protocol::cnc::{Command, MAX_COMMAND_LENGTH, StreamKey};
+    let command = Command::AddSubscription {
+        sequence,
+        stream: StreamKey {
+            stream_id,
+            session_id,
+        },
+        lane: Lane::ZERO,
+        role,
+    };
+    let mut bytes = [0u8; MAX_COMMAND_LENGTH];
+    let length = command.encode(&mut bytes).unwrap();
+    producer.write(command.type_id(), &bytes[..length]).unwrap();
+}
+
+/// The grants of remote client `client`.
+fn grants(driver: &EmbeddedDriver, client: u64) -> usize {
+    driver
+        .ledger(client)
+        .map_or(0, |ledger| ledger.grants().len())
+}
+
+/// An image lane's spare-slot credits (SPEC.md §4, "Admission reserves
+/// the worst case": the reservations never exceed `S - C`) are shared by
+/// its receive owner, which holds `L = 3` of them, and every optional or
+/// observer reader, which takes one. With the template's default five
+/// spares (`C = 1`), one optional reader fits per lane, whoever asks: a
+/// second one is refused with `ResourcesUnavailable`, from the same
+/// client, from another client or in process, while required readers
+/// take no credit. One more spare slot admits one more optional reader. A
+/// local stream with the same five spares and its one publisher credit
+/// admits three.
+#[test]
+fn an_image_lane_admits_as_many_optional_readers_as_its_spare_credits() {
+    use karyos_protocol::cnc::SubscriberRole;
+    let image = (10, 3);
+    let run = |spare_slots: u8, check: &mut dyn FnMut(&mut EmbeddedDriver)| {
+        let mut a = driver(ThreadingMode::Shared);
+        let mut b = image_driver(spare_slots);
+        let address = free_address();
+        let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+        let _publication = a
+            .add_network_publication(aggregate(10, 3, 1), &channel(address))
+            .unwrap();
+        pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+        check(&mut b);
+        let _ = (a.close_network(), b.close_network());
+    };
+    let serve = |driver: &mut EmbeddedDriver| {
+        for _ in 0..20 {
+            let _ = driver.do_work().unwrap();
+        }
+    };
+    // Two optional readers from one remote client: the second is refused.
+    run(5, &mut |b| {
+        let (client, mut producer) = remote_client(b);
+        add_remote_subscription(&mut producer, 1, image, SubscriberRole::Optional);
+        add_remote_subscription(&mut producer, 2, image, SubscriberRole::Optional);
+        serve(b);
+        assert_eq!(grants(b, client), 1, "one client");
+    });
+    // One optional reader from each of two remote clients: the same.
+    run(5, &mut |b| {
+        let (first, mut first_producer) = remote_client(b);
+        let (second, mut second_producer) = remote_client(b);
+        add_remote_subscription(&mut first_producer, 1, image, SubscriberRole::Optional);
+        serve(b);
+        add_remote_subscription(&mut second_producer, 1, image, SubscriberRole::Optional);
+        serve(b);
+        assert_eq!((grants(b, first), grants(b, second)), (1, 0), "two clients");
+    });
+    // In process: the same credit.
+    run(5, &mut |b| {
+        let handle = b.network_image(10, 3).unwrap();
+        let _first = b.subscribe_aggregate(&handle, Role::Optional).unwrap();
+        let second = b.subscribe_aggregate(&handle, Role::Optional);
+        assert!(second.is_err(), "in process");
+    });
+    // Required readers take no credit.
+    run(5, &mut |b| {
+        let (client, mut producer) = remote_client(b);
+        for sequence in 1..=3 {
+            add_remote_subscription(&mut producer, sequence, image, SubscriberRole::Required);
+        }
+        serve(b);
+        assert_eq!(grants(b, client), 3, "required");
+    });
+    // One more spare slot, one more optional reader.
+    run(6, &mut |b| {
+        let (client, mut producer) = remote_client(b);
+        for sequence in 1..=3 {
+            add_remote_subscription(&mut producer, sequence, image, SubscriberRole::Optional);
+        }
+        serve(b);
+        assert_eq!(grants(b, client), 2, "six spares");
+    });
+    // A local stream of five spares: its publisher holds one credit.
+    let mut local = image_driver(5);
+    let mut config = aggregate(20, 1, 1).stream;
+    config.buffer.spare_slots = 5;
+    let _stream = local.add_stream(config).unwrap();
+    let (client, mut producer) = remote_client(&mut local);
+    for sequence in 1..=4 {
+        add_remote_subscription(&mut producer, sequence, (20, 1), SubscriberRole::Optional);
+    }
+    serve(&mut local);
+    assert_eq!(grants(&local, client), 3, "local stream");
+}
+
+/// A driver clock the test moves.
+#[derive(Debug, Clone, Default)]
+struct ManualClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl crate::clock::MonotonicClock for ManualClock {
+    fn now(&mut self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Resolution 8 (network streams over shared terms): a remote client's
+/// liveness retirement (`serve_liveness`, then `stop_serving`) ends its
+/// image grants whose descriptor never left, with its registrations, at
+/// once. A grant already sent may still be mapped by a process that only
+/// stopped, so it stays charged and pins the retired image's storage
+/// until the client's exit proof (its close flag), which ends it; only
+/// then is the image reclaimed. The export ledger does not depend on the
+/// backing, so a heap driver stands for the IPC driver that grants images
+/// from step n3.
+#[test]
+fn a_liveness_retirement_ends_unsent_image_grants_and_the_exit_proof_the_rest() {
+    use karyos_protocol::cnc::{Command, MAX_COMMAND_LENGTH, StreamKey, SubscriberRole};
+    let clock = ManualClock::default();
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = EmbeddedDriver::with_clock(
+        DriverConfig {
+            network: Some(NetworkConfig {
+                threading: ThreadingMode::Shared,
+                ..NetworkConfig::default()
+            }),
+            heartbeat_interval: 10,
+            client_liveness_timeout: 100,
+            ..DriverConfig::default()
+        },
+        Box::new(clock.clone()),
+    )
+    .unwrap();
+    let address = free_address();
+    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    let registrations = b.registrations.len();
+    // A remote client, admitted with its export ledger.
+    let (mut producer, consumer) = karyos_sys::command_ring::command_ring(1024).unwrap();
+    let link = std::sync::Arc::new(karyos_client::link::ClientLink::new());
+    let client = b
+        .admit(
+            consumer,
+            std::sync::Arc::clone(&link),
+            Some(crate::ledger::Ledger::new(4, 4, 1 << 30)),
+        )
+        .unwrap();
+    for sequence in 1..=2 {
+        let command = Command::AddSubscription {
+            sequence,
+            stream: StreamKey {
+                stream_id: 10,
+                session_id: 3,
+            },
+            lane: Lane::ZERO,
+            role: SubscriberRole::Required,
+        };
+        let mut bytes = [0u8; MAX_COMMAND_LENGTH];
+        let length = command.encode(&mut bytes).unwrap();
+        producer.write(command.type_id(), &bytes[..length]).unwrap();
+    }
+    pump(&mut a, &mut b, |_, b| {
+        b.ledger(client)
+            .is_some_and(|ledger| ledger.grants().len() == 2)
+    });
+    let grants = b.ledger(client).unwrap().grants().to_vec();
+    let image_stream = grants[0].stream;
+    assert!(grants.iter().all(|grant| grant.stream == image_stream));
+    assert!(grants.iter().all(|grant| !grant.sent));
+    // The first grant's descriptor left; the second is still held.
+    b.ledger_mut(client).unwrap().mark_sent(grants[0].export);
+    // The client stops beating: its liveness timeout passes.
+    clock.0.store(100, std::sync::atomic::Ordering::Relaxed);
+    pump(&mut a, &mut b, |_, b| {
+        b.ledger(client)
+            .is_some_and(|ledger| ledger.grants().len() == 1)
+    });
+    let left = b.ledger(client).unwrap().grants().to_vec();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].export, grants[0].export, "the sent grant is kept");
+    assert_eq!(b.registrations.len(), registrations, "its registrations go");
+    // The image retires; the sent grant keeps its stream and storage.
+    assert!(b.remove_network_subscription(subscription).unwrap());
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_none());
+    for _ in 0..50 {
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+    }
+    assert!(b.streams.iter().any(|stream| stream.id == image_stream));
+    assert_eq!(b.net.as_ref().unwrap().image_count(), 1);
+    // The exit proof ends the sent grant: the stream frees and the image
+    // is reclaimed.
+    link.mark_closed();
+    pump(&mut a, &mut b, |_, b| {
+        b.net.as_ref().unwrap().image_count() == 0
+    });
+    assert!(b.ledger(client).is_none());
+    assert!(b.streams.iter().all(|stream| stream.id != image_stream));
+    let _ = (a.close_network(), b.close_network());
+}

@@ -47,10 +47,12 @@ use karyos_sys::log_buffer::{
 use karyos_sys::receive::ImageParams;
 use karyos_sys::sizing::TermLength;
 use karyos_sys::term::TermId;
+use karyos_sys::term_bytes::HeapTerms;
 
 use super::EndpointId;
 use super::chain::{ImageChain, SessionCommand, SessionEvent, SessionLink};
 use super::ring::Reservation;
+use crate::embedded::StreamTerms;
 use crate::sessions::receive::SlotRef;
 
 /// The driver default of a subscription's `max_image_term_length`: 64 MiB.
@@ -65,9 +67,17 @@ const ROTATION_SLOTS: u64 = 3;
 /// The image log buffer parameters the answer does not carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageTemplate {
-    /// Spare slots beyond the three rotation slots (default 5).
+    /// Spare slots beyond the three rotation slots (default 5). They are
+    /// also each lane's admission credits (SPEC.md §4: the reservations
+    /// never exceed `spare_slots - CLEANING_HEADROOM`): the receive owner
+    /// holds three, and every optional or observer reader takes one, so
+    /// the default admits one such reader per lane, in process or remote.
+    /// Each further spare admits one more and adds a term per lane to the
+    /// image's storage charge.
     pub spare_slots: u8,
-    /// Local subscribers per image (default 8).
+    /// Local subscribers per image (default 8): subscriber cells, of which
+    /// optional and observer readers are bounded by `spare_slots` as
+    /// well. Required readers take no credit.
     pub max_subscribers: u8,
     /// Whether the receive owner may seal local gaps (default true:
     /// gaps-and-unreliable-delivery.md).
@@ -173,13 +183,13 @@ enum State {
     Refused,
 }
 
-struct Image {
+struct Image<T: StreamTerms> {
     /// The pending slot, at its challenge generation.
     slot: SlotRef,
     endpoint: EndpointId,
     identity: Identity,
     alias: Alias,
-    lanes: Vec<Arc<LogBuffer>>,
+    lanes: Vec<Arc<LogBuffer<T>>>,
     /// Term bytes charged to the budget.
     charge: u64,
     /// The `StorageReclaimed` unit, posted once a retired image's storage
@@ -192,8 +202,8 @@ struct Image {
 }
 
 /// The conductor's image table.
-pub struct ImageTable {
-    images: Vec<Image>,
+pub struct ImageTable<T: StreamTerms = HeapTerms> {
+    images: Vec<Image<T>>,
     max: usize,
     template: ImageTemplate,
     /// Term bytes charged.
@@ -204,7 +214,7 @@ pub struct ImageTable {
     allocations: usize,
 }
 
-impl std::fmt::Debug for ImageTable {
+impl<T: StreamTerms> std::fmt::Debug for ImageTable<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImageTable")
             .field("images", &self.images.len())
@@ -222,7 +232,7 @@ enum Refusal {
     Geometry,
 }
 
-impl ImageTable {
+impl<T: StreamTerms> ImageTable<T> {
     /// A table of at most `max` images (the receiver's `max_images`).
     #[must_use]
     pub fn new(max: usize, template: ImageTemplate) -> Self {
@@ -265,7 +275,7 @@ impl ImageTable {
     /// The lanes of the image installed at `slot`, for subscribers to
     /// attach; `None` until the receiver reported it installed.
     #[must_use]
-    pub fn installed(&self, slot: SlotRef) -> Option<&[Arc<LogBuffer>]> {
+    pub fn installed(&self, slot: SlotRef) -> Option<&[Arc<LogBuffer<T>>]> {
         self.images.iter().find_map(|image| match image.state {
             State::Installed(installed) if installed == slot => Some(image.lanes.as_slice()),
             _ => None,
@@ -289,7 +299,11 @@ impl ImageTable {
                 _ => None,
             })
     }
+}
 
+/// The image table's session chain, which builds lanes on the heap until
+/// the shared lane source of step n2 (network streams over shared terms).
+impl ImageTable<HeapTerms> {
     /// Serves every session event the receiver posted, then reclaims the
     /// retired images no loan holds any more, reporting image events to
     /// `on_event`; returns how many events it served.
