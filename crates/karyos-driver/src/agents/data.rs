@@ -632,13 +632,25 @@ impl<T: StreamTerms> Outbound<T> {
     /// on the lane is `requester`, at `now`. A publication with no repair
     /// path drops it.
     pub fn nak(&mut self, nak: &Nak, requester: Requester, now: u64) -> NakOutcome {
+        self.nak_on(nak, requester, 0, now)
+    }
+
+    /// [`Outbound::nak`] for a NAK that arrived on route `route` (0 on one
+    /// path), which absorbs the copies of it on other routes (RP-11).
+    pub fn nak_on(
+        &mut self,
+        nak: &Nak,
+        requester: Requester,
+        route: usize,
+        now: u64,
+    ) -> NakOutcome {
         let lane = usize::from(nak.range.lane.get());
         let lanes = u8::try_from(self.readers.len()).unwrap_or(u8::MAX);
         let sent_high = self.tracks.get(lane).map_or(0, |track| track.high);
         match self.repair.as_deref_mut() {
-            Some(repair) => repair.nak(
+            Some(repair) => repair.nak_on(
                 nak,
-                requester,
+                (requester, route),
                 self.readers.get(lane),
                 sent_high,
                 lanes,
@@ -646,6 +658,25 @@ impl<T: StreamTerms> Outbound<T> {
             ),
             None => NakOutcome::Dropped,
         }
+    }
+
+    /// Whether `nak`, from a bound receiver, on route `route` at `now`, is
+    /// a copy of one another route carried within `path_skew_window`: it
+    /// is then absorbed, counted, and spends no NAK budget (RP-11).
+    pub fn absorbs(&mut self, nak: &Nak, route: usize, now: u64) -> bool {
+        self.repair
+            .as_deref_mut()
+            .is_some_and(|repair| repair.absorbs(nak, route, now))
+    }
+
+    /// The route `endpoint` serves: its index on a routed publication, 0
+    /// on one path or for an endpoint it does not use.
+    #[must_use]
+    pub fn route_of(&self, endpoint: EndpointId) -> usize {
+        self.routed
+            .as_deref()
+            .and_then(|routed| routed.endpoints().position(|held| held == endpoint))
+            .unwrap_or(0)
     }
 
     /// Serves its repairs on `tx` within `budget`, which it spends, at
@@ -657,14 +688,29 @@ impl<T: StreamTerms> Outbound<T> {
         budget: &mut RepairBudget,
         now: u64,
     ) -> u32 {
-        // Over redundant paths repair stays on the founding route, whose
-        // queues `open_routes` opened: never a second route (#321 review).
-        // Repairs and step 8 ERRs on every path are RP-11, rp-w6.
+        // Over redundant paths `tx` is the founding route's half, as one
+        // route of [`Outbound::serve_repair_routes`], which serves every
+        // live route (RP-11).
         let open = match self.routed.as_deref() {
-            Some(routed) => routed.founding_open(tx.capabilities().epoch),
+            Some(routed) => routed.repair_live(0, tx.capabilities().epoch),
             None => self.open(tx),
         };
-        if self.repair.is_none() || !open {
+        if !open {
+            return 0;
+        }
+        self.serve_repair_with(&mut [Some(tx)], budget, now)
+    }
+
+    /// Serves its repairs on `routes`, the TX halves of its live routes by
+    /// route (one path: its own), within `budget`, which it spends, at
+    /// `now`; returns the heads submitted.
+    pub(super) fn serve_repair_with<O: SocketOps>(
+        &mut self,
+        routes: &mut [Option<&mut SocketsTx<O>>],
+        budget: &mut RepairBudget,
+        now: u64,
+    ) -> u32 {
+        if self.repair.is_none() {
             return 0;
         }
         let mut sent_high = [0u64; MAX_LANES];
@@ -685,7 +731,13 @@ impl<T: StreamTerms> Outbound<T> {
         let Some(repair) = self.repair.as_deref_mut() else {
             return 0;
         };
-        let report = repair.serve(tx, &mut self.readers, (&sent_high, &closed), budget, now);
+        let report = repair.serve_routes(
+            routes,
+            &mut self.readers,
+            (&sent_high, &closed),
+            budget,
+            now,
+        );
         let frames = report
             .lanes
             .iter()
@@ -1558,7 +1610,7 @@ pub(crate) mod testing {
 
 mod routed;
 
-pub use routed::{PathCounters, PathPolicy};
+pub use routed::{MAX_PATH_COPY_ENTRIES, PathCounters, PathPolicy};
 
 #[cfg(test)]
 mod tests;

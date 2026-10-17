@@ -230,6 +230,28 @@ fn the_configuration_is_checked() {
             },
             ..AgentConfig::default()
         },
+        // RP-11: the skew window at most 1 s, 1 to 65536 copy entries.
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                skew_window: crate::paths::MAX_SKEW_WINDOW + 1,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                copy_entries: 0,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                copy_entries: crate::agents::data::MAX_PATH_COPY_ENTRIES + 1,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
     ] {
         assert!(matches!(
             network_agents::<S>(config),
@@ -462,7 +484,8 @@ fn the_receiver_runs_before_the_sender() {
 
 /// The redundant-path defaults are redundant-paths.md section 7's:
 /// `path_lag_limit` 100 ms, `path_skip_ratio` 50%, `path_skip_min_bytes`
-/// 64 KiB, and RP-9's backoffs 10 ms, 1 s and 10 s; and RP-3's interim
+/// 64 KiB, RP-9's backoffs 10 ms, 1 s and 10 s, and RP-11's skew window
+/// 1 ms (the receivers' default) and 256 copy entries; and RP-3's interim
 /// heartbeat, 100 ms.
 #[test]
 fn the_path_defaults_are_section_sevens() {
@@ -476,6 +499,8 @@ fn the_path_defaults_are_section_sevens() {
             backoff_initial: 10_000_000,
             backoff_max: 1_000_000_000,
             backoff_reset: 10_000_000_000,
+            skew_window: 1_000_000,
+            copy_entries: 256,
         }
     );
     assert_eq!(config.path_heartbeat_interval, 100_000_000);

@@ -282,9 +282,11 @@ impl AgentConfig {
             || policy.backoff_initial == 0
             || policy.backoff_max < policy.backoff_initial
             || policy.backoff_reset == 0
+            || policy.skew_window > crate::paths::MAX_SKEW_WINDOW
+            || !(1..=data::MAX_PATH_COPY_ENTRIES).contains(&policy.copy_entries)
         {
             return Err(AgentError::InvalidConfig(
-                "path_policy needs a lag limit of 2 ns or more, a skip ratio of 1 to 100 percent, a minimum of 1 byte, and backoffs of 1 ns or more with the maximum at least the initial one",
+                "path_policy needs a lag limit of 2 ns or more, a skip ratio of 1 to 100 percent, a minimum of 1 byte, backoffs of 1 ns or more with the maximum at least the initial one, a skew window of at most 1 s and 1 to 65536 copy entries",
             ));
         }
         if self.path_heartbeat_interval == 0 {
