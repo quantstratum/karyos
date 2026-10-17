@@ -29,10 +29,27 @@ use crate::net::{NetworkConfig, NetworkSubscription};
 
 type IpcDriver = EmbeddedDriver<SharedTerms>;
 
-fn dir(name: &str) -> PathBuf {
+fn dir(name: &str) -> TempDir {
     let dir = std::env::temp_dir().join(format!("karyos-n3-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    dir
+    TempDir(dir)
+}
+
+/// A test's directory, removed when the test ends, passed or not.
+struct TempDir(PathBuf);
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// An IPC driver with a network, on the system clock, timeouts of 5 s.
@@ -164,10 +181,11 @@ fn an_ipc_drivers_image_lives_in_regions_and_is_read_in_process() {
         b.reconfigure_aggregate(&image, reconfiguration),
         Err(DriverError::ImageCutover { .. })
     ));
-    // A lane of this two-lane aggregate is refused as any aggregate lane.
+    // A lane of this two-lane image names the image as the reason, before
+    // the aggregate-lane refusal any other aggregate's lane gets.
     assert!(matches!(
         b.reconfigure_stream(image.lane(Lane::ZERO).unwrap(), reconfiguration),
-        Err(DriverError::LaneOfAggregate { .. })
+        Err(DriverError::ImageCutover { .. })
     ));
     drop(reader);
     let _ = (a.close_network(), b.close_network());

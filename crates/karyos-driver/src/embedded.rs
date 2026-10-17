@@ -3664,7 +3664,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Stops the network agents and reclaims their endpoints and images
-    /// (wiring note W-g); `None` without a network or once closed. Dropping
+    /// (wiring note W-g); `None` without a network or once closed. An image
+    /// whose `CreateImage` is still queued is refused, on either backing,
+    /// before any lane is built (no region, memfd or heap). Dropping
     /// the driver does the same, then joins any agent thread that did not
     /// stop in time (blocking: such a thread exits once its rings are
     /// gone), so none is ever detached.

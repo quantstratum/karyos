@@ -4731,19 +4731,24 @@ mod shared {
     /// limit is the child's own, so no other test runs short.
     #[test]
     fn a_region_that_cannot_be_created_refuses_the_image() {
-        let status = std::process::Command::new("sh")
+        let output = std::process::Command::new("sh")
             .arg("-c")
             .arg("ulimit -n 64 && exec \"$0\" \"$@\"")
             .arg(std::env::current_exe().unwrap())
             .args([
+                "--ignored",
                 "--exact",
                 "agents::images::tests::shared::a_region_that_cannot_be_created_refuses_the_image_child",
                 "--test-threads=1",
             ])
             .env(EMFILE_CHILD, "1")
-            .status()
+            .output()
             .unwrap();
-        assert!(status.success(), "{status:?}");
+        // A filter that matches nothing also exits 0: the child must have
+        // run its one test.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
     }
 
     /// The child: every descriptor but one is taken, so a four-lane image
@@ -4752,6 +4757,7 @@ mod shared {
     /// storage, and the first region is dropped: its descriptor is free
     /// again. A no-op outside the child.
     #[test]
+    #[ignore = "run by a_region_that_cannot_be_created_refuses_the_image"]
     fn a_region_that_cannot_be_created_refuses_the_image_child() {
         if std::env::var_os(EMFILE_CHILD).is_none() {
             return;
