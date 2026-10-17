@@ -155,6 +155,18 @@ fn the_configuration_is_checked() {
             },
             ..AgentConfig::default()
         },
+        // A zero multicast delay bound at the RTT floor: 15 ns at scale 1.
+        AgentConfig {
+            multicast: crate::repair::loss::MulticastConfig {
+                nak_delay_scale: 1,
+                ..crate::repair::loss::MulticastConfig::default()
+            },
+            rtt: crate::rtt::RttConfig {
+                rtt_floor: 15,
+                ..crate::rtt::RttConfig::default()
+            },
+            ..AgentConfig::default()
+        },
     ] {
         assert!(matches!(
             network_agents::<S>(config),

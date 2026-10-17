@@ -7,9 +7,9 @@
 //!
 //! - N1: an unreliable channel delivers each message at most once and in
 //!   order, and reports every lost message as a local gap.
-//! - N2 and N3 (reliable delivery exactly once and in order through
-//!   repair, N3 with 5% duplicates) join once the sender's repair wiring
-//!   is on main.
+//! - N2: a reliable channel delivers every message exactly once and in
+//!   order, through NAKs and the sender's repairs.
+//! - N3: N2 with 5% duplicated datagrams.
 
 #![allow(
     clippy::print_stdout,
@@ -22,7 +22,7 @@ use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SkipReason};
 use karyos_sys::sizing::MIN_TERM_LENGTH;
 
-use super::{connected, driver, pump};
+use super::{connected, driver, exchange, pump};
 use crate::agents::ThreadingMode;
 
 /// The bytes a 1000-byte message takes in a term: its 32-byte header,
@@ -125,4 +125,81 @@ fn n1_an_unreliable_channel_reports_every_loss_as_a_gap() {
         !gaps.is_empty(),
         "no loss over {count} messages: netem idle?"
     );
+}
+
+/// Two drivers and a reliable channel: every one of `count` messages
+/// reaches a required subscriber exactly once and in order (`exchange`
+/// asserts it), with no loss reported on the lane. Prints what the faults
+/// cost.
+fn reliable_delivery(label: &str, count: u32) {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    exchange(&mut a, &mut b, &publication, &mut reader, count);
+    let poll = reader.poll(|_, _, _| {}, ONE);
+    assert_eq!(poll.lanes[0].first_loss, None, "a reliable lane lost data");
+    let counters =
+        |driver: &crate::embedded::EmbeddedDriver| driver.net.as_ref().unwrap().agent_counters();
+    println!("{label}: {count} delivered in order exactly once");
+    println!("{label} sender side: {}", counters(&a));
+    println!("{label} receiver side: {}", counters(&b));
+}
+
+/// N2: over loss, reordering and duplication a reliable channel delivers
+/// every message exactly once and in order: the receiver NAKs each hole
+/// and the sender's repair path resends it.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n2_a_reliable_channel_delivers_exactly_once_in_order() {
+    super::super::netem::require_netem();
+    reliable_delivery("N2", 2000);
+}
+
+/// The job's netem profile with `duplicate` raised for one test; the
+/// job's profile is back on drop.
+struct Profile {
+    base: String,
+}
+
+impl Profile {
+    /// Replaces the loopback's netem profile by the job's with
+    /// `duplicate {percent}%`.
+    fn duplicate(percent: u32) -> Self {
+        let base = std::env::var("KARYOS_NETEM_PROFILE").unwrap();
+        let mut words: Vec<String> = base.split_whitespace().map(str::to_owned).collect();
+        match words.iter().position(|word| word == "duplicate") {
+            Some(at) => words[at + 1] = format!("{percent}%"),
+            None => words.extend(["duplicate".to_owned(), format!("{percent}%")]),
+        }
+        tc(&words);
+        println!("netem profile for this test: {}", words.join(" "));
+        Self { base }
+    }
+}
+
+impl Drop for Profile {
+    fn drop(&mut self) {
+        let words: Vec<String> = self.base.split_whitespace().map(str::to_owned).collect();
+        tc(&words);
+    }
+}
+
+/// `tc qdisc change dev lo root netem <profile>`.
+fn tc(profile: &[String]) {
+    let status = std::process::Command::new("tc")
+        .args(["qdisc", "change", "dev", "lo", "root", "netem"])
+        .args(profile)
+        .status()
+        .unwrap();
+    assert!(status.success(), "tc qdisc change failed: {status}");
+}
+
+/// N3: N2 with 5% of the datagrams duplicated: repairs and duplicates
+/// together still deliver every message exactly once and in order.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n3_a_reliable_channel_survives_five_percent_duplicates() {
+    super::super::netem::require_netem();
+    let _profile = Profile::duplicate(5);
+    reliable_delivery("N3", 2000);
 }

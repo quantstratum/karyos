@@ -135,6 +135,23 @@ impl EmbeddedDriver<HeapTerms> {
             .map_or(0, crate::net::Network::subscription_refusals)
     }
 
+    /// NAK control group joins that failed (RC-15): those subscriptions
+    /// run without peer suppression input.
+    #[must_use]
+    pub fn network_control_join_failures(&self) -> u64 {
+        self.net
+            .as_ref()
+            .map_or(0, crate::net::Network::control_join_failures)
+    }
+
+    /// Endpoints the network holds (tests).
+    #[cfg(test)]
+    pub(crate) fn network_held_endpoints(&self) -> usize {
+        self.net
+            .as_ref()
+            .map_or(0, crate::net::Network::held_endpoints)
+    }
+
     /// Images installed but not exposed so far: their alias was in use.
     #[must_use]
     pub fn network_images_unexposed(&self) -> u64 {

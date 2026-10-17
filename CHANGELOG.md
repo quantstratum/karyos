@@ -38,7 +38,10 @@ release may break APIs, wire formats and shared-memory layouts.
   job. A first test checks that the shaping takes effect. The first
   driver fault test, N1 (`net::e2e::netem`), checks over these faults that
   an unreliable channel delivers each message at most once and in order
-  and reports every lost one as a local gap.
+  and reports every lost one as a local gap. N2 checks that a reliable
+  channel delivers every message exactly once and in order through NAKs
+  and the sender's repairs, and N3 does the same with 5% duplicates (the
+  test raises netem's duplicate rate and restores the job's profile).
 - `EmbeddedDriver::add_guarded_network_publication(config, channel,
   NetworkGuard { guard, messages, rate })`: a network publication whose
   lane streams are guarded before its sender exists, and whose sender
@@ -74,6 +77,8 @@ release may break APIs, wire formats and shared-memory layouts.
   bound source through the ERR linger. A repair read out of word 0 loads
   now suspends the call with the job and the lane's deficit kept
   (`RepairReadError::Budget`). `AgentConfig::repair` holds the settings.
+  A step 8 ERR goes to the requester's binding as it is at the send; one
+  past the cycle's reply list counts `SenderCounters::nak_replies_dropped`.
 - The network agents measure RTT (RC-1). Each installed image sends one
   RTTM REQUEST per bound path and `rtt_probe_interval`; the sender reads
   the clock immediately before the submitting call and reports the start
