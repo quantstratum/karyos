@@ -284,7 +284,7 @@ fn a_multicast_answer_goes_to_the_group() {
     };
     sender.sessions.add(publication).unwrap();
     let (path, _log) = outbound(EndpointId(1), group);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let challenge = Control::Challenge(karyos_protocol::network::RspChallenge {
         alias: alias(),
         identity: identity(),
@@ -669,6 +669,41 @@ fn control_routes_survive_a_reset() {
     assert_eq!(after.send_failures, before.send_failures);
 }
 
+/// A removed publication's alias leaves the receiver's pre-filter, once
+/// (wiring note W-d, ACS 15929).
+#[test]
+fn a_published_alias_is_removed() {
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let add = AgentCommand::<OsSocket>::AddPublishedAlias {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias,
+    };
+    assert!(matches!(
+        role.command(add),
+        Some((_, AgentEvent::Configured { accepted: true, .. }))
+    ));
+    assert_eq!(role.published, [(EndpointId(1), alias)]);
+    for accepted in [true, false] {
+        let remove = AgentCommand::<OsSocket>::RemovePublishedAlias {
+            reply: replies.reserve().unwrap(),
+            endpoint: EndpointId(1),
+            alias,
+        };
+        assert!(matches!(
+            role.command(remove),
+            Some((_, AgentEvent::Configured { accepted: found, .. })) if found == accepted
+        ));
+    }
+    assert!(role.published.is_empty());
+}
+
 /// Two subscriptions of one stream on one endpoint: the stricter
 /// `max_image_term_length` holds, whatever their order.
 #[test]
@@ -705,7 +740,7 @@ fn the_sender_validates_sms_against_its_bindings() {
     sender.sessions.add(publication(endpoint)).unwrap();
     let group: SocketAddr = "10.0.0.2:4000".parse().unwrap();
     let (path, _log) = outbound(endpoint, group);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // The answer to the receiver's challenge binds it.
     let answer = |boot_id| SetupAnswer {
@@ -833,7 +868,7 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
         )
         .unwrap(),
     ));
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let answer = SetupAnswer {
         alias: alias(),
         identity: identity(),
@@ -1041,7 +1076,7 @@ fn unconfirmed_bindings_never_hold_the_table() {
         .unwrap(),
     };
     let (path, _log) = outbound(endpoint, receiver);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     sender.status(endpoint, receiver, &status, 2);
     assert_eq!(sender.sessions.counters().established, 1);
     assert_eq!(sender.counters().bindings_evicted, 1);
@@ -1208,7 +1243,7 @@ fn sm_sender() -> super::SenderRole {
     let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
     sender.sessions.add(publication(EndpointId(1))).unwrap();
     let (path, _log) = outbound(EndpointId(1), "10.0.0.2:4000".parse().unwrap());
-    sender.publications.push(*path);
+    sender.publications.push(path);
     sender
 }
 
@@ -1620,7 +1655,7 @@ fn rttm_requests_are_reported_and_answered() {
     sender.bind(EndpointId(1), source, &old, 899);
     sender.bind(EndpointId(1), source, &answer, 900);
     let (path, _log) = outbound(EndpointId(1), source);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let status = StatusMessage {
         alias: alias(),
         identity: identity(),

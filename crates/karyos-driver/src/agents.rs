@@ -446,6 +446,30 @@ pub enum AgentCommand<O: SocketOps> {
         /// The lane.
         lane: karyos_protocol::frame::Lane,
     },
+    /// Receiver only: `alias` on `endpoint` is no longer a local
+    /// publication, so the pre-filter stops admitting its controls.
+    /// Answer [`AgentEvent::Configured`], `accepted` when it was there.
+    RemovePublishedAlias {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
+    },
+    /// Sender only: stop sending `alias` on `endpoint` and hand its data
+    /// path back (wiring note W-d), so its readers drop on the control
+    /// path. Answer [`AgentEvent::PublicationRemoved`].
+    RemovePublication {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration, echoed in the answer.
+        registration: u64,
+    },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
     Panic,
@@ -501,6 +525,20 @@ pub enum AgentEvent<O: SocketOps> {
         endpoint: EndpointId,
         /// Its alias.
         alias: karyos_protocol::network::Alias,
+        /// Its registration (`Identity::registration_id`).
+        registration: u64,
+    },
+    /// The sender stopped the publication; `outbound` is its data path,
+    /// `None` when it held no such publication.
+    PublicationRemoved {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// The registration the command named.
+        registration: u64,
+        /// The data path, dropped by the conductor.
+        outbound: Option<Box<data::Outbound>>,
     },
     /// The agent refused the publication (the wrong agent, a full table or
     /// a duplicate alias).
@@ -511,6 +549,8 @@ pub enum AgentEvent<O: SocketOps> {
         endpoint: EndpointId,
         /// Its alias.
         alias: karyos_protocol::network::Alias,
+        /// Its registration (`Identity::registration_id`).
+        registration: u64,
     },
     /// The answer to a receiver configuration command: `accepted` is false
     /// when its table is full.
@@ -690,6 +730,8 @@ impl<O: SocketOps> AgentCore<O> {
                     }
                 }
                 command @ (AgentCommand::AddPublication { .. }
+                | AgentCommand::RemovePublication { .. }
+                | AgentCommand::RemovePublishedAlias { .. }
                 | AgentCommand::AddSubscription { .. }
                 | AgentCommand::AddPublishedAlias { .. }
                 | AgentCommand::SetNetworkTrace { .. }

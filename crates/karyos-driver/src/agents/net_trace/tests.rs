@@ -467,7 +467,7 @@ mod sender {
     #[test]
     fn the_sender_serves_its_journal_commands() {
         let (_tx, path, _log) = sending();
-        let mut publications = vec![*path];
+        let mut publications = vec![path];
         let mut trace = SenderTrace::default();
         let (replies, _keep) = ring::<Event>(NonZeroUsize::new(16).unwrap());
         let mut serve = |trace: &mut SenderTrace, command: Command| {
