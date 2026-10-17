@@ -4,12 +4,16 @@
 //! `karyos::Error`.
 //!
 //! Implemented so far: the client API (publications, subscriptions and the
-//! client conductor) and the error type aggregating client errors. The Archive and Cluster APIs do not exist yet.
+//! client conductor), the SPEC §10 [`Client`] facade that names channels by
+//! URI, and the error type aggregating client errors. The Archive and
+//! Cluster APIs do not exist yet.
 
 pub use karyos_client::{
-    Aborted, ClaimOutcome, ClientClaim, ClientConductor, ClientError, ClientPublication,
-    ClientSubscription, CommitOutcome, Completion, ConductorError, ConductorPoll, MessageInfo,
-    MessageLimit, OfferOutcome, Outcome, Overrun, PollError, PollSummary,
+    Aborted, ClaimOutcome, Client, ClientClaim, ClientConductor, ClientError, ClientPublication,
+    ClientSubscription, CommitOutcome, Completion, ConductorError, ConductorPoll, Connection,
+    Context, ContextBuilder, IdleStrategy, ImageStop, MessageInfo, MessageLimit, OfferOutcome,
+    Outcome, Overrun, PollError, PollSummary, StreamId, Subscription, SubscriptionError,
+    SubscriptionPoll,
 };
 
 /// Every error of the public Karyos API.
@@ -24,4 +28,7 @@ pub enum Error {
     /// A client conductor request could not be submitted.
     #[error(transparent)]
     Conductor(#[from] ConductorError),
+    /// A facade subscription's poll failed or the subscription is closed.
+    #[error(transparent)]
+    Subscription(#[from] SubscriptionError),
 }
