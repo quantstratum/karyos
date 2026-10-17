@@ -383,9 +383,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// a cutover is in progress, `ResourcesUnavailable` when
     /// `max_retained_generations` predecessors are retained,
     /// [`DriverError::GenerationsExhausted`],
-    /// [`DriverError::PositionsExhausted`], and the configuration and
-    /// allocation errors of the successor. [`DriverError::Sys`] from the
-    /// descriptor protocol indicates a broken invariant.
+    /// [`DriverError::PositionsExhausted`], [`DriverError::ImageCutover`]
+    /// for a network image's lane, and the configuration and allocation
+    /// errors of the successor. [`DriverError::Sys`] from the descriptor
+    /// protocol indicates a broken invariant.
     pub fn reconfigure_stream(
         &mut self,
         stream: StreamHandle,
@@ -449,6 +450,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::NetworkCutover { stream: id });
         }
         let target = self.active_stream_mut(stream)?;
+        // An image's lane is written by the receive owner through the
+        // mapping it was given, at the remote sender's geometry; a successor
+        // would never be fed (N-4a).
+        if matches!(
+            target.config.publication,
+            karyos_sys::log_buffer::PublicationMode::Image { .. }
+        ) {
+            return Err(DriverError::ImageCutover { stream: target.id });
+        }
         // A guarded stream's walker and rings follow one mapping; cutovers
         // of guarded streams wait for G-d2.
         if target.guarded.is_some() {

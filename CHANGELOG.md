@@ -44,6 +44,11 @@ release may break APIs, wire formats and shared-memory layouts.
   walker, which holds one spare-slot credit for the stream's life, finds no
   credit (`WalkerUnavailable::NoSpareCredit`) or no reader cell
   (`WalkerUnavailable::NoReaderCell`).
+- Documented image admission: at the default `ImageTemplate::spare_slots`
+  of 5, each image lane admits one optional or observer reader, since the
+  receive owner holds three of its four spare-slot credits; another is
+  refused with `ResourcesUnavailable`. Raising `spare_slots` by one admits
+  one more, at one term per lane of image storage.
 - Driver positions are absolute stream positions after a guard close and
   reopen: `EmbeddedDriver::seal_state` reports the current mapping's base
   plus its seal (`DriverError::PositionsExhausted` past the position

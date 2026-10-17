@@ -195,6 +195,15 @@ pub enum DriverError {
         /// The stream id.
         stream: u64,
     },
+    /// A cutover of a network image's lane: the lane follows the remote
+    /// sender's geometry and the receive owner writes the mapping it was
+    /// given, so an image takes no cutover (`quantstratum-docs:
+    /// karyos/design/network-shared-terms.md`, N-4a).
+    #[error("stream {stream} is a network image's lane, which takes no cutover")]
+    ImageCutover {
+        /// The stream id.
+        stream: u64,
+    },
     /// The stream's incarnation numbers are exhausted; they are never
     /// reused.
     #[error("stream {stream}'s incarnations are exhausted")]
