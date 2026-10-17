@@ -131,6 +131,13 @@ pub enum DriverError {
     /// A control-channel limit or size is invalid.
     #[error("invalid driver configuration")]
     InvalidConfig,
+    /// A replay target of a lane other than 0: only lane 0 recordings are
+    /// replayed (A5).
+    #[error("a replay of lane {lane}: only lane 0 is replayed")]
+    ReplayLane {
+        /// The recorded lane.
+        lane: u8,
+    },
     /// No such guard: a foreign handle or an unknown id.
     #[error("unknown guard")]
     UnknownGuard,

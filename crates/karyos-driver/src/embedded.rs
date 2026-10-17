@@ -903,6 +903,8 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) registrations: Vec<crate::commands::Registration>,
     pub(crate) next_client: u64,
     pub(crate) next_stream: u64,
+    /// The replay targets this driver made (A5b).
+    pub(crate) replays: crate::replay::ReplayTargets,
     /// Tests: the stream id at which staging a lane fails, and the cutover
     /// preparation of that stream.
     #[cfg(test)]
@@ -1278,6 +1280,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             registrations: Vec::new(),
             next_client: 1,
             next_stream: 1,
+            replays: crate::replay::ReplayTargets::default(),
             #[cfg(test)]
             fail_at: None,
             next_registration: 1,
@@ -3720,7 +3723,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 /// Where the image table builds lanes: new regions of an IPC driver's
 /// admission, or the heap without one.
 #[cfg(target_os = "linux")]
-fn lane_source<T: StreamTerms>(
+pub(crate) fn lane_source<T: StreamTerms>(
     admission: Option<&mut crate::admission::Admission<T>>,
 ) -> crate::agents::images::LaneSource<'_> {
     admission.map_or_else(crate::agents::images::LaneSource::heap, |admission| {
