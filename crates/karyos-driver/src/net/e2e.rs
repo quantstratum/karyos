@@ -918,3 +918,196 @@ fn multicast_cycles_run_on_the_network_clock() {
 }
 
 mod netem;
+
+/// The table of the conflated views below: four keys of 16 bytes.
+const VIEW: karyos_sys::conflation::ConflationConfig = karyos_sys::conflation::ConflationConfig {
+    keys: 4,
+    value_capacity: 16,
+    journal_capacity: 1024,
+};
+
+/// Offers `value` under `key` on `lane`, pumping both drivers until it is
+/// accepted.
+fn offer_keyed(
+    a: &mut EmbeddedDriver,
+    b: &mut EmbeddedDriver,
+    lane: &mut karyos_client::ClientPublication<HeapTerms>,
+    key: i64,
+    value: u8,
+) {
+    let options = karyos_sys::log_buffer::AppendOptions {
+        reserved_value: key,
+        ..karyos_sys::log_buffer::AppendOptions::default()
+    };
+    pump(&mut [a, b], |_| {
+        matches!(
+            lane.offer_with(&[value; 16], options).unwrap(),
+            OfferOutcome::Accepted { .. }
+        )
+    });
+}
+
+/// Polls `reader` while pumping both drivers until `done` holds for the
+/// latest `(value, freshness)` of each key.
+fn view_until(
+    a: &mut EmbeddedDriver,
+    b: &mut EmbeddedDriver,
+    reader: &mut karyos_sys::conflation::ConflationReader,
+    latest: &mut [Option<(u8, karyos_sys::freshness::Freshness)>; 4],
+    mut done: impl FnMut(&[Option<(u8, karyos_sys::freshness::Freshness)>; 4]) -> bool,
+) {
+    let budget = karyos_sys::conflation::Budget {
+        keys: 16,
+        retries: 4,
+    };
+    pump(&mut [a, b], |_| {
+        let _ = reader.poll_changed(budget, |key, _, value, freshness| {
+            latest[key as usize] = Some((value[0], freshness));
+        });
+        done(latest)
+    });
+}
+
+/// C4 (conflated-network-images.md (a)): a conflated subscription's image
+/// gets a view fed from its lane; its values read Fresh.
+#[test]
+fn a_conflated_network_view_reads_its_values_fresh() {
+    use karyos_sys::freshness::Freshness;
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let address = free_address();
+    let _subscription = b
+        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    assert_eq!(b.network_view_counters().built, 1);
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    for key in 0..4 {
+        offer_keyed(&mut a, &mut b, &mut lane, key, 10 + key as u8);
+    }
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        (0..4).all(|key| latest[key] == Some((10 + key as u8, Freshness::Fresh)))
+    });
+}
+
+/// C4, GU-9 end to end: on an unreliable channel a lost update makes every
+/// key Stale since the gap's start once the receiver seals it, through the
+/// view's mailbox (the feeder acknowledges after recording the loss); an
+/// update past the gap restores its own key, Fresh.
+#[test]
+fn a_lost_update_stales_the_view_until_replaced() {
+    use karyos_sys::freshness::Freshness;
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let address = free_address();
+    let _subscription = b
+        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    for key in 0..4 {
+        offer_keyed(&mut a, &mut b, &mut lane, key, 10 + key as u8);
+    }
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest.iter().all(Option::is_some)
+    });
+    // The next DATA datagram, key 1's update, is lost; key 2's arrives.
+    b.net.as_mut().unwrap().drop_receiver_data(&[0]);
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 21);
+    offer_keyed(&mut a, &mut b, &mut lane, 2, 22);
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0].is_some_and(|(_, freshness)| freshness != Freshness::Fresh)
+            && latest[2] == Some((22, Freshness::Fresh))
+    });
+    let since = match latest[0] {
+        Some((10, Freshness::Stale { since })) => since,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(latest[1], Some((11, Freshness::Stale { since })));
+    assert_eq!(latest[3], Some((13, Freshness::Stale { since })));
+    // A replacement of key 1 past the gap is Fresh; key 0 stays Stale.
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 31);
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[1] == Some((31, Freshness::Fresh))
+    });
+    assert_eq!(latest[0], Some((10, Freshness::Stale { since })));
+    let views = b.network_view_counters();
+    assert!(views.acked >= 1, "{views:?}");
+    let counters = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert!(
+        counters.barrier_acks >= 1 && counters.gaps_sealed >= 1,
+        "{counters:?}"
+    );
+    assert_eq!(counters.barrier_timeouts, 0);
+}
+
+/// C4, design (c): once the view's terminal cell is published (here by the
+/// receive owner's side of the link), the conductor closes the feeder on
+/// its next duty, and the reader delivers nothing more and reports it.
+#[test]
+fn a_published_terminal_cell_closes_the_network_view() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let address = free_address();
+    let _subscription = b
+        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, VIEW)
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let link = b.network_view_link(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
+    let terminal = karyos_sys::freshness::Terminal {
+        start: 0,
+        end: 64,
+        reason: karyos_sys::freshness::TERMINAL_BARRIER_TIMEOUT,
+    };
+    assert!(link.terminal().unwrap().publish(terminal));
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_view_counters().closed_terminal == 1
+    });
+    let budget = karyos_sys::conflation::Budget {
+        keys: 16,
+        retries: 4,
+    };
+    let mut delivered = 0;
+    let report = reader.poll_changed(budget, |_, _, _, _| delivered += 1);
+    assert_eq!((delivered, report.terminal), (0, Some(terminal)));
+    assert!(
+        b.network_view_link(&image, Lane::ZERO).is_none(),
+        "feeder closed"
+    );
+}
