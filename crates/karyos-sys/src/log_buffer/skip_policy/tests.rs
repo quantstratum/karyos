@@ -441,3 +441,112 @@ fn a_committed_failure_stops_the_other_lanes() {
     assert_eq!(owner.first_hole(lane_one).unwrap(), Some((64, 64)));
     assert_eq!(owner.first_loss(lane_one), Some(None));
 }
+
+/// A gate that answers from a script, recording what it was asked.
+#[derive(Default)]
+struct Scripted {
+    pending: bool,
+    asked: Vec<(Lane, u64, u32, u64)>,
+}
+
+impl SealGate for Scripted {
+    fn before_seal(&mut self, lane: Lane, position: u64, extent: u32, now: u64) -> GateAnswer {
+        self.asked.push((lane, position, extent, now));
+        if self.pending {
+            GateAnswer::Pending
+        } else {
+            GateAnswer::Permit
+        }
+    }
+}
+
+/// A due hole whose gate answers Pending stays due and is posted: nothing
+/// is sealed, a copy into it is late after the skip and not written, and
+/// once the gate permits the hole is sealed whole and the post cleared.
+#[test]
+fn a_pending_gate_posts_the_hole_and_holds_its_seal() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy_of(SkipConfig::unreliable());
+    let mut gate = Scripted {
+        pending: true,
+        ..Scripted::default()
+    };
+    assert_eq!(skip.duty_gated(&mut owner, 0, &mut gate).unwrap().sealed, 0);
+    assert!(gate.asked.is_empty(), "not due yet");
+    let report = skip.duty_gated(&mut owner, MS, &mut gate).unwrap();
+    assert_eq!((report.sealed, report.gated), (0, 1));
+    assert_eq!(gate.asked, [(Lane::ZERO, 64, 64, MS)]);
+    assert_eq!(owner.posted(Lane::ZERO), Some((64, 128)));
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), Some((64, 64)));
+    // A late copy into the posted hole is refused and counted.
+    let late = receive(&mut owner, &data(0, 64, 9));
+    assert_eq!(late, Ok(Received::LateAfterSkip));
+    assert_eq!(owner.counters().frames_late_after_skip, 1);
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), Some((64, 64)));
+    // Still pending on the next duty: asked again, nothing sealed.
+    let report = skip.duty_gated(&mut owner, 2 * MS, &mut gate).unwrap();
+    assert_eq!((report.sealed, report.gated), (0, 1));
+    // Permitted: the whole hole is sealed and the post cleared.
+    gate.pending = false;
+    let report = skip.duty_gated(&mut owner, 3 * MS, &mut gate).unwrap();
+    assert_eq!(
+        (report.sealed, report.sealed_bytes, report.gated),
+        (1, 64, 0)
+    );
+    assert_eq!(owner.posted(Lane::ZERO), None);
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(192));
+    // The lane commits again above the sealed hole.
+    assert_eq!(
+        receive(&mut owner, &data(0, 192, 4)),
+        Ok(Received::Committed {
+            position: 192,
+            extent: 64
+        })
+    );
+}
+
+/// The ungated duty is the duty with a gate that always permits: the same
+/// seals, nothing posted.
+#[test]
+fn the_ungated_duty_seals_as_before() {
+    let (_buffer, mut gated_owner) = with_hole();
+    let (_buffer2, mut owner) = with_hole();
+    let mut gated = policy_of(SkipConfig::unreliable());
+    let mut plain = policy_of(SkipConfig::unreliable());
+    let mut gate = Scripted::default();
+    for now in [0, MS] {
+        let a = gated.duty_gated(&mut gated_owner, now, &mut gate).unwrap();
+        let b = plain.duty(&mut owner, now).unwrap();
+        assert_eq!(a, b);
+    }
+    assert_eq!(gate.asked, [(Lane::ZERO, 64, 64, MS)]);
+    assert_eq!(owner.posted(Lane::ZERO), None);
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(192));
+}
+
+/// A reliable range proven unrecoverable under `skip` asks the gate too:
+/// pending, it is posted and not sealed; permitted, it is sealed whole.
+#[test]
+fn an_unrecoverable_range_is_gated_too() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy_of(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    let mut gate = Scripted {
+        pending: true,
+        ..Scripted::default()
+    };
+    let report = skip
+        .range_unavailable_gated(&mut owner, Lane::ZERO, 96, 0, &mut gate)
+        .unwrap();
+    assert_eq!((report.sealed, report.gated, report.close), (0, 1, None));
+    assert_eq!(owner.posted(Lane::ZERO), Some((64, 128)));
+    // The unrecoverable range stays due: a later duty seals it once
+    // permitted, with no new RANGE_UNAVAILABLE.
+    gate.pending = false;
+    let report = skip.duty_gated(&mut owner, 0, &mut gate).unwrap();
+    assert_eq!((report.sealed, report.sealed_bytes), (1, 64));
+    assert_eq!(owner.posted(Lane::ZERO), None);
+    assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)));
+}
