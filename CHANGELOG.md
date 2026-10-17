@@ -45,8 +45,8 @@ release may break APIs, wire formats and shared-memory layouts.
   `CatchUp`. With several routes a failure stops only its route, kept
   for the control path (`take_failures`), and a route without a TX half
   this call is out for the call. `RouteCounters` count skipped, late and
-  uncancelled copies per route. `StageError::OutOfOrder` refuses a copy not above its route's
-  last one.
+  uncancelled copies per route. `StageError::OutOfOrder` refuses a copy
+  not above its route's last one.
 - A seal gate on the skip policy (conflated-network-images.md (b)):
   `SkipPolicy::duty_gated` and `SkipPolicy::range_unavailable_gated` ask a
   `SealGate` before each seal. While it answers `GateAnswer::Pending`, the
