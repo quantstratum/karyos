@@ -2566,13 +2566,13 @@ fn a_gap_waits_the_skew_window_while_another_path_is_live() {
         repairs: false,
         ..Setup::default()
     };
-    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let (mut rig, _b) = Rig::new(setup.again());
     let slot = established(&mut rig);
     let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
     let wait = nak_wait(&mut rig, slot);
     assert!(wait >= 1_000_000, "{wait} ns");
-    let (mut single, _b) = Rig::new(Setup { ..setup });
+    let (mut single, _b) = Rig::new(setup.again());
     let slot = established(&mut single);
     assert_eq!(nak_wait(&mut single, slot), 0);
 }
