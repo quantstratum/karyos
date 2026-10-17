@@ -356,3 +356,50 @@ fn a_failed_store_is_left_to_settle() {
     restarted.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A source that panics on its first read, taking the agent's thread with
+/// it.
+struct Panics;
+
+impl FrameSource for Panics {
+    fn position(&self) -> u64 {
+        0
+    }
+
+    fn read(&mut self, _out: &mut [u8]) -> Result<Frames, SourceError> {
+        panic!("the source panics on the agent's thread");
+    }
+
+    fn consumed(&mut self, _position: u64) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        Ok(to)
+    }
+}
+
+/// A command to an agent whose thread is gone returns `Gone` at once: the
+/// blocking send and the reply both see the closed channel.
+#[test]
+fn a_command_to_a_dead_agent_is_gone() {
+    let dir = temp_dir("dead");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    // The start is answered before the first duty, which panics.
+    let _ = agent.start(StartRecording {
+        source: Box::new(Panics),
+        ..start(Chunks::default())
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match agent.recordings() {
+            Err(AgentError::Gone) => break,
+            Ok(_) => assert!(std::time::Instant::now() < deadline, "the agent never died"),
+            Err(error) => panic!("{error:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(matches!(agent.stop(1), Err(AgentError::Gone)));
+    assert!(matches!(agent.shutdown(), Err(AgentError::Gone)));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
