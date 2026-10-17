@@ -11,6 +11,15 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- A conflated network view closes on its own. Its image retiring publishes
+  the terminal reason `TERMINAL_IMAGE_RETIRED` (4) with an empty interval;
+  exhausted versions or a feeder that cannot read on publish
+  `TERMINAL_FRESHNESS_EXHAUSTED` or the new `TERMINAL_FEEDER_LOST` (5), and
+  the image lane stays open for its other subscribers.
+  `NetworkViewCounters` splits `unbuilt` into `unbuilt_unexposed` and
+  `unbuilt_failed` with `last_build_failure` (`ViewBuildFailure`), and adds
+  `closed_retired` and `feeders_lost`. A view's configuration is also found
+  for an image on a subscription's later path.
 - `AgentConfig::control_capacity` defaults to 512 (was 256). Configuration
   now refuses a receiver control ring below `max_pending_challenges +
   max_images × max_paths + 32`, since an image's SM goes on each of its

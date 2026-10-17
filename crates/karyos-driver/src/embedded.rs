@@ -2882,15 +2882,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // A network image's view whose terminal cell is published is
             // done: its readers deliver nothing more, and the feeder stops
             // (conflated-network-images.md (c)).
-            if stream
+            let published = stream
                 .feeder
                 .as_ref()
                 .and_then(|feeder| feeder.fresh.as_ref())
-                .is_some_and(|fresh| {
+                .and_then(|fresh| {
                     karyos_sys::freshness::TerminalCell::read(&fresh.link.terminal_words())
-                        .is_some()
-                })
-            {
+                });
+            if let Some(published) = published {
                 if let Some(mut feeder) = stream.feeder.take() {
                     feeder.writer.close();
                 }
@@ -2955,6 +2954,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // A failed poll still reports what it handled before the failure.
             if let Some(counters) = &stream.feeder_counters {
                 counters.add(&self.counters, fed);
+            }
+            // A network image's view closes on its own, never sealing the
+            // image lane its other subscribers read (#324 review): exhausted
+            // versions or a feeder that cannot read on publish the view's
+            // terminal cell, every value stale, and the next duty closes
+            // the feeder.
+            if with_positions {
+                let reason = match (&terminal, &polled) {
+                    (Some(_), _) => Some(karyos_sys::freshness::TERMINAL_FRESHNESS_EXHAUSTED),
+                    (None, Err(_)) => Some(karyos_sys::freshness::TERMINAL_FEEDER_LOST),
+                    (None, Ok(_)) => None,
+                };
+                if let Some(reason) = reason {
+                    let _ = writer.publish_terminal(0, u64::MAX, reason);
+                    if let Some(net) = &mut self.net {
+                        net.count_views(|views| {
+                            if reason == karyos_sys::freshness::TERMINAL_FEEDER_LOST {
+                                views.add(|c| &mut c.feeders_lost, 1);
+                            }
+                        });
+                    }
+                    continue;
+                }
             }
             // A gap the poll stopped at: recorded now, or held (nothing
             // past it is polled) until the barrier takes it.
@@ -3267,28 +3289,50 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some((lane, link)) = self.net.as_ref().and_then(|net| net.image_freshness(slot)) else {
             return;
         };
-        let built = exposed.and_then(|handle| {
+        use crate::net::ViewBuildFailure;
+        // `Err(None)`: the image is not exposed.
+        let built: Result<(), Option<ViewBuildFailure>> = (|| {
+            let handle = exposed.ok_or(None)?;
             let id = handle
                 .lanes
                 .get(usize::from(lane.get()))
                 .copied()
-                .flatten()?;
-            let index = self.streams.iter().position(|stream| stream.id == id)?;
-            let stream_id = self.streams.get(index)?.stream_id;
-            let (_, config) = self.net.as_ref()?.conflation_of(endpoint, stream_id)?;
+                .flatten()
+                .ok_or(Some(ViewBuildFailure::NoLane))?;
+            let index = self
+                .streams
+                .iter()
+                .position(|stream| stream.id == id)
+                .ok_or(Some(ViewBuildFailure::NoLane))?;
+            let stream_id = self
+                .streams
+                .get(index)
+                .ok_or(Some(ViewBuildFailure::NoLane))?
+                .stream_id;
+            let (_, config) = self
+                .net
+                .as_ref()
+                .and_then(|net| net.conflation_of(endpoint, stream_id))
+                .ok_or(Some(ViewBuildFailure::NoConfiguration))?;
             let writer = karyos_sys::conflation::conflation_fresh(
                 config.keys,
                 config.value_capacity,
                 config.journal_capacity,
                 link.clone(),
             )
-            .ok()?;
-            let stream = self.streams.get_mut(index)?;
-            let inner = stream.conductor.subscribe(Role::Required).ok()?;
+            .map_err(|error| Some(ViewBuildFailure::Table(error)))?;
+            let stream = self
+                .streams
+                .get_mut(index)
+                .ok_or(Some(ViewBuildFailure::NoLane))?;
+            let inner = stream
+                .conductor
+                .subscribe(Role::Required)
+                .map_err(|_| Some(ViewBuildFailure::Subscription))?;
             let generation = GenerationLink::new();
             let subscription = ClientSubscription::new(inner)
                 .with_generation(Arc::clone(&generation), 0)
-                .ok()?;
+                .map_err(|_| Some(ViewBuildFailure::Subscription))?;
             stream.members.push(Member {
                 link: Arc::downgrade(&generation),
                 kind: MemberKind::Feeder,
@@ -3307,9 +3351,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if let Some(stream) = self.streams.get_mut(index) {
                 stream.feeder_counters = Some(counters);
             }
-            Some(())
-        });
-        if built.is_some()
+            Ok(())
+        })();
+        let deferred = self
+            .net
+            .as_ref()
+            .is_some_and(crate::net::Network::defers_view_attach);
+        if built.is_ok()
+            && !deferred
             && let Ok(mailbox) = link.mailbox()
         {
             // Attached once its feeder exists: the receiver's gate posts
@@ -3317,13 +3366,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             mailbox.attach();
         }
         if let Some(net) = &mut self.net {
-            net.count_views(|views| {
-                if built.is_some() {
-                    views.add(|c| &mut c.built, 1);
-                } else {
-                    views.add(|c| &mut c.unbuilt, 1);
+            net.count_views(|views| match built {
+                Ok(()) => views.add(|c| &mut c.built, 1),
+                Err(None) => views.add(|c| &mut c.unbuilt_unexposed, 1),
+                Err(Some(failure)) => {
+                    views.add(|c| &mut c.unbuilt_failed, 1);
+                    views.last_build_failure = Some(failure);
                 }
             });
+        }
+    }
+
+    /// Attaches every built conflated view of a network image that
+    /// `Network::defer_view_attach` held back (tests).
+    #[cfg(test)]
+    pub(crate) fn attach_network_views(&self) {
+        for stream in &self.streams {
+            if let Some(fresh) = stream
+                .feeder
+                .as_ref()
+                .and_then(|feeder| feeder.fresh.as_ref())
+                && let Ok(mailbox) = fresh.link.mailbox()
+            {
+                mailbox.attach();
+            }
         }
     }
 
@@ -3407,6 +3473,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }
                     if let Some(handle) = handle {
                         for stream in handle.streams() {
+                            // A conflated view of the image closes with a
+                            // typed reason, marking no value stale (design
+                            // (a)); the retire below closes the feeder.
+                            if let Some(feeder) = self
+                                .stream(stream)
+                                .ok()
+                                .and_then(|lane| lane.feeder.as_ref())
+                                .filter(|feeder| feeder.fresh.is_some())
+                            {
+                                let _ = feeder.writer.publish_terminal(
+                                    0,
+                                    0,
+                                    karyos_sys::freshness::TERMINAL_IMAGE_RETIRED,
+                                );
+                                if let Some(net) = &mut self.net {
+                                    net.count_views(|views| {
+                                        views.add(|c| &mut c.closed_retired, 1);
+                                    });
+                                }
+                            }
                             let _ = self.retire_lane_with(
                                 stream,
                                 SealReason::ImageRetired,

@@ -393,6 +393,15 @@ fn a_subscription_with_another_conflated_lane_is_refused() {
         Err(crate::DriverError::ConflationMismatch),
         "none where the first has one"
     );
+    let other = karyos_sys::conflation::ConflationConfig {
+        value_capacity: 16,
+        ..CONFIG
+    };
+    assert_eq!(
+        b.add_network_subscription_conflated(10, &channel(address), Lane::ZERO, other),
+        Err(crate::DriverError::ConflationMismatch),
+        "the same lane with another table"
+    );
     let second = b
         .add_network_subscription_conflated(10, &channel(address), Lane::ZERO, CONFIG)
         .unwrap();

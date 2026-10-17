@@ -249,22 +249,48 @@ impl NetSubscription {
 /// What the conflated views of network images did
 /// (conflated-network-images.md). Increments are checked: one that would
 /// overflow keeps its value.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct NetworkViewCounters {
     /// Views built over an exposed image lane.
     pub built: u64,
-    /// Installed images with a conflated lane that got no view: unexposed
-    /// (interim keying), or a table that could not be built.
-    pub unbuilt: u64,
+    /// Installed images with a conflated lane that got no view because the
+    /// image was not exposed (interim keying).
+    pub unbuilt_unexposed: u64,
+    /// Views that could not be built over an exposed lane (the lane, the
+    /// configuration, the table or the feeder's subscription failed); the
+    /// cause of the last is kept in `last_build_failure`.
+    pub unbuilt_failed: u64,
+    /// The cause of the last view that could not be built.
+    pub last_build_failure: Option<ViewBuildFailure>,
     /// Seal requests acknowledged after the loss was recorded.
     pub acked: u64,
     /// Seal requests whose acknowledgement was withheld while the barrier
     /// was full.
     pub withheld: u64,
-    /// Gaps met in the log and recorded there (sealed before the attach).
+    /// Ranges met in the log and recorded there as losses: a gap sealed
+    /// before the attach, or any other range the poll skipped (every
+    /// skip reason counts as a loss, conservatively).
     pub caught_up: u64,
-    /// Views closed because their terminal cell was published.
+    /// Views closed because their terminal cell was published (a timeout,
+    /// exhaustion, a loss below the frontier or a lost feeder).
     pub closed_terminal: u64,
+    /// Views closed because their image retired.
+    pub closed_retired: u64,
+    /// Feeders that could not read on: their view closed, the image stayed.
+    pub feeders_lost: u64,
+}
+
+/// Why a conflated view of a network image could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewBuildFailure {
+    /// The image has no stream for the conflated lane.
+    NoLane,
+    /// The subscription's view configuration is gone.
+    NoConfiguration,
+    /// The table could not be created.
+    Table(karyos_sys::conflation::ConflationError),
+    /// The feeder's subscription of the lane could not be made.
+    Subscription,
 }
 
 impl NetworkViewCounters {
@@ -403,6 +429,9 @@ pub(crate) struct Network {
     /// What the conflated views of network images did
     /// (conflated-network-images.md).
     views: NetworkViewCounters,
+    /// Conflated views built from now on are not attached (tests).
+    #[cfg(test)]
+    defer_view_attach: bool,
 }
 
 impl Network {
@@ -456,6 +485,8 @@ impl Network {
             paths_refused: 0,
             path_failures: 0,
             views: NetworkViewCounters::default(),
+            #[cfg(test)]
+            defer_view_attach: false,
         })
     }
 
@@ -879,6 +910,7 @@ impl Network {
 
     /// The conflated lane of the installed image `slot` and a clone of the
     /// link its view shares with the receiver's seal gate.
+    #[must_use]
     pub(crate) fn image_freshness(
         &self,
         slot: SlotRef,
@@ -1002,7 +1034,23 @@ impl Network {
         }
     }
 
+    /// Holds back the attach of the conflated views built from now on, as
+    /// if their feeders attached late (tests).
+    #[cfg(test)]
+    pub(crate) fn defer_view_attach(&mut self) {
+        self.defer_view_attach = true;
+    }
+
+    /// Whether views are attached late (always `false` outside tests).
+    pub(crate) fn defers_view_attach(&self) -> bool {
+        #[cfg(test)]
+        return self.defer_view_attach;
+        #[cfg(not(test))]
+        false
+    }
+
     /// What the conflated views of network images did.
+    #[must_use]
     pub(crate) fn view_counters(&self) -> NetworkViewCounters {
         self.views
     }
@@ -1014,6 +1062,10 @@ impl Network {
 
     /// The conflated lane and table configuration of the subscription to
     /// `stream_id` on `endpoint`, the view an image of that key gets.
+    ///
+    /// An image installed on a later path's endpoint (its first path lost,
+    /// then a path challenge) finds its subscription there too.
+    #[must_use]
     pub(crate) fn conflation_of(
         &self,
         endpoint: EndpointId,
@@ -1021,7 +1073,7 @@ impl Network {
     ) -> Option<(Lane, karyos_sys::conflation::ConflationConfig)> {
         self.subscriptions
             .iter()
-            .find(|entry| (entry.endpoint, entry.stream_id) == (endpoint, stream_id))
+            .find(|entry| entry.serves(endpoint, stream_id))
             .and_then(|entry| entry.conflated)
     }
 

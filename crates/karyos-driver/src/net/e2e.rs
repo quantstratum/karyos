@@ -1112,6 +1112,155 @@ fn a_published_terminal_cell_closes_the_network_view() {
     );
 }
 
+/// Subscribes B to a conflated view of `config` and connects A's one-lane
+/// publication, pumping until B has its image.
+fn conflated_pair(
+    a: &mut EmbeddedDriver,
+    b: &mut EmbeddedDriver,
+    config: karyos_sys::conflation::ConflationConfig,
+) -> (
+    crate::embedded::AggregateHandle,
+    crate::embedded::AggregateHandle,
+    crate::net::NetworkSubscription,
+) {
+    let address = free_address();
+    let subscription = b
+        .add_network_subscription_conflated(10, &channel(address, false), Lane::ZERO, config)
+        .unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address, false))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [a, b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    (publication, image.unwrap(), subscription)
+}
+
+/// C4 follow-up: a view whose table cannot be built is counted with its
+/// cause; the image is served without one.
+#[test]
+fn an_unbuildable_view_is_counted_with_its_cause() {
+    use crate::net::ViewBuildFailure;
+    use karyos_sys::conflation::ConflationError;
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let config = karyos_sys::conflation::ConflationConfig { keys: 0, ..VIEW };
+    let (_publication, image, _subscription) = conflated_pair(&mut a, &mut b, config);
+    let views = b.network_view_counters();
+    assert_eq!(
+        (views.built, views.unbuilt_failed, views.unbuilt_unexposed),
+        (0, 1, 0),
+        "{views:?}"
+    );
+    assert_eq!(
+        views.last_build_failure,
+        Some(ViewBuildFailure::Table(ConflationError::InvalidConfig))
+    );
+    assert!(b.network_view_reader(&image, Lane::ZERO).is_none());
+}
+
+/// C4 follow-up: a gap the receiver seals before the view attaches (the
+/// gate then seals as without a feeder) is met in the poll and recorded
+/// there, so every key read so far is Stale since its start.
+#[test]
+fn a_gap_sealed_before_the_attach_stales_the_view() {
+    use karyos_sys::freshness::Freshness;
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    b.net.as_mut().unwrap().defer_view_attach();
+    let (publication, image, _subscription) = conflated_pair(&mut a, &mut b, VIEW);
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[0] == Some((10, Freshness::Fresh))
+    });
+    b.net.as_mut().unwrap().drop_receiver_data(&[0]);
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 21);
+    offer_keyed(&mut a, &mut b, &mut lane, 2, 22);
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[2] == Some((22, Freshness::Fresh))
+    });
+    assert!(
+        matches!(latest[0], Some((10, Freshness::Stale { .. }))),
+        "{latest:?}"
+    );
+    b.attach_network_views();
+    let views = b.network_view_counters();
+    assert!(views.caught_up >= 1, "{views:?}");
+    assert_eq!(views.acked, 0, "{views:?}");
+}
+
+/// C4 follow-up, driver-level BehindFrontier: a seal request below the
+/// feeder's frontier publishes the terminal cell (reason below frontier)
+/// and is never acknowledged.
+#[test]
+fn a_seal_request_below_the_frontier_closes_the_view() {
+    use karyos_sys::freshness::{Freshness, TERMINAL_BELOW_FRONTIER};
+
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let (publication, image, _subscription) = conflated_pair(&mut a, &mut b, VIEW);
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let link = b.network_view_link(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
+    offer_keyed(&mut a, &mut b, &mut lane, 1, 11);
+    let mut latest = [None; 4];
+    view_until(&mut a, &mut b, &mut reader, &mut latest, |latest| {
+        latest[1] == Some((11, Freshness::Fresh))
+    });
+    let request = link.mailbox().unwrap().post(0, 1).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_view_counters().closed_terminal == 1
+    });
+    assert!(!link.mailbox().unwrap().is_acknowledged(request));
+    let terminal = karyos_sys::freshness::TerminalCell::read(&link.terminal_words()).unwrap();
+    assert_eq!(terminal.reason, TERMINAL_BELOW_FRONTIER);
+}
+
+/// C4 follow-up, docs#119 (a): a retiring image closes its view with the
+/// image-retired terminal reason, which the reader reports.
+#[test]
+fn a_retired_image_closes_its_view_as_retired() {
+    use karyos_sys::freshness::TERMINAL_IMAGE_RETIRED;
+
+    let (mut a, mut b) = (
+        fast_driver(ThreadingMode::Shared),
+        fast_driver(ThreadingMode::Shared),
+    );
+    let (publication, image, _subscription) = conflated_pair(&mut a, &mut b, VIEW);
+    let mut reader = b.network_view_reader(&image, Lane::ZERO).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
+    drop(lane);
+    a.remove_aggregate(&publication).unwrap();
+    let budget = karyos_sys::conflation::Budget {
+        keys: 16,
+        retries: 4,
+    };
+    let mut terminal = None;
+    pump(&mut [&mut a, &mut b], |_| {
+        terminal = reader.poll_changed(budget, |_, _, _, _| {}).terminal;
+        terminal.is_some()
+    });
+    assert_eq!(terminal.map(|t| t.reason), Some(TERMINAL_IMAGE_RETIRED));
+    let views = b.network_view_counters();
+    assert_eq!(
+        (views.closed_retired, views.closed_terminal),
+        (1, 0),
+        "{views:?}"
+    );
+}
+
 /// Offers numbered messages on `lane` up to `until`, runs A and B once and
 /// reads B's `reader`, checking order (T9).
 #[cfg(target_os = "linux")]
