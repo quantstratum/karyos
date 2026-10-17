@@ -2093,6 +2093,17 @@ impl SenderRole {
                 }
             }
         }
+        // A publication with no live receiver (no live member and no
+        // confirmed binding) announces again (ACS 15933).
+        for outbound in &self.publications {
+            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            let bound = self.bindings.iter().any(|binding| {
+                binding.endpoint == endpoint && binding.alias == alias && binding.last_sm.is_some()
+            });
+            if !bound && !outbound.connected(now) {
+                let _ = self.sessions.disconnected(endpoint, alias);
+            }
+        }
         let mut due = std::mem::take(&mut self.due);
         self.sessions
             .announce_due(now, |endpoint, announce| due.push((endpoint, announce)));

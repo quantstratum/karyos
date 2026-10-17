@@ -1120,3 +1120,69 @@ fn unbound_data_solicits_a_new_image() {
     }
     assert!(rig.agents.receiver.counters().data_committed > committed);
 }
+
+/// ACS 15933: a sender whose only receiver is gone past
+/// `image_liveness_timeout` (no live member, no confirmed binding)
+/// announces SETUP again; the receiver binds a new image through a fresh
+/// challenge and messages reach it. The announcements stop again at the
+/// next accepted SM.
+#[test]
+fn a_sender_with_no_receiver_announces_again() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        alias_quarantine: Some(1),
+        ..Setup::default()
+    });
+    let first = established(&mut rig);
+    let before = rig.agents.sender.role.session_counters();
+    // The receiver's image idles out and the sender's binding expires.
+    rig.now += 11_000 * MS;
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().reannounced == 1
+    });
+    rig.until(true, |rig| {
+        rig.agents.sender.role.session_counters().established == 2
+    });
+    let after = rig.agents.sender.role.session_counters();
+    assert!(after.announces > before.announces, "{after:?}");
+    let second = rig
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ImageEvent::Installed { slot, .. } => Some(*slot),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(second, first);
+    // Established again: announcements stop.
+    let announces = rig.agents.sender.role.session_counters().announces;
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    rig.now += 2_000 * MS;
+    for _ in 0..10 {
+        rig.round(true);
+    }
+    assert_eq!(
+        rig.agents.sender.role.session_counters().announces,
+        announces
+    );
+    // Messages reach the new image.
+    let (_conductor, mut subscriber) = image_subscriber(&rig, second, 0, Role::Optional);
+    let message = vec![4u8; 600];
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&message, AppendOptions::default())
+        .unwrap();
+    let mut delivered = None;
+    for _ in 0..2000 {
+        rig.round(true);
+        if let Some(got) = poll_message(&mut subscriber) {
+            delivered = Some(got);
+            break;
+        }
+    }
+    assert_eq!(delivered, Some(message));
+}
