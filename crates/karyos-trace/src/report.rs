@@ -69,12 +69,16 @@
 //! same publication, lane, trace id and `message_id`; it never creates a
 //! message of its own. A fragment drained before its message's `Publish`
 //! or `SubscriberPoll` is parked until one names the message's position:
-//! at most [`MAX_PARKED`] fragments, an overflow counted and putting the
-//! publication's non-final traces out of scope, and a fragment parked
-//! longer than the window `D` aged out and counted. A network journal is
-//! expected for a message at or above its start, below its boundary and
-//! outside its recorded gaps, or whenever it holds a record of the
-//! message. A publication with refused network journals
+//! at most [`MAX_PARKED`] fragments. An overflow is counted and puts every
+//! trace of the publication that is not final then out of scope, its later
+//! messages included (conservative). A fragment whose message can no
+//! longer appear, once every publisher and subscriber journal of its
+//! publication is terminal, is aged out and counted; the drain order of
+//! the journals never changes a verdict. A network journal is expected for
+//! a message at or above its start, below its boundary and outside its
+//! recorded gaps, or whenever it holds a record of the message; one closed
+//! without a boundary is lost, as a subscriber journal without its
+//! boundary is. A publication with refused network journals
 //! ([`TraceReport::network_refused`]) never has a final `Complete`.
 
 use std::cell::Cell;
@@ -209,6 +213,20 @@ struct Journal {
 }
 
 impl Journal {
+    /// The terminal close of its handle, with `boundary`: a network
+    /// journal without one has no decided membership, so it is lost.
+    fn close(&mut self, boundary: Option<u64>) {
+        self.owner_closed = true;
+        match self.kind {
+            Kind::Publisher => {}
+            Kind::Subscriber { .. } => self.boundary = boundary,
+            Kind::Network { .. } => {
+                self.boundary = boundary;
+                self.lost |= boundary.is_none();
+            }
+        }
+    }
+
     fn terminal(&self) -> bool {
         self.finals.is_some()
     }
@@ -337,8 +355,6 @@ type FragmentKey = (PublicationKey, u8, [u64; 2], u64);
 struct Parked {
     key: FragmentKey,
     observation: NetworkObservation,
-    /// Its collection time, in its journal's collection clock.
-    collected: u64,
 }
 
 /// What became of the network fragments the report parked.
@@ -346,7 +362,8 @@ struct Parked {
 pub struct ParkedCounts {
     /// Fragments that found the parking area full.
     pub overflowed: u64,
-    /// Fragments parked longer than the window `D`.
+    /// Fragments whose message can no longer appear: every publisher and
+    /// subscriber journal of their publication was terminal.
     pub aged: u64,
 }
 
@@ -477,7 +494,7 @@ pub struct TraceReport {
     parked: Vec<Parked>,
     parked_counts: ParkedCounts,
     /// Publications whose parking overflowed: their traces that were not
-    /// final then are out of scope.
+    /// final then, and every later message of them, are out of scope.
     parking_lost: Vec<PublicationKey>,
     /// Final answers of those traces, kept as they were.
     pinned: HashMap<[u64; 2], Verdict>,
@@ -675,8 +692,11 @@ impl TraceReport {
 
     /// Records the sealed gaps `[from, to)` of a network receiver journal's
     /// image, as far as known: frames in them are not expected. A gap list
-    /// that overflowed passes the gaps it kept; frames past them stay
-    /// expected.
+    /// that overflowed passes the gaps it kept, and frames past the last of
+    /// them stay expected, which is §5's in-process rule; passing no gaps
+    /// is the tool's rule, where every frame at or after the first gap
+    /// stays expected. Either way a frame lost to an unrecorded gap makes
+    /// its trace `Incomplete`, never a false `Complete`.
     pub fn network_gaps(&mut self, journal: JournalId, gaps: &[(u64, u64)]) {
         if let Some(journal) = self.journals.get_mut(journal.0)
             && matches!(journal.kind, Kind::Network { .. })
@@ -710,10 +730,7 @@ impl TraceReport {
     /// ([`JournalSource::state`]) needs no call.
     pub fn closed(&mut self, journal: JournalId, boundary: Option<u64>) {
         if let Some(journal) = self.journals.get_mut(journal.0) {
-            journal.owner_closed = true;
-            if matches!(journal.kind, Kind::Subscriber { .. } | Kind::Network { .. }) {
-                journal.boundary = boundary;
-            }
+            journal.close(boundary);
         }
     }
 
@@ -764,7 +781,38 @@ impl TraceReport {
         for index in 0..self.journals.len() {
             self.drain_journal(index)?;
         }
+        self.age_parked();
         Ok(())
+    }
+
+    /// Ages out the parked fragments whose message can no longer appear:
+    /// at least one publisher or subscriber journal of their publication
+    /// is registered and all of them are terminal, so every record that
+    /// could name the message was drained. Decided after every journal of
+    /// the pass, so no drain order changes it.
+    fn age_parked(&mut self) {
+        let journals = &self.journals;
+        let settled = |publication: &PublicationKey| {
+            let mut clients = journals.iter().filter(|journal| {
+                journal.publication == *publication
+                    && matches!(journal.kind, Kind::Publisher | Kind::Subscriber { .. })
+            });
+            let mut any = false;
+            let all = clients.all(|journal| {
+                any = true;
+                journal.terminal()
+            });
+            any && all
+        };
+        let before = self.parked.len();
+        self.parked.retain(|parked| !settled(&parked.key.0));
+        let aged = before
+            .checked_sub(self.parked.len())
+            .and_then(|aged| u64::try_from(aged).ok())
+            .unwrap_or(0);
+        if let Some(total) = self.parked_counts.aged.checked_add(aged) {
+            self.parked_counts.aged = total;
+        }
     }
 
     fn drain_journal(&mut self, index: usize) -> Result<(), TraceError> {
@@ -779,21 +827,14 @@ impl TraceReport {
         // after every record it holds.
         match journal.source.state() {
             SourceState::Open => {}
-            SourceState::Closed { boundary } => {
-                journal.owner_closed = true;
-                if matches!(journal.kind, Kind::Subscriber { .. } | Kind::Network { .. }) {
-                    journal.boundary = boundary;
-                }
-            }
+            SourceState::Closed { boundary } => journal.close(boundary),
             SourceState::Lost => {
                 journal.owner_closed = true;
                 journal.lost = true;
             }
         }
         let start = journal.start;
-        // The newest collection time of a network fragment this drain, and
-        // the publications whose fragments found the parking area full.
-        let mut newest: Option<u64> = None;
+        // The publications whose fragments found the parking area full.
         let mut lost_parking: Vec<PublicationKey> = Vec::new();
         loop {
             let item = rebased(journal.source.take(), start);
@@ -803,9 +844,7 @@ impl TraceReport {
                 journal.untracked.push(trace_id);
             }
             match item {
-                Collected::Record {
-                    record, collected, ..
-                } => {
+                Collected::Record { record, .. } => {
                     let observed = record.observed;
                     let clock = journal
                         .clocks
@@ -838,7 +877,6 @@ impl TraceReport {
                             path,
                             observed,
                         };
-                        newest = Some(newest.map_or(collected.time, |n| n.max(collected.time)));
                         let known = self
                             .fragments
                             .get(&fragment)
@@ -848,7 +886,6 @@ impl TraceReport {
                             None if self.parked.len() < MAX_PARKED => self.parked.push(Parked {
                                 key: fragment,
                                 observation,
-                                collected: collected.time,
                             }),
                             None => {
                                 count(&mut self.parked_counts.overflowed);
@@ -901,22 +938,6 @@ impl TraceReport {
         if journal.drained && journal.owner_closed {
             let finals = journal.attributor.close(attempted)?.collect();
             journal.finals = Some(finals);
-        }
-        // Fragments of this journal parked longer than `D` before its
-        // newest one: their message is not coming within the window.
-        if let Some(newest) = newest {
-            let span = self.attribution.span;
-            let before = self.parked.len();
-            self.parked.retain(|parked| {
-                parked.observation.journal != id
-                    || newest
-                        .checked_sub(parked.collected)
-                        .is_none_or(|age| age <= span)
-            });
-            let aged = before - self.parked.len();
-            for _ in 0..aged {
-                count(&mut self.parked_counts.aged);
-            }
         }
         for publication in lost_parking {
             self.lose_parking(publication);
