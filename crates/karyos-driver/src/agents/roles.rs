@@ -48,9 +48,24 @@ use karyos_protocol::network::{
     SetupAnswer, StatusMessage, classify,
 };
 use karyos_sys::host_clock::age_ns;
+use karyos_sys::log_buffer::ReceiveError;
+use karyos_sys::log_buffer::Received;
+use karyos_sys::receive::{Heartbeat, ImageParams, Item, ValidatedDatagram, ValidatedFrame};
+use karyos_sys::term::TermId;
+
+use crate::paths::PathConfig;
+use crate::paths::stats::{Arrival, Delivered, PathStats};
+use karyos_sys::sizing::TermLength;
 
 use super::chain::{ImageChain, SessionCommand, SessionEnd, SessionEvent};
 use super::control::{ControlItem, ControlRoutes, RouteSlot, SmGuard, SmSlot};
+use super::data::Outbound;
+
+/// The data DRR's budget per publication and cycle: probes and bytes.
+const DATA_BUDGET: karyos_protocol::lanes::drr::Budget = karyos_protocol::lanes::drr::Budget {
+    work: 64,
+    bytes: 1 << 20,
+};
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
 use crate::sessions::OsNonces;
@@ -108,6 +123,31 @@ pub struct ReceiverCounters {
     /// An image retired without its `RetireImage` unit, or installed without
     /// its binding: a broken invariant, counted.
     pub chain_invariant: u64,
+    /// DATA frames committed to an image.
+    pub data_committed: u64,
+    /// DATA frames already committed, late, ahead or not ready: dropped
+    /// (repair or the gap policy resolves them).
+    pub data_dropped: u64,
+    /// DATA frames the receive owner refused for a protocol rule.
+    pub data_refused: u64,
+    /// Fresh heartbeats (above the lane's highest seen position).
+    pub heartbeats: u64,
+    /// Heartbeats below the lane's highest seen position: replays,
+    /// refreshing nothing.
+    pub heartbeats_stale: u64,
+    /// Heartbeats at the lane's highest seen position (an idle sender):
+    /// alive only until `idle_image_timeout` after the last fresh evidence.
+    pub heartbeats_stationary: u64,
+    /// Heartbeats outside the image's receive window: rejected.
+    pub heartbeats_rejected: u64,
+    /// DATA datagrams from no binding: dropped.
+    pub data_unbound: u64,
+    /// DATA datagrams that failed validation for their image: dropped.
+    pub data_invalid: u64,
+    /// PATH_HB that refreshed a bound path.
+    pub path_heartbeats: u64,
+    /// PATH_HB from no bound path: dropped.
+    pub path_heartbeats_unbound: u64,
     /// Images asked of the conductor.
     pub create_image: u64,
     /// Later paths bound to installed images (RP-1): no image asked.
@@ -140,6 +180,10 @@ pub struct SenderCounters {
     /// Answered receivers not recorded: the binding table was full of
     /// confirmed bindings.
     pub bindings_full: u64,
+    /// Publications whose endpoint needs a reset before they can send again
+    /// (a gauge, recomputed each cycle; the endpoint table acts on it in
+    /// its own PR, ACS 15721).
+    pub needs_reset: u64,
     /// Unconfirmed bindings evicted to make room for a new answer.
     pub bindings_evicted: u64,
     /// Bindings expired: unconfirmed past `setup_challenge_timeout`, or
@@ -167,6 +211,8 @@ struct ReceiverBinding {
     receiver_id: Option<u64>,
     /// Its highest reported status per lane (consumption and window).
     lanes: Option<Lanes<LaneStatus>>,
+    /// The join points it was answered with: its bound until its first SM.
+    joins: Lanes<u64>,
     /// When it was last answered.
     answered_at: u64,
     /// When it last sent an accepted SM: `None` while unconfirmed.
@@ -207,7 +253,116 @@ pub struct ReceiverRole {
     sm_slots: Vec<Arc<SmSlot>>,
     sm_interval: u64,
     liveness_timeout: u64,
+    idle_timeout: u64,
+    /// The path statistics' configuration (redundant-paths.md section 5).
+    path_config: PathConfig,
     counters: ReceiverCounters,
+}
+
+/// Terms a path's statistics track per lane: the image's slots, three
+/// rotation slots and the default five spares.
+const STAT_TERM_SLOTS: usize = 8;
+
+/// Each lane's `(position, term count)` of `joins`, for
+/// [`PathStats::path_bound`].
+fn path_joins(joins: &Lanes<u64>, term_length: u32) -> [(u64, u64); 4] {
+    let mut out = [(0u64, 0u64); 4];
+    for (slot, join) in out.iter_mut().zip(joins.as_slice()) {
+        let term = join.checked_div(u64::from(term_length)).unwrap_or(0);
+        *slot = (*join, term);
+    }
+    out
+}
+
+/// Applies a datagram's evidence to `image`'s liveness at `now` (trusted
+/// profile): fresh evidence keeps it alive and restarts the idle clock;
+/// stationary heartbeats keep it alive only until `idle_timeout` after the
+/// last fresh evidence; anything else changes nothing.
+fn apply_evidence(
+    image: &mut Installed,
+    fresh: bool,
+    stationary: bool,
+    now: u64,
+    idle_timeout: u64,
+) {
+    if fresh {
+        image.evidence = now;
+        image.last_fresh = now;
+    } else if stationary && age_ns(now, image.last_fresh) < idle_timeout {
+        image.evidence = now;
+    }
+}
+
+/// What a heartbeat is to its image's liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatClass {
+    /// Above the lane's highest seen position: fresh evidence.
+    Fresh,
+    /// At the lane's highest seen position: an idle sender.
+    Stationary,
+    /// Below it: a replay.
+    Stale,
+    /// Outside the image's receive window.
+    Rejected,
+}
+
+/// Classifies `heartbeat` against the image's receive window and the
+/// highest heartbeat position seen on its lane, which a fresh one raises.
+fn classify_heartbeat(image: &mut Installed, heartbeat: &Heartbeat) -> HeartbeatClass {
+    let lane = heartbeat.lane();
+    let Some(position) = heartbeat
+        .term_id()
+        .count_from(image.initial_term_id)
+        .ok()
+        .and_then(|count| u64::from(count.get()).checked_mul(u64::from(image.term_length)))
+        .and_then(|base| base.checked_add(u64::from(heartbeat.term_offset())))
+    else {
+        return HeartbeatClass::Rejected;
+    };
+    if !image.owner.within_window(lane, position).unwrap_or(false) {
+        return HeartbeatClass::Rejected;
+    }
+    let Some(mark) = image.heartbeat_marks.get_mut(usize::from(lane.get())) else {
+        return HeartbeatClass::Rejected;
+    };
+    match *mark {
+        Some(seen) if position < seen => HeartbeatClass::Stale,
+        Some(seen) if position == seen => HeartbeatClass::Stationary,
+        _ => {
+            *mark = Some(position);
+            HeartbeatClass::Fresh
+        }
+    }
+}
+
+/// What the path statistics record of `frame` from `path`: its lane, term
+/// count, stream position and extent. `None` off any bound path or for a
+/// term outside the incarnation.
+fn delivered(
+    image: &Installed,
+    frame: &ValidatedFrame<'_>,
+    path: Option<(SlotRef, usize)>,
+    now: u64,
+) -> Option<Delivered> {
+    let (_, path) = path?;
+    let term = u64::from(
+        frame
+            .term_id()
+            .count_from(image.initial_term_id)
+            .ok()?
+            .get(),
+    );
+    let position = term
+        .checked_mul(u64::from(image.term_length))?
+        .checked_add(u64::from(frame.term_offset()))?;
+    Some(Delivered {
+        path,
+        lane: usize::from(frame.lane().get()),
+        term,
+        position,
+        length: u64::from(frame.extent()),
+        now,
+    })
 }
 
 /// An answered challenge waiting for the conductor's reply.
@@ -219,6 +374,10 @@ struct Chain {
     retire: Reservation,
     lane_count: u8,
     term_length: u32,
+    mtu: u32,
+    initial_term_id: i32,
+    /// The answer's join points: the first path's.
+    joins: Lanes<u64>,
 }
 
 /// An installed image: its receive owner, binding, SM cadence and
@@ -233,6 +392,19 @@ struct Installed {
     key: BindingKey,
     identity: Identity,
     lane_count: u8,
+    /// What its datagrams are validated against.
+    params: ImageParams,
+    /// Its paths' statistics, whose freshness refreshes path liveness
+    /// (redundant-paths.md RP-2).
+    stats: PathStats,
+    /// The term id of its first term, and its term length: a frame's term
+    /// count and stream position.
+    initial_term_id: TermId,
+    term_length: u32,
+    /// The highest heartbeat position seen per lane.
+    heartbeat_marks: [Option<u64>; 4],
+    /// The last fresh evidence: a committed frame or a fresh heartbeat.
+    last_fresh: u64,
     /// The window each SM grants per lane.
     window: u32,
     /// When the last SM was due; `None` before the first.
@@ -252,8 +424,9 @@ struct Installed {
 pub struct SenderRole {
     sessions: SendSessions,
     from_receiver: RingReceiver<ControlItem>,
-    /// Each publication's channel destination and join points.
-    publications: Vec<(EndpointId, Alias, SocketAddr, Lanes<u64>)>,
+    /// Each publication's data path: readers, channel destination, lane
+    /// queues (at most `publications`, allocated at creation).
+    publications: Vec<Outbound>,
     /// Control routes, one slot per endpoint the agent can hold.
     routes: Vec<RouteSlot>,
     budget: u32,
@@ -345,6 +518,11 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
                 .collect(),
             sm_interval: config.sm_interval,
             liveness_timeout: config.image_liveness_timeout,
+            idle_timeout: config.idle_image_timeout,
+            path_config: PathConfig {
+                max_paths: config.sessions.max_paths,
+                ..PathConfig::default()
+            },
             counters: ReceiverCounters::default(),
         },
     ))
@@ -456,6 +634,58 @@ impl ReceiverRole {
         self.sessions.counters()
     }
 
+    /// Live paths of the image at `slot` (tests).
+    #[cfg(test)]
+    pub(super) fn live_paths(&self, slot: SlotRef) -> usize {
+        self.sessions.paths().live(slot)
+    }
+
+    /// Hands the receiver a DATA heartbeat on lane 0 of the image at
+    /// `slot`, `ahead` bytes above its contiguous prefix, as if it came
+    /// from `source` on `endpoint` at `now` (tests).
+    #[cfg(test)]
+    pub(super) fn inject_heartbeat(
+        &mut self,
+        sessions: &SessionEnd,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        slot: SlotRef,
+        ahead: u64,
+        now: u64,
+    ) {
+        use karyos_protocol::frame::{Flags, FrameType, Word0};
+
+        let image = self.images.iter().find(|image| image.slot == slot).unwrap();
+        let position = image.owner.rebuild_position(Lane::ZERO).unwrap() + ahead;
+        let term_length = u64::from(image.term_length);
+        let term_id = image
+            .initial_term_id
+            .get()
+            .checked_add(u32::try_from(position / term_length).unwrap())
+            .unwrap();
+        let term_offset = u32::try_from(position % term_length).unwrap();
+        let alias = image.key.alias;
+        let mut bytes = [0u8; 32];
+        let word0 = Word0::new(
+            32,
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Data,
+        );
+        bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+        bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+        bytes[12..16].copy_from_slice(&alias.session_id.to_le_bytes());
+        bytes[16..20].copy_from_slice(&alias.stream_id.to_le_bytes());
+        bytes[20..24].copy_from_slice(&term_id.to_le_bytes());
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        intake.data(source, alias, &bytes);
+    }
+
     /// Whether the image installed at `slot` is held.
     #[must_use]
     pub fn has_image(&self, slot: SlotRef) -> bool {
@@ -558,6 +788,37 @@ impl ReceiverRole {
             self.count(|c| &mut c.chain_invariant);
             return Err(Some(chain.retire));
         };
+        // What its datagrams are validated against.
+        let params = TermLength::try_new(chain.term_length)
+            .ok()
+            .and_then(|term_length| {
+                ImageParams::new(
+                    key.alias.session_id,
+                    key.alias.stream_id,
+                    chain.lane_count,
+                    term_length,
+                    chain.mtu,
+                )
+                .ok()
+            });
+        let Some(params) = params else {
+            self.count(|c| &mut c.chain_invariant);
+            return Err(Some(chain.retire));
+        };
+        // The image's path statistics: allocated here, once per image, on
+        // the session command path; the first path is bound at its joins.
+        let mut stats = PathStats::new(
+            &self.path_config,
+            usize::from(chain.lane_count),
+            STAT_TERM_SLOTS,
+        );
+        if let Some((_, path)) = self.sessions.paths().lookup(key) {
+            let joins = path_joins(&chain.joins, chain.term_length);
+            stats.path_bound(
+                path,
+                joins.get(..usize::from(chain.lane_count)).unwrap_or(&[]),
+            );
+        }
         // S1: an image whose SM slot cannot be reserved is refused.
         let (Some(sm_slot), Some(sm)) = (
             self.to_sender.reserve(),
@@ -579,6 +840,12 @@ impl ReceiverRole {
             key,
             identity,
             lane_count: chain.lane_count,
+            params,
+            stats,
+            initial_term_id: TermId::new(chain.initial_term_id.cast_unsigned()),
+            term_length: chain.term_length,
+            heartbeat_marks: [None; 4],
+            last_fresh: now,
             window,
             sm_last: None,
             sm_slot: Some(sm_slot),
@@ -605,6 +872,17 @@ impl ReceiverRole {
                 work = work.checked_add(1).ok_or(overflow.clone())?;
                 continue;
             }
+            // §3.2 step 5: the receive owner's bounded cleaning.
+            let cleaned = self
+                .images
+                .get_mut(index)
+                .is_some_and(|image| image.owner.duty());
+            if cleaned {
+                work = work.checked_add(1).ok_or(overflow.clone())?;
+            }
+            let Some(image) = self.images.get(index) else {
+                break;
+            };
             let due = image
                 .sm_last
                 .is_none_or(|last| age_ns(now, last) >= self.sm_interval);
@@ -726,7 +1004,28 @@ impl ReceiverRole {
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Receiver);
-        let mut work = self.sessions.timers(now);
+        // A lost path stops being charged in its image's statistics from
+        // the terms it was lost in (RP-6). The term is the contiguous
+        // prefix's, deliberately: frames above a hole put the cut at the
+        // hole, which charges the lost path less, never more.
+        let images = &mut self.images;
+        let mut work = self.sessions.timers_with(now, |slot, path, _| {
+            if let Some(image) = images.iter_mut().find(|image| image.slot == slot) {
+                let mut terms = [0u64; 4];
+                for (lane, term) in terms.iter_mut().enumerate() {
+                    *term = u8::try_from(lane)
+                        .ok()
+                        .and_then(|lane| Lane::try_new(lane).ok())
+                        .and_then(|lane| image.owner.rebuild_position(lane))
+                        .and_then(|position| position.checked_div(u64::from(image.term_length)))
+                        .unwrap_or(0);
+                }
+                let lanes = usize::from(image.lane_count);
+                image
+                    .stats
+                    .path_lost(path, terms.get(..lanes).unwrap_or(&[]));
+            }
+        });
         work = work
             .checked_add(self.image_timers(sessions, now)?)
             .ok_or(overflow.clone())?;
@@ -774,6 +1073,122 @@ impl Intake<'_> {
         match self.role.to_sender.try_post(item) {
             Ok(()) => self.role.count(|c| &mut c.forwarded),
             Err(_) => self.role.count(full),
+        }
+    }
+
+    /// A DATA datagram from `source` (§3.2 step 2): only through its
+    /// binding (the first path's key or a later path's, RP-1), rechecked
+    /// active, validated against the image's parameters, each frame
+    /// committed by the receive owner. Fresh evidence (a committed frame or
+    /// a heartbeat) keeps the image and the path alive. Nothing allocates.
+    fn data(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
+        let key = BindingKey {
+            endpoint: self.endpoint,
+            source,
+            alias,
+        };
+        let role = &mut *self.role;
+        // The session table's admission rule (a live path's key, or the
+        // founding key of an image with no path rows), then the path's
+        // index for its statistics.
+        let bound = role.sessions.lookup(&key);
+        let path = role.sessions.paths().lookup(key);
+        let found = bound.and_then(|slot| {
+            role.images
+                .iter()
+                .position(|image| image.slot == slot && role.sessions.is_active(slot))
+        });
+        let Some(image) = found.and_then(|index| role.images.get_mut(index)) else {
+            role.count(|c| &mut c.data_unbound);
+            return;
+        };
+        let Ok(datagram) = ValidatedDatagram::parse(bytes, &image.params) else {
+            role.count(|c| &mut c.data_invalid);
+            return;
+        };
+        // Per item: committed, dropped, refused, then fresh, stale,
+        // stationary and rejected heartbeats. A datagram holds at most an
+        // MTU of 32-byte records: no overflow.
+        let mut outcomes = [0u32; 7];
+        let mut path_fresh = false;
+        for item in datagram.items() {
+            let (outcome, arrival) = match item {
+                Item::Frame(frame) => {
+                    let delivered = delivered(image, &frame, path, self.now);
+                    match image.owner.receive(&frame) {
+                        Ok(Received::Committed { position, extent }) => {
+                            // The heartbeat mark rises with committed data
+                            // too: a replayed older heartbeat after a data
+                            // period is never fresh.
+                            let end = position.checked_add(u64::from(extent));
+                            let lane = usize::from(frame.lane().get());
+                            if let (Some(end), Some(mark)) =
+                                (end, image.heartbeat_marks.get_mut(lane))
+                            {
+                                *mark = Some(mark.map_or(end, |seen| seen.max(end)));
+                            }
+                            (0, Some((delivered, Arrival::First)))
+                        }
+                        Ok(Received::Duplicate) => (1, Some((delivered, Arrival::Duplicate))),
+                        Ok(Received::Late) => (1, Some((delivered, Arrival::Late))),
+                        Ok(_) => (1, None),
+                        Err(ReceiveError::Conflict { .. }) => {
+                            (2, Some((delivered, Arrival::Conflict)))
+                        }
+                        Err(_) => (2, None),
+                    }
+                }
+                // A heartbeat is image evidence only inside the receive
+                // window and above the last one seen on its lane, so a
+                // replay keeps nothing alive (network-sessions.md, owner P2).
+                // It is never path evidence (RP-2: fresh frames and PATH_HB).
+                Item::Heartbeat(heartbeat) => match classify_heartbeat(image, &heartbeat) {
+                    HeartbeatClass::Fresh => (3, None),
+                    HeartbeatClass::Stale => (4, None),
+                    HeartbeatClass::Stationary => (5, None),
+                    HeartbeatClass::Rejected => (6, None),
+                },
+            };
+            if let Some((Some(delivered), arrival)) = arrival {
+                let fresh = image.stats.arrived(delivered, arrival);
+                // A conflicting copy is recorded, never path evidence.
+                path_fresh |= fresh && arrival != Arrival::Conflict;
+            }
+            if let Some(count) = outcomes.get_mut(outcome)
+                && let Some(next) = count.checked_add(1)
+            {
+                *count = next;
+            }
+        }
+        let fields: [fn(&mut ReceiverCounters) -> &mut u64; 7] = [
+            |c| &mut c.data_committed,
+            |c| &mut c.data_dropped,
+            |c| &mut c.data_refused,
+            |c| &mut c.heartbeats,
+            |c| &mut c.heartbeats_stale,
+            |c| &mut c.heartbeats_stationary,
+            |c| &mut c.heartbeats_rejected,
+        ];
+        let fresh = outcomes.first().is_some_and(|committed| *committed > 0)
+            || outcomes.get(3).is_some_and(|heartbeats| *heartbeats > 0);
+        // Image liveness, trusted profile (coordinator decision; an
+        // authenticated channel still needs its profile's freshness proof):
+        // fresh evidence (a committed frame or a heartbeat above the lane's
+        // highest seen position) keeps the image alive; an idle sender's
+        // stationary heartbeats keep it alive only until
+        // `idle_image_timeout` after the last fresh evidence; a replay keeps
+        // nothing alive.
+        let stationary = outcomes.get(5).is_some_and(|count| *count > 0);
+        apply_evidence(image, fresh, stationary, self.now, role.idle_timeout);
+        if path_fresh && let Some((slot, path)) = path {
+            // Fresh evidence on the path refreshes its liveness (RP-2),
+            // never the image's.
+            let _ = role.sessions.paths_mut().refresh(slot, path, self.now);
+        }
+        for (field, count) in fields.into_iter().zip(outcomes) {
+            for _ in 0..count {
+                role.count(field);
+            }
         }
     }
 
@@ -886,13 +1301,43 @@ impl Intake<'_> {
                         retire,
                         lane_count: joins.count(),
                         term_length: term.term_length,
+                        mtu: term.mtu,
+                        initial_term_id: term.initial_term_id,
+                        joins,
                     });
                     // The conductor gone: the driver is stopping.
                     let _ = sessions.events.post(create, event);
                     self.role.count(|c| &mut c.create_image);
                 }
-                if let AnswerOutcome::PathBound { .. } = outcome {
+                if let AnswerOutcome::PathBound { image, path } = outcome {
                     self.role.count(|c| &mut c.paths_bound);
+                    // The later path is charged and its freshness tracked
+                    // from its own joins (RP-1).
+                    let joins = self.role.sessions.paths().joins(image, path);
+                    if let (Some(joins), Some(installed)) = (
+                        joins,
+                        self.role.images.iter_mut().find(|held| held.slot == image),
+                    ) {
+                        let joins = path_joins(&joins, installed.term_length);
+                        installed.stats.path_bound(
+                            path,
+                            joins
+                                .get(..usize::from(installed.lane_count))
+                                .unwrap_or(&[]),
+                        );
+                    }
+                }
+            }
+            Control::PathHeartbeat(heartbeat) => {
+                let key = BindingKey {
+                    endpoint,
+                    source,
+                    alias: heartbeat.alias,
+                };
+                // It refreshes only its own bound path; it creates nothing.
+                match self.role.sessions.paths_mut().path_hb(key, now) {
+                    Some(_) => self.role.count(|c| &mut c.path_heartbeats),
+                    None => self.role.count(|c| &mut c.path_heartbeats_unbound),
                 }
             }
             Control::Challenge(_) | Control::Solicit(_) | Control::Status(_) => {
@@ -926,8 +1371,8 @@ impl RxHandler for Intake<'_> {
         let source = datagram.source();
         match classify(datagram.bytes()) {
             Ok(Datagram::Control(control)) => self.control(source, control),
-            Ok(Datagram::DataBatch(_) | Datagram::Heartbeat(_)) => {
-                self.role.count(|c| &mut c.unhandled);
+            Ok(Datagram::DataBatch(data) | Datagram::Heartbeat(data)) => {
+                self.data(source, data.alias(), data.bytes());
             }
             Err(_) => self.role.count(|c| &mut c.decode_errors),
         }
@@ -952,6 +1397,12 @@ impl SenderRole {
         self.sessions.counters()
     }
 
+    /// The data path of its `index`-th publication (tests).
+    #[cfg(test)]
+    pub(crate) fn outbound(&self, index: usize) -> Option<&Outbound> {
+        self.publications.get(index)
+    }
+
     fn count(&mut self, field: fn(&mut SenderCounters) -> &mut u64) {
         let mut overflowed = self.counters.overflowed;
         bump(field(&mut self.counters), &mut overflowed);
@@ -964,13 +1415,12 @@ impl SenderRole {
         &mut self,
         command: AgentCommand<O>,
     ) -> Option<(Reservation, AgentEvent<O>)> {
-        let (reply, publication, destination, joins) = match command {
+        let (reply, publication, outbound) = match command {
             AgentCommand::AddPublication {
                 reply,
                 publication,
-                destination,
-                joins,
-            } => (reply, publication, destination, joins),
+                outbound,
+            } => (reply, publication, outbound),
             AgentCommand::AddSubscription { reply, .. }
             | AgentCommand::AddPublishedAlias { reply, .. } => {
                 return Some((
@@ -982,14 +1432,18 @@ impl SenderRole {
             }
             _ => return None,
         };
-        let event = match self.sessions.add(publication) {
+        let matches = outbound.endpoint() == publication.endpoint
+            && outbound.alias() == publication.alias
+            && outbound.readers().len() == usize::from(publication.lane_count);
+        let added = if matches {
+            self.sessions.add(publication)
+        } else {
+            Err(SendSessionError::InvalidConfig)
+        };
+        let event = match added {
             Ok(()) => {
-                self.publications.push((
-                    publication.endpoint,
-                    publication.alias,
-                    destination,
-                    joins,
-                ));
+                // `add` refuses past `publications` entries, the capacity.
+                self.publications.push(*outbound);
                 AgentEvent::PublicationAdded {
                     endpoint: publication.endpoint,
                     alias: publication.alias,
@@ -1059,10 +1513,11 @@ impl SenderRole {
 
     /// The publication's channel destination and join points.
     fn route_of(&self, endpoint: EndpointId, alias: Alias) -> Option<(SocketAddr, Lanes<u64>)> {
-        self.publications
+        let outbound = self
+            .publications
             .iter()
-            .find(|(held, held_alias, ..)| *held == endpoint && *held_alias == alias)
-            .map(|(_, _, destination, joins)| (*destination, *joins))
+            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)?;
+        Some((outbound.destination(), outbound.joins()?))
     }
 
     /// One cycle: the controls the receiver handed over, then the
@@ -1078,6 +1533,8 @@ impl SenderRole {
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.prune(halves);
+        // Bindings past their lifetime go even when nothing arrives.
+        self.expire_bindings(now);
         let mut work = 0u32;
         for _ in 0..self.budget {
             let Ok(Some(item)) = self.from_receiver.try_take() else {
@@ -1133,7 +1590,66 @@ impl SenderRole {
         }
         // Its capacity stays for the next cycle.
         self.due = due;
+        // First sends (§3.1 step 8), only after establishment (§4.3).
+        let mut needing_reset = 0u64;
+        for index in 0..self.publications.len() {
+            let Some(outbound) = self.publications.get(index) else {
+                break;
+            };
+            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            if !self.sessions.is_established(endpoint, alias) {
+                continue;
+            }
+            let consumption = self.consumption(endpoint, alias);
+            let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                Half::Tx(tx) if *held == endpoint => Some(tx),
+                _ => None,
+            });
+            let (Some(tx), Some(outbound)) = (tx, self.publications.get_mut(index)) else {
+                continue;
+            };
+            let lanes = outbound.readers().len();
+            let served = outbound.serve(
+                tx,
+                DATA_BUDGET,
+                consumption
+                    .as_ref()
+                    .and_then(|positions| positions.get(..lanes)),
+            )?;
+            work = work.checked_add(served).ok_or(overflow.clone())?;
+            if outbound.needs_reset() {
+                needing_reset = needing_reset.checked_add(1).ok_or(overflow.clone())?;
+            }
+        }
+        self.counters.needs_reset = needing_reset;
         Ok(work)
+    }
+
+    /// The least position every receiver bound to `alias` on `endpoint`
+    /// consumed, per lane: a reliable channel's bound (SPEC §4). A receiver
+    /// answered but not yet heard from bounds at its join points. `None`
+    /// with no bound receiver at all: a reliable lane then holds.
+    fn consumption(&self, endpoint: EndpointId, alias: Alias) -> Option<[u64; 4]> {
+        let mut least: Option<[u64; 4]> = None;
+        for binding in &self.bindings {
+            if binding.endpoint != endpoint || binding.alias != alias {
+                continue;
+            }
+            let positions = least.get_or_insert([u64::MAX; 4]);
+            match binding.lanes {
+                Some(lanes) => {
+                    for (position, status) in positions.iter_mut().zip(lanes.as_slice()) {
+                        *position = (*position).min(status.consumption);
+                    }
+                }
+                None => {
+                    for (position, join) in positions.iter_mut().zip(binding.joins.as_slice()) {
+                        *position = (*position).min(*join);
+                    }
+                }
+            }
+        }
+        least
     }
 
     /// Records the receiver `answer` goes to: its challenge's `source` on
@@ -1153,6 +1669,7 @@ impl SenderRole {
             identity: answer.identity,
             receiver_id: None,
             lanes: None,
+            joins: answer.joins,
             answered_at: now,
             last_sm: None,
         };
@@ -1170,7 +1687,9 @@ impl SenderRole {
             .iter_mut()
             .find(|held| tuple(held) == tuple(&binding))
         {
-            *held = binding;
+            // The same receiver again: its consumption never moves back.
+            let lanes = held.lanes;
+            *held = ReceiverBinding { lanes, ..binding };
             return;
         }
         if self.bindings.len() >= self.max_bindings {
@@ -1226,8 +1745,8 @@ impl SenderRole {
         let lane_count = self
             .publications
             .iter()
-            .find(|(held, alias, ..)| *held == endpoint && *alias == status.alias)
-            .map(|(.., joins)| joins.count());
+            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
+            .and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
         let found = self.bindings.iter_mut().find(|binding| {
             binding.endpoint == endpoint
                 && binding.alias == status.alias

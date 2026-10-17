@@ -37,6 +37,7 @@
 
 pub mod chain;
 pub mod control;
+pub mod data;
 pub mod endpoints;
 pub mod images;
 pub mod ring;
@@ -186,6 +187,11 @@ pub struct AgentConfig {
     /// Receiver bindings the sender tracks (the receivers it answered),
     /// at least 1 (default 64).
     pub receiver_bindings: usize,
+    /// `idle_image_timeout` in ns: how long stationary heartbeats (an idle
+    /// sender repeating its position) keep an image alive after its last
+    /// fresh evidence (default 60 s, at least `image_liveness_timeout`;
+    /// coordinator decision, trusted profile).
+    pub idle_image_timeout: u64,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -215,6 +221,7 @@ impl Default for AgentConfig {
             sm_interval: 10_000_000,
             image_liveness_timeout: 10_000_000_000,
             receiver_bindings: 64,
+            idle_image_timeout: 60_000_000_000,
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -267,6 +274,11 @@ impl AgentConfig {
         if self.control_capacity < control {
             return Err(AgentError::InvalidConfig(
                 "control_capacity below max_pending_challenges + max_images + 32",
+            ));
+        }
+        if self.idle_image_timeout < self.image_liveness_timeout {
+            return Err(AgentError::InvalidConfig(
+                "idle_image_timeout below image_liveness_timeout",
             ));
         }
         // S1: three units per image in flight on each session ring.
@@ -378,10 +390,9 @@ pub enum AgentCommand<O: SocketOps> {
         reply: Reservation,
         /// The publication incarnation.
         publication: crate::sessions::send::Publication,
-        /// Its channel destination.
-        destination: std::net::SocketAddr,
-        /// Each lane's join point.
-        joins: karyos_protocol::network::Lanes<u64>,
+        /// Its data path: one reader per lane, the channel destination and
+        /// the lane quanta, built by the conductor ([`data::Outbound::new`]).
+        outbound: Box<data::Outbound>,
     },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]

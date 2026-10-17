@@ -139,7 +139,13 @@ fn created(
 
 /// The publication on A announced to B: the sender's publication, A's
 /// published alias and B's subscription.
-fn add_publication(links: &Links, a: EndpointId, b: EndpointId, destination: SocketAddr) {
+#[must_use = "the publication's log lives as long as its handles"]
+fn add_publication(
+    links: &Links,
+    a: EndpointId,
+    b: EndpointId,
+    destination: SocketAddr,
+) -> super::super::data::testing::TestLog {
     links
         .receiver
         .post(|reply| AgentCommand::AddPublishedAlias {
@@ -157,15 +163,34 @@ fn add_publication(links: &Links, a: EndpointId, b: EndpointId, destination: Soc
             max_term_length: super::super::images::DEFAULT_MAX_IMAGE_TERM_LENGTH,
         })
         .unwrap();
+    let (outbound, log) = outbound(a, destination);
     links
         .sender
         .post(|reply| AgentCommand::AddPublication {
             reply,
             publication: publication(a),
-            destination,
-            joins: Lanes::new(&[0]).unwrap(),
+            outbound,
         })
         .unwrap();
+    log
+}
+
+/// The one-lane test publication's data path on `endpoint`.
+fn outbound(
+    endpoint: EndpointId,
+    destination: SocketAddr,
+) -> (
+    Box<super::super::data::Outbound>,
+    super::super::data::testing::TestLog,
+) {
+    super::super::data::testing::outbound(
+        endpoint,
+        alias(),
+        destination,
+        publication(endpoint).term,
+        1,
+        false,
+    )
 }
 
 fn publication(endpoint: EndpointId) -> Publication {
@@ -189,7 +214,7 @@ fn publication(endpoint: EndpointId) -> Publication {
 fn a_loopback_setup_reaches_create_image() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, b, destination);
+    let _log = add_publication(&links, a, b, destination);
     let created = created(&mut agents, &links, &mut endpoints);
     assert_eq!(created, (b, identity(), Lanes::new(&[0]).unwrap()));
     assert_eq!(agents.receiver.counters().create_image, 1);
@@ -206,7 +231,7 @@ fn a_loopback_setup_reaches_create_image() {
 fn a_solicit_flood_is_capped() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, b, destination);
+    let _log = add_publication(&links, a, b, destination);
     drive(&mut agents, &links, &mut endpoints, |event| match event {
         AgentEvent::PublicationAdded { .. } => Some(()),
         _ => None,
@@ -256,9 +281,8 @@ fn a_multicast_answer_goes_to_the_group() {
         lane_count: 1,
     };
     sender.sessions.add(publication).unwrap();
-    sender
-        .publications
-        .push((EndpointId(1), alias(), group, Lanes::new(&[0]).unwrap()));
+    let (path, _log) = outbound(EndpointId(1), group);
+    sender.publications.push(*path);
     let challenge = Control::Challenge(karyos_protocol::network::RspChallenge {
         alias: alias(),
         identity: identity(),
@@ -365,7 +389,7 @@ fn the_control_path_emits_only_controls() {
 fn an_answer_waits_for_its_chain_credit() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, b, destination);
+    let _log = add_publication(&links, a, b, destination);
     let held: Vec<_> = std::iter::from_fn(|| agents.receiver.sessions.events.reserve()).collect();
     assert_eq!(held.len(), AgentConfig::default().session_command_capacity);
     let mut now = 0u64;
@@ -558,7 +582,16 @@ fn the_receiver_filters_before_the_ring() {
     intake.control(source, announce);
     intake.control(source, challenge_control());
     intake.control(source, solicit);
+    // A PATH_HB from no bound path creates nothing.
+    intake.control(
+        source,
+        Control::PathHeartbeat(karyos_protocol::network::PathHeartbeat {
+            alias: alias(),
+            identity: identity(),
+        }),
+    );
     let counters = role.counters();
+    assert_eq!(counters.path_heartbeats_unbound, 1);
     assert_eq!(counters.unsubscribed, 1);
     assert_eq!(counters.not_published, 3);
     assert_eq!(counters.forwarded, 0);
@@ -599,7 +632,7 @@ fn control_routes_evict_the_least_recently_used() {
 fn control_routes_survive_a_reset() {
     let (mut agents, links, mut endpoints, a, b) = two_endpoints();
     let destination = endpoints.local_address(b).unwrap();
-    add_publication(&links, a, b, destination);
+    let _log = add_publication(&links, a, b, destination);
     created(&mut agents, &links, &mut endpoints);
     endpoints.reset(&links, a).unwrap();
     let mut now = 10_000_000_000u64;
@@ -667,9 +700,8 @@ fn the_sender_validates_sms_against_its_bindings() {
     let endpoint = EndpointId(1);
     sender.sessions.add(publication(endpoint)).unwrap();
     let group: SocketAddr = "10.0.0.2:4000".parse().unwrap();
-    sender
-        .publications
-        .push((endpoint, alias(), group, Lanes::new(&[0]).unwrap()));
+    let (path, _log) = outbound(endpoint, group);
+    sender.publications.push(*path);
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // The answer to the receiver's challenge binds it.
     let answer = |boot_id| SetupAnswer {
@@ -815,9 +847,8 @@ fn unconfirmed_bindings_never_hold_the_table() {
         }])
         .unwrap(),
     };
-    sender
-        .publications
-        .push((endpoint, alias(), receiver, Lanes::new(&[0]).unwrap()));
+    let (path, _log) = outbound(endpoint, receiver);
+    sender.publications.push(*path);
     sender.status(endpoint, receiver, &status, 2);
     assert_eq!(sender.sessions.counters().established, 1);
     assert_eq!(sender.counters().bindings_evicted, 1);
@@ -830,4 +861,227 @@ fn unconfirmed_bindings_never_hold_the_table() {
     // Its SMs stop: it goes after the image liveness timeout.
     sender.expire_bindings(later + config.image_liveness_timeout);
     assert!(sender.bindings.is_empty());
+}
+
+/// The heartbeat rule of the trusted profile (coordinator decision): above
+/// the lane's highest seen position is fresh, at it stationary, below it
+/// stale, outside the image's window rejected.
+/// An installed one-lane image (session 5, stream 6, initial term 9,
+/// 64 KiB terms) for the liveness tests.
+fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
+    use std::sync::Arc;
+
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::log_buffer::{
+        DEFAULT_CLAIM_DEADLINE, LogBuffer, LogBufferConfig, PublicationMode, ReceiveOwner,
+    };
+    use karyos_sys::receive::ImageParams;
+    use karyos_sys::sizing::TermLength;
+    use karyos_sys::term::TermId;
+
+    let term_length = TermLength::try_new(65_536).unwrap();
+    let lane = Arc::new(
+        LogBuffer::new(LogBufferConfig {
+            term_length,
+            spare_slots: 5,
+            max_subscribers: 2,
+            mtu: 1408,
+            max_reserved: 8192,
+            initial_term_id: TermId::new(9),
+            lane: Lane::ZERO,
+            session_id: 5,
+            stream_id: 6,
+            publication: PublicationMode::Image {
+                join: 0,
+                local_gaps: true,
+            },
+            claim_deadline: DEFAULT_CLAIM_DEADLINE,
+            schedule_capacity: 0,
+        })
+        .unwrap(),
+    );
+    let params = ImageParams::new(5, 6, 1, term_length, 1408).unwrap();
+    let owner = ReceiveOwner::new(params, vec![Arc::clone(&lane)]).unwrap();
+    let image = super::Installed {
+        slot: super::SlotRef {
+            slot: 0,
+            generation: 1,
+        },
+        owner: Box::new(owner),
+        retire: None,
+        key: super::BindingKey {
+            endpoint: EndpointId(1),
+            source: "10.0.0.9:5000".parse().unwrap(),
+            alias: alias(),
+        },
+        identity: identity(),
+        lane_count: 1,
+        params,
+        stats: crate::paths::stats::PathStats::new(&crate::paths::PathConfig::default(), 1, 8),
+        initial_term_id: TermId::new(9),
+        term_length: 65_536,
+        heartbeat_marks: [None; 4],
+        last_fresh: 0,
+        window: 32_768,
+        sm_last: None,
+        sm_slot: None,
+        sm: Arc::new(super::SmSlot::default()),
+        evidence: 0,
+    };
+    (image, params)
+}
+
+#[test]
+fn heartbeats_are_classified_against_the_window_and_the_mark() {
+    use karyos_protocol::frame::{Flags, FrameType, Lane, Word0};
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    let heartbeat = |term_id: u32, term_offset: i32| {
+        let mut bytes = [0u8; 32];
+        let word0 = Word0::new(
+            32,
+            Flags::new(true, true, false, false, Lane::ZERO),
+            FrameType::Data,
+        );
+        bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+        bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
+        bytes[12..16].copy_from_slice(&5i32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&6i32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&term_id.to_le_bytes());
+        bytes
+    };
+    let mut classify = |bytes: [u8; 32]| {
+        let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+        let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+            panic!("not a heartbeat");
+        };
+        super::classify_heartbeat(&mut image, &heartbeat)
+    };
+    use super::HeartbeatClass::{Fresh, Rejected, Stale, Stationary};
+    assert_eq!(classify(heartbeat(9, 64)), Fresh);
+    assert_eq!(classify(heartbeat(9, 64)), Stationary);
+    assert_eq!(classify(heartbeat(9, 32)), Stale);
+    assert_eq!(classify(heartbeat(9, 128)), Fresh);
+    // Three terms ahead: outside the window.
+    assert_eq!(classify(heartbeat(12, 0)), Rejected);
+}
+
+#[test]
+fn stationary_heartbeats_stop_refreshing_after_the_idle_timeout() {
+    let (mut image, _) = installed_image();
+    let idle = 60_000_000_000;
+    super::apply_evidence(&mut image, true, false, 1_000, idle);
+    assert_eq!((image.evidence, image.last_fresh), (1_000, 1_000));
+    // Stationary within the idle timeout: alive, the idle clock kept.
+    super::apply_evidence(&mut image, false, true, 1_000 + idle - 1, idle);
+    assert_eq!(
+        (image.evidence, image.last_fresh),
+        (1_000 + idle - 1, 1_000)
+    );
+    // At the idle timeout: no longer evidence, so the image ages out.
+    super::apply_evidence(&mut image, false, true, 1_000 + idle, idle);
+    assert_eq!(
+        (image.evidence, image.last_fresh),
+        (1_000 + idle - 1, 1_000)
+    );
+    super::apply_evidence(&mut image, false, true, 1_000 + 2 * idle, idle);
+    assert_eq!(image.evidence, 1_000 + idle - 1);
+    // Fresh evidence restarts both.
+    super::apply_evidence(&mut image, true, false, 1_000 + 2 * idle, idle);
+    assert_eq!(
+        (image.evidence, image.last_fresh),
+        (1_000 + 2 * idle, 1_000 + 2 * idle)
+    );
+}
+
+#[test]
+fn a_stale_heartbeat_leaves_the_evidence_unchanged() {
+    let (mut image, _) = installed_image();
+    super::apply_evidence(&mut image, true, false, 5_000, 60_000_000_000);
+    super::apply_evidence(&mut image, false, false, 9_000, 60_000_000_000);
+    assert_eq!((image.evidence, image.last_fresh), (5_000, 5_000));
+}
+
+/// A sender with one publication on `EndpointId(1)`.
+fn sm_sender() -> super::SenderRole {
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    sender.sessions.add(publication(EndpointId(1))).unwrap();
+    let (path, _log) = outbound(EndpointId(1), "10.0.0.2:4000".parse().unwrap());
+    sender.publications.push(*path);
+    sender
+}
+
+/// The answer binding a receiver with `boot_id` at `join`.
+fn sm_answer(boot_id: [u64; 2], join: u64) -> karyos_protocol::network::SetupAnswer {
+    karyos_protocol::network::SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(EndpointId(1)).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: boot_id,
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[join]).unwrap(),
+    }
+}
+
+/// An SM from the receiver with `boot_id` at `consumption`.
+fn sm_status(boot_id: [u64; 2], consumption: u64) -> karyos_protocol::network::StatusMessage {
+    use karyos_protocol::network::{LaneStatus, Receiver, StatusMessage};
+
+    StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: boot_id,
+            receiver_id: 1,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[LaneStatus {
+            consumption,
+            window: 32_768,
+        }])
+        .unwrap(),
+    }
+}
+
+#[test]
+fn a_rebind_never_moves_a_reliable_position_back() {
+    let mut sender = sm_sender();
+    let endpoint = EndpointId(1);
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(endpoint, receiver, &sm_status([7, 8], 8192), 1);
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    // A new answer to the same receiver, at an older join: held.
+    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 2);
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    // Its next SM, older still: held, counted stale.
+    sender.status(endpoint, receiver, &sm_status([7, 8], 4096), 3);
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    assert_eq!(sender.counters().sm_stale, 1);
+}
+
+#[test]
+fn an_unconfirmed_receiver_bounds_at_its_joins() {
+    let mut sender = sm_sender();
+    let endpoint = EndpointId(1);
+    let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    assert_eq!(sender.consumption(endpoint, alias()), None);
+    sender.bind(endpoint, first, &sm_answer([7, 8], 0), 0);
+    sender.status(endpoint, first, &sm_status([7, 8], 8192), 1);
+    sender.bind(endpoint, second, &sm_answer([3, 4], 1024), 2);
+    // The second is answered but silent: it bounds at its join.
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 1024);
+    // Once heard from, at its consumption.
+    sender.status(endpoint, second, &sm_status([3, 4], 16_384), 3);
+    assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
+    // Another alias has no bound receiver.
+    let other = Alias {
+        session_id: 99,
+        ..alias()
+    };
+    assert_eq!(sender.consumption(endpoint, other), None);
 }
