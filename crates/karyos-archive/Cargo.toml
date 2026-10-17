@@ -19,6 +19,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# The counting allocator of tests/control_alloc.rs.
+karyos-sys = { workspace = true, features = ["test-hooks"] }
 
 [lints]
 workspace = true

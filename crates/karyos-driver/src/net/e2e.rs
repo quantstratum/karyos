@@ -538,6 +538,130 @@ fn a_multicast_publication_reaches_every_subscriber() {
     });
 }
 
+/// SPEC §13 phase 2, alias collision, on one multicast group: two
+/// publisher drivers use the same `session_id` and stream on one group.
+/// The subscribing driver's receiver keeps two images, keyed by source
+/// endpoint, and commits each source's frames into its own image: every
+/// frame of both publishers commits and none is refused. The driver
+/// exposes one aggregate per alias (interim D2, `add_image_aggregate`), so
+/// one image is exposed and the other is driven unexposed; the exposed
+/// one delivers only its own publisher's messages, every one, in order,
+/// and nothing of the other publisher crosses into it. Linux, after the
+/// loopback multicast probe, like `a_multicast_publication_reaches_every_subscriber`.
+#[cfg(target_os = "linux")]
+#[test]
+fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
+    use std::io::Write as _;
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED colliding_aliases_on_one_multicast_group_keep_two_images_apart: {why}"
+        );
+        return;
+    }
+    let group = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)),
+        free_address().port(),
+    );
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a1, mut a2, mut b) = (
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    let _ = b.add_network_subscription(10, &channel).unwrap();
+    // The same stream and session on both: one alias, two sources.
+    let publications = [
+        a1.add_network_publication(aggregate(10, 3, 1), &channel)
+            .unwrap(),
+        a2.add_network_publication(aggregate(10, 3, 1), &channel)
+            .unwrap(),
+    ];
+    // Two images installed: one exposed, the other driven unexposed.
+    let mut image = None;
+    pump(&mut [&mut a1, &mut a2, &mut b], |drivers| {
+        image = drivers[2].network_image(10, 3);
+        image.is_some() && drivers[2].network_images_unexposed() == 1
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    let mut lanes = [
+        a1.publication(publications[0].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+        a2.publication(publications[1].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+    ];
+    // Publisher p's message i is tagged (p, i).
+    let count = 64u32;
+    let mut sent = [0u32; 2];
+    let mut seen: Vec<(u8, u32)> = Vec::new();
+    let mut offer = |lanes: &mut [karyos_client::ClientPublication<HeapTerms>; 2]| {
+        for (publisher, lane) in lanes.iter_mut().enumerate() {
+            while sent[publisher] < count {
+                let mut payload = [0u8; 1000];
+                payload[0] = u8::try_from(publisher + 1).unwrap();
+                payload[1..5].copy_from_slice(&sent[publisher].to_le_bytes());
+                match lane.offer(&payload).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent[publisher] += 1,
+                    _ => break,
+                }
+            }
+        }
+        sent
+    };
+    pump(&mut [&mut a1, &mut a2, &mut b], |drivers| {
+        let sent = offer(&mut lanes);
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+                seen.push((bytes[0], index));
+            },
+            BUDGET,
+        );
+        // Every frame of both publishers is committed, each into its own
+        // image (1000-byte messages are one frame each).
+        let committed = drivers[2]
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap()
+            .data_committed;
+        sent == [count, count] && seen.len() >= 64 && committed >= 2 * u64::from(count)
+    });
+    // A while more: nothing else reaches the exposed image.
+    for _ in 0..200 {
+        let _ = a1.do_work().unwrap();
+        let _ = a2.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+                seen.push((bytes[0], index));
+            },
+            BUDGET,
+        );
+    }
+    let owner = seen[0].0;
+    let expected: Vec<(u8, u32)> = (0..count).map(|i| (owner, i)).collect();
+    assert_eq!(
+        seen, expected,
+        "a frame of the other publisher crossed, or one was lost"
+    );
+    let counters = b.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert_eq!(counters.create_image, 2, "{counters:?}");
+    assert_eq!(counters.data_refused, 0, "{counters:?}");
+}
+
 /// MC-1, the "required receiver precedence" row: a live required
 /// receiver bounds the sender under every strategy. On one multicast group
 /// B (receiver 77) stalls its subscriber and C reads everything. Under
