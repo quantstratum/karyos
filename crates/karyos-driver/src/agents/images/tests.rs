@@ -121,6 +121,7 @@ impl Rig {
             rig.agents.do_work(0).unwrap();
             rig.endpoints.poll(
                 &rig.links,
+                rig.now,
                 |event| opened += usize::from(matches!(event, EndpointEvent::Opened(_))),
                 |_| {},
             );
@@ -186,7 +187,7 @@ impl Rig {
             }
         }
         self.agents.do_work(self.now).unwrap();
-        self.endpoints.poll(&self.links, |_| {}, |_| {});
+        self.endpoints.poll(&self.links, self.now, |_| {}, |_| {});
         if serve {
             let events = &mut self.events;
             self.images
@@ -885,4 +886,46 @@ fn a_data_heartbeat_does_not_refresh_its_path() {
     assert_eq!(after.heartbeats, before.heartbeats + 10);
     assert_eq!(after.data_unbound, before.data_unbound + 2);
     assert!(rig.agents.receiver.role.has_image(slot));
+}
+
+/// The needs_reset wiring: a publication that needs a reset asks the
+/// endpoint table through the sender's events; the table resets the
+/// endpoint, the new epoch clears the need, and messages flow again.
+#[test]
+fn a_publication_needing_a_reset_gets_one() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    rig.agents
+        .sender
+        .role
+        .outbound_mut(0)
+        .unwrap()
+        .force_needs_reset();
+    rig.until(true, |rig| rig.endpoints.counters().resets == 1);
+    rig.until(true, |rig| {
+        !rig.agents.sender.role.outbound(0).unwrap().needs_reset()
+            && rig.agents.sender.counters().needs_reset == 0
+    });
+    assert!(rig.agents.sender.counters().reset_requests >= 1);
+    let message = vec![5u8; 700];
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&message, AppendOptions::default())
+        .unwrap();
+    let mut delivered = None;
+    for _ in 0..2000 {
+        rig.round(true);
+        if let Some(got) = poll_message(&mut subscriber) {
+            delivered = Some(got);
+            break;
+        }
+    }
+    assert_eq!(delivered, Some(message));
+    assert_eq!(rig.endpoints.counters().resets, 1);
 }

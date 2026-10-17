@@ -90,6 +90,11 @@ impl LaneGate for DataGate<'_> {
 }
 
 /// One lane's staged heads, in order, and what left.
+/// Sender cycles between two reset requests of a publication that still
+/// needs a reset: one lost to a full event ring, or ignored while its
+/// endpoint was busy, is asked again.
+pub const RESET_REQUEST_CYCLES: u64 = 64;
+
 #[derive(Debug)]
 struct LaneTrack {
     /// Ticket and the stream position after it, per staged datagram.
@@ -163,6 +168,9 @@ pub struct Outbound {
     opened: Option<BackendEpoch>,
     /// See [`Outbound::needs_reset`].
     needs_reset: bool,
+    /// The sender cycle its last reset request was posted in, while it
+    /// needs a reset.
+    reset_requested: Option<u64>,
     /// Report storage for closing queues (allocated at construction).
     report: TxReport,
     next_token: u64,
@@ -231,6 +239,7 @@ impl Outbound {
             tracks,
             opened: None,
             needs_reset: false,
+            reset_requested: None,
             report: TxReport::new(),
             next_token: 1,
             counters: OutboundCounters::default(),
@@ -329,6 +338,7 @@ impl Outbound {
         }
         self.opened = Some(epoch);
         self.needs_reset = false;
+        self.reset_requested = None;
         true
     }
 
@@ -452,6 +462,29 @@ impl Outbound {
     #[must_use]
     pub fn needs_reset(&self) -> bool {
         self.needs_reset
+    }
+
+    /// Whether a reset request is due in sender cycle `cycle`: it needs a
+    /// reset, and none was posted in the last [`RESET_REQUEST_CYCLES`].
+    #[must_use]
+    pub fn reset_request_due(&self, cycle: u64) -> bool {
+        self.needs_reset
+            && self.reset_requested.is_none_or(|at| {
+                cycle
+                    .checked_sub(at)
+                    .is_none_or(|age| age >= RESET_REQUEST_CYCLES)
+            })
+    }
+
+    /// Records a reset request posted in sender cycle `cycle`.
+    pub fn reset_request_posted(&mut self, cycle: u64) {
+        self.reset_requested = Some(cycle);
+    }
+
+    /// Marks the publication as needing a reset (tests).
+    #[cfg(test)]
+    pub(crate) fn force_needs_reset(&mut self) {
+        self.needs_reset = true;
     }
 
     /// Stages `lane`'s committed frames, one datagram per claimed TX frame,

@@ -14,6 +14,10 @@
 //!   them, resets the endpoint (reporting each item it returns), reopens it
 //!   with the next epoch, splits it and attaches the new halves;
 //!   [`EndpointEvent::Reopened`] follows once both agents hold them again.
+//!   The sender asks for a reset when a publication needs one
+//!   ([`AgentEvent::ResetRequested`]); a request within the endpoint's
+//!   interval is deferred, and the interval doubles while the fault
+//!   recurs (1 s to 60 s).
 //! - **Retire.** The same hand back and join, then `retire` until complete:
 //!   the socket closes and the entry leaves the table.
 //! - **Failure.** When an agent refuses a half, or a command to one agent
@@ -37,6 +41,7 @@ use karyos_io::sockets::endpoint::{
     Retired, SocketsConfig, SocketsEndpoint, SocketsRx, SocketsTx, SplitFailure,
 };
 use karyos_io::sockets::ops::SocketOps;
+use karyos_sys::host_clock::age_ns;
 
 use super::{
     AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, AgentLink, AgentLinks,
@@ -192,6 +197,52 @@ struct Entry<O: SocketOps> {
     /// The bound local address of the current epoch.
     local: std::net::SocketAddr,
     state: State<O>,
+    /// The least interval between two requested resets (ns).
+    backoff: u64,
+    /// When the last requested reset started.
+    last_reset: Option<u64>,
+    /// A request was deferred since the last requested reset: the fault
+    /// came back within the interval.
+    deferred: bool,
+}
+
+/// The first interval between two requested resets of an endpoint (ns).
+pub const RESET_BACKOFF_MIN: u64 = 1_000_000_000;
+/// The longest interval between two requested resets of an endpoint (ns).
+pub const RESET_BACKOFF_MAX: u64 = 60_000_000_000;
+
+/// The endpoint table's counters; checked, sticky on overflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EndpointCounters {
+    /// Endpoints that failed ([`EndpointEvent::Failed`]).
+    pub failed: u64,
+    /// Reset requests received from the sender.
+    pub reset_requests: u64,
+    /// Resets started for a request.
+    pub resets: u64,
+    /// Requests deferred: the endpoint was reset less than its interval
+    /// ago (a reset storm, bounded by the doubling interval).
+    pub resets_deferred: u64,
+    /// Requests ignored: the endpoint was unknown or not active (a
+    /// duplicate while a reset is in flight).
+    pub requests_ignored: u64,
+    /// Requested resets that could not start ([`Endpoints::reset`]
+    /// failed; the sender asks again).
+    pub resets_refused: u64,
+    /// An increment did not apply.
+    pub overflowed: bool,
+}
+
+impl EndpointCounters {
+    fn bump(&mut self, field: fn(&mut Self) -> &mut u64) {
+        let mut overflowed = self.overflowed;
+        let value = field(self);
+        match value.checked_add(1) {
+            Some(next) => *value = next,
+            None => overflowed = true,
+        }
+        self.overflowed = overflowed;
+    }
 }
 
 /// The conductor's endpoint table.
@@ -200,6 +251,7 @@ pub struct Endpoints<O: SocketOps> {
     max: usize,
     next: Option<InstanceId>,
     report: TxReport,
+    counters: EndpointCounters,
 }
 
 impl<O: SocketOps> std::fmt::Debug for Endpoints<O> {
@@ -235,6 +287,7 @@ impl<O: SocketOps> Endpoints<O> {
             max,
             next: Some(InstanceId::FIRST),
             report: TxReport::new(),
+            counters: EndpointCounters::default(),
         }
     }
 
@@ -333,6 +386,9 @@ impl<O: SocketOps> Endpoints<O> {
                     id,
                     config,
                     local,
+                    backoff: RESET_BACKOFF_MIN,
+                    last_reset: None,
+                    deferred: false,
                     state: State::Failing {
                         error: EndpointError::Agent(error.clone()),
                         sender: Fate::Posted,
@@ -347,13 +403,23 @@ impl<O: SocketOps> Endpoints<O> {
             config,
             local,
             state,
+            backoff: RESET_BACKOFF_MIN,
+            last_reset: None,
+            deferred: false,
         });
         Ok(id)
     }
 
     /// Resets an active endpoint: its halves come back, it is reset,
     /// reopened at its next epoch and attached again
-    /// ([`EndpointEvent::Reopened`]).
+    /// ([`EndpointEvent::Reopened`]). The reopen binds the address the
+    /// endpoint had bound (a port-0 endpoint keeps its port), so receivers'
+    /// bindings keyed by it stay valid. A reopen that fails, or that comes
+    /// back at another address ([`EndpointError::AddressChanged`]), fails
+    /// the endpoint: [`EndpointEvent::Failed`] follows and the entry leaves
+    /// the table. The sender requests resets itself through
+    /// [`AgentEvent::ResetRequested`], which [`Endpoints::poll`] serves
+    /// under a doubling interval.
     ///
     /// # Errors
     ///
@@ -421,25 +487,97 @@ impl<O: SocketOps> Endpoints<O> {
         Ok(())
     }
 
-    /// Serves the agents' endpoint answers and advances every entry,
-    /// reporting endpoint events to `on_event`; other agent events go to
-    /// `other`.
+    /// Serves the agents' endpoint answers and the sender's reset requests
+    /// at `now` (driver clock, ns), and advances every entry, reporting
+    /// endpoint events to `on_event` (failures are counted); other agent
+    /// events go to `other`.
     pub fn poll(
         &mut self,
         links: &AgentLinks<O>,
+        now: u64,
         mut on_event: impl FnMut(EndpointEvent),
         mut other: impl FnMut(AgentEvent<O>),
     ) {
         for link in [&links.sender, &links.receiver] {
             while let Some(event) = link.take_event() {
+                if let AgentEvent::ResetRequested { endpoint } = event {
+                    self.requested(links, endpoint, now);
+                    continue;
+                }
                 if let Some(event) = self.answer(event) {
                     other(event);
                 }
             }
         }
         // Backwards, so a removed entry never makes the loop skip another.
+        // Each entry fails at most once, so at most `max` failures.
+        let (mut failed, mut overflowed) = (0usize, false);
         for index in (0..self.entries.len()).rev() {
-            self.advance(links, index, &mut on_event);
+            self.advance(links, index, &mut |event: EndpointEvent| {
+                if matches!(event, EndpointEvent::Failed { .. }) {
+                    match failed.checked_add(1) {
+                        Some(next) => failed = next,
+                        None => overflowed = true,
+                    }
+                }
+                on_event(event);
+            });
+        }
+        for _ in 0..failed {
+            self.counters.bump(|c| &mut c.failed);
+        }
+        self.counters.overflowed |= overflowed;
+    }
+
+    /// The table's counters.
+    #[must_use]
+    pub fn counters(&self) -> EndpointCounters {
+        self.counters
+    }
+
+    /// A reset request from the sender at `now` (driver clock, ns): the
+    /// endpoint is reset if it is active and its last requested reset is
+    /// at least its interval old. A request within the interval is
+    /// deferred, and the next reset doubles the interval (up to
+    /// [`RESET_BACKOFF_MAX`]); a reset after a clean interval starts over
+    /// at [`RESET_BACKOFF_MIN`]. The sender asks again while the need
+    /// holds, so a deferred or refused request is not lost.
+    fn requested(&mut self, links: &AgentLinks<O>, endpoint: EndpointId, now: u64) {
+        self.counters.bump(|c| &mut c.reset_requests);
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == endpoint)
+            .filter(|entry| matches!(entry.state, State::Active))
+        else {
+            self.counters.bump(|c| &mut c.requests_ignored);
+            return;
+        };
+        if let Some(at) = entry.last_reset
+            && age_ns(now, at) < entry.backoff
+        {
+            entry.deferred = true;
+            self.counters.bump(|c| &mut c.resets_deferred);
+            return;
+        }
+        let backoff = if entry.deferred {
+            entry
+                .backoff
+                .checked_mul(2)
+                .map_or(RESET_BACKOFF_MAX, |doubled| doubled.min(RESET_BACKOFF_MAX))
+        } else {
+            RESET_BACKOFF_MIN
+        };
+        match self.reset(links, endpoint) {
+            Ok(()) => {
+                if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) {
+                    entry.backoff = backoff;
+                    entry.last_reset = Some(now);
+                    entry.deferred = false;
+                }
+                self.counters.bump(|c| &mut c.resets);
+            }
+            Err(_) => self.counters.bump(|c| &mut c.resets_refused),
         }
     }
 
@@ -459,7 +597,8 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::PublicationAdded { .. }
             | AgentEvent::PublicationRefused { .. }
             | AgentEvent::Configured { .. }
-            | AgentEvent::Unsupported { .. } => return Some(event),
+            | AgentEvent::Unsupported { .. }
+            | AgentEvent::ResetRequested { .. } => return Some(event),
         };
         let Ok(index) = self.index(endpoint) else {
             // An answer for an endpoint already gone: dropped (a half in

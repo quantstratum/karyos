@@ -473,6 +473,15 @@ pub enum AgentEvent<O: SocketOps> {
         /// The agent.
         agent: AgentKind,
     },
+    /// The sender asks for an endpoint reset: a publication on `endpoint`
+    /// needs one before it can send again (`Outbound::needs_reset`). Posted
+    /// unsolicited into a free slot, and again every
+    /// `RESET_REQUEST_CYCLES` sender cycles while the need holds; the
+    /// endpoint table ignores it unless the endpoint is active.
+    ResetRequested {
+        /// The endpoint.
+        endpoint: EndpointId,
+    },
 }
 
 /// What an agent has from the conductor: its rings, its stop flag and its
@@ -688,6 +697,13 @@ impl<O: SocketOps> SenderAgent<O> {
             return Ok(served);
         }
         let work = role.duty(&mut core.halves, now)?;
+        // A full ring drops the request; the next cycle asks again.
+        let events = &core.events;
+        role.request_resets(|endpoint| {
+            events
+                .try_post(AgentEvent::ResetRequested { endpoint })
+                .is_ok()
+        });
         served
             .checked_add(work)
             .ok_or(AgentError::CountOverflow(AgentKind::Sender))
