@@ -42,6 +42,18 @@ release may break APIs, wire formats and shared-memory layouts.
   start read before the call, not submitted, or uncertain, when the
   backend left its exposure unknown (RC-6). `ControlSendError::Uncertain`
   reports it, and an uncertain RTT probe yields no sample.
+- The sender agent repairs reliable publications (R4, R5, R7 wired).
+  `agents::repair::RepairPath` admits a bound receiver's NAK against the
+  lane's retention floor and submitted frontier, coalesces it into a
+  group job, and serves jobs through the NAK read into one scratch
+  datagram and a repair queue outside the lane sender, so repairs never
+  touch the data DRR. The cycle runs control, repair and first sends in
+  that order. Repairs take turns across publications within one
+  `RepairConfig::budget` per cycle, and at most `naks_per_cycle` NAKs are
+  admitted. Admission's and step 8's ERR NAK_REPLYs go to the receiver's
+  bound source through the ERR linger. A repair read out of word 0 loads
+  now suspends the call with the job and the lane's deficit kept
+  (`RepairReadError::Budget`). `AgentConfig::repair` holds the settings.
 - The network agents measure RTT (RC-1). Each installed image sends one
   RTTM REQUEST per bound path and `rtt_probe_interval`; the sender reads
   the clock immediately before the submitting call and reports the start

@@ -50,6 +50,14 @@
 //!   the publication's incarnation and its receiver id, within
 //!   `rttm_reply_rate` per source ([`RttReplies`]); the REPLY echoes the
 //!   probe id with the service delay since the request was taken.
+//!   Repair (R4, R5, R7; ACS 15920): a NAK the receiver hands over is
+//!   admitted only from a receiver bound on that endpoint (source, boot
+//!   id, incarnation and receiver id), at most `naks_per_cycle` a cycle;
+//!   admission's ERR goes back to the NAK's source. After the control step
+//!   and before first sends, the reliable publications serve their repair
+//!   jobs in turn from a cursor that moves each cycle, within one repair
+//!   budget per cycle, and their step 8 ERRs go to each requester's bound
+//!   source ([`super::repair`]).
 //!
 //! Every queue and table is allocated when the agents are created; drops
 //! are counted, each under its own counter.
@@ -87,9 +95,11 @@ const DATA_BUDGET: karyos_protocol::lanes::drr::Budget = karyos_protocol::lanes:
     work: 64,
     bytes: 1 << 20,
 };
+use super::repair::{NakOutcome as NakIntake, RepairConfig};
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
 use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
+use crate::repair::admission::Requester;
 use crate::repair::loss::{Hole, ImageLoss, LossConfig, Observation, ReplyOutcome as NakOutcome};
 use crate::rtt::{Probe, ReplyOutcome, RttConfig, RttProbes, RttReplies};
 use crate::sessions::OsNonces;
@@ -192,6 +202,8 @@ pub struct ReceiverCounters {
     pub rttm_replies_unbound: u64,
     /// RTTM REQUESTs forwarded to the sender dropped with the ring full.
     pub ring_full_rttm_request: u64,
+    /// NAKs for a local publication dropped with the ring full.
+    pub ring_full_nak_forwarded: u64,
     /// Probe id refills that drew from the operating system: a system call
     /// on the receiver agent's timer step, a known deviation until the
     /// agents have a control thread (ACS 15868).
@@ -266,6 +278,19 @@ pub struct SenderCounters {
     pub reset_requests: u64,
     /// Reset requests not posted: the event ring was full.
     pub reset_requests_full: u64,
+    /// NAKs that reached admission (at most `naks_per_cycle` per cycle).
+    pub naks: u64,
+    /// NAKs dropped over `naks_per_cycle`: the receiver retries.
+    pub nak_cycle_budget: u64,
+    /// NAKs from no receiver bound on that endpoint (source, alias, boot
+    /// id, incarnation and receiver id), or for no reliable publication.
+    pub nak_unbound: u64,
+    /// ERR NAK_REPLYs sent (admission's and step 8's).
+    pub nak_replies: u64,
+    /// Step 8 ERRs whose requester has no bound source: not sent.
+    pub nak_replies_unbound: u64,
+    /// Repair datagrams submitted.
+    pub repairs: u64,
     /// RTTM REPLYs sent (counted in `sent` too).
     pub rttm_replied: u64,
     /// RTTM REQUESTs from no receiver this sender answered (source, alias,
@@ -763,11 +788,24 @@ pub struct SenderRole {
     membership: MembershipTiming,
     /// The RTTM reply rate per source endpoint (RC-1).
     replies: RttReplies,
+    /// The repair settings (R4, R5, R7).
+    repair: RepairConfig,
+    /// NAKs admitted this cycle.
+    naks_this_cycle: u32,
+    /// The publication whose repairs run first next cycle.
+    repair_cursor: usize,
+    /// Step 8 ERRs drained this cycle, with their endpoint (allocated at
+    /// creation).
+    nak_replies: Vec<(EndpointId, NakReply)>,
     /// The clock read immediately before a REQUEST's backend call.
     clock: fn() -> u64,
     counters: SenderCounters,
     /// The network trace hook and journals (P2.12 step 3).
     trace: super::net_trace::SenderTrace,
+    /// Test only: NAKs are dropped unread, as from a sender that never
+    /// repairs (receiver rigs that answer NAKs themselves).
+    #[cfg(test)]
+    ignore_naks: bool,
 }
 
 /// The driver settings a publication's membership follows: the receivers'
@@ -871,9 +909,15 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             cycle: 0,
             membership: MembershipTiming::of(config),
             replies,
+            repair: config.repair,
+            naks_this_cycle: 0,
+            repair_cursor: 0,
+            nak_replies: Vec::with_capacity(config.repair.replies),
             clock: karyos_sys::host_clock::host_monotonic_ns,
             counters: SenderCounters::default(),
             trace: super::net_trace::SenderTrace::default(),
+            #[cfg(test)]
+            ignore_naks: false,
         },
         ReceiverRole {
             #[cfg(test)]
@@ -2009,6 +2053,10 @@ impl Intake<'_> {
                 control: Control::Rttm(_),
                 ..
             } => |c| &mut c.ring_full_rttm_request,
+            ControlItem::Incoming {
+                control: Control::Nak(_),
+                ..
+            } => |c| &mut c.ring_full_nak_forwarded,
             ControlItem::Incoming { .. } => |c| &mut c.ring_full_challenge,
         };
         match self.role.to_sender.try_post(item) {
@@ -2472,11 +2520,12 @@ impl Intake<'_> {
                     None => self.role.count(|c| &mut c.path_heartbeats_unbound),
                 }
             }
-            Control::Challenge(_) | Control::Solicit(_) | Control::Status(_) => {
+            Control::Challenge(_) | Control::Solicit(_) | Control::Status(_) | Control::Nak(_) => {
                 let alias = match control {
                     Control::Challenge(challenge) => challenge.alias,
                     Control::Solicit(solicit) => solicit.alias,
                     Control::Status(status) => status.alias,
+                    Control::Nak(nak) => nak.alias,
                     _ => return,
                 };
                 // Only for a publication of this endpoint (DN-4 pre-filter).
@@ -2635,7 +2684,20 @@ impl SenderRole {
         let added = match membership {
             Some(membership) if matches => {
                 outbound.attach_membership(Box::new(membership));
-                self.sessions.add(publication)
+                // A reliable publication repairs (R4, R5, R7).
+                let repairs = !outbound.reliable()
+                    || outbound
+                        .enable_repair(
+                            &self.repair,
+                            publication.term.term_length,
+                            publication.identity,
+                        )
+                        .is_ok();
+                if repairs {
+                    self.sessions.add(publication)
+                } else {
+                    Err(SendSessionError::InvalidConfig)
+                }
             }
             _ => Err(SendSessionError::InvalidConfig),
         };
@@ -2770,6 +2832,7 @@ impl SenderRole {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);
+        self.naks_this_cycle = 0;
         // Bindings past their lifetime go even when nothing arrives.
         self.expire_bindings(now);
         let mut work = 0u32;
@@ -2814,6 +2877,12 @@ impl SenderRole {
                     control: Control::Status(status),
                     ..
                 } => self.status(endpoint, source, &status, now),
+                ControlItem::Incoming {
+                    endpoint,
+                    source,
+                    control: Control::Nak(nak),
+                    ..
+                } => self.nak(halves, endpoint, source, &nak, now),
                 ControlItem::Incoming {
                     endpoint,
                     source,
@@ -2871,6 +2940,11 @@ impl SenderRole {
         }
         // Its capacity stays for the next cycle.
         self.due = due;
+        // Repair, then first sends (reliable-transport.md, "Order in a
+        // cycle"), each to its own budget.
+        work = work
+            .checked_add(self.serve_repairs(halves, now)?)
+            .ok_or(overflow.clone())?;
         // First sends (§3.1 step 8), only after establishment (§4.3).
         let mut needing_reset = 0u64;
         for index in 0..self.publications.len() {
@@ -2937,6 +3011,13 @@ impl SenderRole {
     #[cfg(test)]
     pub(super) fn set_clock(&mut self, clock: fn() -> u64) {
         self.clock = clock;
+    }
+
+    /// Drops every NAK unread from now on, as a sender that never repairs
+    /// (tests).
+    #[cfg(test)]
+    pub(super) fn ignore_naks(&mut self) {
+        self.ignore_naks = true;
     }
 
     /// The least position every receiver bound to `alias` on `endpoint`
@@ -3131,6 +3212,167 @@ impl SenderRole {
             },
             ..*request
         })
+    }
+
+    /// A NAK from `source` on `endpoint` at `now` (R4): within the cycle's
+    /// `naks_per_cycle`, only from a receiver bound there (source, boot id,
+    /// incarnation and receiver id), for a reliable publication; then
+    /// admission and the job table. An admission ERR goes back to the
+    /// NAK's source.
+    fn nak<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        source: SocketAddr,
+        nak: &Nak,
+        now: u64,
+    ) {
+        #[cfg(test)]
+        if self.ignore_naks {
+            return;
+        }
+        if self.naks_this_cycle >= self.repair.naks_per_cycle {
+            self.count(|c| &mut c.nak_cycle_budget);
+            return;
+        }
+        self.expire_bindings(now);
+        let normal = normalized(source);
+        let bound = self.bindings.iter().any(|binding| {
+            binding.endpoint == endpoint
+                && binding.alias == nak.alias
+                && binding.source == normal
+                && binding.boot_id == nak.receiver.receiver_boot_id
+                && binding.identity == nak.identity
+                && binding
+                    .receiver_id
+                    .is_none_or(|id| id == nak.receiver.receiver_id)
+        });
+        let index = self.publications.iter().position(|outbound| {
+            outbound.endpoint() == endpoint
+                && outbound.alias() == nak.alias
+                && outbound.repair().is_some()
+        });
+        let (true, Some(index)) = (bound, index) else {
+            self.count(|c| &mut c.nak_unbound);
+            return;
+        };
+        // Counted against the cycle once it reaches admission; below
+        // `naks_per_cycle`, a u32, so it cannot overflow.
+        self.naks_this_cycle = self
+            .naks_this_cycle
+            .checked_add(1)
+            .unwrap_or(self.naks_this_cycle);
+        self.count(|c| &mut c.naks);
+        let Some(outbound) = self.publications.get_mut(index) else {
+            return;
+        };
+        let requester = outbound
+            .membership_mut()
+            .map_or(Requester::Unknown, |membership| {
+                membership.requester(nak.receiver, nak.range.lane, now)
+            });
+        if let NakIntake::Reply(reply) = outbound.nak(nak, requester, now)
+            && self
+                .send(halves, endpoint, source, &Control::NakReply(reply))
+                .submitted()
+        {
+            self.count(|c| &mut c.nak_replies);
+        }
+    }
+
+    /// The cycle's repairs (R7): the publications in turn from a cursor
+    /// that moves each cycle, all within one shared repair budget; each
+    /// one's step 8 ERRs go to their requesters' bound sources. Returns the
+    /// repair datagrams submitted.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::CountOverflow`].
+    fn serve_repairs<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+    ) -> Result<u32, AgentError> {
+        let count = self.publications.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        let first = self.repair_cursor % count;
+        self.repair_cursor = (first + 1) % count;
+        let mut budget = self.repair.budget;
+        let mut submitted = 0u32;
+        let mut replies = std::mem::take(&mut self.nak_replies);
+        for step in 0..count {
+            if budget.bytes == 0 || budget.loads == 0 {
+                break;
+            }
+            let index = (first + step) % count;
+            let Some(outbound) = self.publications.get(index) else {
+                break;
+            };
+            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            if outbound.repair().is_none() || !self.sessions.is_established(endpoint, alias) {
+                continue;
+            }
+            let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                Half::Tx(tx) if *held == endpoint => Some(tx),
+                _ => None,
+            });
+            let (Some(tx), Some(outbound)) = (tx, self.publications.get_mut(index)) else {
+                continue;
+            };
+            let served = outbound.serve_repair(tx, &mut budget, now);
+            submitted = submitted
+                .checked_add(served)
+                .ok_or(AgentError::CountOverflow(AgentKind::Sender))?;
+            let capacity = replies.capacity();
+            outbound.drain_repair_replies(|reply| {
+                // Bounded by the list each path keeps, the same capacity.
+                if replies.len() < capacity {
+                    replies.push((endpoint, *reply));
+                }
+            });
+            for (endpoint, reply) in replies.drain(..) {
+                self.reply_nak(halves, endpoint, &reply);
+            }
+        }
+        self.nak_replies = replies;
+        match self.counters.repairs.checked_add(u64::from(submitted)) {
+            Some(repairs) => self.counters.repairs = repairs,
+            None => self.counters.overflowed = true,
+        }
+        Ok(submitted)
+    }
+
+    /// Sends a step 8 ERR to its requester's bound source on `endpoint`.
+    fn reply_nak<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        reply: &NakReply,
+    ) {
+        let destination = self
+            .bindings
+            .iter()
+            .find(|binding| {
+                binding.endpoint == endpoint
+                    && binding.alias == reply.alias
+                    && binding.identity == reply.identity
+                    && binding.boot_id == reply.receiver.receiver_boot_id
+                    && binding.receiver_id == Some(reply.receiver.receiver_id)
+            })
+            .map(|binding| binding.source);
+        match destination {
+            Some(destination) => {
+                if self
+                    .send(halves, endpoint, destination, &Control::NakReply(*reply))
+                    .submitted()
+                {
+                    self.count(|c| &mut c.nak_replies);
+                }
+            }
+            None => self.count(|c| &mut c.nak_replies_unbound),
+        }
     }
 
     /// RTTM REQUESTs dropped over their source's rate, and dropped with the

@@ -1820,6 +1820,25 @@ fn rttm_requests_reach_the_sender_for_published_aliases() {
         ),
         other => panic!("{other:?}"),
     }
+    // A NAK for the published alias goes to the sender too.
+    let nak = Control::Nak(karyos_protocol::network::Nak {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 1,
+        },
+        range: karyos_protocol::network::NakRange {
+            lane: karyos_protocol::frame::Lane::ZERO,
+            length: 1056,
+            start: 0,
+        },
+    });
+    intake(&mut role, &events, 5).control(source, nak);
+    assert!(matches!(
+        sender.from_receiver.try_take(),
+        Ok(Some(ControlItem::Incoming { control, .. })) if control == nak
+    ));
 }
 
 /// The wired SM path never lowers a lane's reported consumption: after a
@@ -1856,6 +1875,284 @@ fn an_sm_never_lowers_its_consumption() {
     assert_eq!(sent(&mut receiver, 4096, 20_000_000), 4096);
     assert_eq!(sent(&mut receiver, 1024, 40_000_000), 4096);
     assert_eq!(sent(&mut receiver, 8192, 60_000_000), 8192);
+}
+
+/// A sender with reliable publications on endpoint 1 for `aliases`, each
+/// answered and confirmed by receiver 1 at 10.0.0.9:5000 and holding
+/// `frames` 1000-byte messages already sent, over a scripted socket that
+/// records every datagram.
+struct RepairRig {
+    sender: super::SenderRole,
+    role: super::ReceiverRole,
+    halves: Vec<(
+        EndpointId,
+        super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+    )>,
+    observer: karyos_io::sockets::scripted::ScriptedSocket,
+    sent: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    /// The publishing sides, kept alive with the rig.
+    _logs: Vec<super::super::data::testing::TestLog>,
+}
+
+const RECEIVER_SOURCE: ([u8; 4], u16) = ([10, 0, 0, 9], 5000);
+
+impl RepairRig {
+    fn new(config: AgentConfig, aliases: &[Alias], frames: u8) -> Self {
+        use std::sync::{Arc, Mutex};
+
+        use karyos_io::backend::InstanceId;
+        use karyos_io::sockets::endpoint::SocketsEndpoint;
+        use karyos_io::sockets::scripted::ScriptedSocket;
+        use karyos_protocol::network::{LaneStatus, Receiver, SetupAnswer, StatusMessage};
+        use karyos_sys::log_buffer::AppendOptions;
+
+        let (mut sender, role) = super::roles(&config).unwrap();
+        let socket = ScriptedSocket::new();
+        let observer = socket.observer();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&sent);
+        observer.set_send_hook(Box::new(move |_, datagrams| {
+            for datagram in datagrams {
+                record.lock().unwrap().push(datagram.to_vec());
+            }
+        }));
+        let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+        let (tx, _rx) = endpoint.split().unwrap();
+        let halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+        let source = SocketAddr::from(RECEIVER_SOURCE);
+        let (replies, _keep) =
+            super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(8).unwrap());
+        let mut logs = Vec::new();
+        for alias in aliases {
+            let publication = Publication {
+                alias: *alias,
+                ..publication(EndpointId(1))
+            };
+            let (path, mut log) = super::super::data::testing::outbound(
+                EndpointId(1),
+                *alias,
+                source,
+                publication.term,
+                1,
+                true,
+            );
+            let command = AgentCommand::<OsSocket>::AddPublication {
+                reply: replies.reserve().unwrap(),
+                publication,
+                outbound: path,
+            };
+            assert!(matches!(
+                sender.command(command),
+                Some((_, AgentEvent::PublicationAdded { .. }))
+            ));
+            let answer = SetupAnswer {
+                alias: *alias,
+                identity: identity(),
+                term: publication.term,
+                challenge: ChallengeBlock {
+                    receiver_boot_id: [7, 8],
+                    nonce: [9, 9],
+                },
+                joins: Lanes::new(&[0]).unwrap(),
+            };
+            sender.bind(EndpointId(1), source, &answer, 0);
+            let status = StatusMessage {
+                alias: *alias,
+                identity: identity(),
+                receiver: Receiver {
+                    receiver_boot_id: [7, 8],
+                    receiver_id: 1,
+                },
+                group_tag: 0,
+                lanes: Lanes::new(&[LaneStatus {
+                    consumption: 0,
+                    window: 32_768,
+                }])
+                .unwrap(),
+            };
+            sender.status(EndpointId(1), source, &status, 1);
+            assert!(sender.sessions.is_established(EndpointId(1), *alias));
+            for i in 0..frames {
+                let _ = log.publications[0]
+                    .append(&[i; 1000], AppendOptions::default())
+                    .unwrap();
+            }
+            logs.push(log);
+        }
+        let rig = Self {
+            sender,
+            role,
+            halves,
+            observer,
+            sent,
+            _logs: logs,
+        };
+        rig.script(usize::from(frames) * aliases.len());
+        let mut rig = rig;
+        rig.cycle(2);
+        assert_eq!(
+            rig.datagrams().len(),
+            usize::from(frames) * aliases.len(),
+            "first sends"
+        );
+        rig
+    }
+
+    fn script(&self, count: usize) {
+        for _ in 0..count {
+            self.observer
+                .push_send(karyos_io::sockets::ops::SendResult::Sent {
+                    sent: 1,
+                    error: None,
+                });
+        }
+    }
+
+    fn cycle(&mut self, now: u64) {
+        let _ = self.sender.duty(&mut self.halves, now).unwrap();
+    }
+
+    fn datagrams(&self) -> Vec<Vec<u8>> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    /// A NAK of receiver 1 for `alias` from `source`, handed over by the
+    /// receiver.
+    fn nak(&self, alias: Alias, source: SocketAddr, start: u64, length: u32) {
+        use karyos_protocol::frame::Lane;
+        use karyos_protocol::network::{Nak, NakRange, Receiver};
+
+        let nak = Nak {
+            alias,
+            identity: identity(),
+            receiver: Receiver {
+                receiver_boot_id: [7, 8],
+                receiver_id: 1,
+            },
+            range: NakRange {
+                lane: Lane::ZERO,
+                length,
+                start,
+            },
+        };
+        self.role
+            .to_sender
+            .try_post(super::ControlItem::Incoming {
+                endpoint: EndpointId(1),
+                source,
+                control: Control::Nak(nak),
+                seen: 0,
+            })
+            .unwrap();
+    }
+}
+
+/// The aligned length of one 1000-byte message's frame.
+const FRAME: u64 = 1056;
+
+/// A bound receiver's NAK is admitted in the control step and repaired in
+/// the same cycle, before first sends; a NAK from another source naming
+/// that receiver is dropped; admission's and step 8's ERRs go to the
+/// receiver's bound source.
+#[test]
+fn naks_are_repaired_and_answered() {
+    use karyos_protocol::network::{Datagram, NakReplyReason, classify};
+
+    let mut rig = RepairRig::new(AgentConfig::default(), &[alias()], 4);
+    let first = rig.datagrams();
+    let source = SocketAddr::from(RECEIVER_SOURCE);
+    rig.nak(alias(), source, FRAME, 1056);
+    rig.nak(alias(), "10.0.0.66:5000".parse().unwrap(), 0, 1056);
+    rig.script(1);
+    rig.cycle(3);
+    let counters = rig.sender.counters();
+    assert_eq!(
+        (counters.naks, counters.nak_unbound, counters.repairs),
+        (1, 1, 1)
+    );
+    assert_eq!(rig.datagrams().last(), first.get(1));
+    // Beyond what was sent: admission's RANGE_INVALID, to the source.
+    rig.nak(alias(), source, 4 * FRAME, 1056);
+    // Not a frame boundary: step 8's RANGE_INVALID, to the bound source.
+    rig.nak(alias(), source, 2 * FRAME + 32, 1024);
+    rig.script(2);
+    rig.cycle(4);
+    let replies: Vec<_> = rig
+        .datagrams()
+        .iter()
+        .filter_map(|bytes| match classify(bytes) {
+            Ok(Datagram::Control(Control::NakReply(reply))) => Some(reply),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    assert!(
+        replies
+            .iter()
+            .all(|reply| reply.reason == NakReplyReason::RangeInvalid)
+    );
+    assert_eq!(
+        (replies[0].range.start, replies[1].range.start),
+        (4 * FRAME, 2 * FRAME + 32)
+    );
+    assert_eq!(rig.sender.counters().nak_replies, 2);
+}
+
+/// At most `naks_per_cycle` NAKs reach admission in a cycle; the rest are
+/// dropped and counted.
+#[test]
+fn naks_per_cycle_are_bounded() {
+    let mut config = AgentConfig::default();
+    config.repair.naks_per_cycle = 2;
+    let mut rig = RepairRig::new(config, &[alias()], 4);
+    let source = SocketAddr::from(RECEIVER_SOURCE);
+    for at in 0..3 {
+        rig.nak(alias(), source, at * FRAME, 1056);
+    }
+    rig.script(3);
+    rig.cycle(3);
+    let counters = rig.sender.counters();
+    assert_eq!((counters.naks, counters.nak_cycle_budget), (2, 1));
+    // A new cycle admits again.
+    rig.nak(alias(), source, 3 * FRAME, 1056);
+    rig.script(1);
+    rig.cycle(4);
+    assert_eq!(rig.sender.counters().naks, 3);
+}
+
+/// Repair runs the publications in turn from a cursor that moves every
+/// cycle, within one budget per cycle: with room for one frame a cycle,
+/// two publications with two-frame jobs alternate.
+#[test]
+fn repairs_take_turns_across_publications() {
+    use karyos_protocol::network::{Datagram, classify};
+
+    let mut config = AgentConfig::default();
+    config.repair.budget.bytes = FRAME;
+    let other = Alias {
+        session_id: 7,
+        stream_id: 6,
+    };
+    let mut rig = RepairRig::new(config, &[alias(), other], 2);
+    let before = rig.datagrams().len();
+    let source = SocketAddr::from(RECEIVER_SOURCE);
+    rig.nak(alias(), source, 0, 2 * 1056);
+    rig.nak(other, source, 0, 2 * 1056);
+    for now in 3..7 {
+        rig.script(1);
+        rig.cycle(now);
+    }
+    let sessions: Vec<i32> = rig.datagrams()[before..]
+        .iter()
+        .filter_map(|bytes| match classify(bytes) {
+            Ok(Datagram::DataBatch(data)) => Some(data.alias().session_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sessions.len(), 4);
+    assert_ne!(sessions[0], sessions[1], "{sessions:?}");
+    assert_ne!(sessions[1], sessions[2], "{sessions:?}");
+    assert_eq!(rig.sender.counters().repairs, 4);
 }
 
 /// #275 review P2: a SOLICIT the RSP_SETUP limits refuse leaves no entry,
