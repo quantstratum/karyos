@@ -417,6 +417,8 @@ pub struct ClientConductor<T: TermBytes = HeapTerms> {
     events: VecDeque<Event>,
     /// Events dropped because the queue was full.
     events_dropped: u64,
+    /// Event records that did not decode (see `events_undecoded`).
+    events_undecoded: u64,
     /// A client of a driver in another process: its grants complete as
     /// [`Outcome::Fetchable`], never through the in-process hand-over.
     remote: bool,
@@ -476,6 +478,7 @@ impl<T: TermBytes> ClientConductor<T> {
             driver_lost: false,
             events: VecDeque::with_capacity(EVENT_QUEUE),
             events_dropped: 0,
+            events_undecoded: 0,
             remote: false,
             cutover_events: Vec::new(),
             lapped: false,
@@ -586,6 +589,14 @@ impl<T: TermBytes> ClientConductor<T> {
     #[must_use]
     pub fn events_dropped(&self) -> u64 {
         self.events_dropped
+    }
+
+    /// Driver event records that did not decode, skipped: an older client
+    /// counts here the events whose type or reason it does not know (a
+    /// newer driver's), instead of hiding them. Sticky at `u64::MAX`.
+    #[must_use]
+    pub fn events_undecoded(&self) -> u64 {
+        self.events_undecoded
     }
 
     /// Whether the driver's heartbeat stopped for the driver timeout: the
@@ -1361,6 +1372,8 @@ impl<T: TermBytes> ClientConductor<T> {
                             self.events_dropped = self.events_dropped.saturating_add(1);
                         }
                         self.events.push_back(event);
+                    } else if let Some(count) = self.events_undecoded.checked_add(1) {
+                        self.events_undecoded = count;
                     }
                     Some(Some(None))
                 }
@@ -1755,7 +1768,8 @@ mod tests {
 
     /// A driver event the client cannot decode, here a `PublicationClosed`
     /// whose close reason this build does not know, is skipped: the poll
-    /// goes on, later events are queued, and the conductor stays open.
+    /// goes on, later events are queued, the conductor stays open, and the
+    /// skip is counted (`events_undecoded`).
     /// This is what a build from before `EndOfStream` (code 8) does with an
     /// image's clean end; its handles still close on the final seal,
     /// which needs no event (ADR-0061).
@@ -1785,11 +1799,14 @@ mod tests {
         let _ = transmitter
             .transmit(known.type_id(), &unknown[..length])
             .unwrap();
+        let poll = client.poll(usize::MAX, |_| {});
+        assert_eq!((poll.records, client.events_undecoded()), (1, 1));
         let _ = transmitter
             .transmit(known.type_id(), &payload[..length])
             .unwrap();
         let poll = client.poll(usize::MAX, |_| {});
-        assert_eq!(poll.records, 2, "{poll:?}");
+        assert_eq!(poll.records, 1, "{poll:?}");
+        assert_eq!(client.events_undecoded(), 1, "a valid event is not counted");
         let events: Vec<Event> = client.take_events().collect();
         assert_eq!(events, [known]);
         assert!(!client.closed());
