@@ -548,10 +548,16 @@ fn a_recording_out_of_gaps_ends_lapped() {
 #[test]
 fn a_duty_stamps_its_writes_with_its_time() {
     let disk = FaultDisk::default();
+    // A frame of 64 bytes, then one of 32: replay checks frame lengths.
+    let frame = |length: usize| {
+        let mut frame = data(0, length);
+        frame[..4].copy_from_slice(&i32::try_from(length).unwrap().to_le_bytes());
+        frame
+    };
     let script = vec![
-        Script::Data(data(0, 40)),
+        Script::Data(frame(64)),
         Script::Pending,
-        Script::Data(data(40, 24)),
+        Script::Data(frame(32)),
     ];
     let mut recorder = recorder(disk.clone(), Mode::Required, script);
     recorder.duty(500).unwrap();
@@ -562,7 +568,7 @@ fn a_duty_stamps_its_writes_with_its_time() {
         1,
         geometry(),
         0,
-        64,
+        96,
         crate::replay::Rate::AsRecorded,
         256,
     )
