@@ -193,6 +193,9 @@ pub struct AgentConfig {
     /// fresh evidence (default 60 s, at least `image_liveness_timeout`;
     /// coordinator decision, trusted profile).
     pub idle_image_timeout: u64,
+    /// The RTT settings: the receiver's probes and the sender's replies
+    /// (reliable-transport.md, "RTT observations"; RC-1).
+    pub rtt: crate::rtt::RttConfig,
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
@@ -223,6 +226,7 @@ impl Default for AgentConfig {
             image_liveness_timeout: 10_000_000_000,
             receiver_bindings: 64,
             idle_image_timeout: 60_000_000_000,
+            rtt: crate::rtt::RttConfig::default(),
             stop_timeout: Duration::from_secs(1),
         }
     }
@@ -273,6 +277,9 @@ impl AgentConfig {
                     "image_liveness_timeout below ten sm_interval, or idle_image_timeout below it",
                 )
             })?;
+        self.rtt
+            .validate()
+            .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
         // S1: the control ring holds every pending challenge's RSP_SETUP
         // and one SM slot per image, above a floor for forwarded controls
         // (one path per image until redundant paths, RP-1).

@@ -29,6 +29,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The network agents measure RTT (RC-1). Each installed image sends one
+  RTTM REQUEST per bound path and `rtt_probe_interval`; the sender reads
+  the clock immediately before the submitting call and reports the start
+  only when the backend submitted it (`ProbeSlot`, `ProbeGuard`). A REPLY
+  gives a sample only from a bound path naming the image and this
+  receiver, and a lost path's late report is ignored. The sender answers
+  bound receivers within `rttm_reply_rate` per source, echoing the probe
+  id with its service delay. `AgentConfig::rtt` holds the settings.
+  `OsProbeIds` is no longer `Copy` or `Clone`, `ProbeIds::refill` and
+  `RttProbes::refill_ids` return whether they drew, and
+  `RttProbes::generation` and `PathBindings::key` are new.
 - The driver's sender and receiver agents run multicast flow control. Each
   publication's `Outbound` holds a `Membership` (interim defaults: no
   roles, `Strategy::Min`, a minimum window of one maximum frame, a maximum

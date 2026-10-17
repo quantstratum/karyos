@@ -107,7 +107,7 @@ fn os_probe_ids_come_from_a_pool() {
     for (at, id) in drawn.iter().enumerate() {
         assert!(!drawn[at + 1..].contains(id));
     }
-    ids.refill();
+    assert!(ids.refill(), "an empty pool draws");
     assert_eq!(ids.len(), ID_POOL);
     // Above the low-water mark a refill draws nothing.
     let held = ids.pool;
@@ -115,12 +115,12 @@ fn os_probe_ids_come_from_a_pool() {
         ids.probe_id();
     }
     assert_eq!(ids.len(), ID_LOW_WATER + 1);
-    ids.refill();
+    assert!(!ids.refill(), "no draw above the mark");
     assert_eq!(ids.len(), ID_LOW_WATER + 1, "no draw above the mark");
     assert_eq!(ids.pool, held);
     // At the mark it restocks, keeping the ids at hand.
     ids.probe_id();
-    ids.refill();
+    assert!(ids.refill(), "a draw at the mark");
     assert_eq!(ids.len(), ID_POOL);
     assert_eq!(ids.pool[..ID_LOW_WATER], held[..ID_LOW_WATER]);
 }
@@ -149,7 +149,7 @@ fn probes_wait_for_a_refill() {
     }
     assert_eq!(probes.due(0, now), None);
     assert_eq!(probes.counts().id_failures, 1);
-    probes.refill_ids();
+    assert!(probes.refill_ids());
     assert!(probes.due(0, now + 1).is_some());
 }
 

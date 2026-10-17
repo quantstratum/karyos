@@ -338,6 +338,16 @@ impl PathBindings {
         Some((slot, path))
     }
 
+    /// The key `path` of the image at `slot` is bound through.
+    #[must_use]
+    pub fn key(&self, slot: SlotRef, path: usize) -> Option<PathKey> {
+        self.row(slot)?
+            .paths
+            .get(path)?
+            .as_ref()
+            .map(|binding| binding.key)
+    }
+
     /// The join points a path's answer stated (statistics only).
     #[must_use]
     pub fn joins(&self, slot: SlotRef, path: usize) -> Option<Lanes<u64>> {
