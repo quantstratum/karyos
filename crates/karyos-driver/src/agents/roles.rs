@@ -400,6 +400,9 @@ pub struct SenderCounters {
     /// NAKs from no receiver bound on that endpoint (source, alias, boot
     /// id, incarnation and receiver id), or for no reliable publication.
     pub nak_unbound: u64,
+    /// NAK copies absorbed: another path carried the same request within
+    /// `path_skew_window` (RP-11). They spend no NAK budget.
+    pub nak_copies_absorbed: u64,
     /// SMs whose declared tag is not the one configured for their receiver
     /// (MC-2): dropped whole before the binding.
     pub sm_tag_mismatch: u64,
@@ -5220,10 +5223,8 @@ impl<T: StreamTerms> SenderRole<T> {
         if self.ignore_naks {
             return;
         }
-        if self.naks_this_cycle >= self.repair.naks_per_cycle {
-            self.count(|c| &mut c.nak_cycle_budget);
-            return;
-        }
+        // RP-11's order: the binding, then the absorption of copies, then
+        // the cycle's NAK budget, so an absorbed copy spends none.
         self.expire_bindings(now);
         let normal = normalized(source);
         let bound = self.bindings.iter().any(|binding| {
@@ -5245,6 +5246,29 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.nak_unbound);
             return;
         };
+        // Absorption keys on the receiver id, so only one the binding has
+        // validated takes part: a copy that fails validation never absorbs
+        // a real NAK (RP-11).
+        let validated = self.bindings.iter().any(|binding| {
+            binding.endpoint == endpoint
+                && binding.alias == nak.alias
+                && binding.source == normal
+                && binding.boot_id == nak.receiver.receiver_boot_id
+                && binding.identity == nak.identity
+                && binding.receiver_id == Some(nak.receiver.receiver_id)
+        });
+        let Some(outbound) = self.publications.get_mut(index) else {
+            return;
+        };
+        let route = outbound.route_of(endpoint);
+        if validated && outbound.absorbs(nak, route, now) {
+            self.count(|c| &mut c.nak_copies_absorbed);
+            return;
+        }
+        if self.naks_this_cycle >= self.repair.naks_per_cycle {
+            self.count(|c| &mut c.nak_cycle_budget);
+            return;
+        }
         // Counted against the cycle once it reaches admission; below
         // `naks_per_cycle`, a u32, so it cannot overflow.
         self.naks_this_cycle = self
@@ -5260,7 +5284,7 @@ impl<T: StreamTerms> SenderRole<T> {
             .map_or(Requester::Unknown, |membership| {
                 membership.requester(nak.receiver, nak.range.lane, now)
             });
-        if let NakIntake::Reply(reply) = outbound.nak(nak, requester, now)
+        if let NakIntake::Reply(reply) = outbound.nak_on(nak, requester, (route, validated), now)
             && self
                 .send(halves, endpoint, source, &Control::NakReply(reply))
                 .submitted()
@@ -5303,14 +5327,26 @@ impl<T: StreamTerms> SenderRole<T> {
             if outbound.repair().is_none() || !established(&self.sessions, outbound) {
                 continue;
             }
-            let tx = halves.iter_mut().find_map(|(held, half)| match half {
-                Half::Tx(tx) if *held == endpoint => Some(tx),
-                _ => None,
-            });
-            let (Some(tx), Some(outbound)) = (tx, self.publications.get_mut(index)) else {
+            let routed = outbound.is_routed();
+            let served = if routed {
+                // Every live route carries every repair (RP-11).
+                let Some(outbound) = self.publications.get_mut(index) else {
+                    continue;
+                };
+                outbound.serve_repair_routes(halves, &mut budget, now)
+            } else {
+                let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                    Half::Tx(tx) if *held == endpoint => Some(tx),
+                    _ => None,
+                });
+                let (Some(tx), Some(outbound)) = (tx, self.publications.get_mut(index)) else {
+                    continue;
+                };
+                outbound.serve_repair(tx, &mut budget, now)
+            };
+            let Some(outbound) = self.publications.get_mut(index) else {
                 continue;
             };
-            let served = outbound.serve_repair(tx, &mut budget, now);
             let Some(total) = submitted.checked_add(served) else {
                 // The list goes back before the error: it is never
                 // allocated again.
@@ -5320,7 +5356,7 @@ impl<T: StreamTerms> SenderRole<T> {
             submitted = total;
             let capacity = replies.capacity();
             let mut dropped: Option<u64> = Some(0);
-            outbound.drain_repair_replies(|reply| {
+            outbound.drain_repair_replies_on(|reply, endpoint| {
                 // Bounded by the list each path keeps, the same capacity.
                 if replies.len() < capacity {
                     replies.push((endpoint, *reply));

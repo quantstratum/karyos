@@ -11,6 +11,23 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The driver hands an Archive recording a lane's reader (phase 3,
+  A4c-2). `EmbeddedDriver::recording_reader(stream, role)` admits a
+  reserved required or an optional cell and returns a `RecordingReader`:
+  the reader and a lease on its stream, so a removed stream lives until
+  its seal is positioned and read; while it lives the stream refuses a
+  cutover (`DriverError::RecordingCutover`), since the reader follows
+  one mapping. `karyos_archive::source::Guarded`
+  keeps the lease with the reader and drops the reader first. The host
+  wires the two (SPEC section 14); `karyos-sim` records driver streams end
+  to end.
+- `karyos-bench` measures the Archive's write and sync cost on a real disk
+  (phase 3 follow-up): `archive-append` appends to a segment store that
+  never syncs, `archive-sync` syncs after every append. They run only
+  when named with `--workload`, in a removed temporary directory or under
+  `KARYOS_BENCH_DIR`. Their records name the directory, its filesystem,
+  the policy and whether syncs are `F_FULLFSYNC`, and compare only under
+  the same host and filesystem; no gate reads them.
 - A recording reads a lane's log through the network sender's read
   capability (phase 3, A4c-1). `SenderRead::for_recording` admits a
   reserved required cell (a `required` recording) or an optional one (an
@@ -135,6 +152,19 @@ release may break APIs, wire formats and shared-memory layouts.
   counted (`PathCounters::entries`). It bounds `Outbound::sent_low`, the
   least frontier over the live paths, from its first submit; a frame a
   path skipped counts as passed for its frontier.
+- Repair across redundant paths (RP-11; rp-w6). A routed publication opens a
+  repair queue on every route. Each repair datagram is read once and submitted
+  on every live path, debited once at its first submission
+  (`RouteRepairCounts`, `Outbound::repair_route_counts`). A path with no room
+  skips it, counted, so a lagging path never holds a job open. The NAK's
+  arrival path goes with it: a copy of a NAK on another path within
+  `PathPolicy::skew_window` (1 ms, at most 1 s) is absorbed and counted
+  (`nak_copies_absorbed`), from a table of `PathPolicy::copy_entries` (256, at
+  most 4096) that stops absorbing when full. The admission order is now the
+  binding check, the absorption and then the NAK budget, so an unbound NAK
+  counts `nak_unbound` even when the cycle's budget is spent. A step 8 ERR
+  goes once, on the path its requester asked on. Group repair only: the
+  requester domain stays deferred.
 - A close no longer waits on a detached path (rp-w5b; ACS 17049). On a
   guarded lane's abort, the copies of a route whose TX half is detached
   are forgotten through the guard gate (`RoutedLaneSender::forget`), so

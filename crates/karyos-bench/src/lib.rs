@@ -35,6 +35,7 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
     karyos_sys::alloc_count::CountingAllocator;
 
 pub mod analyze;
+pub mod archive;
 pub mod decision;
 pub mod env;
 pub mod inventory;
@@ -207,6 +208,37 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
         });
     }
     configs.extend(network_terms(iterations, warmup));
+    configs
+}
+
+/// The archive workloads (`archive::run`), run only when named with
+/// `--workload`: they write to a disk, so no default run does, and their
+/// records are compared only under the same host and filesystem. A sync
+/// costs milliseconds on some disks, so `archive-sync` measures at most
+/// 2000 iterations.
+#[must_use]
+pub fn archive_configs(iterations: u64) -> Vec<Config> {
+    let mut configs = Vec::new();
+    for workload in [Workload::ArchiveAppend, Workload::ArchiveSync] {
+        let iterations = match workload {
+            Workload::ArchiveSync => iterations.min(2000),
+            _ => iterations,
+        };
+        for message in [4096, 65536] {
+            configs.push(Config {
+                workload,
+                message,
+                publishers: 1,
+                iterations,
+                warmup: (iterations / 10).max(1),
+                term_length: 1 << 20,
+                target_rate: None,
+                nak_frames: None,
+                lanes: None,
+                backing: Backing::Heap,
+            });
+        }
+    }
     configs
 }
 

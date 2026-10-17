@@ -1761,6 +1761,155 @@ fn a_lost_datagram_is_repaired() {
     assert_eq!(rig.agents.receiver.counters().naks, naks);
 }
 
+/// Polls `subscription` until it returns something other than `Pending`,
+/// for at most 200 rounds of `rig`; a message is acknowledged.
+fn next_outcome(
+    rig: &mut Rig,
+    subscription: &mut karyos_sys::log_buffer::Subscription<std::sync::Arc<LogBuffer>>,
+) -> karyos_sys::log_buffer::PollOutcome {
+    use karyos_sys::log_buffer::PollOutcome;
+
+    let mut out = vec![0u8; 65_536];
+    for _ in 0..200 {
+        match subscription.poll(&mut out).unwrap() {
+            PollOutcome::Pending => rig.round(true),
+            outcome => {
+                if matches!(outcome, PollOutcome::Message { .. }) {
+                    subscription.acknowledge();
+                }
+                return outcome;
+            }
+        }
+    }
+    panic!("nothing delivered");
+}
+
+/// T2 (contract-traceability-phase-2.md, "Aborts over the network"): a
+/// writer's claim aborted at its commit deadline on a reliable channel,
+/// read by a subscriber of the remote image. With `lose`, the ABORTED
+/// datagram is lost: the receiver NAKs the hole, which is the aborted
+/// extent exactly, and the sender's repair resends the aborted record.
+/// Either way the subscriber is told the aborted range, then reads the
+/// messages after it, and no NAK names a byte past the extent (without
+/// `lose`, none at all).
+fn aborted_over_the_network(lose: bool) {
+    use karyos_sys::log_buffer::{
+        AppendOptions, ClaimDeadline, ClaimOutcome, DEFAULT_CLAIM_DEADLINE, PollOutcome, Role,
+    };
+
+    // 900 bytes after a 32-byte header, at 32-byte strides.
+    const STRIDE: u64 = 960;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&[1; 900], AppendOptions::default())
+        .unwrap();
+    assert!(matches!(
+        next_outcome(&mut rig, &mut subscriber),
+        PollOutcome::Message { length: 900, .. }
+    ));
+    // The writer claims a block and never commits it.
+    let log = rig.log.as_mut().unwrap();
+    let ClaimOutcome::Claimed(claim) = log.publications[0]
+        .try_claim(1000, AppendOptions::default())
+        .unwrap()
+    else {
+        panic!("not claimed");
+    };
+    core::mem::forget(claim);
+    // The conductor dates the claim, then aborts it at its deadline.
+    let conductor = &mut log.conductors[0];
+    assert_eq!(
+        conductor.abort_expired_claims(rig.now).unwrap(),
+        ClaimDeadline::Waiting
+    );
+    let ClaimDeadline::Aborted {
+        position: start,
+        extent,
+    } = conductor
+        .abort_expired_claims(rig.now + DEFAULT_CLAIM_DEADLINE + 1)
+        .unwrap()
+    else {
+        panic!("not aborted at the deadline");
+    };
+    let end = start + u64::from(extent);
+    // The sender's next DATA datagram is the aborted record, alone.
+    let before = rig.agents.receiver.role.posted_naks().len();
+    if lose {
+        rig.agents.receiver.role.drop_data(&[0]);
+    }
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    // Messages after it reveal the hole.
+    let log = rig.log.as_mut().unwrap();
+    for i in 2..4u8 {
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        PollOutcome::Aborted {
+            position: start,
+            extent
+        }
+    );
+    for (i, at) in [(2u8, end), (3, end + STRIDE)] {
+        let PollOutcome::Message {
+            position, length, ..
+        } = next_outcome(&mut rig, &mut subscriber)
+        else {
+            panic!("message {i} not delivered");
+        };
+        assert_eq!((position, length), (at, 900));
+    }
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    let posted = &rig.agents.receiver.role.posted_naks()[before..];
+    if !lose {
+        assert!(posted.is_empty(), "{posted:?}");
+        return;
+    }
+    // The hole is the aborted extent, whole, and every NAK (a retry while
+    // the repair is in flight) stays inside it.
+    assert!(!posted.is_empty());
+    assert_eq!(
+        (posted[0].range.start, posted[0].range.length),
+        (start, extent)
+    );
+    for nak in posted {
+        assert!(
+            nak.range.start >= start && nak.range.start + u64::from(nak.range.length) <= end,
+            "a NAK outside the aborted extent [{start}, {end}): {nak:?}"
+        );
+    }
+    let counters = rig.agents.receiver.role.loss_counters(slot).unwrap();
+    assert_eq!(
+        (counters.detected, counters.repaired),
+        (1, 1),
+        "{counters:?}"
+    );
+    assert!(rig.agents.sender.counters().repairs >= 1);
+}
+
+#[test]
+fn a_lost_aborted_record_is_repaired_and_never_naked_past() {
+    aborted_over_the_network(true);
+}
+
+#[test]
+fn an_aborted_record_reaches_the_subscriber_of_the_image() {
+    aborted_over_the_network(false);
+}
+
 /// Phase 6 wiring: a RANGE_UNAVAILABLE that echoes the outstanding NAK
 /// proves the hole unrecoverable; under the default `on_unrecoverable =
 /// close` the image closes and is retired.
@@ -4122,7 +4271,7 @@ fn an_overloaded_cycle_keeps_every_per_cycle_bound() {
 /// reaches one image, bound on both paths, every message once.
 #[test]
 fn a_routed_publication_reaches_its_image_on_both_paths() {
-    use karyos_sys::log_buffer::AppendOptions;
+    use karyos_sys::log_buffer::{AppendOptions, Role};
 
     let setup = Setup {
         reliable: true,
@@ -4131,13 +4280,16 @@ fn a_routed_publication_reaches_its_image_on_both_paths() {
     let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
     let slot = established(&mut rig);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let mut reader = image_subscriber(&rig, slot, 0, Role::Optional);
     for i in 0..4u8 {
         let log = rig.log.as_mut().unwrap();
         let _ = log.publications[0]
             .append(&[i; 900], AppendOptions::default())
             .unwrap();
     }
-    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    // Each message arrives on both paths: the subscriber reads it once.
+    assert_eq!(read_messages(&mut rig, &mut reader, 4), [0, 1, 2, 3]);
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 2);
 }
 
 /// The image's conductor and lane 0 subscriber, kept by a test.
@@ -4224,6 +4376,64 @@ fn an_abandoned_copy_is_repaired_on_a_reliable_channel() {
     assert!(counters.repaired >= 1, "{counters:?}");
     assert!(rig.agents.sender.role.counters().naks >= 1);
     assert!(rig.agents.sender.role.counters().repairs >= 1);
+}
+
+/// rp-w6, RP-11, end to end: a datagram lost on both paths is NAKed on
+/// both paths; the sender absorbs the second copy, repairs once,
+/// on both paths, and the subscriber reads every message once, in order.
+#[test]
+fn a_repair_goes_on_both_paths_and_a_nak_copy_is_absorbed() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let append = |rig: &mut Rig, byte: u8| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[byte; 900], AppendOptions::default())
+            .unwrap();
+    };
+    append(&mut rig, 0);
+    rig.round(true);
+    // Both copies of the next datagram are lost.
+    rig.agents.receiver.role.drop_data(&[0, 1]);
+    for byte in 1..5 {
+        append(&mut rig, byte);
+    }
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() >= 5 {
+            break;
+        }
+    }
+    for _ in 0..50 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+    }
+    assert_eq!(seen, [0, 1, 2, 3, 4]);
+    let sender = rig.agents.sender.role.counters();
+    assert!(sender.nak_copies_absorbed >= 1, "{sender:?}");
+    // Absorbed copies are not NAKs admitted, nor budget drops.
+    assert_eq!(sender.nak_cycle_budget, 0, "{sender:?}");
+    assert!(sender.naks >= 1, "{sender:?}");
+    let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
+    let (a, b) = (
+        outbound.repair_route_counts(0).unwrap(),
+        outbound.repair_route_counts(1).unwrap(),
+    );
+    assert!(a.submitted >= 1 && b.submitted >= 1, "{a:?} {b:?}");
 }
 
 /// #16835, unreliable: the receiver's gap policy seals the gap the

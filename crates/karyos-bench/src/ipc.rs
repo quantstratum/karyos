@@ -430,6 +430,7 @@ pub fn ping_pong_with(
         resolution,
         cleaned_slots_per_second: None,
         term_rotations_per_second: None,
+        archive: None,
     })
 }
 
@@ -496,6 +497,7 @@ pub fn throughput_with(
         resolution,
         cleaned_slots_per_second: None,
         term_rotations_per_second: None,
+        archive: None,
     })
 }
 
