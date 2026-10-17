@@ -3,6 +3,7 @@
 use std::sync::atomic::AtomicBool;
 
 use super::*;
+use crate::freshness::{Freshness, FreshnessLink, Terminal, TerminalCell};
 use crate::sync::{AtomicU64, Ordering};
 
 const BUDGET: Budget = Budget {
@@ -21,7 +22,7 @@ fn drain(reader: &mut ConflationReader, budget: Budget) -> Vec<(u32, u64, Vec<u8
     let mut seen = Vec::new();
     let mut settled = false;
     for _ in 0..1000 {
-        let report = reader.poll_changed(budget, |key, version, value| {
+        let report = reader.poll_changed(budget, |key, version, value, _| {
             seen.push((key, version, value.to_vec()));
         });
         if report.journal_drained && report.pending == 0 && !report.scanning {
@@ -166,7 +167,7 @@ fn a_lapped_reader_scans_and_converges() {
                 keys: 7,
                 retries: 2,
             },
-            |key, _, value| {
+            |key, _, value, _| {
                 latest[key as usize] = Some(value.to_vec());
             },
         );
@@ -212,7 +213,7 @@ fn a_stuck_slot_does_not_starve_the_others() {
                 keys: 1,
                 retries: 1,
             },
-            |key, _, value| {
+            |key, _, value, _| {
                 latest[key as usize] = Some(value.to_vec());
             },
         );
@@ -240,7 +241,7 @@ fn version_exhaustion_closes_the_table() {
         writer.slot_version_word(1).unwrap().load(Ordering::Relaxed),
         u64::MAX - 1
     );
-    let report = reader.poll_changed(BUDGET, |_, _, _| {});
+    let report = reader.poll_changed(BUDGET, |_, _, _, _| {});
     assert!(report.closed);
 }
 
@@ -251,7 +252,7 @@ fn dropping_the_writer_closes_and_values_stay_readable() {
     let version = writer.write(1, b"final").unwrap();
     drop(writer);
     let mut seen = Vec::new();
-    let report = reader.poll_changed(BUDGET, |key, version, value| {
+    let report = reader.poll_changed(BUDGET, |key, version, value, _| {
         seen.push((key, version, value.to_vec()));
     });
     assert!(report.closed);
@@ -264,7 +265,7 @@ fn a_panicking_handler_does_not_lose_its_key() {
     let mut reader = writer.reader();
     let version = writer.write(0, b"v").unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        reader.poll_changed(BUDGET, |_, _, _| panic!("handler"));
+        reader.poll_changed(BUDGET, |_, _, _, _| panic!("handler"));
     }));
     assert!(result.is_err());
     assert_eq!(reader.delivered_version(0), Some(0));
@@ -296,7 +297,7 @@ fn concurrent_writer_and_readers_converge() {
                                 keys: 4,
                                 retries: 2,
                             },
-                            |key, version, data| {
+                            |key, version, data, _| {
                                 let round = u32::from(data[0] ^ (key as u8).wrapping_mul(7));
                                 assert_eq!(data, &value(key, round, 24)[..]);
                                 latest[key as usize] = Some((version, data.to_vec()));
@@ -361,7 +362,7 @@ fn a_value_without_a_journal_record_is_found_by_the_sweep() {
                 keys: 1,
                 retries: 1,
             },
-            |key, version, value| {
+            |key, version, value, _| {
                 seen.push((key, version, value.to_vec()));
             },
         );
@@ -387,7 +388,7 @@ fn a_late_reader_after_overflow_delivers_everything() {
                 keys: 3,
                 retries: 1,
             },
-            |key, _, value| {
+            |key, _, value, _| {
                 latest[key as usize] = Some(value.to_vec());
             },
         );
@@ -414,7 +415,7 @@ fn journal_exhaustion_is_refused_before_the_slot_changes() {
         0
     );
     assert_eq!(writer.write(1, b"y"), Err(ConflationError::Closed));
-    let report = reader.poll_changed(BUDGET, |_, _, _| {});
+    let report = reader.poll_changed(BUDGET, |_, _, _, _| {});
     assert!(report.closed);
 }
 
@@ -437,7 +438,7 @@ fn closing_delivers_unread_values_before_finishing() {
                 keys: 2,
                 retries: 1,
             },
-            |_, _, _| {
+            |_, _, _, _| {
                 delivered += 1;
             },
         );
@@ -461,7 +462,7 @@ fn a_zero_budget_does_nothing() {
             keys: 0,
             retries: 5,
         },
-        |_, _, _| unreachable!(),
+        |_, _, _, _| unreachable!(),
     );
     assert_eq!(report.delivered, 0);
     assert!(report.scanning);
@@ -570,9 +571,9 @@ mod region {
             Some((4, &b"last"[..]))
         );
         writer.close();
-        let report = reader.poll_changed(BUDGET, |_, _, _| {});
+        let report = reader.poll_changed(BUDGET, |_, _, _, _| {});
         assert!(report.closed);
-        let report = reader.poll_changed(BUDGET, |_, _, _| unreachable!());
+        let report = reader.poll_changed(BUDGET, |_, _, _, _| unreachable!());
         assert!(report.finished);
     }
 
@@ -589,7 +590,7 @@ mod region {
         }
         let mut seen = Vec::new();
         for _ in 0..1000 {
-            let report = reader.poll_changed(BUDGET, |key, _, value| {
+            let report = reader.poll_changed(BUDGET, |key, _, value, _| {
                 seen.push((key, value.to_vec()));
             });
             lapped |= report.lapped;
@@ -875,7 +876,7 @@ fn a_freshness_write_is_not_a_new_version_and_is_retried() {
     let even = seq.load(Ordering::Relaxed);
     seq.store(even + 1, Ordering::Relaxed);
     let mut seen = Vec::new();
-    let report = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    let report = reader.poll_changed(BUDGET, |key, version, _, _| seen.push((key, version)));
     assert_eq!((report.delivered, report.unstable), (0, 1));
     // The write completes; the value version stays 2.
     seq.store(even, Ordering::Relaxed);
@@ -892,9 +893,9 @@ fn a_freshness_write_is_not_a_new_version_and_is_retried() {
         writer.slot_version_word(1).unwrap().load(Ordering::Relaxed),
         2
     );
-    let _ = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    let _ = reader.poll_changed(BUDGET, |key, version, _, _| seen.push((key, version)));
     assert_eq!(seen, [(1, 2)], "retried, delivered once");
-    let report = reader.poll_changed(BUDGET, |key, version, _| seen.push((key, version)));
+    let report = reader.poll_changed(BUDGET, |key, version, _, _| seen.push((key, version)));
     assert_eq!(report.delivered, 0);
     // The settled freshness write is not even served: the scan reads the
     // value version, not the sequence.
@@ -915,7 +916,7 @@ fn a_slot_stuck_in_a_freshness_write_stays_pending() {
     seq.store(seq.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
     drop(writer);
     for _ in 0..4 {
-        let report = reader.poll_changed(BUDGET, |_, _, _| {});
+        let report = reader.poll_changed(BUDGET, |_, _, _, _| {});
         assert!(report.closed);
         assert!(!report.finished, "an unsettled slot is not finished");
         assert!(report.pending >= 1 || report.unstable >= 1);
@@ -930,4 +931,275 @@ fn an_odd_value_version_is_unstable() {
     slot.write(b"x").unwrap();
     words[1].store(5, Ordering::Relaxed);
     assert_eq!(slot.read(&mut [0u8; 8]), FreshRead::Unstable);
+}
+
+/// Polls until settled; returns `(key, version, freshness)` of each
+/// delivery and the last report.
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test helper, as ADR-0007 allows in tests"
+)]
+fn drain_fresh(reader: &mut ConflationReader) -> (Vec<(u32, u64, Freshness)>, PollReport) {
+    let mut seen = Vec::new();
+    for _ in 0..1000 {
+        let report = reader.poll_changed(BUDGET, |key, version, _, freshness| {
+            seen.push((key, version, freshness));
+        });
+        if report.terminal.is_some()
+            || (report.journal_drained && report.pending == 0 && !report.scanning)
+        {
+            return (seen, report);
+        }
+    }
+    panic!("the reader did not settle");
+}
+
+#[allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test helper, as ADR-0007 allows in tests"
+)]
+fn fresh_table(keys: u32) -> (ConflationWriter, FreshnessLink) {
+    let link = FreshnessLink::new();
+    (conflation_fresh(keys, 8, 1024, link.clone()).unwrap(), link)
+}
+
+/// GU-8, GU-9: a recorded loss makes every written key Stale since the
+/// gap's start at once, before any slot is reconciled, and a reader that
+/// already delivered them gets them again, same versions, Stale. The
+/// reconciliation keeps them Stale and retires the record only after its
+/// last slot. A replacement past the gap restores its own key only.
+#[test]
+fn a_loss_stales_every_key_until_its_replacement() {
+    let (mut writer, _link) = fresh_table(3);
+    let mut reader = writer.reader();
+    for key in 0..3 {
+        assert_eq!(
+            writer.write_at(key, &[key as u8], u64::from(key) * 32),
+            Ok(2)
+        );
+    }
+    writer.passed(96);
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen.len(), 3);
+    assert!(
+        seen.iter()
+            .all(|&(_, version, f)| version == 2 && f == Freshness::Fresh)
+    );
+    assert_eq!(writer.record_loss(96, 160), Ok(1));
+    assert!(writer.recorded(96, 160));
+    // Before any reconciliation: every key Stale, delivered again.
+    let (seen, _) = drain_fresh(&mut reader);
+    let stale = Freshness::Stale { since: 96 };
+    assert_eq!(seen, [(0, 2, stale), (1, 2, stale), (2, 2, stale)]);
+    // A partial pass retires nothing.
+    assert_eq!(writer.reconcile(2), Ok(2));
+    assert_eq!(writer.retired_through(), Some(0));
+    assert!(writer.reconciling());
+    assert_eq!(writer.reconcile(2), Ok(1));
+    assert_eq!(writer.retired_through(), Some(1));
+    assert!(!writer.reconciling());
+    // Reconciled: still Stale, so nothing new for the reader; a reader
+    // created now reads the reconciled slots Stale too.
+    let (seen, _) = drain_fresh(&mut reader);
+    assert!(seen.is_empty(), "{seen:?}");
+    let (seen, _) = drain_fresh(&mut writer.reader());
+    assert_eq!(seen, [(0, 2, stale), (1, 2, stale), (2, 2, stale)]);
+    // The feeder passes the gap; a replacement of key 1 past it is Fresh,
+    // and only key 1 changes.
+    writer.passed(160);
+    assert!(!writer.recorded(96, 160));
+    assert_eq!(writer.write_at(1, &[9], 160), Ok(4));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(1, 4, Freshness::Fresh)]);
+    let counters = writer.fresh_counters().unwrap();
+    assert_eq!(
+        (counters.losses, counters.reconciled, counters.retirements),
+        (1, 3, 1)
+    );
+}
+
+/// A value written between the frontier and a recorded gap ahead lies
+/// below the gap's end: it is Stale since the gap's start, never Fresh.
+#[test]
+fn a_value_below_a_gap_ahead_is_written_stale() {
+    let (mut writer, _link) = fresh_table(2);
+    let mut reader = writer.reader();
+    // The receive owner posted [64, 128) while the feeder is at 0.
+    assert_eq!(writer.record_loss(64, 128), Ok(1));
+    assert_eq!(writer.write_at(0, &[1], 0), Ok(2));
+    writer.passed(32);
+    assert_eq!(writer.write_at(1, &[2], 32), Ok(2));
+    let (seen, _) = drain_fresh(&mut reader);
+    let stale = Freshness::Stale { since: 64 };
+    assert_eq!(seen, [(0, 2, stale), (1, 2, stale)]);
+    // Past the gap, a replacement restores it.
+    writer.passed(128);
+    assert_eq!(writer.write_at(0, &[3], 128), Ok(4));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(0, 4, Freshness::Fresh)]);
+}
+
+/// The frontier rule is enforced, not assumed: a loss below the frontier
+/// records nothing, is counted, and publishes the terminal cell; the
+/// reader then delivers nothing more and reports the close.
+#[test]
+fn a_loss_below_the_frontier_closes_the_view() {
+    let (mut writer, link) = fresh_table(2);
+    let mut reader = writer.reader();
+    assert_eq!(writer.write_at(0, &[1], 0), Ok(2));
+    writer.passed(64);
+    assert_eq!(
+        writer.record_loss(32, 96),
+        Err(LossError::BelowFrontier {
+            start: 32,
+            frontier: 64
+        })
+    );
+    assert_eq!(writer.fresh_counters().unwrap().below_frontier, 1);
+    let terminal = TerminalCell::read(&link.terminal_words()).unwrap();
+    assert_eq!(
+        terminal,
+        Terminal {
+            start: 32,
+            end: 96,
+            reason: crate::freshness::TERMINAL_BELOW_FRONTIER
+        }
+    );
+    // The table closed with the terminal cell.
+    assert_eq!(writer.write_at(1, &[2], 64), Err(ConflationError::Closed));
+    let (seen, report) = drain_fresh(&mut reader);
+    assert!(seen.is_empty(), "{seen:?}");
+    assert_eq!(report.terminal, Some(terminal));
+}
+
+/// The receive owner's fail-safe publishes the shared terminal cell: the
+/// reader stops delivering and reports it.
+#[test]
+fn the_owners_terminal_cell_stops_the_reader() {
+    let (mut writer, link) = fresh_table(2);
+    let mut reader = writer.reader();
+    assert_eq!(writer.write_at(0, &[1], 0), Ok(2));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(0, 2, Freshness::Fresh)]);
+    let terminal = Terminal {
+        start: 64,
+        end: 128,
+        reason: crate::freshness::TERMINAL_BARRIER_TIMEOUT,
+    };
+    assert!(link.terminal().unwrap().publish(terminal));
+    assert!(!writer.publish_terminal(0, 1, 2), "one-shot");
+    assert_eq!(writer.write_at(1, &[2], 0), Ok(2));
+    let (seen, report) = drain_fresh(&mut reader);
+    assert!(seen.is_empty());
+    assert_eq!(report.terminal, Some(terminal));
+}
+
+/// The gaps ahead and the ring are bounded: past `DEFAULT_RING`
+/// unretired records a loss is refused, counted and nothing is stored;
+/// a reconciliation and the frontier passing them make room again.
+#[test]
+fn losses_past_the_ring_wait_for_a_retirement() {
+    let (mut writer, _link) = fresh_table(1);
+    for i in 0..crate::freshness::DEFAULT_RING as u64 {
+        assert_eq!(writer.record_loss(64 * i, 64 * i + 32), Ok(i + 1));
+    }
+    let ring = crate::freshness::DEFAULT_RING as u64;
+    assert_eq!(
+        writer.record_loss(64 * ring, 64 * ring + 32),
+        Err(LossError::Full)
+    );
+    assert_eq!(writer.fresh_counters().unwrap().full, 1);
+    assert_eq!(writer.reconcile(8), Ok(1));
+    // Retired, but still ahead of the frontier: refused.
+    assert_eq!(
+        writer.record_loss(64 * ring, 64 * ring + 32),
+        Err(LossError::Full)
+    );
+    writer.passed(64 * ring);
+    assert_eq!(writer.record_loss(64 * ring, 64 * ring + 32), Ok(ring + 1));
+}
+
+/// An exhausted loss sequence publishes the terminal cell.
+#[test]
+fn an_exhausted_loss_sequence_closes_the_view() {
+    let (mut writer, link) = fresh_table(1);
+    writer.seed_loss_seq(crate::freshness::STALE - 1);
+    assert_eq!(writer.record_loss(0, 32), Err(LossError::Exhausted));
+    assert_eq!(writer.fresh_counters().unwrap().exhausted, 1);
+    assert_eq!(writer.write_at(0, &[1], 32), Err(ConflationError::Closed));
+    assert_eq!(
+        TerminalCell::read(&link.terminal_words()).map(|t| t.reason),
+        Some(crate::freshness::TERMINAL_FRESHNESS_EXHAUSTED)
+    );
+}
+
+/// A table without a barrier (IPC) records no loss, and its values read
+/// Fresh; `write_at` writes as `write`.
+#[test]
+fn a_table_without_a_barrier_reads_fresh() {
+    let mut writer = conflation(1, 8, 1024).unwrap();
+    let mut reader = writer.reader();
+    assert_eq!(writer.record_loss(0, 32), Err(LossError::NoBarrier));
+    assert_eq!(writer.write_at(0, &[1], 0), Ok(2));
+    assert_eq!(writer.reconcile(8), Ok(0));
+    assert!(!writer.publish_terminal(0, 32, 1));
+    assert_eq!(writer.fresh_counters(), None);
+    let (seen, report) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(0, 2, Freshness::Fresh)]);
+    assert_eq!(report.terminal, None);
+}
+
+/// #318 review: a value's freshness needs its position. A table with a
+/// barrier refuses a plain write, and a value below the frontier, whose
+/// gaps behind may be retired already: record_loss(200, 300), passed(400),
+/// write_at(100) would otherwise read Fresh where GU-9 says Stale since
+/// 200. Nothing is stored either way.
+#[test]
+fn a_value_without_its_position_or_behind_the_frontier_is_refused() {
+    let (mut writer, _link) = fresh_table(2);
+    let mut reader = writer.reader();
+    assert_eq!(
+        writer.write(0, &[1]),
+        Err(ConflationError::PositionRequired)
+    );
+    assert_eq!(writer.record_loss(200, 300), Ok(1));
+    writer.passed(400);
+    assert_eq!(
+        writer.write_at(0, &[1], 100),
+        Err(ConflationError::BehindFrontier {
+            position: 100,
+            frontier: 400
+        })
+    );
+    let (seen, _) = drain_fresh(&mut reader);
+    assert!(seen.is_empty(), "{seen:?}");
+    // At the frontier, after the gap: Fresh.
+    assert_eq!(writer.write_at(0, &[2], 400), Ok(2));
+    let (seen, _) = drain_fresh(&mut reader);
+    assert_eq!(seen, [(0, 2, Freshness::Fresh)]);
+}
+
+/// #318 review (M2): the terminal cell is checked again after each copy.
+/// A terminal published during a poll, by the handler of its first value,
+/// stops the poll before the second key's value is delivered.
+#[test]
+fn a_terminal_published_during_a_poll_stops_it() {
+    let (mut writer, link) = fresh_table(2);
+    let mut reader = writer.reader();
+    assert_eq!(writer.write_at(0, &[1], 0), Ok(2));
+    assert_eq!(writer.write_at(1, &[2], 0), Ok(2));
+    let terminal = Terminal {
+        start: 64,
+        end: 128,
+        reason: crate::freshness::TERMINAL_BARRIER_TIMEOUT,
+    };
+    let mut delivered = Vec::new();
+    let report = reader.poll_changed(BUDGET, |key, _, _, _| {
+        delivered.push(key);
+        let _ = link.terminal().unwrap().publish(terminal);
+    });
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert_eq!(report.terminal, Some(terminal));
 }

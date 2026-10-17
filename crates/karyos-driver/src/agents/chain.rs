@@ -94,6 +94,13 @@ pub enum SessionEvent {
         slot: SlotRef,
         /// The installed slot.
         installed: SlotRef,
+        /// The conflated lane of its key and the link its seal gate shares
+        /// with the lane's view (conflated-network-images.md (b)); `None`
+        /// without a conflated view.
+        freshness: Option<(
+            karyos_sys::frame::Lane,
+            karyos_sys::freshness::FreshnessLink,
+        )>,
     },
     /// The image of `slot` was not installed (too late, quarantined, bound
     /// elsewhere, or refused): nothing is bound and the conductor frees its

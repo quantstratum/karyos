@@ -36,6 +36,7 @@
 //!   driver.
 
 pub mod chain;
+pub(crate) mod conflated_gate;
 pub mod control;
 pub mod data;
 pub mod endpoints;
@@ -211,6 +212,11 @@ pub struct AgentConfig {
     /// How long [`AgentRunner::stop`] waits for the agents
     /// (`agent_stop_timeout`).
     pub stop_timeout: Duration,
+    /// `barrier_ack_timeout` in ns: how long a conflated image lane's seal
+    /// waits for its view's feeder before the fail-safe closes the view
+    /// (conflated-network-images.md (c); default 100 ms, an owner flag; at
+    /// least ten idle sleeps of a duty loop, 10 ms).
+    pub barrier_ack_timeout: u64,
 }
 
 impl Default for AgentConfig {
@@ -243,6 +249,7 @@ impl Default for AgentConfig {
             multicast: crate::repair::loss::MulticastConfig::default(),
             group_nak_budget: 64,
             stop_timeout: Duration::from_secs(1),
+            barrier_ack_timeout: conflated_gate::DEFAULT_BARRIER_ACK_TIMEOUT_NS,
         }
     }
 }
@@ -319,6 +326,11 @@ impl AgentConfig {
         if self.control_capacity < control {
             return Err(AgentError::InvalidConfig(
                 "control_capacity below max_pending_challenges + max_images * max_paths + 32",
+            ));
+        }
+        if self.barrier_ack_timeout < conflated_gate::MIN_BARRIER_ACK_TIMEOUT_NS {
+            return Err(AgentError::InvalidConfig(
+                "barrier_ack_timeout must be at least 10 ms",
             ));
         }
         if self.idle_image_timeout < self.image_liveness_timeout {
@@ -436,6 +448,11 @@ pub enum AgentCommand<O: SocketOps> {
         /// The receiver identity its images name (MC-1, MC-2); `None` for
         /// an id derived from each image's slot and tag 0.
         identity: Option<crate::membership::ReceiverIdentity>,
+        /// The lane of its images a conflated view reads
+        /// (conflated-network-images.md (a)): the receiver gates that
+        /// lane's seals through the view's barrier mailbox. `None`: no
+        /// view, the seals as before.
+        conflated: Option<karyos_sys::frame::Lane>,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer
@@ -916,6 +933,16 @@ impl<O: SocketOps> SenderAgent<O> {
     #[cfg(test)]
     pub(crate) fn ignore_naks(&mut self) {
         self.role.ignore_naks();
+    }
+
+    /// Reads NAKs again after [`SenderAgent::ignore_naks`] (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast test (T9)")
+    )]
+    pub(crate) fn heed_naks(&mut self) {
+        self.role.heed_naks();
     }
 
     /// After a stop: the halves of `Attach` commands the agent never read
