@@ -291,8 +291,15 @@ impl AgentConfig {
         self.rtt
             .validate()
             .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
+        // The largest RTT snapshot: a sample never exceeds the probe
+        // timeout; before one, the initial RTT, never below the floor.
+        let max_rtt = self
+            .rtt
+            .rtt_probe_timeout
+            .max(self.rtt.rtt_initial)
+            .max(self.rtt.rtt_floor);
         self.multicast
-            .validate()
+            .validate_for(max_rtt)
             .map_err(|_| AgentError::InvalidConfig("invalid multicast NAK timing"))?;
         // S1: the control ring holds every pending challenge's RSP_SETUP
         // and one SM slot per image, above a floor for forwarded controls
