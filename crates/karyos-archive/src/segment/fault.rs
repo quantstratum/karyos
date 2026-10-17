@@ -40,6 +40,10 @@ pub(super) enum Survives {
     /// Only what a sync made durable: unsynced data is lost, and so is a
     /// file whose directory entry was not synced.
     Synced,
+    /// Writeback in another order: every index byte written survives, but
+    /// a data file keeps only what was synced. An entry can then outlive
+    /// the data it covers.
+    TornData,
 }
 
 /// A shared handle on the in-memory disk.
@@ -74,11 +78,14 @@ impl FaultDisk {
         let files = fs
             .files
             .iter()
-            .filter(|(_, file)| survives == Survives::Everything || file.linked)
+            .filter(|(_, file)| survives != Survives::Synced || file.linked)
             .map(|(path, file)| {
+                let data_file = path.extension().is_some_and(|extension| extension == "seg");
                 let data = match survives {
                     Survives::Everything => file.data.clone(),
                     Survives::Synced => file.synced.clone(),
+                    Survives::TornData if data_file => file.synced.clone(),
+                    Survives::TornData => file.data.clone(),
                 };
                 let file = File {
                     synced: data.clone(),
