@@ -37,6 +37,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Conflated views of network images (conflated-network-images.md, C4).
+  `EmbeddedDriver::add_network_subscription_conflated` names the lane and
+  the view's `ConflationConfig`. When the image of such a key is exposed,
+  the conductor builds a heap table over the image's `FreshnessLink`, feeds
+  it from a required subscription of the lane and attaches it to the
+  mailbox. Each duty the feeder first records a gap met in the log (held,
+  and nothing past it polled, while the barrier is full), then serves the
+  seal request, acknowledging only after the loss is recorded (withheld
+  while full), writes values with their positions (`write_at`) and
+  reconciles in bounded passes. A published terminal cell closes the feeder.
+  `EmbeddedDriver::network_view_counters` reports `NetworkViewCounters`:
+  views built and not built, acknowledgements given and withheld, gaps
+  recorded from the log, views closed by their terminal cell.
 - The receiver gates a conflated network image lane's seals
   (conflated-network-images.md, C3). `AddSubscription` carries the
   conflated lane (driver-internal entry
