@@ -260,12 +260,17 @@ pub enum DriverError {
     /// An IPC driver with a network could hold more descriptors than this
     /// process may open (`RLIMIT_NOFILE`): its image lanes, stream
     /// mappings and clients at their configured bounds. Checked at start.
-    #[error("the driver may need {needed} descriptors, above the limit of {limit}")]
+    /// When `needed` is within `hard`, raising the soft limit is enough.
+    #[error(
+        "the driver may need {needed} descriptors, above the soft limit of {limit} (hard limit {hard:?})"
+    )]
     DescriptorLimit {
         /// Descriptors the configured bounds can hold.
         needed: u64,
         /// The process's soft limit.
         limit: u64,
+        /// The process's hard limit; `None` when unlimited.
+        hard: Option<u64>,
     },
     /// Every publication the stream can issue is out: its exclusive
     /// publication, or all `P` publisher slots of a concurrent stream.

@@ -41,7 +41,10 @@
 //!   driver. Region ids are never reused, so a remote mapping of an old
 //!   image never names a new one. A lane that cannot be created refuses
 //!   the image (`refused_storage`) after the lanes already created for it
-//!   are dropped; no partial image is ever offered.
+//!   are dropped; no partial image is ever offered. At the network's close
+//!   no lane is built: an image still asked for is refused
+//!   (`LaneSource::closing`). An installed image is exposed on either
+//!   backing (n3); an IPC driver's remote clients fetch its regions.
 
 use std::sync::Arc;
 
@@ -242,6 +245,9 @@ pub struct LaneSource<'a> {
     /// The instance and region ids of an IPC driver; `None` on the heap.
     #[cfg(target_os = "linux")]
     regions: Option<crate::admission::RegionIds<'a>>,
+    /// The network is closing: no lane is built, so an image still asked
+    /// for is refused with no region or memory spent on it.
+    closing: bool,
     _lent: core::marker::PhantomData<&'a mut ()>,
 }
 
@@ -252,7 +258,18 @@ impl<'a> LaneSource<'a> {
         Self {
             #[cfg(target_os = "linux")]
             regions: None,
+            closing: false,
             _lent: core::marker::PhantomData,
+        }
+    }
+
+    /// No lanes at all: the network is closing, and every image still asked
+    /// for is refused (`refused_storage`).
+    #[must_use]
+    pub(crate) fn closing() -> Self {
+        Self {
+            closing: true,
+            ..Self::heap()
         }
     }
 
@@ -262,6 +279,7 @@ impl<'a> LaneSource<'a> {
     pub(crate) fn regions(regions: crate::admission::RegionIds<'a>) -> Self {
         Self {
             regions: Some(regions),
+            closing: false,
             _lent: core::marker::PhantomData,
         }
     }
@@ -613,6 +631,9 @@ impl<T: StreamTerms> ImageTable<T> {
         term: TermParams,
         joins: &Lanes<u64>,
     ) -> Result<Built<T>, Refusal> {
+        if source.closing {
+            return Err(Refusal::Storage);
+        }
         let term_length = TermLength::try_new(term.term_length).map_err(|_| Refusal::Geometry)?;
         let params = ImageParams::new(
             alias.session_id,
