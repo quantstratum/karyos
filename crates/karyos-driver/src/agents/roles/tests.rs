@@ -1179,3 +1179,59 @@ fn a_rate_limited_solicit_leaves_no_entry() {
     assert_eq!(sent(), 1);
     assert_eq!(receiver.session_counters().solicits_withdrawn, 3);
 }
+
+/// Mutants of the #275 review: DATA solicits only on a subscribed stream
+/// and from an answerable source (no entry at all otherwise), and a
+/// solicited answer cannot size an image above the subscription's term
+/// bound.
+#[test]
+fn solicits_need_a_subscription_an_answerable_source_and_a_term_bound() {
+    use karyos_protocol::network::SetupAnswer;
+
+    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (sessions, _link) = event_ring();
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let bytes = [0u8; 32];
+    // Not subscribed: nothing.
+    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 1);
+    assert!(sender.from_receiver.try_take().unwrap().is_none());
+    receiver.subscriptions.push((EndpointId(1), 6, 65_536));
+    // A group source cannot be answered: no entry is created.
+    let group: SocketAddr = "239.1.1.1:5000".parse().unwrap();
+    receiver.inject_data(&sessions, EndpointId(1), group, alias(), &bytes, 2);
+    let counters = receiver.session_counters();
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (0, 0));
+    assert_eq!(receiver.counters().unanswerable_source, 1);
+    // Subscribed and answerable: one SOLICIT.
+    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 3);
+    let Ok(Some(super::ControlItem::Outgoing {
+        control: Control::Solicit(solicit),
+        ..
+    })) = sender.from_receiver.try_take()
+    else {
+        panic!("no SOLICIT");
+    };
+    assert_eq!(receiver.session_counters().solicits, 1);
+    // Its answer names a term above the subscription's bound: dropped,
+    // no image.
+    let answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: TermParams {
+            term_length: 1 << 20,
+            initial_term_id: 9,
+            mtu: 1408,
+        },
+        challenge: solicit.challenge,
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    receiver.inject_control(
+        &sessions,
+        EndpointId(1),
+        source,
+        Control::SetupAnswer(answer),
+        4,
+    );
+    assert_eq!(receiver.counters().term_too_large, 1);
+    assert_eq!(receiver.counters().create_image, 0);
+}

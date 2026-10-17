@@ -283,7 +283,8 @@ pub struct SessionCounters {
     pub challenges_replaced: u64,
     /// Challenges freed by the timer after expiry.
     pub challenges_expired: u64,
-    /// Solicit entries created (each sent one SOLICIT).
+    /// SOLICITs sent (an entry whose send was refused is withdrawn and
+    /// not counted here).
     pub solicits: u64,
     /// Solicit entries freed by the timer after expiry.
     pub solicits_expired: u64,
@@ -292,7 +293,9 @@ pub struct SessionCounters {
     /// Solicit entries withdrawn: never sent, or answered with no command
     /// chain; freed with no holdoff.
     pub solicits_withdrawn: u64,
-    /// Announcements and answers dropped, all reasons.
+    /// Announcements, answers and DATA-driven solicits dropped, all
+    /// reasons; DATA for a bound key or a key with an entry counts once
+    /// per datagram.
     pub dropped: u64,
     /// Images installed.
     pub installed: u64,
@@ -344,6 +347,9 @@ enum State {
         path_of: Option<SlotRef>,
         /// The answer's join points, kept for the first path's binding.
         joins: Option<Lanes<u64>>,
+        /// It was a solicit entry (§6.3): a refusal at `ImageReady` ends it
+        /// without a binding and starts the holdoff.
+        solicited: bool,
     },
     /// A pending solicit (§6.3): DATA for an unbound key, no candidate
     /// identity. Its answer supplies identity, term parameters and lanes
@@ -722,6 +728,12 @@ impl ReceiveSessions {
         (held, full)
     }
 
+    /// The SOLICIT of a new entry was handed to the sender: counted in
+    /// `solicits`, which counts only SOLICITs sent.
+    pub fn solicit_sent(&mut self) {
+        self.counters.bump(|c| &mut c.solicits);
+    }
+
     /// Frees `key`'s solicit entry with no holdoff: its SOLICIT was never
     /// sent (an RSP_SETUP limit or the control ring refused it), and it is
     /// never resent.
@@ -792,7 +804,6 @@ impl ReceiveSessions {
                 created_at: now,
             };
         }
-        self.counters.bump(|c| &mut c.solicits);
         SolicitOutcome::Solicit(RspSolicit {
             alias: key.alias,
             challenge: ChallengeBlock {
@@ -934,6 +945,7 @@ impl ReceiveSessions {
                             answered: false,
                             path_of,
                             joins: None,
+                            solicited: false,
                         };
                     }
                     self.counters.bump(|c| &mut c.challenges_replaced);
@@ -961,6 +973,7 @@ impl ReceiveSessions {
                             answered: false,
                             path_of,
                             joins: None,
+                            solicited: false,
                         };
                     }
                     self.counters.bump(|c| &mut c.challenges_replaced);
@@ -1005,6 +1018,7 @@ impl ReceiveSessions {
                 answered: false,
                 path_of,
                 joins: None,
+                solicited: false,
             };
         }
         self.counters.bump(|c| &mut c.challenges);
@@ -1215,6 +1229,7 @@ impl ReceiveSessions {
                 answered: true,
                 path_of: None,
                 joins: Some(answer.joins),
+                solicited: true,
             };
         }
         self.counters.bump(|c| &mut c.solicits_answered);
@@ -1280,6 +1295,7 @@ impl ReceiveSessions {
             created_at,
             answered: true,
             joins,
+            solicited,
             ..
         } = entry.state
         else {
@@ -1295,6 +1311,10 @@ impl ReceiveSessions {
         if refused {
             entry.state = State::Free;
             self.counters.bump(|c| &mut c.released);
+            // A solicit entry ended without a binding.
+            if solicited {
+                self.hold_off(key, now);
+            }
             return ReadyOutcome::Release(slot);
         }
         // The slot's generation moves with every installed image; an

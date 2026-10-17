@@ -656,6 +656,27 @@ impl ReceiverRole {
             .map(|image| image.evidence)
     }
 
+    /// Hands the receiver `control` from `source` on `endpoint` at `now`
+    /// (tests).
+    #[cfg(test)]
+    pub(super) fn inject_control(
+        &mut self,
+        sessions: &SessionEnd,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        control: Control,
+        now: u64,
+    ) {
+        let mut intake = Intake {
+            endpoint,
+            now,
+            role: self,
+            sessions,
+            work: 0,
+        };
+        intake.control(source, control);
+    }
+
     /// Hands the receiver `bytes` as a DATA datagram from `source` on
     /// `endpoint` at `now` (tests).
     #[cfg(test)]
@@ -1291,12 +1312,15 @@ impl Intake<'_> {
         let role = &mut *self.role;
         if let SolicitOutcome::Solicit(solicit) =
             role.sessions.solicit(key, self.now, &mut role.nonces)
-            && !self.challenge(key.source, Control::Solicit(solicit))
         {
-            // Never sent (a rate or the ring refused it): a SOLICIT is
-            // never resent, so the entry goes, with no holdoff, and the
-            // next DATA asks again under the limits.
-            self.role.sessions.withdraw_solicit(&key);
+            if self.challenge(key.source, Control::Solicit(solicit)) {
+                self.role.sessions.solicit_sent();
+            } else {
+                // Never sent (a rate or the ring refused it): a SOLICIT is
+                // never resent, so the entry goes, with no holdoff, and the
+                // next DATA asks again under the limits.
+                self.role.sessions.withdraw_solicit(&key);
+            }
         }
     }
 
