@@ -1003,3 +1003,39 @@ fn sender_read_runs_beside_a_publisher_and_its_conductor() {
     });
     assert_eq!(sink.messages, expected);
 }
+
+/// `rewind` restarts at the registered position, a block boundary the
+/// caller registered: what was read past it is read again, whole.
+#[test]
+fn sender_read_rewinds_to_the_registered_boundary() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let messages = [sized_message(1, 3000), sized_message(2, 3000)];
+    for message in &messages {
+        let _ = publication.append(message, AppendOptions::default()).unwrap();
+    }
+    let mut out = sr_out();
+    // The first message, three one-frame datagrams: a boundary at its end.
+    let mut first = ProbeSink::default();
+    for _ in 0..3 {
+        let Ok(ReadOutcome::Copied { len, .. }) = sr_read(&mut reader, &mut out) else {
+            panic!("not copied");
+        };
+        first.datagram(&out[..len]);
+    }
+    assert!(reader.at_boundary());
+    reader.sent(reader.position()).unwrap();
+    // Part of the second, inside its block, then a reset drops it.
+    let _ = sr_read(&mut reader, &mut out).unwrap();
+    assert!(!reader.at_boundary());
+    reader.rewind();
+    assert_eq!(reader.position(), reader.sent_position());
+    let mut second = ProbeSink::default();
+    while let Ok(ReadOutcome::Copied { len, .. }) = sr_read(&mut reader, &mut out) {
+        second.datagram(&out[..len]);
+    }
+    assert_eq!(first.messages, [messages[0].clone()]);
+    assert_eq!(second.messages, [messages[1].clone()]);
+}
