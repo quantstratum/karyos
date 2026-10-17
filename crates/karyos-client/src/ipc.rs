@@ -320,6 +320,7 @@ impl Session {
             key,
             registration,
             request,
+            by_uri: false,
         };
         let Ok(fetched) = fetch(self, &fetchable) else {
             return;
@@ -684,6 +685,15 @@ impl RemoteClient {
         self.losses.dropped()
     }
 
+    /// Driver events dropped because the queue was full, as
+    /// [`ClientConductor::events_dropped`].
+    #[must_use]
+    pub fn events_dropped(&self) -> u64 {
+        self.conductor
+            .as_ref()
+            .map_or(0, ClientConductor::events_dropped)
+    }
+
     /// Requests a publication on `stream` (the client conductor's
     /// `add_publication`); returns the request sequence.
     ///
@@ -724,6 +734,57 @@ impl RemoteClient {
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?.add_subscription(stream, role)
+    }
+
+    /// Requests an exclusive publication of `stream_id` on the channel
+    /// `uri`, as [`ClientConductor::add_network_publication`]; its grant
+    /// completes as [`Outcome::Fetchable`](crate::Outcome::Fetchable) with
+    /// `by_uri` set.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_network_publication`].
+    pub fn add_network_publication(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        allow_unconnected: bool,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_network_publication(uri, stream_id, allow_unconnected)
+    }
+
+    /// Subscribes `stream_id` on the channel `uri`, as
+    /// [`ClientConductor::add_network_subscription`]: a `karyos:ipc` grant
+    /// completes as [`Outcome::Fetchable`](crate::Outcome::Fetchable) with
+    /// `by_uri` set, a `karyos:udp` one as
+    /// [`Outcome::NetworkSubscription`](crate::Outcome::NetworkSubscription).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::add_network_subscription`].
+    pub fn add_network_subscription(
+        &mut self,
+        uri: &str,
+        stream_id: i32,
+        role: SubscriberRole,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .add_network_subscription(uri, stream_id, role)
+    }
+
+    /// Removes the network subscription `registration`, as
+    /// [`ClientConductor::remove_network_subscription`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::remove_network_subscription`].
+    pub fn remove_network_subscription(
+        &mut self,
+        registration: u64,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .remove_network_subscription(registration)
     }
 
     /// Requests a publication on one lane of `stream`'s aggregate.
@@ -1102,7 +1163,14 @@ impl RemoteClient {
         let generation = fetched.record.generation;
         let publication = (fetched.stream_registration, fetched.incarnation);
         let base = fetched.base;
-        let built = check(&fetched, &fetchable.request).and_then(|()| adopt(&fetched, export));
+        // A request by channel URI names no session id: the grant's is
+        // taken, the stream id and the lane are still checked (W7).
+        let request = if fetchable.by_uri {
+            fetchable.request.with_session(fetched.record.session_id)
+        } else {
+            fetchable.request
+        };
+        let built = check(&fetched, &request).and_then(|()| adopt(&fetched, export));
         match built {
             Ok(handle) => {
                 drop(fetched);
@@ -1121,7 +1189,7 @@ impl RemoteClient {
                 session.links().push(RemoteLink {
                     registration: fetchable.registration,
                     publication,
-                    request: fetchable.request,
+                    request,
                     generation,
                     link: Arc::downgrade(&link),
                 });

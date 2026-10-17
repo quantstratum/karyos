@@ -110,16 +110,18 @@ pub enum ConductorError {
 }
 
 /// The channel URI `uri` for a command: it parses (SPEC §5) and fits.
-fn channel_uri(uri: &str) -> Result<ChannelUri, ConductorError> {
+/// Also whether it names an IPC channel.
+fn channel_uri(uri: &str) -> Result<(ChannelUri, bool), ConductorError> {
     if uri.is_empty() {
         return Err(ConductorError::EmptyUri);
     }
     if uri.len() > karyos_protocol::cnc::MAX_COMMAND_URI {
         return Err(ConductorError::UriTooLong);
     }
-    karyos_protocol::channel::ChannelConfig::parse(uri)
+    let channel = karyos_protocol::channel::ChannelConfig::parse(uri)
         .map_err(|error| ConductorError::InvalidChannel { code: error.code() })?;
-    ChannelUri::new(uri).ok_or(ConductorError::UriTooLong)
+    let ipc = matches!(channel.media, karyos_protocol::channel::Media::Ipc);
+    Ok((ChannelUri::new(uri).ok_or(ConductorError::UriTooLong)?, ipc))
 }
 
 /// How a request ended.
@@ -238,6 +240,19 @@ impl Request {
         }
     }
 
+    /// The request with `session_id` in its stream: a request by channel
+    /// URI names none, so a grant's carries it.
+    #[must_use]
+    pub fn with_session(mut self, session_id: i32) -> Self {
+        match &mut self {
+            Self::Publication { stream, .. }
+            | Self::ConcurrentPublication { stream, .. }
+            | Self::Subscription { stream, .. }
+            | Self::ConflatedSubscription { stream } => stream.session_id = session_id,
+        }
+        self
+    }
+
     /// The lane requested; a conflated view names none.
     #[must_use]
     pub fn lane(&self) -> Option<Lane> {
@@ -259,6 +274,10 @@ pub struct Fetchable {
     pub registration: u64,
     /// What was requested.
     pub request: Request,
+    /// The request named its stream by channel URI (W7): the driver chose
+    /// the stream, so the request's session id is not known and the
+    /// grant's is taken.
+    pub by_uri: bool,
 }
 
 /// A remote client's view of a conflated stream's table, ready to fetch.
@@ -365,6 +384,8 @@ struct Pending {
     request: Option<Request>,
     /// The sizes a `TraceJournal` asked for.
     journal: Option<JournalLayout>,
+    /// The request named its stream by channel URI.
+    by_uri: bool,
 }
 
 /// A client's conductor (not `Clone`). Dropping it closes the client: the
@@ -661,8 +682,16 @@ impl<T: TermBytes> ClientConductor<T> {
         stream_id: i32,
         allow_unconnected: bool,
     ) -> Result<u64, ConductorError> {
-        let uri = channel_uri(uri)?;
-        self.submit(Kind::AddPublication, None, |sequence| {
+        let (uri, _) = channel_uri(uri)?;
+        let request = Request::Publication {
+            stream: StreamKey {
+                stream_id,
+                session_id: 0,
+            },
+            lane: Lane::ZERO,
+            allow_unconnected,
+        };
+        self.submit_uri(Kind::AddPublication, request, |sequence| {
             Command::AddNetworkPublication {
                 sequence,
                 stream_id,
@@ -673,10 +702,14 @@ impl<T: TermBytes> ClientConductor<T> {
     }
 
     /// Subscribes `stream_id` on the channel `uri` (W5); returns the
-    /// request sequence. It completes as [`Outcome::NetworkSubscription`];
-    /// its images are then announced with `ImageAvailable`, and each is
-    /// attached as a stream with [`add_subscription`](Self::add_subscription)
-    /// and `role`.
+    /// request sequence. A `karyos:udp` subscription completes as
+    /// [`Outcome::NetworkSubscription`]; its images are then announced with
+    /// `ImageAvailable`, and each is attached as a stream with
+    /// [`add_subscription`](Self::add_subscription) and `role`. A
+    /// `karyos:ipc` one subscribes the only stream of `stream_id` on lane 0
+    /// and completes as [`add_subscription`](Self::add_subscription) does
+    /// (W7); the driver refuses it with `UnknownStream` when there is none
+    /// or more than one.
     ///
     /// # Errors
     ///
@@ -687,15 +720,26 @@ impl<T: TermBytes> ClientConductor<T> {
         stream_id: i32,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
-        let uri = channel_uri(uri)?;
-        self.submit(Kind::AddNetworkSubscription, None, |sequence| {
-            Command::AddNetworkSubscription {
-                sequence,
-                stream_id,
+        let (uri, ipc) = channel_uri(uri)?;
+        let command = |sequence| Command::AddNetworkSubscription {
+            sequence,
+            stream_id,
+            role,
+            uri,
+        };
+        if ipc {
+            let request = Request::Subscription {
+                stream: StreamKey {
+                    stream_id,
+                    session_id: 0,
+                },
+                lane: Lane::ZERO,
                 role,
-                uri,
-            }
-        })
+            };
+            self.submit_uri(Kind::AddSubscription, request, command)
+        } else {
+            self.submit(Kind::AddNetworkSubscription, None, command)
+        }
     }
 
     /// Removes the network subscription `registration`; its images retire.
@@ -1195,6 +1239,28 @@ impl<T: TermBytes> ClientConductor<T> {
         journal: Option<JournalLayout>,
         command: impl FnOnce(u64) -> Command,
     ) -> Result<u64, ConductorError> {
+        self.submit_full(kind, request, journal, false, command)
+    }
+
+    /// Submits a request that names its stream by channel URI: a remote
+    /// client's grant takes its session id from the driver's.
+    fn submit_uri(
+        &mut self,
+        kind: Kind,
+        request: Request,
+        command: impl FnOnce(u64) -> Command,
+    ) -> Result<u64, ConductorError> {
+        self.submit_full(kind, Some(request), None, true, command)
+    }
+
+    fn submit_full(
+        &mut self,
+        kind: Kind,
+        request: Option<Request>,
+        journal: Option<JournalLayout>,
+        by_uri: bool,
+        command: impl FnOnce(u64) -> Command,
+    ) -> Result<u64, ConductorError> {
         if self.closed() {
             return Err(ConductorError::Closed);
         }
@@ -1220,6 +1286,7 @@ impl<T: TermBytes> ClientConductor<T> {
                     kind,
                     request,
                     journal,
+                    by_uri,
                 });
                 Ok(sequence)
             }
@@ -1383,6 +1450,7 @@ impl<T: TermBytes> ClientConductor<T> {
                         key,
                         registration,
                         request,
+                        by_uri: pending.by_uri,
                     });
                 }
                 _ => {}

@@ -39,7 +39,7 @@ use std::sync::Arc;
 use karyos_client::link::ClientLink;
 use karyos_protocol::channel::{ChannelConfig, CommonConfig, Media, UdpConfig};
 use karyos_protocol::cnc::{
-    Command, ErrorCode, Event as DriverEvent, RequestId, Response, StreamKey,
+    Command, ErrorCode, Event as DriverEvent, RequestId, Response, StreamKey, SubscriberRole,
 };
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode};
@@ -340,12 +340,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Err(ErrorCode::IdentitiesExhausted)
     }
 
-    /// Serves `AddNetworkSubscription` (W5b).
+    /// Serves `AddNetworkSubscription` (W5b). A `karyos:ipc` URI subscribes
+    /// the only stream of `stream_id` as `AddSubscription` does (W7).
     pub(crate) fn serve_network_subscription(
         &mut self,
         client: u64,
+        link: &Arc<ClientLink<T>>,
         request: RequestId,
         stream_id: i32,
+        role: SubscriberRole,
         uri: &str,
     ) -> Response {
         let refuse = |code: ErrorCode, detail: u64| Response::Error {
@@ -356,10 +359,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let detail = u64::from(stream_id.cast_unsigned());
         let udp = match ChannelConfig::parse(uri) {
             Err(error) => return refuse(ErrorCode::InvalidChannel, error.code()),
-            // An IPC subscription is `AddSubscription`'s.
             Ok(ChannelConfig {
                 media: Media::Ipc, ..
-            }) => return refuse(ErrorCode::UnsupportedChannel, detail),
+            }) => {
+                let Some(stream) = self.ipc_stream(stream_id) else {
+                    return refuse(ErrorCode::UnknownStream, detail);
+                };
+                return self.execute(
+                    client,
+                    link,
+                    Command::AddSubscription {
+                        sequence: request.sequence,
+                        stream,
+                        lane: Lane::ZERO,
+                        role,
+                    },
+                );
+            }
             Ok(ChannelConfig {
                 media: Media::Udp(udp),
                 ..
