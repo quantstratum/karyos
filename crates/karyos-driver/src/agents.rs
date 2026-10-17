@@ -918,6 +918,16 @@ impl<O: SocketOps> SenderAgent<O> {
         self.role.ignore_naks();
     }
 
+    /// Reads NAKs again after [`SenderAgent::ignore_naks`] (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast test (T9)")
+    )]
+    pub(crate) fn heed_naks(&mut self) {
+        self.role.heed_naks();
+    }
+
     /// After a stop: the halves of `Attach` commands the agent never read
     /// (DN-8). The conductor reclaims them with the held ones.
     pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {

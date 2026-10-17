@@ -918,3 +918,195 @@ fn multicast_cycles_run_on_the_network_clock() {
 }
 
 mod netem;
+
+/// Offers numbered messages on `lane` up to `until`, runs A and B once and
+/// reads B's `reader`, checking order (T9).
+#[cfg(target_os = "linux")]
+fn offer_and_read(
+    [a, b]: [&mut EmbeddedDriver; 2],
+    lane: &mut karyos_client::ClientPublication<HeapTerms>,
+    reader: &mut AggregateSubscription<HeapTerms>,
+    (sent, seen): (&mut u32, &mut u32),
+    until: u32,
+) {
+    while *sent < until {
+        let mut payload = [0u8; 1000];
+        payload[..4].copy_from_slice(&sent.to_le_bytes());
+        match lane.offer(&payload).unwrap() {
+            OfferOutcome::Accepted { .. } => *sent += 1,
+            _ => break,
+        }
+    }
+    let _ = a.do_work().unwrap();
+    let _ = b.do_work().unwrap();
+    let _ = reader.poll(
+        |bytes, _, _| {
+            let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+            assert_eq!(index, *seen, "B in order, exactly once");
+            *seen += 1;
+        },
+        BUDGET,
+    );
+}
+
+/// T9 (contract-traceability-phase-2.md, "Retention floor"), end to end on
+/// a reliable multicast publication with B required (receiver 77) and C
+/// optional. While the sender holds NAKs back, C loses a datagram and the
+/// sender, bound by B alone, sends `total` messages, B reading them all;
+/// then NAKs flow. Returns C's closes `(unrecoverable, cannot_resume)`, and
+/// with `repair_b`, checks that B's own hole above the floor is repaired.
+/// `None` without multicast on this host.
+#[cfg(target_os = "linux")]
+fn optional_receiver_closes(total: u32, repair_b: bool) -> Option<(u64, u64)> {
+    use std::io::Write as _;
+
+    use crate::membership::{PublicationRoles, ReceiverIdentity, Strategy};
+
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(std::io::stderr(), "SKIPPED T9 retention floor: {why}");
+        return None;
+    }
+    let port = free_address().port();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), port);
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let (mut a, mut b, mut c) = (
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    let required = ReceiverIdentity {
+        receiver_id: core::num::NonZeroU64::new(77).unwrap(),
+        group_tag: 0,
+    };
+    let _ = b
+        .add_network_subscription_as(10, &channel, required)
+        .unwrap();
+    let _ = c.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication_with_roles(
+            aggregate(10, 3, 1),
+            &channel,
+            PublicationRoles {
+                strategy: Strategy::Max,
+                required: vec![77],
+                tags: Vec::new(),
+            },
+        )
+        .unwrap();
+    let mut images = (None, None);
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        images = (
+            drivers[1].network_image(10, 3),
+            drivers[2].network_image(10, 3),
+        );
+        images.0.is_some() && images.1.is_some()
+    });
+    let (Some(on_b), Some(_on_c)) = images else {
+        unreachable!("pumped until both exist");
+    };
+    let mut reader = b.subscribe_aggregate(&on_b, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    // The sender holds NAKs back; C loses its third DATA datagram.
+    a.net.as_mut().unwrap().sender_ignores_naks(true);
+    c.net.as_mut().unwrap().drop_receiver_data(&[2]);
+    let (mut sent, mut seen) = (0u32, 0u32);
+    for _ in 0..40_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        let _ = c.do_work().unwrap();
+        if seen == total {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert_eq!(seen, total, "B is required and reads everything");
+    // NAKs flow again: C's hole is below the floor.
+    a.net.as_mut().unwrap().sender_ignores_naks(false);
+    let closes = |c: &EmbeddedDriver| {
+        c.net.as_ref().unwrap().receiver_counters().map(|counters| {
+            (
+                counters.images_closed_unrecoverable,
+                counters.images_closed_cannot_resume,
+            )
+        })
+    };
+    for _ in 0..40_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        let _ = c.do_work().unwrap();
+        if closes(&c).is_some_and(|(unrecoverable, cannot)| unrecoverable + cannot >= 1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    let on_c = c.net.as_ref().unwrap().receiver_counters().unwrap();
+    assert!(on_c.naks >= 1, "{on_c:?}");
+    if repair_b {
+        // The sender answered C's NAK below its floor (RANGE_UNAVAILABLE).
+        let sender = a.net.as_ref().unwrap().sender_counters().unwrap();
+        assert!(sender.naks >= 1 && sender.nak_replies >= 1, "{sender:?}");
+        // A hole above the floor, B's, is repaired.
+        b.net.as_mut().unwrap().drop_receiver_data(&[1]);
+        let more = total + 8;
+        for _ in 0..40_000 {
+            offer_and_read(
+                [&mut a, &mut b],
+                &mut lane,
+                &mut reader,
+                (&mut sent, &mut seen),
+                more,
+            );
+            if seen == more {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        assert_eq!(seen, more, "B's lost datagram was repaired");
+        let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+        assert!(receiver.naks >= 1, "{receiver:?}");
+        assert_eq!(receiver.images_closed_unrecoverable, 0);
+    }
+    closes(&c)
+}
+
+/// T9: a term and a half, so the floor, bound by B alone, passes C's hole
+/// but stays inside C's window `{r, r + 1}`. C's NAK below the floor is
+/// answered RANGE_UNAVAILABLE and C's image closes as unrecoverable
+/// (`on_unrecoverable = close`); B's own hole above the floor is repaired.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_optional_receivers_hole_below_the_floor_is_unrecoverable() {
+    if let Some(closes) = optional_receiver_closes(MIN_TERM_LENGTH * 3 / 2 / 1000, true) {
+        assert_eq!(closes, (1, 0), "C closed as unrecoverable");
+    }
+}
+
+/// T9, the expected other outcome (GU-6): three terms, so the floor is
+/// beyond C's window when its NAK flows. There is no far-window catch-up,
+/// so C's image closes as GapCannotResume, not as unrecoverable.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_optional_receivers_hole_past_its_window_cannot_resume() {
+    if let Some(closes) = optional_receiver_closes(3 * (MIN_TERM_LENGTH / 1000) + 8, false) {
+        assert_eq!(closes, (0, 1), "C closed as GapCannotResume");
+    }
+}
