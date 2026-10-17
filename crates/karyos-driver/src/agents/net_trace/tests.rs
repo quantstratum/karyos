@@ -555,7 +555,7 @@ mod sender {
                 start: 0,
                 boundary: 0,
                 first_gap: None,
-                gaps: GapIntervals::default(),
+                gaps: None,
             }
         );
         assert_eq!(

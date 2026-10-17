@@ -3605,7 +3605,7 @@ impl Rig {
             .unwrap();
         self.round(true);
         self.trace_events.iter().find_map(|event| match event {
-            crate::agents::AgentEvent::NetworkJournalClosed { facts, .. } => Some(*facts),
+            crate::agents::AgentEvent::NetworkJournalClosed { facts, .. } => Some(facts.clone()),
             _ => None,
         })?
     }
@@ -3771,12 +3771,12 @@ fn a_receiver_journal_keeps_its_sealed_gaps() {
     }
     rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 2);
     let facts = rig.close_receiver_journal(9).expect("facts");
-    let gaps = facts.gaps.intervals();
+    let gaps = facts.gaps.as_deref().unwrap().intervals();
     assert_eq!(gaps.len(), 2, "{gaps:?}");
     assert_eq!((gaps[0].0, gaps[1].0), (positions[1], positions[3]));
     assert!(gaps.iter().all(|(start, end)| end > start));
     assert_eq!(facts.first_gap, Some(positions[1]));
-    assert!(!facts.gaps.overflowed());
+    assert!(!facts.gaps.as_deref().unwrap().overflowed());
 }
 
 /// P2.12 step 3 PR 2 (Q2, ACS 16519): an image that retires closes its
@@ -3814,7 +3814,7 @@ fn a_retired_image_closes_its_journals_with_their_facts() {
     let posted = rig.trace_events.iter().find_map(|event| match event {
         crate::agents::AgentEvent::NetworkJournalClosed {
             facts: Some(facts), ..
-        } => Some(*facts),
+        } => Some(facts.clone()),
         _ => None,
     });
     let posted = posted.expect("the retirement posted the close");
@@ -3828,7 +3828,11 @@ fn a_retired_image_closes_its_journals_with_their_facts() {
     // A close naming another number (a reinstalled identity's journal)
     // finds nothing; the right one has the same facts, then nothing.
     assert_eq!(rig.close_receiver_journal(12), None);
-    assert_eq!(rig.close_receiver_journal(11), Some(posted));
+    // The gaps went with the posted event; a later close answers the rest.
+    assert!(posted.gaps.is_some());
+    let mut again = posted.clone();
+    again.gaps = None;
+    assert_eq!(rig.close_receiver_journal(11), Some(again));
     assert_eq!(rig.close_receiver_journal(11), None);
 }
 

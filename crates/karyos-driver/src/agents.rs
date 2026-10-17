@@ -1056,7 +1056,14 @@ impl<O: SocketOps> ReceiverAgent<O> {
         });
         // Journals a retirement closed reach the conductor with their facts
         // (trace-network.md §4); a full ring keeps them for the next cycle.
-        role.post_retired_journals(|event| events.try_post(event).is_ok());
+        role.post_retired_journals(|event| match events.try_post(event) {
+            Ok(()) => None,
+            Err(
+                ring::PostError::Gone(event)
+                | ring::PostError::Foreign(event)
+                | ring::PostError::Full(event),
+            ) => Some(event),
+        });
         served.checked_add(work).ok_or(overflow)
     }
 

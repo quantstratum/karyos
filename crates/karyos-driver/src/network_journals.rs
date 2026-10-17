@@ -279,8 +279,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let open = self.network.open.swap_remove(index);
                 if let Some(facts) = facts {
                     let receiver = open.side == NetSide::Receiver;
-                    if receiver {
-                        self.network.keep_gaps(number, facts.gaps);
+                    if receiver && let Some(gaps) = facts.gaps {
+                        self.network.keep_gaps(number, *gaps);
                     }
                     let _ = self.trace_journals.update_network(number, |recorded| {
                         recorded.boundary = Some(facts.boundary);
