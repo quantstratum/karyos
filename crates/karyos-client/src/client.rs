@@ -746,6 +746,14 @@ impl<C: Connection> Client<C> {
     /// one creates a network publication. Offers are refused while no
     /// subscriber is connected.
     ///
+    /// It holds every lane, all or nothing. A URI that names `lanes` takes
+    /// exactly that many: any lane refused, the stream configuring fewer
+    /// included, refuses the publication and releases the lanes granted.
+    /// A URI that names none takes the lanes the stream configures, which
+    /// the facade does not know (a driver's default, an IPC aggregate's
+    /// configuration): lanes are taken until the driver refuses one with
+    /// `UnknownStream`.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Conductor`] for a URI that does not parse or a
@@ -764,25 +772,36 @@ impl<C: Connection> Client<C> {
             Found::Outcome(outcome) => self.connection.publication(*outcome)?,
             Found::Network(..) => return Err(ClientError::Unknown),
         };
-        // Every further lane the aggregate configures, all or nothing: the
-        // driver refuses a lane it does not configure with UnknownStream.
+        // The URI's lane count when it names one; it parsed when the
+        // request was submitted.
+        let named = karyos_protocol::channel::ChannelConfig::parse(uri)
+            .ok()
+            .and_then(|channel| channel.common.lanes);
+        let count = named.unwrap_or(karyos_sys::frame::Lane::COUNT);
         let stream = first.stream();
         let mut lanes = vec![first];
-        for index in 1..karyos_sys::frame::Lane::COUNT {
-            let lane = match karyos_sys::frame::Lane::try_new(index) {
-                Ok(lane) => lane,
-                Err(_) => break,
-            };
-            match self.lane_grant(stream, lane) {
-                Ok(Some(publication)) => lanes.push(publication),
-                Ok(None) => break,
-                Err(error) => {
-                    for publication in lanes {
-                        self.connection.release_publication(publication);
+        for index in 1..count {
+            let refused = match karyos_sys::frame::Lane::try_new(index) {
+                Ok(lane) => match self.lane_grant(stream, lane) {
+                    Ok(Some(publication)) => {
+                        lanes.push(publication);
+                        continue;
                     }
-                    return Err(error);
-                }
+                    // The stream configures no more lanes: the end of an
+                    // unnamed count, a refusal of a named one.
+                    Ok(None) if named.is_none() => break,
+                    Ok(None) => ClientError::Refused {
+                        code: ErrorCode::UnknownStream,
+                        detail: u64::from(index),
+                    },
+                    Err(error) => error,
+                },
+                Err(_) => ClientError::Unknown,
+            };
+            for publication in lanes {
+                self.connection.release_publication(publication);
             }
+            return Err(refused);
         }
         Ok(Publication::new(lanes))
     }

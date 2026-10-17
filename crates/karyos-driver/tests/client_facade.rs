@@ -842,3 +842,50 @@ fn a_refused_lane_releases_the_lanes_already_granted() {
         let _ = client.poll();
     }
 }
+
+/// A URI that names `lanes` takes exactly that many: a stream with fewer
+/// refuses the publication, and the lanes granted are released; the
+/// named count, when the stream has it, is taken.
+#[test]
+fn a_named_lane_count_is_taken_exactly() {
+    use karyos_sys::frame::Lane;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = driver.add_aggregate(heap_aggregate(4, 2)).unwrap();
+    // An exclusive publication is issued once per stream incarnation: the
+    // accepted case has its own aggregate.
+    let _ = driver.add_aggregate(heap_aggregate(5, 2)).unwrap();
+    let lanes = [Lane::ZERO, Lane::try_new(1).unwrap()].map(|lane| aggregate.lane(lane).unwrap());
+    let mut client = Client::with_conductor(driver.connect().unwrap(), context());
+    let refused = serve(&mut driver, || {
+        client
+            .add_exclusive_publication("karyos:ipc?lanes=4", StreamId::new(4))
+            .err()
+    });
+    assert!(
+        matches!(
+            refused,
+            Some(ClientError::Refused {
+                code: karyos_protocol::cnc::ErrorCode::UnknownStream,
+                detail: 2,
+            })
+        ),
+        "{refused:?}"
+    );
+    let start = Instant::now();
+    while lanes
+        .iter()
+        .any(|&lane| driver.live_leases(lane).unwrap() > 0)
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a lane is still held"
+        );
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll();
+    }
+    let publication = serve(&mut driver, || {
+        client.add_exclusive_publication("karyos:ipc?lanes=2", StreamId::new(5))
+    });
+    assert_eq!(publication.unwrap().lane_count(), 2);
+}
