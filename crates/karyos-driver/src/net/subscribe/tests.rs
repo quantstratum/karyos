@@ -1266,12 +1266,17 @@ fn a_liveness_retirement_ends_unsent_image_grants_and_the_exit_proof_the_rest() 
     }
     assert!(b.streams.iter().any(|stream| stream.id == image_stream));
     assert_eq!(b.net.as_ref().unwrap().image_count(), 1);
+    assert!(
+        b.net.as_ref().unwrap().image_charge() > 0,
+        "the sent grant keeps the image's storage charged"
+    );
     // The exit proof ends the sent grant: the stream frees and the image
     // is reclaimed.
     link.mark_closed();
     pump(&mut a, &mut b, |_, b| {
         b.net.as_ref().unwrap().image_count() == 0
     });
+    assert_eq!(b.net.as_ref().unwrap().image_charge(), 0);
     assert!(b.ledger(client).is_none());
     assert!(b.streams.iter().all(|stream| stream.id != image_stream));
     let _ = (a.close_network(), b.close_network());

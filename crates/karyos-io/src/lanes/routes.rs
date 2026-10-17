@@ -187,6 +187,11 @@ pub struct RoutedLaneSender {
     /// The routes in the live set (redundant-paths.md RP-8): a route out of
     /// it takes no flush and holds no head back.
     live: [bool; MAX_ROUTES],
+    /// The routes whose last flush would block (no room) or found the
+    /// endpoint inactive, until a copy of theirs is submitted again: not
+    /// ready. A route that has not tried since its last submit counts as
+    /// ready: nothing probes a socket without a copy to send.
+    blocked: [bool; MAX_ROUTES],
 }
 
 /// The routes not lent this call: out from its start.
@@ -277,6 +282,7 @@ impl RoutedLaneSender {
             counters: [RouteCounters::default(); MAX_ROUTES],
             failures: [None; MAX_ROUTES],
             live: std::array::from_fn(|route| route < queues.len()),
+            blocked: [false; MAX_ROUTES],
         })
     }
 
@@ -293,6 +299,7 @@ impl RoutedLaneSender {
 
     /// Whether `route` is in the live set.
     #[must_use]
+    #[inline]
     pub fn is_live(&self, route: usize) -> Option<bool> {
         (route < self.routes)
             .then(|| self.live.get(route).copied())
@@ -333,10 +340,12 @@ impl RoutedLaneSender {
             .count()
     }
 
-    /// The route that alone holds `lane`'s head, at its front, while
-    /// another live route holds a later copy: the lane waits on that route
-    /// (redundant-paths.md RP-8; ACS 16856). `None` when the head is shared,
-    /// absent, or no other route waits.
+    /// The route that alone holds `lane`'s head while another live route,
+    /// ready to submit (not blocked in the last call, not suspended or
+    /// faulted), holds a later copy: the lane waits on that route
+    /// (redundant-paths.md RP-8; ACS 16856). The head need not be at its
+    /// front: a catch-up copy may precede it there. `None` when the head is
+    /// shared or absent, or no ready route waits (a shared bottleneck).
     #[must_use]
     pub fn sole_holder(&self, lane: usize) -> Option<usize> {
         let entry = self.lanes.get(lane)?;
@@ -361,17 +370,16 @@ impl RoutedLaneSender {
         if holders.next().is_some() {
             return None;
         }
-        let at_front = entry
-            .routes
-            .get(holder)
-            .and_then(|route| route.staged.front())
-            .is_some_and(|copy| copy.position == lowest);
+        let ready = |index: &usize| !self.blocked.get(*index).is_some_and(|blocked| *blocked);
         let others_wait = entry.routes.iter().enumerate().any(|(index, route)| {
             index != holder
                 && live(&index)
+                && ready(&index)
+                && !route.suspended
+                && !route.control
                 && route.staged.iter().any(|copy| copy.position > lowest)
         });
-        (at_front && others_wait).then_some(holder)
+        others_wait.then_some(holder)
     }
 
     /// The failures that stopped one route of several since the last call,
@@ -604,6 +612,7 @@ impl RoutedLaneSender {
             failures,
             routes: count,
             live,
+            blocked,
             ..
         } = self;
         let several = *count > 1;
@@ -634,6 +643,9 @@ impl RoutedLaneSender {
                     Flushed::Submitted => {
                         queue.staged.pop_front();
                         gate.left(lane, head.staged, Left::Submitted);
+                        if let Some(route) = blocked.get_mut(index) {
+                            *route = false;
+                        }
                         // At most one copy per route and lane: no overflow.
                         if let Some(next) = done.submitted.checked_add(1) {
                             done.submitted = next;
@@ -653,7 +665,12 @@ impl RoutedLaneSender {
                     }
                     // Tried again on the next call.
                     Flushed::Denied | Flushed::Again => {}
-                    Flushed::Blocked | Flushed::Inactive => *out = true,
+                    Flushed::Blocked | Flushed::Inactive => {
+                        *out = true;
+                        if let Some(route) = blocked.get_mut(index) {
+                            *route = true;
+                        }
+                    }
                     Flushed::Hold => queue.control = true,
                     Flushed::Fail(failure) if several => {
                         keep(failures, index, failure.at(lane));
@@ -696,6 +713,7 @@ impl RoutedLaneSender {
             count: self.routes,
             out,
             live: self.live,
+            blocked: &mut self.blocked,
             inactive: [false; MAX_ROUTES],
             failure: None,
         };
@@ -828,6 +846,8 @@ struct Source<'a, R, G> {
     out: [bool; MAX_ROUTES],
     /// The live set (RP-8).
     live: [bool; MAX_ROUTES],
+    /// Routes whose last flush would block or found them inactive.
+    blocked: &'a mut [bool; MAX_ROUTES],
     /// Routes whose endpoint was resetting or retired in the call.
     inactive: [bool; MAX_ROUTES],
     failure: Option<SenderFailure>,
@@ -894,6 +914,9 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
                 Flushed::Submitted => {
                     queue.staged.pop_front();
                     self.gate.left(lane, head.staged, Left::Submitted);
+                    if let Some(route) = self.blocked.get_mut(index) {
+                        *route = false;
+                    }
                     if served && let Some(counters) = self.counters.get_mut(index) {
                         bump(&mut counters.late, &mut counters.overflowed);
                     }
@@ -916,11 +939,17 @@ impl<R: Routes, G: LaneGate> LaneSource for Source<'_, R, G> {
                 Flushed::Blocked => {
                     *out = true;
                     blocked = true;
+                    if let Some(route) = self.blocked.get_mut(index) {
+                        *route = true;
+                    }
                 }
                 Flushed::Inactive => {
                     *out = true;
                     *inactive = true;
                     blocked = true;
+                    if let Some(route) = self.blocked.get_mut(index) {
+                        *route = true;
+                    }
                 }
                 Flushed::Hold => queue.control = true,
                 // One route of several: only it stops (module docs).

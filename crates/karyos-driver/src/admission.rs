@@ -208,6 +208,82 @@ pub(crate) struct Admission<T: StreamTerms> {
     next_region: u64,
 }
 
+/// The descriptors an IPC driver with `network` can hold at the bounds of
+/// `config` (network-shared-terms, resolution 4): one per image lane
+/// (`max_images` images of at most four lanes, each a region that keeps
+/// its `memfd` to pass it), one per stream mapping (`max_streams` lane
+/// streams, each with up to `max_retained_generations` predecessors) and
+/// a socket and a pidfd per client (`max_clients`). The fixed regions,
+/// the admission socket, the network sockets and the standard streams
+/// are not counted, so this is a lower bound. `None` on overflow.
+pub(crate) fn descriptors_needed(
+    config: &crate::embedded::DriverConfig,
+    network: &crate::net::NetworkConfig,
+) -> Option<u64> {
+    let lanes = u64::try_from(karyos_protocol::network::MAX_LANES).ok()?;
+    let images = u64::try_from(network.agents.sessions.max_images)
+        .ok()?
+        .checked_mul(lanes)?;
+    let mappings = u64::try_from(config.max_retained_generations)
+        .ok()?
+        .checked_add(1)?;
+    let streams = u64::try_from(config.max_streams)
+        .ok()?
+        .checked_mul(mappings)?;
+    let clients = u64::try_from(config.max_clients).ok()?.checked_mul(2)?;
+    images.checked_add(streams)?.checked_add(clients)
+}
+
+/// Refuses `needed` descriptors (`None`: more than `u64` counts) above
+/// `limit` (`None`: unlimited).
+///
+/// # Errors
+///
+/// [`DriverError::DescriptorLimit`] with both numbers.
+pub(crate) fn check_descriptors(
+    needed: Option<u64>,
+    limit: Option<u64>,
+) -> Result<(), DriverError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    match needed {
+        Some(needed) if needed <= limit => Ok(()),
+        needed => Err(DriverError::DescriptorLimit {
+            needed: needed.unwrap_or(u64::MAX),
+            limit,
+        }),
+    }
+}
+
+/// A driver's instance and its region id counter: every region the
+/// driver creates takes the next id, which is never reused.
+#[derive(Debug)]
+pub(crate) struct RegionIds<'a> {
+    instance: u128,
+    next: &'a mut u64,
+}
+
+impl<'a> RegionIds<'a> {
+    /// The ids of `instance` from `*next` on.
+    pub(crate) fn new(instance: u128, next: &'a mut u64) -> Self {
+        Self { instance, next }
+    }
+
+    /// The instance and a fresh region id.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::RegionIdsExhausted`] once the counter is spent.
+    pub(crate) fn next(&mut self) -> Result<(u128, u64), DriverError> {
+        let region = *self.next;
+        *self.next = region
+            .checked_add(1)
+            .ok_or(DriverError::RegionIdsExhausted)?;
+        Ok((self.instance, region))
+    }
+}
+
 /// The admission instance id of a driver: its `driver_id` (SPEC.md §4)
 /// as one 128-bit value. The `driver_id` is the single per-instance id;
 /// IPC mode uses it for admission (coordinator decision, ACS 13555), so
@@ -360,9 +436,14 @@ impl<T: StreamTerms> Admission<T> {
     /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, Terms in the
     /// types). Region ids are never reused.
     pub(crate) fn next_region(&mut self) -> Result<(u128, u64), DriverError> {
-        let region =
-            Self::take_ids(&mut self.next_region, 1).ok_or(DriverError::RegionIdsExhausted)?;
-        Ok((self.instance, region))
+        self.region_ids().next()
+    }
+
+    /// The instance and the region id counter, borrowed apart from the
+    /// rest of the admission: the image table takes its lanes' region ids
+    /// from it on the driver thread.
+    pub(crate) fn region_ids(&mut self) -> RegionIds<'_> {
+        RegionIds::new(self.instance, &mut self.next_region)
     }
 
     fn take_ids(next: &mut u64, count: u64) -> Option<u64> {
@@ -1192,5 +1273,49 @@ mod work_tests {
                 })
             )
         ));
+    }
+}
+
+#[cfg(test)]
+mod descriptor_tests {
+    use super::{check_descriptors, descriptors_needed};
+    use crate::embedded::DriverConfig;
+    use crate::error::DriverError;
+    use crate::net::NetworkConfig;
+
+    /// The defaults: 64 images of four lanes, 64 streams of three mappings
+    /// and 16 clients of two descriptors.
+    #[test]
+    fn the_default_bounds_need_their_image_lanes_streams_and_clients() {
+        let needed = descriptors_needed(&DriverConfig::default(), &NetworkConfig::default());
+        assert_eq!(needed, Some(64 * 4 + 64 * 3 + 16 * 2));
+    }
+
+    /// A limit below the bounds refuses with both numbers; one at or above
+    /// them, or none, passes; an overflowing count is refused as the
+    /// largest.
+    #[test]
+    fn a_limit_below_the_bounds_is_refused_with_both_numbers() {
+        assert_eq!(
+            check_descriptors(Some(480), Some(479)),
+            Err(DriverError::DescriptorLimit {
+                needed: 480,
+                limit: 479
+            })
+        );
+        assert_eq!(check_descriptors(Some(480), Some(480)), Ok(()));
+        assert_eq!(check_descriptors(Some(480), None), Ok(()));
+        assert_eq!(
+            check_descriptors(None, Some(1024)),
+            Err(DriverError::DescriptorLimit {
+                needed: u64::MAX,
+                limit: 1024
+            })
+        );
+        let config = DriverConfig {
+            max_retained_generations: usize::MAX,
+            ..DriverConfig::default()
+        };
+        assert_eq!(descriptors_needed(&config, &NetworkConfig::default()), None);
     }
 }

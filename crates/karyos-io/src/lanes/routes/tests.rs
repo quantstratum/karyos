@@ -1132,3 +1132,88 @@ fn the_sole_holder_of_a_waiting_lane_is_named() {
         .cancel_route(&mut Lent(routes), 0, &mut gate)
         .unwrap();
 }
+
+/// #346 review P2-1: a lone head behind the route's own catch-up copy is
+/// still held alone: routes 0 and 1 stage p0; only route 0 takes p128;
+/// both take p256; route 1 submits p0 while route 0 blocks. Route 0 holds
+/// p128 alone behind p0, and route 1 waits with p256, ready.
+#[test]
+fn a_lone_head_behind_a_catch_up_copy_is_held_alone() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    f.routes[1].accept(1);
+    let _ = f.serve(&mut Gate::default(), 100);
+    assert_eq!(f.sender.debited(0), Some(0));
+    assert_eq!(f.sender.pending(0, 0), Some(3), "p0 lags on route 0");
+    assert_eq!(f.sender.sole_holder(0), Some(0));
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// #346 review P2-2: a shared bottleneck is no stall. Route 1 lags on p0
+/// (its socket would block); route 0 holds p128 alone, route 1 waits with
+/// p256 but its last flush would block: no ready route waits, so the lane
+/// waits on no one route. Once route 1 submits again, it is ready.
+#[test]
+fn a_blocked_waiting_route_is_not_ready() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    let _ = f.serve(&mut Gate::default(), 100);
+    assert_eq!(f.sender.debited(0), Some(0));
+    f.stage(0, 128, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    // Route 0 would block on p128 now; route 1 blocked on p0.
+    let _ = f.serve(&mut Gate::default(), 1000);
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    let _ = sender.catch_up(&mut Lent(routes), &mut gate);
+    assert_eq!(f.sender.sole_holder(0), None, "no ready route waits");
+    // Route 1 catches p0 up: ready, waiting with p256.
+    f.routes[1].accept(1);
+    let Fixture { routes, sender, .. } = &mut f;
+    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate).submitted, 1);
+    assert_eq!(f.sender.sole_holder(0), Some(0));
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}
+
+/// #346 review P2-2: a blocked route that submits in a serve is ready
+/// again, so a lone holder waits on it.
+#[test]
+fn a_route_that_submits_is_ready_again() {
+    let mut f = Fixture::new(&[1000], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(f.sender.debited(0), None, "both routes blocked on p0");
+    f.routes[0].accept(1);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(f.sender.debited(0), Some(0));
+    f.stage(0, 128, 100, 100, &[1]);
+    f.sender.skipped(0);
+    f.stage(0, 256, 100, 100, &[0, 1]);
+    assert_eq!(f.sender.sole_holder(0), Some(1), "route 0 is ready again");
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    sender
+        .cancel_route(&mut Lent(routes), 0, &mut gate)
+        .unwrap();
+    sender
+        .cancel_route(&mut Lent(routes), 1, &mut gate)
+        .unwrap();
+}

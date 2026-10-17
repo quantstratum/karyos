@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The file operations the segment store uses, behind a trait so that the
-//! torn-write and restart tests can crash it at any point.
+//! The file operations of the Archive's stores, behind a trait so that the
+//! torn-write and restart tests can crash them at any point.
 
 use std::io;
 use std::path::Path;
 
-/// The file operations of the segment store.
+/// The file operations of the Archive's stores.
 pub trait Disk {
     /// An open file.
     type File: core::fmt::Debug;
@@ -63,9 +63,9 @@ pub trait Disk {
     /// The operating system's error.
     fn sync(&mut self, file: &Self::File) -> io::Result<()>;
 
-    /// Makes the entries of `dir` durable: a file created there survives a
-    /// crash only after this (Linux). Elsewhere it does nothing, and a new
-    /// file's entry is made durable with its first `F_FULLFSYNC`.
+    /// Makes the entries of `dir` durable: a file created, renamed or
+    /// removed there survives a crash only after this. It syncs the
+    /// directory on every unix target (`F_FULLFSYNC` on Apple ones).
     ///
     /// # Errors
     ///
@@ -85,6 +85,14 @@ pub trait Disk {
     ///
     /// The operating system's error.
     fn remove(&mut self, path: &Path) -> io::Result<()>;
+
+    /// Renames `from` to `to`, replacing `to` atomically. The new name is
+    /// durable only after [`Disk::sync_dir`].
+    ///
+    /// # Errors
+    ///
+    /// The operating system's error.
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()>;
 }
 
 /// The operating system's files, through the standard library.
@@ -133,11 +141,13 @@ impl Disk for StdDisk {
     }
 
     fn sync_dir(&mut self, dir: &Path) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
+        // `fsync` of the directory on Linux; `F_FULLFSYNC` of it on Apple
+        // targets, where the standard library issues it for `sync_all`.
+        #[cfg(unix)]
         {
             std::fs::File::open(dir)?.sync_all()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             let _ = dir;
             Ok(())
@@ -156,5 +166,9 @@ impl Disk for StdDisk {
 
     fn remove(&mut self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
     }
 }

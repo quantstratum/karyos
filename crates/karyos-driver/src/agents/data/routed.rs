@@ -185,6 +185,10 @@ fn leave<R: Routes, G: LaneGate>(
             None => slot.counters.overflowed = true,
         }
     }
+    // A path whose TX half is not lent this cycle (its endpoint resetting)
+    // cannot cancel: its copies stay recorded, counted `uncancelled`, until
+    // its reopen drops them through the guard gate (`reopen_route`) and
+    // settles the ring; a close acknowledgement waits for that reopen.
     sender.cancel_route(lent, index, gate).is_err()
 }
 
@@ -385,7 +389,9 @@ impl Routed {
             let idle = route
                 .last_sent
                 .is_none_or(|at| now.checked_sub(at).is_some_and(|quiet| quiet >= interval));
-            if !idle || route.opened.is_none() || route.needs_reset {
+            // A path out of the live set sends no PATH_HB: its receivers
+            // see it go quiet, as they should (RP-5).
+            if !idle || route.opened.is_none() || route.needs_reset || route.left {
                 continue;
             }
             if post(route.endpoint, route.destination) {
@@ -619,7 +625,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
 
     /// Sets when its paths leave the live set (RP-8); a single-path
     /// publication has none.
-    pub fn set_path_policy(&mut self, policy: PathPolicy) {
+    pub(crate) fn set_path_policy(&mut self, policy: PathPolicy) {
         if let Some(routed) = self.routed.as_deref_mut() {
             routed.policy = policy;
         }
@@ -628,6 +634,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// Path `route`'s live-set counters; `None` on one path or past its
     /// paths.
     #[must_use]
+    #[inline]
     pub fn path_counters(&self, route: usize) -> Option<PathCounters> {
         self.routed
             .as_deref()
@@ -638,6 +645,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// Whether path `route` is in the live set and whether it is
     /// `Degraded`; `None` on one path or past its paths.
     #[must_use]
+    #[inline]
     pub fn path_state(&self, route: usize) -> Option<(bool, bool)> {
         self.routed
             .as_deref()
