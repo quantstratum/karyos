@@ -615,3 +615,425 @@ fn a_resetting_routes_copies_do_not_block_a_rewind() {
     assert_eq!(seen_a.lock().unwrap().len(), 1, "A sends it again");
     let _rx_b = reset(&mut halves, 1, rx_b);
 }
+
+/// rp-w5a test policy: a 1 ms window, the default 50%, and a minimum of
+/// eight datagrams' bytes, so one early skip decides nothing.
+fn policy() -> super::super::PathPolicy {
+    super::super::PathPolicy {
+        lag_limit: 1_000_000,
+        skip_percent: 50,
+        skip_min_bytes: 8 * FRAME,
+    }
+}
+
+/// Commits `count` more messages of 1000 bytes on lane 0, from `first`.
+fn commit(log: &mut TestLog, first: u8, count: u8) {
+    for i in first..first + count {
+        let _ = log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+}
+
+/// RP-8: a path that skips a minority of the window's datagrams is
+/// `Degraded` and stays in the live set; one that skips most leaves it,
+/// counted, and takes nothing more.
+#[test]
+fn a_lagging_path_leaves_and_a_microburst_does_not() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 2);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    // Both take every datagram: neither degraded.
+    commit(&mut log, 0, 2);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 10)
+        .unwrap();
+    assert_eq!(outbound.path_state(1), Some((true, false)));
+    // B blocks: its queue fills, and later datagrams skip it.
+    for _ in 0..16 {
+        observer_b.push_send(SendResult::Error(Errno::AGAIN));
+    }
+    let before = observer_b.send_calls();
+    commit(&mut log, 2, 20);
+    for now in 20..30 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(1), Some((false, false)), "B left");
+    assert_eq!(outbound.routed_sender().unwrap().is_live(1), Some(false));
+    let counters = outbound.path_counters(1).unwrap();
+    assert_eq!(counters.exits, 1);
+    assert_eq!(counters.degraded, 1);
+    assert_eq!(outbound.path_state(0), Some((true, false)), "A stays");
+    // Out of the live set, B takes no copy and no flush.
+    let calls = observer_b.send_calls();
+    assert!(calls > before);
+    commit(&mut log, 22, 2);
+    for now in 30..34 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(observer_b.send_calls(), calls);
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    let _ = seen_b;
+}
+
+/// RP-8: the last live path never leaves, whatever it skips; and a window
+/// with nothing selected (0/0) decides nothing.
+#[test]
+fn the_last_live_path_never_leaves() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    // A 0/0 window: nothing selected, nothing decided.
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 10)
+        .unwrap();
+    assert_eq!(outbound.path_state(0), Some((true, false)));
+    assert_eq!(outbound.path_state(1), Some((true, false)));
+    // B lags and leaves; then A lags too and stays: the live set is never
+    // empty.
+    for _ in 0..32 {
+        observer_b.push_send(SendResult::Error(Errno::AGAIN));
+    }
+    sent(&observer_a, 64);
+    commit(&mut log, 0, 20);
+    for now in 20..30 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    for _ in 0..64 {
+        observer_a.push_send(SendResult::Error(Errno::AGAIN));
+    }
+    commit(&mut log, 20, 20);
+    for now in 30..60 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(0).map(|state| state.0), Some(true));
+    assert_eq!(outbound.path_counters(0).unwrap().exits, 0);
+}
+
+/// RP-8: a microburst costs a few skipped datagrams and no exit. B misses
+/// one datagram of four (its half absent for a cycle): it is `Degraded`
+/// and stays in the live set.
+#[test]
+fn a_microburst_degrades_without_an_exit() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 16);
+    sent(&observer_b, 16);
+    let mut halves = vec![a];
+    let (mut outbound, mut log) = routed(0);
+    // A minimum of four datagrams' bytes: the window below is past it.
+    outbound.set_path_policy(super::super::PathPolicy {
+        skip_min_bytes: 4 * FRAME,
+        ..policy()
+    });
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 10)
+        .unwrap();
+    halves.push(b);
+    commit(&mut log, 1, 3);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 20)
+        .unwrap();
+    assert_eq!(outbound.path_state(1), Some((true, true)), "degraded, live");
+    assert_eq!(outbound.path_counters(1).unwrap().exits, 0);
+}
+
+/// #16835: the copies a leaving path held alone, above the debited
+/// position, are counted: no live path sends them, and the receivers get
+/// them by NAK or close the gap by their gap policy.
+#[test]
+fn a_leaving_paths_lone_copies_are_counted() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    for _ in 0..32 {
+        observer_b.push_send(SendResult::Error(Errno::AGAIN));
+    }
+    sent(&observer_a, 64);
+    let mut halves = vec![b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    // Only B is there for the first datagram: A skips it, B holds it.
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 10)
+        .unwrap();
+    halves.insert(0, a);
+    // B stays blocked: the lane waits on B alone, A cannot send. Under
+    // `path_lag_limit` (1 ms here) B stays; past it, B leaves (ACS 16856).
+    commit(&mut log, 1, 20);
+    // Many cycles inside `path_lag_limit`: time decides, not cycles.
+    for now in (20..990_000).step_by(20_000) {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    assert_eq!(observer_a.send_calls(), 0, "the lane waits on B");
+    // The next cycle spans the limit from the stall's start.
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1_000_100)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    assert_eq!(outbound.path_counters(1).unwrap().copies_abandoned, 1);
+    // The head moves on: A resumes.
+    for now in 1_000_200..1_000_210 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert!(observer_a.send_calls() > 0, "A resumes");
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+}
+
+/// #16782 (2): a path's leave settles the guard gate's ring for it, so a
+/// close acknowledgement afterwards does not wait on the left path.
+#[test]
+fn a_close_after_a_leave_does_not_wait_on_the_left_path() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    for _ in 0..32 {
+        observer_b.push_send(SendResult::Error(Errno::AGAIN));
+    }
+    sent(&observer_a, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    outbound
+        .guard(
+            GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::clone(&cell),
+                epoch: 2,
+                rate: None,
+            },
+            0,
+        )
+        .unwrap();
+    commit(&mut log, 0, 20);
+    for now in 10..20 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 30)
+        .unwrap();
+    let applied = cell.try_read().unwrap();
+    assert_eq!(applied.epoch, 3);
+    assert_eq!(applied.in_flight, 0, "nothing waits on the left path");
+}
+
+/// #346 review P2-3: several paths can leave in one pass, and the last live
+/// one never does. Three paths each take one datagram of three (the others'
+/// halves are away): each skipped two thirds, so A and B leave and C stays.
+#[test]
+fn several_paths_leave_in_one_pass_but_not_the_last() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    let (c, observer_c, _seen_c) = path(3, 0);
+    for observer in [&observer_a, &observer_b, &observer_c] {
+        sent(observer, 16);
+    }
+    let routes = [
+        (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
+        (EndpointId(2), SocketAddr::from(([127, 0, 0, 2], 41_000))),
+        (EndpointId(3), SocketAddr::from(([127, 0, 0, 3], 41_000))),
+    ];
+    let (mut outbound, mut log) = outbound_routed(&routes, ALIAS, TERM, 1, false);
+    outbound.set_path_policy(super::super::PathPolicy {
+        skip_min_bytes: 3 * FRAME,
+        ..policy()
+    });
+    let mut halves = [Some(a), Some(b), Some(c)];
+    for (i, now) in [(0usize, 10u64), (1, 11), (2, 12)] {
+        let mut present = vec![halves[i].take().unwrap()];
+        commit(&mut log, u8::try_from(i).unwrap(), 1);
+        let _ = outbound
+            .serve_routes(&mut present, BUDGET, None, now)
+            .unwrap();
+        halves[i] = present.pop();
+    }
+    let live: Vec<bool> = (0..3)
+        .map(|route| outbound.path_state(route).unwrap().0)
+        .collect();
+    assert_eq!(live, [false, false, true], "A and B leave, C stays");
+    let mut halves: Vec<_> = halves.into_iter().flatten().collect();
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 13)
+        .unwrap();
+}
+
+/// #346 review P2-4: a submit resets the stall clock. B holds the lane's
+/// two first datagrams alone and is blocked for 60% of `path_lag_limit`.
+/// It submits the first and, in the same cycle, still holds the next head
+/// alone; blocked for 60% again, it never leaves.
+#[test]
+fn a_submit_resets_the_stall_clock() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    let mut halves = vec![b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    // B alone takes p0 and p1, and its socket would block (nothing
+    // scripted).
+    commit(&mut log, 0, 2);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1_000)
+        .unwrap();
+    halves.insert(0, a);
+    commit(&mut log, 2, 2);
+    for now in [2_000, 300_000, 601_000] {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    // B submits p0: the clock resets, though B still holds p1 alone.
+    observer_b.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 602_000)
+        .unwrap();
+    for now in [604_000, 900_000, 1_204_000] {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(
+        outbound.path_state(1).map(|state| state.0),
+        Some(true),
+        "each stall stayed under the limit"
+    );
+    sent(&observer_b, 64);
+    for now in 1_205_000..1_205_010 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+}
+
+/// #346 delta review (ACS 17096): a route reopened after a reset is ready
+/// again. A and B block on p0, A submits it, B resets and is reopened (its
+/// copies, and the one that blocked it, dropped). A alone holds p128 and
+/// blocks; B, drained, holds p256: the lane waits on A, which leaves after
+/// `path_lag_limit`.
+#[test]
+fn a_reopened_path_is_waited_on_and_the_lone_holder_leaves() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b, rx_b) = path_rx(2, 0);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1_000)
+        .unwrap();
+    observer_a.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 2_000)
+        .unwrap();
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 0), Some(0));
+    let _rx_b = reset(&mut halves, 1, rx_b);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 3_000)
+        .unwrap();
+    let b_half = halves.remove(1);
+    commit(&mut log, 1, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 4_000)
+        .unwrap();
+    halves.push(b_half);
+    commit(&mut log, 2, 1);
+    sent(&observer_b, 64);
+    for now in (5_000..1_000_000).step_by(100_000) {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(0).map(|state| state.0), Some(true));
+    for now in (1_100_000..1_500_000).step_by(100_000) {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(
+        outbound.path_state(0).map(|state| state.0),
+        Some(false),
+        "A held the lane alone past the limit"
+    );
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    assert!(observer_b.send_calls() > 0, "B resumes");
+}
+
+/// #346 review P2-2: a shared bottleneck evicts no path. B submits p0 and
+/// A blocks on it; B alone takes p1 and blocks too. B holds the lane's head
+/// alone, but A, which holds later copies, is blocked as well: neither
+/// leaves, however long both sockets would block.
+#[test]
+fn a_shared_bottleneck_evicts_no_path() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    observer_b.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 500)
+        .unwrap();
+    let a_half = halves.remove(0);
+    commit(&mut log, 1, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 700)
+        .unwrap();
+    halves.insert(0, a_half);
+    commit(&mut log, 2, 2);
+    for now in (1_000..3_000_000).step_by(100_000) {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(0).map(|state| state.0), Some(true));
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    for now in 3_000_000..3_000_010 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+}

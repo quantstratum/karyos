@@ -1282,6 +1282,8 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     due: Vec<(EndpointId, SetupAnnounce)>,
     /// `path_heartbeat_interval` in ns (RP-3).
     path_heartbeat_interval: u64,
+    /// When a routed publication's path leaves the live set (RP-8).
+    path_policy: super::data::PathPolicy,
     /// The receivers answered, at most `receiver_bindings` (allocated at
     /// creation).
     bindings: Vec<ReceiverBinding>,
@@ -1420,6 +1422,7 @@ pub(super) fn roles<T: StreamTerms>(
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
             path_heartbeat_interval: config.path_heartbeat_interval,
+            path_policy: config.path_policy,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
             unconfirmed_timeout: config.sessions.setup_challenge_timeout,
@@ -1825,6 +1828,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
     #[must_use]
     pub fn session_counters(&self) -> crate::sessions::receive::SessionCounters {
         self.sessions.counters()
+    }
+
+    /// Whether `alias` is published on `endpoint` (tests).
+    #[cfg(test)]
+    pub(crate) fn is_published(&self, endpoint: EndpointId, alias: Alias) -> bool {
+        self.published.contains(&(endpoint, alias))
     }
 
     /// Live paths of the image at `slot` (tests).
@@ -4097,6 +4106,8 @@ impl<T: StreamTerms> SenderRole<T> {
                         .is_ok();
                 // A guarded publication's gate decides every exposure.
                 let guarded = guard.is_none_or(|spec| outbound.guard(spec, (self.clock)()).is_ok());
+                // Its paths leave the live set by the agent's policy (RP-8).
+                outbound.set_path_policy(self.path_policy);
                 if repairs && guarded {
                     add_sessions(&mut self.sessions, &publication, &outbound)
                 } else {
@@ -4602,10 +4613,19 @@ impl<T: StreamTerms> SenderRole<T> {
         self.ignore_naks = false;
     }
 
-    /// The least position every receiver bound to `outbound` on any of its
-    /// paths consumed, per lane: a reliable channel's bound (SPEC §4). A receiver
-    /// answered but not yet heard from bounds at its join points. `None`
-    /// with no bound receiver at all: a reliable lane then holds.
+    /// The receivers bound to `alias` on `endpoint` whose SMs arrived
+    /// (tests): a path's SMs reach the sender only when the receiver agent
+    /// has the alias published on that path's endpoint.
+    #[cfg(test)]
+    pub(crate) fn confirmed_bindings(&self, endpoint: EndpointId, alias: Alias) -> usize {
+        self.bindings
+            .iter()
+            .filter(|binding| {
+                binding.endpoint == endpoint && binding.alias == alias && binding.last_sm.is_some()
+            })
+            .count()
+    }
+
     /// [`Self::consumption`] of the publication `alias` on `endpoint`, any
     /// of its paths (tests).
     #[cfg(test)]
@@ -4616,6 +4636,10 @@ impl<T: StreamTerms> SenderRole<T> {
             .and_then(|outbound| self.consumption(outbound))
     }
 
+    /// The least position every receiver bound to `outbound` on any of its
+    /// paths consumed, per lane: a reliable channel's bound (SPEC §4). A
+    /// receiver answered but not yet heard from bounds at its join points.
+    /// `None` with no bound receiver at all: a reliable lane then holds.
     fn consumption(&self, outbound: &Outbound<T>) -> Option<[u64; 4]> {
         let mut least: Option<[u64; 4]> = None;
         // A receiver bound on any of its paths bounds it: one whose founding
