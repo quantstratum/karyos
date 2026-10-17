@@ -459,7 +459,10 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 }
             },
         };
-        let sink = match self.host.open_replay(request, &described.recording, from, to) {
+        let sink = match self
+            .host
+            .open_replay(request, &described.recording, from, to)
+        {
             Ok(sink) => sink,
             Err(HostRefusal(why)) => {
                 self.respond(correlation_id, 0, ResponseCode::Error, &why);

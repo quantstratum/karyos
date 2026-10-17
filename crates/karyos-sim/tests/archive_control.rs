@@ -186,9 +186,7 @@ impl Sink {
 
 impl ReplaySink for Sink {
     fn frames(&mut self, position: u64, bytes: &[u8]) -> Result<bool, SinkClosed> {
-        self.feed()?
-            .frames(position, bytes)
-            .map_err(|_| SinkClosed)
+        self.feed()?.frames(position, bytes).map_err(|_| SinkClosed)
     }
 
     fn fill(&mut self, position: u64, record: &[u8], extent: u32) -> Result<bool, SinkClosed> {
@@ -252,10 +250,8 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "karyos-sim-archive-control-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("karyos-sim-archive-control-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let mut driver = EmbeddedDriver::new().unwrap();
@@ -342,7 +338,12 @@ fn signal(bytes: &[u8]) -> RecordingSignal {
     }
 }
 
-fn replay(correlation_id: u64, recording_id: u64, position: u64, length: u64) -> ControlMessage<'static> {
+fn replay(
+    correlation_id: u64,
+    recording_id: u64,
+    position: u64,
+    length: u64,
+) -> ControlMessage<'static> {
     ControlMessage::Replay(control::Replay {
         correlation_id,
         recording_id,
@@ -395,7 +396,10 @@ fn a_recording_is_made_and_replayed_by_request() {
     }));
     let answers = rig.answers(2);
     let started = response(&answers[0]);
-    assert_eq!((started.correlation_id, started.code), (1, ResponseCode::Ok));
+    assert_eq!(
+        (started.correlation_id, started.code),
+        (1, ResponseCode::Ok)
+    );
     let recording_id = started.id;
     assert_eq!(signal(&answers[1]).signal, Signal::Started);
 
@@ -403,7 +407,10 @@ fn a_recording_is_made_and_replayed_by_request() {
     let mut expected = Vec::new();
     let mut sent = 0u32;
     let start = Instant::now();
-    while expected.last().is_none_or(|(position, _)| *position < 3 * u64::from(MIN_TERM_LENGTH)) {
+    while expected
+        .last()
+        .is_none_or(|(position, _)| *position < 3 * u64::from(MIN_TERM_LENGTH))
+    {
         assert!(start.elapsed() < Duration::from_secs(20), "not published");
         let length = [100usize, 1400, 3000][usize::try_from(sent % 3).unwrap()];
         let mut message = vec![u8::try_from(sent % 251).unwrap(); length];
@@ -463,7 +470,11 @@ fn a_recording_is_made_and_replayed_by_request() {
         .position(|message| *message == messages[0])
         .unwrap();
     assert_eq!(expected[first..first + messages.len()], messages[..]);
-    assert!(messages.iter().all(|(position, _)| (term..=2 * term).contains(position)));
+    assert!(
+        messages
+            .iter()
+            .all(|(position, _)| (term..=2 * term).contains(position))
+    );
     assert_eq!(
         lane_end,
         LaneEnd::Closed {
