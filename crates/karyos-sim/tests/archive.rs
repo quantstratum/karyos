@@ -226,7 +226,7 @@ fn seal_and_wait(
                 id: ended_id,
                 ended,
             }) if ended_id == id => return ended,
-            Some(Event::Failed { id, error }) => panic!("recording {id} failed: {error}"),
+            Some(Event::Failed { id, failure }) => panic!("recording {id} failed: {failure:?}"),
             _ => assert!(Instant::now() < deadline, "recording {id} never ended"),
         }
     }
