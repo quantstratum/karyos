@@ -569,7 +569,7 @@ fn an_os_failure_halts_the_call() {
 /// A backend that answers a scripted reply per flush, for the rows the
 /// sockets flush never produces (`Returned`) or produces only through
 /// endpoint state (`NotActive`), and for the invariant and caller rows.
-mod fake {
+pub(in crate::lanes) mod fake {
     use std::collections::VecDeque;
     use std::num::NonZeroU64;
 
@@ -580,7 +580,7 @@ mod fake {
         SubmissionId, TxEntry, TxFrame,
     };
 
-    pub(super) struct NoFrame;
+    pub(in crate::lanes) struct NoFrame;
 
     impl TxFrame for NoFrame {
         fn capacity(&self) -> usize {
@@ -599,15 +599,15 @@ mod fake {
 
     /// One flush's answer: the entry's outcome and ticket, if any, and the
     /// stop.
-    pub(super) type Reply = (Option<(TxItemOutcome, TxTicket)>, FlushStop);
+    pub(in crate::lanes) type Reply = (Option<(TxItemOutcome, TxTicket)>, FlushStop);
 
     #[derive(Default)]
-    pub(super) struct Fake {
-        pub(super) replies: VecDeque<Reply>,
-        pub(super) flushes: u32,
+    pub(in crate::lanes) struct Fake {
+        pub(in crate::lanes) replies: VecDeque<Reply>,
+        pub(in crate::lanes) flushes: u32,
     }
 
-    pub(super) fn ticket(slot: u32) -> TxTicket {
+    pub(in crate::lanes) fn ticket(slot: u32) -> TxTicket {
         TxTicket::new(SubmissionId::new(
             InstanceId::FIRST,
             BackendEpoch::FIRST,
@@ -616,7 +616,7 @@ mod fake {
         ))
     }
 
-    pub(super) fn queue(index: u16) -> TxQueueId {
+    pub(in crate::lanes) fn queue(index: u16) -> TxQueueId {
         TxQueueId::new(BackendEpoch::FIRST, index, std::num::NonZeroU32::MIN)
     }
 
@@ -674,7 +674,7 @@ mod fake {
         }
     }
 
-    pub(super) const RETURNED: TxItemOutcome = TxItemOutcome::Returned {
+    pub(in crate::lanes) const RETURNED: TxItemOutcome = TxItemOutcome::Returned {
         reason: ReturnReason::Cancelled,
     };
 }
