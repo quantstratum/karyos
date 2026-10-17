@@ -242,6 +242,12 @@ impl Jobs {
 
     /// Steps 6 and 7 for `request` answered in `domain` at `now`.
     pub fn join_or_create(&mut self, request: &Request, domain: Domain, now: u64) -> Joined {
+        if let Domain::Requester { receiver, .. } = domain {
+            debug_assert!(
+                receiver == request.receiver,
+                "a requester domain names the requesting receiver"
+            );
+        }
         let key = JobKey {
             lane: request.lane,
             start: request.start,
@@ -353,14 +359,16 @@ impl Jobs {
     /// The backend submitted `job` up to `through`: its cursor moves there,
     /// never back and never past its end.
     pub fn progress(&mut self, job: JobRef, through: u64) {
-        if let Some(job) = self.job_mut(job) {
-            let end = job
-                .key
-                .start
-                .checked_add(u64::from(job.key.length))
-                .unwrap_or(job.key.start);
-            job.cursor = job.cursor.max(through.min(end));
-        }
+        let Some(job) = self.job_mut(job) else {
+            return;
+        };
+        // Admission checked the end; an overflow here is a broken
+        // invariant, marked and left without moving the cursor.
+        let Some(end) = job.key.start.checked_add(u64::from(job.key.length)) else {
+            self.counts.overflowed = true;
+            return;
+        };
+        job.cursor = job.cursor.max(through.min(end));
     }
 
     /// The backend submitted `job`'s last frame at `now`: the job ends and
