@@ -94,6 +94,9 @@ struct Setup {
     roles: Option<fn() -> crate::membership::PublicationRoles>,
     /// The subscription's conflated lane (conflated-network-images.md).
     conflated: Option<Lane>,
+    /// Concurrent handles on each lane of the publication's log, in place
+    /// of the exclusive publication.
+    concurrent: Option<u8>,
 }
 
 impl Setup {
@@ -125,6 +128,7 @@ impl Default for Setup {
             identity: None,
             roles: None,
             conflated: None,
+            concurrent: None,
         }
     }
 }
@@ -252,15 +256,26 @@ impl Rig {
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
-        let (outbound, log) = super::super::data::testing::outbound_joined(
-            a,
-            alias(),
-            destination,
-            term(65_536),
-            2,
-            setup.reliable,
-            setup.before,
-        );
+        let (outbound, log) = match setup.concurrent {
+            Some(publishers) => super::super::data::testing::outbound_concurrent(
+                a,
+                alias(),
+                destination,
+                term(65_536),
+                2,
+                setup.reliable,
+                publishers,
+            ),
+            None => super::super::data::testing::outbound_joined(
+                a,
+                alias(),
+                destination,
+                term(65_536),
+                2,
+                setup.reliable,
+                setup.before,
+            ),
+        };
         rig.log = Some(log);
         rig.links
             .sender
@@ -1178,6 +1193,138 @@ fn a_stopped_receiver_back_pressures_a_reliable_publisher() {
     assert!(resumed, "never resumed");
 }
 
+/// T7 (contract-traceability-phase-2.md, "Required sender stall", the
+/// trusted part; SPEC §13): the network sender is a required participant
+/// of its log, with its `L_send` reservation. It stalls in the second half
+/// of term 0, so the publisher's head crosses into term 1 and term 0 is
+/// a candidate for reclamation. While the sender stops consuming (its
+/// agent does not run), its registered position stays, the publisher meets
+/// back pressure within the limit that position allows, and the retention
+/// floor never passes it, however long the conductor runs on: nothing the
+/// sender has not sent is reclaimed. Once the sender runs again, the
+/// remote subscriber reads every message, in order and once.
+#[test]
+fn a_stalled_network_sender_holds_its_log_and_loses_nothing() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome, PollOutcome, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    // The sender's reader is the publication's one subscriber cell,
+    // registered as occupant 1.
+    let sender_position = |rig: &Rig| {
+        rig.log.as_ref().unwrap().conductors[0]
+            .subscribers()
+            .find(|cell| cell.registration == 1)
+            .unwrap()
+            .position
+    };
+    let message = |n: u32| {
+        let mut data = vec![0u8; 992];
+        data[..4].copy_from_slice(&n.to_le_bytes());
+        data
+    };
+    let mut received = Vec::new();
+    let mut out = vec![0u8; 2048];
+    let mut read = |subscriber: &mut karyos_sys::log_buffer::Subscription<_>,
+                    received: &mut Vec<u32>| {
+        while let PollOutcome::Message { length, .. } = subscriber.poll(&mut out).unwrap() {
+            subscriber.acknowledge();
+            assert_eq!(length, 992);
+            received.push(u32::from_le_bytes(out[..4].try_into().unwrap()));
+        }
+    };
+    // Forty messages flow first: the sender then stands in the second
+    // half of term 0 (992 bytes after a 32-byte header, 1024 a message).
+    let flowed = 40u32;
+    let mut appended = 0u32;
+    for _ in 0..2000 {
+        // Paced: the publisher takes them as the limit allows.
+        if appended < flowed {
+            let log = rig.log.as_mut().unwrap();
+            if let AppendOutcome::Appended { .. } = log.publications[0]
+                .append(&message(appended), AppendOptions::default())
+                .unwrap()
+            {
+                appended += 1;
+            }
+        }
+        rig.round(true);
+        read(&mut subscriber, &mut received);
+        if received.len() == 40 {
+            break;
+        }
+    }
+    assert_eq!(received, (0..flowed).collect::<Vec<_>>());
+    // The receiver's status messages move the sender's registered position
+    // past them.
+    rig.until(true, |rig| sender_position(rig) == u64::from(flowed) * 1024);
+    // The sender stalls: only the conductor and the receiver run.
+    let stalled_at = sender_position(&rig);
+    // The limit the stalled position allows, once a duty cycle published it.
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.conductors[0].duty_cycle().unwrap();
+    let limit = log.conductors[0].limit();
+    let held = |rig: &mut Rig| {
+        let log = rig.log.as_mut().unwrap();
+        for conductor in &mut log.conductors {
+            let _ = conductor.duty_cycle().unwrap();
+        }
+        rig.now += MS;
+        rig.agents.receiver.do_work(rig.now).unwrap();
+        let conductor = &rig.log.as_ref().unwrap().conductors[0];
+        assert_eq!(sender_position(rig), stalled_at, "a stalled sender moved");
+        assert_eq!(conductor.limit(), limit, "the limit moved during the stall");
+        assert!(
+            conductor.floor() <= stalled_at,
+            "the floor {} passed the stalled sender at {stalled_at}",
+            conductor.floor()
+        );
+    };
+    let mut pressed = false;
+    for _ in 0..2000 {
+        let log = rig.log.as_mut().unwrap();
+        match log.publications[0]
+            .append(&message(appended), AppendOptions::default())
+            .unwrap()
+        {
+            AppendOutcome::Appended { .. } => appended += 1,
+            AppendOutcome::BackPressured => {
+                pressed = true;
+                break;
+            }
+            AppendOutcome::AdminAction => {}
+            other => panic!("{other:?}"),
+        }
+        held(&mut rig);
+    }
+    assert!(pressed, "never back pressured");
+    // Pressed at the limit the stalled position allows, in term 1: term 0
+    // is behind the head, and only the stalled sender keeps it.
+    let head = rig.log.as_ref().unwrap().conductors[0].head().unwrap();
+    assert!(
+        stalled_at < head && head <= limit,
+        "{stalled_at} {head} {limit}"
+    );
+    assert!(head > 65_536, "the head {head} never left term 0");
+    // A long stall: the conductor runs on and reclaims nothing unsent.
+    for _ in 0..500 {
+        held(&mut rig);
+    }
+    // The sender runs again: every message arrives, in order, once.
+    for _ in 0..2000 {
+        rig.round(true);
+        read(&mut subscriber, &mut received);
+        if received.len() == usize::try_from(appended).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(received, (0..appended).collect::<Vec<_>>());
+}
+
 /// Test 5, two lanes: each lane's messages reach its own image lane under
 /// the data DRR, and neither waits for the other.
 #[test]
@@ -1908,6 +2055,215 @@ fn a_lost_aborted_record_is_repaired_and_never_naked_past() {
 #[test]
 fn an_aborted_record_reaches_the_subscriber_of_the_image() {
     aborted_over_the_network(false);
+}
+
+/// One frame of the rig's publication, lane 0, at stream `position`, as a
+/// faulty peer would send it: `word0`, the header, then `payload`.
+fn peer_frame(
+    word0: karyos_protocol::frame::Word0,
+    position: u64,
+    reserved_value: i64,
+    payload: &[u8],
+) -> Vec<u8> {
+    let term_length = 65_536;
+    let term_id = 9 + u32::try_from(position / term_length).unwrap();
+    let term_offset = u32::try_from(position % term_length).unwrap();
+    let mut bytes = Vec::with_capacity(32 + payload.len());
+    bytes.extend_from_slice(&word0.pack().to_le_bytes());
+    bytes.extend_from_slice(&term_offset.to_le_bytes());
+    bytes.extend_from_slice(&alias().session_id.to_le_bytes());
+    bytes.extend_from_slice(&alias().stream_id.to_le_bytes());
+    bytes.extend_from_slice(&term_id.to_le_bytes());
+    bytes.extend_from_slice(&reserved_value.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// T3 (contract-traceability-phase-2.md, "Fragmented commit and abort
+/// (network)"; SPEC §13 and the assembler rule of §5): a faulty peer
+/// sends a BEGIN, an ABORTED record and a stray END, then a whole message,
+/// each in its own DATA datagram. The subscriber of the image gets the
+/// partial message discarded as `Interrupted` (the assembler's protocol
+/// error, counted as discarded partial bytes), the aborted extent, the
+/// stray END dropped as an `Orphan`, and then the next message, whole.
+#[test]
+fn an_injected_begin_aborted_end_is_discarded_and_the_next_frame_delivered() {
+    use karyos_protocol::frame::{Flags, FrameType, Word0};
+    use karyos_sys::log_buffer::{AppendOptions, PollOutcome, Role, SkipReason};
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&[1; 900], AppendOptions::default())
+        .unwrap();
+    assert!(matches!(
+        next_outcome(&mut rig, &mut subscriber),
+        PollOutcome::Message {
+            position: 0,
+            length: 900,
+            ..
+        }
+    ));
+    // 900 bytes after a 32-byte header, at 32-byte strides.
+    let at = 960;
+    let fragment = |begin: bool, end: bool| {
+        Word0::new(
+            64,
+            Flags::new(begin, end, false, false, Lane::ZERO),
+            FrameType::Data,
+        )
+    };
+    let aborted = Word0::new(32, Flags::NONE, FrameType::Aborted);
+    let datagrams = [
+        peer_frame(fragment(true, false), at, 0, &[2; 32]),
+        peer_frame(aborted, at + 64, 64, &[]),
+        peer_frame(fragment(false, true), at + 128, 0, &[3; 32]),
+        peer_frame(fragment(true, true), at + 192, 0, &[4; 32]),
+    ];
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    for bytes in &datagrams {
+        let receiver = &mut rig.agents.receiver;
+        receiver
+            .role
+            .inject_data(&receiver.sessions, b, source, alias(), bytes, rig.now);
+    }
+    let skipped = |position: u64, reason: SkipReason| PollOutcome::Skipped {
+        position,
+        extent: 64,
+        reason,
+    };
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        skipped(at, SkipReason::Interrupted)
+    );
+    assert_eq!(subscriber.loss_counters().discarded_partial_bytes, 64);
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        PollOutcome::Aborted {
+            position: at + 64,
+            extent: 64
+        }
+    );
+    assert_eq!(
+        next_outcome(&mut rig, &mut subscriber),
+        skipped(at + 128, SkipReason::Orphan)
+    );
+    let mut out = vec![0u8; 64];
+    let PollOutcome::Message {
+        position, length, ..
+    } = subscriber.poll(&mut out).unwrap()
+    else {
+        panic!("the next frame is not delivered");
+    };
+    assert_eq!((position, length), (at + 192, 32));
+    assert_eq!(&out[..32], &[4; 32]);
+    // The stray END is dropped, not counted as a partial.
+    assert_eq!(subscriber.loss_counters().discarded_partial_bytes, 64);
+}
+
+/// T3, the writers' half (contract-traceability-phase-2.md, "Fragmented
+/// commit and abort (network)"; SPEC §13): two concurrent writers of
+/// fragmented messages on a reliable channel, the first stopped in the
+/// middle of its copy, after its first fragment. The second commits behind
+/// it, and nothing reaches the remote subscriber while the first block is
+/// open. The commit deadline aborts the first block: the subscriber of the
+/// image gets one aborted extent, then the second writer's message whole,
+/// and the stopped writer learns that its offer was aborted.
+#[test]
+fn a_fragmented_writer_aborted_mid_copy_reaches_a_remote_reader_as_one_extent() {
+    use karyos_sys::log_buffer::{
+        AppendOptions, ConcurrentOfferOutcome, DEFAULT_CLAIM_DEADLINE, PollOutcome, Role,
+    };
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        concurrent: Some(2),
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let log = rig.log.as_mut().unwrap();
+    let mut handles = std::mem::take(&mut log.concurrent[0]);
+    let mut second = handles.pop().unwrap();
+    let mut first = handles.pop().unwrap();
+    // Both fragmented: more than one 1376-byte fragment each.
+    let tagged =
+        |tag: u8, length: usize| -> Vec<u8> { (0..length).map(|i| tag ^ (i as u8)).collect() };
+    let first_data = tagged(1, 4000);
+    let second_data = tagged(2, 3000);
+    /// Lets the stopped writer go on when dropped, so a failed assertion
+    /// fails the test instead of leaving the writer waiting.
+    struct Release(std::sync::mpsc::SyncSender<()>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+    let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || {
+            first
+                .offer_pausing_after_fragment(&first_data, AppendOptions::default(), 0, &mut || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                })
+                .unwrap()
+        });
+        // The first writer has copied one fragment of its block.
+        paused_rx.recv().unwrap();
+        let release = Release(resume_tx);
+        let ConcurrentOfferOutcome::Appended { position: behind } = second
+            .offer(&second_data, AppendOptions::default())
+            .unwrap()
+        else {
+            panic!("the second writer did not commit");
+        };
+        let mut out = vec![0u8; 8192];
+        for _ in 0..50 {
+            rig.round(true);
+            assert_eq!(
+                subscriber.poll(&mut out).unwrap(),
+                PollOutcome::Pending,
+                "a message got past the open block"
+            );
+        }
+        // The deadline aborts the first block.
+        let now = rig.now;
+        let conductor = &mut rig.log.as_mut().unwrap().conductors[0];
+        assert!(conductor.service_deadlines(&mut || now).unwrap().waiting);
+        let report = conductor
+            .service_deadlines(&mut || now + DEFAULT_CLAIM_DEADLINE + 1)
+            .unwrap();
+        assert_eq!(
+            (report.aborted, report.aborted_bytes),
+            (1, behind),
+            "{report:?}"
+        );
+        assert_eq!(
+            next_outcome(&mut rig, &mut subscriber),
+            PollOutcome::Aborted {
+                position: 0,
+                extent: u32::try_from(behind).unwrap(),
+            }
+        );
+        let PollOutcome::Message {
+            position, length, ..
+        } = subscriber.poll(&mut out).unwrap()
+        else {
+            panic!("the second message is not delivered");
+        };
+        assert_eq!((position, length), (behind, 3000));
+        assert_eq!(&out[..3000], &second_data[..]);
+        drop(release);
+        assert_eq!(
+            writer.join().unwrap(),
+            ConcurrentOfferOutcome::Aborted { position: 0 }
+        );
+    });
 }
 
 /// Phase 6 wiring: a RANGE_UNAVAILABLE that echoes the outstanding NAK
@@ -3193,6 +3549,84 @@ fn a_gap_waits_the_skew_window_while_another_path_is_live() {
     assert_eq!(nak_wait(&mut single, slot), 0);
 }
 
+/// rp-w7b, ADR-0018's case end to end: one path fails (the later path,
+/// live and silent) while the other keeps delivering duplicates of earlier
+/// frames, every DATA datagram twice. The duplicates move nothing: the gap
+/// is NAKed at the skew deadline fixed at detection, one window (1 ms, one
+/// rig round) after it, not later.
+#[test]
+fn duplicates_on_one_path_do_not_delay_the_skew_deadline() {
+    let (wait, _) = skew_wait_under_duplicates(Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    });
+    let window = crate::paths::PathConfig::default().path_skew_window;
+    assert!(
+        (window..=window + MS).contains(&wait),
+        "NAK {wait} ns after detection, window {window} ns"
+    );
+}
+
+/// ADR-0018's case on multicast: the NAK fires at the skew deadline plus
+/// the cycle's NAK delay (here its bound, `rtt * nak_delay_scale / 16`, in
+/// place of the random draw).
+#[test]
+fn a_multicast_nak_fires_at_the_skew_deadline_plus_its_delay() {
+    let (wait, delay) = skew_wait_under_duplicates(Setup {
+        reliable: true,
+        repairs: false,
+        multicast: true,
+        nak_delay: Some(u64::MAX),
+        ..Setup::default()
+    });
+    let delay = delay.expect("the cycle drew its bound");
+    assert!(delay > 0);
+    let window = crate::paths::PathConfig::default().path_skew_window;
+    assert!(
+        (window + delay..=window + delay + MS).contains(&wait),
+        "NAK {wait} ns after detection, window {window} ns, delay {delay} ns"
+    );
+}
+
+/// The ns from a gap's detection to its first NAK, while the later path
+/// is live and silent and the founding path delivers every DATA datagram
+/// twice; and, on multicast, the last NAK delay bound drawn.
+fn skew_wait_under_duplicates(setup: Setup) -> (u64, Option<u64>) {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents.receiver.role.drop_data(&[1]);
+    rig.agents.receiver.role.repeat_data_from(0);
+    for i in 0..8u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|counters| counters.detected >= 1)
+    });
+    let detected = rig.now;
+    assert_eq!(rig.agents.receiver.counters().naks, 0, "within the window");
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    let wait = rig.now - detected;
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 2);
+    let counts = rig.agents.receiver.role.path_counts(slot, 0).unwrap();
+    assert!(
+        counts.stale + counts.duplicates > 0,
+        "the founding path delivered duplicates: {counts:?}"
+    );
+    (wait, rig.agents.receiver.role.last_nak_delay_bound())
+}
+
 /// rp-w3, RP-7: an image's SMs go on every bound path: the founding path
 /// in its reserved slot, each later path as a copy; the default control
 /// ring holds them all, so none is skipped.
@@ -4271,7 +4705,7 @@ fn an_overloaded_cycle_keeps_every_per_cycle_bound() {
 /// reaches one image, bound on both paths, every message once.
 #[test]
 fn a_routed_publication_reaches_its_image_on_both_paths() {
-    use karyos_sys::log_buffer::AppendOptions;
+    use karyos_sys::log_buffer::{AppendOptions, Role};
 
     let setup = Setup {
         reliable: true,
@@ -4280,13 +4714,16 @@ fn a_routed_publication_reaches_its_image_on_both_paths() {
     let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
     let slot = established(&mut rig);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let mut reader = image_subscriber(&rig, slot, 0, Role::Optional);
     for i in 0..4u8 {
         let log = rig.log.as_mut().unwrap();
         let _ = log.publications[0]
             .append(&[i; 900], AppendOptions::default())
             .unwrap();
     }
-    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    // Each message arrives on both paths: the subscriber reads it once.
+    assert_eq!(read_messages(&mut rig, &mut reader, 4), [0, 1, 2, 3]);
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 2);
 }
 
 /// The image's conductor and lane 0 subscriber, kept by a test.
@@ -4373,6 +4810,64 @@ fn an_abandoned_copy_is_repaired_on_a_reliable_channel() {
     assert!(counters.repaired >= 1, "{counters:?}");
     assert!(rig.agents.sender.role.counters().naks >= 1);
     assert!(rig.agents.sender.role.counters().repairs >= 1);
+}
+
+/// rp-w6, RP-11, end to end: a datagram lost on both paths is NAKed on
+/// both paths; the sender absorbs the second copy, repairs once,
+/// on both paths, and the subscriber reads every message once, in order.
+#[test]
+fn a_repair_goes_on_both_paths_and_a_nak_copy_is_absorbed() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let append = |rig: &mut Rig, byte: u8| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[byte; 900], AppendOptions::default())
+            .unwrap();
+    };
+    append(&mut rig, 0);
+    rig.round(true);
+    // Both copies of the next datagram are lost.
+    rig.agents.receiver.role.drop_data(&[0, 1]);
+    for byte in 1..5 {
+        append(&mut rig, byte);
+    }
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() >= 5 {
+            break;
+        }
+    }
+    for _ in 0..50 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+    }
+    assert_eq!(seen, [0, 1, 2, 3, 4]);
+    let sender = rig.agents.sender.role.counters();
+    assert!(sender.nak_copies_absorbed >= 1, "{sender:?}");
+    // Absorbed copies are not NAKs admitted, nor budget drops.
+    assert_eq!(sender.nak_cycle_budget, 0, "{sender:?}");
+    assert!(sender.naks >= 1, "{sender:?}");
+    let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
+    let (a, b) = (
+        outbound.repair_route_counts(0).unwrap(),
+        outbound.repair_route_counts(1).unwrap(),
+    );
+    assert!(a.submitted >= 1 && b.submitted >= 1, "{a:?} {b:?}");
 }
 
 /// #16835, unreliable: the receiver's gap policy seals the gap the
@@ -4649,17 +5144,24 @@ mod shared {
 /// header-only DATA frame with the EOS flag (network-sessions.md,
 /// Liveness and terminal transitions).
 fn eos_heartbeat(lane: u8, position: u64) -> Vec<u8> {
+    frame_at(lane, position, 0, true)
+}
+
+/// A DATA frame of the rig's image carrying `payload` bytes at `position`
+/// of `lane` (none: a heartbeat), with EOS on it when `eos`.
+fn frame_at(lane: u8, position: u64, payload: usize, eos: bool) -> Vec<u8> {
     use karyos_protocol::frame::{Flags, FrameType, Word0};
 
     let term = 65_536u64;
     let term_id = 9u32 + u32::try_from(position / term).unwrap();
     let term_offset = i32::try_from(position % term).unwrap();
+    let length = 32 + payload;
     let word0 = Word0::new(
-        32,
-        Flags::new(true, true, true, false, Lane::try_new(lane).unwrap()),
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, eos, false, Lane::try_new(lane).unwrap()),
         FrameType::Data,
     );
-    let mut bytes = vec![0u8; 32];
+    let mut bytes = vec![0u8; length];
     bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
     bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
     bytes[12..16].copy_from_slice(&alias().session_id.to_le_bytes());
@@ -5154,4 +5656,53 @@ fn a_full_path_queue_drops_only_its_paths_copy() {
     assert_eq!(seen, (0..16).collect::<Vec<u8>>());
     let counters = rig.agents.receiver.counters();
     assert!(counters.path_queue_drops > 0, "{counters:?}");
+}
+
+/// An EOS data frame the receive owner does not commit names no bound: a
+/// frame two terms ahead of the rebuild position reads `Received::Ahead`
+/// (beyond the window `{r, r + 1}`) and is dropped, and the lane's real
+/// bound is still recorded afterwards.
+#[test]
+fn an_eos_data_frame_ahead_of_the_window_names_no_bound() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![4; 300]], &mut subscriber);
+    let before = rig.agents.receiver.counters();
+    rig.inject(b, &frame_at(0, 2 * 65_536, 32, true));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.data_dropped, before.data_dropped + 1, "Ahead");
+    assert_eq!(after.eos_bounds, before.eos_bounds, "no bound");
+    rig.inject(b, &eos_heartbeat(0, end));
+    rig.inject(b, &eos_heartbeat(1, 0));
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 0));
+    rig.until(true, Rig::closed_cleanly);
+}
+
+/// A heartbeat past a lane's recorded bound is counted and classified at
+/// the bound: no fresh evidence beyond it.
+#[test]
+fn a_heartbeat_past_the_terminal_bound_is_counted() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![5; 300]], &mut subscriber);
+    rig.inject(b, &eos_heartbeat(0, end));
+    let before = rig.agents.receiver.counters();
+    rig.inject(b, &frame_at(0, end + 64, 0, false));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(
+        after.heartbeats_past_terminal,
+        before.heartbeats_past_terminal + 1
+    );
+    assert_eq!(
+        after.heartbeats, before.heartbeats,
+        "classified at the bound"
+    );
+    assert_eq!(after.eos_refused, before.eos_refused);
 }

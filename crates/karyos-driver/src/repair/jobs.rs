@@ -164,6 +164,9 @@ struct Slot {
     job: Option<Job>,
     /// The job's requesters: allocated at construction, cleared at reuse.
     requesters: Vec<Receiver>,
+    /// The route each requester's NAK first arrived on, by requester: its
+    /// step 8 ERR goes back there (RP-11).
+    routes: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -223,6 +226,7 @@ impl Jobs {
                 retired: false,
                 job: None,
                 requesters: Vec::with_capacity(config.requesters_per_job),
+                routes: Vec::with_capacity(config.requesters_per_job),
             })
             .collect();
         Ok(Self {
@@ -242,6 +246,18 @@ impl Jobs {
 
     /// Steps 6 and 7 for `request` answered in `domain` at `now`.
     pub fn join_or_create(&mut self, request: &Request, domain: Domain, now: u64) -> Joined {
+        self.join_or_create_on(request, domain, 0, now)
+    }
+
+    /// [`Jobs::join_or_create`] for a request that arrived on route `route`
+    /// (0 on one path), recorded with its requester.
+    pub fn join_or_create_on(
+        &mut self,
+        request: &Request,
+        domain: Domain,
+        route: usize,
+        now: u64,
+    ) -> Joined {
         if let Domain::Requester { receiver, .. } = domain {
             debug_assert!(
                 receiver == request.receiver,
@@ -275,6 +291,7 @@ impl Jobs {
             let full = !recorded && slot.requesters.len() >= limit;
             if !recorded && !full {
                 slot.requesters.push(request.receiver);
+                slot.routes.push(route);
             }
             let generation = slot.generation;
             if full {
@@ -305,6 +322,8 @@ impl Jobs {
         let order = self.next_order;
         slot.requesters.clear();
         slot.requesters.push(request.receiver);
+        slot.routes.clear();
+        slot.routes.push(route);
         slot.job = Some(Job {
             key,
             cursor: key.start,
@@ -354,6 +373,16 @@ impl Jobs {
             .get(usize::from(job.slot))
             .filter(|slot| slot.generation == job.generation && slot.job.is_some())
             .map_or(&[], |slot| slot.requesters.as_slice())
+    }
+
+    /// The route each of `job`'s requesters first asked on, in the order
+    /// of [`Jobs::requesters`].
+    #[must_use]
+    pub fn requester_routes(&self, job: JobRef) -> &[usize] {
+        self.slots
+            .get(usize::from(job.slot))
+            .filter(|slot| slot.generation == job.generation && slot.job.is_some())
+            .map_or(&[], |slot| slot.routes.as_slice())
     }
 
     /// The backend submitted `job` up to `through`: its cursor moves there,

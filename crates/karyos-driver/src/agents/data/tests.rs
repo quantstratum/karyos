@@ -746,3 +746,64 @@ fn a_silent_optional_member_expires_in_the_cycle() {
     assert_eq!(flow.path.membership_mut().unwrap().counters().expired, 1);
     flow.finish();
 }
+
+/// A removal's drain needs the lane's submitted high at its seal
+/// (`high >= seal`), not only its reader there: an unreliable lane whose
+/// staged tail an endpoint reset dropped has read past what it submitted,
+/// so it is not drained early and sends no EOS; at the drain bound it is
+/// given up.
+#[test]
+fn a_tail_dropped_by_a_reset_is_not_drained() {
+    use karyos_io::backend::TxReport;
+    use karyos_io::sockets::endpoint::Retired;
+
+    // Unscripted sends would block: the tail stays staged.
+    let (mut tx, rx, observer, mut path, mut log) = scripted_halves(4, 1);
+    let budget = Budget {
+        work: 64,
+        bytes: 1 << 20,
+    };
+    let _ = path.serve(&mut tx, budget, None, 0).unwrap();
+    let read = path.readers()[0].position();
+    assert!(read > 0, "the tail was staged");
+    assert_eq!(path.counters().submitted, 0, "and never submitted");
+    // The endpoint is reset: the staged tail is dropped, and an unreliable
+    // lane does not read it again.
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    // As `scripted_halves` opened it.
+    let mut local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    local.max_queues = std::num::NonZeroU16::new(4).unwrap();
+    local.max_routes = std::num::NonZeroU16::new(2).unwrap();
+    let _ = endpoint.reopen(&local).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    for _ in 0..16 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let _ = path.serve(&mut tx, budget, None, 0).unwrap();
+    assert_eq!(path.readers()[0].position(), read, "no rewind");
+    // The publisher releases and the seal is positioned at the tail's end.
+    log.publications.clear();
+    log.conductors[0].seal().unwrap();
+    let _ = log.conductors[0].duty_cycle().unwrap();
+    assert_eq!(path.readers()[0].seal_position(), Some(read));
+    let (linger, interval) = (1_000, 100);
+    path.begin_removal(1, linger, interval);
+    for now in [0, 10, 50] {
+        let step = path.serve_removal(Some(&mut tx), now);
+        assert_eq!((step.sent, step.drained, step.gave_up), (0, false, false));
+    }
+    let step = path.serve_removal(Some(&mut tx), linger);
+    assert_eq!((step.sent, step.gave_up), (0, true));
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    while !matches!(endpoint.retire(&mut report), Retired::Complete { .. }) {
+        while report.pop_front().is_some() {}
+    }
+}

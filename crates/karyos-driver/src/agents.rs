@@ -181,7 +181,9 @@ pub struct AgentConfig {
     /// `path_heartbeat_interval` in ns (redundant-paths.md RP-3; default
     /// 100 ms, at least 1): a routed publication's path that submitted no
     /// DATA for this long sends a PATH_HB, so it stays live at its
-    /// receivers while another path carries the stream.
+    /// receivers while another path carries the stream. It also paces the
+    /// EOS repeats of a removed publication's linger
+    /// (driver-network-agents.md §7).
     pub path_heartbeat_interval: u64,
     /// When a routed publication's path leaves the live set
     /// (redundant-paths.md section 7, RP-8): `path_lag_limit` (100 ms),
@@ -304,9 +306,11 @@ impl AgentConfig {
             || policy.backoff_max < policy.backoff_initial
             || policy.backoff_max > data::MAX_PATH_BACKOFF
             || policy.backoff_reset == 0
+            || policy.skew_window > crate::paths::MAX_SKEW_WINDOW
+            || !(1..=data::MAX_PATH_COPY_ENTRIES).contains(&policy.copy_entries)
         {
             return Err(AgentError::InvalidConfig(
-                "path_policy needs a lag limit of 2 ns or more, a skip ratio of 1 to 100 percent, a minimum of 1 byte, and backoffs of 1 ns or more with the maximum at least the initial one and at most 60 s",
+                "path_policy needs a lag limit of 2 ns or more, a skip ratio of 1 to 100 percent, a minimum of 1 byte, backoffs of 1 ns or more with the maximum at least the initial one and at most 60 s, a skew window of at most 1 s and 1 to 4096 copy entries",
             ));
         }
         if self.path_heartbeat_interval == 0 {
@@ -604,10 +608,29 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// The publication's alias.
         alias: karyos_protocol::network::Alias,
     },
-    /// Sender only: stop sending `alias` on `endpoint` and hand its data
-    /// path back (wiring note W-d), so its readers drop on the control
-    /// path. Answer [`AgentEvent::PublicationRemoved`].
+    /// Sender only: start removing `alias` on `endpoint`
+    /// (driver-network-agents.md §7): no new receiver and no SETUP, while
+    /// its lanes drain to their seals, send EOS there and repair for
+    /// `linger`. Answer [`AgentEvent::PublicationDraining`]; once the
+    /// linger is over the sender posts
+    /// [`AgentEvent::SenderSessionDrained`].
     RemovePublication {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration, echoed in the answer.
+        registration: u64,
+        /// `publication_linger` in ns.
+        linger: u64,
+    },
+    /// Sender only: end the drained publication `alias` on `endpoint`:
+    /// its queues, bindings and SETUP side go, and its data path comes back
+    /// (wiring note W-d), so its readers drop on the control path. Answer
+    /// [`AgentEvent::PublicationRemoved`].
+    RemoveSenderSession {
         /// The reply's slot.
         reply: Reservation,
         /// The endpoint.
@@ -682,6 +705,30 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// Its alias.
         alias: karyos_protocol::network::Alias,
         /// Its registration (`Identity::registration_id`).
+        registration: u64,
+    },
+    /// The sender started removing the publication: it drains, sends EOS
+    /// and lingers ([`AgentCommand::RemovePublication`]); `found` is false
+    /// when it held no such publication.
+    PublicationDraining {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// The registration the command named.
+        registration: u64,
+        /// Whether the sender held the publication.
+        found: bool,
+    },
+    /// Posted unsolicited, into a free slot and again each cycle until
+    /// posted: the removed publication's linger is over; the conductor
+    /// answers with [`AgentCommand::RemoveSenderSession`].
+    SenderSessionDrained {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
         registration: u64,
     },
     /// The sender stopped the publication; `outbound` is its data path,
@@ -896,6 +943,7 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                 }
                 command @ (AgentCommand::AddPublication { .. }
                 | AgentCommand::RemovePublication { .. }
+                | AgentCommand::RemoveSenderSession { .. }
                 | AgentCommand::RemovePublishedAlias { .. }
                 | AgentCommand::RemoveSubscription { .. }
                 | AgentCommand::AddSubscription { .. }
@@ -1066,6 +1114,9 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
                 .try_post(AgentEvent::ResetRequested { endpoint })
                 .is_ok()
         });
+        // A drained publication's report; a full ring asks again next
+        // cycle.
+        role.report_drained(|event| events.try_post(event).is_ok());
         served
             .checked_add(work)
             .ok_or(AgentError::CountOverflow(AgentKind::Sender))

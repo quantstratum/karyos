@@ -486,6 +486,29 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         self.offer_pausing(payload, options, &mut |_| {})
     }
 
+    /// [`ConcurrentPublication::offer`] that calls `pause` once, after
+    /// fragment `fragment` is written and before the next one: a writer
+    /// stopped in the middle of its copy (tests, and dependent crates'
+    /// tests through feature `test-hooks`).
+    ///
+    /// # Errors
+    ///
+    /// As [`ConcurrentPublication::offer`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn offer_pausing_after_fragment(
+        &mut self,
+        payload: &[u8],
+        options: AppendOptions,
+        fragment: u32,
+        pause: &mut dyn FnMut(),
+    ) -> Result<ConcurrentOfferOutcome, SysError> {
+        self.offer_pausing(payload, options, &mut |point| {
+            if point == WriterPause::AfterFragment(fragment) {
+                pause();
+            }
+        })
+    }
+
     /// [`ConcurrentPublication::offer`] with test pause points.
     pub(super) fn offer_pausing(
         &mut self,
