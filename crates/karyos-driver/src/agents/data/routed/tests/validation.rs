@@ -518,3 +518,39 @@ fn a_full_absorption_table_serves_copies_as_naks() {
         NakOutcome::Queued
     );
 }
+
+/// rp-w9, RP-10: `path_counters` reports each path's own datagrams and
+/// bytes submitted, for capacity planning: two datagrams on both paths,
+/// then one on A alone while B blocks.
+#[test]
+fn each_path_reports_its_datagrams_and_bytes() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    sent(&observer_b, 2);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    commit(&mut log, 0, 2);
+    for now in 0..4 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    commit(&mut log, 2, 1);
+    for now in 4..8 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    let (a, b) = (
+        outbound.path_counters(0).unwrap(),
+        outbound.path_counters(1).unwrap(),
+    );
+    // Each datagram carries one 1000-byte message: its 32-byte header and
+    // payload, 1032 bytes (the frame's aligned length, FRAME, is 1056).
+    const DATAGRAM: u64 = 1032;
+    assert_eq!((a.datagrams, a.bytes), (3, 3 * DATAGRAM), "{a:?}");
+    assert_eq!((b.datagrams, b.bytes), (2, 2 * DATAGRAM), "{b:?}");
+    drain(&mut outbound, &mut halves, &[&observer_a, &observer_b], 10);
+}

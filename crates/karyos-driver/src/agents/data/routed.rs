@@ -107,7 +107,14 @@ pub struct PathCounters {
     /// receivers get them by NAK (reliable) or close the gap by their gap
     /// policy (unreliable).
     pub copies_abandoned: u64,
-    /// An increment did not apply.
+    /// Datagrams it submitted, catch-up copies included: each path's own
+    /// count, for capacity planning (RP-10). Its route's
+    /// `RouteCounters::datagrams`.
+    pub datagrams: u64,
+    /// Bytes it submitted, catch-up copies included (RP-10). Its route's
+    /// `RouteCounters::bytes`.
+    pub bytes: u64,
+    /// An increment did not apply, here or in its route's counters.
     pub overflowed: bool,
 }
 
@@ -660,10 +667,15 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     #[must_use]
     #[inline]
     pub fn path_counters(&self, route: usize) -> Option<PathCounters> {
-        self.routed
-            .as_deref()
-            .and_then(|routed| routed.routes.get(route))
-            .map(|route| route.counters)
+        let routed = self.routed.as_deref()?;
+        let mut counters = routed.routes.get(route)?.counters;
+        // The datagrams and bytes are the routed sender's, per route.
+        if let Some(sent) = routed.sender.counters(route) {
+            counters.datagrams = sent.datagrams;
+            counters.bytes = sent.bytes;
+            counters.overflowed |= sent.overflowed;
+        }
+        Some(counters)
     }
 
     /// Whether path `route` is in the live set and whether it is
