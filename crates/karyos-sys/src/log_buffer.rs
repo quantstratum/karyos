@@ -84,7 +84,8 @@ pub use receive_owner::{
     GapCounters, ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received,
 };
 pub use sender_read::{
-    CanonicalKind, DEFAULT_CORRUPT_RETRIES, ReadError, ReadOrigin, ReadOutcome, SenderRead,
+    CanonicalKind, DEFAULT_CORRUPT_RETRIES, DEFAULT_NAK_CHECKPOINT_STRIDE,
+    MIN_NAK_CHECKPOINT_STRIDE, NakRead, ReadError, ReadOrigin, ReadOutcome, SenderRead,
     SenderReadCounters,
 };
 pub use skip_policy::{

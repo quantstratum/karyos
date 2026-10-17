@@ -5,6 +5,9 @@
 // once per term backing by `log_buffer.rs` after `common.rs`.
 
 use crate::receive::{FrameKind, ImageParams, Item, ValidatedDatagram};
+use std::collections::{BTreeMap, VecDeque};
+
+use crate::term::TermCount;
 
 /// A datagram buffer of the default MTU.
 fn sr_out() -> Vec<u8> {
@@ -1016,6 +1019,118 @@ fn sender_read_runs_beside_a_publisher_and_its_conductor() {
     assert_eq!(sink.messages, expected);
 }
 
+/// NAK reads under threads (S2 2.3): the reader registers with a lag, and
+/// NAK-reads recent datagram starts while the publisher and its conductor
+/// rotate, reclaim and move the floor. A NAK copy is byte-identical to the
+/// cursor's copy from the same start, or refused only as `Unavailable`
+/// (the floor passed it) or `Retry`; never a torn or foreign copy. Under
+/// Miri, any read of a recycled term races.
+#[test]
+fn sender_read_nak_runs_beside_a_publisher_and_its_conductor() {
+    use core::sync::atomic::AtomicBool;
+
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let total: u32 = if cfg!(miri) { 40 } else { 2000 };
+    let expected: Vec<Vec<u8>> = (0..total)
+        .map(|i| sized_message(i, 24 + (i as usize * 523) % 3000))
+        .collect();
+    let done = AtomicBool::new(false);
+    let mut sink = ProbeSink::default();
+    let mut copies = 0u32;
+    std::thread::scope(|scope| {
+        let messages = &expected;
+        let done = &done;
+        scope.spawn(move || {
+            for message in messages {
+                loop {
+                    match publication.append(message, AppendOptions::default()).unwrap() {
+                        AppendOutcome::Appended { .. } => break,
+                        AppendOutcome::BackPressured | AppendOutcome::AdminAction => {
+                            // The reader stopped (a failed check): stop too.
+                            if done.load(Ordering::Acquire) {
+                                return;
+                            }
+                            let _ = conductor.duty_cycle().unwrap();
+                            std::thread::yield_now();
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+            while !done.load(Ordering::Acquire) {
+                let _ = conductor.duty_cycle().unwrap();
+                std::thread::yield_now();
+            }
+        });
+        // Ends the publisher's loop on a reader panic too.
+        struct Done<'a>(&'a AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _done = Done(done);
+        let mut out = sr_out();
+        let mut nak_out = sr_out();
+        let mut recent: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
+        let mut spins = 0u64;
+        while sink.messages.len() < messages.len() {
+            let from = reader.position();
+            match sr_read(&mut reader, &mut out) {
+                Ok(ReadOutcome::Copied { len, .. }) => {
+                    sink.datagram(&out[..len]);
+                    if recent.len() == 16 {
+                        recent.pop_front();
+                    }
+                    recent.push_back((from, out[..len].to_vec()));
+                }
+                Ok(ReadOutcome::Canonical { .. }) => sink.pads += 1,
+                Ok(ReadOutcome::Pending) | Err(ReadError::Retry) => {
+                    spins += 1;
+                    assert!(
+                        spins < 200_000,
+                        "no progress: position {} sent {} messages {}",
+                        reader.position(),
+                        reader.sent_position(),
+                        sink.messages.len()
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("{error:?} at {}", reader.position()),
+            }
+            // A NAK of a recent start.
+            if let Some((start, bytes)) = recent.get(spins as usize % recent.len().max(1)) {
+                let bound = reader.position();
+                let (result, _) = sr_nak(&mut reader, *start, bound, u32::MAX, &mut nak_out);
+                match result {
+                    // The cursor copied what was committed then; a NAK
+                    // later may copy more whole frames from the same start,
+                    // never different bytes.
+                    Ok(ReadOutcome::Copied { len, .. }) => {
+                        assert!(len >= bytes.len(), "NAK copy at {start}: {len} < {}", bytes.len());
+                        assert_eq!(&nak_out[..bytes.len()], &bytes[..], "NAK copy at {start}");
+                        copies += 1;
+                    }
+                    Err(ReadError::Unavailable { .. } | ReadError::Retry) => {}
+                    other => panic!("{other:?} for a NAK at {start}"),
+                }
+            }
+            // Register with a lag, so recent starts stay retained.
+            // Well inside the publisher's window (`max_reserved`, 8 KiB).
+            let lagged = reader.position().saturating_sub(2 * 1024);
+            if let Some(boundary) = reader.boundary_at_or_below(lagged) {
+                reader.sent(boundary).unwrap();
+            }
+        }
+        done.store(true, Ordering::Release);
+    });
+    assert_eq!(sink.messages, expected);
+    assert!(copies > 0, "no NAK copy was checked");
+}
+
 /// `rewind` restarts at the registered position, a block boundary the
 /// caller registered: what was read past it is read again, whole.
 #[test]
@@ -1155,4 +1270,580 @@ fn sender_read_keeps_registering_far_ahead() {
     }
     assert_eq!(reader.sent_position(), cursor);
     assert!(lag_max <= 4 * 64, "registered lag reached {lag_max} bytes");
+}
+
+// NAK reads (S2 2.3; ACS 15762, 15763).
+
+/// A reader with NAK checkpoints every `stride` bytes.
+fn sr_nak_reader<'a>(
+    conductor: &mut Conductor<&'a LogBuffer<Terms>>,
+    stride: u32,
+) -> SenderRead<&'a LogBuffer<Terms>> {
+    SenderRead::with_nak_stride(
+        conductor.subscribe_as(Role::Required, true, 1).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+        stride,
+    )
+    .unwrap()
+}
+
+/// A NAK read at `from`; checks that the loan was released and that
+/// nothing of the cursor path moved.
+fn sr_nak(
+    reader: &mut SenderRead<&LogBuffer<Terms>>,
+    from: u64,
+    bound: u64,
+    loads: u32,
+    out: &mut [u8],
+) -> (Result<ReadOutcome, ReadError>, u32) {
+    let before = (
+        reader.position(),
+        reader.sent_position(),
+        reader.at_boundary(),
+        reader.boundary_at_or_below(u64::MAX),
+    );
+    let result = reader.read_nak(from, NakRead { bound, loads }, out);
+    assert!(sr_loan_released(reader), "loan held after {result:?}");
+    let after = (
+        reader.position(),
+        reader.sent_position(),
+        reader.at_boundary(),
+        reader.boundary_at_or_below(u64::MAX),
+    );
+    assert_eq!(before, after, "a NAK read moved the cursor path");
+    result
+}
+
+/// Reads the whole log at the cursor, and returns every frame start
+/// (fragments, PAD and ABORTED records included) with its bytes as sent.
+fn sr_walk(reader: &mut SenderRead<&LogBuffer<Terms>>) -> BTreeMap<u64, Vec<u8>> {
+    let mut frames = BTreeMap::new();
+    let mut out = sr_out();
+    loop {
+        let from = reader.position();
+        match sr_read(reader, &mut out) {
+            Ok(ReadOutcome::Copied { len, .. }) => {
+                let mut offset = 0usize;
+                while offset < len {
+                    let raw = u64::from_le_bytes(out[offset..offset + 8].try_into().unwrap());
+                    let length = Word0::unpack(raw).unwrap().frame_length() as usize;
+                    let reserved = length.div_ceil(32) * 32;
+                    frames.insert(from + offset as u64, out[offset..offset + length].to_vec());
+                    offset += reserved;
+                }
+            }
+            Ok(ReadOutcome::Canonical { .. }) => {
+                frames.insert(from, out[..32].to_vec());
+            }
+            Ok(ReadOutcome::Pending) => return frames,
+            Err(error) => panic!("{error:?} at {from}"),
+        }
+    }
+}
+
+/// The reference check: every 32-byte position below the head is either a
+/// frame start, which a NAK reads byte-identical to the cursor's copy,
+/// or `BadRequest`.
+fn sr_nak_matches_walker(sizes: &[usize], abort: Option<usize>, stride: u32) {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, stride);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for (i, size) in sizes.iter().enumerate() {
+        if abort == Some(i) {
+            // An aborted claim of at most 1000 bytes; past the window
+            // (back pressure) nothing is claimed, as appends there are
+            // refused too: the walk reads whatever the log holds.
+            let claim = (*size).min(1000) as u32;
+            if let Ok(ClaimOutcome::Claimed(claim)) =
+                publication.try_claim(claim, AppendOptions::default())
+            {
+                claim.abort();
+            }
+        } else {
+            let _ = publication
+                .append(&sized_message(i as u32, *size), AppendOptions::default())
+                .unwrap();
+        }
+    }
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let mut out = sr_out();
+    let mut position = 0;
+    while position < head {
+        let (result, loads) = sr_nak(&mut reader, position, head, u32::MAX, &mut out);
+        match frames.get(&position) {
+            Some(bytes) => {
+                let len = match result {
+                    Ok(ReadOutcome::Copied { len, .. }) => len,
+                    Ok(ReadOutcome::Canonical { .. }) => 32,
+                    other => panic!("{other:?} at the frame start {position}"),
+                };
+                assert!(len >= bytes.len());
+                assert_eq!(&out[..bytes.len()], &bytes[..], "frame at {position}");
+            }
+            None => assert_eq!(result, Err(ReadError::BadRequest), "at {position}"),
+        }
+        // From the checkpoint of its own stride, recorded when a frame
+        // starts in the stride or later in the term, a scan stays within
+        // one stride.
+        let stride_start = position - position % u64::from(stride);
+        let term_end = (position / TERM + 1) * TERM;
+        if frames.range(stride_start..term_end).next().is_some() {
+            assert!(loads <= stride / 32 + 1, "{loads} loads at {position}");
+        }
+        position += 32;
+    }
+}
+
+/// The reference check on a mix of one-frame, fragmented and aborted
+/// messages, with checkpoints every 4 KiB (deterministic; Miri runs it).
+#[test]
+fn sender_read_nak_matches_the_walk() {
+    let sizes = [100, 3000, 40, 9000, 64, 4, 2500, 700, 5000, 33];
+    sr_nak_matches_walker(&sizes, Some(3), MIN_NAK_CHECKPOINT_STRIDE);
+}
+
+proptest::proptest! {
+    // Under Miri: one case and no failure file (isolation forbids it).
+    #![proptest_config(proptest::prelude::ProptestConfig {
+        cases: if cfg!(miri) { 1 } else { 24 },
+        ..crate::receive::tests_config()
+    })]
+
+    /// The reference check on random logs.
+    #[test]
+    fn sender_read_nak_matches_the_walk_on_random_logs(
+        sizes in proptest::collection::vec(4usize..6000, 1..16),
+        abort in proptest::option::of(0usize..16),
+    ) {
+        sr_nak_matches_walker(&sizes, abort, MIN_NAK_CHECKPOINT_STRIDE);
+    }
+}
+
+/// At or above the bound, past the head, unaligned: `BadRequest`; below
+/// the floor: `Unavailable` with the floor.
+#[test]
+fn sender_read_nak_refuses_out_of_range_positions() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for i in 0..4 {
+        let _ = publication
+            .append(&sized_message(i, 100), AppendOptions::default())
+            .unwrap();
+    }
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let mut out = sr_out();
+    let second = *frames.keys().nth(1).unwrap();
+    assert_eq!(sr_nak(&mut reader, second, second, 99, &mut out).0, Err(ReadError::BadRequest));
+    assert_eq!(sr_nak(&mut reader, head, u64::MAX, 99, &mut out).0, Err(ReadError::BadRequest));
+    assert_eq!(sr_nak(&mut reader, second + 8, head, 99, &mut out).0, Err(ReadError::BadRequest));
+    buffer.floor().store(second, Ordering::Release);
+    assert_eq!(
+        sr_nak(&mut reader, 0, head, 99, &mut out).0,
+        Err(ReadError::Unavailable { lowest: second })
+    );
+    let counters = reader.counters();
+    assert_eq!((counters.nak_bad_request, counters.unavailable), (3, 1));
+}
+
+/// The NAK twin of the forged-header probe: a plausible word 0 inside a
+/// payload is never landed on.
+#[test]
+fn sender_read_nak_never_lands_inside_a_payload() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let mut message = sized_message(1, 200);
+    let forged = Word0::new(64, Flags::new(true, true, false, false, Lane::ZERO), FrameType::Data);
+    message[32..40].copy_from_slice(&forged.pack().to_le_bytes());
+    let _ = publication.append(&message, AppendOptions::default()).unwrap();
+    let _ = sr_walk(&mut reader);
+    let mut out = sr_out();
+    assert_eq!(sr_nak(&mut reader, 64, 256, 99, &mut out).0, Err(ReadError::BadRequest));
+    let (result, _) = sr_nak(&mut reader, 0, 256, 99, &mut out);
+    let Ok(ReadOutcome::Copied { len, next }) = result else {
+        panic!("{result:?}");
+    };
+    let mut sink = ProbeSink::default();
+    sink.datagram(&out[..len]);
+    assert_eq!((next, sink.messages), (256, vec![message]));
+}
+
+/// A checkpoint array tagged with another term count is never used, even
+/// with an entry pointing inside a payload: the scan starts at the term
+/// start and still refuses.
+#[test]
+fn sender_read_nak_ignores_another_terms_checkpoints() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // A message spanning the first stride, with a forged word 0 in its
+    // payload just past the stride.
+    let mut message = sized_message(1, 6000);
+    let at = 4096 + 64 - 32;
+    let forged = Word0::new(64, Flags::new(true, true, false, false, Lane::ZERO), FrameType::Data);
+    message[at..at + 8].copy_from_slice(&forged.pack().to_le_bytes());
+    let _ = publication.append(&message, AppendOptions::default()).unwrap();
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let zero = TermCount::try_new(0).unwrap();
+    let foreign = TermCount::try_new(3).unwrap();
+    // The array of count 0's slot, retagged for count 3, entry 1 aimed at
+    // the forged word 0 (term offset 4096 + 64).
+    reader.plant_checkpoint(zero, foreign, 1, (4096 + 64, 0, true));
+    let mut out = sr_out();
+    let (result, loads) = sr_nak(&mut reader, 4096 + 64, head, u32::MAX, &mut out);
+    if frames.contains_key(&(4096 + 64)) {
+        assert!(matches!(result, Ok(ReadOutcome::Copied { .. })));
+    } else {
+        assert_eq!(result, Err(ReadError::BadRequest));
+    }
+    assert!(loads > 1, "the walk started at the term start");
+}
+
+/// A scan beyond its load budget is `Budget`, counted, and spends no more
+/// than the budget.
+#[test]
+fn sender_read_nak_keeps_to_its_budget() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for i in 0..40 {
+        let _ = publication
+            .append(&sized_message(i, 50), AppendOptions::default())
+            .unwrap();
+    }
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let last = *frames.keys().last().unwrap();
+    let mut out = sr_out();
+    let (result, loads) = sr_nak(&mut reader, last, head, 5, &mut out);
+    assert_eq!(result, Err(ReadError::Budget));
+    assert!(loads <= 5);
+    assert_eq!(reader.counters().nak_budget, 1);
+    let (result, _) = sr_nak(&mut reader, last, head, u32::MAX, &mut out);
+    assert!(matches!(result, Ok(ReadOutcome::Copied { .. })));
+}
+
+/// A corrupt word 0 met by a NAK scan is counted as a NAK corruption and
+/// never faults the reader (C-9 belongs to the cursor).
+#[test]
+fn sender_read_nak_corruption_never_faults() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for i in 0..3 {
+        let _ = publication
+            .append(&sized_message(i, 100), AppendOptions::default())
+            .unwrap();
+    }
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let second = *frames.keys().nth(1).unwrap();
+    let third = *frames.keys().nth(2).unwrap();
+    // Break the second frame's type after the cursor read it: the walk to
+    // the third loads it (the first is passed by its recorded end).
+    let bad = Word0::new(132, Flags::new(true, true, false, false, Lane::ZERO), FrameType::Pad);
+    word0_of_term0(&buffer, second as u32).store(bad.pack().to_le(), Ordering::Relaxed);
+    let mut out = sr_out();
+    for _ in 0..(DEFAULT_CORRUPT_RETRIES + 2) {
+        let (result, _) = sr_nak(&mut reader, third, head, 99, &mut out);
+        assert!(matches!(result, Err(ReadError::CorruptTerm { .. })), "{result:?}");
+    }
+    assert_eq!(reader.counters().nak_corrupt, u64::from(DEFAULT_CORRUPT_RETRIES) + 2);
+    // The cursor path is not faulted.
+    assert_eq!(sr_read(&mut reader, &mut out), Ok(ReadOutcome::Pending));
+}
+
+/// An ABORTED block is read as its canonical record.
+#[test]
+fn sender_read_nak_reads_an_aborted_record() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    claimed(publication.try_claim(100, AppendOptions::default())).abort();
+    let _ = publication
+        .append(&sized_message(1, 100), AppendOptions::default())
+        .unwrap();
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let mut out = sr_out();
+    assert_eq!(
+        sr_nak(&mut reader, 0, head, u32::MAX, &mut out).0,
+        Ok(ReadOutcome::Canonical {
+            record: CanonicalKind::Aborted,
+            next: 160,
+        })
+    );
+    assert_eq!(&out[..32], &frames[&0][..]);
+}
+
+/// A PAD block is read as its canonical record, ending at the term end.
+#[test]
+fn sender_read_nak_reads_a_pad_record() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    // Nine 7000-byte messages reserve 64800 bytes; the tenth pads the rest.
+    let pad = 9 * 7200;
+    let data = sized_message(1, 7000);
+    let mut out = sr_out();
+    for _ in 0..10 {
+        let _ = append_retrying(&mut publication, &mut conductor, &data, || {});
+        while let Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. }) =
+            sr_read(&mut reader, &mut out)
+        {}
+        // Registered no further than the PAD: it stays retained.
+        if let Some(boundary) = reader.boundary_at_or_below(reader.position().min(pad)) {
+            reader.sent(boundary).unwrap();
+        }
+    }
+    let head = reader.position();
+    assert_eq!(
+        sr_nak(&mut reader, pad, head, u32::MAX, &mut out).0,
+        Ok(ReadOutcome::Canonical {
+            record: CanonicalKind::Pad,
+            next: TERM,
+        })
+    );
+}
+
+/// A NAK inside a large block that starts at its stride's checkpoint walks
+/// only the fragments below it: one load for the second fragment, not one
+/// per fragment of the block.
+#[test]
+fn sender_read_nak_walks_a_large_block_from_its_checkpoint() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 7000), AppendOptions::default())
+        .unwrap();
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let starts: Vec<u64> = frames.keys().copied().collect();
+    assert_eq!(starts.len(), 6);
+    let mut out = sr_out();
+    let (result, loads) = sr_nak(&mut reader, starts[1], head, u32::MAX, &mut out);
+    assert_eq!(
+        result,
+        Ok(ReadOutcome::Copied {
+            len: frames[&starts[1]].len(),
+            next: starts[2],
+        })
+    );
+    assert_eq!(&out[..frames[&starts[1]].len()], &frames[&starts[1]][..]);
+    assert_eq!(loads, 1);
+    assert_eq!(reader.counters().nak_loads, 1);
+}
+
+/// A NAK inside a block that starts after its stride's checkpoint takes
+/// the block's end from the next stride's checkpoint, its first fragment
+/// there: the loads stop below it, never at the block's END.
+#[test]
+fn sender_read_nak_takes_a_blocks_end_from_the_next_checkpoint() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for (i, size) in [100, 7000].into_iter().enumerate() {
+        let _ = publication
+            .append(&sized_message(i as u32, size), AppendOptions::default())
+            .unwrap();
+    }
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    // 0, then the large block's fragments from 160: 1568 and 2976 lie in
+    // the first stride, 4384 is the next stride's first frame start.
+    let starts: Vec<u64> = frames.keys().copied().collect();
+    assert_eq!(&starts[..5], &[0, 160, 1568, 2976, 4384]);
+    let mut out = sr_out();
+    let (result, loads) = sr_nak(&mut reader, 1568, head, u32::MAX, &mut out);
+    assert_eq!(
+        result,
+        Ok(ReadOutcome::Copied {
+            len: frames[&1568].len(),
+            next: 2976,
+        })
+    );
+    assert_eq!(&out[..frames[&1568].len()], &frames[&1568][..]);
+    // The block's first word 0 and the fragments at 1568 and 2976.
+    assert_eq!(loads, 3);
+}
+
+/// A NAK inside the block the cursor stands in takes the block's end from
+/// the cursor's open block when the walk reaches the cursor's fragment.
+#[test]
+fn sender_read_nak_takes_a_blocks_end_from_the_cursor() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for (i, size) in [100, 7000].into_iter().enumerate() {
+        let _ = publication
+            .append(&sized_message(i as u32, size), AppendOptions::default())
+            .unwrap();
+    }
+    // One read of the first frame and the large block's first fragment:
+    // the cursor stands inside the block, at 1568.
+    let mut out = vec![0u8; 1568];
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Copied {
+            len: 1568,
+            next: 1568,
+        })
+    );
+    assert!(!reader.at_boundary());
+    let head = buffer.conductor_head().unwrap();
+    let mut nak_out = sr_out();
+    let (result, loads) = sr_nak(&mut reader, 1568, head, u32::MAX, &mut nak_out);
+    assert!(
+        matches!(result, Ok(ReadOutcome::Copied { next: 2976, .. })),
+        "{result:?}"
+    );
+    // Only the block's first word 0.
+    assert_eq!(loads, 1);
+    // The cursor's own read of the fragment is the same bytes.
+    let Ok(ReadOutcome::Copied { len, .. }) = sr_read(&mut reader, &mut out) else {
+        panic!("not copied");
+    };
+    assert_eq!(&nak_out[..len], &out[..len]);
+}
+
+/// A term slot reused by a later term starts with no checkpoints: the
+/// cursor stopped before the second stride of term `slots` leaves that
+/// entry empty, so a NAK at the offset term 0 recorded there walks from
+/// term `slots`'s own entry and never validates the word 0 forged in a
+/// payload at that offset.
+#[test]
+fn sender_read_nak_never_uses_a_reused_slots_checkpoints() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_nak_reader(&mut conductor, MIN_NAK_CHECKPOINT_STRIDE);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let slots = u64::from(buffer.slots);
+    let mut out = sr_out();
+    let mut append = |size: usize| {
+        let _ = append_retrying(
+            &mut publication,
+            &mut conductor,
+            &sized_message(1, size),
+            || {},
+        );
+        while let Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. }) =
+            sr_read(&mut reader, &mut out)
+        {}
+        sr_sent(&mut reader);
+    };
+    // Nine 7000-byte messages per term (7200 bytes each): in each term the
+    // first frame start at or after 4096 is the fragment at 4224. The
+    // last term ends with a 600-byte message, leaving 96 bytes.
+    for _ in 0..slots {
+        for _ in 0..9 {
+            append(7000);
+        }
+    }
+    append(600);
+    assert_eq!(reader.position(), slots * TERM - 96);
+    // Term `slots`, in term 0's slot: a frame at 0, then a block from 160
+    // whose fragment at 2976 runs past 4224.
+    let first = slots * TERM;
+    for size in [100, 7000] {
+        let _ = append_retrying(&mut publication, &mut conductor, &sized_message(2, size), || {});
+    }
+    let forged = Word0::new(64, Flags::new(false, false, false, false, Lane::ZERO), FrameType::Data);
+    word0_of_term0(&buffer, 4224).store(forged.pack().to_le(), Ordering::Relaxed);
+    // The PAD, then the frame at 0 alone: the cursor stops at 160.
+    assert!(matches!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Canonical { record: CanonicalKind::Pad, .. })
+    ));
+    assert_eq!(
+        sr_read(&mut reader, &mut out),
+        Ok(ReadOutcome::Copied {
+            len: 132,
+            next: first + 160,
+        })
+    );
+    let (result, _) = sr_nak(&mut reader, first + 4224, u64::MAX, u32::MAX, &mut out);
+    assert_eq!(result, Err(ReadError::BadRequest));
+}
+
+/// Each floor check of a NAK read refuses on its own: a floor raised
+/// after the loan is refused by the second; a floor the first saw is
+/// refused there, even when a test lowers it before the loan.
+#[test]
+fn sender_read_nak_checks_the_floor_before_and_after_the_loan() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for i in 0..2 {
+        let _ = publication
+            .append(&sized_message(i, 100), AppendOptions::default())
+            .unwrap();
+    }
+    let frames = sr_walk(&mut reader);
+    let head = reader.position();
+    let second = *frames.keys().nth(1).unwrap();
+    let mut out = sr_out();
+    reader.inject(super::sender_read::TestHook::FloorAfterLoan(second));
+    assert_eq!(
+        sr_nak(&mut reader, 0, head, 99, &mut out).0,
+        Err(ReadError::Unavailable { lowest: second })
+    );
+    buffer.floor().store(second, Ordering::Release);
+    reader.inject(super::sender_read::TestHook::FloorBeforeLoan(0));
+    assert_eq!(
+        sr_nak(&mut reader, 0, head, 99, &mut out).0,
+        Err(ReadError::Unavailable { lowest: second })
+    );
+    // The hook is still pending: the next NAK read lowers the floor to 0
+    // before its loan, and the first check passed already.
+    buffer.floor().store(0, Ordering::Release);
+    assert!(matches!(
+        sr_nak(&mut reader, 0, head, 99, &mut out).0,
+        Ok(ReadOutcome::Copied { .. })
+    ));
+}
+
+/// A NAK at the start of an uncommitted block below the bound is
+/// `BadRequest`, counted: the sender never sent it.
+#[test]
+fn sender_read_nak_refuses_an_uncommitted_block() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = sr_reader(&mut conductor);
+    let mut publication = buffer.publication().unwrap().unwrap();
+    let _ = publication
+        .append(&sized_message(1, 100), AppendOptions::default())
+        .unwrap();
+    let claim = claimed(publication.try_claim(100, AppendOptions::default()));
+    let _ = sr_walk(&mut reader);
+    let at = reader.position();
+    assert_eq!(at, 160);
+    let mut out = sr_out();
+    assert_eq!(
+        sr_nak(&mut reader, at, u64::MAX, 99, &mut out).0,
+        Err(ReadError::BadRequest)
+    );
+    // Past it as well: the walk cannot cross it.
+    assert_eq!(
+        sr_nak(&mut reader, at + 160, u64::MAX, 99, &mut out).0,
+        Err(ReadError::BadRequest)
+    );
+    assert_eq!(reader.counters().nak_bad_request, 2);
+    claim.abort();
 }

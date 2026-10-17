@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The sender read path allocates and frees nothing (`quantstratum-docs:
-//! karyos/design/network-sessions-sender.md` 2.5: "on the data path the
-//! capability never allocates"), over a counting global allocator.
+//! The sender read path, NAK reads included, allocates and frees nothing
+//! (`quantstratum-docs: karyos/design/network-sessions-sender.md` 2.5: "on
+//! the data path the capability never allocates"), over a counting global
+//! allocator.
 
 #![cfg(feature = "test-hooks")]
 #![allow(
@@ -15,7 +16,7 @@ use karyos_sys::alloc_count::{CountingAllocator, count};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{
     AppendOptions, DEFAULT_CLAIM_DEADLINE, DEFAULT_CORRUPT_RETRIES, LogBuffer, LogBufferConfig,
-    PublicationMode, ReadOrigin, ReadOutcome, Role, SenderRead,
+    MIN_NAK_CHECKPOINT_STRIDE, NakRead, PublicationMode, ReadOrigin, ReadOutcome, Role, SenderRead,
 };
 use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
@@ -73,4 +74,67 @@ fn a_sender_read_allocates_nothing() {
     });
     assert!(reads >= 8);
     assert_eq!(allocations, 0, "{allocations} allocations in {reads} reads");
+}
+
+#[test]
+fn a_nak_read_allocates_nothing() {
+    let buffer = LogBuffer::new(LogBufferConfig {
+        term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+        spare_slots: 3,
+        max_subscribers: 2,
+        mtu: DEFAULT_MTU,
+        max_reserved: MIN_TERM_LENGTH / 8,
+        initial_term_id: TermId::new(7),
+        lane: Lane::ZERO,
+        session_id: 3,
+        stream_id: 4,
+        claim_deadline: DEFAULT_CLAIM_DEADLINE,
+        publication: PublicationMode::Exclusive,
+        schedule_capacity: 0,
+    })
+    .unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut reader = SenderRead::with_nak_stride(
+        conductor.subscribe_as(Role::Required, true, 1).unwrap(),
+        DEFAULT_CORRUPT_RETRIES,
+        MIN_NAK_CHECKPOINT_STRIDE,
+    )
+    .unwrap();
+    let mut publication = buffer.publication().unwrap().unwrap();
+    for i in 0..8u8 {
+        let _ = publication
+            .append(
+                &vec![i; 100 + usize::from(i) * 700],
+                AppendOptions::default(),
+            )
+            .unwrap();
+    }
+    let mut out = vec![0u8; DEFAULT_MTU as usize];
+    let mut starts = Vec::with_capacity(64);
+    loop {
+        let from = reader.position();
+        match reader.read_committed(from, ReadOrigin::Cursor, &mut out) {
+            Ok(ReadOutcome::Copied { .. } | ReadOutcome::Canonical { .. }) => starts.push(from),
+            Ok(ReadOutcome::Pending) => break,
+            Err(error) => panic!("{error:?}"),
+        }
+    }
+    let bound = reader.position();
+    let (naks, allocations) = count(|| {
+        let mut naks = 0u32;
+        for from in &starts {
+            let (result, _) = reader.read_nak(*from, NakRead { bound, loads: 4096 }, &mut out);
+            if matches!(result, Ok(ReadOutcome::Copied { .. })) {
+                naks += 1;
+            }
+            // A refused position allocates nothing either.
+            let _ = reader.read_nak(*from + 32, NakRead { bound, loads: 4096 }, &mut out);
+        }
+        naks
+    });
+    assert_eq!(naks as usize, starts.len());
+    assert_eq!(
+        allocations, 0,
+        "{allocations} allocations in {naks} NAK reads"
+    );
 }
