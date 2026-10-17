@@ -1210,6 +1210,7 @@ fn installed_image_with(
         copies: Vec::new(),
         routes: Vec::new(),
         anchored: [None; 4],
+        founding_gone: false,
         control_group: None,
         receiver_id: super::receiver_id(super::SlotRef {
             slot: 0,
