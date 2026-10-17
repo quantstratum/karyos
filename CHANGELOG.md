@@ -50,7 +50,10 @@ release may break APIs, wire formats and shared-memory layouts.
   sender refuses or returns the publication, or when the add fails. A
   guarded publication needs a spare slot for its walker beyond the
   sender's reservation (`GuardWalkerUnavailable` otherwise).
-  `add_network_publication` is unchanged.
+  `add_network_publication` is unchanged. Closing the network, or an agent
+  failing, releases every tracked guard sender for deregistration, so no
+  guard close waits on a sender that will never apply it;
+  `NetworkShutdown::guard_senders_released` reports how many.
 - The receiver's controls report a third send outcome. `ReportSlot` and
   `ReportGuard` (formerly `ProbeSlot` and `ProbeGuard`) carry an RTTM
   REQUEST's or a NAK's submission back to the receiver: submitted at the

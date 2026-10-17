@@ -151,7 +151,16 @@ impl EmbeddedDriver<HeapTerms> {
         let Some(guard) = guard else {
             return Ok(None);
         };
-        for stream in handle.streams() {
+        for (lane, stream) in handle.streams().enumerate() {
+            #[cfg(test)]
+            if self.guard_lane_fault == Some(lane) {
+                return Err(DriverError::GuardWalkerUnavailable {
+                    stream: self.stream(stream)?.id,
+                    reason: crate::WalkerUnavailable::NoSpareCredit,
+                });
+            }
+            #[cfg(not(test))]
+            let _ = lane;
             self.guard_stream(stream, guard.guard, guard.messages, guard.rate)?;
         }
         let word = self.guards.view(guard.guard)?;

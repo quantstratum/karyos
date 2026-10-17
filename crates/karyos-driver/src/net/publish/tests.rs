@@ -677,3 +677,121 @@ fn a_guarded_publication_the_sender_refuses_releases_its_guard_sender() {
             .is_empty()
     );
 }
+
+/// A guarded publication of two lanes, with spare slots for the sender's
+/// reservation and the walker.
+fn guarded_pair(
+    driver: &mut EmbeddedDriver,
+    guard: crate::guards::GuardHandle,
+    destination: Destination,
+) -> Result<crate::embedded::AggregateHandle, DriverError> {
+    let mut config = aggregate(10, 2);
+    config.stream.buffer.spare_slots = 4;
+    driver.add_guarded_network_publication(
+        config,
+        &channel(destination),
+        crate::net::NetworkGuard {
+            guard,
+            messages: 2,
+            rate: None,
+        },
+    )
+}
+
+/// #303 review P2: closing the network deregisters the guard sender of a
+/// guarded publication it still tracks, so a guard close afterwards waits
+/// on no sender.
+#[test]
+fn closing_the_network_releases_its_guard_senders() {
+    use karyos_sys::guard::Closed;
+
+    let mut driver = driver();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let handle = guarded_pair(&mut driver, guard, destination).unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    let shutdown = driver.close_network().unwrap();
+    assert_eq!(shutdown.guard_senders_released, 1);
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    assert!(
+        driver
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .senders
+            .is_empty()
+    );
+}
+
+/// #303 review P2: a failed agent (DN-9) never answers again, so the
+/// guard senders of the publications it held are deregistered at once.
+#[test]
+fn a_failed_agent_releases_its_guard_senders() {
+    use karyos_sys::guard::Closed;
+
+    let mut driver = driver();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let handle = guarded_pair(&mut driver, guard, destination).unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|_reply| crate::agents::AgentCommand::Panic)
+        .unwrap();
+    assert!(matches!(
+        driver.do_work(),
+        Err(DriverError::NetworkAgent { .. })
+    ));
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    assert!(
+        driver
+            .close_guard_ack(guard, epoch)
+            .unwrap()
+            .senders
+            .is_empty()
+    );
+    assert_eq!(driver.net.as_ref().unwrap().guard_release_counts(), (0, 0));
+}
+
+/// #303 review P3: a guard that lane 1 refuses after lane 0 was guarded
+/// leaves nothing: both lanes' streams roll back with the aggregate (the
+/// key is free again) and no guard sender was registered.
+#[test]
+fn a_partial_walker_failure_leaves_nothing() {
+    use karyos_sys::guard::Closed;
+
+    let mut driver = driver();
+    let guard = open_guard(&mut driver, "net");
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    driver.guard_lane_fault = Some(1);
+    assert!(matches!(
+        guarded_pair(&mut driver, guard, destination.clone()),
+        Err(DriverError::GuardWalkerUnavailable { .. })
+    ));
+    driver.guard_lane_fault = None;
+    driver.free_retired_streams();
+    let handle = guarded_pair(&mut driver, guard, destination).unwrap();
+    let Closed::Now { epoch } = driver.close_guard(guard, 2).unwrap() else {
+        panic!("not closed");
+    };
+    assert_eq!(
+        driver.close_guard_ack(guard, epoch).unwrap().senders.len(),
+        1,
+        "only the second publication's sender"
+    );
+    driver.remove_aggregate(&handle).unwrap();
+}

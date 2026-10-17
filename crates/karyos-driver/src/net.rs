@@ -157,6 +157,9 @@ pub struct NetworkShutdown {
     pub late: Vec<LateAgent<OsSocket>>,
     /// Whether every agent that was handed back saw its stop flag.
     pub agents_stopped: bool,
+    /// Guard senders of network publications deregistered with the close,
+    /// so no guard close waits on them.
+    pub guard_senders_released: usize,
 }
 
 /// Where a network publication stands with the sender agent.
@@ -214,6 +217,27 @@ struct NetSubscription {
     control: Option<EndpointId>,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
+}
+
+/// Guard senders released for the conductor to deregister: at most one
+/// per tracked publication (allocated at start). One past that is dropped
+/// and counted, which the allocation makes unreachable.
+#[derive(Debug)]
+struct ReleasedGuards {
+    ids: Vec<crate::guard_ack::GuardSenderId>,
+    dropped: u64,
+}
+
+impl ReleasedGuards {
+    fn push(&mut self, id: crate::guard_ack::GuardSenderId) {
+        if self.ids.len() < self.ids.capacity() {
+            self.ids.push(id);
+        } else {
+            if let Some(count) = self.dropped.checked_add(1) {
+                self.dropped = count;
+            }
+        }
+    }
 }
 
 /// Names a network subscription of one driver.
@@ -299,7 +323,10 @@ pub(crate) struct Network {
     /// Guard senders of publications the sender refused or returned, for
     /// the conductor to deregister (at most one per tracked publication,
     /// allocated at start).
-    released_guards: Vec<crate::guard_ack::GuardSenderId>,
+    released_guards: ReleasedGuards,
+    /// Guard senders the conductor failed to deregister (an unknown id):
+    /// counted, never retried.
+    guard_deregister_failures: u64,
     /// The NAK control groups of multicast data groups (RC-15).
     control_groups: ControlGroups,
     /// Control group joins that failed: those keys run without peer
@@ -347,7 +374,11 @@ impl Network {
             capacity: config.agents.publications,
             stale_overflows: 0,
             clock: karyos_sys::host_clock::host_monotonic_ns,
-            released_guards: Vec::with_capacity(config.agents.publications),
+            released_guards: ReleasedGuards {
+                ids: Vec::with_capacity(config.agents.publications),
+                dropped: 0,
+            },
+            guard_deregister_failures: 0,
             control_groups: config.nak_control_groups,
             control_join_failures: 0,
         })
@@ -845,7 +876,7 @@ impl Network {
 
     /// A released guard sender to deregister, each once.
     pub(crate) fn pop_released_guard(&mut self) -> Option<crate::guard_ack::GuardSenderId> {
-        self.released_guards.pop()
+        self.released_guards.ids.pop()
     }
 
     /// Starts removing the publication `registration`; `false` when it is
@@ -909,10 +940,16 @@ impl Network {
             },
             Agents::Closed => return Ok(0),
         };
-        let (received, sent) = work.map_err(|agent| {
-            self.failed = Some(agent);
-            DriverError::NetworkAgent { agent }
-        })?;
+        let (received, sent) = match work {
+            Ok(work) => work,
+            Err(agent) => {
+                // A failed agent never answers again (DN-9): every tracked
+                // guard sender is released, so no close waits on it.
+                self.failed = Some(agent);
+                self.release_guard_senders();
+                return Err(DriverError::NetworkAgent { agent });
+            }
+        };
         // Unsubscriptions the full ring refused earlier.
         // (None in steady state: nothing is taken or freed then.)
         // Retried in place, keeping the preallocated buffer.
@@ -1048,7 +1085,34 @@ impl Network {
             shutdown.endpoints_retired = self.endpoints.reclaim(&self.links, &mut agents, |_| {});
         }
         let _ = self.images.poll(&self.links.sessions, |_| {});
+        // The agents are gone: every tracked guard sender is released for
+        // the conductor to deregister.
+        self.release_guard_senders();
         shutdown
+    }
+
+    /// Moves the guard sender of every tracked publication to the released
+    /// list (agents stopped or failed): the conductor deregisters them.
+    fn release_guard_senders(&mut self) {
+        for entry in &mut self.publications {
+            if let Some(id) = entry.guard_sender.take() {
+                self.released_guards.push(id);
+            }
+        }
+    }
+
+    /// Counts a guard sender the conductor could not deregister.
+    pub(crate) fn count_guard_deregister_failure(&mut self) {
+        if let Some(count) = self.guard_deregister_failures.checked_add(1) {
+            self.guard_deregister_failures = count;
+        }
+    }
+
+    /// Released guard senders dropped for a full list, and deregistrations
+    /// that failed (tests).
+    #[cfg(test)]
+    pub(crate) fn guard_release_counts(&self) -> (u64, u64) {
+        (self.released_guards.dropped, self.guard_deregister_failures)
     }
 
     /// Whether the agents still run.
@@ -1227,15 +1291,13 @@ fn publication_answer(
     publications: &mut Vec<NetPublication>,
     send_endpoints: &mut [SendEndpoint],
     stale: &mut Stale<'_>,
-    released: &mut Vec<crate::guard_ack::GuardSenderId>,
+    released: &mut ReleasedGuards,
     event: AgentEvent<OsSocket>,
 ) {
     // Each tracked publication releases its guard sender once, and the
     // list holds one per tracked publication: it never grows past it.
     let mut release_guard = |entry: &mut NetPublication| {
-        if let Some(id) = entry.guard_sender.take()
-            && released.len() < released.capacity()
-        {
+        if let Some(id) = entry.guard_sender.take() {
             released.push(id);
         }
     };
