@@ -1110,11 +1110,15 @@ fn a_close_does_not_wait_on_a_detached_left_path() {
     // B's half comes back: the route asks for a reset first.
     let calls = observer_b.send_calls();
     halves.push(b_half);
-    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 40).unwrap();
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 40)
+        .unwrap();
     assert!(outbound.needs_reset());
     let _rx_b = reset(&mut halves, 1, rx_b);
     for now in 50..60 {
-        let _ = outbound.serve_routes(&mut halves, BUDGET, None, now).unwrap();
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
     }
     assert!(!outbound.needs_reset());
     assert_eq!(observer_b.send_calls(), calls, "no forgotten copy is sent");
