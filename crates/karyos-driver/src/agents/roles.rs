@@ -1798,6 +1798,12 @@ impl ReceiverRole {
         self.sessions.counters()
     }
 
+    /// Whether `alias` is published on `endpoint` (tests).
+    #[cfg(test)]
+    pub(crate) fn is_published(&self, endpoint: EndpointId, alias: Alias) -> bool {
+        self.published.contains(&(endpoint, alias))
+    }
+
     /// Live paths of the image at `slot` (tests).
     #[cfg(test)]
     pub(super) fn live_paths(&self, slot: SlotRef) -> usize {

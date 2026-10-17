@@ -1047,3 +1047,33 @@ fn a_failed_sender_post_stales_every_paths_alias() {
     );
     assert_eq!(driver.net.as_ref().unwrap().stale_queued(), 2);
 }
+
+/// #343 review: every path's alias is published at the receiver while the
+/// publication lives, and queued stale and removed with it.
+#[test]
+fn every_paths_alias_is_published_and_removed() {
+    let mut driver = paths_driver(8, 64);
+    let handle = driver
+        .add_network_publication(aggregate(10, 1), &two_paths(34))
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&handle) == Some(NetworkPublicationState::Active)
+    });
+    let net = driver.net.as_ref().unwrap();
+    let paths = net.publication_paths(handle.registration());
+    let (_, alias) = net.publication_route(handle.registration()).unwrap();
+    assert_eq!(paths.len(), 2);
+    assert!(
+        paths
+            .iter()
+            .all(|path| net.receiver_published(*path, alias))
+    );
+    driver.remove_aggregate(&handle).unwrap();
+    until(&mut driver, |driver| {
+        let net = driver.net.as_ref().unwrap();
+        driver.network_publication_state(&handle).is_none()
+            && paths
+                .iter()
+                .all(|path| !net.receiver_published(*path, alias))
+    });
+}

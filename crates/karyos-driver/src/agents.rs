@@ -947,6 +947,16 @@ pub struct ReceiverAgent<O: SocketOps> {
 }
 
 impl<O: SocketOps> ReceiverAgent<O> {
+    /// Whether `alias` is published on `endpoint` (tests).
+    #[cfg(test)]
+    pub(crate) fn is_published(
+        &self,
+        endpoint: EndpointId,
+        alias: karyos_protocol::network::Alias,
+    ) -> bool {
+        self.role.is_published(endpoint, alias)
+    }
+
     /// The configured identity of the key `(endpoint, stream_id)`
     /// (tests).
     #[cfg(test)]

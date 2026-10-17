@@ -1701,6 +1701,27 @@ impl Network {
             .collect()
     }
 
+    /// The endpoint of each path of the network publication
+    /// `registration`, the founding one first (tests).
+    #[cfg(test)]
+    pub(crate) fn publication_paths(&self, registration: u64) -> Vec<EndpointId> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| entry.paths().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether the Shared receiver has `alias` published on `endpoint`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn receiver_published(&self, endpoint: EndpointId, alias: Alias) -> bool {
+        match &self.agents {
+            Agents::Shared(agents) => agents.receiver.is_published(endpoint, alias),
+            _ => false,
+        }
+    }
+
     /// Endpoint resets completed so far, for tests.
     #[cfg(test)]
     pub(crate) fn reopened(&self) -> u64 {
