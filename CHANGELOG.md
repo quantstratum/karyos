@@ -60,6 +60,15 @@ release may break APIs, wire formats and shared-memory layouts.
   `SkipPolicy::duty_observed` and `range_unavailable_observed` tell a
   callback of each committed seal; `duty`, `duty_gated`,
   `range_unavailable` and `range_unavailable_gated` delegate to them.
+- The sender over a routed publication's paths (redundant-paths.md, rp-w4b2b):
+  a SETUP side on each path's endpoint, established on any path; SMs, NAKs
+  and bindings found on any path (`Outbound::serves`,
+  `Outbound::destination_on`); and a PATH_HB on each path idle for
+  `AgentConfig::path_heartbeat_interval` (default 100 ms, an interim for the
+  channel heartbeat interval RP-3 names), counted by
+  `SenderCounters::path_heartbeats_sent`. `SendSessions::identity` gives a
+  session's incarnation. A routed publication takes one entry of
+  `AgentConfig::publications` per path.
 - The conductor hands network trace hooks and journals to the agents
   (P2.12 step 3, PR 3a). `set_network_trace_hook` gives the hook to its
   side's agent; a journal opens per lane of a publication once the sender

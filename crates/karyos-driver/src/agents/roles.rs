@@ -67,11 +67,12 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use karyos_io::backend::{Budget, RxBackend, RxDatagram, RxDrop, RxHandler};
+use karyos_io::lanes::routes::MAX_ROUTES;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::frame::{FRAME_ALIGNMENT, Lane};
 use karyos_protocol::network::{
-    Alias, Control, Datagram, Identity, LaneStatus, Lanes, MAX_WINDOW, Nak, NakReply, Receiver,
-    Rttm, RttmKind, SetupAnnounce, SetupAnswer, StatusMessage, classify,
+    Alias, Control, Datagram, Identity, LaneStatus, Lanes, MAX_WINDOW, Nak, NakReply,
+    PathHeartbeat, Receiver, Rttm, RttmKind, SetupAnnounce, SetupAnswer, StatusMessage, classify,
 };
 use karyos_sys::host_clock::age_ns;
 use karyos_sys::log_buffer::ReceiveError;
@@ -352,6 +353,8 @@ pub struct SenderCounters {
     pub reset_requests: u64,
     /// Reset requests not posted: the event ring was full.
     pub reset_requests_full: u64,
+    /// PATH_HBs submitted on idle paths of routed publications (RP-3).
+    pub path_heartbeats_sent: u64,
     /// NAKs that reached admission (at most `naks_per_cycle` per cycle).
     pub naks: u64,
     /// NAKs dropped over `naks_per_cycle`: the receiver retries.
@@ -1249,6 +1252,8 @@ pub struct SenderRole {
     budget: u32,
     /// The announcements due this cycle (allocated at creation).
     due: Vec<(EndpointId, SetupAnnounce)>,
+    /// `path_heartbeat_interval` in ns (RP-3).
+    path_heartbeat_interval: u64,
     /// The receivers answered, at most `receiver_bindings` (allocated at
     /// creation).
     bindings: Vec<ReceiverBinding>,
@@ -1384,6 +1389,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             routes,
             budget: u32::try_from(config.control_capacity).unwrap_or(u32::MAX),
             due: Vec::with_capacity(config.publications),
+            path_heartbeat_interval: config.path_heartbeat_interval,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
             unconfirmed_timeout: config.sessions.setup_challenge_timeout,
@@ -4060,7 +4066,7 @@ impl SenderRole {
                 // A guarded publication's gate decides every exposure.
                 let guarded = guard.is_none_or(|spec| outbound.guard(spec, (self.clock)()).is_ok());
                 if repairs && guarded {
-                    self.sessions.add(publication)
+                    add_sessions(&mut self.sessions, &publication, &outbound)
                 } else {
                     Err(SendSessionError::InvalidConfig)
                 }
@@ -4100,14 +4106,27 @@ impl SenderRole {
         alias: Alias,
         registration: u64,
     ) -> AgentEvent<O> {
-        let _ = self.sessions.remove(endpoint, alias);
-        self.bindings
-            .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
         let mut outbound = self
             .publications
             .iter()
             .position(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
             .map(|index| self.publications.swap_remove(index));
+        // Every path's SETUP side and bindings go with it.
+        match outbound.as_deref() {
+            Some(outbound) => {
+                for path in outbound.route_endpoints() {
+                    let _ = self.sessions.remove(path, alias);
+                }
+                self.bindings.retain(|binding| {
+                    !(outbound.serves(binding.endpoint) && binding.alias == alias)
+                });
+            }
+            None => {
+                let _ = self.sessions.remove(endpoint, alias);
+                self.bindings
+                    .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
+            }
+        }
         // Lanes still traced (their close found no room before the removal)
         // close through the hook, so it closes their writers; the conductor
         // counts them `Lost`.
@@ -4152,6 +4171,54 @@ impl SenderRole {
     }
 
     /// Sends `control` on `endpoint` to `destination`.
+    /// Sends a PATH_HB on each idle path of every established routed
+    /// publication; returns the count submitted.
+    fn path_heartbeats<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+    ) -> u32 {
+        let interval = self.path_heartbeat_interval;
+        let mut submitted = 0u32;
+        for index in 0..self.publications.len() {
+            let Some(outbound) = self.publications.get(index) else {
+                break;
+            };
+            let alias = outbound.alias();
+            let identity = self.sessions.identity(outbound.endpoint(), alias);
+            let (true, true, Some(identity)) = (
+                outbound.is_routed(),
+                established(&self.sessions, outbound),
+                identity,
+            ) else {
+                continue;
+            };
+            let control = Control::PathHeartbeat(PathHeartbeat { alias, identity });
+            let mut due = [None; MAX_ROUTES];
+            let mut held = due.iter_mut();
+            if let Some(outbound) = self.publications.get_mut(index) {
+                let _ = outbound.path_heartbeats(now, interval, |endpoint, destination| {
+                    held.next().is_some_and(|slot| {
+                        *slot = Some((endpoint, destination));
+                        true
+                    })
+                });
+            }
+            for (endpoint, destination) in due.into_iter().flatten() {
+                if matches!(
+                    self.send(halves, endpoint, destination, &control),
+                    Sent::Submitted
+                ) {
+                    self.count(|c| &mut c.path_heartbeats_sent);
+                    if let Some(next) = submitted.checked_add(1) {
+                        submitted = next;
+                    }
+                }
+            }
+        }
+        submitted
+    }
+
     fn send<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
@@ -4200,8 +4267,8 @@ impl SenderRole {
         let outbound = self
             .publications
             .iter()
-            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)?;
-        Some((outbound.destination(), outbound.joins()?))
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)?;
+        Some((outbound.destination_on(endpoint)?, outbound.joins()?))
     }
 
     /// One cycle: the controls the receiver handed over, then the
@@ -4312,9 +4379,12 @@ impl SenderRole {
         // (SPEC.md §4) until a receiver's SMs are live again.
         let mut changes = 0u64;
         for outbound in &mut self.publications {
-            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            let alias = outbound.alias();
+            // A confirmed binding on any of its paths keeps it live.
             let bound = self.bindings.iter().any(|binding| {
-                binding.endpoint == endpoint && binding.alias == alias && binding.last_sm.is_some()
+                outbound.serves(binding.endpoint)
+                    && binding.alias == alias
+                    && binding.last_sm.is_some()
             });
             let live = bound || outbound.connected(now);
             if outbound.set_receivers_live(live)
@@ -4323,7 +4393,9 @@ impl SenderRole {
                 changes = next;
             }
             if !live {
-                let _ = self.sessions.disconnected(endpoint, alias);
+                for path in outbound.route_endpoints() {
+                    let _ = self.sessions.disconnected(path, alias);
+                }
             }
         }
         for _ in 0..changes {
@@ -4359,7 +4431,7 @@ impl SenderRole {
                 break;
             };
             let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
-            if !self.sessions.is_established(endpoint, alias) {
+            if !established(&self.sessions, outbound) {
                 // Not served yet, but a guard close still applies (the
                 // close acknowledgement waits for it).
                 if let Some(outbound) = self.publications.get_mut(index) {
@@ -4419,6 +4491,12 @@ impl SenderRole {
             }
         }
         self.counters.needs_reset = needing_reset;
+        // A routed publication's paths still idle after the first sends keep
+        // their bindings live at the receivers with a PATH_HB, a heartbeat
+        // of the control budget (RP-3).
+        work = work
+            .checked_add(self.path_heartbeats(halves, now))
+            .ok_or(overflow.clone())?;
         Ok(work)
     }
 
@@ -4631,7 +4709,7 @@ impl SenderRole {
         if let Some(membership) = self
             .publications
             .iter_mut()
-            .find(|outbound| outbound.endpoint() == key.endpoint && outbound.alias() == key.alias)
+            .find(|outbound| outbound.serves(key.endpoint) && outbound.alias() == key.alias)
             .and_then(|outbound| outbound.membership_mut())
         {
             let _ = membership.binding_gone(&key, now);
@@ -4723,7 +4801,7 @@ impl SenderRole {
                     .is_none_or(|id| id == nak.receiver.receiver_id)
         });
         let index = self.publications.iter().position(|outbound| {
-            outbound.endpoint() == endpoint
+            outbound.serves(endpoint)
                 && outbound.alias() == nak.alias
                 && outbound.repair().is_some()
         });
@@ -4785,8 +4863,8 @@ impl SenderRole {
             let Some(outbound) = self.publications.get(index) else {
                 break;
             };
-            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
-            if outbound.repair().is_none() || !self.sessions.is_established(endpoint, alias) {
+            let endpoint = outbound.endpoint();
+            if outbound.repair().is_none() || !established(&self.sessions, outbound) {
                 continue;
             }
             let tx = halves.iter_mut().find_map(|(held, half)| match half {
@@ -4888,7 +4966,7 @@ impl SenderRole {
         let publication = self
             .publications
             .iter()
-            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias);
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias);
         let lane_count =
             publication.and_then(|outbound| u8::try_from(outbound.readers().len()).ok());
         // MC-2: an SM whose declared tag is not the one configured for its
@@ -4979,7 +5057,7 @@ impl SenderRole {
         if let Some(membership) = self
             .publications
             .iter_mut()
-            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias)
             .and_then(|outbound| outbound.membership_mut())
         {
             let _ = membership.status(&key, status, now);
@@ -5028,6 +5106,42 @@ impl SenderRole {
             }
         }
     }
+}
+
+/// Adds the SETUP side of `publication` on each of `outbound`'s paths, all
+/// or nothing: a routed publication answers and announces on every path's
+/// endpoint, and takes one session per path of the table's capacity.
+fn add_sessions(
+    sessions: &mut SendSessions,
+    publication: &crate::sessions::send::Publication,
+    outbound: &Outbound,
+) -> Result<(), SendSessionError> {
+    let mut added = 0usize;
+    for path in outbound.route_endpoints() {
+        let result = sessions.add(crate::sessions::send::Publication {
+            endpoint: path,
+            ..*publication
+        });
+        if let Err(error) = result {
+            for undo in outbound.route_endpoints().take(added) {
+                let _ = sessions.remove(undo, publication.alias);
+            }
+            return Err(error);
+        }
+        // At most four paths: no overflow.
+        if let Some(next) = added.checked_add(1) {
+            added = next;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `outbound` is established on any of its paths: its first sends
+/// go on every path once one receiver's SM has arrived on one.
+fn established(sessions: &SendSessions, outbound: &Outbound) -> bool {
+    outbound
+        .route_endpoints()
+        .any(|path| sessions.is_established(path, outbound.alias()))
 }
 
 #[cfg(test)]

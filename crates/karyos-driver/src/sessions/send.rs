@@ -232,6 +232,17 @@ impl SendSessions {
         found.is_some()
     }
 
+    /// The incarnation identity of the publication `alias` on `endpoint`.
+    #[must_use]
+    pub fn identity(&self, endpoint: EndpointId, alias: Alias) -> Option<Identity> {
+        self.sessions
+            .iter()
+            .find(|session| {
+                session.publication.endpoint == endpoint && session.publication.alias == alias
+            })
+            .map(|session| session.publication.identity)
+    }
+
     /// Whether the publication received its first SM.
     #[must_use]
     pub fn is_established(&self, endpoint: EndpointId, alias: Alias) -> bool {

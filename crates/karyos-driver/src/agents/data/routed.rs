@@ -55,6 +55,8 @@ pub(super) struct RouteSlot {
     needs_reset: bool,
     /// The sender cycle of the last reset request posted for it.
     reset_requested: Option<u64>,
+    /// When it last submitted DATA or a PATH_HB was posted on it.
+    last_sent: Option<u64>,
 }
 
 /// One lane's staged copies per route, in order, and what left.
@@ -69,6 +71,8 @@ pub(super) struct RoutedTrack {
     /// Per route: a copy left with an unproven exposure; only that route's
     /// endpoint reset resolves it.
     unknown: [bool; MAX_ROUTES],
+    /// Per route: a copy was submitted this call.
+    sent: [bool; MAX_ROUTES],
 }
 
 /// One to [`MAX_ROUTES`] routes, each on its own endpoint: each route's TX
@@ -136,6 +140,7 @@ impl Routed {
                     opened: None,
                     needs_reset: false,
                     reset_requested: None,
+                    last_sent: None,
                 })
                 .collect(),
             tracks: (0..lanes)
@@ -144,6 +149,7 @@ impl Routed {
                     submitted: None,
                     mismatched: false,
                     unknown: [false; MAX_ROUTES],
+                    sent: [false; MAX_ROUTES],
                 })
                 .collect(),
             scratch: vec![0; mtu],
@@ -173,6 +179,34 @@ impl Routed {
                 });
             due.then_some((route.endpoint, &mut route.reset_requested))
         })
+    }
+
+    /// Posts, through `post`, a PATH_HB toward each route's destination
+    /// that is open and has submitted nothing for `interval` ns at `now`
+    /// (RP-3); `post` says whether it was posted. Returns the count posted.
+    pub(super) fn path_heartbeats(
+        &mut self,
+        now: u64,
+        interval: u64,
+        mut post: impl FnMut(EndpointId, SocketAddr) -> bool,
+    ) -> u32 {
+        let mut posted = 0u32;
+        for route in &mut self.routes {
+            let idle = route
+                .last_sent
+                .is_none_or(|at| now.checked_sub(at).is_some_and(|quiet| quiet >= interval));
+            if !idle || route.opened.is_none() || route.needs_reset {
+                continue;
+            }
+            if post(route.endpoint, route.destination) {
+                route.last_sent = Some(now);
+                // At most four routes: no overflow.
+                if let Some(next) = posted.checked_add(1) {
+                    posted = next;
+                }
+            }
+        }
+        posted
     }
 
     /// Whether the founding route's queues are open in `epoch`.
@@ -278,8 +312,11 @@ impl LaneGate for RoutedGate<'_> {
                 _ => None,
             });
         match (found, how) {
-            (Some((_, next)), Left::Submitted) => {
+            (Some((route, next)), Left::Submitted) => {
                 track.submitted = Some(track.submitted.map_or(next, |high| high.max(next)));
+                if let Some(sent) = track.sent.get_mut(route) {
+                    *sent = true;
+                }
             }
             (Some((route, _)), Left::Unknown) => {
                 if let Some(unknown) = track.unknown.get_mut(route) {
@@ -340,6 +377,42 @@ impl Outbound {
         std::iter::once(self.endpoint)
             .filter(move |_| routed.is_none())
             .chain(routed.into_iter().flat_map(Routed::endpoints))
+    }
+
+    /// Whether one of its paths sends on `endpoint`: controls from a
+    /// receiver on any path (SM, NAK, RTTM) name the publication there.
+    #[must_use]
+    pub fn serves(&self, endpoint: EndpointId) -> bool {
+        self.route_endpoints().any(|held| held == endpoint)
+    }
+
+    /// The destination of its path on `endpoint`, where answers on that
+    /// path go; `None` when no path sends there.
+    #[must_use]
+    pub fn destination_on(&self, endpoint: EndpointId) -> Option<SocketAddr> {
+        match self.routed.as_deref() {
+            Some(routed) => routed
+                .routes
+                .iter()
+                .find(|route| route.endpoint == endpoint)
+                .map(|route| route.destination),
+            None => (self.endpoint == endpoint).then_some(self.destination),
+        }
+    }
+
+    /// Over redundant paths, posts through `post` a PATH_HB toward each
+    /// path's destination that is open and submitted nothing for `interval`
+    /// ns at `now` (redundant-paths.md RP-3); `post` says whether it was
+    /// posted. None on one path. Returns the count posted.
+    pub fn path_heartbeats(
+        &mut self,
+        now: u64,
+        interval: u64,
+        post: impl FnMut(EndpointId, SocketAddr) -> bool,
+    ) -> u32 {
+        self.routed
+            .as_deref_mut()
+            .map_or(0, |routed| routed.path_heartbeats(now, interval, post))
     }
 
     /// Lane `lane`'s sent frontier (tests).
@@ -746,6 +819,16 @@ impl Outbound {
             *slot = slot.or(whole);
         }
         for (index, slot) in routed.routes.iter_mut().enumerate() {
+            // A route that submitted DATA this call is not idle (RP-3).
+            let mut sent = false;
+            for track in &mut routed.tracks {
+                if let Some(flag) = track.sent.get_mut(index) {
+                    sent |= std::mem::take(flag);
+                }
+            }
+            if sent {
+                slot.last_sent = Some(now);
+            }
             if failed.get(index).copied().flatten().is_some() {
                 self.counters.bump(|c| &mut c.send_failures, 1);
                 slot.needs_reset = true;
