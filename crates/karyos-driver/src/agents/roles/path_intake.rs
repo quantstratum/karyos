@@ -17,12 +17,22 @@
 //! image's statistics, skew detection and liveness use, whatever the
 //! queueing delay.
 //!
-//! **Memory.** The queues hold copies in `max_paths × path_queue_datagrams`
-//! buffers of `MAX_DATAGRAM` bytes (8 KiB, the largest datagram an endpoint
-//! can be configured for, so no datagram is too long to queue). They are
-//! allocated on the control path when the receiver first binds a later
-//! path of an image, never in the receive path; a single-path receiver
-//! allocates none. Once allocated they stay until the receiver stops.
+//! The queues are per local receive endpoint: a path is the endpoint one of
+//! an image's bindings arrives on, so the datagrams of every image and
+//! source that endpoint serves share its queue, in arrival order. A control
+//! that arrives on an endpoint whose queue holds datagrams is handled only
+//! once that queue is drained, so a reply such as an ERR never overtakes
+//! that path's earlier DATA.
+//!
+//! **Memory.** The queues hold copies in one slab of `max_paths ×
+//! path_queue_datagrams` slots of `MAX_DATAGRAM` bytes (8 KiB, the largest
+//! datagram an endpoint can be configured for, so no datagram is too long
+//! to queue). It is allocated on the control path when the receiver first
+//! binds a later path of an image, never in the receive path; a
+//! single-path receiver allocates none. Once allocated it stays until the
+//! receiver stops. With `path_queue_datagrams` at least `rx_datagrams` (the
+//! defaults: 256 and 64), one poll never fills a queue, since every queue
+//! is drained after each poll; a smaller queue drops a poll's excess.
 
 use std::net::SocketAddr;
 
@@ -34,14 +44,14 @@ use crate::paths::PathConfig;
 use crate::paths::queues::{PathQueues, Push};
 
 /// One queued datagram: where it came from, when it was polled, and the
-/// buffer that holds its bytes.
+/// slab slot that holds its bytes.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Queued {
     pub(super) source: SocketAddr,
     pub(super) alias: Alias,
     /// The receive poll's time: its arrival time.
     pub(super) now: u64,
-    buffer: usize,
+    slot: usize,
     len: usize,
 }
 
@@ -64,25 +74,31 @@ pub(super) struct PathIntake {
     queues: PathQueues<Queued>,
     /// The endpoint each queue serves, by queue.
     endpoints: Vec<Option<EndpointId>>,
-    buffers: Vec<Vec<u8>>,
-    /// The buffers no queued datagram holds.
+    /// Every slot's bytes, `MAX_DATAGRAM` each, in one allocation. Taken
+    /// out while the receiver delivers from it ([`PathIntake::take_slab`]).
+    slab: Vec<u8>,
+    /// The slots no queued datagram holds.
     free: Vec<usize>,
+}
+
+/// The bytes of slot `slot` in `slab`.
+fn slot_range(slot: usize, len: usize) -> Option<std::ops::Range<usize>> {
+    let start = slot.checked_mul(usize::from(MAX_DATAGRAM))?;
+    Some(start..start.checked_add(len)?)
 }
 
 impl PathIntake {
     /// The queues of `config.max_paths` endpoints of `config`'s
-    /// `path_queue_datagrams` each; it allocates every buffer here. `None`
-    /// when their count is past `usize` (the agent's validation bounds the
-    /// bytes first).
+    /// `path_queue_datagrams` each; it allocates the slab here. `None` when
+    /// its size is past `usize` (the agent's validation bounds it first).
     pub(super) fn new(config: &PathConfig) -> Option<Self> {
         let paths = usize::from(config.max_paths);
         let count = paths.checked_mul(usize::from(config.path_queue_datagrams))?;
+        let bytes = count.checked_mul(usize::from(MAX_DATAGRAM))?;
         Some(Self {
             queues: PathQueues::new(config),
             endpoints: vec![None; paths],
-            buffers: (0..count)
-                .map(|_| vec![0; usize::from(MAX_DATAGRAM)])
-                .collect(),
+            slab: vec![0; bytes],
             free: (0..count).rev().collect(),
         })
     }
@@ -128,17 +144,17 @@ impl PathIntake {
             }
         };
         let len = bytes.len();
-        let Some(buffer) = self.free.pop() else {
+        // Longer than a slot (never: a slot holds the largest datagram an
+        // endpoint delivers) is dropped, not delivered past the path's
+        // queued datagrams.
+        if len > usize::from(MAX_DATAGRAM) {
+            return Queue::Dropped;
+        }
+        let Some(slot) = self.free.pop() else {
             return Queue::Dropped;
         };
-        let Some(target) = self
-            .buffers
-            .get_mut(buffer)
-            .and_then(|held| held.get_mut(..len))
-        else {
-            // Longer than any endpoint delivers (never): dropped, not
-            // delivered past the path's queued datagrams.
-            self.free.push(buffer);
+        let Some(target) = slot_range(slot, len).and_then(|range| self.slab.get_mut(range)) else {
+            self.free.push(slot);
             return Queue::Dropped;
         };
         target.copy_from_slice(bytes);
@@ -146,47 +162,59 @@ impl PathIntake {
             source,
             alias,
             now,
-            buffer,
+            slot,
             len,
         };
         match self.queues.push(queue, entry) {
             Push::Queued => Queue::Queued,
             Push::Full(entry) | Push::UnknownPath(entry) => {
-                self.free.push(entry.buffer);
+                self.free.push(entry.slot);
                 Queue::Dropped
             }
         }
     }
 
-    /// The next datagram round robin across the queues: its endpoint, its
-    /// entry, and its buffer, taken out until [`PathIntake::give_back`].
-    pub(super) fn pop(&mut self) -> Option<(EndpointId, Queued, Vec<u8>)> {
+    /// The next datagram round robin across the queues, and its endpoint.
+    /// Its bytes are in the slab ([`PathIntake::bytes`]) until
+    /// [`PathIntake::release`].
+    pub(super) fn pop(&mut self) -> Option<(EndpointId, Queued)> {
         loop {
             let (queue, entry) = self.queues.pop()?;
-            let endpoint = self.endpoints.get(queue).copied().flatten();
-            let buffer = self
-                .buffers
-                .get_mut(entry.buffer)
-                .map(std::mem::take)
-                .unwrap_or_default();
-            if let Some(endpoint) = endpoint {
-                return Some((endpoint, entry, buffer));
+            if let Some(endpoint) = self.endpoints.get(queue).copied().flatten() {
+                return Some((endpoint, entry));
             }
-            self.give_back(entry, buffer);
+            self.release(entry);
         }
     }
 
-    /// Returns `buffer`, `entry`'s, once its datagram was delivered.
-    pub(super) fn give_back(&mut self, entry: Queued, buffer: Vec<u8>) {
-        if let Some(slot) = self.buffers.get_mut(entry.buffer) {
-            *slot = buffer;
-            self.free.push(entry.buffer);
-        }
+    /// The next datagram of `endpoint` alone, out of turn.
+    pub(super) fn pop_from(&mut self, endpoint: EndpointId) -> Option<Queued> {
+        let queue = self.queue_of(endpoint)?;
+        self.queues.pop_from(queue)
     }
 
-    /// The bytes of `entry` in `buffer`.
-    pub(super) fn bytes<'a>(entry: &Queued, buffer: &'a [u8]) -> &'a [u8] {
-        buffer.get(..entry.len).unwrap_or(&[])
+    /// Frees `entry`'s slot once its datagram was delivered.
+    pub(super) fn release(&mut self, entry: Queued) {
+        self.free.push(entry.slot);
+    }
+
+    /// The slab, taken out while the receiver delivers from it (an empty
+    /// one is left: nothing is queued meanwhile); [`PathIntake::put_slab`]
+    /// gives it back.
+    pub(super) fn take_slab(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.slab)
+    }
+
+    /// Gives the slab back.
+    pub(super) fn put_slab(&mut self, slab: Vec<u8>) {
+        self.slab = slab;
+    }
+
+    /// The bytes of `entry` in `slab`.
+    pub(super) fn bytes<'a>(entry: &Queued, slab: &'a [u8]) -> &'a [u8] {
+        slot_range(entry.slot, entry.len)
+            .and_then(|range| slab.get(range))
+            .unwrap_or(&[])
     }
 
     /// Frees the queues of endpoints with nothing waiting, for endpoints

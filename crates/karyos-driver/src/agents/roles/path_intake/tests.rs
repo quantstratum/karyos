@@ -29,11 +29,13 @@ fn from(port: u16) -> SocketAddr {
 /// Pops every datagram: its endpoint, first byte and poll time.
 fn drain(intake: &mut PathIntake) -> Vec<(EndpointId, u8, u64)> {
     let mut out = Vec::new();
-    while let Some((endpoint, entry, buffer)) = intake.pop() {
-        let first = PathIntake::bytes(&entry, &buffer)[0];
+    let slab = intake.take_slab();
+    while let Some((endpoint, entry)) = intake.pop() {
+        let first = PathIntake::bytes(&entry, &slab)[0];
         out.push((endpoint, first, entry.now));
-        intake.give_back(entry, buffer);
+        intake.release(entry);
     }
+    intake.put_slab(slab);
     out
 }
 
@@ -114,9 +116,17 @@ fn the_largest_datagram_is_queued_whole() {
         intake.push(EndpointId(1), (from(1), ALIAS, 0), &bytes),
         Queue::Queued
     );
-    let (_, entry, buffer) = intake.pop().unwrap();
-    assert_eq!(PathIntake::bytes(&entry, &buffer), bytes.as_slice());
-    intake.give_back(entry, buffer);
+    let slab = intake.take_slab();
+    let (_, entry) = intake.pop().unwrap();
+    assert_eq!(PathIntake::bytes(&entry, &slab), bytes.as_slice());
+    intake.release(entry);
+    intake.put_slab(slab);
+    // One byte more is dropped, never queued nor bypassed.
+    let longer = vec![7u8; usize::from(MAX_DATAGRAM) + 1];
+    assert_eq!(
+        intake.push(EndpointId(1), (from(1), ALIAS, 0), &longer),
+        Queue::Dropped
+    );
 }
 
 /// A path whose queue holds datagrams is never bypassed: with every queue
@@ -149,4 +159,26 @@ fn a_path_keeps_its_queue_until_it_drains() {
     assert!(intake.takes(a, false), "waiting: queued behind");
     let _ = drain(&mut intake);
     assert!(!intake.takes(a, false));
+}
+
+/// A control on an endpoint first takes that path's queued datagrams, out
+/// of turn and in order; the other paths keep theirs.
+#[test]
+fn one_paths_datagrams_are_taken_out_of_turn() {
+    let mut intake = intake(2, 4);
+    let (a, b) = (EndpointId(1), EndpointId(2));
+    let _ = intake.push(b, (from(2), ALIAS, 0), &[9; 8]);
+    let _ = intake.push(a, (from(1), ALIAS, 0), &[1; 8]);
+    let _ = intake.push(a, (from(1), ALIAS, 0), &[2; 8]);
+    let slab = intake.take_slab();
+    let mut firsts = Vec::new();
+    while let Some(entry) = intake.pop_from(a) {
+        firsts.push(PathIntake::bytes(&entry, &slab)[0]);
+        intake.release(entry);
+    }
+    intake.put_slab(slab);
+    assert_eq!(firsts, [1, 2]);
+    assert!(!intake.holds(a));
+    assert!(intake.holds(b), "B keeps its datagram");
+    let _ = drain(&mut intake);
 }
