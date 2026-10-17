@@ -1253,3 +1253,37 @@ fn the_gaps_are_bounded() {
     assert_eq!(store.written(), position, "nothing was written");
     assert!(store.append(position, &[1]).is_ok(), "the store is whole");
 }
+
+/// #341 review P3: an index holding more lost ranges than a store records
+/// (only a crafted one can) is refused at recovery.
+#[test]
+fn an_index_with_too_many_gaps_is_refused() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let geometry = Geometry::new(64, 64 * 1024).unwrap();
+    let mut store =
+        SegmentStore::create(disk.clone(), dir, RECORDING, geometry, SyncPolicy::None, 0).unwrap();
+    let mut position = 0;
+    for _ in 0..MAX_GAPS {
+        position = store.append(position, &[1]).unwrap();
+        position = store.append_gap(position, position + 1).unwrap();
+    }
+    position = store.append(position, &[1]).unwrap();
+    drop(store);
+    // One more gap entry after the last, as no store writes it.
+    let entries = u64::try_from(2 * MAX_GAPS + 1).unwrap();
+    let entry = Entry {
+        start: position,
+        length: 1,
+        data_crc: 0,
+        kind: EntryKind::Gap,
+    };
+    let mut raw = disk.clone();
+    let index = raw.open(&dir.join(index_name(RECORDING, 0))).unwrap();
+    raw.write_at(&index, HEADER + entries * ENTRY, &entry.encode())
+        .unwrap();
+    assert!(matches!(
+        SegmentStore::recover(disk, dir, RECORDING, geometry, SyncPolicy::None),
+        Err(SegmentError::TooManyGaps)
+    ));
+}

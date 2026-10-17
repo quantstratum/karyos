@@ -316,7 +316,12 @@ struct Outbox {
 impl Outbox {
     fn send(&self, event: Event) {
         if self.sender.try_send(event).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            // Sticky at u64::MAX rather than wrapping.
+            let _ = self
+                .dropped
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |dropped| {
+                    dropped.checked_add(1)
+                });
         }
     }
 }
@@ -401,26 +406,21 @@ fn run<D>(
                 return;
             }
         }
-        let mut index = 0;
-        while let Some(recording) = active.get_mut(index) {
-            match recording.recorder.duty(now()) {
+        // Each recording's duty; those that end or fail leave the set.
+        for mut recording in std::mem::take(&mut active) {
+            let event = match recording.recorder.duty(now()) {
                 Ok(duty) => {
                     worked |= duty.recorded > 0;
-                    if duty.ended.is_some() {
-                        let recording = active.swap_remove(index);
-                        // The reason it ended for (the seal, a lap).
-                        let event = finish(recording, &mut catalog, StopReason::Normal, now());
-                        if let Event::Failed { id, .. } = event {
-                            failed.push(id);
-                        }
-                        outbox.send(event);
+                    if duty.ended.is_none() {
+                        active.push(recording);
                         continue;
                     }
+                    // The reason it ended for (the seal, a lap).
+                    finish(recording, &mut catalog, StopReason::Normal, now())
                 }
                 Err(error) => {
                     worked = true;
-                    let recording = active.swap_remove(index);
-                    let event = match error.fail_kind() {
+                    match error.fail_kind() {
                         // The store is whole: close it and stop the
                         // recording, typed.
                         Some(kind) => {
@@ -430,15 +430,13 @@ fn run<D>(
                             id: recording.id,
                             failure: Failure::Store,
                         },
-                    };
-                    if let Event::Failed { id, .. } = event {
-                        failed.push(id);
                     }
-                    outbox.send(event);
-                    continue;
                 }
+            };
+            if let Event::Failed { id, .. } = event {
+                failed.push(id);
             }
-            index += 1;
+            outbox.send(event);
         }
         if !worked {
             match inbox.recv_timeout(config.idle) {
