@@ -473,8 +473,7 @@ impl Network {
     pub(crate) fn add_subscription(
         &mut self,
         stream_id: i32,
-        bind: SocketAddr,
-        multicast: Option<MulticastConfig>,
+        (bind, multicast): (SocketAddr, Option<MulticastConfig>),
         later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
         reliable: bool,

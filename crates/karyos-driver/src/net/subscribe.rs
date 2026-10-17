@@ -153,12 +153,11 @@ impl EmbeddedDriver<HeapTerms> {
             net.count_paths_refused();
             return Err(DriverError::UnsupportedChannel);
         }
-        let (bind, multicast) = receive_route(channel)?;
+        let route = receive_route(channel)?;
         let later = later_routes(channel)?;
         net.add_subscription(
             stream_id,
-            bind,
-            multicast,
+            route,
             &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
             channel.reliable,
