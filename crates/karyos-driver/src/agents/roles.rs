@@ -4581,10 +4581,6 @@ impl SenderRole {
         self.ignore_naks = false;
     }
 
-    /// The least position every receiver bound to `outbound` on any of its
-    /// paths consumed, per lane: a reliable channel's bound (SPEC §4). A receiver
-    /// answered but not yet heard from bounds at its join points. `None`
-    /// with no bound receiver at all: a reliable lane then holds.
     /// The receivers bound to `alias` on `endpoint` whose SMs arrived
     /// (tests): a path's SMs reach the sender only when the receiver agent
     /// has the alias published on that path's endpoint.
@@ -4608,6 +4604,10 @@ impl SenderRole {
             .and_then(|outbound| self.consumption(outbound))
     }
 
+    /// The least position every receiver bound to `outbound` on any of its
+    /// paths consumed, per lane: a reliable channel's bound (SPEC §4). A
+    /// receiver answered but not yet heard from bounds at its join points.
+    /// `None` with no bound receiver at all: a reliable lane then holds.
     fn consumption(&self, outbound: &Outbound) -> Option<[u64; 4]> {
         let mut least: Option<[u64; 4]> = None;
         // A receiver bound on any of its paths bounds it: one whose founding
