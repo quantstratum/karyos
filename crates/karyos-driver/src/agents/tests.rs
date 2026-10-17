@@ -230,12 +230,30 @@ fn the_configuration_is_checked() {
             },
             ..AgentConfig::default()
         },
+        // A maximum past 60 s could keep a left path out for good.
+        AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                backoff_max: crate::agents::data::MAX_PATH_BACKOFF + 1,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        },
     ] {
         assert!(matches!(
             network_agents::<S>(config),
             Err(AgentError::InvalidConfig(_))
         ));
     }
+    assert!(
+        network_agents::<S>(AgentConfig {
+            path_policy: crate::agents::data::PathPolicy {
+                backoff_max: crate::agents::data::MAX_PATH_BACKOFF,
+                ..crate::agents::data::PathPolicy::default()
+            },
+            ..AgentConfig::default()
+        })
+        .is_ok()
+    );
 }
 
 /// A command is refused, with nothing posted, when its reply could not be

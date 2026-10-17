@@ -281,10 +281,11 @@ impl AgentConfig {
             || policy.skip_min_bytes == 0
             || policy.backoff_initial == 0
             || policy.backoff_max < policy.backoff_initial
+            || policy.backoff_max > data::MAX_PATH_BACKOFF
             || policy.backoff_reset == 0
         {
             return Err(AgentError::InvalidConfig(
-                "path_policy needs a lag limit of 2 ns or more, a skip ratio of 1 to 100 percent, a minimum of 1 byte, and backoffs of 1 ns or more with the maximum at least the initial one",
+                "path_policy needs a lag limit of 2 ns or more, a skip ratio of 1 to 100 percent, a minimum of 1 byte, and backoffs of 1 ns or more with the maximum at least the initial one and at most 60 s",
             ));
         }
         if self.path_heartbeat_interval == 0 {

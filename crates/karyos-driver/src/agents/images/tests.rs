@@ -4140,10 +4140,18 @@ fn a_routed_publication_reaches_its_image_on_both_paths() {
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
 }
 
+/// The image's conductor and lane 0 subscriber, kept by a test.
+type Reader = (
+    karyos_sys::log_buffer::Conductor<std::sync::Arc<LogBuffer>>,
+    karyos_sys::log_buffer::Subscription<std::sync::Arc<LogBuffer>>,
+);
+
 /// The two-path rig with path A2 holding `withheld` datagrams alone (path A
 /// skipped them) when it leaves before sending them: no path sends them.
-fn abandoned_rig(reliable: bool, withheld: u32) -> (Rig, SlotRef) {
-    use karyos_sys::log_buffer::AppendOptions;
+/// Then four more messages (100 to 103) go on path A. Returns the image's
+/// lane 0 reader, attached before any message.
+fn abandoned_rig(reliable: bool, withheld: u32) -> (Rig, SlotRef, Reader) {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
 
     let setup = Setup {
         reliable,
@@ -4152,6 +4160,7 @@ fn abandoned_rig(reliable: bool, withheld: u32) -> (Rig, SlotRef) {
     let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
     let slot = established(&mut rig);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let reader = image_subscriber(&rig, slot, 0, Role::Optional);
     let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
     outbound.withhold_route(0, withheld);
     outbound.leave_before_serve(1);
@@ -4179,25 +4188,53 @@ fn abandoned_rig(reliable: bool, withheld: u32) -> (Rig, SlotRef) {
             .append(&[100 + i; 900], AppendOptions::default())
             .unwrap();
     }
-    (rig, slot)
+    (rig, slot, reader)
+}
+
+/// Reads lane 0 over up to 400 rounds until `count` messages arrived (or
+/// the rounds ran out), then 50 rounds more, so a duplicate would show.
+fn read_messages(rig: &mut Rig, reader: &mut Reader, count: usize) -> Vec<u8> {
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut reader.1) {
+            seen.push(message[0]);
+        }
+        if seen.len() >= count {
+            break;
+        }
+    }
+    for _ in 0..50 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut reader.1) {
+            seen.push(message[0]);
+        }
+    }
+    seen
 }
 
 /// #16835, reliable: the datagrams a leaving path held alone reach the
-/// receiver by NAK from retention.
+/// receiver by NAK from retention: every message once, in order.
 #[test]
 fn an_abandoned_copy_is_repaired_on_a_reliable_channel() {
-    let (mut rig, _slot) = abandoned_rig(true, 2);
-    rig.until(true, |rig| {
-        rig.agents.receiver.counters().naks >= 1 && rig.agents.sender.role.counters().naks >= 1
-    });
+    let (mut rig, slot, mut reader) = abandoned_rig(true, 2);
+    let seen = read_messages(&mut rig, &mut reader, 6);
+    assert_eq!(seen, [0, 1, 100, 101, 102, 103]);
+    let counters = rig.agents.receiver.role.loss_counters(slot).unwrap();
+    assert!(counters.repaired >= 1, "{counters:?}");
+    assert!(rig.agents.sender.role.counters().naks >= 1);
+    assert!(rig.agents.sender.role.counters().repairs >= 1);
 }
 
 /// #16835, unreliable: the receiver's gap policy seals the gap the
 /// abandoned datagrams left, and counts it.
 #[test]
 fn an_abandoned_copy_is_a_sealed_gap_on_an_unreliable_channel() {
-    let (mut rig, _slot) = abandoned_rig(false, 2);
-    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+    let (mut rig, _slot, mut reader) = abandoned_rig(false, 2);
+    let seen = read_messages(&mut rig, &mut reader, 4);
+    // The two abandoned messages are the sealed gap; the rest arrive once.
+    assert_eq!(seen, [100, 101, 102, 103]);
+    assert!(rig.agents.receiver.counters().gaps_sealed >= 1);
 }
 
 /// The receiver's end of the session rings, driven by hand, and the table

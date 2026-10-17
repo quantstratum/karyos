@@ -95,9 +95,15 @@ pub struct RouteCounters {
     pub skipped: u64,
     /// Copies this route submitted after another had debited them.
     pub late: u64,
-    /// Cancels this route could not run: its TX half was detached, so its
-    /// copies stay recorded until [`RoutedLaneSender::reopen`].
+    /// Cancels this route could not run, one per lane and call: its TX
+    /// half was detached, so its copies stay recorded until
+    /// [`RoutedLaneSender::reopen`] drops them, or
+    /// [`RoutedLaneSender::forget`] returns them (`forgotten`). A count of
+    /// attempts, not of copies.
     pub uncancelled: u64,
+    /// Copies [`RoutedLaneSender::forget`] returned while the route was
+    /// detached.
+    pub forgotten: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -579,6 +585,7 @@ impl RoutedLaneSender {
     /// never flushed: the detached queue keeps the items until the route's
     /// reopen replaces it. A close then does not wait on a route that may
     /// never come back (ACS 17049). Returns how many it forgot.
+    #[must_use]
     pub fn forget<G: LaneGate>(&mut self, lane: usize, route: usize, gate: &mut G) -> usize {
         let Some(queue) = self
             .lanes
@@ -591,6 +598,15 @@ impl RoutedLaneSender {
         let forgotten = queue.staged.len();
         while let Some(head) = queue.staged.pop_front() {
             gate.left(lane, head.staged, Left::Returned);
+        }
+        if let Some(counters) = self.counters.get_mut(route) {
+            match u64::try_from(forgotten)
+                .ok()
+                .and_then(|forgotten| counters.forgotten.checked_add(forgotten))
+            {
+                Some(total) => counters.forgotten = total,
+                None => counters.overflowed = true,
+            }
         }
         forgotten
     }
