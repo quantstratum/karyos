@@ -199,7 +199,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// The aggregate exposing the image of `stream_id` and `session_id`,
-    /// if one is installed and exposed (interim keying, D2).
+    /// if one is installed and exposed. Images of one alias from several
+    /// sources are each exposed (`quantstratum-docs:
+    /// karyos/design/per-source-images.md`, D2-2); this returns the oldest
+    /// that is not retiring.
     #[must_use]
     pub fn network_image(&self, stream_id: i32, session_id: i32) -> Option<AggregateHandle> {
         self.exposed_network_image(stream_id, session_id)
@@ -309,6 +312,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// The aggregate exposing the image of `stream_id` and `session_id`,
     /// as [`EmbeddedDriver::network_image`].
+    /// Every exposed, non-retiring image of `stream_id`, the oldest first,
+    /// with its source (tests; a public form is the owner's, item 7).
+    #[cfg(test)]
+    pub(crate) fn network_images(
+        &self,
+        stream_id: i32,
+    ) -> Vec<(AggregateHandle, std::net::SocketAddr)> {
+        self.net.as_ref().map_or_else(Vec::new, |net| {
+            net.exposed_images()
+                .filter_map(|handle| {
+                    // The image's source is its stream's (D2-1).
+                    self.streams
+                        .iter()
+                        .find(|stream| {
+                            stream.id == handle.registration()
+                                && !stream.retiring
+                                && stream.stream_id == stream_id
+                        })
+                        .and_then(|stream| Some((handle, stream.source?.source)))
+                })
+                .collect()
+        })
+    }
+
     pub(crate) fn exposed_network_image(
         &self,
         stream_id: i32,

@@ -420,6 +420,20 @@ impl NetworkSubscription {
     }
 }
 
+/// Where an image comes from (`quantstratum-docs:
+/// karyos/design/per-source-images.md`, D2-1): the endpoint it arrived
+/// on, the datagram source its binding names, and the publication
+/// incarnation. A later path's image keeps its founding source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImageSource {
+    /// The endpoint it arrived on.
+    pub(crate) endpoint: EndpointId,
+    /// The datagram source its founding binding names.
+    pub(crate) source: std::net::SocketAddr,
+    /// The publication incarnation.
+    pub(crate) identity: karyos_protocol::network::Identity,
+}
+
 /// An installed image and the aggregate that exposes it, if any.
 #[derive(Debug)]
 struct NetImage<T: StreamTerms> {
@@ -470,8 +484,9 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// Endpoint resets completed (`EndpointEvent::Reopened`), for tests.
     #[cfg(test)]
     reopened: u64,
-    /// Images installed but not exposed: their alias is in use (interim
-    /// keying, ACS 15937) or the stream table is full.
+    /// Images installed but not exposed: their alias is a local stream's
+    /// key, the stream table is full or their aggregate could not be built
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-1).
     images_unexposed: u64,
     /// Aliases the receiver still admits for a publication that is gone
     /// or was refused: `RemovePublishedAlias` is posted as the ring
@@ -1025,7 +1040,7 @@ impl<T: StreamTerms> Network<T> {
     pub(crate) fn record_image(
         &mut self,
         slot: SlotRef,
-        endpoint: EndpointId,
+        source: ImageSource,
         traced: karyos_protocol::trace_hook::PublicationIdentity,
         exposed: Option<crate::embedded::AggregateHandle>,
         lanes: &[Arc<LogBuffer<T>>],
@@ -1042,7 +1057,7 @@ impl<T: StreamTerms> Network<T> {
         }
         self.net_images.push(NetImage {
             slot,
-            endpoint,
+            endpoint: source.endpoint,
             traced,
             lanes: lanes.len(),
             exposed,
@@ -1110,7 +1125,15 @@ impl<T: StreamTerms> Network<T> {
         self.net_images.retain(|image| image.slot != slot);
     }
 
-    /// The exposed image aggregate that `matches`.
+    /// Each exposed image's aggregate, in install order.
+    #[cfg(test)]
+    pub(crate) fn exposed_images(
+        &self,
+    ) -> impl Iterator<Item = crate::embedded::AggregateHandle> + '_ {
+        self.net_images.iter().filter_map(|image| image.exposed)
+    }
+
+    /// The exposed image aggregate that `matches`, the oldest first.
     pub(crate) fn exposed_image(
         &self,
         matches: impl Fn(&crate::embedded::AggregateHandle) -> bool,

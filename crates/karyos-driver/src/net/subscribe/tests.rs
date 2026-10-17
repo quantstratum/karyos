@@ -218,13 +218,135 @@ fn a_removed_subscription_retires_and_reclaims_its_image() {
     });
 }
 
-/// Interim keying (ACS 15937): a second image with an alias in use is not
-/// exposed, and is counted; the first stays exposed.
+/// Two publishers of one alias on different sources (`quantstratum-docs:
+/// karyos/design/per-source-images.md`, D2-1): both images are exposed,
+/// each named by its registration with its own source; the alias resolves
+/// to the oldest; each image's reader gets only its publisher's messages,
+/// in order; removing the subscription retires and reclaims both.
 #[test]
-fn a_second_image_of_one_alias_is_counted_not_exposed() {
+fn two_images_of_one_alias_are_both_exposed_and_read() {
     let mut a = driver(ThreadingMode::Shared);
     let mut c = driver(ThreadingMode::Shared);
     let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let publications = [
+        a.add_network_publication(aggregate(10, 3, 1), &channel(address))
+            .unwrap(),
+        c.add_network_publication(aggregate(10, 3, 1), &channel(address))
+            .unwrap(),
+    ];
+    pump(&mut a, &mut b, |_, b| {
+        let _ = c.do_work().unwrap();
+        b.network_images(10).len() == 2
+    });
+    assert_eq!(b.network_images_unexposed(), 0);
+    let images = b.network_images(10);
+    assert_ne!(images[0].1, images[1].1, "two sources");
+    assert!(images[0].0.registration() < images[1].0.registration());
+    assert_eq!(b.network_image(10, 3), Some(images[0].0), "the oldest");
+    let mut readers = [images[0].0, images[1].0]
+        .map(|image| b.subscribe_aggregate(&image, Role::Required).unwrap());
+    // Which publisher an image is from is learnt from its first message.
+    let mut lanes = [
+        a.publication(publications[0].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+        c.publication(publications[1].lane(Lane::ZERO).unwrap())
+            .unwrap(),
+    ];
+    let messages = 64u32;
+    let mut sent = [0u32; 2];
+    let mut seen: [Vec<(u8, u32)>; 2] = [Vec::new(), Vec::new()];
+    pump(&mut a, &mut b, |_, _| {
+        let _ = c.do_work().unwrap();
+        for (publisher, lane) in lanes.iter_mut().enumerate() {
+            while sent[publisher] < messages {
+                let mut payload = [0u8; 100];
+                payload[0] = u8::try_from(publisher).unwrap();
+                payload[1..5].copy_from_slice(&sent[publisher].to_le_bytes());
+                match lane.offer(&payload).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent[publisher] += 1,
+                    _ => break,
+                }
+            }
+        }
+        for (image, reader) in readers.iter_mut().enumerate() {
+            let _ = reader.poll(
+                |bytes, _, _| {
+                    let index = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+                    seen[image].push((bytes[0], index));
+                },
+                BUDGET,
+            );
+        }
+        seen.iter().all(|seen| seen.len() == 64)
+    });
+    let mut publishers = [seen[0][0].0, seen[1][0].0];
+    for (image, seen) in seen.iter().enumerate() {
+        let publisher = publishers[image];
+        let expect: Vec<(u8, u32)> = (0..messages).map(|index| (publisher, index)).collect();
+        assert_eq!(seen, &expect, "image {image}: only its publisher, in order");
+    }
+    publishers.sort_unstable();
+    assert_eq!(publishers, [0, 1]);
+    drop(readers);
+    drop(lanes);
+    assert!(b.remove_network_subscription(subscription).unwrap());
+    pump(&mut a, &mut b, |_, b| {
+        let _ = c.do_work().unwrap();
+        b.net.as_ref().unwrap().image_count() == 0
+    });
+}
+
+/// The local key rule is symmetric (per-source-images.md, D2-1): an image
+/// whose alias is a live local stream's key stays unexposed and counted,
+/// and a local stream over a live image's key is `DuplicateStream`.
+#[test]
+fn a_local_key_and_an_image_alias_never_coexist() {
+    // A local stream first: the image of its key is not exposed.
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let _local = b.add_aggregate(aggregate(10, 3, 1)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_images_unexposed() == 1);
+    assert!(b.network_image(10, 3).is_none());
+    // An image first: a local stream of its key is refused.
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    assert!(matches!(
+        b.add_aggregate(aggregate(10, 3, 1)),
+        Err(crate::error::DriverError::DuplicateStream {
+            stream_id: 10,
+            session_id: 3
+        })
+    ));
+}
+
+/// An image the stream table has no room for is installed, fed and
+/// counted, not exposed; the first stays exposed.
+#[test]
+fn an_image_without_room_is_counted_not_exposed() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut c = driver(ThreadingMode::Shared);
+    let mut b = EmbeddedDriver::with_config(DriverConfig {
+        max_streams: 1,
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap();
     let address = free_address();
     let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
     let _first = a
@@ -237,7 +359,7 @@ fn a_second_image_of_one_alias_is_counted_not_exposed() {
         let _ = c.do_work().unwrap();
         b.network_images_unexposed() == 1
     });
-    assert!(b.network_image(10, 3).is_some());
+    assert_eq!(b.network_images(10).len(), 1);
     // The unexposed image is still fed past its first term: its terms are
     // prepared by the network, so the reliable publisher is never held.
     let mut lane = c.publication(second.lane(Lane::ZERO).unwrap()).unwrap();
@@ -259,6 +381,54 @@ fn a_second_image_of_one_alias_is_counted_not_exposed() {
         let _ = c.do_work().unwrap();
         b.net.as_ref().unwrap().image_count() == 0
     });
+}
+
+/// A replay target has no source (per-source-images.md, D2-1): it is
+/// refused over a live image's key, as over any stream's, and an image
+/// over a replay target's key stays unexposed and counted.
+#[test]
+fn a_replay_target_and_an_image_never_share_a_key() {
+    use crate::replay::ReplayTargetConfig;
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH};
+
+    let target = |stream_id, session_id| ReplayTargetConfig {
+        stream_id,
+        session_id,
+        term_length: MIN_TERM_LENGTH,
+        initial_term_id: 7,
+        mtu: DEFAULT_MTU,
+        join: 0,
+        lane: Lane::ZERO,
+        source_stream_id: 42,
+        source_session_id: 1,
+    };
+    // An image first: a replay target of its key is refused.
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_image(10, 3).is_some());
+    assert!(matches!(
+        b.replay_target(target(10, 3)),
+        Err(crate::error::DriverError::DuplicateStream {
+            stream_id: 10,
+            session_id: 3
+        })
+    ));
+    // A replay target first: the image of its key is not exposed.
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let address = free_address();
+    let _target = b.replay_target(target(10, 3)).unwrap();
+    let _subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_images_unexposed() == 1);
+    assert!(b.network_images(10).is_empty());
 }
 
 /// #283 P2: two subscriptions of one endpoint and stream share the

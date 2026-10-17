@@ -545,12 +545,12 @@ fn a_multicast_publication_reaches_every_subscriber() {
 /// publisher drivers use the same `session_id` and stream on one group.
 /// The subscribing driver's receiver keeps two images, keyed by source
 /// endpoint, and commits each source's frames into its own image: every
-/// frame of both publishers commits and none is refused. The driver
-/// exposes one aggregate per alias (interim D2, `add_image_aggregate`), so
-/// one image is exposed and the other is driven unexposed; the exposed
-/// one delivers only its own publisher's messages, every one, in order,
-/// and nothing of the other publisher crosses into it. Linux, after the
-/// loopback multicast probe, like `a_multicast_publication_reaches_every_subscriber`.
+/// frame of both publishers commits and none is refused. Both images are
+/// exposed, each with its own source (`quantstratum-docs:
+/// karyos/design/per-source-images.md`, D2-1), and each delivers only its
+/// own publisher's messages, every one, in order: nothing of the other
+/// publisher crosses into it. Linux, after the loopback multicast probe,
+/// like `a_multicast_publication_reaches_every_subscriber`.
 #[cfg(target_os = "linux")]
 #[test]
 fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
@@ -588,15 +588,15 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
         a2.add_network_publication(aggregate(10, 3, 1), &channel)
             .unwrap(),
     ];
-    // Two images installed: one exposed, the other driven unexposed.
-    let mut image = None;
+    // Two images installed, both exposed, from two sources.
     pump(&mut [&mut a1, &mut a2, &mut b], |drivers| {
-        image = drivers[2].network_image(10, 3);
-        image.is_some() && drivers[2].network_images_unexposed() == 1
+        drivers[2].network_images(10).len() == 2
     });
-    let mut reader = b
-        .subscribe_aggregate(&image.unwrap(), Role::Required)
-        .unwrap();
+    assert_eq!(b.network_images_unexposed(), 0);
+    let images = b.network_images(10);
+    assert_ne!(images[0].1, images[1].1, "two sources");
+    let mut readers = [images[0].0, images[1].0]
+        .map(|image| b.subscribe_aggregate(&image, Role::Required).unwrap());
     let mut lanes = [
         a1.publication(publications[0].lane(Lane::ZERO).unwrap())
             .unwrap(),
@@ -606,7 +606,7 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
     // Publisher p's message i is tagged (p, i).
     let count = 64u32;
     let mut sent = [0u32; 2];
-    let mut seen: Vec<(u8, u32)> = Vec::new();
+    let mut seen: [Vec<(u8, u32)>; 2] = [Vec::new(), Vec::new()];
     let mut offer = |lanes: &mut [karyos_client::ClientPublication<HeapTerms>; 2]| {
         for (publisher, lane) in lanes.iter_mut().enumerate() {
             while sent[publisher] < count {
@@ -621,15 +621,21 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
         }
         sent
     };
+    let read = |readers: &mut [AggregateSubscription<HeapTerms>; 2],
+                seen: &mut [Vec<(u8, u32)>; 2]| {
+        for (image, reader) in readers.iter_mut().enumerate() {
+            let _ = reader.poll(
+                |bytes, _, _| {
+                    let index = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+                    seen[image].push((bytes[0], index));
+                },
+                BUDGET,
+            );
+        }
+    };
     pump(&mut [&mut a1, &mut a2, &mut b], |drivers| {
         let sent = offer(&mut lanes);
-        let _ = reader.poll(
-            |bytes, _, _| {
-                let index = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
-                seen.push((bytes[0], index));
-            },
-            BUDGET,
-        );
+        read(&mut readers, &mut seen);
         // Every frame of both publishers is committed, each into its own
         // image (1000-byte messages are one frame each).
         let committed = drivers[2]
@@ -639,27 +645,26 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
             .receiver_counters()
             .unwrap()
             .data_committed;
-        sent == [count, count] && seen.len() >= 64 && committed >= 2 * u64::from(count)
+        sent == [count, count]
+            && seen.iter().all(|seen| seen.len() >= 64)
+            && committed >= 2 * u64::from(count)
     });
-    // A while more: nothing else reaches the exposed image.
+    // A while more: nothing else reaches either image.
     for _ in 0..200 {
         let _ = a1.do_work().unwrap();
         let _ = a2.do_work().unwrap();
         let _ = b.do_work().unwrap();
-        let _ = reader.poll(
-            |bytes, _, _| {
-                let index = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
-                seen.push((bytes[0], index));
-            },
-            BUDGET,
+        read(&mut readers, &mut seen);
+    }
+    let owners = [seen[0][0].0, seen[1][0].0];
+    assert_ne!(owners[0], owners[1], "one publisher per image");
+    for (image, seen) in seen.iter().enumerate() {
+        let expected: Vec<(u8, u32)> = (0..count).map(|i| (owners[image], i)).collect();
+        assert_eq!(
+            seen, &expected,
+            "image {image}: a frame of the other publisher crossed, or one was lost"
         );
     }
-    let owner = seen[0].0;
-    let expected: Vec<(u8, u32)> = (0..count).map(|i| (owner, i)).collect();
-    assert_eq!(
-        seen, expected,
-        "a frame of the other publisher crossed, or one was lost"
-    );
     let counters = b.net.as_ref().unwrap().receiver_counters().unwrap();
     assert_eq!(counters.create_image, 2, "{counters:?}");
     assert_eq!(counters.data_refused, 0, "{counters:?}");

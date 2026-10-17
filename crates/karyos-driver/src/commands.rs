@@ -681,17 +681,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// The lane stream of `stream`'s aggregate on `lane`, or, for `None`,
     /// the lane that carries the aggregate's registration (lane 0, or the
     /// only lane of a stream added with `add_stream`).
+    ///
+    /// A live key names a local stream or images, never both
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-2):
+    /// images of one alias resolve to the oldest, the lowest registration.
     fn find_stream(&self, stream: StreamKey, lane: Option<Lane>) -> Option<usize> {
         // Commands bind by wire key at execution; retiring streams accept
         // nothing new.
-        self.streams.iter().position(|s| {
-            !s.retiring
-                && s.stream_id == stream.stream_id
-                && s.session_id == stream.session_id
-                && lane.map_or(s.id == s.aggregate.registration, |lane| {
-                    s.config.lane == lane
-                })
-        })
+        self.streams
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.retiring
+                    && s.stream_id == stream.stream_id
+                    && s.session_id == stream.session_id
+                    && lane.map_or(s.id == s.aggregate.registration, |lane| {
+                        s.config.lane == lane
+                    })
+            })
+            .min_by_key(|(_, s)| s.aggregate.registration)
+            .map(|(index, _)| index)
     }
 
     /// Handed-over publications held for every client; `None` if the sum

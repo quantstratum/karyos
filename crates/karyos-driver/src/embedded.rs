@@ -474,6 +474,10 @@ static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 pub(crate) struct Stream<T: StreamTerms> {
     pub(crate) id: u64,
+    /// Where a network image's lane comes from; `None` for a local stream,
+    /// a network publication's lane and a replay target
+    /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-1).
+    pub(crate) source: Option<crate::net::ImageSource>,
     /// The aggregate this lane belongs to.
     pub(crate) aggregate: Aggregate,
     pub(crate) retiring: bool,
@@ -888,30 +892,37 @@ pub const FIRST_INCARNATION: u64 = 1;
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Exposes the lanes of an installed image as the lane streams of one
-    /// aggregate, keyed by the image's alias (wiring note W-e, W3; the
-    /// interim D2 step, ACS 15937). Each lane's conductor is issued here,
-    /// so the duty cycle prepares the image's terms as for a local stream.
-    /// Returns `None`, with nothing added, when the key is in use (a local
-    /// stream or an earlier image of the alias), the stream table is full
-    /// or a conductor was already issued. A retiring stream keeps its key
-    /// until it frees, so a new image of that alias installed meanwhile
-    /// stays unexposed for its whole life (interim D2, #283 P3).
+    /// aggregate, named by its registration (`quantstratum-docs:
+    /// karyos/design/per-source-images.md`, D2-1; wiring note W-e, W3).
+    /// Each lane's conductor is issued here, so the duty cycle prepares
+    /// the image's terms as for a local stream.
+    ///
+    /// A network image comes with its `source`: images of one alias from
+    /// different sources are each exposed, and the alias is refused only
+    /// when it is the key of a stream that is not a network image (as a
+    /// local stream over an image's key is refused). A replay target has
+    /// no source and is refused for any stream of its key. Returns `None`,
+    /// with nothing added, for a refused key, a full stream table or an
+    /// aggregate that cannot be built (its quanta, its profile, its
+    /// registrations or a conductor already issued). A retiring stream
+    /// keeps its key until it frees, so an image of that alias installed
+    /// meanwhile stays unexposed for its whole life (#283 P3).
     pub(crate) fn add_image_aggregate(
         &mut self,
         lanes: &[Arc<LogBuffer<T>>],
+        source: Option<crate::net::ImageSource>,
     ) -> Option<AggregateHandle> {
         let first = lanes.first()?.config();
         let key = (first.stream_id, first.session_id);
         let count = u8::try_from(lanes.len()).ok()?;
-        if self
+        if self.streams.iter().any(|stream| {
+            (stream.stream_id, stream.session_id) == key
+                && (source.is_none() || stream.source.is_none())
+        }) || self
             .streams
-            .iter()
-            .any(|stream| (stream.stream_id, stream.session_id) == key)
-            || self
-                .streams
-                .len()
-                .checked_add(lanes.len())
-                .is_none_or(|total| total > self.config.max_streams)
+            .len()
+            .checked_add(lanes.len())
+            .is_none_or(|total| total > self.config.max_streams)
         {
             return None;
         }
@@ -950,6 +961,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             staged.push(Stream {
                 id,
+                source,
                 aggregate,
                 retiring: false,
                 buffer: Arc::clone(buffer),
@@ -2112,6 +2124,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         });
         Ok(Stream {
             id,
+            source: None,
             aggregate,
             retiring: false,
             buffer,
@@ -3526,6 +3539,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 crate::agents::images::ImageEvent::Installed {
                     slot,
                     endpoint,
+                    source,
                     identity,
                     alias,
                 } => {
@@ -3533,10 +3547,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     else {
                         continue;
                     };
-                    let exposed = self.add_image_aggregate(&lanes);
+                    let source = crate::net::ImageSource {
+                        endpoint,
+                        source,
+                        identity,
+                    };
+                    let exposed = self.add_image_aggregate(&lanes, Some(source));
                     if let Some(net) = &mut self.net {
                         let traced = crate::net::trace::identity(&identity, alias);
-                        net.record_image(slot, endpoint, traced, exposed, &lanes);
+                        net.record_image(slot, source, traced, exposed, &lanes);
                     }
                     self.build_network_view(slot, endpoint, exposed.as_ref());
                     // Its receiver journals, while the receiver has a hook.
