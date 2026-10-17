@@ -7,9 +7,10 @@
 //! - **Parse.** The driver parses the URI (`ChannelConfig::parse`); one
 //!   that does not parse is refused with `InvalidChannel`, its detail the
 //!   parse error's code.
-//! - **Publication.** `karyos:ipc` resolves the stream by its id alone, as
-//!   `AddPublication` does (two sessions of the id are ambiguous:
-//!   `UnknownStream`). `karyos:udp` creates an aggregate from the
+//! - **Publication.** `karyos:ipc` resolves the stream by its id alone:
+//!   the one active aggregate of the id, its lanes counted once, that is
+//!   not the network's (a network publication or an image); none or two
+//!   is `UnknownStream`. `karyos:udp` creates an aggregate from the
 //!   network's stream defaults and the URI's `term-length`, `mtu` and
 //!   `lanes`, under a session id the driver draws, sends it (W2), and
 //!   grants lane 0 as `AddPublication` does.
@@ -21,7 +22,15 @@
 //!   one reconcile pass, run every cycle, removes a network publication
 //!   whose registration ended (removed, dropped or its client gone) and a
 //!   network subscription whose client is no longer served. Nothing a
-//!   client created outlives it.
+//!   client created outlives it. A client owns at most
+//!   `NetworkConfig::max_owned_per_client`; another is refused with
+//!   `ResourcesUnavailable` and counted.
+//! - **Images.** A subscription learns of the images already there once,
+//!   in the cycle it is created, and of every later image and retirement
+//!   as it happens; never of one twice, nor of the retirement of one it
+//!   was not told about. Both rest on `announced`: set only once every
+//!   event of `announce_existing_images` went out, and the only gate of
+//!   `announce_image`, which runs after it in each cycle.
 //! - **Shared terms.** A driver admitting other processes refuses `udp`
 //!   with `UnsupportedChannel` (D3, SPEC §18).
 
@@ -64,6 +73,13 @@ pub(crate) struct OwnedNetwork {
     pub(crate) registration: u64,
     pub(crate) client: u64,
     pub(crate) owned: Owned,
+}
+
+/// One word of the system's random source; `None` when it fails.
+fn random_word() -> Option<u64> {
+    let mut word = [0u64; 1];
+    karyos_sys::random::fill_u64s(&mut word).ok()?;
+    Some(word[0])
 }
 
 /// The refusal code of a network operation's error.
@@ -124,6 +140,36 @@ fn aggregate(
     })
 }
 
+/// The most network resources a client may own by URI
+/// (`NetworkConfig::max_owned_per_client`).
+pub(crate) const MAX_OWNED_PER_CLIENT: usize = 4096;
+
+/// The owned table's capacity for `network` and `max_clients`: one bound
+/// per client. `None` when it overflows.
+pub(crate) fn owned_capacity(
+    network: &crate::net::NetworkConfig,
+    max_clients: usize,
+) -> Option<usize> {
+    network.max_owned_per_client.checked_mul(max_clients)
+}
+
+/// Whether a network configuration's client parameters hold, at start:
+/// its stream defaults make a valid log on every lane count they allow,
+/// and a client may own something, within [`MAX_OWNED_PER_CLIENT`] and a
+/// table that fits for `max_clients`.
+pub(crate) fn valid_network(network: &crate::net::NetworkConfig, max_clients: usize) -> bool {
+    let defaults = network.stream_defaults;
+    (1..=MAX_OWNED_PER_CLIENT).contains(&network.max_owned_per_client)
+        && owned_capacity(network, max_clients).is_some()
+        && (1..=Lane::COUNT).contains(&defaults.lanes)
+        && aggregate(&defaults, &CommonConfig::default(), 0, 1, false).is_ok_and(|config| {
+            karyos_sys::log_buffer::LogBuffer::<karyos_sys::term_bytes::HeapTerms>::validate(
+                &config.stream.buffer,
+            )
+            .is_ok()
+        })
+}
+
 impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Serves `AddNetworkPublication` (W5b).
     pub(crate) fn serve_network_publication(
@@ -159,29 +205,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let udp = match channel.media {
             Media::Ipc => {
-                let mut sessions = self
-                    .streams
-                    .iter()
-                    .filter(|stream| !stream.retiring && stream.stream_id == stream_id)
-                    .map(|stream| stream.session_id);
-                let (Some(session_id), None) = (sessions.next(), sessions.next()) else {
-                    return refuse(ErrorCode::UnknownStream, detail);
+                return match self.ipc_stream(stream_id) {
+                    Some(stream) => grant(self, stream),
+                    None => refuse(ErrorCode::UnknownStream, detail),
                 };
-                return grant(
-                    self,
-                    StreamKey {
-                        stream_id,
-                        session_id,
-                    },
-                );
             }
             Media::Udp(udp) => udp,
         };
         let Some(defaults) = self.config.network.map(|network| network.stream_defaults) else {
             return refuse(ErrorCode::UnsupportedChannel, detail);
         };
-        let Some(session_id) = self.draw_session(stream_id) else {
-            return refuse(ErrorCode::IdentitiesExhausted, detail);
+        if !self.may_own(client) {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        }
+        let session_id = match self.draw_session(stream_id, random_word) {
+            Ok(session_id) => session_id,
+            Err(code) => return refuse(code, detail),
         };
         let config = match aggregate(
             &defaults,
@@ -221,15 +260,73 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         response
     }
 
-    /// A session id for a new publication of `stream_id`, nonzero and used
-    /// by no stream of that id; `None` when the random source fails or
-    /// every draw collides.
-    fn draw_session(&self, stream_id: i32) -> Option<i32> {
+    /// The only stream a `karyos:ipc` URI of `stream_id` names, which
+    /// carries no session id: the one active aggregate of the id that is
+    /// not the network's (a network publication or an image). Its lanes
+    /// count once. `None` when there is none or more than one.
+    fn ipc_stream(&self, stream_id: i32) -> Option<StreamKey> {
+        let net = self.net.as_ref();
+        let mut found: Option<StreamKey> = None;
+        for stream in &self.streams {
+            let candidate = !stream.retiring
+                && stream.stream_id == stream_id
+                && stream.id == stream.aggregate.registration
+                && !net.is_some_and(|net| net.is_network_aggregate(stream.aggregate.registration));
+            if !candidate {
+                continue;
+            }
+            match found {
+                None => {
+                    found = Some(StreamKey {
+                        stream_id,
+                        session_id: stream.session_id,
+                    });
+                }
+                Some(key) if key.session_id == stream.session_id => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    /// Whether `client` may own one more network resource
+    /// (`NetworkConfig::max_owned_per_client`); a refusal is counted.
+    fn may_own(&mut self, client: u64) -> bool {
+        let cap = self
+            .config
+            .network
+            .map_or(0, |network| network.max_owned_per_client);
+        let owned = self
+            .net_owned
+            .iter()
+            .filter(|owned| owned.client == client)
+            .count();
+        let room = owned < cap;
+        if !room {
+            match self.owned_refusals.checked_add(1) {
+                Some(count) => self.owned_refusals = count,
+                None => self.owned_refusals_overflowed = true,
+            }
+        }
+        room
+    }
+
+    /// A session id for a new publication of `stream_id` from the words of
+    /// `random`: nonzero and used by no stream of that id.
+    ///
+    /// # Errors
+    ///
+    /// `ResourcesUnavailable` when the random source fails,
+    /// `IdentitiesExhausted` when every draw collides.
+    pub(crate) fn draw_session(
+        &self,
+        stream_id: i32,
+        mut random: impl FnMut() -> Option<u64>,
+    ) -> Result<i32, ErrorCode> {
         for _ in 0..16 {
-            let mut word = [0u64; 1];
-            karyos_sys::random::fill_u64s(&mut word).ok()?;
-            let session_id = u32::try_from(word[0] & u64::from(u32::MAX))
-                .ok()?
+            let word = random().ok_or(ErrorCode::ResourcesUnavailable)?;
+            let session_id = u32::try_from(word & u64::from(u32::MAX))
+                .map_err(|_| ErrorCode::ResourcesUnavailable)?
                 .cast_signed();
             if session_id != 0
                 && !self
@@ -237,10 +334,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     .iter()
                     .any(|stream| (stream.stream_id, stream.session_id) == (stream_id, session_id))
             {
-                return Some(session_id);
+                return Ok(session_id);
             }
         }
-        None
+        Err(ErrorCode::IdentitiesExhausted)
     }
 
     /// Serves `AddNetworkSubscription` (W5b).
@@ -268,6 +365,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 ..
             }) => udp,
         };
+        if self.config.network.is_none() {
+            return refuse(ErrorCode::UnsupportedChannel, detail);
+        }
+        if !self.may_own(client) {
+            return refuse(ErrorCode::ResourcesUnavailable, detail);
+        }
         let registration = self.next_registration;
         let Some(next) = registration.checked_add(1) else {
             return refuse(ErrorCode::IdentitiesExhausted, 0);
@@ -365,19 +468,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         else {
             return;
         };
-        let subscribers: Vec<u64> = self
-            .net_owned
-            .iter()
-            .filter_map(|owned| match owned.owned {
-                Owned::Subscription { handle, .. }
-                    if handle.endpoint() == endpoint && handle.stream_id() == stream.stream_id =>
-                {
-                    Some(owned.registration)
-                }
-                _ => None,
-            })
-            .collect();
-        for registration in subscribers {
+        // A subscription not announced yet learns of its images from
+        // `announce_existing_images`, never twice, and of no retirement of
+        // an image it was not told about.
+        for index in 0..self.net_owned.len() {
+            let Some(OwnedNetwork {
+                registration,
+                owned:
+                    Owned::Subscription {
+                        handle: subscription,
+                        announced: true,
+                    },
+                ..
+            }) = self.net_owned.get(index).copied()
+            else {
+                continue;
+            };
+            if subscription.endpoint() != endpoint || subscription.stream_id() != stream.stream_id {
+                continue;
+            }
             self.emit(&if available {
                 DriverEvent::ImageAvailable {
                     stream,
@@ -393,30 +502,38 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Announces the images installed before a network subscription was
-    /// created, once, after its `NetworkSubscriptionReady` went out.
+    /// created, once, after its `NetworkSubscriptionReady` went out. It runs
+    /// before the cycle's image events, which announce only to announced
+    /// subscriptions. A subscription stays unannounced while an event
+    /// cannot be sent (the broadcast is closed or its positions are
+    /// exhausted, which does not pass).
     pub(crate) fn announce_existing_images(&mut self) {
-        let pending: Vec<(usize, NetworkSubscription, u64)> = self
-            .net_owned
-            .iter()
-            .enumerate()
-            .filter_map(|(index, owned)| match owned.owned {
-                Owned::Subscription {
-                    handle,
-                    announced: false,
-                } => Some((index, handle, owned.registration)),
-                _ => None,
-            })
-            .collect();
-        if pending.is_empty() {
-            return;
-        }
-        let images: Vec<(EndpointId, AggregateHandle)> = self
+        let images = self
             .net
             .as_ref()
-            .map(|net| net.exposed_images().collect())
-            .unwrap_or_default();
-        for (index, subscription, registration) in pending {
-            for (endpoint, handle) in &images {
+            .map_or(0, crate::net::Network::image_slots);
+        for index in 0..self.net_owned.len() {
+            let Some(OwnedNetwork {
+                registration,
+                owned:
+                    Owned::Subscription {
+                        handle: subscription,
+                        announced: false,
+                    },
+                ..
+            }) = self.net_owned.get(index).copied()
+            else {
+                continue;
+            };
+            let mut sent = true;
+            for image in 0..images {
+                let Some((endpoint, handle)) = self
+                    .net
+                    .as_ref()
+                    .and_then(|net| net.exposed_image_at(image))
+                else {
+                    continue;
+                };
                 let stream = self
                     .streams
                     .iter()
@@ -426,19 +543,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         session_id: stream.session_id,
                     });
                 if let Some(stream) = stream
-                    && *endpoint == subscription.endpoint()
+                    && endpoint == subscription.endpoint()
                     && stream.stream_id == subscription.stream_id()
                 {
-                    self.emit(&DriverEvent::ImageAvailable {
+                    sent &= self.try_emit(&DriverEvent::ImageAvailable {
                         stream,
                         registration,
                     });
                 }
             }
-            if let Some(OwnedNetwork {
-                owned: Owned::Subscription { announced, .. },
-                ..
-            }) = self.net_owned.get_mut(index)
+            if sent
+                && let Some(OwnedNetwork {
+                    owned: Owned::Subscription { announced, .. },
+                    ..
+                }) = self.net_owned.get_mut(index)
             {
                 *announced = true;
             }
