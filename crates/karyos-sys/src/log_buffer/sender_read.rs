@@ -58,6 +58,7 @@
 //! never read past its word 0.
 
 use core::sync::atomic::{Ordering, fence};
+use std::collections::VecDeque;
 
 use super::{
     BufferOwner, Cursor, LogBuffer, Lookup, Role, SealWord, Subscription, SubscriptionContext,
@@ -231,7 +232,15 @@ pub struct SenderRead<O: BufferOwner> {
     counters: SenderReadCounters,
     /// An interleaving injected by tests; nothing outside them.
     hook: HookSlot,
+    /// The block-boundary `next` values of reads not yet registered, oldest
+    /// first, at most `BOUNDARIES` (allocated at construction): the only
+    /// positions [`SenderRead::sent`] accepts, so the registered position
+    /// is always a block start that [`SenderRead::rewind`] can restart at.
+    boundaries: VecDeque<u64>,
 }
+
+/// Block-boundary read ends a reader remembers until they are registered.
+const BOUNDARIES: usize = 256;
 
 #[cfg(test)]
 type HookSlot = Option<TestHook>;
@@ -290,6 +299,7 @@ impl<O: BufferOwner> SenderRead<O> {
             faulted: None,
             counters: SenderReadCounters::default(),
             hook: HookSlot::default(),
+            boundaries: VecDeque::with_capacity(BOUNDARIES),
         })
     }
 
@@ -318,27 +328,54 @@ impl<O: BufferOwner> SenderRead<O> {
     }
 
     /// Whether the cursor stands at a block boundary: the last read left
-    /// no block open. A position read at a boundary is a valid restart for
-    /// [`SenderRead::rewind`].
+    /// no block open.
     #[must_use]
     pub fn at_boundary(&self) -> bool {
         self.open.is_none()
     }
 
+    /// The highest block boundary this reader returned above the registered
+    /// position and at or below `position`: what [`SenderRead::sent`]
+    /// accepts for a submission (or a consumption bound) reaching
+    /// `position`. `None` when there is none.
+    #[must_use]
+    pub fn boundary_at_or_below(&self, position: u64) -> Option<u64> {
+        let registered = self.subscription.cursor.acknowledged;
+        self.boundaries
+            .iter()
+            .rev()
+            .copied()
+            .find(|boundary| *boundary > registered && *boundary <= position)
+    }
+
     /// Moves the cursor back to the registered position, dropping what was
     /// read past it and not submitted (an endpoint reset returned it): the
-    /// next read starts there again. The registered position is never below
-    /// the floor, so nothing it rereads is reclaimed.
+    /// next read starts there again. The registered position is a block
+    /// start by construction (the join, or a boundary [`SenderRead::sent`]
+    /// accepted), and never below the floor, so nothing it rereads is
+    /// reclaimed. The C-9 count is kept: a rewind onto a corrupt block does
+    /// not restore its retries.
     ///
-    /// The caller registers only positions read at a block boundary
-    /// ([`SenderRead::at_boundary`]), so the restart is a block start. A
-    /// registered position inside a block would be read as a block start
-    /// and fail its geometry check (`CorruptTerm`): never a wrong copy.
-    pub fn rewind(&mut self) {
+    /// # Errors
+    ///
+    /// [`ReadError::Faulted`] once the reader is faulted; nothing moves.
+    pub fn rewind(&mut self) -> Result<(), ReadError> {
+        if let Some(position) = self.faulted {
+            return Err(ReadError::Faulted { position });
+        }
         let cursor = &mut self.subscription.cursor;
         cursor.position = cursor.acknowledged;
         self.open = None;
-        self.corrupt = None;
+        self.boundaries.clear();
+        Ok(())
+    }
+
+    /// Remembers `next`, a block boundary a read just returned.
+    fn remember(boundaries: &mut VecDeque<u64>, next: u64) {
+        if boundaries.len() >= BOUNDARIES {
+            let _ = boundaries.pop_front();
+        }
+        boundaries.push_back(next);
     }
 
     /// The counters.
@@ -359,23 +396,29 @@ impl<O: BufferOwner> SenderRead<O> {
 
     /// Records the backend's submission up to `position`: the registered
     /// position, which bounds the publisher and the retention floor, moves
-    /// there. The caller passes the `next` of a read it submitted (a frame
-    /// boundary); a position off the 32-byte grid is refused, any other
-    /// one in range is taken as given.
+    /// there. Only a block boundary this reader returned is accepted (see
+    /// [`SenderRead::boundary_at_or_below`]), so the registered position is
+    /// always a valid restart; the registered position itself is a no-op.
     ///
     /// # Errors
     ///
-    /// [`ReadError::Invariant`] for a position behind the registered one,
-    /// past the cursor, or not 32-byte aligned; nothing moves.
+    /// [`ReadError::Invariant`] for any other position; nothing moves.
     pub fn sent(&mut self, position: u64) -> Result<(), ReadError> {
-        let cursor = &mut self.subscription.cursor;
-        if position < cursor.acknowledged
-            || position > cursor.position
-            || !position.is_multiple_of(u64::from(crate::frame::FRAME_ALIGNMENT))
-        {
+        if position == self.subscription.cursor.acknowledged {
+            return Ok(());
+        }
+        if !self.boundaries.contains(&position) {
             self.counters.bump(|c| &mut c.invariant, 1);
             return Err(ReadError::Invariant);
         }
+        while self
+            .boundaries
+            .front()
+            .is_some_and(|boundary| *boundary <= position)
+        {
+            let _ = self.boundaries.pop_front();
+        }
+        let cursor = &mut self.subscription.cursor;
         let cell = self
             .subscription
             .buffer
@@ -455,6 +498,7 @@ impl<O: BufferOwner> SenderRead<O> {
             subscription,
             open: open_block,
             hook,
+            boundaries,
             ..
         } = self;
         if from != subscription.cursor.position {
@@ -541,6 +585,9 @@ impl<O: BufferOwner> SenderRead<O> {
                 let next = next(end);
                 subscription.cursor.position = next;
                 *open_block = open.map(|end| OpenBlock { count, end });
+                if open.is_none() {
+                    Self::remember(boundaries, next);
+                }
                 Ok(ReadOutcome::Copied { len, next })
             }
             Ok(Copy::Pending) => Ok(ReadOutcome::Pending),
@@ -548,6 +595,7 @@ impl<O: BufferOwner> SenderRead<O> {
                 let next = next(end);
                 subscription.cursor.position = next;
                 *open_block = None;
+                Self::remember(boundaries, next);
                 Ok(ReadOutcome::Canonical { record, next })
             }
             Err(CopyError::Corrupt) => Err(ReadError::CorruptTerm { failures: 0 }),
