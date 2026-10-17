@@ -81,6 +81,16 @@ impl Default for Setup {
     }
 }
 
+std::thread_local! {
+    /// The rig's virtual time, which the agents' own clocks read: the
+    /// sender stamps submissions with it, as the driver clock would.
+    static VIRTUAL_NOW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn virtual_now() -> u64 {
+    VIRTUAL_NOW.with(std::cell::Cell::get)
+}
+
 struct Rig {
     /// The publishing endpoint A.
     publisher: EndpointId,
@@ -102,7 +112,10 @@ impl Rig {
         if let Some(quarantine) = setup.alias_quarantine {
             config.sessions.alias_quarantine = quarantine;
         }
-        let (agents, links) = network_agents::<OsSocket>(config).unwrap();
+        let (mut agents, links) = network_agents::<OsSocket>(config).unwrap();
+        VIRTUAL_NOW.with(|now| now.set(0));
+        agents.sender.role.set_clock(virtual_now);
+        agents.receiver.role.set_clock(virtual_now);
         let mut rig = Self {
             publisher: EndpointId(u32::MAX),
             log: None,
@@ -187,6 +200,7 @@ impl Rig {
     /// image table serve the session ring.
     fn round(&mut self, serve: bool) {
         self.now += MS;
+        VIRTUAL_NOW.with(|now| now.set(self.now));
         // The publication's conductor: rotation, floor and limit.
         if let Some(log) = &mut self.log {
             for conductor in &mut log.conductors {
@@ -1186,4 +1200,215 @@ fn a_sender_with_no_receiver_announces_again() {
         }
     }
     assert_eq!(delivered, Some(message));
+}
+
+/// Phase 6 wiring: a DATA datagram lost on a reliable channel leaves a
+/// hole the receiver NAKs to the sender at once, naming the image and the
+/// hole, and again one RTT later while it is not repaired. (Its repair is
+/// the sender side's; until then the sender counts the NAK unhandled.)
+#[test]
+fn a_lost_datagram_is_naked() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    assert_eq!(nak.alias, alias());
+    assert_eq!(nak.identity, identity());
+    assert_eq!(
+        nak.receiver.receiver_id,
+        (u64::from(slot.slot) << 32) | u64::from(slot.generation)
+    );
+    assert!(
+        nak.range.length >= 32 && nak.range.start % 32 == 0,
+        "{nak:?}"
+    );
+    // Unrepaired: asked again after one RTT (rtt_initial, 1 ms).
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 2);
+    assert_eq!(rig.agents.receiver.role.posted_naks()[1].range, nak.range);
+}
+
+/// Phase 6 wiring: a RANGE_UNAVAILABLE that echoes the outstanding NAK
+/// proves the hole unrecoverable; under the default `on_unrecoverable =
+/// close` the image closes and is retired.
+#[test]
+fn range_unavailable_closes_a_reliable_image() {
+    use karyos_protocol::network::{NakReply, NakReplyReason};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    // The NAK's report settles on the next steps.
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    let reply = NakReply::answering(
+        &nak,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: nak.range.start + u64::from(nak.range.length),
+        },
+    );
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        karyos_protocol::network::Control::NakReply(reply),
+        rig.now,
+    );
+    rig.until(true, |rig| !rig.agents.receiver.role.has_image(slot));
+    assert_eq!(
+        rig.agents.receiver.counters().images_closed_unrecoverable,
+        1
+    );
+}
+
+/// Phase 6 wiring: on an unreliable channel a lost datagram is never
+/// NAKed; the skip policy seals its hole after the reorder timeout and
+/// later messages reach the subscriber.
+#[test]
+fn an_unreliable_loss_is_sealed() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
+    let mut delivered = Vec::new();
+    for _ in 0..200 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            delivered.push(message[0]);
+        }
+    }
+    assert!(delivered.contains(&3), "{delivered:?}");
+    assert_eq!(rig.agents.receiver.counters().naks, 0);
+}
+
+/// Phase 6 wiring, tail loss (ACS 15957, 15984): with nothing covered
+/// above the rebuild position, a heartbeat mark ahead of it is a hole once
+/// it persists one RTT; its NAK ends at the mark, the sender's position.
+#[test]
+fn a_tail_loss_is_naked_up_to_the_heartbeat() {
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    rig.now += MS;
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_heartbeat(&receiver.sessions, b, source, slot, 4096, rig.now);
+    // Not before one RTT.
+    rig.round(true);
+    assert_eq!(rig.agents.receiver.counters().naks, 0);
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    assert_eq!(nak.range.length, 4096, "{nak:?}");
+}
+
+/// Phase 6 wiring: `range_invalid_limit` consecutive RANGE_INVALID for
+/// the outstanding NAK are a protocol fault, and the image closes.
+#[test]
+fn repeated_range_invalid_closes_the_image() {
+    use karyos_protocol::network::{Control, NakReply, NakReplyReason};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    for _ in 0..3 {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            b,
+            source,
+            Control::NakReply(NakReply::answering(&nak, NakReplyReason::RangeInvalid)),
+            rig.now,
+        );
+    }
+    rig.until(true, |rig| !rig.agents.receiver.role.has_image(slot));
+    assert_eq!(
+        rig.agents.receiver.counters().images_closed_protocol_fault,
+        1
+    );
+}
+
+/// Phase 6 wiring: the NAK's report settles its submission, so its retry
+/// waits one RTT from it (the path's measured RTT, a few rig steps), not
+/// one cycle: over 50 steps the NAK goes out again, but far fewer than 50
+/// times.
+#[test]
+fn a_nak_retry_waits_one_rtt() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    let first = rig.agents.receiver.counters().naks;
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    let counters = rig.agents.receiver.role.loss_counters(slot).unwrap();
+    let naks = rig.agents.receiver.counters().naks - first;
+    assert!((2..=26).contains(&naks), "{naks} NAKs: {counters:?}");
+    assert_eq!(counters.retries, counters.submitted - 1, "{counters:?}");
 }

@@ -1065,6 +1065,13 @@ fn unconfirmed_bindings_never_hold_the_table() {
 /// An installed one-lane image (session 5, stream 6, initial term 9,
 /// 64 KiB terms) for the liveness tests.
 fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
+    installed_image_with(karyos_sys::log_buffer::SkipConfig::reliable())
+}
+
+/// [`installed_image`] with `skip` as its skip policy's configuration.
+fn installed_image_with(
+    skip: karyos_sys::log_buffer::SkipConfig,
+) -> (super::Installed, karyos_sys::receive::ImageParams) {
     use std::sync::Arc;
 
     use karyos_protocol::frame::Lane;
@@ -1130,6 +1137,26 @@ fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
                 pending: None,
             })
             .collect(),
+        reliable: true,
+        loss: crate::repair::loss::ImageLoss::new(
+            crate::repair::loss::LossConfig::default(),
+            alias(),
+            identity(),
+            karyos_protocol::network::Receiver {
+                receiver_boot_id: [7, 8],
+                receiver_id: 1,
+            },
+            1,
+            0,
+        )
+        .unwrap(),
+        skip: karyos_sys::log_buffer::SkipPolicy::new(skip, 1).unwrap(),
+        naks: vec![super::PendingNak {
+            slot: Arc::new(super::ProbeSlot::default()),
+            pending: None,
+        }],
+        closing: None,
+        tail_since: [None; 4],
     };
     (image, params)
 }
@@ -1915,4 +1942,164 @@ fn a_confirmed_binding_keeps_the_publication_established() {
         .unwrap();
     assert!(!sender.sessions.is_established(endpoint, alias()));
     assert_eq!(sender.session_counters().reannounced, 1);
+}
+
+/// Commits a DATA frame of `payload` bytes at `offset` of the first term
+/// into `image`'s lane 0.
+fn commit_frame(
+    image: &mut super::Installed,
+    params: &karyos_sys::receive::ImageParams,
+    offset: u32,
+    payload: usize,
+) {
+    use karyos_protocol::frame::{Flags, FrameType, Lane, Word0};
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let length = 32 + payload;
+    let mut bytes = vec![0u8; length];
+    let word0 = Word0::new(
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, false, false, Lane::ZERO),
+        FrameType::Data,
+    );
+    bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
+    bytes[8..12].copy_from_slice(&offset.to_le_bytes());
+    bytes[12..16].copy_from_slice(&5i32.to_le_bytes());
+    bytes[16..20].copy_from_slice(&6i32.to_le_bytes());
+    bytes[20..24].copy_from_slice(&9u32.to_le_bytes());
+    let datagram = ValidatedDatagram::parse(&bytes, params).unwrap();
+    for item in datagram.items() {
+        let Item::Frame(frame) = item else {
+            panic!("not a frame");
+        };
+        assert!(matches!(
+            image.owner.receive(&frame),
+            Ok(karyos_sys::log_buffer::Received::Committed { .. })
+        ));
+    }
+}
+
+/// The receiver with `image` installed alone, and the sender whose ring
+/// its NAKs reach.
+fn repairing(image: super::Installed) -> (super::SenderRole, super::ReceiverRole) {
+    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
+    receiver.images.push(image);
+    (sender, receiver)
+}
+
+/// Takes the sender's next NAK and reports it submitted at `start`, as
+/// the sender's control path does.
+fn submit_nak(sender: &super::SenderRole, start: u64) -> karyos_protocol::network::Nak {
+    let Ok(Some(super::ControlItem::Outgoing {
+        control: Control::Nak(nak),
+        guard: Some(super::ItemGuard::Probe(mut guard)),
+        ..
+    })) = sender.from_receiver.try_take()
+    else {
+        panic!("no NAK");
+    };
+    guard.sending(start);
+    guard.submitted();
+    nak
+}
+
+/// Phase 6 wiring, RC-9 with `on_unrecoverable = skip`: RANGE_UNAVAILABLE
+/// with a floor inside a NAKed hole that late data split makes the whole
+/// NAKed range unrecoverable. The first part is sealed at the reply; the
+/// part past the floor, found by the next observation inside the span, is
+/// sealed then. No hole remains.
+#[test]
+fn a_split_hole_past_the_floor_is_sealed_whole() {
+    use karyos_protocol::frame::Lane;
+    use karyos_protocol::network::{NakReply, NakReplyReason};
+    use karyos_sys::log_buffer::{SkipConfig, Unrecoverable};
+
+    let (mut image, params) = installed_image_with(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    let nak = submit_nak(&sender, 1);
+    assert_eq!((nak.range.start, nak.range.length), (64, 1024));
+    receiver.repair(0, 2).unwrap();
+    // Late original data splits the hole: [64, 320) and [576, 1088).
+    commit_frame(&mut receiver.images[0], &params, 320, 224);
+    receiver.repair(0, 3).unwrap();
+    let reply = NakReply::answering(
+        &nak,
+        NakReplyReason::RangeUnavailable {
+            lowest_retained: 400,
+        },
+    );
+    let image = &mut receiver.images[0];
+    let crate::repair::loss::ReplyOutcome::Unrecoverable {
+        hole,
+        lowest_retained,
+        ..
+    } = image.loss.reply(&reply, 1 << 20)
+    else {
+        panic!("not unrecoverable");
+    };
+    super::unrecoverable(
+        image,
+        &mut receiver.counters,
+        Lane::ZERO,
+        hole,
+        lowest_retained,
+        4,
+    );
+    receiver.repair(0, 5).unwrap();
+    assert_eq!(
+        receiver.images[0].owner.first_hole(Lane::ZERO).unwrap(),
+        None
+    );
+    assert_eq!(receiver.counters().gaps_sealed, 2);
+    assert!(receiver.images[0].closing.is_none());
+}
+
+/// Phase 6 wiring: a lane's NAK stays one in the ring: while its report
+/// is not settled (the sender has not taken it), no other is posted.
+#[test]
+fn one_nak_per_lane_waits_in_the_ring() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (_sender, mut receiver) = repairing(image);
+    for now in [1, 10_000_000, 20_000_000, 2_000_000_000] {
+        receiver.repair(0, now).unwrap();
+    }
+    assert_eq!(receiver.counters().naks, 1);
+}
+
+/// Phase 6 wiring: with the control ring full, a due NAK is counted and
+/// reported not submitted; it stays due.
+#[test]
+fn a_full_ring_reports_the_nak_not_submitted() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (_sender, mut receiver) = repairing(image);
+    let filler = || super::ControlItem::Outgoing {
+        endpoint: EndpointId(1),
+        destination: "10.0.0.9:5000".parse().unwrap(),
+        control: Control::SetupAnnounce(karyos_protocol::network::SetupAnnounce {
+            alias: alias(),
+            identity: identity(),
+            term: publication(EndpointId(1)).term,
+            lane_count: 1,
+        }),
+        guard: None,
+    };
+    while receiver.to_sender.try_post(filler()).is_ok() {}
+    receiver.repair(0, 1).unwrap();
+    let counters = receiver.counters();
+    assert_eq!((counters.naks, counters.ring_full_nak), (0, 1));
+    let loss = receiver.images[0].loss.counters();
+    assert_eq!(loss.not_submitted, 1);
+    assert!(receiver.images[0].loss.due(Lane::ZERO, 2).is_some());
 }
