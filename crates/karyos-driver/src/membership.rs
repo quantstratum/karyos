@@ -493,6 +493,8 @@ struct Entry {
     tag: u64,
     /// When a pending entry was expected.
     since: u64,
+    /// The consumption of the joining SM, per lane.
+    joins: [u64; MAX_LANES],
     consumption: [u64; MAX_LANES],
     windows: [u32; MAX_LANES],
     /// `consumption + window`, checked at acceptance.
@@ -514,6 +516,7 @@ impl Entry {
         required: false,
         tag: 0,
         since: 0,
+        joins: [0; MAX_LANES],
         consumption: [0; MAX_LANES],
         windows: [0; MAX_LANES],
         edges: [0; MAX_LANES],
@@ -840,6 +843,7 @@ impl Membership {
             entry.required = required;
             entry.tag = tag;
             entry.windows = windows;
+            entry.joins = consumption;
         }
         entry.consumption = consumption;
         entry.edges = edges;
@@ -888,6 +892,31 @@ impl Membership {
                 State::Pending | State::Active | State::LostRequired
             ) && e.generation == member.generation
         })
+    }
+
+    /// The window a NAK from `receiver` on `lane` is checked against (R4
+    /// step 2): its join point, last accepted consumption and window, for
+    /// a member live at `now`; `None` otherwise.
+    #[must_use]
+    pub fn requester_window(
+        &self,
+        receiver: Receiver,
+        lane: Lane,
+        now: u64,
+    ) -> Option<(u64, u64, u32)> {
+        let at = usize::from(lane.get());
+        if at >= usize::from(self.config.lane_count) {
+            return None;
+        }
+        let slot = self.find(receiver)?;
+        let entry = self
+            .entry(slot)
+            .filter(|e| e.state == State::Active && self.live(e, now))?;
+        Some((
+            entry.joins.get(at).copied()?,
+            entry.consumption.get(at).copied()?,
+            entry.windows.get(at).copied()?,
+        ))
     }
 
     /// `lane`'s submission edge at `now`.

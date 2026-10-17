@@ -242,6 +242,19 @@ release may break APIs, wire formats and shared-memory layouts.
   last reported consumption, so it is never stale at the sender; a lower
   value is counted as a regression. An SM is recorded only once sent, so
   an unsent one stays due. Not wired yet: the receiver agent's SM path.
+- NAK admission at the sender (phase 6 R4, reliable-transport.md, ACS
+  15597, 15701 and 15711): `karyos_driver::repair::admission::Admission`
+  runs steps 1 to 5 of the eight-step order, the first failure deciding.
+  Context and the requester window drop with no reply, each counted: an
+  unreliable publication, an unknown requester or lane, a range below the
+  join point (counted apart before any accepted SM), below the
+  consumption (stale) or beyond `consumption + window`. A range leaving
+  its term, or beyond the NAK bound, answers `RANGE_INVALID`; one below
+  the floor answers `RANGE_UNAVAILABLE` with the floor, before the
+  frontier check. At most one ERR goes per receiver, lane and range
+  within `nak_reply_linger`, from a bounded table. A passing NAK is a
+  `Request` for the job table (R5). `Membership::requester_window` gives
+  a live member's join point, consumption and window.
 - Membership simulator scenarios (P2.7 C preparation, ACS 15661):
   karyos-sim's `tests/membership.rs` drives `Membership` on virtual time,
   40 seeds each. `membership-required-loss` stops admission exactly

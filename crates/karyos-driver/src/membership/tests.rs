@@ -1168,3 +1168,26 @@ fn limits_match_the_reference_model() {
         }
     }
 }
+
+/// R4 step 2 reads a live member's join, consumption and window; nothing
+/// for an expired member, an unknown receiver or a lane outside.
+#[test]
+fn a_requester_window_is_a_live_members() {
+    let mut table = table(config(2), &Roles::default());
+    accepted(status(&mut table, &sm(1, &[(100, 200), (5, 300)]), 0));
+    accepted(status(&mut table, &sm(1, &[(150, 200), (9, 300)]), MS));
+    assert_eq!(
+        table.requester_window(receiver(1, 1), lane(0), MS),
+        Some((100, 150, 200))
+    );
+    assert_eq!(
+        table.requester_window(receiver(1, 1), lane(1), MS),
+        Some((5, 9, 300))
+    );
+    assert_eq!(table.requester_window(receiver(1, 1), lane(2), MS), None);
+    assert_eq!(table.requester_window(receiver(2, 1), lane(0), MS), None);
+    assert_eq!(
+        table.requester_window(receiver(1, 1), lane(0), MS + TIMEOUT),
+        None
+    );
+}
