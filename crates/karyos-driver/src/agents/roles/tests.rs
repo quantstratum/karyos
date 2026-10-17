@@ -1207,6 +1207,9 @@ fn installed_image_with(
         tail_since: [None; 4],
         reset_requested: None,
         next_clean: [0; 4],
+        copies: Vec::new(),
+        routes: Vec::new(),
+        anchored: [None; 4],
         control_group: None,
         receiver_id: super::receiver_id(super::SlotRef {
             slot: 0,
@@ -2761,6 +2764,84 @@ fn a_route_fault_asks_for_a_reset_at_its_cadence() {
     });
     assert_eq!(later, [EndpointId(1)]);
     assert_eq!(receiver.counters().reset_requests, 3);
+}
+
+/// rp-w3, RP-7 helpers: `image` with two path routes and a copy slot per
+/// path on its one lane, its lane 0 hole observed and its NAK due.
+fn two_route_image() -> (super::Installed, karyos_protocol::network::Nak) {
+    use std::sync::Arc;
+
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, _) = installed_image();
+    image.routes = vec![super::CopyRoute::default(); 2];
+    image.copies = (0..2)
+        .map(|_| super::PendingNak {
+            slot: Arc::new(super::ReportSlot::default()),
+            pending: None,
+        })
+        .collect();
+    let hole = crate::repair::loss::Hole {
+        start: 0,
+        length: 64,
+    };
+    let _ = image.loss.observe(Lane::ZERO, Some(hole), 0);
+    let nak = image.loss.due(Lane::ZERO, 0).unwrap();
+    (image, nak)
+}
+
+/// Reports `outcome` for the copy of lane 0 on `path`, started at `start`.
+fn report_copy(
+    image: &mut super::Installed,
+    path: usize,
+    nak: karyos_protocol::network::Nak,
+    start: u64,
+    submitted: bool,
+) {
+    let copy = &mut image.copies[path];
+    let mut guard = super::ReportGuard::take(&copy.slot);
+    guard.sending(start);
+    if submitted {
+        guard.submitted();
+    } else {
+        guard.uncertain();
+    }
+    copy.pending = Some(nak);
+}
+
+/// rp-w3, RP-7: a NAK's copies on several paths anchor it once, at the
+/// first copy submitted; a later copy's report records nothing more.
+#[test]
+fn nak_copies_anchor_their_nak_once() {
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    report_copy(&mut image, 1, nak, 10, true);
+    super::settle_copies(&mut image, &mut counters, 0);
+    assert_eq!(image.loss.counters().submitted, 1);
+    report_copy(&mut image, 0, nak, 20, true);
+    super::settle_copies(&mut image, &mut counters, 0);
+    assert_eq!(image.loss.counters().submitted, 1);
+    assert_eq!(image.loss.counters().retries, 0);
+}
+
+/// rp-w3, RC-6 per route: an uncertain copy on one route anchors the NAK
+/// (counted as submitted at its start) and faults nothing; a second
+/// uncertain copy on the same route while the first is unresolved faults
+/// that route only, never the image's own.
+#[test]
+fn an_uncertain_copy_faults_only_its_route() {
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    report_copy(&mut image, 1, nak, 10, false);
+    super::settle_copies(&mut image, &mut counters, 0);
+    assert_eq!(image.loss.counters().submitted, 1);
+    assert!(!image.routes[1].faulted);
+    report_copy(&mut image, 1, nak, 20, false);
+    super::settle_copies(&mut image, &mut counters, 0);
+    assert!(image.routes[1].faulted);
+    assert!(!image.routes[0].faulted);
+    assert_eq!(counters.nak_route_faults, 1);
+    assert!(!image.loss.is_faulted());
 }
 
 /// A guarded publication with no receiver yet is not served, but its

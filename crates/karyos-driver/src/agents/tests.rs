@@ -155,6 +155,13 @@ fn the_configuration_is_checked() {
             },
             ..AgentConfig::default()
         },
+        // A control ring that cannot hold an SM copy per path of every
+        // image (RP-7): 64 images of 4 paths, 16 challenges and the floor
+        // need 304 units.
+        AgentConfig {
+            control_capacity: 303,
+            ..AgentConfig::default()
+        },
         // A zero multicast delay bound at the RTT floor: 15 ns at scale 1.
         AgentConfig {
             multicast: crate::repair::loss::MulticastConfig {
