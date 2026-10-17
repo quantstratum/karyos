@@ -47,6 +47,12 @@ pub(super) struct RouteSlot {
     queues: Vec<TxQueueId>,
     /// The endpoint epoch its queues were opened in.
     opened: Option<BackendEpoch>,
+    /// This route's endpoint needs a reset before the route sends again: a
+    /// failure of its half, an item of unknown exposure, or a fault its
+    /// queue refused to retry. Its new epoch clears it.
+    needs_reset: bool,
+    /// The sender cycle of the last reset request posted for it.
+    reset_requested: Option<u64>,
 }
 
 /// One lane's staged copies per route, in order, and what left.
@@ -58,6 +64,9 @@ pub(super) struct RoutedTrack {
     submitted: Option<u64>,
     /// A copy left out of staging order, this call.
     mismatched: bool,
+    /// Per route: a copy left with an unproven exposure; only that route's
+    /// endpoint reset resolves it.
+    unknown: [bool; MAX_ROUTES],
 }
 
 /// The routed part of an [`Outbound`].
@@ -97,6 +106,8 @@ impl Routed {
                     destination,
                     queues: queues.clone(),
                     opened: None,
+                    needs_reset: false,
+                    reset_requested: None,
                 })
                 .collect(),
             tracks: (0..lanes)
@@ -104,10 +115,43 @@ impl Routed {
                     staged: std::array::from_fn(|_| VecDeque::with_capacity(bound)),
                     submitted: None,
                     mismatched: false,
+                    unknown: [false; MAX_ROUTES],
                 })
                 .collect(),
             scratch: vec![0; mtu],
         })
+    }
+
+    /// The routes whose endpoint needs a reset.
+    pub(super) fn routes_needing_reset(&self) -> impl Iterator<Item = EndpointId> + '_ {
+        self.routes
+            .iter()
+            .filter(|route| route.needs_reset)
+            .map(|route| route.endpoint)
+    }
+
+    /// The routes needing a reset whose request is due in `cycle`: each
+    /// endpoint with the cycle of its last request, to record a new one.
+    pub(super) fn reset_requests_due(
+        &mut self,
+        cycle: u64,
+    ) -> impl Iterator<Item = (EndpointId, &mut Option<u64>)> + '_ {
+        self.routes.iter_mut().filter_map(move |route| {
+            let due = route.needs_reset
+                && route.reset_requested.is_none_or(|at| {
+                    cycle
+                        .checked_sub(at)
+                        .is_none_or(|age| age >= super::RESET_REQUEST_CYCLES)
+                });
+            due.then_some((route.endpoint, &mut route.reset_requested))
+        })
+    }
+
+    /// Whether the founding route's queues are open in `epoch`.
+    pub(super) fn founding_open(&self, epoch: BackendEpoch) -> bool {
+        self.routes
+            .first()
+            .is_some_and(|route| route.opened == Some(epoch) && !route.needs_reset)
     }
 
     /// The routes' endpoints, in route order.
@@ -174,18 +218,24 @@ impl LaneGate for RoutedGate<'_> {
         let found = track
             .staged
             .iter_mut()
-            .find_map(|copies| match copies.front().copied() {
+            .enumerate()
+            .find_map(|(route, copies)| match copies.front().copied() {
                 Some((ticket, next)) if ticket == staged.ticket => {
                     copies.pop_front();
-                    Some(next)
+                    Some((route, next))
                 }
                 _ => None,
             });
         match (found, how) {
-            (Some(next), Left::Submitted) => {
+            (Some((_, next)), Left::Submitted) => {
                 track.submitted = Some(track.submitted.map_or(next, |high| high.max(next)));
             }
-            (Some(_), Left::Returned | Left::Unknown) => {}
+            (Some((route, _)), Left::Unknown) => {
+                if let Some(unknown) = track.unknown.get_mut(route) {
+                    *unknown = true;
+                }
+            }
+            (Some(_), Left::Returned) => {}
             (None, _) => track.mismatched = true,
         }
     }
@@ -294,15 +344,54 @@ impl Outbound {
             if !ok {
                 continue;
             }
+            // A reset returned what this route staged and did not submit.
+            // While another route still holds a lane's copies, the receivers
+            // get them there or by NAK (RP-9: a route rejoins at the current
+            // selection point). With none left, a reliable lane reads again
+            // from its registered position, as on one path; the copies at
+            // or below its debited position go as catch-up, debiting nothing.
+            let reopened = slot.opened.is_some();
+            for (lane, reader) in self.readers.iter_mut().enumerate() {
+                let others = (0..MAX_ROUTES)
+                    .filter(|route| *route != index)
+                    .filter_map(|route| routed.sender.pending(lane, route))
+                    .any(|held| held > 0);
+                if reopened && self.reliable && !others {
+                    // A faulted reader cannot rewind: its lane already ended.
+                    let _ = reader.rewind();
+                }
+            }
+            // The repair queue, on the founding route and outside the lane
+            // sender (repair stays on the founding path until rp-w6).
+            if index == 0
+                && let Some(repair) = self.repair.as_deref_mut()
+            {
+                let queue = tx
+                    .open_queue(TxQueueConfig {
+                        authority: Authority::FIRST,
+                        route,
+                        max_pending: NonZeroU16::MIN,
+                    })
+                    .ok();
+                if queue.is_none() {
+                    self.counters.bump(|c| &mut c.queue_failures, 1);
+                }
+                repair.reopened(queue);
+            }
             for (lane, queue) in slot.queues.iter().enumerate() {
                 routed.sender.reopen(lane, index, *queue);
-                if let Some(track) = routed.tracks.get_mut(lane)
-                    && let Some(copies) = track.staged.get_mut(index)
-                {
-                    copies.clear();
+                if let Some(track) = routed.tracks.get_mut(lane) {
+                    if let Some(copies) = track.staged.get_mut(index) {
+                        copies.clear();
+                    }
+                    if let Some(unknown) = track.unknown.get_mut(index) {
+                        *unknown = false;
+                    }
                 }
             }
             slot.opened = Some(epoch);
+            slot.needs_reset = false;
+            slot.reset_requested = None;
             open = true;
         }
         open
@@ -371,7 +460,8 @@ impl Outbound {
                     .sender
                     .pending(lane, route)
                     .is_some_and(|pending| pending < bound);
-                let (true, Some(_), Some(queue)) = (room, slot.opened, slot.queues.get(lane))
+                let (true, false, Some(_), Some(queue)) =
+                    (room, slot.needs_reset, slot.opened, slot.queues.get(lane))
                 else {
                     continue;
                 };
@@ -434,7 +524,13 @@ impl Outbound {
                     position: from,
                 };
                 if routed.sender.staged(lane, route, copy).is_err() {
+                    // Committed to the queue but not recorded: the route's
+                    // records are out of step, and only its reset returns the
+                    // item. It takes nothing more until then.
                     counters.bump(|c| &mut c.staged_refused, 1);
+                    if let Some(slot) = routed.routes.get_mut(route) {
+                        slot.needs_reset = true;
+                    }
                     continue;
                 }
                 if let Some(track) = routed.tracks.get_mut(lane)
@@ -507,14 +603,45 @@ impl Outbound {
         let report = routed.sender.serve(&mut lent, &mut gate, budget);
         let caught = routed.sender.catch_up(&mut lent, &mut gate);
         work = work.checked_add(caught.submitted).ok_or(overflow.clone())?;
-        // Interim until rp-w4b1b's per-route control path: any route's
-        // failure marks the publication as needing a reset.
-        let failed = routed.sender.take_failures();
-        if report.failure.is_some()
-            || caught.failure.is_some()
-            || failed.iter().any(Option::is_some)
-        {
-            self.needs_reset = true;
+        // The control path per route (lane-sender.md, outcome table): a
+        // failure resets only its route's endpoint; a faulted queue is
+        // retried, keeping its copies; an unknown copy waits for the reset.
+        let mut failed = routed.sender.take_failures();
+        if let Some(first) = failed.first_mut() {
+            // One route: its failure stopped the call, as on one path.
+            *first = first.or(report.failure).or(caught.failure);
+        }
+        for (index, slot) in routed.routes.iter_mut().enumerate() {
+            if failed.get(index).copied().flatten().is_some() {
+                self.counters.bump(|c| &mut c.send_failures, 1);
+                slot.needs_reset = true;
+            }
+            for lane in 0..self.readers.len() {
+                let unknown = routed
+                    .tracks
+                    .get(lane)
+                    .and_then(|track| track.unknown.get(index))
+                    .is_some_and(|unknown| *unknown);
+                if unknown {
+                    slot.needs_reset = true;
+                    continue;
+                }
+                if slot.needs_reset || routed.sender.needs_control(lane, index) != Some(true) {
+                    continue;
+                }
+                self.counters.bump(|c| &mut c.send_faults, 1);
+                let queue = slot.queues.get(lane).copied();
+                let tx = lent.route(index);
+                let retried = match (queue, tx) {
+                    (Some(queue), Some(tx)) => tx.retry_queue(queue).is_ok(),
+                    _ => false,
+                };
+                if retried {
+                    routed.sender.retry(lane, index);
+                } else {
+                    slot.needs_reset = true;
+                }
+            }
         }
         let Some(routed) = self.routed.as_deref_mut() else {
             return Ok(work);

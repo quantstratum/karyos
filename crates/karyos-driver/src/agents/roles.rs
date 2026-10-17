@@ -4154,13 +4154,12 @@ impl SenderRole {
             let Some(outbound) = self.publications.get_mut(index) else {
                 break;
             };
-            if !outbound.reset_request_due(cycle) {
-                continue;
-            }
-            if post(outbound.endpoint()) {
-                outbound.reset_request_posted(cycle);
+            // Over redundant paths, each route's endpoint on its own.
+            let (posted, refused) = outbound.post_reset_requests(cycle, &mut post);
+            for _ in 0..posted {
                 self.count(|c| &mut c.reset_requests);
-            } else {
+            }
+            for _ in 0..refused {
                 self.count(|c| &mut c.reset_requests_full);
             }
         }
