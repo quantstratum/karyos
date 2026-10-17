@@ -3899,3 +3899,33 @@ fn a_later_paths_higher_join_leaves_the_members_join() {
     assert_eq!(counters.joins, 1, "{counters:?}");
     assert_eq!(counters.accepted, 2, "B's SM below its join: {counters:?}");
 }
+
+/// rp-w7c, §8 "Sender join", the NAK half: the receiver answers again from
+/// a second source on the publication's endpoint with a join two frames
+/// on, as a lagging later path would. The membership's join stays, and a
+/// NAK from that source below its join is still admitted and repaired.
+#[test]
+fn a_nak_below_a_later_bindings_join_is_admitted() {
+    let mut rig = RepairRig::new(AgentConfig::default(), &[alias()], 4);
+    let later: SocketAddr = "10.0.0.10:5001".parse().unwrap();
+    rig.sender
+        .bind(EndpointId(1), later, &sm_answer([7, 8], 2 * FRAME), 1);
+    rig.sender
+        .status(EndpointId(1), later, &sm_status([7, 8], 0), 1);
+    let joins = rig.sender.publications[0]
+        .membership_mut()
+        .unwrap()
+        .counters()
+        .joins;
+    assert_eq!(joins, 1, "the member's join stays");
+    rig.nak(alias(), later, 0, 1056);
+    rig.script(1);
+    rig.cycle(2);
+    let counters = rig.sender.counters();
+    assert_eq!(
+        (counters.naks, counters.nak_unbound),
+        (1, 0),
+        "{counters:?}"
+    );
+    assert!(counters.repairs >= 1, "{counters:?}");
+}
