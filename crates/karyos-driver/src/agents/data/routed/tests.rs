@@ -476,16 +476,20 @@ fn repair_on_a_routed_publication_opens_no_second_route() {
     assert!(!outbound.needs_reset());
 }
 
-/// rp-w6's two-path repair rig: a reliable routed publication with repair,
-/// the default path policy, one message sent on both paths.
-/// B's socket takes only that message: scripted later, or it would block.
-fn repair_rig() -> (
+/// The repair rig's publication, log, halves, what each path saw, and B's
+/// socket.
+type RepairRig = (
     Box<Outbound>,
     TestLog,
     Vec<(EndpointId, Half<ScriptedSocket>)>,
     [Seen; 2],
     ScriptedSocket,
-) {
+);
+
+/// rp-w6's two-path repair rig: a reliable routed publication with repair,
+/// the default path policy, one message sent on both paths.
+/// B's socket takes only that message: scripted later, or it would block.
+fn repair_rig() -> RepairRig {
     let (a, observer_a, seen_a) = path(1, 0);
     let (b, observer_b, seen_b) = path(2, 0);
     sent(&observer_a, 32);
