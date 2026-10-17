@@ -268,10 +268,11 @@ fn network_publications_are_bounded() {
     );
 }
 
-/// #279 P1: a key freed locally while its old publication is still being
-/// removed is refused (`NetworkBusy`), leaving nothing behind; once the
-/// old one is gone the key is accepted, and the new publication is
-/// tracked and removed as any other.
+/// #279 P1: a key whose old publication is still being removed is
+/// refused, leaving nothing behind; once the old one is gone the key is
+/// accepted, and the new publication is tracked and removed as any other.
+/// The old streams stay until the sender's removal ends
+/// (driver-network-agents.md §7), so the key is still held locally.
 #[test]
 fn a_key_still_being_removed_is_refused_until_it_is_gone() {
     let mut driver = driver();
@@ -290,13 +291,13 @@ fn a_key_still_being_removed_is_refused_until_it_is_gone() {
     });
     driver.remove_aggregate(&other).unwrap();
     driver.remove_aggregate(&old).unwrap();
-    // The streams free before the sender answers: the key is free locally.
+    // The streams stay while the removal lingers: the key is held.
     driver.free_retired_streams();
     let users = driver.net.as_ref().unwrap().send_endpoint_users();
-    assert_eq!(
+    assert!(matches!(
         driver.add_network_publication(aggregate(10, 1), &channel(destination.clone())),
-        Err(DriverError::NetworkBusy)
-    );
+        Err(DriverError::DuplicateStream { .. })
+    ));
     assert_eq!(
         driver.net.as_ref().unwrap().send_endpoint_users(),
         users,
@@ -306,6 +307,8 @@ fn a_key_still_being_removed_is_refused_until_it_is_gone() {
         driver.network_publication_state(&old).is_none()
             && driver.network_publication_state(&other).is_none()
     });
+    // The removal ended: the next cycle frees the old streams.
+    driver.free_retired_streams();
     let new = driver
         .add_network_publication(aggregate(10, 1), &channel(destination))
         .unwrap();

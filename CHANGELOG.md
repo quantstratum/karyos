@@ -11,6 +11,16 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The Archive's control messages, version 1, written by hand (phase 3,
+  A1; ADR-0036). `karyos-codec` becomes the runtime of the minimum v1
+  schema: checked little-endian reads and writes, a 12-byte envelope
+  (schema, template, version, block length, message length written
+  last), top-level groups, bounded bytes and UTF-8, and a typed
+  `CodecError`; it drops its unused dependency on `karyos-protocol`.
+  `karyos_archive::control` holds the five requests and three responses
+  of schema 1, validated whole on decode and encoded into the caller's
+  buffer without allocating; an encoding that fails leaves no message
+  in the buffer, not even an earlier one.
 - An Archive recording is read back for replay (phase 3, A5a).
   `karyos_archive::replay::ReplaySource` reads a recording's range
   without changing it, through read-only files (`Disk::open_read`):
@@ -168,6 +178,19 @@ release may break APIs, wire formats and shared-memory layouts.
   counted (`PathCounters::entries`). It bounds `Outbound::sent_low`, the
   least frontier over the live paths, from its first submit; a frame a
   path skipped counts as passed for its frontier.
+- Repair across redundant paths (RP-11; rp-w6). A routed publication opens a
+  repair queue on every route. Each repair datagram is read once and submitted
+  on every live path, debited once at its first submission
+  (`RouteRepairCounts`, `Outbound::repair_route_counts`). A path with no room
+  skips it, counted, so a lagging path never holds a job open. The NAK's
+  arrival path goes with it: a copy of a NAK on another path within
+  `PathPolicy::skew_window` (1 ms, at most 1 s) is absorbed and counted
+  (`nak_copies_absorbed`), from a table of `PathPolicy::copy_entries` (256, at
+  most 4096) that stops absorbing when full. The admission order is now the
+  binding check, the absorption and then the NAK budget, so an unbound NAK
+  counts `nak_unbound` even when the cycle's budget is spent. A step 8 ERR
+  goes once, on the path its requester asked on. Group repair only: the
+  requester domain stays deferred.
 - A close no longer waits on a detached path (rp-w5b; ACS 17049). On a
   guarded lane's abort, the copies of a route whose TX half is detached
   are forgotten through the guard gate (`RoutedLaneSender::forget`), so

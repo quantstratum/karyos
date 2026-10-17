@@ -114,6 +114,13 @@ pub enum DriverError {
         stream: u64,
     },
     /// A stream with the same wire stream id and session already exists.
+    /// That includes a removed network publication's lanes while its
+    /// removal lingers (driver-network-agents.md §7): the key is refused
+    /// until the removal ends, at worst `max(publication_linger,
+    /// path_heartbeat_interval) + publication_linger` after the removal
+    /// starts (about 10 s at the defaults), and a retry once the removal
+    /// has ended succeeds. A client that asks by channel URI sees
+    /// `ErrorCode::ResourcesUnavailable`.
     #[error("stream {stream_id} session {session_id} already exists")]
     DuplicateStream {
         /// Wire stream id.
@@ -268,12 +275,17 @@ pub enum DriverError {
     /// An IPC driver with a network could hold more descriptors than this
     /// process may open (`RLIMIT_NOFILE`): its image lanes, stream
     /// mappings and clients at their configured bounds. Checked at start.
-    #[error("the driver may need {needed} descriptors, above the limit of {limit}")]
+    /// When `needed` is within `hard`, raising the soft limit is enough.
+    #[error(
+        "the driver may need {needed} descriptors, above the soft limit of {limit} (hard limit {hard:?})"
+    )]
     DescriptorLimit {
         /// Descriptors the configured bounds can hold.
         needed: u64,
         /// The process's soft limit.
         limit: u64,
+        /// The process's hard limit; `None` when unlimited.
+        hard: Option<u64>,
     },
     /// Every publication the stream can issue is out: its exclusive
     /// publication, or all `P` publisher slots of a concurrent stream.

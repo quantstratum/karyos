@@ -30,6 +30,12 @@ const ALIAS: Alias = Alias {
     stream_id: 6,
 };
 
+/// A second publication on the same endpoints (rp-w7a).
+const OTHER_ALIAS: Alias = Alias {
+    session_id: 7,
+    stream_id: 6,
+};
+
 const TERM: TermParams = TermParams {
     term_length: 65_536,
     initial_term_id: 9,
@@ -56,6 +62,20 @@ fn path_rx(
     Seen,
     SocketsRx<ScriptedSocket>,
 ) {
+    path_carrying(id, blocked, &[ALIAS])
+}
+
+/// [`path_rx`] for a socket that carries the publications of `aliases`.
+fn path_carrying(
+    id: u32,
+    blocked: usize,
+    aliases: &'static [Alias],
+) -> (
+    (EndpointId, Half<ScriptedSocket>),
+    ScriptedSocket,
+    Seen,
+    SocketsRx<ScriptedSocket>,
+) {
     let socket = ScriptedSocket::new();
     let observer = socket.observer();
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
@@ -73,7 +93,7 @@ fn path_rx(
             let Ok(Datagram::DataBatch(data)) = classify(datagram) else {
                 panic!("not a DATA datagram");
             };
-            assert_eq!(data.alias(), ALIAS);
+            assert!(aliases.contains(&data.alias()), "{:?}", data.alias());
             record.lock().unwrap().push(data.bytes().to_vec());
         }
     }));
@@ -474,6 +494,269 @@ fn repair_on_a_routed_publication_opens_no_second_route() {
     }
     assert_eq!(outbound.counters().staged_refused, 0);
     assert!(!outbound.needs_reset());
+}
+
+/// The repair rig's publication, log, halves, what each path saw, and B's
+/// socket.
+type RepairRig = (
+    Box<Outbound>,
+    TestLog,
+    Vec<(EndpointId, Half<ScriptedSocket>)>,
+    [Seen; 2],
+    ScriptedSocket,
+);
+
+/// rp-w6's two-path repair rig: a reliable routed publication with repair,
+/// the default path policy, one message sent on both paths.
+/// B's socket takes only that message: scripted later, or it would block.
+fn repair_rig() -> RepairRig {
+    let (a, observer_a, seen_a) = path(1, 0);
+    let (b, observer_b, seen_b) = path(2, 0);
+    sent(&observer_a, 32);
+    sent(&observer_b, 1);
+    let mut halves = vec![a, b];
+    let routes = [
+        (EndpointId(1), SocketAddr::from(([127, 0, 0, 1], 41_000))),
+        (EndpointId(2), SocketAddr::from(([127, 0, 0, 2], 41_000))),
+    ];
+    let (mut outbound, mut log) = outbound_routed(&routes, ALIAS, TERM, 1, true);
+    outbound
+        .enable_repair(
+            &crate::agents::repair::RepairConfig::default(),
+            TERM.term_length,
+            repair_identity(),
+        )
+        .unwrap();
+    outbound.set_path_policy(super::super::PathPolicy::default());
+    commit(&mut log, 0, 1);
+    for now in 0..4 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(seen_a.lock().unwrap().len(), 1);
+    assert_eq!(seen_b.lock().unwrap().len(), 1);
+    (outbound, log, halves, [seen_a, seen_b], observer_b)
+}
+
+fn repair_identity() -> karyos_protocol::network::Identity {
+    karyos_protocol::network::Identity {
+        driver_id: [1, 2],
+        registration_id: 1,
+        incarnation: 1,
+    }
+}
+
+/// A NAK for the first datagram.
+fn first_nak() -> karyos_protocol::network::Nak {
+    use karyos_protocol::frame::Lane;
+    use karyos_protocol::network::{Nak, NakRange, Receiver};
+    Nak {
+        alias: ALIAS,
+        identity: repair_identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 1,
+        },
+        range: NakRange {
+            lane: Lane::ZERO,
+            length: u32::try_from(FRAME).unwrap(),
+            start: 0,
+        },
+    }
+}
+
+const MEMBER: crate::repair::admission::Requester = crate::repair::admission::Requester::Member {
+    join: 0,
+    consumption: 0,
+    window: 1 << 20,
+};
+
+/// RP-11: a repair goes on every live path, debited once: the job is
+/// submitted on both paths and counted once.
+#[test]
+fn a_repair_goes_on_every_live_path() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, mut halves, [seen_a, seen_b], observer_b) = repair_rig();
+    sent(&observer_b, 1);
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (1, true), 10),
+        NakOutcome::Queued
+    );
+    let mut budget = crate::repair::scheduler::RepairBudget::default();
+    let served = outbound.serve_repair_routes(&mut halves, &mut budget, 20);
+    assert_eq!(served, 1, "one datagram, debited once");
+    // The budget is spent once, whatever the paths it went on (#355 review).
+    assert_eq!(
+        budget.bytes,
+        crate::repair::scheduler::RepairBudget::default().bytes - FRAME,
+        "debited once"
+    );
+    assert_eq!(seen_a.lock().unwrap().len(), 2);
+    assert_eq!(seen_b.lock().unwrap().len(), 2);
+    assert_eq!(outbound.repair_route_counts(0).unwrap().submitted, 1);
+    assert_eq!(outbound.repair_route_counts(1).unwrap().submitted, 1);
+    assert_eq!(outbound.repair().unwrap().counts().submitted, 1);
+    // The job is complete: nothing more to serve.
+    assert_eq!(
+        outbound.serve_repair_routes(&mut halves, &mut budget, 30),
+        0
+    );
+}
+
+/// RP-11: a path with no room for a repair skips it, counted; the job
+/// completes on the other path and is not held open.
+#[test]
+fn a_full_path_skips_a_repair_and_the_job_completes() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, mut halves, [seen_a, _seen_b], _observer_b) = repair_rig();
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
+        NakOutcome::Queued
+    );
+    let mut budget = crate::repair::scheduler::RepairBudget::default();
+    assert_eq!(
+        outbound.serve_repair_routes(&mut halves, &mut budget, 20),
+        1
+    );
+    assert_eq!(seen_a.lock().unwrap().len(), 2);
+    let b = outbound.repair_route_counts(1).unwrap();
+    assert_eq!((b.submitted, b.skipped), (0, 1), "{b:?}");
+    assert_eq!(
+        outbound.serve_repair_routes(&mut halves, &mut budget, 30),
+        0
+    );
+    let (_, jobs, _) = outbound.repair().unwrap().parts();
+    assert_eq!(jobs.counts().done, 1);
+}
+
+/// RP-11: a path out of the live set takes no repair.
+#[test]
+fn a_left_path_takes_no_repair() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, mut halves, [seen_a, seen_b], observer_b) = repair_rig();
+    sent(&observer_b, 1);
+    outbound.leave_before_serve(1);
+    let _ = outbound.serve_routes(&mut halves, BUDGET, None, 5).unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
+        NakOutcome::Queued
+    );
+    let mut budget = crate::repair::scheduler::RepairBudget::default();
+    assert_eq!(outbound.serve_repair_routes(&mut halves, &mut budget, 6), 1);
+    assert_eq!(seen_a.lock().unwrap().len(), 2);
+    assert_eq!(seen_b.lock().unwrap().len(), 1);
+    assert_eq!(outbound.repair_route_counts(1).unwrap().skipped, 0);
+}
+
+/// RP-11 (decision C): a step 8 ERR goes once, on the path its requester
+/// asked on. A NAK from the middle of a frame is refused at step 8.
+#[test]
+fn a_step_8_err_goes_on_the_requesters_path() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, mut halves, _seen, _observer_b) = repair_rig();
+    let mut nak = first_nak();
+    nak.range.start = 32;
+    nak.range.length = 64;
+    assert_eq!(
+        outbound.nak_on(&nak, MEMBER, (1, true), 10),
+        NakOutcome::Queued
+    );
+    let mut budget = crate::repair::scheduler::RepairBudget::default();
+    assert_eq!(
+        outbound.serve_repair_routes(&mut halves, &mut budget, 20),
+        0
+    );
+    let mut replies = Vec::new();
+    outbound.drain_repair_replies_on(|reply, endpoint| replies.push((endpoint, reply.reason)));
+    assert_eq!(
+        replies,
+        [(
+            EndpointId(2),
+            karyos_protocol::network::NakReplyReason::RangeInvalid
+        )]
+    );
+}
+
+/// #355 review: a NAK that joins a job is recorded too. Two receivers ask
+/// for the same interval on path A; the second one's copy on B is
+/// absorbed.
+#[test]
+fn a_joining_naks_copy_is_absorbed() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, _halves, _seen, _observer_b) = repair_rig();
+    let mut second = first_nak();
+    second.receiver.receiver_id = 2;
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
+        NakOutcome::Queued
+    );
+    assert_eq!(
+        outbound.nak_on(&second, MEMBER, (0, true), 11),
+        NakOutcome::Queued
+    );
+    assert!(outbound.absorbs(&second, 1, 12));
+}
+
+/// #355 review: a NAK whose receiver id is not validated yet takes no part
+/// in absorption: it records nothing, so its copy is served.
+#[test]
+fn an_unvalidated_nak_records_nothing() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, _halves, _seen, _observer_b) = repair_rig();
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, false), 10),
+        NakOutcome::Queued
+    );
+    assert!(!outbound.absorbs(&first_nak(), 1, 11));
+}
+
+/// #355 review: a path in the live set that cannot take a repair (here
+/// detached: no TX half) skips it, counted.
+#[test]
+fn a_detached_live_path_counts_its_skipped_repairs() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, mut halves, _seen, _observer_b) = repair_rig();
+    let b_half = halves.pop().unwrap();
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
+        NakOutcome::Queued
+    );
+    let mut budget = crate::repair::scheduler::RepairBudget::default();
+    assert_eq!(
+        outbound.serve_repair_routes(&mut halves, &mut budget, 20),
+        1
+    );
+    let b = outbound.repair_route_counts(1).unwrap();
+    assert_eq!((b.submitted, b.skipped), (0, 1), "{b:?}");
+    halves.push(b_half);
+}
+
+/// RP-11: the copy of a NAK on the other path within `path_skew_window` is
+/// absorbed; on the same path it is a retry; past the window it is not.
+#[test]
+fn a_nak_copy_on_the_other_path_is_absorbed() {
+    use crate::agents::repair::NakOutcome;
+
+    let (mut outbound, _log, _halves, _seen, _observer_b) = repair_rig();
+    let window = super::super::PathPolicy::default().skew_window;
+    assert!(!outbound.absorbs(&first_nak(), 0, 10));
+    assert_eq!(
+        outbound.nak_on(&first_nak(), MEMBER, (0, true), 10),
+        NakOutcome::Queued
+    );
+    assert!(outbound.absorbs(&first_nak(), 1, 10 + window));
+    assert!(!outbound.absorbs(&first_nak(), 0, 20), "a retry");
+    assert!(!outbound.absorbs(&first_nak(), 1, 11 + window), "past it");
+    assert_eq!(outbound.repair().unwrap().absorb_counts().absorbed, 1);
 }
 
 /// A reset of one route while another still holds a reliable lane's
@@ -1171,6 +1454,54 @@ fn a_close_does_not_wait_on_a_detached_left_path() {
     assert_eq!(observer_b.send_calls(), calls, "no forgotten copy is sent");
 }
 
+/// #355 review (2): on a close, `forget` runs before `cancel`, and only on
+/// a detached route. A lent route that still holds its copies (its socket
+/// blocks) is cancelled through its backend, never forgotten, and is not
+/// sent to a reset.
+#[test]
+fn a_close_never_forgets_a_lent_routes_copies() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::sync::Ordering;
+
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, _observer_b, _seen_b) = path(2, 0);
+    sent(&observer_a, 64);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    let word = Arc::new(karyos_client::HeapWords::zeroed(1));
+    word.words()[0].store(karyos_sys::guard::created(), Ordering::Release);
+    assert_eq!(karyos_sys::guard::reopen(&word.words()[0], 1), Ok(2));
+    let cell = Arc::new(AppliedEpoch::new());
+    outbound
+        .guard(
+            GuardSpec {
+                word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                cell: Arc::clone(&cell),
+                epoch: 2,
+                rate: None,
+            },
+            0,
+        )
+        .unwrap();
+    commit(&mut log, 0, 4);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 10)
+        .unwrap();
+    assert!(outbound.routed_sender().unwrap().pending(0, 1).unwrap() > 0);
+    let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
+    for now in 20..30 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    let counters = outbound.routed_sender().unwrap().counters(1).unwrap();
+    assert_eq!(counters.forgotten, 0, "{counters:?}");
+    assert!(!outbound.needs_reset(), "a healthy path is not reset");
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    assert_eq!(cell.try_read().unwrap().in_flight, 0);
+}
+
 /// #346 review P2-3: several paths can leave in one pass, and the last live
 /// one never does. Three paths each take one datagram of three (the others'
 /// halves are away): each skipped two thirds, so A and B leave and C stays.
@@ -1360,3 +1691,5 @@ fn a_shared_bottleneck_evicts_no_path() {
             .unwrap();
     }
 }
+
+mod validation;

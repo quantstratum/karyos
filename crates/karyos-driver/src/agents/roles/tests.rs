@@ -308,6 +308,43 @@ fn a_multicast_answer_goes_to_the_group() {
     assert!(matches!(answer, Control::SetupAnswer(_)));
 }
 
+/// driver-network-agents.md §7: a publication being removed admits no new
+/// receiver: a challenge gets no answer and is counted refused, while the
+/// publication keeps its incarnation for the linger.
+#[test]
+fn a_removing_publication_admits_no_new_receiver() {
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let destination: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+    sender.sessions.add(publication(EndpointId(1))).unwrap();
+    let (path, _log) = outbound(EndpointId(1), destination);
+    sender.publications.push(path);
+    let challenge = || {
+        Control::Challenge(karyos_protocol::network::RspChallenge {
+            alias: alias(),
+            identity: identity(),
+            challenge: ChallengeBlock {
+                receiver_boot_id: [7, 8],
+                nonce: [9, 9],
+            },
+        })
+    };
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let draining = sender.begin_remove::<OsSocket>(EndpointId(1), alias(), 1, 0);
+    assert!(matches!(
+        draining,
+        AgentEvent::PublicationDraining { found: true, .. }
+    ));
+    let refused = sender.counters().refused;
+    assert!(
+        sender
+            .answer_for(EndpointId(1), source, 0, challenge())
+            .is_none()
+    );
+    assert_eq!(sender.counters().refused, refused + 1);
+    assert!(sender.sessions.identity(EndpointId(1), alias()).is_some());
+    assert!(sender.publications[0].removing());
+}
+
 /// Condition (1), §7.3: an RSP_SETUP answers only a unicast source with a
 /// nonzero port.
 #[test]
@@ -2226,6 +2263,33 @@ fn naks_per_cycle_are_bounded() {
     assert_eq!(rig.sender.counters().naks, 3);
 }
 
+/// RP-11's admission order (rp-w6): the binding check comes before the
+/// cycle's NAK budget, so a NAK from no bound receiver is counted unbound
+/// even once the budget is spent, and spends none of it.
+#[test]
+fn an_unbound_nak_is_counted_before_the_budget() {
+    let mut config = AgentConfig::default();
+    config.repair.naks_per_cycle = 1;
+    let mut rig = RepairRig::new(config, &[alias()], 4);
+    let source = SocketAddr::from(RECEIVER_SOURCE);
+    let stranger = SocketAddr::from(([127, 0, 0, 9], 4_999));
+    rig.nak(alias(), source, 0, 1056);
+    rig.nak(alias(), stranger, FRAME, 1056);
+    rig.nak(alias(), source, FRAME, 1056);
+    rig.script(2);
+    rig.cycle(3);
+    let counters = rig.sender.counters();
+    assert_eq!(
+        (
+            counters.naks,
+            counters.nak_unbound,
+            counters.nak_cycle_budget
+        ),
+        (1, 1, 1),
+        "{counters:?}"
+    );
+}
+
 /// Repair runs the publications in turn from a cursor that moves every
 /// cycle, within one budget per cycle: with room for one frame a cycle,
 /// two publications with two-frame jobs alternate.
@@ -3235,8 +3299,8 @@ fn a_routed_publication_has_a_setup_side_per_path() {
         &sender.sessions,
         &sender.publications[0]
     ));
-    // Removing it ends both paths' SETUP sides.
-    let removed = sender.command(AgentCommand::<OsSocket>::RemovePublication {
+    // Removing it (its drained session) ends both paths' SETUP sides.
+    let removed = sender.command(AgentCommand::<OsSocket>::RemoveSenderSession {
         reply: replies.reserve().unwrap(),
         endpoint: EndpointId(1),
         alias: alias(),
@@ -3679,6 +3743,131 @@ fn the_heartbeat_mark_and_a_tail_nak_stop_at_the_terminal_bound() {
         super::classify_heartbeat(&mut image, &heartbeat),
         super::HeartbeatClass::Stationary,
         "capped at the bound"
+    );
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
+    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert_eq!((hole.start, hole.length), (0, 96));
+}
+
+/// The routed publication's view of the receiver with boot id `[7, 8]`.
+fn member_on(sender: &mut super::SenderRole, now: u64) -> crate::repair::admission::Requester {
+    sender.publications[0].membership_mut().unwrap().requester(
+        karyos_protocol::network::Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 1,
+        },
+        karyos_protocol::frame::Lane::ZERO,
+        now,
+    )
+}
+
+/// rp-w7b, §8 "Control on several paths": one SM delivered on both paths
+/// of a routed publication changes the sender's state once: one member,
+/// joined once at 0, at the consumption it reported (0: nothing is sent
+/// here, and an SM past the sent position is not accepted).
+#[test]
+fn an_sm_on_two_paths_changes_the_sender_once() {
+    use crate::repair::admission::Requester;
+
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (event, _log) = add_routed(&mut sender);
+    assert!(matches!(event, Some(AgentEvent::PublicationAdded { .. })));
+    let on_a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let on_b: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), on_a, &sm_status([7, 8], 0), 1);
+    let once = member_on(&mut sender, 1);
+    sender.status(EndpointId(2), on_b, &sm_status([7, 8], 0), 2);
+    let bound = sender.consumption(&sender.publications[0]);
+    assert_eq!(bound.map(|positions| positions[0]), Some(0));
+    let twice = member_on(&mut sender, 2);
+    assert!(
+        matches!(
+            twice,
+            Requester::Member {
+                join: 0,
+                consumption: 0,
+                ..
+            }
+        ),
+        "{twice:?}"
+    );
+    assert_eq!(once, twice, "the copy on B changed nothing");
+    let counters = *sender.publications[0].membership_mut().unwrap().counters();
+    assert_eq!(counters.joins, 1, "one join over two paths: {counters:?}");
+}
+
+/// rp-w7b, §8 "Control on several paths": a path that lost its return
+/// direction (its binding expires, no SM on it for longer than the image
+/// liveness timeout) does not cost the receiver its membership while the
+/// other path keeps its SMs coming.
+#[test]
+fn a_path_that_lost_its_return_direction_keeps_the_member() {
+    use crate::repair::admission::Requester;
+
+    let config = AgentConfig::default();
+    let timeout = config.image_liveness_timeout;
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let (_event, _log) = add_routed(&mut sender);
+    let on_a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let on_b: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), on_a, &sm_status([7, 8], 0), 1);
+    sender.status(EndpointId(2), on_b, &sm_status([7, 8], 0), 1);
+    // Only B's SMs come back, every tenth of the timeout, for three
+    // timeouts: A's binding expires.
+    let step = timeout / 10;
+    for k in 1..=30u64 {
+        sender.status(EndpointId(2), on_b, &sm_status([7, 8], 0), 1 + k * step);
+    }
+    let now = 1 + 30 * step;
+    assert!(
+        !sender
+            .bindings
+            .iter()
+            .any(|binding| binding.endpoint == EndpointId(1)),
+        "A's binding expired"
+    );
+    assert!(
+        sender
+            .bindings
+            .iter()
+            .any(|binding| binding.endpoint == EndpointId(2)),
+        "B's binding stays"
+    );
+    let member = member_on(&mut sender, now);
+    assert!(matches!(member, Requester::Member { .. }), "{member:?}");
+    // The same member throughout: joined once, A's binding gone while B's
+    // remained, never unbound.
+    let counters = *sender.publications[0].membership_mut().unwrap().counters();
+    assert_eq!(counters.joins, 1, "{counters:?}");
+    assert_eq!(counters.bindings_gone, 1, "{counters:?}");
+    assert_eq!(counters.unbound, 0, "{counters:?}");
+}
+
+/// A plain heartbeat raises the mark first; a lower EOS bound recorded
+/// afterwards still caps the tail hole: nothing past the bound is NAKed.
+#[test]
+fn a_bound_below_the_heartbeat_mark_caps_the_tail_nak() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image();
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(image.heartbeat_marks[0], Some(4096));
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 96),
+        super::Terminal::Recorded
     );
     assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
     let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();

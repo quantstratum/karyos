@@ -393,6 +393,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         reconfiguration: Reconfiguration,
     ) -> Result<Generation, DriverError> {
         let target = self.active_stream_mut(stream)?;
+        // An image's lane names the real reason first, whatever the lane
+        // count (N-4a).
+        if matches!(
+            target.config.publication,
+            karyos_sys::log_buffer::PublicationMode::Image { .. }
+        ) {
+            return Err(DriverError::ImageCutover { stream: target.id });
+        }
         if target.aggregate.lanes > 1 {
             return Err(DriverError::LaneOfAggregate { stream: target.id });
         }
