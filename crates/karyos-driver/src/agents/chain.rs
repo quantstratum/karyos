@@ -117,6 +117,11 @@ pub enum SessionEvent {
     RetireImage {
         /// The installed slot.
         slot: SlotRef,
+        /// Whether the image ended cleanly: every lane's complete prefix
+        /// reached the terminal bound its EOS named (network-sessions.md,
+        /// Liveness and terminal transitions). Otherwise it is retired
+        /// with its prefix possibly unresolved.
+        complete: bool,
     },
 }
 

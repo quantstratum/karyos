@@ -17,7 +17,8 @@
 //! Each lane keeps a first-loss position, set by its first overrun,
 //! local gap or skipped range and never cleared. The aggregate's terminal
 //! is a clean EOS only when every lane closed at its seal on the stream's
-//! removal and no lane has a first loss (L6, GU-13).
+//! removal, or an image's at its remote EOS bound, and no lane has a first
+//! loss (L6, GU-13).
 
 use std::sync::Arc;
 
@@ -73,16 +74,17 @@ pub enum LaneEnd {
 
 impl LaneEnd {
     /// Whether the lane ended without loss: closed at its seal by the
-    /// stream's removal (L6). `Unspecified` is not clean: it also stands
-    /// for a reason code this build does not know, which could be a loss.
-    /// Nor is `ImageRetired`: a retired image's remote prefix may be
-    /// unresolved; a clean remote end comes with EOS.
+    /// stream's removal (L6), or, for an image, at the terminal bound its
+    /// remote EOS named, reached through a complete prefix
+    /// (`EndOfStream`). `Unspecified` is not clean: it also stands for a
+    /// reason code this build does not know, which could be a loss. Nor is
+    /// `ImageRetired`: a retired image's remote prefix may be unresolved.
     #[must_use]
     pub fn clean(self) -> bool {
         matches!(
             self,
             Self::Closed {
-                reason: SealReason::StreamRemoved,
+                reason: SealReason::StreamRemoved | SealReason::EndOfStream,
                 ..
             }
         )

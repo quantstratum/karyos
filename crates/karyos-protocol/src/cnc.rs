@@ -1847,6 +1847,9 @@ pub enum CloseReason {
     /// The stream is an image whose remote publication the receiver
     /// retired.
     ImageRetired,
+    /// The stream is an image whose remote publication ended: every lane
+    /// reached its EOS bound through a complete prefix.
+    EndOfStream,
 }
 
 impl CloseReason {
@@ -1859,6 +1862,7 @@ impl CloseReason {
             Self::StreamRemoved => 3,
             Self::ConflationFeederLost => 4,
             Self::ImageRetired => 7,
+            Self::EndOfStream => 8,
         }
     }
 
@@ -1869,6 +1873,7 @@ impl CloseReason {
             3 => Some(Self::StreamRemoved),
             4 => Some(Self::ConflationFeederLost),
             7 => Some(Self::ImageRetired),
+            8 => Some(Self::EndOfStream),
             _ => None,
         }
     }
@@ -1883,6 +1888,7 @@ impl CloseReason {
             SealReason::StreamRemoved => Some(Self::StreamRemoved),
             SealReason::ConflationFeederLost => Some(Self::ConflationFeederLost),
             SealReason::ImageRetired => Some(Self::ImageRetired),
+            SealReason::EndOfStream => Some(Self::EndOfStream),
             _ => None,
         }
     }
@@ -2143,12 +2149,41 @@ mod tests {
             SealReason::StreamRemoved,
             SealReason::ConflationFeederLost,
             SealReason::ImageRetired,
+            SealReason::EndOfStream,
         ] {
             let close = CloseReason::from_seal(reason).unwrap();
             assert_eq!(close.code(), reason.code());
             assert_eq!(CloseReason::from_code(reason.code()), Some(close));
         }
         assert_eq!(CloseReason::from_seal(SealReason::GuardClosed), None);
+    }
+
+    /// A `PublicationClosed` whose reason code this build does not know is
+    /// a typed decode error (`CncError::Reserved`), never a panic: what a
+    /// build from before `EndOfStream` (code 8) decodes for an image's
+    /// clean end. The client skips such an event.
+    #[test]
+    fn a_close_reason_this_build_does_not_know_is_a_typed_decode_error() {
+        let event = Event::PublicationClosed {
+            stream: stream(),
+            lane: Lane::ZERO,
+            reason: CloseReason::StreamRemoved,
+        };
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let length = event.encode(&mut out).unwrap();
+        for code in [9u64, 200, u64::MAX] {
+            let mut bytes = out;
+            bytes[8..16].copy_from_slice(&code.to_le_bytes());
+            assert_eq!(
+                Event::decode(event.type_id(), &bytes[..length]),
+                Err(CncError::Reserved {
+                    type_id: event.type_id()
+                })
+            );
+        }
+        assert_eq!(CloseReason::from_code(9), None);
+        // Code 8 is known to this build.
+        assert_eq!(CloseReason::from_code(8), Some(CloseReason::EndOfStream));
     }
 
     fn stream() -> StreamKey {
