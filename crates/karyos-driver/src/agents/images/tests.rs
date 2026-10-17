@@ -946,3 +946,28 @@ fn a_stopped_required_subscriber_back_pressures_a_reliable_publisher() {
     let receiver = rig.agents.receiver.counters();
     assert_eq!(receiver.data_refused, 0, "{receiver:?}");
 }
+
+/// M5 (#255 third pass): a heartbeat below its lane's mark, through the
+/// receiver's DATA intake, is counted stale and changes no evidence.
+#[test]
+fn a_stale_heartbeat_through_the_intake_changes_no_evidence() {
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    rig.now += MS;
+    let receiver = &mut rig.agents.receiver;
+    receiver
+        .role
+        .inject_heartbeat(&receiver.sessions, b, source, slot, 64, rig.now);
+    let fresh_at = rig.now;
+    assert_eq!(receiver.role.image_evidence(slot), Some(fresh_at));
+    let before = receiver.counters();
+    rig.now += MS;
+    receiver
+        .role
+        .inject_heartbeat(&receiver.sessions, b, source, slot, 32, rig.now);
+    let after = receiver.counters();
+    assert_eq!(after.heartbeats_stale, before.heartbeats_stale + 1);
+    assert_eq!(after.heartbeats, before.heartbeats);
+    assert_eq!(receiver.role.image_evidence(slot), Some(fresh_at));
+}

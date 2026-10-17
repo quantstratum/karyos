@@ -640,6 +640,15 @@ impl ReceiverRole {
         self.sessions.paths().live(slot)
     }
 
+    /// The last image evidence of the image at `slot` (tests).
+    #[cfg(test)]
+    pub(super) fn image_evidence(&self, slot: SlotRef) -> Option<u64> {
+        self.images
+            .iter()
+            .find(|image| image.slot == slot)
+            .map(|image| image.evidence)
+    }
+
     /// Hands the receiver a DATA heartbeat on lane 0 of the image at
     /// `slot`, `ahead` bytes above its contiguous prefix, as if it came
     /// from `source` on `endpoint` at `now` (tests).
