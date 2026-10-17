@@ -168,9 +168,20 @@ impl<T: StreamTerms> ClientSlot<T> {
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
+
+    /// Whether the driver still serves the client: neither retired as
+    /// faulty or timed out, nor closed.
+    pub(crate) fn serving(&self) -> bool {
+        self.consumer.is_some() && !self.link.is_closed()
+    }
 }
 
 impl Registration {
+    /// Its registration id.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// The stream id this registration belongs to.
     pub(crate) fn stream(&self) -> u64 {
         self.stream
@@ -826,7 +837,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// Preflight, then effect. Returns the single response.
-    fn execute(&mut self, client: u64, link: &Arc<ClientLink<T>>, command: Command) -> Response {
+    pub(crate) fn execute(
+        &mut self,
+        client: u64,
+        link: &Arc<ClientLink<T>>,
+        command: Command,
+    ) -> Response {
         let request = RequestId {
             client,
             sequence: command.sequence(),
@@ -1015,6 +1031,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             Command::RemovePublication { registration, .. }
             | Command::RemoveSubscription { registration, .. } => {
+                // A network subscription the client created by URI (W5b).
+                if matches!(command, Command::RemoveSubscription { .. })
+                    && self.remove_owned_subscription(client, registration)
+                {
+                    return Response::OperationSucceeded { request };
+                }
                 let kind = if matches!(command, Command::RemovePublication { .. }) {
                     Kind::Publication
                 } else {
@@ -1104,13 +1126,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 operation,
                 ..
             } => self.guard_command(client, request, guard, operation, Some(expected)),
-            // Network channels by URI are served from W5b; until then the
-            // driver refuses them without effect.
-            Command::AddNetworkPublication { stream_id, .. }
-            | Command::AddNetworkSubscription { stream_id, .. } => refuse(
-                ErrorCode::UnsupportedChannel,
-                u64::from(stream_id.cast_unsigned()),
+            // Network channels by URI (W5b, net/client.rs).
+            Command::AddNetworkPublication {
+                stream_id,
+                allow_unconnected,
+                uri,
+                ..
+            } => self.serve_network_publication(
+                client,
+                link,
+                request,
+                stream_id,
+                allow_unconnected,
+                uri.as_str(),
             ),
+            Command::AddNetworkSubscription { stream_id, uri, .. } => {
+                self.serve_network_subscription(client, request, stream_id, uri.as_str())
+            }
         }
     }
 

@@ -594,6 +594,9 @@ pub enum AgentEvent<O: SocketOps> {
         agent: AgentKind,
         /// Whether the entry was added (or was already there).
         accepted: bool,
+        /// The endpoint and stream of an `AddSubscription`'s answer; `None`
+        /// for the other configuration commands.
+        subscription: Option<(EndpointId, i32)>,
     },
     /// The agent holds the new network trace hook.
     NetworkTraceSet {
