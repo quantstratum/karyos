@@ -346,6 +346,10 @@ pub struct ReceiverRole {
     /// Subscribed streams: endpoint, stream, largest image term length,
     /// and whether the channel is reliable (its `reliable` parameter).
     subscriptions: Vec<(EndpointId, i32, u32, bool)>,
+    /// Whether a subscription was ever removed: from then on each cycle
+    /// retires the images of streams no longer subscribed (bounded by the
+    /// subscription table).
+    unsubscribed: bool,
     /// Aliases published per endpoint.
     published: Vec<(EndpointId, Alias)>,
     max_entries: usize,
@@ -886,6 +890,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             to_sender,
             budget: Budget::new(datagrams, bytes, ops),
             subscriptions: Vec::with_capacity(config.subscriptions),
+            unsubscribed: false,
             published: Vec::with_capacity(config.subscriptions),
             max_entries: config.subscriptions,
             rsp_destinations,
@@ -998,6 +1003,21 @@ impl ReceiverRole {
                         true
                     });
                 Some((reply, configured(accepted)))
+            }
+            AgentCommand::RemoveSubscription {
+                reply,
+                endpoint,
+                stream_id,
+            } => {
+                let found = self
+                    .subscriptions
+                    .iter()
+                    .position(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id));
+                if let Some(index) = found {
+                    self.subscriptions.swap_remove(index);
+                    self.unsubscribed = true;
+                }
+                Some((reply, configured(found.is_some())))
             }
             AgentCommand::RemovePublishedAlias {
                 reply,
@@ -1483,7 +1503,11 @@ impl ReceiverRole {
         let mut work = 0u32;
         let mut index = 0usize;
         while let Some(image) = self.images.get(index) {
-            if age_ns(now, image.evidence) >= self.liveness_timeout {
+            let unsubscribed = self.unsubscribed
+                && !self.subscriptions.iter().any(|(endpoint, stream, ..)| {
+                    (*endpoint, *stream) == (image.key.endpoint, image.key.alias.stream_id)
+                });
+            if unsubscribed || age_ns(now, image.evidence) >= self.liveness_timeout {
                 let image = self.images.swap_remove(index);
                 self.retire(sessions, image, now);
                 work = work.checked_add(1).ok_or(overflow.clone())?;
@@ -2563,7 +2587,8 @@ impl SenderRole {
             } => return Some((reply, self.remove(endpoint, alias, registration))),
             AgentCommand::AddSubscription { reply, .. }
             | AgentCommand::AddPublishedAlias { reply, .. }
-            | AgentCommand::RemovePublishedAlias { reply, .. } => {
+            | AgentCommand::RemovePublishedAlias { reply, .. }
+            | AgentCommand::RemoveSubscription { reply, .. } => {
                 return Some((
                     reply,
                     AgentEvent::Unsupported {

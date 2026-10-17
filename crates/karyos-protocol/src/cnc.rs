@@ -1512,6 +1512,9 @@ pub enum CloseReason {
     StreamRemoved,
     /// The stream's conflation feeder failed and could not go on.
     ConflationFeederLost,
+    /// The stream is an image whose remote publication the receiver
+    /// retired.
+    ImageRetired,
 }
 
 impl CloseReason {
@@ -1523,6 +1526,7 @@ impl CloseReason {
             Self::ConflationVersionsExhausted => 2,
             Self::StreamRemoved => 3,
             Self::ConflationFeederLost => 4,
+            Self::ImageRetired => 7,
         }
     }
 
@@ -1532,6 +1536,7 @@ impl CloseReason {
             2 => Some(Self::ConflationVersionsExhausted),
             3 => Some(Self::StreamRemoved),
             4 => Some(Self::ConflationFeederLost),
+            7 => Some(Self::ImageRetired),
             _ => None,
         }
     }
@@ -1545,6 +1550,7 @@ impl CloseReason {
             SealReason::ConflationVersionsExhausted => Some(Self::ConflationVersionsExhausted),
             SealReason::StreamRemoved => Some(Self::StreamRemoved),
             SealReason::ConflationFeederLost => Some(Self::ConflationFeederLost),
+            SealReason::ImageRetired => Some(Self::ImageRetired),
             _ => None,
         }
     }
@@ -1754,6 +1760,24 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A close reason's code is its seal reason's, both ways, the image
+    /// retirement included (W3, ACS 15937).
+    #[test]
+    fn close_reasons_use_the_seal_codes() {
+        for reason in [
+            SealReason::RequiredParticipantLost,
+            SealReason::ConflationVersionsExhausted,
+            SealReason::StreamRemoved,
+            SealReason::ConflationFeederLost,
+            SealReason::ImageRetired,
+        ] {
+            let close = CloseReason::from_seal(reason).unwrap();
+            assert_eq!(close.code(), reason.code());
+            assert_eq!(CloseReason::from_code(reason.code()), Some(close));
+        }
+        assert_eq!(CloseReason::from_seal(SealReason::GuardClosed), None);
+    }
 
     fn stream() -> StreamKey {
         StreamKey {

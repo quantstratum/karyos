@@ -159,6 +159,44 @@ fn a_frame_is_published_and_read() {
     assert_eq!(owner.counters().frames_committed, 1);
 }
 
+/// Dropping the owner releases the image's publication (W3): a terminal
+/// seal is then positioned at the committed head, so a subscriber reads
+/// what was committed and then sees the seal and its reason.
+#[test]
+fn a_dropped_owner_lets_the_seal_be_positioned() {
+    use crate::log_buffer::SealReason;
+
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 0, 128, 7)), committed(0, 128));
+    conductor.seal_with_reason(SealReason::ImageRetired).unwrap();
+    let _ = conductor.duty_cycle().unwrap();
+    // The owner still holds the publication: the seal waits.
+    let mut out = [0u8; 256];
+    assert!(matches!(
+        subscription.poll(&mut out).unwrap(),
+        PollOutcome::Message { .. }
+    ));
+    assert!(!matches!(
+        subscription.poll(&mut out).unwrap(),
+        PollOutcome::Closed { .. }
+    ));
+    drop(owner);
+    let _ = conductor.duty_cycle().unwrap();
+    assert!(
+        matches!(
+            subscription.poll(&mut out).unwrap(),
+            PollOutcome::Closed {
+                reason: SealReason::ImageRetired,
+                ..
+            }
+        ),
+        "the seal is positioned at the committed head"
+    );
+}
+
 /// An image's consumption is its rebuild position, lowered to its least
 /// required subscriber's; optional subscribers bound nothing.
 #[test]

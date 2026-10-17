@@ -25,7 +25,9 @@ use super::{LogBuffer, Lookup, PublicationMode};
 use crate::error::SysError;
 use crate::frame::{FRAME_ALIGNMENT, Lane};
 use crate::loan::{LoanOutcome, Rotation, release_loan, rotate_to, take_loan};
-use crate::publication::{active_term_count, observe_block, publish_block, take_publication};
+use crate::publication::{
+    active_term_count, observe_block, publish_block, release_publication, take_publication,
+};
 use crate::receive::{ImageParams, ValidatedFrame};
 use crate::term::{TERM_COUNT_LIMIT, TermCount};
 use crate::term_bytes::{HeapTerms, TermBytes};
@@ -531,6 +533,10 @@ impl<T: TermBytes> Drop for ReceiveOwner<T> {
     fn drop(&mut self) {
         for lane in &mut self.lanes {
             lane.release_all();
+            // The owner is the image's only publication: its release, after
+            // its last commit, lets the conductor position a seal there,
+            // as a local publication's drop does (publication-seal.md).
+            release_publication(lane.buffer.exclusive_released());
         }
     }
 }

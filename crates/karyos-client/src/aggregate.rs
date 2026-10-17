@@ -75,6 +75,8 @@ impl LaneEnd {
     /// Whether the lane ended without loss: closed at its seal by the
     /// stream's removal (L6). `Unspecified` is not clean: it also stands
     /// for a reason code this build does not know, which could be a loss.
+    /// Nor is `ImageRetired`: a retired image's remote prefix may be
+    /// unresolved; a clean remote end comes with EOS.
     #[must_use]
     pub fn clean(self) -> bool {
         matches!(

@@ -2718,6 +2718,11 @@ pub enum SealReason {
     /// and ended the incarnation (guards-and-abort.md, G7 and GC-8).
     /// Reported as [`AppendOutcome::Gated`], as a guard close is.
     DeadlineMissed,
+    /// The stream is the image of a remote publication that the receiver
+    /// retired: its publisher timed out, or its subscription was removed
+    /// (`quantstratum-docs: karyos/design/network-sessions.md`, S1
+    /// retirement). A local removal is [`SealReason::StreamRemoved`].
+    ImageRetired,
 }
 
 impl SealReason {
@@ -2732,6 +2737,7 @@ impl SealReason {
             Self::ConflationFeederLost => 4,
             Self::GuardClosed => 5,
             Self::DeadlineMissed => 6,
+            Self::ImageRetired => 7,
         }
     }
 
@@ -2752,6 +2758,7 @@ impl SealReason {
             4 => Self::ConflationFeederLost,
             5 => Self::GuardClosed,
             6 => Self::DeadlineMissed,
+            7 => Self::ImageRetired,
             _ => Self::Unspecified,
         }
     }

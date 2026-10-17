@@ -31,13 +31,19 @@
 //!   when its last publication is removed. Removing a publication takes
 //!   its data path back (`RemovePublication`), so its lane readers drop on
 //!   the control path.
-//!
-//! Images follow in W3.
+//! - **Subscriptions and images (W-e, W3).** A network subscription binds
+//!   its endpoint at the channel's receive address (or the group's port,
+//!   joined) and posts `AddSubscription`; removing it posts
+//!   `RemoveSubscription`, which retires its images. The image table's
+//!   events go to the conductor, which exposes an installed image as the
+//!   lane streams of one aggregate (interim keying, ACS 15937) and seals
+//!   and retires them with the image. An image it cannot expose is still
+//!   fed: its lane conductors are driven here until it retires.
 
 use std::net::SocketAddr;
 
 use karyos_io::sockets::OsSocket;
-use karyos_io::sockets::endpoint::SocketsConfig;
+use karyos_io::sockets::endpoint::{MulticastConfig, SocketsConfig};
 use karyos_protocol::network::Alias;
 
 use crate::agents::data::Outbound;
@@ -45,12 +51,15 @@ use crate::agents::{AgentCommand, AgentEvent, EndpointId};
 use crate::sessions::send::Publication;
 
 use crate::agents::endpoints::Endpoints;
-use crate::agents::images::{ImageTable, ImageTemplate};
+use crate::agents::images::{ImageEvent, ImageTable, ImageTemplate};
 use crate::agents::{
     AgentConfig, AgentError, AgentKind, AgentLinks, AgentRunner, LateAgent, NetworkAgents,
     ThreadingMode, YieldThenSleep, guarded, network_agents,
 };
 use crate::error::DriverError;
+use crate::sessions::receive::SlotRef;
+use karyos_sys::log_buffer::{Conductor, LogBuffer};
+use std::sync::Arc;
 
 /// The network configuration of a driver (wiring note W-a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,13 +134,44 @@ struct NetPublication {
     remove_posted: bool,
 }
 
-/// A send endpoint shared by the publications bound to one address.
+/// An endpoint shared by the publications and subscriptions bound to one
+/// address (and multicast group).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SendEndpoint {
     bind: SocketAddr,
+    multicast: Option<MulticastConfig>,
     endpoint: EndpointId,
-    /// Publications that hold it.
+    /// Publications and subscriptions that hold it.
     users: usize,
+}
+
+/// A network subscription of this driver (W3): the receiver holds one
+/// entry per endpoint and stream, so the handles of one key are counted
+/// (#283 P2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NetSubscription {
+    endpoint: EndpointId,
+    stream_id: i32,
+    /// Handles of this key; the receiver's entry goes with the last.
+    users: usize,
+}
+
+/// Names a network subscription of one driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NetworkSubscription {
+    endpoint: EndpointId,
+    stream_id: i32,
+}
+
+/// An installed image and the aggregate that exposes it, if any.
+#[derive(Debug)]
+struct NetImage {
+    slot: SlotRef,
+    exposed: Option<crate::embedded::AggregateHandle>,
+    /// An unexposed image's lane conductors, driven here so its terms are
+    /// still prepared and it keeps being fed (ACS 15937); dropped when it
+    /// retires.
+    conductors: Vec<Conductor<Arc<LogBuffer>>>,
 }
 
 /// The conductor's network state.
@@ -145,6 +185,14 @@ pub(crate) struct Network {
     failed: Option<AgentKind>,
     publications: Vec<NetPublication>,
     send_endpoints: Vec<SendEndpoint>,
+    subscriptions: Vec<NetSubscription>,
+    /// Installed images, at most `max_images`.
+    net_images: Vec<NetImage>,
+    /// The image table's events of the last cycle, for the conductor.
+    image_events: Vec<ImageEvent>,
+    /// Images installed but not exposed: their alias is in use (interim
+    /// keying, ACS 15937) or the stream table is full.
+    images_unexposed: u64,
     /// Aliases the receiver still admits for a publication that is gone
     /// or was refused: `RemovePublishedAlias` is posted as the ring
     /// allows. Bounded by construction: an alias is queued only from a
@@ -185,6 +233,10 @@ impl Network {
             failed: None,
             publications: Vec::with_capacity(config.agents.publications),
             send_endpoints: Vec::with_capacity(config.agents.max_endpoints),
+            subscriptions: Vec::with_capacity(config.agents.subscriptions),
+            net_images: Vec::with_capacity(config.agents.sessions.max_images),
+            image_events: Vec::with_capacity(config.agents.sessions.max_images),
+            images_unexposed: 0,
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
             stale_overflows: 0,
@@ -201,10 +253,20 @@ impl Network {
         &mut self,
         bind: SocketAddr,
     ) -> Result<EndpointId, DriverError> {
+        self.hold_endpoint(bind, None)
+    }
+
+    /// The endpoint bound to `bind`, joined to `multicast` if any, opened
+    /// on first use; one more user holds it.
+    fn hold_endpoint(
+        &mut self,
+        bind: SocketAddr,
+        multicast: Option<MulticastConfig>,
+    ) -> Result<EndpointId, DriverError> {
         if let Some(entry) = self
             .send_endpoints
             .iter_mut()
-            .find(|entry| entry.bind == bind)
+            .find(|entry| (entry.bind, entry.multicast) == (bind, multicast))
         {
             entry.users = entry
                 .users
@@ -212,16 +274,208 @@ impl Network {
                 .ok_or(DriverError::NetworkEndpoint)?;
             return Ok(entry.endpoint);
         }
+        let mut config = SocketsConfig::new(bind);
+        config.multicast = multicast;
         let endpoint = self
             .endpoints
-            .open(&self.links, SocketsConfig::new(bind), OsSocket::new())
+            .open(&self.links, config, OsSocket::new())
             .map_err(|_| DriverError::NetworkEndpoint)?;
         self.send_endpoints.push(SendEndpoint {
             bind,
+            multicast,
             endpoint,
             users: 1,
         });
         Ok(endpoint)
+    }
+
+    /// Subscribes `stream_id` on the endpoint bound to `bind` (joined to
+    /// `multicast`): the receiver challenges its announcements and
+    /// installs its images (control path). A second subscription of the
+    /// same endpoint and stream shares the receiver's entry. The
+    /// receiver's answer is not awaited: a receiver whose subscription
+    /// table is full (`AgentConfig::subscriptions`) answers
+    /// `Configured { accepted: false }` and never challenges the stream,
+    /// so no image appears for it.
+    ///
+    /// `reliable` is the channel's `reliable` parameter: the receiver
+    /// repairs its images' losses with NAKs, otherwise its skip policy
+    /// seals them. A second subscription of the same endpoint and stream
+    /// shares the first's receiver entry, and with it the first's
+    /// reliability.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NetworkEndpoint`], [`DriverError::NetworkBusy`].
+    pub(crate) fn add_subscription(
+        &mut self,
+        stream_id: i32,
+        bind: SocketAddr,
+        multicast: Option<MulticastConfig>,
+        max_term_length: u32,
+        reliable: bool,
+    ) -> Result<NetworkSubscription, DriverError> {
+        let endpoint = self.hold_endpoint(bind, multicast)?;
+        let handle = NetworkSubscription {
+            endpoint,
+            stream_id,
+        };
+        if let Some(entry) = self
+            .subscriptions
+            .iter_mut()
+            .find(|entry| (entry.endpoint, entry.stream_id) == (endpoint, stream_id))
+        {
+            let Some(users) = entry.users.checked_add(1) else {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::NetworkBusy);
+            };
+            entry.users = users;
+            return Ok(handle);
+        }
+        let posted = self
+            .links
+            .receiver
+            .post(|reply| AgentCommand::AddSubscription {
+                reply,
+                endpoint,
+                stream_id,
+                max_term_length,
+                reliable,
+            });
+        if posted.is_err() {
+            release(&mut self.send_endpoints, endpoint);
+            return Err(DriverError::NetworkBusy);
+        }
+        self.subscriptions.push(NetSubscription {
+            endpoint,
+            stream_id,
+            users: 1,
+        });
+        Ok(handle)
+    }
+
+    /// Stops `subscription`: its images retire and its endpoint is
+    /// released (control path). `false` when it is unknown.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::NetworkBusy`]; nothing changes then.
+    pub(crate) fn remove_subscription(
+        &mut self,
+        subscription: NetworkSubscription,
+    ) -> Result<bool, DriverError> {
+        let Some(index) = self.subscriptions.iter().position(|entry| {
+            (entry.endpoint, entry.stream_id) == (subscription.endpoint, subscription.stream_id)
+        }) else {
+            return Ok(false);
+        };
+        let NetworkSubscription {
+            endpoint,
+            stream_id,
+        } = subscription;
+        match self.subscriptions.get_mut(index) {
+            // Another handle still holds the receiver's entry.
+            Some(entry) if entry.users > 1 => {
+                if let Some(users) = entry.users.checked_sub(1) {
+                    entry.users = users;
+                }
+            }
+            _ => {
+                self.links
+                    .receiver
+                    .post(|reply| AgentCommand::RemoveSubscription {
+                        reply,
+                        endpoint,
+                        stream_id,
+                    })
+                    .map_err(|_| DriverError::NetworkBusy)?;
+                self.subscriptions.swap_remove(index);
+            }
+        }
+        release(&mut self.send_endpoints, endpoint);
+        Ok(true)
+    }
+
+    /// The image events of the last cycle, for the conductor to apply;
+    /// hand the buffer back with [`Network::return_image_events`].
+    pub(crate) fn take_image_events(&mut self) -> Vec<ImageEvent> {
+        core::mem::take(&mut self.image_events)
+    }
+
+    /// Gives the event buffer back, emptied, keeping its capacity.
+    pub(crate) fn return_image_events(&mut self, mut events: Vec<ImageEvent>) {
+        events.clear();
+        self.image_events = events;
+    }
+
+    /// The lane buffers of the installed image `slot`.
+    pub(crate) fn image_lanes(&self, slot: SlotRef) -> Option<Vec<Arc<LogBuffer>>> {
+        self.images.installed(slot).map(<[_]>::to_vec)
+    }
+
+    /// Records the installed image `slot` and the aggregate exposing it;
+    /// an unexposed image's lane conductors are taken from `lanes` and
+    /// driven here.
+    pub(crate) fn record_image(
+        &mut self,
+        slot: SlotRef,
+        exposed: Option<crate::embedded::AggregateHandle>,
+        lanes: &[Arc<LogBuffer>],
+    ) {
+        let mut conductors = Vec::new();
+        if exposed.is_none() {
+            if let Some(count) = self.images_unexposed.checked_add(1) {
+                self.images_unexposed = count;
+            }
+            conductors = lanes
+                .iter()
+                .filter_map(LogBuffer::conductor_owned)
+                .collect();
+        }
+        self.net_images.push(NetImage {
+            slot,
+            exposed,
+            conductors,
+        });
+    }
+
+    /// Drops the conductors of the unexposed image `slot`, which retires.
+    pub(crate) fn retire_unexposed(&mut self, slot: SlotRef) {
+        if let Some(image) = self.net_images.iter_mut().find(|image| image.slot == slot) {
+            image.conductors.clear();
+        }
+    }
+
+    /// The aggregate exposing the image `slot`, if any.
+    pub(crate) fn image_aggregate(
+        &self,
+        slot: SlotRef,
+    ) -> Option<crate::embedded::AggregateHandle> {
+        self.net_images
+            .iter()
+            .find(|image| image.slot == slot)
+            .and_then(|image| image.exposed)
+    }
+
+    /// Forgets the reclaimed image `slot`.
+    pub(crate) fn forget_image(&mut self, slot: SlotRef) {
+        self.net_images.retain(|image| image.slot != slot);
+    }
+
+    /// The exposed image aggregate that `matches`.
+    pub(crate) fn exposed_image(
+        &self,
+        matches: impl Fn(&crate::embedded::AggregateHandle) -> bool,
+    ) -> Option<crate::embedded::AggregateHandle> {
+        self.net_images
+            .iter()
+            .filter_map(|image| image.exposed)
+            .find(|handle| matches(handle))
+    }
+
+    /// Images installed but not exposed so far.
+    pub(crate) fn images_unexposed(&self) -> u64 {
+        self.images_unexposed
     }
 
     /// One publication less holds `endpoint`; the last one retires it.
@@ -406,7 +660,19 @@ impl Network {
         let (endpoints, links) = (&mut self.endpoints, &self.links);
         self.send_endpoints
             .retain(|entry| entry.users > 0 || endpoints.retire(links, entry.endpoint).is_err());
-        let images = self.images.poll(&self.links.sessions, |_| {});
+        // Unexposed images' terms are prepared here; exposed ones are
+        // streams the conductor drives.
+        for image in &mut self.net_images {
+            for conductor in &mut image.conductors {
+                let _ = conductor.duty_cycle();
+            }
+        }
+        // Image events go to the conductor, which exposes and retires the
+        // images' streams (W3).
+        let image_events = &mut self.image_events;
+        let images = self
+            .images
+            .poll(&self.links.sessions, |event| image_events.push(event));
         let overflow = DriverError::WorkCountOverflow {
             count: received,
             delta: sent,
@@ -460,6 +726,12 @@ impl Network {
     #[cfg(test)]
     pub(crate) fn is_running(&self) -> bool {
         !matches!(self.agents, Agents::Closed)
+    }
+
+    /// Images in the image table, for tests.
+    #[cfg(test)]
+    pub(crate) fn image_count(&self) -> usize {
+        self.images.len()
     }
 
     /// Stale aliases that found the queue full, for tests.
@@ -652,6 +924,10 @@ impl Stop for crate::agents::ReceiverAgent<OsSocket> {
 }
 
 mod publish;
+mod subscribe;
+
+#[cfg(test)]
+mod netem;
 
 #[cfg(test)]
 mod tests;
