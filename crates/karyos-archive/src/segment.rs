@@ -19,7 +19,7 @@
 //!   append that rolls past it, and the close); or sync when
 //!   [`SegmentStore::tick`] finds the interval passed, a finished segment
 //!   included (its files stay open until then, so no sync runs on the
-//!   write path). An explicit [`SegmentStore::sync`] is always possible;
+//!   write path; a roll past four waiting segments syncs them inline). An explicit [`SegmentStore::sync`] is always possible;
 //!   under no sync it cannot cover a segment finished without one, so
 //!   `durable` stays. Under every policy, the append that rolls into a new
 //!   segment creates its files and syncs them and their directory entries:
@@ -66,6 +66,11 @@ const VERSION: u32 = 1;
 const HEADER: u64 = 48;
 /// An index entry's length.
 const ENTRY: u64 = 32;
+
+/// Finished segments the interval policy keeps open for its next tick; a
+/// roll past this many syncs them inline, so a store that is never ticked
+/// holds a bounded number of files.
+const MAX_FINISHED: usize = 4;
 
 /// A recording's segment geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,10 +641,14 @@ impl<D: Disk> SegmentStore<D> {
         match self.policy {
             SyncPolicy::None if dirty => self.unsynced_behind = true,
             SyncPolicy::PerSegment if dirty => self.sync_open()?,
-            // The next tick syncs it: no sync on the write path.
+            // The next tick syncs it: no sync on the write path, unless
+            // more than `MAX_FINISHED` wait (no tick for many rolls).
             SyncPolicy::Every { .. } if dirty => {
                 if let Some(open) = self.current.take() {
                     self.finished.push(open);
+                }
+                if self.finished.len() > MAX_FINISHED {
+                    self.sync_open()?;
                 }
             }
             _ => {}
@@ -952,18 +961,22 @@ fn scan_segment<D: Disk>(
         }
         None => HeaderRead::Missing,
     };
-    // A torn header with data or entries behind it was durable once: the
-    // segment was not being created, it is damaged.
+    // The header is durable before anything is written in the segment: a
+    // header missing or torn with data or entries behind it was durable
+    // once, so the segment was not being created, it is damaged.
     let empty = match (&data, &index) {
         (Some(data), Some(index)) => disk.len(data)? == 0 && disk.len(index)? <= HEADER,
         (None, Some(index)) => disk.len(index)? <= HEADER,
-        (_, None) => true,
+        (Some(data), None) => disk.len(data)? == 0,
+        (None, None) => true,
     };
     let (header, data, index) = match (read, data, index) {
         (HeaderRead::Valid(header), Some(data), Some(index)) => (header, data, index),
         (HeaderRead::Valid(_), None, Some(_)) => return Err(bad(HeaderProblem::Incomplete)),
         (HeaderRead::Foreign, _, _) => return Err(bad(HeaderProblem::Foreign)),
         (HeaderRead::Torn, _, _) if !empty => return Err(bad(HeaderProblem::Corrupt)),
+        (HeaderRead::Missing, _, Some(_)) if !empty => return Err(bad(HeaderProblem::Corrupt)),
+        (HeaderRead::Missing, _, None) if !empty => return Err(bad(HeaderProblem::Incomplete)),
         // Only the last segment can be the one being created (at the
         // recording's start, or a roll, with nothing written in it).
         (HeaderRead::Missing | HeaderRead::Torn, _, _) if last => {
