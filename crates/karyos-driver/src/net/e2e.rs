@@ -669,9 +669,18 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
 /// B (receiver 77) stalls its subscriber and C reads everything. Under
 /// `max` with no required receiver, the sender follows C and is not held;
 /// with B required it is held at B's window, under `max` and under a
-/// `tagged` group that C alone is in. The channel is unreliable, so only the
-/// strategy limit bounds the sender (no retention hold). Linux, after the
-/// multicast probe.
+/// `tagged` group that C alone is in: in every cycle its sent frontier
+/// (`sent_high`) is at most B's position plus the window B advertises
+/// (SPEC §13), and it is held only where one more maximum frame would
+/// pass it. B's position is its image's join, since its subscriber never
+/// reads. Two mechanisms hold the sender at that one point: the strategy
+/// limit with B's precedence, and, on this unreliable channel too, the
+/// retention of a joined required member, which keeps the log's registered
+/// position at B's consumption so the publisher meets back pressure half
+/// a term past it. B's window is also half a term, so this test cannot
+/// tell them apart; `membership/tests.rs`
+/// (`edges_are_checked_sums_and_required_members_bound_every_strategy`)
+/// checks the limit alone. Linux, after the multicast probe.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_required_receiver_bounds_every_strategy() {
@@ -761,7 +770,18 @@ fn a_required_receiver_bounds_every_strategy() {
         let mut lane = a
             .publication(publication.lane(Lane::ZERO).unwrap())
             .unwrap();
-        let (mut accepted, mut delivered) = (0u32, 0u32);
+        // B's position plus its window: the stalled subscriber stays at
+        // the image's join, and B advertises half a term (the receiver's
+        // window rule, `agents/roles.rs`).
+        let image_lane = b.stream_ref(stalled.lane(Lane::ZERO).unwrap()).unwrap();
+        let config = image_lane.buffer.config();
+        let PublicationMode::Image { join, .. } = config.publication else {
+            panic!("{name}: not an image");
+        };
+        let window = (config.term_length.get() / 2).min(karyos_protocol::network::MAX_WINDOW)
+            & !(karyos_sys::frame::FRAME_ALIGNMENT - 1);
+        let bound = join + u64::from(window);
+        let (mut accepted, mut delivered, mut sent) = (0u32, 0u32, 0u64);
         for _ in 0..4000 {
             if matches!(
                 lane.offer(&[7u8; 1000]).unwrap(),
@@ -773,15 +793,26 @@ fn a_required_receiver_bounds_every_strategy() {
             let _ = b.do_work().unwrap();
             let _ = c.do_work().unwrap();
             let _ = reader.poll(|_, _, _| delivered += 1, BUDGET);
+            sent = shared(&mut a).sender.sent_high(0, 0).unwrap();
+            if held {
+                assert!(
+                    sent <= bound,
+                    "{name}: sent {sent} past B's position {join} plus its window {window}"
+                );
+            }
         }
         if held {
             assert!(
                 accepted < 1024,
                 "{name}: {accepted} accepted while B stalls"
             );
-            // Held at B's window, not before any send: B joined as the
-            // required receiver (one that never joins holds every first
-            // send).
+            // Held at B's window, not before it: a first send needs a whole
+            // maximum frame to fit below the edge, and one more would pass
+            // it.
+            assert!(
+                sent + u64::from(DEFAULT_MTU) > bound,
+                "{name}: held at {sent}, short of B's bound {bound}"
+            );
             assert!(delivered > 0, "{name}: nothing sent");
         } else {
             assert!(

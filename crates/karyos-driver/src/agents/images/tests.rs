@@ -4357,6 +4357,169 @@ fn stale_data_after_a_sender_restart_is_accepted_only_inside_the_new_window() {
     ));
 }
 
+/// T6 (contract-traceability-phase-2.md, "Receiver restart freshness",
+/// the trusted half; SPEC §13): a restarted receiver, here a fresh rig
+/// with a new boot id and no binding, challenge or quarantine state, while
+/// the publisher stays live. Replayed old DATA is unbound and delivered
+/// nowhere. The replayed SETUP makes the receiver challenge afresh, and
+/// while that challenge is pending a replayed old SETUP_ANSWER, echoing the
+/// old boot id and nonce, is dropped and binds nothing: only the fresh
+/// challenge's answer binds. Once bound, above a join point, old DATA
+/// below the join and every replayed copy of a committed frame are not
+/// delivered: each message reaches the subscriber once. `multicast` only
+/// changes how the image times its NAKs here (the rig runs on loopback
+/// unicast). The MAC cases need the authenticated profile (owner decision
+/// 5, ADR-0035).
+fn a_restarted_receiver_binds_only_through_a_fresh_challenge(multicast: bool) {
+    use karyos_protocol::network::{ChallengeBlock, Control, SetupAnswer};
+    use karyos_sys::log_buffer::{AppendOptions, PollOutcome, Role};
+
+    let (mut rig, b) = Rig::new(Setup {
+        multicast,
+        before: 2,
+        ..Setup::default()
+    });
+    // The subscription and the publication are added.
+    rig.round(true);
+    let source = rig.endpoints.local_address(rig.publisher).unwrap();
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert_eq!(sessions.installed, 0);
+    // The answer the receiver got before its restart, replayed.
+    let old_answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: term(65_536),
+        challenge: ChallengeBlock {
+            receiver_boot_id: [0x0b00_7001, 1],
+            nonce: [0x0001_d001, 2],
+        },
+        joins: Lanes::new(&[0, 0]).unwrap(),
+    };
+    // Old DATA of the alias, replayed: no image binds it.
+    let unbound = rig.agents.receiver.counters().data_unbound;
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_data(
+        &receiver.sessions,
+        b,
+        source,
+        alias(),
+        &stale_frame(9, 0, 32),
+        rig.now,
+    );
+    assert_eq!(rig.agents.receiver.counters().data_unbound, unbound + 1);
+    // The old SETUP, replayed: the receiver challenges with its new boot
+    // id, and that challenge is pending.
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::SetupAnnounce(announce(65_536)),
+        rig.now,
+    );
+    // (The old DATA solicited; the SETUP's challenge replaces that.)
+    let pending = rig.agents.receiver.role.session_counters();
+    assert!(
+        pending.challenges + pending.challenges_replaced
+            > sessions.challenges + sessions.challenges_replaced,
+        "no challenge pending: {pending:?}"
+    );
+    // The old answer, replayed while it is: its boot id and nonce are not
+    // the pending challenge's, so it is dropped and binds nothing.
+    let receiver = &mut rig.agents.receiver;
+    receiver.role.inject_control(
+        &receiver.sessions,
+        b,
+        source,
+        Control::SetupAnswer(old_answer),
+        rig.now,
+    );
+    let after = rig.agents.receiver.role.session_counters();
+    assert_eq!(after.dropped, pending.dropped + 1, "the old answer");
+    assert_eq!(after.installed, 0);
+    // Only the fresh challenge's answer, from the live publisher, binds.
+    let slot = established(&mut rig);
+    let challenges: Vec<_> = rig
+        .agents
+        .receiver
+        .role
+        .posted_challenges()
+        .iter()
+        .filter_map(|(_, control)| match control {
+            Control::Challenge(challenge) => Some(challenge.challenge),
+            _ => None,
+        })
+        .collect();
+    // Every challenge carries the restarted receiver's own boot id.
+    let boot_id = challenges.first().unwrap().receiver_boot_id;
+    assert!(
+        challenges
+            .iter()
+            .all(|challenge| challenge.receiver_boot_id == boot_id),
+        "{challenges:?}"
+    );
+    assert_eq!(rig.agents.receiver.role.session_counters().installed, 1);
+    // The image joins above 0: after the two messages appended first.
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let join = 2 * 1056;
+    // Every DATA datagram from here arrives twice, as replays would.
+    let dropped = rig.agents.receiver.counters().data_dropped;
+    rig.agents.receiver.role.drop_data(&[]);
+    rig.agents.receiver.role.repeat_data_from(0);
+    let log = rig.log.as_mut().unwrap();
+    for i in 0..3u8 {
+        let _ = log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let mut delivered = Vec::new();
+    let mut out = vec![0u8; 2048];
+    for _ in 0..200 {
+        rig.round(true);
+        while let PollOutcome::Message { position, .. } = subscriber.poll(&mut out).unwrap() {
+            subscriber.acknowledge();
+            delivered.push(position);
+        }
+        if delivered.len() == 3 {
+            break;
+        }
+    }
+    assert_eq!(delivered, [join, join + 1056, join + 2 * 1056]);
+    // Each frame's copy was dropped as a duplicate.
+    let copies = rig.agents.receiver.counters().data_dropped - dropped;
+    assert!(copies >= 3, "{copies} copies dropped");
+    // Old DATA below the join point, replayed.
+    let dropped = rig.agents.receiver.counters().data_dropped;
+    let committed = rig.agents.receiver.counters().data_committed;
+    for offset in [0, 1056] {
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_data(
+            &receiver.sessions,
+            b,
+            source,
+            alias(),
+            &stale_frame(9, offset, 1000),
+            rig.now,
+        );
+    }
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.counters().data_committed, committed);
+    assert!(rig.agents.receiver.counters().data_dropped >= dropped + 2);
+    assert_eq!(subscriber.poll(&mut out).unwrap(), PollOutcome::Pending);
+}
+
+#[test]
+fn a_restarted_unicast_receiver_binds_only_through_a_fresh_challenge() {
+    a_restarted_receiver_binds_only_through_a_fresh_challenge(false);
+}
+
+#[test]
+fn a_restarted_multicast_receiver_binds_only_through_a_fresh_challenge() {
+    a_restarted_receiver_binds_only_through_a_fresh_challenge(true);
+}
+
 /// P2.12 step 3 PR 2: a hook that records the receiver's commits and its
 /// journals' opens and closes.
 /// What a [`CommitRecorder`] saw: the commits, the journals opened and
@@ -5830,6 +5993,98 @@ fn a_different_eos_bound_is_refused_at_the_intake() {
     assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 1));
 }
 
+/// rp-w8: a one-path receiver allocates no path queues and queues nothing.
+#[test]
+fn a_one_path_receiver_has_no_path_queues() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    for _ in 0..200 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() == 4 {
+            break;
+        }
+    }
+    assert_eq!(seen, [0, 1, 2, 3]);
+    assert!(!rig.agents.receiver.role.has_path_queues());
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(
+        (counters.path_queue_drops, counters.path_queue_bypassed),
+        (0, 0)
+    );
+}
+
+/// rp-w8, §8 "Queues and statistics": over two paths, the path queues are
+/// allocated when the later path binds. With one-entry queues, a burst
+/// fills them: each full queue drops only its own path's datagram,
+/// counted, and the other path's copy, or repair once later data shows
+/// the gap, still delivers every message once, in order.
+#[test]
+fn a_full_path_queue_drops_only_its_paths_copy() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        tune: Some(|config: &mut AgentConfig| config.path_queue_datagrams = 1),
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    assert!(rig.agents.receiver.role.has_path_queues());
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    for i in 0..8u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    // Then one message every ten rounds: later data shows the receiver
+    // the gaps the drops left, and repair fills them.
+    let mut seen = Vec::new();
+    let mut next = 8u8;
+    for round in 0..600 {
+        if round % 10 == 0 && next < 16 {
+            let log = rig.log.as_mut().unwrap();
+            let _ = log.publications[0]
+                .append(&[next; 900], AppendOptions::default())
+                .unwrap();
+            next += 1;
+        }
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+        if seen.len() >= 16 {
+            break;
+        }
+    }
+    for _ in 0..50 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            seen.push(message[0]);
+        }
+    }
+    assert_eq!(seen, (0..16).collect::<Vec<u8>>());
+    let counters = rig.agents.receiver.counters();
+    assert!(counters.path_queue_drops > 0, "{counters:?}");
+}
+
 /// An EOS data frame the receive owner does not commit names no bound: a
 /// frame two terms ahead of the rebuild position reads `Received::Ahead`
 /// (beyond the window `{r, r + 1}`) and is dropped, and the lane's real
@@ -5877,4 +6132,103 @@ fn a_heartbeat_past_the_terminal_bound_is_counted() {
         "classified at the bound"
     );
     assert_eq!(after.eos_refused, before.eos_refused);
+}
+
+/// rp-w7c, §8 Liveness: an idle path kept by PATH_HB stays live. Data
+/// flows every second on path A only (path A2 takes no copy: its
+/// selections are skipped, too few bytes for it to leave), for 15 s, past
+/// the path liveness timeout: A2 stays bound on the sender's PATH_HB
+/// alone, which never counts as image evidence (RP-2).
+#[test]
+fn an_idle_path_kept_by_path_heartbeats_stays_live() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents
+        .sender
+        .role
+        .publication_mut(0)
+        .unwrap()
+        .withhold_route(1, 1_000);
+    let heartbeats = rig.agents.receiver.counters().path_heartbeats;
+    for second in 0..15u8 {
+        rig.now += 1_000_000_000;
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[second; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..5 {
+            rig.round(true);
+        }
+        assert_eq!(
+            rig.agents.receiver.role.live_paths(slot),
+            2,
+            "both paths live after {} s",
+            second + 1
+        );
+    }
+    assert!(rig.agents.receiver.counters().path_heartbeats > heartbeats);
+    let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
+    assert_eq!(
+        outbound.path_state(1).map(|state| state.0),
+        Some(true),
+        "A2 never left"
+    );
+}
+
+/// rp-w7c, §8 Join reconciliation: a later path lost (silent past its
+/// liveness timeout) and bound again reconciles as a new later path: the
+/// image's position does not move, and its subscriber reads every message
+/// once, in order, across the loss and the rebind.
+#[test]
+fn a_path_lost_and_bound_again_moves_no_cursor() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let mut seen = Vec::new();
+    let mut next = 0u8;
+    let mut send = |rig: &mut Rig, seen: &mut Vec<u8>| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[next; 100], AppendOptions::default())
+            .unwrap();
+        next += 1;
+        for _ in 0..5 {
+            rig.round(true);
+            while let Some(message) = poll_message(&mut subscriber) {
+                seen.push(message[0]);
+            }
+        }
+    };
+    // The later path is silent: it times out while data flows.
+    for _ in 0..15 {
+        rig.now += 1_000_000_000;
+        send(&mut rig, &mut seen);
+        if rig.agents.receiver.role.live_paths(slot) == 1 {
+            break;
+        }
+    }
+    assert_eq!(rig.agents.receiver.role.live_paths(slot), 1, "B2 lost");
+    // Bound again, at the sender's position now.
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    for _ in 0..4 {
+        send(&mut rig, &mut seen);
+    }
+    assert_eq!(seen, (0..next).collect::<Vec<u8>>());
+    assert!(rig.agents.receiver.role.has_image(slot));
 }

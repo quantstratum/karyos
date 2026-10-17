@@ -153,6 +153,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- Receive path queues (redundant-paths.md section 5; rp-w8). A multi-path
+  image's DATA datagrams and heartbeats wait in their path's queue between
+  the endpoint's receive poll and the image, and the receiver serves the
+  queues round robin after every poll, so a fast path cannot starve a slow
+  one. A full queue drops only that path's datagram, counted in
+  `ReceiverCounters::path_queue_drops`; with no free queue a datagram is
+  delivered at once (`path_queue_bypassed`), and a path never switches
+  between the two while its queue holds datagrams, so its order holds.
+  Each datagram keeps its poll's time as its arrival for the statistics,
+  skew detection and liveness. `AgentConfig::path_queue_datagrams` (256)
+  sizes each queue; the queues take `sessions.max_paths ×
+  path_queue_datagrams × 8 KiB` (8 MiB by default, at most 64 MiB,
+  validated), allocated when the first later path is bound and kept: a
+  single-path receiver allocates none.
 - The live set of a routed publication's paths (redundant-paths.md section
   7, RP-8; rp-w5a). Each path keeps a `path_lag_limit` window (100 ms) of
   bytes selected and skipped: one that skipped anything is `Degraded`, and
