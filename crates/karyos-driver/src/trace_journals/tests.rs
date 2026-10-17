@@ -1727,3 +1727,54 @@ fn a_closed_network_journal_releases_its_network_bytes() {
     assert_eq!(driver.trace_journals.net_bytes, one);
     assert_eq!(driver.trace_journals.bytes, client_bytes);
 }
+
+/// Noting the publisher journals when a subscriber journal ends, and
+/// advancing the notes' drain conditions, run on the drain path and
+/// allocate nothing: the note buffer is reserved when the journal is
+/// inserted, and the progress scratch at start (#257 review).
+#[test]
+fn noting_and_advancing_allocate_nothing() {
+    use karyos_sys::alloc_count::count;
+    let ((), made) = count(|| drop(std::hint::black_box(vec![0_u8; 8])));
+    assert!(made > 0, "the counting allocator counts in this binary");
+    let mut driver = driver(4, 64, 64);
+    let (mut conductor, _publication, publication) = publisher(&mut driver);
+    let mut publishing = journal(&mut driver, &mut conductor, publication);
+    let (_subscription, subscription) = subscribe(&mut driver, &mut conductor);
+    let mut observing = journal(&mut driver, &mut conductor, subscription);
+    append(&mut publishing, [1, 2]);
+    let observed = observing.journal();
+    end(&mut driver, &mut observing);
+    let _ = driver.do_work().unwrap();
+    let journals = &mut driver.trace_journals;
+    let index = journals
+        .slots
+        .iter()
+        .position(|slot| {
+            slot.as_ref()
+                .is_some_and(|held| held.entry.journal == observed)
+        })
+        .unwrap();
+    // Undo the drain's notes, keeping their buffer, to note again alone.
+    let held = journals.slots[index].as_mut().unwrap();
+    held.spare = held.notes.take().unwrap();
+    let ((), made) = count(|| journals.note_end(index));
+    assert_eq!(made, 0, "note_end allocated");
+    let notes = journals.slots[index]
+        .as_ref()
+        .unwrap()
+        .notes
+        .as_ref()
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].drained.is_none());
+    let ((), made) = count(|| journals.advance());
+    assert_eq!(made, 0, "advance allocated");
+    let notes = journals.slots[index]
+        .as_ref()
+        .unwrap()
+        .notes
+        .as_ref()
+        .unwrap();
+    assert!(notes[0].drained.is_some());
+}
