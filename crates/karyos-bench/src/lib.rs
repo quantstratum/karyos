@@ -7,9 +7,12 @@
 //! workloads (offer and poll, claim, a two-thread round trip, concurrent
 //! throughput, open-loop scheduled load, cleaner slots against term
 //! production, and a receive owner committing or comparing frames of an
-//! image), latency histograms from `karyos-trace`, environment labels and a
-//! stored history. Open-loop latency is measured from the scheduled send time
-//! through delivery, so producer delay remains visible. Every report is
+//! image), the copies of network streams on each term backing (a sender
+//! read staging or answering NAKs, the receive owner, image install;
+//! `quantstratum-docs: karyos/design/network-shared-terms.md`, N-5), latency
+//! histograms from `karyos-trace`, environment labels and a stored history.
+//! Open-loop latency is measured from the scheduled send time through
+//! delivery, so producer delay remains visible. Every report is
 //! labelled with its environment class (E1 to E4 of manifest 6.3) and
 //! verdict, such as `E4 non-decision` ([`mod@env`]): nothing here establishes
 //! a SPEC.md §12 target, which needs an eligible physical host (SPEC.md
@@ -44,10 +47,11 @@ pub mod preflight;
 pub mod report;
 pub mod samples;
 pub mod stats;
+mod terms;
 pub mod wire;
 pub mod workloads;
 
-pub use workloads::{BenchError, Config, Measurement, Workload, run};
+pub use workloads::{Backing, BackingRefused, BenchError, Config, Measurement, Workload, run};
 
 /// The default configurations: each workload at the message sizes of the
 /// design, with `iterations` measured and a tenth of them as warm-up.
@@ -66,6 +70,9 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
                 warmup,
                 term_length,
                 target_rate: None,
+                nak_frames: None,
+                lanes: None,
+                backing: Backing::Heap,
             });
         }
     }
@@ -79,6 +86,35 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
                 warmup,
                 term_length,
                 target_rate: None,
+                nak_frames: None,
+                lanes: None,
+                backing: Backing::Heap,
+            });
+        }
+    }
+    // The receive owner's write on every backing, with one full frame of
+    // the default MTU (network-shared-terms.md, N-5).
+    for backing in Backing::ALL
+        .into_iter()
+        .filter(|backing| available(*backing))
+    {
+        let messages: &[usize] = if backing == Backing::Heap {
+            &[1376]
+        } else {
+            &[32, 256, 1024, 1376]
+        };
+        for &message in messages {
+            configs.push(Config {
+                workload: Workload::Receive,
+                message,
+                publishers: 1,
+                iterations,
+                warmup,
+                term_length,
+                target_rate: None,
+                nak_frames: None,
+                lanes: None,
+                backing,
             });
         }
     }
@@ -92,6 +128,9 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
                 warmup,
                 term_length,
                 target_rate: None,
+                nak_frames: None,
+                lanes: None,
+                backing: Backing::Heap,
             });
         }
     }
@@ -104,6 +143,9 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
             warmup,
             term_length,
             target_rate: None,
+            nak_frames: None,
+            lanes: None,
+            backing: Backing::Heap,
         });
     }
     for message in [32, 256, 1024] {
@@ -115,6 +157,9 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
             warmup,
             term_length,
             target_rate: Some(10_000),
+            nak_frames: None,
+            lanes: None,
+            backing: Backing::Heap,
         });
     }
     for message in [32, 256, 1024] {
@@ -127,6 +172,9 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
             warmup: (iterations / 10).max(warmup),
             term_length,
             target_rate: None,
+            nak_frames: None,
+            lanes: None,
+            backing: Backing::Heap,
         });
     }
     // Between processes: only where the driver's IPC mode exists.
@@ -140,6 +188,9 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
                 warmup,
                 term_length,
                 target_rate: None,
+                nak_frames: None,
+                lanes: None,
+                backing: Backing::Region,
             });
         }
         configs.push(Config {
@@ -150,7 +201,80 @@ pub fn defaults(iterations: u64) -> Vec<Config> {
             warmup,
             term_length,
             target_rate: None,
+            nak_frames: None,
+            lanes: None,
+            backing: Backing::Region,
         });
+    }
+    configs.extend(network_terms(iterations, warmup));
+    configs
+}
+
+/// Whether `backing` exists on this target: a region only on Linux.
+fn available(backing: Backing) -> bool {
+    backing != Backing::Region || cfg!(target_os = "linux")
+}
+
+/// The sender and image workloads of network streams over shared terms
+/// (`quantstratum-docs: karyos/design/network-shared-terms.md`, N-5) on
+/// every backing they run on here: unfragmented messages up to one full
+/// frame at the default MTU, and for `sender-read` also 8 KiB and 64 KiB
+/// messages, fragmented, over 1 MiB terms. `sender-nak` reads ranges of 1,
+/// 16 and 256 frames over 1 MiB terms, so a whole range fits the
+/// publication's window before it is registered. `image-install` runs a
+/// hundredth of the iterations, at least ten.
+fn network_terms(iterations: u64, warmup: u64) -> Vec<Config> {
+    let config = |workload, message, term_length, backing| Config {
+        workload,
+        message,
+        publishers: 1,
+        iterations,
+        warmup,
+        term_length,
+        target_rate: None,
+        nak_frames: None,
+        lanes: None,
+        backing,
+    };
+    let mut configs = Vec::new();
+    for backing in Backing::ALL
+        .into_iter()
+        .filter(|backing| available(*backing))
+    {
+        for message in [32, 256, 1024, 1376] {
+            configs.push(config(Workload::SenderRead, message, 64 * 1024, backing));
+        }
+        for message in [8 * 1024, 64 * 1024] {
+            configs.push(config(Workload::SenderRead, message, 1024 * 1024, backing));
+        }
+        for nak_frames in [1, 16, 256] {
+            for message in [32, 256, 1024, 1376] {
+                configs.push(Config {
+                    nak_frames: Some(nak_frames),
+                    ..config(Workload::SenderNak, message, 1024 * 1024, backing)
+                });
+            }
+        }
+    }
+    // An install of four 64 MiB lanes takes tens of milliseconds on some
+    // hosts: a hundredth of the iterations, at least ten.
+    let installs = (iterations / 100).max(10);
+    for backing in Workload::ImageInstall
+        .backings()
+        .iter()
+        .copied()
+        .filter(|backing| available(*backing))
+    {
+        for lanes in [1, 4] {
+            for term_length in [64 * 1024, 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024] {
+                configs.push(Config {
+                    lanes: Some(lanes),
+                    iterations: installs,
+                    warmup: (installs / 10).max(1),
+                    ..config(Workload::ImageInstall, 0, term_length, backing)
+                });
+            }
+        }
     }
     configs
 }

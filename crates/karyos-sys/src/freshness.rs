@@ -463,6 +463,13 @@ pub const TERMINAL_FRESHNESS_EXHAUSTED: u64 = 2;
 /// Terminal close reason: a loss below the feeder's frontier, which breaks
 /// the invariant the readers' classification rests on.
 pub const TERMINAL_BELOW_FRONTIER: u64 = 3;
+/// Terminal close reason: the view's image retired, so no value of it
+/// changes again (conflated-network-images.md (a)). Published with an
+/// empty interval: it marks no value stale.
+pub const TERMINAL_IMAGE_RETIRED: u64 = 4;
+/// Terminal close reason: the view's feeder could not read on (its
+/// subscription failed): the view closes, the image stays.
+pub const TERMINAL_FEEDER_LOST: u64 = 5;
 
 /// A terminal cell's states.
 const EMPTY: u64 = 0;

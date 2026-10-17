@@ -508,8 +508,10 @@ pub enum AgentCommand<O: SocketOps> {
         /// The journal the conductor created.
         journal: karyos_protocol::trace_hook::NetJournal,
     },
-    /// Close the journal of `lane` of `publication`. Answer
-    /// [`AgentEvent::NetworkJournalClosed`].
+    /// Close journal `number`, of `lane` of `publication`. Answer
+    /// [`AgentEvent::NetworkJournalClosed`]. The number, not the
+    /// publication and lane, names the journal, so a stale close never
+    /// answers a later journal of a reinstalled identity.
     CloseNetworkJournal {
         /// The reply's slot.
         reply: Reservation,
@@ -517,6 +519,8 @@ pub enum AgentCommand<O: SocketOps> {
         publication: karyos_protocol::trace_hook::PublicationIdentity,
         /// The lane.
         lane: karyos_protocol::frame::Lane,
+        /// The journal number.
+        number: u64,
     },
     /// Receiver only: stop subscribing `stream_id` on `endpoint`: no new
     /// image is challenged for it, and its images retire. Answer
@@ -687,8 +691,8 @@ pub enum AgentEvent<O: SocketOps> {
         /// The journal.
         journal: karyos_protocol::trace_hook::NetJournal,
     },
-    /// The agent closed the journal; `facts` is `None` when it had none
-    /// open for the publication and lane.
+    /// The agent closed journal `number`; `facts` is `None` when it had
+    /// no such journal.
     NetworkJournalClosed {
         /// The agent.
         agent: AgentKind,
@@ -696,6 +700,8 @@ pub enum AgentEvent<O: SocketOps> {
         publication: karyos_protocol::trace_hook::PublicationIdentity,
         /// The lane.
         lane: karyos_protocol::frame::Lane,
+        /// The journal number.
+        number: u64,
         /// Its start and boundary.
         facts: Option<net_trace::JournalFacts>,
     },
