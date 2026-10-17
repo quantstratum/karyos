@@ -17,6 +17,7 @@ use crate::sessions::receive::SlotRef;
 
 /// The identity a trace journal names for the publication `identity`
 /// sends under `alias` (§5).
+#[must_use]
 pub(crate) fn identity(identity: &Identity, alias: Alias) -> PublicationIdentity {
     PublicationIdentity {
         driver: identity.driver_id,
@@ -191,6 +192,7 @@ impl Network {
 
     /// The active publication `registration`, as its sender journals see
     /// it.
+    #[must_use]
     pub(crate) fn traced_publication(&self, registration: u64) -> Option<Traced> {
         self.publications
             .iter()
@@ -207,6 +209,7 @@ impl Network {
     }
 
     /// The registrations of the active publications.
+    #[must_use]
     pub(crate) fn active_publications(&self) -> Vec<u64> {
         self.publications
             .iter()
@@ -216,6 +219,7 @@ impl Network {
     }
 
     /// The installed image `slot`, as its receiver journals see it.
+    #[must_use]
     pub(crate) fn traced_image(&self, slot: SlotRef) -> Option<Traced> {
         self.net_images
             .iter()
@@ -233,6 +237,7 @@ impl Network {
     }
 
     /// The slots of the installed images.
+    #[must_use]
     pub(crate) fn installed_images(&self) -> Vec<SlotRef> {
         self.net_images.iter().map(|image| image.slot).collect()
     }

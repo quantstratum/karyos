@@ -67,6 +67,17 @@ struct Open {
     close_posted: bool,
 }
 
+/// A publication's refused network journals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refused {
+    pub(crate) publication: PublicationIdentity,
+    pub(crate) count: u64,
+    /// The publication closed or its image retired: its place can be
+    /// reused once no mirror entry names it (a report can no longer be
+    /// built from its journals).
+    pub(crate) gone: bool,
+}
+
 /// The hooks' state, the open network journals and the refused counts.
 pub(crate) struct NetworkTracing {
     /// Whether the sender and the receiver have a hook.
@@ -76,7 +87,7 @@ pub(crate) struct NetworkTracing {
     open: Vec<Open>,
     /// Refused journals per publication, for the in-process report (§5):
     /// at most its reserved capacity.
-    refused: Vec<(PublicationIdentity, u64)>,
+    refused: Vec<Refused>,
     /// Refusals of publications the full table could not hold.
     untracked: u64,
 }
@@ -141,11 +152,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         side: NetSide,
         hook: Option<Box<dyn NetworkTraceHook>>,
     ) {
-        for _ in self.network.open.iter().filter(|open| open.side == side) {
+        // A journal whose close is posted keeps its entry: the close, ahead
+        // in the ring, answers its facts.
+        let unhooked = |open: &Open| open.side == side && !open.close_posted;
+        for _ in self.network.open.iter().filter(|open| unhooked(open)) {
             self.counters
                 .add(crate::counters::Event::NetworkTraceJournalsUnhooked, 1);
         }
-        self.network.open.retain(|open| open.side != side);
+        self.network.open.retain(|open| !unhooked(open));
         if let Some(hooked) = self.network.hooked.get_mut(slot(side)) {
             *hooked = hook.is_some();
         }
@@ -194,6 +208,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             }
         }
+    }
+
+    /// The network closed: its agents dropped their hooks and journals, so
+    /// every open network journal is `Lost`, and no hook is set any more.
+    pub(crate) fn close_network_tracing(&mut self) {
+        for _ in &self.network.open {
+            self.counters
+                .add(crate::counters::Event::NetworkTraceJournalsUnhooked, 1);
+        }
+        self.network.open.clear();
+        self.network.hooked = [false, false];
+        self.network.pending = [None, None];
     }
 
     /// One cycle of the network journals' glue: pending hooks go to their
@@ -247,7 +273,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 self.open_publication_journals(registration);
             }
             TraceEvent::PublicationRemoved { traced } => {
-                self.forget_network_publication(&traced);
+                // Its lanes still open were closed by the sender, without
+                // facts: `Lost`.
+                self.network
+                    .open
+                    .retain(|open| !(open.side == NetSide::Sender && open.publication == traced));
+                self.network_publication_gone(&traced);
             }
         }
     }
@@ -303,11 +334,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 Handed::Posted => {}
                 Handed::Busy(journal) => self.refuse_handed(journal),
                 // The journal dropped with the command: its writer closed,
-                // with no start, so it is `Lost`.
+                // with no start. Counted as refused, the safe direction.
                 Handed::Gone => {
                     if let Some(index) = self.network.position(number) {
                         self.network.open.swap_remove(index);
                     }
+                    self.refuse_network_journal(traced.publication);
                 }
             }
         }
@@ -317,12 +349,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// start, so it is `Lost`) and counts as refused (§5), so no trace of
     /// its publication is reported `Complete`.
     fn refuse_handed(&mut self, journal: NetJournal) {
-        if let Some(index) = self.network.position(journal.number) {
-            self.network.open.swap_remove(index);
-        }
         let publication = journal.publication;
+        let index = self.network.position(journal.number);
         drop(journal);
-        self.refuse_network_journal(publication);
+        // One a hook change already counted (unhooked) is not counted again.
+        if let Some(index) = index {
+            self.network.open.swap_remove(index);
+            self.refuse_network_journal(publication);
+        }
     }
 
     /// The sender journals of publication `registration` to close before
@@ -353,22 +387,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = &self.net else {
             return;
         };
-        let mut lost = Vec::new();
-        for open in self
-            .network
-            .open
-            .iter_mut()
-            .filter(|open| open.image == Some(image) && !open.close_posted)
-        {
-            open.close_posted = true;
-            if !net.post_close_journal(open.side, open.publication, open.lane, open.journal) {
-                lost.push(open.journal);
+        let mut index = 0;
+        while let Some(open) = self.network.open.get_mut(index) {
+            if open.image == Some(image) && !open.close_posted {
+                open.close_posted = true;
+                if !net.post_close_journal(open.side, open.publication, open.lane, open.journal) {
+                    self.network.open.swap_remove(index);
+                    continue;
+                }
             }
+            index = index.saturating_add(1);
         }
-        for journal in lost {
-            if let Some(index) = self.network.position(journal) {
-                self.network.open.swap_remove(index);
-            }
+        if let Some(traced) = net.traced_image(image) {
+            self.network_publication_gone(&traced.publication);
         }
     }
 
@@ -379,16 +410,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.network
             .refused
             .iter()
-            .find(|(refused, _)| refused == publication)
-            .map_or(self.network.untracked, |(_, count)| *count)
+            .find(|refused| refused.publication == *publication)
+            .map_or(self.network.untracked, |refused| refused.count)
     }
 
-    /// Drops the refused count of `publication` (control path): it closed,
-    /// or its image retired, so no report can still need it.
-    pub(crate) fn forget_network_publication(&mut self, publication: &PublicationIdentity) {
-        self.network
+    /// `publication` closed, or its image retired (control path). Its
+    /// refused count stays while a mirror entry names the publication, so
+    /// a report built after the close still sees it (ACS 16668); only then
+    /// can its place be reused.
+    pub(crate) fn network_publication_gone(&mut self, publication: &PublicationIdentity) {
+        if let Some(refused) = self
+            .network
             .refused
-            .retain(|(refused, _)| refused != publication);
+            .iter_mut()
+            .find(|refused| refused.publication == *publication)
+        {
+            refused.gone = true;
+        }
     }
 
     /// Opens the network journal of `side` for `lane` of `publication`
@@ -530,18 +568,34 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let index = network
             .refused
             .iter()
-            .position(|(found, _)| *found == publication);
+            .position(|found| found.publication == publication);
+        let fresh = Refused {
+            publication,
+            count: 0,
+            gone: false,
+        };
         let index = match index {
             Some(index) => Some(index),
             // Within the capacity reserved at start: no allocation.
             None if network.refused.len() < network.refused.capacity() => {
-                network.refused.push((publication, 0));
+                network.refused.push(fresh);
                 network.refused.len().checked_sub(1)
             }
-            None => None,
+            // Full: the place of a gone publication no mirror entry names
+            // any more.
+            None => {
+                let journals = &self.trace_journals;
+                let reusable = network.refused.iter().position(|refused| {
+                    refused.gone && !journals.names_network(&refused.publication)
+                });
+                if let Some(slot) = reusable.and_then(|index| network.refused.get_mut(index)) {
+                    *slot = fresh;
+                }
+                reusable
+            }
         };
         let count = match index.and_then(|index| network.refused.get_mut(index)) {
-            Some((_, count)) => count,
+            Some(refused) => &mut refused.count,
             None => &mut network.untracked,
         };
         match count.checked_add(1) {

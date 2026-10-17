@@ -3455,6 +3455,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // them stays in a close acknowledgement.
         shutdown.guard_senders_released = self.deregister_released_guards();
         self.net = None;
+        // The agents stopped with their hooks: no network journal stays open.
+        self.close_network_tracing();
         Some(shutdown)
     }
 

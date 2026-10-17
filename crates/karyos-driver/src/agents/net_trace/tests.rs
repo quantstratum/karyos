@@ -278,6 +278,8 @@ mod sender {
                 (identity(), Lane::ZERO, 0, 0)
             );
         }
+        // Another journal's number untraces nothing (#332 review).
+        assert_eq!(path.untrace(0, 2), None);
         let facts = path.untrace(0, 1).unwrap();
         assert_eq!(facts.start, 0);
         assert_eq!(facts.boundary, path.readers()[0].position());

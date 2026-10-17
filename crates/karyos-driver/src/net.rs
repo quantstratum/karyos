@@ -452,7 +452,15 @@ impl Network {
             subscription_refusals: 0,
             net_images: Vec::with_capacity(config.agents.sessions.max_images),
             image_events: Vec::with_capacity(config.agents.sessions.max_images),
-            trace_events: Vec::with_capacity(config.agents.publications),
+            // An answer per lane of every publication and image at once.
+            trace_events: Vec::with_capacity(
+                config
+                    .agents
+                    .publications
+                    .checked_add(config.agents.sessions.max_images)
+                    .and_then(|count| count.checked_mul(usize::from(Lane::COUNT)))
+                    .unwrap_or(config.agents.publications),
+            ),
             images_unexposed: 0,
             #[cfg(test)]
             reopened: 0,
@@ -1241,8 +1249,9 @@ impl Network {
         else {
             return false;
         };
-        // Its sender journals close first, in the same ring.
-        entry.trace_closes = trace_closes;
+        // Its sender journals close first, in the same ring; a repeated
+        // removal adds to the closes still pending, never replaces them.
+        entry.trace_closes.extend(trace_closes);
         if entry.state == NetworkPublicationState::Refused {
             // Nothing reached the sender; its endpoint is released.
             self.publications
