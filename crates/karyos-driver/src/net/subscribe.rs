@@ -115,7 +115,7 @@ impl EmbeddedDriver<HeapTerms> {
         stream_id: i32,
         channel: &UdpConfig,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, None)
+        self.subscribe_network(stream_id, channel, (None, None))
     }
 
     /// [`EmbeddedDriver::add_network_subscription`] whose images name the
@@ -138,14 +138,37 @@ impl EmbeddedDriver<HeapTerms> {
         channel: &UdpConfig,
         identity: ReceiverIdentity,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, Some(identity))
+        self.subscribe_network(stream_id, channel, (Some(identity), None))
+    }
+
+    /// [`EmbeddedDriver::add_network_subscription`] with a conflated view
+    /// of `lane` of its images (conflated-network-images.md (a)): the
+    /// receiver gates that lane's seals through the view's barrier mailbox.
+    /// Driver-internal: a URI or public form is the owner's (item 7).
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_network_subscription`], and
+    /// [`DriverError::ConflationMismatch`] for a stream already subscribed
+    /// on the endpoint with another conflated lane, or with none.
+    #[allow(
+        dead_code,
+        reason = "driver-internal until the conductor builds the view (C4)"
+    )]
+    pub(crate) fn add_network_subscription_conflated(
+        &mut self,
+        stream_id: i32,
+        channel: &UdpConfig,
+        lane: karyos_sys::frame::Lane,
+    ) -> Result<NetworkSubscription, DriverError> {
+        self.subscribe_network(stream_id, channel, (None, Some(lane)))
     }
 
     fn subscribe_network(
         &mut self,
         stream_id: i32,
         channel: &UdpConfig,
-        identity: Option<ReceiverIdentity>,
+        options: (Option<ReceiverIdentity>, Option<karyos_sys::frame::Lane>),
     ) -> Result<NetworkSubscription, DriverError> {
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
         // Redundant paths need sockets isolated per interface; without
@@ -162,7 +185,7 @@ impl EmbeddedDriver<HeapTerms> {
             &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
             channel.reliable,
-            identity,
+            options,
         )
     }
 

@@ -507,7 +507,13 @@ impl Outbound {
         let report = routed.sender.serve(&mut lent, &mut gate, budget);
         let caught = routed.sender.catch_up(&mut lent, &mut gate);
         work = work.checked_add(caught.submitted).ok_or(overflow.clone())?;
-        if report.failure.is_some() || caught.failure.is_some() {
+        // Interim until rp-w4b1b's per-route control path: any route's
+        // failure marks the publication as needing a reset.
+        let failed = routed.sender.take_failures();
+        if report.failure.is_some()
+            || caught.failure.is_some()
+            || failed.iter().any(Option::is_some)
+        {
             self.needs_reset = true;
         }
         let Some(routed) = self.routed.as_deref_mut() else {

@@ -183,6 +183,9 @@ struct Image {
     /// is reclaimed.
     reclaimed: Reservation,
     state: State,
+    /// The conflated lane and the link its view shares with the receiver's
+    /// seal gate (conflated-network-images.md (b)), once installed.
+    freshness: Option<(Lane, karyos_sys::freshness::FreshnessLink)>,
 }
 
 /// The conductor's image table.
@@ -266,6 +269,24 @@ impl ImageTable {
         })
     }
 
+    /// The conflated lane of the image installed at `slot` and the link
+    /// its view shares with the receiver's seal gate; `None` without a
+    /// conflated view.
+    #[must_use]
+    pub fn freshness(
+        &self,
+        slot: SlotRef,
+    ) -> Option<(Lane, &karyos_sys::freshness::FreshnessLink)> {
+        self.images
+            .iter()
+            .find_map(|image| match (&image.state, &image.freshness) {
+                (State::Installed(installed), Some((lane, link))) if *installed == slot => {
+                    Some((*lane, link))
+                }
+                _ => None,
+            })
+    }
+
     /// Serves every session event the receiver posted, then reclaims the
     /// retired images no loan holds any more, reporting image events to
     /// `on_event`; returns how many events it served.
@@ -337,20 +358,23 @@ impl ImageTable {
                     on_event(event);
                 }
             }
-            SessionEvent::ImageInstalled { slot, installed } => {
-                match self.images.iter_mut().find(|image| image.slot == slot) {
-                    Some(image) if image.state == State::Offered => {
-                        image.state = State::Installed(installed);
-                        self.counters.bump(|c| &mut c.installed);
-                        on_event(ImageEvent::Installed {
-                            slot: installed,
-                            endpoint: image.endpoint,
-                            identity: image.identity,
-                        });
-                    }
-                    _ => self.counters.bump(|c| &mut c.stale_replies),
+            SessionEvent::ImageInstalled {
+                slot,
+                installed,
+                freshness,
+            } => match self.images.iter_mut().find(|image| image.slot == slot) {
+                Some(image) if image.state == State::Offered => {
+                    image.state = State::Installed(installed);
+                    image.freshness = freshness;
+                    self.counters.bump(|c| &mut c.installed);
+                    on_event(ImageEvent::Installed {
+                        slot: installed,
+                        endpoint: image.endpoint,
+                        identity: image.identity,
+                    });
                 }
-            }
+                _ => self.counters.bump(|c| &mut c.stale_replies),
+            },
             SessionEvent::RetireImage { slot } => {
                 let found = self
                     .images
@@ -433,6 +457,7 @@ impl ImageTable {
             charge,
             reclaimed,
             state,
+            freshness: None,
         };
         // Then the budget, before any allocation.
         let Some((charge, total)) = self.charge(term, joins).and_then(|charge| {

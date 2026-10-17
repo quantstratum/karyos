@@ -504,32 +504,96 @@ fn a_denied_lowest_copy_holds_the_lane() {
     assert_eq!(f.routes[1].socket.send_calls(), 1);
 }
 
-/// #317 review P2: a failure after another route submitted the head still
-/// debits it, then stops the call.
+/// #317 re-review P2: with several routes a failure stops only its route
+/// (a failure stops only that half): the head another route submitted is
+/// debited, the failed route is out for the call with its failure kept,
+/// and the other route serves every lane, on every call.
 #[test]
-fn a_failure_after_a_submitted_copy_still_debits() {
+fn a_failed_route_stops_alone() {
     let mut f = Fixture::new(&[100, 100], 100, 2);
     f.stage(0, 0, 100, 100, &[0, 1]);
     f.stage(1, 0, 100, 100, &[0, 1]);
-    f.routes[0].accept(1);
+    f.routes[0].accept(2);
     f.routes[1]
         .socket
         .push_send(SendResult::Error(crate::sockets::ops::Errno::BADF));
     let report = f.serve(&mut Gate::default(), 1000);
-    assert_eq!(served(&report, 2), [100, 0]);
+    assert_eq!(served(&report, 2), [100, 100]);
+    assert_eq!(report.failure, None);
     assert_eq!(f.sender.debited(0), Some(0));
+    assert_eq!(f.routes[0].socket.send_calls(), 2);
+    assert_eq!(f.routes[1].socket.send_calls(), 1, "out for the call");
+    let failures = f.sender.take_failures();
     assert!(
         matches!(
-            report.failure,
+            failures[1],
             Some(SenderFailure::Backend {
                 lane: 0,
                 stop: FlushStop::Failed(_)
             })
         ),
-        "{:?}",
-        report.failure
+        "{failures:?}"
     );
-    assert_eq!(f.routes[0].socket.send_calls(), 1, "lane 1 is not tried");
+    assert_eq!(failures[0], None);
+    assert_eq!(f.sender.take_failures(), [None; MAX_ROUTES]);
+    // The next call: route 1's half stays stopped until its reset (its
+    // queues read as needing one), and route 0 still serves.
+    f.stage(0, 128, 100, 100, &[0, 1]);
+    f.routes[0].accept(1);
+    let report = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(served(&report, 2), [100, 0]);
+    assert_eq!(report.failure, None);
+    assert_eq!(f.routes[1].socket.send_calls(), 1);
+}
+
+/// #317 re-review P1: a detached route (no TX half lent) is out for the
+/// call: lane 0's position held only there leaves lane 0 ineligible, and
+/// lane 1 is served on route 1 with no work burnt.
+#[test]
+fn a_detached_route_is_out_for_the_call() {
+    let mut f = Fixture::new(&[100, 100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0]);
+    f.sender.skipped(1);
+    f.stage(1, 0, 100, 100, &[1]);
+    f.sender.skipped(0);
+    f.routes[1].accept(1);
+    let Fixture { routes, sender, .. } = &mut f;
+    let mut lent = Detach(routes, 0);
+    let report = sender.serve(
+        &mut lent,
+        &mut Gate::default(),
+        Budget {
+            work: 64,
+            bytes: 1000,
+        },
+    );
+    assert_eq!(served(&report, 2), [0, 100]);
+    assert_eq!(report.drr.lanes[0].failed, 0);
+    assert!(
+        matches!(report.drr.stop, Stop::Idle),
+        "{:?}",
+        report.drr.stop
+    );
+}
+
+/// #317 re-review P3: a socket that would block in `catch_up` takes no
+/// more flushes in the call, on any lane.
+#[test]
+fn a_blocked_route_is_out_for_the_catch_up() {
+    let mut f = Fixture::new(&[100, 100], 100, 2);
+    f.stage(0, 0, 100, 100, &[0, 1]);
+    f.stage(1, 0, 100, 100, &[0, 1]);
+    f.routes[1].accept(2);
+    let _ = f.serve(&mut Gate::default(), 1000);
+    assert_eq!(
+        (f.sender.pending(0, 0), f.sender.pending(1, 0)),
+        (Some(1), Some(1))
+    );
+    let calls = f.routes[0].socket.send_calls();
+    let mut gate = Gate::default();
+    let Fixture { routes, sender, .. } = &mut f;
+    assert_eq!(sender.catch_up(&mut Lent(routes), &mut gate).submitted, 0);
+    assert_eq!(f.routes[0].socket.send_calls(), calls + 1);
 }
 
 /// #317 review P2: a cancel goes on past a route's error and returns the
@@ -623,10 +687,12 @@ fn a_catch_up_failure_is_reported() {
     let Fixture { routes, sender, .. } = &mut f;
     let done = sender.catch_up(&mut Lent(routes), &mut gate);
     assert_eq!(done.submitted, 0);
+    // One route of two: kept for its control path, not a stop.
+    assert_eq!(done.failure, None);
+    let failures = f.sender.take_failures();
     assert!(
-        matches!(done.failure, Some(SenderFailure::Backend { lane: 0, .. })),
-        "{:?}",
-        done.failure
+        matches!(failures[0], Some(SenderFailure::Backend { lane: 0, .. })),
+        "{failures:?}"
     );
 }
 
@@ -656,6 +722,20 @@ fn a_copy_out_of_order_is_refused() {
         if !outcome.more {
             break;
         }
+    }
+}
+
+/// The routes with one of them detached.
+struct Detach<'a>(&'a mut [Route], usize);
+
+impl Routes for Detach<'_> {
+    type Backend = SocketsTx<ScriptedSocket>;
+
+    fn route(&mut self, route: usize) -> Option<&mut Self::Backend> {
+        if route == self.1 {
+            return None;
+        }
+        self.0.get_mut(route).map(|route| &mut route.tx)
     }
 }
 
@@ -752,12 +832,16 @@ fn one_route_reports_every_outcome_as_the_lane_sender() {
             replies: vec![reply].into(),
             flushes: 0,
         };
-        let a = plain.serve(&mut backend, &mut Gate::default(), budget);
+        let mut gate_a = Gate::default();
+        let a = plain.serve(&mut backend, &mut gate_a, budget);
         let mut routes = Faked(vec![Fake {
             replies: vec![reply].into(),
             flushes: 0,
         }]);
-        let b = routed.serve(&mut routes, &mut Gate::default(), budget);
+        let mut gate_b = Gate::default();
+        let b = routed.serve(&mut routes, &mut gate_b, budget);
+        assert_eq!(gate_a.left, gate_b.left, "{reply:?}");
+        assert_eq!(routed.take_failures(), [None; MAX_ROUTES], "{reply:?}");
         assert_eq!(a.failure, b.failure, "{reply:?}");
         assert_eq!(a.drr.stop, b.drr.stop, "{reply:?}");
         assert_eq!(a.inactive, b.inactive, "{reply:?}");
@@ -768,6 +852,11 @@ fn one_route_reports_every_outcome_as_the_lane_sender() {
                 "{reply:?} lane {lane}"
             );
             assert_eq!(plain.pending(lane), routed.pending(lane, 0), "{reply:?}");
+            assert_eq!(
+                plain.needs_control(lane),
+                routed.needs_control(lane, 0),
+                "{reply:?}"
+            );
         }
     }
 }
