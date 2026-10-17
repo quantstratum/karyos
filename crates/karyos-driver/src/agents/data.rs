@@ -70,10 +70,12 @@ use karyos_protocol::lanes::drr::{Budget, DrrConfig};
 use karyos_protocol::network::{Alias, Identity, Lanes, MAX_LANES, Nak, NakReply};
 use karyos_sys::log_buffer::{LogBuffer, ReadError, ReadOrigin, ReadOutcome, SenderRead};
 use karyos_sys::sizing::align_frame;
+use karyos_sys::term_bytes::HeapTerms;
 
 use super::net_trace::{TracedLane, traced_frames, traced_frames_per_datagram};
 use super::repair::{NakOutcome, RepairConfig, RepairConfigError, RepairPath};
 use super::{AgentError, AgentKind, EndpointId};
+use crate::embedded::StreamTerms;
 use crate::guard_gate::{GateError, GateHead, GateLane, GuardGate};
 use crate::membership::{Admission, Limit, Membership};
 use crate::repair::admission::Requester;
@@ -84,8 +86,8 @@ use karyos_protocol::trace_hook::{NetPickup, NetworkTraceHook};
 /// Membership timer actions per cycle.
 const MEMBERSHIP_TIMER_ACTIONS: u32 = 16;
 
-/// A publication's lane reader.
-pub type LaneReader = SenderRead<Arc<LogBuffer>>;
+/// A publication's lane reader, over the driver's term backing.
+pub type LaneReader<T = HeapTerms> = SenderRead<Arc<LogBuffer<T>>>;
 
 /// Datagrams staged per lane queue at once.
 const STAGED_PER_LANE: u16 = 8;
@@ -238,11 +240,11 @@ impl OutboundCounters {
 
 /// One publication's data path toward its channel destination.
 #[derive(Debug)]
-pub struct Outbound {
+pub struct Outbound<T: StreamTerms = HeapTerms> {
     endpoint: EndpointId,
     alias: Alias,
     destination: SocketAddr,
-    readers: Vec<LaneReader>,
+    readers: Vec<LaneReader<T>>,
     reliable: bool,
     /// The largest datagram, the channel MTU.
     mtu: usize,
@@ -365,7 +367,7 @@ pub enum OutboundError {
 /// A sender that goes leaves its readers' cells not counting for the
 /// connection before they are released (SPEC.md §4): the publication is
 /// unconnected from then on, whatever its receivers did.
-impl Drop for Outbound {
+impl<T: StreamTerms> Drop for Outbound<T> {
     fn drop(&mut self) {
         for reader in &self.readers {
             let _ = reader.set_receivers_live(false);
@@ -373,7 +375,7 @@ impl Drop for Outbound {
     }
 }
 
-impl Outbound {
+impl<T: StreamTerms> Outbound<T> {
     /// The data path of the publication `alias` on `endpoint` toward
     /// `destination`, reading `readers` (one per lane, in lane order) into
     /// datagrams of at most `mtu` bytes, served with `quanta`. Allocates
@@ -386,7 +388,7 @@ impl Outbound {
         endpoint: EndpointId,
         alias: Alias,
         destination: SocketAddr,
-        readers: Vec<LaneReader>,
+        readers: Vec<LaneReader<T>>,
         quanta: &Lanes<u64>,
         mtu: u32,
         reliable: bool,
@@ -479,13 +481,13 @@ impl Outbound {
 
     /// The readers, in lane order.
     #[must_use]
-    pub fn readers(&self) -> &[LaneReader] {
+    pub fn readers(&self) -> &[LaneReader<T>] {
         &self.readers
     }
 
     /// The readers, mutable (tests).
     #[cfg(test)]
-    pub(crate) fn readers_mut(&mut self) -> &mut [LaneReader] {
+    pub(crate) fn readers_mut(&mut self) -> &mut [LaneReader<T>] {
         &mut self.readers
     }
 

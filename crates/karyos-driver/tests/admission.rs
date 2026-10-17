@@ -1688,3 +1688,121 @@ fn a_tool_reads_the_diagnostics_the_driver_writes() {
     }
     assert_eq!(tool.loss_report().scan(&mut 0, |_, _| {}).delivered, 1);
 }
+
+/// Resolution 9 (network streams over shared terms): a `Fetch` of a
+/// `Held` grant whose stream is retiring is served, since the grant keeps
+/// the stream and its mapping (`free_retired_streams`); the fetched
+/// subscriber delivers the backlog to the removal's seal and then reports
+/// closed there, never open. An image's `RetireImage` seals its lanes the
+/// same way, with `SealReason::ImageRetired`.
+#[test]
+fn a_held_grant_fetched_on_a_retiring_stream_reports_closed_at_the_seal() {
+    let dir = dir("retiring-fetch");
+    let mut driver = system_driver(&dir);
+    let stream = driver
+        .add_stream(StreamConfig {
+            allow_unconnected: true,
+            ..shared_stream_config()
+        })
+        .unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let _ = client
+        .add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    let mut done: Vec<Completion> = Vec::new();
+    let start = Instant::now();
+    while done.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    // One message, then the stream is removed while the grant is held.
+    let mut publication: ClientPublication<SharedTerms> = driver.publication(stream).unwrap();
+    let start = Instant::now();
+    while !matches!(
+        publication.offer(b"backlog").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ) {
+        assert!(start.elapsed() < Duration::from_secs(5), "never accepted");
+        let _ = driver.do_work().unwrap();
+    }
+    drop(publication);
+    driver.remove_stream(stream).unwrap();
+    let _ = driver.do_work().unwrap();
+    assert_eq!(
+        driver.stream_state(stream).unwrap(),
+        karyos_driver::StreamState::Retiring
+    );
+    let socket = client.admission_socket().unwrap();
+    let fetch = encode(&Message::Fetch { fetch: 1, key: 1 });
+    assert_eq!(ipc::send(socket, &fetch, None).unwrap(), Sent::Sent);
+    let (manifest, _) = next_message(&mut driver, socket);
+    let Message::Manifest { records, .. } = manifest else {
+        panic!("a fetch on a retiring stream is served, got {manifest:?}");
+    };
+    let [record] = records[..] else {
+        panic!("one record");
+    };
+    let karyos_protocol::admission::Capability::RequiredSubscriber { cell } = record.capability
+    else {
+        panic!("a required subscriber record");
+    };
+    let (region, fd) = next_message(&mut driver, socket);
+    assert_eq!(region, Message::Region { fetch: 1, index: 0 });
+    let region = karyos_sys::ipc::Region::attach(
+        fd.unwrap(),
+        karyos_sys::ipc::RegionRecord {
+            instance: driver.instance().unwrap(),
+            region: record.region,
+            kind: karyos_sys::ipc::RegionKind::LogBuffer,
+            generation: record.generation,
+            layout: u64::from(record.layout),
+            structure_length: usize::try_from(record.structure_length).unwrap(),
+        },
+    )
+    .unwrap();
+    let buffer = karyos_sys::log_buffer::LogBuffer::attach(region).unwrap();
+    let mut adopted = karyos_sys::log_buffer::Subscription::adopt(
+        &buffer,
+        usize::try_from(cell).unwrap(),
+        Role::Required,
+        record.export,
+    )
+    .unwrap();
+    let mut out = [0u8; 64];
+    let karyos_sys::log_buffer::PollOutcome::Message { length, .. } =
+        adopted.poll(&mut out).unwrap()
+    else {
+        panic!("the backlog first");
+    };
+    assert_eq!(&out[..length as usize], b"backlog");
+    adopted.acknowledge();
+    for _ in 0..2 {
+        let outcome = adopted.poll(&mut out).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                karyos_sys::log_buffer::PollOutcome::Closed {
+                    reason: karyos_driver::SealReason::StreamRemoved,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+    // The fetched grant still names the stream: it is not freed under the
+    // client's mapping.
+    for _ in 0..10 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        driver.stream_state(stream).unwrap(),
+        karyos_driver::StreamState::Retiring
+    );
+}
