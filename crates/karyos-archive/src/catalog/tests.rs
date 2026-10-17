@@ -78,7 +78,7 @@ fn run(disk: FaultDisk, ops: &[Op]) -> Done {
                     .start(new_recording(stream_id, &channel))
                     .map(|id| done.ids.push(id))
             }
-            Op::Stop(id) => catalog.stop(id, 100, 9, StopReason::Normal),
+            Op::Stop(id) => catalog.stop(id, 100, 9, StopReason::Normal, false),
             Op::Forget(id) => catalog.forget(id),
             Op::Compact => catalog.compact(),
         };
@@ -178,7 +178,7 @@ fn the_watermark_keeps_a_compacted_id_used() {
     let channel = channel_of(1);
     assert_eq!(catalog.start(new_recording(1, &channel)).unwrap(), 1);
     assert_eq!(catalog.start(new_recording(2, &channel)).unwrap(), 2);
-    catalog.stop(2, 64, 9, StopReason::Normal).unwrap();
+    catalog.stop(2, 64, 9, StopReason::Normal, false).unwrap();
     catalog.forget(2).unwrap();
     catalog.compact().unwrap();
     let mut reopened = Catalog::open(disk.clone(), dir).unwrap().catalog;
@@ -311,6 +311,7 @@ fn a_checked_record_that_does_not_hold_is_refused() {
             position: 0,
             time_ns: 1,
             reason: StopReason::Normal,
+            incomplete: false,
         },
     }
     .encode()
@@ -359,8 +360,8 @@ fn a_whole_header_that_does_not_match_is_refused() {
         (13, 0xFF, |error| {
             matches!(error, CatalogError::Corrupt { offset: 0 })
         }),
-        (4, 2, |error| {
-            matches!(error, CatalogError::UnsupportedVersion { version: 2 })
+        (4, 3, |error| {
+            matches!(error, CatalogError::UnsupportedVersion { version: 3 })
         }),
     ];
     for (at, byte, expected) in cases {
@@ -455,7 +456,8 @@ fn settling_stops_what_a_crash_left_open() {
         Some(Stop {
             position: 200,
             time_ns: 77,
-            reason: StopReason::Recovered
+            reason: StopReason::Recovered,
+            incomplete: false,
         })
     );
     assert_eq!(
@@ -482,12 +484,12 @@ fn refusals_change_nothing() {
         Err(CatalogError::NotStopped { .. })
     ));
     assert!(matches!(
-        catalog.stop(9, 0, 0, StopReason::Normal),
+        catalog.stop(9, 0, 0, StopReason::Normal, false),
         Err(CatalogError::UnknownRecording { id: 9 })
     ));
-    catalog.stop(id, 0, 0, StopReason::Normal).unwrap();
+    catalog.stop(id, 0, 0, StopReason::Normal, false).unwrap();
     assert!(matches!(
-        catalog.stop(id, 0, 0, StopReason::Normal),
+        catalog.stop(id, 0, 0, StopReason::Normal, false),
         Err(CatalogError::AlreadyStopped { .. })
     ));
     assert_eq!(catalog.next_id(), 2);
@@ -541,4 +543,94 @@ proptest! {
             prop_assert!(result.is_ok(), "{:?}: {:?}", survives, result);
         }
     }
+}
+
+/// A4: a lapped stop and the incomplete flag round-trip, and settling a
+/// recording whose segments hold a gap marks it incomplete.
+#[test]
+fn lapped_and_incomplete_stops_are_kept() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut catalog = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    let channel = channel_of(1);
+    let lapped = catalog.start(new_recording(1, &channel)).unwrap();
+    catalog
+        .stop(lapped, 64, 3, StopReason::Lapped, true)
+        .unwrap();
+    let gapped = catalog.start(new_recording(2, &channel)).unwrap();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        dir,
+        gapped,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    store.append(0, &[1; 10]).unwrap();
+    store.append_gap(10, 50).unwrap();
+    store.append(50, &[2; 10]).unwrap();
+    store.sync().unwrap();
+    drop(store);
+    drop(catalog);
+    let restarted = disk.after_crash(Survives::Synced);
+    let mut catalog = Catalog::open(restarted.clone(), dir).unwrap().catalog;
+    let settled = catalog.settle(8).unwrap();
+    assert_eq!(settled.len(), 1);
+    let reopened = Catalog::open(restarted, dir).unwrap().catalog;
+    let first = reopened.get(lapped).unwrap().stop.unwrap();
+    assert_eq!((first.reason, first.incomplete), (StopReason::Lapped, true));
+    let second = reopened.get(gapped).unwrap().stop.unwrap();
+    assert_eq!(
+        (second.position, second.reason, second.incomplete),
+        (60, StopReason::Recovered, true)
+    );
+}
+
+/// A catalog of format version 1 (before A4's stop reasons) is refused as
+/// unsupported, and kept.
+#[test]
+fn a_version_1_catalog_is_unsupported() {
+    let (disk, _) = three_started();
+    let mut found = catalog_bytes(&disk)[..HEADER].to_vec();
+    found[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let crc = crc32c(&found[..12]);
+    found[12..16].copy_from_slice(&crc.to_le_bytes());
+    poke(&disk, 0, &found);
+    let kept = catalog_bytes(&disk);
+    assert!(matches!(
+        Catalog::open(disk.clone(), Path::new(DIR)),
+        Err(CatalogError::UnsupportedVersion { version: 1 })
+    ));
+    assert_eq!(catalog_bytes(&disk), kept);
+}
+
+/// A `Stopped` record with a reason byte this version does not know,
+/// under a valid CRC, is corruption, never mapped to a known reason.
+#[test]
+fn an_unknown_stop_reason_is_corrupt() {
+    let (disk, _) = three_started();
+    let end = u64::try_from(catalog_bytes(&disk).len()).unwrap();
+    let mut stopped = Record::Stopped {
+        id: 1,
+        stop: Stop {
+            position: 0,
+            time_ns: 1,
+            reason: StopReason::Stopped,
+            incomplete: false,
+        },
+    }
+    .encode()
+    .unwrap();
+    // Kind and length, then id, position and time: the reason follows.
+    let reason = HEAD + 24;
+    stopped[reason] = 0xEE;
+    let crc = crc32c(&stopped[..stopped.len() - TAIL]);
+    let at = stopped.len() - TAIL;
+    stopped[at..].copy_from_slice(&crc.to_le_bytes());
+    poke(&disk, end, &stopped);
+    assert!(matches!(
+        Catalog::open(disk, Path::new(DIR)),
+        Err(CatalogError::Corrupt { offset }) if offset == end
+    ));
 }
