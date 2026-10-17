@@ -575,7 +575,7 @@ fn a_taken_view_reads_and_detaches_on_drop() {
             "nothing delivered"
         );
         let _ = driver.do_work().unwrap();
-        let _ = view.poll_changed(|key, value| seen.push((key, value.to_vec())));
+        let _ = view.poll_changed(|key, value| seen.push((key, value.payload().to_vec())));
     }
     assert_eq!(seen, vec![(3, b"latest".to_vec())]);
     assert_eq!(counter(&driver, "grants exported"), 1);

@@ -51,7 +51,8 @@ pub use conductor::{
     DEFAULT_HEARTBEAT_INTERVAL, EVENT_QUEUE, Fetchable, FetchableConflated, Outcome, Request,
 };
 pub use conflated_subscription::{
-    CONFLATION_BUDGETS_EXHAUSTED, CONFLATION_SKIPS, ConflatedSubscription, ReaderCounts,
+    CONFLATION_BUDGETS_EXHAUSTED, CONFLATION_SKIPS, ConflatedSubscription, ConflatedValue,
+    ReaderCounts, ViewClosed,
 };
 pub use counter::{ClientCounterHandle, CounterReleases};
 pub use error::ClientError;
@@ -60,6 +61,7 @@ pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
 pub use karyos_protocol::cnc::StreamId;
 pub use karyos_sys::frame::Lane;
+pub use karyos_sys::freshness::Freshness;
 pub use loss::{LOSS_REPORT_QUEUE, LossReports};
 pub use publication::{ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, OfferOutcome};
 pub use subscription::{
