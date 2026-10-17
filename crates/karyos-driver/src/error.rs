@@ -50,6 +50,10 @@ pub enum DriverError {
     /// added, active or being removed).
     #[error("too many network publications")]
     NetworkPublicationsFull,
+    /// `AgentConfig::subscriptions` distinct network subscriptions are
+    /// held: the receiver's table is full.
+    #[error("too many network subscriptions")]
+    NetworkSubscriptionsFull,
     /// A network agent's command ring is full; retry later.
     #[error("network agent busy")]
     NetworkBusy,
