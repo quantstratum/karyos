@@ -1112,12 +1112,49 @@ fn a_solicit_for_an_active_identity_binds_a_path() {
     let nonce = solicited(sessions.solicit(key(3), 2 * MS, &mut nonces))
         .challenge
         .nonce;
-    assert!(matches!(
-        sessions.answer(key(3), &answer(1, nonce), 3 * MS, || panic!("no chain for a path")),
-        AnswerOutcome::PathBound { image: bound, .. } if bound == image
-    ));
+    let later = SetupAnswer {
+        joins: Lanes::new(&[4096, 8192]).unwrap(),
+        ..answer(1, nonce)
+    };
+    let AnswerOutcome::PathBound { image: bound, path } =
+        sessions.answer(key(3), &later, 3 * MS, || panic!("no chain for a path"))
+    else {
+        panic!("not bound as a path");
+    };
+    assert_eq!(bound, image);
     assert_eq!(sessions.lookup(&key(3)), Some(image));
+    // The joins are recorded for the path, never applied to the image.
+    assert_eq!(sessions.paths().joins(image, path), Some(later.joins));
+    assert_eq!(
+        sessions.paths().joins(image, 0),
+        Some(Lanes::new(&[0, 0]).unwrap())
+    );
     assert_eq!(sessions.counters().solicits_answered, 1);
+    // Bound with a binding: no holdoff, and the key is bound now.
+    assert_eq!(
+        sessions.solicit(key(3), 4 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::KeyBound)
+    );
+    // Other term parameters for the same identity: refused as on the
+    // challenge path, consumed without a binding, held off.
+    let nonce = solicited(sessions.solicit(key(4), 4 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    let mismatched = SetupAnswer {
+        term: TermParams {
+            term_length: 131_072,
+            ..term()
+        },
+        ..answer(1, nonce)
+    };
+    assert_eq!(
+        sessions.answer(key(4), &mismatched, 5 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    assert_eq!(
+        sessions.solicit(key(4), 6 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
+    );
     let nonce = solicited(sessions.solicit(other_key(), 4 * MS, &mut nonces))
         .challenge
         .nonce;
