@@ -2886,10 +2886,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .feeder
                 .as_ref()
                 .and_then(|feeder| feeder.fresh.as_ref())
-                .and_then(|fresh| {
+                .is_some_and(|fresh| {
                     karyos_sys::freshness::TerminalCell::read(&fresh.link.terminal_words())
+                        .is_some()
                 });
-            if let Some(published) = published {
+            if published {
                 if let Some(mut feeder) = stream.feeder.take() {
                     feeder.writer.close();
                 }

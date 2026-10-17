@@ -1100,6 +1100,21 @@ impl Network {
         self.subscriptions.len()
     }
 
+    /// The endpoint of each path of the subscription to `stream_id`, the
+    /// first path first (tests).
+    #[cfg(test)]
+    pub(crate) fn subscription_endpoints(&self, stream_id: i32) -> Vec<EndpointId> {
+        self.subscriptions
+            .iter()
+            .find(|entry| entry.stream_id == stream_id)
+            .map(|entry| {
+                core::iter::once(entry.endpoint)
+                    .chain(entry.later.into_iter().flatten())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The configured identity the receiver holds for each path endpoint
     /// of the subscription to `stream_id`, the first path first (tests,
     /// Shared mode only).

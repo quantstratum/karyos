@@ -770,6 +770,40 @@ fn path_channel(group: SocketAddr, paths: Vec<Interface>) -> UdpConfig {
     }
 }
 
+/// C4 follow-up: an image on any path of a conflated subscription finds
+/// its view's lane and table, the later paths' included.
+#[test]
+fn every_path_of_a_conflated_subscription_finds_its_view() {
+    use karyos_sys::frame::Lane;
+
+    const CONFIG: karyos_sys::conflation::ConflationConfig =
+        karyos_sys::conflation::ConflationConfig {
+            keys: 4,
+            value_capacity: 8,
+            journal_capacity: 1024,
+        };
+    let mut driver = driver(ThreadingMode::Shared);
+    driver.net.as_mut().unwrap().assume_isolated_paths();
+    let group = SocketAddr::from(([239, 7, 9, 3], free_port()));
+    let any = Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let channel = path_channel(group, vec![any, Interface::Address(LOOPBACK)]);
+    // As above: a host without multicast has nothing to check.
+    let Ok(subscription) =
+        driver.add_network_subscription_conflated(6, &channel, Lane::ZERO, CONFIG)
+    else {
+        return;
+    };
+    let net = driver.net.as_ref().unwrap();
+    let endpoints = net.subscription_endpoints(6);
+    if driver.network_path_counters().1 == 0 {
+        assert_eq!(endpoints.len(), 2, "both paths joined");
+    }
+    for endpoint in endpoints {
+        assert_eq!(net.conflation_of(endpoint, 6), Some((Lane::ZERO, CONFIG)));
+    }
+    assert!(driver.remove_network_subscription(subscription).unwrap());
+}
+
 /// #307 review P2-4: a second handle of a key must ask for the same
 /// paths; other paths would be dropped unseen, so they are refused and
 /// counted.
