@@ -438,6 +438,10 @@ pub struct ReceiverRole {
     /// Test only: DATA datagrams seen since the hook was set.
     #[cfg(test)]
     data_seen: u64,
+    /// Test only: DATA datagrams from this count on arrive twice (a path
+    /// that duplicates).
+    #[cfg(test)]
+    repeat_data_from: Option<u64>,
     /// Test only: every NAK handed to the sender.
     #[cfg(test)]
     posted_naks: Vec<Nak>,
@@ -1079,7 +1083,6 @@ fn receiver_id(slot: SlotRef) -> u64 {
     (u64::from(slot.slot) << 32) | u64::from(slot.generation)
 }
 
-/// Adds one to a receiver counter; sticky on overflow.
 /// The publication identity an image receives (trace-network.md §5).
 fn publication_of(image: &Installed) -> karyos_protocol::trace_hook::PublicationIdentity {
     karyos_protocol::trace_hook::PublicationIdentity {
@@ -1111,6 +1114,7 @@ fn journal_facts(
     }
 }
 
+/// Adds one to a receiver counter; sticky on overflow.
 fn tally(counters: &mut ReceiverCounters, field: fn(&mut ReceiverCounters) -> &mut u64) {
     let mut overflowed = counters.overflowed;
     bump(field(counters), &mut overflowed);
@@ -1355,6 +1359,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             drop_data: Vec::new(),
             #[cfg(test)]
             data_seen: 0,
+            #[cfg(test)]
+            repeat_data_from: None,
             #[cfg(test)]
             posted_naks: Vec::new(),
             #[cfg(test)]
@@ -1854,6 +1860,13 @@ impl ReceiverRole {
     pub(super) fn drop_data(&mut self, nth: &[u64]) {
         self.drop_data = nth.to_vec();
         self.data_seen = 0;
+    }
+
+    /// Delivers every DATA datagram twice from the `from`th since
+    /// [`Self::drop_data`] was set (tests).
+    #[cfg(test)]
+    pub(super) fn repeat_data_from(&mut self, from: u64) {
+        self.repeat_data_from = Some(from);
     }
 
     /// Makes the image at `slot` hold a route fault: two uncertain NAKs,
@@ -2909,12 +2922,12 @@ impl ReceiverRole {
         } = image;
         // Its lanes' journals close now, with their facts, for the
         // conductor (trace-network.md §4: they close with the image).
-        let (_, dropped) = self
-            .trace
-            .retire(slot, |traced| journal_facts(traced, Some(&*owner)));
-        for _ in 0..dropped {
-            self.count(|c| &mut c.net_journals_retired_dropped);
-        }
+        let counters = &mut self.counters;
+        self.trace.retire(
+            slot,
+            |traced| journal_facts(traced, Some(&*owner)),
+            || tally(counters, |c| &mut c.net_journals_retired_dropped),
+        );
         let _ = self.sessions.retire(slot, now);
         drop(owner);
         self.count(|c| &mut c.images_retired);
@@ -3373,7 +3386,15 @@ impl Intake<'_> {
             if self.role.drop_data.contains(&seen) {
                 return;
             }
+            if self.role.repeat_data_from.is_some_and(|from| seen >= from) {
+                self.data_once(source, alias, bytes);
+            }
         }
+        self.data_once(source, alias, bytes);
+    }
+
+    /// One DATA datagram's intake ([`Self::data`]).
+    fn data_once(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
         let key = BindingKey {
             endpoint: self.endpoint,
             source,

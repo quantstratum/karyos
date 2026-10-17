@@ -323,21 +323,20 @@ impl ReceiverTrace {
     /// The image at `slot` retires: every journal of its lanes closes now,
     /// with the facts `facts` gives, and is queued for the conductor. A
     /// full queue drops its oldest posted entry first; with none posted,
-    /// the newest close keeps no entry and is counted by the caller.
-    /// Returns how many journals closed and how many found no room.
+    /// the newest close keeps no entry and `dropped` is called for it, so
+    /// the caller counts each one.
     pub(crate) fn retire(
         &mut self,
         slot: crate::sessions::receive::SlotRef,
         mut facts: impl FnMut(&TracedImageLane) -> JournalFacts,
-    ) -> (u32, u32) {
-        let (mut closed, mut dropped) = (0u32, 0u32);
+        mut dropped: impl FnMut(),
+    ) {
         while let Some(index) = self.lanes.iter().position(|traced| traced.slot == slot) {
             let traced = self.lanes.swap_remove(index);
             if let Some(hook) = self.hook.as_mut() {
                 hook.0
                     .close_journal(NetSide::Receiver, &traced.publication, traced.lane);
             }
-            closed = closed.checked_add(1).unwrap_or(closed);
             if self.retired.len() >= self.capacity
                 && let Some(oldest) = self.retired.iter().position(|retired| retired.posted)
             {
@@ -350,10 +349,9 @@ impl ReceiverTrace {
                     posted: false,
                 });
             } else {
-                dropped = dropped.checked_add(1).unwrap_or(dropped);
+                dropped();
             }
         }
-        (closed, dropped)
     }
 
     /// Posts each retired journal not posted yet through `post`, which
@@ -378,8 +376,10 @@ pub(crate) fn frame_extension(
     if word0.frame_type_code() != FrameType::Data.code() || !word0.flags().ext() {
         return None;
     }
-    // The body starts at header byte 8; the extension follows the header.
-    let start = usize::try_from(HEADER_LENGTH).ok()?.checked_sub(8)?;
+    // The extension follows the header, within the body.
+    let start = usize::try_from(HEADER_LENGTH)
+        .ok()?
+        .checked_sub(BODY_OFFSET)?;
     let end = start.checked_add(usize::try_from(EXTENSION_LENGTH).ok()?)?;
     Some(
         frame
@@ -388,6 +388,10 @@ pub(crate) fn frame_extension(
             .and_then(|ext| TraceExtension::decode(ext).ok()),
     )
 }
+
+/// The header byte where a validated frame's body starts, after word 0
+/// (`ValidatedFrame::body`).
+const BODY_OFFSET: usize = 8;
 
 fn lane_of(lane: usize) -> Option<Lane> {
     u8::try_from(lane)

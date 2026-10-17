@@ -3604,15 +3604,94 @@ fn a_receiver_journal_records_each_traced_commit_once() {
     assert_eq!(rig.close_receiver_journal(), None);
 }
 
+/// P2.12 step 3 PR 2 (NT-2, #327 review): a traced frame lost and
+/// repaired by NAK records its commit once, at the repair; every copy of
+/// an already committed frame (Duplicate or Late) records nothing.
+#[test]
+fn a_repaired_traced_frame_records_once_and_its_copies_never() {
+    use karyos_sys::log_buffer::{AppendOptions, AppendOutcome};
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let recorder = CommitRecorder::default();
+    rig.trace_receiver(Some(recorder.clone()), b, 5);
+    // The second datagram is lost; every one from the third on, the
+    // repair included, arrives twice.
+    rig.agents.receiver.role.drop_data(&[1]);
+    rig.agents.receiver.role.repeat_data_from(2);
+    let dropped = rig.agents.receiver.counters().data_dropped;
+    let mut positions = Vec::new();
+    for i in 0..4u8 {
+        let mut bytes = [0u8; 64];
+        trace_extension(u64::from(i)).encode(&mut bytes).unwrap();
+        let traced = AppendOptions {
+            extension: Some(bytes),
+            ..AppendOptions::default()
+        };
+        let log = rig.log.as_mut().unwrap();
+        let AppendOutcome::Appended { position } =
+            log.publications[0].append(&[i; 900], traced).unwrap()
+        else {
+            panic!("not appended");
+        };
+        positions.push(position);
+    }
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|counters| counters.repaired >= 1)
+    });
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert!(
+        rig.agents.receiver.counters().data_dropped > dropped,
+        "copies arrived"
+    );
+    let mut commits: Vec<(u64, u64)> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .0
+        .iter()
+        .map(|(ext, at)| (ext.message_id, at.position))
+        .collect();
+    commits.sort_unstable();
+    let expected: Vec<(u64, u64)> = (0..4u64).zip(positions).collect();
+    assert_eq!(commits, expected, "each traced frame once, at its position");
+}
+
 /// P2.12 step 3 PR 2 (Q2, ACS 16519): an image that retires closes its
 /// lanes' journals at once and posts their facts to the conductor
 /// unsolicited; a later close answers the same facts once.
 #[test]
 fn a_retired_image_closes_its_journals_with_their_facts() {
+    use karyos_sys::log_buffer::AppendOptions;
+
     let (mut rig, b) = Rig::new(Setup::default());
-    let _slot = established(&mut rig);
+    let slot = established(&mut rig);
     let recorder = CommitRecorder::default();
     rig.trace_receiver(Some(recorder.clone()), b, 11);
+    let start = rig.trace_events.iter().find_map(|event| match event {
+        crate::agents::AgentEvent::NetworkJournalOpened {
+            number: 11, start, ..
+        } => Some(*start),
+        _ => None,
+    });
+    let log = rig.log.as_mut().unwrap();
+    let _ = log.publications[0]
+        .append(&[1; 100], AppendOptions::default())
+        .unwrap();
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().data_committed >= 1
+    });
+    let boundary = rig.agents.receiver.role.rebuild_position(slot, Lane::ZERO);
+    assert!(boundary > start, "{boundary:?} {start:?}");
     rig.trace_events.clear();
     rig.now += 11_000 * MS;
     rig.until(true, |rig| {
@@ -3627,6 +3706,11 @@ fn a_retired_image_closes_its_journals_with_their_facts() {
     });
     let posted = posted.expect("the retirement posted the close");
     assert_eq!(posted.publication, traced_publication());
+    assert_eq!(
+        (Some(posted.start), Some(posted.boundary), posted.first_gap),
+        (start, boundary, None),
+        "the facts at the retirement"
+    );
     assert_eq!(recorder.0.lock().unwrap().2, 1, "closed through the hook");
     // A later close: the same facts, then nothing.
     assert_eq!(rig.close_receiver_journal(), Some(posted));

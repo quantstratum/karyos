@@ -41,8 +41,9 @@ release may break APIs, wire formats and shared-memory layouts.
   section 5, NT-2 to NT-4). The receiver agent writes one journal per lane
   of an installed image: `OpenNetworkJournal` starts it at the lane's next
   commit position (the image join fact); a traced DATA frame records one
-  `ReceiverCommit` when it commits, naming its path, and duplicates, late
-  copies and repairs record nothing; `CloseNetworkJournal` answers the
+  `ReceiverCommit` when it commits, naming its path (a repair that fills a
+  hole records too), and copies of an already committed frame record
+  nothing; `CloseNetworkJournal` answers the
   start, the lane's resolved prefix as the commit boundary and its first
   sealed gap. An image that retires closes its lanes' journals at once and
   posts their facts as `NetworkJournalClosed`, retried while the event ring
