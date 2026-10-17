@@ -281,6 +281,115 @@ impl Rig {
         (rig, b)
     }
 
+    /// rp-w5b's two-path rig: publisher endpoints A and A2, subscriber
+    /// endpoints B and B2, and one routed publication of two lanes over the
+    /// paths A to B and A2 to B2, subscribed on both B and B2. Each path's
+    /// SETUP side announces, challenges and answers on its own endpoints.
+    /// Returns the rig, `[A, A2]` and `[B, B2]`.
+    fn routed(setup: Setup) -> (Self, [EndpointId; 2], [EndpointId; 2]) {
+        let mut config = AgentConfig::default();
+        if let Some(tune) = setup.tune {
+            tune(&mut config);
+        }
+        let (mut agents, links) = network_agents::<OsSocket>(config).unwrap();
+        VIRTUAL_NOW.with(|now| now.set(0));
+        agents.sender.role.set_clock(virtual_now);
+        agents.receiver.role.set_clock(virtual_now);
+        if !setup.repairs {
+            agents.sender.role.ignore_naks();
+        }
+        let mut rig = Self {
+            publisher: EndpointId(u32::MAX),
+            control: None,
+            log: None,
+            second: None,
+            agents,
+            links,
+            endpoints: Endpoints::new(&config),
+            images: ImageTable::new(config.sessions.max_images, setup.template),
+            events: Vec::new(),
+            now: 0,
+            trace_events: Vec::new(),
+        };
+        let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let mut open = || {
+            rig.endpoints
+                .open(&rig.links, loopback, OsSocket::new())
+                .unwrap()
+        };
+        let (a, a2, b, b2) = (open(), open(), open(), open());
+        let mut opened = 0;
+        for _ in 0..100 {
+            rig.agents.do_work(0).unwrap();
+            rig.endpoints.poll(
+                &rig.links,
+                rig.now,
+                |event| opened += usize::from(matches!(event, EndpointEvent::Opened(_))),
+                |_| {},
+            );
+            if opened == 4 {
+                break;
+            }
+        }
+        assert_eq!(opened, 4);
+        rig.publisher = a;
+        for publisher in [a, a2] {
+            rig.links
+                .receiver
+                .post(|reply| AgentCommand::AddPublishedAlias {
+                    reply,
+                    endpoint: publisher,
+                    alias: alias(),
+                })
+                .unwrap();
+        }
+        for subscriber in [b, b2] {
+            rig.links
+                .receiver
+                .post(|reply| AgentCommand::AddSubscription {
+                    reply,
+                    endpoint: subscriber,
+                    stream_id: alias().stream_id,
+                    max_term_length: setup.max_term_length,
+                    reliable: setup.reliable,
+                    multicast: false,
+                    control_group: None,
+                    identity: setup.identity,
+                    conflated: setup.conflated,
+                })
+                .unwrap();
+        }
+        let routes = [
+            (a, rig.endpoints.local_address(b).unwrap()),
+            (a2, rig.endpoints.local_address(b2).unwrap()),
+        ];
+        let (outbound, log) = super::super::data::testing::outbound_routed(
+            &routes,
+            alias(),
+            term(65_536),
+            2,
+            setup.reliable,
+        );
+        rig.log = Some(log);
+        rig.links
+            .sender
+            .post(|reply| AgentCommand::AddPublication {
+                reply,
+                publication: Publication {
+                    endpoint: a,
+                    alias: alias(),
+                    identity: identity(),
+                    term: term(setup.term_length),
+                    lane_count: 2,
+                },
+                outbound,
+                guard: setup.guard,
+                roles: setup.roles.map(|roles| Box::new(roles())),
+            })
+            .unwrap();
+        (rig, [a, a2], [b, b2])
+    }
+
     /// One round: the agents, then the conductor's tables; `serve` lets the
     /// image table serve the session ring.
     fn round(&mut self, serve: bool) {
@@ -3999,4 +4108,86 @@ fn an_overloaded_cycle_keeps_every_per_cycle_bound() {
     let sender = rig.agents.sender.counters();
     assert!(sender.nak_cycle_budget >= 1, "{sender:?}");
     assert!(sender.repairs >= 12, "{sender:?}");
+}
+
+/// rp-w5b's two-path rig: a routed publication over A to B and A2 to B2
+/// reaches one image, bound on both paths, every message once.
+#[test]
+fn a_routed_publication_reaches_its_image_on_both_paths() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+}
+
+/// The two-path rig with path A2 holding `withheld` datagrams alone (path A
+/// skipped them) when it leaves before sending them: no path sends them.
+fn abandoned_rig(reliable: bool, withheld: u32) -> (Rig, SlotRef) {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable,
+        ..Setup::default()
+    };
+    let (mut rig, _publishers, _subscribers) = Rig::routed(setup.again());
+    let slot = established(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let outbound = rig.agents.sender.role.publication_mut(0).unwrap();
+    outbound.withhold_route(0, withheld);
+    outbound.leave_before_serve(1);
+    for i in 0..u8::try_from(withheld).unwrap() {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.round(true);
+    let counters = rig
+        .agents
+        .sender
+        .role
+        .publication_mut(0)
+        .unwrap()
+        .path_counters(1)
+        .unwrap();
+    assert_eq!(counters.exits, 1);
+    assert_eq!(counters.copies_abandoned, u64::from(withheld));
+    // Later data on path A shows the receivers the gap.
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[100 + i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    (rig, slot)
+}
+
+/// #16835, reliable: the datagrams a leaving path held alone reach the
+/// receiver by NAK from retention.
+#[test]
+fn an_abandoned_copy_is_repaired_on_a_reliable_channel() {
+    let (mut rig, _slot) = abandoned_rig(true, 2);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().naks >= 1 && rig.agents.sender.role.counters().naks >= 1
+    });
+}
+
+/// #16835, unreliable: the receiver's gap policy seals the gap the
+/// abandoned datagrams left, and counts it.
+#[test]
+fn an_abandoned_copy_is_a_sealed_gap_on_an_unreliable_channel() {
+    let (mut rig, _slot) = abandoned_rig(false, 2);
+    rig.until(true, |rig| rig.agents.receiver.counters().gaps_sealed >= 1);
 }

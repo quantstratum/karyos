@@ -128,6 +128,37 @@ impl PathWindow {
     }
 }
 
+/// Path `index` leaves the live set (RP-8): out of the sender's live set,
+/// its never-exposed copies of `lanes` lanes back through `gate` (the guard's
+/// ring settles), and those it held alone counted abandoned. Returns whether
+/// the cancel failed.
+fn leave<R: Routes, G: LaneGate>(
+    sender: &mut RoutedLaneSender,
+    routes: &mut [RouteSlot],
+    index: usize,
+    lanes: usize,
+    lent: &mut R,
+    gate: &mut G,
+) -> bool {
+    let Some(slot) = routes.get_mut(index) else {
+        return false;
+    };
+    slot.left = true;
+    slot.stall_since = None;
+    slot.degraded = false;
+    slot.window = PathWindow::default();
+    bump_path(&mut slot.counters.exits, &mut slot.counters.overflowed);
+    sender.set_live(index, false);
+    for lane in 0..lanes {
+        let alone = u64::try_from(sender.exclusive(lane, index)).ok();
+        match alone.and_then(|alone| slot.counters.copies_abandoned.checked_add(alone)) {
+            Some(total) => slot.counters.copies_abandoned = total,
+            None => slot.counters.overflowed = true,
+        }
+    }
+    sender.cancel_route(lent, index, gate).is_err()
+}
+
 /// Adds one to a path count, or records the overflow.
 fn bump_path(count: &mut u64, overflowed: &mut bool) {
     match count.checked_add(1) {
@@ -202,6 +233,14 @@ fn check_routes(routes: &[(EndpointId, SocketAddr)]) -> Result<(), OutboundError
 pub(super) struct Routed {
     sender: RoutedLaneSender,
     policy: PathPolicy,
+    /// Per route, datagrams it takes no copy of (tests: a skip without a
+    /// full socket).
+    #[cfg(test)]
+    withhold: [u32; MAX_ROUTES],
+    /// A route that leaves before the next cycle's flush (tests: copies
+    /// it alone holds, never sent).
+    #[cfg(test)]
+    leave_now: Option<usize>,
     routes: Vec<RouteSlot>,
     tracks: Vec<RoutedTrack>,
     /// The frame read once per datagram before its copies.
@@ -227,6 +266,10 @@ impl Routed {
         Ok(Self {
             sender,
             policy: PathPolicy::default(),
+            #[cfg(test)]
+            withhold: [0; MAX_ROUTES],
+            #[cfg(test)]
+            leave_now: None,
             routes: routes
                 .iter()
                 .map(|&(endpoint, destination)| RouteSlot {
@@ -553,6 +596,28 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             .map(|route| (!route.left, route.degraded))
     }
 
+    /// Path `route` takes no copy of the next `count` datagrams, as if its
+    /// socket had no room (tests).
+    #[cfg(test)]
+    pub(crate) fn withhold_route(&mut self, route: usize, count: u32) {
+        if let Some(left) = self
+            .routed
+            .as_deref_mut()
+            .and_then(|routed| routed.withhold.get_mut(route))
+        {
+            *left = count;
+        }
+    }
+
+    /// Path `route` leaves the live set before the next cycle's flush
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn leave_before_serve(&mut self, route: usize) {
+        if let Some(routed) = self.routed.as_deref_mut() {
+            routed.leave_now = Some(route);
+        }
+    }
+
     /// Lane `lane`'s sent frontier (tests).
     #[cfg(test)]
     pub(crate) fn sent_high(&self, lane: usize) -> Option<u64> {
@@ -747,6 +812,8 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     .sender
                     .pending(lane, route)
                     .is_some_and(|pending| pending < bound);
+                #[cfg(test)]
+                let room = room && routed.withhold.get(route).is_none_or(|left| *left == 0);
                 // A path out of the live set takes no copy (RP-8).
                 let (true, false, false, Some(_), Some(queue)) = (
                     room,
@@ -864,6 +931,14 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     *took = true;
                 }
             }
+            #[cfg(test)]
+            if copies > 0 {
+                for left in &mut routed.withhold {
+                    if let Some(next) = left.checked_sub(1) {
+                        *left = next;
+                    }
+                }
+            }
             // RP-8: the datagram was selected for every live path; those
             // that took no copy skipped it. A datagram no path took waits
             // or is a gap, never one path's skip.
@@ -951,6 +1026,17 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             held,
             guard: self.guard.as_deref_mut(),
         };
+        #[cfg(test)]
+        if let Some(index) = routed.leave_now.take() {
+            let _ = leave(
+                &mut routed.sender,
+                &mut routed.routes,
+                index,
+                self.readers.len(),
+                &mut lent,
+                &mut gate,
+            );
+        }
         let report = routed.sender.serve(&mut lent, &mut gate, budget);
         let caught = routed.sender.catch_up(&mut lent, &mut gate);
         // RP-8, after this cycle's flushes: a lagging path leaves the live
@@ -1014,27 +1100,14 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             if !(lagging || stalled_long) || live < 2 {
                 continue;
             }
-            slot.left = true;
-            slot.stall_since = None;
-            slot.degraded = false;
-            slot.window = PathWindow::default();
-            bump_path(&mut slot.counters.exits, &mut slot.counters.overflowed);
-            routed.sender.set_live(index, false);
-            for lane in 0..self.readers.len() {
-                let alone = u64::try_from(routed.sender.exclusive(lane, index)).ok();
-                let Some(slot) = routed.routes.get_mut(index) else {
-                    continue;
-                };
-                match alone.and_then(|alone| slot.counters.copies_abandoned.checked_add(alone)) {
-                    Some(total) => slot.counters.copies_abandoned = total,
-                    None => slot.counters.overflowed = true,
-                }
-            }
-            if routed
-                .sender
-                .cancel_route(&mut lent, index, &mut gate)
-                .is_err()
-            {
+            if leave(
+                &mut routed.sender,
+                &mut routed.routes,
+                index,
+                self.readers.len(),
+                &mut lent,
+                &mut gate,
+            ) {
                 self.counters.bump(|c| &mut c.queue_failures, 1);
             }
         }
