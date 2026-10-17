@@ -8,13 +8,16 @@
 //!
 //! - **Probes** ([`RttProbes`], one per image). Each path holds at most one
 //!   outstanding REQUEST, whose `probe_id` is a random nonzero 64-bit value
-//!   ([`ProbeIds`]; the operating system's source in the driver), so an
-//!   off-path spoofer cannot forge a reply and skew the RTT that NAK timing
-//!   uses. A failed draw sends nothing until the next interval and is
-//!   counted. A probe is due every `rtt_probe_interval` and expires after
-//!   `rtt_probe_timeout`. Its start is the time read immediately before the
-//!   backend call that the backend reports as submitting it; a probe only
-//!   accepted, failed or uncertain yields no sample.
+//!   ([`ProbeIds`]), so an off-path spoofer cannot forge a reply and skew
+//!   the RTT that NAK timing uses. In the driver the ids come from a pool
+//!   ([`OsProbeIds`]) drawn from the operating system on the control path,
+//!   at construction and at [`RttProbes::refill_ids`]; the duty path only
+//!   takes one, with no system call. An empty pool or a failed draw sends
+//!   nothing until the next interval and is counted. A probe is due every
+//!   `rtt_probe_interval` and expires after `rtt_probe_timeout`. Its start
+//!   is the time read immediately before the backend call that the backend
+//!   reports as submitting it; a probe only accepted, failed or uncertain
+//!   yields no sample.
 //! - **Samples.** A REPLY is validated against the outstanding probe of its
 //!   path and binding generation; a duplicate, expired, unmatched, wrong
 //!   path or old generation reply changes no estimate and is counted. The
@@ -28,8 +31,9 @@
 //!   shorten every retry at once; before the first sample, and after a
 //!   rebinding, it is `rtt_initial`. A stale estimate is kept while probes
 //!   continue. A path whose binding generation is exhausted stops probing
-//!   for good and is counted; the generation never wraps. With redundant paths, NAK timing uses the largest estimate
-//!   over the image's live paths ([`RttProbes::snapshot`]).
+//!   for good and is counted; the generation never wraps. With redundant
+//!   paths, NAK timing uses the largest estimate over the image's live
+//!   paths ([`RttProbes::snapshot`]).
 //! - **Replies** ([`RttReplies`], the sender's): at most `rttm_reply_rate`
 //!   per second per source endpoint, in a table of `rttm_reply_sources`
 //!   (as the SETUP answer rate), so one source cannot starve the others;
@@ -173,25 +177,93 @@ struct Outstanding {
 
 /// Where probe ids come from: random nonzero 64-bit values.
 pub trait ProbeIds {
-    /// A fresh nonzero id; `None` when the source failed.
+    /// A fresh nonzero id, on the duty path; `None` when none is at hand.
     fn probe_id(&mut self) -> Option<u64>;
+
+    /// Restocks the source, on the control path. The default does nothing.
+    fn refill(&mut self) {}
 }
 
-/// Probe ids from the operating system (`karyos_sys::random::fill_u64s`).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OsProbeIds;
+/// Probe ids the pool holds: a probe per path per `rtt_probe_interval`
+/// for up to `MAX_PATHS` paths, twice over.
+const ID_POOL: usize = 32;
+
+/// The pool is restocked only at or below this many ids, so a refill each
+/// control cycle makes no system call in steady state.
+const ID_LOW_WATER: usize = ID_POOL / 2;
+
+/// Probe ids from the operating system (`karyos_sys::random::fill_u64s`),
+/// drawn into a pool on the control path ([`ProbeIds::refill`]); taking
+/// one makes no system call, and a refill draws only once the pool is at
+/// or below half full.
+#[derive(Debug, Clone, Copy)]
+pub struct OsProbeIds {
+    pool: [u64; ID_POOL],
+    len: usize,
+}
+
+impl OsProbeIds {
+    /// A full pool, drawn now: call it on the control path.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut ids = Self {
+            pool: [0; ID_POOL],
+            len: 0,
+        };
+        ids.refill();
+        ids
+    }
+
+    /// The ids at hand.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no id is at hand.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for OsProbeIds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ProbeIds for OsProbeIds {
     fn probe_id(&mut self) -> Option<u64> {
-        // A zero draw is retried once, then reported as a failure.
-        for _ in 0..2 {
-            let mut word = [0u64; 1];
-            karyos_sys::random::fill_u64s(&mut word).ok()?;
-            if word != [0] {
-                return word.first().copied();
-            }
+        let last = self.len.checked_sub(1)?;
+        let id = self.pool.get(last).copied()?;
+        self.len = last;
+        Some(id)
+    }
+
+    fn refill(&mut self) {
+        if self.len > ID_LOW_WATER {
+            return;
         }
-        None
+        let Some(missing) = self.pool.get_mut(self.len..) else {
+            return;
+        };
+        if karyos_sys::random::fill_u64s(missing).is_err() {
+            return;
+        }
+        // Zero draws are left out: an id is nonzero.
+        let drawn = self.pool;
+        let kept = drawn
+            .iter()
+            .take(self.len)
+            .copied()
+            .chain(drawn.iter().skip(self.len).copied().filter(|id| *id != 0));
+        let mut len = 0;
+        for (count, (slot, id)) in (1..).zip(self.pool.iter_mut().zip(kept)) {
+            *slot = id;
+            len = count;
+        }
+        self.len = len;
     }
 }
 
@@ -243,13 +315,14 @@ pub struct RttProbes<I: ProbeIds = OsProbeIds> {
 
 impl RttProbes {
     /// The probes of an image with `paths` paths, with ids from the
-    /// operating system; it allocates only here.
+    /// operating system drawn now; it allocates only here. Call it on the
+    /// control path.
     ///
     /// # Errors
     ///
     /// See [`RttConfigError`].
     pub fn new(config: RttConfig, paths: usize) -> Result<Self, RttConfigError> {
-        Self::with_ids(config, paths, OsProbeIds)
+        Self::with_ids(config, paths, OsProbeIds::new())
     }
 }
 
@@ -279,6 +352,14 @@ impl<I: ProbeIds> RttProbes<I> {
             ids,
             counts: RttCounts::default(),
         })
+    }
+
+    /// Restocks the probe ids, on the control path: the duty path only
+    /// takes them. With [`OsProbeIds`] it draws only once the pool is at or
+    /// below half full, so calling it every control cycle is free in steady
+    /// state.
+    pub fn refill_ids(&mut self) {
+        self.ids.refill();
     }
 
     /// What the probes counted.

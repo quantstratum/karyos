@@ -188,8 +188,11 @@ release may break APIs, wire formats and shared-memory layouts.
 - RTT observations (P2.7 B, reliable-transport.md, RC-1, ACS 15597):
   `karyos_driver::rtt::RttProbes` probes each path of an image with at most
   one outstanding RTTM REQUEST (random nonzero 64-bit ids from
-  `ProbeIds`, the operating system's in the driver, so an off-path
-  spoofer cannot forge a reply; a failed draw is counted),
+  `ProbeIds`, so an off-path spoofer cannot forge a reply; in the driver
+  a pool, `OsProbeIds`, drawn from the operating system on the control
+  path and restocked by `refill_ids` once at or below half full, so the
+  duty path makes no system call and a refill each control cycle is free
+  in steady state; an empty pool or failed draw is counted),
   samples only submitted probes from the time read before the submitting
   call to the validated reply, never subtracts `service_delay_ns`, raises a
   sample below `rtt_floor` to it, refuses a zero sample, keeps the largest
