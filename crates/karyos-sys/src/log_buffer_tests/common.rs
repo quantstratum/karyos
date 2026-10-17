@@ -3454,3 +3454,19 @@ mod layout_properties {
         }
     }
 }
+
+/// `LogBuffer::validate` accepts and refuses exactly what `new` does,
+/// without building a buffer (W5c).
+#[test]
+fn validate_agrees_with_new() {
+    let valid = config(3, 4);
+    assert_eq!(LogBuffer::<Terms>::validate(&valid), Ok(()));
+    assert!(new_buffer(valid).is_ok());
+    let mut deadline = config(3, 4);
+    deadline.claim_deadline = 0;
+    for invalid in [config(0, 4), config(200, 4), deadline] {
+        let expected = new_buffer(invalid).err();
+        assert!(expected.is_some());
+        assert_eq!(LogBuffer::<Terms>::validate(&invalid).err(), expected);
+    }
+}
