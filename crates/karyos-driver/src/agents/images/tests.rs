@@ -1412,3 +1412,41 @@ fn a_nak_retry_waits_one_rtt() {
     assert!((2..=26).contains(&naks), "{naks} NAKs: {counters:?}");
     assert_eq!(counters.retries, counters.submitted - 1, "{counters:?}");
 }
+
+/// Phase 6 wiring, RC-6: a route fault (a second uncertain NAK while one
+/// is unresolved) stops the image's NAKs; the endpoint's reset, a new
+/// epoch of its halves, resolves them and the NAKs resume.
+#[test]
+fn an_endpoint_reset_resolves_uncertain_naks() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    rig.agents.receiver.role.fault_naks(slot, &nak);
+    let naks = rig.agents.receiver.counters().naks;
+    for _ in 0..50 {
+        rig.round(true);
+    }
+    assert_eq!(
+        rig.agents.receiver.counters().naks,
+        naks,
+        "NAKs during the fault"
+    );
+    rig.endpoints.reset(&rig.links, b).unwrap();
+    rig.until(true, |rig| rig.agents.receiver.counters().naks > naks);
+}

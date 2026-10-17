@@ -1187,7 +1187,7 @@ fn installed_image_with(
         .unwrap(),
         skip: karyos_sys::log_buffer::SkipPolicy::new(skip, 1).unwrap(),
         naks: vec![super::PendingNak {
-            slot: Arc::new(super::ProbeSlot::default()),
+            slot: Arc::new(super::ReportSlot::default()),
             pending: None,
         }],
         closing: None,
@@ -1978,7 +1978,9 @@ fn the_total_rsp_rate_is_checked_before_any_entry() {
     };
     let (sender, mut receiver) = super::roles(&config).unwrap();
     let (sessions, _link) = event_ring();
-    receiver.subscriptions.push((EndpointId(1), 6, 1 << 20));
+    receiver
+        .subscriptions
+        .push((EndpointId(1), 6, 1 << 20, true));
     let bytes = [0u8; 32];
     let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
@@ -2068,7 +2070,7 @@ fn repairing(image: super::Installed) -> (super::SenderRole, super::ReceiverRole
 fn submit_nak(sender: &super::SenderRole, start: u64) -> karyos_protocol::network::Nak {
     let Ok(Some(super::ControlItem::Outgoing {
         control: Control::Nak(nak),
-        guard: Some(super::ItemGuard::Probe(mut guard)),
+        guard: Some(super::ItemGuard::Report(mut guard)),
         ..
     })) = sender.from_receiver.try_take()
     else {
@@ -2178,4 +2180,40 @@ fn a_full_ring_reports_the_nak_not_submitted() {
     let loss = receiver.images[0].loss.counters();
     assert_eq!(loss.not_submitted, 1);
     assert!(receiver.images[0].loss.due(Lane::ZERO, 2).is_some());
+}
+
+/// Phase 6 wiring, RC-6: an uncertain NAK counts as submitted at its
+/// start (its retry waits one RTT); a second while it is unresolved is a
+/// route fault, and the image's NAKs stop.
+#[test]
+fn uncertain_naks_are_bounded_per_image() {
+    let (mut image, params) = installed_image();
+    commit_frame(&mut image, &params, 0, 32);
+    commit_frame(&mut image, &params, 1088, 32);
+    let (sender, mut receiver) = repairing(image);
+    let take = |sender: &super::SenderRole| {
+        let Ok(Some(super::ControlItem::Outgoing {
+            guard: Some(super::ItemGuard::Report(mut guard)),
+            ..
+        })) = sender.from_receiver.try_take()
+        else {
+            panic!("no NAK");
+        };
+        guard.sending(1);
+        guard.uncertain();
+    };
+    receiver.repair(0, 1).unwrap();
+    take(&sender);
+    receiver.repair(0, 2).unwrap();
+    let loss = receiver.images[0].loss.counters();
+    assert_eq!((loss.uncertain, loss.submitted), (1, 1));
+    // Its retry, one RTT later, is uncertain too: a route fault.
+    let rtt = crate::rtt::RttConfig::default().rtt_initial;
+    receiver.repair(0, 2 + rtt).unwrap();
+    take(&sender);
+    receiver.repair(0, 3 + rtt).unwrap();
+    assert_eq!(receiver.counters().nak_route_faults, 1);
+    let naks = receiver.counters().naks;
+    receiver.repair(0, 10 * rtt).unwrap();
+    assert_eq!(receiver.counters().naks, naks);
 }

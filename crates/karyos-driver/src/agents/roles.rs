@@ -200,6 +200,9 @@ pub struct ReceiverCounters {
     pub naks: u64,
     /// NAKs not handed over: the control ring was full (each stays due).
     pub ring_full_nak: u64,
+    /// A second uncertain NAK of an image while one is unresolved (RC-6):
+    /// its NAKs stop until the endpoint reset resolves them.
+    pub nak_route_faults: u64,
     /// ERR NAK_REPLY controls for no installed image.
     pub nak_replies_unbound: u64,
     /// Images closed by repair: a range proven unrecoverable under
@@ -317,6 +320,12 @@ pub struct ReceiverRole {
     /// Test only: every NAK handed to the sender.
     #[cfg(test)]
     posted_naks: Vec<Nak>,
+    /// The epoch of each endpoint's RX half last seen, at most
+    /// `max_endpoints` (allocated at creation): a new one is the endpoint's
+    /// reset, which resolves its images' uncertain NAKs (RC-6).
+    rx_epochs: Vec<(EndpointId, karyos_io::backend::BackendEpoch)>,
+    /// The most endpoints the agent holds (`max_endpoints`).
+    max_endpoints: usize,
     /// The network trace hook (P2.12 step 3).
     trace: super::net_trace::ReceiverTrace,
     sessions: ReceiveSessions,
@@ -541,7 +550,7 @@ struct Installed {
 /// whether it submitted) and the NAK the report belongs to.
 #[derive(Debug)]
 struct PendingNak {
-    slot: Arc<ProbeSlot>,
+    slot: Arc<ReportSlot>,
     pending: Option<Nak>,
 }
 
@@ -843,6 +852,8 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             data_seen: 0,
             #[cfg(test)]
             posted_naks: Vec::new(),
+            rx_epochs: Vec::with_capacity(config.max_endpoints),
+            max_endpoints: config.max_endpoints,
             sessions,
             nonces: OsNonces,
             to_sender,
@@ -1064,6 +1075,25 @@ impl ReceiverRole {
     pub(super) fn drop_data(&mut self, nth: &[u64]) {
         self.drop_data = nth.to_vec();
         self.data_seen = 0;
+    }
+
+    /// Makes the image at `slot` hold a route fault: two uncertain NAKs,
+    /// the second while the first is unresolved (tests).
+    #[cfg(test)]
+    pub(super) fn fault_naks(&mut self, slot: SlotRef, nak: &Nak) {
+        struct Fixed;
+        impl crate::repair::loss::RttSource for Fixed {
+            fn rtt_snapshot(&self, _: usize) -> u64 {
+                0
+            }
+        }
+        let image = self
+            .images
+            .iter_mut()
+            .find(|image| image.slot == slot)
+            .unwrap();
+        let _ = image.loss.uncertain(nak, 0, &Fixed);
+        let _ = image.loss.uncertain(nak, 0, &Fixed);
     }
 
     /// Every NAK handed to the sender (tests).
@@ -1327,7 +1357,7 @@ impl ReceiverRole {
         };
         let naks = (0..chain.lane_count)
             .map(|_| PendingNak {
-                slot: Arc::new(ProbeSlot::default()),
+                slot: Arc::new(ReportSlot::default()),
                 pending: None,
             })
             .collect();
@@ -1441,6 +1471,33 @@ impl ReceiverRole {
         Ok(work)
     }
 
+    /// Records the epoch of `endpoint`'s RX half: a new one (the endpoint
+    /// was reset and both halves reopened) resolves the uncertain NAKs of
+    /// its images (RC-6), and their NAKs resume.
+    fn rx_epoch(&mut self, endpoint: EndpointId, epoch: karyos_io::backend::BackendEpoch) {
+        let room = self.rx_epochs.len() < self.max_endpoints;
+        match self
+            .rx_epochs
+            .iter_mut()
+            .find(|(held, _)| *held == endpoint)
+        {
+            Some((_, seen)) if *seen == epoch => {}
+            Some((_, seen)) => {
+                *seen = epoch;
+                for image in &mut self.images {
+                    if image.key.endpoint == endpoint {
+                        image.loss.uncertain_resolved();
+                    }
+                }
+            }
+            // At most `max_endpoints` halves: a full table is not reached.
+            None if room => {
+                self.rx_epochs.push((endpoint, epoch));
+            }
+            None => {}
+        }
+    }
+
     /// The repair step of the image at `index` at `now` (phase 6). On a
     /// reliable image each lane's last NAK report is settled, its first
     /// hole observed, and a due NAK handed to the sender, at most one per
@@ -1475,8 +1532,15 @@ impl ReceiverRole {
                 && let Some(nak) = report.pending.take()
             {
                 match settled {
-                    ProbeReport::Submitted(start) => image.loss.submitted(&nak, start, &image.rtt),
-                    ProbeReport::NotSubmitted => image.loss.not_submitted(&nak),
+                    SendReport::Submitted(start) => image.loss.submitted(&nak, start, &image.rtt),
+                    SendReport::NotSubmitted => image.loss.not_submitted(&nak),
+                    // RC-6: counts as submitted at its start; a second
+                    // while one is unresolved is a route fault.
+                    SendReport::Uncertain(start) => {
+                        if image.loss.uncertain(&nak, start, &image.rtt).is_err() {
+                            tally(counters, |c| &mut c.nak_route_faults);
+                        }
+                    }
                 }
             }
             if !image.reliable {
@@ -1510,7 +1574,7 @@ impl ReceiverRole {
                 endpoint: image.key.endpoint,
                 destination: image.key.source,
                 control: Control::Nak(nak),
-                guard: Some(ItemGuard::Probe(ProbeGuard::take(&report.slot))),
+                guard: Some(ItemGuard::Report(ReportGuard::take(&report.slot))),
             };
             // A dropped item drops its guard: reported not submitted, and
             // the NAK stays due.
@@ -1748,6 +1812,11 @@ impl ReceiverRole {
         work = work
             .checked_add(self.image_timers(sessions, now)?)
             .ok_or(overflow.clone())?;
+        for (endpoint, half) in halves.iter() {
+            if let Half::Rx(rx) = half {
+                self.rx_epoch(*endpoint, rx.capabilities().epoch);
+            }
+        }
         for (endpoint, half) in halves.iter_mut() {
             let Half::Rx(rx) = half else {
                 continue;
