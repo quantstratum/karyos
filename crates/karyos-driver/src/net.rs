@@ -993,7 +993,6 @@ impl Network {
         self.subscription_refusals
     }
 
-    /// Distinct network subscription keys held, for tests.
     /// Drops the receiver's DATA datagrams numbered `nth` (from 0) from
     /// now on, as a lossy path would (tests, Shared mode only).
     #[cfg(test)]
@@ -1043,6 +1042,7 @@ impl Network {
         }
     }
 
+    /// Distinct network subscription keys held, for tests.
     #[cfg(test)]
     pub(crate) fn subscription_count(&self) -> usize {
         self.subscriptions.len()

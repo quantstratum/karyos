@@ -3252,10 +3252,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         served
     }
 
-    /// Applies the image table's events (W3): an installed image becomes
-    /// the lane streams of one aggregate, or is driven unexposed; a
-    /// retiring one has its streams sealed and retired, so they free once
-    /// no lease holds them and the image table can reclaim the image.
     /// Builds the conflated view of the installed image `slot`, when its
     /// key asked for one (conflated-network-images.md (a)): a heap table
     /// over the link the receiver's seal gate shares, fed from a required
@@ -3374,6 +3370,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .unwrap_or_default()
     }
 
+    /// Applies the image table's events (W3): an installed image becomes
+    /// the lane streams of one aggregate, or is driven unexposed; a
+    /// retiring one has its streams sealed and retired, so they free once
+    /// no lease holds them and the image table can reclaim the image.
     fn serve_images(&mut self) {
         let Some(events) = self
             .net
