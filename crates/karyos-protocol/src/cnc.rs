@@ -1844,11 +1844,13 @@ pub enum CloseReason {
     StreamRemoved,
     /// The stream's conflation feeder failed and could not go on.
     ConflationFeederLost,
-    /// The stream is an image whose remote publication the receiver
-    /// retired.
+    /// The stream is an image retired without a complete end: one whose
+    /// remote publication the receiver retired, or an Archive replay
+    /// stopped or failed before its end.
     ImageRetired,
-    /// The stream is an image whose remote publication ended: every lane
-    /// reached its EOS bound through a complete prefix.
+    /// The stream is an image whose source ended cleanly: a remote
+    /// publication whose every lane reached its EOS bound through a
+    /// complete prefix, or an Archive replay that reached its end.
     EndOfStream,
 }
 

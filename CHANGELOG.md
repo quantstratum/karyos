@@ -11,6 +11,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- An Archive replay's target stream (phase 3, A5b).
+  `EmbeddedDriver::replay_target(ReplayTargetConfig)` makes a one-lane
+  image with local gaps, joined at the replay's first position and
+  exposed as an aggregate of lane streams as a network image is (n3), on
+  the heap or, on an IPC driver, in a region with a fresh id. Its
+  `ReplayFeed`, the image's only writer, takes a recording's whole frames
+  and PAD or ABORTED records at their recorded positions, each frame's
+  session and stream ids written as the target's, and seals a lost range
+  as a local gap (`GapReason::RangeUnavailable`); a term not ready yet is
+  offered again later. `EmbeddedDriver::finish_replay` seals the target
+  with `EndOfStream` when the feed reached the replay's end, else
+  `ImageRetired`. Only lane 0 is replayed (`DriverError::ReplayLane`).
+  The `EndOfStream` and `ImageRetired` docs now cover a replay's end.
 - The Archive's control messages, version 1, written by hand (phase 3,
   A1; ADR-0036). `karyos-codec` becomes the runtime of the minimum v1
   schema: checked little-endian reads and writes, a 12-byte envelope

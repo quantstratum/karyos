@@ -33,6 +33,7 @@ mod positions;
 pub mod recording;
 mod remote_generations;
 pub mod repair;
+pub mod replay;
 pub mod rtt;
 pub mod schedule;
 pub mod sessions;
