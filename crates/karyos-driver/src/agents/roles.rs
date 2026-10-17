@@ -28,7 +28,7 @@
 //!   - RTT (reliable-transport.md, "RTT observations"; RC-1; ACS 15868).
 //!     Each installed image probes its bound paths: after its SM, one
 //!     RTTM REQUEST per path and `rtt_probe_interval`, at most one per path
-//!     in the ring, with a report slot ([`ProbeSlot`]) the sender settles
+//!     in the ring, with a report slot ([`ReportSlot`]) the sender settles
 //!     with the time it read before the submitting call. A REPLY counts
 //!     only from a bound path, naming the image's identity and this
 //!     receiver; the path's report is settled first, and the sample ends
@@ -77,8 +77,8 @@ use karyos_sys::sizing::TermLength;
 
 use super::chain::{ImageChain, SessionCommand, SessionEnd, SessionEvent};
 use super::control::{
-    ControlItem, ControlRoutes, ItemGuard, ProbeGuard, ProbeReport, ProbeSlot, RouteSlot, SmGuard,
-    SmSlot,
+    ControlItem, ControlRoutes, ControlSendError, ItemGuard, ReportGuard, ReportSlot, RouteSlot,
+    SendReport, SmGuard, SmSlot,
 };
 use super::data::Outbound;
 
@@ -494,7 +494,7 @@ struct Installed {
 /// REQUEST per path in the ring) and the probe the report belongs to.
 #[derive(Debug)]
 struct PathProbe {
-    slot: Arc<ProbeSlot>,
+    slot: Arc<ReportSlot>,
     pending: Option<Probe>,
 }
 
@@ -512,7 +512,7 @@ fn tally(counters: &mut ReceiverCounters, field: fn(&mut ReceiverCounters) -> &m
 }
 
 /// Settles `probe`'s report into `rtt`, if the sender made one; `replied`
-/// as in [`ProbeSlot::collect`].
+/// as in [`ReportSlot::collect`].
 fn collect_probe(rtt: &mut RttProbes, probe: &mut PathProbe, replied: bool) {
     let Some(report) = probe.slot.collect(replied) else {
         return;
@@ -520,9 +520,27 @@ fn collect_probe(rtt: &mut RttProbes, probe: &mut PathProbe, replied: bool) {
     // A probe of an older binding generation is ignored by `rtt`.
     if let Some(pending) = probe.pending.take() {
         match report {
-            ProbeReport::Submitted(start) => rtt.submitted(pending, start),
-            ProbeReport::NotSubmitted => rtt.not_submitted(pending),
+            SendReport::Submitted(start) => rtt.submitted(pending, start),
+            // An uncertain probe yields no sample (RC-1).
+            SendReport::NotSubmitted | SendReport::Uncertain(_) => rtt.not_submitted(pending),
         }
+    }
+}
+
+/// What one control send did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    /// The backend submitted it.
+    Submitted,
+    /// It was not submitted.
+    NotSubmitted,
+    /// Its exposure is unknown.
+    Uncertain,
+}
+
+impl Sent {
+    fn submitted(self) -> bool {
+        self == Self::Submitted
     }
 }
 
@@ -1065,7 +1083,7 @@ impl ReceiverRole {
         };
         let probes = (0..paths)
             .map(|_| PathProbe {
-                slot: Arc::new(ProbeSlot::default()),
+                slot: Arc::new(ReportSlot::default()),
                 pending: None,
             })
             .collect();
@@ -1204,7 +1222,7 @@ impl ReceiverRole {
                     probe_id: due.probe_id,
                     kind: RttmKind::Request,
                 }),
-                guard: Some(ItemGuard::Probe(ProbeGuard::take(&probe.slot))),
+                guard: Some(ItemGuard::Report(ReportGuard::take(&probe.slot))),
             };
             // A dropped item drops its guard: reported not submitted.
             match to_sender.try_post(item) {
@@ -1970,14 +1988,14 @@ impl SenderRole {
         endpoint: EndpointId,
         destination: SocketAddr,
         control: &Control,
-    ) -> bool {
+    ) -> Sent {
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
             _ => None,
         });
         let Some(tx) = tx else {
             self.count(|c| &mut c.no_endpoint);
-            return false;
+            return Sent::NotSubmitted;
         };
         let index = self
             .routes
@@ -1988,17 +2006,21 @@ impl SenderRole {
             // More held halves than slots: the agent holds at most
             // `max_endpoints`, so this does not happen.
             self.count(|c| &mut c.no_endpoint);
-            return false;
+            return Sent::NotSubmitted;
         };
         slot.endpoint = Some(endpoint);
         match slot.routes.send(tx, destination, control) {
             Ok(()) => {
                 self.count(|c| &mut c.sent);
-                true
+                Sent::Submitted
+            }
+            Err(ControlSendError::Uncertain) => {
+                self.count(|c| &mut c.send_failures);
+                Sent::Uncertain
             }
             Err(_) => {
                 self.count(|c| &mut c.send_failures);
-                false
+                Sent::NotSubmitted
             }
         }
     }
@@ -2044,12 +2066,15 @@ impl SenderRole {
                     endpoint,
                     destination,
                     control,
-                    guard: Some(ItemGuard::Probe(guard)),
+                    guard: Some(ItemGuard::Report(guard)),
                 } => {
                     let mut guard = guard;
                     guard.sending((self.clock)());
-                    if self.send(halves, endpoint, destination, &control) {
-                        guard.submitted();
+                    match self.send(halves, endpoint, destination, &control) {
+                        Sent::Submitted => guard.submitted(),
+                        Sent::Uncertain => guard.uncertain(),
+                        // Dropped unsettled: not submitted.
+                        Sent::NotSubmitted => drop(guard),
                     }
                 }
                 ControlItem::Outgoing {
@@ -2074,7 +2099,9 @@ impl SenderRole {
                     seen,
                 } => {
                     if let Some(reply) = self.rttm_request(endpoint, source, &request, seen, now)
-                        && self.send(halves, endpoint, source, &Control::Rttm(reply))
+                        && self
+                            .send(halves, endpoint, source, &Control::Rttm(reply))
+                            .submitted()
                     {
                         self.count(|c| &mut c.rttm_replied);
                     }
