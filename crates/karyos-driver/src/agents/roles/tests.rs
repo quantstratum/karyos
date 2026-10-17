@@ -1319,3 +1319,39 @@ fn a_reset_request_is_repeated_at_its_cadence() {
         (2, 1)
     );
 }
+
+/// The wired SM path never lowers a lane's reported consumption: after a
+/// real SM, a lower sample (a required reader joining during a sample,
+/// here a lowered published head) is clamped by the image's SM schedule
+/// to the earlier report, which the sender would otherwise take for a
+/// replay; a higher sample is reported as it is.
+#[test]
+fn an_sm_never_lowers_its_consumption() {
+    use karyos_protocol::network::StatusMessage;
+
+    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (sessions, _link) = event_ring();
+    let (image, _) = installed_image();
+    receiver.images.push(image);
+    let sent = |receiver: &mut super::ReceiverRole, head, now| {
+        let image = &mut receiver.images[0];
+        assert!(
+            image
+                .owner
+                .set_published_head(karyos_protocol::frame::Lane::ZERO, head)
+        );
+        image.evidence = now;
+        receiver.image_timers(&sessions, now).unwrap();
+        let Ok(Some(super::ControlItem::Outgoing {
+            control: Control::Status(StatusMessage { lanes, .. }),
+            ..
+        })) = sender.from_receiver.try_take()
+        else {
+            panic!("no SM at {now}");
+        };
+        lanes.as_slice()[0].consumption
+    };
+    assert_eq!(sent(&mut receiver, 4096, 20_000_000), 4096);
+    assert_eq!(sent(&mut receiver, 1024, 40_000_000), 4096);
+    assert_eq!(sent(&mut receiver, 8192, 60_000_000), 8192);
+}

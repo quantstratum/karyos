@@ -186,6 +186,45 @@ fn consumption_is_held_by_a_required_subscriber() {
     assert_eq!(owner.consumption(Lane::try_new(1).unwrap()), None);
 }
 
+/// A head raised between the conductor's head read and the admission of a
+/// required reader moves its join (`join_after_admit`): the cell's
+/// position, the subscription's position and its acknowledged position are
+/// all the raised head, and the image's consumption never reports past it.
+#[test]
+fn a_head_raised_during_admission_moves_the_join() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 0, 128, 7)), committed(0, 128));
+    let raised = {
+        let buffer = Arc::clone(&buffer);
+        move || buffer.reserved_head().store(256, Ordering::Release)
+    };
+    let required = conductor.subscribe_pausing(Role::Required, raised).unwrap();
+    assert_eq!(required.position(), 256);
+    assert_eq!(required.acknowledged_position(), 256);
+    let cell = buffer.cells().get(required.cell()).unwrap();
+    assert_eq!(cell.position.load(Ordering::Acquire), 256);
+    assert_eq!(buffer.required_position(), Some(256));
+    // Without a raise the join is the head read.
+    let second = conductor.subscribe_pausing(Role::Optional, || {}).unwrap();
+    assert_eq!(second.position(), 256);
+}
+
+/// Consumption reports the published head, not the owner's rebuild
+/// position: a rebuild move whose head store did not happen (the
+/// `split_end` error path, simulated by lowering the head) is never
+/// reported.
+#[test]
+fn consumption_reports_the_published_head() {
+    let buffer = image(0);
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 0, 128, 7)), committed(0, 128));
+    assert_eq!(owner.rebuild_position(Lane::ZERO), Some(128));
+    buffer.reserved_head().store(64, Ordering::Release);
+    assert_eq!(owner.consumption(Lane::ZERO), Some(64));
+}
+
 #[test]
 fn an_overlapping_frame_is_refused_and_the_committed_one_kept() {
     let buffer = image(0);
