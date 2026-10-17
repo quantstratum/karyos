@@ -1038,6 +1038,22 @@ impl ImageLoss {
         now: u64,
         rtt: &impl RttSource,
     ) -> Result<(), RouteFault> {
+        self.route_uncertain()?;
+        let rtt = self.interval(nak.range.lane, rtt.rtt_snapshot(self.path));
+        self.record_submission(nak, now, rtt);
+        Ok(())
+    }
+
+    /// An uncertain outcome on the image's own route for a NAK already
+    /// anchored by another path's copy (redundant paths, RP-7): the RC-6
+    /// limit and route fault apply as for [`ImageLoss::uncertain`], but no
+    /// submission is recorded, since the copy that anchored the NAK did.
+    ///
+    /// # Errors
+    ///
+    /// [`RouteFault`] when another uncertain NAK of the route is
+    /// unresolved.
+    pub fn route_uncertain(&mut self) -> Result<(), RouteFault> {
         if self.uncertain {
             self.faulted = true;
             self.counters.bump(|c| &mut c.route_faults);
@@ -1045,8 +1061,6 @@ impl ImageLoss {
         }
         self.uncertain = true;
         self.counters.bump(|c| &mut c.uncertain);
-        let rtt = self.interval(nak.range.lane, rtt.rtt_snapshot(self.path));
-        self.record_submission(nak, now, rtt);
         Ok(())
     }
 

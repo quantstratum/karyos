@@ -72,6 +72,51 @@ pub enum ClientError {
     /// A lower layer failed.
     #[error(transparent)]
     Sys(SysError),
+    /// The facade's context is not usable (`client::ContextBuilder::build`).
+    #[error("invalid context: {reason}")]
+    InvalidContext {
+        /// What is wrong.
+        reason: &'static str,
+    },
+    /// `Client::connect` needs the driver's directory.
+    #[error("the context names no driver directory")]
+    NoDirectory,
+    /// Attaching to the driver, or taking a grant from it, failed.
+    #[cfg(target_os = "linux")]
+    #[error(transparent)]
+    Attach(#[from] crate::ipc::AttachError),
+    /// A request could not be submitted.
+    #[error(transparent)]
+    Conductor(#[from] crate::conductor::ConductorError),
+    /// A request did not complete within the context's timeout. What its
+    /// late answer grants is released when it arrives
+    /// (`Client::late_grants_released`).
+    #[error("the driver did not answer in time")]
+    Timeout,
+    /// The driver does not serve this channel on this connection: a
+    /// network channel of a remote client (D3), no network, or a feature
+    /// not wired yet.
+    #[error("the driver does not serve this channel (detail {detail})")]
+    UnsupportedChannel {
+        /// The refusal's detail.
+        detail: u64,
+    },
+    /// The driver refused the request.
+    #[error("the driver refused the request ({code:?}, detail {detail})")]
+    Refused {
+        /// Why.
+        code: karyos_protocol::cnc::ErrorCode,
+        /// The refusal's detail.
+        detail: u64,
+    },
+    /// A request ended without a usable answer: the driver was lost, or it
+    /// answered with a grant of another kind.
+    #[error("the request ended without a usable answer")]
+    Unknown,
+    /// Driver events were lost, so a network subscription can no longer
+    /// know its images: it is closed.
+    #[error("driver events were lost; the subscription is closed")]
+    EventsLost,
 }
 
 impl From<SysError> for ClientError {

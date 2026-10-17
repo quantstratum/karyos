@@ -105,6 +105,12 @@ pub enum FreshnessError {
         /// The newest loss sequence.
         newest: u64,
     },
+    /// An acknowledgement of a request that is not the outstanding one.
+    #[error("seal request {request} is not outstanding")]
+    UnknownRequest {
+        /// The acknowledged request number.
+        request: u64,
+    },
 }
 
 /// The number of words of a barrier with `ring` records; `None` below
@@ -511,6 +517,156 @@ impl<'a> TerminalCell<'a> {
             end: words.load(2)?,
             reason: words.load(3)?,
         })
+    }
+}
+
+/// Words of a [`BarrierMailbox`]: `[request, start, end, ack, attached]`.
+pub const MAILBOX_WORDS: usize = 5;
+/// Mailbox word indexes.
+const REQUEST: usize = 0;
+const REQUEST_START: usize = 1;
+const REQUEST_END: usize = 2;
+const ACK: usize = 3;
+const ATTACHED: usize = 4;
+
+/// One lane image's seal mailbox between its receive owner and its view's
+/// feeder (`quantstratum-docs: karyos/design/conflated-network-images.md`,
+/// (b); GU-8's reviewed bounded handshake).
+///
+/// The owner posts the interval it intends to seal
+/// ([`BarrierMailbox::post`]) and seals only after it reads the
+/// acknowledgement ([`BarrierMailbox::is_acknowledged`], Acquire). The
+/// feeder takes the request ([`BarrierMailbox::pending`], Acquire), appends
+/// the loss to its barrier and publishes it, and only then acknowledges
+/// ([`BarrierMailbox::acknowledge`], Release): an owner that sees the
+/// acknowledgement sees the barrier record. One request is outstanding at a
+/// time, so the mailbox is fixed size. Each side writes only its own words:
+/// the owner `request`, `start` and `end`; the feeder `ack` and `attached`.
+///
+/// While the feeder is not attached ([`BarrierMailbox::is_attached`]), no
+/// view exists to protect: the owner seals at once, and the feeder, which
+/// catches up from the image log after [`BarrierMailbox::attach`], meets
+/// the committed gap itself and appends it before it publishes any value
+/// past it. The Loom model `tests/loom_barrier_mailbox.rs` checks the
+/// handshake together with the barrier, a slot and the terminal cell.
+#[derive(Debug, Clone, Copy)]
+pub struct BarrierMailbox<'a> {
+    words: &'a [AtomicU64],
+}
+
+/// A posted seal request, as the feeder reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealRequest {
+    /// The request number, to acknowledge.
+    pub request: u64,
+    /// The interval's start.
+    pub start: u64,
+    /// The interval's end.
+    pub end: u64,
+}
+
+impl<'a> BarrierMailbox<'a> {
+    /// Wraps the mailbox's [`MAILBOX_WORDS`] words.
+    ///
+    /// # Errors
+    ///
+    /// [`FreshnessError::InvalidLayout`] for any other length.
+    pub fn new(words: &'a [AtomicU64]) -> Result<Self, FreshnessError> {
+        if words.len() != MAILBOX_WORDS {
+            return Err(FreshnessError::InvalidLayout);
+        }
+        Ok(Self { words })
+    }
+
+    fn word(&self, index: usize) -> Result<&'a AtomicU64, FreshnessError> {
+        self.words.get(index).ok_or(FreshnessError::InvalidLayout)
+    }
+
+    /// Owner: whether the feeder is attached (Acquire). Until it is, the
+    /// owner seals without the mailbox.
+    #[must_use]
+    pub fn is_attached(&self) -> bool {
+        self.word(ATTACHED)
+            .is_ok_and(|word| word.load(Ordering::Acquire) != 0)
+    }
+
+    /// Owner: posts the interval `[start, end)` it intends to seal: the
+    /// interval (Relaxed), then the next request number (Release). Returns
+    /// the request number, to wait for with
+    /// [`BarrierMailbox::is_acknowledged`].
+    ///
+    /// # Errors
+    ///
+    /// [`FreshnessError::InvalidInterval`] for an empty interval,
+    /// [`FreshnessError::Busy`] while the previous request is not
+    /// acknowledged, [`FreshnessError::Exhausted`]. Nothing is stored on
+    /// error.
+    pub fn post(&self, start: u64, end: u64) -> Result<u64, FreshnessError> {
+        if start >= end {
+            return Err(FreshnessError::InvalidInterval { start, end });
+        }
+        let request = self.word(REQUEST)?;
+        // The owner's own word: Relaxed.
+        let current = request.load(Ordering::Relaxed);
+        // Acquire: the feeder's reads of the previous interval happen
+        // before the stores below overwrite it.
+        if self.word(ACK)?.load(Ordering::Acquire) != current {
+            return Err(FreshnessError::Busy);
+        }
+        let next = current.checked_add(1).ok_or(FreshnessError::Exhausted)?;
+        self.word(REQUEST_START)?.store(start, Ordering::Relaxed);
+        self.word(REQUEST_END)?.store(end, Ordering::Relaxed);
+        request.store(next, Ordering::Release);
+        Ok(next)
+    }
+
+    /// Owner: whether the feeder acknowledged `request` (Acquire): its
+    /// barrier then holds the interval, and the owner may seal.
+    #[must_use]
+    pub fn is_acknowledged(&self, request: u64) -> bool {
+        self.word(ACK)
+            .is_ok_and(|word| word.load(Ordering::Acquire) == request)
+    }
+
+    /// Feeder: marks the feeder attached (Release), before it catches up
+    /// from the image log.
+    pub fn attach(&self) {
+        if let Ok(word) = self.word(ATTACHED) {
+            word.store(1, Ordering::Release);
+        }
+    }
+
+    /// Feeder: the outstanding request, if any (an Acquire load of the
+    /// request number, then the interval).
+    #[must_use]
+    pub fn pending(&self) -> Option<SealRequest> {
+        let request = self.word(REQUEST).ok()?.load(Ordering::Acquire);
+        // The feeder's own word: Relaxed.
+        if self.word(ACK).ok()?.load(Ordering::Relaxed) == request {
+            return None;
+        }
+        Some(SealRequest {
+            request,
+            start: self.word(REQUEST_START).ok()?.load(Ordering::Relaxed),
+            end: self.word(REQUEST_END).ok()?.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Feeder: acknowledges `request` (Release), only after its barrier
+    /// published the interval ([`BarrierWords::append_loss`]).
+    ///
+    /// # Errors
+    ///
+    /// [`FreshnessError::UnknownRequest`] unless `request` is the
+    /// outstanding request; nothing is stored then.
+    pub fn acknowledge(&self, request: u64) -> Result<(), FreshnessError> {
+        let current = self.word(REQUEST)?.load(Ordering::Acquire);
+        let ack = self.word(ACK)?;
+        if request != current || request == ack.load(Ordering::Relaxed) {
+            return Err(FreshnessError::UnknownRequest { request });
+        }
+        ack.store(request, Ordering::Release);
+        Ok(())
     }
 }
 
