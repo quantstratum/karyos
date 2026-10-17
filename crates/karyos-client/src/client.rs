@@ -10,7 +10,8 @@
 //!
 //! let ctx = Context::builder().dir("/dev/shm/karyos").build()?;
 //! let mut client = Client::connect(ctx)?;
-//! let mut orders = client.add_exclusive_publication("karyos:ipc", StreamId::new(1001))?;
+//! let mut orders =
+//!     client.add_exclusive_publication("karyos:ipc", StreamId::new(1001))?;
 //! let _ = orders.offer(b"order")?;
 //! let mut md = client.add_subscription("karyos:ipc", StreamId::new(2001))?;
 //! md.poll(|payload, _info| drop(payload), MessageLimit::new(16))?;
@@ -59,8 +60,8 @@
 //! and the answer to a control call waiting at that moment may be lost
 //! too: the call then returns [`ClientError::Timeout`] or
 //! [`ClientError::Unknown`], and the facade cannot release what it
-//! granted, which stays held until the client leaves. `ClientError::Attach` exists on
-//! Linux only, where remote clients do.
+//! granted, which stays held until the client leaves.
+//! `ClientError::Attach` exists on Linux only, where remote clients do.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +78,10 @@ use crate::conductor::{
 use crate::error::ClientError;
 use crate::publication::ClientPublication;
 use crate::subscription::{ClientSubscription, MessageInfo, MessageLimit, PollError, PollSummary};
+
+mod publish;
+
+pub use publish::{Accepted, Claim, MessageLength, OfferError, Publication};
 
 /// Default wait of a control call.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -316,6 +321,17 @@ pub trait Connection: sealed::Sealed {
     fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError>;
 
     #[doc(hidden)]
+    fn add_publication_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: karyos_sys::frame::Lane,
+    ) -> Result<u64, ConductorError>;
+
+    /// Releases a publication handle the facade will not hand out.
+    #[doc(hidden)]
+    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>);
+
+    #[doc(hidden)]
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError>;
 
     #[doc(hidden)]
@@ -367,6 +383,19 @@ impl Connection for ClientConductor {
 
     fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
         ClientConductor::add_subscription(self, stream, ROLE)
+    }
+
+    fn add_publication_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: karyos_sys::frame::Lane,
+    ) -> Result<u64, ConductorError> {
+        ClientConductor::add_publication_on_lane(self, stream, lane, false)
+    }
+
+    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) {
+        // A handle that cannot be removed now is dropped, ending its lease.
+        let _ = self.remove_publication(publication);
     }
 
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError> {
@@ -445,6 +474,19 @@ impl Connection for crate::ipc::RemoteClient {
 
     fn add_subscription(&mut self, stream: StreamKey) -> Result<u64, ConductorError> {
         crate::ipc::RemoteClient::add_subscription(self, stream, ROLE)
+    }
+
+    fn add_publication_on_lane(
+        &mut self,
+        stream: StreamKey,
+        lane: karyos_sys::frame::Lane,
+    ) -> Result<u64, ConductorError> {
+        crate::ipc::RemoteClient::add_publication_on_lane(self, stream, lane, false)
+    }
+
+    fn release_publication(&mut self, publication: ClientPublication<Self::Terms>) {
+        // Dropped: the handle detaches its export and ends its registration.
+        drop(publication);
     }
 
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError> {
@@ -563,13 +605,17 @@ impl<T: TermBytes> Inbox<T> {
 
     /// Retires the image `id`: one not taken yet is dropped here.
     fn retire(&self, id: u64) {
+        let mut removed = None;
         self.update(|state| {
             if let Some(index) = state.arrived.iter().position(|image| image.id == id) {
-                drop(state.arrived.swap_remove(index));
+                removed = Some(state.arrived.swap_remove(index));
             } else {
                 state.retired.push(id);
             }
         });
+        // Dropped after the lock: dropping a subscription ends its lease,
+        // which the subscription's own poll must never wait behind.
+        drop(removed);
     }
 
     fn update(&self, change: impl FnOnce(&mut InboxState<T>)) {
@@ -672,11 +718,13 @@ impl<C: Connection> Client<C> {
     fn new(connection: C, context: Context) -> Self {
         let events_dropped = connection.events_dropped();
         let laps = connection.laps();
+        // Every attach is a request in flight: at most max_pending.
+        let attaches = Vec::with_capacity(context.max_pending);
         Self {
             connection,
             context,
             networks: Vec::new(),
-            attaches: Vec::new(),
+            attaches,
             removals: Vec::new(),
             events_dropped,
             laps,
@@ -698,6 +746,18 @@ impl<C: Connection> Client<C> {
     /// one creates a network publication. Offers are refused while no
     /// subscriber is connected.
     ///
+    /// It holds every lane, all or nothing. A URI that names `lanes` takes
+    /// exactly that many: the driver refuses a count other than the
+    /// stream's with `LaneMismatch` before granting anything, so the
+    /// publication can be asked for again. A lane refused or timed out
+    /// after lane 0 releases the lanes granted, but the stream's exclusive
+    /// publication is granted once per incarnation: it cannot be taken
+    /// again until the stream is configured anew.
+    /// A URI that names none takes the lanes the stream configures, which
+    /// the facade does not know (a driver's default, an IPC aggregate's
+    /// configuration): lanes are taken until the driver refuses one with
+    /// `UnknownStream`.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Conductor`] for a URI that does not parse or a
@@ -708,13 +768,91 @@ impl<C: Connection> Client<C> {
         &mut self,
         uri: &str,
         stream_id: StreamId,
-    ) -> Result<ClientPublication<C::Terms>, ClientError> {
+    ) -> Result<Publication<C::Terms>, ClientError> {
         let sequence = self
             .connection
             .add_network_publication(uri, stream_id.get())?;
+        let first = match self.wait(sequence)? {
+            Found::Outcome(outcome) => self.connection.publication(*outcome)?,
+            Found::Network(..) => return Err(ClientError::Unknown),
+        };
+        // The URI's lane count when it names one; it parsed when the
+        // request was submitted.
+        let named = karyos_protocol::channel::ChannelConfig::parse(uri)
+            .ok()
+            .and_then(|channel| channel.common.lanes);
+        let count = named.unwrap_or(karyos_sys::frame::Lane::COUNT);
+        let stream = first.stream();
+        let mut lanes = vec![first];
+        for index in 1..count {
+            let refused = match karyos_sys::frame::Lane::try_new(index) {
+                Ok(lane) => match self.lane_grant(stream, lane) {
+                    Ok(Some(publication)) => {
+                        lanes.push(publication);
+                        continue;
+                    }
+                    // The stream configures no more lanes: the end of an
+                    // unnamed count, a refusal of a named one.
+                    Ok(None) if named.is_none() => break,
+                    // The driver checks a named count against the stream
+                    // before lane 0 (LaneMismatch); this is a stream that
+                    // changed meanwhile. The detail is the stream id, as
+                    // the driver's.
+                    Ok(None) => ClientError::Refused {
+                        code: ErrorCode::UnknownStream,
+                        detail: u64::from(stream.stream_id.cast_unsigned()),
+                    },
+                    Err(error) => error,
+                },
+                Err(_) => ClientError::Unknown,
+            };
+            for publication in lanes {
+                self.connection.release_publication(publication);
+            }
+            return Err(refused);
+        }
+        Ok(Publication::new(lanes))
+    }
+
+    /// The exclusive publication of `lane` of `stream`; `None` when the
+    /// stream does not configure the lane.
+    fn lane_grant(
+        &mut self,
+        stream: StreamKey,
+        lane: karyos_sys::frame::Lane,
+    ) -> Result<Option<ClientPublication<C::Terms>>, ClientError> {
+        let sequence = self.connection.add_publication_on_lane(stream, lane)?;
         match self.wait(sequence)? {
-            Found::Outcome(outcome) => self.connection.publication(*outcome),
+            Found::Outcome(outcome) => match *outcome {
+                Outcome::Refused {
+                    code: ErrorCode::UnknownStream,
+                    ..
+                } => Ok(None),
+                other => self.connection.publication(other).map(Some),
+            },
             Found::Network(..) => Err(ClientError::Unknown),
+        }
+    }
+
+    /// Releases `publication`'s handles, as dropping it does not remove
+    /// them from the driver at once.
+    ///
+    /// ```no_run
+    /// # #[cfg(target_os = "linux")]
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use karyos_client::{Client, Context, StreamId};
+    ///
+    /// let mut client = Client::connect(Context::builder().dir("/dev/shm/karyos").build()?)?;
+    /// let orders = client.add_exclusive_publication("karyos:ipc", StreamId::new(1001))?;
+    /// client.remove_publication(orders);
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(target_os = "linux"))]
+    /// # fn main() {}
+    /// ```
+    pub fn remove_publication(&mut self, publication: Publication<C::Terms>) {
+        for lane in publication.into_lanes() {
+            self.connection.release_publication(lane);
         }
     }
 

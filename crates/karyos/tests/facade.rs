@@ -2,7 +2,8 @@
 
 //! A consumer of the facade alone can name every claim and poll type.
 
-use karyos::{Aborted, ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome, PollSummary};
+use karyos::PollSummary;
+use karyos::embedded::{Aborted, ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome};
 
 /// Uses each type by name; compiling is the test.
 #[allow(dead_code)]

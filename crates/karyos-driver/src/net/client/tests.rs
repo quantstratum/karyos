@@ -1236,3 +1236,52 @@ fn a_local_reader_keeps_a_network_publication_connected() {
         OfferOutcome::Accepted { .. }
     ));
 }
+
+/// #313 review: a silent sender cell still bounds the publisher. With no
+/// receiver the sender sends nothing, so its reader never advances; an
+/// unconnected-allowed publication fills up to that bound and is then
+/// back pressured, never unbounded.
+#[test]
+fn a_silent_sender_still_back_pressures_the_publisher() {
+    let mut a = driver();
+    let mut publisher = a.connect().unwrap();
+    let port = port();
+    let published = publisher
+        .add_network_publication(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            10,
+            true,
+        )
+        .unwrap();
+    let Outcome::Publication(mut publication) = complete(&mut a, &mut publisher, published) else {
+        panic!("not a publication");
+    };
+    let payload = [7u8; 1024];
+    let mut accepted = 0u64;
+    let start = std::time::Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "accepted {accepted}"
+        );
+        match publication.offer(&payload).unwrap() {
+            OfferOutcome::Accepted { .. } => accepted += 1,
+            OfferOutcome::BackPressured => break,
+            OfferOutcome::AdminAction => {}
+            other => panic!("{other:?}"),
+        }
+        let _ = a.do_work().unwrap();
+    }
+    // The publisher stopped within the log's bound: the stream defaults'
+    // 64 KiB terms and three spare slots hold far fewer than 1024 such
+    // messages.
+    assert!(accepted > 0 && accepted < 1024, "accepted {accepted}");
+    // Still back pressured after more cycles: nothing moved the bound.
+    for _ in 0..50 {
+        let _ = a.do_work().unwrap();
+    }
+    assert!(matches!(
+        publication.offer(&payload).unwrap(),
+        OfferOutcome::BackPressured | OfferOutcome::AdminAction
+    ));
+}
