@@ -121,6 +121,7 @@ impl Rig {
             rig.agents.do_work(0).unwrap();
             rig.endpoints.poll(
                 &rig.links,
+                rig.now,
                 |event| opened += usize::from(matches!(event, EndpointEvent::Opened(_))),
                 |_| {},
             );
@@ -186,7 +187,7 @@ impl Rig {
             }
         }
         self.agents.do_work(self.now).unwrap();
-        self.endpoints.poll(&self.links, |_| {}, |_| {});
+        self.endpoints.poll(&self.links, self.now, |_| {}, |_| {});
         if serve {
             let events = &mut self.events;
             self.images
@@ -885,6 +886,64 @@ fn a_data_heartbeat_does_not_refresh_its_path() {
     assert_eq!(after.heartbeats, before.heartbeats + 10);
     assert_eq!(after.data_unbound, before.data_unbound + 2);
     assert!(rig.agents.receiver.role.has_image(slot));
+}
+
+/// The needs_reset wiring: a publication that needs a reset asks the
+/// endpoint table through the sender's events; the table resets the
+/// endpoint, the new epoch clears the need, and messages flow again.
+#[test]
+fn a_publication_needing_a_reset_gets_one() {
+    use karyos_sys::log_buffer::{AppendOptions, Role};
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    // Messages sent when the need arises all arrive after the reset (the
+    // rewind itself is tested over the scripted socket, where the reset
+    // returns what loopback would already have sent).
+    let messages: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i; 900]).collect();
+    for message in &messages {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(message, AppendOptions::default())
+            .unwrap();
+    }
+    rig.round(true);
+    let force = |rig: &mut Rig| {
+        rig.agents
+            .sender
+            .role
+            .outbound_mut(0)
+            .unwrap()
+            .force_needs_reset();
+    };
+    force(&mut rig);
+    rig.until(true, |rig| rig.endpoints.counters().resets == 1);
+    rig.until(true, |rig| {
+        !rig.agents.sender.role.outbound(0).unwrap().needs_reset()
+            && rig.agents.sender.counters().needs_reset == 0
+    });
+    let mut delivered = Vec::new();
+    for _ in 0..3000 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            delivered.push(message);
+        }
+        if delivered.len() == messages.len() {
+            break;
+        }
+    }
+    assert_eq!(delivered, messages);
+    assert_eq!(rig.endpoints.counters().resets, 1);
+    // A second need right after the reset is asked for on the next cycle:
+    // the new epoch cleared the last request's record.
+    let requests = rig.agents.sender.counters().reset_requests;
+    force(&mut rig);
+    rig.round(true);
+    assert_eq!(rig.agents.sender.counters().reset_requests, requests + 1);
 }
 
 /// Test 3, subscriber side (§5): the image's SMs report its least required

@@ -67,6 +67,7 @@ fn two_endpoints_with(
             let mut opened = false;
             endpoints.poll(
                 &links,
+                0,
                 |event| opened |= event == EndpointEvent::Opened(id),
                 |_| {},
             );
@@ -96,6 +97,7 @@ fn drive<T>(
         let mut hit = None;
         endpoints.poll(
             links,
+            0,
             |_| {},
             |event| {
                 if hit.is_none() {
@@ -122,7 +124,7 @@ fn created(
     for _ in 0..2000 {
         now += 1_000_000;
         agents.do_work(now).unwrap();
-        endpoints.poll(links, |_| {}, |_| {});
+        endpoints.poll(links, 0, |_| {}, |_| {});
         if let Some(super::super::chain::SessionEvent::CreateImage {
             endpoint,
             identity,
@@ -254,7 +256,7 @@ fn a_solicit_flood_is_capped() {
     // moves 1 ms per round) to refill only a few tokens.
     for round in 1..=40u64 {
         agents.do_work(round * 1_000).unwrap();
-        endpoints.poll(&links, |_| {}, |_| {});
+        endpoints.poll(&links, 0, |_| {}, |_| {});
         std::thread::sleep(Duration::from_millis(1));
     }
     let refused = agents.sender.counters().refused;
@@ -396,7 +398,7 @@ fn an_answer_waits_for_its_chain_credit() {
     for _ in 0..300 {
         now += 1_000_000;
         agents.do_work(now).unwrap();
-        endpoints.poll(&links, |_| {}, |_| {});
+        endpoints.poll(&links, 0, |_| {}, |_| {});
         std::thread::sleep(Duration::from_micros(200));
     }
     assert_eq!(agents.receiver.counters().create_image, 0);
@@ -642,6 +644,7 @@ fn control_routes_survive_a_reset() {
         agents.do_work(now).unwrap();
         endpoints.poll(
             &links,
+            0,
             |event| {
                 reopened |=
                     matches!(event, EndpointEvent::Reopened { endpoint, .. } if endpoint == a);
@@ -658,7 +661,7 @@ fn control_routes_survive_a_reset() {
     for _ in 0..400 {
         now += 1_000_000;
         agents.do_work(now).unwrap();
-        endpoints.poll(&links, |_| {}, |_| {});
+        endpoints.poll(&links, 0, |_| {}, |_| {});
     }
     let after = agents.sender.counters();
     assert!(after.sent >= before.sent + 3, "{before:?} {after:?}");
@@ -1084,4 +1087,47 @@ fn an_unconfirmed_receiver_bounds_at_its_joins() {
         ..alias()
     };
     assert_eq!(sender.consumption(endpoint, other), None);
+}
+
+/// A publication that needs a reset asks for it once, then again only after
+/// `RESET_REQUEST_CYCLES`; a request the ring could not take is counted and
+/// asked again on the next cycle.
+#[test]
+fn a_reset_request_is_repeated_at_its_cadence() {
+    use super::super::data::RESET_REQUEST_CYCLES;
+
+    let mut sender = sm_sender();
+    let mut asked = Vec::new();
+    sender.cycle = 10;
+    sender.request_resets(|endpoint| {
+        asked.push(endpoint);
+        true
+    });
+    assert!(asked.is_empty(), "nothing needs a reset");
+    sender.publications[0].force_needs_reset();
+    // The ring is full: counted, not recorded.
+    sender.request_resets(|_| false);
+    sender.cycle = 11;
+    sender.request_resets(|endpoint| {
+        asked.push(endpoint);
+        true
+    });
+    assert_eq!(asked, [EndpointId(1)]);
+    sender.cycle = 11 + RESET_REQUEST_CYCLES - 1;
+    sender.request_resets(|endpoint| {
+        asked.push(endpoint);
+        true
+    });
+    assert_eq!(asked.len(), 1);
+    sender.cycle = 11 + RESET_REQUEST_CYCLES;
+    sender.request_resets(|endpoint| {
+        asked.push(endpoint);
+        true
+    });
+    assert_eq!(asked.len(), 2);
+    let counters = sender.counters();
+    assert_eq!(
+        (counters.reset_requests, counters.reset_requests_full),
+        (2, 1)
+    );
 }

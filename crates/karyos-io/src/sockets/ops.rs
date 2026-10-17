@@ -80,6 +80,8 @@ impl Errno {
     pub const NOTSOCK: Self = Self(codes::ENOTSOCK);
     /// `EMSGSIZE`.
     pub const MSGSIZE: Self = Self(codes::EMSGSIZE);
+    /// `EADDRINUSE`.
+    pub const ADDRINUSE: Self = Self(codes::EADDRINUSE);
     /// `EADDRNOTAVAIL`.
     pub const ADDRNOTAVAIL: Self = Self(codes::EADDRNOTAVAIL);
     /// `ENETDOWN`.
@@ -143,6 +145,7 @@ mod codes {
     pub(super) const ENOSYS: i32 = 38;
     pub(super) const ENOTSOCK: i32 = 88;
     pub(super) const EMSGSIZE: i32 = 90;
+    pub(super) const EADDRINUSE: i32 = 98;
     pub(super) const EADDRNOTAVAIL: i32 = 99;
     pub(super) const ENETDOWN: i32 = 100;
     pub(super) const ENETUNREACH: i32 = 101;
@@ -164,6 +167,7 @@ mod codes {
     pub(super) const EAGAIN: i32 = 35;
     pub(super) const ENOTSOCK: i32 = 38;
     pub(super) const EMSGSIZE: i32 = 40;
+    pub(super) const EADDRINUSE: i32 = 48;
     pub(super) const EADDRNOTAVAIL: i32 = 49;
     pub(super) const ENETDOWN: i32 = 50;
     pub(super) const ENETUNREACH: i32 = 51;
@@ -322,6 +326,7 @@ mod tests {
         assert_eq!(kind(Errno::ACCES), ErrorKind::PermissionDenied);
         assert_eq!(kind(Errno::INVAL), ErrorKind::InvalidInput);
         assert_eq!(kind(Errno::NOSYS), ErrorKind::Unsupported);
+        assert_eq!(kind(Errno::ADDRINUSE), ErrorKind::AddrInUse);
         assert_eq!(kind(Errno::ADDRNOTAVAIL), ErrorKind::AddrNotAvailable);
         assert_eq!(kind(Errno::NETDOWN), ErrorKind::NetworkDown);
         assert_eq!(kind(Errno::NETUNREACH), ErrorKind::NetworkUnreachable);
