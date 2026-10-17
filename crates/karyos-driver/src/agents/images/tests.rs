@@ -4934,17 +4934,24 @@ mod shared {
 /// header-only DATA frame with the EOS flag (network-sessions.md,
 /// Liveness and terminal transitions).
 fn eos_heartbeat(lane: u8, position: u64) -> Vec<u8> {
+    frame_at(lane, position, 0, true)
+}
+
+/// A DATA frame of the rig's image carrying `payload` bytes at `position`
+/// of `lane` (none: a heartbeat), with EOS on it when `eos`.
+fn frame_at(lane: u8, position: u64, payload: usize, eos: bool) -> Vec<u8> {
     use karyos_protocol::frame::{Flags, FrameType, Word0};
 
     let term = 65_536u64;
     let term_id = 9u32 + u32::try_from(position / term).unwrap();
     let term_offset = i32::try_from(position % term).unwrap();
+    let length = 32 + payload;
     let word0 = Word0::new(
-        32,
-        Flags::new(true, true, true, false, Lane::try_new(lane).unwrap()),
+        i32::try_from(length).unwrap(),
+        Flags::new(true, true, eos, false, Lane::try_new(lane).unwrap()),
         FrameType::Data,
     );
-    let mut bytes = vec![0u8; 32];
+    let mut bytes = vec![0u8; length];
     bytes[..8].copy_from_slice(&word0.pack().to_le_bytes());
     bytes[8..12].copy_from_slice(&term_offset.to_le_bytes());
     bytes[12..16].copy_from_slice(&alias().session_id.to_le_bytes());
@@ -5347,4 +5354,53 @@ fn a_different_eos_bound_is_refused_at_the_intake() {
     rig.until(true, Rig::closed_cleanly);
     let counters = rig.agents.receiver.counters();
     assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 1));
+}
+
+/// An EOS data frame the receive owner does not commit names no bound: a
+/// frame two terms ahead of the rebuild position reads `Received::Ahead`
+/// (beyond the window `{r, r + 1}`) and is dropped, and the lane's real
+/// bound is still recorded afterwards.
+#[test]
+fn an_eos_data_frame_ahead_of_the_window_names_no_bound() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![4; 300]], &mut subscriber);
+    let before = rig.agents.receiver.counters();
+    rig.inject(b, &frame_at(0, 2 * 65_536, 32, true));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(after.data_dropped, before.data_dropped + 1, "Ahead");
+    assert_eq!(after.eos_bounds, before.eos_bounds, "no bound");
+    rig.inject(b, &eos_heartbeat(0, end));
+    rig.inject(b, &eos_heartbeat(1, 0));
+    let counters = rig.agents.receiver.counters();
+    assert_eq!((counters.eos_bounds, counters.eos_refused), (2, 0));
+    rig.until(true, Rig::closed_cleanly);
+}
+
+/// A heartbeat past a lane's recorded bound is counted and classified at
+/// the bound: no fresh evidence beyond it.
+#[test]
+fn a_heartbeat_past_the_terminal_bound_is_counted() {
+    use karyos_sys::log_buffer::Role;
+
+    let (mut rig, b) = Rig::new(Setup::default());
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let end = rig.deliver(0, &[vec![5; 300]], &mut subscriber);
+    rig.inject(b, &eos_heartbeat(0, end));
+    let before = rig.agents.receiver.counters();
+    rig.inject(b, &frame_at(0, end + 64, 0, false));
+    let after = rig.agents.receiver.counters();
+    assert_eq!(
+        after.heartbeats_past_terminal,
+        before.heartbeats_past_terminal + 1
+    );
+    assert_eq!(
+        after.heartbeats, before.heartbeats,
+        "classified at the bound"
+    );
+    assert_eq!(after.eos_refused, before.eos_refused);
 }

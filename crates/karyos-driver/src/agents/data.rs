@@ -284,6 +284,8 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     picked: Vec<(TraceExtension, u64)>,
     /// The redundant paths of a routed publication ([`Outbound::new_routed`]).
     routed: Option<Box<routed::Routed>>,
+    /// Its removal linger, once removing (driver-network-agents.md §7).
+    removal: Option<Box<removal::Removal>>,
 }
 
 /// The guard of a guarded publication, as the conductor hands it to the
@@ -447,6 +449,7 @@ impl<T: StreamTerms> Outbound<T> {
                     .ok_or(OutboundError::Mtu)?,
             ),
             routed: None,
+            removal: None,
         })
     }
 
@@ -1675,6 +1678,7 @@ pub(crate) mod testing {
     }
 }
 
+mod removal;
 mod routed;
 
 pub use routed::{MAX_PATH_BACKOFF, MAX_PATH_COPY_ENTRIES, PathCounters, PathPolicy};

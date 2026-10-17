@@ -126,7 +126,36 @@ pub struct NetworkStreamDefaults {
     pub max_subscribers: u8,
     /// How long a claim may stay open, in the driver clock's unit.
     pub claim_deadline: u64,
+    /// `publication_linger` in ns (default 5 s; driver-level, for every
+    /// network publication of the driver): how long a removed publication
+    /// keeps its incarnation after each lane's EOS at its seal, repeating
+    /// the EOS and serving repair (driver-network-agents.md §7). With an
+    /// established receiver the linger always runs in full; a removal with
+    /// none ends at once (`removals_unestablished`), since nobody would
+    /// read its EOS. It also bounds the drain, as one timer from the
+    /// removal's start, `max(linger, interval)` with the interval
+    /// `AgentConfig::path_heartbeat_interval`: a lane not drained to its
+    /// seal by then (a seal never positioned, a faulted reader, a closed
+    /// flow-control window, a blocked socket or a detached route) sends no
+    /// EOS, the removal is counted (`removals_undrained`, or
+    /// `removals_guard_closed` for a lane its guard closed) and the session
+    /// is reported drained anyway. The removal ends at the later of `start +
+    /// linger` and the latest first EOS plus `linger`, so at worst at
+    /// `start + max(linger, interval) + linger`. A linger of 0 still lets a
+    /// tail drain within one interval: it sends one EOS on each lane
+    /// drained by then, then frees; a lost EOS then falls back to the
+    /// receivers' liveness timeout. While a removal lingers, its stream key
+    /// stays in use: re-adding it is refused with `DuplicateStream` until
+    /// the removal ends, at worst `max(linger, interval) + linger` after it
+    /// starts (about 10 s at the defaults). At most 60 s
+    /// ([`MAX_PUBLICATION_LINGER`]); a longer one is refused as
+    /// `InvalidConfig`.
+    pub publication_linger: u64,
 }
+
+/// The longest `publication_linger` a network accepts (ns): 60 s. A
+/// removal holds its stream key for up to about twice its linger.
+pub const MAX_PUBLICATION_LINGER: u64 = 60_000_000_000;
 
 impl Default for NetworkStreamDefaults {
     fn default() -> Self {
@@ -137,6 +166,7 @@ impl Default for NetworkStreamDefaults {
             spare_slots: 3,
             max_subscribers: 8,
             claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication_linger: 5_000_000_000,
         }
     }
 }
@@ -209,6 +239,12 @@ struct NetPublication {
     /// Whether `RemovePublication` is posted; retried while the ring is
     /// full.
     remove_posted: bool,
+    /// Whether the sender reported the removal's linger over
+    /// (`SenderSessionDrained`), or held no such publication.
+    drained: bool,
+    /// Whether `RemoveSenderSession` is posted; retried while the ring is
+    /// full.
+    session_posted: bool,
     /// A guarded publication's sender gate, registered with the guard's
     /// owner; released once the sender refused or returned it.
     guard_sender: Option<crate::guard_ack::GuardSenderId>,
@@ -437,6 +473,8 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     stale_aliases: Vec<(EndpointId, Alias)>,
     /// Network publications and stale aliases held at once.
     capacity: usize,
+    /// `publication_linger` (ns), handed to the sender at each removal.
+    publication_linger: u64,
     /// Stale aliases that found the queue full: never, by construction;
     /// counted if it happens.
     stale_overflows: u64,
@@ -476,11 +514,15 @@ impl<T: StreamTerms> Network<T> {
     /// # Errors
     ///
     /// [`DriverError::InvalidConfig`] for an agent configuration the agents
-    /// refuse; [`DriverError::NetworkStart`] when a thread cannot start.
+    /// refuse or a `publication_linger` above [`MAX_PUBLICATION_LINGER`];
+    /// [`DriverError::NetworkStart`] when a thread cannot start.
     pub(crate) fn start(config: &NetworkConfig) -> Result<Self, DriverError>
     where
         T: 'static,
     {
+        if config.stream_defaults.publication_linger > MAX_PUBLICATION_LINGER {
+            return Err(DriverError::InvalidConfig);
+        }
         control_group::validate(&config.nak_control_groups)?;
         let (agents, links) = network_agents_over::<OsSocket, T>(config.agents)
             .map_err(|_| DriverError::InvalidConfig)?;
@@ -519,6 +561,7 @@ impl<T: StreamTerms> Network<T> {
             reopened: 0,
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
+            publication_linger: config.stream_defaults.publication_linger,
             stale_overflows: 0,
             clock: karyos_sys::host_clock::host_monotonic_ns,
             released_guards: ReleasedGuards {
@@ -1341,6 +1384,8 @@ impl<T: StreamTerms> Network<T> {
             alias,
             state: NetworkPublicationState::Adding,
             remove_posted: false,
+            drained: false,
+            session_posted: false,
             guard_sender,
             traced,
             lanes,
@@ -1382,7 +1427,12 @@ impl<T: StreamTerms> Network<T> {
             queue: &mut self.stale_aliases,
             overflows: &mut self.stale_overflows,
         };
-        post_removals(&self.links, &mut self.publications, &mut stale);
+        post_removals(
+            &self.links,
+            &mut self.publications,
+            &mut stale,
+            self.publication_linger,
+        );
         true
     }
 
@@ -1452,7 +1502,12 @@ impl<T: StreamTerms> Network<T> {
             queue: &mut self.stale_aliases,
             overflows: &mut self.stale_overflows,
         };
-        post_removals(&self.links, &mut self.publications, &mut stale);
+        post_removals(
+            &self.links,
+            &mut self.publications,
+            &mut stale,
+            self.publication_linger,
+        );
         // Answers about endpoints go to the table, which also serves the
         // sender's reset requests at the network clock (W-f); publication
         // answers update the publications.
@@ -1632,6 +1687,19 @@ impl<T: StreamTerms> Network<T> {
         (self.released_guards.dropped, self.guard_deregister_failures)
     }
 
+    /// Whether the network publication `registration` still holds its
+    /// stream: tracked, and the sender still serves it (its removal
+    /// lingers until `PublicationRemoved`). A failed or stopped sender
+    /// holds nothing (driver-network-agents.md §7: no linger).
+    pub(crate) fn holds_publication(&self, registration: u64) -> bool {
+        self.failed.is_none()
+            && !matches!(self.agents, Agents::Closed)
+            && self
+                .publications
+                .iter()
+                .any(|entry| entry.registration == registration)
+    }
+
     /// Whether the agents still run.
     #[cfg(test)]
     pub(crate) fn is_running(&self) -> bool {
@@ -1804,14 +1872,18 @@ fn release(table: &mut [SendEndpoint], endpoint: EndpointId) {
     }
 }
 
-/// Posts `RemovePublication` for every publication being removed that
-/// is not posted yet, after its sender journals' closes, queueing its
-/// alias as stale, then `RemovePublishedAlias` for every stale alias; a
-/// full ring leaves the rest for the next cycle.
+/// Posts `RemovePublication`, with the `linger`, for every publication
+/// being removed that is not posted yet, after its sender journals'
+/// closes; then `RemoveSenderSession` for every one whose linger is over,
+/// queueing its alias as stale; then `RemovePublishedAlias` for every
+/// stale alias. The receiver keeps admitting the alias's controls (SMs
+/// and NAKs) through the linger. A full ring leaves the rest for the next
+/// cycle.
 fn post_removals<T: StreamTerms>(
     links: &AgentLinks<OsSocket, T>,
     publications: &mut [NetPublication],
     stale: &mut Stale<'_>,
+    linger: u64,
 ) {
     'entries: for entry in publications
         .iter_mut()
@@ -1838,11 +1910,29 @@ fn post_removals<T: StreamTerms>(
             endpoint,
             alias,
             registration,
+            linger,
         });
         if posted.is_err() {
             break;
         }
         entry.remove_posted = true;
+    }
+    for entry in publications.iter_mut().filter(|entry| {
+        entry.state == NetworkPublicationState::Removing && entry.drained && !entry.session_posted
+    }) {
+        let (endpoint, alias, registration) = (entry.endpoint, entry.alias, entry.registration);
+        let posted = links
+            .sender
+            .post(|reply| AgentCommand::RemoveSenderSession {
+                reply,
+                endpoint,
+                alias,
+                registration,
+            });
+        if posted.is_err() {
+            break;
+        }
+        entry.session_posted = true;
         for path in entry.paths() {
             stale.queue_alias(path, alias);
         }
@@ -1949,6 +2039,35 @@ fn publication_answer<T: StreamTerms>(
                     Some(entry) => entry.state = NetworkPublicationState::Refused,
                     None => {}
                 }
+            }
+        }
+        // The sender drains and lingers; a publication it did not hold has
+        // nothing to drain.
+        AgentEvent::PublicationDraining {
+            endpoint,
+            alias,
+            registration,
+            found,
+        } => {
+            if !found
+                && let Some(entry) = find(publications, endpoint, alias, registration)
+                    .and_then(|index| publications.get_mut(index))
+            {
+                entry.drained = true;
+            }
+        }
+        // The linger is over: the next removal step posts
+        // `RemoveSenderSession`.
+        AgentEvent::SenderSessionDrained {
+            endpoint,
+            alias,
+            registration,
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get_mut(index))
+                && entry.state == NetworkPublicationState::Removing
+            {
+                entry.drained = true;
             }
         }
         AgentEvent::PublicationRemoved {
