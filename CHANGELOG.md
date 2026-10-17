@@ -363,6 +363,8 @@ release may break APIs, wire formats and shared-memory layouts.
 First alpha: the embedded driver on every supported platform and the
 cross-process control path on Linux. See
 [RELEASE-NOTES-0.1.0-alpha.1.md](RELEASE-NOTES-0.1.0-alpha.1.md).
+- `SenderRead::floor`: the retention floor its reads enforce (Acquire),
+  for NAK admission to check requests against before the read.
 
 ### Build and tooling
 
