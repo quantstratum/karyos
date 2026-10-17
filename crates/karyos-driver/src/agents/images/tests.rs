@@ -65,6 +65,8 @@ struct Setup {
     /// Whether the channel is reliable: the sender is then a required
     /// participant of its log.
     reliable: bool,
+    /// The receiver's `alias_quarantine`, when not the default.
+    alias_quarantine: Option<u64>,
 }
 
 impl Default for Setup {
@@ -74,6 +76,7 @@ impl Default for Setup {
             max_term_length: DEFAULT_MAX_IMAGE_TERM_LENGTH,
             template: ImageTemplate::default(),
             reliable: false,
+            alias_quarantine: None,
         }
     }
 }
@@ -95,7 +98,10 @@ impl Rig {
     /// Two loopback endpoints A and B, and a publication of two lanes on A
     /// announced to B: published on A, subscribed on B.
     fn new(setup: Setup) -> (Self, EndpointId) {
-        let config = AgentConfig::default();
+        let mut config = AgentConfig::default();
+        if let Some(quarantine) = setup.alias_quarantine {
+            config.sessions.alias_quarantine = quarantine;
+        }
         let (agents, links) = network_agents::<OsSocket>(config).unwrap();
         let mut rig = Self {
             publisher: EndpointId(u32::MAX),
@@ -1029,4 +1035,88 @@ fn a_stale_heartbeat_through_the_intake_changes_no_evidence() {
     assert_eq!(after.heartbeats_stale, before.heartbeats_stale + 1);
     assert_eq!(after.heartbeats, before.heartbeats);
     assert_eq!(receiver.role.image_evidence(slot), Some(fresh_at));
+}
+
+/// §6.3 end to end, a unicast receiver restart within the sender's
+/// binding: the receiver retires its idle image while its SMs keep the
+/// sender's binding alive, so the sender stays established, announces
+/// nothing and keeps sending up to the member's edge. That DATA reaches an
+/// unbound key and sends one SOLICIT, whose answer installs a new image
+/// in another slot (the quarantine is short here; its refusal and holdoff
+/// are tested on the session table). With no live member left, MC-3 stops
+/// first sends, so no DATA would come to solicit from (ACS 15932).
+#[test]
+fn unbound_data_solicits_a_new_image() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        alias_quarantine: Some(1),
+        ..Setup::default()
+    });
+    let first = established(&mut rig);
+    // Idle in steps: the image's SMs keep the binding fresh until the
+    // image retires after `image_liveness_timeout`.
+    let mut retired = false;
+    for _ in 0..200 {
+        rig.now += 99 * MS;
+        rig.round(true);
+        if rig
+            .events
+            .iter()
+            .any(|event| matches!(event, ImageEvent::Retiring { .. }))
+        {
+            retired = true;
+            break;
+        }
+    }
+    assert!(retired);
+    assert!(!rig.agents.receiver.role.has_image(first));
+    let announces = rig.agents.sender.role.session_counters().announces;
+    let message = vec![3u8; 500];
+    let append = |rig: &mut Rig| {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&message, AppendOptions::default())
+            .unwrap();
+    };
+    let mut installed = false;
+    for _ in 0..2000 {
+        append(&mut rig);
+        rig.round(true);
+        if rig.agents.receiver.role.session_counters().installed == 2 {
+            installed = true;
+            break;
+        }
+    }
+    let sessions = rig.agents.receiver.role.session_counters();
+    assert!(
+        installed,
+        "{sessions:?} {:?}",
+        rig.agents.receiver.counters()
+    );
+    assert_eq!((sessions.solicits, sessions.solicits_answered), (1, 1));
+    // No announcement was needed.
+    assert_eq!(
+        rig.agents.sender.role.session_counters().announces,
+        announces
+    );
+    let second = rig
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ImageEvent::Installed { slot, .. } => Some(*slot),
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(second, first);
+    // DATA reaches the new image: its frames are committed. (Frames sent
+    // between the answer and the installation were unbound and dropped:
+    // the hole they leave waits for repair, phase 6.)
+    let committed = rig.agents.receiver.counters().data_committed;
+    for _ in 0..200 {
+        append(&mut rig);
+        rig.round(true);
+    }
+    assert!(rig.agents.receiver.counters().data_committed > committed);
 }

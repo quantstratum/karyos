@@ -489,6 +489,7 @@ fn inject(
         answered,
         path_of: None,
         joins: answered.then(|| Lanes::new(&[0, 0]).unwrap()),
+        solicited: false,
     };
     SlotRef {
         slot: u32::try_from(index).unwrap(),
@@ -935,4 +936,439 @@ fn a_path_answer_for_a_gone_image_is_refused_by_the_recheck() {
     );
     assert_eq!(sessions.paths().lookup(key(2)), None);
     assert_eq!(sessions.counters().paths_bound, 0);
+}
+
+fn solicited(outcome: SolicitOutcome) -> RspSolicit {
+    match outcome {
+        SolicitOutcome::Solicit(solicit) => solicit,
+        SolicitOutcome::Dropped(reason) => panic!("dropped: {reason:?}"),
+    }
+}
+
+/// [`solicited`], with the send reported as the receiver reports it once
+/// the SOLICIT is posted.
+fn sent(sessions: &mut ReceiveSessions, outcome: SolicitOutcome) -> RspSolicit {
+    let solicit = solicited(outcome);
+    sessions.solicit_sent();
+    solicit
+}
+
+/// §6.3: DATA for an unbound key sends one SOLICIT; its answer supplies
+/// the identity, term parameters and lanes and installs the image.
+#[test]
+fn a_solicit_answer_installs_an_image() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let outcome = sessions.solicit(key(1), 0, &mut nonces);
+    let solicit = sent(&mut sessions, outcome);
+    assert_eq!(solicit.alias, key(1).alias);
+    assert_eq!(solicit.challenge.receiver_boot_id, BOOT);
+    let AnswerOutcome::CreateImage {
+        slot,
+        identity: answered,
+        term: params,
+        joins,
+    } = sessions.answer(key(1), &answer(4, solicit.challenge.nonce), MS, || true)
+    else {
+        panic!("not accepted");
+    };
+    assert_eq!((answered, params, joins.count()), (identity(4), term(), 2));
+    let ReadyOutcome::Installed(bound) = sessions.image_ready(slot, 2 * MS) else {
+        panic!("not installed");
+    };
+    assert_eq!(sessions.lookup(&key(1)), Some(bound));
+    assert_eq!(sessions.binding(bound), Some((key(1), identity(4))));
+    let counters = sessions.counters();
+    assert_eq!((counters.solicits, counters.solicits_answered), (1, 1));
+    // A bound key solicits nothing.
+    assert_eq!(
+        sessions.solicit(key(1), 3 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::KeyBound)
+    );
+}
+
+/// A storm of DATA for one key sends one SOLICIT per entry: further DATA
+/// neither replaces it nor sends another, and after it expires the key is
+/// held off for `setup_challenge_timeout`.
+#[test]
+fn a_data_storm_sends_one_solicit_per_entry() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let outcome = sessions.solicit(key(1), 0, &mut nonces);
+    let first = sent(&mut sessions, outcome);
+    for at in 1..100 {
+        assert_eq!(
+            sessions.solicit(key(1), at * MS, &mut nonces),
+            SolicitOutcome::Dropped(Ignored::EntryPending)
+        );
+    }
+    // The entry kept its nonce: the answer still matches.
+    assert_eq!(nonces.next, 1);
+    // Expired and freed by the timer: held off for a second.
+    sessions.timers(SECOND);
+    assert_eq!(sessions.counters().solicits_expired, 1);
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, first.challenge.nonce), SECOND, || true),
+        AnswerOutcome::Dropped(Ignored::NoChallenge)
+    );
+    assert_eq!(
+        sessions.solicit(key(1), 2 * SECOND - 1, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
+    );
+    // Another key is not held off.
+    let outcome = sessions.solicit(key(2), SECOND, &mut nonces);
+    sent(&mut sessions, outcome);
+    let outcome = sessions.solicit(key(1), 2 * SECOND, &mut nonces);
+    sent(&mut sessions, outcome);
+    assert_eq!(sessions.counters().solicits, 3);
+}
+
+/// A mismatched answer leaves the entry; an expired one is refused.
+#[test]
+fn a_solicit_answer_must_match_before_expiry() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let solicit = solicited(sessions.solicit(key(1), 0, &mut nonces));
+    let nonce = solicit.challenge.nonce;
+    let foreign = SetupAnswer {
+        challenge: ChallengeBlock {
+            receiver_boot_id: [9, 9],
+            nonce,
+        },
+        ..answer(1, nonce)
+    };
+    assert_eq!(
+        sessions.answer(key(1), &foreign, MS, || true),
+        AnswerOutcome::Dropped(Ignored::Mismatch)
+    );
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, [99, 0]), MS, || true),
+        AnswerOutcome::Dropped(Ignored::Mismatch)
+    );
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, nonce), SECOND, || true),
+        AnswerOutcome::Dropped(Ignored::Expired)
+    );
+    // Without a command credit the entry goes with no holdoff: the
+    // publisher answers once, and the next DATA solicits again.
+    let mut sessions = table(SessionConfig::default());
+    let nonce = solicited(sessions.solicit(key(1), 0, &mut nonces))
+        .challenge
+        .nonce;
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, nonce), MS, || false),
+        AnswerOutcome::Dropped(Ignored::NoCommandCredit)
+    );
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, nonce), 2 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::NoChallenge)
+    );
+    let nonce = solicited(sessions.solicit(key(1), 3 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    accepted(sessions.answer(key(1), &answer(1, nonce), 4 * MS, || true));
+    assert_eq!(sessions.counters().solicits_withdrawn, 1);
+}
+
+/// A withdrawn solicit (never sent) leaves no entry and no holdoff.
+#[test]
+fn a_withdrawn_solicit_leaves_nothing() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    solicited(sessions.solicit(key(1), 0, &mut nonces));
+    sessions.withdraw_solicit(&key(1));
+    // Withdrawing a key with no solicit entry changes nothing.
+    sessions.withdraw_solicit(&key(2));
+    solicited(sessions.solicit(key(1), MS, &mut nonces));
+    assert_eq!(sessions.counters().solicits_withdrawn, 1);
+}
+
+/// A solicited answer naming a quarantined identity consumes the entry,
+/// binds nothing and holds the key off.
+#[test]
+fn a_quarantined_solicit_answer_binds_nothing() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let bound = install_on_key_one(&mut sessions, &mut nonces);
+    sessions.retire(bound, 2 * MS);
+    let nonce = solicited(sessions.solicit(key(2), 3 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    assert_eq!(
+        sessions.answer(key(2), &answer(1, nonce), 4 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::Quarantined)
+    );
+    assert_eq!(
+        sessions.answer(key(2), &answer(1, nonce), 5 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::NoChallenge)
+    );
+    assert_eq!(
+        sessions.solicit(key(2), 6 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
+    );
+    assert_eq!(sessions.counters().installed, 1);
+}
+
+/// An announcement for a solicited key names the identity the solicit
+/// lacks: it replaces the entry, and the solicit's nonce stops answering.
+#[test]
+fn an_announcement_replaces_a_solicit() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let solicit = solicited(sessions.solicit(key(1), 0, &mut nonces));
+    let challenge = challenged(sessions.announce(key(1), &announce(1), MS, &mut nonces));
+    assert_ne!(challenge.challenge.nonce, solicit.challenge.nonce);
+    assert_eq!(sessions.counters().challenges_replaced, 1);
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, solicit.challenge.nonce), 2 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::Mismatch)
+    );
+    accepted(sessions.answer(
+        key(1),
+        &answer(1, challenge.challenge.nonce),
+        3 * MS,
+        || true,
+    ));
+    // The key has an entry: DATA solicits nothing more.
+    assert_eq!(
+        sessions.solicit(key(1), 4 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::EntryPending)
+    );
+}
+
+/// A solicited answer for an identity already active under another key of
+/// the same alias binds a later path of that image (RP-1), as a challenged
+/// later path does; another alias is another writer.
+#[test]
+fn a_solicit_for_an_active_identity_binds_a_path() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let image = install_on_key_one(&mut sessions, &mut nonces);
+    let nonce = solicited(sessions.solicit(key(3), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    let later = SetupAnswer {
+        joins: Lanes::new(&[4096, 8192]).unwrap(),
+        ..answer(1, nonce)
+    };
+    let AnswerOutcome::PathBound { image: bound, path } =
+        sessions.answer(key(3), &later, 3 * MS, || panic!("no chain for a path"))
+    else {
+        panic!("not bound as a path");
+    };
+    assert_eq!(bound, image);
+    assert_eq!(sessions.lookup(&key(3)), Some(image));
+    // The joins are recorded for the path, never applied to the image.
+    assert_eq!(sessions.paths().joins(image, path), Some(later.joins));
+    assert_eq!(
+        sessions.paths().joins(image, 0),
+        Some(Lanes::new(&[0, 0]).unwrap())
+    );
+    assert_eq!(sessions.counters().solicits_answered, 1);
+    // Bound with a binding: no holdoff, and the key is bound now.
+    assert_eq!(
+        sessions.solicit(key(3), 4 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::KeyBound)
+    );
+    // Other term parameters for the same identity: refused as on the
+    // challenge path, consumed without a binding, held off.
+    let nonce = solicited(sessions.solicit(key(4), 4 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    let mismatched = SetupAnswer {
+        term: TermParams {
+            term_length: 131_072,
+            ..term()
+        },
+        ..answer(1, nonce)
+    };
+    assert_eq!(
+        sessions.answer(key(4), &mismatched, 5 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    assert_eq!(
+        sessions.solicit(key(4), 6 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
+    );
+    let nonce = solicited(sessions.solicit(other_key(), 4 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    let other = SetupAnswer {
+        alias: other_key().alias,
+        ..answer(1, nonce)
+    };
+    assert_eq!(
+        sessions.answer(other_key(), &other, 5 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+}
+
+/// Solicits share the pending limits of challenges, and a holdoff table
+/// full of unexpired keys refuses new SOLICITs until a row expires.
+#[test]
+fn solicits_are_bounded() {
+    let config = SessionConfig {
+        max_pending_challenges: 2,
+        max_pending_per_source: 2,
+        ..SessionConfig::default()
+    };
+    let mut sessions = table(config);
+    let mut nonces = Counter::default();
+    solicited(sessions.solicit(key(1), 0, &mut nonces));
+    solicited(sessions.solicit(key(3), 0, &mut nonces));
+    assert_eq!(
+        sessions.solicit(key(4), MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::ChallengeCapacity)
+    );
+    assert_eq!(
+        sessions.announce(key(4), &announce(4), MS, &mut nonces),
+        AnnounceOutcome::Dropped(Ignored::ChallengeCapacity)
+    );
+    // Both expire at 1 s and are held off until 2 s: the table is full.
+    sessions.timers(SECOND);
+    assert_eq!(sessions.counters().solicits_expired, 2);
+    assert_eq!(
+        sessions.solicit(key(4), SECOND + SECOND / 2, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::HoldoffFull)
+    );
+    solicited(sessions.solicit(key(4), 2 * SECOND, &mut nonces));
+}
+
+/// #275 review: a solicited answer accepted and then refused at
+/// `ImageReady` (the identity quarantined meanwhile) ended without a
+/// binding: the key is held off.
+#[test]
+fn a_solicited_image_refused_at_ready_holds_off() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let bound = install_on_key_one(&mut sessions, &mut nonces);
+    let nonce = solicited(sessions.solicit(key(2), 2 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    let pending = accepted(sessions.answer(key(2), &answer(2, nonce), 3 * MS, || true));
+    sessions.retire(bound, 4 * MS);
+    // Late: past the challenge timeout.
+    assert_eq!(
+        sessions.image_ready(pending, 3 * MS + SECOND),
+        ReadyOutcome::Release(pending)
+    );
+    assert_eq!(
+        sessions.solicit(key(2), 3 * MS + SECOND, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
+    );
+    // A challenged image refused at ready starts no holdoff.
+    let nonce = challenged(sessions.announce(key(3), &announce(3), 5 * SECOND, &mut nonces))
+        .challenge
+        .nonce;
+    let pending = accepted(sessions.answer(key(3), &answer(3, nonce), 5 * SECOND, || true));
+    assert_eq!(
+        sessions.image_ready(pending, 7 * SECOND),
+        ReadyOutcome::Release(pending)
+    );
+    solicited(sessions.solicit(key(3), 7 * SECOND, &mut nonces));
+}
+
+/// Mutants of the #275 review: a later path refused by a full path table
+/// holds the key off; an identity challenged under another key, or active
+/// with another lane count, is a duplicate; the per-source pending limit
+/// applies to solicits.
+#[test]
+fn solicit_refusals_are_held_off_and_bounded() {
+    let config = SessionConfig {
+        max_paths: 1,
+        max_pending_per_source: 2,
+        ..SessionConfig::default()
+    };
+    let mut sessions = table(config);
+    let mut nonces = Counter::default();
+    install_on_key_one(&mut sessions, &mut nonces);
+    // The image has its one path: a solicited later path is refused.
+    let nonce = solicited(sessions.solicit(key(3), MS, &mut nonces))
+        .challenge
+        .nonce;
+    assert!(matches!(
+        sessions.answer(key(3), &answer(1, nonce), 2 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::PathRefused | Ignored::PathsFull)
+    ));
+    assert_eq!(
+        sessions.solicit(key(3), 3 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
+    );
+    // Another lane count for the active identity: a duplicate.
+    let nonce = solicited(sessions.solicit(key(4), 3 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    let one_lane = SetupAnswer {
+        joins: Lanes::new(&[0]).unwrap(),
+        ..answer(1, nonce)
+    };
+    assert_eq!(
+        sessions.answer(key(4), &one_lane, 4 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    // An identity challenged (not yet answered) under another key.
+    challenged(sessions.announce(key(5), &announce(7), 5 * MS, &mut nonces));
+    let nonce = solicited(sessions.solicit(key(6), 5 * MS, &mut nonces))
+        .challenge
+        .nonce;
+    assert_eq!(
+        sessions.answer(key(6), &answer(7, nonce), 6 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::DuplicateIdentity)
+    );
+    // Per source: key 5 and key 7 pend from 10.0.0.1; a third is refused.
+    solicited(sessions.solicit(key(7), 7 * MS, &mut nonces));
+    assert_eq!(
+        sessions.solicit(key(8), 7 * MS, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::ChallengeCapacity)
+    );
+}
+
+/// The holdoff table never grows past `max_pending_challenges` and
+/// reuses expired rows.
+#[test]
+fn the_holdoff_table_reuses_rows_and_never_grows() {
+    let config = SessionConfig {
+        max_pending_challenges: 2,
+        max_pending_per_source: 2,
+        ..SessionConfig::default()
+    };
+    let mut sessions = table(config);
+    let mut nonces = Counter::default();
+    let capacity = sessions.holdoffs.capacity();
+    solicited(sessions.solicit(key(1), 0, &mut nonces));
+    solicited(sessions.solicit(key(2), 0, &mut nonces));
+    sessions.timers(SECOND);
+    assert_eq!(sessions.holdoffs.len(), 2);
+    // Both rows expire at 2 s; key 3 reuses one when its entry ends.
+    solicited(sessions.solicit(key(3), 2 * SECOND, &mut nonces));
+    sessions.timers(3 * SECOND);
+    assert_eq!(sessions.holdoffs.len(), 2);
+    assert_eq!(sessions.holdoffs.capacity(), capacity);
+    assert_eq!(
+        sessions.solicit(key(3), 3 * SECOND, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
+    );
+}
+
+/// A holdoff for a new key while every row is unexpired records nothing:
+/// the table never grows past `max_pending_challenges`, and the new key
+/// is not held off.
+#[test]
+fn a_full_holdoff_table_records_nothing() {
+    let config = SessionConfig {
+        max_pending_challenges: 2,
+        max_pending_per_source: 2,
+        ..SessionConfig::default()
+    };
+    let mut sessions = table(config);
+    let capacity = sessions.holdoffs.capacity();
+    sessions.hold_off(key(1), 0);
+    sessions.hold_off(key(2), 0);
+    sessions.hold_off(key(3), MS);
+    assert_eq!(sessions.holdoffs.len(), 2);
+    assert_eq!(sessions.holdoffs.capacity(), capacity);
+    assert_eq!(sessions.held_off(&key(3), MS), (false, true));
+    // A held key's row is renewed in place.
+    sessions.hold_off(key(1), 2 * MS);
+    assert_eq!(sessions.holdoffs.len(), 2);
 }

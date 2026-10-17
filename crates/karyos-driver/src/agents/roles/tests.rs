@@ -1777,3 +1777,109 @@ fn an_sm_never_lowers_its_consumption() {
     assert_eq!(sent(&mut receiver, 1024, 40_000_000), 4096);
     assert_eq!(sent(&mut receiver, 8192, 60_000_000), 8192);
 }
+
+/// #275 review P2: a SOLICIT the RSP_SETUP limits refuse leaves no entry,
+/// so the next DATA for the key asks again once the rate refills, instead
+/// of waiting out an entry that was never sent and its holdoff.
+#[test]
+fn a_rate_limited_solicit_leaves_no_entry() {
+    let config = AgentConfig {
+        rsp_setup_per_destination: 1,
+        ..AgentConfig::default()
+    };
+    let (sender, mut receiver) = super::roles(&config).unwrap();
+    let (sessions, _link) = event_ring();
+    receiver.subscriptions.push((EndpointId(1), 6, 1 << 20));
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let other = Alias {
+        session_id: 50,
+        stream_id: 6,
+    };
+    let sent = || {
+        let mut count = 0;
+        while let Ok(Some(_)) = sender.from_receiver.try_take() {
+            count += 1;
+        }
+        count
+    };
+    let bytes = [0u8; 32];
+    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 1);
+    assert_eq!(sent(), 1);
+    // The destination's rate is spent: refused, and withdrawn.
+    for at in 2..5 {
+        receiver.inject_data(&sessions, EndpointId(1), source, other, &bytes, at);
+    }
+    assert_eq!(sent(), 0);
+    // Only the SOLICIT sent counts; the refused ones were withdrawn.
+    let counters = receiver.session_counters();
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (1, 3));
+    assert_eq!(receiver.counters().rsp_setup_rate_limited, 3);
+    // A second later the rate has refilled: the key is solicited.
+    receiver.inject_data(
+        &sessions,
+        EndpointId(1),
+        source,
+        other,
+        &bytes,
+        1_000_000_002,
+    );
+    assert_eq!(sent(), 1);
+    let counters = receiver.session_counters();
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (2, 3));
+}
+
+/// Mutants of the #275 review: DATA solicits only on a subscribed stream
+/// and from an answerable source (no entry at all otherwise), and a
+/// solicited answer cannot size an image above the subscription's term
+/// bound.
+#[test]
+fn solicits_need_a_subscription_an_answerable_source_and_a_term_bound() {
+    use karyos_protocol::network::SetupAnswer;
+
+    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (sessions, _link) = event_ring();
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let bytes = [0u8; 32];
+    // Not subscribed: nothing.
+    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 1);
+    assert!(sender.from_receiver.try_take().unwrap().is_none());
+    receiver.subscriptions.push((EndpointId(1), 6, 65_536));
+    // A group source cannot be answered: no entry is created.
+    let group: SocketAddr = "239.1.1.1:5000".parse().unwrap();
+    receiver.inject_data(&sessions, EndpointId(1), group, alias(), &bytes, 2);
+    let counters = receiver.session_counters();
+    assert_eq!((counters.solicits, counters.solicits_withdrawn), (0, 0));
+    assert_eq!(receiver.counters().unanswerable_source, 1);
+    // Subscribed and answerable: one SOLICIT.
+    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 3);
+    let Ok(Some(super::ControlItem::Outgoing {
+        control: Control::Solicit(solicit),
+        ..
+    })) = sender.from_receiver.try_take()
+    else {
+        panic!("no SOLICIT");
+    };
+    assert_eq!(receiver.session_counters().solicits, 1);
+    // Its answer names a term above the subscription's bound: dropped,
+    // no image.
+    let answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: TermParams {
+            term_length: 1 << 20,
+            initial_term_id: 9,
+            mtu: 1408,
+        },
+        challenge: solicit.challenge,
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    receiver.inject_control(
+        &sessions,
+        EndpointId(1),
+        source,
+        Control::SetupAnswer(answer),
+        4,
+    );
+    assert_eq!(receiver.counters().term_too_large, 1);
+    assert_eq!(receiver.counters().create_image, 0);
+}

@@ -47,7 +47,8 @@
 use std::net::SocketAddr;
 
 use karyos_protocol::network::{
-    Alias, ChallengeBlock, Identity, Lanes, RspChallenge, SetupAnnounce, SetupAnswer, TermParams,
+    Alias, ChallengeBlock, Identity, Lanes, RspChallenge, RspSolicit, SetupAnnounce, SetupAnswer,
+    TermParams,
 };
 use karyos_sys::host_clock::age_ns;
 
@@ -168,6 +169,16 @@ pub enum AnnounceOutcome {
     Dropped(Ignored),
 }
 
+/// What the receiver does with DATA for an unbound key
+/// (network-control-schemas.md §6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolicitOutcome {
+    /// Send this SOLICIT, once: the entry is never resent.
+    Solicit(RspSolicit),
+    /// Ignored and counted: the reason.
+    Dropped(Ignored),
+}
+
 /// What the receiver does with an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnswerOutcome {
@@ -247,6 +258,17 @@ pub enum Ignored {
     AliasMismatch,
     /// The challenge was sent less than `challenge_resend_interval` ago.
     ResendHoldoff,
+    /// DATA from a bound key: nothing to solicit.
+    KeyBound,
+    /// The key has a current challenge or solicit entry: DATA neither
+    /// replaces it nor sends another SOLICIT.
+    EntryPending,
+    /// The key's solicit entry ended without a binding less than
+    /// `solicit_holdoff` (`setup_challenge_timeout`) ago.
+    SolicitHoldoff,
+    /// The holdoff table is full of unexpired keys: no SOLICIT is sent
+    /// whose end could not be held off.
+    HoldoffFull,
 }
 
 /// Counters of the table; increments are checked and `overflowed` is
@@ -261,7 +283,19 @@ pub struct SessionCounters {
     pub challenges_replaced: u64,
     /// Challenges freed by the timer after expiry.
     pub challenges_expired: u64,
-    /// Announcements and answers dropped, all reasons.
+    /// SOLICITs sent (an entry whose send was refused is withdrawn and
+    /// not counted here).
+    pub solicits: u64,
+    /// Solicit entries freed by the timer after expiry.
+    pub solicits_expired: u64,
+    /// Solicited answers accepted (an image created or a path bound).
+    pub solicits_answered: u64,
+    /// Solicit entries withdrawn: never sent, or answered with no command
+    /// chain; freed with no holdoff.
+    pub solicits_withdrawn: u64,
+    /// Announcements, answers and DATA-driven solicits dropped, all
+    /// reasons; DATA for a bound key or a key with an entry counts once
+    /// per datagram.
     pub dropped: u64,
     /// Images installed.
     pub installed: u64,
@@ -313,6 +347,17 @@ enum State {
         path_of: Option<SlotRef>,
         /// The answer's join points, kept for the first path's binding.
         joins: Option<Lanes<u64>>,
+        /// It was a solicit entry (§6.3): a refusal at `ImageReady` ends it
+        /// without a binding and starts the holdoff.
+        solicited: bool,
+    },
+    /// A pending solicit (§6.3): DATA for an unbound key, no candidate
+    /// identity. Its answer supplies identity, term parameters and lanes
+    /// and, accepted, makes it an answered challenge.
+    Solicited {
+        key: BindingKey,
+        nonce: [u64; 2],
+        created_at: u64,
     },
     Active {
         key: BindingKey,
@@ -343,6 +388,10 @@ pub struct ReceiveSessions {
     counters: SessionCounters,
     /// The images' path bindings (redundant-paths.md sections 2 and 3).
     paths: PathBindings,
+    /// Keys whose solicit entry ended without a binding, and until when no
+    /// new SOLICIT goes out for them (`solicit_holdoff`, §7.4): at most
+    /// `max_pending_challenges` (allocated at creation).
+    holdoffs: Vec<(BindingKey, u64)>,
 }
 
 impl ReceiveSessions {
@@ -377,6 +426,7 @@ impl ReceiveSessions {
             ],
             counters: SessionCounters::default(),
             paths,
+            holdoffs: Vec::with_capacity(config.max_pending_challenges),
         })
     }
 
@@ -578,7 +628,7 @@ impl ReceiveSessions {
         self.slots
             .iter()
             .filter(|slot| match slot.state {
-                State::Challenged { key, .. } => {
+                State::Challenged { key, .. } | State::Solicited { key, .. } => {
                     source.is_none_or(|source| source_ip(key.source) == source_ip(source))
                 }
                 _ => false,
@@ -592,11 +642,24 @@ impl ReceiveSessions {
         let timeout = self.config.setup_challenge_timeout;
         let quarantine = self.config.alias_quarantine;
         let mut freed = 0u32;
-        for slot in &mut self.slots {
+        for index in 0..self.slots.len() {
             if freed >= limit {
                 break;
             }
+            let Some(slot) = self.slots.get(index).copied() else {
+                break;
+            };
             let free = match slot.state {
+                State::Solicited {
+                    key, created_at, ..
+                } => {
+                    let expired = age_ns(now, created_at) >= timeout;
+                    if expired {
+                        self.counters.bump(|c| &mut c.solicits_expired);
+                        self.hold_off(key, now);
+                    }
+                    expired
+                }
                 State::Challenged {
                     created_at,
                     answered: false,
@@ -616,12 +679,138 @@ impl ReceiveSessions {
                 _ => false,
             };
             if free {
-                slot.state = State::Free;
+                if let Some(slot) = self.slots.get_mut(index) {
+                    slot.state = State::Free;
+                }
                 // Bounded by `limit`, a u32: it cannot overflow.
                 freed = freed.checked_add(1).unwrap_or(freed);
             }
         }
         freed
+    }
+
+    /// Starts `key`'s solicit holdoff at `now`: its row is renewed, or an
+    /// expired row reused, or a row added below capacity. A full table of
+    /// unexpired rows records nothing; [`ReceiveSessions::solicit`] then
+    /// refuses new SOLICITs until a row expires.
+    fn hold_off(&mut self, key: BindingKey, now: u64) {
+        let holdoff = self.config.setup_challenge_timeout;
+        let row = self
+            .holdoffs
+            .iter()
+            .position(|(held, _)| *held == key)
+            .or_else(|| {
+                self.holdoffs
+                    .iter()
+                    .position(|(_, since)| age_ns(now, *since) >= holdoff)
+            });
+        let below = self.holdoffs.len() < self.config.max_pending_challenges;
+        match row.and_then(|row| self.holdoffs.get_mut(row)) {
+            Some(entry) => *entry = (key, now),
+            None if below => self.holdoffs.push((key, now)),
+            None => {}
+        }
+    }
+
+    /// Whether `key` is held off at `now`, and whether the holdoff table
+    /// has no row free for another key.
+    fn held_off(&self, key: &BindingKey, now: u64) -> (bool, bool) {
+        let holdoff = self.config.setup_challenge_timeout;
+        let held = self
+            .holdoffs
+            .iter()
+            .any(|(held, since)| held == key && age_ns(now, *since) < holdoff);
+        let full = self.holdoffs.len() >= self.config.max_pending_challenges
+            && self
+                .holdoffs
+                .iter()
+                .all(|(_, since)| age_ns(now, *since) < holdoff);
+        (held, full)
+    }
+
+    /// The SOLICIT of a new entry was handed to the sender: counted in
+    /// `solicits`, which counts only SOLICITs sent.
+    pub fn solicit_sent(&mut self) {
+        self.counters.bump(|c| &mut c.solicits);
+    }
+
+    /// Frees `key`'s solicit entry with no holdoff: its SOLICIT was never
+    /// sent (an RSP_SETUP limit or the control ring refused it), and it is
+    /// never resent.
+    pub fn withdraw_solicit(&mut self, key: &BindingKey) {
+        let found = self
+            .slots
+            .iter_mut()
+            .find(|slot| matches!(slot.state, State::Solicited { key: held, .. } if held == *key));
+        if let Some(slot) = found {
+            slot.state = State::Free;
+            self.counters.bump(|c| &mut c.solicits_withdrawn);
+        }
+    }
+
+    /// DATA, PAD, ABORTED or a heartbeat from `key`, a key with no binding,
+    /// on a subscribed stream, at `now` (network-control-schemas.md §6.3):
+    /// a solicit entry and one SOLICIT, unless the key is bound, has a
+    /// current challenge or solicit entry, or is held off, or the pending
+    /// limits of challenges are reached. A SOLICIT is never resent; DATA
+    /// never replaces a current entry.
+    pub fn solicit(
+        &mut self,
+        key: BindingKey,
+        now: u64,
+        nonces: &mut impl NonceSource,
+    ) -> SolicitOutcome {
+        if self.lookup(&key).is_some() || self.paths.lookup(key).is_some() {
+            return SolicitOutcome::Dropped(self.ignore(Ignored::KeyBound));
+        }
+        let pending = self.slots.iter().any(|slot| {
+            matches!(slot.state,
+                State::Challenged { key: held, .. } | State::Solicited { key: held, .. }
+                    if held == key)
+        });
+        if pending {
+            return SolicitOutcome::Dropped(self.ignore(Ignored::EntryPending));
+        }
+        match self.held_off(&key, now) {
+            (true, _) => return SolicitOutcome::Dropped(self.ignore(Ignored::SolicitHoldoff)),
+            (false, true) => return SolicitOutcome::Dropped(self.ignore(Ignored::HoldoffFull)),
+            (false, false) => {}
+        }
+        let full = |table: &Self| {
+            table.pending(None) >= table.config.max_pending_challenges
+                || table.pending(Some(key.source)) >= table.config.max_pending_per_source
+                || !table.slots.iter().any(|slot| slot.state == State::Free)
+        };
+        // DATA comes at line rate: the sweep here is bounded by the timer
+        // budget (the timer duty frees the rest).
+        if full(self) {
+            self.sweep(now, self.config.timer_actions);
+        }
+        if self.pending(None) >= self.config.max_pending_challenges
+            || self.pending(Some(key.source)) >= self.config.max_pending_per_source
+        {
+            return SolicitOutcome::Dropped(self.ignore(Ignored::ChallengeCapacity));
+        }
+        let Some(index) = self.slots.iter().position(|slot| slot.state == State::Free) else {
+            return SolicitOutcome::Dropped(self.ignore(Ignored::TableFull));
+        };
+        let Some(nonce) = nonces.nonce() else {
+            return SolicitOutcome::Dropped(self.ignore(Ignored::NoNonce));
+        };
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.state = State::Solicited {
+                key,
+                nonce,
+                created_at: now,
+            };
+        }
+        SolicitOutcome::Solicit(RspSolicit {
+            alias: key.alias,
+            challenge: ChallengeBlock {
+                receiver_boot_id: self.boot_id,
+                nonce,
+            },
+        })
     }
 
     /// Timer duty, up to the configured `timer_actions` in all: frees
@@ -689,7 +878,9 @@ impl ReceiveSessions {
             .enumerate()
             .position(|(index, slot)| match slot.state {
                 State::Active { .. } => self.bound_here(index, slot, &key),
-                State::Challenged { key: bound, .. } => bound == key,
+                State::Challenged { key: bound, .. } | State::Solicited { key: bound, .. } => {
+                    bound == key
+                }
                 _ => false,
             });
         if let Some(index) = existing
@@ -754,6 +945,35 @@ impl ReceiveSessions {
                             answered: false,
                             path_of,
                             joins: None,
+                            solicited: false,
+                        };
+                    }
+                    self.counters.bump(|c| &mut c.challenges_replaced);
+                    return AnnounceOutcome::Challenge(self.challenge(
+                        key,
+                        announce.identity,
+                        fresh,
+                    ));
+                }
+                // An announcement names the identity a solicit lacks: it
+                // replaces the entry, whose nonce stops matching.
+                State::Solicited { .. } => {
+                    let Some(fresh) = nonces.nonce() else {
+                        return AnnounceOutcome::Dropped(self.ignore(Ignored::NoNonce));
+                    };
+                    if let Some(slot) = self.slots.get_mut(index) {
+                        slot.state = State::Challenged {
+                            key,
+                            identity: announce.identity,
+                            term: announce.term,
+                            lane_count: announce.lane_count,
+                            nonce: fresh,
+                            created_at: now,
+                            last_sent: now,
+                            answered: false,
+                            path_of,
+                            joins: None,
+                            solicited: false,
                         };
                     }
                     self.counters.bump(|c| &mut c.challenges_replaced);
@@ -798,6 +1018,7 @@ impl ReceiveSessions {
                 answered: false,
                 path_of,
                 joins: None,
+                solicited: false,
             };
         }
         self.counters.bump(|c| &mut c.challenges);
@@ -832,7 +1053,11 @@ impl ReceiveSessions {
             .iter()
             .enumerate()
             .find_map(|(index, slot)| match slot.state {
-                State::Challenged { key: pending, .. } if pending == key => Some(index),
+                State::Challenged { key: pending, .. } | State::Solicited { key: pending, .. }
+                    if pending == key =>
+                {
+                    Some(index)
+                }
                 _ => None,
             });
         let Some(index) = found else {
@@ -841,6 +1066,20 @@ impl ReceiveSessions {
         let Some(slot) = self.slots.get(index).copied() else {
             return AnswerOutcome::Dropped(self.ignore(Ignored::NoChallenge));
         };
+        if let State::Solicited {
+            nonce, created_at, ..
+        } = slot.state
+        {
+            return self.answer_solicited(
+                index,
+                &slot,
+                key,
+                answer,
+                (nonce, created_at),
+                now,
+                reserve,
+            );
+        }
         let State::Challenged {
             identity,
             term,
@@ -904,6 +1143,104 @@ impl ReceiveSessions {
         }
     }
 
+    /// The answer to a solicit entry (§6.3 step 3): its challenge block
+    /// must match before expiry; identity, term parameters and lanes come
+    /// from the answer. A quarantined or duplicate identity consumes the
+    /// entry, binds nothing and starts the holdoff. An identity active
+    /// under another key binds a later path of that image (RP-1), as a
+    /// challenged later path does; otherwise the entry becomes an answered
+    /// challenge and the image is created as for an announcement.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the entry's index, copy, key and challenge state, kept together on one cold path"
+    )]
+    fn answer_solicited(
+        &mut self,
+        index: usize,
+        slot: &Slot,
+        key: BindingKey,
+        answer: &SetupAnswer,
+        (nonce, created_at): ([u64; 2], u64),
+        now: u64,
+        reserve: impl FnOnce() -> bool,
+    ) -> AnswerOutcome {
+        // The caller builds the key from the answer's alias.
+        debug_assert_eq!(answer.alias, key.alias);
+        if answer.challenge.receiver_boot_id != self.boot_id || answer.challenge.nonce != nonce {
+            return AnswerOutcome::Dropped(self.ignore(Ignored::Mismatch));
+        }
+        if age_ns(now, created_at) >= self.config.setup_challenge_timeout {
+            return AnswerOutcome::Dropped(self.ignore(Ignored::Expired));
+        }
+        let identity = answer.identity;
+        let consumed = |table: &mut Self, reason| {
+            if let Some(entry) = table.slots.get_mut(index) {
+                entry.state = State::Free;
+            }
+            table.hold_off(key, now);
+            AnswerOutcome::Dropped(table.ignore(reason))
+        };
+        if self.quarantined(&identity, now) {
+            return consumed(self, Ignored::Quarantined);
+        }
+        if self.pending_elsewhere(&identity, &key) {
+            return consumed(self, Ignored::DuplicateIdentity);
+        }
+        if let Some(image) = self.active_elsewhere(&identity, &key) {
+            let same = self.get(image).is_some_and(
+                |held| matches!(held.state, State::Active { key: held, .. } if held.alias == key.alias),
+            ) && self.paths.image(image).is_some_and(|(held, term, lanes, _)| {
+                held == identity && term == answer.term && lanes == answer.joins.count()
+            });
+            if !same {
+                return consumed(self, Ignored::DuplicateIdentity);
+            }
+            let outcome = self.answer_path(index, image, key, answer, now);
+            match outcome {
+                AnswerOutcome::PathBound { .. } => {
+                    self.counters.bump(|c| &mut c.solicits_answered);
+                }
+                _ => self.hold_off(key, now),
+            }
+            return outcome;
+        }
+        if !reserve() {
+            // The publisher answers a SOLICIT once: keeping the entry would
+            // wait for its expiry and a holdoff. It goes, with no holdoff,
+            // and the next DATA asks again under the limits.
+            if let Some(entry) = self.slots.get_mut(index) {
+                entry.state = State::Free;
+            }
+            self.counters.bump(|c| &mut c.solicits_withdrawn);
+            return AnswerOutcome::Dropped(self.ignore(Ignored::NoCommandCredit));
+        }
+        let Some(slot_ref) = Self::slot_ref(index, slot) else {
+            return AnswerOutcome::Dropped(self.ignore(Ignored::TableFull));
+        };
+        if let Some(entry) = self.slots.get_mut(index) {
+            entry.state = State::Challenged {
+                key,
+                identity,
+                term: answer.term,
+                lane_count: answer.joins.count(),
+                nonce,
+                created_at,
+                last_sent: created_at,
+                answered: true,
+                path_of: None,
+                joins: Some(answer.joins),
+                solicited: true,
+            };
+        }
+        self.counters.bump(|c| &mut c.solicits_answered);
+        AnswerOutcome::CreateImage {
+            slot: slot_ref,
+            identity,
+            term: answer.term,
+            joins: answer.joins,
+        }
+    }
+
     /// A later path's checked answer (RP-1): the image must still be
     /// active under another key; the path is bound with its joins recorded,
     /// never applied, and no image is created, so no conductor chain is
@@ -958,6 +1295,7 @@ impl ReceiveSessions {
             created_at,
             answered: true,
             joins,
+            solicited,
             ..
         } = entry.state
         else {
@@ -973,6 +1311,10 @@ impl ReceiveSessions {
         if refused {
             entry.state = State::Free;
             self.counters.bump(|c| &mut c.released);
+            // A solicit entry ended without a binding.
+            if solicited {
+                self.hold_off(key, now);
+            }
             return ReadyOutcome::Release(slot);
         }
         // The slot's generation moves with every installed image; an
