@@ -73,6 +73,7 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
             Workload::OpenLoop => "scheduled latency (due time to delivery)",
             Workload::SenderNak => "latency per NAK range",
             Workload::ImageInstall => "install time per image",
+            Workload::ImageFirstFill => "fill time of each fresh image's first term",
             _ => "latency",
         };
         out.push_str(&format!(
@@ -113,7 +114,7 @@ pub fn text(measurement: &Measurement, labels: &Labels) -> String {
     }
     let unit = match measurement.config.workload {
         Workload::SenderNak => "NAK ranges",
-        Workload::ImageInstall => "images",
+        Workload::ImageInstall | Workload::ImageFirstFill => "images",
         _ => "messages",
     };
     out.push_str(&format!("  rate {:.0} {unit}/s\n", measurement.rate));
