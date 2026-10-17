@@ -2449,3 +2449,54 @@ fn a_complete_term_charges_each_path_its_missing_bytes() {
     );
     assert_eq!(founding.missing_bytes, 0, "{founding:?}");
 }
+
+/// Detection-to-NAK time of a lost datagram on a reliable image: the rig
+/// time between the round its hole is detected and the round its NAK is
+/// handed over.
+fn nak_wait(rig: &mut Rig, slot: SlotRef) -> u64 {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| {
+        rig.agents
+            .receiver
+            .role
+            .loss_counters(slot)
+            .is_some_and(|counters| counters.detected >= 1)
+    });
+    let detected = rig.now;
+    let naks = rig.agents.receiver.counters().naks;
+    if naks >= 1 {
+        return 0;
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    rig.now - detected
+}
+
+/// rp-w2, ADR-0018's case: with a later path live and silent, a gap on the
+/// founding path is requested only once the skew window (1 ms) passed
+/// since detection, in case the other path delivers it; with one live
+/// path the NAK goes in the round that detected the gap (RP-5).
+#[test]
+fn a_gap_waits_the_skew_window_while_another_path_is_live() {
+    let setup = Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let wait = nak_wait(&mut rig, slot);
+    assert!(wait >= 1_000_000, "{wait} ns");
+    let (mut single, _b) = Rig::new(Setup { ..setup });
+    let slot = established(&mut single);
+    assert_eq!(nak_wait(&mut single, slot), 0);
+}

@@ -73,8 +73,13 @@
 //! suppression (RC-14). Each hole counts its consecutive suppressed
 //! cycles, and the image keeps the maximum as a diagnostic.
 //!
-//! The redundant-path skew wait comes later. Nothing here allocates;
-//! positions and times are checked.
+//! **Redundant paths** (RP-4, RP-5): a hole detected while two or more
+//! paths are live ([`ImageLoss::set_live_paths`]) waits the skew window
+//! (`path_skew_window`) from detection before its NAK, or its first
+//! multicast cycle, in case another path still delivers it. The deadline
+//! is fixed at detection; with one live path there is no wait.
+//!
+//! Nothing here allocates; positions and times are checked.
 
 use karyos_protocol::frame::Lane;
 use karyos_protocol::network::{
@@ -82,6 +87,7 @@ use karyos_protocol::network::{
 };
 use karyos_sys::host_clock::age_ns;
 
+use crate::paths::skew::SkewDeadline;
 use crate::rtt::{ProbeIds, RttProbes};
 
 /// The bounded random draw of a multicast cycle's NAK delay (RC-2).
@@ -229,12 +235,21 @@ pub struct LossConfig {
     /// image reports a protocol fault (`range_invalid_limit`, RC-8,
     /// default 3).
     pub range_invalid_limit: u32,
+    /// `path_skew_window` (RP-4): how long after detection a gap waits
+    /// for another live path to deliver it before its NAK, 0 to 1 s,
+    /// default 1 ms. With fewer than two live paths at detection there is
+    /// no wait (RP-5).
+    pub skew_window_ns: u64,
 }
+
+/// The largest `path_skew_window` (RP-4): one second.
+pub const MAX_SKEW_WINDOW_NS: u64 = 1_000_000_000;
 
 impl Default for LossConfig {
     fn default() -> Self {
         Self {
             range_invalid_limit: 3,
+            skew_window_ns: 1_000_000,
         }
     }
 }
@@ -251,6 +266,9 @@ pub enum LossConfigError {
     /// A multicast setting is out of its range.
     #[error("invalid multicast repair setting: {0}")]
     Multicast(&'static str),
+    /// `path_skew_window` above [`MAX_SKEW_WINDOW_NS`].
+    #[error("path_skew_window above 1 s")]
+    SkewWindow,
 }
 
 /// One missing interval of a lane, within one term.
@@ -325,6 +343,10 @@ struct LaneLoss {
     no_peer: bool,
     /// Consecutive suppressed cycles of this hole.
     suppressed_run: u64,
+    /// The decision's skew deadline (RP-4, RP-5): its NAK, or its first
+    /// multicast cycle, waits until then. Fixed at detection; neither a
+    /// duplicate, a path's arrival nor a path's loss moves it.
+    skew_until: u64,
 }
 
 impl LaneLoss {
@@ -339,6 +361,7 @@ impl LaneLoss {
         failed_count: 0,
         no_peer: false,
         suppressed_run: 0,
+        skew_until: 0,
     };
 }
 
@@ -524,6 +547,10 @@ pub struct ImageLoss {
     faulted: bool,
     /// Multicast timing and suppression, when the image is multicast.
     multicast: Option<MulticastConfig>,
+    /// The image's live path bindings, as the caller last reported them
+    /// ([`ImageLoss::set_live_paths`]): a gap detected with two or more
+    /// waits the skew window.
+    live_paths: usize,
     counters: LossCounters,
 }
 
@@ -544,6 +571,9 @@ impl ImageLoss {
         if config.range_invalid_limit == 0 {
             return Err(LossConfigError::ZeroLimit);
         }
+        if config.skew_window_ns > MAX_SKEW_WINDOW_NS {
+            return Err(LossConfigError::SkewWindow);
+        }
         let lane_count = usize::from(lane_count);
         if !(1..=MAX_LANES).contains(&lane_count) {
             return Err(LossConfigError::LaneCount);
@@ -560,8 +590,16 @@ impl ImageLoss {
             uncertain: false,
             faulted: false,
             multicast: None,
+            live_paths: 1,
             counters: LossCounters::default(),
         })
+    }
+
+    /// The image's live path bindings now (RP-5): the caller reports them
+    /// before it observes, so a gap is detected with the count of its
+    /// moment. Later changes never move a deadline already fixed.
+    pub fn set_live_paths(&mut self, live: usize) {
+        self.live_paths = live;
     }
 
     /// The same state, timed by multicast cycles with B+C suppression.
@@ -596,7 +634,8 @@ impl ImageLoss {
             return;
         };
         let start = match (state.decision, state.cycle) {
-            (Decision::NakDue { .. }, None) => true,
+            // A hole's first cycle starts once its skew deadline passed.
+            (Decision::NakDue { .. }, None) => now >= state.skew_until,
             // A suppressed cycle's window ended with the hole still there.
             (Decision::NakDue { .. }, Some(cycle)) => {
                 let ended = cycle
@@ -777,6 +816,8 @@ impl ImageLoss {
         if self.closed {
             return Observation::Nothing;
         }
+        let (window, live) = (self.config.skew_window_ns, self.live_paths);
+        let mut timing_overflowed = false;
         let Some(state) = self.lane_mut(lane) else {
             return Observation::Nothing;
         };
@@ -854,11 +895,21 @@ impl ImageLoss {
                 }
             }
             (_, Some(seen)) => {
+                // RP-4, RP-5: fixed now; a deadline past the clock waits
+                // nothing, counted.
+                let skew_until = match SkewDeadline::reliable(now, window, live) {
+                    Ok(deadline) => deadline.at(),
+                    Err(_) => {
+                        timing_overflowed = true;
+                        now
+                    }
+                };
                 *state = LaneLoss {
                     decision: Decision::NakDue {
                         hole: seen,
                         detected_at: now,
                     },
+                    skew_until,
                     ..LaneLoss::IDLE
                 };
                 event = Some(|c| &mut c.detected);
@@ -869,6 +920,9 @@ impl ImageLoss {
         }
         if repair_suppressed {
             self.counters.bump(|c| &mut c.repair_suppressions);
+        }
+        if timing_overflowed {
+            self.counters.bump(|c| &mut c.timing_overflows);
         }
         observation
     }
@@ -884,6 +938,10 @@ impl ImageLoss {
         let (alias, identity, receiver) = (self.alias, self.identity, self.receiver);
         let multicast = self.multicast.is_some();
         let state = self.lane_mut(lane)?;
+        // RP-4: a gap waits its skew deadline before any NAK.
+        if matches!(state.decision, Decision::NakDue { .. }) && now < state.skew_until {
+            return None;
+        }
         let hole = match (state.decision, multicast) {
             (Decision::NakDue { hole, .. }, false) => hole,
             // Multicast: once the cycle's drawn delay passed, unless the

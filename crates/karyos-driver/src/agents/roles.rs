@@ -1701,7 +1701,10 @@ impl ReceiverRole {
         };
         // A multicast image times its NAKs by cycle (RC-2).
         let loss = ImageLoss::new(
-            LossConfig::default(),
+            LossConfig {
+                skew_window_ns: self.path_config.path_skew_window,
+                ..LossConfig::default()
+            },
             key.alias,
             identity,
             receiver,
@@ -1718,10 +1721,15 @@ impl ReceiverRole {
         let Ok(loss) = loss else {
             return Err(Some(chain.retire));
         };
-        let skip_config = if reliable {
-            SkipConfig::reliable()
-        } else {
-            SkipConfig::unreliable()
+        // The skew window (RP-4): on an unreliable image the seal waits
+        // the larger of it and the reorder interval, never their sum.
+        let skip_config = SkipConfig {
+            skew_window_ns: self.path_config.path_skew_window,
+            ..if reliable {
+                SkipConfig::reliable()
+            } else {
+                SkipConfig::unreliable()
+            }
         };
         let Ok(skip) = SkipPolicy::new(skip_config, usize::from(chain.lane_count)) else {
             return Err(Some(chain.retire));
@@ -1972,6 +1980,7 @@ impl ReceiverRole {
     fn repair(&mut self, index: usize, now: u64) -> Result<u32, AgentError> {
         let Self {
             images,
+            sessions,
             to_sender,
             counters,
             delays,
@@ -1982,6 +1991,9 @@ impl ReceiverRole {
         let Some(image) = images.get_mut(index) else {
             return Ok(0);
         };
+        // RP-5: a gap detected now waits the skew window only with two or
+        // more live paths.
+        image.loss.set_live_paths(sessions.paths().live(image.slot));
         let mut sent = 0u32;
         let lanes = usize::from(image.lane_count);
         for at in 0..lanes {
