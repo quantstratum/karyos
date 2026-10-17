@@ -32,12 +32,15 @@
 //!   equals `written` afterwards. A write the index does not cover was
 //!   never `written`, so a torn write is never read back. The data file is
 //!   shortened to `written`, so no stale byte past it lingers.
-//! - **Headers.** Only the last segment's index header may be missing,
-//!   short, zeroed or torn: that segment was being created, and recovery
-//!   removes it. Any other bad header is a typed error that removes nothing:
-//!   one torn before the last segment, one of another format version, one
-//!   naming another recording or geometry, or one whose start is outside
-//!   its segment.
+//! - **Headers.** Only the last segment can be one being created, and
+//!   recovery removes it: its index header is missing, short or zeroed, or
+//!   torn (failing its CRC) with no data and no entry behind it. Creation
+//!   makes the header durable before any write, so a torn header with
+//!   data or entries behind it is corruption. Any other bad header is a
+//!   typed error that removes nothing: one missing or torn before the last
+//!   segment, a corrupt one, one of another format version, one naming
+//!   another recording or geometry, or one whose start is outside its
+//!   segment.
 //!
 //! - **Kinds.** An index entry covers data, a fill or a gap (byte 16 of
 //!   the entry; zero, data, in every entry of the first version). A fill
@@ -294,6 +297,9 @@ pub enum HeaderProblem {
     /// Missing, short, zeroed or torn, before the last segment; or a data
     /// file missing under its index.
     Incomplete,
+    /// Torn (failing its CRC) with data or entries behind it: written and
+    /// made durable at creation, then damaged.
+    Corrupt,
     /// Another format (magic or version) under a valid CRC.
     Foreign,
     /// Another recording, base or geometry under a valid CRC: the store is
@@ -307,8 +313,10 @@ pub enum HeaderProblem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeaderRead {
     Valid(Header),
-    /// Missing, short, zeroed or torn (its CRC fails).
-    Incomplete,
+    /// Missing, short or zeroed.
+    Missing,
+    /// Whole but failing its CRC.
+    Torn,
     /// A valid CRC over another magic or version.
     Foreign,
 }
@@ -438,15 +446,18 @@ impl Header {
 
     fn read(bytes: Option<&[u8; 48]>) -> HeaderRead {
         let Some(bytes) = bytes else {
-            return HeaderRead::Incomplete;
+            return HeaderRead::Missing;
         };
+        if bytes.iter().all(|byte| *byte == 0) {
+            return HeaderRead::Missing;
+        }
         let checked = bytes
             .get(..44)
             .map(crc32c)
             .zip(u32_at(bytes, 44))
             .is_some_and(|(crc, stored)| crc == stored);
-        if bytes.iter().all(|byte| *byte == 0) || !checked {
-            return HeaderRead::Incomplete;
+        if !checked {
+            return HeaderRead::Torn;
         }
         if u32_at(bytes, 0) != Some(MAGIC) || u32_at(bytes, 4) != Some(VERSION) {
             return HeaderRead::Foreign;
@@ -467,7 +478,7 @@ impl Header {
                     term_length,
                 })
             }
-            _ => HeaderRead::Incomplete,
+            _ => HeaderRead::Missing,
         }
     }
 }
@@ -1167,15 +1178,23 @@ fn scan_segment<D: Disk>(
                 Err(error) => return Err(error.into()),
             }
         }
-        None => HeaderRead::Incomplete,
+        None => HeaderRead::Missing,
+    };
+    // A torn header with data or entries behind it was durable once: the
+    // segment was not being created, it is damaged.
+    let empty = match (&data, &index) {
+        (Some(data), Some(index)) => disk.len(data)? == 0 && disk.len(index)? <= HEADER,
+        (None, Some(index)) => disk.len(index)? <= HEADER,
+        (_, None) => true,
     };
     let (header, data, index) = match (read, data, index) {
         (HeaderRead::Valid(header), Some(data), Some(index)) => (header, data, index),
         (HeaderRead::Valid(_), None, Some(_)) => return Err(bad(HeaderProblem::Incomplete)),
         (HeaderRead::Foreign, _, _) => return Err(bad(HeaderProblem::Foreign)),
+        (HeaderRead::Torn, _, _) if !empty => return Err(bad(HeaderProblem::Corrupt)),
         // Only the last segment can be the one being created (at the
         // recording's start, or a roll, with nothing written in it).
-        (HeaderRead::Incomplete, _, _) if last => {
+        (HeaderRead::Missing | HeaderRead::Torn, _, _) if last => {
             if scan.start.is_some() && scan.written.is_some_and(|written| written != base) {
                 scan.cut = Some(Cut {
                     position: scan.written.unwrap_or(base),
