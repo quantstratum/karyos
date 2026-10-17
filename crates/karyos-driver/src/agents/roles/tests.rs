@@ -803,6 +803,194 @@ fn the_sender_validates_sms_against_its_bindings() {
     );
 }
 
+/// The membership wiring (ACS 15648, 15707): an accepted SM reaches the
+/// publication's membership under its binding key; a re-bind whose next SM
+/// names another receiver id ends the former membership first; a binding's
+/// expiry ends its member, synchronously.
+#[test]
+fn accepted_sms_and_gone_bindings_reach_the_membership() {
+    use karyos_protocol::frame::Lane;
+    use karyos_protocol::network::{LaneStatus, Receiver, SetupAnswer, StatusMessage};
+
+    use crate::membership::{Membership, MembershipConfig, Roles};
+    use crate::repair::admission::Requester;
+
+    let config = AgentConfig::default();
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let endpoint = EndpointId(1);
+    sender.sessions.add(publication(endpoint)).unwrap();
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let (mut path, _log) = outbound(endpoint, receiver);
+    path.attach_membership(Box::new(
+        Membership::new(
+            MembershipConfig::new(1, 1408, 32_768),
+            identity(),
+            alias(),
+            &Roles::default(),
+            0,
+        )
+        .unwrap(),
+    ));
+    sender.publications.push(*path);
+    let answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(endpoint).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    let status = |receiver_id, consumption| StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(&[LaneStatus {
+            consumption,
+            window: 32_768,
+        }])
+        .unwrap(),
+    };
+    let member = |sender: &mut super::SenderRole, receiver_id, now| {
+        sender.publications[0].membership_mut().unwrap().requester(
+            Receiver {
+                receiver_boot_id: [7, 8],
+                receiver_id,
+            },
+            Lane::ZERO,
+            now,
+        )
+    };
+    sender.bind(endpoint, receiver, &answer, 0);
+    sender.status(endpoint, receiver, &status(1, 0), 1);
+    assert!(matches!(
+        member(&mut sender, 1, 1),
+        Requester::Member { .. }
+    ));
+    // A new answer (a reinstalled image), then an SM of receiver 2: 1 goes.
+    sender.bind(endpoint, receiver, &answer, 2);
+    sender.status(endpoint, receiver, &status(2, 0), 3);
+    assert_eq!(member(&mut sender, 1, 3), Requester::Unknown);
+    assert!(matches!(
+        member(&mut sender, 2, 3),
+        Requester::Member { .. }
+    ));
+    // A new answer resets the row; it expires before its next SM, and the
+    // former receiver's membership goes with it.
+    sender.bind(endpoint, receiver, &answer, 4);
+    assert!(matches!(
+        member(&mut sender, 2, 4),
+        Requester::Member { .. }
+    ));
+    sender.expire_bindings(4 + config.sessions.setup_challenge_timeout);
+    assert!(sender.bindings.is_empty());
+    assert_eq!(member(&mut sender, 2, 5), Requester::Unknown);
+    // Confirmed, then its SMs stop: the binding expires, and the member
+    // with it, at once.
+    sender.bind(endpoint, receiver, &answer, 6);
+    sender.status(endpoint, receiver, &status(3, 0), 7);
+    sender.expire_bindings(7 + config.image_liveness_timeout);
+    assert!(sender.bindings.is_empty());
+    assert_eq!(member(&mut sender, 3, 8), Requester::Unknown);
+    // A reset row evicted for a newcomer ends its former receiver's too.
+    let t = 8 + config.image_liveness_timeout;
+    sender.bind(endpoint, receiver, &answer, t);
+    sender.status(endpoint, receiver, &status(4, 0), t + 1);
+    sender.bind(endpoint, receiver, &answer, t + 2);
+    for boot in 1..u64::try_from(config.receiver_bindings).unwrap() {
+        let mut stranger = answer;
+        stranger.challenge.receiver_boot_id = [boot, 99];
+        let port = 6000 + u16::try_from(boot).unwrap();
+        sender.bind(
+            endpoint,
+            SocketAddr::from(([10, 0, 0, 8], port)),
+            &stranger,
+            t + 3,
+        );
+    }
+    assert!(matches!(
+        member(&mut sender, 4, t + 3),
+        Requester::Member { .. }
+    ));
+    let mut newcomer = answer;
+    newcomer.challenge.receiver_boot_id = [1, 1];
+    sender.bind(
+        endpoint,
+        SocketAddr::from(([10, 0, 0, 7], 7000)),
+        &newcomer,
+        t + 4,
+    );
+    assert_eq!(sender.counters().bindings_evicted, 1);
+    assert_eq!(member(&mut sender, 4, t + 4), Requester::Unknown);
+}
+
+/// A publication's membership follows the driver's SM cadence and image
+/// liveness, and a configuration they cannot satisfy is refused.
+#[test]
+fn a_publication_membership_follows_the_driver_timing() {
+    let config = AgentConfig {
+        sm_interval: 20_000_000,
+        image_liveness_timeout: 20_000_000_000,
+        idle_image_timeout: 90_000_000_000,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let endpoint = EndpointId(1);
+    let (path, _log) = outbound(endpoint, "10.0.0.9:5000".parse().unwrap());
+    let command = AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(endpoint),
+        outbound: path,
+    };
+    assert!(matches!(
+        sender.command(command),
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    let held = *sender.publications[0].membership_mut().unwrap().config();
+    assert_eq!(
+        (
+            held.sm_interval,
+            held.receiver_timeout,
+            held.pause_timeout,
+            held.join_timeout
+        ),
+        (20_000_000, 20_000_000_000, 90_000_000_000, 20_000_000_000)
+    );
+    let short = AgentConfig {
+        image_liveness_timeout: 9 * config.sm_interval,
+        ..config
+    };
+    assert!(matches!(
+        short.validate(),
+        Err(super::AgentError::InvalidConfig(_))
+    ));
+}
+
+/// An SM skipped because the image's previous one still waits stays due;
+/// only a posted SM is recorded as sent.
+#[test]
+fn a_skipped_sm_stays_due() {
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (image, _) = installed_image();
+    role.images.push(image);
+    let due = role.images[0].schedule.due(0, &[0]).unwrap();
+    let waiting = super::SmGuard::take(&role.images[0].sm);
+    role.send_sm(0, &due, 0);
+    assert_eq!(role.counters().sm_skipped, 1);
+    assert!(role.images[0].schedule.due(1, &[0]).is_some(), "still due");
+    drop(waiting);
+    role.send_sm(0, &due, 1);
+    assert_eq!(role.counters().sm_sent, 1);
+    assert!(role.images[0].schedule.due(2, &[0]).is_none(), "sent");
+}
+
 /// P1: a flood of answered strangers cannot hold the binding table. An
 /// unconfirmed binding expires after `setup_challenge_timeout` and is the
 /// first evicted when the table is full; a confirmed one stays while its
@@ -926,7 +1114,7 @@ fn installed_image() -> (super::Installed, karyos_sys::receive::ImageParams) {
         heartbeat_marks: [None; 4],
         last_fresh: 0,
         window: 32_768,
-        sm_last: None,
+        schedule: crate::sm_schedule::SmSchedule::new(10_000_000, &[32_768]).unwrap(),
         sm_slot: None,
         sm: Arc::new(super::SmSlot::default()),
         evidence: 0,
@@ -1130,6 +1318,42 @@ fn a_reset_request_is_repeated_at_its_cadence() {
         (counters.reset_requests, counters.reset_requests_full),
         (2, 1)
     );
+}
+
+/// The wired SM path never lowers a lane's reported consumption: after a
+/// real SM, a lower sample (a required reader joining during a sample,
+/// here a lowered published head) is clamped by the image's SM schedule
+/// to the earlier report, which the sender would otherwise take for a
+/// replay; a higher sample is reported as it is.
+#[test]
+fn an_sm_never_lowers_its_consumption() {
+    use karyos_protocol::network::StatusMessage;
+
+    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (sessions, _link) = event_ring();
+    let (image, _) = installed_image();
+    receiver.images.push(image);
+    let sent = |receiver: &mut super::ReceiverRole, head, now| {
+        let image = &mut receiver.images[0];
+        assert!(
+            image
+                .owner
+                .set_published_head(karyos_protocol::frame::Lane::ZERO, head)
+        );
+        image.evidence = now;
+        receiver.image_timers(&sessions, now).unwrap();
+        let Ok(Some(super::ControlItem::Outgoing {
+            control: Control::Status(StatusMessage { lanes, .. }),
+            ..
+        })) = sender.from_receiver.try_take()
+        else {
+            panic!("no SM at {now}");
+        };
+        lanes.as_slice()[0].consumption
+    };
+    assert_eq!(sent(&mut receiver, 4096, 20_000_000), 4096);
+    assert_eq!(sent(&mut receiver, 1024, 40_000_000), 4096);
+    assert_eq!(sent(&mut receiver, 8192, 60_000_000), 8192);
 }
 
 /// #275 review P2: a SOLICIT the RSP_SETUP limits refuse leaves no entry,

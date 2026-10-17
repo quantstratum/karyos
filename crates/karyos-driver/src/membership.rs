@@ -589,6 +589,12 @@ impl Membership {
         })
     }
 
+    /// Its settings.
+    #[must_use]
+    pub const fn config(&self) -> &MembershipConfig {
+        &self.config
+    }
+
     /// The counters.
     #[must_use]
     pub const fn counters(&self) -> &MembershipCounters {

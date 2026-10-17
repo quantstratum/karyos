@@ -68,6 +68,7 @@ const DATA_BUDGET: karyos_protocol::lanes::drr::Budget = karyos_protocol::lanes:
 };
 use super::ring::{self, Reservation, RingReceiver, RingSender};
 use super::{AgentCommand, AgentConfig, AgentError, AgentEvent, AgentKind, EndpointId, Half};
+use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
 use crate::sessions::OsNonces;
 use crate::sessions::rate::{EndpointRates, RateRefused, TotalRate, normalized};
 use crate::sessions::receive::{
@@ -75,6 +76,7 @@ use crate::sessions::receive::{
     SessionConfigError, SlotRef, SolicitOutcome,
 };
 use crate::sessions::send::{SendSessionError, SendSessions};
+use crate::sm_schedule::{SmDue, SmSchedule};
 use karyos_sys::log_buffer::ReceiveOwner;
 
 /// The receiver's counters; checked, sticky on overflow.
@@ -213,6 +215,9 @@ struct ReceiverBinding {
     identity: Identity,
     /// The receiver id of its first SM since the last answer.
     receiver_id: Option<u64>,
+    /// The receiver id before the last answer reset it: a membership to
+    /// end if the next SM names another (ACS 15648).
+    former: Option<u64>,
     /// Its highest reported status per lane (consumption and window).
     lanes: Option<Lanes<LaneStatus>>,
     /// The join points it was answered with: its bound until its first SM.
@@ -411,8 +416,9 @@ struct Installed {
     last_fresh: u64,
     /// The window each SM grants per lane.
     window: u32,
-    /// When the last SM was due; `None` before the first.
-    sm_last: Option<u64>,
+    /// When its SMs are due (multicast-flow-control.md MC-6): the join at
+    /// once, then every `sm_interval` and on a quarter-window advance.
+    schedule: SmSchedule,
     /// The control ring slot of its next SM, while none waits (S1: one SM
     /// slot per binding).
     sm_slot: Option<Reservation>,
@@ -447,7 +453,50 @@ pub struct SenderRole {
     confirmed_timeout: u64,
     /// Duty cycles run, for the reset request cadence.
     cycle: u64,
+    /// The driver's timing of each publication's membership.
+    membership: MembershipTiming,
     counters: SenderCounters,
+}
+
+/// The driver settings a publication's membership follows: the receivers'
+/// SM cadence and the liveness that the receive side applies to images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MembershipTiming {
+    /// The receivers' `sm_interval`.
+    pub sm_interval: u64,
+    /// A member silent this long expires: `image_liveness_timeout`, after
+    /// which its binding and image are gone too.
+    pub receiver_timeout: u64,
+    /// A member whose SMs are stationary expires after this long:
+    /// `idle_image_timeout`, as stationary heartbeats keep an image.
+    pub pause_timeout: u64,
+}
+
+impl MembershipTiming {
+    /// The timing of `config`.
+    pub(super) const fn of(config: &AgentConfig) -> Self {
+        Self {
+            sm_interval: config.sm_interval,
+            receiver_timeout: config.image_liveness_timeout,
+            pause_timeout: config.idle_image_timeout,
+        }
+    }
+
+    /// A publication's membership settings with this timing; a required
+    /// member's join waits one `receiver_timeout`.
+    pub(super) const fn config(
+        &self,
+        lane_count: u8,
+        min_window: u32,
+        max_window: u32,
+    ) -> MembershipConfig {
+        let mut config = MembershipConfig::new(lane_count, min_window, max_window);
+        config.sm_interval = self.sm_interval;
+        config.receiver_timeout = self.receiver_timeout;
+        config.pause_timeout = self.pause_timeout;
+        config.join_timeout = self.receiver_timeout;
+        config
+    }
 }
 
 /// Both roles and the control ring between them, sized by `config`.
@@ -506,6 +555,7 @@ pub(super) fn roles(config: &AgentConfig) -> Result<(SenderRole, ReceiverRole), 
             unconfirmed_timeout: config.sessions.setup_challenge_timeout,
             confirmed_timeout: config.image_liveness_timeout,
             cycle: 0,
+            membership: MembershipTiming::of(config),
             counters: SenderCounters::default(),
         },
         ReceiverRole {
@@ -890,6 +940,13 @@ impl ReceiverRole {
         };
         // Half a term per SM: aligned, within the wire's window bound.
         let window = (chain.term_length / 2).min(MAX_WINDOW) & !(FRAME_ALIGNMENT - 1);
+        let windows = [window; 4];
+        let Some(schedule) = windows
+            .get(..usize::from(chain.lane_count))
+            .and_then(|windows| SmSchedule::new(self.sm_interval, windows).ok())
+        else {
+            return Err(Some(chain.retire));
+        };
         // The table holds a slot for every session, so it has room for
         // every installed image.
         self.images.push(Installed {
@@ -906,7 +963,7 @@ impl ReceiverRole {
             heartbeat_marks: [None; 4],
             last_fresh: now,
             window,
-            sm_last: None,
+            schedule,
             sm_slot: Some(sm_slot),
             sm,
             evidence: now,
@@ -942,11 +999,26 @@ impl ReceiverRole {
             let Some(image) = self.images.get(index) else {
                 break;
             };
-            let due = image
-                .sm_last
-                .is_none_or(|last| age_ns(now, last) >= self.sm_interval);
-            if due {
-                self.send_sm(index, now);
+            // Each lane's consumption: its rebuild position, or its least
+            // required subscriber's position below it.
+            let mut consumption = [0u64; 4];
+            for (lane, position) in consumption
+                .iter_mut()
+                .take(usize::from(image.lane_count))
+                .enumerate()
+            {
+                *position = u8::try_from(lane)
+                    .ok()
+                    .and_then(|lane| Lane::try_new(lane).ok())
+                    .and_then(|lane| image.owner.consumption(lane))
+                    .unwrap_or(0);
+            }
+            let due = self
+                .images
+                .get_mut(index)
+                .and_then(|image| image.schedule.due(now, &consumption));
+            if let Some(due) = due {
+                self.send_sm(index, &due, now);
                 work = work.checked_add(1).ok_or(overflow.clone())?;
             }
             index = index.checked_add(1).ok_or(overflow.clone())?;
@@ -978,23 +1050,18 @@ impl ReceiverRole {
         }
     }
 
-    /// Sends the SM of the image at `index`: every lane's consumption (its
-    /// rebuild position, or its least required subscriber's position below
-    /// it) and window, from the receiver block of this boot.
-    fn send_sm(&mut self, index: usize, now: u64) {
+    /// Sends the SM `due` of the image at `index`: every lane's
+    /// consumption, never below what it reported, and window, from the
+    /// receiver block of this boot. Only an SM posted to the sender is
+    /// recorded as sent; a skipped one stays due.
+    fn send_sm(&mut self, index: usize, due: &SmDue, now: u64) {
         let boot_id = self.sessions.boot_id();
         let Some(image) = self.images.get_mut(index) else {
             return;
         };
-        image.sm_last = Some(now);
         let mut entries = [LaneStatus::default(); 4];
         let count = usize::from(image.lane_count);
-        for (lane, entry) in entries.iter_mut().take(count).enumerate() {
-            let consumption = u8::try_from(lane)
-                .ok()
-                .and_then(|lane| Lane::try_new(lane).ok())
-                .and_then(|lane| image.owner.consumption(lane))
-                .unwrap_or(0);
+        for (entry, consumption) in entries.iter_mut().take(count).zip(due.consumption) {
             *entry = LaneStatus {
                 consumption,
                 window: image.window,
@@ -1035,8 +1102,12 @@ impl ReceiverRole {
             control: Control::Status(status),
             guard: Some(SmGuard::take(&image.sm)),
         };
-        // The sender gone: the driver is stopping.
+        // The sender gone: the driver is stopping. The SM is then recorded
+        // as sent all the same: nothing will send another.
         let _ = self.to_sender.post(slot, item);
+        if let Some(image) = self.images.get_mut(index) {
+            image.schedule.sent(due, now);
+        }
         self.count(|c| &mut c.sm_sent);
     }
 
@@ -1557,13 +1628,36 @@ impl SenderRole {
             }
             _ => return None,
         };
+        let mut outbound = outbound;
         let matches = outbound.endpoint() == publication.endpoint
             && outbound.alias() == publication.alias
             && outbound.readers().len() == usize::from(publication.lane_count);
-        let added = if matches {
-            self.sessions.add(publication)
-        } else {
-            Err(SendSessionError::InvalidConfig)
+        // Its receivers' membership (multicast-flow-control.md): windows
+        // from the largest datagram to half a term, as receivers grant, and
+        // the driver's SM cadence and liveness; roles and tags are not
+        // configurable yet, so no required member and the creation time (it
+        // only times a required member's join) is 0.
+        let max_window =
+            (publication.term.term_length / 2).min(MAX_WINDOW) & !(FRAME_ALIGNMENT - 1);
+        let membership = u32::try_from(outbound.max_frame())
+            .ok()
+            .and_then(|min_window| {
+                Membership::new(
+                    self.membership
+                        .config(publication.lane_count, min_window, max_window),
+                    publication.identity,
+                    publication.alias,
+                    &Roles::default(),
+                    0,
+                )
+                .ok()
+            });
+        let added = match membership {
+            Some(membership) if matches => {
+                outbound.attach_membership(Box::new(membership));
+                self.sessions.add(publication)
+            }
+            _ => Err(SendSessionError::InvalidConfig),
         };
         let event = match added {
             Ok(()) => {
@@ -1741,6 +1835,7 @@ impl SenderRole {
                 consumption
                     .as_ref()
                     .and_then(|positions| positions.get(..lanes)),
+                now,
             )?;
             work = work.checked_add(served).ok_or(overflow.clone())?;
             if outbound.needs_reset() {
@@ -1819,6 +1914,7 @@ impl SenderRole {
             boot_id: answer.challenge.receiver_boot_id,
             identity: answer.identity,
             receiver_id: None,
+            former: None,
             lanes: None,
             joins: answer.joins,
             answered_at: now,
@@ -1838,9 +1934,15 @@ impl SenderRole {
             .iter_mut()
             .find(|held| tuple(held) == tuple(&binding))
         {
-            // The same receiver again: its consumption never moves back.
+            // The same receiver again: its consumption never moves back,
+            // and the receiver id it had is remembered for the next SM.
             let lanes = held.lanes;
-            *held = ReceiverBinding { lanes, ..binding };
+            let former = held.receiver_id.or(held.former);
+            *held = ReceiverBinding {
+                lanes,
+                former,
+                ..binding
+            };
             return;
         }
         if self.bindings.len() >= self.max_bindings {
@@ -1855,8 +1957,13 @@ impl SenderRole {
                 self.count(|c| &mut c.bindings_full);
                 return;
             };
-            let _ = self.bindings.swap_remove(index);
+            let evicted = self.bindings.swap_remove(index);
             self.count(|c| &mut c.bindings_evicted);
+            // A reset row keeps its former receiver id until its next SM:
+            // that membership ends with the row (ACS 15648).
+            if let Some(receiver_id) = evicted.receiver_id.or(evicted.former) {
+                self.binding_gone(&evicted, receiver_id, now);
+            }
         }
         self.bindings.push(binding);
     }
@@ -1866,16 +1973,50 @@ impl SenderRole {
     /// `image_liveness_timeout` (its image is retired by then).
     fn expire_bindings(&mut self, now: u64) {
         let (unconfirmed, confirmed) = (self.unconfirmed_timeout, self.confirmed_timeout);
-        let before = self.bindings.len();
-        self.bindings.retain(|binding| match binding.last_sm {
-            None => age_ns(now, binding.answered_at) < unconfirmed,
-            Some(last) => age_ns(now, last) < confirmed,
-        });
-        // `retain` only removes: no underflow.
-        if let Some(expired) = before.checked_sub(self.bindings.len()) {
-            for _ in 0..expired {
-                self.count(|c| &mut c.bindings_expired);
+        let mut index = 0usize;
+        while let Some(binding) = self.bindings.get(index) {
+            let live = match binding.last_sm {
+                None => age_ns(now, binding.answered_at) < unconfirmed,
+                Some(last) => age_ns(now, last) < confirmed,
+            };
+            if live {
+                let Some(next) = index.checked_add(1) else {
+                    break;
+                };
+                index = next;
+                continue;
             }
+            let binding = self.bindings.swap_remove(index);
+            self.count(|c| &mut c.bindings_expired);
+            // Synchronously, at the removal (ACS 15648); a reset row that
+            // expires before its next SM ends its former receiver's.
+            if let Some(receiver_id) = binding.receiver_id.or(binding.former) {
+                self.binding_gone(&binding, receiver_id, now);
+            }
+        }
+    }
+
+    /// Tells `binding`'s publication that the binding of receiver
+    /// `receiver_id` is gone (ACS 15648): its membership ends with its last
+    /// binding.
+    fn binding_gone(&mut self, binding: &ReceiverBinding, receiver_id: u64, now: u64) {
+        let key = SmKey {
+            endpoint: binding.endpoint,
+            alias: binding.alias,
+            source: binding.source,
+            identity: binding.identity,
+            receiver: Receiver {
+                receiver_boot_id: binding.boot_id,
+                receiver_id,
+            },
+        };
+        if let Some(membership) = self
+            .publications
+            .iter_mut()
+            .find(|outbound| outbound.endpoint() == key.endpoint && outbound.alias() == key.alias)
+            .and_then(Outbound::membership_mut)
+        {
+            let _ = membership.binding_gone(&key, now);
         }
     }
 
@@ -1917,6 +2058,13 @@ impl SenderRole {
             self.count(|c| &mut c.sm_mismatch);
             return;
         }
+        // A reset binding whose next SM names another receiver: the former
+        // one's membership ends first (ACS 15648).
+        let gone = match (binding.receiver_id, binding.former.take()) {
+            (None, Some(former)) if former != status.receiver.receiver_id => Some(former),
+            _ => None,
+        };
+        let held = *binding;
         binding.receiver_id = Some(status.receiver.receiver_id);
         binding.last_sm = Some(now);
         // Consumption only moves forward: a replayed or reordered SM keeps
@@ -1948,6 +2096,25 @@ impl SenderRole {
         self.count(|c| &mut c.sm_accepted);
         if stale {
             self.count(|c| &mut c.sm_stale);
+        }
+        if let Some(former) = gone {
+            self.binding_gone(&held, former, now);
+        }
+        // Accepted here, the SM goes to the publication's membership.
+        let key = SmKey {
+            endpoint,
+            alias: status.alias,
+            source,
+            identity: status.identity,
+            receiver: status.receiver,
+        };
+        if let Some(membership) = self
+            .publications
+            .iter_mut()
+            .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
+            .and_then(Outbound::membership_mut)
+        {
+            let _ = membership.status(&key, status, now);
         }
     }
 
