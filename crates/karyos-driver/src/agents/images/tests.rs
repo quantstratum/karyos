@@ -65,9 +65,6 @@ struct Setup {
     /// Whether the channel is reliable: the sender is then a required
     /// participant of its log.
     reliable: bool,
-    /// Bind the publishing endpoint to a fixed port, so a reset reopens it
-    /// at the same address.
-    fixed_publisher: bool,
 }
 
 impl Default for Setup {
@@ -77,7 +74,6 @@ impl Default for Setup {
             max_term_length: DEFAULT_MAX_IMAGE_TERM_LENGTH,
             template: ImageTemplate::default(),
             reliable: false,
-            fixed_publisher: false,
         }
     }
 }
@@ -112,20 +108,9 @@ impl Rig {
             now: 0,
         };
         let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
-        let publishing = if setup.fixed_publisher {
-            // A free port, released for the endpoint to bind.
-            let port = std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
-            SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], port)))
-        } else {
-            loopback
-        };
         let a = rig
             .endpoints
-            .open(&rig.links, publishing, OsSocket::new())
+            .open(&rig.links, loopback, OsSocket::new())
             .unwrap();
         let b = rig
             .endpoints
@@ -843,7 +828,6 @@ fn a_reliable_lane_resends_after_a_reset() {
 
     let (mut rig, _b) = Rig::new(Setup {
         reliable: true,
-        fixed_publisher: true,
         ..Setup::default()
     });
     let slot = established(&mut rig);

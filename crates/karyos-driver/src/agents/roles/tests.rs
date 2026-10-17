@@ -1003,31 +1003,34 @@ fn a_stale_heartbeat_leaves_the_evidence_unchanged() {
     assert_eq!((image.evidence, image.last_fresh), (5_000, 5_000));
 }
 
-/// A sender with one publication on `EndpointId(1)`, the answer binding a
-/// receiver with `boot_id` at `join`, and an SM from it at `consumption`.
-fn sm_harness() -> (
-    super::SenderRole,
-    impl Fn([u64; 2], u64) -> karyos_protocol::network::SetupAnswer,
-    impl Fn([u64; 2], u64) -> karyos_protocol::network::StatusMessage,
-) {
-    use karyos_protocol::network::{LaneStatus, Receiver, SetupAnswer, StatusMessage};
-
+/// A sender with one publication on `EndpointId(1)`.
+fn sm_sender() -> super::SenderRole {
     let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
-    let endpoint = EndpointId(1);
-    sender.sessions.add(publication(endpoint)).unwrap();
-    let (path, _log) = outbound(endpoint, "10.0.0.2:4000".parse().unwrap());
+    sender.sessions.add(publication(EndpointId(1))).unwrap();
+    let (path, _log) = outbound(EndpointId(1), "10.0.0.2:4000".parse().unwrap());
     sender.publications.push(*path);
-    let answer = move |boot_id, join| SetupAnswer {
+    sender
+}
+
+/// The answer binding a receiver with `boot_id` at `join`.
+fn sm_answer(boot_id: [u64; 2], join: u64) -> karyos_protocol::network::SetupAnswer {
+    karyos_protocol::network::SetupAnswer {
         alias: alias(),
         identity: identity(),
-        term: publication(endpoint).term,
+        term: publication(EndpointId(1)).term,
         challenge: ChallengeBlock {
             receiver_boot_id: boot_id,
             nonce: [9, 9],
         },
         joins: Lanes::new(&[join]).unwrap(),
-    };
-    let status = |boot_id, consumption| StatusMessage {
+    }
+}
+
+/// An SM from the receiver with `boot_id` at `consumption`.
+fn sm_status(boot_id: [u64; 2], consumption: u64) -> karyos_protocol::network::StatusMessage {
+    use karyos_protocol::network::{LaneStatus, Receiver, StatusMessage};
+
+    StatusMessage {
         alias: alias(),
         identity: identity(),
         receiver: Receiver {
@@ -1040,41 +1043,40 @@ fn sm_harness() -> (
             window: 32_768,
         }])
         .unwrap(),
-    };
-    (sender, answer, status)
+    }
 }
 
 #[test]
 fn a_rebind_never_moves_a_reliable_position_back() {
-    let (mut sender, answer, status) = sm_harness();
+    let mut sender = sm_sender();
     let endpoint = EndpointId(1);
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(endpoint, receiver, &answer([7, 8], 0), 0);
-    sender.status(endpoint, receiver, &status([7, 8], 8192), 1);
+    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(endpoint, receiver, &sm_status([7, 8], 8192), 1);
     assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
     // A new answer to the same receiver, at an older join: held.
-    sender.bind(endpoint, receiver, &answer([7, 8], 0), 2);
+    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 2);
     assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
     // Its next SM, older still: held, counted stale.
-    sender.status(endpoint, receiver, &status([7, 8], 4096), 3);
+    sender.status(endpoint, receiver, &sm_status([7, 8], 4096), 3);
     assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
     assert_eq!(sender.counters().sm_stale, 1);
 }
 
 #[test]
 fn an_unconfirmed_receiver_bounds_at_its_joins() {
-    let (mut sender, answer, status) = sm_harness();
+    let mut sender = sm_sender();
     let endpoint = EndpointId(1);
     let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
     assert_eq!(sender.consumption(endpoint, alias()), None);
-    sender.bind(endpoint, first, &answer([7, 8], 0), 0);
-    sender.status(endpoint, first, &status([7, 8], 8192), 1);
-    sender.bind(endpoint, second, &answer([3, 4], 1024), 2);
+    sender.bind(endpoint, first, &sm_answer([7, 8], 0), 0);
+    sender.status(endpoint, first, &sm_status([7, 8], 8192), 1);
+    sender.bind(endpoint, second, &sm_answer([3, 4], 1024), 2);
     // The second is answered but silent: it bounds at its join.
     assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 1024);
     // Once heard from, at its consumption.
-    sender.status(endpoint, second, &status([3, 4], 16_384), 3);
+    sender.status(endpoint, second, &sm_status([3, 4], 16_384), 3);
     assert_eq!(sender.consumption(endpoint, alias()).unwrap()[0], 8192);
     // Another alias has no bound receiver.
     let other = Alias {
