@@ -176,6 +176,17 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- A recording group's three prefixes (phase 3, A7c; SPEC §8.3).
+  `karyos_archive::group::prefix::PrefixTracker` tracks `delivered_seq`,
+  `complete_recording_seq` and `durable_group_seq`: an event is complete
+  once its records through its end are written, its end is complete and
+  the payload it names by reference is written in its recording, and
+  durable once all of those are durable. An incomplete event or a gap
+  stops both prefixes. Events not yet durable wait in a queue sized when
+  the tracker is made; one with no room is refused. A `PrefixView`
+  publishes the three values, each a wait-free load, and
+  `prefix::recover` recomputes them from a recovered journal. The
+  journal's `walk` now gives each record's end too.
 - A recording group's journal on disk (phase 3, A7b).
   `karyos_archive::group::journal::GroupJournal` keeps a group's records
   back to back in a segment store named by the group (written and durable

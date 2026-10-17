@@ -265,7 +265,8 @@ impl<D: Disk> GroupJournal<D> {
     }
 
     /// Reads the records from `from`, a record boundary, in order, giving
-    /// each with its position to `visit` until it returns `false` or the
+    /// each with its position and its end to `visit` until it returns
+    /// `false` or the
     /// written position is reached; padding is skipped. Returns where it
     /// stopped: the position of the record `visit` declined, or the
     /// written position.
@@ -277,7 +278,7 @@ impl<D: Disk> GroupJournal<D> {
     pub fn walk(
         &mut self,
         from: u64,
-        mut visit: impl FnMut(u64, &GroupRecord<'_>) -> bool,
+        mut visit: impl FnMut(u64, u64, &GroupRecord<'_>) -> bool,
     ) -> Result<u64, JournalError> {
         let mut position = from;
         while let Some((length, next)) = self.read(position)? {
@@ -288,7 +289,11 @@ impl<D: Disk> GroupJournal<D> {
                     .ok_or(JournalError::Corrupt { position })?;
                 let record =
                     GroupRecord::decode(bytes).map_err(|_| JournalError::Corrupt { position })?;
-                if !visit(position, &record) {
+                let end = u64::try_from(length)
+                    .ok()
+                    .and_then(|length| position.checked_add(length))
+                    .ok_or(JournalError::Corrupt { position })?;
+                if !visit(position, end, &record) {
                     return Ok(position);
                 }
             }
