@@ -423,6 +423,12 @@ impl<O: BufferOwner> SenderRead<O> {
             self.counters.bump(|c| &mut c.invariant, 1);
             return Err(ReadError::Invariant);
         }
+        // The cell first: a failed lookup leaves the ring and the cursor
+        // as they were.
+        let Ok(cell) = self.subscription.buffer.cell(self.subscription.cursor.cell) else {
+            self.counters.bump(|c| &mut c.invariant, 1);
+            return Err(ReadError::Invariant);
+        };
         while self
             .boundaries
             .front()
@@ -430,13 +436,7 @@ impl<O: BufferOwner> SenderRead<O> {
         {
             let _ = self.boundaries.pop_front();
         }
-        let cursor = &mut self.subscription.cursor;
-        let cell = self
-            .subscription
-            .buffer
-            .cell(cursor.cell)
-            .map_err(|_| ReadError::Invariant)?;
-        cursor.acknowledged = position;
+        self.subscription.cursor.acknowledged = position;
         cell.position.store(position, Ordering::Release);
         Ok(())
     }
