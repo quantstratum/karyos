@@ -515,8 +515,7 @@ fn cancel_returns_a_lanes_staged_items_through_the_gate() {
     let mut gate = Gate::default();
     let _ = f.serve(&mut gate, 1000);
     assert_eq!(f.sender.pending(0), Some(2));
-    let returned = f.sender.cancel(&mut f.tx, 0, &mut gate).unwrap();
-    assert_eq!(returned, 2);
+    f.sender.cancel(&mut f.tx, 0, &mut gate).unwrap();
     assert_eq!(f.sender.pending(0), Some(0));
     assert_eq!(gate.left, [0, 2, 0]);
     assert_eq!(gate.last_left, Some((0, second, Left::Returned)));

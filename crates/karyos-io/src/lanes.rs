@@ -310,9 +310,10 @@ impl LaneSender {
     /// flushed again, so an item the kernel refused (would block) before
     /// the close would stay staged, and counted in flight, for good. Each
     /// returned item leaves through `gate` as [`Left::Returned`], in staging
-    /// order, with its staged record. Returns the items returned; a report
-    /// that names another item than the lane's next one stops the call
-    /// (drained), leaving the rest staged.
+    /// order, with its staged record. Items already handed to the kernel are
+    /// not pending, so none of them is returned. A report that names another
+    /// item than the lane's next one stops the call (drained), leaving the
+    /// rest staged.
     ///
     /// # Errors
     ///
@@ -322,14 +323,11 @@ impl LaneSender {
         backend: &mut B,
         lane: usize,
         gate: &mut G,
-    ) -> Result<usize, QueueError> {
+    ) -> Result<(), QueueError> {
         let Self { lanes, report, .. } = self;
         let Some(entry) = lanes.get_mut(lane) else {
-            return Ok(0);
+            return Ok(());
         };
-        let staged = entry.staged.len();
-        // The staged count only falls in this call, so this never saturates.
-        let returned = |entry: &Lane| staged.saturating_sub(entry.staged.len());
         loop {
             let outcome = backend.cancel_pending(entry.queue, report)?;
             while let Some(item) = report.pop_front() {
@@ -340,12 +338,12 @@ impl LaneSender {
                     }
                     _ => {
                         while report.pop_front().is_some() {}
-                        return Ok(returned(entry));
+                        return Ok(());
                     }
                 }
             }
             if !outcome.more {
-                return Ok(returned(entry));
+                return Ok(());
             }
         }
     }

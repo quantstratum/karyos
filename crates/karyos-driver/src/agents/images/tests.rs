@@ -2070,8 +2070,9 @@ fn group_naks_are_validated() {
     other_alias.alias.session_id += 1;
     let mut own = peer_nak(HOLE);
     own.receiver = rig.agents.receiver.role.receiver_of(slot);
+    // The image has two lanes: lane 2 is the first past them.
     let past_lane = peer_nak(NakRange {
-        lane: karyos_protocol::frame::Lane::try_new(3).unwrap(),
+        lane: karyos_protocol::frame::Lane::try_new(2).unwrap(),
         ..HOLE
     });
     // Across the end of the first 64 KiB term.
@@ -2127,11 +2128,20 @@ fn group_naks_are_budgeted_and_never_reach_the_sender() {
     for _ in 0..3 {
         peer.send_to(&bytes, group).unwrap();
     }
-    rig.until(true, |rig| rig.agents.receiver.counters().group_naks >= 1);
-    // One per cycle.
-    assert_eq!(rig.agents.receiver.counters().group_naks, 1);
-    rig.until(true, |rig| rig.agents.receiver.counters().group_naks >= 3);
+    // Real datagrams arrive on their own schedule, not the rig's clock:
+    // the check is per cycle, at most one read, until all three are in.
+    let mut previous = rig.agents.receiver.counters().group_naks;
+    for _ in 0..20_000 {
+        rig.round(true);
+        let read = rig.agents.receiver.counters().group_naks;
+        assert!(read - previous <= 1, "{read} after {previous} in one cycle");
+        previous = read;
+        if read >= 3 {
+            break;
+        }
+    }
     let counters = rig.agents.receiver.counters();
+    assert_eq!(counters.group_naks, 3, "{counters:?}");
     assert!(counters.group_nak_budget_full >= 3, "{counters:?}");
     assert_eq!(counters.group_nak_suppressions, 1, "{counters:?}");
     assert_eq!(rig.agents.sender.counters().naks, sender_naks);
@@ -2163,4 +2173,48 @@ fn an_empty_delay_pool_is_counted_in_its_step() {
     rig.agents.receiver.role.drain_nak_delays(false);
     rig.round(true);
     assert_eq!(rig.agents.receiver.counters().nak_delay_draws, draws + 1);
+}
+
+/// #298 review: a NAK on an endpoint that is not this image's control
+/// group finds no image, and validation runs in order, so a NAK failing
+/// several checks counts only the first: another alias before its own
+/// block, its own block before the term rule.
+#[test]
+fn group_nak_validation_is_ordered_and_bound_to_its_control_group() {
+    use karyos_protocol::network::{Control, NakRange};
+
+    let (mut rig, b) = Rig::new(control_setup(u64::MAX));
+    let slot = established(&mut rig);
+    let control = rig.control.unwrap();
+    lose_one(&mut rig);
+    rig.until(true, |rig| rig.agents.receiver.counters().nak_cycles >= 1);
+    let own = rig.agents.receiver.role.receiver_of(slot);
+    // A valid peer NAK, but on the data endpoint B.
+    let valid = encoded(Control::Nak(peer_nak(HOLE)));
+    rig.agents.receiver.role.inject_group(b, &valid, rig.now);
+    // Another alias and our own block: unbound, not own.
+    let mut other_and_own = peer_nak(HOLE);
+    other_and_own.alias.session_id += 1;
+    other_and_own.receiver = own;
+    // Our own block and a range across the term: own, not range.
+    let mut own_and_across = peer_nak(NakRange {
+        start: 65_536 - 32,
+        length: 64,
+        ..HOLE
+    });
+    own_and_across.receiver = own;
+    for bytes in [
+        encoded(Control::Nak(other_and_own)),
+        encoded(Control::Nak(own_and_across)),
+    ] {
+        rig.agents
+            .receiver
+            .role
+            .inject_group(control, &bytes, rig.now);
+    }
+    let counters = rig.agents.receiver.counters();
+    assert_eq!(counters.group_nak_unbound, 2, "{counters:?}");
+    assert_eq!(counters.group_nak_own, 1, "{counters:?}");
+    assert_eq!(counters.group_nak_range, 0, "{counters:?}");
+    assert_eq!(counters.group_naks, 0, "{counters:?}");
 }
