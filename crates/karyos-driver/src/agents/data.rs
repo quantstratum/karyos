@@ -1558,5 +1558,7 @@ pub(crate) mod testing {
 
 mod routed;
 
+pub use routed::{PathCounters, PathPolicy};
+
 #[cfg(test)]
 mod tests;

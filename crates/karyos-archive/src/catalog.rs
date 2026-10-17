@@ -57,7 +57,9 @@ const TEMPORARY: &str = "catalog.kyc.tmp";
 /// "KYCT", the catalog magic.
 const MAGIC: u32 = u32::from_le_bytes(*b"KYCT");
 /// The catalog format version.
-const VERSION: u32 = 1;
+/// Version 2: `Stopped` carries the `incomplete` flag and the reasons of
+/// A4 (nothing of version 1 was released).
+const VERSION: u32 = 2;
 /// The header's length: magic, version, reserved, CRC.
 const HEADER: usize = 16;
 /// [`HEADER`] as a file offset.
@@ -78,13 +80,34 @@ const FORGOTTEN: u16 = 4;
 /// Why a recording stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
-    /// Its recorder stopped it.
+    /// The recorded stream was sealed, and the recording reached the seal.
     Normal,
     /// A crash left it open; recovery stopped it at its recovered written
     /// position.
     Recovered,
     /// A crash left it open before its segment store existed: it is empty.
     Empty,
+    /// An async recording was lapped and stopped there (`on_lap = Stop`),
+    /// or lapped once more than its store records gaps.
+    Lapped,
+    /// A stop command stopped it.
+    Stopped,
+    /// The agent shut down while it recorded.
+    Shutdown,
+    /// Its source failed; its store was closed whole.
+    Failed(FailKind),
+}
+
+/// Why a recording's source failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailKind {
+    /// The source reported an error (revoked, faulted, an invariant).
+    Source,
+    /// A required recording was lapped, which its role excludes.
+    RequiredLapped,
+    /// The source returned what a source never may: a seal away from the
+    /// written position, an empty copy or an empty loss.
+    Invalid,
 }
 
 impl StopReason {
@@ -93,6 +116,12 @@ impl StopReason {
             Self::Normal => 1,
             Self::Recovered => 2,
             Self::Empty => 3,
+            Self::Lapped => 4,
+            Self::Stopped => 5,
+            Self::Shutdown => 6,
+            Self::Failed(FailKind::Source) => 7,
+            Self::Failed(FailKind::RequiredLapped) => 8,
+            Self::Failed(FailKind::Invalid) => 9,
         }
     }
 
@@ -101,6 +130,12 @@ impl StopReason {
             1 => Some(Self::Normal),
             2 => Some(Self::Recovered),
             3 => Some(Self::Empty),
+            4 => Some(Self::Lapped),
+            5 => Some(Self::Stopped),
+            6 => Some(Self::Shutdown),
+            7 => Some(Self::Failed(FailKind::Source)),
+            8 => Some(Self::Failed(FailKind::RequiredLapped)),
+            9 => Some(Self::Failed(FailKind::Invalid)),
             _ => None,
         }
     }
@@ -115,6 +150,9 @@ pub struct Stop {
     pub time_ns: u64,
     /// Why.
     pub reason: StopReason,
+    /// The recording lost ranges (an async recording lapped and resumed):
+    /// its segments hold gap entries there.
+    pub incomplete: bool,
 }
 
 /// A recording the catalog lists.
@@ -349,7 +387,7 @@ impl Record {
                 payload.bytes(&id.to_le_bytes());
                 payload.bytes(&stop.position.to_le_bytes());
                 payload.bytes(&stop.time_ns.to_le_bytes());
-                payload.bytes(&[stop.reason.code()]);
+                payload.bytes(&[stop.reason.code(), u8::from(stop.incomplete)]);
                 STOPPED
             }
             Self::NextId(next) => {
@@ -408,6 +446,11 @@ impl Record {
                     position: input.u64()?,
                     time_ns: input.u64()?,
                     reason: StopReason::of(input.u8()?)?,
+                    incomplete: match input.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return None,
+                    },
                 },
             },
             NEXT_ID => Self::NextId(input.u64()?),
@@ -532,7 +575,7 @@ impl<D: Disk> Catalog<D> {
         if length < HEADER_LEN {
             // A short header: the catalog's creation did not complete (it is
             // synced before its name is), so no record of it was reported.
-            disk.truncate(&file, 0)?;
+            disk.set_len(&file, 0)?;
             disk.write_at(&file, 0, &header())?;
             cut = Some(0);
         } else {
@@ -557,7 +600,7 @@ impl<D: Disk> Catalog<D> {
             }
         }
         if let Some(at) = cut.filter(|at| *at > 0) {
-            disk.truncate(&file, at)?;
+            disk.set_len(&file, at)?;
         }
         disk.sync(&file)?;
         if removed_temporary || cut.is_some() {
@@ -661,8 +704,9 @@ impl<D: Disk> Catalog<D> {
         Ok(id)
     }
 
-    /// Stops recording `id` at `position`: its `Stopped` record is durable
-    /// on return. The caller closes its segment store first.
+    /// Stops recording `id` at `position`, `incomplete` when it lost
+    /// ranges: its `Stopped` record is durable on return. The caller closes
+    /// its segment store first.
     ///
     /// # Errors
     ///
@@ -675,6 +719,7 @@ impl<D: Disk> Catalog<D> {
         position: u64,
         time_ns: u64,
         reason: StopReason,
+        incomplete: bool,
     ) -> Result<(), CatalogError> {
         let recording = self
             .recordings
@@ -688,6 +733,7 @@ impl<D: Disk> Catalog<D> {
             position,
             time_ns,
             reason,
+            incomplete,
         };
         self.append(&Record::Stopped { id, stop })?;
         if let Some(recording) = self
@@ -805,13 +851,17 @@ impl<D: Disk + Clone> Catalog<D> {
             .collect();
         let mut settled = Vec::with_capacity(open.len());
         for (id, start, geometry, policy) in open {
-            let (position, reason) =
+            let (position, reason, incomplete) =
                 match SegmentStore::recover(self.disk.clone(), &self.dir, id, geometry, policy) {
-                    Ok(recovered) => (recovered.store.written(), StopReason::Recovered),
-                    Err(SegmentError::NotFound { .. }) => (start, StopReason::Empty),
+                    Ok(recovered) => (
+                        recovered.store.written(),
+                        StopReason::Recovered,
+                        !recovered.store.gaps().is_empty(),
+                    ),
+                    Err(SegmentError::NotFound { .. }) => (start, StopReason::Empty, false),
                     Err(error) => return Err(error.into()),
                 };
-            self.stop(id, position, now_ns, reason)?;
+            self.stop(id, position, now_ns, reason, incomplete)?;
             settled.push(Settled {
                 id,
                 position,
@@ -841,7 +891,9 @@ enum Parsed {
 fn check_header(found: &[u8; HEADER]) -> Result<(), CatalogError> {
     let corrupt = CatalogError::Corrupt { offset: 0 };
     let word = |at: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(found.get(at..at + 4)?.try_into().ok()?))
+        Some(u32::from_le_bytes(
+            found.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
     };
     let (Some(magic), Some(version), Some(crc)) = (word(0), word(4), word(12)) else {
         return Err(corrupt);
@@ -867,7 +919,7 @@ fn parse<D: Disk>(
     length: u64,
     buf: &mut Vec<u8>,
 ) -> Result<Parsed, CatalogError> {
-    let available = length - offset;
+    let available = length.checked_sub(offset).ok_or(CatalogError::LogFull)?;
     let head_len = u64::try_from(HEAD).map_err(io::Error::other)?;
     if available < head_len {
         return Ok(Parsed::Torn);
@@ -877,7 +929,10 @@ fn parse<D: Disk>(
     let [kind_low, kind_high, length_low, length_high] = head;
     let kind = u16::from_le_bytes([kind_low, kind_high]);
     let body = usize::from(u16::from_le_bytes([length_low, length_high]));
-    let whole = HEAD + body + TAIL;
+    let whole = HEAD
+        .checked_add(body)
+        .and_then(|sum| sum.checked_add(TAIL))
+        .ok_or(CatalogError::LogFull)?;
     let whole_len = u64::try_from(whole).map_err(io::Error::other)?;
     if whole_len >= available {
         // Reaching the end of the log, even exactly: a crash may leave the
@@ -892,9 +947,15 @@ fn parse<D: Disk>(
             Ok(Parsed::Corrupt)
         };
     }
-    let payload = buf.get(HEAD..HEAD + body).unwrap_or_default();
+    let payload = HEAD
+        .checked_add(body)
+        .and_then(|end| buf.get(HEAD..end))
+        .unwrap_or_default();
     match Record::decode(kind, payload) {
-        Some(record) => Ok(Parsed::Record(record, offset + whole_len)),
+        Some(record) => Ok(Parsed::Record(
+            record,
+            offset.checked_add(whole_len).ok_or(CatalogError::LogFull)?,
+        )),
         // A valid CRC over a record that does not decode: never a tear.
         None => Ok(Parsed::Corrupt),
     }
@@ -911,7 +972,10 @@ fn checks<D: Disk>(
     buf.clear();
     buf.resize(whole, 0);
     disk.read_at(file, offset, buf)?;
-    let (checked, tail) = buf.split_at(whole - TAIL);
+    let body_end = whole.checked_sub(TAIL).ok_or(CatalogError::LogFull)?;
+    let (checked, tail) = buf
+        .split_at_checked(body_end)
+        .ok_or(CatalogError::LogFull)?;
     let crc = u32::from_le_bytes(tail.try_into().map_err(io::Error::other)?);
     Ok(crc32c(checked) == crc)
 }
@@ -926,13 +990,16 @@ fn zeros_from<D: Disk>(
     let mut chunk = [0u8; 4096];
     let mut at = offset;
     while at < length {
-        let take = usize::try_from((length - at).min(4096)).map_err(io::Error::other)?;
+        let left = length.checked_sub(at).ok_or(CatalogError::LogFull)?;
+        let take = usize::try_from(left.min(4096)).map_err(io::Error::other)?;
         let part = chunk.get_mut(..take).unwrap_or_default();
         disk.read_at(file, at, part)?;
         if part.iter().any(|&byte| byte != 0) {
             return Ok(false);
         }
-        at += u64::try_from(take).map_err(io::Error::other)?;
+        at = at
+            .checked_add(u64::try_from(take).map_err(io::Error::other)?)
+            .ok_or(CatalogError::LogFull)?;
     }
     Ok(true)
 }

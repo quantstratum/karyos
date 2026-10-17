@@ -1696,6 +1696,49 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// Per path of the network publication `registration`, the receivers
+    /// whose SMs reached the sender there, in Shared mode (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux two-path test")
+    )]
+    pub(crate) fn publication_path_bindings(&self, registration: u64) -> Vec<usize> {
+        let (Some(entry), Agents::Shared(agents)) = (
+            self.publications
+                .iter()
+                .find(|entry| entry.registration == registration),
+            &self.agents,
+        ) else {
+            return Vec::new();
+        };
+        entry
+            .paths()
+            .map(|path| agents.sender.confirmed_bindings(path, entry.alias))
+            .collect()
+    }
+
+    /// The endpoint of each path of the network publication
+    /// `registration`, the founding one first (tests).
+    #[cfg(test)]
+    pub(crate) fn publication_paths(&self, registration: u64) -> Vec<EndpointId> {
+        self.publications
+            .iter()
+            .find(|entry| entry.registration == registration)
+            .map(|entry| entry.paths().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether the Shared receiver has `alias` published on `endpoint`
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn receiver_published(&self, endpoint: EndpointId, alias: Alias) -> bool {
+        match &self.agents {
+            Agents::Shared(agents) => agents.receiver.is_published(endpoint, alias),
+            _ => false,
+        }
+    }
+
     /// Endpoint resets completed so far, for tests.
     #[cfg(test)]
     pub(crate) fn reopened(&self) -> u64 {

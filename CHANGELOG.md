@@ -11,6 +11,30 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `karyos-archive` gains its recorder and agent (phase 3, A4b). A
+  `Recorder` copies a lane's committed frames from a `FrameSource` into
+  its recording's segment store: data, a padding or aborted block as a
+  fill, a lost range as a gap. `Mode::Required` throttles the publisher
+  when the disk stalls (SPEC section 8.1); `Mode::Async` records a lap as a gap
+  and stops there or resumes where its source rejoins. The
+  `ArchiveHandle` agent thread owns the catalog and the recorders, settles
+  the catalog at start, and stops each recording in the catalog once its
+  store is closed with everything durable (`SegmentStore::close_synced`,
+  whatever the policy), at the durable position. A source that fails or
+  returns what a source never may ends its recording with
+  `StopReason::Failed(FailKind)`; a store that fails leaves it open for
+  the next start to settle (`Event::Failed { failure }`). A command stop,
+  the shutdown and the seal record `Stopped`, `Shutdown` and `Normal`.
+  Dropped events are counted (`ArchiveHandle::dropped_events`). A store
+  records at most `MAX_GAPS` lost ranges; an async recording lapped past
+  them ends `Lapped`. The catalog format becomes version 2.
+- The Archive's segment index entries have a kind (phase 3, A4): data, a
+  fill (a padding or aborted block's canonical record, covering its
+  extent) or a gap (a range an async recording lost, refused to reads).
+  `SegmentStore::append_fill`, `append_gap` and `gaps`; an unknown kind is
+  refused at recovery. The catalog's stop gains the reason `Lapped` and an
+  `incomplete` flag, which `settle` sets for a recording with gaps. The
+  `Disk` trait's `truncate` becomes `set_len`, which also extends.
 - `karyos-archive` gains its catalog (phase 3, A3): `catalog.kyc`, an
   append-only log of CRC-32C checked records (a recording started,
   stopped or forgotten, and the id watermark), each durable before the
@@ -79,6 +103,19 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Added
 
+- The live set of a routed publication's paths (redundant-paths.md section
+  7, RP-8; rp-w5a). Each path keeps a `path_lag_limit` window (100 ms) of
+  bytes selected and skipped: one that skipped anything is `Degraded`, and
+  one whose skipped share passes `path_skip_ratio` (50%, once
+  `path_skip_min_bytes`, 64 KiB, were selected), or that the lane waited on
+  alone for longer than `path_lag_limit`, leaves the live set while another
+  path remains (`AgentConfig::path_policy`, validated at start). A path out
+  of it takes no copy and no flush and holds no head back
+  (`RoutedLaneSender::set_live`); its never-exposed copies come back
+  (`RoutedLaneSender::cancel_route`) through the guard gate; those it held
+  alone are counted (`PathCounters::copies_abandoned`) and reach receivers
+  by NAK or close as gaps. `Outbound::path_state` and
+  `Outbound::path_counters` report it; return is rp-w5b.
 - Receiver trace journals keep their sealed gaps (P2.12 step 3, PR 3b,
   trace-network.md section 5): the first `FACT_GAP_INTERVALS` (16) gaps of
   each traced lane, in order, with an overflow flag, carried in

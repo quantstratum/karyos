@@ -1625,4 +1625,24 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
         );
         seen == 128
     });
+    // Path 2 carries the stream too (#343 review): the receiver's SMs reach
+    // the sender on path 2's endpoint, so path 2 is bound, published and
+    // live end to end. A host whose loopback cannot join the group on path 2
+    // exercises the founding path only, and says so.
+    if b.network_path_counters().1 > 0 {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED path 2 of a_two_path_publication_reaches_a_two_path_subscription: its join failed on this host"
+        );
+        return;
+    }
+    let registration = publication.registration();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let bound = drivers[0]
+            .net
+            .as_ref()
+            .unwrap()
+            .publication_path_bindings(registration);
+        bound.len() == 2 && bound.iter().all(|bound| *bound > 0)
+    });
 }
