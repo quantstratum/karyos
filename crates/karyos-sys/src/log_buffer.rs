@@ -521,6 +521,16 @@ impl<T: TermBytes> LogBuffer<T> {
         Ok(buffer)
     }
 
+    /// Checks `config` as [`LogBuffer::new`] would, without allocating:
+    /// for a configuration validated ahead of its buffers.
+    ///
+    /// # Errors
+    ///
+    /// As [`LogBuffer::new`].
+    pub fn validate(config: &LogBufferConfig) -> Result<(), SysError> {
+        Self::plan(config).map(|_| ())
+    }
+
     /// Validates `config` and computes its layout, slot count and largest
     /// message: the same checks for a new buffer and for an attachment.
     fn plan(config: &LogBufferConfig) -> Result<(Layout, u8, u32), SysError> {

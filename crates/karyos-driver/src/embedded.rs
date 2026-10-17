@@ -874,8 +874,11 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// The network agents and their tables, when configured.
     pub(crate) net: Option<crate::net::Network>,
     /// What clients created by channel URI, owned by their registrations
-    /// (W5b).
+    /// (W5b): at most `NetworkConfig::max_owned_per_client` per client,
+    /// preallocated for every client.
     pub(crate) net_owned: Vec<crate::net::client::OwnedNetwork>,
+    /// Network resources refused because their client owned its most.
+    pub(crate) owned_refusals: u64,
 }
 
 /// The incarnation of a stream's publication in the embedded driver: one per
@@ -1089,7 +1092,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .checked_add(HEADER_LENGTH as usize)
                 .is_some_and(|record| config.ring_capacity / 8 >= record)
             && config.broadcast_capacity >= needed
-            && config.guard_ack_timeout > 0;
+            && config.guard_ack_timeout > 0
+            && config
+                .network
+                .is_none_or(|network| crate::net::client::valid_network(&network));
         if !valid {
             return Err(DriverError::InvalidConfig);
         }
@@ -1207,7 +1213,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             network: crate::network_journals::NetworkTracing::new(config.max_trace_journals),
             guards: crate::guards::Guards::new(id, config.max_guards, config.guard_audit_records),
             guard_senders: crate::guard_ack::GuardSenders::new(config.max_guard_senders),
-            net_owned: Vec::new(),
+            net_owned: Vec::with_capacity(config.network.map_or(0, |network| {
+                network
+                    .max_owned_per_client
+                    .saturating_mul(config.max_clients)
+            })),
+            owned_refusals: 0,
             // Last: a driver that fails to build starts no agent.
             net: config
                 .network
@@ -3131,8 +3142,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Ok(work) => (work, None),
             Err(error) => (0, Some(error)),
         };
-        self.serve_images();
+        // Subscriptions created since the last cycle learn of the images
+        // already there first; the cycle's image events then go to every
+        // announced subscription, so none is told twice.
         self.announce_existing_images();
+        self.serve_images();
         served
     }
 
