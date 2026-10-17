@@ -1213,6 +1213,7 @@ fn installed_image_with(
         copies: Vec::new(),
         routes: Vec::new(),
         anchored: [None; 4],
+        uncertain_at: [None; 4],
         founding_gone: false,
         control_group: None,
         receiver_id: super::receiver_id(super::SlotRef {
@@ -2838,6 +2839,7 @@ fn an_uncertain_copy_faults_only_its_route() {
     let mut counters = super::ReceiverCounters::default();
     report_copy(&mut image, 1, nak, 10, false);
     super::settle_copies(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
     assert_eq!(image.loss.counters().submitted, 1);
     assert!(!image.routes[1].faulted);
     report_copy(&mut image, 1, nak, 20, false);
@@ -2963,4 +2965,85 @@ fn a_publication_takes_its_configured_roles() {
             );
         }
     }
+}
+
+/// #310 review: the anchor is the first copy submitted. An uncertain copy
+/// reported first, in an earlier settle or in the same one, never
+/// anchors when another copy of the round is submitted: the retry runs
+/// from the submitted copy's start.
+#[test]
+fn a_submitted_copy_anchors_over_an_uncertain_one() {
+    use karyos_protocol::frame::Lane;
+
+    // Uncertain on path 0 first, submitted on path 1 later.
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    report_copy(&mut image, 0, nak, 10, false);
+    super::settle_copies(&mut image, &mut counters, 0);
+    report_copy(&mut image, 1, nak, 20, true);
+    super::settle_copies(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert_eq!(image.loss.counters().submitted, 1);
+    // The retry is due one RTT after 20, not after 10: at 10 + RTT + 5
+    // nothing is due yet.
+    let rtt = crate::repair::loss::RttSource::rtt_snapshot(&image.rtt, 0);
+    assert_eq!(image.loss.due(Lane::ZERO, 15 + rtt), None);
+    // The same settle: both reports in before one call.
+    let (mut image, nak) = two_route_image();
+    report_copy(&mut image, 0, nak, 10, false);
+    report_copy(&mut image, 1, nak, 20, true);
+    super::settle_copies(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert_eq!(image.loss.counters().submitted, 1);
+    assert_eq!(image.loss.due(Lane::ZERO, 15 + rtt), None);
+    assert!(image.uncertain_at[0].is_none());
+}
+
+/// #310 review: with no copy submitted once every copy reported, the
+/// earliest uncertain copy anchors the NAK.
+#[test]
+fn the_earliest_uncertain_copy_anchors_when_none_is_submitted() {
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    report_copy(&mut image, 1, nak, 30, false);
+    report_copy(&mut image, 0, nak, 10, false);
+    super::settle_copies(&mut image, &mut counters, 0);
+    super::anchor_uncertain(&mut image, 0);
+    assert_eq!(image.loss.counters().submitted, 1);
+    assert_eq!(counters.nak_copies_uncertain, 2);
+}
+
+/// #310 review (M2): a NAK copy the control ring cannot take is skipped
+/// and counted, its report slot left free: it never holds the lane's
+/// next NAK back.
+#[test]
+fn a_skipped_copy_leaves_its_slot_free() {
+    use std::num::NonZeroUsize;
+
+    let (mut image, nak) = two_route_image();
+    let mut counters = super::ReceiverCounters::default();
+    let later = crate::sessions::receive::BindingKey {
+        source: std::net::SocketAddr::from(([127, 0, 0, 1], 9)),
+        ..image.key
+    };
+    let (mut to_sender, _from) = super::super::ring::ring(NonZeroUsize::new(1).unwrap());
+    let filler = super::ControlItem::Outgoing {
+        endpoint: image.key.endpoint,
+        destination: image.key.source,
+        control: karyos_protocol::network::Control::Nak(nak),
+        guard: None,
+    };
+    assert!(to_sender.try_post(filler).is_ok());
+    let _ = super::post_copies(
+        &mut image,
+        |path| (path == 1).then_some(later),
+        &mut to_sender,
+        &mut counters,
+        0,
+        nak,
+    );
+    assert_eq!(counters.nak_copies_skipped, 1);
+    assert_eq!(counters.nak_copies, 0);
+    assert!(image.copies[1].pending.is_none());
+    assert!(!super::copies_busy(&image, 0));
 }

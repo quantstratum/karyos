@@ -91,6 +91,22 @@ pub enum ConflationError {
     /// The table is closed; no further writes are accepted.
     #[error("conflation table closed")]
     Closed,
+    /// A value of a table with a loss barrier written without its stream
+    /// position: its freshness cannot be told (use
+    /// `ConflationWriter::write_at`). Nothing is stored.
+    #[error("a table with a loss barrier needs each value's position")]
+    PositionRequired,
+    /// A value below the writer's frontier: a gap behind the frontier may
+    /// already be retired, so its freshness cannot be told. A feeder writes
+    /// in log order: `passed(position)`, then `write_at` at that position.
+    /// Nothing is stored.
+    #[error("value at {position} below the frontier {frontier}")]
+    BehindFrontier {
+        /// The value's position.
+        position: u64,
+        /// The writer's frontier.
+        frontier: u64,
+    },
 }
 
 /// Configuration shared by a conflated publication and its table.
@@ -1023,6 +1039,10 @@ mod owned {
         pub reconciled: u64,
         /// Retirements published, each after a full pass over the slots.
         pub retirements: u64,
+        /// Losses refused because the loss sequence or the barrier version
+        /// was exhausted, and slot sequences exhausted by a reconciliation,
+        /// each closing the view terminally.
+        pub exhausted: u64,
     }
 
     fn bump(counter: &mut u64) {
@@ -1203,7 +1223,14 @@ mod owned {
         /// [`ConflationError::ValueTooLarge`] (nothing is stored),
         /// [`ConflationError::VersionsExhausted`] (nothing is stored; the
         /// table is closed) and [`ConflationError::Closed`].
+        ///
+        /// A table with a loss barrier refuses it with
+        /// [`ConflationError::PositionRequired`]: its values go through
+        /// [`ConflationWriter::write_at`].
         pub fn write(&mut self, key: u32, value: &[u8]) -> Result<u64, ConflationError> {
+            if self.fresh.is_some() {
+                return Err(ConflationError::PositionRequired);
+            }
             self.write_slot(key, value, None)
         }
 
@@ -1213,9 +1240,14 @@ mod owned {
         /// newest loss. A replacement past every gap restores its key; it
         /// restores no other. Without a barrier, as [`ConflationWriter::write`].
         ///
+        /// The value lies at or above the frontier: a feeder calls
+        /// [`ConflationWriter::passed`] with a value's position, then this.
+        ///
         /// # Errors
         ///
-        /// As [`ConflationWriter::write`].
+        /// As [`ConflationWriter::write`], and
+        /// [`ConflationError::BehindFrontier`] for a value below the
+        /// frontier. Nothing is stored on error.
         pub fn write_at(
             &mut self,
             key: u32,
@@ -1224,6 +1256,12 @@ mod owned {
         ) -> Result<u64, ConflationError> {
             let freshness = match (&self.fresh, self.table.barrier_words()) {
                 (Some(fresh), Some(words)) => {
+                    if position < fresh.frontier {
+                        return Err(ConflationError::BehindFrontier {
+                            position,
+                            frontier: fresh.frontier,
+                        });
+                    }
                     let barrier = BarrierWords::new(words, DEFAULT_RING)
                         .map_err(|_| ConflationError::InvalidConfig)?;
                     let since = fresh
@@ -1334,7 +1372,7 @@ mod owned {
             if start < fresh.frontier {
                 bump(&mut fresh.counters.below_frontier);
                 let frontier = fresh.frontier;
-                let _ = self.publish_terminal(start, end, TERMINAL_BELOW_FRONTIER);
+                self.close_terminally(start, end, TERMINAL_BELOW_FRONTIER);
                 return Err(LossError::BelowFrontier { start, frontier });
             }
             if fresh.ahead.len() >= DEFAULT_RING || fresh.unretired.len() >= DEFAULT_RING {
@@ -1355,11 +1393,20 @@ mod owned {
                     Err(LossError::Full)
                 }
                 Err(FreshnessError::Exhausted) => {
-                    let _ = self.publish_terminal(start, end, TERMINAL_FRESHNESS_EXHAUSTED);
+                    bump(&mut fresh.counters.exhausted);
+                    self.close_terminally(start, end, TERMINAL_FRESHNESS_EXHAUSTED);
                     Err(LossError::Exhausted)
                 }
                 Err(_) => Err(LossError::NoBarrier),
             }
+        }
+
+        /// Publishes the terminal cell and closes the table: its readers
+        /// deliver nothing more and report the terminal close and the
+        /// closed table.
+        fn close_terminally(&mut self, start: u64, end: u64, reason: u64) {
+            let _ = self.publish_terminal(start, end, reason);
+            self.close();
         }
 
         /// Whether `[start, end)` is a recorded gap still ahead of the
@@ -1426,8 +1473,8 @@ mod owned {
                     };
                     if let Err(error) = slot.set_freshness(reconciled) {
                         fresh.pass = Some((through, key));
-                        self.close();
-                        let _ = self.publish_terminal(0, through, TERMINAL_FRESHNESS_EXHAUSTED);
+                        bump(&mut fresh.counters.exhausted);
+                        self.close_terminally(0, through, TERMINAL_FRESHNESS_EXHAUSTED);
                         return Err(error);
                     }
                     bump(&mut fresh.counters.reconciled);
@@ -1586,7 +1633,12 @@ mod owned {
         /// The view's published terminal invalidation (GU-8): every value
         /// below its end is stale since its start, and the view delivers
         /// nothing more. Its reason is a `TERMINAL_*` code of
-        /// [`crate::freshness`].
+        /// [`crate::freshness`]. A poll that sees it returns before reading
+        /// the journal: `closed` reports the writer's close only once seen
+        /// before (a writer that publishes the cell closes the table, and
+        /// the conductor's feeder closes it when the receive owner
+        /// published), and `finished` stays `false`, since the reader
+        /// stopped before the last values.
         pub terminal: Option<Terminal>,
     }
 
@@ -1834,7 +1886,7 @@ mod owned {
 
         fn report(&self, mut report: PollReport) -> PollReport {
             report.pending = u32::try_from(self.len).unwrap_or(u32::MAX);
-            report.scanning = self.scan_remaining > 0;
+            report.scanning = self.scan_remaining > 0 || self.loss_scan > 0;
             report.closed = self.closed_seen;
             report.terminal = self.terminal;
             report.finished = self.closed_seen
@@ -1962,9 +2014,11 @@ mod owned {
                         length,
                         freshness,
                     }) => {
-                        // Every record the slot has not applied lies above
-                        // every value written before it (the writer's
-                        // frontier rule), so position 0 classifies exactly.
+                        // Every record the slot has not applied starts at or
+                        // above the writer's frontier, which `record_loss`
+                        // enforces, so every value written before it lies
+                        // below its end: classifying at position 0 marks
+                        // exactly the values GU-9 marks.
                         let classified = match (snapshot, self.source.barrier()) {
                             (Some(snapshot), Some((words, _))) => {
                                 snapshot.classify(&words, freshness, 0)

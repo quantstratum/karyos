@@ -2982,6 +2982,7 @@ fn control_flows_on_the_later_path_after_the_founding_one_goes() {
     assert!(rig.agents.receiver.role.has_image(slot));
     let before = rig.agents.receiver.counters();
     let founding = rig.agents.receiver.role.founding_naks();
+    let founding_sms = rig.agents.receiver.role.founding_sms();
     rig.agents.receiver.role.drop_data(&[1]);
     for i in 0..4u8 {
         let log = rig.log.as_mut().unwrap();
@@ -3001,8 +3002,9 @@ fn control_flows_on_the_later_path_after_the_founding_one_goes() {
     });
     let after = rig.agents.receiver.counters();
     assert!(after.nak_copies > before.nak_copies, "{after:?}");
-    // Nothing went on the founding path.
+    // Nothing went on the founding path: no NAK and no SM.
     assert_eq!(rig.agents.receiver.role.founding_naks(), founding);
+    assert_eq!(rig.agents.receiver.role.founding_sms(), founding_sms);
 }
 
 /// #307 review, §8 join reconciliation: a later path whose join is below
@@ -3196,4 +3198,101 @@ fn a_stalled_feeder_closes_the_conflated_view() {
             reason: karyos_sys::freshness::TERMINAL_BARRIER_TIMEOUT,
         })
     );
+}
+
+/// #310 review, RC-6 per route: a faulted later route asks for its own
+/// endpoint's reset, and the reset's new epoch clears the route.
+#[test]
+fn a_faulted_later_route_is_reset_and_cleared() {
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents.receiver.role.fault_route(slot, 1);
+    let resets = rig.endpoints.counters().resets;
+    rig.until(true, |rig| rig.endpoints.counters().resets > resets);
+    rig.until(true, |rig| !rig.agents.receiver.role.route_faulted(slot, 1));
+}
+
+/// #310 review: a path lost and bound again starts with a clean route; it
+/// does not inherit the old route's fault.
+#[test]
+fn a_rebound_path_starts_with_a_clean_route() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    for i in 0..15u8 {
+        rig.now += 1_000_000_000;
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..5 {
+            rig.round(true);
+        }
+        if rig.agents.receiver.role.live_paths(slot) == 1 {
+            break;
+        }
+    }
+    // The lost path's route is faulted; it asks no reset while unbound.
+    rig.agents.receiver.role.fault_route(slot, 1);
+    rig.reannounce(b2, announce(setup.term_length));
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    assert!(!rig.agents.receiver.role.route_faulted(slot, 1));
+}
+
+/// #312 review P2: the founding route already faulted when its
+/// subscription goes. The later route is healthy, so NAKs still go on it,
+/// and the released founding endpoint asks for no reset.
+#[test]
+fn a_faulted_founding_route_that_goes_leaves_the_later_path_naking() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        repairs: false,
+        ..Setup::default()
+    };
+    let (mut rig, b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    for _ in 0..5 {
+        rig.round(true);
+    }
+    // The founding route faults, then its subscription goes.
+    let nak = rig.agents.receiver.role.posted_naks()[0];
+    let resets = rig.agents.receiver.counters().reset_requests;
+    rig.agents.receiver.role.fault_naks(slot, &nak);
+    rig.unsubscribe(b);
+    for _ in 0..3 {
+        rig.round(true);
+    }
+    let before = rig.agents.receiver.counters();
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().nak_copies > before.nak_copies + 1
+    });
+    for _ in 0..20 {
+        rig.round(true);
+    }
+    assert_eq!(rig.agents.receiver.counters().reset_requests, resets);
 }
