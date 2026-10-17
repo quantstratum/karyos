@@ -69,6 +69,20 @@ pub(super) struct RoutedTrack {
     unknown: [bool; MAX_ROUTES],
 }
 
+/// One to [`MAX_ROUTES`] routes, each on its own endpoint: each route's TX
+/// half is found by its endpoint.
+fn check_routes(routes: &[(EndpointId, SocketAddr)]) -> Result<(), OutboundError> {
+    let shared = (0..routes.len()).any(|index| {
+        let (seen, rest) = routes.split_at(index);
+        rest.first()
+            .is_some_and(|(endpoint, _)| seen.iter().any(|(other, _)| other == endpoint))
+    });
+    if routes.is_empty() || routes.len() > MAX_ROUTES || shared {
+        return Err(OutboundError::Routes);
+    }
+    Ok(())
+}
+
 /// The routed part of an [`Outbound`].
 #[derive(Debug)]
 pub(super) struct Routed {
@@ -88,9 +102,7 @@ impl Routed {
         config: DrrConfig,
         mtu: usize,
     ) -> Result<Self, OutboundError> {
-        if routes.is_empty() || routes.len() > MAX_ROUTES {
-            return Err(OutboundError::Lanes);
-        }
+        check_routes(routes)?;
         let placeholder = TxQueueId::new(BackendEpoch::FIRST, u16::MAX, NonZeroU32::MAX);
         let queues = vec![placeholder; lanes];
         let per_route: Vec<&[TxQueueId]> = routes.iter().map(|_| queues.as_slice()).collect();
@@ -249,7 +261,9 @@ impl Outbound {
     /// # Errors
     ///
     /// [`OutboundError`].
-    pub fn new_routed(
+    /// Driver-internal until rp-w4b2b wires routed publications: only tests
+    /// construct one (the #321 interlock).
+    pub(crate) fn new_routed(
         routes: &[(EndpointId, SocketAddr)],
         alias: karyos_protocol::network::Alias,
         readers: Vec<super::LaneReader>,
@@ -257,7 +271,7 @@ impl Outbound {
         mtu: u32,
         reliable: bool,
     ) -> Result<Self, OutboundError> {
-        let &(endpoint, destination) = routes.first().ok_or(OutboundError::Lanes)?;
+        let &(endpoint, destination) = routes.first().ok_or(OutboundError::Routes)?;
         let lanes = readers.len();
         let mut outbound = Self::new(endpoint, alias, destination, readers, quanta, mtu, reliable)?;
         let max_charge = align_frame(mtu).map_err(|_| OutboundError::Mtu)?;

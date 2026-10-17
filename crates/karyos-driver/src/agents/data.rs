@@ -357,6 +357,9 @@ pub enum OutboundError {
     Quanta,
     /// The MTU is zero or does not fit a datagram.
     Mtu,
+    /// No path, more than four, or two paths on one endpoint: a routed
+    /// publication finds each route's TX half by its endpoint.
+    Routes,
 }
 
 /// A sender that goes leaves its readers' cells not counting for the
