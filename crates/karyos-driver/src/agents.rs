@@ -467,6 +467,8 @@ pub enum AgentCommand<O: SocketOps> {
         endpoint: EndpointId,
         /// The publication's alias.
         alias: karyos_protocol::network::Alias,
+        /// Its registration, echoed in the answer.
+        registration: u64,
     },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
@@ -523,6 +525,8 @@ pub enum AgentEvent<O: SocketOps> {
         endpoint: EndpointId,
         /// Its alias.
         alias: karyos_protocol::network::Alias,
+        /// Its registration (`Identity::registration_id`).
+        registration: u64,
     },
     /// The sender stopped the publication; `outbound` is its data path,
     /// `None` when it held no such publication.
@@ -531,6 +535,8 @@ pub enum AgentEvent<O: SocketOps> {
         endpoint: EndpointId,
         /// Its alias.
         alias: karyos_protocol::network::Alias,
+        /// The registration the command named.
+        registration: u64,
         /// The data path, dropped by the conductor.
         outbound: Option<Box<data::Outbound>>,
     },
@@ -543,6 +549,8 @@ pub enum AgentEvent<O: SocketOps> {
         endpoint: EndpointId,
         /// Its alias.
         alias: karyos_protocol::network::Alias,
+        /// Its registration (`Identity::registration_id`).
+        registration: u64,
     },
     /// The answer to a receiver configuration command: `accepted` is false
     /// when its table is full.

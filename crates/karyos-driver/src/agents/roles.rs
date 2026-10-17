@@ -533,7 +533,7 @@ pub struct SenderRole {
     from_receiver: RingReceiver<ControlItem>,
     /// Each publication's data path: readers, channel destination, lane
     /// queues (at most `publications`, allocated at creation).
-    publications: Vec<Outbound>,
+    publications: Vec<Box<Outbound>>,
     /// Control routes, one slot per endpoint the agent can hold.
     routes: Vec<RouteSlot>,
     budget: u32,
@@ -808,6 +808,7 @@ impl ReceiverRole {
                     agent: AgentKind::Receiver,
                     endpoint: publication.endpoint,
                     alias: publication.alias,
+                    registration: publication.identity.registration_id,
                 },
             )),
             command => self.trace.command(command),
@@ -1773,13 +1774,15 @@ impl SenderRole {
     /// The data path of its `index`-th publication (tests).
     #[cfg(test)]
     pub(crate) fn outbound(&self, index: usize) -> Option<&Outbound> {
-        self.publications.get(index)
+        self.publications.get(index).map(|outbound| &**outbound)
     }
 
     /// The data path of its `index`-th publication, mutable (tests).
     #[cfg(test)]
     pub(crate) fn outbound_mut(&mut self, index: usize) -> Option<&mut Outbound> {
-        self.publications.get_mut(index)
+        self.publications
+            .get_mut(index)
+            .map(|outbound| &mut **outbound)
     }
 
     fn count(&mut self, field: fn(&mut SenderCounters) -> &mut u64) {
@@ -1804,7 +1807,8 @@ impl SenderRole {
                 reply,
                 endpoint,
                 alias,
-            } => return Some((reply, self.remove(endpoint, alias))),
+                registration,
+            } => return Some((reply, self.remove(endpoint, alias, registration))),
             AgentCommand::AddSubscription { reply, .. }
             | AgentCommand::AddPublishedAlias { reply, .. }
             | AgentCommand::RemovePublishedAlias { reply, .. } => {
@@ -1851,10 +1855,12 @@ impl SenderRole {
         let event = match added {
             Ok(()) => {
                 // `add` refuses past `publications` entries, the capacity.
-                self.publications.push(*outbound);
+                // Kept boxed: removal hands the box back without allocating.
+                self.publications.push(outbound);
                 AgentEvent::PublicationAdded {
                     endpoint: publication.endpoint,
                     alias: publication.alias,
+                    registration: publication.identity.registration_id,
                 }
             }
             Err(
@@ -1865,6 +1871,7 @@ impl SenderRole {
                 agent: AgentKind::Sender,
                 endpoint: publication.endpoint,
                 alias: publication.alias,
+                registration: publication.identity.registration_id,
             },
         };
         Some((reply, event))
@@ -1872,7 +1879,12 @@ impl SenderRole {
 
     /// Stops the publication `alias` on `endpoint`: its SETUP side, its
     /// bindings and its data path, which goes back to the conductor.
-    fn remove<O: SocketOps>(&mut self, endpoint: EndpointId, alias: Alias) -> AgentEvent<O> {
+    fn remove<O: SocketOps>(
+        &mut self,
+        endpoint: EndpointId,
+        alias: Alias,
+        registration: u64,
+    ) -> AgentEvent<O> {
         let _ = self.sessions.remove(endpoint, alias);
         self.bindings
             .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
@@ -1880,10 +1892,11 @@ impl SenderRole {
             .publications
             .iter()
             .position(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
-            .map(|index| Box::new(self.publications.swap_remove(index)));
+            .map(|index| self.publications.swap_remove(index));
         AgentEvent::PublicationRemoved {
             endpoint,
             alias,
+            registration,
             outbound,
         }
     }
@@ -2256,7 +2269,7 @@ impl SenderRole {
             .publications
             .iter_mut()
             .find(|outbound| outbound.endpoint() == key.endpoint && outbound.alias() == key.alias)
-            .and_then(Outbound::membership_mut)
+            .and_then(|outbound| outbound.membership_mut())
         {
             let _ = membership.binding_gone(&key, now);
         }
@@ -2409,7 +2422,7 @@ impl SenderRole {
             .publications
             .iter_mut()
             .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == status.alias)
-            .and_then(Outbound::membership_mut)
+            .and_then(|outbound| outbound.membership_mut())
         {
             let _ = membership.status(&key, status, now);
         }

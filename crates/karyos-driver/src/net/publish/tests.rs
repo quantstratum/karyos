@@ -265,3 +265,145 @@ fn network_publications_are_bounded() {
             .is_ok()
     );
 }
+
+/// #279 P1: a key freed locally while its old publication is still being
+/// removed is refused (`NetworkBusy`), leaving nothing behind; once the
+/// old one is gone the key is accepted, and the new publication is
+/// tracked and removed as any other.
+#[test]
+fn a_key_still_being_removed_is_refused_until_it_is_gone() {
+    let mut driver = driver();
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let other = driver
+        .add_network_publication(aggregate(11, 1), &channel(destination.clone()))
+        .unwrap();
+    let old = driver
+        .add_network_publication(aggregate(10, 1), &channel(destination.clone()))
+        .unwrap();
+    until(&mut driver, |driver| {
+        [&other, &old].iter().all(|handle| {
+            driver.network_publication_state(handle) == Some(NetworkPublicationState::Active)
+        })
+    });
+    driver.remove_aggregate(&other).unwrap();
+    driver.remove_aggregate(&old).unwrap();
+    // The streams free before the sender answers: the key is free locally.
+    driver.free_retired_streams();
+    let users = driver.net.as_ref().unwrap().send_endpoint_users();
+    assert_eq!(
+        driver.add_network_publication(aggregate(10, 1), &channel(destination.clone())),
+        Err(DriverError::NetworkBusy)
+    );
+    assert_eq!(
+        driver.net.as_ref().unwrap().send_endpoint_users(),
+        users,
+        "the refused attempt released its endpoint"
+    );
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&old).is_none()
+            && driver.network_publication_state(&other).is_none()
+    });
+    let new = driver
+        .add_network_publication(aggregate(10, 1), &channel(destination))
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&new) == Some(NetworkPublicationState::Active)
+    });
+    // A single-lane publication goes with its stream too.
+    driver.remove_stream(new.lane(Lane::ZERO).unwrap()).unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&new).is_none()
+            && driver.net.as_ref().unwrap().send_endpoints() == 0
+    });
+}
+
+/// A publication the sender refuses (its table full) releases its endpoint
+/// and leaves its alias stale, so the receiver forgets it; re-adding the
+/// key before that removal is posted drops it from the queue.
+#[test]
+fn a_refused_publication_releases_its_endpoint_and_alias() {
+    use karyos_protocol::network::{Alias, Identity, TermParams};
+
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.agents.publications = 2;
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    // One entry of the sender's table the conductor does not track.
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let foreign = Alias {
+        session_id: 99,
+        stream_id: 99,
+    };
+    let endpoint = crate::agents::EndpointId(999);
+    let (outbound, _log) = crate::agents::data::testing::outbound(
+        endpoint,
+        foreign,
+        socket.local_addr().unwrap(),
+        term,
+        1,
+        false,
+    );
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .links()
+        .sender
+        .post(|reply| crate::agents::AgentCommand::AddPublication {
+            reply,
+            publication: crate::sessions::send::Publication {
+                endpoint,
+                alias: foreign,
+                identity: Identity {
+                    driver_id: [0, 0],
+                    registration_id: 999,
+                    incarnation: 1,
+                },
+                term,
+                lane_count: 1,
+            },
+            outbound,
+        })
+        .unwrap();
+    let first = driver
+        .add_network_publication(aggregate(10, 1), &channel(destination.clone()))
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&first) == Some(NetworkPublicationState::Active)
+    });
+    let refused = driver
+        .add_network_publication(aggregate(11, 1), &channel(destination.clone()))
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&refused) == Some(NetworkPublicationState::Refused)
+    });
+    let net = driver.net.as_ref().unwrap();
+    assert_eq!(
+        net.send_endpoint_users(),
+        1,
+        "the refusal released its endpoint"
+    );
+    assert_eq!(net.stale_queued(), 1, "its alias is stale");
+    // Re-adding the key before the stale alias is posted supersedes it.
+    driver.remove_aggregate(&refused).unwrap();
+    driver.free_retired_streams();
+    assert_eq!(driver.network_publication_state(&refused), None);
+    let again = driver
+        .add_network_publication(aggregate(11, 1), &channel(destination))
+        .unwrap();
+    assert_eq!(driver.net.as_ref().unwrap().stale_queued(), 0);
+    assert!(driver.network_publication_state(&again).is_some());
+}

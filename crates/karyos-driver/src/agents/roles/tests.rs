@@ -284,7 +284,7 @@ fn a_multicast_answer_goes_to_the_group() {
     };
     sender.sessions.add(publication).unwrap();
     let (path, _log) = outbound(EndpointId(1), group);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let challenge = Control::Challenge(karyos_protocol::network::RspChallenge {
         alias: alias(),
         identity: identity(),
@@ -740,7 +740,7 @@ fn the_sender_validates_sms_against_its_bindings() {
     sender.sessions.add(publication(endpoint)).unwrap();
     let group: SocketAddr = "10.0.0.2:4000".parse().unwrap();
     let (path, _log) = outbound(endpoint, group);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // The answer to the receiver's challenge binds it.
     let answer = |boot_id| SetupAnswer {
@@ -868,7 +868,7 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
         )
         .unwrap(),
     ));
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let answer = SetupAnswer {
         alias: alias(),
         identity: identity(),
@@ -1076,7 +1076,7 @@ fn unconfirmed_bindings_never_hold_the_table() {
         .unwrap(),
     };
     let (path, _log) = outbound(endpoint, receiver);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     sender.status(endpoint, receiver, &status, 2);
     assert_eq!(sender.sessions.counters().established, 1);
     assert_eq!(sender.counters().bindings_evicted, 1);
@@ -1243,7 +1243,7 @@ fn sm_sender() -> super::SenderRole {
     let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
     sender.sessions.add(publication(EndpointId(1))).unwrap();
     let (path, _log) = outbound(EndpointId(1), "10.0.0.2:4000".parse().unwrap());
-    sender.publications.push(*path);
+    sender.publications.push(path);
     sender
 }
 
@@ -1641,7 +1641,7 @@ fn rttm_requests_are_reported_and_answered() {
     sender.bind(EndpointId(1), source, &old, 899);
     sender.bind(EndpointId(1), source, &answer, 900);
     let (path, _log) = outbound(EndpointId(1), source);
-    sender.publications.push(*path);
+    sender.publications.push(path);
     let status = StatusMessage {
         alias: alias(),
         identity: identity(),

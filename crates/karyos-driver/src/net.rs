@@ -244,14 +244,27 @@ impl Network {
         outbound: Box<Outbound>,
     ) -> Result<(), DriverError> {
         let (endpoint, alias) = (publication.endpoint, publication.alias);
+        // One tracked publication per key: the sender's answers then name
+        // exactly one entry, and a key freed locally while its old
+        // publication is still being removed waits for it (#279 P1).
+        if self
+            .publications
+            .iter()
+            .any(|entry| (entry.endpoint, entry.alias) == (endpoint, alias))
+        {
+            return Err(DriverError::NetworkBusy);
+        }
+        // A queued alias of this key is superseded by the add below, so it
+        // takes no room.
         let stale_only = self
             .stale_aliases
             .iter()
             .filter(|key| {
-                !self
-                    .publications
-                    .iter()
-                    .any(|entry| (entry.endpoint, entry.alias) == **key)
+                **key != (endpoint, alias)
+                    && !self
+                        .publications
+                        .iter()
+                        .any(|entry| (entry.endpoint, entry.alias) == **key)
             })
             .count();
         if self
@@ -262,11 +275,6 @@ impl Network {
         {
             return Err(DriverError::NetworkPublicationsFull);
         }
-        // A key reused before its stale alias was posted: the new
-        // `AddPublishedAlias` supersedes it, and a removal posted later
-        // would drop the new publication's alias. One posted earlier
-        // precedes the add in the ring.
-        self.stale_aliases.retain(|key| *key != (endpoint, alias));
         self.links
             .receiver
             .post(|reply| AgentCommand::AddPublishedAlias {
@@ -275,14 +283,29 @@ impl Network {
                 alias,
             })
             .map_err(|_| DriverError::NetworkBusy)?;
-        self.links
+        // A key reused before its stale alias was posted: the new
+        // `AddPublishedAlias`, now in the ring, supersedes it, and a removal
+        // posted later would drop the new publication's alias. One posted
+        // earlier precedes the add in the ring.
+        self.stale_aliases.retain(|key| *key != (endpoint, alias));
+        let posted = self
+            .links
             .sender
             .post(|reply| AgentCommand::AddPublication {
                 reply,
                 publication,
                 outbound,
-            })
-            .map_err(|_| DriverError::NetworkBusy)?;
+            });
+        if posted.is_err() {
+            // The receiver learned the alias: it is stale now. The capacity
+            // check above leaves room for it.
+            Stale {
+                queue: &mut self.stale_aliases,
+                overflows: &mut self.stale_overflows,
+            }
+            .queue_alias(endpoint, alias);
+            return Err(DriverError::NetworkBusy);
+        }
         self.publications.push(NetPublication {
             registration,
             endpoint,
@@ -445,6 +468,18 @@ impl Network {
         self.stale_overflows
     }
 
+    /// Stale aliases still queued, for tests.
+    #[cfg(test)]
+    pub(crate) fn stale_queued(&self) -> usize {
+        self.stale_aliases.len()
+    }
+
+    /// Publications holding send endpoints, over all of them, for tests.
+    #[cfg(test)]
+    pub(crate) fn send_endpoint_users(&self) -> usize {
+        self.send_endpoints.iter().map(|entry| entry.users).sum()
+    }
+
     /// The send endpoints held, for tests.
     #[cfg(test)]
     pub(crate) fn send_endpoints(&self) -> usize {
@@ -486,11 +521,12 @@ fn post_removals(
         .iter_mut()
         .filter(|entry| entry.state == NetworkPublicationState::Removing && !entry.remove_posted)
     {
-        let (endpoint, alias) = (entry.endpoint, entry.alias);
+        let (endpoint, alias, registration) = (entry.endpoint, entry.alias, entry.registration);
         let posted = links.sender.post(|reply| AgentCommand::RemovePublication {
             reply,
             endpoint,
             alias,
+            registration,
         });
         if posted.is_err() {
             break;
@@ -541,15 +577,21 @@ fn publication_answer(
     stale: &mut Stale<'_>,
     event: AgentEvent<OsSocket>,
 ) {
-    let find = |publications: &mut Vec<NetPublication>, endpoint, alias| {
-        publications
-            .iter()
-            .position(|entry: &NetPublication| (entry.endpoint, entry.alias) == (endpoint, alias))
+    // Answers name the publication's registration (#279 P1), never only
+    // its key.
+    let find = |publications: &mut Vec<NetPublication>, endpoint, alias, registration| {
+        publications.iter().position(|entry: &NetPublication| {
+            (entry.endpoint, entry.alias, entry.registration) == (endpoint, alias, registration)
+        })
     };
     match event {
-        AgentEvent::PublicationAdded { endpoint, alias } => {
-            if let Some(entry) =
-                find(publications, endpoint, alias).and_then(|index| publications.get_mut(index))
+        AgentEvent::PublicationAdded {
+            endpoint,
+            alias,
+            registration,
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get_mut(index))
                 && entry.state == NetworkPublicationState::Adding
             {
                 entry.state = NetworkPublicationState::Active;
@@ -559,8 +601,9 @@ fn publication_answer(
             agent: AgentKind::Sender,
             endpoint,
             alias,
+            registration,
         } => {
-            if let Some(index) = find(publications, endpoint, alias) {
+            if let Some(index) = find(publications, endpoint, alias, registration) {
                 release(send_endpoints, endpoint);
                 // The receiver learned the alias before the refusal.
                 stale.queue_alias(endpoint, alias);
@@ -577,11 +620,12 @@ fn publication_answer(
         AgentEvent::PublicationRemoved {
             endpoint,
             alias,
+            registration,
             outbound,
         } => {
             // The lane readers drop here, on the control path.
             drop(outbound);
-            if let Some(index) = find(publications, endpoint, alias) {
+            if let Some(index) = find(publications, endpoint, alias, registration) {
                 publications.swap_remove(index);
                 release(send_endpoints, endpoint);
             }
