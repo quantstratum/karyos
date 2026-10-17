@@ -58,7 +58,8 @@ pub struct PathPolicy {
     /// returns (RP-9; default 10 ms, at least 1).
     pub backoff_initial: u64,
     /// `path_backoff_max` in ns: the wait doubles up to it (default 1 s, at
-    /// least `backoff_initial`).
+    /// least `backoff_initial`, at most [`MAX_PATH_BACKOFF`], so a left
+    /// path always comes back).
     pub backoff_max: u64,
     /// `path_backoff_reset` in ns: live this long, a path's wait starts
     /// over at `backoff_initial` (default 10 s, at least 1).
@@ -70,6 +71,10 @@ pub struct PathPolicy {
     /// (RP-11; default 256, 1 to [`MAX_PATH_COPY_ENTRIES`]).
     pub copy_entries: usize,
 }
+
+/// The longest `path_backoff_max`, in ns (60 s): past it a left path
+/// could wait so long it never comes back.
+pub const MAX_PATH_BACKOFF: u64 = 60_000_000_000;
 
 /// The largest `path_copy_entries`.
 pub const MAX_PATH_COPY_ENTRIES: usize = 65_536;
@@ -673,8 +678,12 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     }
 
     /// Lane `lane`'s `sent_low`: the least frontier over its live paths, a
-    /// returning path not counted until it submits (RP-9); `None` on one
-    /// path or with no live path.
+    /// returning path not counted until it submits (RP-9). It can move
+    /// backwards: a path counts again from its first submit after a
+    /// return, at the selection point, which can be below the frontier of
+    /// the paths that stayed. `None` for a publication that is not routed
+    /// (it has one path and no `sent_low`), past its lanes, or with no
+    /// live path.
     #[must_use]
     pub fn sent_low(&self, lane: usize) -> Option<u64> {
         let routed = self.routed.as_deref()?;
@@ -1204,7 +1213,15 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             }
         }
         for index in 0..routed.routes.len() {
-            let live = routed.routes.iter().filter(|route| !route.left).count();
+            // The other paths that can send now: live and not returning (a
+            // returning path is not live until it submits, RP-9; #350
+            // review). One of them must remain for a path to leave.
+            let others = routed
+                .routes
+                .iter()
+                .enumerate()
+                .filter(|(other, route)| *other != index && !route.left && !route.returning)
+                .count();
             let Some(slot) = routed.routes.get_mut(index) else {
                 continue;
             };
@@ -1273,7 +1290,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             let faulted = slot.needs_reset
                 || (0..self.readers.len())
                     .any(|lane| routed.sender.needs_control(lane, index) == Some(true));
-            if !(lagging || stalled_long || faulted) || live < 2 {
+            if !(lagging || stalled_long || faulted) || others == 0 {
                 continue;
             }
             if leave(
@@ -1302,17 +1319,11 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             if !gate.aborting(lane) || !pending {
                 continue;
             }
-            match routed.sender.cancel(&mut lent, lane, &mut gate) {
-                Ok(()) => cancelled = true,
-                Err(_) => {
-                    cancelled = true;
-                    self.counters.bump(|c| &mut c.queue_failures, 1);
-                }
-            }
             // A detached route cannot cancel, and may never come back: its
-            // copies are forgotten, so the close does not wait for its
-            // reopen (ACS 17049). Its queue still holds them, so it comes
-            // back only through a reset, whose reopen replaces the queue.
+            // copies are forgotten first, so the close does not wait for its
+            // reopen (ACS 17049) and `cancel` counts none `uncancelled`. Its
+            // queue still holds them, so it comes back only through a reset,
+            // whose reopen replaces the queue.
             for (index, slot) in routed.routes.iter_mut().enumerate() {
                 let held = routed
                     .sender
@@ -1323,6 +1334,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 }
                 if routed.sender.forget(lane, index, &mut gate) > 0 {
                     slot.needs_reset = true;
+                    cancelled = true;
                 }
                 if let Some(copies) = gate
                     .tracks
@@ -1330,6 +1342,19 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     .and_then(|track| track.staged.get_mut(index))
                 {
                     copies.clear();
+                }
+            }
+            let pending = (0..MAX_ROUTES)
+                .filter_map(|route| routed.sender.pending(lane, route))
+                .any(|held| held > 0);
+            if !pending {
+                continue;
+            }
+            match routed.sender.cancel(&mut lent, lane, &mut gate) {
+                Ok(()) => cancelled = true,
+                Err(_) => {
+                    cancelled = true;
+                    self.counters.bump(|c| &mut c.queue_failures, 1);
                 }
             }
         }

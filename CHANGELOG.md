@@ -118,8 +118,9 @@ release may break APIs, wire formats and shared-memory layouts.
   `Outbound::path_counters` report it. A faulted route leaves too, while
   another path is live.
 - A left path returns (RP-9; rp-w5b) after its backoff
-  (`PathPolicy::backoff_initial`, 10 ms, doubling to `backoff_max`, 1 s,
-  and starting over after `backoff_reset`, 10 s, live): on its open queue,
+  (`PathPolicy::backoff_initial`, 10 ms, doubling to `backoff_max`, 1 s
+  and at most `MAX_PATH_BACKOFF`, 60 s, and starting over after
+  `backoff_reset`, 10 s, live): on its open queue,
   or by `retry_queue` after a fault, from the current selection point,
   counted (`PathCounters::entries`). It bounds `Outbound::sent_low`, the
   least frontier over the live paths, from its first submit; a frame a
@@ -140,8 +141,9 @@ release may break APIs, wire formats and shared-memory layouts.
 - A close no longer waits on a detached path (rp-w5b; ACS 17049). On a
   guarded lane's abort, the copies of a route whose TX half is detached
   are forgotten through the guard gate (`RoutedLaneSender::forget`), so
-  the close can become effective if the path never comes back. The route
-  then returns only through an endpoint reset.
+  the close can become effective if the path never comes back, and counted
+  (`RouteCounters::forgotten`). The route then returns only through an
+  endpoint reset.
 - Receiver trace journals keep their sealed gaps (P2.12 step 3, PR 3b,
   trace-network.md section 5): the first `FACT_GAP_INTERVALS` (16) gaps of
   each traced lane, in order, with an overflow flag, carried in

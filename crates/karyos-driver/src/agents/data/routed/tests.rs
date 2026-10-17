@@ -1217,6 +1217,48 @@ fn a_faulted_route_leaves_and_returns_by_retry() {
     assert!(!outbound.needs_reset());
 }
 
+/// #350 review P2: a returning path that has not submitted is not live for
+/// the leave guard. B leaves and returns while its socket blocks, then A
+/// faults: A stays, the last path that can send, and `sent_low` keeps a
+/// frontier.
+#[test]
+fn a_returning_path_does_not_let_the_last_live_one_leave() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b) = path(2, 0);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(return_policy());
+    outbound.leave_before_serve(1);
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1000)
+        .unwrap();
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(false));
+    // Back after 10 ns; its socket blocks, so it submits nothing.
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1010)
+        .unwrap();
+    assert!(outbound.routed.as_deref().unwrap().routes[1].returning);
+    observer_a.push_send(SendResult::Error(Errno::NETUNREACH));
+    commit(&mut log, 1, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1011)
+        .unwrap();
+    assert_eq!(
+        outbound.path_state(0).map(|state| state.0),
+        Some(true),
+        "A is the last path that can send"
+    );
+    assert!(outbound.sent_low(0).is_some());
+    sent(&observer_a, 64);
+    sent(&observer_b, 64);
+    for now in 1012..1100 {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+}
+
 /// RP-8: room is judged after the cycle's flushes, so a path whose socket
 /// takes everything never looks full, however the backend orders its
 /// queues: across many cycles it skips nothing and never leaves.
@@ -1304,6 +1346,11 @@ fn a_close_does_not_wait_on_a_detached_left_path() {
     assert_eq!(applied.epoch, 3);
     assert_eq!(applied.in_flight, 0, "nothing waits on the detached path");
     assert_eq!(outbound.routed_sender().unwrap().pending(0, 1), Some(0));
+    // The leave's cancel found B detached once; the close forgot its
+    // copies and attempted no more cancels on it (#350 review).
+    let counters = outbound.routed_sender().unwrap().counters(1).unwrap();
+    assert_eq!(counters.uncancelled, 1, "{counters:?}");
+    assert!(counters.forgotten > 0, "{counters:?}");
     // B's half comes back: the route asks for a reset first.
     let calls = observer_b.send_calls();
     halves.push(b_half);

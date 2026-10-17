@@ -1627,7 +1627,7 @@ pub(crate) mod testing {
 
 mod routed;
 
-pub use routed::{MAX_PATH_COPY_ENTRIES, PathCounters, PathPolicy};
+pub use routed::{MAX_PATH_BACKOFF, MAX_PATH_COPY_ENTRIES, PathCounters, PathPolicy};
 
 #[cfg(test)]
 mod tests;
