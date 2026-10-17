@@ -550,3 +550,106 @@ fn an_unrecoverable_range_is_gated_too() {
     assert_eq!(owner.posted(Lane::ZERO), None);
     assert_eq!(owner.first_loss(Lane::ZERO), Some(Some(64)));
 }
+
+/// P2.12 step 3 PR 3b: `duty_observed` tells of each committed seal once,
+/// with its lane, position and extent; a later duty with nothing due tells
+/// nothing more.
+#[test]
+fn each_committed_seal_is_told_once() {
+    let (_buffer, mut owner) = with_hole();
+    // A second hole [192, 320).
+    receive(&mut owner, &data(0, 320, 3)).unwrap();
+    let mut skip = policy_of(SkipConfig {
+        reorder_timeout_ns: 0,
+        ..SkipConfig::unreliable()
+    });
+    let mut sealed = Vec::new();
+    let report = skip
+        .duty_observed(&mut owner, 5, &mut Ungated, |lane, position, extent| {
+            sealed.push((lane, position, extent));
+        })
+        .unwrap();
+    assert_eq!(report.sealed, 2);
+    assert_eq!(sealed, [(Lane::ZERO, 64, 64), (Lane::ZERO, 192, 128)]);
+    let report = skip
+        .duty_observed(&mut owner, 6, &mut Ungated, |lane, position, extent| {
+            sealed.push((lane, position, extent));
+        })
+        .unwrap();
+    assert_eq!(report.sealed, 0);
+    assert_eq!(sealed.len(), 2, "nothing more");
+}
+
+/// PR 3b: a seal published before a later step failed (GU-11) is told
+/// once, as committed.
+#[test]
+fn a_seal_committed_before_a_failure_is_told() {
+    let (_buffer, mut owner) = with_hole();
+    receive(&mut owner, &data(0, 320, 3)).unwrap();
+    let mut skip = policy_of(SkipConfig {
+        reorder_timeout_ns: 0,
+        ..SkipConfig::unreliable()
+    });
+    owner.fail_next_advance(Lane::ZERO, SysError::ResourcesUnavailable);
+    let mut sealed = Vec::new();
+    let report = skip
+        .duty_observed(&mut owner, 5, &mut Ungated, |lane, position, extent| {
+            sealed.push((lane, position, extent));
+        })
+        .unwrap();
+    assert!(report.committed_failure.is_some());
+    assert_eq!(sealed, [(Lane::ZERO, 64, 64)]);
+}
+
+/// PR 3b: a hole the gate holds (posted, not sealed) tells nothing, on
+/// each duty it stays pending; once permitted, its seal is told once.
+#[test]
+fn a_held_seal_is_told_only_once_committed() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy_of(SkipConfig::unreliable());
+    let mut gate = Scripted {
+        pending: true,
+        ..Scripted::default()
+    };
+    let mut sealed = Vec::new();
+    for now in [0, MS, 2 * MS] {
+        let _ = skip
+            .duty_observed(&mut owner, now, &mut gate, |lane, position, extent| {
+                sealed.push((lane, position, extent));
+            })
+            .unwrap();
+    }
+    assert!(sealed.is_empty(), "posted, never sealed");
+    gate.pending = false;
+    for now in [3 * MS, 4 * MS] {
+        let _ = skip
+            .duty_observed(&mut owner, now, &mut gate, |lane, position, extent| {
+                sealed.push((lane, position, extent));
+            })
+            .unwrap();
+    }
+    assert_eq!(sealed, [(Lane::ZERO, 64, 64)]);
+}
+
+/// PR 3b: an unrecoverable range sealed under `skip` is told too.
+#[test]
+fn an_unrecoverable_seal_is_told() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy_of(SkipConfig {
+        on_unrecoverable: Unrecoverable::Skip,
+        ..SkipConfig::reliable()
+    });
+    let mut sealed = Vec::new();
+    let report = skip
+        .range_unavailable_observed(
+            &mut owner,
+            Lane::ZERO,
+            160,
+            0,
+            &mut Ungated,
+            |lane, position, extent| sealed.push((lane, position, extent)),
+        )
+        .unwrap();
+    assert_eq!(report.sealed, 1);
+    assert_eq!(sealed, [(Lane::ZERO, 64, 64)]);
+}
