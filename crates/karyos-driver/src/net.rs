@@ -10,9 +10,12 @@
 //!   own threads in the other modes ([`AgentRunner`]).
 //! - **Duty (W-c).** Each conductor cycle runs the agents when they share
 //!   its thread, then drains their events into the endpoint and image
-//!   tables. In `Shared` mode the agents get the driver clock's reading;
-//!   their threads read `host_monotonic_ns`. An agent compares only its own
-//!   timestamps, so the two never mix.
+//!   tables. The network's time base is `host_monotonic_ns` in every
+//!   mode: a shared cycle passes it to the agents and the endpoint table,
+//!   as runner threads do. The agents also read it directly (their role
+//!   clocks: an RTTM REQUEST's or a NAK's start, a reply's `seen`) and
+//!   compare those with their cycles' `now`, so one base is required. The
+//!   driver's injectable clock times claim deadlines only.
 //! - **Failure (W-g, DN-9).** An agent that fails or panics is fatal for
 //!   the driver: the duty cycle returns [`DriverError::NetworkAgent`] from
 //!   then on, and the failed agents never run again. In `Shared` mode each
@@ -210,6 +213,9 @@ pub(crate) struct Network {
     /// Stale aliases that found the queue full: never, by construction;
     /// counted if it happens.
     stale_overflows: u64,
+    /// The network's time base, the agents' role clock: `host_monotonic_ns`
+    /// (module documentation, Duty).
+    clock: fn() -> u64,
 }
 
 impl Network {
@@ -247,6 +253,7 @@ impl Network {
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
             stale_overflows: 0,
+            clock: karyos_sys::host_clock::host_monotonic_ns,
         })
     }
 
@@ -618,15 +625,16 @@ impl Network {
             .map(|entry| entry.state)
     }
 
-    /// One conductor cycle of network work at `now`, in driver clock
-    /// nanoseconds: the agents when they share this thread, then their
-    /// events. Returns the work done.
+    /// One conductor cycle of network work at the network clock's reading:
+    /// the agents when they share this thread, then their events. Returns
+    /// the work done.
     ///
     /// # Errors
     ///
     /// [`DriverError::NetworkAgent`] once an agent failed (DN-9), and on
     /// every later cycle; [`DriverError::WorkCountOverflow`].
-    pub(crate) fn duty(&mut self, now: u64) -> Result<u32, DriverError> {
+    pub(crate) fn duty(&mut self) -> Result<u32, DriverError> {
+        let now = (self.clock)();
         if let Some(agent) = self.failed {
             return Err(DriverError::NetworkAgent { agent });
         }
@@ -656,7 +664,7 @@ impl Network {
         };
         post_removals(&self.links, &mut self.publications, &mut stale);
         // Answers about endpoints go to the table, which also serves the
-        // sender's reset requests at the driver clock (W-f); publication
+        // sender's reset requests at the network clock (W-f); publication
         // answers update the publications.
         let mut events = Some(0u32);
         #[cfg(test)]
@@ -716,9 +724,10 @@ impl Network {
     }
 
     /// Stops the agents, reclaims every endpoint and drains the image
-    /// table at `now`, the driver clock's reading (control path; at most
-    /// once, later calls report nothing).
-    pub(crate) fn close(&mut self, now: u64) -> NetworkShutdown {
+    /// table at the network clock's reading (control path; at most once,
+    /// later calls report nothing).
+    pub(crate) fn close(&mut self) -> NetworkShutdown {
+        let now = (self.clock)();
         let mut shutdown = NetworkShutdown::default();
         let agents = match core::mem::replace(&mut self.agents, Agents::Closed) {
             Agents::Shared(mut agents) => {

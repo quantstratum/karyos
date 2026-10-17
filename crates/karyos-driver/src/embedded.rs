@@ -3069,7 +3069,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(net) = &mut self.net else {
             return (0, None);
         };
-        let served = match net.duty(self.clock.now()) {
+        let served = match net.duty() {
             Ok(work) => (work, None),
             Err(error) => (0, Some(error)),
         };
@@ -3136,7 +3136,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// gone), so none is ever detached.
     pub fn close_network(&mut self) -> Option<crate::net::NetworkShutdown> {
         let mut net = self.net.take()?;
-        Some(net.close(self.clock.now()))
+        Some(net.close())
     }
 
     pub(crate) fn clock_now(&mut self) -> u64 {
