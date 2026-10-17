@@ -860,7 +860,9 @@ enum Parsed {
 fn check_header(found: &[u8; HEADER]) -> Result<(), CatalogError> {
     let corrupt = CatalogError::Corrupt { offset: 0 };
     let word = |at: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(found.get(at..at + 4)?.try_into().ok()?))
+        Some(u32::from_le_bytes(
+            found.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
     };
     let (Some(magic), Some(version), Some(crc)) = (word(0), word(4), word(12)) else {
         return Err(corrupt);
@@ -886,7 +888,7 @@ fn parse<D: Disk>(
     length: u64,
     buf: &mut Vec<u8>,
 ) -> Result<Parsed, CatalogError> {
-    let available = length - offset;
+    let available = length.checked_sub(offset).ok_or(CatalogError::LogFull)?;
     let head_len = u64::try_from(HEAD).map_err(io::Error::other)?;
     if available < head_len {
         return Ok(Parsed::Torn);
@@ -896,7 +898,10 @@ fn parse<D: Disk>(
     let [kind_low, kind_high, length_low, length_high] = head;
     let kind = u16::from_le_bytes([kind_low, kind_high]);
     let body = usize::from(u16::from_le_bytes([length_low, length_high]));
-    let whole = HEAD + body + TAIL;
+    let whole = HEAD
+        .checked_add(body)
+        .and_then(|sum| sum.checked_add(TAIL))
+        .ok_or(CatalogError::LogFull)?;
     let whole_len = u64::try_from(whole).map_err(io::Error::other)?;
     if whole_len >= available {
         // Reaching the end of the log, even exactly: a crash may leave the
@@ -911,9 +916,15 @@ fn parse<D: Disk>(
             Ok(Parsed::Corrupt)
         };
     }
-    let payload = buf.get(HEAD..HEAD + body).unwrap_or_default();
+    let payload = HEAD
+        .checked_add(body)
+        .and_then(|end| buf.get(HEAD..end))
+        .unwrap_or_default();
     match Record::decode(kind, payload) {
-        Some(record) => Ok(Parsed::Record(record, offset + whole_len)),
+        Some(record) => Ok(Parsed::Record(
+            record,
+            offset.checked_add(whole_len).ok_or(CatalogError::LogFull)?,
+        )),
         // A valid CRC over a record that does not decode: never a tear.
         None => Ok(Parsed::Corrupt),
     }
@@ -930,7 +941,10 @@ fn checks<D: Disk>(
     buf.clear();
     buf.resize(whole, 0);
     disk.read_at(file, offset, buf)?;
-    let (checked, tail) = buf.split_at(whole - TAIL);
+    let body_end = whole.checked_sub(TAIL).ok_or(CatalogError::LogFull)?;
+    let (checked, tail) = buf
+        .split_at_checked(body_end)
+        .ok_or(CatalogError::LogFull)?;
     let crc = u32::from_le_bytes(tail.try_into().map_err(io::Error::other)?);
     Ok(crc32c(checked) == crc)
 }
@@ -945,13 +959,16 @@ fn zeros_from<D: Disk>(
     let mut chunk = [0u8; 4096];
     let mut at = offset;
     while at < length {
-        let take = usize::try_from((length - at).min(4096)).map_err(io::Error::other)?;
+        let left = length.checked_sub(at).ok_or(CatalogError::LogFull)?;
+        let take = usize::try_from(left.min(4096)).map_err(io::Error::other)?;
         let part = chunk.get_mut(..take).unwrap_or_default();
         disk.read_at(file, at, part)?;
         if part.iter().any(|&byte| byte != 0) {
             return Ok(false);
         }
-        at += u64::try_from(take).map_err(io::Error::other)?;
+        at = at
+            .checked_add(u64::try_from(take).map_err(io::Error::other)?)
+            .ok_or(CatalogError::LogFull)?;
     }
     Ok(true)
 }
