@@ -1147,9 +1147,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 allow_unconnected,
                 uri.as_str(),
             ),
-            Command::AddNetworkSubscription { stream_id, uri, .. } => {
-                self.serve_network_subscription(client, request, stream_id, uri.as_str())
-            }
+            Command::AddNetworkSubscription {
+                stream_id,
+                role,
+                uri,
+                ..
+            } => self.serve_network_subscription(
+                client,
+                link,
+                request,
+                stream_id,
+                role,
+                uri.as_str(),
+            ),
         }
     }
 

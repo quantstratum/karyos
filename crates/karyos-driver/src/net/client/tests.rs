@@ -193,7 +193,15 @@ fn ipc_uris_and_refusals() {
     let ipc_subscription = client
         .add_network_subscription("karyos:ipc", 20, SubscriberRole::Optional)
         .unwrap();
-    let sequences = [resolved, ambiguous, ipc_subscription];
+    let ambiguous_subscription = client
+        .add_network_subscription("karyos:ipc", 21, SubscriberRole::Optional)
+        .unwrap();
+    let sequences = [
+        resolved,
+        ambiguous,
+        ipc_subscription,
+        ambiguous_subscription,
+    ];
     run(
         &mut [&mut driver],
         &mut [&mut client],
@@ -215,10 +223,15 @@ fn ipc_uris_and_refusals() {
             ..
         }
     ));
+    // W7: an IPC URI subscribes the only stream of the id.
     assert!(matches!(
         take(&mut outcomes, ipc_subscription),
+        Outcome::Subscription(_)
+    ));
+    assert!(matches!(
+        take(&mut outcomes, ambiguous_subscription),
         Outcome::Refused {
-            code: ErrorCode::UnsupportedChannel,
+            code: ErrorCode::UnknownStream,
             ..
         }
     ));
@@ -846,4 +859,243 @@ fn invalid_stream_defaults_are_refused_at_start() {
             Err(crate::DriverError::InvalidConfig)
         ));
     }
+}
+
+/// #294's race (#300 follow-up): a subscription created in the same cycle
+/// as its image's `Installed` is told of the image once. One subscription
+/// is created every cycle (one command per client ring and cycle) until
+/// well after the image arrives, so one of them is created in the cycle
+/// that installs it; every one of them sees exactly one `ImageAvailable`.
+#[test]
+fn a_subscription_made_in_the_installing_cycle_learns_of_the_image_once() {
+    let mut a = driver();
+    let mut b = driver_with(|config| {
+        if let Some(network) = &mut config.network {
+            network.max_owned_per_client = 4096;
+        }
+    });
+    let mut publisher = a.connect().unwrap();
+    let mut subscriber = b.connect().unwrap();
+    let port = port();
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}");
+    let mut published = None;
+    // The publication's handle is kept: dropping it would end it.
+    let mut publication = None;
+    let mut counts: Vec<(u64, u32, u32)> = Vec::new();
+    let mut after_image = 0u32;
+    let start = std::time::Instant::now();
+    while after_image < 20 {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "{} subscriptions",
+            counts.len()
+        );
+        let _ = subscriber
+            .add_network_subscription(&uri, 10, SubscriberRole::Required)
+            .unwrap();
+        // The publication follows the first subscription: its receiver
+        // is bound when its first setup arrives.
+        if published.is_none() && !counts.is_empty() {
+            published = Some(
+                publisher
+                    .add_network_publication(&format!("{uri}|interface=127.0.0.1"), 10, true)
+                    .unwrap(),
+            );
+        }
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+        let _ = publisher.poll(usize::MAX, |completion| {
+            assert_eq!(Some(completion.sequence), published);
+            let Outcome::Publication(handle) = completion.outcome else {
+                panic!("not a publication: {:?}", completion.outcome);
+            };
+            publication = Some(handle);
+        });
+        let _ = subscriber.poll(usize::MAX, |completion| {
+            let Outcome::NetworkSubscription { registration } = completion.outcome else {
+                panic!("not a network subscription: {:?}", completion.outcome);
+            };
+            counts.push((registration, 0, 0));
+        });
+        image_events(&mut subscriber, &mut counts);
+        if counts.iter().any(|entry| entry.1 > 0) {
+            after_image += 1;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    // Late events of the last subscriptions.
+    for _ in 0..20 {
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+        let _ = subscriber.poll(usize::MAX, |completion| {
+            if let Outcome::NetworkSubscription { registration } = completion.outcome {
+                counts.push((registration, 0, 0));
+            }
+        });
+        image_events(&mut subscriber, &mut counts);
+    }
+    assert!(publication.is_some());
+    assert!(
+        counts.iter().all(|entry| entry.1 == 1),
+        "every subscription saw the image exactly once: {:?}",
+        counts
+            .iter()
+            .filter(|entry| entry.1 != 1)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Publish before subscribe, the usual order (#300 follow-up, ACS
+/// 16256): a unicast publication announces to an endpoint nobody is bound
+/// to yet; a subscription made later still gets its image, and messages
+/// flow. The publication's handle is kept: dropping it would end it.
+#[test]
+fn a_publication_made_before_its_subscription_reaches_it() {
+    let (mut a, mut b) = (driver(), driver());
+    let mut publisher = a.connect().unwrap();
+    let mut subscriber = b.connect().unwrap();
+    let port = port();
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}");
+    let published = publisher
+        .add_network_publication(&format!("{uri}|interface=127.0.0.1"), 10, true)
+        .unwrap();
+    let Outcome::Publication(mut publication) = complete(&mut a, &mut publisher, published) else {
+        panic!("not a publication");
+    };
+    // Its announcements go unanswered for a while.
+    for _ in 0..50 {
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let subscribed = subscriber
+        .add_network_subscription(&uri, 10, SubscriberRole::Required)
+        .unwrap();
+    let mut outcomes = Vec::new();
+    let mut image = None;
+    run(
+        &mut [&mut a, &mut b],
+        &mut [&mut publisher, &mut subscriber],
+        &mut outcomes,
+        |_, clients| {
+            for event in clients[1].take_events() {
+                if let Event::ImageAvailable { stream, .. } = event {
+                    image = Some(stream);
+                }
+            }
+            image.is_some()
+        },
+    );
+    assert!(matches!(
+        take_of(&mut outcomes, 1, subscribed),
+        Outcome::NetworkSubscription { .. }
+    ));
+    let attach = subscriber
+        .add_subscription(image.unwrap(), SubscriberRole::Required)
+        .unwrap();
+    let Outcome::Subscription(mut reading) = complete(&mut b, &mut subscriber, attach) else {
+        panic!("not a subscription");
+    };
+    let (mut sent, mut seen) = (0u32, 0u32);
+    run(
+        &mut [&mut a, &mut b],
+        &mut [&mut publisher, &mut subscriber],
+        &mut outcomes,
+        |_, _| {
+            while sent < 32 {
+                match publication.offer(&sent.to_le_bytes()).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent += 1,
+                    _ => break,
+                }
+            }
+            let _ = reading.poll(
+                |bytes, _| {
+                    assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), seen);
+                    seen += 1;
+                },
+                MessageLimit::new(32),
+            );
+            seen == 32
+        },
+    );
+}
+
+/// #306 review: a network subscription whose request timed out is
+/// removed when its late grant arrives, so it holds nothing.
+#[test]
+fn a_late_network_subscription_grant_is_removed() {
+    let mut driver = driver();
+    let mut client = karyos_client::Client::with_conductor(
+        driver.connect().unwrap(),
+        karyos_client::Context::builder()
+            .timeout(Duration::from_millis(20))
+            .build()
+            .unwrap(),
+    );
+    let port = port();
+    // The driver runs on this thread: the request times out.
+    assert!(matches!(
+        client.add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            karyos_protocol::cnc::StreamId::new(10),
+        ),
+        Err(karyos_client::ClientError::Timeout)
+    ));
+    let start = std::time::Instant::now();
+    while client.late_grants_released() == 0 {
+        assert!(start.elapsed() < Duration::from_secs(5), "not released");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll();
+    }
+    eventually(&mut driver, |driver| {
+        driver.net_owned.is_empty() && driver.net.as_ref().unwrap().subscription_count() == 0
+    });
+}
+
+/// #306 review (P1): a lap of the client's broadcast receiver loses image
+/// events, so the facade closes its network subscriptions with
+/// `EventsLost` instead of keeping images it can no longer track.
+#[test]
+fn a_lap_closes_the_network_subscriptions() {
+    let mut driver = driver();
+    let mut client = karyos_client::Client::with_conductor(
+        driver.connect().unwrap(),
+        karyos_client::Context::builder().build().unwrap(),
+    );
+    let port = port();
+    let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}");
+    let mut reading = std::thread::scope(|scope| {
+        let handle =
+            scope.spawn(|| client.add_subscription(&uri, karyos_protocol::cnc::StreamId::new(10)));
+        while !handle.is_finished() {
+            let _ = driver.do_work().unwrap();
+        }
+        handle.join().unwrap().unwrap()
+    });
+    assert!(reading.poll(|_, _| {}, MessageLimit::new(1)).is_ok());
+    // Another client's answers fill the broadcast many times over while
+    // this client does not poll: its receiver is lapped.
+    let mut other = driver.connect().unwrap();
+    for _ in 0..200 {
+        for _ in 0..32 {
+            let _ = other.add_subscription(
+                StreamKey {
+                    stream_id: 99,
+                    session_id: 1,
+                },
+                SubscriberRole::Optional,
+            );
+        }
+        for _ in 0..40 {
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = other.poll(usize::MAX, |_| {});
+    }
+    let _ = client.poll();
+    assert_eq!(
+        reading.poll(|_, _| {}, MessageLimit::new(1)).err(),
+        Some(karyos_client::SubscriptionError::Closed(
+            karyos_client::ClientError::EventsLost
+        ))
+    );
 }

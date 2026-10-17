@@ -304,6 +304,25 @@ pub struct RequestId {
     pub sequence: u64,
 }
 
+/// A stream id (SPEC §10): the application's name for a stream on a
+/// channel. Every value is valid; a stream's sessions share it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamId(i32);
+
+impl StreamId {
+    /// The stream id `id`.
+    #[must_use]
+    pub const fn new(id: i32) -> Self {
+        Self(id)
+    }
+
+    /// The raw id.
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
 /// A stream's wire identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamKey {
