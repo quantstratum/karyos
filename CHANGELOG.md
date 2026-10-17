@@ -42,6 +42,18 @@ release may break APIs, wire formats and shared-memory layouts.
   channel delivers every message exactly once and in order through NAKs
   and the sender's repairs, and N3 does the same with 5% duplicates (the
   test raises netem's duplicate rate and restores the job's profile).
+- `EmbeddedDriver::add_guarded_network_publication(config, channel,
+  NetworkGuard { guard, messages, rate })`: a network publication whose
+  lane streams are guarded before its sender exists, and whose sender
+  gate is registered with the guard's owner, so it takes part in the
+  close acknowledgement from its first send. It is deregistered when the
+  sender refuses or returns the publication, or when the add fails. A
+  guarded publication needs a spare slot for its walker beyond the
+  sender's reservation (`GuardWalkerUnavailable` otherwise).
+  `add_network_publication` is unchanged. Closing the network, or an agent
+  failing, releases every tracked guard sender for deregistration, so no
+  guard close waits on a sender that will never apply it;
+  `NetworkShutdown::guard_senders_released` reports how many.
 - The receiver's controls report a third send outcome. `ReportSlot` and
   `ReportGuard` (formerly `ProbeSlot` and `ProbeGuard`) carry an RTTM
   REQUEST's or a NAK's submission back to the receiver: submitted at the

@@ -24,9 +24,10 @@ use karyos_sys::log_buffer::{DEFAULT_CORRUPT_RETRIES, Role, SenderRead};
 use karyos_sys::term_bytes::HeapTerms;
 
 use super::NetworkPublicationState;
-use crate::agents::data::Outbound;
+use crate::agents::data::{GuardSpec, Outbound};
 use crate::embedded::{AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION};
 use crate::error::DriverError;
+use crate::guards::{GuardHandle, GuardRate};
 use crate::sessions::send::Publication;
 
 /// Where a channel sends, and the local address its endpoint binds.
@@ -48,6 +49,22 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, SocketAddr), DriverError> {
     Ok((destination, SocketAddr::new(ip, 0)))
 }
 
+/// The guard of a guarded network publication: every lane stream is
+/// guarded by `guard` with an outcome ring of `messages` records and, with
+/// `rate`, the publication's rate limit, as
+/// [`EmbeddedDriver::guard_stream`] guards a local stream; the sender agent
+/// runs its gate (local close only on sockets, O-11 and GC-6).
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkGuard {
+    /// The guard.
+    pub guard: GuardHandle,
+    /// Outcome records per lane stream (`C_m`).
+    pub messages: u64,
+    /// The publication's rate limit (GC-5: a channel's lanes are one
+    /// publication).
+    pub rate: Option<GuardRate>,
+}
+
 impl EmbeddedDriver<HeapTerms> {
     /// Creates an aggregate publication, as [`EmbeddedDriver::add_aggregate`]
     /// does, whose lanes the sender agent sends over `channel` (control
@@ -67,13 +84,42 @@ impl EmbeddedDriver<HeapTerms> {
         config: AggregateConfig,
         channel: &UdpConfig,
     ) -> Result<AggregateHandle, DriverError> {
+        self.add_network(config, channel, None)
+    }
+
+    /// [`EmbeddedDriver::add_network_publication`], guarded by `guard`:
+    /// every lane stream is guarded before the sender exists, and the
+    /// sender runs the guard's gate from its first send. A close is local
+    /// on sockets (O-11, GC-6).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`EmbeddedDriver::add_network_publication`], of
+    /// [`EmbeddedDriver::guard_stream`] and of
+    /// [`EmbeddedDriver::register_guard_sender`]. Nothing is left
+    /// configured on error.
+    pub fn add_guarded_network_publication(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        guard: NetworkGuard,
+    ) -> Result<AggregateHandle, DriverError> {
+        self.add_network(config, channel, Some(guard))
+    }
+
+    fn add_network(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        guard: Option<NetworkGuard>,
+    ) -> Result<AggregateHandle, DriverError> {
         if self.net.is_none() {
             return Err(DriverError::NetworkUnavailable);
         }
         let (destination, bind) = route(channel)?;
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
         let handle = self.add_aggregate(config)?;
-        let added = self.attach_sender(&handle, destination, bind, channel.reliable, quanta);
+        let added = self.attach_sender(&handle, destination, bind, channel.reliable, quanta, guard);
         if let Err(error) = added {
             let _ = self.remove_aggregate(&handle);
             return Err(error);
@@ -93,8 +139,46 @@ impl EmbeddedDriver<HeapTerms> {
             .publication_state(aggregate.registration())
     }
 
-    /// Builds the sender's data path over the lanes of `handle` and posts
-    /// it.
+    /// Guards every lane stream of `handle` with `guard`, and registers the
+    /// publication's sender gate with the guard's owner: the spec the
+    /// sender's gate is built from. The streams' guard goes with the
+    /// aggregate when it is removed.
+    fn guard_lanes(
+        &mut self,
+        handle: &AggregateHandle,
+        guard: Option<NetworkGuard>,
+    ) -> Result<Option<(GuardSpec, crate::guard_ack::GuardSenderId)>, DriverError> {
+        let Some(guard) = guard else {
+            return Ok(None);
+        };
+        for (lane, stream) in handle.streams().enumerate() {
+            #[cfg(test)]
+            if self.guard_lane_fault == Some(lane) {
+                return Err(DriverError::GuardWalkerUnavailable {
+                    stream: self.stream(stream)?.id,
+                    reason: crate::WalkerUnavailable::NoSpareCredit,
+                });
+            }
+            #[cfg(not(test))]
+            let _ = lane;
+            self.guard_stream(stream, guard.guard, guard.messages, guard.rate)?;
+        }
+        let word = self.guards.view(guard.guard)?;
+        let epoch = self.guards.state(guard.guard)?.epoch;
+        let (id, cell) = self.register_guard_sender(guard.guard)?;
+        Ok(Some((
+            GuardSpec {
+                word,
+                cell,
+                epoch,
+                rate: guard.rate.map(|rate| rate.policy),
+            },
+            id,
+        )))
+    }
+
+    /// Builds the sender's data path over the lanes of `handle`, guards its
+    /// lanes with `guard`, and posts it with the guard's spec.
     fn attach_sender(
         &mut self,
         handle: &AggregateHandle,
@@ -102,6 +186,34 @@ impl EmbeddedDriver<HeapTerms> {
         bind: SocketAddr,
         reliable: bool,
         quanta: Lanes<u64>,
+        guard: Option<NetworkGuard>,
+    ) -> Result<(), DriverError> {
+        let mut guard_sender = None;
+        let posted = self.post_sender(
+            handle,
+            (destination, bind),
+            reliable,
+            quanta,
+            guard,
+            &mut guard_sender,
+        );
+        // A sender never posted leaves the close acknowledgement at once.
+        if posted.is_err()
+            && let Some(id) = guard_sender
+        {
+            let _ = self.deregister_guard_sender(id);
+        }
+        posted
+    }
+
+    fn post_sender(
+        &mut self,
+        handle: &AggregateHandle,
+        (destination, bind): (SocketAddr, SocketAddr),
+        reliable: bool,
+        quanta: Lanes<u64>,
+        guard: Option<NetworkGuard>,
+        guard_sender: &mut Option<crate::guard_ack::GuardSenderId>,
     ) -> Result<(), DriverError> {
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
         let mut term = None;
@@ -130,6 +242,11 @@ impl EmbeddedDriver<HeapTerms> {
             occupant = next;
         }
         self.next_export = occupant;
+        // Guarded after the sender's readers hold their reservations, so a
+        // stream short of spare slots for its walker says so
+        // (`GuardWalkerUnavailable`).
+        let guard = self.guard_lanes(handle, guard)?;
+        *guard_sender = guard.as_ref().map(|(_, id)| *id);
         let (config, alias) = term.ok_or(DriverError::InvalidConfig)?;
         let lane_count = u8::try_from(readers.len()).map_err(|_| DriverError::InvalidConfig)?;
         let publication = |endpoint| Publication {
@@ -164,6 +281,7 @@ impl EmbeddedDriver<HeapTerms> {
                 handle.registration(),
                 publication(endpoint),
                 Box::new(outbound),
+                guard,
             )
         });
         if posted.is_err() {
