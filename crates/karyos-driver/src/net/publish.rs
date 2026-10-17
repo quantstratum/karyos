@@ -149,8 +149,7 @@ impl EmbeddedDriver<HeapTerms> {
             bind,
             channel.reliable,
             quanta,
-            guard,
-            roles,
+            (guard, roles),
         );
         if let Err(error) = added {
             let _ = self.remove_aggregate(&handle);
@@ -210,7 +209,8 @@ impl EmbeddedDriver<HeapTerms> {
     }
 
     /// Builds the sender's data path over the lanes of `handle`, guards its
-    /// lanes with `guard`, and posts it with the guard's spec.
+    /// lanes with `guard`, and posts it with the guard's spec and the
+    /// receivers' `roles`.
     fn attach_sender(
         &mut self,
         handle: &AggregateHandle,
@@ -218,8 +218,7 @@ impl EmbeddedDriver<HeapTerms> {
         bind: SocketAddr,
         reliable: bool,
         quanta: Lanes<u64>,
-        guard: Option<NetworkGuard>,
-        roles: Option<Box<PublicationRoles>>,
+        (guard, roles): (Option<NetworkGuard>, Option<Box<PublicationRoles>>),
     ) -> Result<(), DriverError> {
         let mut guard_sender = None;
         let posted = self.post_sender(
