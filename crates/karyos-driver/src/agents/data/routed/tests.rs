@@ -1216,6 +1216,62 @@ fn a_submit_resets_the_stall_clock() {
     }
 }
 
+/// #346 delta review (ACS 17096): a route reopened after a reset is ready
+/// again. A and B block on p0, A submits it, B resets and is reopened (its
+/// copies, and the one that blocked it, dropped). A alone holds p128 and
+/// blocks; B, drained, holds p256: the lane waits on A, which leaves after
+/// `path_lag_limit`.
+#[test]
+fn a_reopened_path_is_waited_on_and_the_lone_holder_leaves() {
+    let (a, observer_a, _seen_a) = path(1, 0);
+    let (b, observer_b, _seen_b, rx_b) = path_rx(2, 0);
+    let mut halves = vec![a, b];
+    let (mut outbound, mut log) = routed(0);
+    outbound.set_path_policy(policy());
+    commit(&mut log, 0, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 1_000)
+        .unwrap();
+    observer_a.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 2_000)
+        .unwrap();
+    assert_eq!(outbound.routed_sender().unwrap().pending(0, 0), Some(0));
+    let _rx_b = reset(&mut halves, 1, rx_b);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 3_000)
+        .unwrap();
+    let b_half = halves.remove(1);
+    commit(&mut log, 1, 1);
+    let _ = outbound
+        .serve_routes(&mut halves, BUDGET, None, 4_000)
+        .unwrap();
+    halves.push(b_half);
+    commit(&mut log, 2, 1);
+    sent(&observer_b, 64);
+    for now in (5_000..1_000_000).step_by(100_000) {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(outbound.path_state(0).map(|state| state.0), Some(true));
+    for now in (1_100_000..1_500_000).step_by(100_000) {
+        let _ = outbound
+            .serve_routes(&mut halves, BUDGET, None, now)
+            .unwrap();
+    }
+    assert_eq!(
+        outbound.path_state(0).map(|state| state.0),
+        Some(false),
+        "A held the lane alone past the limit"
+    );
+    assert_eq!(outbound.path_state(1).map(|state| state.0), Some(true));
+    assert!(observer_b.send_calls() > 0, "B resumes");
+}
+
 /// #346 review P2-2: a shared bottleneck evicts no path. B submits p0 and
 /// A blocks on it; B alone takes p1 and blocks too. B holds the lane's head
 /// alone, but A, which holds later copies, is blocked as well: neither
