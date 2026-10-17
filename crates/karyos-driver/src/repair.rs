@@ -15,4 +15,5 @@
 
 pub mod admission;
 pub mod jobs;
+pub mod loss;
 pub mod scheduler;
